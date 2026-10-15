@@ -4,34 +4,38 @@
 use core::net::SocketAddrV4;
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, SocketRequest, SocketResponse,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
-    ConnectSocketRequest, CreateSocketRequest, GetTcpOptionRequest, IpProtocol,
+    ConnectSocketRequest, CreateSocketRequest, GetSocketOptionRequest, IpProtocol,
     ListenSocketRequest, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags,
     ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
-    ReceiveSocketResponse, SendFlags, SendSocketRequest, SendToSocketRequest, SetTcpOptionRequest,
-    ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
-    SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
+    ReceiveSocketResponse, SendFlags, SendSocketRequest, SendToSocketRequest,
+    SetSocketOptionRequest, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
+    SocketError, SocketOptionName, SocketOptionValue, SocketStatusRequest, SocketStatusResponse,
+    SocketType,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Creates a broker-owned IPv4 TCP stream socket.
+    /// Creates a broker-owned IPv4 TCP stream socket with the status flags
+    /// `flags`.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn create_tcp_socket(&self) -> Result<ObjectHandle, Channel::Error> {
+    pub fn create_tcp_socket(&self, flags: FileOpenFlags) -> Result<ObjectHandle, Channel::Error> {
         let response = self.request_socket(SocketRequest::Create(CreateSocketRequest {
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Stream,
             protocol: IpProtocol::Tcp,
+            flags,
         }))?;
         let SocketResponse::Create(response) = response else {
             panic!("broker returned unexpected socket create response: {response:?}");
@@ -39,16 +43,18 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         Ok(response.handle)
     }
 
-    /// Creates a broker-owned IPv4 UDP datagram socket.
+    /// Creates a broker-owned IPv4 UDP datagram socket with the status flags
+    /// `flags`.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn create_udp_socket(&self) -> Result<ObjectHandle, Channel::Error> {
+    pub fn create_udp_socket(&self, flags: FileOpenFlags) -> Result<ObjectHandle, Channel::Error> {
         let response = self.request_socket(SocketRequest::Create(CreateSocketRequest {
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Datagram,
             protocol: IpProtocol::Udp,
+            flags,
         }))?;
         let SocketResponse::Create(response) = response else {
             panic!("broker returned unexpected socket create response: {response:?}");
@@ -117,7 +123,10 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = test_broker_local(channel, memory.clone());
 
-        assert_eq!(local.create_udp_socket().unwrap(), handle);
+        assert_eq!(
+            local.create_udp_socket(FileOpenFlags::NONE).unwrap(),
+            handle
+        );
         assert_eq!(
             local
                 .send_to_socket(
@@ -169,18 +178,19 @@ mod tests {
     }
 
     #[test]
-    fn tcp_options_use_typed_requests() {
+    fn socket_options_use_typed_requests() {
         let handle = ObjectHandle(7);
+        let timeout = Some(core::time::Duration::from_secs(3));
         let channel = ScriptedChannel::new([
-            BrokerResult::Socket(SocketResponse::SetTcpOption),
-            BrokerResult::Socket(SocketResponse::GetTcpOption(
-                litebox_broker_protocol::socket::GetTcpOptionResponse {
-                    value: TcpOptionValue::NoDelay(true),
+            BrokerResult::Socket(SocketResponse::SetOption),
+            BrokerResult::Socket(SocketResponse::GetOption(
+                litebox_broker_protocol::socket::GetSocketOptionResponse {
+                    value: SocketOptionValue::NoDelay(true),
                 },
             )),
-            BrokerResult::Socket(SocketResponse::GetTcpOption(
-                litebox_broker_protocol::socket::GetTcpOptionResponse {
-                    value: TcpOptionValue::KeepAlive(false),
+            BrokerResult::Socket(SocketResponse::GetOption(
+                litebox_broker_protocol::socket::GetSocketOptionResponse {
+                    value: SocketOptionValue::ReceiveTimeout(timeout),
                 },
             )),
         ]);
@@ -188,34 +198,34 @@ mod tests {
         let local = test_broker_local(channel, memory);
 
         local
-            .set_tcp_option(handle, TcpOptionValue::NoDelay(true))
+            .set_socket_option(handle, SocketOptionValue::NoDelay(true))
             .unwrap();
         assert_eq!(
             local
-                .get_tcp_option(handle, TcpOptionName::NoDelay)
+                .get_socket_option(handle, SocketOptionName::NoDelay)
                 .unwrap(),
-            TcpOptionValue::NoDelay(true)
+            SocketOptionValue::NoDelay(true)
         );
         assert_eq!(
             local
-                .get_tcp_option(handle, TcpOptionName::KeepAlive)
+                .get_socket_option(handle, SocketOptionName::ReceiveTimeout)
                 .unwrap(),
-            TcpOptionValue::KeepAlive(false)
+            SocketOptionValue::ReceiveTimeout(timeout)
         );
         assert_eq!(
             local.channel.sent_operations.borrow().as_slice(),
             [
-                BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+                BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
                     handle,
-                    value: TcpOptionValue::NoDelay(true),
+                    value: SocketOptionValue::NoDelay(true),
                 })),
-                BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                BrokerOperation::Socket(SocketRequest::GetOption(GetSocketOptionRequest {
                     handle,
-                    name: TcpOptionName::NoDelay,
+                    name: SocketOptionName::NoDelay,
                 })),
-                BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                BrokerOperation::Socket(SocketRequest::GetOption(GetSocketOptionRequest {
                     handle,
-                    name: TcpOptionName::KeepAlive,
+                    name: SocketOptionName::ReceiveTimeout,
                 })),
             ]
         );
@@ -345,7 +355,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Accepts one pending connection from a broker-owned TCP listener.
+    /// Accepts one pending connection from a broker-owned TCP listener into a
+    /// socket with the status flags `flags`.
     ///
     /// # Panics
     ///
@@ -353,8 +364,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn accept_socket(
         &self,
         handle: ObjectHandle,
+        flags: FileOpenFlags,
     ) -> Result<core::result::Result<AcceptSocketResponse, SocketError>, Channel::Error> {
-        match self.request_socket(SocketRequest::Accept(AcceptSocketRequest { handle }))? {
+        match self.request_socket(SocketRequest::Accept(AcceptSocketRequest { handle, flags }))? {
             SocketResponse::Accept(response) => Ok(Ok(response)),
             SocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected socket accept response: {response:?}"),
@@ -378,53 +390,50 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         Ok(response)
     }
 
-    /// Sets a typed option on a broker-owned TCP socket.
+    /// Sets one option of a broker-owned socket.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn set_tcp_option(
+    pub fn set_socket_option(
         &self,
         handle: ObjectHandle,
-        value: TcpOptionValue,
+        value: SocketOptionValue,
     ) -> Result<(), Channel::Error> {
-        let response = self.request_socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+        let response = self.request_socket(SocketRequest::SetOption(SetSocketOptionRequest {
             handle,
             value,
         }))?;
         assert_eq!(
             response,
-            SocketResponse::SetTcpOption,
-            "broker returned unexpected TCP option set response"
+            SocketResponse::SetOption,
+            "broker returned unexpected socket option set response"
         );
         Ok(())
     }
 
-    /// Reads a typed option from a broker-owned TCP socket.
+    /// Reads one option of a broker-owned socket.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation or
-    /// returns a value for a different option.
-    pub fn get_tcp_option(
+    /// a value for a different option.
+    pub fn get_socket_option(
         &self,
         handle: ObjectHandle,
-        name: TcpOptionName,
-    ) -> Result<TcpOptionValue, Channel::Error> {
-        let response = self.request_socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+        name: SocketOptionName,
+    ) -> Result<SocketOptionValue, Channel::Error> {
+        let response = self.request_socket(SocketRequest::GetOption(GetSocketOptionRequest {
             handle,
             name,
         }))?;
-        let SocketResponse::GetTcpOption(response) = response else {
-            panic!("broker returned unexpected TCP option get response: {response:?}");
+        let SocketResponse::GetOption(response) = response else {
+            panic!("broker returned unexpected socket option get response: {response:?}");
         };
-        assert!(
-            matches!(
-                (name, response.value),
-                (TcpOptionName::NoDelay, TcpOptionValue::NoDelay(_))
-                    | (TcpOptionName::KeepAlive, TcpOptionValue::KeepAlive(_))
-            ),
-            "broker returned a mismatched TCP option value"
+        assert_eq!(
+            response.value.name(),
+            name,
+            "broker returned a mismatched socket option value"
         );
         Ok(response.value)
     }

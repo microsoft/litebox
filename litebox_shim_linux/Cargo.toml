@@ -36,6 +36,7 @@ libc = "0.2.177"
 # by the build target so the tests can run on whichever userland platform matches
 # the host.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+litebox_broker_platform_linux_userland = { path = "../litebox_broker_platform_linux_userland/", version = "0.1.0" }
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0" }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]

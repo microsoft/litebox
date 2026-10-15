@@ -444,15 +444,19 @@ impl Default for PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_broker_protocol::fs::FileOpenFlags;
+
     const IPV4_TCP: CreateSocketRequest = CreateSocketRequest {
         address_family: AddressFamily::Ipv4,
         socket_type: SocketType::Stream,
         protocol: IpProtocol::Tcp,
+        flags: FileOpenFlags::NONE,
     };
     const IPV4_UDP: CreateSocketRequest = CreateSocketRequest {
         address_family: AddressFamily::Ipv4,
         socket_type: SocketType::Datagram,
         protocol: IpProtocol::Udp,
+        flags: FileOpenFlags::NONE,
     };
 
     fn cidr(address: [u8; 4], prefix_length: u8) -> Ipv4Cidr {

@@ -19,7 +19,7 @@ use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags, ShutdownMode,
-    SocketConnectionStatus, SocketError, SocketOutcome, TcpOptionName, TcpOptionValue,
+    SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
 };
 use rustix::event::epoll;
 use rustix::io::{Errno, ioctl_fionread};
@@ -932,19 +932,22 @@ fn discard_guest_read_shutdown_data(socket: &mut SocketEntry) -> BrokerResult<()
     Ok(())
 }
 
-pub(super) fn set_tcp_option(socket: &mut SocketEntry, value: TcpOptionValue) -> BrokerResult<()> {
+pub(super) fn set_tcp_option(
+    socket: &mut SocketEntry,
+    value: SocketOptionValue,
+) -> BrokerResult<()> {
     if socket.kind() != SocketKind::Tcp {
         return Err(BrokerError::UnsupportedOperation);
     }
     match value {
-        TcpOptionValue::NoDelay(value) => {
+        SocketOptionValue::NoDelay(value) => {
             if socket.tcp_state()?.descriptor.is_external() {
                 sockopt::set_tcp_nodelay(socket.tcp_state()?.descriptor.socket()?, value)
                     .map_err(broker_error_from_errno)?;
             }
             socket.tcp_state_mut()?.no_delay = value;
         }
-        TcpOptionValue::KeepAlive(value) => {
+        SocketOptionValue::KeepAlive(value) => {
             if socket.tcp_state()?.descriptor.is_external() {
                 sockopt::set_socket_keepalive(socket.tcp_state()?.descriptor.socket()?, value)
                     .map_err(broker_error_from_errno)?;
@@ -967,24 +970,26 @@ pub(super) fn apply_tcp_options(
 
 pub(super) fn get_tcp_option(
     socket: &SocketEntry,
-    name: TcpOptionName,
-) -> BrokerResult<TcpOptionValue> {
+    name: SocketOptionName,
+) -> BrokerResult<SocketOptionValue> {
     if socket.kind() != SocketKind::Tcp {
         return Err(BrokerError::UnsupportedOperation);
     }
     match name {
-        TcpOptionName::NoDelay if socket.tcp_state()?.descriptor.is_external() => {
+        SocketOptionName::NoDelay if socket.tcp_state()?.descriptor.is_external() => {
             sockopt::tcp_nodelay(socket.tcp_state()?.descriptor.socket()?)
-                .map(TcpOptionValue::NoDelay)
+                .map(SocketOptionValue::NoDelay)
                 .map_err(broker_error_from_errno)
         }
-        TcpOptionName::NoDelay => Ok(TcpOptionValue::NoDelay(socket.tcp_state()?.no_delay)),
-        TcpOptionName::KeepAlive if socket.tcp_state()?.descriptor.is_external() => {
+        SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(socket.tcp_state()?.no_delay)),
+        SocketOptionName::KeepAlive if socket.tcp_state()?.descriptor.is_external() => {
             sockopt::socket_keepalive(socket.tcp_state()?.descriptor.socket()?)
-                .map(TcpOptionValue::KeepAlive)
+                .map(SocketOptionValue::KeepAlive)
                 .map_err(broker_error_from_errno)
         }
-        TcpOptionName::KeepAlive => Ok(TcpOptionValue::KeepAlive(socket.tcp_state()?.keep_alive)),
+        SocketOptionName::KeepAlive => {
+            Ok(SocketOptionValue::KeepAlive(socket.tcp_state()?.keep_alive))
+        }
         _ => Err(BrokerError::UnsupportedOperation),
     }
 }
@@ -1241,7 +1246,7 @@ impl Reactor {
     pub(super) fn set_tcp_socket_option(
         &mut self,
         id: u64,
-        value: TcpOptionValue,
+        value: SocketOptionValue,
     ) -> BrokerResult<()> {
         self.sockets
             .get_mut(&id)
@@ -1252,8 +1257,8 @@ impl Reactor {
     pub(super) fn get_tcp_socket_option(
         &self,
         id: u64,
-        name: TcpOptionName,
-    ) -> BrokerResult<TcpOptionValue> {
+        name: SocketOptionName,
+    ) -> BrokerResult<SocketOptionValue> {
         self.sockets
             .get(&id)
             .ok_or(BrokerError::Internal)

@@ -215,12 +215,11 @@ pub(super) enum UdpReceiveOrigin {
     External,
 }
 
-#[derive(Clone, Copy)]
+/// A UDP peer address. Like an IP network, routing and peer filtering use
+/// only the address, never the identity of the socket bound to it.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReactorUdpPeer {
-    Internal {
-        socket_id: u64,
-        internal_address: SocketAddrV4,
-    },
+    Internal(SocketAddrV4),
     External(SocketAddrV4),
 }
 
@@ -321,13 +320,70 @@ impl Reactor {
                 SocketOutcome::Completed(ReactorUdpPeer::External(destination))
             };
         }
+        SocketOutcome::Completed(ReactorUdpPeer::Internal(destination))
+    }
+
+    /// Returns the guest socket that accepts a datagram from `source_address`
+    /// to `destination`, if any.
+    pub(super) fn internal_udp_receiver(
+        &self,
+        destination: SocketAddrV4,
+        source_address: SocketAddrV4,
+    ) -> BrokerResult<Option<u64>> {
         let Some(binding) = self.udp.guest_binding(destination) else {
-            return SocketOutcome::Failed(SocketError::ConnectionRefused);
+            return Ok(None);
         };
-        SocketOutcome::Completed(ReactorUdpPeer::Internal {
-            socket_id: binding.socket_id,
-            internal_address: destination,
-        })
+        let receiver = self
+            .sockets
+            .get(&binding.socket_id)
+            .ok_or(BrokerError::Internal)?;
+        let accepts_source = receiver
+            .udp_state()?
+            .peer
+            .is_none_or(|peer| peer == ReactorUdpPeer::Internal(source_address));
+        Ok(accepts_source.then_some(binding.socket_id))
+    }
+
+    /// Reports an undeliverable internal datagram to a sender connected to
+    /// its destination, as an ICMP port-unreachable error would.
+    pub(super) fn record_udp_port_unreachable(
+        &mut self,
+        socket_id: u64,
+        destination: SocketAddrV4,
+    ) -> BrokerResult<()> {
+        let socket = self
+            .sockets
+            .get_mut(&socket_id)
+            .ok_or(BrokerError::Internal)?;
+        if socket.udp_state()?.peer != Some(ReactorUdpPeer::Internal(destination)) {
+            return Ok(());
+        }
+        socket.pending_error = Some(SocketError::ConnectionRefused);
+        // The error is committed and the cached snapshot remains authoritative
+        // even if this association cannot accept the notification.
+        let _ = self.publish_udp_readiness(socket_id);
+        Ok(())
+    }
+
+    /// Consumes a cached socket error, which takes precedence over data
+    /// transfer.
+    pub(super) fn take_udp_cached_error(
+        &mut self,
+        socket_id: u64,
+    ) -> BrokerResult<Option<SocketError>> {
+        let error = self
+            .sockets
+            .get_mut(&socket_id)
+            .ok_or(BrokerError::Internal)?
+            .pending_error
+            .take();
+        if error.is_some() {
+            // The error is consumed and the cached snapshot remains
+            // authoritative even if this association cannot accept the
+            // notification.
+            let _ = self.publish_udp_readiness(socket_id);
+        }
+        Ok(error)
     }
 
     pub(super) fn reserve_udp_external_peer(
@@ -693,30 +749,20 @@ impl Reactor {
             source.udp_state()?;
             source.process_authority
         };
-        let accepts_source = {
-            let Some(destination) = self.sockets.get(&destination_socket_id) else {
-                return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
-            };
+        {
+            let destination = self
+                .sockets
+                .get(&destination_socket_id)
+                .ok_or(BrokerError::Internal)?;
             if destination.kind() != SocketKind::Udp || destination.read_shutdown {
                 return Ok(SocketOutcome::Completed(payload.len()));
             }
-            let udp = destination.udp_state()?;
-            match udp.peer {
-                None => true,
-                Some(ReactorUdpPeer::Internal {
-                    socket_id,
-                    internal_address,
-                }) => socket_id == source_socket_id && internal_address == source_address,
-                Some(ReactorUdpPeer::External(_)) => false,
-            }
-        };
-        if !accepts_source
-            || self.udp_queue_would_drop(
-                destination_socket_id,
-                source_process_authority,
-                payload.len(),
-            )?
-        {
+        }
+        if self.udp_queue_would_drop(
+            destination_socket_id,
+            source_process_authority,
+            payload.len(),
+        )? {
             return Ok(SocketOutcome::Completed(payload.len()));
         }
 
@@ -1353,7 +1399,7 @@ impl Reactor {
                 {
                     Some(peer)
                 }
-                Some(ReactorUdpPeer::Internal { .. } | ReactorUdpPeer::External(_)) => None,
+                Some(ReactorUdpPeer::Internal(_) | ReactorUdpPeer::External(_)) => None,
                 None => udp.external_peers.get(&host_source).copied(),
             }
         })

@@ -7,19 +7,21 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::fmt;
 use core::net::{Ipv4Addr, SocketAddrV4};
+use core::time::Duration;
 
 use hashbrown::HashSet;
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
     MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromFlags, SendFlags, ShutdownMode,
-    SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse, SocketType,
-    TcpOptionName, TcpOptionValue,
+    SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
+    SocketStatusResponse, SocketType,
 };
 use spin::Mutex;
 
-use crate::object::{ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, ProcessId, Result};
@@ -597,11 +599,15 @@ pub trait PlatformSocket: Send + Sync {
     /// failure must leave the listener active and retryable.
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>>;
 
-    /// Sets a typed TCP socket option.
-    fn set_tcp_option(&self, value: TcpOptionValue) -> Result<()>;
+    /// Sets a TCP socket's [`SocketOptionValue::NoDelay`] or
+    /// [`SocketOptionValue::KeepAlive`], which the transport implements.
+    ///
+    /// A socket accepted from a listener starts with the listener's values.
+    fn set_tcp_option(&self, value: SocketOptionValue) -> Result<()>;
 
-    /// Reads a typed TCP socket option.
-    fn get_tcp_option(&self, name: TcpOptionName) -> Result<TcpOptionValue>;
+    /// Reads a TCP socket's [`SocketOptionName::NoDelay`] or
+    /// [`SocketOptionName::KeepAlive`].
+    fn get_tcp_option(&self, name: SocketOptionName) -> Result<SocketOptionValue>;
 
     /// Returns platform-observed socket state and consumes at most one pending
     /// error.
@@ -646,11 +652,15 @@ impl SocketProvider for UnsupportedSocketProvider {
 }
 
 /// Creates a broker-owned socket.
+///
+/// The socket starts with the status flags `request.flags`, which must be
+/// within [`FileOpenFlags::STATUS`].
 pub fn create(
     process: &BrokerProcess,
     request: CreateSocketRequest,
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<ObjectHandle> {
+    let status = StatusFlags::new(request.flags)?;
     let rights = process
         .core
         .policy
@@ -686,7 +696,9 @@ pub fn create(
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(None),
     });
-    let handle = reference.commit(ObjectEntry::Socket(SocketObject::new(resource, request)))?;
+    let handle = reference.commit(ObjectEntry::Socket(SocketObject::new(
+        resource, request, status,
+    )))?;
     Ok(handle)
 }
 
@@ -958,13 +970,21 @@ pub fn listen(
 }
 
 /// Accepts one pending TCP connection and creates a broker socket capability.
+///
+/// The accepted socket starts with the status flags `flags`, which must be
+/// within [`FileOpenFlags::STATUS`], and default options other than those
+/// [`PlatformSocket::set_tcp_option`] sets. When no connection is pending,
+/// fails with [`BrokerError::WouldBlock`], or with
+/// [`BrokerError::NonBlockingWouldBlock`] if the listener is non-blocking.
 pub fn accept(
     process: &BrokerProcess,
     handle: ObjectHandle,
+    flags: FileOpenFlags,
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<SocketOutcome<AcceptedBrokerSocket>> {
+    let status = StatusFlags::new(flags)?;
     let listener = process.authorized_object(handle, ObjectRights::WAIT)?;
-    let (listener_resource, create_request) = {
+    let (listener_resource, create_request, nonblocking) = {
         let listener = listener.read();
         let ObjectEntry::Socket(socket) = &*listener else {
             return Err(BrokerError::InvalidRights);
@@ -975,7 +995,11 @@ pub fn accept(
         if !socket.listening {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
-        (Arc::clone(&socket.resource), socket.create_request)
+        (
+            Arc::clone(&socket.resource),
+            socket.create_request,
+            socket.status.nonblocking(),
+        )
     };
     let rights = process
         .core
@@ -998,7 +1022,7 @@ pub fn accept(
         }
         Err(error) => {
             readiness.retire();
-            return Err(error);
+            return Err(would_block_error(error, nonblocking));
         }
     };
     let AcceptedPlatformSocket {
@@ -1019,7 +1043,8 @@ pub fn accept(
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(Some(guest_source_lease)),
     });
-    let accepted_socket = SocketObject::new_connected(resource, create_request, local_address);
+    let accepted_socket =
+        SocketObject::new_connected(resource, create_request, status, local_address);
     let handle = reference.commit(ObjectEntry::Socket(accepted_socket))?;
     Ok(SocketOutcome::Completed(AcceptedBrokerSocket {
         handle,
@@ -1029,6 +1054,9 @@ pub fn accept(
 }
 
 /// Sends TCP stream bytes without waiting for readiness.
+///
+/// A temporarily full socket fails with [`BrokerError::WouldBlock`], or with
+/// [`BrokerError::NonBlockingWouldBlock`] if the socket is non-blocking.
 pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1039,15 +1067,18 @@ pub fn send(
         return Err(BrokerError::UnsupportedOperation);
     }
     let length = data.len();
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WRITE)?;
-    if !is_tcp(create_request) {
+    let state = socket_state(process, handle, ObjectRights::WRITE)?;
+    if !is_tcp(state.create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if resource_retired {
+    if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let outcome = resource.platform_socket.send(data, flags)?;
+    let outcome = state
+        .resource
+        .platform_socket
+        .send(data, flags)
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(sent) = outcome
         && (sent > length || (length != 0 && sent == 0))
     {
@@ -1060,8 +1091,9 @@ pub fn send(
 ///
 /// The first valid send with an explicit destination on an unbound datagram
 /// socket reserves and binds a guest-visible local endpoint before invoking
-/// the platform. A temporarily full socket returns
-/// [`BrokerError::WouldBlock`].
+/// the platform. A temporarily full socket fails with
+/// [`BrokerError::WouldBlock`], or with [`BrokerError::NonBlockingWouldBlock`]
+/// if the socket is non-blocking.
 pub fn send_to(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1104,7 +1136,7 @@ pub fn send_to(
             Err(error) => return Err(error),
         }
     }
-    let (resource, needs_bind) = {
+    let (resource, needs_bind, nonblocking) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
@@ -1125,7 +1157,11 @@ pub fn send_to(
             }
             socket.configuration_in_flight = true;
         }
-        (Arc::clone(&socket.resource), needs_bind)
+        (
+            Arc::clone(&socket.resource),
+            needs_bind,
+            socket.status.nonblocking(),
+        )
     };
     if needs_bind {
         match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
@@ -1154,7 +1190,10 @@ pub fn send_to(
     }) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let outcome = resource.platform_socket.send_to(data, flags, destination)?;
+    let outcome = resource
+        .platform_socket
+        .send_to(data, flags, destination)
+        .map_err(|error| would_block_error(error, nonblocking))?;
     if let SocketOutcome::Completed(sent) = outcome
         && sent != length
     {
@@ -1164,6 +1203,9 @@ pub fn send_to(
 }
 
 /// Receives TCP stream bytes without waiting for readiness.
+///
+/// A temporarily empty socket fails with [`BrokerError::WouldBlock`], or with
+/// [`BrokerError::NonBlockingWouldBlock`] if the socket is non-blocking.
 pub fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1190,12 +1232,11 @@ pub fn receive(
     {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WAIT)?;
-    if !is_tcp(create_request) {
+    let state = socket_state(process, handle, ObjectRights::WAIT)?;
+    if !is_tcp(state.create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if resource_retired {
+    if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     if length == 0 {
@@ -1203,9 +1244,11 @@ pub fn receive(
             Vec::new(),
         )));
     }
-    let outcome = resource
+    let outcome = state
+        .resource
         .platform_socket
-        .receive(length, flags, peek_offset, peek_length)?;
+        .receive(length, flags, peek_offset, peek_length)
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(PlatformStreamReceive::Received(received)) = &outcome
         && (received.len() > length || received.is_empty())
     {
@@ -1216,7 +1259,8 @@ pub fn receive(
 
 /// Receives one datagram without waiting for readiness.
 ///
-/// When no datagram is available, returns [`BrokerError::WouldBlock`].
+/// When no datagram is available, fails with [`BrokerError::WouldBlock`], or
+/// with [`BrokerError::NonBlockingWouldBlock`] if the socket is non-blocking.
 pub fn receive_from(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1226,15 +1270,18 @@ pub fn receive_from(
     if flags.has_unsupported_bits() || length > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WAIT)?;
-    if !is_udp(create_request) {
+    let state = socket_state(process, handle, ObjectRights::WAIT)?;
+    if !is_udp(state.create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if resource_retired {
+    if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let outcome = resource.platform_socket.receive_from(length, flags)?;
+    let outcome = state
+        .resource
+        .platform_socket
+        .receive_from(length, flags)
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(received) = &outcome
         && (received.data.len() != received.datagram_length.min(length)
             || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize
@@ -1245,46 +1292,76 @@ pub fn receive_from(
     Ok(outcome)
 }
 
-/// Sets a typed option on a broker-owned TCP socket.
-pub fn set_tcp_option(
+/// Sets one option of a broker-owned socket.
+///
+/// The transport implements a TCP socket's `NoDelay` and `KeepAlive`; the
+/// broker stores the other options, and fails with `UnsupportedOperation` for
+/// `NoDelay` on a datagram socket.
+pub fn set_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    value: TcpOptionValue,
+    value: SocketOptionValue,
 ) -> Result<()> {
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WRITE)?;
-    if !is_tcp(create_request) {
-        return Err(BrokerError::UnsupportedOperation);
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let mut object = object.write();
+    let ObjectEntry::Socket(socket) = &mut *object else {
+        return Err(BrokerError::InvalidRights);
+    };
+    if !is_tcp_option(socket.create_request, value.name()) {
+        return socket.options.set(value);
     }
-    if resource_retired {
+    if socket.resource_retired {
         return Err(BrokerError::Internal);
     }
+    let resource = Arc::clone(&socket.resource);
+    drop(object);
     resource.platform_socket.set_tcp_option(value)
 }
 
-/// Reads a typed option from a broker-owned TCP socket.
-pub fn get_tcp_option(
+/// Returns one option of a broker-owned socket.
+pub fn get_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    name: TcpOptionName,
-) -> Result<TcpOptionValue> {
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WAIT)?;
-    if !is_tcp(create_request) {
-        return Err(BrokerError::UnsupportedOperation);
+    name: SocketOptionName,
+) -> Result<SocketOptionValue> {
+    let object = process
+        .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let object = object.read();
+    let ObjectEntry::Socket(socket) = &*object else {
+        return Err(BrokerError::InvalidRights);
+    };
+    if !is_tcp_option(socket.create_request, name) {
+        return socket.options.get(name);
     }
-    if resource_retired {
+    if socket.resource_retired {
         return Err(BrokerError::Internal);
     }
+    let resource = Arc::clone(&socket.resource);
+    drop(object);
     let value = resource.platform_socket.get_tcp_option(name)?;
-    if !matches!(
-        (name, value),
-        (TcpOptionName::NoDelay, TcpOptionValue::NoDelay(_))
-            | (TcpOptionName::KeepAlive, TcpOptionValue::KeepAlive(_))
-    ) {
+    if value.name() != name {
         return Err(BrokerError::Internal);
     }
     Ok(value)
+}
+
+/// Returns whether the transport of a socket created by `create_request`
+/// implements the option `name`.
+fn is_tcp_option(create_request: CreateSocketRequest, name: SocketOptionName) -> bool {
+    is_tcp(create_request)
+        && matches!(
+            name,
+            SocketOptionName::NoDelay | SocketOptionName::KeepAlive
+        )
+}
+
+/// Returns `error`, reporting [`BrokerError::WouldBlock`] as
+/// [`BrokerError::NonBlockingWouldBlock`] for a non-blocking socket.
+fn would_block_error(error: BrokerError, nonblocking: bool) -> BrokerError {
+    match error {
+        BrokerError::WouldBlock if nonblocking => BrokerError::NonBlockingWouldBlock,
+        error => error,
+    }
 }
 
 /// Applies a directional or TCP lifecycle shutdown mode.
@@ -1636,21 +1713,31 @@ fn socket_resource(
     Ok(Arc::clone(&socket.resource))
 }
 
+/// A snapshot of the state of a socket that an operation needs after
+/// releasing the object lock.
+struct SocketState {
+    resource: Arc<SocketResource>,
+    create_request: CreateSocketRequest,
+    resource_retired: bool,
+    nonblocking: bool,
+}
+
 fn socket_state(
     process: &BrokerProcess,
     handle: ObjectHandle,
     required_rights: ObjectRights,
-) -> Result<(Arc<SocketResource>, CreateSocketRequest, bool)> {
+) -> Result<SocketState> {
     let object = process.authorized_object(handle, required_rights)?;
     let object = object.read();
     let ObjectEntry::Socket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
     };
-    Ok((
-        Arc::clone(&socket.resource),
-        socket.create_request,
-        socket.resource_retired,
-    ))
+    Ok(SocketState {
+        resource: Arc::clone(&socket.resource),
+        create_request: socket.create_request,
+        resource_retired: socket.resource_retired,
+        nonblocking: socket.status.nonblocking(),
+    })
 }
 
 enum ReserveAndBindOutcome {
@@ -1944,6 +2031,51 @@ fn finish_retired_configuration(
     Ok(())
 }
 
+/// Options a socket stores without its transport implementing them, which
+/// every reference to the socket shares.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SocketOptions {
+    receive_timeout: Option<Duration>,
+    send_timeout: Option<Duration>,
+    linger: Option<Duration>,
+    reuse_address: bool,
+    keep_alive: bool,
+    broadcast: bool,
+}
+
+impl SocketOptions {
+    /// Stores `value`, failing with `UnsupportedOperation` for
+    /// [`SocketOptionValue::NoDelay`], which only a TCP transport implements.
+    pub(crate) fn set(&mut self, value: SocketOptionValue) -> Result<()> {
+        match value {
+            SocketOptionValue::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
+            SocketOptionValue::SendTimeout(timeout) => self.send_timeout = timeout,
+            SocketOptionValue::Linger(timeout) => self.linger = timeout,
+            SocketOptionValue::ReuseAddress(value) => self.reuse_address = value,
+            SocketOptionValue::KeepAlive(value) => self.keep_alive = value,
+            SocketOptionValue::Broadcast(value) => self.broadcast = value,
+            SocketOptionValue::NoDelay(_) => return Err(BrokerError::UnsupportedOperation),
+        }
+        Ok(())
+    }
+
+    /// Returns the stored value of the option `name`, failing with
+    /// `UnsupportedOperation` for [`SocketOptionName::NoDelay`].
+    pub(crate) fn get(&self, name: SocketOptionName) -> Result<SocketOptionValue> {
+        Ok(match name {
+            SocketOptionName::ReceiveTimeout => {
+                SocketOptionValue::ReceiveTimeout(self.receive_timeout)
+            }
+            SocketOptionName::SendTimeout => SocketOptionValue::SendTimeout(self.send_timeout),
+            SocketOptionName::Linger => SocketOptionValue::Linger(self.linger),
+            SocketOptionName::ReuseAddress => SocketOptionValue::ReuseAddress(self.reuse_address),
+            SocketOptionName::KeepAlive => SocketOptionValue::KeepAlive(self.keep_alive),
+            SocketOptionName::Broadcast => SocketOptionValue::Broadcast(self.broadcast),
+            SocketOptionName::NoDelay => return Err(BrokerError::UnsupportedOperation),
+        })
+    }
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "socket lifecycle latches are independent"
@@ -1951,6 +2083,9 @@ fn finish_retired_configuration(
 pub(crate) struct SocketObject {
     resource: Arc<SocketResource>,
     create_request: CreateSocketRequest,
+    status: StatusFlags,
+    /// Options other than those [`is_tcp_option`] selects.
+    options: SocketOptions,
     connection_status: SocketConnectionStatus,
     local_address: Option<SocketAddrV4>,
     connect_in_flight: bool,
@@ -1961,10 +2096,16 @@ pub(crate) struct SocketObject {
 }
 
 impl SocketObject {
-    fn new(resource: Arc<SocketResource>, create_request: CreateSocketRequest) -> Self {
+    fn new(
+        resource: Arc<SocketResource>,
+        create_request: CreateSocketRequest,
+        status: StatusFlags,
+    ) -> Self {
         Self {
             resource,
             create_request,
+            status,
+            options: SocketOptions::default(),
             connection_status: SocketConnectionStatus::Unconnected,
             local_address: None,
             connect_in_flight: false,
@@ -1978,9 +2119,10 @@ impl SocketObject {
     fn new_connected(
         resource: Arc<SocketResource>,
         create_request: CreateSocketRequest,
+        status: StatusFlags,
         local_address: SocketAddrV4,
     ) -> Self {
-        let mut socket = Self::new(resource, create_request);
+        let mut socket = Self::new(resource, create_request, status);
         socket.connection_status = SocketConnectionStatus::Connected;
         socket.local_address = Some(local_address);
         socket
@@ -1988,6 +2130,16 @@ impl SocketObject {
 
     pub(crate) fn resource(&self) -> Arc<SocketResource> {
         Arc::clone(&self.resource)
+    }
+
+    /// Returns the socket's access mode and status flags.
+    pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
+        self.status.get(FileAccessMode::ReadWrite)
+    }
+
+    /// Changes the status flags in `mask` to their values in `flags`.
+    pub(crate) fn set_status_flags(&mut self, mask: FileOpenFlags, flags: FileOpenFlags) {
+        self.status.set(mask, flags);
     }
 
     /// Publishes this socket's later readiness changes through

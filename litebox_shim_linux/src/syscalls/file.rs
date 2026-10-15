@@ -10,7 +10,7 @@ use alloc::{
 };
 use litebox::{
     event::{Events, wait::WaitError},
-    fd::{FdEnabledSubsystem, MetadataError, TypedFd},
+    fd::{FdEnabledSubsystem, TypedFd},
     fs::errors::OpenError,
     path,
     process::InheritableFd,
@@ -410,7 +410,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 /// A raw fd resolved once into the subsystem that owns it.
 pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
     Fs(alloc::sync::Arc<FileFd>),
-    Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
+    Inet(alloc::sync::Arc<TypedFd<super::inet::InetSocketSubsystem<Platform>>>),
     Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
     Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
@@ -425,7 +425,7 @@ macro_rules! on_any_fd {
     ($any:expr, |$fd:ident| $body:expr) => {
         match $any {
             AnyTypedFd::Fs($fd) => $body,
-            AnyTypedFd::Network($fd) => $body,
+            AnyTypedFd::Inet($fd) => $body,
             AnyTypedFd::Pipes($fd) => $body,
             AnyTypedFd::Eventfd($fd) => $body,
             AnyTypedFd::Epoll($fd) => $body,
@@ -440,7 +440,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     pub(crate) fn subsystem_name(&self) -> &'static str {
         match self {
             Self::Fs(_) => "fs",
-            Self::Network(_) => "net",
+            Self::Inet(_) => "inet",
             Self::Pipes(_) => "pipes",
             Self::Eventfd(_) => "eventfd",
             Self::Epoll(_) => "epoll",
@@ -467,7 +467,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     pub(crate) fn dispatch<R>(
         &self,
         fs: impl FnOnce(&FileFd) -> R,
-        net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
+        inet: impl FnOnce(&TypedFd<super::inet::InetSocketSubsystem<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<litebox::pipes::Pipes<Platform>>) -> R,
         eventfd: impl FnOnce(&TypedFd<super::eventfd::EventfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<super::epoll::EpollSubsystem<Platform>>) -> R,
@@ -476,7 +476,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     ) -> R {
         match self {
             Self::Fs(fd) => fs(fd),
-            Self::Network(fd) => net(fd),
+            Self::Inet(fd) => inet(fd),
             Self::Pipes(fd) => pipes(fd),
             Self::Eventfd(fd) => eventfd(fd),
             Self::Epoll(fd) => epoll(fd),
@@ -696,7 +696,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         InheritableFd::ReadinessQueue(alloc::sync::Arc::clone(file.queue())),
                     ))
                 })?,
-                AnyTypedFd::Network(_) => return Err(Errno::EAGAIN),
+                AnyTypedFd::Inet(_) => return Err(Errno::EAGAIN),
             };
             next_fd = raw_fd + 1;
             let inherited_fd = ForkedFd {
@@ -945,14 +945,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
-                self.global.receive(
-                    &self.wait_cx(),
-                    fd,
-                    &mut buf.borrow_mut(),
-                    litebox_common_linux::ReceiveFlags::empty(),
-                    super::net::ReceiveContext::new(None, false),
-                    None,
-                )
+                self.global.with_inet_socket(fd, |socket| {
+                    let mut buf = buf.borrow_mut();
+                    if buf.is_empty() {
+                        return Ok(0);
+                    }
+                    let received = socket.receive(
+                        &self.wait_cx(),
+                        &mut buf,
+                        litebox_common_linux::ReceiveFlags::empty(),
+                        super::inet::ReceiveContext::new(None, false),
+                        None,
+                    )?;
+                    Ok(received.min(buf.len()))
+                })
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -1044,17 +1050,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
-                is_datagram.set(matches!(
-                    self.global.get_socket_type(fd)?,
-                    litebox_common_linux::SockType::Datagram
-                ));
-                self.global.sendto(
-                    &self.wait_cx(),
-                    fd,
-                    buf,
-                    litebox_common_linux::SendFlags::empty(),
-                    None,
-                )
+                self.global.with_inet_socket(fd, |socket| {
+                    is_datagram.set(!socket.is_stream());
+                    socket.sendto(
+                        &self.wait_cx(),
+                        buf,
+                        litebox_common_linux::SendFlags::empty(),
+                        None,
+                    )
+                })
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -1334,9 +1338,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
                 if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<litebox::net::Network<Platform>>(raw_fd)
+                    rds.fd_consume_raw_integer::<super::inet::InetSocketSubsystem<Platform>>(raw_fd)
                 {
-                    AnyTypedFd::Network(fd)
+                    AnyTypedFd::Inet(fd)
                 } else if let Ok(fd) =
                     rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd)
                 {
@@ -1379,16 +1383,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.finalize_elf_patch(fd);
                 result
             }
-            // A `vfork` child cannot create sockets, so each socket the child's table refers to
-            // is also held by the suspended parent's table or, if a sibling thread has since
-            // closed it there, waits in the network's deferred closes. Only the child's
-            // descriptor goes, and then a socket it held last closes.
-            AnyTypedFd::Network(fd) if self.vfork.borrow().is_some() => {
+            AnyTypedFd::Inet(fd) => {
                 self.remove_and_drop_descriptor(&fd);
-                self.global.net.lock().finish_deferred_closes();
                 Ok(())
             }
-            AnyTypedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             AnyTypedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
             AnyTypedFd::Eventfd(fd) => {
                 self.remove_and_drop_descriptor(&fd);
@@ -1542,11 +1540,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// datagram per iovec.
     fn datagram_size_limit(&self, fd: &AnyTypedFd<Platform>) -> Option<usize> {
         match fd {
-            AnyTypedFd::Network(fd) => matches!(
-                self.global.get_socket_type(fd),
-                Ok(litebox_common_linux::SockType::Datagram)
-            )
-            .then_some(litebox::net::MAX_UDP_DATAGRAM_SIZE),
+            AnyTypedFd::Inet(fd) => {
+                let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
+                handle
+                    .with_entry(|socket| !socket.is_stream())
+                    .then_some(litebox::inet_socket::MAX_UDP_DATAGRAM_SIZE)
+            }
             AnyTypedFd::Unix(fd) => {
                 let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
                 // Like `sendmsg`, Unix datagrams have no size limit of their own.
@@ -1570,7 +1569,7 @@ fn read_datagram_from_iovec<Platform: ShimPlatform>(
         return Ok(0);
     }
     let mut buffer = alloc::vec::Vec::new();
-    let capacity = capacity.min(litebox::net::SOCKET_RECEIVE_OPERATION_SIZE);
+    let capacity = capacity.min(litebox::inet_socket::SOCKET_RECEIVE_OPERATION_SIZE);
     buffer
         .try_reserve_exact(capacity)
         .map_err(|_| Errno::ENOMEM)?;
@@ -2158,43 +2157,32 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 set_file_descriptor_flags(&fd, &self.global, flags);
                 Ok(0)
             }
-            FcntlArg::GETFL => {
-                macro_rules! getfl_from_metadata {
-                    ($fd:expr, $MetaType:path) => {
-                        Ok(self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .with_metadata($fd, |$MetaType(flags)| {
-                                *flags & OFlags::STATUS_FLAGS_MASK
-                            })
-                            .unwrap_or(OFlags::empty()))
-                    };
-                }
-                Ok(fd
-                    .dispatch(
-                        |fd| linux_status_flags(self.global.litebox.get_file_status_flags(fd)?),
-                        |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
-                        |fd| linux_status_flags(self.global.pipes.get_status_flags(fd)?),
-                        |fd| {
-                            self.global
-                                .with_eventfd(fd, super::eventfd::EventFile::get_status_flags)
-                        },
-                        |fd| {
-                            self.global
-                                .with_epoll(fd, super::epoll::EpollFile::get_status_flags)
-                        },
-                        |fd| {
-                            self.global
-                                .with_unix_socket(fd, super::unix::UnixSocket::get_status_flags)
-                        },
-                        |fd| {
-                            self.global
-                                .with_timerfd(fd, super::timerfd::TimerFile::get_status_flags)
-                        },
-                    )?
-                    .bits())
-            }
+            FcntlArg::GETFL => Ok(fd
+                .dispatch(
+                    |fd| linux_status_flags(self.global.litebox.get_file_status_flags(fd)?),
+                    |fd| {
+                        self.global
+                            .with_inet_socket(fd, super::inet::InetSocket::get_status_flags)
+                    },
+                    |fd| linux_status_flags(self.global.pipes.get_status_flags(fd)?),
+                    |fd| {
+                        self.global
+                            .with_eventfd(fd, super::eventfd::EventFile::get_status_flags)
+                    },
+                    |fd| {
+                        self.global
+                            .with_epoll(fd, super::epoll::EpollFile::get_status_flags)
+                    },
+                    |fd| {
+                        self.global
+                            .with_unix_socket(fd, super::unix::UnixSocket::get_status_flags)
+                    },
+                    |fd| {
+                        self.global
+                            .with_timerfd(fd, super::timerfd::TimerFile::get_status_flags)
+                    },
+                )?
+                .bits()),
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
                     | OFlags::NONBLOCK
@@ -2202,29 +2190,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | OFlags::DIRECT
                     | OFlags::NOATIME;
                 let flags = flags & setfl_mask;
-                macro_rules! setfl_in_metadata {
-                    ($fd:expr, $MetaType:path, $no_metadata_msg:expr) => {
-                        setfl_in_metadata!($fd, $MetaType, $no_metadata_msg, |diff: OFlags| {
-                            if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
-                                log_unsupported!("unsupported flags");
-                            }
-                        })
-                    };
-                    ($fd:expr, $MetaType:path, $no_metadata_msg:expr, $check_diff:expr) => {
-                        self.global
-                            .litebox
-                            .descriptor_table_mut()
-                            .with_metadata_mut($fd, |$MetaType(f)| {
-                                let diff = (*f & setfl_mask) ^ flags;
-                                $check_diff(diff);
-                                f.toggle(diff);
-                            })
-                            .map_err(|err| match err {
-                                MetadataError::ClosedFd => Errno::EBADF,
-                                MetadataError::NoSuchMetadata => $no_metadata_msg,
-                            })
-                    };
-                }
                 fd.dispatch(
                     |fd| {
                         if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
@@ -2233,11 +2198,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         set_file_status_flags(&self.global.litebox, fd, setfl_mask, flags)
                     },
                     |fd| {
-                        setfl_in_metadata!(
-                            fd,
-                            crate::syscalls::net::SocketOFlags,
-                            unreachable!("all sockets have SocketOFlags when created")
-                        )
+                        if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
+                            log_unsupported!("unsupported flags");
+                        }
+                        self.global.with_inet_socket(fd, |socket| {
+                            socket.set_status_flags(setfl_mask, flags)
+                        })
                     },
                     |fd| {
                         if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
@@ -2519,24 +2485,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             flags,
                         )
                     },
-                    |socket_fd| {
-                        if let Err(e) = self
-                            .global
-                            .litebox
-                            .descriptor_table_mut()
-                            .with_metadata_mut(
-                                socket_fd,
-                                |crate::syscalls::net::SocketOFlags(flags)| {
-                                    flags.set(OFlags::NONBLOCK, val != 0);
-                                },
-                            )
-                        {
-                            match e {
-                                MetadataError::ClosedFd => return Err(Errno::EBADF),
-                                MetadataError::NoSuchMetadata => unreachable!(),
-                            }
-                        }
-                        Ok(())
+                    |fd| {
+                        self.global.with_inet_socket(fd, |socket| {
+                            socket.set_status_flags(OFlags::NONBLOCK, flags)
+                        })
                     },
                     |fd| {
                         self.global
@@ -3034,9 +2986,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |fd| {
                 dup(self, &files, fd, close_on_exec, target, |fd| {
-                    let _ = self
-                        .global
-                        .close_socket(&self.wait_cx(), alloc::sync::Arc::new(fd));
+                    self.remove_and_drop_descriptor(&fd);
                 })
             },
             |fd| {

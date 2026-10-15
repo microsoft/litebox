@@ -25,8 +25,8 @@ use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, MAX_UDP_DATAGRAM_SIZE, ReceiveFlags,
-    ReceiveFromFlags, SendFlags, ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome,
-    SocketType, TcpOptionName, TcpOptionValue,
+    ReceiveFromFlags, SendFlags, ShutdownMode, SocketConnectionStatus, SocketError,
+    SocketOptionName, SocketOptionValue, SocketOutcome, SocketType,
 };
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, epoll, eventfd};
@@ -369,7 +369,7 @@ impl PlatformSocket for LinuxSocket {
         })
     }
 
-    fn set_tcp_option(&self, value: TcpOptionValue) -> BrokerResult<()> {
+    fn set_tcp_option(&self, value: SocketOptionValue) -> BrokerResult<()> {
         self.reactor
             .request(|response| ReactorCommand::SetTcpOption {
                 id: self.id,
@@ -378,7 +378,7 @@ impl PlatformSocket for LinuxSocket {
             })
     }
 
-    fn get_tcp_option(&self, name: TcpOptionName) -> BrokerResult<TcpOptionValue> {
+    fn get_tcp_option(&self, name: SocketOptionName) -> BrokerResult<SocketOptionValue> {
         self.reactor
             .request(|response| ReactorCommand::GetTcpOption {
                 id: self.id,
@@ -850,13 +850,13 @@ enum ReactorCommand {
     },
     SetTcpOption {
         id: u64,
-        value: TcpOptionValue,
+        value: SocketOptionValue,
         response: SyncSender<BrokerResult<()>>,
     },
     GetTcpOption {
         id: u64,
-        name: TcpOptionName,
-        response: SyncSender<BrokerResult<TcpOptionValue>>,
+        name: SocketOptionName,
+        response: SyncSender<BrokerResult<SocketOptionValue>>,
     },
     Status {
         id: u64,
@@ -1134,7 +1134,7 @@ impl Reactor {
             };
             let mut reused_native_endpoint = false;
             let mut staged_endpoint = match peer {
-                ReactorUdpPeer::Internal { .. } => None,
+                ReactorUdpPeer::Internal(_) => None,
                 ReactorUdpPeer::External(destination) => {
                     if self
                         .sockets
@@ -1179,12 +1179,8 @@ impl Reactor {
                     .udp
                     .binding_for_socket(id)
                     .ok_or(BrokerError::Internal)?;
-                let destination = match peer {
-                    ReactorUdpPeer::Internal {
-                        internal_address, ..
-                    } => internal_address,
-                    ReactorUdpPeer::External(destination) => destination,
-                };
+                let (ReactorUdpPeer::Internal(destination) | ReactorUdpPeer::External(destination)) =
+                    peer;
                 binding
                     .guest_binding
                     .source_address_for_destination(destination)
@@ -1231,11 +1227,17 @@ impl Reactor {
         data: &[u8],
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let (peer, authorize_external_reply) = {
+        {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
             if socket.kind() != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
                 return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
             }
+        }
+        if let Some(error) = self.take_udp_cached_error(id)? {
+            return Ok(SocketOutcome::Failed(error));
+        }
+        let (peer, authorize_external_reply) = {
+            let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
             if socket.write_shutdown {
                 return Ok(SocketOutcome::Failed(SocketError::Other));
             }
@@ -1252,27 +1254,24 @@ impl Reactor {
             }
         };
         match peer {
-            ReactorUdpPeer::Internal {
-                socket_id: destination_id,
-                internal_address,
-            } => {
+            ReactorUdpPeer::Internal(destination) => {
                 let source_address = self
                     .udp
                     .binding_for_socket(id)
                     .and_then(|binding| {
                         binding
                             .guest_binding
-                            .source_address_for_destination(internal_address)
+                            .source_address_for_destination(destination)
                     })
                     .ok_or(BrokerError::Internal)?;
-                if self
-                    .udp
-                    .binding_for_socket(destination_id)
-                    .is_none_or(|binding| !binding.guest_binding.covers(internal_address))
+                if let Some(receiver_id) =
+                    self.internal_udp_receiver(destination, source_address)?
                 {
-                    return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
+                    self.enqueue_internal_datagram(id, receiver_id, source_address, data)
+                } else {
+                    self.record_udp_port_unreachable(id, destination)?;
+                    Ok(SocketOutcome::Completed(data.len()))
                 }
-                self.enqueue_internal_datagram(id, destination_id, source_address, data)
             }
             ReactorUdpPeer::External(destination) => {
                 let external_peer_added = if authorize_external_reply {
@@ -1382,6 +1381,9 @@ impl Reactor {
         length: usize,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<ReactorReceiveFromOutcome> {
+        if let Some(error) = self.take_udp_cached_error(id)? {
+            return Ok(ReactorReceiveFromOutcome::Failed(error));
+        }
         if self
             .sockets
             .get(&id)

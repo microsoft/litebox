@@ -1157,6 +1157,7 @@ fn handle_socket_request<Memory: SharedMemory>(
             match litebox_broker_core::socket::accept(
                 process,
                 request.handle,
+                request.flags,
                 Arc::clone(readiness_sink),
             )
             .map_err(RequestFailure::from)?
@@ -1317,16 +1318,16 @@ fn handle_socket_request<Memory: SharedMemory>(
                 SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
             }
         }
-        SocketRequest::SetTcpOption(request) => {
-            litebox_broker_core::socket::set_tcp_option(process, request.handle, request.value)
-                .map(|()| SocketResponse::SetTcpOption)
+        SocketRequest::SetOption(request) => {
+            litebox_broker_core::socket::set_option(process, request.handle, request.value)
+                .map(|()| SocketResponse::SetOption)
                 .map_err(RequestFailure::from)
         }
-        SocketRequest::GetTcpOption(request) => {
-            litebox_broker_core::socket::get_tcp_option(process, request.handle, request.name)
+        SocketRequest::GetOption(request) => {
+            litebox_broker_core::socket::get_option(process, request.handle, request.name)
                 .map(|value| {
-                    SocketResponse::GetTcpOption(
-                        litebox_broker_protocol::socket::GetTcpOptionResponse { value },
+                    SocketResponse::GetOption(
+                        litebox_broker_protocol::socket::GetSocketOptionResponse { value },
                     )
                 })
                 .map_err(RequestFailure::from)
@@ -1799,8 +1800,8 @@ mod tests {
         ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
         ReceiveSocketRequest, SendFlags, SendSocketRequest, SendToSocketRequest,
         SendToSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
-        SocketError, SocketStatusRequest, SocketStatusResponse, SocketType, TcpOptionName,
-        TcpOptionValue,
+        SocketError, SocketOptionName, SocketOptionValue, SocketStatusRequest,
+        SocketStatusResponse, SocketType,
     };
     use litebox_broker_protocol::timer::{
         CreateTimerRequest, GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
@@ -2067,17 +2068,17 @@ mod tests {
             Ok(SocketOutcome::Completed(()))
         }
 
-        fn set_tcp_option(&self, _value: TcpOptionValue) -> litebox_broker_core::Result<()> {
+        fn set_tcp_option(&self, _value: SocketOptionValue) -> litebox_broker_core::Result<()> {
             Ok(())
         }
 
         fn get_tcp_option(
             &self,
-            name: TcpOptionName,
-        ) -> litebox_broker_core::Result<TcpOptionValue> {
+            name: SocketOptionName,
+        ) -> litebox_broker_core::Result<SocketOptionValue> {
             match name {
-                TcpOptionName::NoDelay => Ok(TcpOptionValue::NoDelay(false)),
-                TcpOptionName::KeepAlive => Ok(TcpOptionValue::KeepAlive(false)),
+                SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(false)),
+                SocketOptionName::KeepAlive => Ok(SocketOptionValue::KeepAlive(false)),
                 _ => Err(litebox_broker_core::BrokerError::UnsupportedOperation),
             }
         }
@@ -3245,6 +3246,7 @@ mod tests {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
+                flags: FileOpenFlags::NONE,
             })),
             &shared_buffers,
         );
@@ -3396,6 +3398,7 @@ mod tests {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Datagram,
                 protocol: IpProtocol::Udp,
+                flags: FileOpenFlags::NONE,
             })),
             &shared_buffers,
         );

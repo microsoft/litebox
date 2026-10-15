@@ -51,7 +51,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
     File(Arc<crate::FileFd>),
-    Socket(Arc<super::net::SocketFd<Platform>>),
+    Inet(Arc<TypedFd<super::inet::InetSocketSubsystem<Platform>>>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform>>>),
     Timerfd(Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
@@ -63,8 +63,10 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
         if let Ok(fd) = rds.fd_from_raw_integer::<litebox::fs::BrokerFile>(raw_fd) {
             return Ok(EpollDescriptor::File(fd));
         }
-        if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
-            return Ok(EpollDescriptor::Socket(fd));
+        if let Ok(fd) =
+            rds.fd_from_raw_integer::<super::inet::InetSocketSubsystem<Platform>>(raw_fd)
+        {
+            return Ok(EpollDescriptor::Inet(fd));
         }
         if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
             return Ok(EpollDescriptor::Pipe(fd));
@@ -121,10 +123,7 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|file| poll(&global.litebox.broker_file_pollable(file))))
             }
-            EpollDescriptor::Socket(fd) => {
-                let socket = global.get_network_socket(fd).ok()?;
-                Some(poll(&socket))
-            }
+            EpollDescriptor::Inet(fd) => poll_entry!(fd),
             EpollDescriptor::Pipe(fd) => poll_entry!(fd),
             EpollDescriptor::Unix(fd) => poll_entry!(fd),
             EpollDescriptor::Timerfd(fd) => poll_entry!(fd),
@@ -151,10 +150,9 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
             EpollDescriptor::Unix(fd) => global.with_unix_socket(fd, |socket| {
                 f(&ReadinessTarget::UnixSocket(socket.unix_socket()))
             }),
-            EpollDescriptor::Socket(fd) => {
-                let socket = global.get_network_socket(fd)?;
-                f(&ReadinessTarget::NetworkSocket(&socket))
-            }
+            EpollDescriptor::Inet(fd) => global.with_inet_socket(fd, |socket| {
+                f(&ReadinessTarget::InetSocket(socket.inet_socket()))
+            }),
             EpollDescriptor::Epoll(_) => Err(Errno::EPERM),
         }
     }

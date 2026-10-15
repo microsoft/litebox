@@ -5,6 +5,10 @@
 //!
 //! The broker core and its mutable in-memory fs are process-wide. The repository's supported
 //! `cargo nextest` runner isolates each test in its own process.
+//!
+//! On Linux, IP sockets are backed by host sockets. Guests share a private
+//! network and reach host-loopback TCP services through
+//! [`HOST_GATEWAY_IPV4_ADDRESS`].
 
 extern crate std;
 
@@ -13,8 +17,10 @@ use core::convert::Infallible;
 use std::sync::OnceLock;
 
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine,
+    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
+    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
     fs::{in_mem::InitialNode, resolver::Resolver},
+    socket::HOST_GATEWAY_IPV4_ADDRESS,
     stdio::StdioStream,
     test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
 };
@@ -23,7 +29,10 @@ use litebox_broker_host::{
     test_support::{InProcessBrokerChannel, InProcessBrokerSetup},
 };
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::fs::{FileMode, FileUser};
+use litebox_broker_protocol::{
+    fs::{FileMode, FileUser},
+    socket::{Ipv4Address, Port},
+};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::syscalls::tests::TestPlatform;
@@ -115,14 +124,36 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
             })
             .build()
             .expect("the test filesystem must be valid");
-        let core = TestBrokerCoreBuilder::new(
+        #[cfg(target_os = "linux")]
+        let socket_provider = litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
+            limits.max_sockets,
+            limits.max_sockets_per_process,
+        )
+        .expect("the test socket provider must start");
+        let builder = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
+                .with_process_duplication_enabled(true)
+                .with_socket_policy(socket_policy()),
         )
         .with_limits(limits)
-        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
-        .build()
-        .expect("a test process may build only one broker core");
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)));
+        #[cfg(target_os = "linux")]
+        let builder = builder.with_socket_provider(Arc::new(socket_provider));
+        let core = builder
+            .build()
+            .expect("a test process may build only one broker core");
         TestBroker { core, stdio }
     })
+}
+
+fn socket_policy() -> SocketPolicy {
+    SocketPolicy::guest_network()
+        .with_tcp_destination_rules(&[DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32)
+                .expect("the gateway CIDR must be valid"),
+            DestinationPortRange::new(Port(1), Port(u16::MAX))
+                .expect("the gateway port range must be valid"),
+        )])
+        .expect("the test socket policy must be valid")
 }

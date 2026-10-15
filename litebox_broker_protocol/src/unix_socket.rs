@@ -11,14 +11,13 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::time::Duration;
 
 use thiserror::Error;
 
 use crate::ObjectHandle;
 use crate::fs::{FileError, FileMode, FileOpenFlags, FileUser};
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
-use crate::socket::{ShutdownMode, SocketType};
+use crate::socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType};
 
 /// Maximum length in bytes of the guest-visible part of a Unix socket name.
 pub const MAX_UNIX_SOCKET_NAME_SIZE: u32 = 108;
@@ -231,58 +230,6 @@ pub enum UnixSocketError {
     File(FileError),
 }
 
-/// Unix socket option name.
-///
-/// Every reference to a socket shares its options.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnixSocketOptionName {
-    /// Longest time a blocking receive or accept waits.
-    ReceiveTimeout,
-    /// Longest time a blocking send or connect waits.
-    SendTimeout,
-    /// Linger time on close.
-    Linger,
-    /// Whether address reuse was requested.
-    ReuseAddress,
-    /// Whether keepalive was requested.
-    KeepAlive,
-    /// Whether broadcast was requested.
-    Broadcast,
-}
-
-/// Unix socket option value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnixSocketOptionValue {
-    /// [`UnixSocketOptionName::ReceiveTimeout`], or `None` to wait
-    /// indefinitely.
-    ReceiveTimeout(Option<Duration>),
-    /// [`UnixSocketOptionName::SendTimeout`], or `None` to wait indefinitely.
-    SendTimeout(Option<Duration>),
-    /// [`UnixSocketOptionName::Linger`], or `None` to close in the
-    /// background.
-    Linger(Option<Duration>),
-    /// [`UnixSocketOptionName::ReuseAddress`].
-    ReuseAddress(bool),
-    /// [`UnixSocketOptionName::KeepAlive`].
-    KeepAlive(bool),
-    /// [`UnixSocketOptionName::Broadcast`].
-    Broadcast(bool),
-}
-
-impl UnixSocketOptionValue {
-    /// Returns the name of the option this value sets.
-    pub fn name(self) -> UnixSocketOptionName {
-        match self {
-            Self::ReceiveTimeout(_) => UnixSocketOptionName::ReceiveTimeout,
-            Self::SendTimeout(_) => UnixSocketOptionName::SendTimeout,
-            Self::Linger(_) => UnixSocketOptionName::Linger,
-            Self::ReuseAddress(_) => UnixSocketOptionName::ReuseAddress,
-            Self::KeepAlive(_) => UnixSocketOptionName::KeepAlive,
-            Self::Broadcast(_) => UnixSocketOptionName::Broadcast,
-        }
-    }
-}
-
 /// Request to create one Unix socket or a connected pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateUnixSocketRequest {
@@ -463,7 +410,7 @@ pub struct SetUnixSocketOptionRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Option value to store.
-    pub value: UnixSocketOptionValue,
+    pub value: SocketOptionValue,
 }
 
 /// Request to read one socket option.
@@ -472,14 +419,14 @@ pub struct GetUnixSocketOptionRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Option name to read.
-    pub name: UnixSocketOptionName,
+    pub name: SocketOptionName,
 }
 
 /// Response containing one socket option value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GetUnixSocketOptionResponse {
     /// Stored option value.
-    pub value: UnixSocketOptionValue,
+    pub value: SocketOptionValue,
 }
 
 #[cfg(test)]

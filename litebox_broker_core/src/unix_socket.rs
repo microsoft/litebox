@@ -31,7 +31,6 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use core::time::Duration;
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -39,11 +38,12 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatusFlags, FileUser,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::socket::{ShutdownMode, SocketType};
+use litebox_broker_protocol::socket::{
+    ShutdownMode, SocketOptionName, SocketOptionValue, SocketType,
+};
 use litebox_broker_protocol::unix_socket::{
     MAX_UNIX_SOCKET_BACKLOG, MAX_UNIX_SOCKET_TRANSFER_SIZE, UNIX_SOCKET_BUFFER_SIZE,
-    UnixSocketAddress, UnixSocketError, UnixSocketName, UnixSocketOptionName,
-    UnixSocketOptionValue,
+    UnixSocketAddress, UnixSocketError, UnixSocketName,
 };
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
 
@@ -51,6 +51,7 @@ use crate::channel::{Channel, ChannelState, Waiter, Wakeups};
 use crate::fs::File;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
+use crate::socket::SocketOptions;
 use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a Unix socket operation.
@@ -446,27 +447,28 @@ pub fn name(
 }
 
 /// Stores one option of a Unix socket.
+///
+/// Fails with `UnsupportedOperation` for [`SocketOptionValue::NoDelay`].
 pub fn set_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    value: UnixSocketOptionValue,
+    value: SocketOptionValue,
 ) -> Result<()> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
-    lease.socket.state.lock().options.set(value);
-    Ok(())
+    lease.socket.state.lock().options.set(value)
 }
 
 /// Returns one stored option of a Unix socket.
 pub fn get_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    name: UnixSocketOptionName,
-) -> Result<UnixSocketOptionValue> {
+    name: SocketOptionName,
+) -> Result<SocketOptionValue> {
     let lease = Lease::new(
         process
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
     )?;
-    Ok(lease.socket.state.lock().options.get(name))
+    lease.socket.state.lock().options.get(name)
 }
 
 /// Returns the rights and status flags of a new socket with the status flags
@@ -717,47 +719,6 @@ impl NameKey {
     }
 }
 
-/// Options stored with a socket and shared by its references.
-#[derive(Default)]
-struct Options {
-    receive_timeout: Option<Duration>,
-    send_timeout: Option<Duration>,
-    linger: Option<Duration>,
-    reuse_address: bool,
-    keep_alive: bool,
-    broadcast: bool,
-}
-
-impl Options {
-    fn set(&mut self, value: UnixSocketOptionValue) {
-        match value {
-            UnixSocketOptionValue::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
-            UnixSocketOptionValue::SendTimeout(timeout) => self.send_timeout = timeout,
-            UnixSocketOptionValue::Linger(timeout) => self.linger = timeout,
-            UnixSocketOptionValue::ReuseAddress(value) => self.reuse_address = value,
-            UnixSocketOptionValue::KeepAlive(value) => self.keep_alive = value,
-            UnixSocketOptionValue::Broadcast(value) => self.broadcast = value,
-        }
-    }
-
-    fn get(&self, name: UnixSocketOptionName) -> UnixSocketOptionValue {
-        match name {
-            UnixSocketOptionName::ReceiveTimeout => {
-                UnixSocketOptionValue::ReceiveTimeout(self.receive_timeout)
-            }
-            UnixSocketOptionName::SendTimeout => {
-                UnixSocketOptionValue::SendTimeout(self.send_timeout)
-            }
-            UnixSocketOptionName::Linger => UnixSocketOptionValue::Linger(self.linger),
-            UnixSocketOptionName::ReuseAddress => {
-                UnixSocketOptionValue::ReuseAddress(self.reuse_address)
-            }
-            UnixSocketOptionName::KeepAlive => UnixSocketOptionValue::KeepAlive(self.keep_alive),
-            UnixSocketOptionName::Broadcast => UnixSocketOptionValue::Broadcast(self.broadcast),
-        }
-    }
-}
-
 /// One Unix socket.
 ///
 /// Dropping a socket tears nothing down: [`Socket::close`] does once nothing
@@ -786,7 +747,7 @@ struct State {
     /// File created by binding to a path, held open so the node that
     /// identifies the name stays allocated.
     marker: Option<File>,
-    options: Options,
+    options: SocketOptions,
     /// Whether the socket stopped sending. Its incoming channel is shut once
     /// it stops receiving.
     write_shut: bool,
@@ -883,7 +844,7 @@ impl Socket {
                 binding: false,
                 name_key: None,
                 marker: None,
-                options: Options::default(),
+                options: SocketOptions::default(),
                 write_shut: false,
                 closed: false,
                 connection,

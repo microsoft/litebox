@@ -8,15 +8,16 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, UnixSocketRequest, UnixSocketResponse,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
-use litebox_broker_protocol::socket::{ShutdownMode, SocketType};
+use litebox_broker_protocol::socket::{
+    ShutdownMode, SocketOptionName, SocketOptionValue, SocketType,
+};
 use litebox_broker_protocol::unix_socket::{
     AcceptUnixSocketRequest, BindUnixSocketRequest, ConnectUnixSocketRequest,
     CreateUnixSocketPairResponse, CreateUnixSocketRequest, GetUnixSocketNameRequest,
     GetUnixSocketOptionRequest, ListenUnixSocketRequest, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketRequest,
     ReceiveUnixSocketResponse, SendUnixSocketRequest, SetUnixSocketOptionRequest,
-    ShutdownUnixSocketRequest, UnixSocketError, UnixSocketName, UnixSocketOptionName,
-    UnixSocketOptionValue,
+    ShutdownUnixSocketRequest, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -330,7 +331,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn set_unix_socket_option(
         &self,
         handle: ObjectHandle,
-        value: UnixSocketOptionValue,
+        value: SocketOptionValue,
     ) -> Result<(), Channel::Error> {
         match self.request_unix_socket(UnixSocketRequest::SetOption(
             SetUnixSocketOptionRequest { handle, value },
@@ -349,8 +350,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn get_unix_socket_option(
         &self,
         handle: ObjectHandle,
-        name: UnixSocketOptionName,
-    ) -> Result<UnixSocketOptionValue, Channel::Error> {
+        name: SocketOptionName,
+    ) -> Result<SocketOptionValue, Channel::Error> {
         let response =
             self.request_unix_socket(UnixSocketRequest::GetOption(GetUnixSocketOptionRequest {
                 handle,

@@ -22,7 +22,6 @@ use core::cell::{Cell, RefCell};
 use core::ops::Deref;
 use litebox::{
     LiteBox,
-    net::Network,
     pipes::Pipes,
     platform::{RawConstPointer, RawPointerProvider},
     shim::ContinueOperation,
@@ -395,13 +394,11 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// Build the shim.
     pub fn build(self) -> LinuxShim<Platform> {
         let litebox = Arc::new(self.litebox);
-        let net = Network::new(&litebox);
         let global = Arc::new(GlobalState {
             platform: self.platform,
             mm: MemoryManager::new(self.platform),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&litebox),
-            net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
             process_id: self.process_id,
             litebox,
@@ -736,7 +733,7 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         }
 
         resolve_fd!(litebox::fs::BrokerFile, Fs);
-        resolve_fd!(Network<Platform>, Network);
+        resolve_fd!(syscalls::inet::InetSocketSubsystem<Platform>, Inet);
         resolve_fd!(Pipes<Platform>, Pipes);
         resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);
         resolve_fd!(syscalls::epoll::EpollSubsystem<Platform>, Epoll);
@@ -1519,8 +1516,6 @@ struct GlobalState<Platform: ShimPlatform> {
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
-    /// The network subsystem.
-    net: litebox::sync::Mutex<Platform, Network<Platform>>,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.

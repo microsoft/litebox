@@ -10,8 +10,10 @@
 //! or flag the broker has not agreed to support.
 
 use core::net::SocketAddrV4;
+use core::time::Duration;
 
 use crate::ObjectHandle;
+use crate::fs::FileOpenFlags;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use thiserror::Error;
 
@@ -80,24 +82,60 @@ pub enum ShutdownMode {
     StopListening,
 }
 
-/// Broker-supported TCP socket option name.
+/// Socket option name, shared by internet and Unix sockets.
+///
+/// Every reference to a socket shares its options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TcpOptionName {
-    /// Disable or enable Nagle's algorithm.
-    NoDelay,
-    /// Enable or disable TCP keepalive probes.
+pub enum SocketOptionName {
+    /// Longest time a blocking receive or accept waits.
+    ReceiveTimeout,
+    /// Longest time a blocking send or connect waits.
+    SendTimeout,
+    /// Linger time on close.
+    Linger,
+    /// Whether address reuse was requested.
+    ReuseAddress,
+    /// Whether keepalive was requested, which enables keepalive probes on a
+    /// TCP socket.
     KeepAlive,
+    /// Whether broadcast was requested.
+    Broadcast,
+    /// Whether Nagle's algorithm is disabled, which only TCP sockets support.
+    NoDelay,
 }
 
-/// Broker-supported TCP socket option value.
+/// Socket option value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TcpOptionValue {
-    /// Whether Nagle's algorithm is disabled.
-    NoDelay(bool),
-    /// Whether TCP keepalive probes are enabled.
+pub enum SocketOptionValue {
+    /// [`SocketOptionName::ReceiveTimeout`], or `None` to wait indefinitely.
+    ReceiveTimeout(Option<Duration>),
+    /// [`SocketOptionName::SendTimeout`], or `None` to wait indefinitely.
+    SendTimeout(Option<Duration>),
+    /// [`SocketOptionName::Linger`], or `None` to close in the background.
+    Linger(Option<Duration>),
+    /// [`SocketOptionName::ReuseAddress`].
+    ReuseAddress(bool),
+    /// [`SocketOptionName::KeepAlive`].
     KeepAlive(bool),
+    /// [`SocketOptionName::Broadcast`].
+    Broadcast(bool),
+    /// [`SocketOptionName::NoDelay`].
+    NoDelay(bool),
+}
+
+impl SocketOptionValue {
+    /// Returns the name of the option this value sets.
+    pub fn name(self) -> SocketOptionName {
+        match self {
+            Self::ReceiveTimeout(_) => SocketOptionName::ReceiveTimeout,
+            Self::SendTimeout(_) => SocketOptionName::SendTimeout,
+            Self::Linger(_) => SocketOptionName::Linger,
+            Self::ReuseAddress(_) => SocketOptionName::ReuseAddress,
+            Self::KeepAlive(_) => SocketOptionName::KeepAlive,
+            Self::Broadcast(_) => SocketOptionName::Broadcast,
+            Self::NoDelay(_) => SocketOptionName::NoDelay,
+        }
+    }
 }
 
 /// IPv4 address in network byte order.
@@ -276,6 +314,8 @@ pub struct CreateSocketRequest {
     pub socket_type: SocketType,
     /// Transport protocol.
     pub protocol: IpProtocol,
+    /// Initial status flags, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
 }
 
 /// Response to a socket create request.
@@ -338,6 +378,8 @@ pub struct ListenSocketResponse {
 pub struct AcceptSocketRequest {
     /// Listening socket handle.
     pub handle: ObjectHandle,
+    /// Status flags of the accepted socket, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
 }
 
 /// Response containing one accepted broker socket.
@@ -474,29 +516,29 @@ pub struct ShutdownSocketRequest {
     pub mode: ShutdownMode,
 }
 
-/// Request to set a typed TCP socket option.
+/// Request to set a socket option.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetTcpOptionRequest {
+pub struct SetSocketOptionRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Option value to apply.
-    pub value: TcpOptionValue,
+    pub value: SocketOptionValue,
 }
 
-/// Request to read a typed TCP socket option.
+/// Request to read a socket option.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetTcpOptionRequest {
+pub struct GetSocketOptionRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Option name to read.
-    pub name: TcpOptionName,
+    pub name: SocketOptionName,
 }
 
-/// Response containing a typed TCP socket option value.
+/// Response containing a socket option value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetTcpOptionResponse {
-    /// Authoritative option value returned by the platform socket.
-    pub value: TcpOptionValue,
+pub struct GetSocketOptionResponse {
+    /// Stored option value.
+    pub value: SocketOptionValue,
 }
 
 /// Request for a socket's connection state.

@@ -207,7 +207,8 @@ pub(crate) fn get_status_flags(
         ObjectEntry::Pipe(pipe) => return Ok(pipe.get_status_flags()),
         ObjectEntry::Timer(timer) => return Ok(timer.get_status_flags()),
         ObjectEntry::ReadinessQueue(queue) => return Ok(queue.get_status_flags()),
-        ObjectEntry::Socket(_) | ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
+        ObjectEntry::Socket(socket) => return Ok(socket.get_status_flags()),
+        ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
     };
     crate::fs::get_status_flags(process, &file)
 }
@@ -241,7 +242,11 @@ pub(crate) fn set_status_flags(
             queue.set_status_flags(mask, flags);
             return Ok(());
         }
-        ObjectEntry::Socket(_) | ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
+        ObjectEntry::Socket(socket) => {
+            socket.set_status_flags(mask, flags);
+            return Ok(());
+        }
+        ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
     };
     crate::fs::set_status_flags(process, &file, mask, flags)
 }

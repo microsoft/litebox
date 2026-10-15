@@ -34,10 +34,10 @@ use crate::signal::{OpenSignalsResponse, SendSignalRequest, SignalEvent, TakeSig
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
-    GetTcpOptionRequest, GetTcpOptionResponse, ListenSocketRequest, ListenSocketResponse,
+    GetSocketOptionRequest, GetSocketOptionResponse, ListenSocketRequest, ListenSocketResponse,
     ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
     ReceiveSocketResponse, SendSocketRequest, SendSocketResponse, SendToSocketRequest,
-    SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
+    SendToSocketResponse, SetSocketOptionRequest, ShutdownSocketRequest, SocketError,
     SocketStatusRequest, SocketStatusResponse,
 };
 use crate::timer::{
@@ -180,8 +180,8 @@ impl BrokerOperation {
                 | SocketRequest::Listen(_)
                 | SocketRequest::Accept(_)
                 | SocketRequest::Shutdown(_)
-                | SocketRequest::SetTcpOption(_)
-                | SocketRequest::GetTcpOption(_)
+                | SocketRequest::SetOption(_)
+                | SocketRequest::GetOption(_)
                 | SocketRequest::Status(_),
             )
             | Self::File(
@@ -444,10 +444,10 @@ pub enum SocketRequest {
     ReceiveFrom(ReceiveFromSocketRequest),
     /// Shut down one or both directions.
     Shutdown(ShutdownSocketRequest),
-    /// Set a typed TCP socket option.
-    SetTcpOption(SetTcpOptionRequest),
-    /// Read a typed TCP socket option.
-    GetTcpOption(GetTcpOptionRequest),
+    /// Set a socket option.
+    SetOption(SetSocketOptionRequest),
+    /// Read a socket option.
+    GetOption(GetSocketOptionRequest),
     /// Read a socket's connection state.
     Status(SocketStatusRequest),
 }
@@ -637,10 +637,10 @@ pub enum SocketResponse {
     ReceiveFrom(ReceiveFromSocketResponse),
     /// Shutdown operation completed.
     Shutdown,
-    /// TCP socket option was updated.
-    SetTcpOption,
-    /// TCP socket option response.
-    GetTcpOption(GetTcpOptionResponse),
+    /// Socket option was updated.
+    SetOption,
+    /// Socket option response.
+    GetOption(GetSocketOptionResponse),
     /// Status operation response.
     Status(SocketStatusResponse),
     /// A host network operation failed.

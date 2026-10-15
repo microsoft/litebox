@@ -47,10 +47,13 @@ fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
         litebox_broker_core::socket::connect(&connector_process, connector, address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    let SocketOutcome::Completed(accepted) =
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness)
-            .expect("guest accept failed")
-    else {
+    let SocketOutcome::Completed(accepted) = litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness,
+    )
+    .expect("guest accept failed") else {
         panic!("guest accept returned a socket failure");
     };
     GuestTcpPair {
@@ -184,24 +187,24 @@ fn reactor_drives_a_loopback_tcp_socket() {
     assert_ne!(local_address.port(), 0);
     assert_eq!(status.pending_error, None);
     assert_eq!(
-        litebox_broker_core::socket::get_tcp_option(&process, handle, TcpOptionName::NoDelay,),
-        Ok(TcpOptionValue::NoDelay(false))
+        litebox_broker_core::socket::get_option(&process, handle, SocketOptionName::NoDelay,),
+        Ok(SocketOptionValue::NoDelay(false))
     );
-    litebox_broker_core::socket::set_tcp_option(&process, handle, TcpOptionValue::NoDelay(true))
+    litebox_broker_core::socket::set_option(&process, handle, SocketOptionValue::NoDelay(true))
         .unwrap();
     assert_eq!(
-        litebox_broker_core::socket::get_tcp_option(&process, handle, TcpOptionName::NoDelay,),
-        Ok(TcpOptionValue::NoDelay(true))
+        litebox_broker_core::socket::get_option(&process, handle, SocketOptionName::NoDelay,),
+        Ok(SocketOptionValue::NoDelay(true))
     );
     assert_eq!(
-        litebox_broker_core::socket::get_tcp_option(&process, handle, TcpOptionName::KeepAlive,),
-        Ok(TcpOptionValue::KeepAlive(false))
+        litebox_broker_core::socket::get_option(&process, handle, SocketOptionName::KeepAlive,),
+        Ok(SocketOptionValue::KeepAlive(false))
     );
-    litebox_broker_core::socket::set_tcp_option(&process, handle, TcpOptionValue::KeepAlive(true))
+    litebox_broker_core::socket::set_option(&process, handle, SocketOptionValue::KeepAlive(true))
         .unwrap();
     assert_eq!(
-        litebox_broker_core::socket::get_tcp_option(&process, handle, TcpOptionName::KeepAlive,),
-        Ok(TcpOptionValue::KeepAlive(true))
+        litebox_broker_core::socket::get_option(&process, handle, SocketOptionName::KeepAlive,),
+        Ok(SocketOptionValue::KeepAlive(true))
     );
 
     let mut unavailable = [0_u8; 1];
@@ -1145,13 +1148,17 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
         listener,
         ReadinessFlags::READ,
     );
-    let accepted =
-        match litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone())
-            .unwrap()
-        {
-            SocketOutcome::Completed(accepted) => accepted.handle,
-            SocketOutcome::Failed(error) => panic!("guest accept failed: {error:?}"),
-        };
+    let accepted = match litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness.clone(),
+    )
+    .unwrap()
+    {
+        SocketOutcome::Completed(accepted) => accepted.handle,
+        SocketOutcome::Failed(error) => panic!("guest accept failed: {error:?}"),
+    };
     assert_eq!(
         send_bytes(&listener_process, accepted, b"unread", SendFlags::NONE,),
         Ok(SocketOutcome::Completed(6))
@@ -1186,8 +1193,13 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
         litebox_broker_core::socket::connect(&connector_process, aborting, guest_address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    let abort_peer =
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness).unwrap();
+    let abort_peer = litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness,
+    )
+    .unwrap();
     let SocketOutcome::Completed(abort_peer) = abort_peer else {
         panic!("second guest accept failed");
     };
@@ -1554,13 +1566,17 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
         listener,
         ReadinessFlags::READ,
     );
-    let accepted =
-        match litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone())
-            .unwrap()
-        {
-            SocketOutcome::Completed(accepted) => accepted,
-            SocketOutcome::Failed(error) => panic!("accept failed: {error:?}"),
-        };
+    let accepted = match litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness.clone(),
+    )
+    .unwrap()
+    {
+        SocketOutcome::Completed(accepted) => accepted,
+        SocketOutcome::Failed(error) => panic!("accept failed: {error:?}"),
+    };
     assert_eq!(accepted.local_address, guest_address);
     assert_eq!(accepted.remote_address, client_address);
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
@@ -1680,6 +1696,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
         let accepted = match litebox_broker_core::socket::accept(
             &listener_process,
             listener,
+            FileOpenFlags::NONE,
             readiness.clone(),
         )
         .unwrap()
@@ -1739,6 +1756,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
     let accepted = match litebox_broker_core::socket::accept(
         &listener_process,
         wildcard_listener,
+        FileOpenFlags::NONE,
         readiness.clone(),
     )
     .unwrap()
@@ -1802,6 +1820,7 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
+                flags: FileOpenFlags::NONE,
             },
             readiness.clone(),
         ),
@@ -1820,7 +1839,12 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
             .contains(ReadinessFlags::READ)
     );
     assert!(matches!(
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone(),),
+        litebox_broker_core::socket::accept(
+            &listener_process,
+            listener,
+            FileOpenFlags::NONE,
+            readiness.clone(),
+        ),
         Err(BrokerError::WouldBlock)
     ));
     assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
@@ -1916,8 +1940,13 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
         ReadinessFlags::READ,
     );
 
-    let accepted = match litebox_broker_core::socket::accept(&listener_process, listener, readiness)
-        .unwrap()
+    let accepted = match litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness,
+    )
+    .unwrap()
     {
         SocketOutcome::Completed(accepted) => accepted,
         SocketOutcome::Failed(error) => panic!("late accept failed: {error:?}"),
@@ -2012,10 +2041,13 @@ fn guest_tcp_zero_backlog_accepts_one_unspecified_destination() {
             SocketError::ConnectionRefused,
         )))
     );
-    let SocketOutcome::Completed(accepted) =
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone())
-            .unwrap()
-    else {
+    let SocketOutcome::Completed(accepted) = litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness.clone(),
+    )
+    .unwrap() else {
         panic!("zero-backlog listener did not accept its queued connection");
     };
     assert_eq!(accepted.local_address, concrete_listener);
@@ -2106,9 +2138,13 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
         listener,
         ReadinessFlags::READ,
     );
-    let accepted =
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone())
-            .unwrap();
+    let accepted = litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness.clone(),
+    )
+    .unwrap();
     let SocketOutcome::Completed(accepted) = accepted else {
         panic!("first FIFO accept failed");
     };
@@ -2143,9 +2179,13 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
             .unwrap(),
     );
     for expected_remote in expected {
-        let accepted =
-            litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone())
-                .unwrap();
+        let accepted = litebox_broker_core::socket::accept(
+            &listener_process,
+            listener,
+            FileOpenFlags::NONE,
+            readiness.clone(),
+        )
+        .unwrap();
         let SocketOutcome::Completed(accepted) = accepted else {
             panic!("later FIFO accept failed");
         };
@@ -2185,16 +2225,16 @@ fn guest_tcp_stream_preserves_options_peek_waitall_and_half_close() {
         litebox_broker_core::socket::bind(&listener_process, listener, address),
         Ok(SocketOutcome::Completed(address))
     );
-    litebox_broker_core::socket::set_tcp_option(
+    litebox_broker_core::socket::set_option(
         &listener_process,
         listener,
-        TcpOptionValue::NoDelay(true),
+        SocketOptionValue::NoDelay(true),
     )
     .unwrap();
-    litebox_broker_core::socket::set_tcp_option(
+    litebox_broker_core::socket::set_option(
         &listener_process,
         listener,
-        TcpOptionValue::KeepAlive(true),
+        SocketOptionValue::KeepAlive(true),
     )
     .unwrap();
     assert_eq!(
@@ -2206,27 +2246,31 @@ fn guest_tcp_stream_preserves_options_peek_waitall_and_half_close() {
         litebox_broker_core::socket::connect(&connector_process, connector, address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    let accepted =
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone())
-            .unwrap();
+    let accepted = litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness.clone(),
+    )
+    .unwrap();
     let SocketOutcome::Completed(accepted) = accepted else {
         panic!("guest accept failed");
     };
     assert_eq!(
-        litebox_broker_core::socket::get_tcp_option(
+        litebox_broker_core::socket::get_option(
             &listener_process,
             accepted.handle,
-            TcpOptionName::NoDelay,
+            SocketOptionName::NoDelay,
         ),
-        Ok(TcpOptionValue::NoDelay(true))
+        Ok(SocketOptionValue::NoDelay(true))
     );
     assert_eq!(
-        litebox_broker_core::socket::get_tcp_option(
+        litebox_broker_core::socket::get_option(
             &listener_process,
             accepted.handle,
-            TcpOptionName::KeepAlive,
+            SocketOptionName::KeepAlive,
         ),
-        Ok(TcpOptionValue::KeepAlive(true))
+        Ok(SocketOptionValue::KeepAlive(true))
     );
     listener_process.close_object_reference(listener).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
@@ -2667,7 +2711,12 @@ fn guest_tcp_connect_publication_failure_purges_committed_queue() {
             .contains(ReadinessFlags::READ)
     );
     assert!(matches!(
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness),
+        litebox_broker_core::socket::accept(
+            &listener_process,
+            listener,
+            FileOpenFlags::NONE,
+            readiness
+        ),
         Err(BrokerError::WouldBlock)
     ));
     assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
@@ -2714,7 +2763,12 @@ fn guest_tcp_accept_publication_failure_purges_registered_endpoint() {
     );
     readiness.fail_next_publish_matching_any(ReadinessFlags::WRITE, ReadinessFlags::READ);
     assert!(matches!(
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone()),
+        litebox_broker_core::socket::accept(
+            &listener_process,
+            listener,
+            FileOpenFlags::NONE,
+            readiness.clone()
+        ),
         Err(BrokerError::ResourceExhausted)
     ));
     readiness.assert_no_pending_publish_failure();
@@ -2787,6 +2841,7 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
+                flags: FileOpenFlags::NONE,
             },
             readiness.clone(),
         ),
@@ -2794,8 +2849,13 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
     );
     assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
 
-    let accepted =
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness).unwrap();
+    let accepted = litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness,
+    )
+    .unwrap();
     assert!(matches!(accepted, SocketOutcome::Completed(_)));
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
 }
@@ -2838,7 +2898,12 @@ fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
     );
     assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
     assert!(matches!(
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone(),),
+        litebox_broker_core::socket::accept(
+            &listener_process,
+            listener,
+            FileOpenFlags::NONE,
+            readiness.clone(),
+        ),
         Err(BrokerError::ResourceExhausted)
     ));
     assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
@@ -2851,8 +2916,13 @@ fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
         retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
         listener_capacity
     );
-    let accepted =
-        litebox_broker_core::socket::accept(&listener_process, listener, readiness).unwrap();
+    let accepted = litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness,
+    )
+    .unwrap();
     assert!(matches!(accepted, SocketOutcome::Completed(_)));
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
 }
@@ -2900,13 +2970,17 @@ fn abortive_connector_close_releases_descriptor_capacity() {
         Ok(SocketOutcome::Completed(()))
     );
     assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
-    let accepted =
-        match litebox_broker_core::socket::accept(&listener_process, listener, readiness.clone())
-            .unwrap()
-        {
-            SocketOutcome::Completed(accepted) => accepted.handle,
-            SocketOutcome::Failed(error) => panic!("accept after Abort failed: {error:?}"),
-        };
+    let accepted = match litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness.clone(),
+    )
+    .unwrap()
+    {
+        SocketOutcome::Completed(accepted) => accepted.handle,
+        SocketOutcome::Failed(error) => panic!("accept after Abort failed: {error:?}"),
+    };
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
     connector_process.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
@@ -3052,7 +3126,12 @@ fn reactor_drives_a_loopback_tcp_listener() {
         Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     assert!(matches!(
-        litebox_broker_core::socket::accept(&process, listener, readiness.clone()),
+        litebox_broker_core::socket::accept(
+            &process,
+            listener,
+            FileOpenFlags::NONE,
+            readiness.clone()
+        ),
         Err(BrokerError::WouldBlock)
     ));
     let failed_accept_handle = retirements.recv_timeout(TEST_TIMEOUT).unwrap();
@@ -3089,11 +3168,17 @@ fn reactor_drives_a_loopback_tcp_listener() {
         Ok(SocketOutcome::Completed(local_address))
     );
 
-    let first =
-        match litebox_broker_core::socket::accept(&process, listener, readiness.clone()).unwrap() {
-            SocketOutcome::Completed(accepted) => accepted,
-            SocketOutcome::Failed(error) => panic!("first accept failed: {error:?}"),
-        };
+    let first = match litebox_broker_core::socket::accept(
+        &process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness.clone(),
+    )
+    .unwrap()
+    {
+        SocketOutcome::Completed(accepted) => accepted,
+        SocketOutcome::Failed(error) => panic!("first accept failed: {error:?}"),
+    };
     assert_eq!(first.local_address, local_address);
     assert_eq!(first.remote_address, first_client_address);
     assert!(
@@ -3104,11 +3189,17 @@ fn reactor_drives_a_loopback_tcp_listener() {
         "accept must preserve listener readiness until the queue is observed empty"
     );
 
-    let second =
-        match litebox_broker_core::socket::accept(&process, listener, readiness.clone()).unwrap() {
-            SocketOutcome::Completed(accepted) => accepted,
-            SocketOutcome::Failed(error) => panic!("second accept failed: {error:?}"),
-        };
+    let second = match litebox_broker_core::socket::accept(
+        &process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness.clone(),
+    )
+    .unwrap()
+    {
+        SocketOutcome::Completed(accepted) => accepted,
+        SocketOutcome::Failed(error) => panic!("second accept failed: {error:?}"),
+    };
     assert_eq!(second.local_address, local_address);
     assert_eq!(second.remote_address, second_client_address);
     assert!(
@@ -3119,7 +3210,12 @@ fn reactor_drives_a_loopback_tcp_listener() {
         "accept must clear listener readiness after draining the queue"
     );
     assert!(matches!(
-        litebox_broker_core::socket::accept(&process, listener, readiness.clone()),
+        litebox_broker_core::socket::accept(
+            &process,
+            listener,
+            FileOpenFlags::NONE,
+            readiness.clone()
+        ),
         Err(BrokerError::WouldBlock)
     ));
     assert!(
@@ -3185,7 +3281,12 @@ fn reactor_drives_a_loopback_tcp_listener() {
             .contains(ReadinessFlags::HANGUP)
     );
     assert!(matches!(
-        litebox_broker_core::socket::accept(&process, listener, readiness.clone()),
+        litebox_broker_core::socket::accept(
+            &process,
+            listener,
+            FileOpenFlags::NONE,
+            readiness.clone()
+        ),
         Ok(SocketOutcome::Failed(SocketError::NotConnected))
     ));
     process.close_object_reference(first.handle).unwrap();

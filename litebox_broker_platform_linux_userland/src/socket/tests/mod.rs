@@ -16,6 +16,7 @@ use litebox_broker_core::{
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
 };
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::socket::{Ipv4Address, Port, ReceiveSocketResponse};
 
 use super::tcp::TcpPendingErrors;
@@ -451,6 +452,7 @@ fn create_socket(
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Stream,
             protocol: IpProtocol::Tcp,
+            flags: FileOpenFlags::NONE,
         },
         readiness,
     )
@@ -467,6 +469,7 @@ fn create_udp_socket(
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Datagram,
             protocol: IpProtocol::Udp,
+            flags: FileOpenFlags::NONE,
         },
         readiness,
     )

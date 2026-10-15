@@ -5,6 +5,7 @@ use super::*;
 use crate::readiness::tests::TestReadinessSink;
 use crate::{BrokerCore, CallerCredential};
 use core::sync::atomic::{AtomicUsize, Ordering};
+use litebox_broker_protocol::fs::SetStatusFlagsRequest;
 use litebox_broker_protocol::socket::{AddressFamily, IpProtocol, SocketType};
 use std::net::Ipv4Addr;
 use std::sync::{Mutex as StdMutex, mpsc};
@@ -576,7 +577,7 @@ struct TestSocketState {
     invalid_bind_address: StdMutex<Option<TestInvalidAddress>>,
     invalid_accept_address: StdMutex<Option<TestInvalidAddress>>,
     fail_shutdown: core::sync::atomic::AtomicBool,
-    tcp_option_sets: StdMutex<std::vec::Vec<TcpOptionValue>>,
+    tcp_option_sets: StdMutex<std::vec::Vec<SocketOptionValue>>,
     failed_readiness: StdMutex<Option<ReadinessRegistration>>,
     live_readiness: StdMutex<Option<ReadinessRegistration>>,
     /// Runs whenever a socket's readiness is read.
@@ -1015,22 +1016,22 @@ impl PlatformSocket for TestPlatformSocket {
         Ok(SocketOutcome::Completed(()))
     }
 
-    fn set_tcp_option(&self, value: TcpOptionValue) -> Result<()> {
+    fn set_tcp_option(&self, value: SocketOptionValue) -> Result<()> {
         self.state.tcp_option_sets.lock().unwrap().push(value);
         let mut options = self.tcp_options.lock().unwrap();
         match value {
-            TcpOptionValue::NoDelay(value) => options.no_delay = value,
-            TcpOptionValue::KeepAlive(value) => options.keep_alive = value,
+            SocketOptionValue::NoDelay(value) => options.no_delay = value,
+            SocketOptionValue::KeepAlive(value) => options.keep_alive = value,
             _ => return Err(BrokerError::UnsupportedOperation),
         }
         Ok(())
     }
 
-    fn get_tcp_option(&self, name: TcpOptionName) -> Result<TcpOptionValue> {
+    fn get_tcp_option(&self, name: SocketOptionName) -> Result<SocketOptionValue> {
         let options = self.tcp_options.lock().unwrap();
         match name {
-            TcpOptionName::NoDelay => Ok(TcpOptionValue::NoDelay(options.no_delay)),
-            TcpOptionName::KeepAlive => Ok(TcpOptionValue::KeepAlive(options.keep_alive)),
+            SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(options.no_delay)),
+            SocketOptionName::KeepAlive => Ok(SocketOptionValue::KeepAlive(options.keep_alive)),
             _ => Err(BrokerError::UnsupportedOperation),
         }
     }
@@ -1172,6 +1173,7 @@ fn accepted_guest_source_lease_is_retained() {
     let SocketOutcome::Completed(accepted) = accept(
         &listener_session,
         listener,
+        FileOpenFlags::NONE,
         Arc::new(TestReadinessSink::default()),
     )
     .unwrap() else {
@@ -1272,6 +1274,7 @@ fn check_queued_guest_source_lease_release(stop_listener: bool) {
             accept(
                 &listener_session,
                 listener,
+                FileOpenFlags::NONE,
                 Arc::new(TestReadinessSink::default())
             ),
             Ok(SocketOutcome::Failed(SocketError::NotConnected))
@@ -1308,6 +1311,7 @@ fn check_queued_guest_source_lease_release(stop_listener: bool) {
         accept(
             &listener_session,
             replacement,
+            FileOpenFlags::NONE,
             Arc::new(TestReadinessSink::default())
         ),
         Err(BrokerError::WouldBlock)
@@ -1479,7 +1483,7 @@ fn failed_accept_rolls_back_readiness_and_quota() {
     for failure in [TestAcceptFailure::Socket, TestAcceptFailure::Broker] {
         let readiness = Arc::new(TestReadinessSink::default());
         provider.fail_next_accept(failure);
-        let result = accept(&process, listener, readiness.clone());
+        let result = accept(&process, listener, FileOpenFlags::NONE, readiness.clone());
         match failure {
             TestAcceptFailure::Socket => assert!(matches!(
                 result,
@@ -1708,7 +1712,12 @@ fn invalid_accepted_metadata_retires_socket_readiness_and_quota() {
         provider.retain_next_socket();
         let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
         assert!(matches!(
-            accept(&listener_session, listener, readiness.clone()),
+            accept(
+                &listener_session,
+                listener,
+                FileOpenFlags::NONE,
+                readiness.clone()
+            ),
             Err(BrokerError::Internal)
         ));
         assert_eq!(
@@ -2198,20 +2207,20 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         receive_calls
     );
     assert_eq!(
-        set_tcp_option(&process, handle, TcpOptionValue::NoDelay(true)),
+        set_option(&process, handle, SocketOptionValue::NoDelay(true)),
         Ok(())
     );
     assert_eq!(
-        get_tcp_option(&process, handle, TcpOptionName::NoDelay),
-        Ok(TcpOptionValue::NoDelay(true))
+        get_option(&process, handle, SocketOptionName::NoDelay),
+        Ok(SocketOptionValue::NoDelay(true))
     );
     assert_eq!(
-        set_tcp_option(&process, handle, TcpOptionValue::KeepAlive(true)),
+        set_option(&process, handle, SocketOptionValue::KeepAlive(true)),
         Ok(())
     );
     assert_eq!(
-        get_tcp_option(&process, handle, TcpOptionName::KeepAlive),
-        Ok(TcpOptionValue::KeepAlive(true))
+        get_option(&process, handle, SocketOptionName::KeepAlive),
+        Ok(SocketOptionValue::KeepAlive(true))
     );
     assert_eq!(
         shutdown(&process, handle, ShutdownMode::Both),
@@ -2240,8 +2249,8 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     assert_eq!(
         provider.state.tcp_option_sets.lock().unwrap().as_slice(),
         [
-            TcpOptionValue::NoDelay(true),
-            TcpOptionValue::KeepAlive(true),
+            SocketOptionValue::NoDelay(true),
+            SocketOptionValue::KeepAlive(true),
         ]
     );
     let process_authority = process.id();
@@ -2269,11 +2278,11 @@ fn check_tcp_option_state_is_per_socket(broker: &BrokerCore) {
     .unwrap();
 
     assert_eq!(
-        set_tcp_option(&process, first, TcpOptionValue::NoDelay(true)),
+        set_option(&process, first, SocketOptionValue::NoDelay(true)),
         Ok(())
     );
     assert_eq!(
-        set_tcp_option(&process, first, TcpOptionValue::KeepAlive(true)),
+        set_option(&process, first, SocketOptionValue::KeepAlive(true)),
         Ok(())
     );
     assert_eq!(process.close_object_reference(first), Ok(()));
@@ -2285,15 +2294,122 @@ fn check_tcp_option_state_is_per_socket(broker: &BrokerCore) {
     )
     .unwrap();
     assert_eq!(
-        get_tcp_option(&process, second, TcpOptionName::NoDelay),
-        Ok(TcpOptionValue::NoDelay(false))
+        get_option(&process, second, SocketOptionName::NoDelay),
+        Ok(SocketOptionValue::NoDelay(false))
     );
     assert_eq!(
-        get_tcp_option(&process, second, TcpOptionName::KeepAlive),
-        Ok(TcpOptionValue::KeepAlive(false))
+        get_option(&process, second, SocketOptionName::KeepAlive),
+        Ok(SocketOptionValue::KeepAlive(false))
     );
 
     assert_eq!(process.close_object_reference(second), Ok(()));
+}
+
+#[test]
+fn sockets_store_options_and_status_flags() {
+    let broker = test_broker(Arc::new(TestSocketProvider::default()));
+    let process = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    for request in [create_request(), create_udp_request()] {
+        let handle = create(&process, request, Arc::new(TestReadinessSink::default())).unwrap();
+        assert_eq!(
+            get_option(&process, handle, SocketOptionName::ReceiveTimeout),
+            Ok(SocketOptionValue::ReceiveTimeout(None))
+        );
+        for value in [
+            SocketOptionValue::ReceiveTimeout(Some(Duration::from_millis(1500))),
+            SocketOptionValue::SendTimeout(Some(Duration::from_secs(2))),
+            SocketOptionValue::Linger(Some(Duration::from_secs(3))),
+            SocketOptionValue::ReuseAddress(true),
+            SocketOptionValue::KeepAlive(true),
+            SocketOptionValue::Broadcast(true),
+        ] {
+            assert_eq!(set_option(&process, handle, value), Ok(()));
+            assert_eq!(get_option(&process, handle, value.name()), Ok(value));
+        }
+        if request.protocol == IpProtocol::Udp {
+            assert_eq!(
+                set_option(&process, handle, SocketOptionValue::NoDelay(true)),
+                Err(BrokerError::UnsupportedOperation)
+            );
+        }
+        assert_eq!(
+            process.get_status_flags(handle),
+            Ok(FileStatusFlags {
+                access: FileAccessMode::ReadWrite,
+                flags: FileOpenFlags::NONE,
+            })
+        );
+        assert_eq!(
+            process.set_status_flags(SetStatusFlagsRequest {
+                handle,
+                mask: FileOpenFlags::STATUS,
+                flags: FileOpenFlags::NONBLOCKING | FileOpenFlags::APPEND,
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            process.get_status_flags(handle),
+            Ok(FileStatusFlags {
+                access: FileAccessMode::ReadWrite,
+                flags: FileOpenFlags::NONBLOCKING | FileOpenFlags::APPEND,
+            })
+        );
+        assert_eq!(process.close_object_reference(handle), Ok(()));
+    }
+    assert_eq!(
+        create(
+            &process,
+            CreateSocketRequest {
+                flags: FileOpenFlags::CREATE,
+                ..create_request()
+            },
+            Arc::new(TestReadinessSink::default()),
+        ),
+        Err(BrokerError::UnsupportedOperation)
+    );
+
+    // A non-blocking listener reports that no connection is pending as
+    // `NonBlockingWouldBlock`.
+    let listener = create(
+        &process,
+        CreateSocketRequest {
+            flags: FileOpenFlags::NONBLOCKING,
+            ..create_request()
+        },
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        process.get_status_flags(listener),
+        Ok(FileStatusFlags {
+            access: FileAccessMode::ReadWrite,
+            flags: FileOpenFlags::NONBLOCKING,
+        })
+    );
+    let SocketOutcome::Completed(listener_address) = bind(
+        &process,
+        listener,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+    )
+    .unwrap() else {
+        panic!("guest TCP bind failed");
+    };
+    assert_eq!(
+        listen(&process, listener, 1),
+        Ok(SocketOutcome::Completed(listener_address))
+    );
+    assert!(matches!(
+        accept(
+            &process,
+            listener,
+            FileOpenFlags::NONE,
+            Arc::new(TestReadinessSink::default())
+        ),
+        Err(BrokerError::NonBlockingWouldBlock)
+    ));
+    assert_eq!(process.close_object_reference(listener), Ok(()));
 }
 
 fn check_private_tcp_connect_uses_private_source_for_wildcard_binding(
@@ -2355,15 +2471,16 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
         address_family: AddressFamily::Ipv4,
         socket_type: SocketType::Datagram,
         protocol: IpProtocol::Udp,
+        flags: FileOpenFlags::NONE,
     };
     let handle = create(&process, request, readiness).unwrap();
 
     assert_eq!(
-        set_tcp_option(&process, handle, TcpOptionValue::NoDelay(true)),
+        set_option(&process, handle, SocketOptionValue::NoDelay(true)),
         Err(BrokerError::UnsupportedOperation)
     );
     assert_eq!(
-        get_tcp_option(&process, handle, TcpOptionName::NoDelay),
+        get_option(&process, handle, SocketOptionName::NoDelay),
         Err(BrokerError::UnsupportedOperation)
     );
     assert_eq!(
@@ -2592,6 +2709,7 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Datagram,
             protocol: IpProtocol::Udp,
+            flags: FileOpenFlags::NONE,
         },
         Arc::new(TestReadinessSink::default()),
     )
@@ -2634,6 +2752,7 @@ fn check_udp_status_validates_local_address(broker: &BrokerCore, provider: &Test
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Datagram,
             protocol: IpProtocol::Udp,
+            flags: FileOpenFlags::NONE,
         },
         Arc::new(TestReadinessSink::default()),
     )
@@ -2704,6 +2823,7 @@ fn check_udp_status_validates_local_address(broker: &BrokerCore, provider: &Test
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Datagram,
             protocol: IpProtocol::Udp,
+            flags: FileOpenFlags::NONE,
         },
         Arc::new(TestReadinessSink::default()),
     )
@@ -2930,7 +3050,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
         Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     assert!(matches!(
-        accept(&process, listener, readiness.clone()),
+        accept(&process, listener, FileOpenFlags::NONE, readiness.clone()),
         Err(BrokerError::ResourceExhausted)
     ));
     assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
@@ -2948,7 +3068,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
         })
     );
     assert!(matches!(
-        accept(&process, listener, readiness.clone()),
+        accept(&process, listener, FileOpenFlags::NONE, readiness.clone()),
         Ok(SocketOutcome::Failed(SocketError::NotConnected))
     ));
     assert_eq!(
@@ -3382,11 +3502,11 @@ fn check_connect_errors_classify_peer_state(broker: &BrokerCore, provider: &Test
         shutdown_calls_before
     );
     assert_eq!(
-        set_tcp_option(&process, poisoned, TcpOptionValue::NoDelay(true)),
+        set_option(&process, poisoned, SocketOptionValue::NoDelay(true)),
         Err(BrokerError::Internal)
     );
     assert_eq!(
-        get_tcp_option(&process, poisoned, TcpOptionName::NoDelay),
+        get_option(&process, poisoned, SocketOptionName::NoDelay),
         Err(BrokerError::Internal)
     );
     assert_eq!(
@@ -3953,6 +4073,7 @@ const fn create_request() -> CreateSocketRequest {
         address_family: AddressFamily::Ipv4,
         socket_type: SocketType::Stream,
         protocol: IpProtocol::Tcp,
+        flags: FileOpenFlags::NONE,
     }
 }
 
@@ -3961,6 +4082,7 @@ const fn create_udp_request() -> CreateSocketRequest {
         address_family: AddressFamily::Ipv4,
         socket_type: SocketType::Datagram,
         protocol: IpProtocol::Udp,
+        flags: FileOpenFlags::NONE,
     }
 }
 

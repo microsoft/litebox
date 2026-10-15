@@ -34,14 +34,14 @@ use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
-    SocketConnectionStatus, SocketOutcome, SocketStatusResponse, SocketType, TcpOptionName,
-    TcpOptionValue,
+    SocketConnectionStatus, SocketOptionName, SocketOptionValue, SocketOutcome,
+    SocketStatusResponse, SocketType,
 };
 use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_protocol::unix_socket::{
     CreateUnixSocketPairResponse, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE,
     ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
-    UnixSocketName, UnixSocketOptionName, UnixSocketOptionValue,
+    UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
@@ -153,9 +153,15 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
 
-    fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+    fn create_tcp_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
-    fn create_udp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+    fn create_udp_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn connect_socket(
         &self,
@@ -178,6 +184,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn accept_socket(
         &self,
         handle: ObjectHandle,
+        flags: FileOpenFlags,
     ) -> core::result::Result<SocketOutcome<AcceptSocketResponse>, BrokerControlError>;
 
     fn socket_status(
@@ -223,17 +230,17 @@ pub(crate) trait BrokerControl: Send + Sync {
         mode: ShutdownMode,
     ) -> core::result::Result<SocketOutcome<()>, BrokerControlError>;
 
-    fn set_tcp_option(
+    fn set_socket_option(
         &self,
         handle: ObjectHandle,
-        value: TcpOptionValue,
+        value: SocketOptionValue,
     ) -> core::result::Result<(), BrokerControlError>;
 
-    fn get_tcp_option(
+    fn get_socket_option(
         &self,
         handle: ObjectHandle,
-        name: TcpOptionName,
-    ) -> core::result::Result<TcpOptionValue, BrokerControlError>;
+        name: SocketOptionName,
+    ) -> core::result::Result<SocketOptionValue, BrokerControlError>;
 
     fn create_event_with_count(
         &self,
@@ -521,14 +528,14 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn set_unix_socket_option(
         &self,
         handle: ObjectHandle,
-        value: UnixSocketOptionValue,
+        value: SocketOptionValue,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn get_unix_socket_option(
         &self,
         handle: ObjectHandle,
-        name: UnixSocketOptionName,
-    ) -> core::result::Result<UnixSocketOptionValue, BrokerControlError>;
+        name: SocketOptionName,
+    ) -> core::result::Result<SocketOptionValue, BrokerControlError>;
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 
@@ -839,12 +846,18 @@ where
         self.request(|local| local.fill_random(lease.sequence(), output))
     }
 
-    fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(BrokerLocal::create_tcp_socket)
+    fn create_tcp_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_tcp_socket(flags))
     }
 
-    fn create_udp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(BrokerLocal::create_udp_socket)
+    fn create_udp_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_udp_socket(flags))
     }
 
     fn connect_socket(
@@ -886,8 +899,9 @@ where
     fn accept_socket(
         &self,
         handle: ObjectHandle,
+        flags: FileOpenFlags,
     ) -> core::result::Result<SocketOutcome<AcceptSocketResponse>, BrokerControlError> {
-        self.request(|local| local.accept_socket(handle))
+        self.request(|local| local.accept_socket(handle, flags))
             .map(|result| match result {
                 Ok(accepted) => SocketOutcome::Completed(accepted),
                 Err(error) => SocketOutcome::Failed(error),
@@ -999,20 +1013,20 @@ where
             })
     }
 
-    fn set_tcp_option(
+    fn set_socket_option(
         &self,
         handle: ObjectHandle,
-        value: TcpOptionValue,
+        value: SocketOptionValue,
     ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.set_tcp_option(handle, value))
+        self.request(|local| local.set_socket_option(handle, value))
     }
 
-    fn get_tcp_option(
+    fn get_socket_option(
         &self,
         handle: ObjectHandle,
-        name: TcpOptionName,
-    ) -> core::result::Result<TcpOptionValue, BrokerControlError> {
-        self.request(|local| local.get_tcp_option(handle, name))
+        name: SocketOptionName,
+    ) -> core::result::Result<SocketOptionValue, BrokerControlError> {
+        self.request(|local| local.get_socket_option(handle, name))
     }
 
     fn create_event_with_count(
@@ -1464,7 +1478,7 @@ where
     fn set_unix_socket_option(
         &self,
         handle: ObjectHandle,
-        value: UnixSocketOptionValue,
+        value: SocketOptionValue,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.set_unix_socket_option(handle, value))
     }
@@ -1472,8 +1486,8 @@ where
     fn get_unix_socket_option(
         &self,
         handle: ObjectHandle,
-        name: UnixSocketOptionName,
-    ) -> core::result::Result<UnixSocketOptionValue, BrokerControlError> {
+        name: SocketOptionName,
+    ) -> core::result::Result<SocketOptionValue, BrokerControlError> {
         self.request(|local| local.get_unix_socket_option(handle, name))
     }
 

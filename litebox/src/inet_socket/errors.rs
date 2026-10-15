@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Possible errors from [`Network`] and its sockets
+//! Possible errors from [`InetSocket`] operations
 
 use core::net::SocketAddr;
 
@@ -9,16 +9,16 @@ use core::net::SocketAddr;
     unused_imports,
     reason = "used for doc string links to work out, but not for code"
 )]
-use super::Network;
+use super::InetSocket;
 
 use thiserror::Error;
 
-/// Possible errors from [`Network::socket`]
+/// Possible errors from [`LiteBox::create_inet_socket`](crate::LiteBox::create_inet_socket)
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SocketError {
-    #[error("Unsupported protocol {0}")]
-    UnsupportedProtocol(u8),
+    #[error("Unsupported socket type")]
+    UnsupportedType,
     #[error("Brokered networking is unavailable")]
     BrokerUnavailable,
     #[error("Socket resources are exhausted")]
@@ -29,22 +29,10 @@ pub enum SocketError {
     BackendFailure,
 }
 
-/// Possible errors from [`Network::close`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum CloseError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
-    #[error("Socket closed with data still pending transmission")]
-    DataPending,
-}
-
-/// Possible errors from [`Network::shutdown`]
+/// Possible errors from [`InetSocket::shutdown`] and [`InetSocket::stop_listening`]
 #[non_exhaustive]
 #[derive(Error, Clone, Copy, Debug)]
 pub enum ShutdownError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
     #[error("Socket is listening for connections")]
     Listening,
     #[error("Shutdown is unsupported for this socket")]
@@ -53,12 +41,10 @@ pub enum ShutdownError {
     OperationFailed(SocketAsyncError),
 }
 
-/// Possible errors from [`Network::connect`]
+/// Possible errors from [`InetSocket::connect`]
 #[non_exhaustive]
 #[derive(Error, Clone, Copy, Debug)]
 pub enum ConnectError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
     #[error("Unsupported address {0}")]
     UnsupportedAddress(SocketAddr),
     #[error("Invalid address")]
@@ -77,30 +63,18 @@ pub enum ConnectError {
     OperationFailed(SocketAsyncError),
 }
 
-/// Possible errors from [`Network::get_local_addr`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum LocalAddrError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
-}
-
-/// Possible errors from [`Network::get_remote_addr`]
+/// Possible errors from [`InetSocket::remote_addr`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum RemoteAddrError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
     #[error("Socket is not connected")]
     NotConnected,
 }
 
-/// Possible errors from [`Network::bind`]
+/// Possible errors from [`InetSocket::bind`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum BindError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
     #[error("Unsupported address {0}")]
     UnsupportedAddress(SocketAddr),
     #[error("Port {0} already in use")]
@@ -113,12 +87,10 @@ pub enum BindError {
     OperationFailed(SocketAsyncError),
 }
 
-/// Possible errors from [`Network::listen`]
+/// Possible errors from [`InetSocket::listen`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ListenError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
     #[error("Invalid address")]
     InvalidAddress,
     #[error("Socket is in invalid state")]
@@ -129,61 +101,31 @@ pub enum ListenError {
     OperationFailed(SocketAsyncError),
 }
 
-/// Possible errors from [`Network::accept`]
+/// Possible errors from [`InetSocket::accept`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum AcceptError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
     #[error("🙉 Socket is not listening for connections")]
     NotListening,
     #[error("No connections ready to be accepted")]
     NoConnectionsReady,
+    #[error("No connections ready to be accepted on a nonblocking socket")]
+    NonBlocking,
     #[error("Accepting connections is unsupported for this socket")]
     UnsupportedOperation,
     #[error("Socket operation failed: {0:?}")]
     OperationFailed(SocketAsyncError),
 }
 
-/// Possible errors from [`Network::send`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum SendError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
-    #[error("Socket is in an invalid state")]
-    SocketInInvalidState,
-    #[error("Destination address is unaddressable")]
-    Unaddressable,
-    #[error("Buffer is full")]
-    BufferFull,
-    #[error("Datagram is too large")]
-    MessageTooLong,
-    #[error("unnecessary destination address provided")]
-    UnnecessaryDestinationAddress,
-    #[error("destination address required but not provided")]
-    DestinationAddressRequired,
-}
-
-/// Possible errors from [`Network::receive`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum ReceiveError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
-    #[error("Socket is in an invalid state")]
-    SocketInInvalidState,
-    #[error("Operation finished")]
-    OperationFinished,
-}
-
-/// Possible errors from [`NetworkSocket::try_read`](super::NetworkSocket::try_read).
+/// Possible errors from [`InetSocket::try_read`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketReadError {
     /// The local read side has been shut down.
     ReadShutdown,
     /// No data is currently available.
     WouldBlock,
+    /// No data is currently available, and the socket is nonblocking.
+    NonBlocking,
     /// The stream has not reached a connected state.
     NotConnected,
     /// The stream is closed.
@@ -192,7 +134,7 @@ pub enum SocketReadError {
     Socket(SocketAsyncError),
 }
 
-/// Possible errors from [`NetworkSocket::try_write`](super::NetworkSocket::try_write).
+/// Possible errors from [`InetSocket::try_write`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketWriteError {
     /// The local write side has been shut down.
@@ -205,6 +147,8 @@ pub enum SocketWriteError {
     Unaddressable,
     /// The transmit buffer is full.
     BufferFull,
+    /// The transmit buffer is full, and the socket is nonblocking.
+    NonBlocking,
     /// The datagram exceeds the protocol maximum.
     MessageTooLong,
     /// A destination address is required but was not provided.
@@ -247,31 +191,4 @@ crate::utilities::macros::repr_enum! {
         /// An argument or socket state is invalid for the operation.
         InvalidArgument = 14,
     }
-}
-
-/// Possible errors from [`Network::set_tcp_option`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum SetTcpOptionError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
-    #[error("Not a TCP socket")]
-    NotTcpSocket,
-    #[error("TCP option is unsupported by this socket backend")]
-    Unsupported,
-    #[error("TCP socket backend failed")]
-    BackendFailure,
-}
-/// Possible errors from [`Network::get_tcp_option`]
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum GetTcpOptionError {
-    #[error("Not a valid open file descriptor")]
-    InvalidFd,
-    #[error("Not a TCP socket")]
-    NotTcpSocket,
-    #[error("TCP option is unsupported by this socket backend")]
-    Unsupported,
-    #[error("TCP socket backend failed")]
-    BackendFailure,
 }

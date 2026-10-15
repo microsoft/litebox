@@ -30,7 +30,7 @@ use crate::{
         polling::TryOpError, timer::Timer, wait::WaitContext,
     },
     fs::{FileFd, errors::StatusFlagsError},
-    net::NetworkSocket,
+    inet_socket::InetSocket,
     pipes::PipeFd,
     process::ProcessError,
     sync::RawSyncPrimitivesProvider,
@@ -71,8 +71,8 @@ pub enum ReadinessTarget<'a, Platform: RawSyncPrimitivesProvider + TimeProvider>
     Pipe(&'a PipeFd<Platform>),
     /// A Unix socket.
     UnixSocket(&'a UnixSocket<Platform>),
-    /// A network socket.
-    NetworkSocket(&'a NetworkSocket<Platform>),
+    /// An IPv4 socket.
+    InetSocket(&'a InetSocket<Platform>),
     /// An event counter.
     EventCounter(&'a EventCounter<Platform>),
     /// A timer.
@@ -297,7 +297,7 @@ fn with_target_handle<Platform: RawSyncPrimitivesProvider + TimeProvider>(
             request(pipe.handle())
         }
         ReadinessTarget::UnixSocket(socket) => request(socket.handle()),
-        ReadinessTarget::NetworkSocket(socket) => request(socket.handle()),
+        ReadinessTarget::InetSocket(socket) => request(socket.handle()),
         ReadinessTarget::EventCounter(counter) => request(counter.handle()),
         ReadinessTarget::Timer(timer) => request(timer.handle()),
     };
