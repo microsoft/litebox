@@ -1876,7 +1876,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_tcp_connection_states_with_rewriter() {
-    use std::io::Read as _;
+    use std::io::{Read as _, Write as _};
     use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
     use std::os::fd::AsRawFd as _;
     use std::time::Duration;
@@ -1934,15 +1934,27 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
     let half_closed_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let half_closed_port = half_closed_listener.local_addr().unwrap().port();
     let half_closed_server = std::thread::spawn(move || {
-        let (stream, _) = half_closed_listener.accept().unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        (0..2)
+            .map(|_| {
+                let (stream, _) = half_closed_listener.accept().unwrap();
+                stream.shutdown(Shutdown::Write).unwrap();
+                stream
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let greeting_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let greeting_port = greeting_listener.local_addr().unwrap().port();
+    let greeting_server = std::thread::spawn(move || {
+        let (mut stream, _) = greeting_listener.accept().unwrap();
+        stream.write_all(b"hi").unwrap();
         stream
     });
 
     let open_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let open_port = open_listener.local_addr().unwrap().port();
     let open_server = std::thread::spawn(move || {
-        (0..3)
+        (0..8)
             .map(|_| open_listener.accept().unwrap().0)
             .collect::<Vec<_>>()
     });
@@ -1971,13 +1983,15 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
         .arg(refused_port.to_string())
         .arg(half_closed_port.to_string())
         .arg(open_port.to_string())
+        .arg(greeting_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    assert_eq!(broker.next_close_object_count(), 16);
+    assert_eq!(broker.next_close_object_count(), 27);
     broker.join();
     reset_server.join().unwrap();
     half_closed_server.join().unwrap();
     open_server.join().unwrap();
+    greeting_server.join().unwrap();
 }
 
 #[cfg(target_os = "linux")]

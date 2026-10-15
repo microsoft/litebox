@@ -888,11 +888,9 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &SocketFd<Platform>,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
-        if sockaddr.port() == 0 || sockaddr.ip().is_unspecified() {
-            return Err(Errno::ECONNREFUSED);
-        }
         let send_timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let mut check_progress = false;
+        let mut already_in_progress = false;
         cx.wait_on_events::<_, Errno>(
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
@@ -907,10 +905,17 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     check_progress = true;
                     Err(TryOpError::TryAgain)
                 }
+                // A blocking call waits for an earlier attempt just as for its own.
+                Err(litebox::net::errors::ConnectError::AlreadyInProgress) => {
+                    check_progress = true;
+                    already_in_progress = true;
+                    Err(TryOpError::TryAgain)
+                }
                 Err(e) => Err(TryOpError::Other(e.into())),
             },
         )
         .map_err(|err| match err {
+            TryOpError::TryAgain if already_in_progress => Errno::EALREADY,
             TryOpError::TryAgain => Errno::EINPROGRESS,
             err => wait_errno(send_timeout, err),
         })

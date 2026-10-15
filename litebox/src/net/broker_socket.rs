@@ -28,11 +28,15 @@ use super::{
 use crate::{
     broker::{BrokerControl, BrokerPollableRegistry, error::BrokerObjectError, readiness_events},
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
-    sync::{Mutex, RawSyncPrimitivesProvider},
+    sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider},
 };
 
 const _: () = assert!(MAX_SOCKET_PEEK_SIZE as usize == super::SOCKET_RECEIVE_OPERATION_SIZE);
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "socket state latches are independent"
+)]
 struct BrokerTcpSocketState {
     connection: SocketConnectionStatus,
     local_address: Option<SocketAddrV4>,
@@ -40,6 +44,13 @@ struct BrokerTcpSocketState {
     async_error: Option<BrokerTcpAsyncError>,
     next_async_error: Option<BrokerTcpAsyncError>,
     listening: bool,
+    /// Whether the connection has been reported as established, by `connect`
+    /// or a shutdown, so that a later `connect` fails (Linux's `SS_CONNECTED`).
+    connect_reported: bool,
+    /// Directions shut down by this socket. Like Linux, a socket records a
+    /// shutdown even when it is not connected, and keeps it if it connects later.
+    read_shutdown: bool,
+    write_shutdown: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,8 +115,16 @@ impl BrokerTcpSocketState {
     /// another operation has already reported it.
     fn disconnect(&mut self) -> Option<SocketAsyncError> {
         let error = self.take_connection_failure();
-        self.connection = SocketConnectionStatus::Unconnected;
+        self.reset_connection();
         error
+    }
+
+    /// Returns the socket to the unconnected state, discarding its shutdowns
+    /// as Linux's `tcp_disconnect` does.
+    fn reset_connection(&mut self) {
+        self.connection = SocketConnectionStatus::Unconnected;
+        self.read_shutdown = false;
+        self.write_shutdown = false;
     }
 }
 
@@ -118,7 +137,6 @@ pub struct BrokerTcpSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     status_lock: Mutex<Platform, ()>,
     receive_lock: Mutex<Platform, ()>,
     state: Mutex<Platform, BrokerTcpSocketState>,
-    write_shutdown: AtomicBool,
     closed: AtomicBool,
 }
 
@@ -149,8 +167,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 async_error: None,
                 next_async_error: None,
                 listening: false,
+                connect_reported: false,
+                read_shutdown: false,
+                write_shutdown: false,
             }),
-            write_shutdown: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         });
         socket
@@ -178,8 +198,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 async_error: None,
                 next_async_error: None,
                 listening: false,
+                connect_reported: true,
+                read_shutdown: false,
+                write_shutdown: false,
             }),
-            write_shutdown: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         });
         socket
@@ -250,7 +272,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
 
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
         let status_guard = self.status_lock.lock();
-        let previous = self.state.lock().connection;
+        let (previous, already_connected) = {
+            let state = self.state.lock();
+            (state.connection, state.listening || state.connect_reported)
+        };
+        // Like Linux, check the socket's state before the address.
+        if already_connected {
+            return Err(ConnectError::AlreadyConnected);
+        }
+        if previous != SocketConnectionStatus::Unconnected {
+            // An earlier attempt has not been reported yet; report its outcome
+            // if it has one.
+            return match self.connect_progress(status_guard) {
+                Err(ConnectError::InProgress) => Err(ConnectError::AlreadyInProgress),
+                result => result,
+            };
+        }
+        if address.port() == 0 || address.ip().is_unspecified() {
+            // Like a connection Linux refuses, this disconnects the socket,
+            // discarding its shutdowns.
+            self.state.lock().reset_connection();
+            return Err(ConnectError::Unaddressable);
+        }
         let outcome = self
             .broker
             .connect_socket(self.handle, address)
@@ -264,32 +307,26 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 return Err(ConnectError::OperationFailed(error));
             }
         };
-        let remote_address = (previous == SocketConnectionStatus::Unconnected).then_some(address);
         let status = {
             let mut state = self.state.lock();
             let status = state.update_connection(status);
             if state.remote_address.is_none() {
-                state.remote_address = remote_address;
+                state.remote_address = Some(address);
             }
             status
         };
         let result = match status {
-            SocketConnectionStatus::Connected => Ok(()),
+            SocketConnectionStatus::Connected => {
+                self.state.lock().connect_reported = true;
+                Ok(())
+            }
             SocketConnectionStatus::Connecting => Err(ConnectError::InProgress),
             SocketConnectionStatus::Failed(error) => {
-                let claimed = self.state.lock().disconnect();
-                // A failure that a status refresh already observed is reported
-                // by whichever operation claims it first, leaving only an abort
-                // for a later `connect` to report.
-                let error = if matches!(previous, SocketConnectionStatus::Failed(_)) {
-                    claimed.unwrap_or(SocketAsyncError::ConnectionAborted)
-                } else {
-                    error.into()
-                };
+                let _ = self.state.lock().disconnect();
                 drop(status_guard);
                 self.pollee.wake_observers();
                 self.pollee.notify_observers(Events::OUT | Events::HUP);
-                return Err(ConnectError::OperationFailed(error));
+                return Err(ConnectError::OperationFailed(error.into()));
             }
             SocketConnectionStatus::Unconnected => Err(ConnectError::InvalidState),
             _ => Err(ConnectError::OperationFailed(
@@ -301,7 +338,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn check_connect_progress(&self) -> Result<(), ConnectError> {
-        let status_guard = self.status_lock.lock();
+        self.connect_progress(self.status_lock.lock())
+    }
+
+    /// Reports the outcome of the pending connection attempt, if it has one.
+    fn connect_progress(
+        &self,
+        status_guard: MutexGuard<'_, Platform, ()>,
+    ) -> Result<(), ConnectError> {
         let response = self.broker.socket_status(self.handle).map_err(|error| {
             ConnectError::OperationFailed(BrokerObjectError::from(error).into())
         })?;
@@ -319,6 +363,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             self.pollee.wake_observers();
             self.pollee.notify_observers(Events::OUT | Events::HUP);
             return Err(ConnectError::OperationFailed(error));
+        }
+        if status == SocketConnectionStatus::Connected {
+            self.state.lock().connect_reported = true;
         }
         drop(status_guard);
         match status {
@@ -362,17 +409,43 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 if connecting && self.abort_connect() {
                     return Ok(());
                 }
-                if matches!(mode, ShutdownMode::Write | ShutdownMode::Both) {
-                    self.write_shutdown.store(true, Ordering::Release);
-                    self.pollee.notify_observers(Events::OUT);
-                }
+                self.record_shutdown(mode);
                 Ok(())
+            }
+            SocketOutcome::Failed(BrokerSocketError::NotConnected) => {
+                // Like Linux, a socket without a connection records the shutdown
+                // even though the call fails.
+                self.record_shutdown(mode);
+                Err(SocketAsyncError::NotConnected)
             }
             SocketOutcome::Failed(error) => {
                 let error = error.into();
                 Err(error)
             }
         }
+    }
+
+    /// Records a shutdown, which, like Linux's `inet_shutdown`, also reports an
+    /// established connection so that a later `connect` fails.
+    fn record_shutdown(&self, mode: ShutdownMode) {
+        let mut events = Events::empty();
+        let mut state = self.state.lock();
+        if state.connection == SocketConnectionStatus::Connected {
+            state.connect_reported = true;
+        }
+        if matches!(mode, ShutdownMode::Read | ShutdownMode::Both) {
+            state.read_shutdown = true;
+            events |= Events::IN | Events::RDHUP;
+        }
+        if matches!(mode, ShutdownMode::Write | ShutdownMode::Both) {
+            state.write_shutdown = true;
+            events |= Events::OUT;
+        }
+        if state.read_shutdown && state.write_shutdown {
+            events |= Events::HUP;
+        }
+        drop(state);
+        self.pollee.notify_observers(events);
     }
 
     /// Returns the socket to the unconnected state, retaining the error, if
@@ -388,7 +461,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if !failed {
             return false;
         }
-        self.state.lock().connection = SocketConnectionStatus::Unconnected;
+        self.state.lock().reset_connection();
         drop(status_guard);
         self.pollee.wake_observers();
         self.pollee
@@ -452,7 +525,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             .map_err(|error| SocketAsyncError::from(BrokerObjectError::from(error)))?
         {
             SocketOutcome::Completed(()) => {
-                self.state.lock().listening = false;
+                let mut state = self.state.lock();
+                state.listening = false;
+                // Like Linux, which disconnects a listener to stop it.
+                state.reset_connection();
+                drop(state);
                 self.pollee.notify_observers(Events::OUT | Events::HUP);
                 Ok(())
             }
@@ -536,11 +613,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if buffer.is_empty() {
             return Ok(0);
         }
-        match self.state.lock().connection {
-            SocketConnectionStatus::Unconnected => return Err(ChannelReadError::NotConnected),
-            SocketConnectionStatus::Failed(_) => return Err(ChannelReadError::ConnectionClosed),
-            _ => {}
-        }
+        let read_shutdown = {
+            let state = self.state.lock();
+            match state.connection {
+                // As in Linux, a listener ignores shutdowns, and a pending error
+                // is reported before a shutdown.
+                SocketConnectionStatus::Unconnected
+                    if state.read_shutdown && !state.listening && state.async_error.is_none() =>
+                {
+                    return Err(ChannelReadError::ReadShutdown);
+                }
+                SocketConnectionStatus::Unconnected => return Err(ChannelReadError::NotConnected),
+                SocketConnectionStatus::Failed(_) => {
+                    return Err(ChannelReadError::ConnectionClosed);
+                }
+                _ => {}
+            }
+            state.read_shutdown
+        };
         let _receive = self.receive_lock.lock();
         let discard = flags.contains(ReceiveFlags::DISCARD);
         let mut broker_flags = BrokerReceiveFlags::NONE;
@@ -549,7 +639,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if peek {
             broker_flags.0 |= BrokerReceiveFlags::PEEK.0;
         }
-        if wait_all && peek {
+        // The broker's socket does not know about a shutdown recorded before it
+        // connected, so it must not wait for more data than is queued.
+        if wait_all && peek && !read_shutdown {
             broker_flags.0 |= BrokerReceiveFlags::WAITALL.0;
         }
         let target = if peek {
@@ -583,6 +675,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                     if error == BrokerObjectError::WouldBlock {
                         if offset != 0 {
                             return Ok(offset);
+                        }
+                        // The broker's socket does not know about a shutdown
+                        // recorded before it connected.
+                        if read_shutdown {
+                            return Err(ChannelReadError::ReadShutdown);
                         }
                         return Err(ChannelReadError::WouldBlock);
                     }
@@ -625,11 +722,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if self.closed.load(Ordering::Acquire) {
             return Err(ChannelWriteError::ConnectionClosed);
         }
-        if self.write_shutdown.load(Ordering::Acquire) {
+        let (write_shutdown, connection) = {
+            let state = self.state.lock();
+            (state.write_shutdown, state.connection)
+        };
+        if write_shutdown {
+            // As in Linux, a send waits for a pending connection attempt, and
+            // reports its failure, before it reports a write shutdown recorded
+            // before connecting. Nothing else refreshes the cached status while
+            // a send waits, so it does so here.
+            if connection == SocketConnectionStatus::Connecting {
+                self.refresh_connection_status(false);
+                let state = self.state.lock();
+                if state.connection == SocketConnectionStatus::Connecting
+                    && state.async_error.is_none()
+                {
+                    return Err(ChannelWriteError::BufferFull);
+                }
+            }
             return Err(ChannelWriteError::WriteShutdown);
         }
         if matches!(
-            self.state.lock().connection,
+            connection,
             SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_)
         ) {
             return Err(ChannelWriteError::NotConnected);
@@ -821,6 +935,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerTc
         let listening = state.listening;
         let connection = state.connection;
         let has_async_error = state.async_error.is_some();
+        let read_shutdown = state.read_shutdown;
+        let write_shutdown = state.write_shutdown;
         drop(state);
         match connection {
             // A failed connection attempt leaves the socket closed in both directions.
@@ -832,11 +948,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerTc
             }
             _ => {}
         }
+        if !listening {
+            // As in Linux's `tcp_poll`, a write shutdown makes a socket
+            // writable only once it is no longer connecting.
+            if read_shutdown {
+                events |= Events::IN | Events::RDHUP;
+            }
+            if write_shutdown && connection != SocketConnectionStatus::Connecting {
+                events |= Events::OUT;
+            }
+            // Both directions are closed once the write side is shut down and
+            // the read side is shut down, locally or by the peer.
+            if write_shutdown && events.contains(Events::RDHUP) {
+                events |= Events::HUP;
+            }
+        }
         if has_async_error {
             events.insert(Events::ERR);
-        }
-        if self.write_shutdown.load(Ordering::Acquire) {
-            events.insert(Events::OUT);
         }
         events
     }
@@ -941,6 +1069,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
     }
 
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
+        if address.port() == 0 || address.ip().is_unspecified() {
+            return Err(ConnectError::Unaddressable);
+        }
         let _configuration = self.configuration_lock.lock();
         let outcome = self
             .broker
@@ -1398,6 +1529,9 @@ mod tests {
             async_error: None,
             next_async_error: None,
             listening: false,
+            connect_reported: false,
+            read_shutdown: false,
+            write_shutdown: false,
         };
 
         state.prepend_async_error(SocketAsyncError::NetworkUnreachable);
@@ -1423,6 +1557,9 @@ mod tests {
             )),
             next_async_error: None,
             listening: false,
+            connect_reported: false,
+            read_shutdown: false,
+            write_shutdown: false,
         };
 
         state.append_retained_error(BrokerTcpAsyncError::Other(
@@ -1452,6 +1589,9 @@ mod tests {
                 SocketAsyncError::ConnectionRefused,
             )),
             listening: false,
+            connect_reported: false,
+            read_shutdown: false,
+            write_shutdown: false,
         };
 
         state.take_connection_failure();

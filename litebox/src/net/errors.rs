@@ -65,6 +65,10 @@ pub enum ConnectError {
     Unaddressable,
     #[error("Connection is still in progress")]
     InProgress,
+    #[error("An earlier connection attempt is still in progress")]
+    AlreadyInProgress,
+    #[error("Socket is already connected")]
+    AlreadyConnected,
     #[error("Socket is in an invalid state")]
     InvalidState,
     #[error("Connection timed out")]
