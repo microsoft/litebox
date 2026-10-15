@@ -21,9 +21,8 @@ use super::{
     ReceiveFlags, TcpOptionData, TcpOptionName,
     errors::{
         AcceptError, BindError, ConnectError, GetTcpOptionError, ListenError, RemoteAddrError,
-        SetTcpOptionError, SocketAsyncError,
+        SetTcpOptionError, SocketAsyncError, SocketReadError, SocketWriteError,
     },
-    socket_channel::{ChannelReadError, ChannelWriteError, SocketState},
 };
 use crate::{
     broker::{BrokerControl, BrokerPollableRegistry, error::BrokerObjectError, readiness_events},
@@ -537,28 +536,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         }
     }
 
-    pub(super) fn set_state(&self, state: SocketState) {
-        if state == SocketState::Closed {
-            self.close(false);
-            return;
-        }
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        let connection = match state {
-            SocketState::Initial => SocketConnectionStatus::Unconnected,
-            SocketState::Connecting => SocketConnectionStatus::Connecting,
-            SocketState::Connected => SocketConnectionStatus::Connected,
-            SocketState::Error => self.state.lock().connection,
-            SocketState::Listening => {
-                self.state.lock().listening = true;
-                return;
-            }
-            SocketState::Closed => return,
-        };
-        self.state.lock().update_connection(connection);
-    }
-
     pub(super) fn set_async_error(&self, error: SocketAsyncError) {
         if self.closed.load(Ordering::Acquire) {
             return;
@@ -603,9 +580,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         buffer: &mut [u8],
         flags: ReceiveFlags,
         source_address: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, ChannelReadError> {
+    ) -> Result<usize, SocketReadError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(ChannelReadError::ConnectionClosed);
+            return Err(SocketReadError::ConnectionClosed);
         }
         if let Some(source_address) = source_address {
             *source_address = None;
@@ -621,11 +598,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 SocketConnectionStatus::Unconnected
                     if state.read_shutdown && !state.listening && state.async_error.is_none() =>
                 {
-                    return Err(ChannelReadError::ReadShutdown);
+                    return Err(SocketReadError::ReadShutdown);
                 }
-                SocketConnectionStatus::Unconnected => return Err(ChannelReadError::NotConnected),
+                SocketConnectionStatus::Unconnected => return Err(SocketReadError::NotConnected),
                 SocketConnectionStatus::Failed(_) => {
-                    return Err(ChannelReadError::ConnectionClosed);
+                    return Err(SocketReadError::ConnectionClosed);
                 }
                 _ => {}
             }
@@ -657,10 +634,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 &mut buffer[offset..offset + length],
                 broker_flags,
                 u32::try_from(offset)
-                    .map_err(|_| ChannelReadError::Socket(SocketAsyncError::BackendFailure))?,
+                    .map_err(|_| SocketReadError::Socket(SocketAsyncError::BackendFailure))?,
                 if peek {
                     u32::try_from(target)
-                        .map_err(|_| ChannelReadError::Socket(SocketAsyncError::BackendFailure))?
+                        .map_err(|_| SocketReadError::Socket(SocketAsyncError::BackendFailure))?
                 } else {
                     0
                 },
@@ -669,7 +646,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 Ok(outcome) => outcome,
                 Err(error) => {
                     if self.closed.load(Ordering::Acquire) {
-                        return Err(ChannelReadError::ConnectionClosed);
+                        return Err(SocketReadError::ConnectionClosed);
                     }
                     let error = BrokerObjectError::from(error);
                     if error == BrokerObjectError::WouldBlock {
@@ -679,9 +656,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                         // The broker's socket does not know about a shutdown
                         // recorded before it connected.
                         if read_shutdown {
-                            return Err(ChannelReadError::ReadShutdown);
+                            return Err(SocketReadError::ReadShutdown);
                         }
-                        return Err(ChannelReadError::WouldBlock);
+                        return Err(SocketReadError::WouldBlock);
                     }
                     return Err(error.into());
                 }
@@ -689,7 +666,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             match outcome {
                 SocketOutcome::Completed(ReceiveSocketResponse::Received(received)) => {
                     let received = usize::try_from(received)
-                        .map_err(|_| ChannelReadError::Socket(SocketAsyncError::BackendFailure))?;
+                        .map_err(|_| SocketReadError::Socket(SocketAsyncError::BackendFailure))?;
                     offset += received;
                     if !peek || received < length || offset == target {
                         return Ok(offset);
@@ -697,13 +674,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 }
                 SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream) => {
                     return if offset == 0 {
-                        Err(ChannelReadError::ConnectionClosed)
+                        Err(SocketReadError::ConnectionClosed)
                     } else {
                         Ok(offset)
                     };
                 }
                 SocketOutcome::Completed(_) => {
-                    return Err(ChannelReadError::Socket(SocketAsyncError::BackendFailure));
+                    return Err(SocketReadError::Socket(SocketAsyncError::BackendFailure));
                 }
                 SocketOutcome::Failed(error) => {
                     let error = error.into();
@@ -712,15 +689,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                         self.set_async_error(error);
                         return Ok(offset);
                     }
-                    return Err(ChannelReadError::Socket(error));
+                    return Err(SocketReadError::Socket(error));
                 }
             }
         }
     }
 
-    pub(super) fn try_write(&self, buffer: &[u8]) -> Result<usize, ChannelWriteError> {
+    pub(super) fn try_write(&self, buffer: &[u8]) -> Result<usize, SocketWriteError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(ChannelWriteError::ConnectionClosed);
+            return Err(SocketWriteError::ConnectionClosed);
         }
         let (write_shutdown, connection) = {
             let state = self.state.lock();
@@ -737,16 +714,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 if state.connection == SocketConnectionStatus::Connecting
                     && state.async_error.is_none()
                 {
-                    return Err(ChannelWriteError::BufferFull);
+                    return Err(SocketWriteError::BufferFull);
                 }
             }
-            return Err(ChannelWriteError::WriteShutdown);
+            return Err(SocketWriteError::WriteShutdown);
         }
         if matches!(
             connection,
             SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_)
         ) {
-            return Err(ChannelWriteError::NotConnected);
+            return Err(SocketWriteError::NotConnected);
         }
         let length = buffer.len().min(MAX_SOCKET_TRANSFER_SIZE as usize);
         let outcome = self
@@ -754,21 +731,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             .send_socket(self.handle, &buffer[..length], BrokerSendFlags::NONE)
             .map_err(|error| {
                 if self.closed.load(Ordering::Acquire) {
-                    ChannelWriteError::ConnectionClosed
+                    SocketWriteError::ConnectionClosed
                 } else {
-                    ChannelWriteError::from(BrokerObjectError::from(error))
+                    SocketWriteError::from(BrokerObjectError::from(error))
                 }
             })?;
         match outcome {
             SocketOutcome::Completed(sent) => Ok(sent),
             SocketOutcome::Failed(BrokerSocketError::NotConnected) => {
                 self.refresh_after_synchronous_error();
-                Err(ChannelWriteError::NotConnected)
+                Err(SocketWriteError::NotConnected)
             }
             SocketOutcome::Failed(error) => {
                 let error = error.into();
                 self.refresh_after_synchronous_error();
-                Err(ChannelWriteError::Socket(error))
+                Err(SocketWriteError::Socket(error))
             }
         }
     }
@@ -1164,28 +1141,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
         }
     }
 
-    pub(super) fn set_state(&self, state: SocketState) {
-        if state == SocketState::Closed {
-            self.close();
-            return;
-        }
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        match state {
-            SocketState::Initial => {
-                self.state.lock().connection = SocketConnectionStatus::Unconnected;
-            }
-            SocketState::Connected => {
-                self.state.lock().connection = SocketConnectionStatus::Connected;
-            }
-            SocketState::Connecting
-            | SocketState::Listening
-            | SocketState::Error
-            | SocketState::Closed => {}
-        }
-    }
-
     pub(super) fn set_async_error(&self, error: SocketAsyncError) {
         if self.closed.load(Ordering::Acquire) {
             return;
@@ -1239,22 +1194,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
         buffer: &mut [u8],
         flags: ReceiveFlags,
         mut source_address: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, ChannelReadError> {
+    ) -> Result<usize, SocketReadError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(ChannelReadError::ConnectionClosed);
+            return Err(SocketReadError::ConnectionClosed);
         }
         if let Some(error) = self.take_async_error() {
-            return Err(ChannelReadError::Socket(error));
+            return Err(SocketReadError::Socket(error));
         }
         if self.read_shutdown.load(Ordering::Acquire) {
-            return Err(ChannelReadError::ReadShutdown);
+            return Err(SocketReadError::ReadShutdown);
         }
         if let Some(source_address) = &mut source_address {
             **source_address = None;
         }
         let receive = self.receive_lock.lock();
         if self.read_shutdown.load(Ordering::Acquire) {
-            return Err(ChannelReadError::ReadShutdown);
+            return Err(SocketReadError::ReadShutdown);
         }
         let mut broker_flags = BrokerReceiveFromFlags::NONE;
         if flags.contains(ReceiveFlags::PEEK) {
@@ -1275,15 +1230,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
             Ok(outcome) => outcome,
             Err(error) => {
                 if self.closed.load(Ordering::Acquire) {
-                    return Err(ChannelReadError::ConnectionClosed);
+                    return Err(SocketReadError::ConnectionClosed);
                 }
                 let error = BrokerObjectError::from(error);
                 if error == BrokerObjectError::WouldBlock
                     && let Some(error) = self.take_async_error()
                 {
-                    return Err(ChannelReadError::Socket(error));
+                    return Err(SocketReadError::Socket(error));
                 }
-                return Err(ChannelReadError::from(error));
+                return Err(SocketReadError::from(error));
             }
         };
         match outcome {
@@ -1296,20 +1251,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
                     *source_address = Some(SocketAddr::V4(response_source_address));
                 }
                 let received = usize::try_from(received)
-                    .map_err(|_| ChannelReadError::Socket(SocketAsyncError::BackendFailure))?;
+                    .map_err(|_| SocketReadError::Socket(SocketAsyncError::BackendFailure))?;
                 let datagram_length = usize::try_from(datagram_length)
-                    .map_err(|_| ChannelReadError::Socket(SocketAsyncError::BackendFailure))?;
+                    .map_err(|_| SocketReadError::Socket(SocketAsyncError::BackendFailure))?;
                 debug_assert!(received <= target_length);
                 Ok(datagram_length)
             }
             SocketOutcome::Failed(BrokerSocketError::NotConnected)
                 if self.read_shutdown.load(Ordering::Acquire) =>
             {
-                Err(ChannelReadError::ReadShutdown)
+                Err(SocketReadError::ReadShutdown)
             }
             SocketOutcome::Failed(error) => {
                 self.refresh_status();
-                Err(ChannelReadError::Socket(error.into()))
+                Err(SocketReadError::Socket(error.into()))
             }
         }
     }
@@ -1318,32 +1273,32 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
         &self,
         buffer: &[u8],
         destination: Option<SocketAddr>,
-    ) -> Result<usize, ChannelWriteError> {
+    ) -> Result<usize, SocketWriteError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(ChannelWriteError::ConnectionClosed);
+            return Err(SocketWriteError::ConnectionClosed);
         }
         if let Some(error) = self.take_async_error() {
-            return Err(ChannelWriteError::Socket(error));
+            return Err(SocketWriteError::Socket(error));
         }
         if self.write_shutdown.load(Ordering::Acquire) {
-            return Err(ChannelWriteError::WriteShutdown);
+            return Err(SocketWriteError::WriteShutdown);
         }
         let send_operation = self.send_lock.lock();
         if self.write_shutdown.load(Ordering::Acquire) {
-            return Err(ChannelWriteError::WriteShutdown);
+            return Err(SocketWriteError::WriteShutdown);
         }
         if buffer.len() > MAX_UDP_DATAGRAM_SIZE as usize {
-            return Err(ChannelWriteError::MessageTooLong);
+            return Err(SocketWriteError::MessageTooLong);
         }
         let destination = match destination {
             Some(SocketAddr::V4(address)) => Some(address),
-            Some(SocketAddr::V6(_)) => return Err(ChannelWriteError::Unaddressable),
+            Some(SocketAddr::V6(_)) => return Err(SocketWriteError::Unaddressable),
             None => None,
         };
         if destination.is_none()
             && self.state.lock().connection != SocketConnectionStatus::Connected
         {
-            return Err(ChannelWriteError::DestinationAddressRequired);
+            return Err(SocketWriteError::DestinationAddressRequired);
         }
         let outcome =
             self.broker
@@ -1353,22 +1308,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
             Ok(outcome) => outcome,
             Err(error) => {
                 if self.closed.load(Ordering::Acquire) {
-                    return Err(ChannelWriteError::ConnectionClosed);
+                    return Err(SocketWriteError::ConnectionClosed);
                 }
                 let error = BrokerObjectError::from(error);
                 if error == BrokerObjectError::WouldBlock
                     && let Some(error) = self.take_async_error()
                 {
-                    return Err(ChannelWriteError::Socket(error));
+                    return Err(SocketWriteError::Socket(error));
                 }
-                return Err(ChannelWriteError::from(error));
+                return Err(SocketWriteError::from(error));
             }
         };
         match outcome {
             SocketOutcome::Completed(sent) => Ok(sent),
             SocketOutcome::Failed(error) => {
                 self.refresh_status();
-                Err(ChannelWriteError::Socket(error.into()))
+                Err(SocketWriteError::Socket(error.into()))
             }
         }
     }
@@ -1461,7 +1416,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for BrokerUdpSocke
     }
 }
 
-impl From<BrokerObjectError> for ChannelReadError {
+impl From<BrokerObjectError> for SocketReadError {
     fn from(error: BrokerObjectError) -> Self {
         match error {
             BrokerObjectError::WouldBlock => Self::WouldBlock,
@@ -1471,7 +1426,7 @@ impl From<BrokerObjectError> for ChannelReadError {
     }
 }
 
-impl From<BrokerObjectError> for ChannelWriteError {
+impl From<BrokerObjectError> for SocketWriteError {
     fn from(error: BrokerObjectError) -> Self {
         match error {
             BrokerObjectError::WouldBlock => Self::BufferFull,

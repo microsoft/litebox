@@ -122,14 +122,8 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
                 Some(handle.with_entry(|file| poll(&global.litebox.broker_file_pollable(file))))
             }
             EpollDescriptor::Socket(fd) => {
-                let proxy = global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(fd, |super::net::SocketProxy::<Platform>(proxy)| {
-                        proxy.clone()
-                    })
-                    .ok()?;
-                Some(poll(&proxy))
+                let socket = global.get_network_socket(fd).ok()?;
+                Some(poll(&socket))
             }
             EpollDescriptor::Pipe(fd) => poll_entry!(fd),
             EpollDescriptor::Unix(fd) => poll_entry!(fd),
@@ -158,14 +152,8 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
                 f(&ReadinessTarget::UnixSocket(socket.unix_socket()))
             }),
             EpollDescriptor::Socket(fd) => {
-                let proxy = global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(fd, |super::net::SocketProxy::<Platform>(proxy)| {
-                        proxy.clone()
-                    })
-                    .map_err(|_| Errno::EBADF)?;
-                f(&ReadinessTarget::NetworkSocket(&proxy))
+                let socket = global.get_network_socket(fd)?;
+                f(&ReadinessTarget::NetworkSocket(&socket))
             }
             EpollDescriptor::Epoll(_) => Err(Errno::EPERM),
         }

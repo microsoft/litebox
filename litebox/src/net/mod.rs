@@ -14,19 +14,18 @@ use litebox_platform::time::TimeProvider;
 
 use crate::{
     LiteBox,
-    net::socket_channel::NetworkProxy,
+    event::{Events, IOPollable, observer::Observer},
     sync::{self, RawSyncPrimitivesProvider},
 };
 
 mod broker_socket;
 pub mod errors;
-pub mod socket_channel;
 
 pub use broker_socket::{BrokerTcpSocket, BrokerUdpSocket};
 
 use errors::{
     AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
-    RemoteAddrError, SendError, SocketError,
+    RemoteAddrError, SendError, SocketAsyncError, SocketError, SocketReadError, SocketWriteError,
 };
 
 impl From<crate::broker::error::BrokerObjectError> for SocketError {
@@ -67,8 +66,8 @@ pub enum ShutdownDirection {
 
 /// The `Network` provides access to broker-owned networking functionality.
 ///
-/// [`attach_socket_proxy`](Self::attach_socket_proxy) provides a per-socket interface for
-/// nonblocking I/O and readiness notification.
+/// [`get_socket`](Self::get_socket) provides a per-socket interface for nonblocking I/O and
+/// readiness notification.
 pub struct Network<Platform>
 where
     Platform: TimeProvider + sync::RawSyncPrimitivesProvider,
@@ -93,19 +92,20 @@ where
 
 /// Per-open-file-description state for a broker-owned socket.
 pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    broker_socket: BrokerSocket<Platform>,
+    socket: NetworkSocket<Platform>,
     /// Whether the final TCP close should be abortive.
     immediate_close: AtomicBool,
-    /// The proxy associated with this socket for I/O and event notification.
-    proxy: Option<Arc<NetworkProxy<Platform>>>,
 }
 
-enum BrokerSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+/// A broker-owned network socket, for nonblocking I/O and readiness notification.
+pub enum NetworkSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    /// A TCP socket.
     Tcp(Arc<BrokerTcpSocket<Platform>>),
+    /// A UDP socket.
     Udp(Arc<BrokerUdpSocket<Platform>>),
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Clone for BrokerSocket<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Clone for NetworkSocket<Platform> {
     fn clone(&self) -> Self {
         match self {
             Self::Tcp(socket) => Self::Tcp(Arc::clone(socket)),
@@ -114,11 +114,88 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Clone for BrokerSocket<
     }
 }
 
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkSocket<Platform> {
+    /// The broker handle of this socket, which stays open until the socket
+    /// closes.
+    pub(crate) fn handle(&self) -> litebox_broker_protocol::ObjectHandle {
+        match self {
+            Self::Tcp(socket) => socket.handle(),
+            Self::Udp(socket) => socket.handle(),
+        }
+    }
+
+    /// Set the asynchronous socket error.
+    pub fn set_async_error(&self, error: SocketAsyncError) {
+        match self {
+            Self::Tcp(socket) => socket.set_async_error(error),
+            Self::Udp(socket) => socket.set_async_error(error),
+        }
+    }
+
+    /// Read and optionally clear the asynchronous socket error.
+    pub fn get_async_error(&self, clear: bool) -> Option<SocketAsyncError> {
+        match self {
+            Self::Tcp(socket) => socket.get_async_error(clear),
+            Self::Udp(socket) => socket.get_async_error(clear),
+        }
+    }
+
+    /// Attempt to read data from the socket.
+    pub fn try_read(
+        &self,
+        buf: &mut [u8],
+        flags: ReceiveFlags,
+        source_addr: Option<&mut Option<SocketAddr>>,
+    ) -> Result<usize, SocketReadError> {
+        match self {
+            Self::Tcp(socket) => socket.try_read(buf, flags, source_addr),
+            Self::Udp(socket) => socket.try_read(buf, flags, source_addr),
+        }
+    }
+
+    /// Attempt to write data to the socket.
+    pub fn try_write(
+        &self,
+        buf: &[u8],
+        flags: SendFlags,
+        destination: Option<SocketAddr>,
+    ) -> Result<usize, SocketWriteError> {
+        if !flags.is_empty() {
+            unimplemented!()
+        }
+        if let Some(addr) = destination
+            && (addr.port() == 0 || addr.ip().is_unspecified())
+        {
+            return Err(SocketWriteError::Unaddressable);
+        }
+        match self {
+            Self::Tcp(socket) => socket.try_write(buf),
+            Self::Udp(socket) => socket.try_write(buf, destination),
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkSocket<Platform> {
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
+        match self {
+            Self::Tcp(socket) => socket.register_observer(observer, mask),
+            Self::Udp(socket) => socket.register_observer(observer, mask),
+        }
+    }
+
+    fn check_io_events(&self) -> Events {
+        match self {
+            Self::Tcp(socket) => socket.check_io_events(),
+            Self::Udp(socket) => socket.check_io_events(),
+        }
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
     fn protocol(&self) -> Protocol {
-        match self.broker_socket {
-            BrokerSocket::Tcp(_) => Protocol::Tcp,
-            BrokerSocket::Udp(_) => Protocol::Udp,
+        match self.socket {
+            NetworkSocket::Tcp(_) => Protocol::Tcp,
+            NetworkSocket::Udp(_) => Protocol::Udp,
         }
     }
 }
@@ -128,16 +205,13 @@ where
     Platform: TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     /// Creates a broker-owned TCP or UDP socket.
-    ///
-    /// By default, the created socket has no associated proxy; to set a proxy, use
-    /// [`attach_socket_proxy`](Self::attach_socket_proxy).
     pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
-        let broker_socket = match (&protocol, self.litebox.broker_control()) {
-            (Protocol::Tcp, Some(broker)) => BrokerSocket::Tcp(
+        let socket = match (&protocol, self.litebox.broker_control()) {
+            (Protocol::Tcp, Some(broker)) => NetworkSocket::Tcp(
                 BrokerTcpSocket::new(broker, self.litebox.broker_pollable_registry())
                     .map_err(SocketError::from)?,
             ),
-            (Protocol::Udp, Some(broker)) => BrokerSocket::Udp(
+            (Protocol::Udp, Some(broker)) => NetworkSocket::Udp(
                 BrokerUdpSocket::new(broker, self.litebox.broker_pollable_registry())
                     .map_err(SocketError::from)?,
             ),
@@ -153,35 +227,17 @@ where
         };
 
         Ok(self.litebox.descriptor_table_mut().insert(SocketHandle {
-            broker_socket,
+            socket,
             immediate_close: AtomicBool::new(false),
-            proxy: None,
         }))
     }
 
-    /// Creates and attaches the userspace I/O proxy matching `fd`.
-    ///
-    /// If a proxy is already attached, this returns another reference to that proxy.
-    ///
-    /// Returns `None` if `fd` is invalid.
+    /// Returns the socket at `fd`, or `None` if `fd` is invalid.
     #[must_use]
-    pub fn attach_socket_proxy(
-        &self,
-        fd: &SocketFd<Platform>,
-    ) -> Option<Arc<NetworkProxy<Platform>>> {
+    pub fn get_socket(&self, fd: &SocketFd<Platform>) -> Option<NetworkSocket<Platform>> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut entry = descriptor_table.get_entry_mut(fd)?;
-        let socket_handle = &mut entry.entry;
-        if let Some(proxy) = &socket_handle.proxy {
-            return Some(Arc::clone(proxy));
-        }
-        let proxy = match &socket_handle.broker_socket {
-            BrokerSocket::Tcp(socket) => NetworkProxy::BrokerStream(Arc::clone(socket)),
-            BrokerSocket::Udp(socket) => NetworkProxy::BrokerDatagram(Arc::clone(socket)),
-        };
-        let proxy = Arc::new(proxy);
-        socket_handle.proxy = Some(Arc::clone(&proxy));
-        Some(proxy)
+        let entry = descriptor_table.get_entry(fd)?;
+        Some(entry.entry.socket.clone())
     }
 
     /// Close the socket at `fd`.
@@ -245,13 +301,12 @@ where
 
     fn close_handle(socket_handle: SocketHandle<Platform>) {
         let SocketHandle {
-            broker_socket,
+            socket,
             immediate_close,
-            proxy: _,
         } = socket_handle;
-        match broker_socket {
-            BrokerSocket::Tcp(socket) => socket.close(immediate_close.load(Ordering::SeqCst)),
-            BrokerSocket::Udp(socket) => socket.close(),
+        match socket {
+            NetworkSocket::Tcp(socket) => socket.close(immediate_close.load(Ordering::SeqCst)),
+            NetworkSocket::Udp(socket) => socket.close(),
         }
     }
 
@@ -273,15 +328,15 @@ where
         let entry = descriptor_table
             .get_entry(fd)
             .ok_or(ConnectError::InvalidFd)?;
-        match &entry.entry.broker_socket {
-            BrokerSocket::Tcp(socket) => {
+        match &entry.entry.socket {
+            NetworkSocket::Tcp(socket) => {
                 if check_progress {
                     socket.check_connect_progress()
                 } else {
                     socket.start_connect(*addr)
                 }
             }
-            BrokerSocket::Udp(socket) => {
+            NetworkSocket::Udp(socket) => {
                 if check_progress {
                     socket.check_connect_progress()
                 } else {
@@ -297,9 +352,9 @@ where
         let entry = descriptor_table
             .get_entry(fd)
             .ok_or(LocalAddrError::InvalidFd)?;
-        Ok(match &entry.entry.broker_socket {
-            BrokerSocket::Tcp(socket) => socket.local_addr(),
-            BrokerSocket::Udp(socket) => socket.local_addr(),
+        Ok(match &entry.entry.socket {
+            NetworkSocket::Tcp(socket) => socket.local_addr(),
+            NetworkSocket::Udp(socket) => socket.local_addr(),
         })
     }
 
@@ -327,14 +382,14 @@ where
             ShutdownDirection::Write => litebox_broker_protocol::socket::ShutdownMode::Write,
             ShutdownDirection::Both => litebox_broker_protocol::socket::ShutdownMode::Both,
         };
-        match &entry.entry.broker_socket {
-            BrokerSocket::Tcp(socket) => {
+        match &entry.entry.socket {
+            NetworkSocket::Tcp(socket) => {
                 if socket.is_listening() {
                     return Err(errors::ShutdownError::Listening);
                 }
                 socket.shutdown(mode)
             }
-            BrokerSocket::Udp(socket) => socket.shutdown(mode),
+            NetworkSocket::Udp(socket) => socket.shutdown(mode),
         }
         .map_err(errors::ShutdownError::OperationFailed)
     }
@@ -345,7 +400,7 @@ where
         let entry = descriptor_table
             .get_entry(fd)
             .ok_or(errors::ShutdownError::InvalidFd)?;
-        let BrokerSocket::Tcp(socket) = &entry.entry.broker_socket else {
+        let NetworkSocket::Tcp(socket) = &entry.entry.socket else {
             return Err(errors::ShutdownError::UnsupportedOperation);
         };
         if !socket.is_listening() {
@@ -361,9 +416,9 @@ where
     fn get_remote_addr_for_handle(
         socket_handle: &SocketHandle<Platform>,
     ) -> Result<SocketAddr, RemoteAddrError> {
-        match &socket_handle.broker_socket {
-            BrokerSocket::Tcp(socket) => socket.remote_addr(),
-            BrokerSocket::Udp(socket) => socket.remote_addr(),
+        match &socket_handle.socket {
+            NetworkSocket::Tcp(socket) => socket.remote_addr(),
+            NetworkSocket::Udp(socket) => socket.remote_addr(),
         }
     }
 
@@ -382,12 +437,12 @@ where
             .entry_handle(fd)
             .ok_or(BindError::InvalidFd)?;
         let entry = descriptor_table.get_entry(fd).ok_or(BindError::InvalidFd)?;
-        let socket = entry.entry.broker_socket.clone();
+        let socket = entry.entry.socket.clone();
         drop(entry);
         drop(descriptor_table);
         let result = match socket {
-            BrokerSocket::Tcp(socket) => socket.bind(*addr),
-            BrokerSocket::Udp(socket) => socket.bind(*addr),
+            NetworkSocket::Tcp(socket) => socket.bind(*addr),
+            NetworkSocket::Udp(socket) => socket.bind(*addr),
         };
         drop(entry_handle);
         result
@@ -402,7 +457,7 @@ where
         let entry = descriptor_table
             .get_entry(fd)
             .ok_or(ListenError::InvalidFd)?;
-        let BrokerSocket::Tcp(socket) = &entry.entry.broker_socket else {
+        let NetworkSocket::Tcp(socket) = &entry.entry.socket else {
             return Err(ListenError::UnsupportedOperation);
         };
         let socket = Arc::clone(socket);
@@ -418,9 +473,6 @@ where
     /// Accept a new incoming connection on a listening socket.
     ///
     /// If `peer` is provided, it is filled with the remote address of the accepted connection.
-    ///
-    /// The returned socket has no associated proxy; use
-    /// [`attach_socket_proxy`](Self::attach_socket_proxy) to attach one.
     pub fn accept(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -433,7 +485,7 @@ where
         let entry = descriptor_table
             .get_entry(fd)
             .ok_or(AcceptError::InvalidFd)?;
-        let BrokerSocket::Tcp(listener) = &entry.entry.broker_socket else {
+        let NetworkSocket::Tcp(listener) = &entry.entry.socket else {
             return Err(AcceptError::UnsupportedOperation);
         };
         let listener = Arc::clone(listener);
@@ -447,9 +499,8 @@ where
             })?;
         }
         Ok(self.litebox.descriptor_table_mut().insert(SocketHandle {
-            broker_socket: BrokerSocket::Tcp(accepted),
+            socket: NetworkSocket::Tcp(accepted),
             immediate_close: AtomicBool::new(false),
-            proxy: None,
         }))
     }
 
@@ -466,26 +517,24 @@ where
         }
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table.get_entry(fd).ok_or(SendError::InvalidFd)?;
-        let outcome = match &entry.entry.broker_socket {
-            BrokerSocket::Tcp(socket) => {
+        let outcome = match &entry.entry.socket {
+            NetworkSocket::Tcp(socket) => {
                 if destination.is_some() {
                     return Err(SendError::UnnecessaryDestinationAddress);
                 }
                 socket.try_write(buf)
             }
-            BrokerSocket::Udp(socket) => socket.try_write(buf, destination),
+            NetworkSocket::Udp(socket) => socket.try_write(buf, destination),
         };
         outcome.map_err(|error| match error {
-            socket_channel::ChannelWriteError::BufferFull => SendError::BufferFull,
-            socket_channel::ChannelWriteError::MessageTooLong => SendError::MessageTooLong,
-            socket_channel::ChannelWriteError::Unaddressable => SendError::Unaddressable,
-            socket_channel::ChannelWriteError::DestinationAddressRequired => {
-                SendError::DestinationAddressRequired
-            }
-            socket_channel::ChannelWriteError::WriteShutdown
-            | socket_channel::ChannelWriteError::NotConnected
-            | socket_channel::ChannelWriteError::ConnectionClosed
-            | socket_channel::ChannelWriteError::Socket(_) => SendError::SocketInInvalidState,
+            SocketWriteError::BufferFull => SendError::BufferFull,
+            SocketWriteError::MessageTooLong => SendError::MessageTooLong,
+            SocketWriteError::Unaddressable => SendError::Unaddressable,
+            SocketWriteError::DestinationAddressRequired => SendError::DestinationAddressRequired,
+            SocketWriteError::WriteShutdown
+            | SocketWriteError::NotConnected
+            | SocketWriteError::ConnectionClosed
+            | SocketWriteError::Socket(_) => SendError::SocketInInvalidState,
         })
     }
 
@@ -506,24 +555,24 @@ where
         let entry = descriptor_table
             .get_entry(fd)
             .ok_or(ReceiveError::InvalidFd)?;
-        let outcome = match &entry.entry.broker_socket {
-            BrokerSocket::Tcp(socket) => socket.try_read(buf, flags, source_addr),
-            BrokerSocket::Udp(socket) => socket.try_read(buf, flags, source_addr).map(|received| {
-                if flags.intersects(ReceiveFlags::TRUNC | ReceiveFlags::DISCARD) {
-                    received
-                } else {
-                    received.min(buf.len())
-                }
-            }),
+        let outcome = match &entry.entry.socket {
+            NetworkSocket::Tcp(socket) => socket.try_read(buf, flags, source_addr),
+            NetworkSocket::Udp(socket) => {
+                socket.try_read(buf, flags, source_addr).map(|received| {
+                    if flags.intersects(ReceiveFlags::TRUNC | ReceiveFlags::DISCARD) {
+                        received
+                    } else {
+                        received.min(buf.len())
+                    }
+                })
+            }
         };
         outcome.or_else(|error| match error {
-            socket_channel::ChannelReadError::WouldBlock => Ok(0),
-            socket_channel::ChannelReadError::ReadShutdown
-            | socket_channel::ChannelReadError::ConnectionClosed => {
+            SocketReadError::WouldBlock => Ok(0),
+            SocketReadError::ReadShutdown | SocketReadError::ConnectionClosed => {
                 Err(ReceiveError::OperationFinished)
             }
-            socket_channel::ChannelReadError::NotConnected
-            | socket_channel::ChannelReadError::Socket(_) => {
+            SocketReadError::NotConnected | SocketReadError::Socket(_) => {
                 Err(ReceiveError::SocketInInvalidState)
             }
         })
@@ -542,7 +591,7 @@ where
         let entry = descriptor_table
             .get_entry(fd)
             .ok_or(errors::SetTcpOptionError::InvalidFd)?;
-        let BrokerSocket::Tcp(socket) = &entry.entry.broker_socket else {
+        let NetworkSocket::Tcp(socket) = &entry.entry.socket else {
             return Err(errors::SetTcpOptionError::NotTcpSocket);
         };
         let socket = Arc::clone(socket);
@@ -566,7 +615,7 @@ where
         let entry = descriptor_table
             .get_entry(fd)
             .ok_or(errors::GetTcpOptionError::InvalidFd)?;
-        let BrokerSocket::Tcp(socket) = &entry.entry.broker_socket else {
+        let NetworkSocket::Tcp(socket) = &entry.entry.socket else {
             return Err(errors::GetTcpOptionError::NotTcpSocket);
         };
         let socket = Arc::clone(socket);

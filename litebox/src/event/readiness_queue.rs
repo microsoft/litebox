@@ -30,7 +30,7 @@ use crate::{
         polling::TryOpError, timer::Timer, wait::WaitContext,
     },
     fs::{FileFd, errors::StatusFlagsError},
-    net::socket_channel::NetworkProxy,
+    net::NetworkSocket,
     pipes::PipeFd,
     process::ProcessError,
     sync::RawSyncPrimitivesProvider,
@@ -72,7 +72,7 @@ pub enum ReadinessTarget<'a, Platform: RawSyncPrimitivesProvider + TimeProvider>
     /// A Unix socket.
     UnixSocket(&'a UnixSocket<Platform>),
     /// A network socket.
-    NetworkSocket(&'a NetworkProxy<Platform>),
+    NetworkSocket(&'a NetworkSocket<Platform>),
     /// An event counter.
     EventCounter(&'a EventCounter<Platform>),
     /// A timer.

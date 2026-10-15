@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Possible errors from [`Network`]
+//! Possible errors from [`Network`] and its sockets
 
 use core::net::SocketAddr;
 
@@ -175,6 +175,42 @@ pub enum ReceiveError {
     SocketInInvalidState,
     #[error("Operation finished")]
     OperationFinished,
+}
+
+/// Possible errors from [`NetworkSocket::try_read`](super::NetworkSocket::try_read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketReadError {
+    /// The local read side has been shut down.
+    ReadShutdown,
+    /// No data is currently available.
+    WouldBlock,
+    /// The stream has not reached a connected state.
+    NotConnected,
+    /// The stream is closed.
+    ConnectionClosed,
+    /// The host network operation failed.
+    Socket(SocketAsyncError),
+}
+
+/// Possible errors from [`NetworkSocket::try_write`](super::NetworkSocket::try_write).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketWriteError {
+    /// The local write side has been shut down.
+    WriteShutdown,
+    /// The stream has not reached a connected state.
+    NotConnected,
+    /// The stream is closed.
+    ConnectionClosed,
+    /// The destination address cannot be used.
+    Unaddressable,
+    /// The transmit buffer is full.
+    BufferFull,
+    /// The datagram exceeds the protocol maximum.
+    MessageTooLong,
+    /// A destination address is required but was not provided.
+    DestinationAddressRequired,
+    /// The host network operation failed.
+    Socket(SocketAsyncError),
 }
 
 crate::utilities::macros::repr_enum! {

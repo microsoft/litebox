@@ -594,19 +594,19 @@ impl From<litebox::net::errors::SendError> for Errno {
     }
 }
 
-impl From<litebox::net::socket_channel::ChannelWriteError> for Errno {
-    fn from(value: litebox::net::socket_channel::ChannelWriteError) -> Self {
+impl From<litebox::net::errors::SocketWriteError> for Errno {
+    fn from(value: litebox::net::errors::SocketWriteError) -> Self {
         match value {
-            litebox::net::socket_channel::ChannelWriteError::WriteShutdown
-            | litebox::net::socket_channel::ChannelWriteError::NotConnected
-            | litebox::net::socket_channel::ChannelWriteError::ConnectionClosed => Errno::EPIPE,
-            litebox::net::socket_channel::ChannelWriteError::Unaddressable => Errno::EINVAL,
-            litebox::net::socket_channel::ChannelWriteError::BufferFull => Errno::EAGAIN,
-            litebox::net::socket_channel::ChannelWriteError::MessageTooLong => Errno::EMSGSIZE,
-            litebox::net::socket_channel::ChannelWriteError::DestinationAddressRequired => {
+            litebox::net::errors::SocketWriteError::WriteShutdown
+            | litebox::net::errors::SocketWriteError::NotConnected
+            | litebox::net::errors::SocketWriteError::ConnectionClosed => Errno::EPIPE,
+            litebox::net::errors::SocketWriteError::Unaddressable => Errno::EINVAL,
+            litebox::net::errors::SocketWriteError::BufferFull => Errno::EAGAIN,
+            litebox::net::errors::SocketWriteError::MessageTooLong => Errno::EMSGSIZE,
+            litebox::net::errors::SocketWriteError::DestinationAddressRequired => {
                 Errno::EDESTADDRREQ
             }
-            litebox::net::socket_channel::ChannelWriteError::Socket(error) => error.into(),
+            litebox::net::errors::SocketWriteError::Socket(error) => error.into(),
         }
     }
 }

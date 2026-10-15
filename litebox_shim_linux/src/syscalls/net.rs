@@ -18,9 +18,8 @@ use litebox::{
     },
     fd::EntryHandle,
     net::{
-        CloseBehavior, SOCKET_RECEIVE_OPERATION_SIZE, TcpOptionData,
-        errors::AcceptError,
-        socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy, SocketState},
+        CloseBehavior, NetworkSocket, SOCKET_RECEIVE_OPERATION_SIZE, TcpOptionData,
+        errors::{AcceptError, SocketReadError, SocketWriteError},
     },
     platform::page_mgmt::MemoryRegionPermissions,
     sync::{Mutex, MutexGuard},
@@ -88,7 +87,7 @@ pub(crate) struct InetSocketPin<'a, Platform: ShimPlatform> {
     global: &'a GlobalState<Platform>,
     entry: Option<EntryHandle<Platform, litebox::net::Network<Platform>>>,
     state: SocketIoState,
-    proxy: Arc<NetworkProxy<Platform>>,
+    network_socket: NetworkSocket<Platform>,
     recv_timeout: Option<core::time::Duration>,
     is_nonblock: bool,
     socket_type: SockType,
@@ -268,7 +267,6 @@ pub(super) struct SocketOptions {
 
 #[derive(Clone)]
 pub(crate) struct SocketOFlags(pub OFlags);
-pub(crate) struct SocketProxy<Platform: ShimPlatform>(pub Arc<NetworkProxy<Platform>>);
 #[derive(Clone)]
 struct SocketIoState(Arc<core::sync::atomic::AtomicUsize>);
 /// Entry metadata that shares `recvmmsg` serialization across duplicated descriptors.
@@ -333,12 +331,6 @@ impl<Platform: ShimPlatform> Clone for SocketRecvmmsgLock<Platform> {
 const SOCKET_IO_CLOSE_PENDING: usize = 1 << (usize::BITS - 1);
 const SOCKET_IO_PIN_COUNT_MASK: usize = SOCKET_IO_CLOSE_PENDING - 1;
 
-impl<Platform: ShimPlatform> Clone for SocketProxy<Platform> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
 pub(super) enum SocketOptionValue {
     Timeout(Option<core::time::Duration>),
     U32(u32),
@@ -354,7 +346,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &SocketFd<Platform>,
         sock_type: SockType,
         flags: SockFlags,
-    ) -> Arc<NetworkProxy<Platform>> {
+    ) {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
@@ -381,17 +373,16 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         assert!(old.is_none());
         drop(dt);
 
-        let proxy = self
+        let network_socket = self
             .net
             .lock()
-            .attach_socket_proxy(fd)
-            .expect("newly-created socket must have a proxy");
-        // Save the proxy in descriptor metadata so the shim can access it without holding the
-        // network lock. `attach_socket_proxy` has already installed the same proxy in `Network`.
+            .get_socket(fd)
+            .expect("newly-created socket must be open");
+        // Save the socket in descriptor metadata so the shim can access it without holding the
+        // network lock.
         let mut dt = self.litebox.descriptor_table_mut();
-        let old = dt.set_entry_metadata(fd, SocketProxy(proxy.clone()));
+        let old = dt.set_entry_metadata(fd, network_socket);
         assert!(old.is_none());
-        proxy
     }
 
     fn with_socket_options<R>(
@@ -489,7 +480,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                 None
             };
         if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE))
-            && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+            && matches!(self.get_network_socket(fd)?, NetworkSocket::Tcp(_))
         {
             let value: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
             return self
@@ -504,7 +495,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                 (SocketOption::LINGER, SocketOptionValue::Timeout(Some(_)))
             );
             if unsupported_broker_option
-                && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+                && matches!(self.get_network_socket(fd)?, NetworkSocket::Tcp(_))
             {
                 return Err(Errno::EOPNOTSUPP);
             }
@@ -632,11 +623,9 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
-                    let proxy = self.get_proxy(fd)?;
-                    let NetworkProxy::BrokerStream(_) = proxy.as_ref() else {
+                    if !matches!(self.get_network_socket(fd)?, NetworkSocket::Tcp(_)) {
                         return Err(Errno::ENOPROTOOPT);
-                    };
-                    drop(proxy);
+                    }
                     let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
                     if matches!(to, TcpOption::CORK) {
                         return Err(Errno::EOPNOTSUPP);
@@ -725,7 +714,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         len: u32,
     ) -> Result<usize, Errno> {
         if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE))
-            && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+            && matches!(self.get_network_socket(fd)?, NetworkSocket::Tcp(_))
         {
             let TcpOptionData::KEEPALIVE(enabled) = self
                 .net
@@ -767,8 +756,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                 }
                 SocketOption::ERROR => {
                     // SO_ERROR is self-clearing: atomically read and reset to 0.
-                    let proxy = self.get_proxy(fd)?;
-                    match proxy.get_async_error(true) {
+                    match self.get_network_socket(fd)?.get_async_error(true) {
                         Some(err) => {
                             let errno: Errno = err.into();
                             i32::from(errno).cast_unsigned()
@@ -819,7 +807,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     }
                     TcpOption::NODELAY | TcpOption::CORK => {
                         if matches!(tcpopt, TcpOption::CORK)
-                            && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+                            && matches!(self.get_network_socket(fd)?, NetworkSocket::Tcp(_))
                         {
                             return Err(Errno::EOPNOTSUPP);
                         }
@@ -869,8 +857,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN,
             |observer, filter| {
-                let proxy = self.get_proxy(fd)?;
-                proxy.register_observer(observer, filter);
+                self.get_network_socket(fd)?
+                    .register_observer(observer, filter);
                 Ok(())
             },
             || self.try_accept(fd, peer.as_deref_mut()),
@@ -895,8 +883,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
             |observer, filter| {
-                let proxy = self.get_proxy(fd)?;
-                proxy.register_observer(observer, filter);
+                self.get_network_socket(fd)?
+                    .register_observer(observer, filter);
                 Ok(())
             },
             || match self.net.lock().connect(fd, &sockaddr, check_progress) {
@@ -925,10 +913,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
-    /// Send data via socket channel (lock-free path).
-    ///
-    /// This uses the channel-based approach where the user writes to a TX ring buffer,
-    /// and the network worker later drains it.
+    /// Sends data on an inet socket without holding the network lock.
     pub(crate) fn sendto(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -937,7 +922,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
-        let proxy = self.get_proxy(fd)?;
+        let socket = self.get_network_socket(fd)?;
 
         // Convert `SendFlags` to `litebox::net::SendFlags`
         // `DONTWAIT` is handled in this function and `NOSIGNAL` should be handled by caller,
@@ -956,27 +941,26 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
-        let is_empty_stream =
-            buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::BrokerStream(_));
+        let is_empty_stream = buf.is_empty() && matches!(socket, NetworkSocket::Tcp(_));
 
         cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
                 Events::OUT,
                 |observer, filter| {
-                    proxy.register_observer(observer, filter);
+                    socket.register_observer(observer, filter);
                     Ok(())
                 },
-                || match proxy.try_write(buf, new_flags, sockaddr) {
+                || match socket.try_write(buf, new_flags, sockaddr) {
                     Ok(0) if buf.is_empty() => Ok(0),
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
-                    Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
-                    Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
+                    Err(SocketWriteError::BufferFull) if is_empty_stream => Ok(0),
+                    Err(SocketWriteError::BufferFull) => Err(TryOpError::TryAgain),
                     // Like Linux, a pending socket error (such as a reset) is reported, and
                     // consumed, in place of `EPIPE`.
                     Err(e) => Err(TryOpError::Other(match Errno::from(e) {
-                        Errno::EPIPE => proxy
+                        Errno::EPIPE => socket
                             .get_async_error(true)
                             .map_or(Errno::EPIPE, Errno::from),
                         errno => errno,
@@ -986,10 +970,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             .map_err(|error| wait_errno(timeout, socket_io_errno(error)))
     }
 
-    /// Receive data via socket channel (lock-free path).
-    ///
-    /// This uses the channel-based approach where the user reads from an RX ring buffer
-    /// that the network worker populates.
+    /// Receives data from an inet socket without holding the network lock.
     pub(crate) fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -1017,8 +998,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     ) -> Result<InetSocketPin<'_, Platform>, Errno> {
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table.entry_handle(fd).ok_or(Errno::EBADF)?;
-        let proxy = descriptor_table
-            .with_metadata(fd, |SocketProxy(proxy)| proxy.clone())
+        let network_socket = descriptor_table
+            .with_metadata(fd, |socket: &NetworkSocket<Platform>| socket.clone())
             .map_err(|error| match error {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
@@ -1064,7 +1045,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             global: self,
             entry: Some(entry),
             state,
-            proxy,
+            network_socket,
             recv_timeout,
             is_nonblock,
             socket_type,
@@ -1095,7 +1076,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         let wait_all = flags.contains(ReceiveFlags::WAITALL)
             && matches!(socket_type, SockType::Stream)
             && !is_nonblock;
-        if buf.is_empty() && matches!(socket.proxy.as_ref(), NetworkProxy::BrokerStream(_)) {
+        if buf.is_empty() && matches!(socket.network_socket, NetworkSocket::Tcp(_)) {
             return Ok(0);
         }
 
@@ -1123,14 +1104,14 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             }
         }
 
-        let proxy = &socket.proxy;
+        let network_socket = &socket.network_socket;
         let target_len = buf.len();
         let mut received = 0;
         let result = cx.with_timeout(timeout).wait_on_events(
             is_nonblock,
             Events::IN,
             |observer, filter| {
-                proxy.register_observer(observer, filter);
+                network_socket.register_observer(observer, filter);
                 Ok(())
             },
             || loop {
@@ -1139,12 +1120,12 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                 } else {
                     &mut buf[..target_len]
                 };
-                match proxy.try_read(destination, new_flags, source_addr.as_deref_mut()) {
+                match network_socket.try_read(destination, new_flags, source_addr.as_deref_mut()) {
                     Ok(n) if !wait_all => return Ok(n),
                     Ok(n) if peek => {
                         received = n;
                         if received == target_len
-                            || proxy
+                            || network_socket
                                 .check_io_events()
                                 .intersects(Events::ERR | Events::HUP | Events::RDHUP)
                         {
@@ -1158,43 +1139,43 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                             return Ok(received);
                         }
                     }
-                    Err(ChannelReadError::ReadShutdown)
+                    Err(SocketReadError::ReadShutdown)
                         if is_nonblock && matches!(socket_type, SockType::Datagram) =>
                     {
                         return Err(TryOpError::TryAgain);
                     }
-                    Err(ChannelReadError::ReadShutdown) => return Ok(received),
-                    Err(ChannelReadError::WouldBlock) => return Err(TryOpError::TryAgain),
-                    Err(ChannelReadError::ConnectionClosed) => {
+                    Err(SocketReadError::ReadShutdown) => return Ok(received),
+                    Err(SocketReadError::WouldBlock) => return Err(TryOpError::TryAgain),
+                    Err(SocketReadError::ConnectionClosed) => {
                         if received != 0 || context.has_prior_progress {
                             return Ok(received);
                         }
-                        return match proxy.get_async_error(true) {
+                        return match network_socket.get_async_error(true) {
                             Some(err) => Err(TryOpError::Other(err.into())),
                             None => Ok(0),
                         };
                     }
-                    Err(ChannelReadError::NotConnected)
+                    Err(SocketReadError::NotConnected)
                         if received != 0 || context.has_prior_progress =>
                     {
                         return Ok(received);
                     }
-                    Err(ChannelReadError::Socket(error))
+                    Err(SocketReadError::Socket(error))
                         if received != 0 || context.has_prior_progress =>
                     {
-                        proxy.set_async_error(error);
+                        network_socket.set_async_error(error);
                         return Ok(received);
                     }
                     // A pending error, such as the reset of an aborted connection attempt, is
                     // reported first.
-                    Err(ChannelReadError::NotConnected) => {
+                    Err(SocketReadError::NotConnected) => {
                         return Err(TryOpError::Other(
-                            proxy
+                            network_socket
                                 .get_async_error(true)
                                 .map_or(Errno::ENOTCONN, Errno::from),
                         ));
                     }
-                    Err(ChannelReadError::Socket(error)) => {
+                    Err(SocketReadError::Socket(error)) => {
                         return Err(TryOpError::Other(error.into()));
                     }
                 }
@@ -1207,18 +1188,20 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             }
             Err(error @ TryOpError::WaitError(_)) if wait_all && peek => {
                 new_flags.remove(litebox::net::ReceiveFlags::WAITALL);
-                match proxy.try_read(&mut buf[..target_len], new_flags, source_addr) {
+                match network_socket.try_read(&mut buf[..target_len], new_flags, source_addr) {
                     Ok(received) => Ok(received),
-                    Err(ChannelReadError::ReadShutdown) => Ok(0),
-                    Err(ChannelReadError::ConnectionClosed) => match proxy.get_async_error(true) {
-                        Some(error) => Err(error.into()),
-                        None => Ok(0),
-                    },
-                    Err(ChannelReadError::NotConnected) => Err(proxy
+                    Err(SocketReadError::ReadShutdown) => Ok(0),
+                    Err(SocketReadError::ConnectionClosed) => {
+                        match network_socket.get_async_error(true) {
+                            Some(error) => Err(error.into()),
+                            None => Ok(0),
+                        }
+                    }
+                    Err(SocketReadError::NotConnected) => Err(network_socket
                         .get_async_error(true)
                         .map_or(Errno::ENOTCONN, Errno::from)),
-                    Err(ChannelReadError::Socket(error)) => Err(error.into()),
-                    Err(ChannelReadError::WouldBlock) => {
+                    Err(SocketReadError::Socket(error)) => Err(error.into()),
+                    Err(SocketReadError::WouldBlock) => {
                         Err(wait_errno(timeout, socket_io_errno(error)))
                     }
                 }
@@ -1246,13 +1229,13 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             & OFlags::STATUS_FLAGS_MASK
     }
 
-    pub(crate) fn get_proxy(
+    pub(crate) fn get_network_socket(
         &self,
         fd: &SocketFd<Platform>,
-    ) -> Result<Arc<NetworkProxy<Platform>>, Errno> {
+    ) -> Result<NetworkSocket<Platform>, Errno> {
         self.litebox
             .descriptor_table()
-            .with_metadata(fd, |SocketProxy(proxy)| proxy.clone())
+            .with_metadata(fd, |socket: &NetworkSocket<Platform>| socket.clone())
             .map_err(|e| match e {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
@@ -1270,12 +1253,12 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             Some(_) => CloseBehavior::GracefulIfNoPendingData,
             None => CloseBehavior::Graceful,
         };
-        let proxy = self.get_proxy(&fd)?;
+        let socket = self.get_network_socket(&fd)?;
         match cx.with_timeout(linger_timeout).wait_on_events(
             self.get_status(&fd).contains(OFlags::NONBLOCK),
             Events::HUP,
             |observer, filter| {
-                proxy.register_observer(observer, filter);
+                socket.register_observer(observer, filter);
                 Ok(())
             },
             || match self.close_network_socket(&fd, behavior) {
@@ -1388,7 +1371,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     _ => unimplemented!(),
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
-                let _ = self.global.initialize_socket(&socket, ty, flags);
+                self.global.initialize_socket(&socket, ty, flags);
                 files.insert_raw_fd(socket).map_err(|socket| {
                     self.global.close_unpublished_socket(&socket);
                     Errno::EMFILE
@@ -1715,10 +1698,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Inet);
 
-                let proxy = self
-                    .global
+                self.global
                     .initialize_socket(&accepted_file, sock_type, flags);
-                proxy.set_state(SocketState::Connected);
                 let raw_fd = files
                     .insert_raw_fd(accepted_file)
                     .map_err(|accepted_file| {
@@ -2549,7 +2530,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Stash the suppressed async socket error back onto the socket.
         if let (Some(async_error), ReceiveSocket::Inet(socket)) = (async_error_to_restore, &socket)
         {
-            socket.proxy.set_async_error(async_error);
+            socket.network_socket.set_async_error(async_error);
         }
 
         // Match Linux's `__sys_recvmmsg`: the remaining timespec is only
@@ -2735,6 +2716,7 @@ mod tests {
     type TestTask = crate::Task<crate::syscalls::tests::TestPlatform>;
 
     use alloc::string::ToString as _;
+    use litebox::net::NetworkSocket;
     use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
         AddressFamily, MapFlags, ProtFlags, ReceiveFlags, SendFlags, SockFlags, SockType,
@@ -2866,13 +2848,17 @@ mod tests {
             .try_pin_inet_socket(&task.global, old_fd as usize)
             .unwrap()
             .unwrap();
+        let udp = |socket: &NetworkSocket<_>| match socket {
+            NetworkSocket::Udp(socket) => alloc::sync::Arc::clone(socket),
+            NetworkSocket::Tcp(_) => unreachable!(),
+        };
         assert!(alloc::sync::Arc::ptr_eq(
-            &replacement.proxy,
-            &new_socket.proxy
+            &udp(&replacement.network_socket),
+            &udp(&new_socket.network_socket)
         ));
         assert!(!alloc::sync::Arc::ptr_eq(
-            &replacement.proxy,
-            &old_socket.proxy
+            &udp(&replacement.network_socket),
+            &udp(&old_socket.network_socket)
         ));
 
         drop(old_socket);
