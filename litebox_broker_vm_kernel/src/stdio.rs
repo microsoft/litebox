@@ -92,7 +92,7 @@ impl StdioProvider for ConsoleStdio {
         if stream == StdioStream::Stdin {
             self.watchers.lock().watch(registration)?;
             if self.console.has_input() {
-                registration.publish(ReadinessFlags::READ)?;
+                registration.publish(ReadinessFlags::READ);
             }
         }
         Ok(())

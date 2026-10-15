@@ -82,6 +82,12 @@ impl IdAllocator {
             self.occupied.remove(&id);
         }
     }
+
+    /// Returns whether `id` has a user.
+    #[cfg(test)]
+    pub(crate) fn is_allocated(&self, id: u32) -> bool {
+        self.occupied.contains_key(&id)
+    }
 }
 
 #[cfg(test)]

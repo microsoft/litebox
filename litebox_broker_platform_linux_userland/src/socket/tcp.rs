@@ -15,12 +15,12 @@ use litebox_broker_core::socket::{
     is_internal_socket_address, normalize_socket_destination,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags, ShutdownMode,
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
 };
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use rustix::event::epoll;
 use rustix::io::{Errno, ioctl_fionread};
 use rustix::net::ipproto;
@@ -119,6 +119,9 @@ pub(super) struct TcpSocketState {
     pub(super) listener: Option<GuestTcpListenerState>,
     pub(super) guest_endpoint: Option<GuestTcpEndpoint>,
     pub(super) peek_waitall_threshold: Option<usize>,
+    /// The reader whose peek the next request past offset zero may continue,
+    /// as [`continue_peek`] describes.
+    peek_reader: Option<ObjectHandle>,
     pub(super) pending_errors: TcpPendingErrors,
     guest_read_shutdown: Option<GuestTcpReadShutdown>,
     pub(super) abortive_close: bool,
@@ -239,6 +242,7 @@ pub(super) fn create_tcp_transport() -> SocketTransportState {
         listener: None,
         guest_endpoint: None,
         peek_waitall_threshold: None,
+        peek_reader: None,
         pending_errors: TcpPendingErrors::default(),
         guest_read_shutdown: None,
         abortive_close: false,
@@ -323,14 +327,14 @@ fn active_epoll_events() -> epoll::EventFlags {
         | epoll::EventFlags::ET
 }
 
-fn add_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerResult<()> {
+fn add_readiness(socket: &SocketEntry, readiness: ReadinessFlags) {
     let current = socket.snapshot.load();
-    update_snapshot(socket, ReadinessFlags(current.0 | readiness.0))
+    update_snapshot(socket, ReadinessFlags(current.0 | readiness.0));
 }
 
-fn clear_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerResult<()> {
+fn clear_readiness(socket: &SocketEntry, readiness: ReadinessFlags) {
     let current = socket.snapshot.load();
-    update_snapshot(socket, ReadinessFlags(current.0 & !readiness.0))
+    update_snapshot(socket, ReadinessFlags(current.0 & !readiness.0));
 }
 
 fn consume_synchronous_error(socket: &mut SocketEntry) -> BrokerResult<()> {
@@ -349,7 +353,8 @@ fn consume_synchronous_error(socket: &mut SocketEntry) -> BrokerResult<()> {
     } else {
         current | ReadinessFlags::ERROR
     };
-    update_snapshot(socket, readiness)
+    update_snapshot(socket, readiness);
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -458,7 +463,7 @@ fn fail_connect(socket: &mut SocketEntry, error: SocketError) {
     }
     socket.connection_status = SocketConnectionStatus::Failed(error);
     let readiness = socket.snapshot.load() | ReadinessFlags::ERROR;
-    let _ = update_snapshot(socket, readiness);
+    update_snapshot(socket, readiness);
 }
 
 pub(super) fn connect_external_tcp_socket(
@@ -525,8 +530,7 @@ pub(super) fn connect_external_tcp_socket(
                     Err(error) => {
                         socket.connection_status =
                             SocketConnectionStatus::Failed(SocketError::Other);
-                        update_snapshot(socket, ReadinessFlags::ERROR)
-                            .map_err(PlatformConnectError::PeerIndeterminate)?;
+                        update_snapshot(socket, ReadinessFlags::ERROR);
                         return Err(PlatformConnectError::PeerIndeterminate(error));
                     }
                 };
@@ -585,7 +589,7 @@ pub(super) fn send_socket(
             }
             Err(Errno::INTR) => {}
             Err(Errno::AGAIN) => {
-                clear_readiness(socket, ReadinessFlags::WRITE)?;
+                clear_readiness(socket, ReadinessFlags::WRITE);
                 return Err(BrokerError::WouldBlock);
             }
             Err(error) => {
@@ -602,6 +606,30 @@ pub(super) fn send_socket(
             }
         }
     }
+}
+
+/// Records the receive by `reader` for the peek continuation check, failing
+/// with `WouldBlock` if it is a request past offset zero that does not
+/// continue `reader`'s peek.
+///
+/// A peek longer than one transfer takes one request at each offset. A
+/// receive by another reader between them may consume bytes the earlier
+/// requests returned, so the rest of the peek would not follow them. The
+/// interrupted reader then returns the bytes it already has.
+fn continue_peek(
+    tcp: &mut TcpSocketState,
+    reader: ObjectHandle,
+    flags: ReceiveFlags,
+    peek_offset: usize,
+) -> BrokerResult<()> {
+    if !flags.contains(ReceiveFlags::PEEK) {
+        tcp.peek_reader = None;
+    } else if peek_offset == 0 {
+        tcp.peek_reader = Some(reader);
+    } else if tcp.peek_reader != Some(reader) {
+        return Err(BrokerError::WouldBlock);
+    }
+    Ok(())
 }
 
 fn validate_peek_window(
@@ -791,7 +819,7 @@ fn receive_socket_once(
                 } else {
                     ReadinessFlags::READ | ReadinessFlags::HANGUP
                 };
-                let _ = add_readiness(socket, readiness);
+                add_readiness(socket, readiness);
                 return Ok(ReactorReceiveOutcome::EndOfStream);
             }
             Ok((_buffer, received)) => {
@@ -803,14 +831,14 @@ fn receive_socket_once(
                     let no_queued_data = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
                         .is_ok_and(|available| available == 0);
                     if no_queued_data {
-                        let _ = clear_readiness(socket, ReadinessFlags::READ);
+                        clear_readiness(socket, ReadinessFlags::READ);
                     }
                 }
                 return Ok(ReactorReceiveOutcome::Received(data));
             }
             Err(Errno::INTR) => {}
             Err(Errno::AGAIN) => {
-                clear_readiness(socket, ReadinessFlags::READ)?;
+                clear_readiness(socket, ReadinessFlags::READ);
                 return Err(BrokerError::WouldBlock);
             }
             Err(error) => {
@@ -1087,7 +1115,7 @@ pub(super) fn shutdown_tcp_socket(
             .map_err(broker_error_from_errno)?
     {
         socket.connection_status = SocketConnectionStatus::Failed(socket_error_from_errno(error));
-        let _ = update_snapshot(socket, ReadinessFlags::ERROR);
+        update_snapshot(socket, ReadinessFlags::ERROR);
         return Ok(SocketOutcome::Completed(()));
     }
     let shutdown_error = if let Some(mut queued) = guest_read_shutdown_buffer {
@@ -1112,10 +1140,9 @@ pub(super) fn shutdown_tcp_socket(
             .is_some();
     let current = socket.snapshot.load();
     let readiness = with_tcp_closed(socket, ReadinessFlags((current.0 & !clear.0) | add.0));
-    // Kernel shutdown and the cached directional state are committed.
-    let _ = update_snapshot(socket, readiness);
+    update_snapshot(socket, readiness);
     if republish_readiness {
-        let _ = socket.readiness.republish(readiness);
+        socket.readiness.republish(readiness);
     }
     if let Some(error) = shutdown_error {
         return Err(error);
@@ -1127,17 +1154,8 @@ pub(super) fn handle_socket_event(
     socket: &mut SocketEntry,
     events: epoll::EventFlags,
 ) -> BrokerResult<()> {
-    // Readiness publication is best-effort on the shared reactor path: a single
-    // association's publication failure must not fail the reactor for every
-    // other process using it (this mirrors the UDP endpoint handler).
-    // `update_snapshot` commits the cached snapshot before publishing, so a
-    // dropped notification leaves the cached readiness authoritative. In
-    // production an admitted socket's publication does not fail: the broker
-    // bounds live readiness registrations to the sink's capacity at association
-    // setup, so this only absorbs a synthetic sink fault. Genuine host-syscall
-    // or internal-consistency errors still propagate and remain fatal.
     if socket.kind() == SocketKind::Udp {
-        let _ = update_snapshot(socket, readiness_from_epoll(socket, events));
+        update_snapshot(socket, readiness_from_epoll(socket, events));
         return Ok(());
     }
     if events.contains(epoll::EventFlags::IN) {
@@ -1169,19 +1187,19 @@ pub(super) fn handle_socket_event(
             complete_connect(socket, events)?;
         }
         SocketConnectionStatus::Connected => {
-            let _ = update_snapshot(socket, readiness_from_epoll(socket, events));
+            update_snapshot(socket, readiness_from_epoll(socket, events));
         }
         SocketConnectionStatus::Failed(SocketError::NotConnected) if socket.read_shutdown => {
-            let _ = update_snapshot(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
+            update_snapshot(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
         }
         SocketConnectionStatus::Failed(_) => {
-            let _ = update_snapshot(socket, ReadinessFlags::ERROR);
+            update_snapshot(socket, ReadinessFlags::ERROR);
         }
         _ => return Err(BrokerError::Internal),
     }
     if republish_readiness {
         let readiness = socket.snapshot.load();
-        let _ = socket.readiness.republish(readiness);
+        socket.readiness.republish(readiness);
     }
     Ok(())
 }
@@ -1205,7 +1223,7 @@ fn complete_connect(socket: &mut SocketEntry, events: epoll::EventFlags) -> Brok
         _ => return Err(BrokerError::Internal),
     };
     socket.connection_status = status;
-    let _ = update_snapshot(socket, readiness);
+    update_snapshot(socket, readiness);
     Ok(())
 }
 
@@ -1224,23 +1242,25 @@ impl Reactor {
     pub(super) fn receive_tcp_socket(
         &mut self,
         id: u64,
+        reader: ObjectHandle,
         length: usize,
         flags: ReceiveFlags,
         peek_offset: usize,
         peek_length: usize,
     ) -> BrokerResult<ReactorReceiveOutcome> {
-        match self.sockets.get_mut(&id) {
-            Some(socket) => receive_socket(
-                socket,
-                &mut self.tcp.peek_cache,
-                id,
-                length,
-                flags,
-                peek_offset,
-                peek_length,
-            ),
-            None => Err(BrokerError::Internal),
+        let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
+        if socket.kind() == SocketKind::Tcp {
+            continue_peek(socket.tcp_state_mut()?, reader, flags, peek_offset)?;
         }
+        receive_socket(
+            socket,
+            &mut self.tcp.peek_cache,
+            id,
+            length,
+            flags,
+            peek_offset,
+            peek_length,
+        )
     }
 
     pub(super) fn set_tcp_socket_option(
@@ -1291,7 +1311,7 @@ impl Reactor {
                 socket.read_shutdown = true;
                 socket.connection_status =
                     SocketConnectionStatus::Failed(SocketError::NotConnected);
-                let _ = update_snapshot(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
+                update_snapshot(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
                 listener.queue
             };
             self.discard_queued_guest_connections(queued, true);
@@ -1347,8 +1367,7 @@ impl Reactor {
                     .get_mut(&id)
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
                 socket.connection_status = status;
-                update_snapshot(socket, ReadinessFlags::ERROR)
-                    .map_err(PlatformConnectError::PeerIndeterminate)?;
+                update_snapshot(socket, ReadinessFlags::ERROR);
                 return Ok(status);
             }
         };
@@ -1389,27 +1408,19 @@ impl Reactor {
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?,
             host_destination,
         )?;
+        let socket = self
+            .sockets
+            .get_mut(&id)
+            .ok_or(PlatformConnectError::PeerIndeterminate(
+                BrokerError::Internal,
+            ))?;
         if matches!(
             status,
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ) {
-            let socket =
-                self.sockets
-                    .get_mut(&id)
-                    .ok_or(PlatformConnectError::PeerIndeterminate(
-                        BrokerError::Internal,
-                    ))?;
             socket.guest_local_address = Some(guest_local_address);
         }
-        update_snapshot(
-            self.sockets
-                .get(&id)
-                .ok_or(PlatformConnectError::PeerIndeterminate(
-                    BrokerError::Internal,
-                ))?,
-            readiness,
-        )
-        .map_err(PlatformConnectError::PeerIndeterminate)?;
+        update_snapshot(socket, readiness);
         Ok(status)
     }
 
@@ -1489,8 +1500,7 @@ impl Reactor {
                     .get_mut(&connector_socket_id)
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
                 connector.connection_status = status;
-                update_snapshot(connector, ReadinessFlags::ERROR)
-                    .map_err(PlatformConnectError::PeerIndeterminate)?;
+                update_snapshot(connector, ReadinessFlags::ERROR);
                 return Ok(status);
             }
         }
@@ -1535,6 +1545,7 @@ impl Reactor {
             });
             connector.guest_local_address = Some(source_address);
             connector.connection_status = SocketConnectionStatus::Connected;
+            update_snapshot(connector, ReadinessFlags::WRITE);
         }
         self.sockets
             .get_mut(&listener_id)
@@ -1557,20 +1568,7 @@ impl Reactor {
             .get_mut(&connector_process_authority)
             .expect("validated connector process missing")
             .pending_guest_connection_count = next_pending_count;
-
-        if let Err(error) = update_snapshot(
-            self.sockets.get(&connector_socket_id).ok_or(
-                PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
-            )?,
-            ReadinessFlags::WRITE,
-        ) {
-            self.remove_queued_guest_connection(listener_id, connector_socket_id, false);
-            return Err(PlatformConnectError::PeerIndeterminate(error));
-        }
-        if let Err(error) = self.publish_listener_queue_readiness(listener_id) {
-            self.remove_queued_guest_connection(listener_id, connector_socket_id, false);
-            return Err(PlatformConnectError::PeerIndeterminate(error));
-        }
+        self.publish_listener_queue_readiness(listener_id);
         Ok(SocketConnectionStatus::Connected)
     }
 
@@ -1757,7 +1755,7 @@ impl Reactor {
         if reset_connector {
             self.mark_guest_socket_reset(connection.connector_socket_id);
         }
-        let _ = self.publish_listener_queue_readiness(listener_id);
+        self.publish_listener_queue_readiness(listener_id);
         self.processes
             .retain(|_, process| retain_process_state(process));
         true
@@ -1799,37 +1797,34 @@ impl Reactor {
             | ReadinessFlags::ERROR
             | ReadinessFlags::HANGUP
             | ReadinessFlags::CLOSED;
-        let _ = if readiness == current {
-            socket.readiness.republish(readiness)
+        if readiness == current {
+            socket.readiness.republish(readiness);
         } else {
-            update_snapshot(socket, readiness)
-        };
+            update_snapshot(socket, readiness);
+        }
     }
 
-    fn publish_listener_queue_readiness(&self, listener_id: u64) -> BrokerResult<()> {
-        let listener = self
-            .sockets
-            .get(&listener_id)
-            .ok_or(BrokerError::Internal)?;
-        let queue_nonempty = listener
-            .tcp_state()?
-            .listener
-            .as_ref()
-            .is_some_and(|state| !state.queue.is_empty());
+    fn publish_listener_queue_readiness(&self, listener_id: u64) {
+        let Some(listener) = self.sockets.get(&listener_id) else {
+            return;
+        };
+        let queue_nonempty = listener.tcp_state().is_ok_and(|tcp| {
+            tcp.listener
+                .as_ref()
+                .is_some_and(|state| !state.queue.is_empty())
+        });
         let current = listener.snapshot.load();
         if queue_nonempty {
             if current.contains(ReadinessFlags::READ) {
-                listener.readiness.republish(current)
+                listener.readiness.republish(current);
             } else {
-                update_snapshot(listener, current | ReadinessFlags::READ)
+                update_snapshot(listener, current | ReadinessFlags::READ);
             }
         } else if current.contains(ReadinessFlags::READ) {
             update_snapshot(
                 listener,
                 ReadinessFlags(current.0 & !ReadinessFlags::READ.0),
-            )
-        } else {
-            Ok(())
+            );
         }
     }
 
@@ -1965,7 +1960,7 @@ impl Reactor {
             )
         };
         if queue_length == 0 {
-            self.publish_listener_queue_readiness(listener_id)?;
+            self.publish_listener_queue_readiness(listener_id);
             return Err(BrokerError::WouldBlock);
         }
         let accepted_connector_socket_id =
@@ -2012,15 +2007,9 @@ impl Reactor {
             }
         }
         snapshot.store(ReadinessFlags::WRITE);
-        if let Err(error) = readiness.publish(ReadinessFlags::WRITE) {
-            self.purge_failed_accept_setup(listener_id, accepted_connector_socket_id);
-            return Err(error);
-        }
-        if queue_length > 1
-            && let Err(error) = self.publish_listener_queue_readiness(listener_id)
-        {
-            self.purge_failed_accept_setup(listener_id, accepted_connector_socket_id);
-            return Err(error);
+        readiness.publish(ReadinessFlags::WRITE);
+        if queue_length > 1 {
+            self.publish_listener_queue_readiness(listener_id);
         }
         if !lifecycle.activate() {
             self.purge_failed_accept_setup(listener_id, accepted_connector_socket_id);
@@ -2065,6 +2054,7 @@ impl Reactor {
                         reset_state: GuestTcpResetState::None,
                     }),
                     peek_waitall_threshold: None,
+                    peek_reader: None,
                     pending_errors: TcpPendingErrors::default(),
                     guest_read_shutdown: None,
                     abortive_close: false,
@@ -2086,7 +2076,7 @@ impl Reactor {
             .ok_or(BrokerError::Internal)?;
         process.live_socket_count = next_listener_live_count;
         if queue_length == 1 {
-            let _ = self.publish_listener_queue_readiness(listener_id);
+            self.publish_listener_queue_readiness(listener_id);
         }
         Ok(SocketOutcome::Completed(AcceptedEndpoints {
             local_address,
@@ -2137,7 +2127,7 @@ pub(super) fn consume_pending_guest_reset(
         if let Some(readiness) = cleared_readiness {
             // The synchronous operation reports the reset even if its
             // readiness notification cannot be delivered.
-            let _ = socket.readiness.publish(readiness);
+            socket.readiness.publish(readiness);
         }
     }
     Ok(consumed)

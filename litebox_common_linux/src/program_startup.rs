@@ -32,6 +32,7 @@ const UNIX_SOCKET_TAG: u8 = 2;
 const EVENTFD_TAG: u8 = 3;
 const TIMERFD_TAG: u8 = 4;
 const EPOLL_TAG: u8 = 5;
+const INET_SOCKET_TAG: u8 = 6;
 const PROGRAM_STARTUP_TAG: u8 = 0;
 const FORK_STARTUP_TAG: u8 = 1;
 
@@ -136,6 +137,11 @@ pub enum InheritedFdKind {
     },
     /// An epoll instance.
     Epoll,
+    /// An IPv4 socket.
+    InetSocket {
+        /// Stream (TCP) or datagram (UDP).
+        socket_type: SocketType,
+    },
 }
 
 /// Clock against which a timerfd measures absolute expiration times.
@@ -553,6 +559,7 @@ impl InheritedFd {
                 InheritedFdKind::File | InheritedFdKind::Epoll => 0,
                 InheritedFdKind::Pipe { .. }
                 | InheritedFdKind::UnixSocket { .. }
+                | InheritedFdKind::InetSocket { .. }
                 | InheritedFdKind::Eventfd { .. }
                 | InheritedFdKind::Timerfd { .. } => size_of::<u8>(),
             }
@@ -590,6 +597,14 @@ impl InheritedFd {
                 });
             }
             InheritedFdKind::Epoll => output.push(EPOLL_TAG),
+            InheritedFdKind::InetSocket { socket_type } => {
+                output.push(INET_SOCKET_TAG);
+                output.push(match socket_type {
+                    SocketType::Stream => 0,
+                    SocketType::Datagram => 1,
+                    _ => unreachable!("IPv4 sockets are streams or datagrams"),
+                });
+            }
         }
     }
 
@@ -627,6 +642,13 @@ impl InheritedFd {
                 },
             },
             EPOLL_TAG => InheritedFdKind::Epoll,
+            INET_SOCKET_TAG => InheritedFdKind::InetSocket {
+                socket_type: match read_u8(input)? {
+                    0 => SocketType::Stream,
+                    1 => SocketType::Datagram,
+                    _ => return Err(LinuxProgramStartupError::Malformed),
+                },
+            },
             _ => return Err(LinuxProgramStartupError::Malformed),
         };
         Ok(Self { fd, handle, kind })
@@ -866,6 +888,13 @@ mod tests {
                     handle: ObjectHandle(13),
                     kind: InheritedFdKind::Epoll,
                 },
+                InheritedFd {
+                    fd: 11,
+                    handle: ObjectHandle(14),
+                    kind: InheritedFdKind::InetSocket {
+                        socket_type: SocketType::Stream,
+                    },
+                },
             ],
         };
 
@@ -1020,6 +1049,16 @@ mod tests {
                         kind: InheritedFdKind::Epoll,
                     },
                     close_on_exec: true,
+                },
+                ForkedFd {
+                    inherited: InheritedFd {
+                        fd: 8,
+                        handle: ObjectHandle(13),
+                        kind: InheritedFdKind::InetSocket {
+                            socket_type: SocketType::Datagram,
+                        },
+                    },
+                    close_on_exec: false,
                 },
             ],
         }

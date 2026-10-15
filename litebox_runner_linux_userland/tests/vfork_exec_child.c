@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
         printf("child-fds stdin_setfl=%d hidden_closed=%d\n", stdin_setfl, hidden_closed);
         return 42;
     }
-    if (strcmp(marker, "unix-fd") == 0 && argc > 3) {
+    if ((strcmp(marker, "unix-fd") == 0 || strcmp(marker, "inet-fd") == 0) && argc > 3) {
         int socket_fd = atoi(argv[2]);
         int hidden = atoi(argv[3]);
         int type = 0;
@@ -138,8 +138,8 @@ int main(int argc, char **argv) {
         int replied = poll(&poll_fd, 1, 30000) == 1 &&
                       read(socket_fd, reply, sizeof reply - 1) == 5 && strcmp(reply, "reply") == 0;
         int hidden_closed = fcntl(hidden, F_GETFD) == -1 && errno == EBADF;
-        printf("child-unix stream=%d sent=%d replied=%d hidden_closed=%d\n", is_stream, sent,
-               replied, hidden_closed);
+        printf("child-%.4s stream=%d sent=%d replied=%d hidden_closed=%d\n", marker, is_stream,
+               sent, replied, hidden_closed);
         return 42;
     }
     if (strcmp(marker, "stdout-mode") == 0) {

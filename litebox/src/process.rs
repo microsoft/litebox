@@ -26,6 +26,7 @@ use crate::event::{
     readiness_queue::ReadinessQueue, timer::Timer,
 };
 use crate::fs::FileFd;
+use crate::inet_socket::InetSocket;
 use crate::pipes::PipeFd;
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::unix_socket::UnixSocket;
@@ -199,6 +200,8 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Pipe(Arc<PipeFd<Platform>>),
     /// A Unix socket, adopted with [`LiteBox::adopt_inherited_unix_socket`].
     UnixSocket(Arc<UnixSocket<Platform>>),
+    /// An IPv4 socket, adopted with [`LiteBox::adopt_inherited_inet_socket`].
+    InetSocket(Arc<InetSocket<Platform>>),
     /// An event counter, adopted with [`LiteBox::adopt_inherited_event_counter`].
     EventCounter(Arc<EventCounter<Platform>>),
     /// A timer, adopted with [`LiteBox::adopt_inherited_timer`].
@@ -278,6 +281,7 @@ impl PendingChild {
                     held_sockets.push(Arc::clone(socket));
                     socket.handle()
                 }
+                InheritableFd::InetSocket(socket) => socket.handle(),
                 InheritableFd::EventCounter(counter) => counter.handle(),
                 InheritableFd::Timer(timer) => timer.handle(),
                 InheritableFd::ReadinessQueue(queue) => queue.handle(),

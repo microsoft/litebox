@@ -66,6 +66,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_aarch64_state.c",
     "fork_epoll_parent.c",
     "fork_event_parent.c",
+    "fork_inet_parent.c",
     "fork_unix_parent.c",
     "gate_signals.c",
     "process_group_parent.c",
@@ -1093,6 +1094,47 @@ fn forked_and_exec_children_share_unix_sockets() {
         );
     }
     let child_line = line("child-unix ");
+    for field in ["stream=", "sent=", "replied=", "hidden_closed="] {
+        assert_eq!(numeric_field(child_line, field), 1, "{field} in {output:?}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn forked_and_exec_children_share_inet_sockets() {
+    let parent = common::compile(
+        "./tests/fork_inet_parent.c",
+        "fork_inet_parent",
+        true,
+        false,
+    );
+    let child = common::compile("./tests/vfork_exec_child.c", "fork_inet_child", true, false);
+    let child_guest_path = std::path::absolute(&child).unwrap();
+    let mut runner = Runner::new(&parent, "fork_inet_parent");
+    runner
+        .allow_process_duplication()
+        .arg(&child_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&child, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+    let parent_line = line("inet-fork ");
+    for field in ["tcp=", "udp=", "orphan=", "exec="] {
+        assert_eq!(
+            numeric_field(parent_line, field),
+            0,
+            "{field} in {output:?}"
+        );
+    }
+    let child_line = line("child-inet ");
     for field in ["stream=", "sent=", "replied=", "hidden_closed="] {
         assert_eq!(numeric_field(child_line, field), 1, "{field} in {output:?}");
     }

@@ -21,10 +21,12 @@ use litebox::{
         self,
         errors::{AcceptError, ConnectError, ShutdownError, SocketReadError, SocketWriteError},
     },
+    process::ProcessError,
     sync::{Mutex, MutexGuard},
     utils::TruncateExt as _,
 };
 use litebox_broker_protocol::{
+    ObjectHandle,
     fs::FileOpenFlags,
     socket::{self, SocketType},
 };
@@ -687,6 +689,22 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             .entry_handle(fd)
             .ok_or(Errno::EBADF)?;
         handle.with_entry(f)
+    }
+
+    /// Adopts an internet socket of type `socket_type` this process inherited
+    /// from its parent as `handle`.
+    pub(super) fn adopt_inherited_inet_socket(
+        &self,
+        handle: ObjectHandle,
+        socket_type: SocketType,
+    ) -> Result<TypedFd<InetSocketSubsystem<Platform>>, ProcessError> {
+        let socket = self
+            .litebox
+            .adopt_inherited_inet_socket(handle, socket_type)?;
+        Ok(self
+            .litebox
+            .descriptor_table_mut()
+            .insert::<InetSocketSubsystem<Platform>>(InetSocket::from(socket)))
     }
 }
 

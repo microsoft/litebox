@@ -209,7 +209,7 @@ impl ProcessSignalsState {
     /// since.
     fn republish(&self) {
         if let Some(readiness) = &self.readiness {
-            let _ = readiness.republish(ReadinessFlags::READ);
+            readiness.republish(ReadinessFlags::READ);
         }
     }
 }

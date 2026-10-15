@@ -982,9 +982,7 @@ impl PlatformSocket for TestPlatformSocket {
         {
             return Ok(SocketConnectionStatus::Unconnected);
         }
-        self.readiness
-            .publish(ReadinessFlags::WRITE)
-            .map_err(PlatformConnectError::PeerIndeterminate)?;
+        self.readiness.publish(ReadinessFlags::WRITE);
         if is_udp(self.create_request) {
             Ok(SocketConnectionStatus::Connected)
         } else {
@@ -1051,6 +1049,7 @@ impl PlatformSocket for TestPlatformSocket {
 
     fn receive(
         &self,
+        _reader: ObjectHandle,
         length: usize,
         _flags: ReceiveFlags,
         _peek_offset: u32,
@@ -1527,8 +1526,7 @@ fn check_failed_create_rolls_back(broker: &BrokerCore, provider: &TestSocketProv
         .unwrap()
         .as_ref()
         .unwrap()
-        .publish(ReadinessFlags::READ)
-        .unwrap();
+        .publish(ReadinessFlags::READ);
     assert!(readiness.published.lock().unwrap().is_empty());
     assert_eq!(readiness.retired.lock().unwrap().len(), 1);
     assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
@@ -1581,7 +1579,7 @@ fn failed_accept_rolls_back_readiness_and_quota() {
             .unwrap()
             .take()
             .expect("failed accept did not retain readiness");
-        registration.publish(ReadinessFlags::READ).unwrap();
+        registration.publish(ReadinessFlags::READ);
         assert!(readiness.published.lock().unwrap().is_empty());
         assert_eq!(readiness.retired.lock().unwrap().len(), 1);
         assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
@@ -1596,6 +1594,197 @@ fn failed_accept_rolls_back_readiness_and_quota() {
     }
 
     process.close_object_reference(listener).unwrap();
+}
+
+/// A sink whose every publication fails.
+struct FailingReadinessSink;
+
+impl ReadinessSink for FailingReadinessSink {
+    fn max_tracked_objects(&self) -> usize {
+        usize::MAX
+    }
+
+    fn publish(&self, _handle: ObjectHandle, _readiness: ReadinessFlags) -> Result<()> {
+        Err(BrokerError::ResourceExhausted)
+    }
+
+    fn republish(&self, _handle: ObjectHandle, _readiness: ReadinessFlags) -> Result<()> {
+        Err(BrokerError::ResourceExhausted)
+    }
+
+    fn retire(&self, _handle: ObjectHandle) {}
+}
+
+#[test]
+fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let creator = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let target = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let failing = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let creator_id = creator.id();
+    let creator_sink = Arc::new(TestReadinessSink::default());
+    let socket = create(&creator, create_udp_request(), creator_sink.clone()).unwrap();
+    let duplicate = creator
+        .duplicate_object_reference_to(socket, &target, ObjectRights::all())
+        .unwrap();
+    let target_sink = Arc::new(TestReadinessSink::default());
+    target
+        .register_readiness(&(target_sink.clone() as Arc<dyn ReadinessSink>))
+        .unwrap();
+    creator
+        .duplicate_object_reference_to(socket, &failing, ObjectRights::all())
+        .unwrap();
+    failing
+        .register_readiness(&(Arc::new(FailingReadinessSink) as Arc<dyn ReadinessSink>))
+        .unwrap();
+    creator_sink.published.lock().unwrap().clear();
+    let provider_readiness = provider
+        .state
+        .live_readiness
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+
+    // A publication reaches every reference, whatever another reference's
+    // sink does with it.
+    provider_readiness.publish(ReadinessFlags::READ);
+    assert_eq!(
+        *creator_sink.published.lock().unwrap(),
+        [(socket, ReadinessFlags::READ)]
+    );
+    assert_eq!(
+        *target_sink.published.lock().unwrap(),
+        [(duplicate, ReadinessFlags::READ)]
+    );
+    provider_readiness.republish(ReadinessFlags::READ);
+    assert_eq!(
+        *creator_sink.republished.lock().unwrap(),
+        [(socket, ReadinessFlags::READ)]
+    );
+    assert_eq!(
+        *target_sink.republished.lock().unwrap(),
+        [(duplicate, ReadinessFlags::READ)]
+    );
+    drop(failing);
+
+    // The duplicate keeps the socket, and the creator's provider state and
+    // ID, after the creator releases its references.
+    let retired_sockets = provider.state.retired_sockets.load(Ordering::Relaxed);
+    creator.cleanup(true);
+    assert_eq!(*creator_sink.retired.lock().unwrap(), [socket]);
+    assert!(
+        !provider
+            .state
+            .closed_processes
+            .lock()
+            .unwrap()
+            .contains(&creator_id)
+    );
+    assert!(broker.ids.lock().is_allocated(creator_id.0));
+    provider_readiness.publish(ReadinessFlags::WRITE);
+    assert_eq!(creator_sink.published.lock().unwrap().len(), 1);
+    assert_eq!(
+        target_sink.published.lock().unwrap().last(),
+        Some(&(duplicate, ReadinessFlags::WRITE))
+    );
+    assert_eq!(
+        provider.state.retired_sockets.load(Ordering::Relaxed),
+        retired_sockets
+    );
+
+    target.close_object_reference(duplicate).unwrap();
+    assert_eq!(
+        provider.state.retired_sockets.load(Ordering::Relaxed),
+        retired_sockets + 1
+    );
+    assert!(
+        provider
+            .state
+            .closed_processes
+            .lock()
+            .unwrap()
+            .contains(&creator_id)
+    );
+    assert!(!broker.ids.lock().is_allocated(creator_id.0));
+}
+
+#[test]
+fn socket_accepted_through_a_duplicate_is_charged_to_the_listener() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let owner = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let sharer = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let connector_session = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let listener = create(
+        &owner,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    let listener_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 44010);
+    assert_eq!(
+        bind(&owner, listener, listener_address),
+        Ok(SocketOutcome::Completed(listener_address))
+    );
+    assert_eq!(
+        listen(&owner, listener, 1),
+        Ok(SocketOutcome::Completed(listener_address))
+    );
+    let duplicate = owner
+        .duplicate_object_reference_to(listener, &sharer, ObjectRights::all())
+        .unwrap();
+    let connector = create(
+        &connector_session,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    provider.queue_next_guest_connect();
+    assert_eq!(
+        connect(&connector_session, connector, listener_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    let SocketOutcome::Completed(accepted) = accept(
+        &sharer,
+        duplicate,
+        FileOpenFlags::NONE,
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap() else {
+        panic!("accept through the duplicate failed");
+    };
+    let closed = |process: &BrokerProcess| {
+        provider
+            .state
+            .closed_processes
+            .lock()
+            .unwrap()
+            .contains(&process.id())
+    };
+
+    owner.cleanup(true);
+    sharer.close_object_reference(duplicate).unwrap();
+    assert!(!closed(&owner));
+    sharer.close_object_reference(accepted.handle).unwrap();
+    assert!(closed(&owner));
+    assert!(!closed(&sharer));
+    sharer.cleanup(true);
+    assert!(closed(&sharer));
+    connector_session.close_object_reference(connector).unwrap();
 }
 
 #[test]
@@ -1647,8 +1836,7 @@ fn socket_readiness_reaches_readiness_queues() {
         .unwrap()
         .as_ref()
         .unwrap()
-        .publish(ReadinessFlags::READ)
-        .unwrap();
+        .publish(ReadinessFlags::READ);
     assert_eq!(
         *socket_sink.published.lock().unwrap(),
         [(socket, ReadinessFlags::READ)]
@@ -1815,7 +2003,7 @@ fn invalid_accepted_metadata_retires_socket_readiness_and_quota() {
             .expect("rejected accepted socket was not retained")
             .readiness
             .clone();
-        registration.publish(ReadinessFlags::READ).unwrap();
+        registration.publish(ReadinessFlags::READ);
         assert!(readiness.published.lock().unwrap().is_empty());
         assert_eq!(readiness.retired.lock().unwrap().len(), 1);
         assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
@@ -2326,9 +2514,11 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     let in_flight = socket_resource(&process, handle, ObjectRights::WAIT).unwrap();
     assert_eq!(process.close_object_reference(handle), Ok(()));
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
-    assert_eq!(readiness.retired.lock().unwrap().as_slice(), []);
-    drop(in_flight);
+    // The reference's registration retires with it, while the in-flight
+    // operation keeps the socket.
     assert_eq!(readiness.retired.lock().unwrap().as_slice(), [handle]);
+    assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 0);
+    drop(in_flight);
     assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process.reserved_sockets.load(Ordering::Relaxed), 0);
@@ -3509,7 +3699,7 @@ fn check_quota_waits_for_deferred_retirement(broker: &BrokerCore, provider: &Tes
     assert_eq!(process.reserved_sockets.load(Ordering::Relaxed), 1);
 
     release_tx.send(()).unwrap();
-    publisher.join().unwrap().unwrap();
+    publisher.join().unwrap();
     assert_eq!(readiness.retired.load(Ordering::Relaxed), 1);
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process.reserved_sockets.load(Ordering::Relaxed), 0);

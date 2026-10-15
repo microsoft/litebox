@@ -73,37 +73,35 @@ impl ReadinessRegistration {
 
     /// Publishes the object's current readiness.
     ///
-    /// Updates after the broker retires the object are discarded.
-    pub fn publish(&self, readiness: ReadinessFlags) -> Result<()> {
-        {
-            let mut state = self.inner.state.lock();
-            if state.retired {
-                return Ok(());
-            }
-            state.active_publishers = state
-                .active_publishers
-                .checked_add(1)
-                .ok_or(BrokerError::ResourceExhausted)?;
+    /// Updates after the broker retires the object are discarded. Sink
+    /// failures are ignored because connection setup sizes every sink for all
+    /// of its association's registrations.
+    pub fn publish(&self, readiness: ReadinessFlags) {
+        if let Some(_publishing) = self.begin_publish() {
+            let _ = self.inner.sink.publish(self.inner.handle, readiness);
         }
-        let _publishing = ReadinessPublishGuard { inner: &self.inner };
-        self.inner.sink.publish(self.inner.handle, readiness)
     }
 
     /// Re-publishes the current readiness to wake waiters whose condition
     /// changed without changing the readiness flags.
-    pub fn republish(&self, readiness: ReadinessFlags) -> Result<()> {
-        {
-            let mut state = self.inner.state.lock();
-            if state.retired {
-                return Ok(());
-            }
-            state.active_publishers = state
-                .active_publishers
-                .checked_add(1)
-                .ok_or(BrokerError::ResourceExhausted)?;
+    ///
+    /// Updates are discarded or ignored as for [`Self::publish`].
+    pub fn republish(&self, readiness: ReadinessFlags) {
+        if let Some(_publishing) = self.begin_publish() {
+            let _ = self.inner.sink.republish(self.inner.handle, readiness);
         }
-        let _publishing = ReadinessPublishGuard { inner: &self.inner };
-        self.inner.sink.republish(self.inner.handle, readiness)
+    }
+
+    /// Defers retirement until the returned publication ends, or returns
+    /// `None` if the registration is retired.
+    fn begin_publish(&self) -> Option<ReadinessPublishGuard<'_>> {
+        let mut state = self.inner.state.lock();
+        if state.retired {
+            return None;
+        }
+        // Each active publisher is a live call, so this cannot overflow.
+        state.active_publishers += 1;
+        Some(ReadinessPublishGuard { inner: &self.inner })
     }
 
     pub(crate) fn retire(&self) {
@@ -147,12 +145,22 @@ impl ReadinessWatchers {
     ///
     /// This republishes even when the flags match an earlier publication,
     /// since a waiter may need more than the flags report, such as space for
-    /// an atomic write. Failures are ignored because connection setup sizes
-    /// every sink for all of its association's references.
+    /// an atomic write.
     pub fn publish(&self, readiness: ReadinessFlags) {
         for watcher in &self.0 {
             if let Some(inner) = watcher.upgrade() {
-                let _ = ReadinessRegistration { inner }.republish(readiness);
+                ReadinessRegistration { inner }.republish(readiness);
+            }
+        }
+    }
+
+    /// Tells every watcher the object's readiness is now `readiness`, which
+    /// a watcher need not wake waiters for if the flags match its last
+    /// publication.
+    pub fn publish_if_changed(&self, readiness: ReadinessFlags) {
+        for watcher in &self.0 {
+            if let Some(inner) = watcher.upgrade() {
+                ReadinessRegistration { inner }.publish(readiness);
             }
         }
     }
@@ -173,6 +181,12 @@ impl SharedReadinessWatchers {
     /// Wakes every watcher, as [`ReadinessWatchers::publish`] describes.
     pub fn publish(&self, readiness: ReadinessFlags) {
         self.0.lock().publish(readiness);
+    }
+
+    /// Tells every watcher the object's readiness, as
+    /// [`ReadinessWatchers::publish_if_changed`] describes.
+    pub fn publish_if_changed(&self, readiness: ReadinessFlags) {
+        self.0.lock().publish_if_changed(readiness);
     }
 }
 
@@ -282,7 +296,7 @@ pub(crate) mod tests {
         let retained = registration.clone();
 
         registration.retire();
-        retained.publish(ReadinessFlags::READ).unwrap();
+        retained.publish(ReadinessFlags::READ);
 
         assert!(sink.published.lock().unwrap().is_empty());
         assert_eq!(sink.retired.lock().unwrap().as_slice(), [ObjectHandle(99)]);

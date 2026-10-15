@@ -359,8 +359,8 @@ impl Reactor {
             return Ok(());
         }
         socket.pending_error = Some(SocketError::ConnectionRefused);
-        // The error is committed and the cached snapshot remains authoritative
-        // even if this association cannot accept the notification.
+        // The error is already committed; ignore a failure to recompute
+        // readiness.
         let _ = self.publish_udp_readiness(socket_id);
         Ok(())
     }
@@ -378,9 +378,8 @@ impl Reactor {
             .pending_error
             .take();
         if error.is_some() {
-            // The error is consumed and the cached snapshot remains
-            // authoritative even if this association cannot accept the
-            // notification.
+            // The error is already consumed; ignore a failure to recompute
+            // readiness.
             let _ = self.publish_udp_readiness(socket_id);
         }
         Ok(error)
@@ -556,7 +555,8 @@ impl Reactor {
             .sockets
             .get_mut(&socket_id)
             .ok_or(BrokerError::Internal)?;
-        update_snapshot(socket, readiness)
+        update_snapshot(socket, readiness);
+        Ok(())
     }
 
     fn take_udp_error(&mut self, socket_id: u64) -> BrokerResult<Option<SocketError>> {
@@ -635,11 +635,11 @@ impl Reactor {
             .sockets
             .get_mut(&socket_id)
             .ok_or(BrokerError::Internal)?;
-        let _ = update_snapshot(socket, readiness);
+        update_snapshot(socket, readiness);
         if republish_error {
             // Returning the cached error leaves another error pending without
             // changing readiness, so wake a waiter for the remaining error.
-            let _ = socket.readiness.republish(readiness);
+            socket.readiness.republish(readiness);
         }
         if let Err(error) = self.rearm_udp_endpoint_if_needed(socket_id) {
             if let Some(pending_error) = pending_error {
@@ -649,7 +649,7 @@ impl Reactor {
                     .expect("UDP status socket disappeared after rearm failure");
                 socket.pending_error = Some(pending_error);
                 let readiness = socket.snapshot.load() | ReadinessFlags::ERROR;
-                let _ = update_snapshot(socket, readiness);
+                update_snapshot(socket, readiness);
             }
             return Err(error);
         }
@@ -679,7 +679,7 @@ impl Reactor {
             .ok_or(BrokerError::Internal)?;
         socket.pending_error = Some(cached_error);
         let readiness = socket.snapshot.load() | ReadinessFlags::ERROR;
-        let _ = update_snapshot(socket, readiness);
+        update_snapshot(socket, readiness);
         socket
             .udp_state_mut()?
             .native_endpoint
@@ -1311,9 +1311,8 @@ impl Reactor {
             self.drain_rejected_external_datagrams(target.socket_id)?;
         }
         self.rearm_udp_endpoint(target.socket_id)?;
-        // The cached snapshot remains authoritative if this association cannot
-        // accept a notification. One process's sink must not fail the shared
-        // reactor and every other process using it.
+        // One socket's failure to recompute readiness must not fail the shared
+        // reactor for every other socket.
         let _ = self.publish_udp_readiness(target.socket_id);
         Ok(())
     }
@@ -1618,8 +1617,8 @@ impl Reactor {
                 .udp_state_mut()?;
             udp.peeked_origin = None;
             udp.next_receive_origin = UdpReceiveOrigin::External;
-            // The dequeue is committed and the cached snapshot is authoritative
-            // even if this association cannot accept the notification.
+            // The dequeue is already committed; ignore a failure to recompute
+            // readiness.
             let _ = self.publish_udp_readiness(socket_id);
         }
         Ok(Some(ReactorReceiveFromOutcome::Received {
@@ -1754,8 +1753,8 @@ impl Reactor {
                 // authorized datagram keeps READ asserted without requiring
                 // an asynchronous low-to-high publication.
                 let _ = self.drain_rejected_external_datagrams(socket_id);
-                // The cached snapshot remains authoritative if notification
-                // delivery fails after irreversible consumption.
+                // Consumption is irreversible; ignore a failure to recompute
+                // readiness.
                 let _ = self.publish_udp_readiness(socket_id);
                 return Ok(Some(ReactorReceiveFromOutcome::Received {
                     data,

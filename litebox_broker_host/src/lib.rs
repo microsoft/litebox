@@ -2042,8 +2042,7 @@ mod tests {
                 *self.local_address.lock().unwrap() = Some(source_address);
             }
             self.readiness
-                .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)
-                .map_err(PlatformConnectError::PeerUnchanged)?;
+                .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE);
             if self.create_request.socket_type == SocketType::Datagram {
                 Ok(SocketConnectionStatus::Connected)
             } else {
@@ -2070,6 +2069,7 @@ mod tests {
 
         fn receive(
             &self,
+            _reader: ObjectHandle,
             length: usize,
             _flags: ReceiveFlags,
             _peek_offset: u32,

@@ -14,6 +14,7 @@ use crate::id::IdAllocator;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::signal::ProcessSignals;
+use crate::socket::SocketAccount;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
@@ -195,6 +196,9 @@ pub struct BrokerProcess {
     pub(crate) unix_socket_bytes: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    /// The provider socket state charged to this process, until it releases
+    /// its references.
+    socket_account: Mutex<Option<Arc<SocketAccount>>>,
     /// Readiness queue entries added by this process that are still live.
     pub(crate) readiness_queue_entries: Arc<AtomicUsize>,
     /// Signals and child exits this process has not taken.
@@ -334,6 +338,7 @@ impl BrokerProcess {
             |creator| creator.membership(),
         );
         Self::retain_membership_ids(&mut core.ids.lock(), membership);
+        let socket_account = Arc::new(SocketAccount::new(&core, id));
         Self {
             core,
             id,
@@ -365,6 +370,7 @@ impl BrokerProcess {
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             unix_socket_bytes: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            socket_account: Mutex::new(Some(socket_account)),
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),
             cancellation: AssociationCancellation::default(),
@@ -1399,13 +1405,14 @@ impl BrokerProcess {
     /// Duplicates a supported object reference into another process.
     ///
     /// The returned handle is owned by `target` and refers to the same
-    /// underlying event, file, Unix socket, pipe endpoint, or timer. `rights`
-    /// must be nonempty, allowed by the target's policy, and no broader than
-    /// the source reference's rights. The source reference is unchanged.
-    /// Socket and signal references are not supported because their readiness
-    /// registration is currently bound to one process and handle.
+    /// underlying event, file, Unix socket, pipe endpoint, socket, timer, or
+    /// readiness queue. `rights` must be nonempty, allowed by the target's
+    /// policy, and no broader than the source reference's rights. The source
+    /// reference is unchanged. Signal references are not supported because
+    /// they belong to one process.
     ///
-    /// Pipe capacity remains charged to the process that created the pipe.
+    /// Pipe capacity remains charged to the process that created the pipe,
+    /// and a socket to the process that created it, or its listener.
     /// Child creation must call this operation explicitly according to the
     /// guest operating system's inheritance semantics.
     pub fn duplicate_object_reference_to(
@@ -1796,8 +1803,9 @@ impl BrokerProcess {
         self.core.process_lifecycle_sink.changed();
     }
 
-    /// Releases every object reference and provider socket state owned by this
-    /// process, returning whether an accounting fault was observed.
+    /// Releases every object reference owned by this process, and the
+    /// provider socket state charged to it once no socket charged to it
+    /// remains, returning whether an accounting fault was observed.
     ///
     /// Calling this method more than once is harmless.
     fn release_references(&self) -> bool {
@@ -1852,8 +1860,21 @@ impl BrokerProcess {
                 .any(|reference| reference.owner == self.id)
         );
 
-        self.core.socket_provider.close_process(self.id);
+        // Dropping the account may release provider state, so it must not
+        // run while its lock is held.
+        let socket_account = self.socket_account.lock().take();
+        drop(socket_account);
         invariant_fault
+    }
+
+    /// Returns the account of the provider socket state charged to this
+    /// process, or fails with `PeerClosed` once the process has released its
+    /// references.
+    pub(crate) fn socket_account(&self) -> Result<Arc<SocketAccount>> {
+        self.socket_account
+            .lock()
+            .clone()
+            .ok_or(BrokerError::PeerClosed)
     }
 
     /// Removes `threads` from the core thread registry, so they no longer

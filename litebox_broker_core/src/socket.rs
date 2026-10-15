@@ -21,10 +21,12 @@ use litebox_broker_protocol::socket::{
 };
 use spin::{Mutex, RwLock};
 
+use crate::id::IdAllocator;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
-use crate::{BrokerError, BrokerProcess, ProcessId, Result};
+use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessId, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
 const DEFAULT_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
@@ -472,8 +474,12 @@ pub trait SocketProvider: Send + Sync {
         readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>>;
 
-    /// Releases remaining provider state charged to a process after its socket
-    /// references close.
+    /// Releases remaining provider state charged to a process.
+    ///
+    /// Core calls this once, after the process has released its references
+    /// and every socket charged to it has retired, and does not reuse the
+    /// process's ID before then. A socket stays charged to the process that
+    /// created it, even while other processes share it.
     ///
     /// This is a teardown and accounting boundary, not a separate network
     /// namespace; it must not disturb endpoints owned by other processes.
@@ -513,8 +519,9 @@ pub trait PlatformSocket: Send + Sync {
     ///
     /// When no connection is pending, returns [`BrokerError::WouldBlock`]. The
     /// returned socket follows the readiness contract of
-    /// [`SocketProvider::create`]. On a non-completed return, the provider
-    /// releases all resources allocated for an unreturned socket.
+    /// [`SocketProvider::create`] and is charged to the process this listener
+    /// is charged to. On a non-completed return, the provider releases all
+    /// resources allocated for an unreturned socket.
     fn accept(
         &self,
         readiness: ReadinessRegistration,
@@ -571,8 +578,16 @@ pub trait PlatformSocket: Send + Sync {
     /// A temporarily empty socket returns [`BrokerError::WouldBlock`]. End of
     /// stream returns [`PlatformStreamReceive::EndOfStream`]. The core handles
     /// zero-length receives without invoking the platform.
+    ///
+    /// `reader` identifies the reference receiving. A peek longer than one
+    /// transfer takes one request at each offset, starting from zero, by the
+    /// same reader. A request past offset zero returns
+    /// [`BrokerError::WouldBlock`] if another receive came after that reader's
+    /// request at offset zero, since the bytes it would return might not
+    /// follow those already returned.
     fn receive(
         &self,
+        reader: ObjectHandle,
         length: usize,
         flags: ReceiveFlags,
         peek_offset: u32,
@@ -665,19 +680,11 @@ pub fn create(
         .core
         .policy
         .authorize_socket_create(process.caller_credential, request)?;
+    let account = process.socket_account()?;
     let quota = Arc::new(reserve_socket(process)?);
     let reference = process.reserve_object_reference(rights)?;
-    let watchers = SharedReadinessWatchers::default();
-    let readiness_sink = Arc::new(SocketReadinessSink::new(
-        reference.handle(),
-        readiness_sink,
-        watchers.clone(),
-    ));
-    let readiness = ReadinessRegistration::new_with_retirement_guard(
-        reference.handle(),
-        readiness_sink.clone(),
-        quota,
-    );
+    let (registration, socket_sink, readiness) =
+        socket_readiness(&reference, readiness_sink, quota)?;
     let platform_socket =
         match process
             .core
@@ -696,15 +703,14 @@ pub fn create(
     let resource = Arc::new(SocketResource {
         platform_socket,
         readiness,
-        readiness_sink,
-        watchers,
+        readiness_sink: socket_sink,
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(None),
+        account,
     });
     let socket = SocketObject::new(resource, request, status);
     socket.sync_readiness();
-    let handle = reference.commit(ObjectEntry::Socket(socket))?;
-    Ok(handle)
+    reference.commit_with_readiness(ObjectEntry::Socket(socket), Some(registration))
 }
 
 /// Starts a nonblocking connection attempt, or reports one already started.
@@ -1215,17 +1221,8 @@ pub fn accept(
         .principal_object_rights(process.caller_credential)?;
     let quota = Arc::new(reserve_socket(process)?);
     let reference = process.reserve_object_reference(rights)?;
-    let watchers = SharedReadinessWatchers::default();
-    let readiness_sink = Arc::new(SocketReadinessSink::new(
-        reference.handle(),
-        readiness_sink,
-        watchers.clone(),
-    ));
-    let readiness = ReadinessRegistration::new_with_retirement_guard(
-        reference.handle(),
-        readiness_sink.clone(),
-        quota,
-    );
+    let (registration, socket_sink, readiness) =
+        socket_readiness(&reference, readiness_sink, quota)?;
     let accepted = match listener_resource.platform_socket.accept(readiness.clone()) {
         Ok(SocketOutcome::Completed(accepted)) => accepted,
         Ok(SocketOutcome::Failed(error)) => {
@@ -1251,10 +1248,11 @@ pub fn accept(
     let resource = Arc::new(SocketResource {
         platform_socket: socket,
         readiness,
-        readiness_sink,
-        watchers,
+        readiness_sink: socket_sink,
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(Some(guest_source_lease)),
+        // The provider charges an accepted socket to its listener's process.
+        account: Arc::clone(&listener_resource.account),
     });
     let accepted_socket = SocketObject::new_connected(
         resource,
@@ -1264,7 +1262,8 @@ pub fn accept(
         remote_address,
     );
     accepted_socket.sync_readiness();
-    let handle = reference.commit(ObjectEntry::Socket(accepted_socket))?;
+    let handle = reference
+        .commit_with_readiness(ObjectEntry::Socket(accepted_socket), Some(registration))?;
     Ok(SocketOutcome::Completed(AcceptedBrokerSocket {
         handle,
         local_address,
@@ -1569,13 +1568,14 @@ pub fn receive(
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
-    let result = receive_stream(&object, length, flags, peek_offset, peek_length);
+    let result = receive_stream(&object, handle, length, flags, peek_offset, peek_length);
     sync_readiness(&object);
     result
 }
 
 fn receive_stream(
     object: &RwLock<ObjectEntry>,
+    reader: ObjectHandle,
     length: usize,
     mut flags: ReceiveFlags,
     peek_offset: u32,
@@ -1611,7 +1611,7 @@ fn receive_stream(
     if read_shutdown {
         flags = ReceiveFlags(flags.0 & !ReceiveFlags::WAITALL.0);
     }
-    match transport_receive(object, length, flags, peek_offset, peek_length) {
+    match transport_receive(object, reader, length, flags, peek_offset, peek_length) {
         Err(BrokerError::WouldBlock | BrokerError::NonBlockingWouldBlock) if read_shutdown => {
             Ok(SocketOutcome::Failed(SocketError::Shutdown))
         }
@@ -1625,6 +1625,7 @@ fn receive_stream(
 
 fn transport_receive(
     object: &RwLock<ObjectEntry>,
+    reader: ObjectHandle,
     length: usize,
     flags: ReceiveFlags,
     peek_offset: u32,
@@ -1642,7 +1643,7 @@ fn transport_receive(
     let outcome = state
         .resource
         .platform_socket
-        .receive(length, flags, peek_offset, peek_length)
+        .receive(reader, length, flags, peek_offset, peek_length)
         .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(PlatformStreamReceive::Received(received)) = &outcome
         && (received.len() > length || received.is_empty())
@@ -2929,19 +2930,21 @@ impl SocketObject {
     /// Publishes this socket's later readiness changes through
     /// `registration` until every clone of `registration` drops.
     pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
-        self.resource.watchers.watch(registration)
+        self.resource.readiness_sink.watchers.watch(registration)
     }
 }
 
 pub(crate) struct SocketResource {
     platform_socket: Arc<dyn PlatformSocket>,
+    /// The provider's registration, whose publications `readiness_sink`
+    /// forwards.
     readiness: ReadinessRegistration,
     readiness_sink: Arc<SocketReadinessSink>,
-    /// Registrations other than the owner's, such as readiness queue entries,
-    /// which the provider's publications also wake.
-    watchers: SharedReadinessWatchers,
     port_binding: Mutex<Option<Arc<GuestPortBinding>>>,
     guest_source_lease: Mutex<Option<GuestSourceLease>>,
+    /// The account the provider charges this socket to, which drops after the
+    /// socket retires.
+    account: Arc<SocketAccount>,
 }
 
 impl SocketResource {
@@ -3134,12 +3137,70 @@ fn reserve_socket(process: &BrokerProcess) -> Result<QuotaReservation> {
     )
 }
 
+/// Creates the readiness state of a new socket for `reference`: the
+/// reference's registration with `readiness_sink`, which already watches the
+/// socket so it receives the provider's initial publication, the socket's
+/// sink, and the provider's registration with that sink, which holds `quota`
+/// until its retirement is delivered.
+fn socket_readiness(
+    reference: &PendingObjectReference<'_>,
+    readiness_sink: Arc<dyn ReadinessSink>,
+    quota: Arc<QuotaReservation>,
+) -> Result<(
+    ReadinessRegistration,
+    Arc<SocketReadinessSink>,
+    ReadinessRegistration,
+)> {
+    let registration = ReadinessRegistration::new(reference.handle(), readiness_sink);
+    let socket_sink = Arc::new(SocketReadinessSink::default());
+    socket_sink.watchers.watch(&registration)?;
+    let readiness = ReadinessRegistration::new_with_retirement_guard(
+        reference.handle(),
+        socket_sink.clone(),
+        quota,
+    );
+    Ok((registration, socket_sink, readiness))
+}
+
+/// The provider socket state charged to one process, which
+/// [`SocketProvider::close_process`] releases once the process has released
+/// its references and every socket charged to it has retired.
+///
+/// Each socket charged to the process holds this, and so does the process
+/// until it releases its references. It keeps the process's ID allocated, so
+/// a later process cannot reuse the ID while the provider still charges
+/// state to it.
+pub(crate) struct SocketAccount {
+    process_id: ProcessId,
+    socket_provider: Arc<dyn SocketProvider>,
+    ids: Arc<Mutex<IdAllocator>>,
+}
+
+impl SocketAccount {
+    /// Creates the account of the process with the allocated ID `process_id`.
+    pub(crate) fn new(core: &BrokerCore, process_id: ProcessId) -> Self {
+        core.ids.lock().retain(process_id.0);
+        Self {
+            process_id,
+            socket_provider: Arc::clone(&core.socket_provider),
+            ids: Arc::clone(&core.ids),
+        }
+    }
+}
+
+impl Drop for SocketAccount {
+    fn drop(&mut self) {
+        self.socket_provider.close_process(self.process_id);
+        self.ids.lock().release(self.process_id.0);
+    }
+}
+
 /// Readiness sink of one socket resource, which forwards its provider's
-/// publications, changed by the socket's state, to the owning association
-/// and wakes the socket's watchers.
+/// publications, changed by the socket's state, to the socket's watchers: the
+/// registrations of every reference to the socket and of readiness queue
+/// entries watching it.
+#[derive(Default)]
 struct SocketReadinessSink {
-    handle: ObjectHandle,
-    owner: Arc<dyn ReadinessSink>,
     watchers: SharedReadinessWatchers,
     state: Mutex<SocketReadinessState>,
 }
@@ -3153,19 +3214,6 @@ struct SocketReadinessState {
 }
 
 impl SocketReadinessSink {
-    fn new(
-        handle: ObjectHandle,
-        owner: Arc<dyn ReadinessSink>,
-        watchers: SharedReadinessWatchers,
-    ) -> Self {
-        Self {
-            handle,
-            owner,
-            watchers,
-            state: Mutex::new(SocketReadinessState::default()),
-        }
-    }
-
     /// Changes how the socket's state changes its transport's readiness,
     /// publishing the socket's readiness if that changes it.
     fn set_overlay(&self, overlay: ReadinessOverlay) {
@@ -3177,52 +3225,43 @@ impl SocketReadinessSink {
         let after = overlay.apply(state.transport);
         state.overlay = overlay;
         if before != after {
-            // The owner reports a failed publication when it retires the
-            // object.
-            let _ = self.owner.publish(self.handle, after);
-            self.watchers.publish(after);
+            self.watchers.publish_if_changed(after);
         }
     }
 
-    fn forward(
-        &self,
-        handle: ObjectHandle,
-        transport: ReadinessFlags,
-        republish: bool,
-    ) -> Result<()> {
+    fn forward(&self, transport: ReadinessFlags, republish: bool) {
         // Publishing under the lock keeps publications in order.
         let mut state = self.state.lock();
         if state.retired {
-            return Ok(());
+            return;
         }
         state.transport = transport;
         let readiness = state.overlay.apply(transport);
-        let result = if republish {
-            self.owner.republish(handle, readiness)
+        if republish {
+            self.watchers.publish(readiness);
         } else {
-            self.owner.publish(handle, readiness)
-        };
-        self.watchers.publish(readiness);
-        result
+            self.watchers.publish_if_changed(readiness);
+        }
     }
 }
 
 impl ReadinessSink for SocketReadinessSink {
     fn max_tracked_objects(&self) -> usize {
-        self.owner.max_tracked_objects()
+        1
     }
 
-    fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
-        self.forward(handle, readiness, false)
+    fn publish(&self, _handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+        self.forward(readiness, false);
+        Ok(())
     }
 
-    fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
-        self.forward(handle, readiness, true)
+    fn republish(&self, _handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+        self.forward(readiness, true);
+        Ok(())
     }
 
-    fn retire(&self, handle: ObjectHandle) {
+    fn retire(&self, _handle: ObjectHandle) {
         self.state.lock().retired = true;
-        self.owner.retire(handle);
     }
 }
 

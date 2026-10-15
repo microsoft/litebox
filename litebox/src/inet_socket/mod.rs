@@ -32,6 +32,7 @@ use crate::{
     },
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
     fs::errors::StatusFlagsError,
+    process::ProcessError,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 
@@ -64,7 +65,9 @@ pub struct InetSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
     /// Serializes a TCP socket's receives, since a large peek takes several
-    /// requests.
+    /// requests. The broker cuts a peek short if a receive through another
+    /// reference to the socket, such as in another process, comes between
+    /// them.
     receive_lock: Mutex<Platform, ()>,
 }
 
@@ -86,6 +89,25 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
             _ => return Err(SocketError::UnsupportedType),
         }
         .map_err(BrokerObjectError::from)?;
+        Ok(InetSocket::new(
+            broker,
+            self.broker_pollable_registry(),
+            handle,
+            socket_type,
+        ))
+    }
+
+    /// Returns the IPv4 socket of type `socket_type` this process inherited
+    /// from its parent as `handle`.
+    ///
+    /// The socket owns `handle`, so callers adopt each handle once and share
+    /// the socket for every other use.
+    pub fn adopt_inherited_inet_socket(
+        &self,
+        handle: ObjectHandle,
+        socket_type: SocketType,
+    ) -> Result<InetSocket<Platform>, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(InetSocket::new(
             broker,
             self.broker_pollable_registry(),

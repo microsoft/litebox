@@ -664,347 +664,6 @@ fn tcp_connect_to_zero_port_returns_an_ordinary_socket_outcome() {
 }
 
 #[test]
-fn tcp_receive_survives_readiness_publication_failure() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (send_data, wait_to_send_data) = channel();
-    let (release_server, wait_to_release_server) = channel();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        wait_to_send_data.recv_timeout(TEST_TIMEOUT).unwrap();
-        stream.write_all(b"reply").unwrap();
-        wait_to_release_server.recv_timeout(TEST_TIMEOUT).unwrap();
-    });
-
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(gateway_tcp_policy()),
-        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
-        provider,
-    )
-    .unwrap();
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    let handle = create_socket(&process, readiness.clone());
-    assert!(matches!(
-        litebox_broker_core::socket::connect(
-            &process,
-            handle,
-            gateway_address(socket_address_v4(address)),
-        ),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&process, handle, &publications);
-
-    send_data.send(()).unwrap();
-    wait_until_ready(&process, &publications, handle, ReadinessFlags::READ);
-    readiness.fail_next_publish_matching(handle, ReadinessFlags::default(), ReadinessFlags::READ);
-    let mut data = [0_u8; 5];
-    assert_eq!(
-        receive_into(&process, handle, &mut data, ReceiveFlags::NONE, 0, 0),
-        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(5)))
-    );
-    assert_eq!(&data, b"reply");
-    readiness.assert_no_pending_publish_failure();
-    assert!(
-        !process
-            .check_readiness(handle)
-            .unwrap()
-            .contains(ReadinessFlags::READ)
-    );
-
-    release_server.send(()).unwrap();
-    server.join().unwrap();
-}
-
-#[test]
-fn tcp_status_publication_failure_preserves_consumed_error() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (abort_connection, wait_to_abort_connection) = channel();
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        wait_to_abort_connection.recv_timeout(TEST_TIMEOUT).unwrap();
-        sockopt::set_socket_linger(&stream, Some(Duration::ZERO)).unwrap();
-    });
-
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(gateway_tcp_policy()),
-        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
-        provider,
-    )
-    .unwrap();
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    let handle = create_socket(&process, readiness.clone());
-    assert!(matches!(
-        litebox_broker_core::socket::connect(
-            &process,
-            handle,
-            gateway_address(socket_address_v4(address)),
-        ),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&process, handle, &publications);
-
-    abort_connection.send(()).unwrap();
-    wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
-    readiness.fail_next_publish_matching(handle, ReadinessFlags::default(), ReadinessFlags::ERROR);
-    let status = litebox_broker_core::socket::status(&process, handle).unwrap();
-    assert_eq!(status.status, SocketConnectionStatus::Connected);
-    assert_eq!(status.pending_error, Some(SocketError::ConnectionReset));
-    readiness.assert_no_pending_publish_failure();
-    assert!(
-        !process
-            .check_readiness(handle)
-            .unwrap()
-            .contains(ReadinessFlags::ERROR)
-    );
-    server.join().unwrap();
-}
-
-#[test]
-fn external_tcp_readiness_failure_does_not_fail_shared_reactor() {
-    // Process A owns the socket whose asynchronous reactor publication fails.
-    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address_a = listener_a.local_addr().unwrap();
-    let (send_reply_a, wait_to_send_reply_a) = channel();
-    let (release_a, wait_to_release_a) = channel();
-    let server_a = thread::spawn(move || {
-        let (mut stream, _) = listener_a.accept().unwrap();
-        wait_to_send_reply_a.recv_timeout(TEST_TIMEOUT).unwrap();
-        stream.write_all(b"reply").unwrap();
-        wait_to_release_a.recv_timeout(TEST_TIMEOUT).unwrap();
-    });
-
-    // Process B shares the same reactor. The original bug cleared every
-    // process's sockets, so B is the cross-process isolation witness.
-    let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address_b = listener_b.local_addr().unwrap();
-    let (send_beta_b, wait_to_send_beta_b) = channel();
-    let (release_b, wait_to_release_b) = channel();
-    let server_b = thread::spawn(move || {
-        let (mut stream, _) = listener_b.accept().unwrap();
-        wait_to_send_beta_b.recv_timeout(TEST_TIMEOUT).unwrap();
-        stream.write_all(b"beta").unwrap();
-        wait_to_release_b.recv_timeout(TEST_TIMEOUT).unwrap();
-    });
-
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(gateway_tcp_policy()),
-        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
-        provider,
-    )
-    .unwrap();
-
-    let process_a = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published_a, publications_a) = channel();
-    let (retired_a, _retirements_a) = channel();
-    let readiness_a = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink {
-            published: published_a,
-            retired: retired_a,
-        },
-        fail_next_publish: Mutex::new(None),
-    });
-    let handle_a = create_socket(&process_a, readiness_a.clone());
-    assert!(matches!(
-        litebox_broker_core::socket::connect(
-            &process_a,
-            handle_a,
-            gateway_address(socket_address_v4(address_a)),
-        ),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&process_a, handle_a, &publications_a);
-
-    // Process B gets its own readiness sink, mirroring production's
-    // per-association sinks.
-    let process_b = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published_b, publications_b) = channel();
-    let (retired_b, _retirements_b) = channel();
-    let readiness_b = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink {
-            published: published_b,
-            retired: retired_b,
-        },
-        fail_next_publish: Mutex::new(None),
-    });
-    let handle_b = create_socket(&process_b, readiness_b.clone());
-    assert!(matches!(
-        litebox_broker_core::socket::connect(
-            &process_b,
-            handle_b,
-            gateway_address(socket_address_v4(address_b)),
-        ),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&process_b, handle_b, &publications_b);
-
-    // Fail process A's asynchronous readiness publication at the moment the
-    // peer's data makes the socket readable. This exercises the shared-reactor
-    // event path (`handle_socket_event`), not a synchronous command: the reactor
-    // must absorb one association's publication failure and keep serving that
-    // socket rather than tearing down every process's sockets.
-    readiness_a.fail_next_publish_matching(
-        handle_a,
-        ReadinessFlags::READ,
-        ReadinessFlags::default(),
-    );
-    send_reply_a.send(()).unwrap();
-    readiness_a.wait_for_publish_failure_consumed();
-
-    // `update_snapshot` commits the cached snapshot before publishing, so the
-    // guest-visible readiness reflects READ even though the notification was
-    // dropped.
-    assert!(
-        process_a
-            .check_readiness(handle_a)
-            .unwrap()
-            .contains(ReadinessFlags::READ)
-    );
-
-    // Process A's own socket is still serviceable through the reactor.
-    let mut data_a = [0_u8; 5];
-    assert_eq!(
-        receive_into(&process_a, handle_a, &mut data_a, ReceiveFlags::NONE, 0, 0),
-        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(5)))
-    );
-    assert_eq!(&data_a, b"reply");
-    readiness_a.assert_no_pending_publish_failure();
-
-    // Cross-process isolation: process B still transacts after A's failure.
-    // Under the original bug the reactor would have exited and cleared B's
-    // socket, so this receive would fail.
-    send_beta_b.send(()).unwrap();
-    wait_until_ready(&process_b, &publications_b, handle_b, ReadinessFlags::READ);
-    let mut data_b = [0_u8; 4];
-    assert_eq!(
-        receive_into(&process_b, handle_b, &mut data_b, ReceiveFlags::NONE, 0, 0),
-        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
-    );
-    assert_eq!(&data_b, b"beta");
-
-    release_a.send(()).unwrap();
-    release_b.send(()).unwrap();
-    server_a.join().unwrap();
-    server_b.join().unwrap();
-}
-
-#[test]
-fn external_tcp_connect_completion_readiness_failure_does_not_fail_shared_reactor() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (send_data, wait_to_send_data) = channel();
-    let (release_server, wait_to_release_server) = channel();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        wait_to_send_data.recv_timeout(TEST_TIMEOUT).unwrap();
-        stream.write_all(b"reply").unwrap();
-        wait_to_release_server.recv_timeout(TEST_TIMEOUT).unwrap();
-    });
-
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(gateway_tcp_policy()),
-        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
-        provider,
-    )
-    .unwrap();
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    let handle = create_socket(&process, readiness.clone());
-
-    // Arm the failure before connecting. A non-blocking loopback connect
-    // returns EINPROGRESS, so the reactor publishes empty readiness
-    // synchronously (no WRITE, no match) and completes the connection
-    // asynchronously through `complete_connect`, whose best-effort WRITE
-    // publication is the site under test. Forbidding ERROR keeps a
-    // failed-connect publication from matching instead.
-    readiness.fail_next_publish_matching(handle, ReadinessFlags::WRITE, ReadinessFlags::ERROR);
-    assert!(matches!(
-        litebox_broker_core::socket::connect(
-            &process,
-            handle,
-            gateway_address(socket_address_v4(address)),
-        ),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    readiness.wait_for_publish_failure_consumed();
-
-    // The cached snapshot committed the connected, writable state before the
-    // dropped notification, so the guest still observes a usable socket.
-    assert_eq!(
-        litebox_broker_core::socket::status(&process, handle)
-            .unwrap()
-            .status,
-        SocketConnectionStatus::Connected
-    );
-    assert!(
-        process
-            .check_readiness(handle)
-            .unwrap()
-            .contains(ReadinessFlags::WRITE)
-    );
-
-    // The connection is fully usable despite the dropped connect-completion
-    // notification.
-    send_data.send(()).unwrap();
-    wait_until_ready(&process, &publications, handle, ReadinessFlags::READ);
-    let mut data = [0_u8; 5];
-    assert_eq!(
-        receive_into(&process, handle, &mut data, ReceiveFlags::NONE, 0, 0),
-        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(5)))
-    );
-    assert_eq!(&data, b"reply");
-    readiness.assert_no_pending_publish_failure();
-
-    release_server.send(()).unwrap();
-    server.join().unwrap();
-}
-
-#[test]
 fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -1101,6 +760,105 @@ fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
     );
     assert!(second.iter().all(|byte| *byte == 0x42));
     server.join().unwrap();
+}
+
+#[test]
+fn tcp_peek_continues_only_for_its_reader() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let chunk = MAX_SOCKET_TRANSFER_SIZE as usize;
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(&vec![0x41; chunk]).unwrap();
+        stream.write_all(&vec![0x42; chunk]).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+    });
+
+    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_tcp_policy()),
+        BrokerCoreLimits::new_with_all_limits(3, 0, 1, 1),
+        provider,
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let sharer = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let handle = create_socket(&process, readiness);
+    assert!(matches!(
+        litebox_broker_core::socket::connect(
+            &process,
+            handle,
+            gateway_address(socket_address_v4(address)),
+        ),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&process, handle, &publications);
+    wait_until_ready(
+        &process,
+        &publications,
+        handle,
+        ReadinessFlags::READ | ReadinessFlags::HANGUP,
+    );
+    server.join().unwrap();
+    let duplicate = process
+        .duplicate_object_reference_to(handle, &sharer, ObjectRights::all())
+        .unwrap();
+
+    let peek_length = MAX_SOCKET_TRANSFER_SIZE * 2;
+    let mut data = vec![0_u8; chunk];
+    let peek = |process: &BrokerProcess, handle, data: &mut [u8], peek_offset| {
+        receive_into(
+            process,
+            handle,
+            data,
+            ReceiveFlags::PEEK,
+            peek_offset,
+            peek_length,
+        )
+    };
+    let received = Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
+        MAX_SOCKET_TRANSFER_SIZE,
+    )));
+    assert_eq!(peek(&process, handle, &mut data, 0), received);
+    assert!(data.iter().all(|byte| *byte == 0x41));
+    assert_eq!(
+        peek(&sharer, duplicate, &mut data, MAX_SOCKET_TRANSFER_SIZE),
+        Err(BrokerError::WouldBlock)
+    );
+    assert_eq!(
+        peek(&process, handle, &mut data, MAX_SOCKET_TRANSFER_SIZE),
+        received
+    );
+    assert!(data.iter().all(|byte| *byte == 0x42));
+
+    // A receive by another reader interrupts the peek, even when it does not
+    // consume anything.
+    assert_eq!(peek(&process, handle, &mut data, 0), received);
+    assert_eq!(peek(&sharer, duplicate, &mut data, 0), received);
+    assert_eq!(
+        peek(&process, handle, &mut data, MAX_SOCKET_TRANSFER_SIZE),
+        Err(BrokerError::WouldBlock)
+    );
+    assert_eq!(
+        receive_into(&sharer, duplicate, &mut data, ReceiveFlags::NONE, 0, 0),
+        received
+    );
+    assert_eq!(
+        peek(&sharer, duplicate, &mut data, MAX_SOCKET_TRANSFER_SIZE),
+        Err(BrokerError::WouldBlock)
+    );
+    assert_eq!(peek(&process, handle, &mut data, 0), received);
+    assert!(data.iter().all(|byte| *byte == 0x42));
 }
 
 #[test]
@@ -2730,136 +2488,6 @@ fn drained_guest_read_shutdown_close_delivers_end_of_stream() {
 }
 
 #[test]
-fn guest_tcp_connect_publication_failure_purges_committed_queue() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::guest_network()),
-        BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
-        provider.clone(),
-    )
-    .unwrap();
-    let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, _publications) = channel();
-    let (retired, retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8094);
-    let listener = create_socket(&listener_process, readiness.clone());
-    assert_eq!(
-        litebox_broker_core::socket::bind(&listener_process, listener, address),
-        Ok(SocketOutcome::Completed(address))
-    );
-    assert_eq!(
-        litebox_broker_core::socket::listen(&listener_process, listener, 1),
-        Ok(SocketOutcome::Completed(address))
-    );
-    let connector = create_socket(&connector_process, readiness.clone());
-    readiness.fail_next_publish_matching(listener, ReadinessFlags::READ, ReadinessFlags::default());
-    assert_eq!(
-        litebox_broker_core::socket::connect(&connector_process, connector, address),
-        Err(BrokerError::ResourceExhausted)
-    );
-    readiness.assert_no_pending_publish_failure();
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
-    assert!(
-        !listener_process
-            .check_readiness(listener)
-            .unwrap()
-            .contains(ReadinessFlags::READ)
-    );
-    assert!(matches!(
-        litebox_broker_core::socket::accept(
-            &listener_process,
-            listener,
-            FileOpenFlags::NONE,
-            readiness
-        ),
-        Err(BrokerError::WouldBlock)
-    ));
-    assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
-    connector_process.close_object_reference(connector).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-}
-
-#[test]
-fn guest_tcp_accept_publication_failure_purges_registered_endpoint() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::guest_network()),
-        BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
-        provider.clone(),
-    )
-    .unwrap();
-    let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8096);
-    let listener = create_socket(&listener_process, readiness.clone());
-    assert_eq!(
-        litebox_broker_core::socket::bind(&listener_process, listener, address),
-        Ok(SocketOutcome::Completed(address))
-    );
-    assert_eq!(
-        litebox_broker_core::socket::listen(&listener_process, listener, 1),
-        Ok(SocketOutcome::Completed(address))
-    );
-    let connector = create_socket(&connector_process, readiness.clone());
-    assert_eq!(
-        litebox_broker_core::socket::connect(&connector_process, connector, address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
-    );
-    readiness.fail_next_publish_matching_any(ReadinessFlags::WRITE, ReadinessFlags::READ);
-    assert!(matches!(
-        litebox_broker_core::socket::accept(
-            &listener_process,
-            listener,
-            FileOpenFlags::NONE,
-            readiness.clone()
-        ),
-        Err(BrokerError::ResourceExhausted)
-    ));
-    readiness.assert_no_pending_publish_failure();
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
-    assert!(
-        !listener_process
-            .check_readiness(listener)
-            .unwrap()
-            .contains(ReadinessFlags::READ)
-    );
-    wait_for_guest_reset(&publications, connector);
-    let mut byte = [0_u8; 1];
-    assert_eq!(
-        receive_into(
-            &connector_process,
-            connector,
-            &mut byte,
-            ReceiveFlags::NONE,
-            0,
-            0,
-        ),
-        Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
-    );
-}
-
-#[test]
 fn queued_guest_accept_transfers_capacity_without_global_growth() {
     let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
     let broker = test_broker_core(
@@ -3075,89 +2703,6 @@ fn abortive_connector_close_releases_descriptor_capacity() {
     ));
     wait_until_connected(&connector_process, replacement, &publications);
     assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
-}
-
-#[test]
-fn stop_listening_cleanup_survives_readiness_failure() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::guest_network()),
-        BrokerCoreLimits::new_with_all_limits(8, 0, 3, 3),
-        provider.clone(),
-    )
-    .unwrap();
-    let listener_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let connector_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8088);
-    let listener = create_socket(&listener_process, readiness.clone());
-    assert_eq!(
-        litebox_broker_core::socket::bind(&listener_process, listener, guest_address),
-        Ok(SocketOutcome::Completed(guest_address))
-    );
-    assert_eq!(
-        litebox_broker_core::socket::listen(&listener_process, listener, 1),
-        Ok(SocketOutcome::Completed(guest_address))
-    );
-    let connector = create_socket(&connector_process, readiness.clone());
-    assert!(matches!(
-        litebox_broker_core::socket::connect(&connector_process, connector, guest_address,),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&connector_process, connector, &publications);
-    wait_until_ready(
-        &listener_process,
-        &publications,
-        listener,
-        ReadinessFlags::READ,
-    );
-    connector_process.close_object_reference(connector).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
-
-    readiness.fail_next_publish_matching(listener, ReadinessFlags::CLOSED, ReadinessFlags::READ);
-    assert_eq!(
-        litebox_broker_core::socket::shutdown(
-            &listener_process,
-            listener,
-            ShutdownMode::StopListening,
-        ),
-        Ok(SocketOutcome::Completed(()))
-    );
-    readiness.assert_no_pending_publish_failure();
-    let listener_readiness = listener_process.check_readiness(listener).unwrap();
-    // Like Linux, a stopped listener is closed but not shut down for reading.
-    assert!(listener_readiness.contains(ReadinessFlags::WRITE | ReadinessFlags::CLOSED));
-    assert!(!listener_readiness.contains(ReadinessFlags::READ));
-    assert!(!listener_readiness.contains(ReadinessFlags::HANGUP));
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
-    assert_eq!(
-        litebox_broker_core::socket::listen(&listener_process, listener, 1),
-        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
-    );
-
-    let refused = create_socket(&connector_process, readiness);
-    assert_eq!(
-        litebox_broker_core::socket::connect(&connector_process, refused, guest_address),
-        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
-    );
-    connector_process.close_object_reference(refused).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), refused);
-    listener_process.close_object_reference(listener).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
 }
 
 #[test]

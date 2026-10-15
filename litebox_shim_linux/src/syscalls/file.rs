@@ -328,6 +328,13 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
+                InheritedFdKind::InetSocket { socket_type } => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_inet_socket(handle, socket_type)
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
+                }
                 InheritedFdKind::Eventfd { semaphore } => {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, || {
                         global
@@ -620,11 +627,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the descriptors a fresh runner inherits, skipping those marked close-on-exec
     /// unless `include_close_on_exec` is set.
     ///
-    /// Linux keeps every inherited descriptor, whatever it refers to. A fresh runner can share only
-    /// objects the broker holds, and not all of those yet, so this fails with `EAGAIN` if one of
-    /// them is:
+    /// Linux keeps every inherited descriptor, whatever it refers to. A fresh runner cannot share
+    /// state local to this runner, so this fails with `EAGAIN` if a descriptor is:
     ///
-    /// - a network socket: the broker does not duplicate socket objects;
     /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
     ///   runner; or
     /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
@@ -696,7 +701,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         InheritableFd::ReadinessQueue(alloc::sync::Arc::clone(file.queue())),
                     ))
                 })?,
-                AnyTypedFd::Inet(_) => return Err(Errno::EAGAIN),
+                AnyTypedFd::Inet(socket) => {
+                    let socket = self.global.with_inet_socket(&socket, |socket| {
+                        Ok(alloc::sync::Arc::clone(socket.inet_socket()))
+                    })?;
+                    (
+                        InheritedFdKind::InetSocket {
+                            socket_type: socket.socket_type(),
+                        },
+                        InheritableFd::InetSocket(socket),
+                    )
+                }
             };
             next_fd = raw_fd + 1;
             let inherited_fd = ForkedFd {
