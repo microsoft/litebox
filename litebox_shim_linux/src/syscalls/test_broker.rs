@@ -115,9 +115,10 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
             })
             .build()
             .expect("the test filesystem must be valid");
-        let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
+        let core = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
         .with_limits(limits)
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()

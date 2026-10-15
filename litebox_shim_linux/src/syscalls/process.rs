@@ -2254,15 +2254,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             result => result,
         };
+        // The broker posts the child's exit before it can be collected, but its readiness
+        // notification may arrive later. Drain it even on ECHILD: an automatically reaped
+        // child's notification must be handled under the current SIGCHLD disposition.
+        self.take_signals(true);
         let exit = match exited {
             Ok(exit) => exit,
             Err(TryOpError::TryAgain) => return Ok(0),
             Err(error) => return Err(error.into()),
         };
-        // Like Linux, which queues a child's `SIGCHLD` before the child can be reaped, queue it
-        // before returning: the broker has already posted the child's exit, but may not yet have
-        // notified this process of it.
-        self.take_signals(true);
         let (code, status) = child_termination(exit.exit_status);
         let status = if code == CLD_EXITED {
             status << 8
@@ -3007,6 +3007,77 @@ mod tests {
             }
             self.inner.call(request)
         }
+    }
+
+    #[test]
+    fn wait4_echild_drains_unnotified_ignored_child_exit() {
+        use alloc::boxed::Box;
+        use core::sync::atomic::Ordering;
+        use litebox_broker_protocol::process::ProcessExitStatus;
+        use litebox_common_linux::{
+            errno::Errno,
+            signal::{SIG_IGN, SaFlags, SigAction, SigSet, SigmaskHow, Signal},
+        };
+
+        let task = crate::syscalls::tests::init_platform();
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            // Leave the watcher unregistered to withhold readiness notifications.
+            assert!(
+                task.process()
+                    .signals
+                    .set(Box::new(task.global.litebox.open_signals().unwrap()))
+                    .is_ok()
+            );
+            let blocked = SigSet::empty().with(Signal::SIGCHLD);
+            task.sys_rt_sigprocmask(
+                SigmaskHow::SIG_BLOCK,
+                Some(UserPtr::from_ptr(&raw const blocked)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            let mut action = SigAction {
+                sigaction: SIG_IGN,
+                flags: SaFlags::empty(),
+                #[cfg(target_pointer_width = "64")]
+                __pad: 0,
+                restorer: 0,
+                mask: SigSet::empty(),
+            };
+            task.sys_rt_sigaction(
+                Signal::SIGCHLD,
+                Some(UserPtr::from_ptr(&raw const action)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            let child = task.global.litebox.allocate_child_process().unwrap();
+            child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
+            // Model the child exit being visible before its readiness notification arrives.
+            task.process().signal_watcher.changed.store(false, Ordering::SeqCst);
+            assert_eq!(task.sys_wait4(-1, None, 0, None), Err(Errno::ECHILD));
+
+            action.sigaction = 0x1000;
+            task.sys_rt_sigaction(
+                Signal::SIGCHLD,
+                Some(UserPtr::from_ptr(&raw const action)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            task.take_signals(true);
+            task.sys_rt_sigprocmask(
+                SigmaskHow::SIG_UNBLOCK,
+                Some(UserPtr::from_ptr(&raw const blocked)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            assert!(
+                !task.pending_signal_set().contains(Signal::SIGCHLD),
+                "an ignored child's exit must not reach the replacement handler"
+            );
+        });
     }
 
     #[test]
