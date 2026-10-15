@@ -166,8 +166,10 @@ pub fn serve(info: &StartupInfo) -> ! {
     );
     let ta_uuid =
         TeeUuid::read_from_bytes(&info.identity[..size_of::<TeeUuid>()]).expect("16-byte UUID");
+    // TA images come from the trusted payload; signatures are not verified.
     assert!(
-        shim.store_ta_bin(&ta_uuid, ta),
+        litebox_common_optee::parse_ta_head(ta).is_some_and(|head| head.uuid == ta_uuid)
+            && shim.store_embedded_ta_bin(ta),
         "the TA image does not match the process's TA UUID"
     );
     let mut runner = Runner {

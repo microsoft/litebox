@@ -95,7 +95,7 @@ pub fn run_ta_with_test_commands(
     let ta_commands: Vec<TaCommandBase64> = serde_json::from_str(json_str).unwrap();
     let ta_head =
         litebox_common_optee::parse_ta_head(ta_bin).expect("Failed to parse TA header from ta_bin");
-    assert!(shim.store_ta_bin(&ta_head.uuid, ta_bin));
+    assert!(shim.store_embedded_ta_bin(ta_bin));
     let mut ta_info: Option<LoadedProgram<VmKernel>> = None;
     let mut session_id: Option<u32> = None;
 

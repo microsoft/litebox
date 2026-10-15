@@ -96,7 +96,7 @@ fn run_ta_with_default_commands(
     let ta_uuid = litebox_common_optee::parse_ta_head(ta_bin)
         .expect("Failed to parse TA header from ta_bin")
         .uuid;
-    assert!(shim.store_ta_bin(&ta_uuid, ta_bin));
+    assert!(shim.store_embedded_ta_bin(ta_bin));
     let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
     let session_token = shim
