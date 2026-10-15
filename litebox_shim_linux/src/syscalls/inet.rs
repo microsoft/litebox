@@ -16,16 +16,15 @@ use litebox::{
     event::{
         Events, IOPollable,
         observer::Observer,
-        polling::{Pollee, TryOpError},
+        polling::TryOpError,
         wait::{WaitContext, WaitError},
     },
-    fd::{EntryHandle, FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     inet_socket::{
         self,
         errors::{AcceptError, ConnectError, ShutdownError, SocketReadError, SocketWriteError},
     },
     process::ProcessError,
-    sync::{Mutex, MutexGuard},
     utils::TruncateExt as _,
 };
 use litebox_broker_protocol::{
@@ -72,15 +71,12 @@ impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for InetSocket<Platform> {}
 /// An internet socket descriptor's open file description.
 pub(crate) struct InetSocket<Platform: ShimPlatform> {
     socket: Arc<inet_socket::InetSocket<Platform>>,
-    /// Serializes `recvmmsg` calls on the socket.
-    recvmmsg_lock: Arc<RecvmmsgLock<Platform>>,
 }
 
 impl<Platform: ShimPlatform> From<inet_socket::InetSocket<Platform>> for InetSocket<Platform> {
     fn from(socket: inet_socket::InetSocket<Platform>) -> Self {
         Self {
             socket: Arc::new(socket),
-            recvmmsg_lock: Arc::new(RecvmmsgLock::new()),
         }
     }
 }
@@ -178,10 +174,6 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     /// The LiteBox socket.
     pub(crate) fn inet_socket(&self) -> &Arc<inet_socket::InetSocket<Platform>> {
         &self.socket
-    }
-
-    pub(super) fn recvmmsg_lock(&self) -> &Arc<RecvmmsgLock<Platform>> {
-        &self.recvmmsg_lock
     }
 
     pub(super) fn is_stream(&self) -> bool {
@@ -821,87 +813,6 @@ fn socket_io_errno(error: TryOpError<Errno>) -> Errno {
     }
 }
 
-/// Serializes multi-message receives while allowing contended waits to be interrupted or timed out.
-pub(super) struct RecvmmsgLock<Platform: ShimPlatform> {
-    mutex: Mutex<Platform, ()>,
-    pollee: Pollee<Platform>,
-}
-
-pub(super) struct RecvmmsgGuard<'a, Platform: ShimPlatform> {
-    guard: Option<MutexGuard<'a, Platform, ()>>,
-    lock: &'a RecvmmsgLock<Platform>,
-}
-
-impl<Platform: ShimPlatform> RecvmmsgLock<Platform> {
-    fn new() -> Self {
-        Self {
-            mutex: Mutex::new(()),
-            pollee: Pollee::new(),
-        }
-    }
-
-    /// Locks out other multi-message receives on `socket`, failing with `EAGAIN` instead of
-    /// waiting if `flags` or the socket is nonblocking.
-    ///
-    /// `cx` enforces the call's `timeout`, if any, which along with the socket's receive timeout
-    /// decides whether an interrupted wait restarts.
-    pub(super) fn lock(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-        socket: &EntryHandle<Platform, InetSocketSubsystem<Platform>>,
-        flags: ReceiveFlags,
-        timeout: Option<Duration>,
-    ) -> Result<RecvmmsgGuard<'_, Platform>, Errno> {
-        if let Some(guard) = self.try_lock() {
-            return Ok(guard);
-        }
-        if flags.contains(ReceiveFlags::DONTWAIT)
-            || socket.with_entry(InetSocket::is_nonblocking)?
-        {
-            return Err(Errno::EAGAIN);
-        }
-        self.lock_interruptibly(cx).map_err(|error| {
-            let timeout = timeout.or_else(|| {
-                socket
-                    .with_entry(InetSocket::receive_timeout)
-                    .ok()
-                    .flatten()
-            });
-            wait_errno(timeout, error)
-        })
-    }
-
-    fn try_lock(&self) -> Option<RecvmmsgGuard<'_, Platform>> {
-        Some(RecvmmsgGuard {
-            guard: Some(self.mutex.try_lock()?),
-            lock: self,
-        })
-    }
-
-    fn lock_interruptibly(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-    ) -> Result<RecvmmsgGuard<'_, Platform>, Errno> {
-        cx.wait_on_events(
-            false,
-            Events::IN,
-            |observer, filter| {
-                self.pollee.register_observer(observer, filter);
-                Ok(())
-            },
-            || self.try_lock().ok_or(TryOpError::TryAgain),
-        )
-        .map_err(socket_io_errno)
-    }
-}
-
-impl<Platform: ShimPlatform> Drop for RecvmmsgGuard<'_, Platform> {
-    fn drop(&mut self) {
-        drop(self.guard.take());
-        self.lock.pollee.notify_observers(Events::IN);
-    }
-}
-
 #[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
@@ -917,7 +828,7 @@ mod tests {
     };
     use zerocopy::FromZeros as _;
 
-    use super::{CSockInetAddr, RecvmmsgLock};
+    use super::CSockInetAddr;
     use crate::{
         UserPtr, UserPtrMut,
         syscalls::{
@@ -1624,50 +1535,5 @@ mod tests {
             .unwrap();
         close_socket(&task, socket_fd);
         close_socket(&task, socket_fd2);
-    }
-
-    #[test]
-    fn recvmmsg_lock_wakes_contended_waiter() {
-        let task = init_platform();
-        let lock = alloc::sync::Arc::new(RecvmmsgLock::new());
-        let guard = lock.try_lock().unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
-        let worker_lock = alloc::sync::Arc::clone(&lock);
-        let worker = task.spawn_clone_for_test(move |task| {
-            started_tx.send(()).unwrap();
-            let _guard = worker_lock.lock_interruptibly(&task.wait_cx()).unwrap();
-            acquired_tx.send(()).unwrap();
-        });
-
-        started_rx
-            .recv_timeout(core::time::Duration::from_secs(1))
-            .unwrap();
-        assert!(
-            acquired_rx
-                .recv_timeout(core::time::Duration::from_millis(20))
-                .is_err()
-        );
-        drop(guard);
-        acquired_rx
-            .recv_timeout(core::time::Duration::from_secs(1))
-            .unwrap();
-        worker.join().unwrap();
-    }
-
-    #[test]
-    fn recvmmsg_lock_honors_wait_deadline() {
-        let task = init_platform();
-        let lock = RecvmmsgLock::new();
-        let guard = lock.try_lock().unwrap();
-        let wait_cx = task
-            .wait_cx()
-            .with_timeout(core::time::Duration::from_millis(20));
-
-        assert!(matches!(
-            lock.lock_interruptibly(&wait_cx),
-            Err(Errno::EAGAIN)
-        ));
-        drop(guard);
     }
 }

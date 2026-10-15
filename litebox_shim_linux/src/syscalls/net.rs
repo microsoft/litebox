@@ -13,7 +13,6 @@ use core::{
     time::Duration,
 };
 
-use alloc::sync::Arc;
 use litebox::{
     event::wait::WaitContext,
     fd::{EntryHandle, FdEnabledSubsystem},
@@ -1259,25 +1258,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if msgvec_base.checked_add(msgvec_len).is_none() {
             return Err(Errno::EFAULT);
         }
-
-        let recvmmsg_lock = match &socket {
-            ReceiveSocket::Inet(handle) if vlen > 1 => Some((
-                handle,
-                handle.with_entry(|socket| Arc::clone(socket.recvmmsg_lock())),
-            )),
-            _ => None,
-        };
-        let _recvmmsg = recvmmsg_lock
-            .as_ref()
-            .map(|(handle, lock)| {
-                lock.lock(
-                    &self.wait_cx().with_deadline(deadline),
-                    handle,
-                    flags,
-                    timeout_duration,
-                )
-            })
-            .transpose()?;
 
         // WAITFORONE is mmsg-only; the inner recvmsg doesn't recognize it.
         let waitforone = flags.contains(ReceiveFlags::WAITFORONE);
