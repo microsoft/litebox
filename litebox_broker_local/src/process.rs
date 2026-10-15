@@ -10,8 +10,9 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    StartChildProcessRequest, ThreadInfo, WriteChildMemoryRequest,
+    MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
@@ -46,6 +47,44 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             startup: ProcessStartupDescriptor { buffer },
         }))? {
             ProcessResponse::StartChild => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Starts a pending child in an already-created platform runner.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn start_child_with_existing_runner(
+        &self,
+        child_process_id: ProcessId,
+        buffer: SharedBufferSequence,
+        launch_descriptor: &[u8],
+        bootstrap: &[u8],
+    ) -> Result<(), Channel::Error> {
+        if launch_descriptor.len() > MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE as usize
+            || bootstrap.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize
+            || buffer.length() as usize != launch_descriptor.len() + bootstrap.len()
+        {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+
+        let mut data = Vec::new();
+        data.try_reserve_exact(buffer.length() as usize)
+            .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
+        data.extend_from_slice(launch_descriptor);
+        data.extend_from_slice(bootstrap);
+        self.write_shared_buffer(buffer, &data);
+        match self.request_process(ProcessRequest::StartChildWithExistingRunner(
+            StartChildWithExistingRunnerRequest {
+                child_process_id,
+                launch_descriptor_length: u32::try_from(launch_descriptor.len())
+                    .expect("validated launch descriptor length fits u32"),
+                data: buffer,
+            },
+        ))? {
+            ProcessResponse::StartChildWithExistingRunner => Ok(()),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

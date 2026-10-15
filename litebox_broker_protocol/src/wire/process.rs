@@ -6,7 +6,8 @@ use crate::message::{ProcessRequest, ProcessResponse};
 use crate::process::{
     ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    StartChildProcessRequest, ThreadInfo, WriteChildMemoryRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
 
@@ -25,6 +26,7 @@ const PROCESS_REQUEST_TAG_SET_ORPHAN_ADOPTION: u8 = 8;
 const PROCESS_REQUEST_TAG_COLLECT_CHILD_EXIT: u8 = 9;
 const PROCESS_REQUEST_TAG_GET_INFO: u8 = 10;
 const PROCESS_REQUEST_TAG_GET_THREAD_INFO: u8 = 11;
+const PROCESS_REQUEST_TAG_START_CHILD_WITH_EXISTING_RUNNER: u8 = 12;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -38,6 +40,7 @@ const PROCESS_RESPONSE_TAG_SET_ORPHAN_ADOPTION: u8 = 8;
 const PROCESS_RESPONSE_TAG_COLLECT_CHILD_EXIT: u8 = 9;
 const PROCESS_RESPONSE_TAG_GET_INFO: u8 = 10;
 const PROCESS_RESPONSE_TAG_GET_THREAD_INFO: u8 = 11;
+const PROCESS_RESPONSE_TAG_START_CHILD_WITH_EXISTING_RUNNER: u8 = 12;
 
 const PROCESS_EXIT_STATUS_TAG_EXITED: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_SIGNALED: u8 = 1;
@@ -75,6 +78,16 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
             encoder.u8(PROCESS_REQUEST_TAG_START_CHILD);
             encoder.process_id(child_process_id);
             encoder.shared_buffer_sequence(startup.buffer);
+        }
+        ProcessRequest::StartChildWithExistingRunner(StartChildWithExistingRunnerRequest {
+            child_process_id,
+            launch_descriptor_length,
+            data,
+        }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_START_CHILD_WITH_EXISTING_RUNNER);
+            encoder.process_id(child_process_id);
+            encoder.u32(launch_descriptor_length);
+            encoder.shared_buffer_sequence(data);
         }
         ProcessRequest::ExitChild(ExitChildProcessRequest {
             child_process_id,
@@ -139,6 +152,13 @@ pub(super) fn decode_process_request(
                 buffer: decoder.shared_buffer_sequence()?,
             },
         }),
+        PROCESS_REQUEST_TAG_START_CHILD_WITH_EXISTING_RUNNER => {
+            ProcessRequest::StartChildWithExistingRunner(StartChildWithExistingRunnerRequest {
+                child_process_id: decoder.process_id()?,
+                launch_descriptor_length: decoder.u32()?,
+                data: decoder.shared_buffer_sequence()?,
+            })
+        }
         PROCESS_REQUEST_TAG_EXIT_CHILD => ProcessRequest::ExitChild(ExitChildProcessRequest {
             child_process_id: decoder.process_id()?,
             exit_status: decode_process_exit_status(decoder)?,
@@ -177,6 +197,9 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
         }
         ProcessResponse::WriteChildMemory => encoder.u8(PROCESS_RESPONSE_TAG_WRITE_CHILD_MEMORY),
         ProcessResponse::StartChild => encoder.u8(PROCESS_RESPONSE_TAG_START_CHILD),
+        ProcessResponse::StartChildWithExistingRunner => {
+            encoder.u8(PROCESS_RESPONSE_TAG_START_CHILD_WITH_EXISTING_RUNNER);
+        }
         ProcessResponse::ExitChild => encoder.u8(PROCESS_RESPONSE_TAG_EXIT_CHILD),
         ProcessResponse::CancelChild => encoder.u8(PROCESS_RESPONSE_TAG_CANCEL_CHILD),
         ProcessResponse::ReportExitStatus => encoder.u8(PROCESS_RESPONSE_TAG_REPORT_EXIT_STATUS),
@@ -216,6 +239,9 @@ pub(super) fn decode_process_response(
         PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD => ProcessResponse::DuplicateObjectsToChild,
         PROCESS_RESPONSE_TAG_WRITE_CHILD_MEMORY => ProcessResponse::WriteChildMemory,
         PROCESS_RESPONSE_TAG_START_CHILD => ProcessResponse::StartChild,
+        PROCESS_RESPONSE_TAG_START_CHILD_WITH_EXISTING_RUNNER => {
+            ProcessResponse::StartChildWithExistingRunner
+        }
         PROCESS_RESPONSE_TAG_EXIT_CHILD => ProcessResponse::ExitChild,
         PROCESS_RESPONSE_TAG_CANCEL_CHILD => ProcessResponse::CancelChild,
         PROCESS_RESPONSE_TAG_REPORT_EXIT_STATUS => ProcessResponse::ReportExitStatus,

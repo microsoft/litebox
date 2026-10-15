@@ -3,6 +3,7 @@
 
 //! Runner launch support backed by broker-owned process lifecycle state.
 
+use std::collections::HashMap;
 use std::io::{Error as IoError, Result as IoResult};
 use std::process::ExitStatus;
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -13,15 +14,17 @@ use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
 
-use crate::runner::{RunnerCompletion, RunnerConfig, RunnerInstance};
+use crate::runner::{RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess};
 
 /// Userland implementation that starts one out-of-process runner per process.
 pub(crate) struct UserlandProcessLauncher {
     broker: BrokerCore,
     started_runner_config: RunnerConfig,
     lifecycle: Arc<ProcessLifecycleNotifier>,
+    runners: Mutex<HashMap<ProcessId, std::sync::Weak<Mutex<RunnerProcess>>>>,
 }
 
 /// Pending association for a broker-created runner process.
@@ -120,6 +123,7 @@ impl UserlandProcessLauncher {
             broker,
             started_runner_config,
             lifecycle,
+            runners: Mutex::new(HashMap::new()),
         })
     }
 
@@ -161,21 +165,36 @@ impl UserlandProcessLauncher {
         completion_sender: Option<SyncSender<IoResult<ExitStatus>>>,
     ) -> Result<(), BrokerError> {
         let process = Arc::clone(&association.process);
-        let process_id = process.id();
         let Ok(instance) = RunnerInstance::start(config) else {
             let _ = process.fail_start(BrokerError::PeerClosed, false, false);
             process.retire(true);
             return Err(BrokerError::PeerClosed);
         };
+        self.launch_runner_instance(association, instance, completion_sender)
+    }
+
+    fn launch_runner_instance(
+        self: Arc<Self>,
+        association: PendingRunnerAssociation,
+        instance: RunnerInstance,
+        completion_sender: Option<SyncSender<IoResult<ExitStatus>>>,
+    ) -> Result<(), BrokerError> {
+        let process = Arc::clone(&association.process);
+        let process_id = process.id();
+        self.runners
+            .lock()
+            .expect("runner registry mutex poisoned")
+            .insert(process_id, Arc::downgrade(&instance.runner_process()));
         let setup_deadline = instance.setup_deadline();
         let broker = self.broker.clone();
         let launcher = Arc::clone(&self);
+        let association_launcher = Arc::clone(&launcher);
         let completion_process = Arc::clone(&process);
         let thread = std::thread::Builder::new()
             .name(format!("litebox-runner-{}", process_id.0))
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    instance.run_process_to_completion(association, broker, launcher)
+                    instance.run_process_to_completion(association, broker, association_launcher)
                 }));
                 let (completion, thread_panicked) = match outcome {
                     Ok(completion) => (completion, false),
@@ -187,11 +206,20 @@ impl UserlandProcessLauncher {
                     completion.process_exit_status(),
                     abnormal,
                 );
+                launcher
+                    .runners
+                    .lock()
+                    .expect("runner registry mutex poisoned")
+                    .remove(&process_id);
                 if let Some(completion_sender) = completion_sender {
                     let _ = completion_sender.send(completion.into_result());
                 }
             });
         if thread.is_err() {
+            self.runners
+                .lock()
+                .expect("runner registry mutex poisoned")
+                .remove(&process_id);
             let _ = process.fail_start(BrokerError::OutOfMemory, false, true);
             process.retire(true);
             return Err(BrokerError::OutOfMemory);
@@ -221,6 +249,79 @@ impl ProcessLauncher for UserlandProcessLauncher {
             config,
             None,
         )
+    }
+
+    fn launch_existing(
+        self: Arc<Self>,
+        parent_process_id: litebox_broker_protocol::ProcessId,
+        process: Arc<BrokerProcess>,
+        startup: ProcessStartupData,
+        launch_descriptor: Vec<u8>,
+    ) -> Result<(), BrokerError> {
+        #[cfg(target_os = "linux")]
+        {
+            let adoption = (|| {
+                let descriptor = litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerLaunchDescriptor::decode(&launch_descriptor)
+                    .map_err(|_| BrokerError::PolicyDenied)?;
+                let parent = self
+                    .runners
+                    .lock()
+                    .expect("runner registry mutex poisoned")
+                    .get(&parent_process_id)
+                    .and_then(std::sync::Weak::upgrade)
+                    .ok_or(BrokerError::PeerClosed)?;
+                RunnerInstance::adopt(&parent, &descriptor).map_err(|_| BrokerError::PolicyDenied)
+            })();
+            let instance = match adoption {
+                Ok(instance) => instance,
+                Err(error) => {
+                    let _ = process.fail_start(error, false, true);
+                    process.retire(true);
+                    return Err(error);
+                }
+            };
+            self.launch_runner_instance(
+                PendingRunnerAssociation::new(process, Some(startup), None),
+                instance,
+                None,
+            )
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let adoption = (|| {
+                let descriptor = litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerLaunchDescriptor::decode(&launch_descriptor)
+                    .map_err(|_| BrokerError::PolicyDenied)?;
+                let parent = self
+                    .runners
+                    .lock()
+                    .expect("runner registry mutex poisoned")
+                    .get(&parent_process_id)
+                    .and_then(std::sync::Weak::upgrade)
+                    .ok_or(BrokerError::PeerClosed)?;
+                RunnerInstance::adopt(&parent, &descriptor).map_err(|_| BrokerError::PolicyDenied)
+            })();
+            let instance = match adoption {
+                Ok(instance) => instance,
+                Err(error) => {
+                    let _ = process.fail_start(error, false, true);
+                    process.retire(true);
+                    return Err(error);
+                }
+            };
+            self.launch_runner_instance(
+                PendingRunnerAssociation::new(process, Some(startup), None),
+                instance,
+                None,
+            )
+        }
+        #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+        {
+            let _ = startup;
+            let _ = launch_descriptor;
+            let _ = process.fail_start(BrokerError::UnsupportedOperation, false, true);
+            process.retire(true);
+            Err(BrokerError::UnsupportedOperation)
+        }
     }
 
     fn create_image(

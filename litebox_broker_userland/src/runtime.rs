@@ -712,7 +712,9 @@ where
             // guest, which learns of readiness through notifications instead.
             holds_role = !matches!(
                 request.operation,
-                BrokerOperation::Process(ProcessRequest::StartChild(_))
+                BrokerOperation::Process(
+                    ProcessRequest::StartChild(_) | ProcessRequest::StartChildWithExistingRunner(_)
+                )
             );
             if !holds_role {
                 self.pass_role();

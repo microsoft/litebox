@@ -6,23 +6,29 @@ use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
+use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
+use litebox_broker_transport_linux_userland::existing_runner::{
+    ExistingRunnerLaunchDescriptor, remove_control_channel,
+};
 use litebox_broker_transport_linux_userland::memfd::{MemfdProcessImage, MemfdSharedMemory};
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 
 use super::{
-    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, UserlandProcessLauncher, accept_runner_channel,
-    runner_has_exited,
+    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerProcess, UserlandProcessLauncher,
+    accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -86,6 +92,7 @@ pub(super) struct PlatformRunnerEndpoint {
     socket_path: PathBuf,
     listener: Option<UnixListener>,
     directory: Option<tempfile::TempDir>,
+    adopted_directory: bool,
 }
 
 impl PlatformRunnerEndpoint {
@@ -100,6 +107,32 @@ impl PlatformRunnerEndpoint {
             socket_path,
             listener: Some(listener),
             directory: Some(directory),
+            adopted_directory: false,
+        })
+    }
+
+    pub(super) fn create_at(socket_path: PathBuf) -> IoResult<Self> {
+        let directory = socket_path.parent().ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidInput, "control socket has no directory")
+        })?;
+        std::fs::DirBuilder::new().mode(0o700).create(directory)?;
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                remove_control_channel(&socket_path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = listener.set_nonblocking(true) {
+            drop(listener);
+            remove_control_channel(&socket_path);
+            return Err(error);
+        }
+        Ok(Self {
+            socket_path,
+            listener: Some(listener),
+            directory: None,
+            adopted_directory: true,
         })
     }
 
@@ -109,7 +142,7 @@ impl PlatformRunnerEndpoint {
 
     pub(super) fn serve(
         &mut self,
-        runner: &Arc<Mutex<Child>>,
+        runner: &Arc<Mutex<RunnerProcess>>,
         startup: PendingRunnerAssociation,
         setup_deadline: Instant,
         broker: BrokerCore,
@@ -130,12 +163,86 @@ impl PlatformRunnerEndpoint {
     pub(super) fn close(&mut self) {
         self.listener.take();
         self.directory.take();
+        if self.adopted_directory {
+            remove_control_channel(&self.socket_path);
+            self.adopted_directory = false;
+        }
     }
+}
+
+pub(crate) struct AdoptedProcess {
+    process_id: u32,
+    status: Option<ExitStatus>,
+}
+
+impl AdoptedProcess {
+    pub(super) const fn id(&self) -> u32 {
+        self.process_id
+    }
+
+    pub(super) fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let process_id =
+            libc::pid_t::try_from(self.process_id).map_err(|_| ErrorKind::InvalidInput)?;
+        let mut status = 0;
+        // SAFETY: `process_id` names a direct child of this broker and `status` is writable.
+        let result = unsafe { libc::waitpid(process_id, &raw mut status, libc::WNOHANG) };
+        if result < 0 {
+            return Err(IoError::last_os_error());
+        }
+        if result == 0 {
+            return Ok(None);
+        }
+        let status = ExitStatus::from_raw(status);
+        self.status = Some(status);
+        Ok(Some(status))
+    }
+
+    pub(super) fn kill(&mut self) -> IoResult<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        let process_id =
+            libc::pid_t::try_from(self.process_id).map_err(|_| ErrorKind::InvalidInput)?;
+        // SAFETY: `process_id` was verified as this broker's direct child during adoption.
+        if unsafe { libc::kill(process_id, libc::SIGKILL) } < 0 {
+            return Err(IoError::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn adopt_process(
+    parent: &Arc<Mutex<RunnerProcess>>,
+    descriptor: &ExistingRunnerLaunchDescriptor,
+) -> IoResult<RunnerProcess> {
+    let parent = parent.lock().expect("parent runner process mutex poisoned");
+    if parent.id() != descriptor.parent_process_id {
+        return Err(IoError::new(
+            ErrorKind::PermissionDenied,
+            "existing runner descriptor does not match its parent",
+        ));
+    }
+    let process_id = libc::pid_t::try_from(descriptor.process_id)
+        .map_err(|_| IoError::from(ErrorKind::InvalidInput))?;
+    let mut status = 0;
+    // SAFETY: WNOHANG only observes or reaps `process_id`; success proves it is our direct child.
+    let result = unsafe { libc::waitpid(process_id, &raw mut status, libc::WNOHANG) };
+    if result < 0 {
+        return Err(IoError::last_os_error());
+    }
+    let status = (result != 0).then(|| ExitStatus::from_raw(status));
+    Ok(RunnerProcess::Adopted(AdoptedProcess {
+        process_id: descriptor.process_id,
+        status,
+    }))
 }
 
 fn serve_association(
     control_listener: &UnixListener,
-    runner: &Arc<Mutex<Child>>,
+    runner: &Arc<Mutex<RunnerProcess>>,
     mut startup: PendingRunnerAssociation,
     setup_deadline: Instant,
     broker: BrokerCore,
@@ -182,7 +289,7 @@ fn serve_association(
 
 fn accept_control_channel(
     control_listener: &UnixListener,
-    runner: &Arc<Mutex<Child>>,
+    runner: &Arc<Mutex<RunnerProcess>>,
     setup_deadline: Instant,
 ) -> IoResult<UnixStreamHostSetupChannel> {
     let control_stream = accept_runner_channel(
@@ -211,7 +318,7 @@ fn accept_control_channel(
 /// Waits until the runner exits, `listener` becomes readable, or `timeout`
 /// elapses. Callers recheck their own condition, so early returns are harmless.
 pub(super) fn wait_for_runner_event(
-    runner: &Arc<Mutex<Child>>,
+    runner: &Arc<Mutex<RunnerProcess>>,
     listener: Option<&UnixListener>,
     timeout: Option<Duration>,
 ) -> IoResult<()> {

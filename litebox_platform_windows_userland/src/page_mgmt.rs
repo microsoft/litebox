@@ -213,6 +213,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     const RESERVATION_ALIGNMENT: usize = 0x1_0000;
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Bidirectional;
 
+    unsafe fn adopt_pages(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<WindowsUserlandReservation<ALIGN>, AllocationError> {
+        if range.is_empty()
+            || !range.start.is_multiple_of(ALIGN)
+            || !range.end.is_multiple_of(ALIGN)
+        {
+            return Err(AllocationError::AddressInUse);
+        }
+        // SAFETY: The caller guarantees this exact inherited range is mapped and exclusively owned.
+        Ok(unsafe { WindowsUserlandReservation::new(range) })
+    }
+
     unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
         _replaced_reservations: impl FnOnce() -> Reservations,
