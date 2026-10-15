@@ -53,6 +53,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86
+      - name: Enable KVM
+        # GitHub-hosted x64 Linux runners support KVM, but the runner user
+        # cannot open /dev/kvm by default.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Cache custom out directories
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -85,25 +93,25 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo nextest
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
-      - name: Run OP-TEE TAs in a QEMU VM (TCG)
+      - name: Run OP-TEE TAs in a QEMU VM (KVM)
         # Also builds the runner.
         run: |
-          QEMU_ACCEL=tcg CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_qemu.sh
-      - name: Run OP-TEE TAs in a QEMU VM with stacked runners (TCG)
+      - name: Run OP-TEE TAs in a QEMU VM with stacked runners (KVM)
         # Also builds the kernel and userland runners.
         run: |
-          QEMU_ACCEL=tcg CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh
-      - name: Run unmodified OP-TEE TAs in a QEMU VM with stacked runners (TCG)
+      - name: Run unmodified OP-TEE TAs in a QEMU VM with stacked runners (KVM)
         # The kernel reflects their syscalls to the userland runner.
         run: |
-          QEMU_ACCEL=tcg CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
-      - name: Run static Linux programs in a QEMU VM with stacked runners (TCG)
+      - name: Run static Linux programs in a QEMU VM with stacked runners (KVM)
         # Also builds the kernel and userland runners.
         run: |
-          QEMU_ACCEL=tcg CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
