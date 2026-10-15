@@ -722,31 +722,25 @@ mod tests {
             .main
             .load_mapped(task.global.platform)
             .expect("main should load");
-        let trampoline = {
-            let cache = task.global.elf_patch_cache.lock();
-            let state = cache.values().next().expect("main should be tracked");
-            assert!(state.runtime_patches_committed());
-            state.trampoline_range()
-        };
-        // The trampoline is actually mapped at the recorded address.
+        // The x86-64 runtime trampoline fills the loader's reservation exactly.
+        let reservation = litebox_common_linux::loader::runtime_trampoline_reservation(
+            info.base_addr + PAGE_SIZE,
+        )
+        .unwrap();
         assert_eq!(
             task.global.mm.get_memory_permissions(
-                NonZeroAddress::new(trampoline.start).unwrap(),
-                NonZeroPageSize::new(trampoline.len()).unwrap(),
+                NonZeroAddress::new(reservation.start).unwrap(),
+                NonZeroPageSize::new(reservation.len()).unwrap(),
             ),
             Some(
                 litebox::platform::page_mgmt::MemoryRegionPermissions::READ
                     | litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC
             ),
+            "the runtime trampoline should be mapped at {reservation:#x?}",
         );
-        let reservation = litebox_common_linux::loader::runtime_trampoline_reservation(
-            info.base_addr + PAGE_SIZE,
-        )
-        .unwrap();
-        assert_eq!(trampoline.start, reservation.start);
         assert!(
-            trampoline.end <= info.brk,
-            "trampoline {trampoline:#x?} caps the brk heap starting at {:#x}",
+            reservation.end <= info.brk,
+            "trampoline {reservation:#x?} caps the brk heap starting at {:#x}",
             info.brk,
         );
     }

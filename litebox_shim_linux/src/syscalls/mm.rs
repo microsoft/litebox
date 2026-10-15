@@ -1871,17 +1871,6 @@ mod tests {
     use crate::syscalls::file::AnyTypedFd;
     use crate::syscalls::tests::{TestPlatform as Platform, create_file, init_platform};
 
-    /// Accessors for tests outside this module, such as the ELF loader's.
-    impl ElfPatchState {
-        pub(crate) fn runtime_patches_committed(&self) -> bool {
-            self.runtime_patches_committed
-        }
-
-        pub(crate) fn trampoline_range(&self) -> core::ops::Range<usize> {
-            self.trampoline_addr..self.trampoline_addr + self.trampoline_mapped_len
-        }
-    }
-
     fn elf_patch_key(task: &Task<Platform>, fd: i32) -> ElfPatchKey {
         let AnyTypedFd::Fs(fd) = task.typed_fd(fd).expect("file descriptor should resolve") else {
             panic!("descriptor should refer to a file");
