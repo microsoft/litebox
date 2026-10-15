@@ -223,10 +223,13 @@ where
         max_events: usize,
     ) -> Result<Vec<ReadyEntry>, TryOpError<ReadinessQueueError>> {
         assert!(max_events > 0, "a wait must take at least one event");
-        let mut events = Vec::new();
         let len = max_events.min(MAX_READINESS_QUEUE_EVENTS as usize);
+        // Allocate everything up front, since taking events consumes them.
+        let mut events = Vec::new();
+        let mut entries = Vec::new();
         events
             .try_reserve_exact(len)
+            .and_then(|()| entries.try_reserve_exact(len))
             .map_err(|_| TryOpError::Other(ReadinessQueueError::OutOfMemory))?;
         events.resize(len, ReadyEvent::default());
         let count = self.pollee.wait(cx, false, Events::IN, || {
@@ -236,13 +239,11 @@ where
                 Err(error) => Err(self.broker_request_error(error)),
             }
         })?;
-        Ok(events[..count]
-            .iter()
-            .map(|event| ReadyEntry {
-                token: event.token,
-                events: readiness_events(event.readiness),
-            })
-            .collect())
+        entries.extend(events[..count].iter().map(|event| ReadyEntry {
+            token: event.token,
+            events: readiness_events(event.readiness),
+        }));
+        Ok(entries)
     }
 
     /// Returns the queue's access mode and status flags.

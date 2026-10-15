@@ -21,7 +21,10 @@ use litebox::{
     process::ProcessError,
     utils::ReinterpretUnsignedExt,
 };
-use litebox_broker_protocol::{ObjectHandle, readiness_queue::ReadinessQueueEntryFlags};
+use litebox_broker_protocol::{
+    ObjectHandle,
+    readiness_queue::{MAX_READINESS_QUEUE_EVENTS, ReadinessQueueEntryFlags},
+};
 use litebox_common_linux::{EpollEvent, EpollOp, OFlags, errno::Errno};
 
 use super::file::{FilesState, linux_status_flags, status_flags_change};
@@ -204,11 +207,20 @@ impl<Platform: ShimPlatform> EpollFile<Platform> {
         cx: &WaitContext<'_, Platform>,
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, Errno> {
+        // Allocate up front, since waiting consumes the events it takes.
+        let mut events = Vec::new();
+        events
+            .try_reserve_exact(maxevents.min(MAX_READINESS_QUEUE_EVENTS as usize))
+            .map_err(|_| Errno::ENOMEM)?;
         match self.queue.wait(cx, maxevents) {
-            Ok(entries) => Ok(entries
-                .into_iter()
-                .map(|entry| EpollEvent::new(entry.events.bits(), entry.token))
-                .collect()),
+            Ok(entries) => {
+                events.extend(
+                    entries
+                        .into_iter()
+                        .map(|entry| EpollEvent::new(entry.events.bits(), entry.token)),
+                );
+                Ok(events)
+            }
             Err(TryOpError::WaitError(WaitError::TimedOut)) => Ok(Vec::new()),
             Err(TryOpError::WaitError(WaitError::Interrupted)) => Err(Errno::EINTR),
             Err(error) => Err(error.into()),
