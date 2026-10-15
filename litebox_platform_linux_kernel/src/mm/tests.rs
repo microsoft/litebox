@@ -32,8 +32,8 @@ use super::pgtable::PageTableImpl;
 const MAX_ORDER: usize = 23;
 
 static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAllocator::new();
-/// const Array for VA to PA mapping
-static MAPPING: SpinMutex<ArrayVec<VirtAddr, 1024>> = SpinMutex::new(ArrayVec::new_const());
+/// const Array for VA to PA mapping. Large enough for 2 MiB slab refills (8 MiB mapped each).
+static MAPPING: SpinMutex<ArrayVec<VirtAddr, 8192>> = SpinMutex::new(ArrayVec::new_const());
 
 impl litebox::mm::allocator::MemoryProvider for MockKernel {
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
@@ -94,6 +94,36 @@ fn test_buddy() {
     assert!(ptr.is_some_and(|p| p as usize != 0));
     unsafe {
         MockKernel::mem_free_pages(ptr.unwrap(), 1);
+    }
+}
+
+#[test]
+fn test_too_large_alloc_returns_null() {
+    let layout = Layout::from_size_align(1 << MAX_ORDER, 0x1000).unwrap();
+    let ptr = unsafe { ALLOCATOR.alloc(layout) };
+    assert!(ptr.is_null());
+}
+
+#[test]
+fn test_slab_large_align() {
+    // Keep several allocations live to exercise slots past the start of a slab page.
+    const LIVE: usize = 8;
+    for &(size, align) in &[
+        (0x20, 0x80),
+        (0x20, 0x100),
+        (0x20, 0x1000),
+        (0x20, 0x2000),
+        (0x20, 0x1_0000),
+    ] {
+        let layout = Layout::from_size_align(size, align).unwrap();
+        let ptrs: [*mut u8; LIVE] = core::array::from_fn(|_| unsafe { ALLOCATOR.alloc(layout) });
+        for &ptr in &ptrs {
+            assert!(!ptr.is_null());
+            assert!((ptr as usize).is_multiple_of(align));
+        }
+        for ptr in ptrs {
+            unsafe { ALLOCATOR.dealloc(ptr, layout) };
+        }
     }
 }
 
