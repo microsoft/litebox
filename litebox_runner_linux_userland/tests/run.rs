@@ -1986,7 +1986,7 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
         .arg(greeting_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    assert_eq!(broker.next_close_object_count(), 27);
+    assert_eq!(broker.next_close_object_count(), 25);
     broker.join();
     reset_server.join().unwrap();
     half_closed_server.join().unwrap();

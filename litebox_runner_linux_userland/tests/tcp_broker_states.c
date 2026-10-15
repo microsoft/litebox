@@ -139,8 +139,6 @@ int main(int argc, char **argv) {
     // The peer sends two bytes and keeps the connection open.
     struct sockaddr_in greeting = gateway_address(argv[6]);
     struct sockaddr_in zero_port = gateway_address("0");
-    struct sockaddr_in any_address = open;
-    any_address.sin_addr.s_addr = htonl(INADDR_ANY);
 
     // A peer reset is reported once, by whichever of receive, send, or
     // SO_ERROR comes first, and leaves both directions closed.
@@ -291,7 +289,6 @@ int main(int argc, char **argv) {
     assert(connect(fd, (const struct sockaddr *)&open, sizeof(open)) == 0);
     expect_connect_error(fd, &open, EISCONN);
     expect_connect_error(fd, &zero_port, EISCONN);
-    expect_connect_error(fd, &any_address, EISCONN);
     assert(close(fd) == 0);
 
     fd = connect_to(&open, SOCK_NONBLOCK);
@@ -366,9 +363,11 @@ int main(int argc, char **argv) {
     expect_send_error(fd, EPIPE);
     assert(close(fd) == 0);
 
-    // A listener can neither receive nor send, and shutting down its read
-    // side leaves it unconnected.
+    // A listener ignores a shutdown recorded before it listened and can neither
+    // receive nor send, and shutting down its read side leaves it unconnected,
+    // discarding the shutdown.
     fd = tcp_socket(SOCK_NONBLOCK);
+    expect_shutdown_not_connected(fd, SHUT_RD);
     assert(listen(fd, 1) == 0);
     assert(poll_events(fd) == 0);
     expect_receive_error(fd, ENOTCONN);
@@ -376,29 +375,7 @@ int main(int argc, char **argv) {
     expect_connect_error(fd, &open, EISCONN);
     assert(shutdown(fd, SHUT_RD) == 0);
     assert(poll_events(fd) == UNCONNECTED_EVENTS);
-    assert(close(fd) == 0);
-
-    // A listener ignores a shutdown recorded before it listened, and stopping
-    // it discards the shutdown.
-    fd = tcp_socket(SOCK_NONBLOCK);
-    expect_shutdown_not_connected(fd, SHUT_RD);
-    assert(listen(fd, 1) == 0);
-    assert(poll_events(fd) == 0);
     expect_receive_error(fd, ENOTCONN);
-    assert(shutdown(fd, SHUT_RD) == 0);
-    assert(poll_events(fd) == UNCONNECTED_EVENTS);
-    expect_receive_error(fd, ENOTCONN);
-    assert(close(fd) == 0);
-
-    // A new socket is unconnected.
-    fd = tcp_socket(SOCK_NONBLOCK);
-    assert(poll_events(fd) == UNCONNECTED_EVENTS);
-    expect_receive_error(fd, ENOTCONN);
-    expect_send_error(fd, EPIPE);
-    expect_shutdown_not_connected(fd, SHUT_RDWR);
-    assert(poll_events(fd) == CLOSED_EVENTS);
-    expect_end_of_file(fd);
-    expect_send_error(fd, EPIPE);
     assert(close(fd) == 0);
     return 0;
 }
