@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! Devices behind device-neutral types ([`ConsoleDevice`],
-//! [`NetworkDevice`]), each probing
+//! [`NetworkDevice`], [`NinePDevice`]), each probing
 //! the drivers the HAL has for its kind. Runners choose which devices to
 //! probe, where they interrupt, and what to do without one.
 
@@ -10,7 +10,9 @@ use crate::dma::Hal;
 use crate::interrupt::InterruptTarget;
 use crate::virtio::console::VirtioConsole;
 use crate::virtio::net::VirtioNet;
+use crate::virtio::nine_p::Virtio9p;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::fmt;
 
 /// A console: output, and input if the device receives any. Not internally
@@ -166,6 +168,64 @@ impl fmt::Display for NetworkDevice {
             mac[3],
             mac[4],
             mac[5],
+        )
+    }
+}
+
+/// A host directory served over 9P, one request at a time. Not internally
+/// synchronized.
+pub struct NinePDevice(Box<Virtio9p>);
+
+impl NinePDevice {
+    /// The largest message either way: the most a 9P client may negotiate.
+    pub const MAX_MESSAGE_SIZE: usize = crate::virtio::nine_p::MAX_MESSAGE_SIZE;
+
+    /// The VM's 9P devices, interrupting `interrupt` if they can (see
+    /// [`Self::interrupts`]), or why one cannot be driven.
+    pub fn probe_all(
+        hal: &'static dyn Hal,
+        interrupt: InterruptTarget,
+    ) -> Vec<Result<Self, crate::virtio::Error>> {
+        // Virtio over PCI.
+        Virtio9p::probe_all(hal, interrupt.msi_message())
+            .into_iter()
+            .map(|device| device.map(|device| Self(Box::new(device))))
+            .collect()
+    }
+
+    /// Whether the device raises its interrupt; else it must be polled.
+    pub fn interrupts(&self) -> bool {
+        self.0.transport().interrupts()
+    }
+
+    /// The share's name, if it has one: untrusted bytes from the host.
+    pub fn mount_tag(&self) -> Option<&[u8]> {
+        self.0.mount_tag()
+    }
+
+    /// Queues `message`, one whole 9P request; false if one is in flight.
+    ///
+    /// # Panics
+    ///
+    /// If `message` is empty or longer than [`Self::MAX_MESSAGE_SIZE`].
+    pub fn transmit(&mut self, message: &[u8]) -> bool {
+        self.0.transmit(message)
+    }
+
+    /// The response's length, once the device answered, its bytes copied
+    /// into `response` (truncated); unchecked as 9P.
+    pub fn receive(&mut self, response: &mut [u8]) -> Option<usize> {
+        self.0.receive(response)
+    }
+}
+
+impl fmt::Display for NinePDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "virtio (pci {}, interrupts {})",
+            self.0.transport().function(),
+            self.interrupts()
         )
     }
 }

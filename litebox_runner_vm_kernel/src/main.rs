@@ -12,7 +12,9 @@
 //!
 //! QEMU exits with 33 if all tests pass, 65 otherwise. Runner processes'
 //! standard streams are the VM's console device, if there is one, and their
-//! sockets reach the VM's network device, if there is one ([`devices`]).
+//! sockets reach the VM's network device, if there is one; programs also see
+//! the host directories of virtio-9p devices, read-only, at their mount tags
+//! ([`devices`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -39,12 +41,13 @@ fn kernel_main(kernel: Kernel) -> ! {
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
-    let broker = |console| {
+    let broker = |console, shares| {
         litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
             platform: kernel.platform,
             console,
             events: devices,
             root: payload.file("rootfs.tar"),
+            shares,
             network: devices.network(),
         })
     };
@@ -57,7 +60,7 @@ fn kernel_main(kernel: Kernel) -> ! {
             wall_clock,
             devices,
             &payload,
-            broker(stdio),
+            broker(stdio, devices.shares()),
         );
         client::program::run(programs, &mut service, stdio);
     } else {
@@ -67,7 +70,9 @@ fn kernel_main(kernel: Kernel) -> ! {
             wall_clock,
             devices,
             &payload,
-            broker(devices),
+            // No shares: TA storage (OP-TEE secure storage) needs a file
+            // system of its own, not provided yet.
+            broker(devices, alloc::vec::Vec::new()),
         );
         client::script::run(&payload, &mut service);
     }

@@ -6,9 +6,8 @@
 //! [`crate::dma::Hal`]) and interrupts by MSI-X. Split virtqueues
 //! ([`queue`]).
 //!
-//! Devices: [`console`] and [`net`]. The transport and queues are
-//! device-independent, for further devices (e.g., file systems for the
-//! broker).
+//! Devices: [`console`], [`net`], and [`nine_p`]. The transport and queues
+//! are device-independent, for further devices.
 //!
 //! Devices are not trusted: the capability list, BAR ranges, queue sizes and
 //! used-ring entries are checked, and lengths the device reports are clamped
@@ -17,16 +16,17 @@
 mod buffers;
 pub mod console;
 pub mod net;
+pub mod nine_p;
 pub mod pci;
 pub mod queue;
 
 const PCI_VENDOR: u16 = 0x1af4;
 
-/// The first virtio function of type `device_type` on bus 0. Modern-only
-/// device IDs are 0x1040 + type; transitional ones (0x1000..=0x103f) give
-/// the type in the subsystem ID.
-pub fn find_pci_device(device_type: u16) -> Option<crate::pci::Function> {
-    crate::pci::find(|function| {
+/// The virtio functions of type `device_type` on bus 0. Modern-only device
+/// IDs are 0x1040 + type; transitional ones (0x1000..=0x103f) give the type
+/// in the subsystem ID.
+pub fn find_pci_devices(device_type: u16) -> impl Iterator<Item = crate::pci::Function> {
+    crate::pci::functions().filter(move |function| {
         let device_id = function.device_id();
         function.vendor_id() == PCI_VENDOR
             && (device_id == 0x1040 + device_type

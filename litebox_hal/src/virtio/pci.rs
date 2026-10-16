@@ -209,6 +209,21 @@ impl PciTransport {
         self.add_status(status::FAILED);
     }
 
+    /// Resets the device: once this succeeds, it no longer accesses its
+    /// queues or buffers.
+    ///
+    /// # Errors
+    ///
+    /// The device did not reset.
+    pub fn reset(&self) -> Result<(), Error> {
+        self.set_status(0);
+        if (0..RESET_POLL_LIMIT).any(|_| self.status() == 0) {
+            Ok(())
+        } else {
+            Err(Error::ResetTimedOut)
+        }
+    }
+
     /// Resets the device and negotiates `wanted` features (plus
     /// `VIRTIO_F_VERSION_1`) as far as it offers them; returns those. Set up
     /// queues next, then [`Self::start`].
@@ -218,10 +233,7 @@ impl PciTransport {
     /// The device did not reset, is not modern, or rejected the features. It
     /// is left `FAILED`, except after a reset timeout.
     pub fn init(&self, wanted: u64) -> Result<u64, Error> {
-        self.set_status(0);
-        if !(0..RESET_POLL_LIMIT).any(|_| self.status() == 0) {
-            return Err(Error::ResetTimedOut);
-        }
+        self.reset()?;
         self.add_status(status::ACKNOWLEDGE);
         self.add_status(status::DRIVER);
         let offered = (0..2u32).fold(0, |features, word| {

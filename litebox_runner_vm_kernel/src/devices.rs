@@ -11,6 +11,8 @@
 //!   deadlines.
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
 //!   `SetTimer` deadline and time slice.
+//! - [`Devices::shares`]: the VM's virtio-9p devices, each a host directory
+//!   mounted at its tag.
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
@@ -20,14 +22,17 @@
 //! `litebox_platform_vm_kernel`).
 
 use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::stdio::StdioOutputStream;
 use litebox_broker_smoltcp::Network;
 use litebox_broker_vm_kernel::Events;
+use litebox_broker_vm_kernel::share::{Share, Transport, TransportError};
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
-use litebox_hal::devices::{ConsoleDevice, NetworkDevice};
+use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice};
 use litebox_hal::interrupt::LocalApic;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::{Instant, VmKernel};
@@ -37,6 +42,12 @@ use spin::Mutex;
 /// How long a console write may wait for the device to take output before
 /// the rest is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How long a share's server may take to answer a request before the share
+/// fails.
+const SHARE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a share that does not interrupt is polled.
+const SHARE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// The local APIC's timer.
 const TIMER_VECTOR: u8 = 0x30;
@@ -122,6 +133,48 @@ impl Devices {
             .as_ref()
             .expect("the broker has a network only with a device")
             .lock()
+    }
+
+    /// The VM's virtio-9p devices, brought up, as shares mounted at their
+    /// tags (see [`mount_path`]). Devices that cannot be driven, or whose tag
+    /// is not such a path or repeats another's, are skipped. Call once.
+    pub fn shares(&'static self) -> Vec<Share> {
+        let mut shares: Vec<Share> = Vec::new();
+        for probed in NinePDevice::probe_all(self.platform, self.apic.target(DEVICE_VECTOR)) {
+            let device = match probed {
+                Ok(device) => device,
+                Err(error) => {
+                    litebox_util_log::warn!(error:% = error; "9P device unusable");
+                    continue;
+                }
+            };
+            let Some(path) = device.mount_tag().and_then(mount_path) else {
+                litebox_util_log::warn!(
+                    device:% = device,
+                    tag:? = device.mount_tag().map(String::from_utf8_lossy);
+                    "9P device's mount tag is not a path to mount at"
+                );
+                continue;
+            };
+            if shares.iter().any(|share| share.path == path) {
+                litebox_util_log::warn!(
+                    device:% = device,
+                    path:% = path;
+                    "9P device's mount tag repeats another's"
+                );
+                continue;
+            }
+            litebox_util_log::info!(device:% = device, path:% = path; "share");
+            shares.push(Share {
+                path,
+                transport: Box::new(ShareTransport {
+                    devices: self,
+                    device,
+                    failed: false,
+                }),
+            });
+        }
+        shares
     }
 
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
@@ -265,4 +318,67 @@ impl Network for Devices {
     fn interrupts(&self) -> bool {
         self.network_interrupts
     }
+}
+
+/// A share's virtio-9p device: a request at a time, waiting for its response
+/// in [`Devices::halt`], not [`Devices::block`]: the 9P client holds its lock
+/// across the round trip, and while the worker is suspended, the kernel may
+/// take it (e.g., ending another process's association closes its files),
+/// which on one CPU nothing would release.
+struct ShareTransport {
+    devices: &'static Devices,
+    device: NinePDevice,
+    /// A request timed out, and the device may still answer it: the share is
+    /// no longer used.
+    failed: bool,
+}
+
+impl Transport for ShareTransport {
+    fn max_message_size(&self) -> usize {
+        NinePDevice::MAX_MESSAGE_SIZE
+    }
+
+    fn round_trip(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, TransportError> {
+        if self.failed || !self.device.transmit(request) {
+            return Err(TransportError);
+        }
+        let platform = self.devices.platform;
+        let deadline = platform
+            .now()
+            .checked_add(SHARE_TIMEOUT)
+            .expect("the clock is far from overflowing");
+        loop {
+            if let Some(len) = self.device.receive(response) {
+                return Ok(len);
+            }
+            let now = platform.now();
+            if now >= deadline {
+                litebox_util_log::warn!(
+                    device:% = self.device;
+                    "9P server did not answer; share failed"
+                );
+                self.failed = true;
+                return Err(TransportError);
+            }
+            // Until the device returns the request; nothing else runs meanwhile.
+            let wake = match now.checked_add(SHARE_POLL_INTERVAL) {
+                Some(poll) if !self.device.interrupts() && poll < deadline => poll,
+                _ => deadline,
+            };
+            self.devices.halt(Some(wake));
+        }
+    }
+}
+
+/// A mount tag as the path to mount its share at, if the broker can: its
+/// `Composer` panics on paths that are not absolute and normalized, and `/`
+/// and `/dev` (with what is under it) are reserved. Tags come from the host.
+fn mount_path(tag: &[u8]) -> Option<String> {
+    let path = core::str::from_utf8(tag).ok()?;
+    let mut components = path.strip_prefix('/')?.split('/');
+    let valid = components
+        .clone()
+        .all(|component| !matches!(component, "" | "." | ".."))
+        && components.next() != Some("dev");
+    valid.then(|| String::from(path))
 }

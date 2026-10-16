@@ -65,7 +65,7 @@ impl VirtioNet {
         hal: &'static dyn Hal,
         interrupt: Option<MsiMessage>,
     ) -> Option<Result<Self, Error>> {
-        let function = super::find_pci_device(DEVICE_TYPE)?;
+        let function = super::find_pci_devices(DEVICE_TYPE).next()?;
         Some(
             PciTransport::new(hal, function, interrupt)
                 .and_then(|transport| Self::bring_up(hal, transport)),

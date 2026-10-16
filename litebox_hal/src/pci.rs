@@ -249,23 +249,21 @@ pub struct MemoryBar {
     pub size: u64,
 }
 
-/// The first function on bus 0 that `matches`.
-pub fn find(matches: impl Fn(Function) -> bool) -> Option<Function> {
-    for device in 0..32 {
-        let first = Function {
-            device,
-            function: 0,
-        };
-        if first.vendor_id() == 0xffff {
-            continue;
-        }
-        let multifunction = first.read_u8(HEADER_TYPE) & 0x80 != 0;
-        for function in 0..if multifunction { 8 } else { 1 } {
-            let candidate = Function { device, function };
-            if matches(candidate) {
-                return Some(candidate);
+/// The functions present on bus 0, in order.
+pub fn functions() -> impl Iterator<Item = Function> {
+    (0..32)
+        .filter_map(|device| {
+            let first = Function {
+                device,
+                function: 0,
+            };
+            if first.vendor_id() == 0xffff {
+                return None;
             }
-        }
-    }
-    None
+            let multifunction = first.read_u8(HEADER_TYPE) & 0x80 != 0;
+            Some((device, if multifunction { 8 } else { 1 }))
+        })
+        .flat_map(|(device, count)| (0..count).map(move |function| Function { device, function }))
+        // Functions of a multifunction device may be absent too.
+        .filter(|function| function.vendor_id() != 0xffff)
 }

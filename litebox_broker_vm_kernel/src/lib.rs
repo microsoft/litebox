@@ -9,8 +9,9 @@
 //! buffers.
 //!
 //! Files are the devices under `/dev`, with standard streams on the
-//! runner's [`stdio::Console`], and those of an optional read-only root
-//! ([`Config::root`]). Timers are on the kernel clock. IPv4 TCP and UDP
+//! runner's [`stdio::Console`], those of an optional read-only root
+//! ([`Config::root`]), and read-only host directories ([`Config::shares`]).
+//! Timers are on the kernel clock. IPv4 TCP and UDP
 //! sockets are `litebox_broker_smoltcp`'s, which mediates their traffic:
 //! between runner processes directly, and, with the runner's [`Network`]
 //! device ([`Config::network`]), to the outside on smoltcp. Readiness (e.g., of
@@ -30,6 +31,7 @@ extern crate alloc;
 mod memory;
 mod providers;
 mod readiness;
+pub mod share;
 pub mod stdio;
 mod timers;
 
@@ -90,6 +92,8 @@ pub struct Config {
     pub events: &'static dyn Events,
     /// A tar, read-only at `/`, e.g., a Linux program's files.
     pub root: Option<&'static [u8]>,
+    /// Host directories, each mounted read-only at its path.
+    pub shares: Vec<share::Share>,
     /// The network sockets reach beyond the guest, if any.
     pub network: Option<&'static dyn Network>,
 }
@@ -112,7 +116,8 @@ impl Broker {
     ///
     /// # Panics
     ///
-    /// Without a hardware CSPRNG, or on a second call.
+    /// Without a hardware CSPRNG, on a second call, or if a share cannot be
+    /// mounted.
     pub fn new(config: Config) -> Self {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
         let timers = Arc::new(KernelTimers::new(config.platform));
@@ -126,6 +131,7 @@ impl Broker {
         Self {
             core: providers::core(
                 config.root,
+                config.shares,
                 stdio.clone(),
                 timers.clone(),
                 sockets.clone(),

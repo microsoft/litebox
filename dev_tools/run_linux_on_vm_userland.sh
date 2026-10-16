@@ -27,6 +27,9 @@
 # isolated from the host (restrict=on) but for an echo server (cat) at
 # 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
+# A fresh host directory per test, with greeting.txt, is mounted read-only at
+# /mnt/host over virtio-9p (its mount tag).
+#
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
 #   -r   build and run the release kernel and runner
@@ -121,6 +124,14 @@ network_args() {
         -device virtio-net-pci,netdev=n0,disable-legacy=on
 }
 
+# The virtio-9p share for test $1: see the header.
+share_args() {
+    mkdir "$WORK/$1.share"
+    echo "hello from the host" >"$WORK/$1.share/greeting.txt"
+    echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
+        -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
+}
+
 # The kernel checks the output; this only shows it.
 show_console() {
     if [[ ${verbose:-0} -ne 0 ]]; then
@@ -150,7 +161,7 @@ for t in "${tests[@]}"; do
         feeder=$!
     fi
     # shellcheck disable=SC2046 # these print separate arguments
-    run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args)
+    run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args) $(share_args "$t")
     if [[ -n $feeder ]]; then
         kill "$feeder" 2>/dev/null || true
         wait "$feeder" 2>/dev/null || true
