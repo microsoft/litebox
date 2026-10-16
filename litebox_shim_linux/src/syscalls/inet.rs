@@ -329,19 +329,27 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             false,
             Events::IN | Events::OUT,
             || self.timeout(socket::SocketOptionName::SendTimeout),
-            || match self.socket.connect(&address, check_progress) {
-                Ok(()) => Ok(()),
-                Err(ConnectError::InProgress) => {
-                    check_progress = true;
-                    Err(TryOpError::TryAgain)
+            || loop {
+                match self.socket.connect(&address, check_progress) {
+                    Ok(()) => break Ok(()),
+                    Err(ConnectError::InProgress) => {
+                        check_progress = true;
+                        break Err(TryOpError::TryAgain);
+                    }
+                    // A blocking call waits for an earlier attempt just as for its own.
+                    Err(ConnectError::AlreadyInProgress) => {
+                        check_progress = true;
+                        already_in_progress = true;
+                        break Err(TryOpError::TryAgain);
+                    }
+                    // The earlier attempt was abandoned without effect, so this call makes its
+                    // own, as if it had found the socket unconnected.
+                    Err(ConnectError::InvalidState) if already_in_progress => {
+                        check_progress = false;
+                        already_in_progress = false;
+                    }
+                    Err(error) => break Err(TryOpError::Other(error.into())),
                 }
-                // A blocking call waits for an earlier attempt just as for its own.
-                Err(ConnectError::AlreadyInProgress) => {
-                    check_progress = true;
-                    already_in_progress = true;
-                    Err(TryOpError::TryAgain)
-                }
-                Err(error) => Err(TryOpError::Other(error.into())),
             },
         );
         // Like Linux, a connect whose wait times out reports that it is still in progress.

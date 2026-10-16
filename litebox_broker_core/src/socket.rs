@@ -750,27 +750,33 @@ fn connect_stream(
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let unaddressable = is_unaddressable(address);
-    let (view, connected) = write_socket(object, |socket| {
-        let view = socket.view();
-        let connected = socket.listening || socket.connect_reported;
-        // Like a refused connection, this disconnects the socket. Checking the state under the
-        // same lock keeps a concurrent connect from completing in between.
-        if unaddressable && !connected && view == SocketConnectionStatus::Unconnected {
-            socket.reset_connection();
-        }
-        (view, connected)
-    })?;
-    // The socket's state is reported before any problem with the address.
-    if connected {
-        return Ok(SocketOutcome::Failed(SocketError::AlreadyConnected));
-    }
-    if view != SocketConnectionStatus::Unconnected {
-        return Ok(match check_connect_stream(object)? {
-            SocketOutcome::Completed(SocketConnectionStatus::Connecting) => {
-                SocketOutcome::Failed(SocketError::AlreadyInProgress)
+    loop {
+        let (view, connected) = write_socket(object, |socket| {
+            let view = socket.view();
+            let connected = socket.listening || socket.connect_reported;
+            // Like a refused connection, this disconnects the socket. Checking the state under
+            // the same lock keeps a concurrent connect from completing in between.
+            if unaddressable && !connected && view == SocketConnectionStatus::Unconnected {
+                socket.reset_connection();
             }
-            outcome => outcome,
-        });
+            (view, connected)
+        })?;
+        // The socket's state is reported before any problem with the address.
+        if connected {
+            return Ok(SocketOutcome::Failed(SocketError::AlreadyConnected));
+        }
+        if view == SocketConnectionStatus::Unconnected {
+            break;
+        }
+        match check_connect_stream(object)? {
+            SocketOutcome::Completed(SocketConnectionStatus::Connecting) => {
+                return Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress));
+            }
+            // The attempt seen above was abandoned without effect, so this connect starts over
+            // on the unconnected socket.
+            SocketOutcome::Completed(SocketConnectionStatus::Unconnected) => {}
+            outcome => return Ok(outcome),
+        }
     }
     if unaddressable {
         return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
