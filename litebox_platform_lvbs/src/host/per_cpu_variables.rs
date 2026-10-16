@@ -71,6 +71,11 @@ pub struct PerCpuVariables {
     pub(crate) preemption_armed: Cell<bool>,
     /// Set when a preemption timer killed user-mode code.
     pub(crate) preemption_timeout_killed_user: Cell<bool>,
+    /// This core's CR3 and stack pointer from before entering the vault, restored
+    /// if it panics there (see `vault::abort_on_panic`). `pre_vault_cr3` is nonzero only
+    /// while inside the vault; `pre_vault_rsp` is meaningful only then.
+    pub(crate) pre_vault_cr3: Cell<u64>,
+    pub(crate) pre_vault_rsp: Cell<u64>,
     /// Reference to the currently loaded page table (`None`: the base page table).
     active_page_table: UnsafeCell<Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
     stacks: PerCpuStacks,
@@ -137,6 +142,11 @@ impl PerCpuVariables {
 
     pub(crate) fn kernel_stack_top(&self) -> u64 {
         (self.stacks.base + KERNEL_STACK_OFFSET + KERNEL_STACK_SIZE - 1) as u64
+    }
+
+    /// Lowest address of this core's double-fault (IST1) stack.
+    pub(crate) fn double_fault_stack_bottom(&self) -> u64 {
+        (self.stacks.base + DOUBLE_FAULT_STACK_OFFSET) as u64
     }
 
     pub(crate) fn double_fault_stack_top(&self) -> u64 {

@@ -174,6 +174,20 @@ pub fn raise_vtl0_gp_fault() -> Result<u64, HypervCallError> {
     hvcall_set_vp_vtl0_registers(HV_REGISTER_PENDING_EVENT0, exception.as_u64())
 }
 
+/// After a VTL1 panic, return to VTL0 with a #GP so that it crash-dumps and reboots.
+pub fn panic_to_vtl0() -> ! {
+    use core::ops::Neg as _;
+    use litebox::utils::ReinterpretSignedExt as _;
+    match raise_vtl0_gp_fault() {
+        Ok(result) => crate::mshv::vtl_switch::vtl_switch(Some(result.reinterpret_as_signed())),
+        Err(err) => crate::mshv::vtl_switch::vtl_switch(Some(
+            (err as u32).reinterpret_as_signed().neg().into(),
+        )),
+    };
+    // The kernel is in an undefined state after a panic, so never resume it.
+    crate::arch::instrs::hlt_loop()
+}
+
 #[inline]
 fn validate_and_continue_vtl0_register_write(
     reg_name: u32,

@@ -1633,6 +1633,13 @@ macro_rules! CLEAR_CPU_BUFFERS_ASM {
 // Declared after the asm macros above so that it can use them.
 pub(crate) mod vault;
 
+/// Call first in the panic handler. If this core panicked in state that must not
+/// be revealed (the vault), scrubs it, prints only `location`, and returns to
+/// VTL0. Otherwise, returns.
+pub fn on_panic(location: Option<&core::panic::Location<'_>>) {
+    vault::abort_on_panic(location);
+}
+
 /// Save user context right after `syscall`-driven mode transition to the memory area
 /// pointed by the current stack pointer (`rsp`).
 ///
