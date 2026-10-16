@@ -125,7 +125,7 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 // The VTL1 kernel region at the top of the address space maps the
 // VTL1 kernel via PA + KERNEL_OFFSET, excluding boot-reserved vault frames.
 // A 1 TiB guard gap separates it from the vmap region. Vault pages sit in the gap, mapped
-// only in the vault page table (see `vault`).
+// only in the vault page tables (see `vault`).
 
 /// Offset added to any physical address to obtain the corresponding kernel
 /// virtual address in the high-canonical direct map.

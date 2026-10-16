@@ -37,11 +37,30 @@ pub const VTL1_REMAP_PDPT_PAGE: usize = VTL1_KERNEL_STACK_PAGE + 1;
 pub const VTL1_REMAP_PDE_PAGE: usize = VTL1_REMAP_PDPT_PAGE + 1;
 
 /// Vault backing pages in the unused boot gap, excluded from the normal mapping
-/// and allocator. PRK, dispatch page, then the private stack.
+/// and allocator. The PRK page, then one private stack per vault slot.
 pub const VTL1_VAULT_START_PAGE: usize = VTL1_REMAP_PDE_PAGE + 1;
 // IDKS P-384 signing needs ~26 KiB in debug and ~8.3 KiB in release.
 pub const VTL1_VAULT_STACK_PAGES: usize = if cfg!(debug_assertions) { 16 } else { 4 };
-pub const VTL1_VAULT_PAGES: usize = 2 + VTL1_VAULT_STACK_PAGES;
+/// Requested concurrent vault entries: 4, or the largest `vault-slots-*` feature.
+const VTL1_VAULT_REQUESTED_SLOTS: usize = if cfg!(feature = "vault-slots-32") {
+    32
+} else if cfg!(feature = "vault-slots-16") {
+    16
+} else if cfg!(feature = "vault-slots-8") {
+    8
+} else {
+    4
+};
+/// Slots that fit between the PRK page and the initial heap (14 with debug stacks).
+const VTL1_VAULT_MAX_SLOTS: usize =
+    (VTL1_INIT_HEAP_START_PAGE - VTL1_VAULT_START_PAGE - 1) / VTL1_VAULT_STACK_PAGES;
+/// Concurrent vault entries: the requested count, capped to what fits.
+pub const VTL1_VAULT_SLOTS: usize = if VTL1_VAULT_REQUESTED_SLOTS < VTL1_VAULT_MAX_SLOTS {
+    VTL1_VAULT_REQUESTED_SLOTS
+} else {
+    VTL1_VAULT_MAX_SLOTS
+};
+pub const VTL1_VAULT_PAGES: usize = 1 + VTL1_VAULT_SLOTS * VTL1_VAULT_STACK_PAGES;
 const _: () = assert!(VTL1_VAULT_START_PAGE + VTL1_VAULT_PAGES <= VTL1_INIT_HEAP_START_PAGE);
 
 pub(crate) fn vault_frame_range(

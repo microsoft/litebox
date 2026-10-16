@@ -43,6 +43,11 @@ devbox = []
 # Tighten the preemption timer quantum so runaway-TA preemption can be tested
 # without waiting out the production budget. Test builds only.
 preemption_test_quantum = []
+# Raise the number of concurrent vault entries (default 4). Additive: the
+# largest enabled wins. Capped to what fits in the boot gap (14 in debug builds).
+vault-slots-8 = []
+vault-slots-16 = []
+vault-slots-32 = []
 
 [lints]
 workspace = true

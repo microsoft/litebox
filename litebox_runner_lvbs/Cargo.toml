@@ -23,6 +23,9 @@ x86_64 = { version = "0.15.2", default-features = false, features = ["instructio
 [features]
 devbox = ["litebox_platform_lvbs/devbox"]
 preemption_test_quantum = ["litebox_platform_lvbs/preemption_test_quantum"]
+vault-slots-8 = ["litebox_platform_lvbs/vault-slots-8"]
+vault-slots-16 = ["litebox_platform_lvbs/vault-slots-16"]
+vault-slots-32 = ["litebox_platform_lvbs/vault-slots-32"]
 
 [lints]
 workspace = true
