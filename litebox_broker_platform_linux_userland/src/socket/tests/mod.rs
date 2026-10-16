@@ -353,7 +353,10 @@ fn wait_until_failed(
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
 ) -> SocketError {
     // Like a guest, observe the failure through readiness, which queues it.
+    // Readiness can show the transport's error before the broker has seen the
+    // failure, so check once more to queue it before `status` consumes it.
     wait_until_ready(process, publications, handle, ReadinessFlags::ERROR);
+    process.check_readiness(handle).unwrap();
     match litebox_broker_core::socket::status(process, handle)
         .unwrap()
         .status
