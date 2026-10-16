@@ -21,15 +21,17 @@ use litebox_broker_transport_windows_userland::existing_runner::{
 
 type Platform = WindowsUserland<{ litebox_common_linux::PAGE_SIZE }>;
 
-fn fork_launcher() -> litebox_shim_linux::ForkLauncher {
+fn fork_launcher() -> litebox_shim_linux::syscalls::process::ForkLauncher {
     // SAFETY: The bootstrap abandons the copied task, resets platform state, and reconnects
     // through its owned control-channel name before running the guest in a fresh shim.
-    unsafe { litebox_shim_linux::ForkLauncher::new::<Platform>(NativeForkRunner) }
+    unsafe {
+        litebox_shim_linux::syscalls::process::ForkLauncher::new::<Platform>(NativeForkRunner)
+    }
 }
 
 struct NativeForkRunner;
 
-impl litebox_shim_linux::ForkRunner<Platform> for NativeForkRunner {
+impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkRunner {
     type ControlChannel = std::ffi::OsString;
 
     fn create_control_channel(&self) -> Self::ControlChannel {
