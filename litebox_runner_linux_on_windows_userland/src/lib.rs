@@ -9,11 +9,97 @@ extern crate alloc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use litebox::platform::{ProcessHandle as _, ProcessProvider};
 use litebox_broker_local_userland as broker;
 use litebox_common_linux::program_startup::{LinuxProcessStartup, LinuxProgramStartup};
 use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
+use std::os::windows::io::AsRawHandle;
+
+use litebox_broker_transport_windows_userland::existing_runner::{
+    ExistingRunnerLaunchDescriptor, unique_control_channel,
+};
 
 type Platform = WindowsUserland<{ litebox_common_linux::vmem::PAGE_SIZE }>;
+
+fn fork_launcher() -> litebox_shim_linux::ForkLauncher {
+    // SAFETY: The bootstrap abandons the copied task, resets platform state, and reconnects
+    // through its owned control-channel name before running the guest in a fresh shim.
+    unsafe { litebox_shim_linux::ForkLauncher::new::<Platform>(NativeForkRunner) }
+}
+
+struct NativeForkRunner;
+
+impl litebox_shim_linux::ForkRunner<Platform> for NativeForkRunner {
+    type ControlChannel = std::ffi::OsString;
+
+    fn create_control_channel(&self) -> Self::ControlChannel {
+        unique_control_channel()
+    }
+
+    fn encode_launch_descriptor(
+        &self,
+        process: &<Platform as ProcessProvider>::ProcessHandle,
+        control_channel: Self::ControlChannel,
+    ) -> Result<Vec<u8>, litebox::process::ProcessError> {
+        let process_id = process.process_id().map_err(|error| {
+            litebox_util_log::error!("failed to identify native fork child: {error}");
+            litebox::process::ProcessError::ServiceFailed
+        })?;
+        ExistingRunnerLaunchDescriptor {
+            process_handle: process.as_raw_handle() as usize as u64,
+            process_id,
+            control_channel,
+        }
+        .encode()
+        .map_err(|_| litebox::process::ProcessError::OutOfMemory)
+    }
+
+    unsafe fn run_child(&self, control_channel: Self::ControlChannel) -> ! {
+        // SAFETY: NtCreateUserProcess cloned only this thread, and this path never returns through
+        // the copied parent task or its registration guard.
+        let prepared = unsafe { Platform::prepare_forked_process() };
+        let result = (|| -> Result<()> {
+            prepared.context("failed to prepare native fork child")?;
+            let platform = Platform::new();
+            Platform::set_guest_tls_mode(GuestTlsMode::Linux);
+            let (connection, startup) = broker::connect(&control_channel)?;
+            let broker::BrokerConnection {
+                local,
+                notifications,
+                process_image,
+            } = connection;
+            if process_image.is_some() {
+                anyhow::bail!("native fork child unexpectedly received a process image");
+            }
+            let (litebox, process_id, initial_thread) =
+                litebox::LiteBox::new_process_with_broker_local(platform, local);
+            let process_id =
+                i32::try_from(process_id.0).context("process ID does not fit Linux pid_t")?;
+            broker::start_notification_receiver(
+                notifications,
+                litebox.broker_notification_dispatcher(),
+                litebox.broker_failure_dispatcher(),
+            )?;
+            let shim = litebox_shim_linux::LinuxShimBuilder::new_with_litebox(
+                platform, litebox, process_id,
+            )
+            .with_fork_launcher(fork_launcher())
+            .build();
+            let startup = startup.context("native fork child has no startup data")?;
+            let LinuxProcessStartup::Fork(startup) = LinuxProcessStartup::decode(&startup.payload)
+                .context("invalid native fork child startup")?
+            else {
+                anyhow::bail!("native fork child received program startup");
+            };
+            let program = shim
+                .restore_fork_from_native_clone(*startup, initial_thread)
+                .context("failed to adopt native fork memory")?;
+            run_program(&shim, program)
+        })();
+        let _ = result;
+        std::process::exit(127)
+    }
+}
 
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///
@@ -89,6 +175,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     )?;
     let shim_builder =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
+    let shim_builder = if std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none() {
+        shim_builder.with_fork_launcher(fork_launcher())
+    } else {
+        shim_builder
+    };
 
     let shim = shim_builder.build();
     let startup = startup

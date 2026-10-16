@@ -645,8 +645,8 @@ mod tests {
     };
     use crate::process::{
         ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-        ProcessExitStatus, ProcessIdentity, ProcessInfo, StartChildProcessRequest, ThreadInfo,
-        WriteChildMemoryRequest,
+        ProcessExitStatus, ProcessIdentity, ProcessInfo, StartChildProcessRequest,
+        StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
     };
     use crate::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
     use crate::readiness_queue::{
@@ -1116,6 +1116,13 @@ mod tests {
                     buffer: largest_sequence,
                 },
             })),
+            BrokerOperation::Process(ProcessRequest::StartChildWithExistingRunner(
+                StartChildWithExistingRunnerRequest {
+                    child_process_id: process_id(u32::MAX),
+                    launch_descriptor_length: u32::MAX,
+                    data: largest_sequence,
+                },
+            )),
             BrokerOperation::Process(ProcessRequest::ExitChild(ExitChildProcessRequest {
                 child_process_id: process_id(u32::MAX),
                 exit_status: ProcessExitStatus::Exited { code: u32::MAX },
@@ -1665,6 +1672,7 @@ mod tests {
             BrokerResult::Process(ProcessResponse::DuplicateObjectsToChild),
             BrokerResult::Process(ProcessResponse::WriteChildMemory),
             BrokerResult::Process(ProcessResponse::StartChild),
+            BrokerResult::Process(ProcessResponse::StartChildWithExistingRunner),
             BrokerResult::Process(ProcessResponse::ExitChild),
             BrokerResult::Process(ProcessResponse::CancelChild),
             BrokerResult::Process(ProcessResponse::ReportExitStatus),

@@ -37,6 +37,7 @@ extern crate alloc;
 #[cfg_attr(target_arch = "x86_64", path = "x86_64.rs")]
 mod arch;
 mod page_mgmt;
+pub mod process_clone;
 
 #[cfg(target_arch = "aarch64")]
 use arch::{
@@ -126,6 +127,22 @@ impl LinuxUserland {
             boot_id: std::sync::OnceLock::new(),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Creates a fresh platform around signal handlers inherited by a native process clone.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the sole thread in a process cloned from an initialized
+    /// [`LinuxUserland`] runner. The child must not use or destroy the copied platform instance.
+    pub unsafe fn new_after_process_clone() -> &'static Self {
+        #[cfg(target_arch = "aarch64")]
+        assert_tls_block_placement();
+
+        Box::leak(Box::new(Self {
+            cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            boot_id: std::sync::OnceLock::new(),
+        }))
     }
 
     /// Configures the process-wide guest TLS mode.
@@ -238,6 +255,7 @@ impl LinuxUserland {
         positional_io_fds: &[std::os::fd::RawFd],
         shutdown_fds: &[std::os::fd::RawFd],
         scope: SeccompScope,
+        allow_native_fork_bootstrap: bool,
     ) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
@@ -338,6 +356,94 @@ impl LinuxUserland {
             ),
             (libc::SYS_close, vec![]),
         ];
+        if allow_native_fork_bootstrap {
+            let native_fork_flags = u64::from(
+                u32::try_from(libc::CLONE_PARENT | libc::CLONE_PIDFD | libc::SIGCHLD)
+                    .expect("native fork flags must be non-negative"),
+            );
+            let unix_stream_type = u64::from(
+                u32::try_from(libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+                    .expect("Unix socket flags must be non-negative"),
+            );
+            rules.extend([
+                (
+                    libc::SYS_clone,
+                    vec![
+                        SeccompRule::new(vec![
+                            SeccompCondition::new(
+                                0,
+                                SeccompCmpArgLen::Dword,
+                                SeccompCmpOp::Eq,
+                                native_fork_flags,
+                            )
+                            .unwrap(),
+                        ])
+                        .unwrap(),
+                    ],
+                ),
+                (
+                    libc::SYS_socket,
+                    vec![
+                        SeccompRule::new(vec![
+                            SeccompCondition::new(
+                                0,
+                                SeccompCmpArgLen::Dword,
+                                SeccompCmpOp::Eq,
+                                u64::from(libc::AF_UNIX as u32),
+                            )
+                            .unwrap(),
+                            SeccompCondition::new(
+                                1,
+                                SeccompCmpArgLen::Dword,
+                                SeccompCmpOp::Eq,
+                                unix_stream_type,
+                            )
+                            .unwrap(),
+                        ])
+                        .unwrap(),
+                    ],
+                ),
+                (libc::SYS_connect, vec![]),
+                (libc::SYS_recvmsg, vec![]),
+                (libc::SYS_fcntl, vec![]),
+                (
+                    libc::SYS_ioctl,
+                    vec![
+                        SeccompRule::new(vec![
+                            SeccompCondition::new(
+                                1,
+                                SeccompCmpArgLen::Dword,
+                                SeccompCmpOp::Eq,
+                                libc::FIONBIO,
+                            )
+                            .unwrap(),
+                        ])
+                        .unwrap(),
+                    ],
+                ),
+                (libc::SYS_fstat, vec![]),
+                (libc::SYS_getsockopt, vec![]),
+                (libc::SYS_setsockopt, vec![]),
+                (
+                    libc::SYS_prctl,
+                    vec![
+                        SeccompRule::new(vec![
+                            SeccompCondition::new(
+                                0,
+                                SeccompCmpArgLen::Dword,
+                                SeccompCmpOp::Eq,
+                                u64::from(libc::PR_SET_NAME as u32),
+                            )
+                            .unwrap(),
+                        ])
+                        .unwrap(),
+                    ],
+                ),
+                (libc::SYS_clock_nanosleep, vec![]),
+                (libc::SYS_close_range, vec![]),
+                (libc::SYS_pidfd_send_signal, vec![]),
+            ]);
+        }
         if !positional_io_fds.is_empty() {
             // Broker shared memory uses positional descriptor I/O.
             let fd_rules = || {
@@ -363,10 +469,10 @@ impl LinuxUserland {
             rules.push((libc::SYS_pread64, fd_rules()));
             rules.push((libc::SYS_pwrite64, fd_rules()));
         }
-        if !shutdown_fds.is_empty() {
+        if !shutdown_fds.is_empty() || allow_native_fork_bootstrap {
             // Association failure shuts down the control socket in both
             // directions to interrupt local and peer liveness waits.
-            let shutdown_rules = shutdown_fds
+            let mut shutdown_rules: Vec<_> = shutdown_fds
                 .iter()
                 .map(|fd| {
                     SeccompRule::new(vec![
@@ -393,6 +499,23 @@ impl LinuxUserland {
                     .unwrap()
                 })
                 .collect();
+            if allow_native_fork_bootstrap {
+                shutdown_rules.push(
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            u64::from(
+                                u32::try_from(libc::SHUT_RDWR)
+                                    .expect("SHUT_RDWR must be non-negative"),
+                            ),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                );
+            }
             rules.push((libc::SYS_shutdown, shutdown_rules));
         }
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
@@ -666,6 +789,24 @@ pub struct ThreadHandle(std::sync::Arc<std::sync::Mutex<Option<libc::pthread_t>>
 
 thread_local! {
     static CURRENT_THREAD: std::cell::RefCell<Option<ThreadHandle>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Discards copied guest-thread registration before a natively cloned process reboots LiteBox.
+///
+/// # Panics
+///
+/// Panics if copied platform thread state is borrowed or poisoned.
+///
+/// # Safety
+///
+/// The caller must be the sole thread in a newly cloned process and must never return through the
+/// copied guest-thread stack after calling this function.
+pub unsafe fn reset_current_thread_after_process_clone() {
+    let current = CURRENT_THREAD.take();
+    if let Some(current) = current {
+        *current.0.lock().expect("thread handle mutex poisoned") = None;
+    }
+    replace_guest_thread_marker(false);
 }
 
 impl ThreadHandle {
@@ -2005,6 +2146,7 @@ mod tests {
             &[allowed.as_raw_fd()],
             &[allowed_shutdown.as_raw_fd()],
             super::SeccompScope::AllThreads,
+            false,
         );
         barrier.wait();
 

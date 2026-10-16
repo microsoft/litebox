@@ -66,6 +66,7 @@ pub mod syscalls;
 mod wait;
 
 pub(crate) use litebox::fs::FileFd;
+pub use syscalls::process::{ForkLauncher, ForkRunner};
 
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
@@ -365,6 +366,7 @@ pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
     process_id: i32,
+    fork_launcher: ForkLauncher,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -383,7 +385,15 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform,
             litebox,
             process_id,
+            fork_launcher: ForkLauncher::default(),
         }
+    }
+
+    /// Uses `launcher` to start children created by Linux `fork`, replacing the copy-based default.
+    #[must_use]
+    pub fn with_fork_launcher(mut self, launcher: ForkLauncher) -> Self {
+        self.fork_launcher = launcher;
+        self
     }
 
     /// Returns the litebox object for the shim.
@@ -402,6 +412,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             boot_time: self.platform.now(),
             process_id: self.process_id,
             litebox,
+            fork_launcher: self.fork_launcher,
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim(global)
@@ -526,6 +537,43 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         initial_thread: litebox::thread::Thread,
         load_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
     ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
+        self.restore_fork_with_memory(startup, initial_thread, |mm, regions| {
+            Task::restore_fork_image(mm, regions, load_image)
+        })
+    }
+
+    /// Continues a process whose address space was duplicated natively by the host.
+    ///
+    /// Each recorded guest mapping must already exist at its parent address. This method adopts
+    /// ownership of those inherited mappings without allocating, copying, or changing them.
+    pub fn restore_fork_from_native_clone(
+        &self,
+        startup: litebox_common_linux::program_startup::LinuxForkStartup,
+        initial_thread: litebox::thread::Thread,
+    ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
+        self.restore_fork_with_memory(startup, initial_thread, |mm, regions| {
+            for region in regions {
+                // SAFETY: A native clone inherited this exact mapping, and the fresh memory
+                // manager has not adopted any guest ranges yet.
+                unsafe { mm.adopt_existing_pages(region.range.clone(), region.flags) }.map_err(
+                    |error| {
+                        ForkRestoreError::Memory(region.range.start, MappingError::MapError(error))
+                    },
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn restore_fork_with_memory(
+        &self,
+        startup: litebox_common_linux::program_startup::LinuxForkStartup,
+        initial_thread: litebox::thread::Thread,
+        restore_memory: impl FnOnce(
+            &MemoryManager<Platform>,
+            &[litebox_common_linux::program_startup::ForkMemoryRegion],
+        ) -> Result<(), ForkRestoreError>,
+    ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
         let litebox_common_linux::program_startup::LinuxForkStartup {
             uid,
             euid,
@@ -553,7 +601,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             return Err(ForkRestoreError::IncompatibleRunner);
         }
 
-        Task::restore_fork_image(&self.0.mm, &regions, load_image)?;
+        restore_memory(&self.0.mm, &regions)?;
         self.0
             .mm
             .restore_program_break(initial_program_break, program_break);
@@ -1520,6 +1568,8 @@ struct GlobalState<Platform: ShimPlatform> {
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.
     process_id: i32,
+    /// Host-specific process duplication backend, if enabled by the runner.
+    fork_launcher: ForkLauncher,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
 }
