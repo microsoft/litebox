@@ -63,6 +63,8 @@ pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
 
+pub use syscalls::process::{ForkLauncher, ForkRunner};
+
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
 /// This exists so that the (many) `impl` blocks throughout the shim can be written
@@ -361,20 +363,7 @@ pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
     process_id: i32,
-    fork_backend: Option<Arc<dyn ForkBackend>>,
-}
-
-/// Optional host-specific backend for starting a process duplicated by Linux `fork`.
-pub trait ForkBackend: Send + Sync {
-    /// Starts `child` from the finalized Linux startup payload.
-    ///
-    /// Native backends may resume in the cloned process, but that path must diverge and never
-    /// return through the copied shim task.
-    fn start(
-        &self,
-        child: &litebox::process::PendingChild,
-        startup: &[u8],
-    ) -> Result<(), litebox::process::ProcessError>;
+    fork_launcher: ForkLauncher,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -393,14 +382,14 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform,
             litebox,
             process_id,
-            fork_backend: None,
+            fork_launcher: ForkLauncher::default(),
         }
     }
 
-    /// Uses `backend` to start children created by Linux `fork`.
+    /// Uses `launcher` to start children created by Linux `fork`, replacing the copy-based default.
     #[must_use]
-    pub fn with_fork_backend(mut self, backend: Arc<dyn ForkBackend>) -> Self {
-        self.fork_backend = Some(backend);
+    pub fn with_fork_launcher(mut self, launcher: ForkLauncher) -> Self {
+        self.fork_launcher = launcher;
         self
     }
 
@@ -419,7 +408,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             boot_time: self.platform.now(),
             process_id: self.process_id,
             litebox,
-            fork_backend: self.fork_backend,
+            fork_launcher: self.fork_launcher,
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim(global)
@@ -1590,7 +1579,7 @@ struct GlobalState<Platform: ShimPlatform> {
     /// Process ID assigned to this shim.
     process_id: i32,
     /// Host-specific process duplication backend, if enabled by the runner.
-    fork_backend: Option<Arc<dyn ForkBackend>>,
+    fork_launcher: ForkLauncher,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, loader::patch::ElfPatchCache<Platform>>,
 }
