@@ -399,36 +399,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     where
         Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
     {
-        let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
+        let Some((file, file_offset)) = self.lookup_cow_region(source_data) else {
             return Err(CowAllocationError::UnsupportedSourceRegion);
         };
         if !file_offset.is_multiple_of(ALIGN) {
             return Err(CowAllocationError::Unaligned);
         }
 
-        let file_path_cstr =
-            std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
-        // TODO(jb): We should likely be storing pre-opened FDs, right?
-        #[cfg(target_arch = "x86_64")]
-        let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
-                file_path_cstr.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
-        };
-        #[cfg(target_arch = "aarch64")]
-        let fd = unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::openat,
-                AT_FDCWD,
-                file_path_cstr.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
-        };
-        let fd = fd.expect("file should remain unchanged on host");
+        let fd = usize::try_from(std::os::fd::AsRawFd::as_raw_fd(&*file)).unwrap();
 
         let mut flags = MapFlags::MAP_PRIVATE;
         match fixed_address_behavior {
@@ -448,8 +426,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 file_offset,
             )
         };
-
-        let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
 
         match result {
             Ok(address) => {
@@ -543,5 +519,64 @@ mod tests {
             assert_eq!(libc::munmap(new as *mut libc::c_void, 2 * PAGE), 0);
             assert_eq!(libc::close(fd), 0);
         }
+    }
+
+    /// CoW pages are mapped from the descriptor opened at registration: mapping needs no host
+    /// path open, which the seccomp filter denies, and maps the registered file even after its
+    /// path is replaced.
+    #[test]
+    fn cow_pages_map_the_registered_file_without_opening_it() {
+        const PAGE: usize = 4096;
+        let platform = LinuxUserland::new();
+        let dir = std::env::temp_dir().join(format!("litebox-cow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("backing");
+        std::fs::write(&path, [0xa5_u8; PAGE]).unwrap();
+        let data = {
+            let file = std::fs::File::open(&path).unwrap();
+            // SAFETY: A private read-only mapping of the file replaces nothing.
+            let data = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    PAGE,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    std::os::fd::AsRawFd::as_raw_fd(&file),
+                    0,
+                )
+            };
+            assert_ne!(data, libc::MAP_FAILED);
+            // SAFETY: The mapping is readable and is never unmapped.
+            let data: &'static [u8] = unsafe { core::slice::from_raw_parts(data.cast(), PAGE) };
+            data
+        };
+        platform.register_cow_region(data, &path);
+
+        // Replace the file at the path, then remove it: only the registered descriptor still
+        // refers to the original contents.
+        let replacement = dir.join("replacement");
+        std::fs::write(&replacement, [0x5a_u8; PAGE]).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+
+        LinuxUserland::enable_seccomp_filter(&[], &[], crate::SeccompScope::CallingThread);
+        // SAFETY: A hinted mapping replaces nothing.
+        let reservation = unsafe {
+            <LinuxUserland as litebox::platform::PageManagementProvider<PAGE>>::try_allocate_cow_pages(
+                platform,
+                core::iter::empty,
+                0,
+                data,
+                MemoryRegionPermissions::READ,
+                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            )
+        }
+        .unwrap();
+        let mapped: core::ops::Range<usize> = reservation.into();
+        assert_eq!(mapped.len(), PAGE);
+        // SAFETY: The CoW mapping is readable for `PAGE` bytes.
+        let pages = unsafe { core::slice::from_raw_parts(mapped.start as *const u8, PAGE) };
+        assert!(pages.iter().all(|&byte| byte == 0xa5));
     }
 }
