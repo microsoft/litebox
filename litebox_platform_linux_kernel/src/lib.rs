@@ -79,11 +79,7 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox::arch::x86_64::is_valid_user_fs_base::<
-                    Self,
-                    { litebox_common_linux::PAGE_SIZE },
-                >(val)
-                {
+                if litebox::arch::x86_64::is_valid_user_fs_base(val) {
                     unsafe { litebox::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {

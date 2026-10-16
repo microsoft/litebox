@@ -11,7 +11,6 @@ use core::time::Duration;
 use int_enum::IntEnum;
 use litebox::{
     fs::OFlags,
-    platform::PageManagementProvider,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use syscalls::Sysno;
@@ -3067,24 +3066,22 @@ pub struct PtRegs {
 
 #[cfg(target_arch = "x86_64")]
 pub mod arch {
-    use litebox::arch::x86_64::{
-        EFLAGS_AF, EFLAGS_CF, EFLAGS_DF, EFLAGS_FIXED, EFLAGS_ID, EFLAGS_IF, EFLAGS_OF, EFLAGS_PF,
-        EFLAGS_RF, EFLAGS_SF, EFLAGS_ZF,
-    };
+    use litebox::arch::x86_64::RFlags;
 
     pub const USER_CS: usize = 0x33;
     pub const USER_DS: usize = 0x2b;
-    pub const SAFE_USER_EFLAGS: usize = EFLAGS_CF
-        | EFLAGS_FIXED
-        | EFLAGS_PF
-        | EFLAGS_AF
-        | EFLAGS_ZF
-        | EFLAGS_SF
-        | EFLAGS_IF
-        | EFLAGS_DF
-        | EFLAGS_OF
-        | EFLAGS_RF
-        | EFLAGS_ID;
+    /// RFLAGS bits a guest may keep when returning to user mode.
+    pub const SAFE_USER_EFLAGS: RFlags = RFlags::CF
+        .union(RFlags::FIXED)
+        .union(RFlags::PF)
+        .union(RFlags::AF)
+        .union(RFlags::ZF)
+        .union(RFlags::SF)
+        .union(RFlags::IF)
+        .union(RFlags::DF)
+        .union(RFlags::OF)
+        .union(RFlags::RF)
+        .union(RFlags::ID);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3096,63 +3093,58 @@ pub mod arch {
 }
 
 impl PtRegs {
-    /// Returns whether `rip` and `rsp` are in the platform task address range.
-    #[cfg(target_arch = "x86_64")]
+    /// Returns whether the instruction and stack pointers are in the architecture's user range.
     #[must_use]
-    pub fn has_user_return_addresses<Platform>(&self) -> bool
-    where
-        Platform: PageManagementProvider<PAGE_SIZE>,
-    {
-        (Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&self.rip)
-            && (Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&self.rsp)
+    pub fn has_user_return_addresses(&self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        use litebox::arch::aarch64 as arch;
+        #[cfg(target_arch = "x86_64")]
+        use litebox::arch::x86_64 as arch;
+
+        #[cfg(target_arch = "x86_64")]
+        let sp = self.rsp;
+        #[cfg(target_arch = "aarch64")]
+        let sp = self.sp;
+
+        let user_range = arch::USER_ADDR_MIN..arch::USER_ADDR_END;
+        user_range.contains(&self.get_ip()) && user_range.contains(&sp)
     }
 
     /// Sanitizes CPU state and normalizes the context to the x86_64 Linux user ABI.
     ///
-    /// Returns `false` if `rip` or `rsp` are outside the platform task address range. On success,
-    /// privileged or unsafe RFLAGS bits are cleared, the fixed RFLAGS bit is set, interrupts are
-    /// enabled, and the user CS/SS selectors are restored.
+    /// Returns `false` if `rip` or `rsp` are outside the x86_64 Linux user address range.
+    /// On success, privileged or unsafe RFLAGS bits are cleared, the fixed
+    /// RFLAGS bit is set, interrupts are enabled, and the user CS/SS selectors
+    /// are set to the x86_64 Linux ABI values.
     #[cfg(target_arch = "x86_64")]
     #[must_use]
-    pub fn sanitize_for_user_return<Platform>(&mut self) -> bool
-    where
-        Platform: PageManagementProvider<PAGE_SIZE>,
-    {
-        if !self.has_user_return_addresses::<Platform>() {
+    pub fn sanitize_for_user_return(&mut self) -> bool {
+        use litebox::arch::x86_64::RFlags;
+
+        if !self.has_user_return_addresses() {
             return false;
         }
-        self.eflags = (self.eflags & arch::SAFE_USER_EFLAGS)
-            | litebox::arch::x86_64::EFLAGS_FIXED
-            | litebox::arch::x86_64::EFLAGS_IF;
+        self.eflags = ((RFlags::from_bits_retain(self.eflags as u64) & arch::SAFE_USER_EFLAGS)
+            | RFlags::FIXED
+            | RFlags::IF)
+            .bits()
+            .trunc();
         self.cs = arch::USER_CS;
         self.ss = arch::USER_DS;
         true
     }
 
-    /// Returns whether `pc` and `sp` are in the platform task address range.
-    #[cfg(target_arch = "aarch64")]
-    #[must_use]
-    pub fn has_user_return_addresses<Platform>(&self) -> bool
-    where
-        Platform: PageManagementProvider<PAGE_SIZE>,
-    {
-        (Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&self.pc)
-            && (Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&self.sp)
-    }
-
-    /// Sanitizes CPU state and normalizes the context to the AArch64 Linux user ABI.
+    /// Sanitizes CPU state and normalizes the context to the aarch64 Linux user ABI.
     ///
-    /// Returns `false` if `pc` or `sp` are outside the platform task address range. On success,
-    /// `pstate` is coerced to a clean AArch64 EL0t state: the guest keeps only condition flags and
-    /// benign mitigation bits. Every other bit is cleared, forceing EL0t, AArch64 execution state,
-    /// unmasked exceptions, and no illegal-state or single-step exceptions.
+    /// Returns `false` if `pc` or `sp` are outside the aarch64 Linux user address
+    /// range. On success, `pstate` is coerced to a clean AArch64 EL0t state: the
+    /// guest keeps only the condition flags and benign mitigation bits. Every
+    /// other bit is cleared, forcing EL0t, AArch64 execution state, unmasked
+    /// exceptions, and no illegal-state or single-step.
     #[cfg(target_arch = "aarch64")]
     #[must_use]
-    pub fn sanitize_for_user_return<Platform>(&mut self) -> bool
-    where
-        Platform: PageManagementProvider<PAGE_SIZE>,
-    {
-        if !self.has_user_return_addresses::<Platform>() {
+    pub fn sanitize_for_user_return(&mut self) -> bool {
+        if !self.has_user_return_addresses() {
             return false;
         }
         self.pstate &= arch::SAFE_USER_PSTATE;

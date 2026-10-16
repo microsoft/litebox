@@ -3,32 +3,51 @@
 
 //! Shared x86-64 CPU-state helpers.
 
-use crate::platform::PageManagementProvider;
-
 pub mod xstate;
 
-pub const EFLAGS_CF: usize = 1 << 0;
-pub const EFLAGS_FIXED: usize = 1 << 1;
-pub const EFLAGS_PF: usize = 1 << 2;
-pub const EFLAGS_AF: usize = 1 << 4;
-pub const EFLAGS_ZF: usize = 1 << 6;
-pub const EFLAGS_SF: usize = 1 << 7;
-pub const EFLAGS_IF: usize = 1 << 9;
-pub const EFLAGS_DF: usize = 1 << 10;
-pub const EFLAGS_OF: usize = 1 << 11;
-pub const EFLAGS_RF: usize = 1 << 16;
-pub const EFLAGS_ID: usize = 1 << 21;
+/// Inclusive lower bound for user instruction and stack pointers, excluding the null guard.
+pub const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
+/// Exclusive upper bound for user addresses, reserving the final low-canonical page as a guard.
+pub const USER_ADDR_END: usize = 0x0000_7fff_ffff_f000;
 
-/// Returns whether `base` is a valid user FS-segment base for `Platform`.
+bitflags::bitflags! {
+    /// x86-64 RFLAGS bits used by CPU-state helpers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RFlags: u64 {
+        /// Carry flag.
+        const CF = 1 << 0;
+        /// Reserved bit that must always be set.
+        const FIXED = 1 << 1;
+        /// Parity flag.
+        const PF = 1 << 2;
+        /// Auxiliary carry flag.
+        const AF = 1 << 4;
+        /// Zero flag.
+        const ZF = 1 << 6;
+        /// Sign flag.
+        const SF = 1 << 7;
+        /// Interrupt enable flag.
+        const IF = 1 << 9;
+        /// Direction flag.
+        const DF = 1 << 10;
+        /// Overflow flag.
+        const OF = 1 << 11;
+        /// Resume flag.
+        const RF = 1 << 16;
+        /// CPUID availability flag.
+        const ID = 1 << 21;
+    }
+}
+
+/// Returns whether `base` is a valid x86_64 Linux user FS-segment base.
 ///
-/// A user FS base is valid iff it is below the top of the platform's user
-/// address space. A non-canonical FS base can cause `wrfsbase` to raise #GP.
+/// A user FS base is valid iff it is below the top of the user address
+/// space. Especially, if a given address is non-canonical, `wrfsbase`
+/// can result in a #GP fault. This check is based on Linux kernel's
+/// `do_arch_prctl_64`.
 #[must_use]
-pub fn is_valid_user_fs_base<Platform, const ALIGN: usize>(base: usize) -> bool
-where
-    Platform: PageManagementProvider<ALIGN>,
-{
-    base < Platform::TASK_ADDR_MAX
+pub const fn is_valid_user_fs_base(base: usize) -> bool {
+    base < USER_ADDR_END
 }
 
 /// Reads the FS segment base address

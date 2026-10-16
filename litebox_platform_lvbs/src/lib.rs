@@ -480,7 +480,7 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox::arch::x86_64::is_valid_user_fs_base::<Self, PAGE_SIZE>(val) {
+                if litebox::arch::x86_64::is_valid_user_fs_base(val) {
                     unsafe { litebox::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {
@@ -1991,7 +1991,7 @@ unsafe extern "C" fn init_handler(thread_ctx: &ThreadContext) {
     let ctx = unsafe { &mut *thread_ctx.ctx };
     match thread_ctx.shim.init(ctx) {
         ContinueOperation::Resume => {
-            if ctx.sanitize_for_user_return::<crate::host::LvbsLinuxKernel>() {
+            if ctx.sanitize_for_user_return() {
                 unsafe { switch_to_user(ctx) }
             }
             litebox_util_log::warn!("terminating thread with invalid user return context");
@@ -2007,7 +2007,7 @@ unsafe extern "C" fn reenter_handler(thread_ctx: &ThreadContext) {
     let ctx = unsafe { &mut *thread_ctx.ctx };
     match thread_ctx.shim.reenter(ctx) {
         ContinueOperation::Resume => {
-            if ctx.sanitize_for_user_return::<crate::host::LvbsLinuxKernel>() {
+            if ctx.sanitize_for_user_return() {
                 unsafe { switch_to_user(ctx) }
             }
             litebox_util_log::warn!("terminating thread with invalid user return context");
@@ -2021,13 +2021,13 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &ThreadContext) {
     // is still blocked in `run_thread_arch`, so the pointer is valid. We entered
     // from user mode, so no shim call is in progress and no other reference exists.
     let ctx = unsafe { &mut *thread_ctx.ctx };
-    if !ctx.has_user_return_addresses::<crate::host::LvbsLinuxKernel>() {
+    if !ctx.has_user_return_addresses() {
         return;
     }
 
     match thread_ctx.shim.syscall(ctx) {
         ContinueOperation::Resume => {
-            if ctx.sanitize_for_user_return::<crate::host::LvbsLinuxKernel>() {
+            if ctx.sanitize_for_user_return() {
                 unsafe { switch_to_user(ctx) }
             }
             litebox_util_log::warn!("terminating thread with invalid user return context");
@@ -2119,7 +2119,7 @@ unsafe extern "C" fn exception_handler(
                 0
             } else {
                 // User-mode exception handled; resume user execution.
-                if ctx.sanitize_for_user_return::<crate::host::LvbsLinuxKernel>() {
+                if ctx.sanitize_for_user_return() {
                     unsafe { switch_to_user(ctx) }
                 } else {
                     litebox_util_log::warn!("terminating thread with invalid user return context");

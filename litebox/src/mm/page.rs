@@ -62,7 +62,7 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
     }
 
     /// Returns the non-zero start address and length of this range.
-    #[allow(
+    #[expect(
         clippy::missing_panics_doc,
         reason = "This function should not fail as the range is guaranteed to be non-empty and aligned."
     )]

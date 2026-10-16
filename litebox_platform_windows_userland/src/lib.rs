@@ -1732,7 +1732,7 @@ impl<const ALIGN: usize> litebox::platform::ArchSpecificProvider for WindowsUser
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase => {
-                if litebox::arch::x86_64::is_valid_user_fs_base::<Self, ALIGN>(val) {
+                if litebox::arch::x86_64::is_valid_user_fs_base(val) {
                     // Use WindowsUserland's per-thread FS base management system
                     Self::set_thread_fs_base(val);
                     Ok(())
