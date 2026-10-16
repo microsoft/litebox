@@ -9,7 +9,12 @@ pub(crate) fn shim_builder() -> crate::OpteeShimBuilder<Platform> {
     static SESSION_MANAGER: once_cell::race::OnceBox<crate::session::SessionManager<Platform>> =
         once_cell::race::OnceBox::new();
 
-    let platform = *PLATFORM.call_once(Platform::new);
+    let platform = *PLATFORM.call_once(|| {
+        let platform = Platform::new();
+        // `compute_with_derived_key` (used by IDKS) needs the boot ID.
+        platform.initialize_boot_specific_kdf_support();
+        platform
+    });
     let session_manager = SESSION_MANAGER
         .get_or_init(|| alloc::boxed::Box::new(crate::session::SessionManager::new()));
 

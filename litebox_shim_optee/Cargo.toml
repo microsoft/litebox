@@ -24,6 +24,7 @@ thiserror = { version = "2.0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 p384 = { version = "0.13.1", default-features = false, features = ["arithmetic", "ecdsa"] }
+ecdsa = { version = "0.16.9", default-features = false, features = ["signing"] }
 
 [features]
 idks-production = []

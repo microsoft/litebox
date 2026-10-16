@@ -405,12 +405,48 @@ pub trait DerivedKeyProvider {
     ///
     /// Platforms may run `shim_kdf` in a restricted context (e.g., a separate address space with
     /// interrupts disabled), so it must be a pure computation over its arguments: no locks, no
-    /// allocation, and no access to other memory.
+    /// allocation, no access to other memory, and no panics (which may be fatal there). Since the
+    /// platform cannot hide its timing, it should also avoid secret-dependent branches and memory
+    /// accesses.
     fn derive_key<E>(
         &self,
         shim_kdf: Option<fn(&[u8], KDFParams) -> Result<(), E>>,
         params: KDFParams,
     ) -> Result<(), DerivedKeyError<E>>;
+
+    /// Derive a `KEY_LEN`-byte key from the `root` key and `key_context` with `shim_kdf`, then
+    /// run `op(key, params)` and place its result into `params.output`.
+    ///
+    /// A platform may support only some root keys, returning
+    /// [`DerivedKeyError::UnsupportedRebootPersistentKey`] or
+    /// [`DerivedKeyError::UnsupportedPerBootKey`] for the others.
+    ///
+    /// The derived key is never returned: `op` receives only the output of `shim_kdf` as its
+    /// key. Only `params.output` and error values (`E`) leave the platform, so neither may carry
+    /// key material. Errors from both `shim_kdf` and `op` are returned as
+    /// [`DerivedKeyError::ShimKDFError`].
+    ///
+    /// Callers share the root key, so `key_context` should start with a label unique to its use.
+    ///
+    /// `shim_kdf` and `op` have the same restrictions as `shim_kdf` in [`Self::derive_key`].
+    fn compute_with_derived_key<E, const KEY_LEN: usize>(
+        &self,
+        root: RootKey,
+        shim_kdf: fn(&[u8], KDFParams) -> Result<(), E>,
+        key_context: &[u8],
+        op: fn(&[u8], ComputeParams) -> Result<(), E>,
+        params: ComputeParams,
+    ) -> Result<(), DerivedKeyError<E>>;
+}
+
+/// Root key from which [`DerivedKeyProvider::compute_with_derived_key`] derives keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootKey {
+    /// A reboot-persistent device-specific secret: derived keys survive reboots.
+    Persistent,
+    /// A secret that is new every boot and reveals nothing about the device-specific secret:
+    /// derived keys change every boot, and the same context yields the same key within a boot.
+    PerBoot,
 }
 
 /// Input and output parameters to a KDF other than the secret itself.
@@ -423,6 +459,14 @@ pub struct KDFParams<'a> {
     pub output: &'a mut [u8],
 }
 
+/// Input and output parameters to a computation other than its key.
+pub struct ComputeParams<'a> {
+    /// The input data to the computation.
+    pub input: &'a [u8],
+    /// The output of the computation, of the exact length of the buffer provided.
+    pub output: &'a mut [u8],
+}
+
 #[derive(Debug, Error)]
 /// Errors that might be returned upon attempting to derive a key.
 pub enum DerivedKeyError<ShimKDFError> {
@@ -432,4 +476,8 @@ pub enum DerivedKeyError<ShimKDFError> {
     ShimKDFError(#[from] ShimKDFError),
     #[error("this platform does not support reboot-persistent keys")]
     UnsupportedRebootPersistentKey,
+    #[error("this platform does not support per-boot keys")]
+    UnsupportedPerBootKey,
+    #[error("the requested key is not available (yet)")]
+    KeyUnavailable,
 }

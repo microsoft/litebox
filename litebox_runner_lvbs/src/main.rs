@@ -242,8 +242,8 @@ unsafe fn apply_relocations() {
 /// | 15              | `VTL1_REMAP_PDE_PAGE`   | PDE pointing to PTE pages 5–12        |
 /// | 16              | `VTL1_VAULT_START_PAGE` | Vault PRK                             |
 /// | 17              |                         | Vault dispatch                        |
-/// | 18–25 (debug)   |                         | Vault stack                           |
-/// | 18–19 (release) |                         | Vault stack                           |
+/// | 18–33 (debug)   |                         | Vault stack                           |
+/// | 18–21 (release) |                         | Vault stack                           |
 ///
 /// Vault pages are cleared during boot and excluded from the Phase 2 mapping
 /// and allocator; only the vault page table maps them.

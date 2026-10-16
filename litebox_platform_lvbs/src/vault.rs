@@ -1,15 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Vault address space for Platform Root Key (PRK) based key derivation.
+//! Vault address space for Platform Root Key (PRK) computations
+//! (`DerivedKeyProvider`): deriving keys from the PRK, and running computations
+//! with such keys without exposing the PRK to them.
 //!
-//! Threat model: VTL1 userspace using speculative side channels. VTL0
-//! is out of scope as it provides the PRK.
+//! Threat model: speculative side channels from VTL1 userspace and post-boot
+//! VTL0. VTL0 is trusted only in early boot, when it supplies the PRK and then
+//! wipes its copy; afterwards it is an untrusted ring-0 attacker without the
+//! PRK. The controls below do not depend on the attacker. Isolating VTL1 memory
+//! from VTL0 is Hyper-V's job.
 //!
 //! - Boot reserves the PRK, dispatch and stack pages outside the normal kernel
 //!   mapping and allocator. Only the vault page table maps them.
-//! - The KDF runs on the vault stack, which is wiped on exit. Caller-saved
-//!   GPRs and VTL1 extended state (x87/SSE) are overwritten too.
+//! - Shim callbacks (KDFs and computations) run on the vault stack, which is
+//!   wiped on exit, derived keys included. Caller-saved GPRs and VTL1 extended
+//!   state (x87/SSE) are overwritten too.
 //! - Entry: IBPB, STIBP, SSBD, RSB stuffing; vault dispatch uses retpolines.
 //!   Exit: `VERW`, L1D flush (best-effort eviction if unavailable), IBPB.
 //!   Retpolines do not replace SRSO microcode; eviction is not a guaranteed flush.
@@ -17,17 +23,24 @@
 //!   Other cores keep running.
 //!
 //! Retpolines protect explicit vault dispatches, not indirect branches inside
-//! the KDF. Those rely on available IBPB and eIBRS/AutoIBRS controls.
+//! the shim callbacks. Those rely on available IBPB and eIBRS/AutoIBRS controls.
 //!
-//! SMT: the sibling hyperthread may run userspace of this VM. eIBRS/AutoIBRS
-//! plus STIBP block branch injection from it; concurrent data sampling is
-//! an accepted risk limited to older CPUs.
+//! SMT: the sibling hyperthread may run userspace or VTL0 of this VM. STIBP
+//! blocks branch injection from it (eIBRS/AutoIBRS does not separate VTL0 and
+//! VTL1 kernel mode); concurrent data sampling is an accepted risk limited to
+//! older CPUs.
+//!
+//! Other cores share the last-level cache, which the vault does not flush; shim
+//! callbacks should avoid secret-dependent branches and memory accesses.
 //!
 //! The vault shares only the VTL1 kernel region (`>= KERNEL_OFFSET`: image,
 //! heap, stacks); see [`is_accessible`].
 //!
 //! A fault or panic inside the vault is fatal (VTL0 crash dump and reboot),
 //! so the skipped exit path cannot leak to userspace.
+//!
+//! TODO: The panic path returns to VTL0 for the crash dump without scrubbing
+//! (no stack wipe, `VERW`, L1D flush or IBPB).
 
 use crate::arch::spec_ctrl::VaultControls;
 use crate::host::per_cpu_variables::PerCpuVariablesAsm;
@@ -37,6 +50,7 @@ use crate::mshv::vtl1_mem_layout::{
 };
 use crate::{PageTableManager, mm};
 use alloc::boxed::Box;
+use litebox::platform::{ComputeParams, KDFParams};
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmem::{PAGE_SIZE, PageRange, VmFlags};
 use litebox_common_lvbs::PRK_LEN;
@@ -58,7 +72,7 @@ const _: () = assert!(
 
 const VAULT_PRK_VA: u64 = VAULT_BASE;
 
-const VAULT_STACK_PAGES: usize = VTL1_VAULT_STACK_PAGES; // 32 KiB debug, 8 KiB release
+const VAULT_STACK_PAGES: usize = VTL1_VAULT_STACK_PAGES; // 64 KiB debug, 16 KiB release
 const VAULT_STACK_SIZE: usize = VAULT_STACK_PAGES * PAGE_SIZE;
 /// Unmapped guard pages surround the stack.
 const VAULT_STACK_BOTTOM: u64 = VAULT_BASE + 2 * PAGE_SIZE as u64;
@@ -77,10 +91,6 @@ pub(crate) enum InstallError<E> {
 }
 
 pub(crate) struct NotInstalled;
-
-pub(crate) fn is_installed() -> bool {
-    VAULT.is_completed()
-}
 
 /// Returns whether `buf` is mapped inside the vault, i.e., lies in the VTL1
 /// kernel region (`>= KERNEL_OFFSET`) rather than user, vmap, or the
@@ -245,6 +255,124 @@ pub(crate) fn with_prk<C>(ctx: &mut C, f: fn(&[u8; PRK_LEN], &mut C)) -> Result<
     Ok(())
 }
 
+/// Input to a pipeline stage, copied to the kernel heap if the vault cannot
+/// reach it.
+pub(crate) enum Input<'a> {
+    Borrowed(&'a [u8]),
+    Copied(Zeroizing<alloc::vec::Vec<u8>>),
+}
+
+impl<'a> Input<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        if is_accessible(buf) {
+            Self::Borrowed(buf)
+        } else {
+            Self::Copied(Zeroizing::new(buf.to_vec()))
+        }
+    }
+
+    fn get(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(buf) => buf,
+            Self::Copied(buf) => buf,
+        }
+    }
+}
+
+/// A stage of a vault pipeline: maps `key` to `output`.
+pub(crate) trait Stage<E> {
+    /// # Safety
+    ///
+    /// Must run inside the serialized vault window.
+    unsafe fn run(&self, key: &[u8], output: &mut [u8]) -> Result<(), E>;
+}
+
+/// Shim KDF stage: `f(key, KDFParams { context, output })`.
+pub(crate) struct Kdf<'a, E> {
+    pub f: fn(&[u8], KDFParams) -> Result<(), E>,
+    pub context: Input<'a>,
+}
+
+impl<E> Stage<E> for Kdf<'_, E> {
+    unsafe fn run(&self, key: &[u8], output: &mut [u8]) -> Result<(), E> {
+        let params = KDFParams {
+            context: self.context.get(),
+            output,
+        };
+        // Safety: the caller is inside the vault window, and `DerivedKeyProvider`
+        // requires `f` to obey the vault restrictions.
+        unsafe { invoke(self.f, key, params) }
+    }
+}
+
+/// Shim computation stage: `f(key, ComputeParams { input, output })`.
+pub(crate) struct Compute<'a, E> {
+    pub f: fn(&[u8], ComputeParams) -> Result<(), E>,
+    pub input: Input<'a>,
+}
+
+impl<E> Stage<E> for Compute<'_, E> {
+    unsafe fn run(&self, key: &[u8], output: &mut [u8]) -> Result<(), E> {
+        let params = ComputeParams {
+            input: self.input.get(),
+            output,
+        };
+        // Safety: the caller is inside the vault window, and `DerivedKeyProvider`
+        // requires `f` to obey the vault restrictions.
+        unsafe { invoke(self.f, key, params) }
+    }
+}
+
+/// `A` then `B`: `A`'s `N`-byte output, kept on the (wiped) vault stack, is
+/// `B`'s key.
+pub(crate) struct Then<A, B, const N: usize>(pub A, pub B);
+
+impl<E, A: Stage<E>, B: Stage<E>, const N: usize> Stage<E> for Then<A, B, N> {
+    unsafe fn run(&self, key: &[u8], output: &mut [u8]) -> Result<(), E> {
+        let mut mid = Zeroizing::new([0u8; N]);
+        // Safety: the caller is inside the vault window.
+        unsafe {
+            self.0.run(key, &mut *mid)?;
+            self.1.run(&*mid, output)
+        }
+    }
+}
+
+/// Run `stage` inside the vault with the PRK as its key, writing `output`
+/// (copied out on success if the vault cannot reach it).
+pub(crate) fn run<E, S: Stage<E>>(
+    stage: &S,
+    output: &mut [u8],
+) -> Result<Result<(), E>, NotInstalled> {
+    struct Ctx<'a, S, E> {
+        stage: &'a S,
+        output: &'a mut [u8],
+        result: Option<Result<(), E>>,
+    }
+
+    let mut output_copy =
+        (!is_accessible(output)).then(|| Zeroizing::new(alloc::vec![0u8; output.len()]));
+    let result = {
+        let mut ctx = Ctx {
+            stage,
+            output: match output_copy.as_mut() {
+                Some(copy) => copy.as_mut_slice(),
+                None => &mut *output,
+            },
+            result: None,
+        };
+        with_prk(&mut ctx, |prk, ctx| {
+            // Safety: inside the serialized vault window.
+            ctx.result = Some(unsafe { ctx.stage.run(prk, ctx.output) });
+        })?;
+        ctx.result.expect("vault did not run the stage")
+    };
+    if let (Ok(()), Some(copy)) = (&result, &output_copy) {
+        output.copy_from_slice(copy);
+    }
+    Ok(result)
+}
+
 impl Vault {
     /// `thunk` must obey the vault restrictions and accept `arg` plus the PRK address.
     unsafe fn run(&self, thunk: unsafe extern "C" fn(*mut u8, *const u8), arg: *mut u8) {
@@ -283,27 +411,23 @@ fn evict_l1d(buffer: Option<&[u8]>) {
     }
 }
 
-/// Invoke the shim KDF through a retpoline.
+/// Invoke a shim callback (KDF or computation) through a retpoline.
 ///
 /// # Safety
 ///
-/// Must run inside the serialized vault window; `kdf` must obey its restrictions.
-pub(crate) unsafe fn invoke_kdf<E>(
-    kdf: fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>,
-    prk: &[u8],
-    params: litebox::platform::KDFParams,
-) -> Result<(), E> {
-    union Dispatch<E> {
+/// Must run inside the serialized vault window; `f` must obey its restrictions.
+unsafe fn invoke<E, P>(f: fn(&[u8], P) -> Result<(), E>, key: &[u8], params: P) -> Result<(), E> {
+    union Dispatch<E, P> {
         entry: *const (),
-        call: unsafe fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>,
+        call: unsafe fn(&[u8], P) -> Result<(), E>,
     }
     // Safety: caller holds the vault lock and has loaded its page table.
     unsafe {
-        set_dispatch(kdf as *const () as usize);
+        set_dispatch(f as *const () as usize);
         (Dispatch {
             entry: dispatch_retpoline as *const (),
         }
-        .call)(prk, params)
+        .call)(key, params)
     }
 }
 
@@ -492,7 +616,7 @@ mod tests {
         // access only their arguments and need no vault CR3.
         unsafe {
             assert_eq!(
-                invoke_kdf(
+                invoke(
                     small,
                     &prk,
                     KDFParams {
@@ -503,7 +627,7 @@ mod tests {
                 Err(0x1234_5678)
             );
             assert_eq!(
-                invoke_kdf(
+                invoke(
                     large,
                     &prk,
                     KDFParams {

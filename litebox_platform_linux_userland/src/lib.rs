@@ -1842,6 +1842,32 @@ impl litebox::platform::DerivedKeyProvider for LinuxUserland {
             }
         }
     }
+
+    fn compute_with_derived_key<E, const KEY_LEN: usize>(
+        &self,
+        root: litebox::platform::RootKey,
+        shim_kdf: fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>,
+        key_context: &[u8],
+        op: fn(&[u8], litebox::platform::ComputeParams) -> Result<(), E>,
+        params: litebox::platform::ComputeParams,
+    ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
+        // Only per-boot keys: the boot ID changes on every reboot.
+        if root != litebox::platform::RootKey::PerBoot {
+            return Err(litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey);
+        }
+        let Some(boot_id) = self.boot_id.get() else {
+            return Err(litebox::platform::DerivedKeyError::UnsupportedPerBootKey);
+        };
+        let mut key = [0u8; KEY_LEN];
+        shim_kdf(
+            boot_id,
+            litebox::platform::KDFParams {
+                context: key_context,
+                output: &mut key,
+            },
+        )?;
+        Ok(op(&key, params)?)
+    }
 }
 
 /// Dummy `VmapManager`.

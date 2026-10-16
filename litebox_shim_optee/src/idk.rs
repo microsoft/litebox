@@ -6,28 +6,33 @@ use crate::{
     NormalWorldMutPtr, TA_DIGEST_LEN, TaDigest, Task, UserConstPtr, UserMutPtr, syscalls::Cleanup,
 };
 use alloc::vec::Vec;
+use ecdsa::hazmat::{SignPrimitive as _, bits2field};
+use hmac::{Hmac, Mac};
 use litebox::{
-    LiteBox,
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{
+        ComputeParams, DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _,
+        RootKey,
+    },
     utils::TruncateExt,
 };
 use litebox_common_linux::{errno::Errno, vmem::PAGE_SIZE};
 use litebox_common_optee::{TaFlags, TeeParamType, TeeResult, TeeUuid, UteeParams};
 use num_enum::TryFromPrimitive;
 use p384::{
-    NonZeroScalar,
-    ecdsa::{Signature, SigningKey, signature::Signer},
-    elliptic_curve::sec1::ToEncodedPoint,
+    NistP384, NonZeroScalar, PublicKey, ecdsa::Signature, elliptic_curve::sec1::ToEncodedPoint,
 };
+use sha2::{Digest, Sha384};
 use spin::Once;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
+const IDENTITY_SIGNING_KEY_LABEL: &[u8] = b"litebox-optee-idks-v1";
 const IDENTITY_SIGNING_PRIVATE_KEY_LEN: usize = 48;
 const IDENTITY_SIGNING_PUBLIC_KEY_LEN: usize = 97;
+const SHA384_DIGEST_LEN: usize = 48;
 const KEY_ALGORITHM_MASK: u64 = 0xff00;
 const KEY_VARIANT_MASK: u64 = 0xff;
 const KEY_ALGORITHM_VALUE_MASK: u64 = KEY_ALGORITHM_MASK | KEY_VARIANT_MASK;
-const MAX_KEYGEN_ATTEMPT: usize = 256;
+const MAX_KEYGEN_ATTEMPT: u32 = 256;
 const IDKS_ENDORSEMENT_DATA_MAX_SIZE: usize = 1024 * 1024;
 const IDKS_ENDORSEMENT_MAGIC: &[u8; 4] = b"IDKS";
 const IDKS_ENDORSEMENT_VERSION: u32 = 1;
@@ -167,9 +172,7 @@ impl IdksPta {
             placement,
         )
         .ok_or(TeeResult::BadParameters)?;
-        let key_pair = get_identity_signing_key_pair(task.global.platform)
-            .map_err(|_| TeeResult::GenericError)?;
-        let signature = endorse_data_with(&endorsement, &key_pair.private_key)
+        let signature = endorse_data_with(task.global.platform, &endorsement)
             .map_err(|_| TeeResult::GenericError)?;
         endorsement.extend_from_slice(&signature);
         UserMutPtr::<Platform, u8>::from_usize(
@@ -270,23 +273,50 @@ fn build_endorsement_data(
     Some(endorsement)
 }
 
-fn endorse_data_with(
+fn endorse_data_with<Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
     endorsement_data: &[u8],
-    private_key: &[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN],
 ) -> Result<[u8; IDKS_ENDORSEMENT_SIGNATURE_LEN], Errno> {
-    let signing_key = SigningKey::from_slice(private_key).map_err(|_| Errno::EINVAL)?;
-    let signature: Signature = signing_key.sign(endorsement_data);
-    let mut signature_bytes = [0u8; IDKS_ENDORSEMENT_SIGNATURE_LEN];
-    signature_bytes.copy_from_slice(&signature.to_bytes());
-    Ok(signature_bytes)
+    // Hash here to keep the platform callback short.
+    let digest: [u8; SHA384_DIGEST_LEN] = Sha384::digest(endorsement_data).into();
+    let mut signature = [0u8; IDKS_ENDORSEMENT_SIGNATURE_LEN];
+    compute_with_identity_signing_key(platform, identity_signing_op, &digest, &mut signature)?;
+    Ok(signature)
 }
 
-static IDENTITY_SIGNING_KEY_PAIR: Once<IdentitySigningKeyPair> = Once::new();
-
-struct IdentitySigningKeyPair {
-    private_key: Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]>,
-    public_key: [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN],
+// IDK_S exists only inside `compute_with_derived_key`: each use derives it from
+// the platform's per-boot root key (`RootKey::PerBoot`) with
+// `identity_signing_key_kdf` and runs `op` there. The per-boot root key makes
+// IDK_S new on every boot.
+fn compute_with_identity_signing_key<Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
+    op: fn(&[u8], ComputeParams) -> Result<(), Errno>,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<(), Errno> {
+    platform
+        .compute_with_derived_key::<_, IDENTITY_SIGNING_PRIVATE_KEY_LEN>(
+            RootKey::PerBoot,
+            identity_signing_key_kdf,
+            IDENTITY_SIGNING_KEY_LABEL,
+            op,
+            ComputeParams { input, output },
+        )
+        .map_err(derived_key_errno)
 }
+
+fn derived_key_errno(err: DerivedKeyError<Errno>) -> Errno {
+    match err {
+        DerivedKeyError::ShimKDFError(err) => err,
+        DerivedKeyError::ShimKDFRequired
+        | DerivedKeyError::UnsupportedRebootPersistentKey
+        | DerivedKeyError::UnsupportedPerBootKey => Errno::EOPNOTSUPP,
+        DerivedKeyError::KeyUnavailable => Errno::ENOKEY,
+    }
+}
+
+/// Cached IDK_S public key; IDK_S itself is re-derived on every use.
+static IDENTITY_SIGNING_PUBLIC_KEY: Once<[u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN]> = Once::new();
 
 #[derive(TryFromPrimitive)]
 #[repr(u8)]
@@ -305,7 +335,7 @@ enum EcdsaCurve {
 }
 
 pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
-    platform: &'static Platform,
+    platform: &Platform,
     public_key_pa: u64,
     key_alg: u64,
 ) -> i64 {
@@ -315,12 +345,12 @@ pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
     }
 }
 
-/// This function generates an identity signing key pair (IDK_S) and returns the public
-/// portion of it.
+/// This function returns the public portion of the identity signing key (IDK_S),
+/// deriving it on first use.
 ///
 /// - `public_key_pa`: VTL0/Normal-world physical address where an uncompressed SEC1 P-384
-///   public key will be written. The corresponding private key is generated by the platform
-///   CRNG, retained for the boot cycle, and never leaves VTL1/secure-world.
+///   public key will be written. The private key is derived from the platform's per-boot root
+///   key inside `compute_with_derived_key` and never leaves the platform.
 /// - `key_alg`: Key algorithm namespace and variant. Only ECDSA P-384 is supported.
 ///
 /// We intentially uses the raw format. Any DER/SPKI wrapping or TCG event‑log construction
@@ -330,7 +360,7 @@ pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
 /// address (in a single or contiguous physical memory page(s)) whose length is equal to
 /// or greater than `IDENTITY_SIGNING_PUBLIC_KEY_LEN`.
 fn generate_identity_signing_key_inner<Platform: crate::OpteeShimPlatform>(
-    platform: &'static Platform,
+    platform: &Platform,
     public_key_pa: u64,
     key_alg: u64,
 ) -> Result<i64, Errno> {
@@ -343,9 +373,9 @@ fn generate_identity_signing_key_inner<Platform: crate::OpteeShimPlatform>(
         )
         .map_err(|_| Errno::EINVAL)?;
 
-    let key_pair = get_identity_signing_key_pair(platform)?;
+    let public_key = get_identity_signing_public_key(platform)?;
     pubkey_ptr
-        .write_at_offset(0, key_pair.public_key)
+        .write_at_offset(0, *public_key)
         .map_err(|_| Errno::EFAULT)?;
     Ok(0)
 }
@@ -373,54 +403,82 @@ fn validate_key_algorithm(key_alg: u64) -> Result<(), Errno> {
     }
 }
 
-fn get_identity_signing_key_pair<Platform: crate::OpteeShimPlatform>(
-    platform: &'static Platform,
-) -> Result<&'static IdentitySigningKeyPair, Errno> {
-    IDENTITY_SIGNING_KEY_PAIR.try_call_once(|| {
-        let private_key = generate_identity_signing_private_key(platform)?;
-        let public_key = identity_signing_public_key_from_private_key(&private_key)?;
-        Ok(IdentitySigningKeyPair {
-            private_key,
-            public_key,
-        })
+fn get_identity_signing_public_key<Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
+) -> Result<&'static [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], Errno> {
+    IDENTITY_SIGNING_PUBLIC_KEY.try_call_once(|| {
+        let mut public_key = [0u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN];
+        compute_with_identity_signing_key(
+            platform,
+            identity_signing_public_key_op,
+            &[],
+            &mut public_key,
+        )?;
+        Ok(public_key)
     })
 }
 
-fn generate_identity_signing_private_key<Platform: crate::OpteeShimPlatform>(
-    platform: &'static Platform,
-) -> Result<Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]>, Errno> {
-    let mut private_key_bytes = Zeroizing::new([0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]);
+// The callbacks below follow the `DerivedKeyProvider::derive_key` callback rules.
 
-    for _ in 0..MAX_KEYGEN_ATTEMPT {
-        LiteBox::new(platform)
-            .fill_random(&mut private_key_bytes[..])
-            .map_err(|_| Errno::EIO)?;
-        if is_valid_identity_signing_private_key(&private_key_bytes) {
-            return Ok(private_key_bytes);
+/// KDF for IDK_S. `context`: label. `output`: the first valid P-384 scalar of
+/// HMAC-SHA384(root_key, label || ctr).
+fn identity_signing_key_kdf(root_key: &[u8], params: KDFParams<'_>) -> Result<(), Errno> {
+    if params.output.len() != IDENTITY_SIGNING_PRIVATE_KEY_LEN {
+        return Err(Errno::EINVAL);
+    }
+    for ctr in 0..MAX_KEYGEN_ATTEMPT {
+        let mut bytes = Hmac::<Sha384>::new_from_slice(root_key)
+            .map_err(|_| Errno::EINVAL)?
+            .chain_update(params.context)
+            .chain_update(ctr.to_le_bytes())
+            .finalize()
+            .into_bytes();
+        // Rejects zero and scalars not below the curve order.
+        let valid = NonZeroScalar::try_from(&bytes[..]).is_ok();
+        if valid {
+            params.output.copy_from_slice(&bytes);
+        }
+        bytes.zeroize();
+        if valid {
+            return Ok(());
         }
     }
-
     Err(Errno::EIO)
 }
 
-#[inline]
-fn is_valid_identity_signing_private_key(
-    private_key: &[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN],
-) -> bool {
-    // P-384 private keys must be valid non-zero scalars smaller than the curve order.
-    NonZeroScalar::try_from(&private_key[..]).is_ok()
+/// `key`: IDK_S. `output`: uncompressed SEC1 public key.
+fn identity_signing_public_key_op(key: &[u8], params: ComputeParams<'_>) -> Result<(), Errno> {
+    if params.output.len() != IDENTITY_SIGNING_PUBLIC_KEY_LEN {
+        return Err(Errno::EINVAL);
+    }
+    let secret = identity_signing_key(key)?;
+    params.output.copy_from_slice(
+        PublicKey::from_secret_scalar(&secret)
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+    Ok(())
 }
 
-fn identity_signing_public_key_from_private_key(
-    private_key: &[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN],
-) -> Result<[u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], Errno> {
-    let private_key_scalar =
-        Zeroizing::new(NonZeroScalar::try_from(&private_key[..]).map_err(|_| Errno::EINVAL)?);
-    let public_key = p384::PublicKey::from_secret_scalar(&private_key_scalar);
-    let encoded_point = public_key.to_encoded_point(false);
-    let mut public_key_bytes = [0u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN];
-    public_key_bytes.copy_from_slice(encoded_point.as_bytes());
-    Ok(public_key_bytes)
+/// `key`: IDK_S. `input`: SHA-384 digest. `output`: raw big-endian `r || s`.
+fn identity_signing_op(key: &[u8], params: ComputeParams<'_>) -> Result<(), Errno> {
+    if params.output.len() != IDKS_ENDORSEMENT_SIGNATURE_LEN {
+        return Err(Errno::EINVAL);
+    }
+    // Same signature as `SigningKey::sign_prehash`, but signing with the scalar directly
+    // skips the public-key computation that constructing a `SigningKey` performs.
+    let z = bits2field::<NistP384>(params.input).map_err(|_| Errno::EINVAL)?;
+    let (signature, _): (Signature, _) = identity_signing_key(key)?
+        .try_sign_prehashed_rfc6979::<Sha384>(&z, &[])
+        .map_err(|_| Errno::EINVAL)?;
+    params.output.copy_from_slice(&signature.to_bytes());
+    Ok(())
+}
+
+fn identity_signing_key(key: &[u8]) -> Result<Zeroizing<NonZeroScalar>, Errno> {
+    NonZeroScalar::try_from(key)
+        .map(Zeroizing::new)
+        .map_err(|_| Errno::EINVAL)
 }
 
 #[cfg(test)]
@@ -491,17 +549,6 @@ mod tests {
     #[test]
     fn pta_endorsement_uses_global_certificate_and_reports_output_size() {
         use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
-
-        // Use a fixed valid scalar: key generation requires the broker-backed RNG.
-        IDENTITY_SIGNING_KEY_PAIR.call_once(|| {
-            let mut private_key = Zeroizing::new([0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]);
-            private_key[IDENTITY_SIGNING_PRIVATE_KEY_LEN - 1] = 1;
-            let public_key = identity_signing_public_key_from_private_key(&private_key).unwrap();
-            IdentitySigningKeyPair {
-                private_key,
-                public_key,
-            }
-        });
 
         for (cert, ta_dynamic) in [
             (TEST_CERT, false),
@@ -593,9 +640,8 @@ mod tests {
                     assert_eq!(params.get_values(2).unwrap(), None);
                     assert_eq!(&output[..expected.len()], expected);
                     assert_eq!(output[required_size], 0xcc);
-                    let key_pair = get_identity_signing_key_pair(task.global.platform).unwrap();
-                    let verifying_key =
-                        VerifyingKey::from_sec1_bytes(&key_pair.public_key).unwrap();
+                    let public_key = get_identity_signing_public_key(task.global.platform).unwrap();
+                    let verifying_key = VerifyingKey::from_sec1_bytes(public_key).unwrap();
                     let signature =
                         Signature::from_slice(&output[expected.len()..required_size]).unwrap();
                     verifying_key.verify(&expected, &signature).unwrap();
@@ -648,11 +694,40 @@ mod tests {
     }
 
     #[test]
-    fn endorsement_signature_covers_input_report_and_signature_params() {
-        use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    fn identity_signing_key_depends_on_root_and_context() {
+        let derive = |root: &[u8], context: &[u8]| {
+            let mut key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
+            identity_signing_key_kdf(
+                root,
+                KDFParams {
+                    context,
+                    output: &mut key,
+                },
+            )
+            .unwrap();
+            key
+        };
+        let key = derive(&[0x42; 32], IDENTITY_SIGNING_KEY_LABEL);
+        assert_ne!(key, derive(&[0x43; 32], IDENTITY_SIGNING_KEY_LABEL));
+        assert_ne!(key, derive(&[0x42; 32], b"other-label"));
+    }
 
-        let mut private_key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
-        private_key[IDENTITY_SIGNING_PRIVATE_KEY_LEN - 1] = 1;
+    #[test]
+    fn endorsement_signature_covers_input_report_and_signature_params() {
+        use p384::ecdsa::{
+            Signature, SigningKey, VerifyingKey,
+            signature::{Verifier, hazmat::PrehashSigner},
+        };
+
+        let mut key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
+        identity_signing_key_kdf(
+            &[0x42u8; 32],
+            KDFParams {
+                context: IDENTITY_SIGNING_KEY_LABEL,
+                output: &mut key,
+            },
+        )
+        .unwrap();
         let mut endorsement = build_endorsement_data(
             b"TA data",
             &TeeUuid::NIL,
@@ -663,9 +738,31 @@ mod tests {
             TaDataPlacement::BeforeMagic,
         )
         .unwrap();
-        let signature = endorse_data_with(&endorsement, &private_key).unwrap();
-        let public_key = identity_signing_public_key_from_private_key(&private_key).unwrap();
+        let mut public_key = [0u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN];
+        identity_signing_public_key_op(
+            &key,
+            ComputeParams {
+                input: &[],
+                output: &mut public_key,
+            },
+        )
+        .unwrap();
+        let digest = Sha384::digest(&endorsement);
+        let mut signature = [0u8; IDKS_ENDORSEMENT_SIGNATURE_LEN];
+        identity_signing_op(
+            &key,
+            ComputeParams {
+                input: &digest,
+                output: &mut signature,
+            },
+        )
+        .unwrap();
+        // Matches `SigningKey::sign_prehash` with the same scalar.
+        let signing_key = SigningKey::from(*identity_signing_key(&key).unwrap());
+        let expected: Signature = signing_key.sign_prehash(&digest).unwrap();
+        assert_eq!(signature[..], expected.to_bytes()[..]);
         let verifying_key = VerifyingKey::from_sec1_bytes(&public_key).unwrap();
+        assert_eq!(&verifying_key, signing_key.verifying_key());
         let signature = Signature::from_slice(&signature).unwrap();
         verifying_key.verify(&endorsement, &signature).unwrap();
 

@@ -705,6 +705,25 @@ impl litebox::platform::DerivedKeyProvider for VmUserland {
         zeroize::Zeroize::zeroize(&mut key);
         Ok(result?)
     }
+
+    fn compute_with_derived_key<E, const KEY_LEN: usize>(
+        &self,
+        root: litebox::platform::RootKey,
+        _shim_kdf: fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>,
+        _key_context: &[u8],
+        _op: fn(&[u8], litebox::platform::ComputeParams) -> Result<(), E>,
+        _params: litebox::platform::ComputeParams,
+    ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
+        // No per-boot root key, and reboot-persistent keys are only exposed via `derive_key`.
+        Err(match root {
+            litebox::platform::RootKey::Persistent => {
+                litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey
+            }
+            litebox::platform::RootKey::PerBoot => {
+                litebox::platform::DerivedKeyError::UnsupportedPerBootKey
+            }
+        })
+    }
 }
 
 /// Unsupported: physical memory is not accessible from ring 3.

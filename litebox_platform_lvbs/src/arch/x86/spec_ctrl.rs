@@ -1,9 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Hardware speculation controls protecting the VTL1 kernel from userspace
-//! (VTL0 -> VTL1 attacks are Hyper-V's job). Each control is enabled only if
-//! the CPU, as exposed by Hyper-V, enumerates it:
+//! Hardware speculation controls protecting the VTL1 kernel from userspace.
+//! Post-boot VTL0 (the normal world) is an attacker too, but these controls do
+//! not cover it: Hyper-V isolates VTL1 memory and state, and the vault guards
+//! its secrets against both. Each control is enabled only if the CPU, as
+//! exposed by Hyper-V, enumerates it:
 //!
 //! - Intel eIBRS or AMD AutoIBRS: Userspace cannot steer kernel indirect branches.
 //! - `BHI_DIS_S`, `RRSBA_DIS_S`: close the BHI and RSB-underflow gaps in eIBRS.
@@ -15,7 +17,7 @@
 //! Hyper-V (verified on hardware; OpenHCL's `is_vtl_shared_reg` agrees), so
 //! they are written once per core with no save/restore on VTL switches.
 //!
-//! The PRK vault adds IBPB, STIBP, SSBD, L1D flush, and `VERW`; see `VaultControls`.
+//! The vault adds IBPB, STIBP, SSBD, L1D flush, and `VERW`; see `VaultControls`.
 
 use super::instrs::{rdmsr, wrmsr};
 use super::msr::MSR_EFER;

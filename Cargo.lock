@@ -2313,6 +2313,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "ctr",
+ "ecdsa",
  "elf",
  "hashbrown",
  "hmac",
