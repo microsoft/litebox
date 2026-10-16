@@ -2,5 +2,9 @@
   {
     "argv": ["/share"],
     "expect_stdout": "hello from the host\nread-only\n"
+  },
+  {
+    "argv": ["/share-dyn"],
+    "expect_stdout": "hello from the host\nread-only\n"
   }
 ]

@@ -18,6 +18,7 @@
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
+#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
 #   TIMEOUT       per-run timeout in seconds (default: 120)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runner, run in its directory

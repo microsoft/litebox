@@ -3,13 +3,18 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Run static libc Linux programs under QEMU with stacked runners:
+# Run Linux programs under QEMU with stacked runners:
 # litebox_runner_vm_kernel as the guest kernel and
 # litebox_runner_linux_on_vm_userland as a ring-3 process per program run.
-# Every litebox_runner_vm_kernel/tests/linux/<name>.c is compiled twice, as
-# /<name> (static) and /<name>-pie (static PIE), into rootfs.tar, the broker's
-# read-only root. It is packed with the userland runner and a test's runs into
-# a tar passed as the initrd.
+# Every litebox_runner_vm_kernel/tests/linux/<name>.c is compiled three times,
+# as /<name> (static), /<name>-pie (static PIE), and /<name>-dyn (dynamically
+# linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, into rootfs.tar, the
+# broker's read-only root. As in litebox_runner_linux_userland's tests, the
+# root also has the dynamic programs' shared libraries and interpreter, as
+# ldd lists them, and libgcc_s.so.1, at their host paths; as the root has no
+# symbolic links, they are copies of what the links name. The shim patches
+# their syscalls as the programs map them. The root is packed with the
+# userland runner and a test's runs into a tar passed as the initrd.
 #
 # A test is litebox_runner_vm_kernel/tests/linux/<test>.json, the kernel's
 # programs.json (see litebox_runner_vm_kernel/src/client/program.rs), which
@@ -36,10 +41,11 @@
 #   -v   print the full guest log and console output for passing runs too
 #
 # Environment:
-#   CC            C compiler with a static libc (default: cc)
+#   CC            C compiler with a static and a shared glibc (default: cc)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
+#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
 #   TIMEOUT       per-run timeout in seconds (default: 120)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners, run in their directories
@@ -89,13 +95,33 @@ echo "[*] kernel: $KERNEL"
 echo "[*] userland runner: $USERLAND"
 echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU"
 
+# Tests that need a dynamic linker (e.g., dlopen), not built static.
+DYNAMIC_ONLY=(dynamic)
+
 mkdir -p "$WORK/rootfs"
 for src in "$TESTS_DIR"/*.c; do
     name=$(basename "$src" .c)
-    ${CC:-cc} -static -O2 -o "$WORK/rootfs/$name" "$src"
-    ${CC:-cc} -static-pie -fPIE -O2 -o "$WORK/rootfs/$name-pie" "$src"
+    if [[ ! " ${DYNAMIC_ONLY[*]} " =~ " $name " ]]; then
+        ${CC:-cc} -static -O2 -o "$WORK/rootfs/$name" "$src"
+        ${CC:-cc} -static-pie -fPIE -O2 -o "$WORK/rootfs/$name-pie" "$src"
+    fi
+    ${CC:-cc} -O2 -o "$WORK/rootfs/$name-dyn" "$src"
 done
-(cd "$WORK/rootfs" && tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -- *)
+# ldd's lines are `soname => /path (address)` or `/path (address)`, after a
+# `program:` line per program; the vDSO has no path.
+libs=$(ldd "$WORK"/rootfs/*-dyn |
+    awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// && $2 ~ /^\(/ { print $1 }' | sort -u)
+# Not a link-time dependency, but glibc loads it (dlopen) to unwind threads
+# for pthread_exit and pthread_cancel; without it, they abort.
+libs+=$'\n'$(realpath "$(${CC:-cc} -print-file-name=libgcc_s.so.1)")
+while read -r lib; do
+    [[ -f $lib ]] || { echo "error: no shared library $lib" >&2; exit 2; }
+    mkdir -p "$WORK/rootfs$(dirname "$lib")"
+    cp -L "$lib" "$WORK/rootfs$lib"
+done <<<"$libs"
+# Files only: the broker's root infers directories from paths.
+(cd "$WORK/rootfs" && find . -type f -printf '%P\n' |
+    tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -T -)
 
 # The virtio console's files for test $1: its output, and the FIFO of its
 # input if it has any (see `feed_input`).

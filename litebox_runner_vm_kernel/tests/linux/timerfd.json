@@ -1,3 +1,4 @@
 [
-  { "argv": ["/timerfd"], "expect_stdout": "one-shot: 1\nperiodic: 1\ndisarm: 1\nabsolute: 1\npoll: 1\nepoll: 1\nepoll nonblocking: 1\nepoll many: 1 (70)\n" }
+  { "argv": ["/timerfd"], "expect_stdout": "one-shot: 1\nperiodic: 1\ndisarm: 1\nabsolute: 1\npoll: 1\nepoll: 1\nepoll nonblocking: 1\nepoll many: 1 (70)\n" },
+  { "argv": ["/timerfd-dyn"], "expect_stdout": "one-shot: 1\nperiodic: 1\ndisarm: 1\nabsolute: 1\npoll: 1\nepoll: 1\nepoll nonblocking: 1\nepoll many: 1 (70)\n" }
 ]

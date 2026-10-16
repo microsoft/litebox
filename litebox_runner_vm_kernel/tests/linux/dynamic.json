@@ -1,0 +1,7 @@
+[
+  {
+    "argv": ["/dynamic-dyn"],
+    "expect_stdout": "interpreter: yes\nlibc: shared\ndlopen: ok\ndlopen missing: ok\n",
+    "expect_stderr": ""
+  }
+]

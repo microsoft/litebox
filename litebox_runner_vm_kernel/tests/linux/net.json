@@ -6,5 +6,9 @@
   {
     "argv": ["/net-pie", "external", "10.0.2.100", "7"],
     "expect_stdout": "external 10.0.2.100:7: ok\n"
+  },
+  {
+    "argv": ["/net-dyn", "loopback"],
+    "expect_stdout": "tcp 127.0.0.1: ok\ntcp 10.0.2.15: ok\ntcp refused: ok\nudp: ok\n"
   }
 ]

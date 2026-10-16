@@ -108,7 +108,7 @@ jobs:
         run: |
           QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
-      - name: Run static Linux programs in a QEMU VM with stacked runners (KVM)
+      - name: Run static and dynamic Linux programs in a QEMU VM with stacked runners (KVM)
         # Also builds the kernel and userland runners.
         run: |
           QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \

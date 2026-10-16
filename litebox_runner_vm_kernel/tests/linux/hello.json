@@ -1,4 +1,5 @@
 [
   { "argv": ["/hello"], "expect_stdout": "hello, world\n", "expect_stderr": "" },
-  { "argv": ["/hello-pie"], "expect_stdout": "hello, world\n", "expect_stderr": "" }
+  { "argv": ["/hello-pie"], "expect_stdout": "hello, world\n", "expect_stderr": "" },
+  { "argv": ["/hello-dyn"], "expect_stdout": "hello, world\n", "expect_stderr": "" }
 ]

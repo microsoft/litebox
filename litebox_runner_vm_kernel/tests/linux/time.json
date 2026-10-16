@@ -1,3 +1,4 @@
 [
-  { "argv": ["/time"], "expect_stdout": "agree: 1\nplausible: 1\nadvances: 1\n" }
+  { "argv": ["/time"], "expect_stdout": "agree: 1\nplausible: 1\nadvances: 1\n" },
+  { "argv": ["/time-dyn"], "expect_stdout": "agree: 1\nplausible: 1\nadvances: 1\n" }
 ]

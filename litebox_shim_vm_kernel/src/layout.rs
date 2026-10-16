@@ -55,9 +55,10 @@ pub const IMAGES: UserRange = UserRange {
     len: 1024 * MIB,
 };
 
+/// Lazily backed: a runner pays only for what its allocator touches.
 pub const HEAP: UserRange = UserRange {
     start: BASE + 0x8000_0000,
-    len: 256 * MIB,
+    len: 1024 * MIB,
 };
 
 const _: () = assert!(BROKER_CONTROL_RING.len >= CONTROL_RING_SIZE as u64);

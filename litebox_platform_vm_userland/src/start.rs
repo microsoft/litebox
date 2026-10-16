@@ -70,8 +70,10 @@ extern "C" fn runner_main(info: *const StartupInfo) -> ! {
     __litebox_runner_main(&info)
 }
 
-/// Largest single allocation: `1 << (HEAP_ORDER - 1)` bytes (16 MiB).
-const HEAP_ORDER: usize = 25;
+/// Largest single allocation: `1 << (HEAP_ORDER - 1)` bytes (128 MiB). A
+/// Linux runner patching a shared library's syscalls as it maps it decodes
+/// the whole code segment at once, e.g., 20 MiB for glibc's `libc.so.6`.
+const HEAP_ORDER: usize = 28;
 
 /// [`StartupInfo::heap`], and nothing else.
 #[global_allocator]

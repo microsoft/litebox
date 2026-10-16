@@ -1,3 +1,4 @@
 [
-  { "argv": ["/sleep"], "expect_stdout": "nanosleep: ok\nusleep: ok\nfutex: ok\n" }
+  { "argv": ["/sleep"], "expect_stdout": "nanosleep: ok\nusleep: ok\nfutex: ok\n" },
+  { "argv": ["/sleep-dyn"], "expect_stdout": "nanosleep: ok\nusleep: ok\nfutex: ok\n" }
 ]
