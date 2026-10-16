@@ -2020,7 +2020,6 @@ dependencies = [
  "litebox_util_log",
  "tar",
  "tracing-subscriber",
- "windows-sys 0.60.2",
 ]
 
 [[package]]
