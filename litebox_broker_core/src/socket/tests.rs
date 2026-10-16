@@ -2050,6 +2050,7 @@ fn check_in_flight_connect_preserves_local_address(
     );
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let connect_calls = provider.state.connect_calls.load(Ordering::Relaxed);
     *provider.state.connect_block.lock().unwrap() = Some((started_tx, release_rx));
 
     let connect_session = Arc::clone(&process);
@@ -2063,6 +2064,35 @@ fn check_in_flight_connect_preserves_local_address(
             local_address: Some(local_address),
             pending_error: None,
         })
+    );
+    // Every other operation also sees the attempt, without using the transport before it starts
+    // connecting.
+    for address in [
+        loopback_address(),
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+    ] {
+        assert_eq!(
+            connect(&process, handle, address),
+            Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress))
+        );
+    }
+    assert_eq!(
+        send(&process, handle, vec![1], SendFlags::NONE),
+        Err(BrokerError::WouldBlock)
+    );
+    assert_eq!(
+        receive(&process, handle, 1, ReceiveFlags::NONE, 0, 0),
+        Err(BrokerError::WouldBlock)
+    );
+    assert_eq!(
+        receive(&process, handle, 0, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+            Vec::new()
+        )))
+    );
+    assert_eq!(
+        provider.state.connect_calls.load(Ordering::Relaxed),
+        connect_calls + 1
     );
     release_tx.send(()).unwrap();
     assert_eq!(

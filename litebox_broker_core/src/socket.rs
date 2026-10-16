@@ -1282,7 +1282,8 @@ pub fn accept(
 ///
 /// A socket shut down for writing fails with `Shutdown` once any connection
 /// attempt has finished, and an unconnected socket fails with `NotConnected`.
-/// A temporarily full socket fails with [`BrokerError::WouldBlock`], or with
+/// A temporarily full socket, or one whose connection attempt is still being
+/// started, fails with [`BrokerError::WouldBlock`], or with
 /// [`BrokerError::NonBlockingWouldBlock`] if the socket is non-blocking.
 pub fn send(
     process: &BrokerProcess,
@@ -1304,14 +1305,16 @@ fn send_stream(
     data: Vec<u8>,
     flags: SendFlags,
 ) -> Result<SocketOutcome<usize>> {
-    let (create_request, write_shutdown, view, nonblocking) = read_socket(object, |socket| {
-        (
-            socket.create_request,
-            socket.write_shutdown,
-            socket.view(),
-            socket.status.nonblocking(),
-        )
-    })?;
+    let (create_request, write_shutdown, view, connect_in_flight, nonblocking) =
+        read_socket(object, |socket| {
+            (
+                socket.create_request,
+                socket.write_shutdown,
+                socket.view(),
+                socket.connect_in_flight,
+                socket.status.nonblocking(),
+            )
+        })?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
@@ -1334,6 +1337,10 @@ fn send_stream(
         SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_)
     ) {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+    }
+    // The transport may not have started connecting yet.
+    if connect_in_flight {
+        return Err(would_block_error(BrokerError::WouldBlock, nonblocking));
     }
     let outcome = transport_send(object, data, flags)?;
     if let SocketOutcome::Failed(_) = outcome {
@@ -1545,7 +1552,8 @@ fn transport_send_to(
 /// An unconnected socket fails with `NotConnected`, or with `Shutdown` if it
 /// was shut down for reading and has no pending error, and a failed
 /// connection reports end of stream. A socket shut down for reading fails
-/// with `Shutdown` instead of waiting. A temporarily empty socket fails with
+/// with `Shutdown` instead of waiting. A temporarily empty socket, or one
+/// whose connection attempt is still being started, fails with
 /// [`BrokerError::WouldBlock`], or with [`BrokerError::NonBlockingWouldBlock`]
 /// if the socket is non-blocking.
 pub fn receive(
@@ -1588,25 +1596,32 @@ fn receive_stream(
     peek_offset: u32,
     peek_length: u32,
 ) -> Result<SocketOutcome<PlatformStreamReceive>> {
-    let (create_request, read_shutdown, precheck) = read_socket(object, |socket| {
-        let precheck = match socket.view() {
-            // A listener ignores shutdowns, and a pending error is reported
-            // before a shutdown.
-            SocketConnectionStatus::Unconnected
-                if socket.read_shutdown && !socket.listening && socket.errors.is_empty() =>
-            {
-                Some(SocketOutcome::Failed(SocketError::Shutdown))
-            }
-            SocketConnectionStatus::Unconnected => {
-                Some(SocketOutcome::Failed(SocketError::NotConnected))
-            }
-            SocketConnectionStatus::Failed(_) => {
-                Some(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
-            }
-            _ => None,
-        };
-        (socket.create_request, socket.read_shutdown, precheck)
-    })?;
+    let (create_request, read_shutdown, connect_in_flight, nonblocking, precheck) =
+        read_socket(object, |socket| {
+            let precheck = match socket.view() {
+                // A listener ignores shutdowns, and a pending error is reported
+                // before a shutdown.
+                SocketConnectionStatus::Unconnected
+                    if socket.read_shutdown && !socket.listening && socket.errors.is_empty() =>
+                {
+                    Some(SocketOutcome::Failed(SocketError::Shutdown))
+                }
+                SocketConnectionStatus::Unconnected => {
+                    Some(SocketOutcome::Failed(SocketError::NotConnected))
+                }
+                SocketConnectionStatus::Failed(_) => {
+                    Some(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
+                }
+                _ => None,
+            };
+            (
+                socket.create_request,
+                socket.read_shutdown,
+                socket.connect_in_flight,
+                socket.status.nonblocking(),
+                precheck,
+            )
+        })?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
@@ -1618,7 +1633,13 @@ fn receive_stream(
     if read_shutdown {
         flags = ReceiveFlags(flags.0 & !ReceiveFlags::WAITALL.0);
     }
-    match transport_receive(object, reader, length, flags, peek_offset, peek_length) {
+    // The transport may not have started connecting yet.
+    let result = if connect_in_flight && length != 0 {
+        Err(would_block_error(BrokerError::WouldBlock, nonblocking))
+    } else {
+        transport_receive(object, reader, length, flags, peek_offset, peek_length)
+    };
+    match result {
         Err(BrokerError::WouldBlock | BrokerError::NonBlockingWouldBlock) if read_shutdown => {
             Ok(SocketOutcome::Failed(SocketError::Shutdown))
         }
@@ -2840,7 +2861,9 @@ impl SocketObject {
 
     /// Returns the socket's connection state.
     fn view(&self) -> SocketConnectionStatus {
-        if self.disconnected {
+        if self.connect_in_flight {
+            SocketConnectionStatus::Connecting
+        } else if self.disconnected {
             SocketConnectionStatus::Unconnected
         } else {
             self.connection_status
