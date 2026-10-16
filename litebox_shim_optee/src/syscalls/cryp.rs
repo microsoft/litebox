@@ -64,10 +64,13 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             },
         );
 
-        let handle = tee_cryp_state_map.allocate(&cryp_state);
-        state
-            .write_at_offset(0, handle)
-            .ok_or(TeeResult::BadParameters)?;
+        let handle = tee_cryp_state_map
+            .allocate(&cryp_state)
+            .ok_or(TeeResult::OutOfMemory)?;
+        if state.write_at_offset(0, handle).is_none() {
+            tee_cryp_state_map.remove(handle);
+            return Err(TeeResult::BadParameters);
+        }
 
         if key1 != TeeObjHandle::NULL {
             tee_obj_map.set_busy(key1, true);
@@ -230,7 +233,9 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     ) -> Result<(), TeeResult> {
         let tee_obj_map = &self.tee_obj_map;
         let tee_obj = TeeObj::new(typ, max_size);
-        let handle = tee_obj_map.allocate(&tee_obj);
+        let handle = tee_obj_map
+            .allocate(&tee_obj)
+            .ok_or(TeeResult::OutOfMemory)?;
         if let Some(()) = obj.write_at_offset(0, handle) {
             Ok(())
         } else {
