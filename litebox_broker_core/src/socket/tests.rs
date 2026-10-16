@@ -1222,6 +1222,33 @@ fn zero_port_connect_fails_before_platform_dispatch() {
 }
 
 #[test]
+fn abandoned_connect_wakes_waiters() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let process = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let readiness = Arc::new(TestReadinessSink::default());
+    let socket = create(&process, create_request(), readiness.clone()).unwrap();
+    let object = process
+        .authorized_object(socket, ObjectRights::WRITE)
+        .unwrap();
+    readiness.republished.lock().unwrap().clear();
+
+    // A waiter that saw the attempt in progress is woken although the socket
+    // returns to its earlier readiness.
+    provider.fail_next_connect();
+    assert_eq!(
+        transport_connect(&process, &object, loopback_address()),
+        Err(BrokerError::Internal)
+    );
+    assert_eq!(
+        readiness.republished.lock().unwrap().as_slice(),
+        [(socket, ReadinessFlags::WRITE | ReadinessFlags::CLOSED)]
+    );
+}
+
+#[test]
 fn accepted_guest_source_lease_is_retained() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);

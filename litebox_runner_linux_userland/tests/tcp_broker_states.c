@@ -239,9 +239,6 @@ int main(int argc, char **argv) {
     // discarding any shutdown.
     fd = tcp_socket(0);
     expect_shutdown_not_connected(fd, SHUT_RD);
-    expect_connect_error(fd, &zero_port, ECONNREFUSED);
-    assert(poll_events(fd) == UNCONNECTED_EVENTS);
-    expect_shutdown_not_connected(fd, SHUT_RD);
     assert(connect(fd, (const struct sockaddr *)&refused, sizeof(refused)) == -1);
     assert(errno == ECONNREFUSED);
     assert(poll_events(fd) == UNCONNECTED_EVENTS);

@@ -722,8 +722,8 @@ pub fn create(
 /// `AlreadyConnected`, and while an earlier attempt is unreported, a stream
 /// reports it as [`check_connect`] does, except that an attempt still in
 /// progress fails with `AlreadyInProgress`. Port zero and the unspecified
-/// address fail with `ConnectionRefused`; refusing a stream also discards its
-/// shutdowns. Otherwise an authorized attempt first binds an unbound socket.
+/// address fail with `ConnectionRefused` without changing the socket.
+/// Otherwise an authorized attempt first binds an unbound socket.
 /// Connect never reports [`SocketConnectionStatus::Failed`]: a failed attempt
 /// is a [`SocketOutcome::Failed`], after which a stream is unconnected but
 /// fails every later attempt the same way. UDP connects complete
@@ -749,17 +749,9 @@ fn connect_stream(
     object: &RwLock<ObjectEntry>,
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
-    let unaddressable = is_unaddressable(address);
     loop {
-        let (view, connected) = write_socket(object, |socket| {
-            let view = socket.view();
-            let connected = socket.listening || socket.connect_reported;
-            // Like a refused connection, this disconnects the socket. Checking the state under
-            // the same lock keeps a concurrent connect from completing in between.
-            if unaddressable && !connected && view == SocketConnectionStatus::Unconnected {
-                socket.reset_connection();
-            }
-            (view, connected)
+        let (view, connected) = read_socket(object, |socket| {
+            (socket.view(), socket.listening || socket.connect_reported)
         })?;
         // The socket's state is reported before any problem with the address.
         if connected {
@@ -778,7 +770,7 @@ fn connect_stream(
             outcome => return Ok(outcome),
         }
     }
-    if unaddressable {
+    if is_unaddressable(address) {
         return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
     }
     let status = match transport_connect(process, object, address)? {
@@ -980,7 +972,7 @@ fn transport_connect(
             match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
                 Ok(binding) => binding,
                 Err(error) => {
-                    finish_connect(object, SocketConnectionStatus::Unconnected);
+                    abandon_connect(object);
                     return Err(error);
                 }
             };
@@ -989,7 +981,7 @@ fn transport_connect(
                 attach_binding(object, local_address, port_binding)?;
             }
             ReserveAndBindOutcome::Failed(error) => {
-                finish_connect(object, SocketConnectionStatus::Unconnected);
+                abandon_connect(object);
                 return Ok(SocketOutcome::Failed(error));
             }
             ReserveAndBindOutcome::Retired(port_binding) => {
@@ -1003,7 +995,7 @@ fn transport_connect(
         .source_address_for_destination(destination)
         .is_none()
     {
-        finish_connect(object, SocketConnectionStatus::Unconnected);
+        abandon_connect(object);
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     let guest_source_lease = match resource.source_lease_for_connect(destination) {
@@ -1025,7 +1017,7 @@ fn transport_connect(
         }
         Ok(status) => status,
         Err(PlatformConnectError::PeerUnchanged(error)) => {
-            finish_connect(object, SocketConnectionStatus::Unconnected);
+            abandon_connect(object);
             return Err(error);
         }
         Err(PlatformConnectError::PeerIndeterminate(error)) => {
@@ -2635,11 +2627,20 @@ fn finish_retired_datagram_connect(object: &spin::RwLock<ObjectEntry>) {
     }
 }
 
-fn finish_connect(object: &spin::RwLock<ObjectEntry>, status: SocketConnectionStatus) {
+/// Abandons a claimed stream connection attempt that had no effect, leaving
+/// the stream unconnected.
+///
+/// The stream returns to its readiness before the claim, so this republishes
+/// that readiness to wake waiters that saw the attempt in progress.
+fn abandon_connect(object: &spin::RwLock<ObjectEntry>) {
     let mut object = object.write();
     if let ObjectEntry::Socket(socket) = &mut *object {
         socket.connect_in_flight = false;
-        socket.connection_status = status;
+        socket.connection_status = SocketConnectionStatus::Unconnected;
+        socket
+            .resource
+            .readiness_sink
+            .set_overlay(socket.readiness_overlay(), true);
     }
 }
 
@@ -2950,7 +2951,7 @@ impl SocketObject {
     fn sync_readiness(&self) {
         self.resource
             .readiness_sink
-            .set_overlay(self.readiness_overlay());
+            .set_overlay(self.readiness_overlay(), false);
     }
 
     pub(crate) fn resource(&self) -> Arc<SocketResource> {
@@ -3259,16 +3260,19 @@ struct SocketReadinessState {
 
 impl SocketReadinessSink {
     /// Changes how the socket's state changes its transport's readiness,
-    /// publishing the socket's readiness if that changes it.
-    fn set_overlay(&self, overlay: ReadinessOverlay) {
+    /// publishing the socket's readiness if that changes it or, with
+    /// `republish`, regardless.
+    fn set_overlay(&self, overlay: ReadinessOverlay, republish: bool) {
         let mut state = self.state.lock();
-        if state.retired || state.overlay == overlay {
+        if state.retired {
             return;
         }
         let before = state.overlay.apply(state.transport);
         let after = overlay.apply(state.transport);
         state.overlay = overlay;
-        if before != after {
+        if republish {
+            self.watchers.publish(after);
+        } else if before != after {
             self.watchers.publish_if_changed(after);
         }
     }
