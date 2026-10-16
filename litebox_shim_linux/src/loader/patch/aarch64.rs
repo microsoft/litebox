@@ -12,7 +12,7 @@ use litebox_syscall_rewriter::aarch64::{CodeScanRanges, ElfCodeMetadata};
 use zerocopy::FromZeros as _;
 
 use super::{ElfPatchState, read_file_exact_at};
-use crate::{ShimPlatform, Task, UserPtrMut};
+use crate::{ShimPlatform, Task, UserPtrMut, syscalls::file::File};
 
 /// Pre-patched AArch64 trampolines are populated (and their gates finalized)
 /// whenever a file mapping becomes executable, including through `mprotect`.
@@ -174,9 +174,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Returns the arch state and the page-aligned trampoline capacity. Falls
     /// back to one page (with trap fallback on exhaustion) if scanning fails.
-    pub(super) fn plan_runtime_trampoline(
-        file: &litebox::fs::File<Platform>,
-    ) -> (ArchPatchState, usize) {
+    pub(super) fn plan_runtime_trampoline(file: &File<Platform>) -> (ArchPatchState, usize) {
         let scanned = file.status().ok().and_then(|stat| {
             let file_size = usize::try_from(stat.size).ok()?;
             let word_len = file_size.div_ceil(8);

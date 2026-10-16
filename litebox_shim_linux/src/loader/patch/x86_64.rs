@@ -9,7 +9,7 @@ use core::ops::Range;
 use litebox_common_linux::{ProtFlags, errno::Errno};
 
 use super::ElfPatchState;
-use crate::{ShimPlatform, Task, UserPtrMut};
+use crate::{ShimPlatform, Task, UserPtrMut, syscalls::file::File};
 
 /// Fixed size of every runtime trampoline.
 pub(super) const RUNTIME_TRAMPOLINE_SIZE: usize =
@@ -85,9 +85,7 @@ impl CodeRewriter {
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the arch state and capacity of an unpatched file's runtime trampoline.
-    pub(super) fn plan_runtime_trampoline(
-        _file: &litebox::fs::File<Platform>,
-    ) -> (ArchPatchState, usize) {
+    pub(super) fn plan_runtime_trampoline(_file: &File<Platform>) -> (ArchPatchState, usize) {
         (ArchPatchState {}, RUNTIME_TRAMPOLINE_SIZE)
     }
 

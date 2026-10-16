@@ -136,8 +136,12 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
         f: impl FnOnce(&ReadinessTarget<'_, Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         match self {
-            EpollDescriptor::File(fd) => f(&ReadinessTarget::File(&*global.file(fd)?)),
-            EpollDescriptor::Pipe(fd) => f(&ReadinessTarget::Pipe(&*global.pipe_end(fd)?)),
+            EpollDescriptor::File(fd) => {
+                global.with_file(fd, |file| f(&ReadinessTarget::File(file.file())))
+            }
+            EpollDescriptor::Pipe(fd) => {
+                global.with_pipe_end(fd, |pipe| f(&ReadinessTarget::Pipe(pipe.pipe_end())))
+            }
             EpollDescriptor::Eventfd(fd) => {
                 global.with_eventfd(fd, |file| f(&ReadinessTarget::EventCounter(file.counter())))
             }

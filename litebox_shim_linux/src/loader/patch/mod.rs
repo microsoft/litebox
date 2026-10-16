@@ -28,6 +28,7 @@ use crate::FileFd;
 use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
+use crate::syscalls::file::File;
 use crate::syscalls::mm::prot_flags_from_permissions;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::vmem::VmFlags;
@@ -203,12 +204,12 @@ pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, ElfPat
 
 /// Fills `data` from `file` at `offset`, failing with `EIO` at end of file.
 fn read_file_exact_at<Platform: ShimPlatform>(
-    file: &litebox::fs::File<Platform>,
+    file: &File<Platform>,
     mut data: &mut [u8],
     mut offset: usize,
 ) -> Result<(), Errno> {
     while !data.is_empty() {
-        let read = file.read(data, Some(offset), None).map_err(Errno::from)?;
+        let read = file.read(data, Some(offset), None)?;
         if read == 0 {
             return Err(Errno::EIO);
         }
@@ -221,7 +222,7 @@ fn read_file_exact_at<Platform: ShimPlatform>(
 /// Reads the LiteBox trampoline header at the file tail.
 /// Returns `Ok(None)` if the file is unreadable or carries no LiteBox header.
 fn read_trampoline_layout<Platform: ShimPlatform>(
-    file: &litebox::fs::File<Platform>,
+    file: &File<Platform>,
 ) -> Result<Option<TrampolineLayout>, TrampolineHeaderError> {
     let Ok(stat) = file.status() else {
         return Ok(None);
@@ -382,7 +383,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let metadata = if (syscall_entry != 0 || !prot.contains(ProtFlags::PROT_EXEC))
             && !self.global.elf_patch_cache.lock().contains_key(&key)
         {
-            Some(self.read_elf_patch_metadata(&key, offset))
+            Some(
+                self.global
+                    .with_file(file, |file| Ok(Self::read_elf_patch_metadata(file, offset)))
+                    .unwrap_or(Err(ElfPatchInit::Untracked)),
+            )
         } else {
             None
         };
@@ -644,7 +649,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(())
     }
 
-    /// Read address-independent ELF patch metadata for an fd on its first mmap.
+    /// Read address-independent ELF patch metadata for a file on its first mmap.
     ///
     /// Derives patch state and the architecture-specific trampoline fallback.
     ///
@@ -653,13 +658,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Requires the supported architectures' common 64-bit ELF layout.
     fn read_elf_patch_metadata(
-        &self,
-        fd: &ElfPatchKey<Platform>,
+        file: &File<Platform>,
         file_offset: usize,
     ) -> Result<ElfPatchMetadata, ElfPatchInit> {
-        let Ok(file) = self.global.file(&fd.0) else {
-            return Err(ElfPatchInit::Untracked);
-        };
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
         match file.read(&mut ehdr_buf, Some(0), None) {
@@ -739,7 +740,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(ElfPatchInit::Untracked); // No PT_LOAD segments
         }
 
-        let trampoline_layout = match read_trampoline_layout(&file) {
+        let trampoline_layout = match read_trampoline_layout(file) {
             Err(error) => {
                 litebox_util_log::debug!(
                     file_offset:? = file_offset, error:? = error;
@@ -754,7 +755,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Pre-patched files carry their own trampoline.
             (arch::ArchPatchState::default(), 0)
         } else {
-            Self::plan_runtime_trampoline(&file)
+            Self::plan_runtime_trampoline(file)
         };
         let min_load_start: usize = min_load_start.trunc();
         let max_load_end: usize = max_load_end.trunc();
@@ -997,8 +998,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
         if self
             .global
-            .file(&fd.0)
-            .and_then(|file| read_file_exact_at(&file, &mut tramp_data, file_off))
+            .with_file(&fd.0, |file| {
+                read_file_exact_at(file, &mut tramp_data, file_off)
+            })
             .is_err()
         {
             let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
