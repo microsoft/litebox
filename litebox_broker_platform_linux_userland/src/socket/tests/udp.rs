@@ -542,7 +542,7 @@ fn reactor_preserves_udp_datagram_semantics() {
         shutdown_handle,
         ReadinessFlags::WRITE,
     );
-    // Like Linux, an unconnected socket records a shutdown that fails.
+    // An unconnected socket records a shutdown that fails.
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, shutdown_handle, ShutdownMode::Both,),
         Ok(SocketOutcome::Failed(SocketError::NotConnected))
@@ -836,7 +836,7 @@ fn reactor_preserves_udp_datagram_semantics() {
         litebox_broker_core::socket::connect(&process, handle, server_address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    // Like Linux, a socket shut down for writing is writable.
+    // A socket shut down for writing is writable.
     assert!(
         process
             .check_readiness(handle)

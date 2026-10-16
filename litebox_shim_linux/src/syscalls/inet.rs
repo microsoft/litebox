@@ -538,7 +538,12 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
         );
         match result {
             Ok(received) => Ok(received),
-            Err(TryOpError::WaitError(_)) if received != 0 || has_prior_progress => Ok(received),
+            // `TryAgain` here means the socket became nonblocking after data was received.
+            Err(TryOpError::WaitError(_) | TryOpError::TryAgain)
+                if received != 0 || has_prior_progress =>
+            {
+                Ok(received)
+            }
             Err(error @ TryOpError::WaitError(_)) if wait_all && peek => {
                 receive_flags.remove(inet_socket::ReceiveFlags::WAITALL);
                 match self

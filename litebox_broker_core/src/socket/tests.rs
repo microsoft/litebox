@@ -4458,7 +4458,7 @@ fn check_pending_errors_and_readiness(broker: &BrokerCore, provider: &TestSocket
     process.close_object_reference(failed).unwrap();
 
     // Once another operation reports the failure, `check_connect` reports
-    // that the connection was aborted, as Linux does.
+    // that the connection was aborted.
     let reported = new_socket(create_request());
     assert_eq!(
         connect(&process, reported, loopback_address()),

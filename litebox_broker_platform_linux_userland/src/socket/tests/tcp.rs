@@ -227,7 +227,7 @@ fn reactor_drives_a_loopback_tcp_socket() {
     allow_response.send(()).unwrap();
     wait_until_ready(&process, &publications, handle, ReadinessFlags::READ);
     let current_readiness = process.check_readiness(handle).unwrap();
-    // Like Linux, a socket shut down for writing is writable.
+    // A socket shut down for writing is writable.
     assert!(current_readiness.contains(ReadinessFlags::WRITE));
     assert!(!current_readiness.contains(ReadinessFlags::ERROR));
 
@@ -1845,8 +1845,8 @@ fn guest_tcp_zero_backlog_wildcard_listener_accepts_one_connection() {
     .unwrap() else {
         panic!("wildcard connector bind failed");
     };
-    // Like a connection Linux refuses, an unspecified destination leaves the
-    // socket free to connect again.
+    // Like a refused connection, an unspecified destination leaves the socket
+    // free to connect again.
     assert_eq!(
         litebox_broker_core::socket::connect(&connector_process, connector, wildcard_listener),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))

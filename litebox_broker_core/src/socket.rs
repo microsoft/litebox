@@ -747,10 +747,18 @@ fn connect_stream(
     object: &RwLock<ObjectEntry>,
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
-    let (view, connected) = read_socket(object, |socket| {
-        (socket.view(), socket.listening || socket.connect_reported)
+    let unaddressable = is_unaddressable(address);
+    let (view, connected) = write_socket(object, |socket| {
+        let view = socket.view();
+        let connected = socket.listening || socket.connect_reported;
+        // Like a refused connection, this disconnects the socket. Checking the state under the
+        // same lock keeps a concurrent connect from completing in between.
+        if unaddressable && !connected && view == SocketConnectionStatus::Unconnected {
+            socket.reset_connection();
+        }
+        (view, connected)
     })?;
-    // Like Linux, check the socket's state before the address.
+    // The socket's state is reported before any problem with the address.
     if connected {
         return Ok(SocketOutcome::Failed(SocketError::AlreadyConnected));
     }
@@ -762,9 +770,7 @@ fn connect_stream(
             outcome => outcome,
         });
     }
-    if is_unaddressable(address) {
-        // Like a connection Linux refuses, this disconnects the socket.
-        write_socket(object, SocketObject::reset_connection)?;
+    if unaddressable {
         return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
     }
     let status = match transport_connect(process, object, address)? {
@@ -1310,8 +1316,8 @@ fn send_stream(
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     if write_shutdown {
-        // Like Linux, wait for a connection attempt, and report its failure,
-        // before reporting a shutdown recorded while connecting.
+        // Wait for a connection attempt, and report its failure, before
+        // reporting a shutdown recorded while connecting.
         if view == SocketConnectionStatus::Connecting {
             refresh(object, false);
             let connecting = read_socket(object, |socket| {
@@ -1584,8 +1590,8 @@ fn receive_stream(
 ) -> Result<SocketOutcome<PlatformStreamReceive>> {
     let (create_request, read_shutdown, precheck) = read_socket(object, |socket| {
         let precheck = match socket.view() {
-            // Like Linux, a listener ignores shutdowns, and a pending error is
-            // reported before a shutdown.
+            // A listener ignores shutdowns, and a pending error is reported
+            // before a shutdown.
             SocketConnectionStatus::Unconnected
                 if socket.read_shutdown && !socket.listening && socket.errors.is_empty() =>
             {
@@ -1828,7 +1834,7 @@ fn shutdown_stream(object: &RwLock<ObjectEntry>, mode: ShutdownMode) -> Result<S
             }
             let outcome = transport_shutdown(object, mode)?;
             write_socket(object, |socket| {
-                // Like Linux, which disconnects a listener to stop it.
+                // A stopped listener returns to the unconnected state.
                 if !socket.listening {
                     socket.reset_connection();
                 }
@@ -1862,8 +1868,8 @@ fn shutdown_stream(object: &RwLock<ObjectEntry>, mode: ShutdownMode) -> Result<S
                     Ok(SocketOutcome::Completed(()))
                 }
                 SocketOutcome::Failed(SocketError::NotConnected) => {
-                    // Like Linux, an unconnected socket records the shutdown
-                    // even though the call fails.
+                    // An unconnected socket records the shutdown even though
+                    // the call fails.
                     write_socket(object, |socket| socket.record_shutdown(mode))?;
                     Ok(SocketOutcome::Failed(SocketError::NotConnected))
                 }
@@ -2841,8 +2847,7 @@ impl SocketObject {
         }
     }
 
-    /// Returns a stream to the unconnected state, discarding its shutdowns as
-    /// Linux's `tcp_disconnect` does.
+    /// Returns a stream to the unconnected state, discarding its shutdowns.
     fn reset_connection(&mut self) {
         self.disconnected = true;
         self.read_shutdown = false;
@@ -2858,8 +2863,8 @@ impl SocketObject {
         error
     }
 
-    /// Records a shutdown, which, like Linux's `inet_shutdown`, also reports
-    /// an established connection so that a later `connect` fails.
+    /// Records a shutdown, which also reports an established connection so
+    /// that a later `connect` fails.
     fn record_shutdown(&mut self, mode: ShutdownMode) {
         if self.view() == SocketConnectionStatus::Connected {
             self.connect_reported = true;
@@ -2890,7 +2895,7 @@ impl SocketObject {
                 _ => None,
             };
         }
-        // Like Linux, a listener ignores shutdowns.
+        // A listener ignores shutdowns.
         if !self.listening {
             if self.read_shutdown {
                 overlay.add = overlay.add | ReadinessFlags::READ | ReadinessFlags::HANGUP;
@@ -3028,8 +3033,8 @@ impl QueuedSocketError {
 
 /// A socket's pending errors, oldest first.
 ///
-/// Like Linux, which reports a socket's error before consuming the next one
-/// from its error queue, this holds at most two.
+/// This holds at most two: the socket's current error, and the next one,
+/// which becomes current once the current one is taken.
 #[derive(Default)]
 struct SocketErrorQueue {
     head: Option<QueuedSocketError>,

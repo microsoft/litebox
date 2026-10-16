@@ -79,7 +79,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
                 }
                 Ok(SocketOutcome::Completed(_)) => return Err(backend_failure()),
                 Ok(SocketOutcome::Failed(error)) if offset != 0 => {
-                    // Like Linux, the bytes already peeked are returned. A
+                    // The bytes already peeked are returned. A
                     // transport error the failed request consumed is left
                     // pending, while a shutdown or disconnection persists.
                     if !matches!(
