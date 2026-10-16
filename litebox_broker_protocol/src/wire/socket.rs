@@ -24,21 +24,21 @@ use super::primitive::{Decoder, Encoder};
 
 const SOCKET_TAG_CREATE: u8 = 0;
 const SOCKET_TAG_CONNECT: u8 = 1;
-const SOCKET_TAG_SEND: u8 = 2;
-const SOCKET_TAG_RECEIVE: u8 = 3;
-const SOCKET_TAG_SHUTDOWN: u8 = 4;
-const SOCKET_TAG_FAILED: u8 = 6;
-const SOCKET_TAG_BIND: u8 = 7;
-const SOCKET_TAG_LISTEN: u8 = 8;
-const SOCKET_TAG_ACCEPT: u8 = 9;
-const SOCKET_TAG_SEND_TO: u8 = 10;
-const SOCKET_TAG_RECEIVE_FROM: u8 = 11;
-const SOCKET_TAG_SET_OPTION: u8 = 12;
-const SOCKET_TAG_GET_OPTION: u8 = 13;
-const SOCKET_TAG_CHECK_CONNECT: u8 = 14;
-const SOCKET_TAG_GET_NAME: u8 = 15;
-const SOCKET_TAG_TAKE_ERROR: u8 = 16;
-const SOCKET_TAG_SET_ERROR: u8 = 17;
+const SOCKET_TAG_BIND: u8 = 2;
+const SOCKET_TAG_LISTEN: u8 = 3;
+const SOCKET_TAG_ACCEPT: u8 = 4;
+const SOCKET_TAG_SEND: u8 = 5;
+const SOCKET_TAG_SEND_TO: u8 = 6;
+const SOCKET_TAG_RECEIVE: u8 = 7;
+const SOCKET_TAG_RECEIVE_FROM: u8 = 8;
+const SOCKET_TAG_SHUTDOWN: u8 = 9;
+const SOCKET_TAG_SET_OPTION: u8 = 10;
+const SOCKET_TAG_GET_OPTION: u8 = 11;
+const SOCKET_TAG_CHECK_CONNECT: u8 = 12;
+const SOCKET_TAG_GET_NAME: u8 = 13;
+const SOCKET_TAG_TAKE_ERROR: u8 = 14;
+const SOCKET_TAG_SET_ERROR: u8 = 15;
+const SOCKET_TAG_FAILED: u8 = 16;
 
 const ADDRESS_FAMILY_TAG_IPV4: u8 = 0;
 
