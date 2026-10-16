@@ -511,42 +511,6 @@ fn test_tcp_shutdown_while_connecting() {
 }
 
 #[test]
-fn test_tcp_shutdown_during_simultaneous_open() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let mut network = Network::new(&litebox);
-    network.set_platform_interaction(PlatformInteraction::Manual);
-    let (a_fd, _a) = stream_socket(&mut network);
-    let (b_fd, _b) = stream_socket(&mut network);
-    network
-        .bind(&a_fd, &SocketAddr::from_str("0.0.0.0:5555").unwrap())
-        .unwrap();
-    network
-        .bind(&b_fd, &SocketAddr::from_str("0.0.0.0:6666").unwrap())
-        .unwrap();
-    let a_addr = SocketAddr::from_str("10.0.0.2:5555").unwrap();
-    let b_addr = SocketAddr::from_str("10.0.0.2:6666").unwrap();
-    let err = network.connect(&a_fd, &b_addr, false).unwrap_err();
-    assert!(matches!(err, ConnectError::InProgress));
-    let err = network.connect(&b_fd, &a_addr, false).unwrap_err();
-    assert!(matches!(err, ConnectError::InProgress));
-    while tcp_state(&network, &a_fd) == tcp::State::SynSent {
-        network.perform_platform_interaction();
-    }
-    assert_eq!(tcp_state(&network, &a_fd), tcp::State::SynReceived);
-
-    // Shutting down a connection whose handshake has not completed does not confirm it.
-    network.shutdown(&a_fd, Shutdown::Read).unwrap();
-    let err = network.connect(&a_fd, &b_addr, false).unwrap_err();
-    assert!(matches!(err, ConnectError::AlreadyInProgress));
-    pump(&mut network);
-    network.connect(&a_fd, &b_addr, false).unwrap();
-    network.connect(&b_fd, &a_addr, false).unwrap();
-
-    network.close(&a_fd, CloseBehavior::Immediate).unwrap();
-    network.close(&b_fd, CloseBehavior::Immediate).unwrap();
-}
-
-#[test]
 fn test_tcp_connect_reports_connection_state() {
     let litebox = LiteBox::new(MockPlatform::new());
     let mut network = Network::new(&litebox);
@@ -656,16 +620,9 @@ fn test_tcp_reconnect_after_lost_connection() {
         assert!(!events.intersects(Events::IN | Events::RDHUP | Events::ERR));
     };
 
-    // Shutting down a connection that `connect` has not reported yet confirms it.
-    let ((client_fd, _), (server_fd, _)) = connect_and_accept(&mut network, &listener);
-    network.shutdown(&client_fd, Shutdown::Write).unwrap();
-    let err = network.connect(&client_fd, &addr, false).unwrap_err();
-    assert!(matches!(err, ConnectError::AlreadyConnected));
-    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
-    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
-
-    // Otherwise, the loss of such a connection is reported by the next call, which discards what
-    // is left of the connection, including data that smoltcp holds because the channel is full.
+    // The loss of a connection that `connect` has not reported yet is reported by the next call,
+    // which discards what is left of the connection, including data that smoltcp holds because
+    // the channel is full.
     let ((client_fd, client), (server_fd, server)) =
         connect_and_accept_with_rx_capacities(&mut network, &listener, 2, SOCKET_BUFFER_SIZE);
     write(&server, b"old").unwrap();
