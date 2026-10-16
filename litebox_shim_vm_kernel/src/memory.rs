@@ -13,7 +13,10 @@ use alloc::boxed::Box;
 use core::ops::Range;
 use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
 use litebox::platform::{PageManagementProvider, RawConstPointer as _, RawMutPointer as _};
-use litebox_common_linux::vmem::{PAGE_SIZE, VmFlags, VmemPageFaultHandler};
+use litebox_common_linux::{
+    PAGE_SIZE,
+    vmem::{VmFlags, VmemPageFaultHandler},
+};
 use litebox_common_vm_abi::{Placement, Populate, Prot, Status};
 use litebox_platform_vm_kernel::VmKernel;
 use rangemap::RangeMap;

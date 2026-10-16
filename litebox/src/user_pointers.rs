@@ -4,7 +4,7 @@
 //! Address-only user pointer types.
 //!
 //! These wrap a bare `usize` address and, unlike
-//! [`litebox::platform::RawConstPointer`]/[`litebox::platform::RawMutPointer`],
+//! [`crate::platform::RawConstPointer`]/[`crate::platform::RawMutPointer`],
 //! carry no [`RawPointerProvider`] (`Platform`) parameter. This keeps `Platform`
 //! from being viral across every type that merely *stores* a user pointer value.
 //! Memory is accessed by converting back to the platform pointer type via
@@ -12,12 +12,12 @@
 //! convenience access methods), which take the platform as an explicit witness
 //! `P`.
 
-use litebox::platform::{RawConstPointer, RawMutPointer, RawPointerProvider};
+use crate::platform::{RawConstPointer, RawMutPointer, RawPointerProvider};
 use zerocopy::{FromBytes, IntoBytes};
 
 /// A user-space const pointer represented purely as an address (`usize`).
 ///
-/// Unlike [`litebox::platform::RawConstPointer`], this type carries no
+/// Unlike [`crate::platform::RawConstPointer`], this type carries no
 /// [`RawPointerProvider`] (`Platform`) parameter: it only *stores* the address
 /// of a user pointer. Memory is accessed by converting back to the platform
 /// pointer type via the [`Self::read_at_offset`]/[`Self::to_owned_slice`]

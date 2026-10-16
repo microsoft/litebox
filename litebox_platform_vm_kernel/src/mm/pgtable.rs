@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_common_linux::vmem::PAGE_SIZE;
+use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::vmem::PageFaultError;
 
 use crate::arch::{

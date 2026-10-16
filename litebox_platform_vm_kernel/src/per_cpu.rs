@@ -13,8 +13,8 @@ use alloc::{
 use core::alloc::Layout;
 use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
-use litebox_common_linux::vmem::PAGE_SIZE;
-use litebox_common_linux::{rdgsbase, wrgsbase};
+use litebox::arch::x86_64::{rdgsbase, wrgsbase};
+use litebox_common_linux::PAGE_SIZE;
 use x86_64::VirtAddr;
 
 // Include guards in the power-of-two allocation to avoid buddy-allocator waste.
@@ -381,10 +381,8 @@ pub(crate) fn unmap_stack_guards(page_table: &crate::mm::PageTable<PAGE_SIZE>) {
 ///
 /// `start` is an aligned, unused page of an allocation that is never freed.
 pub(crate) unsafe fn unmap_guard(page_table: &crate::mm::PageTable<PAGE_SIZE>, start: usize) {
-    let range = litebox_common_linux::vmem::PageRange {
-        start,
-        end: start + PAGE_SIZE,
-    };
+    let range = litebox::mm::page::PageRange::new(start, start + PAGE_SIZE)
+        .expect("stack guard page must be aligned and non-empty");
     // Safety: see the function's.
     unsafe { page_table.unmap_pages(range, UnmapOptions::KEEP_FRAMES) }
         .expect("failed to unmap a stack guard page");

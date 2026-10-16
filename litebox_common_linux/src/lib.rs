@@ -21,13 +21,12 @@ pub mod errno;
 pub mod gate_recovery;
 pub mod loader;
 pub mod mm;
-pub mod physical_pointers;
 pub mod program_startup;
 pub mod signal;
 mod guest_vector_state {
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "x86_64")] {
-            pub type Selected = litebox_common::arch::x86_64::xstate::XsaveArea;
+            pub type Selected = litebox::arch::x86_64::xstate::XsaveArea;
         } else if #[cfg(target_arch = "aarch64")] {
             pub type Selected = crate::signal::aarch64::GuestVectorState;
         } else {
@@ -36,13 +35,11 @@ mod guest_vector_state {
     }
 }
 pub use guest_vector_state::Selected as GuestVectorState;
-pub mod user_pointers;
-pub mod vmap;
 pub mod vmem;
 
 extern crate alloc;
 
-use user_pointers::{UserPtr, UserPtrMut};
+use litebox::user_pointers::{UserPtr, UserPtrMut};
 
 /// Host page size in bytes.
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -52,12 +49,10 @@ pub const HOST_PAGE_SIZE: usize = 4096;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const HOST_PAGE_SIZE: usize = 16384;
 
-/// Number of AArch64 general-purpose registers saved by the Linux user ABI
-/// (`x0` through `x30`).
-#[cfg(target_arch = "aarch64")]
-pub const AARCH64_GENERAL_REGISTER_COUNT: usize = 31;
-
 // TODO(jayb): Should errno::Errno be publicly re-exported?
+
+/// Page size required by the supported Linux guest ABIs.
+pub const PAGE_SIZE: usize = 4096;
 
 pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
@@ -1273,81 +1268,6 @@ pub enum ArchPrctlArg {
     CETStatus,
     CETDisable,
     CETLock,
-}
-
-/// Reads the FS segment base address
-///
-/// ## Safety
-///
-/// If `CR4.FSGSBASE` is not set, calling this instruction from user land will throw an `#UD`.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn rdfsbase() -> usize {
-    let ret: usize;
-    unsafe {
-        core::arch::asm!(
-            "rdfsbase {}",
-            out(reg) ret,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-    ret
-}
-
-/// Writes the FS segment base address
-///
-/// ## Safety
-///
-/// If `CR4.FSGSBASE` is not set, calling this instruction from user land will throw an `#UD`.
-///
-/// The caller must ensure that this write operation has no unsafe side
-/// effects, as the FS segment base address is often used for thread
-/// local storage.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn wrfsbase(fs_base: usize) {
-    unsafe {
-        core::arch::asm!(
-            "wrfsbase {}",
-            in(reg) fs_base,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-}
-
-/// Reads the GS segment base address
-///
-/// ## Safety
-///
-/// If `CR4.FSGSBASE` is not set, this instruction will throw an `#UD`.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn rdgsbase() -> usize {
-    let ret: usize;
-    unsafe {
-        core::arch::asm!(
-            "rdgsbase {}",
-            out(reg) ret,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-    ret
-}
-
-/// Writes the GS segment base address
-///
-/// ## Safety
-///
-/// If `CR4.FSGSBASE` is not set, this instruction will throw an `#UD`.
-///
-/// The caller must ensure that this write operation has no unsafe side
-/// effects, as the GS segment base address might be in use.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn wrgsbase(gs_base: usize) {
-    unsafe {
-        core::arch::asm!(
-            "wrgsbase {}",
-            in(reg) gs_base,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
 }
 
 /// Flags for the clone3 system call as defined in `/usr/include/linux/sched.h`.
@@ -3417,7 +3337,7 @@ pub struct PtRegs {
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 pub struct PtRegs {
     /// General-purpose registers x0-x30.
-    pub regs: [usize; AARCH64_GENERAL_REGISTER_COUNT],
+    pub regs: [usize; litebox::arch::aarch64::GENERAL_REGISTER_COUNT],
     /// Stack pointer.
     pub sp: usize,
     /// Program counter.
@@ -3435,59 +3355,28 @@ pub struct PtRegs {
 
 #[cfg(target_arch = "x86_64")]
 pub mod arch {
-    // User returns must not target the null-guard region.
-    pub const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
-    // Exclusive upper bound; the final low-canonical page is reserved as a guard page.
-    pub const USER_ADDR_END: usize = 0x0000_7fff_ffff_f000;
+    use litebox::arch::x86_64::RFlags;
+
     pub const USER_CS: usize = 0x33;
     pub const USER_DS: usize = 0x2b;
-    pub const EFLAGS_CF: usize = 1 << 0;
-    pub const EFLAGS_FIXED: usize = 1 << 1;
-    pub const EFLAGS_PF: usize = 1 << 2;
-    pub const EFLAGS_AF: usize = 1 << 4;
-    pub const EFLAGS_ZF: usize = 1 << 6;
-    pub const EFLAGS_SF: usize = 1 << 7;
-    pub const EFLAGS_IF: usize = 1 << 9;
-    pub const EFLAGS_DF: usize = 1 << 10;
-    pub const EFLAGS_OF: usize = 1 << 11;
-    pub const EFLAGS_RF: usize = 1 << 16;
-    pub const EFLAGS_ID: usize = 1 << 21;
-    pub const SAFE_USER_EFLAGS: usize = EFLAGS_CF
-        | EFLAGS_FIXED
-        | EFLAGS_PF
-        | EFLAGS_AF
-        | EFLAGS_ZF
-        | EFLAGS_SF
-        | EFLAGS_IF
-        | EFLAGS_DF
-        | EFLAGS_OF
-        | EFLAGS_RF
-        | EFLAGS_ID;
-
-    /// Returns whether `base` is a valid x86_64 Linux user FS-segment base.
-    ///
-    /// A user FS base is valid iff it is below the top of the user address
-    /// space. Especially, if a given address is non-canonical, `wrfsbase`
-    /// can result in a #GP fault. This check is based on Linux kernel's
-    /// `do_arch_prctl_64`.
-    #[must_use]
-    pub fn is_valid_user_fs_base(base: usize) -> bool {
-        base < USER_ADDR_END
-    }
+    /// RFLAGS bits a guest may keep when returning to user mode.
+    pub const SAFE_USER_EFLAGS: RFlags = RFlags::CF
+        .union(RFlags::FIXED)
+        .union(RFlags::PF)
+        .union(RFlags::AF)
+        .union(RFlags::ZF)
+        .union(RFlags::SF)
+        .union(RFlags::IF)
+        .union(RFlags::DF)
+        .union(RFlags::OF)
+        .union(RFlags::RF)
+        .union(RFlags::ID);
 }
 
 #[cfg(target_arch = "aarch64")]
 pub mod arch {
-    // User returns must not target the null-guard region.
-    pub const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
-    // Exclusive upper bound; keep the final low-userspace page reserved as a guard page.
-    pub const USER_ADDR_END: usize = 0x0000_ffff_ffff_f000;
-    /// PSTATE condition flags (N, Z, C, V) — guest-controllable arithmetic state.
-    pub const PSR_NZCV_MASK: u64 = 0b1111 << 28;
-    /// Speculative Store Bypass Safe bit — a benign, user-settable mitigation bit.
-    pub const PSR_SSBS_BIT: u64 = 1 << 12;
-    /// Data Independent Timing bit — a benign, user-settable mitigation bit.
-    pub const PSR_DIT_BIT: u64 = 1 << 24;
+    use litebox::arch::aarch64::{PSR_DIT_BIT, PSR_NZCV_MASK, PSR_SSBS_BIT};
+
     /// PSTATE bits a guest may keep when returning to EL0.
     pub const SAFE_USER_PSTATE: u64 = PSR_NZCV_MASK | PSR_SSBS_BIT | PSR_DIT_BIT;
 
@@ -3501,17 +3390,26 @@ pub mod arch {
     /// Returns whether `base` lies within LiteBox's guest address range.
     #[must_use]
     pub fn is_valid_user_tls_base(base: usize) -> bool {
-        base < USER_ADDR_END
+        base < litebox::arch::aarch64::USER_ADDR_END
     }
 }
 
 impl PtRegs {
-    /// Returns whether `rip` and `rsp` are in the x86_64 Linux user address range.
-    #[cfg(target_arch = "x86_64")]
+    /// Returns whether the instruction and stack pointers are in the architecture's user range.
     #[must_use]
     pub fn has_user_return_addresses(&self) -> bool {
-        (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.rip)
-            && (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.rsp)
+        #[cfg(target_arch = "aarch64")]
+        use litebox::arch::aarch64 as arch;
+        #[cfg(target_arch = "x86_64")]
+        use litebox::arch::x86_64 as arch;
+
+        #[cfg(target_arch = "x86_64")]
+        let sp = self.rsp;
+        #[cfg(target_arch = "aarch64")]
+        let sp = self.sp;
+
+        let user_range = arch::USER_ADDR_MIN..arch::USER_ADDR_END;
+        user_range.contains(&self.get_ip()) && user_range.contains(&sp)
     }
 
     /// Sanitizes CPU state and normalizes the context to the x86_64 Linux user ABI.
@@ -3523,21 +3421,19 @@ impl PtRegs {
     #[cfg(target_arch = "x86_64")]
     #[must_use]
     pub fn sanitize_for_user_return(&mut self) -> bool {
+        use litebox::arch::x86_64::RFlags;
+
         if !self.has_user_return_addresses() {
             return false;
         }
-        self.eflags = (self.eflags & arch::SAFE_USER_EFLAGS) | arch::EFLAGS_FIXED | arch::EFLAGS_IF;
+        self.eflags = ((RFlags::from_bits_retain(self.eflags as u64) & arch::SAFE_USER_EFLAGS)
+            | RFlags::FIXED
+            | RFlags::IF)
+            .bits()
+            .trunc();
         self.cs = arch::USER_CS;
         self.ss = arch::USER_DS;
         true
-    }
-
-    /// Returns whether `pc` and `sp` are in the aarch64 Linux user address range.
-    #[cfg(target_arch = "aarch64")]
-    #[must_use]
-    pub fn has_user_return_addresses(&self) -> bool {
-        (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.pc)
-            && (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.sp)
     }
 
     /// Sanitizes CPU state and normalizes the context to the aarch64 Linux user ABI.

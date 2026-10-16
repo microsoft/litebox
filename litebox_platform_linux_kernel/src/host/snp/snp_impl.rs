@@ -274,7 +274,7 @@ impl litebox::platform::GuestVectorStateProvider for SnpLinuxKernel {
 
     fn get_guest_vector_state(&self) -> Self::GuestVectorState {
         litebox_common_linux::GuestVectorState::initial(
-            litebox_common::arch::x86_64::xstate::XsaveLayout::get(),
+            litebox::arch::x86_64::xstate::XsaveLayout::get(),
         )
     }
 
@@ -317,7 +317,7 @@ const fn is_err_value(x: u64) -> bool {
     x >= !MAX_ERRNO
 }
 
-const PAGE_SIZE: u64 = litebox_common_linux::vmem::PAGE_SIZE as u64;
+const PAGE_SIZE: u64 = litebox_common_linux::PAGE_SIZE as u64;
 /// Max physical address
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 

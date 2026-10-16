@@ -6,13 +6,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use litebox::fs::errors::{FileStatusError, OpenError, PathError, ReadError};
+use litebox::mm::page::NonZeroPageSize;
 use litebox::platform::{
     RawConstPointer as _, RawMutPointer as _, RawPointerProvider,
     page_mgmt::MemoryRegionPermissions,
 };
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags, FileType};
-use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, NonZeroPageSize};
+use litebox_common_linux::vmem::{CreatePagesFlags, MappingError};
 use litebox_common_windows::loader::PAGE_SIZE;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};

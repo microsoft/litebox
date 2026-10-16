@@ -5,9 +5,22 @@ use crate::syscalls::Cleanup;
 use crate::{Task, UserMutPtr};
 use litebox::platform::page_mgmt::PageManagementProvider;
 use litebox::platform::{RawConstPointer, RawMutPointer};
-use litebox_common_linux::vmem::PAGE_SIZE;
-use litebox_common_linux::{MapFlags, ProtFlags};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{LdelfMapFlags, TeeResult, TeeUuid};
+
+fn tee_result_from_errno(err: Errno) -> TeeResult {
+    match err {
+        Errno::ENOSYS => TeeResult::NotSupported,
+        Errno::EINVAL | Errno::EFAULT => TeeResult::BadParameters,
+        Errno::EPERM | Errno::EACCES => TeeResult::AccessDenied,
+        Errno::ENOMEM => TeeResult::OutOfMemory,
+        Errno::EEXIST => TeeResult::AccessConflict,
+        Errno::EOVERFLOW => TeeResult::Overflow,
+        Errno::EBUSY => TeeResult::Busy,
+        _ => TeeResult::GenericError,
+    }
+}
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -207,7 +220,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
 
         let addr = self
             .sys_mmap(va, map_len, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
-            .map_err(TeeResult::from)?;
+            .map_err(tee_result_from_errno)?;
         let guard = MmapGuard::new(self, addr, map_len);
 
         let usable_start_addr = addr
@@ -420,7 +433,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
                 -1,
                 0,
             )
-            .map_err(TeeResult::from)?;
+            .map_err(tee_result_from_errno)?;
         let guard = MmapGuard::new(self, map_base_addr, alloc_len);
 
         let usable_start_addr = map_base_addr

@@ -4557,9 +4557,8 @@ mod tests {
 
     #[test]
     fn pstate_capture_and_restore_preserve_only_user_bits() {
-        use litebox_common_linux::arch::{
-            PSR_DIT_BIT, PSR_NZCV_MASK, PSR_SSBS_BIT, SAFE_USER_PSTATE,
-        };
+        use litebox::arch::aarch64::{PSR_DIT_BIT, PSR_NZCV_MASK, PSR_SSBS_BIT};
+        use litebox_common_linux::arch::SAFE_USER_PSTATE;
 
         MacosUserland::new();
         let vector = get_guest_vector_state();
@@ -4738,7 +4737,7 @@ mod tests {
             let source = unsafe {
                 mm.create_writable_pages(
                     None,
-                    litebox_common_linux::vmem::NonZeroPageSize::new(HOST_PAGE_SIZE).unwrap(),
+                    litebox::mm::page::NonZeroPageSize::new(HOST_PAGE_SIZE).unwrap(),
                     litebox_common_linux::vmem::CreatePagesFlags::empty(),
                     |_| Ok(0),
                 )

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use crate::platform::page_mgmt::MemoryRegionPermissions;
 use thiserror::Error;
 
 /// A provider to map and unmap physical pages with virtually contiguous addresses.
@@ -113,11 +113,11 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
 
 /// Data structure representing a physical address with page alignment.
 ///
-/// Currently, this is an alias to [`crate::vmem::NonZeroAddress`]. This might change if
+/// Currently, this is an alias to [`crate::mm::page::NonZeroAddress`]. This might change if
 /// we selectively conduct sanity checks based on whether an address is virtual or physical
 /// (e.g., whether a virtual address is canonical, whether a physical address is tagged with
 /// a valid key ID, etc.).
-pub type PhysPageAddr<const ALIGN: usize> = crate::vmem::NonZeroAddress<ALIGN>;
+pub type PhysPageAddr<const ALIGN: usize> = crate::mm::page::NonZeroAddress<ALIGN>;
 
 /// Data structure for an array of physical page addresses which are virtually contiguous.
 pub type PhysPageAddrArray<const ALIGN: usize> = [PhysPageAddr<ALIGN>];
@@ -159,7 +159,7 @@ impl PhysPageMapInfo for NoopPhysPageMapInfo {
 
 bitflags::bitflags! {
     /// Physical page map permissions which is a restricted version of
-    /// [`litebox::platform::page_mgmt::MemoryRegionPermissions`].
+    /// [`crate::platform::page_mgmt::MemoryRegionPermissions`].
     ///
     /// This module only supports READ and WRITE permissions. Both EXECUTE and SHARED
     /// permissions are explicitly prohibited.

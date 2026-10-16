@@ -1721,13 +1721,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "litebox_common"
-version = "0.1.0"
-dependencies = [
- "spin 0.9.8",
-]
-
-[[package]]
 name = "litebox_common_linux"
 version = "0.1.0"
 dependencies = [
@@ -1737,7 +1730,6 @@ dependencies = [
  "int-enum",
  "litebox",
  "litebox_broker_protocol",
- "litebox_common",
  "litebox_syscall_rewriter",
  "litebox_util_log",
  "rangemap",
@@ -1753,7 +1745,6 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
  "litebox",
- "litebox_common_linux",
  "num_enum",
  "thiserror",
  "x86_64",
@@ -1781,7 +1772,6 @@ dependencies = [
  "bitflags 2.13.1",
  "elf",
  "litebox",
- "litebox_common_linux",
  "litebox_common_vm_abi",
  "num_enum",
  "zerocopy",
@@ -1861,7 +1851,6 @@ dependencies = [
  "bindgen",
  "bitflags 2.13.1",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_platform",
  "litebox_util_log",
@@ -1882,7 +1871,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_common_optee",
  "litebox_platform",
@@ -1957,7 +1945,6 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_common_vm_abi",
  "litebox_platform",
@@ -1973,7 +1960,6 @@ name = "litebox_platform_windows_userland"
 version = "0.1.0"
 dependencies = [
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_common_windows",
  "litebox_platform",
@@ -2243,7 +2229,6 @@ dependencies = [
  "elf",
  "hashbrown",
  "litebox",
- "litebox_common_linux",
  "litebox_common_lvbs",
  "log",
  "object",

@@ -10,6 +10,10 @@ use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables}
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
+use litebox::mm::page::PageRange;
+use litebox::mm::vmap::{
+    PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
+};
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
     RawPointerProvider, page_mgmt::DeallocationError,
@@ -17,13 +21,8 @@ use litebox::platform::{
 use litebox::{
     platform::page_mgmt::FixedAddressBehavior, shim::ContinueOperation, utils::TruncateExt,
 };
-use litebox_common_linux::vmap::{
-    PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
-};
-use litebox_common_linux::{
-    errno::Errno,
-    vmem::{PAGE_SIZE, PageRange},
-};
+use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::PAGE_SIZE;
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -486,8 +485,8 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
-                    unsafe { litebox_common_linux::wrfsbase(val) };
+                if litebox::arch::x86_64::is_valid_user_fs_base(val) {
+                    unsafe { litebox::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {
                     Err(ArchSpecificError::RegisterUnpermittedValue)
@@ -506,7 +505,7 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
         reg: &ArchSpecificRegister,
     ) -> Result<usize, ArchSpecificError> {
         match reg {
-            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox::arch::x86_64::rdfsbase() }),
             ArchSpecificRegister::GsBase => {
                 // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538
                 unimplemented!()
@@ -1138,7 +1137,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
         let new_range = PageRange::new(new_range.start, new_range.end)
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
-        if old_range.start.max(new_range.start) < old_range.end.min(new_range.end) {
+        if old_range.start().max(new_range.start()) < old_range.end().min(new_range.end()) {
             return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
         }
         unsafe {

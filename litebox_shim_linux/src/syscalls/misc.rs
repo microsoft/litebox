@@ -6,9 +6,9 @@
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
 use crate::{ShimPlatform, Task};
+use litebox::user_pointers::UserPtrMut;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::errno::Errno;
-use litebox_common_linux::user_pointers::UserPtrMut;
 use litebox_platform::time::Instant as _;
 
 impl<Platform: ShimPlatform> Task<Platform> {
@@ -170,8 +170,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 #[cfg(test)]
 mod tests {
     use crate::syscalls::tests::init_platform;
+    use litebox::user_pointers::UserPtrMut;
     use litebox_common_linux::errno::Errno;
-    use litebox_common_linux::user_pointers::UserPtrMut;
     use zerocopy::FromZeros as _;
 
     #[test]

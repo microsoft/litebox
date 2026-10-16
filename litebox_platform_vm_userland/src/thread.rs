@@ -89,10 +89,10 @@ static MAIN: MainThread = MainThread {
 /// `kcall::ready`), which reset it; this sets it.
 pub(crate) fn current() -> &'static SwitchState {
     // Safety: the kernel enables FSGSBASE; the runner owns GS.
-    match unsafe { litebox_common_linux::rdgsbase() } {
+    match unsafe { litebox::arch::x86_64::rdgsbase() } {
         0 => {
             // Safety: as above.
-            unsafe { litebox_common_linux::wrgsbase(&raw const MAIN.state as usize) };
+            unsafe { litebox::arch::x86_64::wrgsbase(&raw const MAIN.state as usize) };
             &MAIN.state
         }
         // Safety: set above, or by the kernel to the thread's own (see
@@ -630,7 +630,7 @@ pub(crate) fn spawn(
         // The guest's, as Linux's `clone` keeps it (but for `CLONE_SETTLS`,
         // which the shim applies).
         // Safety: the kernel enables FSGSBASE; no memory access.
-        fs_base: unsafe { litebox_common_linux::rdfsbase() } as u64,
+        fs_base: unsafe { litebox::arch::x86_64::rdfsbase() } as u64,
         gs_base: core::ptr::from_ref(&record.state) as u64,
         upcall_stack: record.upcall_stack.range(),
     };

@@ -26,8 +26,9 @@ use litebox_common_linux::{
     MapFlags, ProtFlags,
     errno::Errno,
     loader::{ElfParseError, ElfParsedFile},
-    vmem::{MappingError, PAGE_SIZE},
+    vmem::MappingError,
 };
+use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{LdelfArg, TeeUuid};
 use thiserror::Error;
 

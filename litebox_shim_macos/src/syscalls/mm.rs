@@ -9,6 +9,7 @@
 
 use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
 use core::ops::Range;
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
     fs::errors::ReadError,
     platform::{
@@ -17,9 +18,7 @@ use litebox::{
     },
     utils::TruncateExt as _,
 };
-use litebox_common_linux::vmem::{
-    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmFlags, VmemProtectError,
-};
+use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, VmFlags, VmemProtectError};
 use litebox_common_macos::{
     MmapFlags, PAGE_SIZE, VmProtection, errno::Errno, loader::MAX_IMAGE_SIZE,
 };

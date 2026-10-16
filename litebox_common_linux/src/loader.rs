@@ -17,7 +17,7 @@ use litebox::{
 use thiserror::Error;
 use zerocopy::FromBytes;
 
-use crate::{HOST_PAGE_SIZE, errno::Errno, vmem::PAGE_SIZE};
+use crate::{HOST_PAGE_SIZE, PAGE_SIZE, errno::Errno};
 
 type Endian = elf::endian::LittleEndian;
 

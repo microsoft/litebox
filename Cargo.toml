@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "litebox",
-    "litebox_common",
     "litebox_broker_local",
     "litebox_broker_local_userland",
     "litebox_broker_core",
@@ -63,7 +62,6 @@ members = [
 ]
 default-members = [
     "litebox",
-    "litebox_common",
     "litebox_broker_local",
     "litebox_broker_local_userland",
     "litebox_broker_core",

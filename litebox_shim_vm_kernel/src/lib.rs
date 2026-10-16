@@ -338,7 +338,7 @@ impl Process {
             .platform
             .get_arch_specific_register(&ArchSpecificRegister::FsBase)
             .expect("the platform supports FS");
-        if litebox_common_linux::arch::is_valid_user_fs_base(fs_base) {
+        if litebox::arch::x86_64::is_valid_user_fs_base(fs_base) {
             thread.fs_base.set(fs_base);
         } else {
             thread.fs_base.set(0);

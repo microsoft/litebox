@@ -33,13 +33,13 @@
 //! all LiteBox/Rust code and data live, so a raw pointer into a foreign physical
 //! mapping cannot alias any Rust reference.
 
-use crate::vmap::{
+use crate::mm::vmap::{
     PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
-use core::marker::PhantomData;
-use litebox::platform::common_providers::userspace_pointers::{
+use crate::platform::common_providers::userspace_pointers::{
     UserConstPtr, UserMutPtr, ValidateAccess,
 };
+use core::marker::PhantomData;
 use zerocopy::{FromBytes, IntoBytes};
 
 #[inline]
@@ -449,7 +449,7 @@ impl<V: VmapManager<ALIGN>, T, const ALIGN: usize> MappedGuard<'_, V, T, ALIGN> 
     unsafe fn copy_out(&self, dst: *mut u8) -> Result<(), PhysPointerError> {
         // Fallible: another core may unmap this page concurrently.
         let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(dst, self.ptr.cast::<u8>(), self.size)
+            crate::mm::exception_table::memcpy_fallible(dst, self.ptr.cast::<u8>(), self.size)
         };
         debug_assert!(result.is_ok(), "fault reading from mapped physical page");
         result.map_err(|_| PhysPointerError::CopyFailed)
@@ -465,7 +465,7 @@ impl<V: VmapManager<ALIGN>, T, const ALIGN: usize> MappedGuard<'_, V, T, ALIGN> 
     unsafe fn copy_in(&self, src: *const u8) -> Result<(), PhysPointerError> {
         // Fallible: another core may unmap this page concurrently.
         let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(self.ptr.cast::<u8>(), src, self.size)
+            crate::mm::exception_table::memcpy_fallible(self.ptr.cast::<u8>(), src, self.size)
         };
         debug_assert!(result.is_ok(), "fault writing to mapped physical page");
         result.map_err(|_| PhysPointerError::CopyFailed)

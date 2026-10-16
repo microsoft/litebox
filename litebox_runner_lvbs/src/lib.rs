@@ -11,7 +11,8 @@ use litebox::{
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
-use litebox_common_linux::{errno::Errno, vmem::PAGE_SIZE};
+use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::PAGE_SIZE;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand,
@@ -360,7 +361,84 @@ fn vsm_dispatch(platform: &'static Platform, func_id: VsmFunction, params: &[u64
     };
     match result {
         Ok(value) => value,
-        Err(e) => Errno::from(e).as_neg().into(),
+        Err(e) => vsm_error_to_errno(e).as_neg().into(),
+    }
+}
+
+fn vsm_error_to_errno(error: VsmError) -> Errno {
+    use litebox_common_lvbs::VerificationError;
+
+    match error {
+        // Address/pointer errors and memory copy failures - memory access fault
+        VsmError::InvalidInputAddress
+        | VsmError::InvalidPhysicalAddress
+        | VsmError::InvalidVirtualAddress
+        | VsmError::CpuOnlineMaskCopyFailed
+        | VsmError::HekiPagesCopyFailed
+        | VsmError::Vtl0CopyFailed => Errno::EFAULT,
+
+        // Not found errors
+        VsmError::SystemCertificatesNotFound
+        | VsmError::KernelSymbolTableNotFound
+        | VsmError::PrecomputedPatchNotFound => Errno::ENOENT,
+
+        // Operation not permitted after end of boot
+        VsmError::OperationAfterEndOfBoot(_) => Errno::EPERM,
+
+        // Unsupported operation
+        VsmError::OperationNotSupported(_) => Errno::ENOTSUP,
+
+        // Security/verification failures - access denied
+        VsmError::TextPatchSuspicious
+        | VsmError::SystemCertificatesInvalid
+        | VsmError::SystemCertificatesNotLoaded => Errno::EACCES,
+
+        // Size/range errors
+        VsmError::BufferTooSmall(_)
+        | VsmError::KexecSegmentRangeInvalid
+        | VsmError::ModuleElfSizeExceeded { .. }
+        | VsmError::CodePageOffsetOverflow
+        | VsmError::IntegerOverflow
+        | VsmError::SymbolNameTooLong
+        | VsmError::SymbolTableOutOfRange => Errno::ERANGE,
+
+        // Init/hardware failures - I/O error
+        VsmError::ApInitFailed(_) | VsmError::HypercallFailed(_) => Errno::EIO,
+        VsmError::OutOfMemory => Errno::ENOMEM,
+
+        // True format/validation errors - invalid argument
+        VsmError::AddressNotPageAligned
+        | VsmError::MemoryAttributeInvalid
+        | VsmError::KernelDataTypeInvalid
+        | VsmError::ModuleMemoryTypeInvalid
+        | VsmError::ModuleRelocationInvalid
+        | VsmError::ModuleTokenInvalid
+        | VsmError::ProtectedFrameOverlap
+        | VsmError::KexecTypeInvalid
+        | VsmError::KexecImageSegmentsInvalid
+        | VsmError::SymbolTableEmpty
+        | VsmError::SymbolTableLengthInvalid
+        | VsmError::SymbolNameOffsetInvalid
+        | VsmError::SymbolNameInvalidUtf8
+        | VsmError::SymbolNameNoTerminator
+        | VsmError::CertificateDerLengthInvalid { .. }
+        | VsmError::CertificateParseFailed => Errno::EINVAL,
+
+        // Signature verification failures delegate to VerificationError's Errno mapping
+        VsmError::SignatureVerificationFailed(error) => match error {
+            VerificationError::AuthenticationFailed => Errno::EKEYREJECTED,
+            VerificationError::SignatureNotFound => Errno::ENODATA,
+            VerificationError::Unsupported => Errno::ENOPKG,
+            VerificationError::InvalidCertificate => Errno::ENOKEY,
+            VerificationError::InvalidSignature | VerificationError::ParseFailed => Errno::ELIBBAD,
+            _ => Errno::EINVAL,
+        },
+
+        // Future VSM errors default to an invalid request and are logged so they can be mapped.
+        unmapped => {
+            debug_serial_println!("Unmapped VSM error: {unmapped:?}");
+            Errno::EINVAL
+        }
     }
 }
 

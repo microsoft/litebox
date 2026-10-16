@@ -103,7 +103,7 @@ pub(crate) fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
 fn map_csr_server_shared_memory(
     page_manager: &crate::WindowsPageManager<TestPlatform>,
 ) -> Option<usize> {
-    let length = litebox_common_linux::vmem::NonZeroPageSize::new(
+    let length = litebox::mm::page::NonZeroPageSize::new(
         crate::syscalls::section::WINDOWS_SHARED_SECTION_SIZE,
     )?;
     page_manager

@@ -9,13 +9,13 @@
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
+use litebox::mm::page::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider, Provider,
 };
 use litebox_common_linux::errno::Errno;
-use litebox_common_linux::vmem::PageRange;
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -84,8 +84,8 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
-                    unsafe { litebox_common_linux::wrfsbase(val) };
+                if litebox::arch::x86_64::is_valid_user_fs_base(val) {
+                    unsafe { litebox::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {
                     Err(ArchSpecificError::RegisterUnpermittedValue)
@@ -104,7 +104,7 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
         reg: &ArchSpecificRegister,
     ) -> Result<usize, ArchSpecificError> {
         match reg {
-            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox::arch::x86_64::rdfsbase() }),
             ArchSpecificRegister::GsBase => {
                 // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538
                 unimplemented!()
@@ -459,7 +459,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
         let new_range = PageRange::new(new_range.start, new_range.end)
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
-        if old_range.start.max(new_range.start) < old_range.end.min(new_range.end) {
+        if old_range.start().max(new_range.start()) < old_range.end().min(new_range.end()) {
             return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
         }
         unsafe { self.page_table.remap_pages(old_range, new_range) }?;

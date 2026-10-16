@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use litebox_common_linux::{ProtFlags, errno::Errno, vmem::PAGE_SIZE};
+use litebox_common_linux::{PAGE_SIZE, ProtFlags, errno::Errno};
 use litebox_syscall_rewriter::aarch64::{CodeScanRanges, ElfCodeMetadata};
 use zerocopy::FromZeros as _;
 

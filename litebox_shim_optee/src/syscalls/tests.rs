@@ -77,8 +77,8 @@ fn test_sys_get_time_system_is_monotonic() {
 
 #[test]
 fn test_sys_map_zi_uses_bottom_up_placement() {
-    use litebox_common_linux::vmem::PAGE_SIZE;
     use litebox_common_optee::LdelfMapFlags;
+    use litebox_common_optee::PAGE_SIZE;
 
     let task = init_platform();
     let (header, header_cleanup) = task

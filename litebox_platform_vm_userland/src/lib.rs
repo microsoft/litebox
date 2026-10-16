@@ -35,6 +35,9 @@ mod timer;
 pub use timer::Timer;
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use litebox::mm::vmap::{
+    NoopPhysPageMapInfo, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
+};
 use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, HintPlacementBehavior,
     MemoryRegionPermissions, PermissionUpdateError,
@@ -43,10 +46,10 @@ use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
     RawPointerProvider, common_providers::reservations::NoTrackedReservations,
 };
-use litebox_common_linux::vmap::{
-    NoopPhysPageMapInfo, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
+use litebox_common_linux::{
+    PAGE_SIZE,
+    vmem::{PageFaultError, VmFlags, VmemPageFaultHandler},
 };
-use litebox_common_linux::vmem::{PAGE_SIZE, PageFaultError, VmFlags, VmemPageFaultHandler};
 use litebox_common_vm_abi::{
     LogLevel, Placement, Populate, Prot, RUNNER_MANAGED_MAX, RUNNER_MANAGED_MIN, StartupInfo,
     Status, WallClock,
@@ -132,10 +135,10 @@ impl ArchSpecificProvider for VmUserland {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                if litebox::arch::x86_64::is_valid_user_fs_base(val) {
                     // Safety: the kernel enables FSGSBASE, and FS belongs to the
                     // guest.
-                    unsafe { litebox_common_linux::wrfsbase(val) };
+                    unsafe { litebox::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {
                     Err(ArchSpecificError::RegisterUnpermittedValue)
@@ -151,7 +154,7 @@ impl ArchSpecificProvider for VmUserland {
     ) -> Result<usize, ArchSpecificError> {
         match reg {
             // Safety: the kernel enables FSGSBASE.
-            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox::arch::x86_64::rdfsbase() }),
             _ => Err(ArchSpecificError::RegisterUnsupported),
         }
     }
@@ -673,7 +676,7 @@ impl litebox::platform::GuestVectorStateProvider for VmUserland {
 
     fn get_guest_vector_state(&self) -> Self::GuestVectorState {
         litebox_common_linux::GuestVectorState::initial(
-            litebox_common::arch::x86_64::xstate::XsaveLayout::get(),
+            litebox::arch::x86_64::xstate::XsaveLayout::get(),
         )
     }
 

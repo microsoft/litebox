@@ -19,12 +19,12 @@ use std::os::raw::c_void;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use litebox::arch::x86_64::xstate::{XsaveArea, XsaveChunk, XsaveLayout, XsaveLegacyArea};
 use litebox::platform::page_mgmt::{
     AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
-use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveChunk, XsaveLayout, XsaveLegacyArea};
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -132,18 +132,18 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
                 (*tls).guest_fs_base.set(fs_base);
             }
         }
-        unsafe { litebox_common_linux::wrfsbase(fs_base) };
+        unsafe { litebox::arch::x86_64::wrfsbase(fs_base) };
     }
 
     fn get_thread_fs_base() -> usize {
         get_tls_ptr().map_or_else(
-            || unsafe { litebox_common_linux::rdfsbase() },
+            || unsafe { litebox::arch::x86_64::rdfsbase() },
             |tls| unsafe { &*tls }.guest_fs_base.get(),
         )
     }
 
     fn restore_thread_fs_base(tls: &TlsState) {
-        unsafe { litebox_common_linux::wrfsbase(tls.guest_fs_base.get()) };
+        unsafe { litebox::arch::x86_64::wrfsbase(tls.guest_fs_base.get()) };
     }
 }
 
@@ -237,7 +237,7 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     // the interrupt path to ensure that any pending interrupts are also handled.
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && guest_tls_mode() == GuestTlsMode::Linux
-        && unsafe { litebox_common_linux::rdfsbase() } == 0
+        && unsafe { litebox::arch::x86_64::rdfsbase() } == 0
         && tls.guest_fs_base.get() != 0
     {
         set_context_to_interrupt_callback(context);
@@ -1790,7 +1790,7 @@ impl<const ALIGN: usize> litebox::platform::ArchSpecificProvider for WindowsUser
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase => {
-                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                if litebox::arch::x86_64::is_valid_user_fs_base(val) {
                     Self::set_thread_fs_base(val);
                     Ok(())
                 } else {
@@ -1800,7 +1800,7 @@ impl<const ALIGN: usize> litebox::platform::ArchSpecificProvider for WindowsUser
             litebox::platform::ArchSpecificRegister::GsBase
                 if guest_tls_mode() == GuestTlsMode::Windows =>
             {
-                if val != 0 && litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                if val != 0 && litebox::arch::x86_64::is_valid_user_fs_base(val) {
                     Self::set_guest_teb(val);
                     Ok(())
                 } else {

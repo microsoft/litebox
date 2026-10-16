@@ -196,7 +196,7 @@ impl Inner {
         }
         let fs_base: usize = r.fs_base.trunc();
         if !(user_address(r.regs.rip) && user_address(r.regs.rsp))
-            || (fs_base != 0 && !litebox_common_linux::arch::is_valid_user_fs_base(fs_base))
+            || (fs_base != 0 && !litebox::arch::x86_64::is_valid_user_fs_base(fs_base))
         {
             return Err(Status::InvalidArgument);
         }

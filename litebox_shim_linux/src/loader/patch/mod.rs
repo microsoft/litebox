@@ -14,13 +14,12 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use core::ops::Range;
 use litebox_common_linux::{
-    MapFlags, ProtFlags,
+    MapFlags, PAGE_SIZE, ProtFlags,
     errno::Errno,
     loader::{
         TRAMPOLINE_HEADER_SIZE, TrampolineHeaderError, TrampolineLayout, parse_trampoline_header,
     },
     mm::MmapPlacement,
-    vmem::PAGE_SIZE,
 };
 use litebox_syscall_rewriter::trampoline_allocation_range;
 
@@ -1407,13 +1406,10 @@ mod tests {
     use super::{ElfPatchKey, ElfPatchState, PAGE_SIZE, Task};
     use alloc::collections::BTreeSet;
     use alloc::vec::Vec;
+    use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
     use litebox_broker_protocol::fs::FileMode as Mode;
-    use litebox_common_linux::{
-        MapFlags, OFlags, ProtFlags,
-        errno::Errno,
-        vmem::{NonZeroAddress, NonZeroPageSize},
-    };
+    use litebox_common_linux::{MapFlags, OFlags, ProtFlags, errno::Errno};
     use rangemap::RangeSet;
 
     use crate::UserPtrMut;

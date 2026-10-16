@@ -32,6 +32,10 @@ use crate::per_cpu::{PerCpuVariablesAsm, with_per_cpu_variables};
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
+use litebox::mm::page::PageRange;
+use litebox::mm::vmap::{
+    NoopPhysPageMapInfo, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
+};
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
     RawPointerProvider,
@@ -48,13 +52,10 @@ use litebox::{
     shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo},
     utils::TruncateExt,
 };
-use litebox_common_linux::vmap::{
-    NoopPhysPageMapInfo, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
-};
 use litebox_common_linux::{
-    PtRegs,
+    PAGE_SIZE, PtRegs,
     errno::Errno,
-    vmem::{PAGE_SIZE, PageFaultError, PageRange, VmFlags, VmemPageFaultHandler},
+    vmem::{PageFaultError, VmFlags, VmemPageFaultHandler},
 };
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
@@ -394,10 +395,10 @@ impl ArchSpecificProvider for VmKernel {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                if litebox::arch::x86_64::is_valid_user_fs_base(val) {
                     // Safety: FSGSBASE is enabled, and `val` is a valid user FS
                     // base; the kernel does not use FS.
-                    unsafe { litebox_common_linux::wrfsbase(val) };
+                    unsafe { litebox::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {
                     Err(ArchSpecificError::RegisterUnpermittedValue)
@@ -416,7 +417,7 @@ impl ArchSpecificProvider for VmKernel {
     ) -> Result<usize, ArchSpecificError> {
         match reg {
             // Safety: FSGSBASE is enabled.
-            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox::arch::x86_64::rdfsbase() }),
             ArchSpecificRegister::GsBase => {
                 panic!("GS belongs to the kernel (per-CPU data via `swapgs`)")
             }
@@ -623,7 +624,7 @@ impl VmKernel {
         range: core::ops::Range<usize>,
     ) -> Result<PinnedUserPages, Errno> {
         let range = PageRange::<PAGE_SIZE>::new(range.start, range.end).ok_or(Errno::EINVAL)?;
-        if range.is_empty() || range.start < USER_ADDR_MIN || range.end > USER_ADDR_MAX {
+        if range.is_empty() || range.start() < USER_ADDR_MIN || range.end() > USER_ADDR_MAX {
             return Err(Errno::EINVAL);
         }
         if address_space == AddressSpaceId::KERNEL {
@@ -852,10 +853,10 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
         }
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(AllocationError::Unaligned)?;
-        if range.start < USER_ADDR_MIN {
+        if range.start() < USER_ADDR_MIN {
             return Err(AllocationError::BelowMinAddress);
         }
-        if range.end > USER_ADDR_MAX {
+        if range.end() > USER_ADDR_MAX {
             return Err(AllocationError::AboveMaxAddress);
         }
         let current_pt = self.page_table_manager.current_page_table();

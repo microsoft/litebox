@@ -9,7 +9,7 @@ hashbrown = "0.15.2"
 smallvec = "1.13.2"
 spin = { version = "0.9.8", default-features = false, features = ["once", "spin_mutex"] }
 thiserror = { version = "2.0.6", default-features = false }
-zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "alloc"] }
 rangemap = { version = "1.5.1", features = ["const_fn"] }
 buddy_system_allocator = { version = "0.11.0", default-features = false, features = ["use_spin"] }
 # Depend on (currently unreleased) slabmalloc `main`, which contains some fixes on top of `0.11.0`

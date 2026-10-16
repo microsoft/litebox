@@ -7,15 +7,14 @@ use core::{
     marker::PhantomData,
     mem::{align_of, size_of},
 };
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::{
     RawConstPointer as _, RawMutPointer as _, RawPointerProvider,
     page_mgmt::MemoryRegionPermissions,
 };
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
-use litebox_common_linux::vmem::{
-    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError,
-};
+use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, VmemProtectError};
 use litebox_common_windows::loader::{
     AccessMemory, Fault, KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, MapMemory, MappingInfo, PAGE_SIZE, PeExportError,

@@ -28,12 +28,11 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, CloseRangeFlags, EfdFlags, EpollCreateFlags, FcntlArg,
-    FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx,
-    StatxMask, TimeParam,
+    FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, PAGE_SIZE,
+    Statx, StatxMask, TimeParam,
     errno::Errno,
     program_startup::{ForkedFd, InheritedFd, InheritedFdKind},
     signal::Signal,
-    vmem::PAGE_SIZE,
 };
 use thiserror::Error;
 

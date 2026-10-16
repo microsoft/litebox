@@ -4,11 +4,10 @@
 use core::mem::size_of;
 
 use int_enum::IntEnum;
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::page_mgmt::{AllocationError, MemoryRegionPermissions};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
-use litebox_common_linux::vmem::{
-    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmFlags, VmemProtectError,
-};
+use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, VmFlags, VmemProtectError};
 use litebox_common_windows::nt_status::NtStatus;
 use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};

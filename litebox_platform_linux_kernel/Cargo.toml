@@ -11,7 +11,6 @@ bindgen = "0.71.0"
 [dependencies]
 bitflags = "2.13.1"
 litebox = { path = "../litebox/", version = "0.1.0" }
-litebox_common = { path = "../litebox_common", version = "0.1.0", default-features = false }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }

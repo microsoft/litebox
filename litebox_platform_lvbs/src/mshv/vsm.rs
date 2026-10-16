@@ -24,8 +24,8 @@ use crate::{
 };
 use alloc::vec::Vec;
 use core::ops::Range;
+use litebox::mm::vmap::{PhysPageAddr, PhysPageAddrArray, PhysPointerError};
 use litebox::utils::TruncateExt;
-use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_lvbs::{
     FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, ReservationStatus, VsmError,
     Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
@@ -454,20 +454,16 @@ impl ProtectedFrameRegistry {
     /// guard that prevents protection or reservation updates until dropped.
     pub(crate) fn acquire_access_guard<const ALIGN: usize>(
         &self,
-        pages: &litebox_common_linux::vmap::PhysPageAddrArray<ALIGN>,
-    ) -> Result<ProtectedFrameAccessGuard<'_>, litebox_common_linux::vmap::PhysPointerError> {
+        pages: &PhysPageAddrArray<ALIGN>,
+    ) -> Result<ProtectedFrameAccessGuard<'_>, PhysPointerError> {
         let guard = self.frames.read();
         for page in pages {
             let start = page.as_usize() as u64;
             let end = start
                 .checked_add(ALIGN as u64)
-                .ok_or(litebox_common_linux::vmap::PhysPointerError::Overflow)?;
+                .ok_or(PhysPointerError::Overflow)?;
             if guard.overlaps(&(start..end)) {
-                return Err(
-                    litebox_common_linux::vmap::PhysPointerError::InvalidPhysicalAddress(
-                        page.as_usize(),
-                    ),
-                );
+                return Err(PhysPointerError::InvalidPhysicalAddress(page.as_usize()));
             }
         }
         Ok(ProtectedFrameAccessGuard { _guard: guard })

@@ -28,7 +28,7 @@ use litebox_common_linux::{
     AddressFamily, FileDescriptorFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType,
     SocketOption, SocketOptionName, UserMmsgHdr, UserMsgHdr, errno::Errno, signal::Signal,
 };
-use litebox_common_linux::{mm::VmemManager, vmem::PAGE_SIZE};
+use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
 use litebox_platform::time::Instant as _;
 
 use crate::syscalls::{

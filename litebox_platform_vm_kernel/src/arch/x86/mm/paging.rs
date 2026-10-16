@@ -3,9 +3,10 @@
 
 use arrayvec::ArrayVec;
 use core::ops::Range;
+use litebox::mm::page::PageRange;
 use litebox::platform::page_mgmt;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::vmem::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
+use litebox_common_linux::vmem::{PageFaultError, VmFlags, VmemPageFaultHandler};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -182,8 +183,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 } {
                     Ok(()) => {}
                     Err(PageFaultError::AllocationFailed) => {
-                        if addr != range.start {
-                            let populated = PageRange::new(range.start, addr)
+                        if addr != range.start() {
+                            let populated = PageRange::new(range.start(), addr)
                                 .expect("a nonempty prefix of an aligned range is aligned");
                             // Safety: mapped above and not yet handed out.
                             unsafe { self.unmap_pages(populated, UnmapOptions::RELEASE) }
@@ -196,7 +197,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
             }
         }
-        Ok(UserMutPtr::from_ptr(range.start as *mut u8))
+        Ok(UserMutPtr::from_ptr(range.start() as *mut u8))
     }
 
     /// # Safety
@@ -214,9 +215,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         if range.is_empty() {
             return Ok(());
         }
-        let start = Page::<Size4KiB>::from_start_address(VirtAddr::new(range.start as _))
+        let start = Page::<Size4KiB>::from_start_address(VirtAddr::new(range.start() as _))
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
-        let end = Page::<Size4KiB>::from_start_address(VirtAddr::new(range.end as _))
+        let end = Page::<Size4KiB>::from_start_address(VirtAddr::new(range.end() as _))
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
         let mut allocator = PageTableAllocator::<M>::new();
 
@@ -321,8 +322,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         range: PageRange<ALIGN>,
         new_flags: VmFlags,
     ) -> Result<(), page_mgmt::PermissionUpdateError> {
-        let start = VirtAddr::new(range.start as _);
-        let end = VirtAddr::new(range.end as _);
+        let start = VirtAddr::new(range.start() as _);
+        let end = VirtAddr::new(range.end() as _);
         let new_flags = vmflags_to_pteflags(new_flags) & Self::MPROTECT_PTE_MASK;
         let start: Page<Size4KiB> =
             Page::from_start_address(start).or(Err(page_mgmt::PermissionUpdateError::Unaligned))?;

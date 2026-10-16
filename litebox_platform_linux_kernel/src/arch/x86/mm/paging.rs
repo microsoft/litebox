@@ -1,8 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use litebox::mm::page::PageRange;
 use litebox::platform::{RawConstPointer as _, page_mgmt};
-use litebox_common_linux::vmem::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
+use litebox_common_linux::vmem::{PageFaultError, VmFlags, VmemPageFaultHandler};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -100,7 +101,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 } {
                     // Only `range.start..=page_addr` may have been touched (including any
                     // page-table frames allocated by the failed fault); avoid walking the rest.
-                    let populated = PageRange::new(range.start, page_addr + ALIGN).unwrap();
+                    let populated = PageRange::new(range.start(), page_addr + ALIGN).unwrap();
                     // SAFETY: `range` was unmapped before this call and is not yet returned.
                     let _ = unsafe { self.unmap_pages(populated, true) };
                     return Err(match err {
@@ -112,7 +113,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
             }
         }
-        Ok(UserMutPtr::from_usize(range.start))
+        Ok(UserMutPtr::from_usize(range.start()))
     }
 
     /// Unmap 4KiB pages from the page table
@@ -125,10 +126,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         range: PageRange<ALIGN>,
         dealloc_frames: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
-        let start_va = VirtAddr::new(range.start as _);
+        let start_va = VirtAddr::new(range.start() as _);
         let start = Page::<Size4KiB>::from_start_address(start_va)
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
-        let end_va = VirtAddr::new(range.end as _);
+        let end_va = VirtAddr::new(range.end() as _);
         let end = Page::<Size4KiB>::from_start_address(end_va)
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
         let mut allocator = PageTableAllocator::<M>::new();
@@ -164,12 +165,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         new_range: PageRange<ALIGN>,
     ) -> Result<UserMutPtr<u8>, page_mgmt::RemapError> {
         let mut start: Page<Size4KiB> =
-            Page::from_start_address(VirtAddr::new(old_range.start as u64))
+            Page::from_start_address(VirtAddr::new(old_range.start() as u64))
                 .or(Err(page_mgmt::RemapError::Unaligned))?;
         let mut new_start: Page<Size4KiB> =
-            Page::from_start_address(VirtAddr::new(new_range.start as u64))
+            Page::from_start_address(VirtAddr::new(new_range.start() as u64))
                 .or(Err(page_mgmt::RemapError::Unaligned))?;
-        let end: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(old_range.end as u64))
+        let end: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(old_range.end() as u64))
             .or(Err(page_mgmt::RemapError::Unaligned))?;
 
         // Note this implementation is slow as each page requires three full page table walks.
@@ -221,7 +222,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             new_start += 1;
         }
 
-        Ok(UserMutPtr::from_usize(new_range.start))
+        Ok(UserMutPtr::from_usize(new_range.start()))
     }
 
     pub(crate) unsafe fn mprotect_pages(
@@ -229,8 +230,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         range: PageRange<ALIGN>,
         new_flags: VmFlags,
     ) -> Result<(), page_mgmt::PermissionUpdateError> {
-        let start = VirtAddr::new(range.start as _);
-        let end = VirtAddr::new(range.end as _);
+        let start = VirtAddr::new(range.start() as _);
+        let end = VirtAddr::new(range.end() as _);
         let new_flags = vmflags_to_pteflags(new_flags) & Self::MPROTECT_PTE_MASK;
         let start: Page<Size4KiB> =
             Page::from_start_address(start).or(Err(page_mgmt::PermissionUpdateError::Unaligned))?;

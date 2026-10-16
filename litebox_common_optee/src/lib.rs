@@ -12,13 +12,15 @@ use alloc::boxed::Box;
 use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::{PtRegs, errno::Errno};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub mod envelope;
 pub mod syscall_nr;
+
+/// Page size required by the OP-TEE shared-memory ABI.
+pub const PAGE_SIZE: usize = 4096;
 
 /// Maximum size for a single memref parameter in syscalls that copy data
 /// between TA and OP-TEE shim.
@@ -32,9 +34,9 @@ const MAX_SYSCALL_COPY_SIZE: usize = 8 * 1024 * 1024;
 const MAX_CRYP_OBJ_POPULATE_ATTRS: usize = 1;
 
 #[inline]
-fn checked_syscall_copy_size(size: usize) -> Result<usize, Errno> {
+fn checked_syscall_copy_size(size: usize) -> Result<usize, TeeResult> {
     if size > MAX_SYSCALL_COPY_SIZE {
-        return Err(Errno::EINVAL);
+        return Err(TeeResult::BadParameters);
     }
     Ok(size)
 }
@@ -152,14 +154,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
 }
 
-// `litebox_common_optee` does use error codes for OP-TEE-like world (TAs) and Linux-like world (the LVBS platform).
-// for the below syscall handling, we use Linux error codes (i.e., `Errno`) because any errors will be returned
-// to the LVBS platform or runner.
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
-    pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, Errno> {
-        let ctx = SyscallContext::from_pt_regs(ctx);
-        let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
-        let dispatcher = match TeeSyscallNr::try_from(sysnr).map_err(|_| Errno::ENOSYS)? {
+    /// Decodes a raw OP-TEE syscall number and register context.
+    pub fn try_from_raw(syscall_number: usize, ctx: &SyscallContext) -> Result<Self, TeeResult> {
+        let sysnr = u32::try_from(syscall_number).map_err(|_| TeeResult::NotSupported)?;
+        let dispatcher = match TeeSyscallNr::try_from(sysnr).map_err(|_| TeeResult::NotSupported)? {
             TeeSyscallNr::Return => SyscallRequest::Return {
                 ret: ctx.syscall_arg(0),
             },
@@ -172,7 +171,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             TeeSyscallNr::GetProperty => SyscallRequest::GetProperty {
                 prop_set: TeePropSet::try_from_usize(ctx.syscall_arg(0))?,
-                index: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
+                index: u32::try_from(ctx.syscall_arg(1)).map_err(|_| TeeResult::BadParameters)?,
                 name: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
                 name_len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
@@ -187,18 +186,22 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             TeeSyscallNr::OpenTaSession => SyscallRequest::OpenTaSession {
                 ta_uuid: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
-                cancel_req_to: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
+                cancel_req_to: u32::try_from(ctx.syscall_arg(1))
+                    .map_err(|_| TeeResult::BadParameters)?,
                 usr_params: Platform::RawConstPointer::from_usize(ctx.syscall_arg(2)),
                 ta_sess_id: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 ret_orig: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
             TeeSyscallNr::CloseTaSession => SyscallRequest::CloseTaSession {
-                ta_sess_id: u32::try_from(ctx.syscall_arg(0)).map_err(|_| Errno::EINVAL)?,
+                ta_sess_id: u32::try_from(ctx.syscall_arg(0))
+                    .map_err(|_| TeeResult::BadParameters)?,
             },
             TeeSyscallNr::InvokeTaCommand => SyscallRequest::InvokeTaCommand {
-                ta_sess_id: u32::try_from(ctx.syscall_arg(0)).map_err(|_| Errno::EINVAL)?,
-                cancel_req_to: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
-                cmd_id: u32::try_from(ctx.syscall_arg(2)).map_err(|_| Errno::EINVAL)?,
+                ta_sess_id: u32::try_from(ctx.syscall_arg(0))
+                    .map_err(|_| TeeResult::BadParameters)?,
+                cancel_req_to: u32::try_from(ctx.syscall_arg(1))
+                    .map_err(|_| TeeResult::BadParameters)?,
+                cmd_id: u32::try_from(ctx.syscall_arg(2)).map_err(|_| TeeResult::BadParameters)?,
                 params: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 ret_orig: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
@@ -246,7 +249,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             TeeSyscallNr::CrypObjAlloc => SyscallRequest::CrypObjAlloc {
                 typ: TeeObjectType::try_from_usize(ctx.syscall_arg(0))?,
-                max_size: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
+                max_size: u32::try_from(ctx.syscall_arg(1))
+                    .map_err(|_| TeeResult::BadParameters)?,
                 obj: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
             },
             TeeSyscallNr::CrypObjClose => SyscallRequest::CrypObjClose {
@@ -261,7 +265,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 attr_count: if ctx.syscall_arg(2) <= MAX_CRYP_OBJ_POPULATE_ATTRS {
                     ctx.syscall_arg(2)
                 } else {
-                    return Err(Errno::EINVAL);
+                    return Err(TeeResult::BadParameters);
                 },
             },
             TeeSyscallNr::CrypObjCopy => SyscallRequest::CrypObjCopy {
@@ -272,7 +276,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
                 blen: ctx.syscall_arg(1),
             },
-            _ => return Err(Errno::ENOSYS),
+            _ => return Err(TeeResult::NotSupported),
         };
 
         Ok(dispatcher)
@@ -306,10 +310,11 @@ macro_rules! open_enum {
         #[allow(non_upper_case_globals)]
         impl $name {
             $($pub const $variant: $name = $name($value);)*
-            $pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
-                Ok(match <$ty>::try_from(value).map_err(|_| Errno::EINVAL)? {
+            /// Converts a machine-sized syscall argument into a supported enum value.
+            $pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
+                Ok(match <$ty>::try_from(value).map_err(|_| TeeResult::BadParameters)? {
                     $($value => Self::$variant,)*
-                    _ => return Err(Errno::EINVAL),
+                    _ => return Err(TeeResult::BadParameters),
                 })
             }
             /// Get the underlying value for `self`.
@@ -338,24 +343,9 @@ impl SyscallContext {
         }
     }
 
+    /// Creates a syscall context from its raw argument registers.
     pub fn new(args: &[usize; MAX_SYSCALL_ARGS]) -> Self {
         SyscallContext { args: *args }
-    }
-
-    /// Create OP-TEE TA's `SyscallContext` from `PtRegs`.
-    pub fn from_pt_regs(pt_regs: &PtRegs) -> Self {
-        SyscallContext {
-            args: [
-                pt_regs.rdi,
-                pt_regs.rsi,
-                pt_regs.rdx,
-                pt_regs.r10,
-                pt_regs.r8,
-                pt_regs.r9,
-                pt_regs.r12,
-                pt_regs.r13,
-            ],
-        }
     }
 }
 
@@ -369,9 +359,10 @@ pub struct TeeObjHandle(pub u32);
 impl TeeObjHandle {
     pub const NULL: Self = TeeObjHandle(0);
 
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+    /// Converts a machine-sized value into an OP-TEE object handle.
+    pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
+            .map_err(|_| TeeResult::BadParameters)
             .map(TeeObjHandle)
     }
 }
@@ -384,9 +375,10 @@ impl TeeObjHandle {
 pub struct TeeCrypStateHandle(pub u32);
 
 impl TeeCrypStateHandle {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+    /// Converts a machine-sized value into an OP-TEE cryptographic-state handle.
+    pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
+            .map_err(|_| TeeResult::BadParameters)
             .map(TeeCrypStateHandle)
     }
 }
@@ -398,9 +390,10 @@ impl TeeCrypStateHandle {
 pub struct TaSessionId(pub u32);
 
 impl TaSessionId {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+    /// Converts a machine-sized value into a trusted-application session ID.
+    pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
+            .map_err(|_| TeeResult::BadParameters)
             .map(TaSessionId)
     }
 }
@@ -413,9 +406,10 @@ impl TaSessionId {
 pub struct CommandId(pub u32);
 
 impl CommandId {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+    /// Converts a machine-sized value into a trusted-application command ID.
+    pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
+            .map_err(|_| TeeResult::BadParameters)
             .map(CommandId)
     }
 }
@@ -531,18 +525,20 @@ impl UteeParams {
         })
     }
 
-    pub fn get_type(&self, index: usize) -> Result<TeeParamType, Errno> {
+    /// Returns the parameter type stored at `index`.
+    pub fn get_type(&self, index: usize) -> Result<TeeParamType, TeeResult> {
         let type_byte = match index {
             0 => self.types.type_0(),
             1 => self.types.type_1(),
             2 => self.types.type_2(),
             3 => self.types.type_3(),
-            _ => return Err(Errno::EINVAL),
+            _ => return Err(TeeResult::BadParameters),
         };
-        TeeParamType::try_from(type_byte).map_err(|_| Errno::EINVAL)
+        TeeParamType::try_from(type_byte).map_err(|_| TeeResult::BadParameters)
     }
 
-    pub fn get_values(&self, index: usize) -> Result<Option<(u64, u64)>, Errno> {
+    /// Returns the value pair stored at `index`, or `None` for an unused parameter.
+    pub fn get_values(&self, index: usize) -> Result<Option<(u64, u64)>, TeeResult> {
         if self.get_type(index)? == TeeParamType::None {
             Ok(None)
         } else {
@@ -551,20 +547,27 @@ impl UteeParams {
         }
     }
 
-    pub fn set_type(&mut self, index: usize, param_type: TeeParamType) -> Result<(), Errno> {
+    /// Sets the parameter type at `index`.
+    pub fn set_type(&mut self, index: usize, param_type: TeeParamType) -> Result<(), TeeResult> {
         match index {
             0 => self.types.set_type_0(param_type as u8),
             1 => self.types.set_type_1(param_type as u8),
             2 => self.types.set_type_2(param_type as u8),
             3 => self.types.set_type_3(param_type as u8),
-            _ => return Err(Errno::EINVAL),
+            _ => return Err(TeeResult::BadParameters),
         }
         Ok(())
     }
 
-    pub fn set_values(&mut self, index: usize, value_a: u64, value_b: u64) -> Result<(), Errno> {
+    /// Sets the value pair stored at `index`.
+    pub fn set_values(
+        &mut self,
+        index: usize,
+        value_a: u64,
+        value_b: u64,
+    ) -> Result<(), TeeResult> {
         if index >= Self::TEE_NUM_PARAMS {
-            return Err(Errno::EINVAL);
+            return Err(TeeResult::BadParameters);
         }
         let base_index = index * 2;
         self.vals[base_index] = value_a;
@@ -572,6 +575,7 @@ impl UteeParams {
         Ok(())
     }
 
+    /// Creates an empty parameter collection.
     pub fn new() -> Self {
         Self::default()
     }
@@ -861,11 +865,12 @@ pub enum TeeTimeCategory {
 }
 
 impl TeeTimeCategory {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+    /// Converts a machine-sized syscall argument into a supported time category.
+    pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .ok()
             .and_then(|v| Self::try_from(v).ok())
-            .ok_or(Errno::EINVAL)
+            .ok_or(TeeResult::BadParameters)
     }
 }
 
@@ -915,6 +920,7 @@ impl Default for TeeObjectInfo {
 }
 
 impl TeeObjectInfo {
+    /// Creates object metadata for an uninitialized object of the requested type and capacity.
     pub fn new(object_type: TeeObjectType, max_object_size: u32) -> Self {
         TeeObjectInfo {
             object_type,
@@ -970,10 +976,11 @@ pub enum TeeOperationMode {
 }
 
 impl TeeOperationMode {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+    /// Converts a machine-sized syscall argument into a cryptographic operation mode.
+    pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
-            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+            .map_err(|_| TeeResult::BadParameters)
+            .and_then(|v| Self::try_from(v).map_err(|_| TeeResult::BadParameters))
     }
 }
 
@@ -1001,10 +1008,11 @@ pub enum TeePropSet {
 }
 
 impl TeePropSet {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+    /// Converts a machine-sized syscall argument into an OP-TEE property-set handle.
+    pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
-            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+            .map_err(|_| TeeResult::BadParameters)
+            .and_then(|v| Self::try_from(v).map_err(|_| TeeResult::BadParameters))
     }
 }
 
@@ -1023,10 +1031,11 @@ bitflags::bitflags! {
 }
 
 impl TeeMemoryAccessRights {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+    /// Converts a machine-sized syscall argument into memory-access rights.
+    pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
-            .and_then(|v| Self::from_bits(v).ok_or(Errno::EINVAL))
+            .map_err(|_| TeeResult::BadParameters)
+            .and_then(|v| Self::from_bits(v).ok_or(TeeResult::BadParameters))
     }
 }
 
@@ -1057,10 +1066,11 @@ pub enum TeeAlgorithm {
 }
 
 impl TeeAlgorithm {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+    /// Converts a machine-sized syscall argument into a supported algorithm identifier.
+    pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
-            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+            .map_err(|_| TeeResult::BadParameters)
+            .and_then(|v| Self::try_from(v).map_err(|_| TeeResult::BadParameters))
     }
 }
 
@@ -1194,21 +1204,6 @@ impl From<TeeResult> for u32 {
     }
 }
 
-impl From<Errno> for TeeResult {
-    fn from(err: Errno) -> Self {
-        match err {
-            Errno::ENOSYS => Self::NotSupported,
-            Errno::EINVAL | Errno::EFAULT => Self::BadParameters,
-            Errno::EPERM | Errno::EACCES => Self::AccessDenied,
-            Errno::ENOMEM => Self::OutOfMemory,
-            Errno::EEXIST => Self::AccessConflict,
-            Errno::EOVERFLOW => Self::Overflow,
-            Errno::EBUSY => Self::Busy,
-            _ => Self::GenericError,
-        }
-    }
-}
-
 const UTEE_ENTRY_FUNC_OPEN_SESSION: u32 = 0;
 const UTEE_ENTRY_FUNC_CLOSE_SESSION: u32 = 1;
 const UTEE_ENTRY_FUNC_INVOKE_COMMAND: u32 = 2;
@@ -1294,10 +1289,12 @@ pub enum LdelfSyscallRequest<Platform: litebox::platform::RawPointerProvider> {
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platform> {
-    pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, Errno> {
-        let ctx = SyscallContext::from_pt_regs(ctx);
-        let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
-        let dispatcher = match LdelfSyscallNr::try_from(sysnr).map_err(|_| Errno::ENOSYS)? {
+    /// Decodes a raw ldelf syscall number and register context.
+    pub fn try_from_raw(syscall_number: usize, ctx: &SyscallContext) -> Result<Self, TeeResult> {
+        let sysnr = u32::try_from(syscall_number).map_err(|_| TeeResult::NotSupported)?;
+        let dispatcher = match LdelfSyscallNr::try_from(sysnr)
+            .map_err(|_| TeeResult::NotSupported)?
+        {
             LdelfSyscallNr::Return => LdelfSyscallRequest::Return {
                 ret: ctx.syscall_arg(0),
             },
@@ -1325,12 +1322,12 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
                 handle: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
             },
             LdelfSyscallNr::CloseBin => LdelfSyscallRequest::CloseBin {
-                handle: u32::try_from(ctx.syscall_arg(0)).map_err(|_| Errno::EINVAL)?,
+                handle: u32::try_from(ctx.syscall_arg(0)).map_err(|_| TeeResult::BadParameters)?,
             },
             LdelfSyscallNr::MapBin => LdelfSyscallRequest::MapBin {
                 va: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
                 num_bytes: ctx.syscall_arg(1),
-                handle: u32::try_from(ctx.syscall_arg(2)).map_err(|_| Errno::EINVAL)?,
+                handle: u32::try_from(ctx.syscall_arg(2)).map_err(|_| TeeResult::BadParameters)?,
                 offs: ctx.syscall_arg(3),
                 pad_begin: ctx.syscall_arg(4),
                 pad_end: ctx.syscall_arg(5),
@@ -1340,13 +1337,13 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
                 dst: ctx.syscall_arg(0),
                 offs: ctx.syscall_arg(1),
                 num_bytes: ctx.syscall_arg(2),
-                handle: u32::try_from(ctx.syscall_arg(3)).map_err(|_| Errno::EINVAL)?,
+                handle: u32::try_from(ctx.syscall_arg(3)).map_err(|_| TeeResult::BadParameters)?,
             },
             LdelfSyscallNr::GenRndNum => LdelfSyscallRequest::GenRndNum {
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
                 num_bytes: ctx.syscall_arg(1),
             },
-            _ => return Err(Errno::ENOSYS),
+            _ => return Err(TeeResult::NotSupported),
         };
 
         Ok(dispatcher)
@@ -1405,6 +1402,7 @@ pub struct LdelfArg {
 }
 
 impl LdelfArg {
+    /// Creates loader arguments for the trusted application identified by `ta_uuid`.
     pub fn new(ta_uuid: TeeUuid) -> Self {
         Self {
             uuid: ta_uuid,
@@ -2767,27 +2765,12 @@ pub enum OpteeSmcReturnCode {
     RpcCmd = OPTEE_SMC_RETURN_RPC_CMD,
 }
 
-impl From<litebox_common_linux::vmap::PhysPointerError> for OpteeSmcReturnCode {
-    fn from(err: litebox_common_linux::vmap::PhysPointerError) -> Self {
-        use litebox_common_linux::vmap::PhysPointerError;
+impl From<litebox::mm::vmap::PhysPointerError> for OpteeSmcReturnCode {
+    fn from(err: litebox::mm::vmap::PhysPointerError) -> Self {
+        use litebox::mm::vmap::PhysPointerError;
         match err {
             PhysPointerError::AlreadyMapped(_) => OpteeSmcReturnCode::EBusy,
             _ => OpteeSmcReturnCode::EBadAddr,
-        }
-    }
-}
-
-impl From<OpteeSmcReturnCode> for litebox_common_linux::errno::Errno {
-    fn from(ret: OpteeSmcReturnCode) -> Self {
-        match ret {
-            OpteeSmcReturnCode::EBusy | OpteeSmcReturnCode::EThreadLimit => {
-                litebox_common_linux::errno::Errno::EBUSY
-            }
-            OpteeSmcReturnCode::EResume => litebox_common_linux::errno::Errno::EAGAIN,
-            OpteeSmcReturnCode::EBadAddr => litebox_common_linux::errno::Errno::EFAULT,
-            OpteeSmcReturnCode::ENomem => litebox_common_linux::errno::Errno::ENOMEM,
-            OpteeSmcReturnCode::ENotAvail => litebox_common_linux::errno::Errno::ENOENT,
-            _ => litebox_common_linux::errno::Errno::EINVAL,
         }
     }
 }

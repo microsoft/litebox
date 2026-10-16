@@ -628,9 +628,9 @@ mod tests {
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+    use litebox_common_linux::PAGE_SIZE;
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::loader::{ElfParsedFile, MapMemory, Protection, ReadAt};
-    use litebox_common_linux::vmem::PAGE_SIZE;
     use std::boxed::Box;
 
     const R: Perm = Perm::READ;
@@ -1178,7 +1178,7 @@ mod tests {
         let source = unsafe {
             mm.create_writable_pages(
                 None,
-                litebox_common_linux::vmem::NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                litebox::mm::page::NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                 litebox_common_linux::vmem::CreatePagesFlags::empty(),
                 |_| Ok(0),
             )

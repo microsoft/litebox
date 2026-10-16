@@ -5,6 +5,7 @@
 
 use core::ops::Range;
 
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::common_providers::reservations::TrackedReservations;
 use litebox::platform::page_mgmt::{
@@ -13,8 +14,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::sync::{RwLock, RwLockReadGuard};
 use litebox_common_linux::vmem::{
-    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmFlags, VmemProtectError,
-    VmemUnmapError,
+    CreatePagesFlags, MappingError, VmFlags, VmemProtectError, VmemUnmapError,
 };
 use rangemap::RangeMap;
 

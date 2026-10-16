@@ -21,13 +21,14 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, mm::VmemManager, vmem::PAGE_SIZE};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, mm::VmemManager};
+use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SHDR_BOOTSTRAP_TA, SHDR_MAGIC, SHDR_UUID_LEN, SHDR_VERSION_LEN,
-    Shdr, SyscallRequest, TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256, TaFlags, TeeAlgorithm,
-    TeeAlgorithmClass, TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin,
-    TeeObjHandle, TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid,
-    UteeAttribute,
+    Shdr, SyscallContext, SyscallRequest, TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256, TaFlags,
+    TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag,
+    TeeIdentity, TeeLogin, TeeObjHandle, TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult,
+    TeeUuid, UteeAttribute,
 };
 use litebox_platform::time::{Instant as _, TimeProvider};
 use sha2::{Digest, Sha256};
@@ -51,6 +52,12 @@ const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 pub(crate) const TA_DIGEST_LEN: usize = 32;
 pub(crate) type TaDigest = [u8; TA_DIGEST_LEN];
 
+fn syscall_context_from_pt_regs(ctx: &litebox_common_linux::PtRegs) -> SyscallContext {
+    SyscallContext::new(&[
+        ctx.rdi, ctx.rsi, ctx.rdx, ctx.r10, ctx.r8, ctx.r9, ctx.r12, ctx.r13,
+    ])
+}
+
 /// Platform capabilities required by the OP-TEE shim.
 pub trait OpteeShimPlatform:
     litebox::platform::RawPointerProvider
@@ -65,7 +72,7 @@ pub trait OpteeShimPlatform:
     + litebox::platform::SystemInfoProvider
     + litebox::platform::ArchSpecificProvider
     + litebox::platform::DerivedKeyProvider
-    + litebox_common_linux::vmap::VmapManager<{ PAGE_SIZE }>
+    + litebox::mm::vmap::VmapManager<{ PAGE_SIZE }>
     + 'static
     + Sized
 {
@@ -83,7 +90,7 @@ where
         + litebox::platform::SystemInfoProvider
         + litebox::platform::ArchSpecificProvider
         + litebox::platform::DerivedKeyProvider
-        + litebox_common_linux::vmap::VmapManager<{ PAGE_SIZE }>
+        + litebox::mm::vmap::VmapManager<{ PAGE_SIZE }>
         + 'static,
     T::Reservations: litebox_common_linux::vmem::LinuxReservationStore<T, PAGE_SIZE>,
 {
@@ -589,10 +596,12 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> ContinueOperation {
-        let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
+        let syscall_context = syscall_context_from_pt_regs(ctx);
+        let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, &syscall_context)
+        {
             Ok(request) => request,
             Err(err) => {
-                ctx.rax = TeeResult::from(err) as usize;
+                ctx.rax = err as usize;
                 return ContinueOperation::Resume;
             }
         };
@@ -884,13 +893,15 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> ContinueOperation {
-        let request = match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
-            Ok(request) => request,
-            Err(err) => {
-                ctx.rax = TeeResult::from(err) as usize;
-                return ContinueOperation::Resume;
-            }
-        };
+        let syscall_context = syscall_context_from_pt_regs(ctx);
+        let request =
+            match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, &syscall_context) {
+                Ok(request) => request,
+                Err(err) => {
+                    ctx.rax = err as usize;
+                    return ContinueOperation::Resume;
+                }
+            };
 
         if let LdelfSyscallRequest::Return { ret } = request {
             ctx.rax = self.sys_return(ret);
@@ -1934,9 +1945,9 @@ impl SessionIdPool {
 }
 
 pub type NormalWorldConstPtr<'a, Platform, T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysConstPtr<'a, Platform, T, ALIGN>;
+    litebox::mm::physical_pointers::PhysConstPtr<'a, Platform, T, ALIGN>;
 pub type NormalWorldMutPtr<'a, Platform, T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<'a, Platform, T, ALIGN>;
+    litebox::mm::physical_pointers::PhysMutPtr<'a, Platform, T, ALIGN>;
 
 #[cfg(test)]
 mod test_utils {

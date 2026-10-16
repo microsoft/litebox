@@ -18,6 +18,7 @@ use litebox::event::observer::Observer;
 use litebox::event::polling::{Pollee, TryOpError};
 use litebox::event::wait::WaitError;
 use litebox::event::{Events, IOPollable as _};
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::TimerHandle;
@@ -33,12 +34,13 @@ use litebox_common_linux::ProtFlags;
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
-use litebox_common_linux::vmem::{
-    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE,
-};
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
     errno::Errno, program_startup::LinuxProgramStartup,
+};
+use litebox_common_linux::{
+    PAGE_SIZE,
+    vmem::{CreatePagesFlags, MappingError},
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
@@ -1560,7 +1562,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let addr = tls.trunc();
             // Validate the user-controlled TLS base before spawning the thread.
             #[cfg(target_arch = "x86_64")]
-            let valid = litebox_common_linux::arch::is_valid_user_fs_base(addr);
+            let valid = litebox::arch::x86_64::is_valid_user_fs_base(addr);
             #[cfg(target_arch = "aarch64")]
             let valid = litebox_common_linux::arch::is_valid_user_tls_base(addr);
             if !valid {
@@ -2875,7 +2877,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     // PSTATE (EL0t, all interrupts unmasked) before entering the
                     // new image; only PC and SP carry information.
                     *ctx = litebox_common_linux::PtRegs {
-                        regs: [0; litebox_common_linux::AARCH64_GENERAL_REGISTER_COUNT],
+                        regs: [0; litebox::arch::aarch64::GENERAL_REGISTER_COUNT],
                         sp: load_info.user_stack_top,
                         pc: load_info.entry_point,
                         pstate: 0,
@@ -3418,7 +3420,7 @@ mod tests {
             );
 
              // `process_signals` is called when about to switch back to userspace, so simulate that here.
-            let mut stack = [0u8; 2 * litebox_common_linux::vmem::PAGE_SIZE];
+            let mut stack = [0u8; 2 * litebox_common_linux::PAGE_SIZE];
              #[cfg(target_arch = "x86_64")]
              let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
              #[cfg(target_arch = "aarch64")]
@@ -3749,7 +3751,7 @@ mod tests {
 
         let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
-            let mut stack = [0u8; 2 * litebox_common_linux::vmem::PAGE_SIZE];
+            let mut stack = [0u8; 2 * litebox_common_linux::PAGE_SIZE];
             let set = SigSet::empty().with(Signal::SIGCHLD);
             let sigprocmask = |how| {
                 task.sys_rt_sigprocmask(

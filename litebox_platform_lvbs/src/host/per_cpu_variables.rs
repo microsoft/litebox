@@ -19,8 +19,8 @@ use alloc::{
 use core::alloc::Layout;
 use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
+use litebox::arch::x86_64::{rdgsbase, wrgsbase};
 use litebox::utils::TruncateExt;
-use litebox_common_linux::{rdgsbase, wrgsbase};
 use litebox_common_lvbs::MAX_CORES;
 use x86_64::VirtAddr;
 
@@ -649,17 +649,19 @@ pub fn allocate_per_cpu_variables() {
 /// Unmap this CPU's stack guards before enabling interrupts.
 /// Requires the permanent page table, hypercalls, and VTL1 VP tracking.
 /// The raw stack arena stays allocated; guard pages must never be accessed.
+///
+/// # Panics
+///
+/// Panics if the stack layout contains a guard that is not page-aligned.
 pub fn unmap_per_cpu_stack_guards(manager: &crate::PageTableManager) {
-    use litebox_common_linux::vmem::PageRange;
+    use litebox::mm::page::PageRange;
 
     let base = with_per_cpu_variables(|pcv| pcv.stacks.base);
     for offset in STACK_GUARD_OFFSETS {
         let start = base + offset;
-        let range = PageRange {
-            start,
-            end: start + PAGE_SIZE,
-        };
-        // Safety: aligned, unused guards in a leaked allocation. Retain backing
+        let range =
+            PageRange::new(start, start + PAGE_SIZE).expect("stack guard range is page-aligned");
+        // SAFETY: The range contains aligned, unused guards in a leaked allocation. Retain backing
         // frames and shared page tables; flush stale translations on all CPUs.
         let _ = unsafe {
             manager

@@ -15,7 +15,7 @@ use crate::Instant;
 use crate::per_cpu::with_per_cpu_variables;
 use alloc::boxed::Box;
 use core::cell::Cell;
-use litebox_common_linux::vmem::PAGE_SIZE;
+use litebox_common_linux::PAGE_SIZE;
 
 /// At least the CPU's kernel stack; with the guard page, a power of two, which
 /// the allocator would round up to anyway.

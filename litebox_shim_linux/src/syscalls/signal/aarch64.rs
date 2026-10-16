@@ -8,10 +8,11 @@
 use crate::syscalls::signal::{DeliverFault, SignalState};
 use crate::{ShimPlatform, Task, UserPtrMut};
 use core::mem::offset_of;
+use litebox::arch::aarch64::GENERAL_REGISTER_COUNT;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
-use litebox_common_linux::vmem::PAGE_SIZE;
+use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
-    AARCH64_GENERAL_REGISTER_COUNT, MapFlags, ProtFlags, PtRegs,
+    MapFlags, ProtFlags, PtRegs,
     signal::{
         SaFlags, SigAction, Siginfo, Ucontext,
         aarch64::{GuestVectorState, Sigcontext},
@@ -194,7 +195,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     ) -> Result<(), DeliverFault> {
         let last_exception = self.last_exception.get();
 
-        let mut regs = [0u64; AARCH64_GENERAL_REGISTER_COUNT];
+        let mut regs = [0u64; GENERAL_REGISTER_COUNT];
         for (dst, src) in regs.iter_mut().zip(ctx.regs.iter()) {
             *dst = *src as u64;
         }

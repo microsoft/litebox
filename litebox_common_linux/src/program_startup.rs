@@ -773,7 +773,7 @@ fn read_vector_state(input: &mut &[u8]) -> Result<GuestVectorState, LinuxProgram
     let length =
         usize::try_from(read_u32(input)?).map_err(|_| LinuxProgramStartupError::Malformed)?;
     let bytes = take_bytes(input, length)?;
-    let layout = litebox_common::arch::x86_64::xstate::XsaveLayout::get();
+    let layout = litebox::arch::x86_64::xstate::XsaveLayout::get();
     GuestVectorState::from_bytes(bytes, layout).ok_or(LinuxProgramStartupError::Malformed)
 }
 
@@ -940,7 +940,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     fn fork_vector_state() -> GuestVectorState {
-        GuestVectorState::initial(litebox_common::arch::x86_64::xstate::XsaveLayout::get())
+        GuestVectorState::initial(litebox::arch::x86_64::xstate::XsaveLayout::get())
     }
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]

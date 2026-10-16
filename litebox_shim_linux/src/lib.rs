@@ -20,24 +20,23 @@ use alloc::vec::Vec;
 
 use core::cell::{Cell, RefCell};
 use core::ops::Deref;
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
     LiteBox,
     platform::{RawConstPointer, RawPointerProvider},
     shim::ContinueOperation,
     sync::Mutex,
     sync::futex::FutexManager,
+    user_pointers::{UserPtr, UserPtrMut},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
 use litebox_broker_protocol::fs::FileSeekWhence as SeekWhence;
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
-    FcntlArg, SyscallRequest,
+    FcntlArg, PAGE_SIZE, SyscallRequest,
     errno::Errno,
     mm::VmemManager,
-    user_pointers::{UserPtr, UserPtrMut},
-    vmem::{
-        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
-    },
+    vmem::{CreatePagesFlags, MappingError, VmemUnmapError},
 };
 use litebox_platform::time::TimeProvider;
 use syscalls::signal::SyscallRestart;

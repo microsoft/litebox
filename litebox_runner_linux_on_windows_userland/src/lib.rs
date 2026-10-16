@@ -13,7 +13,7 @@ use litebox_broker_local_userland as broker;
 use litebox_common_linux::program_startup::{LinuxProcessStartup, LinuxProgramStartup};
 use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
 
-type Platform = WindowsUserland<{ litebox_common_linux::vmem::PAGE_SIZE }>;
+type Platform = WindowsUserland<{ litebox_common_linux::PAGE_SIZE }>;
 
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///

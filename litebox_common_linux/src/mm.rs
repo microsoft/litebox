@@ -8,6 +8,7 @@
 use core::ops::Range;
 
 use alloc::vec::Vec;
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
@@ -19,13 +20,14 @@ use litebox::{
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
+use crate::PAGE_SIZE;
+
 use crate::{
     MRemapFlags, MapFlags, ProtFlags, UserPtrMut,
     errno::Errno,
     vmem::{
-        self, CreatePagesFlags, LinuxReservationStore, MappingError, NonZeroAddress,
-        NonZeroPageSize, PAGE_SIZE, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler,
-        VmemProtectError, VmemResetError, VmemUnmapError,
+        self, CreatePagesFlags, LinuxReservationStore, MappingError, PageFaultError, VmFlags, Vmem,
+        VmemPageFaultHandler, VmemProtectError, VmemResetError, VmemUnmapError,
     },
 };
 

@@ -7,7 +7,8 @@
 extern crate std;
 
 use core::cell::RefCell;
-use litebox_common_linux::vmem::{PAGE_SIZE, PageRange, VmFlags};
+use litebox::mm::page::PageRange;
+use litebox_common_linux::{PAGE_SIZE, vmem::VmFlags};
 use std::collections::HashMap;
 use x86_64::structures::idt::PageFaultErrorCode;
 use x86_64::structures::paging::{
@@ -263,7 +264,7 @@ fn prot_none_preserves_contents_and_can_be_unmapped() {
     let writable = VmFlags::VM_READ | VmFlags::VM_WRITE;
     // Safety: unused user range in a table that is never loaded.
     unsafe { pgtable.map_pages(page, writable, true) }.unwrap();
-    let frame = mapped_frame(&pgtable, page.start);
+    let frame = mapped_frame(&pgtable, page.start());
     let ptr = frame.start_address().as_u64() as *mut u64;
     // Safety: HostMemory uses PA == VA; the live frame is exclusively owned.
     unsafe { ptr.write(0x1234_5678_9abc_def0) };
@@ -277,8 +278,8 @@ fn prot_none_preserves_contents_and_can_be_unmapped() {
     ] {
         // Safety: the table is not loaded and there are no references to its mappings.
         unsafe { pgtable.mprotect_pages(page, flags) }.unwrap();
-        check_mapped(&pgtable, page.start, vmflags_to_pteflags(flags));
-        assert_eq!(mapped_frame(&pgtable, page.start), frame);
+        check_mapped(&pgtable, page.start(), vmflags_to_pteflags(flags));
+        assert_eq!(mapped_frame(&pgtable, page.start()), frame);
         assert_eq!(live_frames(), allocated);
         // Safety: protection changes do not affect HostMemory's backing allocation.
         assert_eq!(unsafe { ptr.read() }, 0x1234_5678_9abc_def0);
@@ -286,7 +287,7 @@ fn prot_none_preserves_contents_and_can_be_unmapped() {
     assert!(!vmflags_to_pteflags(VmFlags::empty()).contains(PageTableFlags::PRESENT));
     // Safety: the table is never loaded and no access to the frame remains.
     unsafe { pgtable.unmap_pages(page, UnmapOptions::RELEASE) }.unwrap();
-    check_unmapped(&pgtable, page.start);
+    check_unmapped(&pgtable, page.start());
     assert_eq!(live_frames(), allocated - 1);
     drop(pgtable);
     assert_eq!(live_frames(), before);
@@ -302,11 +303,11 @@ fn populated_prot_none_keeps_and_drops_frames() {
     for page in pages {
         check_mapped(&pgtable, page, vmflags_to_pteflags(VmFlags::empty()));
     }
-    let frame = mapped_frame(&pgtable, pages.start);
+    let frame = mapped_frame(&pgtable, pages.start());
     let allocated = live_frames();
     // Safety: no access to these mappings; the retained frame is freed below.
-    unsafe { pgtable.unmap_pages(range(pages.start, 1), UnmapOptions::KEEP_FRAMES) }.unwrap();
-    check_unmapped(&pgtable, pages.start);
+    unsafe { pgtable.unmap_pages(range(pages.start(), 1), UnmapOptions::KEEP_FRAMES) }.unwrap();
+    check_unmapped(&pgtable, pages.start());
     assert_eq!(live_frames(), allocated);
     drop(pgtable);
     assert_eq!(live_frames(), before + 1);

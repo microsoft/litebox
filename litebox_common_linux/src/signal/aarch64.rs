@@ -3,7 +3,6 @@
 
 //! Definitions for aarch64 signal context structures.
 
-use crate::AARCH64_GENERAL_REGISTER_COUNT;
 use zerocopy::{FromBytes, IntoBytes};
 
 /// Architectural AArch64 FP/SIMD state.
@@ -31,7 +30,7 @@ pub struct GuestVectorState {
 #[allow(clippy::pub_underscore_fields)]
 pub struct Sigcontext {
     pub fault_address: u64,
-    pub regs: [u64; AARCH64_GENERAL_REGISTER_COUNT],
+    pub regs: [u64; litebox::arch::aarch64::GENERAL_REGISTER_COUNT],
     pub sp: u64,
     pub pc: u64,
     pub pstate: u64,

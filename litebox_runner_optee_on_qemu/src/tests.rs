@@ -20,7 +20,7 @@ pub fn check_user_memory_protection(platform: &VmKernel) {
         PageManagementProvider, RawMutPointer as _,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions as Permissions},
     };
-    use litebox_common_linux::vmem::PAGE_SIZE;
+    use litebox_common_linux::PAGE_SIZE;
     use litebox_platform_vm_kernel::AddressSpaceId;
 
     let id = platform.create_address_space();

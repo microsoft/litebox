@@ -127,7 +127,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
     /// The trailing `UteeParams` slot is left untouched here because
     /// `set_utee_params` overwrites it in full.
     fn scrub(&mut self) -> Option<()> {
-        use litebox_common_linux::vmem::PAGE_SIZE;
+        use litebox_common_optee::PAGE_SIZE;
         const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 
         for offset in (0..self.pos).step_by(ZERO_CHUNK.len()) {
@@ -215,7 +215,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
         len: usize,
     ) -> Option<usize>
     where
-        Platform: litebox_common_linux::vmap::VmapManager<ALIGN>,
+        Platform: litebox::mm::vmap::VmapManager<ALIGN>,
     {
         let address = self.push_param_memref(param_type, None, len)?;
         shm_info
@@ -244,7 +244,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
         stack_canary: [u8; 16],
     ) -> Option<TaMemrefAddresses>
     where
-        Platform: litebox_common_linux::vmap::VmapManager<ALIGN>,
+        Platform: litebox::mm::vmap::VmapManager<ALIGN>,
     {
         if params.len() > UteeParams::TEE_NUM_PARAMS {
             return None;
@@ -346,7 +346,7 @@ pub(crate) fn allocate_stack<Platform: crate::OpteeShimPlatform>(
     let sp = if let Some(stack_base) = stack_base {
         UserMutPtr::<Platform, _>::from_usize(stack_base)
     } else {
-        let length = litebox_common_linux::vmem::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+        let length = litebox::mm::page::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
         unsafe {
             task.global

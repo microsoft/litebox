@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
 use litebox::platform::{DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt;
-use litebox_common_linux::vmem::PAGE_SIZE;
+use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{
     HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, OpteeMsgArgs, OpteeSmcReturnCode, TaFlags,
     TeeOrigin, TeeParamType, TeeResult, TeeUuid, UteeParams,

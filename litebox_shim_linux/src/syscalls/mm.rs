@@ -7,11 +7,12 @@
 //! Runtime ELF syscall patching of file mappings lives in [`crate::loader::patch`].
 
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     mm::MmapPlacement,
-    vmem::{MappingError, PAGE_SIZE, VmemProtectError},
+    vmem::{MappingError, VmemProtectError},
 };
 
 use crate::ShimPlatform;

@@ -6,11 +6,13 @@ use core::alloc::{GlobalAlloc, Layout};
 use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
+use litebox::mm::page::PageRange;
 use litebox::{mm::allocator::SafeZoneAllocator, platform::RawConstPointer, utils::TruncateExt};
 use litebox_common_linux::{
     mm::VmemManager,
-    vmem::{PAGE_SIZE, PageFaultError, PageRange, VmFlags},
+    vmem::{PageFaultError, VmFlags},
 };
+use litebox_common_lvbs::PAGE_SIZE;
 use spin::mutex::SpinMutex;
 
 use crate::{
@@ -237,8 +239,8 @@ fn test_vmm_page_fault() {
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(
-                Some(litebox_common_linux::vmem::NonZeroAddress::new(start_addr).unwrap()),
-                litebox_common_linux::vmem::NonZeroPageSize::new(4 * PAGE_SIZE).unwrap(),
+                Some(litebox::mm::page::NonZeroAddress::new(start_addr).unwrap()),
+                litebox::mm::page::NonZeroPageSize::new(4 * PAGE_SIZE).unwrap(),
                 litebox_common_linux::vmem::CreatePagesFlags::FIXED_ADDR,
                 |_: UserMutPtr<u8>| Ok(0),
             )
@@ -276,8 +278,8 @@ fn test_vmm_page_fault() {
     unsafe {
         assert_eq!(
             vmm.create_stack_pages(
-                Some(litebox_common_linux::vmem::NonZeroAddress::new(stack_addr).unwrap()),
-                litebox_common_linux::vmem::NonZeroPageSize::new(4 * PAGE_SIZE).unwrap(),
+                Some(litebox::mm::page::NonZeroAddress::new(stack_addr).unwrap()),
+                litebox::mm::page::NonZeroPageSize::new(4 * PAGE_SIZE).unwrap(),
                 litebox_common_linux::vmem::CreatePagesFlags::FIXED_ADDR,
             )
             .unwrap()
