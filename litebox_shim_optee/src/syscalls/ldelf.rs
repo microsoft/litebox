@@ -259,8 +259,14 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         if !self.global.contains_ta_bin(&ta_uuid) {
             return Err(TeeResult::ItemNotFound);
         }
-        let new_handle = self.ta_handle_map.insert(ta_uuid);
-        let _ = handle.write_at_offset(0, new_handle);
+        let new_handle = self
+            .ta_handle_map
+            .insert(ta_uuid)
+            .ok_or(TeeResult::OutOfMemory)?;
+        if handle.write_at_offset(0, new_handle).is_none() {
+            self.ta_handle_map.remove(new_handle);
+            return Err(TeeResult::AccessDenied);
+        }
 
         Ok(())
     }

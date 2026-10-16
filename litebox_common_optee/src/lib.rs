@@ -2818,7 +2818,8 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
                 return None;
             }
 
-            return TaHead::read_from_bytes(&elf_data[offset..offset + size_of::<TaHead>()]).ok();
+            let end = offset.checked_add(size_of::<TaHead>())?;
+            return TaHead::read_from_bytes(elf_data.get(offset..end)?).ok();
         }
     }
     None

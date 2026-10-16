@@ -1283,14 +1283,13 @@ impl TeeObjMap {
         }
     }
 
-    pub fn allocate(&self, tee_obj: &TeeObj) -> TeeObjHandle {
+    pub fn allocate(&self, tee_obj: &TeeObj) -> Option<TeeObjHandle> {
         let mut inner = self.inner.lock();
-        let handle = match inner.keys().max() {
-            Some(max_handle) => TeeObjHandle(max_handle.0 + 1),
-            None => TeeObjHandle(1), // start from 1 since 0 means an invalid handle
-        };
+        let handle = TeeObjHandle(next_free_handle(inner.keys().map(|h| h.0).max(), |h| {
+            inner.contains_key(&TeeObjHandle(h))
+        })?);
         inner.insert(handle, tee_obj.clone());
-        handle
+        Some(handle)
     }
 
     pub fn replace(&self, handle: TeeObjHandle, tee_obj: &TeeObj) {
@@ -1453,14 +1452,13 @@ impl TeeCrypStateMap {
         }
     }
 
-    pub fn allocate(&self, tee_cryp_state: &TeeCrypState) -> TeeCrypStateHandle {
+    pub fn allocate(&self, tee_cryp_state: &TeeCrypState) -> Option<TeeCrypStateHandle> {
         let mut inner = self.inner.lock();
-        let handle = match inner.keys().max() {
-            Some(max_handle) => TeeCrypStateHandle(max_handle.0 + 1),
-            None => TeeCrypStateHandle(1), // start from 1 since 0 means an invalid handle
-        };
+        let handle = TeeCrypStateHandle(next_free_handle(inner.keys().map(|h| h.0).max(), |h| {
+            inner.contains_key(&TeeCrypStateHandle(h))
+        })?);
         inner.insert(handle, tee_cryp_state.clone());
-        handle
+        Some(handle)
     }
 
     pub fn set_cipher(&self, handle: TeeCrypStateHandle, cipher: &Cipher) -> Result<(), TeeResult> {
@@ -1502,24 +1500,20 @@ impl TeeCrypStateMap {
 /// Data structure to maintain a mapping from handles to their TA UUIDs.
 pub(crate) struct TaHandleMap {
     inner: spin::mutex::SpinMutex<HashMap<u32, TeeUuid>>,
-    next_handle: core::sync::atomic::AtomicU32,
 }
 
 impl TaHandleMap {
     pub(crate) fn new() -> Self {
         Self {
             inner: spin::mutex::SpinMutex::new(HashMap::new()),
-            next_handle: 1.into(),
         }
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid) -> u32 {
-        let handle = self
-            .next_handle
-            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    pub(crate) fn insert(&self, uuid: TeeUuid) -> Option<u32> {
         let mut inner = self.inner.lock();
+        let handle = next_free_handle(inner.keys().copied().max(), |h| inner.contains_key(&h))?;
         inner.insert(handle, uuid);
-        handle
+        Some(handle)
     }
 
     pub(crate) fn get(&self, handle: u32) -> Option<TeeUuid> {
@@ -1528,6 +1522,16 @@ impl TaHandleMap {
 
     pub(crate) fn remove(&self, handle: u32) -> Option<TeeUuid> {
         self.inner.lock().remove(&handle)
+    }
+}
+
+/// Handle 0 is invalid; never wrap into it or onto a live handle.
+fn next_free_handle(max_in_use: Option<u32>, in_use: impl Fn(u32) -> bool) -> Option<u32> {
+    match max_in_use {
+        None => Some(1),
+        Some(max) => max
+            .checked_add(1)
+            .or_else(|| (1..u32::MAX).find(|&h| !in_use(h))),
     }
 }
 
