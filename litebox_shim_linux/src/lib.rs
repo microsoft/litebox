@@ -64,8 +64,6 @@ pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
 
-pub(crate) use syscalls::file::FileFd;
-
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
 /// This exists so that the (many) `impl` blocks throughout the shim can be written

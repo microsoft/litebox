@@ -27,7 +27,14 @@ use litebox_broker_protocol::{
 };
 use litebox_common_linux::{EpollEvent, EpollOp, OFlags, errno::Errno};
 
-use super::file::{FilesState, linux_status_flags, status_flags_change};
+use super::{
+    eventfd::EventfdFd,
+    file::{FileFd, FilesState, linux_status_flags, status_flags_change},
+    inet::InetSocketFd,
+    pipe::PipeFd,
+    timerfd::TimerfdFd,
+    unix::UnixSocketFd,
+};
 use crate::{GlobalState, ShimPlatform};
 
 pub(crate) struct EpollSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
@@ -50,13 +57,13 @@ bitflags::bitflags! {
 }
 
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
-    Eventfd(Arc<super::eventfd::EventfdFd<Platform>>),
+    Eventfd(Arc<EventfdFd<Platform>>),
     Epoll(Arc<EpollFd<Platform>>),
-    File(Arc<crate::FileFd<Platform>>),
-    Inet(Arc<super::inet::InetSocketFd<Platform>>),
-    Pipe(Arc<super::pipe::PipeFd<Platform>>),
-    Unix(Arc<crate::syscalls::unix::UnixSocketFd<Platform>>),
-    Timerfd(Arc<super::timerfd::TimerfdFd<Platform>>),
+    File(Arc<FileFd<Platform>>),
+    Inet(Arc<InetSocketFd<Platform>>),
+    Pipe(Arc<PipeFd<Platform>>),
+    Unix(Arc<UnixSocketFd<Platform>>),
+    Timerfd(Arc<TimerfdFd<Platform>>),
 }
 
 impl<Platform: ShimPlatform> EpollDescriptor<Platform> {

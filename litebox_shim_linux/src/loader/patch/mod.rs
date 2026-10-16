@@ -24,11 +24,10 @@ use litebox_common_linux::{
 };
 use litebox_syscall_rewriter::trampoline_allocation_range;
 
-use crate::FileFd;
 use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
-use crate::syscalls::file::File;
+use crate::syscalls::file::{File, FileFd};
 use crate::syscalls::mm::prot_flags_from_permissions;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::vmem::VmFlags;

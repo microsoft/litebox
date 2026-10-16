@@ -37,6 +37,10 @@ use litebox_common_linux::{
 };
 use thiserror::Error;
 
+use super::{
+    epoll::EpollFd, eventfd::EventfdFd, inet::InetSocketFd, pipe::PipeFd, timerfd::TimerfdFd,
+    unix::UnixSocketFd,
+};
 use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -603,13 +607,13 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 
 /// A raw fd resolved once into the subsystem that owns it.
 pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
-    File(alloc::sync::Arc<FileFd<Platform>>),
-    Inet(alloc::sync::Arc<super::inet::InetSocketFd<Platform>>),
-    Pipe(alloc::sync::Arc<super::pipe::PipeFd<Platform>>),
-    Eventfd(alloc::sync::Arc<super::eventfd::EventfdFd<Platform>>),
-    Epoll(alloc::sync::Arc<super::epoll::EpollFd<Platform>>),
-    Unix(alloc::sync::Arc<super::unix::UnixSocketFd<Platform>>),
-    Timerfd(alloc::sync::Arc<super::timerfd::TimerfdFd<Platform>>),
+    File(Arc<FileFd<Platform>>),
+    Inet(Arc<InetSocketFd<Platform>>),
+    Pipe(Arc<PipeFd<Platform>>),
+    Eventfd(Arc<EventfdFd<Platform>>),
+    Epoll(Arc<EpollFd<Platform>>),
+    Unix(Arc<UnixSocketFd<Platform>>),
+    Timerfd(Arc<TimerfdFd<Platform>>),
 }
 
 /// Apply one subsystem-generic expression to whichever subsystem an [`AnyTypedFd`] holds.
@@ -661,12 +665,12 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     pub(crate) fn dispatch<R>(
         &self,
         file: impl FnOnce(&FileFd<Platform>) -> R,
-        inet: impl FnOnce(&super::inet::InetSocketFd<Platform>) -> R,
-        pipe: impl FnOnce(&super::pipe::PipeFd<Platform>) -> R,
-        eventfd: impl FnOnce(&super::eventfd::EventfdFd<Platform>) -> R,
-        epoll: impl FnOnce(&super::epoll::EpollFd<Platform>) -> R,
-        unix: impl FnOnce(&super::unix::UnixSocketFd<Platform>) -> R,
-        timerfd: impl FnOnce(&super::timerfd::TimerfdFd<Platform>) -> R,
+        inet: impl FnOnce(&InetSocketFd<Platform>) -> R,
+        pipe: impl FnOnce(&PipeFd<Platform>) -> R,
+        eventfd: impl FnOnce(&EventfdFd<Platform>) -> R,
+        epoll: impl FnOnce(&EpollFd<Platform>) -> R,
+        unix: impl FnOnce(&UnixSocketFd<Platform>) -> R,
+        timerfd: impl FnOnce(&TimerfdFd<Platform>) -> R,
     ) -> R {
         match self {
             Self::File(fd) => file(fd),
@@ -2808,9 +2812,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let Ok(fd) = files
                     .raw_descriptor_store
                     .read()
-                    .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<Platform>>(
-                    raw_fd,
-                ) else {
+                    .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform>>(raw_fd)
+                else {
                     return Err(Errno::EBADF);
                 };
                 self.global

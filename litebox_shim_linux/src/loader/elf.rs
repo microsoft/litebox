@@ -27,7 +27,7 @@ struct ElfFile<'a, Platform: ShimPlatform> {
     task: &'a Task<Platform>,
     fd: i32,
     #[cfg(target_arch = "aarch64")]
-    file_fd: alloc::sync::Arc<crate::FileFd<Platform>>,
+    file_fd: alloc::sync::Arc<crate::syscalls::file::FileFd<Platform>>,
     load_high: bool,
     reserve_runtime_trampoline: bool,
 }
