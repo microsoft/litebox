@@ -21,7 +21,8 @@ use litebox::event::{Events, IOPollable as _};
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::TimerHandle;
-use litebox::process::ProcessError;
+use litebox::platform::{ForkError, ForkResult, ProcessHandle, ProcessProvider};
+use litebox::process::{PendingChild, ProcessError};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
@@ -42,6 +43,124 @@ use litebox_common_linux::{
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
+
+type StartRunner =
+    dyn Fn(&PendingChild, &[u8]) -> Result<(), ForkError<ProcessError>> + Send + Sync;
+
+/// Runner-specific transport and bootstrap operations used by [`ForkLauncher`].
+pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
+    /// Owned rendezvous identifier used to connect the forked runner to its broker.
+    type ControlChannel;
+
+    /// Creates the rendezvous identifier before forking.
+    fn create_control_channel(&self) -> Self::ControlChannel;
+
+    /// Encodes the parent's launch descriptor before resuming a suspended child.
+    ///
+    /// Host process identity lookup failures must return [`ProcessError::ServiceFailed`].
+    fn encode_launch_descriptor(
+        &self,
+        process: &Platform::ProcessHandle,
+        channel: Self::ControlChannel,
+    ) -> Result<Vec<u8>, ProcessError>;
+
+    /// Rebuilds the child's runtime and resumes the guest without returning or unwinding.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the sole thread in a newly forked process and must never return through
+    /// the copied guest-thread stack. Inherited runtime state must not be used until rebuilt.
+    unsafe fn run_child(&self, channel: Self::ControlChannel) -> !;
+}
+
+/// Starts a natively forked runner using platform process operations and runner-specific hooks.
+///
+/// Descriptor encoding and child bootstrap remain in the runner, keeping this launcher independent
+/// of host transport types. The default launcher requests copy-based startup without invoking the
+/// runner.
+pub struct ForkLauncher {
+    start_runner: Box<StartRunner>,
+}
+
+impl Default for ForkLauncher {
+    fn default() -> Self {
+        Self {
+            start_runner: Box::new(|_, _| Err(ForkError::Unsupported)),
+        }
+    }
+}
+
+impl ForkLauncher {
+    /// Creates a launcher using the runner's transport and bootstrap operations.
+    ///
+    /// The parent encodes its descriptor before resuming a suspended child. The child receives its
+    /// copy of the control channel without encoding a descriptor or resuming a process.
+    ///
+    /// # Safety
+    ///
+    /// The runner and its control-channel state must be clone-safe for
+    /// [`ForkRunner::run_child`] immediately after [`ProcessProvider::fork_process`], with
+    /// only the calling thread present. The bootstrap must rebuild the child's runtime state and
+    /// must neither return nor unwind through the copied shim task.
+    pub unsafe fn new<Platform: ProcessProvider + 'static>(
+        runner: impl ForkRunner<Platform>,
+    ) -> Self {
+        Self {
+            start_runner: Box::new(move |child, startup| {
+                let control_channel = runner.create_control_channel();
+                // SAFETY: Only `start` invokes this callback, with sibling guest threads paused.
+                // The constructor guarantees a clone-safe child bootstrap that never unwinds.
+                match unsafe { Platform::fork_process() } {
+                    Ok(ForkResult::Parent(process)) => {
+                        let result = (|| {
+                            let descriptor =
+                                runner.encode_launch_descriptor(&process, control_channel)?;
+                            process.resume().map_err(|error| {
+                                litebox_util_log::error!(
+                                    "failed to resume native fork child: {error}"
+                                );
+                                ProcessError::ServiceFailed
+                            })?;
+                            child.start_with_existing_runner(&descriptor, startup)
+                        })();
+                        if result.is_err()
+                            && let Err(error) = process.terminate()
+                        {
+                            litebox_util_log::error!(
+                                "failed to terminate native fork child: {error}"
+                            );
+                        }
+                        result.map_err(ForkError::Failed)
+                    }
+                    // SAFETY: This is the new child, under the bootstrap contract of `new`.
+                    Ok(ForkResult::Child) => unsafe { runner.run_child(control_channel) },
+                    Err(ForkError::Unsupported) => Err(ForkError::Unsupported),
+                    Err(ForkError::Failed(error)) => {
+                        litebox_util_log::error!("native process cloning failed: {error}");
+                        Err(ForkError::Failed(ProcessError::Unavailable))
+                    }
+                }
+            }),
+        }
+    }
+
+    /// Starts `child` from the finalized Linux startup payload.
+    ///
+    /// `Unsupported` requests copy-based startup before any native child is created or the
+    /// pending child's startup state changes. Other failures propagate without retrying.
+    ///
+    /// # Safety
+    ///
+    /// All other relevant guest threads must remain paused until this call returns. The startup
+    /// payload must describe the calling thread and its process's current, stable guest state.
+    pub unsafe fn start(
+        &self,
+        child: &PendingChild,
+        startup: &[u8],
+    ) -> Result<(), ForkError<ProcessError>> {
+        (self.start_runner)(child, startup)
+    }
+}
 
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState<Platform: ShimPlatform> {
@@ -1160,10 +1279,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let mut regions = Vec::new();
         for (range, flags) in self.global.mm.mappings() {
-            // Mappings without flags are reserved by the runner, which reserves its own.
-            if flags.is_empty() {
-                continue;
-            }
             if flags.contains(VmFlags::VM_SHARED) {
                 return Err(Errno::EAGAIN);
             }
@@ -1213,9 +1328,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_err(Errno::from)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
-        if self.global.fork_backend.is_none() {
-            self.write_fork_image(&child, &startup.regions)?;
-        }
         let handles = child
             .inherit(&self.global.litebox, &objects)
             .map_err(Errno::from)?;
@@ -1225,13 +1337,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let payload = startup
             .encode()
             .expect("the startup fit with placeholder handles");
-        if let Some(backend) = &self.global.fork_backend {
-            backend.start(&child, &payload).map_err(Errno::from)?;
-        } else {
-            // The child's memory and objects are copied, so the other threads may go on.
-            drop(pause);
-            child.start(&payload).map_err(Errno::from)?;
+        // SAFETY: Sibling guest threads remain paused, and the payload snapshots this
+        // calling thread and the stable process state.
+        match unsafe { self.global.fork_launcher.start(&child, &payload) } {
+            Ok(()) => return Ok(child_pid.cast_unsigned() as usize),
+            Err(litebox::platform::ForkError::Unsupported) => {}
+            Err(litebox::platform::ForkError::Failed(error)) => {
+                return Err(Errno::from(error));
+            }
         }
+        self.write_fork_image(&child, &startup.regions)?;
+        // The child's memory and objects are copied, so the other threads may go on.
+        drop(pause);
+        child.start(&payload).map_err(Errno::from)?;
         Ok(child_pid.cast_unsigned() as usize)
     }
 
@@ -2985,6 +3103,137 @@ mod tests {
     };
     use litebox_broker_transport::channel::LocalCallChannel;
 
+    struct ForkRecordingChannel {
+        inner: InProcessBrokerChannel,
+        requests: alloc::sync::Arc<
+            StdMutex<alloc::vec::Vec<litebox_broker_protocol::message::ProcessRequest>>,
+        >,
+    }
+
+    impl LocalCallChannel for ForkRecordingChannel {
+        type Error = <InProcessBrokerChannel as LocalCallChannel>::Error;
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            use litebox_broker_protocol::message::{BrokerResult, ProcessRequest, ProcessResponse};
+
+            if let BrokerOperation::Process(operation) = &request.operation {
+                self.requests.lock().unwrap().push(operation.clone());
+                if matches!(operation, ProcessRequest::WriteChildMemory(_)) {
+                    // The in-process broker has no image launcher; acknowledge the observed write.
+                    return Ok(BrokerResponse {
+                        request_id: request.request_id,
+                        result: BrokerResult::Process(ProcessResponse::WriteChildMemory),
+                    });
+                }
+                if matches!(operation, ProcessRequest::StartChild(_)) {
+                    // Observe copy-based startup without launching a real runner.
+                    return Ok(BrokerResponse {
+                        request_id: request.request_id,
+                        result: BrokerResult::Error(
+                            litebox_broker_protocol::error::ErrorCode::PolicyDenied,
+                        ),
+                    });
+                }
+            }
+            self.inner.call(request)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ForkLauncherMode {
+        Default,
+        Unsupported,
+        Failure,
+    }
+
+    fn check_fork_launcher_fallback(mode: ForkLauncherMode) {
+        use crate::syscalls::tests::TestPlatform;
+        use alloc::sync::Arc;
+        use litebox::platform::ThreadProvider;
+        use litebox_broker_core::BrokerCoreLimits;
+        use litebox_broker_protocol::message::ProcessRequest;
+        use litebox_common_linux::{MapFlags, ProtFlags, PtRegs, errno::Errno, vmem::PAGE_SIZE};
+
+        let copies_memory = !matches!(mode, ForkLauncherMode::Failure);
+        let platform = crate::syscalls::tests::test_platform();
+        TestPlatform::run_test_thread(|| {
+            let requests = Arc::new(StdMutex::new(alloc::vec::Vec::new()));
+            let observer = Arc::clone(&requests);
+            let limits = BrokerCoreLimits::new(
+                super::super::test_broker::MAX_TEST_BROKER_REFERENCES,
+                BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+            );
+            let (litebox, process_id) =
+                super::super::test_broker::litebox_with_channel(platform, limits, |inner| {
+                    ForkRecordingChannel {
+                        inner,
+                        requests: observer,
+                    }
+                });
+            let builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
+            let builder = match mode {
+                ForkLauncherMode::Default => builder,
+                ForkLauncherMode::Unsupported => {
+                    builder.with_fork_launcher(super::fork_tests::failing_launcher(true))
+                }
+                ForkLauncherMode::Failure => {
+                    builder.with_fork_launcher(super::fork_tests::failing_launcher(false))
+                }
+            };
+            let shim = builder.build();
+            let task = shim.0.new_test_task();
+            let mapping = task
+                .sys_mmap(
+                    0,
+                    PAGE_SIZE,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+                .unwrap();
+            mapping.write_at_offset::<TestPlatform>(0, 42).unwrap();
+
+            let result = task.sys_fork(&PtRegs::default());
+            assert_eq!(
+                result,
+                Err(if copies_memory {
+                    Errno::EPERM
+                } else {
+                    Errno::ENOSYS
+                }),
+            );
+            let requests = requests.lock().unwrap();
+            let writes = requests
+                .iter()
+                .filter(|request| matches!(request, ProcessRequest::WriteChildMemory(_)))
+                .count();
+            let starts = requests
+                .iter()
+                .filter(|request| matches!(request, ProcessRequest::StartChild(_)))
+                .count();
+            assert_eq!(writes, usize::from(copies_memory));
+            assert_eq!(starts, usize::from(copies_memory));
+            drop(requests);
+            task.sys_munmap(mapping, PAGE_SIZE).unwrap();
+        });
+    }
+
+    #[test]
+    fn fork_launcher_default_copies_memory_and_starts_fresh_runner() {
+        check_fork_launcher_fallback(ForkLauncherMode::Default);
+    }
+
+    #[test]
+    fn fork_launcher_unsupported_copies_memory_and_starts_fresh_runner() {
+        check_fork_launcher_fallback(ForkLauncherMode::Unsupported);
+    }
+
+    #[test]
+    fn fork_launcher_failure_does_not_copy_memory_or_retry_startup() {
+        check_fork_launcher_fallback(ForkLauncherMode::Failure);
+    }
+
     struct BlockingThreadExitChannel {
         inner: InProcessBrokerChannel,
         exit_started: mpsc::SyncSender<()>,
@@ -3962,5 +4211,305 @@ mod tests {
             parse_shebang(b"#!/usr/bin/env\tpython3\n"),
             Some(("/usr/bin/env", Some("python3")))
         );
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    extern crate std;
+
+    use super::*;
+    use alloc::vec;
+    use litebox_broker_core::BrokerCoreLimits;
+    use litebox_broker_host::test_support::InProcessBrokerChannel;
+    use litebox_broker_protocol::message::{
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, ProcessRequest,
+        ProcessResponse,
+    };
+    use litebox_broker_transport::channel::LocalCallChannel;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Stage {
+        Channel,
+        Fork,
+        Identify,
+        Encode,
+        Resume,
+        Start,
+        Terminate,
+        DropHandle,
+    }
+
+    struct State {
+        unsupported: bool,
+        failure: Option<Stage>,
+        events: Vec<Stage>,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        unsupported: false,
+        failure: None,
+        events: Vec::new(),
+    });
+
+    fn record(event: Stage) -> Result<(), ProcessError> {
+        let mut state = STATE.lock().unwrap();
+        state.events.push(event);
+        if state.failure == Some(event) {
+            Err(ProcessError::OutOfMemory)
+        } else {
+            Ok(())
+        }
+    }
+
+    struct MockPlatform;
+    struct MockHandle;
+
+    impl ProcessProvider for MockPlatform {
+        type ProcessHandle = MockHandle;
+        type ProcessError = ProcessError;
+
+        unsafe fn fork_process() -> Result<ForkResult<MockHandle>, ForkError<ProcessError>> {
+            record(Stage::Fork).map_err(ForkError::Failed)?;
+            if STATE.lock().unwrap().unsupported {
+                Err(ForkError::Unsupported)
+            } else {
+                Ok(ForkResult::Parent(MockHandle))
+            }
+        }
+
+        unsafe fn prepare_forked_process() -> Result<(), ProcessError> {
+            unreachable!("the mock does not create a child")
+        }
+    }
+
+    impl ProcessHandle for MockHandle {
+        type Error = ProcessError;
+
+        fn process_id(&self) -> Result<u32, ProcessError> {
+            record(Stage::Identify)?;
+            Ok(123)
+        }
+
+        fn resume(&self) -> Result<(), ProcessError> {
+            record(Stage::Resume)
+        }
+
+        fn terminate(&self) -> Result<(), ProcessError> {
+            record(Stage::Terminate)
+        }
+    }
+
+    impl Drop for MockHandle {
+        fn drop(&mut self) {
+            record(Stage::DropHandle).unwrap();
+        }
+    }
+
+    struct StartChannel(InProcessBrokerChannel);
+
+    impl LocalCallChannel for StartChannel {
+        type Error = <InProcessBrokerChannel as LocalCallChannel>::Error;
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            if matches!(
+                request.operation,
+                BrokerOperation::Process(ProcessRequest::StartChildWithExistingRunner(_))
+            ) {
+                let result = if record(Stage::Start).is_ok() {
+                    BrokerResult::Process(ProcessResponse::StartChildWithExistingRunner)
+                } else {
+                    BrokerResult::Error(litebox_broker_protocol::error::ErrorCode::PolicyDenied)
+                };
+                return Ok(BrokerResponse {
+                    request_id: request.request_id,
+                    result,
+                });
+            }
+            self.0.call(request)
+        }
+    }
+
+    struct MockRunner {
+        channel: u32,
+    }
+
+    impl ForkRunner<MockPlatform> for MockRunner {
+        type ControlChannel = u32;
+
+        fn create_control_channel(&self) -> u32 {
+            record(Stage::Channel).unwrap();
+            self.channel
+        }
+
+        fn encode_launch_descriptor(
+            &self,
+            process: &MockHandle,
+            channel: u32,
+        ) -> Result<Vec<u8>, ProcessError> {
+            let process_id = process
+                .process_id()
+                .map_err(|_| ProcessError::ServiceFailed)?;
+            record(Stage::Encode)?;
+            assert_eq!(process_id, 123);
+            assert_eq!(channel, self.channel);
+            Ok(vec![1, 2, 3])
+        }
+
+        unsafe fn run_child(&self, _channel: u32) -> ! {
+            unreachable!("the mock does not create a child")
+        }
+    }
+
+    fn launcher() -> ForkLauncher {
+        // SAFETY: The mock platform never creates a child, so the bootstrap cannot run.
+        unsafe { ForkLauncher::new::<MockPlatform>(MockRunner { channel: 456 }) }
+    }
+
+    pub(super) fn failing_launcher(unsupported: bool) -> ForkLauncher {
+        *STATE.lock().unwrap() = State {
+            unsupported,
+            failure: if unsupported { None } else { Some(Stage::Fork) },
+            events: Vec::new(),
+        };
+        launcher()
+    }
+
+    fn check_start(
+        unsupported: bool,
+        failure: Option<Stage>,
+        expected_events: &[Stage],
+    ) -> Result<(), ForkError<ProcessError>> {
+        *STATE.lock().unwrap() = State {
+            unsupported,
+            failure,
+            events: Vec::new(),
+        };
+        let platform = crate::syscalls::tests::test_platform();
+        let limits = BrokerCoreLimits::new(
+            crate::syscalls::test_broker::MAX_TEST_BROKER_REFERENCES,
+            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+        );
+        let (litebox, _) =
+            crate::syscalls::test_broker::litebox_with_channel(platform, limits, StartChannel);
+        let child = litebox.allocate_child_process().unwrap();
+        let launcher = launcher();
+        // SAFETY: No native child is created and no guest threads or guest startup state exist.
+        let result = unsafe { launcher.start(&child, b"startup") };
+        assert_eq!(STATE.lock().unwrap().events, expected_events);
+        result
+    }
+
+    #[test]
+    fn native_fork_starts_existing_runner_and_releases_handle() {
+        check_start(
+            false,
+            None,
+            &[
+                Stage::Channel,
+                Stage::Fork,
+                Stage::Identify,
+                Stage::Encode,
+                Stage::Resume,
+                Stage::Start,
+                Stage::DropHandle,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn native_fork_unsupported_has_no_child_startup_side_effects() {
+        assert!(matches!(
+            check_start(true, None, &[Stage::Channel, Stage::Fork]),
+            Err(ForkError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn native_fork_failure_does_not_request_fallback() {
+        assert!(matches!(
+            check_start(false, Some(Stage::Fork), &[Stage::Channel, Stage::Fork]),
+            Err(ForkError::Failed(ProcessError::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn native_fork_identity_failure_terminates_child() {
+        assert!(matches!(
+            check_start(
+                false,
+                Some(Stage::Identify),
+                &[
+                    Stage::Channel,
+                    Stage::Fork,
+                    Stage::Identify,
+                    Stage::Terminate,
+                    Stage::DropHandle,
+                ],
+            ),
+            Err(ForkError::Failed(ProcessError::ServiceFailed))
+        ));
+    }
+
+    #[test]
+    fn native_fork_descriptor_failure_terminates_child() {
+        assert!(matches!(
+            check_start(
+                false,
+                Some(Stage::Encode),
+                &[
+                    Stage::Channel,
+                    Stage::Fork,
+                    Stage::Identify,
+                    Stage::Encode,
+                    Stage::Terminate,
+                    Stage::DropHandle,
+                ],
+            ),
+            Err(ForkError::Failed(ProcessError::OutOfMemory))
+        ));
+    }
+
+    #[test]
+    fn native_fork_resume_failure_terminates_child() {
+        assert!(matches!(
+            check_start(
+                false,
+                Some(Stage::Resume),
+                &[
+                    Stage::Channel,
+                    Stage::Fork,
+                    Stage::Identify,
+                    Stage::Encode,
+                    Stage::Resume,
+                    Stage::Terminate,
+                    Stage::DropHandle,
+                ],
+            ),
+            Err(ForkError::Failed(ProcessError::ServiceFailed))
+        ));
+    }
+
+    #[test]
+    fn native_fork_broker_start_failure_terminates_child() {
+        assert!(matches!(
+            check_start(
+                false,
+                Some(Stage::Start),
+                &[
+                    Stage::Channel,
+                    Stage::Fork,
+                    Stage::Identify,
+                    Stage::Encode,
+                    Stage::Resume,
+                    Stage::Start,
+                    Stage::Terminate,
+                    Stage::DropHandle,
+                ],
+            ),
+            Err(ForkError::Failed(ProcessError::PolicyDenied))
+        ));
     }
 }

@@ -3,11 +3,10 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
+use litebox::platform::{ProcessHandle as _, ProcessProvider};
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use litebox_platform_linux_userland::SeccompScope;
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use litebox_broker_local_userland as broker;
 use litebox_broker_transport_linux_userland::existing_runner::{
@@ -17,7 +16,6 @@ use litebox_common_linux::program_startup::{
     LinuxForkStartup, LinuxProcessStartup, LinuxProgramStartup,
 };
 use litebox_common_linux::signal::SigSet;
-use litebox_platform_linux_userland::process_clone::{ProcessClone, clone_current_process};
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
 // credentials aligned with packaged guest files and avoids truncating high host IDs.
@@ -31,55 +29,99 @@ const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
     "NO_PROXY",
 ];
 
-struct NativeForkBackend;
-
-impl litebox_shim_linux::ForkBackend for NativeForkBackend {
-    fn start(
-        &self,
-        child: &litebox::process::PendingChild,
-        startup: &[u8],
-    ) -> Result<(), litebox::process::ProcessError> {
-        let control_channel = unique_control_channel();
-        // SAFETY: The shim has paused all sibling guest threads. The child immediately abandons
-        // copied runtime state and enters `run_native_fork_child`, which never returns.
-        match unsafe { clone_current_process() } {
-            Ok(ProcessClone::Parent {
-                process_id,
-                process,
-            }) => {
-                let descriptor = ExistingRunnerLaunchDescriptor {
-                    parent_process_id: std::process::id(),
-                    process_id,
-                    control_channel: control_channel.clone(),
-                }
-                .encode()
-                .map_err(|_| {
-                    terminate_process(&process);
-                    litebox::process::ProcessError::OutOfMemory
-                })?;
-                let result = child.start_with_existing_runner(&descriptor, startup);
-                if result.is_err() {
-                    terminate_process(&process);
-                }
-                result
-            }
-            Ok(ProcessClone::Child) => run_native_fork_child(control_channel),
-            Err(_) => Err(litebox::process::ProcessError::Unavailable),
-        }
-    }
+fn fork_launcher() -> litebox_shim_linux::ForkLauncher {
+    // SAFETY: The bootstrap abandons the copied task, resets platform state, and reconnects
+    // through its owned control-channel path before running the guest in a fresh shim.
+    unsafe { litebox_shim_linux::ForkLauncher::new::<Platform>(NativeForkRunner) }
 }
 
-fn terminate_process(process: &OwnedFd) {
-    // SAFETY: `process` is a pidfd returned for the cloned child; failure is best-effort cleanup.
-    let _ = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            process.as_raw_fd(),
-            libc::SIGKILL,
-            core::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
+struct NativeForkRunner;
+
+impl litebox_shim_linux::ForkRunner<Platform> for NativeForkRunner {
+    type ControlChannel = PathBuf;
+
+    fn create_control_channel(&self) -> PathBuf {
+        unique_control_channel()
+    }
+
+    fn encode_launch_descriptor(
+        &self,
+        process: &<Platform as ProcessProvider>::ProcessHandle,
+        control_channel: PathBuf,
+    ) -> Result<Vec<u8>, litebox::process::ProcessError> {
+        let process_id = process.process_id().map_err(|error| {
+            litebox_util_log::error!("failed to identify native fork child: {error}");
+            litebox::process::ProcessError::ServiceFailed
+        })?;
+        ExistingRunnerLaunchDescriptor {
+            parent_process_id: std::process::id(),
+            process_id,
+            control_channel,
+        }
+        .encode()
+        .map_err(|_| litebox::process::ProcessError::OutOfMemory)
+    }
+
+    unsafe fn run_child(&self, control_channel: PathBuf) -> ! {
+        // SAFETY: The clone contains only this thread, and this function never returns through the
+        // copied guest task or its thread-registration guard.
+        if unsafe { Platform::prepare_forked_process() }.is_err() {
+            // SAFETY: The cloned process cannot safely unwind through copied runtime state.
+            unsafe { libc::_exit(127) }
+        }
+        let result = (|| -> Result<i32> {
+            // SAFETY: clone3 copied only this thread, the inherited handlers remain installed, and
+            // this path never returns through or destroys the copied parent runtime.
+            let platform = unsafe { Platform::new_after_process_clone() };
+            #[cfg(target_arch = "x86_64")]
+            platform.set_guest_tls_mode(litebox_platform_linux_userland::GuestTlsMode::Linux);
+            let (connection, startup) =
+                litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+                    broker::connect(&control_channel)
+                })?;
+            let broker::BrokerConnection {
+                local,
+                notifications,
+                coordinator,
+                positional_io_fds: _,
+                shutdown_fd: _,
+                process_image,
+            } = connection;
+            if process_image.is_some() {
+                anyhow::bail!("native fork child unexpectedly received a process image");
+            }
+            let (litebox, process_id, initial_thread) =
+                litebox::LiteBox::new_process_with_broker_local(platform, local);
+            let process_id =
+                i32::try_from(process_id.0).context("process ID does not fit Linux pid_t")?;
+            coordinator.install_dispatch(litebox.broker_failure_dispatcher());
+            litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+                broker::start_notification_receiver(
+                    notifications,
+                    coordinator,
+                    litebox.broker_notification_dispatcher(),
+                )
+            })?;
+            let shim = litebox_shim_linux::LinuxShimBuilder::new_with_litebox(
+                platform, litebox, process_id,
+            )
+            .with_fork_launcher(fork_launcher())
+            .build();
+            let startup = startup.context("native fork child has no startup data")?;
+            let LinuxProcessStartup::Fork(startup) = LinuxProcessStartup::decode(&startup.payload)
+                .context("invalid native fork child startup")?
+            else {
+                anyhow::bail!("native fork child received program startup");
+            };
+            let program = shim
+                .restore_fork_from_native_clone(*startup, initial_thread)
+                .context("failed to adopt native fork memory")?;
+            Ok(run_program(&shim, program))
+        })();
+        // Do not run destructors or atexit handlers copied from the multithreaded parent runtime.
+        // SAFETY: `_exit` terminates this process immediately with a conventional shell status.
+        unsafe { libc::_exit(result.unwrap_or(127)) }
+    }
 }
 
 /// Runs a Linux program with LiteBox on unmodified Linux and returns its exit code.
@@ -223,7 +265,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
     let shim_builder =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
     let shim_builder = if native_fork_enabled {
-        shim_builder.with_fork_backend(Arc::new(NativeForkBackend))
+        shim_builder.with_fork_launcher(fork_launcher())
     } else {
         shim_builder
     };
@@ -376,69 +418,6 @@ fn run_program(
         .litebox()
         .report_exit_status(program.process.wait_for_exit_status());
     program.process.wait_for_unix_shell_exit_code()
-}
-
-fn run_native_fork_child(control_channel: PathBuf) -> ! {
-    // SAFETY: The clone contains only this thread, and this function never returns through the
-    // copied guest task or its thread-registration guard.
-    unsafe { litebox_platform_linux_userland::reset_current_thread_after_process_clone() };
-    // Drop copied parent associations and host resources before negotiating the child's own.
-    // SAFETY: The child deliberately retains only stdin, stdout, and stderr.
-    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } < 0 {
-        // SAFETY: The cloned process cannot safely unwind through copied runtime state.
-        unsafe { libc::_exit(127) }
-    }
-    let result = (|| -> Result<i32> {
-        // SAFETY: clone3 copied only this thread, the inherited handlers remain installed, and
-        // this path never returns through or destroys the copied parent runtime.
-        let platform = unsafe { Platform::new_after_process_clone() };
-        #[cfg(target_arch = "x86_64")]
-        platform.set_guest_tls_mode(litebox_platform_linux_userland::GuestTlsMode::Linux);
-        let (connection, startup) =
-            litebox_platform_linux_userland::with_guest_signals_blocked(|| {
-                broker::connect(&control_channel)
-            })?;
-        let broker::BrokerConnection {
-            local,
-            notifications,
-            coordinator,
-            positional_io_fds: _,
-            shutdown_fd: _,
-            process_image,
-        } = connection;
-        if process_image.is_some() {
-            anyhow::bail!("native fork child unexpectedly received a process image");
-        }
-        let (litebox, process_id, initial_thread) =
-            litebox::LiteBox::new_process_with_broker_local(platform, local);
-        let process_id =
-            i32::try_from(process_id.0).context("process ID does not fit Linux pid_t")?;
-        coordinator.install_dispatch(litebox.broker_failure_dispatcher());
-        litebox_platform_linux_userland::with_guest_signals_blocked(|| {
-            broker::start_notification_receiver(
-                notifications,
-                coordinator,
-                litebox.broker_notification_dispatcher(),
-            )
-        })?;
-        let shim =
-            litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
-                .with_fork_backend(Arc::new(NativeForkBackend))
-                .build();
-        let startup = startup.context("native fork child has no startup data")?;
-        let LinuxProcessStartup::Fork(startup) = LinuxProcessStartup::decode(&startup.payload)
-            .context("invalid native fork child startup")?
-        else {
-            anyhow::bail!("native fork child received program startup");
-        };
-        let program = shim
-            .restore_fork_from_native_clone(*startup, initial_thread)
-            .context("failed to adopt native fork memory")?;
-        Ok(run_program(&shim, program))
-    })();
-    // Do not run destructors or atexit handlers copied from the multithreaded parent runtime.
-    // SAFETY: `_exit` terminates this process immediately with a conventional shell status.
-    unsafe { libc::_exit(result.unwrap_or(127)) }
 }
 
 /// Continues the process a parent duplicated by `fork`, whose memory contents are in

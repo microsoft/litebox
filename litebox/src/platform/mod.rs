@@ -98,6 +98,82 @@ pub trait ThreadProvider: RawPointerProvider {
     }
 }
 
+/// Result of duplicating the calling process.
+pub enum ForkResult<Handle> {
+    /// The parent owns a handle to the new process.
+    Parent(Handle),
+    /// The child resumes on the calling thread.
+    Child,
+}
+
+/// Distinguishes unavailable native cloning from failures that must not fall back.
+#[derive(Debug, Error)]
+pub enum ForkError<E> {
+    /// No child was created and no startup side effects occurred; copying is still possible.
+    #[error("native process cloning is unsupported")]
+    Unsupported,
+    /// Native cloning or startup failed.
+    #[error(transparent)]
+    Failed(E),
+}
+
+/// Optional host process operations used by runners implementing native `fork`.
+///
+/// This is deliberately not a supertrait of [`Provider`]. A provider may return
+/// [`ForkError::Unsupported`] to request the copy-based path at runtime. Other failures
+/// must propagate instead of retrying process creation.
+pub trait ProcessProvider {
+    /// Owned host process resources, including any suspended initial thread.
+    ///
+    /// Dropping this handle releases resources but does not terminate the process.
+    type ProcessHandle: ProcessHandle<Error = Self::ProcessError>;
+    /// Host operation error.
+    type ProcessError: core::error::Error;
+
+    /// Duplicates the caller's address space with only the calling thread.
+    ///
+    /// The parent must call [`ProcessHandle::resume`] before waiting for child startup. The
+    /// child may already be running before that call, depending on the host.
+    ///
+    /// # Safety
+    ///
+    /// All other relevant threads must be quiescent. The child must immediately enter a
+    /// clone-safe bootstrap path, prepare its platform state, and never return through or
+    /// destroy the copied runtime. Inherited locks may belong to threads that no longer exist.
+    unsafe fn fork_process()
+    -> Result<ForkResult<Self::ProcessHandle>, ForkError<Self::ProcessError>> {
+        Err(ForkError::Unsupported)
+    }
+
+    /// Discards copied platform thread registration and inherited host connections.
+    ///
+    /// Standard input, output, and error remain available. This does not reconstruct the
+    /// runner's broker connection or shim state.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the sole thread in a newly cloned process and must never return
+    /// through the copied guest-thread stack, including on failure.
+    unsafe fn prepare_forked_process() -> Result<(), Self::ProcessError>;
+}
+
+/// Owned native child process resources created by [`ProcessProvider`].
+///
+/// Dropping a handle releases resources but does not terminate the process.
+pub trait ProcessHandle {
+    /// Host operation error.
+    type Error: core::error::Error;
+
+    /// Returns the host process ID of the clone.
+    fn process_id(&self) -> Result<u32, Self::Error>;
+
+    /// Releases the clone's initial suspension, or succeeds if it was created running.
+    fn resume(&self) -> Result<(), Self::Error>;
+
+    /// Terminates the clone after startup fails.
+    fn terminate(&self) -> Result<(), Self::Error>;
+}
+
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum TimerCreationError {
@@ -432,4 +508,46 @@ pub enum DerivedKeyError<ShimKDFError> {
     ShimKDFError(#[from] ShimKDFError),
     #[error("this platform does not support reboot-persistent keys")]
     UnsupportedRebootPersistentKey,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::convert::Infallible;
+
+    struct UnsupportedPlatform;
+
+    impl ProcessProvider for UnsupportedPlatform {
+        type ProcessHandle = Infallible;
+        type ProcessError = Infallible;
+
+        unsafe fn prepare_forked_process() -> Result<(), Infallible> {
+            unreachable!("unsupported platforms cannot create native clones")
+        }
+    }
+
+    impl ProcessHandle for Infallible {
+        type Error = Infallible;
+
+        fn process_id(&self) -> Result<u32, Infallible> {
+            match *self {}
+        }
+
+        fn resume(&self) -> Result<(), Infallible> {
+            match *self {}
+        }
+
+        fn terminate(&self) -> Result<(), Infallible> {
+            match *self {}
+        }
+    }
+
+    #[test]
+    fn unsupported_provider_does_not_create_a_child() {
+        // SAFETY: This provider uses the default implementation, which cannot create a child.
+        assert!(matches!(
+            unsafe { UnsupportedPlatform::fork_process() },
+            Err(ForkError::Unsupported)
+        ));
+    }
 }
