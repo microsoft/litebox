@@ -214,6 +214,9 @@ pub(crate) struct PendingFilePatch {
     trampoline_extent: Option<Range<usize>>,
     /// Inaccessible pages reserved for the mapping plus `trampoline_extent`.
     reservation: Option<UserPtrMut<u8>>,
+    /// Whether completing this mapping cached the patch state, rather than a
+    /// concurrent mapping of the same file.
+    inserted: bool,
 }
 
 impl PendingFilePatch {
@@ -365,6 +368,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             metadata,
             trampoline_extent,
             reservation: None,
+            inserted: false,
         };
         if pending.trampoline_extent.is_some() {
             pending.reservation = Some(
@@ -399,16 +403,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// On failure, releases the mapping and its reservation.
     pub(crate) fn complete_file_patch(
         &self,
-        pending: PendingFilePatch,
+        mut pending: PendingFilePatch,
         mapped: UserPtrMut<u8>,
     ) -> Result<(), Errno> {
-        // Whether this call cached the patch state, rather than a concurrent mapping.
-        let mut inserted = false;
-        let mut pending = pending;
-        let result = self.try_complete_file_patch(&mut pending, mapped, &mut inserted);
+        let result = self.try_complete_file_patch(&mut pending, mapped);
         if result.is_err() {
             // A failed first mapping must not retain its provisional load base.
-            if inserted && pending.reservation.is_some() {
+            if pending.inserted && pending.reservation.is_some() {
                 self.global.elf_patch_cache.lock().remove(&pending.key);
             }
             if let Err(error) = self.sys_munmap(mapped, pending.allocation_len()) {
@@ -425,7 +426,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         pending: &mut PendingFilePatch,
         mapped: UserPtrMut<u8>,
-        inserted: &mut bool,
     ) -> Result<(), Errno> {
         let key = &pending.key;
         let len = pending.len;
@@ -435,7 +435,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(metadata) => self.init_elf_patch_state(key, mapped.as_usize(), metadata),
                 Err(init) => init,
             };
-            *inserted = init == ElfPatchInit::Ready;
+            pending.inserted = init == ElfPatchInit::Ready;
             // A missing load base is not fatal for a non-executable mapping:
             // a later mapping may reveal it.
             if init == ElfPatchInit::Malformed || (is_exec && init == ElfPatchInit::MissingLoadBase)
@@ -476,7 +476,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 )?;
             }
             let unused = mapped.as_usize() + tail_start..mapped.as_usize() + extent.end;
-            self.retain_pre_patched_reservation(key, unused, *inserted)?;
+            self.retain_pre_patched_reservation(key, unused, pending.inserted)?;
         }
         Ok(())
     }
@@ -515,6 +515,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         syscall_entry: usize,
     ) -> Result<(), Errno> {
+        if len == 0 {
+            return Ok(());
+        }
         let mprotect_start = addr.as_usize();
         let mprotect_end = mprotect_start.saturating_add(len);
 
@@ -536,7 +539,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     let patch_start = segment.start.max(mprotect_start);
                     let patch_end = segment.end.min(mprotect_end);
-                    let restore_protections = self
+                    let restore_protections: alloc::vec::Vec<ProtectionRange> = self
                         .global
                         .mm
                         .overlapping(patch_start..patch_end)
@@ -551,6 +554,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             )
                         })
                         .collect();
+                    // Nothing of a fully unmapped segment is left to patch, and
+                    // the mprotect itself will fail.
+                    if restore_protections.is_empty() {
+                        continue;
+                    }
                     result.push((
                         fd.clone(),
                         patch_start,
@@ -828,7 +836,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
     ) -> bool {
         let range = start..start.saturating_add(len);
-        let end = range.end;
         if state
             .load_span
             .as_ref()
@@ -836,11 +843,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return true;
         }
-        for (range, flags) in self.global.mm.overlapping(start..end) {
+        for (victim_range, flags) in self.global.mm.overlapping(range.clone()) {
             if flags.intersects(VmFlags::VM_ACCESS_FLAGS) {
                 litebox_util_log::error!(
-                    tramp_start:? = start, tramp_end:? = end,
-                    victim_start:? = range.start, victim_end:? = range.end,
+                    tramp_start:? = range.start, tramp_end:? = range.end,
+                    victim_start:? = victim_range.start, victim_end:? = victim_range.end,
                     victim_flags:? = flags;
                     "refusing to map a trampoline over another mapping's live pages"
                 );
