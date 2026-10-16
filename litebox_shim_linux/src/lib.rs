@@ -63,7 +63,7 @@ pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
 
-pub use syscalls::process::{ForkLauncher, ForkRunner};
+use syscalls::process::ForkLauncher;
 
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///

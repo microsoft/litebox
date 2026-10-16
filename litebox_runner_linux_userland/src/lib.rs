@@ -29,15 +29,17 @@ const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
     "NO_PROXY",
 ];
 
-fn fork_launcher() -> litebox_shim_linux::ForkLauncher {
+fn fork_launcher() -> litebox_shim_linux::syscalls::process::ForkLauncher {
     // SAFETY: The bootstrap abandons the copied task, resets platform state, and reconnects
     // through its owned control-channel path before running the guest in a fresh shim.
-    unsafe { litebox_shim_linux::ForkLauncher::new::<Platform>(NativeForkRunner) }
+    unsafe {
+        litebox_shim_linux::syscalls::process::ForkLauncher::new::<Platform>(NativeForkRunner)
+    }
 }
 
 struct NativeForkRunner;
 
-impl litebox_shim_linux::ForkRunner<Platform> for NativeForkRunner {
+impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkRunner {
     type ControlChannel = PathBuf;
 
     fn create_control_channel(&self) -> PathBuf {
