@@ -5,6 +5,7 @@
 
 pub mod auxv;
 pub mod elf;
+pub(crate) mod patch;
 mod stack;
 
 pub(crate) const DEFAULT_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MB

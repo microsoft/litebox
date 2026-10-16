@@ -270,7 +270,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         #[cfg(target_arch = "aarch64")]
         if self.parsed.has_trampoline() {
             let patch_key =
-                crate::syscalls::mm::ElfPatchKey(alloc::sync::Arc::clone(&self.file.file_fd));
+                crate::loader::patch::ElfPatchKey(alloc::sync::Arc::clone(&self.file.file_fd));
             if !self
                 .file
                 .task
@@ -278,7 +278,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
                 .elf_patch_cache
                 .lock()
                 .get(&patch_key)
-                .is_some_and(crate::syscalls::mm::ElfPatchState::trampoline_is_populated)
+                .is_some_and(crate::loader::patch::ElfPatchState::trampoline_is_populated)
             {
                 litebox_util_log::error!(fd:? = self.file.fd; "AArch64 trampoline was not populated while loading the ELF");
                 return Err(ElfLoaderError::LoadError(

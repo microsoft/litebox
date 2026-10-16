@@ -617,6 +617,15 @@ where
             .collect()
     }
 
+    /// Returns the mappings that overlap `range`, unclipped and in address order.
+    pub fn overlapping(&self, range: Range<usize>) -> Vec<(Range<usize>, VmFlags)> {
+        self.vmem
+            .read()
+            .overlapping(range)
+            .map(|(r, vma)| (r.start..r.end, vma.flags()))
+            .collect()
+    }
+
     /// Returns whether every byte in `range` is mapped with `required` permissions.
     pub fn range_has_permissions(
         &self,

@@ -1526,7 +1526,7 @@ struct GlobalState<Platform: ShimPlatform> {
     /// Process ID assigned to this shim.
     process_id: i32,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
-    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    elf_patch_cache: litebox::sync::Mutex<Platform, loader::patch::ElfPatchCache>,
 }
 
 struct Task<Platform: ShimPlatform> {
