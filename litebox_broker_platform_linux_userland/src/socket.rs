@@ -1242,7 +1242,7 @@ impl Reactor {
         let (peer, authorize_external_reply) = {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
             if socket.write_shutdown {
-                return Ok(SocketOutcome::Failed(SocketError::Other));
+                return Ok(SocketOutcome::Failed(SocketError::Shutdown));
             }
             let udp = socket.udp_state()?;
             match destination {

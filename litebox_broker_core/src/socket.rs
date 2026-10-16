@@ -554,8 +554,9 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Sends bytes without waiting for platform readiness.
     ///
-    /// A temporarily full socket returns [`BrokerError::WouldBlock`]. Ordinary
-    /// network failures return [`SocketOutcome::Failed`].
+    /// A temporarily full socket returns [`BrokerError::WouldBlock`]. A socket
+    /// shut down for writing fails with `Shutdown`. Ordinary network failures
+    /// return [`SocketOutcome::Failed`].
     fn send(&self, data: Vec<u8>, flags: SendFlags) -> Result<SocketOutcome<usize>>;
 
     /// Sends one complete datagram without waiting for platform readiness.
@@ -564,9 +565,10 @@ pub trait PlatformSocket: Send + Sync {
     /// the socket's connected peer. An explicit destination is normalized but
     /// remains guest-visible; the provider must validate it with
     /// [`normalize_socket_destination`] before choosing a host-socket target.
-    /// A temporarily full socket returns [`BrokerError::WouldBlock`]. Partial
-    /// successful sends are invalid. Resource failures are broker errors rather
-    /// than ordinary socket failures.
+    /// A temporarily full socket returns [`BrokerError::WouldBlock`], and a
+    /// socket shut down for writing fails with `Shutdown`. Partial successful
+    /// sends are invalid. Resource failures are broker errors rather than
+    /// ordinary socket failures.
     fn send_to(
         &self,
         data: Vec<u8>,
@@ -777,20 +779,17 @@ fn connect_stream(
         SocketOutcome::Completed(status) => status,
         SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
     };
-    write_socket(object, |socket| {
-        socket.disconnected = false;
-        match status {
-            SocketConnectionStatus::Connected => {
-                socket.connect_reported = true;
-                SocketOutcome::Completed(status)
-            }
-            SocketConnectionStatus::Failed(error) => {
-                // This attempt reports the failure, so it is not also pending.
-                let _ = socket.disconnect();
-                SocketOutcome::Failed(error)
-            }
-            status => SocketOutcome::Completed(status),
+    write_socket(object, |socket| match status {
+        SocketConnectionStatus::Connected => {
+            socket.connect_reported = true;
+            SocketOutcome::Completed(status)
         }
+        SocketConnectionStatus::Failed(error) => {
+            // This attempt reports the failure, so it is not also pending.
+            let _ = socket.disconnect();
+            SocketOutcome::Failed(error)
+        }
+        status => SocketOutcome::Completed(status),
     })
 }
 
@@ -966,6 +965,8 @@ fn transport_connect(
             return Ok(SocketOutcome::Completed(socket.connection_status));
         }
         socket.connect_in_flight = true;
+        // The attempt replaces any earlier disconnection.
+        socket.disconnected = false;
         (Arc::clone(&socket.resource), socket.local_address.is_none())
     };
     if needs_bind {

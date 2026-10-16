@@ -560,7 +560,7 @@ pub(super) fn send_socket(
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     if socket.write_shutdown {
-        return Ok(SocketOutcome::Failed(SocketError::Other));
+        return Ok(SocketOutcome::Failed(SocketError::Shutdown));
     }
     if guest_reset_pending(socket)? {
         if !consume_pending_guest_reset(socket, true)? {

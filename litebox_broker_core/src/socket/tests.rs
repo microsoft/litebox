@@ -1195,6 +1195,30 @@ fn zero_port_connect_fails_before_platform_dispatch() {
         &[]
     );
     assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 0);
+
+    // A later attempt is visible as soon as it is claimed, before the connect
+    // that claimed it records its result.
+    let object = process
+        .authorized_object(socket, ObjectRights::WRITE)
+        .unwrap();
+    assert_eq!(
+        transport_connect(&process, &object, loopback_address()),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider.return_next_status(SocketConnectionStatus::Connecting, None);
+    assert_eq!(
+        connect(
+            &process,
+            socket,
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)
+        ),
+        Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress))
+    );
+    provider.return_next_status(SocketConnectionStatus::Connecting, None);
+    assert_eq!(
+        connect(&process, socket, loopback_address()),
+        Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress))
+    );
 }
 
 #[test]
