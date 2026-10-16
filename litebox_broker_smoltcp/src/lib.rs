@@ -211,13 +211,11 @@ impl Shared {
         let publications = core::mem::take(&mut stack.publications);
         drop(stack);
         for publication in publications {
-            // A sink that cannot take an update keeps the snapshot, which
-            // `PlatformSocket::readiness` reports.
-            let _ = if publication.republish {
-                publication.registration.republish(publication.flags)
+            if publication.republish {
+                publication.registration.republish(publication.flags);
             } else {
-                publication.registration.publish(publication.flags)
-            };
+                publication.registration.publish(publication.flags);
+            }
         }
         result
     }

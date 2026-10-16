@@ -514,7 +514,7 @@ impl Stack {
             Err(error) => return Ok(SocketOutcome::Failed(error)),
         };
         if udp.write_shutdown {
-            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+            return Ok(SocketOutcome::Failed(SocketError::Shutdown));
         }
         let source = match udp.source_for(destination) {
             Ok(source) => source,

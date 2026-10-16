@@ -24,6 +24,7 @@ use litebox_broker_core::{
     ObjectRights, PolicyEngine, Result as BrokerResult, SocketPolicy,
 };
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port, ReceiveFlags,
     ReceiveFromFlags, SendFlags, ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome,
@@ -269,6 +270,7 @@ impl Test {
                 address_family: AddressFamily::Ipv4,
                 socket_type,
                 protocol,
+                flags: FileOpenFlags::NONE,
             },
             self.sink.clone(),
         )
@@ -331,7 +333,7 @@ fn pair(test: &Test, destination: [u8; 4]) -> Pair {
         core_socket::listen(&server, listener, 4),
         Ok(SocketOutcome::Completed(bound))
     );
-    assert_eq!(test.published(listener), None);
+    assert_eq!(test.published(listener), Some(ReadinessFlags::default()));
     let connector = test.socket(&client, SocketType::Stream);
     // Guest connections complete within the call.
     assert_eq!(
@@ -340,7 +342,7 @@ fn pair(test: &Test, destination: [u8; 4]) -> Pair {
     );
     assert_eq!(test.published(listener), Some(ReadinessFlags::READ));
     let SocketOutcome::Completed(accepted) =
-        core_socket::accept(&server, listener, test.sink.clone()).unwrap()
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).unwrap()
     else {
         panic!("accept failed");
     };
@@ -486,9 +488,7 @@ fn a_listener_stops_and_frees_its_port() {
     let late = test.socket(&pair.client, SocketType::Stream);
     assert_eq!(
         core_socket::connect(&pair.client, late, address([127, 0, 0, 1], 8080)),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     // The accepted connection outlives its listener.
     assert_eq!(
@@ -561,9 +561,7 @@ fn without_a_link_external_destinations_are_unreachable() {
     let tcp = test.socket(&process, SocketType::Stream);
     assert_eq!(
         core_socket::connect(&process, tcp, address([192, 0, 2, 1], 80)),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::NetworkUnreachable
-        )))
+        Ok(SocketOutcome::Failed(SocketError::NetworkUnreachable))
     );
     let udp = test.socket(&process, SocketType::Datagram);
     assert_eq!(
@@ -778,6 +776,7 @@ fn unaccepted_guest_connections_count_against_the_connecting_process() {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
+                flags: FileOpenFlags::NONE,
             },
             test.sink.clone(),
         )
@@ -787,7 +786,7 @@ fn unaccepted_guest_connections_count_against_the_connecting_process() {
     // Accepted, they are the server's.
     for _ in 0..2 {
         let SocketOutcome::Completed(_) =
-            core_socket::accept(&server, listener, test.sink.clone()).unwrap()
+            core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).unwrap()
         else {
             panic!("accept failed");
         };
@@ -814,7 +813,7 @@ fn unaccepted_guest_connections_count_against_the_connecting_process() {
     test.provider.close_process(processes[0]);
     assert_eq!(queued(), Vec::<ProcessId>::new());
     assert_eq!(
-        core_socket::accept(&server, listener, test.sink.clone()).map(|_| ()),
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).map(|_| ()),
         Err(BrokerError::WouldBlock)
     );
 }
@@ -832,7 +831,7 @@ fn accepting_beyond_the_listeners_process_limit_fails() {
     );
     // The listener and its first accepted connection fill the server's two.
     let SocketOutcome::Completed(accepted) =
-        core_socket::accept(&server, listener, test.sink.clone()).unwrap()
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).unwrap()
     else {
         panic!("accept failed");
     };
@@ -844,12 +843,12 @@ fn accepting_beyond_the_listeners_process_limit_fails() {
     );
     // As on the userland broker; the connection waits.
     assert_eq!(
-        core_socket::accept(&server, listener, test.sink.clone()).map(|_| ()),
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).map(|_| ()),
         Err(BrokerError::ResourceExhausted)
     );
     server.close_object_reference(accepted.handle).unwrap();
     let SocketOutcome::Completed(_) =
-        core_socket::accept(&server, listener, test.sink.clone()).unwrap()
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).unwrap()
     else {
         panic!("accept failed");
     };
@@ -1103,13 +1102,11 @@ fn a_connection_beyond_the_backlog_is_refused() {
     let full = test.socket(&client, SocketType::Stream);
     assert_eq!(
         core_socket::connect(&client, full, destination),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     // Room again.
     let SocketOutcome::Completed(_) =
-        core_socket::accept(&server, listener, test.sink.clone()).unwrap()
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).unwrap()
     else {
         panic!("accept failed");
     };
@@ -1372,10 +1369,10 @@ fn an_idle_connection_does_not_time_out() {
         Err(BrokerError::WouldBlock)
     );
     // Nor does TIME-WAIT ending, with keep-alive on, time it out.
-    core_socket::set_tcp_option(
+    core_socket::set_option(
         &process,
         socket,
-        litebox_broker_protocol::socket::TcpOptionValue::KeepAlive(true),
+        litebox_broker_protocol::socket::SocketOptionValue::KeepAlive(true),
     )
     .unwrap();
     host.close_echo(b"");
@@ -1726,9 +1723,7 @@ fn the_networks_broadcast_address_is_refused() {
     let tcp = test.socket(&process, SocketType::Stream);
     assert_eq!(
         core_socket::connect(&process, tcp, broadcast),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::NetworkUnreachable
-        )))
+        Ok(SocketOutcome::Failed(SocketError::NetworkUnreachable))
     );
     assert!(wire.to_host.lock().is_empty());
 }
@@ -1881,10 +1876,10 @@ fn a_keep_alive_timeout_is_a_timeout() {
     let test = Test::new(Some(wire));
     let mut host = Host::new(wire, &test.clock);
     let (process, socket) = echo_connection(&test, &mut host);
-    core_socket::set_tcp_option(
+    core_socket::set_option(
         &process,
         socket,
-        litebox_broker_protocol::socket::TcpOptionValue::KeepAlive(true),
+        litebox_broker_protocol::socket::SocketOptionValue::KeepAlive(true),
     )
     .unwrap();
     wire.cut.store(true, Ordering::Relaxed);
@@ -2007,9 +2002,7 @@ fn a_closing_connection_cannot_be_made_again() {
     let (_, status) = connect(&mut host);
     assert_eq!(
         status,
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::AddressNotAvailable
-        )))
+        Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable))
     );
 }
 
@@ -2060,7 +2053,7 @@ fn a_guest_connection_carries_what_was_sent_before_it_was_accepted() {
     // Closed before being accepted, gracefully: still queued.
     client.close_object_reference(socket).unwrap();
     let SocketOutcome::Completed(accepted) =
-        core_socket::accept(&server, listener, test.sink.clone()).unwrap()
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).unwrap()
     else {
         panic!("accept failed");
     };
@@ -2087,7 +2080,7 @@ fn aborting_an_unaccepted_guest_connection_withdraws_it() {
     // As on the userland broker.
     assert_eq!(test.published(listener), Some(ReadinessFlags::default()));
     assert_eq!(
-        core_socket::accept(&server, listener, test.sink.clone()).map(|_| ()),
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).map(|_| ()),
         Err(BrokerError::WouldBlock)
     );
     assert!(test.provider.0.stack.lock().sockets.pairs.is_empty());
@@ -2196,9 +2189,10 @@ fn a_udp_read_shutdown_drops_datagrams_from_outside() {
         core_socket::bind(&process, socket, bound),
         Ok(SocketOutcome::Completed(bound))
     );
+    // An unconnected socket records the shutdown even though the call fails.
     assert_eq!(
         core_socket::shutdown(&process, socket, ShutdownMode::Read),
-        Ok(SocketOutcome::Completed(()))
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     // As from guest sockets, and on the userland broker.
     wire.to_guest.lock().push_back(udp_frame(
@@ -2374,16 +2368,15 @@ fn a_shutdown_while_connecting_ends_the_attempt() {
     // As on Linux, the attempt is gone (no reset is sent), and it reports
     // the reset once.
     assert_eq!(test.provider.0.stack.lock().sockets.set.iter().count(), 1);
-    let status = core_socket::status(&process, socket).unwrap();
     assert_eq!(
-        status.status,
+        core_socket::status(&process, socket).unwrap().status,
         SocketConnectionStatus::Failed(SocketError::ConnectionReset)
     );
-    assert_eq!(status.pending_error, Some(SocketError::ConnectionReset));
     assert_eq!(
-        core_socket::status(&process, socket).unwrap().pending_error,
-        None
+        core_socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
     );
+    assert_eq!(core_socket::take_error(&process, socket), Ok(None));
 }
 
 #[test]
@@ -2411,4 +2404,57 @@ fn a_waiting_peek_is_woken_despite_a_receive_meanwhile() {
     // Readable all along: only the peek's wakeup is published.
     assert_eq!(send(b"efghij"), Ok(SocketOutcome::Completed(6)));
     assert!(publications() > before);
+}
+
+#[test]
+fn a_peek_continues_only_for_its_reader() {
+    let test = Test::new(None);
+    let pair = pair(&test, [127, 0, 0, 1]);
+    let chunk = litebox_broker_protocol::socket::MAX_SOCKET_TRANSFER_SIZE;
+    let (first, second) = (vec![0x41; chunk as usize], vec![0x42; chunk as usize]);
+    for data in [&first, &second] {
+        assert_eq!(
+            core_socket::send(&pair.client, pair.connector, data.clone(), SendFlags::NONE),
+            Ok(SocketOutcome::Completed(data.len()))
+        );
+    }
+    let sharer = test.process();
+    let duplicate = pair
+        .server
+        .duplicate_object_reference_to(pair.accepted, &sharer, ObjectRights::all())
+        .unwrap();
+    let peek = |process: &BrokerProcess, handle, offset| {
+        core_socket::receive(
+            process,
+            handle,
+            chunk as usize,
+            ReceiveFlags::PEEK,
+            offset,
+            2 * chunk,
+        )
+    };
+    assert_eq!(peek(&pair.server, pair.accepted, 0), received(&first));
+    assert_eq!(
+        peek(&sharer, duplicate, chunk),
+        Err(BrokerError::WouldBlock)
+    );
+    assert_eq!(peek(&pair.server, pair.accepted, chunk), received(&second));
+
+    // A receive by another reader interrupts the peek, even one that
+    // consumes nothing.
+    assert_eq!(peek(&pair.server, pair.accepted, 0), received(&first));
+    assert_eq!(peek(&sharer, duplicate, 0), received(&first));
+    assert_eq!(
+        peek(&pair.server, pair.accepted, chunk),
+        Err(BrokerError::WouldBlock)
+    );
+    assert_eq!(peek(&sharer, duplicate, chunk), received(&second));
+    assert_eq!(
+        receive(&sharer, duplicate, chunk as usize),
+        received(&first)
+    );
+    assert_eq!(
+        peek(&sharer, duplicate, chunk),
+        Err(BrokerError::WouldBlock)
+    );
 }

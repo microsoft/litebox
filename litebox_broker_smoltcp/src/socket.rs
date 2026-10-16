@@ -16,13 +16,13 @@ use litebox_broker_core::socket::{
     SocketProvider,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, ReceiveFlags, ReceiveFromFlags, SendFlags,
-    ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome, SocketType, TcpOptionName,
-    TcpOptionValue,
+    ShutdownMode, SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue,
+    SocketOutcome, SocketType,
 };
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 
 use super::tcp::Tcp;
 use super::udp::Udp;
@@ -174,13 +174,14 @@ impl PlatformSocket for SmoltcpSocket {
 
     fn receive(
         &self,
+        reader: ObjectHandle,
         length: usize,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         self.with(
-            |tcp, sockets| tcp.receive(sockets, length, flags, peek_offset, peek_length),
+            |tcp, sockets| tcp.receive(sockets, reader, length, flags, peek_offset, peek_length),
             |_, _| Ok(invalid()),
         )
     }
@@ -205,14 +206,14 @@ impl PlatformSocket for SmoltcpSocket {
         })
     }
 
-    fn set_tcp_option(&self, value: TcpOptionValue) -> BrokerResult<()> {
+    fn set_tcp_option(&self, value: SocketOptionValue) -> BrokerResult<()> {
         self.with(
             |tcp, sockets| tcp.set_option(sockets, value),
             |_, _| Err(BrokerError::UnsupportedOperation),
         )
     }
 
-    fn get_tcp_option(&self, name: TcpOptionName) -> BrokerResult<TcpOptionValue> {
+    fn get_tcp_option(&self, name: SocketOptionName) -> BrokerResult<SocketOptionValue> {
         self.with(
             |tcp, _| tcp.option(name),
             |_, _| Err(BrokerError::UnsupportedOperation),

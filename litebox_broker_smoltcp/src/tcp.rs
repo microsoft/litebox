@@ -20,12 +20,12 @@ use litebox_broker_core::socket::{
     PlatformStreamReceive, is_internal_socket_address, normalize_socket_destination,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    ReceiveFlags, ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome, TcpOptionName,
-    TcpOptionValue,
+    ReceiveFlags, ShutdownMode, SocketConnectionStatus, SocketError, SocketOptionName,
+    SocketOptionValue, SocketOutcome,
 };
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::storage::RingBuffer;
@@ -86,6 +86,9 @@ pub(super) struct Tcp {
     /// A peek with `WAITALL` waits for this much data; its waiters are
     /// woken once it arrives or the stream ends.
     waitall: Option<usize>,
+    /// The reader whose peek started at offset zero, unless a receive came
+    /// after it (see [`Tcp::continue_peek`]).
+    peek_reader: Option<ObjectHandle>,
     /// Data waits to be sent, so the socket probes (see
     /// [`ZERO_WINDOW_PROBE_INTERVAL`]).
     probing: bool,
@@ -187,6 +190,7 @@ impl Tcp {
             reset: false,
             pending_error: None,
             waitall: None,
+            peek_reader: None,
             probing: false,
             unacknowledged: false,
             heard: Duration::ZERO,
@@ -491,15 +495,35 @@ impl Tcp {
         SocketOutcome::Completed(PlatformStreamReceive::EndOfStream)
     }
 
+    /// A peek's later chunk continues only the same reader's peek, with no
+    /// receive since: otherwise its bytes might not follow those returned.
+    fn continue_peek(
+        &mut self,
+        reader: ObjectHandle,
+        flags: ReceiveFlags,
+        peek_offset: u32,
+    ) -> BrokerResult<()> {
+        if !flags.contains(ReceiveFlags::PEEK) {
+            self.peek_reader = None;
+        } else if peek_offset == 0 {
+            self.peek_reader = Some(reader);
+        } else if self.peek_reader != Some(reader) {
+            return Err(BrokerError::WouldBlock);
+        }
+        Ok(())
+    }
+
     /// The broker core validated the peek window.
     pub(super) fn receive(
         &mut self,
         sockets: &mut Sockets,
+        reader: ObjectHandle,
         length: usize,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
+        self.continue_peek(reader, flags, peek_offset)?;
         if !matches!(self.phase, Phase::Internal(..) | Phase::External(_)) {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
@@ -610,7 +634,7 @@ impl Tcp {
             return Ok(SocketOutcome::Failed(error));
         }
         if self.write_shutdown {
-            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+            return Ok(SocketOutcome::Failed(SocketError::Shutdown));
         }
         let sent = match self.phase {
             Phase::Internal(id, end) => {
@@ -642,11 +666,11 @@ impl Tcp {
     pub(super) fn set_option(
         &mut self,
         sockets: &mut Sockets,
-        value: TcpOptionValue,
+        value: SocketOptionValue,
     ) -> BrokerResult<()> {
         match value {
-            TcpOptionValue::NoDelay(enabled) => self.no_delay = enabled,
-            TcpOptionValue::KeepAlive(enabled) => self.keep_alive = enabled,
+            SocketOptionValue::NoDelay(enabled) => self.no_delay = enabled,
+            SocketOptionValue::KeepAlive(enabled) => self.keep_alive = enabled,
             _ => return Err(BrokerError::UnsupportedOperation),
         }
         if let Phase::External(handle) = self.phase {
@@ -657,10 +681,10 @@ impl Tcp {
         Ok(())
     }
 
-    pub(super) fn option(&self, name: TcpOptionName) -> BrokerResult<TcpOptionValue> {
+    pub(super) fn option(&self, name: SocketOptionName) -> BrokerResult<SocketOptionValue> {
         match name {
-            TcpOptionName::NoDelay => Ok(TcpOptionValue::NoDelay(self.no_delay)),
-            TcpOptionName::KeepAlive => Ok(TcpOptionValue::KeepAlive(self.keep_alive)),
+            SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(self.no_delay)),
+            SocketOptionName::KeepAlive => Ok(SocketOptionValue::KeepAlive(self.keep_alive)),
             _ => Err(BrokerError::UnsupportedOperation),
         }
     }
