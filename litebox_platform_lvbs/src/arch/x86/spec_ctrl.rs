@@ -191,6 +191,13 @@ impl VaultControls {
         }
     }
 
+    /// Scrub microarchitectural state after an aborted vault entry, keeping the
+    /// stricter `IA32_SPEC_CTRL` from [`Self::enter`].
+    pub(crate) fn abort(&self) {
+        self.flush_l1d();
+        self.ibpb();
+    }
+
     pub(crate) fn has_l1d_flush(&self) -> bool {
         self.l1d_flush
     }

@@ -37,20 +37,22 @@
 //! The vault shares only the VTL1 kernel region (`>= KERNEL_OFFSET`: image,
 //! heap, stacks); see [`is_accessible`].
 //!
-//! A fault or panic inside the vault is fatal (VTL0 crash dump and reboot),
-//! so the skipped exit path cannot leak to userspace.
-//!
-//! TODO: The panic path returns to VTL0 for the crash dump without scrubbing
-//! (no stack wipe, `VERW`, L1D flush or IBPB).
+//! A fault or panic inside the vault is fatal (VTL0 crash dump and reboot).
+//! The panic handler first leaves the vault through [`abort_on_panic`], which
+//! scrubs like the normal exit, and then prints only the location, since the
+//! message may hold vault state (e.g., exception registers).
 
 use crate::arch::spec_ctrl::VaultControls;
-use crate::host::per_cpu_variables::PerCpuVariablesAsm;
+use crate::host::per_cpu_variables::{
+    DOUBLE_FAULT_STACK_SIZE, PerCpuVariablesAsm, with_per_cpu_variables,
+};
 use crate::mm::MemoryProvider;
 use crate::mshv::vtl1_mem_layout::{
     VTL1_VAULT_SLOTS, VTL1_VAULT_STACK_PAGES, get_memory_base_address, vault_frame_range,
 };
 use crate::{PageTableManager, mm};
 use alloc::boxed::Box;
+use core::panic::Location;
 use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::platform::{ComputeParams, KDFParams};
 use litebox::utils::TruncateExt;
@@ -433,9 +435,26 @@ impl Vault {
                     return false;
                 };
                 let spec = self.spec.enter();
+                let (kernel_cr3, kernel_rsp): (u64, u64);
+                // Safety: reads registers only.
+                unsafe {
+                    core::arch::asm!(
+                        "mov {cr3}, cr3",
+                        "mov {rsp}, rsp",
+                        cr3 = out(reg) kernel_cr3,
+                        rsp = out(reg) kernel_rsp,
+                        options(nomem, nostack, preserves_flags),
+                    );
+                }
+                // Frames below `kernel_rsp` are dead if `abort_on_panic` reuses it.
+                with_per_cpu_variables(|pcv| {
+                    pcv.pre_vault_rsp.set(kernel_rsp);
+                    pcv.pre_vault_cr3.set(kernel_cr3);
+                });
                 // Safety: interrupts are disabled, the slot is held, and the
                 // caller supplies a valid thunk.
                 unsafe { trampoline(self.slots[slot].p4, thunk, arg) };
+                with_per_cpu_variables(|pcv| pcv.pre_vault_cr3.set(0));
                 evict_l1d(self.eviction.as_deref());
                 self.spec.exit(spec);
                 self.busy.release(slot);
@@ -447,6 +466,106 @@ impl Vault {
             // All slots are busy, which is rare: wait with interrupts restored.
             core::hint::spin_loop();
         }
+    }
+}
+
+/// If this core panicked inside the vault, leave it scrubbing like the normal
+/// exit, print only `location` (the message may hold vault state), and return
+/// to VTL0. Otherwise, return.
+pub(crate) fn abort_on_panic(location: Option<&Location<'_>>) {
+    extern "C" fn tail(location: *const Location<'static>) -> ! {
+        match VAULT.get() {
+            Some(vault) => {
+                evict_l1d(vault.eviction.as_deref());
+                vault.spec.abort();
+            }
+            // During installation; without L1D flush support, nothing is evicted.
+            None => VaultControls::detect().abort(),
+        }
+        // Safety: null or `Location::caller()` data, which is static.
+        if let Some(location) = unsafe { location.as_ref() } {
+            crate::serial_println!("panicked inside the vault at {location}");
+        }
+        crate::mshv::vsm_intercept::panic_to_vtl0()
+    }
+
+    // Per-CPU variables are not set up yet (e.g., an early AP panic).
+    if x86_64::registers::model_specific::GsBase::read().is_null() {
+        return;
+    }
+    let (kernel_cr3, kernel_rsp, double_fault_stack) = with_per_cpu_variables(|pcv| {
+        (
+            pcv.pre_vault_cr3.replace(0),
+            pcv.pre_vault_rsp.get(),
+            pcv.double_fault_stack_bottom(),
+        )
+    });
+    if kernel_cr3 == 0 {
+        return;
+    }
+    let location = location.map_or(core::ptr::null(), |location| {
+        core::ptr::from_ref(location).cast::<Location<'static>>()
+    });
+    let cr3: u64;
+    // Safety: reads a register only.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+    }
+    if cr3 == kernel_cr3 {
+        // Not inside the vault page table, so its stack is not mapped.
+        tail(location);
+    }
+    // Safety: the vault page table is loaded, and `kernel_rsp`/`kernel_cr3` are
+    // this core's state at vault entry, whose frames below are dead.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, r14",
+            "and rsp, -16",
+            "xor eax, eax",
+            "mov cr2, rax",
+            // A vault stack overflow saves registers on the double-fault stack.
+            "mov rdi, r15",
+            "mov ecx, {double_fault_stack_qwords}",
+            "rep stosq",
+            "movabs rdi, {stack_bottom}",
+            "mov ecx, {stack_qwords}",
+            "rep stosq",
+            "mov cr3, r13",
+            XRSTOR_VTL1_ASM!({user_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {user_xsaved_off}),
+            "xor eax, eax",
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "xor esi, esi",
+            "xor edi, edi",
+            "xor r8d, r8d",
+            "xor r9d, r9d",
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            // Callee-saved registers may still hold vault values.
+            "xor ebx, ebx",
+            "xor ebp, ebp",
+            "xor r13d, r13d",
+            "xor r14d, r14d",
+            "xor r15d, r15d",
+            CLEAR_CPU_BUFFERS_ASM!({verw_sel_off}),
+            "mov rdi, r12",
+            "call {tail}",
+            "ud2",
+            double_fault_stack_qwords = const DOUBLE_FAULT_STACK_SIZE / 8,
+            stack_bottom = const VAULT_STACK_BOTTOM.cast_signed(),
+            stack_qwords = const VAULT_STACK_SIZE / 8,
+            user_xsave_area_off = const PerCpuVariablesAsm::vtl1_user_xsave_area_addr_offset(),
+            xsave_mask_lo_off = const PerCpuVariablesAsm::vtl1_xsave_mask_lo_offset(),
+            xsave_mask_hi_off = const PerCpuVariablesAsm::vtl1_xsave_mask_hi_offset(),
+            user_xsaved_off = const PerCpuVariablesAsm::vtl1_user_xsaved_offset(),
+            verw_sel_off = const PerCpuVariablesAsm::verw_sel_offset(),
+            tail = sym tail,
+            in("r12") location,
+            in("r13") kernel_cr3,
+            in("r14") kernel_rsp,
+            in("r15") double_fault_stack,
+            options(noreturn),
+        );
     }
 }
 

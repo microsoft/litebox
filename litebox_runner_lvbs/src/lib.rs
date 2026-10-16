@@ -6,7 +6,7 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, sync::Arc, vec};
-use core::{ops::Neg, panic::PanicInfo};
+use core::panic::PanicInfo;
 use litebox::{
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
@@ -20,9 +20,6 @@ use litebox_common_optee::{
 };
 use litebox_platform_lvbs::host::LvbsLinuxKernel as Platform;
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
-use litebox_platform_lvbs::{
-    arch::instrs::hlt_loop, mshv::vsm_intercept::raise_vtl0_gp_fault, serial_println,
-};
 use litebox_platform_lvbs::{
     arch::{gdt, interrupts, timer},
     debug_serial_println,
@@ -41,6 +38,7 @@ use litebox_platform_lvbs::{
         },
     },
 };
+use litebox_platform_lvbs::{mshv::vsm_intercept::panic_to_vtl0, serial_println};
 use litebox_shim_optee::ClientPta;
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
@@ -1780,13 +1778,7 @@ fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    litebox_platform_lvbs::on_panic(info.location());
     serial_println!("{}", info);
-    match raise_vtl0_gp_fault() {
-        Ok(result) => vtl_switch(Some(result.reinterpret_as_signed())),
-        Err(err) => vtl_switch(Some((err as u32).reinterpret_as_signed().neg().into())),
-    };
-    // We assume that once this VTL1 kernel panics, we don't try to resume its execution.
-    // This is because, after the panic, the kernel is in an undefined state.
-    // Switch back to VTL0, do crash dump, and reboot the machine.
-    hlt_loop()
+    panic_to_vtl0()
 }
