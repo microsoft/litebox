@@ -25,9 +25,9 @@ use crate::event::{
     Events, IOPollable, counter::EventCounter, observer::Observer, polling::Pollee,
     readiness_queue::ReadinessQueue, timer::Timer,
 };
-use crate::fs::FileFd;
+use crate::fs::File;
 use crate::inet_socket::InetSocket;
-use crate::pipes::PipeFd;
+use crate::pipes::PipeEnd;
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::unix_socket::UnixSocket;
 
@@ -55,9 +55,6 @@ pub enum ProcessError {
     /// The child process is invalid or no longer available.
     #[error("invalid child process")]
     InvalidChild,
-    /// A descriptor passed to the child process is closed.
-    #[error("descriptor is closed")]
-    ClosedDescriptor,
     /// No process has the target process ID.
     #[error("no such process")]
     NoSuchProcess,
@@ -195,9 +192,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
 /// descriptor number, in the child's startup payload alongside the handle `inherit` returns.
 pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// A file, adopted with [`LiteBox::adopt_inherited_file`].
-    File(Arc<FileFd>),
+    File(Arc<File<Platform>>),
     /// A pipe end, adopted with [`LiteBox::adopt_inherited_pipe`].
-    Pipe(Arc<PipeFd<Platform>>),
+    Pipe(Arc<PipeEnd<Platform>>),
     /// A Unix socket, adopted with [`LiteBox::adopt_inherited_unix_socket`].
     UnixSocket(Arc<UnixSocket<Platform>>),
     /// An IPv4 socket, adopted with [`LiteBox::adopt_inherited_inet_socket`].
@@ -251,36 +248,15 @@ impl PendingChild {
     /// Panics if the broker returns fewer handles than were duplicated.
     pub fn inherit<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         &self,
-        litebox: &LiteBox<Platform>,
         fds: &[InheritableFd<Platform>],
     ) -> Result<Vec<ObjectHandle>, ProcessError> {
-        // Holding the objects keeps their handles open until the child has its own.
-        let mut held_files = Vec::new();
-        let mut held_pipes = Vec::new();
-        let mut held_sockets = Vec::new();
+        // `fds` holds the objects, which keeps their handles open until the child has its own.
         let mut fd_handles = Vec::new();
         for fd in fds {
             let handle = match fd {
-                InheritableFd::File(file) => {
-                    let file = litebox
-                        .broker_file(file)
-                        .ok_or(ProcessError::ClosedDescriptor)?;
-                    let handle = file.handle();
-                    held_files.push(file);
-                    handle
-                }
-                InheritableFd::Pipe(pipe) => {
-                    let pipe = litebox
-                        .broker_pipe_end(pipe)
-                        .ok_or(ProcessError::ClosedDescriptor)?;
-                    let handle = pipe.handle();
-                    held_pipes.push(pipe);
-                    handle
-                }
-                InheritableFd::UnixSocket(socket) => {
-                    held_sockets.push(Arc::clone(socket));
-                    socket.handle()
-                }
+                InheritableFd::File(file) => file.handle(),
+                InheritableFd::Pipe(pipe) => pipe.handle(),
+                InheritableFd::UnixSocket(socket) => socket.handle(),
                 InheritableFd::InetSocket(socket) => socket.handle(),
                 InheritableFd::EventCounter(counter) => counter.handle(),
                 InheritableFd::Timer(timer) => timer.handle(),

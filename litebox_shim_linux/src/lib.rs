@@ -22,7 +22,6 @@ use core::cell::{Cell, RefCell};
 use core::ops::Deref;
 use litebox::{
     LiteBox,
-    pipes::Pipes,
     platform::{RawConstPointer, RawPointerProvider},
     shim::ContinueOperation,
     sync::Mutex,
@@ -65,7 +64,7 @@ pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
 
-pub(crate) use litebox::fs::FileFd;
+pub(crate) use syscalls::file::FileFd;
 
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
@@ -398,7 +397,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform: self.platform,
             mm: MemoryManager::new(self.platform),
             futex_manager: FutexManager::new(),
-            pipes: Pipes::new(&litebox),
             boot_time: self.platform.now(),
             process_id: self.process_id,
             litebox,
@@ -732,9 +730,9 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
             };
         }
 
-        resolve_fd!(litebox::fs::BrokerFile, Fs);
+        resolve_fd!(syscalls::file::FileSubsystem<Platform>, Fs);
         resolve_fd!(syscalls::inet::InetSocketSubsystem<Platform>, Inet);
-        resolve_fd!(Pipes<Platform>, Pipes);
+        resolve_fd!(syscalls::pipe::PipeSubsystem<Platform>, Pipes);
         resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);
         resolve_fd!(syscalls::epoll::EpollSubsystem<Platform>, Epoll);
         resolve_fd!(syscalls::unix::UnixSocketSubsystem<Platform>, Unix);
@@ -1514,14 +1512,12 @@ struct GlobalState<Platform: ShimPlatform> {
     mm: MemoryManager<Platform>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
-    /// The anonymous pipe implementation.
-    pipes: Pipes<Platform>,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.
     process_id: i32,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
-    elf_patch_cache: litebox::sync::Mutex<Platform, loader::patch::ElfPatchCache>,
+    elf_patch_cache: litebox::sync::Mutex<Platform, loader::patch::ElfPatchCache<Platform>>,
 }
 
 struct Task<Platform: ShimPlatform> {

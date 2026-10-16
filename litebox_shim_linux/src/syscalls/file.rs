@@ -9,8 +9,8 @@ use alloc::{
     vec,
 };
 use litebox::{
-    event::{Events, wait::WaitError},
-    fd::{FdEnabledSubsystem, TypedFd},
+    event::{Events, IOPollable, observer::Observer, wait::WaitError},
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     fs::errors::OpenError,
     path,
     process::InheritableFd,
@@ -32,8 +32,54 @@ use litebox_common_linux::{
 };
 use thiserror::Error;
 
-use crate::{FileFd, GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
+use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+pub(crate) struct FileSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
+impl<Platform: ShimPlatform> FdEnabledSubsystem for FileSubsystem<Platform> {
+    type Entry = File<Platform>;
+}
+
+impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for File<Platform> {}
+
+pub(crate) type FileFd<Platform> = TypedFd<FileSubsystem<Platform>>;
+
+/// A file descriptor's open file description.
+pub(crate) struct File<Platform: ShimPlatform> {
+    file: Arc<litebox::fs::File<Platform>>,
+}
+
+impl<Platform: ShimPlatform> From<litebox::fs::File<Platform>> for File<Platform> {
+    fn from(file: litebox::fs::File<Platform>) -> Self {
+        Self {
+            file: Arc::new(file),
+        }
+    }
+}
+
+impl<Platform: ShimPlatform> IOPollable for File<Platform> {
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.file.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        self.file.check_io_events()
+    }
+}
+
+impl<Platform: ShimPlatform> GlobalState<Platform> {
+    /// Returns the file at `fd`, without holding the descriptor table.
+    pub(crate) fn file(
+        &self,
+        fd: &FileFd<Platform>,
+    ) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
+        self.litebox
+            .descriptor_table()
+            .with_entry(fd, |file| Arc::clone(&file.file))
+            .ok_or(Errno::EBADF)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct AccessUserInfo {
@@ -159,13 +205,13 @@ fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), O
 /// Changes the status flags in `mask` of the open file description at `fd` to their values in
 /// `flags`, ignoring flags other than `O_NONBLOCK` and `O_APPEND`.
 fn set_file_status_flags<Platform: ShimPlatform>(
-    litebox: &litebox::LiteBox<Platform>,
-    fd: &FileFd,
+    global: &GlobalState<Platform>,
+    fd: &FileFd<Platform>,
     mask: OFlags,
     flags: OFlags,
 ) -> Result<(), Errno> {
     let (mask, flags) = status_flags_change(mask, flags);
-    litebox.set_file_status_flags(fd, mask, flags)?;
+    global.file(fd)?.set_status_flags(mask, flags)?;
     Ok(())
 }
 
@@ -306,9 +352,12 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             let first_fd = descriptions.get(&inherited.handle).copied();
             let handle = inherited.handle;
             let adopt_file = || {
-                litebox
+                let file = litebox
                     .adopt_inherited_file(handle)
-                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
+                Ok(litebox
+                    .descriptor_table_mut()
+                    .insert::<FileSubsystem<Platform>>(file))
             };
             match inherited.kind {
                 InheritedFdKind::File => {
@@ -416,9 +465,9 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 
 /// A raw fd resolved once into the subsystem that owns it.
 pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
-    Fs(alloc::sync::Arc<FileFd>),
+    Fs(alloc::sync::Arc<FileFd<Platform>>),
     Inet(alloc::sync::Arc<TypedFd<super::inet::InetSocketSubsystem<Platform>>>),
-    Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
+    Pipes(alloc::sync::Arc<super::pipe::PipeFd<Platform>>),
     Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
     Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform>>>),
@@ -457,7 +506,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     }
 
     /// The filesystem fd behind this descriptor, or `None` for every other subsystem.
-    pub(crate) fn as_fs(&self) -> Option<&FileFd> {
+    pub(crate) fn as_fs(&self) -> Option<&FileFd<Platform>> {
         match self {
             Self::Fs(fd) => Some(fd),
             _ => None,
@@ -465,7 +514,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     }
 
     /// Like [`Self::as_fs`], but fails with `otherwise` for non-filesystem descriptors.
-    pub(crate) fn fs_only(&self, otherwise: Errno) -> Result<&FileFd, Errno> {
+    pub(crate) fn fs_only(&self, otherwise: Errno) -> Result<&FileFd<Platform>, Errno> {
         self.as_fs().ok_or(otherwise)
     }
 
@@ -473,9 +522,9 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch<R>(
         &self,
-        fs: impl FnOnce(&FileFd) -> R,
+        fs: impl FnOnce(&FileFd<Platform>) -> R,
         inet: impl FnOnce(&TypedFd<super::inet::InetSocketSubsystem<Platform>>) -> R,
-        pipes: impl FnOnce(&TypedFd<litebox::pipes::Pipes<Platform>>) -> R,
+        pipes: impl FnOnce(&super::pipe::PipeFd<Platform>) -> R,
         eventfd: impl FnOnce(&TypedFd<super::eventfd::EventfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<super::epoll::EpollSubsystem<Platform>>) -> R,
         unix: impl FnOnce(&TypedFd<super::unix::UnixSocketSubsystem<Platform>>) -> R,
@@ -662,12 +711,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     if descriptors.with_metadata(&file, |_: &Diroff| ()).is_ok() {
                         return Err(Errno::EAGAIN);
                     }
-                    (InheritedFdKind::File, InheritableFd::File(file))
+                    drop(descriptors);
+                    (
+                        InheritedFdKind::File,
+                        InheritableFd::File(self.global.file(&file)?),
+                    )
                 }
-                AnyTypedFd::Pipes(pipe) => (
-                    self.global.inherited_linux_pipe_kind(&pipe)?,
-                    InheritableFd::Pipe(pipe),
-                ),
+                AnyTypedFd::Pipes(pipe) => {
+                    let pipe = self.global.pipe_end(&pipe)?;
+                    (
+                        InheritedFdKind::Pipe {
+                            endpoint: pipe.endpoint_type(),
+                        },
+                        InheritableFd::Pipe(pipe),
+                    )
+                }
                 AnyTypedFd::Unix(socket) => {
                     let socket = self.global.with_unix_socket(&socket, |socket| {
                         Ok(alloc::sync::Arc::clone(socket.unix_socket()))
@@ -778,7 +836,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         path: impl path::Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<FileFd, Errno> {
+    ) -> Result<litebox::fs::File<Platform>, Errno> {
         let mode = mode & !self.get_umask();
         let fs = self.fs.borrow();
         let context = fs.context.read();
@@ -799,25 +857,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: impl path::Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<FileFd, Errno> {
+    ) -> Result<litebox::fs::File<Platform>, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
         self.do_open(path, flags, mode)
     }
 
-    fn insert_raw_file_fd(&self, file: FileFd, flags: OFlags) -> Result<u32, Errno> {
+    fn insert_raw_file_fd(
+        &self,
+        file: litebox::fs::File<Platform>,
+        flags: OFlags,
+    ) -> Result<u32, Errno> {
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<FileSubsystem<Platform>>(file);
         if flags.contains(OFlags::CLOEXEC) {
-            let None = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-            else {
-                unreachable!()
-            };
+            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
         }
+        drop(dt);
         let files = self.files.borrow();
-        let raw_fd = files.insert_raw_fd(file).map_err(|file| {
-            self.global.litebox.close_file(&file).unwrap();
+        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+            self.remove_and_drop_descriptor(&typed);
             Errno::EMFILE
         })?;
         Ok(u32::try_from(raw_fd).unwrap())
@@ -854,8 +913,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fd.dispatch(
             |fd| {
                 self.global
-                    .litebox
-                    .truncate_file(fd, length, false)
+                    .file(fd)?
+                    .truncate(length, false)
                     .map_err(Errno::from)
             },
             |_fd| todo!("net"),
@@ -887,13 +946,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match file_type {
             InodeType::File => {
                 let mode = Mode::from_u32_bits_truncate(mode_and_type & !FILE_TYPE_MASK);
-                let file = self.do_openat(
+                drop(self.do_openat(
                     dirfd,
                     pathname,
                     OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                     mode,
-                )?;
-                let _ = self.global.litebox.close_file(&file);
+                )?);
             }
             // TODO: Named pipe, socket, block and char files are not supported
             InodeType::NamedPipe
@@ -954,8 +1012,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let result = fd.dispatch(
             |fd| {
                 self.global
-                    .litebox
-                    .read_file(fd, &mut buf.borrow_mut(), offset, Some(&self.wait_cx()))
+                    .file(fd)?
+                    .read(&mut buf.borrow_mut(), offset, Some(&self.wait_cx()))
                     .map_err(Errno::from)
             },
             |fd| {
@@ -1059,8 +1117,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let result = fd.dispatch(
             |fd| {
                 self.global
-                    .litebox
-                    .write_file(fd, buf, offset, Some(&self.wait_cx()))
+                    .file(fd)?
+                    .write(buf, offset, Some(&self.wait_cx()))
                     .map_err(Errno::from)
             },
             |fd| {
@@ -1142,8 +1200,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let rewind = isize::try_from(unread_n).map_err(|_| Errno::EOVERFLOW)?;
         let fd = in_fd.fs_only(Errno::EINVAL)?;
         self.global
-            .litebox
-            .seek_file(fd, -rewind, SeekWhence::RelativeToCurrentOffset)
+            .file(fd)?
+            .seek(-rewind, SeekWhence::RelativeToCurrentOffset)
             .map(|_| ())
             .map_err(Errno::from)
     }
@@ -1183,16 +1241,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Errno::EINVAL
             };
             let read_result = match typed_in_fd.as_fs() {
-                Some(fd) => self
-                    .global
-                    .litebox
-                    .read_file(
-                        fd,
-                        &mut kernel_buf[..to_read],
-                        cur_off,
-                        Some(&self.wait_cx()),
-                    )
-                    .map_err(Errno::from),
+                Some(fd) => self.global.file(fd).and_then(|file| {
+                    file.read(&mut kernel_buf[..to_read], cur_off, Some(&self.wait_cx()))
+                        .map_err(Errno::from)
+                }),
                 None => Err(non_fs_err),
             };
             let read_n = match read_result {
@@ -1272,7 +1324,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         whence: SeekWhence,
     ) -> Result<usize, Errno> {
         let fd = fd.fs_only(Errno::ESPIPE)?;
-        match self.global.litebox.seek_file(fd, offset, whence) {
+        match self.global.file(fd)?.seek(offset, whence) {
             Ok(pos) => Ok(pos),
             Err(litebox::fs::errors::SeekError::NotAFile) => {
                 let base = match whence {
@@ -1318,7 +1370,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
-        self.do_close_and_replace::<litebox::fs::BrokerFile>(raw_fd, None)
+        self.do_close_and_replace::<FileSubsystem<Platform>>(raw_fd, None)
     }
 
     pub(super) fn remove_and_drop_descriptor<S: FdEnabledSubsystem>(&self, fd: &TypedFd<S>) {
@@ -1341,7 +1393,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
         let consumed: AnyTypedFd<Platform> = match rds
-            .fd_consume_raw_integer::<litebox::fs::BrokerFile>(raw_fd)
+            .fd_consume_raw_integer::<FileSubsystem<Platform>>(raw_fd)
         {
             Ok(fd) => AnyTypedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
@@ -1357,7 +1409,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     AnyTypedFd::Inet(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd)
+                    rds.fd_consume_raw_integer::<super::pipe::PipeSubsystem<Platform>>(raw_fd)
                 {
                     AnyTypedFd::Pipes(fd)
                 } else if let Ok(fd) =
@@ -1394,15 +1446,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         match consumed {
             AnyTypedFd::Fs(fd) => {
-                let result = self.global.litebox.close_file(&fd).map_err(Errno::from);
+                self.remove_and_drop_descriptor(&fd);
                 self.finalize_elf_patch(fd);
-                result
+                Ok(())
             }
             AnyTypedFd::Inet(fd) => {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
-            AnyTypedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
+            AnyTypedFd::Pipes(fd) => {
+                self.remove_and_drop_descriptor(&fd);
+                Ok(())
+            }
             AnyTypedFd::Eventfd(fd) => {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
@@ -1891,7 +1946,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let files = self.files.borrow();
                 let typed_fd = files.typed_fd(fd)?;
                 if let Some(file) = typed_fd.as_fs() {
-                    let status = self.global.litebox.file_status(file)?;
+                    let status = self.global.file(file)?.status()?;
                     return Self::do_access_mode(status.mode, status.owner.into(), caller, &mode);
                 }
                 drop(files);
@@ -1988,7 +2043,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn file_status(&self, fd: i32) -> Result<FileStatus, Errno> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
-        Ok(self.global.litebox.file_status(fd.fs_only(Errno::EBADF)?)?)
+        Ok(self.global.file(fd.fs_only(Errno::EBADF)?)?.status()?)
     }
 
     pub(crate) fn do_stat<T>(&self, fd: &AnyTypedFd<Platform>) -> Result<T, Errno>
@@ -2020,7 +2075,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | u32::from((Mode::RWXU | Mode::RWXG | Mode::RWXO).bits());
         let rw_user_mode = u32::from((Mode::RUSR | Mode::WUSR).bits());
         fd.dispatch(
-            |fd| T::try_from(self.global.litebox.file_status(fd)?),
+            |fd| T::try_from(self.global.file(fd)?.status()?),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |fd| {
                 Ok(T::from(synthetic(
@@ -2174,12 +2229,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             FcntlArg::GETFL => Ok(fd
                 .dispatch(
-                    |fd| linux_status_flags(self.global.litebox.get_file_status_flags(fd)?),
+                    |fd| linux_status_flags(self.global.file(fd)?.get_status_flags()?),
                     |fd| {
                         self.global
                             .with_inet_socket(fd, super::inet::InetSocket::get_status_flags)
                     },
-                    |fd| linux_status_flags(self.global.pipes.get_status_flags(fd)?),
+                    |fd| self.global.linux_pipe_status_flags(fd),
                     |fd| {
                         self.global
                             .with_eventfd(fd, super::eventfd::EventFile::get_status_flags)
@@ -2210,7 +2265,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
                             log_unsupported!("unsupported flags");
                         }
-                        set_file_status_flags(&self.global.litebox, fd, setfl_mask, flags)
+                        set_file_status_flags(&self.global, fd, setfl_mask, flags)
                     },
                     |fd| {
                         if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
@@ -2401,18 +2456,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(raw_fd) => raw_fd,
             Err(writer) => {
                 drop(rds);
-                self.global.close_linux_pipe(&writer).unwrap();
-                self.global.close_linux_pipe(&reader).unwrap();
+                self.remove_and_drop_descriptor(&writer);
+                self.remove_and_drop_descriptor(&reader);
                 return Err(Errno::EMFILE);
             }
         };
         let rd_raw_fd = match files.insert_raw_fd_locked(&mut rds, reader) {
             Ok(raw_fd) => raw_fd,
             Err(reader) => {
-                let writer = rds.fd_consume_raw_integer(wr_raw_fd).unwrap();
+                let writer = rds
+                    .fd_consume_raw_integer::<super::pipe::PipeSubsystem<Platform>>(wr_raw_fd)
+                    .unwrap();
                 drop(rds);
-                self.global.close_linux_pipe(&writer).unwrap();
-                self.global.close_linux_pipe(&reader).unwrap();
+                self.remove_and_drop_descriptor(&writer);
+                self.remove_and_drop_descriptor(&reader);
                 return Err(Errno::EMFILE);
             }
         };
@@ -2492,14 +2549,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     OFlags::empty()
                 };
                 fd.dispatch(
-                    |file_fd| {
-                        set_file_status_flags(
-                            &self.global.litebox,
-                            file_fd,
-                            OFlags::NONBLOCK,
-                            flags,
-                        )
-                    },
+                    |file_fd| set_file_status_flags(&self.global, file_fd, OFlags::NONBLOCK, flags),
                     |fd| {
                         self.global.with_inet_socket(fd, |socket| {
                             socket.set_status_flags(OFlags::NONBLOCK, flags)
@@ -2557,7 +2607,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.fs_only(Errno::ENOTTY)?;
-                if self.global.litebox.is_terminal(fd)? {
+                if self.global.file(fd)?.is_terminal()? {
                     self.stdio_ioctl(&arg)
                 } else {
                     Err(Errno::ENOTTY)
@@ -2996,7 +3046,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         file.dispatch(
             |fd| {
                 dup(self, &files, fd, close_on_exec, target, |fd| {
-                    let _ = self.global.litebox.close_file(&fd);
+                    self.remove_and_drop_descriptor(&fd);
                 })
             },
             |fd| {
@@ -3006,7 +3056,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |fd| {
                 dup(self, &files, fd, close_on_exec, target, |fd| {
-                    let _ = self.global.close_linux_pipe(&fd);
+                    self.remove_and_drop_descriptor(&fd);
                 })
             },
             |fd| {
@@ -3124,7 +3174,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut dir_off = dir_off.0;
         let mut nbytes = 0;
 
-        let mut entries = self.global.litebox.read_file_directory(file)?;
+        let mut entries = self.global.file(file)?.read_directory()?;
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
         for entry in entries.iter().skip(dir_off) {

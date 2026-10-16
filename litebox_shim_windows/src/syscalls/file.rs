@@ -32,8 +32,8 @@ use crate::syscalls::event::{EventAccess, EventSubsystem};
 use crate::syscalls::file_path::{FilePathResolver, FilePathRoot, FileTarget};
 use crate::syscalls::ksecdd;
 use crate::{
-    ConstPtr, MutPtr, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
-    raw_handle_entry, write_slice,
+    ConstPtr, MutPtr, ShimPlatform, Task, probe_guest_output_buffer,
+    probe_guest_output_preserving_value, raw_handle_entry, write_slice,
 };
 
 bitflags::bitflags! {
@@ -445,13 +445,13 @@ struct FileStandardInformation {
     padding: [u8; 2],
 }
 
-impl FdEnabledSubsystem for FileObject {
+impl<Platform: ShimPlatform> FdEnabledSubsystem for FileObject<Platform> {
     type Entry = Self;
 }
 
-impl FdEnabledSubsystemEntry for FileObject {}
+impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for FileObject<Platform> {}
 
-impl crate::WindowsHandleSubsystem for FileObject {
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for FileObject<Platform> {
     fn normalize_desired_access(desired_access: u32) -> u32 {
         FileAccess::from_desired_access(desired_access).bits()
     }
@@ -473,9 +473,9 @@ impl crate::WindowsHandleSubsystem for FileObject {
     }
 }
 
-pub(crate) struct FileObject {
+pub(crate) struct FileObject<Platform: ShimPlatform> {
     path: String,
-    backing: FileObjectBacking,
+    backing: FileObjectBacking<Platform>,
     create_time_access: FileAccess,
     share_access: FileShareAccess,
     create_options: FileCreateOptions,
@@ -490,15 +490,15 @@ struct DirectoryQueryState {
     entries: Vec<DirectoryEntry>,
 }
 
-enum FileObjectBacking {
+enum FileObjectBacking<Platform: ShimPlatform> {
     Filesystem {
-        fd: litebox::fs::FileFd,
+        fd: litebox::fs::File<Platform>,
         is_directory: bool,
     },
     CondrvStream {
         object: CondrvObject,
         stream_object: Arc<CondrvStreamObject>,
-        fd: litebox::fs::FileFd,
+        fd: litebox::fs::File<Platform>,
     },
     CondrvControl(CondrvObject),
     /// A handle to `\Device\KsecDD`.
@@ -522,7 +522,7 @@ enum FileIoOperation {
 /// with the resolved absolute byte offset (`None` when the current file-pointer
 /// position should be used).
 type PreparedFileIo<Platform> = (
-    litebox::fd::EntryHandle<Platform, FileObject>,
+    litebox::fd::EntryHandle<Platform, FileObject<Platform>>,
     Option<usize>,
 );
 
@@ -535,7 +535,7 @@ enum FileSharingIdentity<'a> {
 }
 
 impl FileSharingIdentity<'_> {
-    fn matches(self, file: &FileObject) -> bool {
+    fn matches<Platform: ShimPlatform>(self, file: &FileObject<Platform>) -> bool {
         match self {
             Self::Path(path) => file.condrv_stream_object_id().is_none() && file.path == path,
             Self::CondrvObject(object_id) => file.condrv_stream_object_id() == Some(object_id),
@@ -543,7 +543,7 @@ impl FileSharingIdentity<'_> {
     }
 }
 
-impl FileObject {
+impl<Platform: ShimPlatform> FileObject<Platform> {
     fn condrv_object(&self) -> Option<CondrvObject> {
         match self.backing {
             FileObjectBacking::CondrvStream { object, .. }
@@ -820,8 +820,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn file_entry(
         &self,
         handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, FileObject>, NtStatus> {
-        raw_handle_entry::<Platform, FileObject>(
+    ) -> Result<litebox::fd::EntryHandle<Platform, FileObject<Platform>>, NtStatus> {
+        raw_handle_entry::<Platform, FileObject<Platform>>(
             &self.global.litebox,
             &self.process.handles,
             handle,
@@ -833,26 +833,33 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         &self,
         handle: Handle,
         operation: FileIoOperation,
-    ) -> Result<(litebox::fd::EntryHandle<Platform, FileObject>, bool), NtStatus> {
+    ) -> Result<
+        (
+            litebox::fd::EntryHandle<Platform, FileObject<Platform>>,
+            bool,
+        ),
+        NtStatus,
+    > {
         let mut append_only = false;
-        let file =
-            self.typed_handle_entry_with_access_check::<FileObject>(handle, |granted_access| {
-                match operation {
-                    FileIoOperation::Read => granted_access & FileAccess::READ_DATA.bits() != 0,
-                    FileIoOperation::Write => {
-                        append_only = granted_access & FileAccess::WRITE_DATA.bits() == 0
-                            && granted_access & FileAccess::APPEND_DATA.bits() != 0;
-                        granted_access & (FileAccess::WRITE_DATA | FileAccess::APPEND_DATA).bits()
-                            != 0
-                    }
+        let file = self.typed_handle_entry_with_access_check::<FileObject<Platform>>(
+            handle,
+            |granted_access| match operation {
+                FileIoOperation::Read => granted_access & FileAccess::READ_DATA.bits() != 0,
+                FileIoOperation::Write => {
+                    append_only = granted_access & FileAccess::WRITE_DATA.bits() == 0
+                        && granted_access & FileAccess::APPEND_DATA.bits() != 0;
+                    granted_access & (FileAccess::WRITE_DATA | FileAccess::APPEND_DATA).bits() != 0
                 }
-            })?;
+            },
+        )?;
         Ok((file, append_only))
     }
 
     pub(crate) fn image_section_file_path(&self, handle: Handle) -> Result<String, NtStatus> {
-        let entry =
-            self.typed_handle_entry_with_access::<FileObject>(handle, FileAccess::EXECUTE.bits())?;
+        let entry = self.typed_handle_entry_with_access::<FileObject<Platform>>(
+            handle,
+            FileAccess::EXECUTE.bits(),
+        )?;
         entry.with_entry(|file| match &file.backing {
             FileObjectBacking::Filesystem {
                 is_directory: false,
@@ -867,23 +874,23 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         })
     }
 
-    fn insert_file_handle(&self, file: FileObject) -> Result<Handle, NtStatus> {
+    fn insert_file_handle(&self, file: FileObject<Platform>) -> Result<Handle, NtStatus> {
         let granted_access = file.create_time_access.bits();
-        self.insert_typed_handle::<FileObject>(file, granted_access, |file| {
+        self.insert_typed_handle::<FileObject<Platform>>(file, granted_access, |file| {
             self.close_file(file);
         })
     }
 
     pub(crate) fn close_file_handle(&self, handle: Handle) {
-        self.close_typed_handle::<FileObject>(handle, |file| {
+        self.close_typed_handle::<FileObject<Platform>>(handle, |file| {
             self.close_file(file);
         });
     }
 
-    pub(crate) fn close_file(&self, file: FileObject) {
+    pub(crate) fn close_file(&self, file: FileObject<Platform>) {
         match file.backing {
             FileObjectBacking::Filesystem { fd, is_directory } => {
-                let _ = self.fs.close_file(&fd);
+                drop(fd);
                 if file
                     .create_options
                     .contains(FileCreateOptions::DELETE_ON_CLOSE)
@@ -895,10 +902,9 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     }
                 }
             }
-            FileObjectBacking::CondrvStream { fd, .. } => {
-                let _ = self.fs.close_file(&fd);
-            }
-            FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {}
+            FileObjectBacking::CondrvStream { .. }
+            | FileObjectBacking::CondrvControl(_)
+            | FileObjectBacking::KsecDevice => {}
         }
     }
 
@@ -1165,7 +1171,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let status = match file.with_entry(|file| match &file.backing {
             FileObjectBacking::Filesystem { fd, .. }
             | FileObjectBacking::CondrvStream { fd, .. } => {
-                self.fs.file_status(fd).map_err(map_file_status_error)
+                fd.status().map_err(map_file_status_error)
             }
             FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
                 Err(NtStatus::INVALID_DEVICE_REQUEST)
@@ -1212,7 +1218,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         {
             return NtStatus::ACCESS_VIOLATION;
         }
-        let file = match self.typed_handle_entry_with_access_check::<FileObject>(
+        let file = match self.typed_handle_entry_with_access_check::<FileObject<Platform>>(
             file_handle,
             |granted_access| {
                 granted_access & (FileAccess::READ_DATA | FileAccess::WRITE_DATA).bits() != 0
@@ -1233,12 +1239,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     if *is_directory {
                         return Err(NtStatus::INVALID_DEVICE_REQUEST);
                     }
-                    self.fs
-                        .seek_file(fd, 0, SeekWhence::RelativeToCurrentOffset)
+                    fd.seek(0, SeekWhence::RelativeToCurrentOffset)
                 }
                 FileObjectBacking::CondrvStream { fd, .. } => {
-                    self.fs
-                        .seek_file(fd, 0, SeekWhence::RelativeToCurrentOffset)
+                    fd.seek(0, SeekWhence::RelativeToCurrentOffset)
                 }
                 FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
                     return Err(NtStatus::INVALID_DEVICE_REQUEST);
@@ -1305,7 +1309,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         if position < 0 {
             return NtStatus::INVALID_PARAMETER;
         }
-        let file = match self.typed_handle_entry_with_access_check::<FileObject>(
+        let file = match self.typed_handle_entry_with_access_check::<FileObject<Platform>>(
             file_handle,
             |granted_access| {
                 granted_access & (FileAccess::READ_DATA | FileAccess::WRITE_DATA).bits() != 0
@@ -1326,12 +1330,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     if *is_directory {
                         return Err(NtStatus::INVALID_DEVICE_REQUEST);
                     }
-                    self.fs
-                        .seek_file(fd, position, SeekWhence::RelativeToBeginning)
+                    fd.seek(position, SeekWhence::RelativeToBeginning)
                 }
                 FileObjectBacking::CondrvStream { fd, .. } => {
-                    self.fs
-                        .seek_file(fd, position, SeekWhence::RelativeToBeginning)
+                    fd.seek(position, SeekWhence::RelativeToBeginning)
                 }
                 FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
                     return Err(NtStatus::INVALID_DEVICE_REQUEST);
@@ -1462,10 +1464,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                         if *is_directory {
                             return Err(WriteError::NotAFile);
                         }
-                        self.fs.write_file(fd, &bytes, chunk_offset, Some(cx))
+                        fd.write(&bytes, chunk_offset, Some(cx))
                     }
                     FileObjectBacking::CondrvStream { fd, .. } => {
-                        self.fs.write_file(fd, &bytes, chunk_offset, Some(cx))
+                        fd.write(&bytes, chunk_offset, Some(cx))
                     }
                     FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
                         Err(WriteError::NotAFile)
@@ -1493,8 +1495,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                         .intersects(FileCreateOptions::SYNCHRONOUS_IO)
                     && input_length != 0
                 {
-                    let _ = self.fs.seek_file(
-                        fd,
+                    let _ = fd.seek(
                         (offset + total_written).cast_signed(),
                         SeekWhence::RelativeToBeginning,
                     );
@@ -1567,24 +1568,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                                 return Err(ReadError::NotAFile);
                             }
                             (
-                                self.fs.read_file(
-                                    fd,
-                                    &mut bytes[..chunk_length],
-                                    chunk_offset,
-                                    Some(cx),
-                                ),
+                                fd.read(&mut bytes[..chunk_length], chunk_offset, Some(cx)),
                                 true,
                             )
                         }
                         // TODO(condrv-large-read): Continue with per-operation nonblocking reads
                         // after the first chunk once FileSystem can report WouldBlock.
                         FileObjectBacking::CondrvStream { fd, .. } => (
-                            self.fs.read_file(
-                                fd,
-                                &mut bytes[..chunk_length],
-                                chunk_offset,
-                                Some(cx),
-                            ),
+                            fd.read(&mut bytes[..chunk_length], chunk_offset, Some(cx)),
                             false,
                         ),
                         FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
@@ -1613,8 +1604,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                         .intersects(FileCreateOptions::SYNCHRONOUS_IO)
                     && output_length != 0
                 {
-                    let _ = self.fs.seek_file(
-                        fd,
+                    let _ = fd.seek(
                         (offset + total_read).cast_signed(),
                         SeekWhence::RelativeToBeginning,
                     );
@@ -1672,7 +1662,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             {
                 let status = file
                     .with_entry(|file| match &file.backing {
-                        FileObjectBacking::Filesystem { fd, .. } => self.fs.file_status(fd),
+                        FileObjectBacking::Filesystem { fd, .. } => fd.status(),
                         _ => self.fs.path_file_status(&self.fs_context, &file.path),
                     })
                     .map_err(map_file_status_error)?;
@@ -1819,7 +1809,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             return NtStatus::INFO_LENGTH_MISMATCH;
         }
 
-        let file = match self.typed_handle_entry_with_access::<FileObject>(
+        let file = match self.typed_handle_entry_with_access::<FileObject<Platform>>(
             file_handle,
             FileAccess::LIST_DIRECTORY.bits(),
         ) {
@@ -1881,7 +1871,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
 
     fn query_directory(
         &self,
-        file: &mut FileObject,
+        file: &mut FileObject<Platform>,
         supplied_pattern: Option<String>,
         information_class: FileInformationClass,
         flags: DirectoryQueryFlags,
@@ -1970,7 +1960,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         Ok((NtStatus::SUCCESS, output))
     }
 
-    fn read_directory_entries(&self, file: &FileObject) -> Result<Vec<DirectoryEntry>, NtStatus> {
+    fn read_directory_entries(
+        &self,
+        file: &FileObject<Platform>,
+    ) -> Result<Vec<DirectoryEntry>, NtStatus> {
         let FileObjectBacking::Filesystem { fd, is_directory } = &file.backing else {
             return Err(NtStatus::INVALID_PARAMETER);
         };
@@ -1978,7 +1971,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             return Err(NtStatus::INVALID_PARAMETER);
         }
 
-        let current_status = self.fs.file_status(fd).map_err(map_file_status_error)?;
+        let current_status = fd.status().map_err(map_file_status_error)?;
         let parent_path = parent_directory_path(&file.path);
         let parent_status = self
             .fs
@@ -2206,7 +2199,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
         file_attributes: u32,
-    ) -> Result<(FileObject, FileCreateInformation), NtStatus> {
+    ) -> Result<(FileObject<Platform>, FileCreateInformation), NtStatus> {
         self.check_file_sharing(
             FileSharingIdentity::Path(&path),
             desired_access,
@@ -2256,7 +2249,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         create_options: FileCreateOptions,
         ea_buffer: Option<ConstPtr<Platform, u8>>,
         ea_length: u32,
-    ) -> Result<(FileObject, FileCreateInformation), NtStatus> {
+    ) -> Result<(FileObject<Platform>, FileCreateInformation), NtStatus> {
         if object == CondrvObject::Connect {
             condrv::validate_connect_server_ea::<Platform>(ea_buffer, ea_length)?;
         } else if ea_buffer.is_some() || ea_length != 0 {
@@ -2328,7 +2321,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         desired_access: FileAccess,
         share_access: FileShareAccess,
         create_options: FileCreateOptions,
-    ) -> Result<(FileObject, FileCreateInformation), NtStatus> {
+    ) -> Result<(FileObject<Platform>, FileCreateInformation), NtStatus> {
         if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
             return Err(NtStatus::NOT_A_DIRECTORY);
         }
@@ -2352,7 +2345,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
         mode: Mode,
-    ) -> Result<(litebox::fs::FileFd, bool, FileCreateInformation), NtStatus> {
+    ) -> Result<(litebox::fs::File<Platform>, bool, FileCreateInformation), NtStatus> {
         let existed_before_open = self.fs.path_file_status(&self.fs_context, path).is_ok();
         if create_disposition == CreateDisposition::Supersede
             && existed_before_open
@@ -2365,17 +2358,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             .fs
             .open_file(&self.fs_context, path, access, flags, mode)
             .map_err(|error| map_open_error(error, create_disposition))?;
-        let file_status = match self.fs.file_status(&fd) {
-            Ok(file_status) => file_status,
-            Err(error) => {
-                let _ = self.fs.close_file(&fd);
-                return Err(map_file_status_error(error));
-            }
-        };
+        let file_status = fd.status().map_err(map_file_status_error)?;
         if create_options.contains(FileCreateOptions::NON_DIRECTORY_FILE)
             && file_status.file_type == FileType::Directory
         {
-            let _ = self.fs.close_file(&fd);
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
         }
         let information = create_disposition.success_information(existed_before_open);
@@ -2394,7 +2380,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
         file_attributes: u32,
-    ) -> Result<(FileObject, FileCreateInformation), NtStatus> {
+    ) -> Result<(FileObject<Platform>, FileCreateInformation), NtStatus> {
         if matches!(
             create_disposition,
             CreateDisposition::Supersede
@@ -2493,7 +2479,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             let Some(handle) = Handle::from_raw_fd(raw_handle) else {
                 continue;
             };
-            let Some(entry) = raw_handle_entry::<Platform, FileObject>(
+            let Some(entry) = raw_handle_entry::<Platform, FileObject<Platform>>(
                 &self.global.litebox,
                 &self.process.handles,
                 handle,
@@ -2837,11 +2823,7 @@ mod tests {
                 Mode::RUSR | Mode::WUSR,
             )
             .unwrap();
-        assert_eq!(
-            task.fs.write_file(&fd, data, Some(0), None).unwrap(),
-            data.len()
-        );
-        task.fs.close_file(&fd).unwrap();
+        assert_eq!(fd.write(data, Some(0), None).unwrap(), data.len());
     }
 
     fn create_file(
@@ -3355,7 +3337,7 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(
-            task.typed_handle::<FileObject>(maximum_duplicate)
+            task.typed_handle::<FileObject<TestPlatform>>(maximum_duplicate)
                 .and_then(|typed| {
                     task.typed_handle_metadata(&typed)
                         .map(|metadata| metadata.granted_access)
@@ -3411,14 +3393,8 @@ mod tests {
                 )
                 .unwrap();
             let mut contents = [0; 5];
-            assert_eq!(
-                task.fs
-                    .read_file(&fd, &mut contents, Some(0), None)
-                    .unwrap(),
-                5
-            );
+            assert_eq!(fd.read(&mut contents, Some(0), None).unwrap(), 5);
             assert_eq!(&contents, b"data!");
-            task.fs.close_file(&fd).unwrap();
         });
     }
 

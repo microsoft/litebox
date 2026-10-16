@@ -30,12 +30,7 @@ pub enum OpenError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`crate::LiteBox::close_file`].
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum CloseError {}
-
-/// Possible errors from [`crate::LiteBox::read_file`].
+/// Possible errors from [`super::File::read`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadError {
@@ -53,7 +48,7 @@ pub enum ReadError {
     Io,
 }
 
-/// Possible errors from [`crate::LiteBox::write_file`].
+/// Possible errors from [`super::File::write`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum WriteError {
@@ -71,7 +66,7 @@ pub enum WriteError {
     Io,
 }
 
-/// Possible errors from [`crate::LiteBox::seek_file`].
+/// Possible errors from [`super::File::seek`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SeekError {
@@ -89,7 +84,7 @@ pub enum SeekError {
     Io,
 }
 
-/// Possible errors from [`crate::LiteBox::truncate_file`].
+/// Possible errors from [`super::File::truncate`].
 #[derive(Error, Debug)]
 pub enum TruncateError {
     #[error("fd has been closed already")]
@@ -192,7 +187,7 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`crate::LiteBox::read_file_directory`].
+/// Possible errors from [`super::File::read_directory`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
@@ -206,7 +201,7 @@ pub enum ReadDirError {
     Io,
 }
 
-/// Possible errors from [`crate::LiteBox::path_file_status`] and [`crate::LiteBox::file_status`].
+/// Possible errors from [`crate::LiteBox::path_file_status`] and [`super::File::status`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum FileStatusError {
@@ -218,7 +213,7 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`crate::LiteBox::is_terminal`].
+/// Possible errors from [`super::File::is_terminal`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum IsTerminalError {
@@ -228,8 +223,8 @@ pub enum IsTerminalError {
     Io,
 }
 
-/// Possible errors from [`crate::LiteBox::get_file_status_flags`] and
-/// [`crate::LiteBox::set_file_status_flags`].
+/// Possible errors from [`super::File::get_status_flags`] and
+/// [`super::File::set_status_flags`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum StatusFlagsError {

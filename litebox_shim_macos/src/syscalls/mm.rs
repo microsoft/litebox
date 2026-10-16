@@ -28,6 +28,7 @@ use litebox_syscall_rewriter::{
     trampoline_allocation_range,
 };
 
+use crate::syscalls::file::{FileFd, FileSubsystem};
 use crate::{SharedCacheRegion, SharedCacheTrampoline, ShimPlatform, Task};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,6 +199,24 @@ fn mmap_read_error(error: ReadError) -> Errno {
         ReadError::NotForReading => Errno::EACCES,
         _ => Errno::EIO,
     }
+}
+
+fn read_file_exact_at<P: ShimPlatform>(
+    file: &litebox::fs::File<P>,
+    mut bytes: &mut [u8],
+    mut offset: usize,
+) -> Result<(), Errno> {
+    while !bytes.is_empty() {
+        let read = file
+            .read(bytes, Some(offset), None)
+            .map_err(|_| Errno::EIO)?;
+        if read == 0 || read > bytes.len() {
+            return Err(Errno::EIO);
+        }
+        offset = offset.checked_add(read).ok_or(Errno::EFBIG)?;
+        bytes = &mut bytes[read..];
+    }
+    Ok(())
 }
 
 fn protection_error(error: VmemProtectError) -> Errno {
@@ -557,6 +576,7 @@ impl<P: ShimPlatform> Task<P> {
         }
 
         let file = self.files.typed_fd(fd)?;
+        let contents = self.files.file(&file)?;
         let executable = protection.contains(VmProtection::EXECUTE);
         let macho = if executable {
             Some(self.macho_patch_info(&file)?)
@@ -590,10 +610,8 @@ impl<P: ShimPlatform> Task<P> {
                     let mut copied = 0;
                     while copied < length.as_usize() {
                         let chunk = (length.as_usize() - copied).min(buffer.len());
-                        let read = self
-                            .global
-                            .litebox
-                            .read_file(&file, &mut buffer[..chunk], Some(file_offset), None)
+                        let read = contents
+                            .read(&mut buffer[..chunk], Some(file_offset), None)
                             .map_err(|error| {
                                 initialization_error = Some(error);
                                 MappingError::NotForReading
@@ -995,39 +1013,28 @@ impl<P: ShimPlatform> Task<P> {
         }
     }
 
-    fn cache_macho_patch_info(
-        &self,
-        file: &litebox::fs::FileFd,
-        patch_info: Option<Arc<MachoPatchInfo>>,
-    ) {
+    fn cache_macho_patch_info(&self, file: &FileFd<P>, patch_info: Option<Arc<MachoPatchInfo>>) {
         self.global
             .litebox
             .descriptor_table_mut()
-            .set_entry_metadata::<litebox::fs::BrokerFile, _>(file, MachoPatchMetadata(patch_info));
+            .set_entry_metadata::<FileSubsystem<P>, _>(file, MachoPatchMetadata(patch_info));
     }
 
-    fn macho_patch_info(
-        &self,
-        file: &Arc<litebox::fs::FileFd>,
-    ) -> Result<Arc<MachoPatchInfo>, Errno> {
+    fn macho_patch_info(&self, file: &Arc<FileFd<P>>) -> Result<Arc<MachoPatchInfo>, Errno> {
         if let Ok(patch_info) = self
             .global
             .litebox
             .descriptor_table()
-            .with_metadata::<litebox::fs::BrokerFile, MachoPatchMetadata, _>(file, |metadata| {
+            .with_metadata::<FileSubsystem<P>, MachoPatchMetadata, _>(file, |metadata| {
                 metadata.0.clone()
             })
         {
             return patch_info.ok_or(Errno::ENOEXEC);
         }
+        let contents = self.files.file(file)?;
         // Status and oversize failures are deliberately not cached: the backing
         // file may change and become a valid, bounded image before a later mmap.
-        let size = self
-            .global
-            .litebox
-            .file_status(file)
-            .map_err(|_| Errno::EIO)?
-            .size;
+        let size = contents.status().map_err(|_| Errno::EIO)?.size;
         if size > u64::try_from(MAX_IMAGE_SIZE).expect("image limit fits in u64") {
             return Err(Errno::EFBIG);
         }
@@ -1036,7 +1043,7 @@ impl<P: ShimPlatform> Task<P> {
         let supported_header = if size < header.len() {
             false
         } else {
-            self.read_file_exact_at(file, &mut header, 0)?;
+            read_file_exact_at(&contents, &mut header, 0)?;
             litebox_common_macos::loader::may_contain_arm64_macho(&header)
         };
         if !supported_header {
@@ -1044,7 +1051,7 @@ impl<P: ShimPlatform> Task<P> {
             return Err(Errno::ENOEXEC);
         }
         let mut bytes = vec![0; size];
-        self.read_file_exact_at(file, &mut bytes, 0)?;
+        read_file_exact_at(&contents, &mut bytes, 0)?;
         let parsed = (|| {
             let slice_range = litebox_common_macos::loader::arm64_slice_range(&bytes)
                 .map_err(|_| Errno::ENOEXEC)?;
@@ -1241,27 +1248,6 @@ impl<P: ShimPlatform> Task<P> {
             )
         }
         .map_err(protection_error)
-    }
-
-    fn read_file_exact_at(
-        &self,
-        file: &litebox::fs::FileFd,
-        mut bytes: &mut [u8],
-        mut offset: usize,
-    ) -> Result<(), Errno> {
-        while !bytes.is_empty() {
-            let read = self
-                .global
-                .litebox
-                .read_file(file, bytes, Some(offset), None)
-                .map_err(|_| Errno::EIO)?;
-            if read == 0 || read > bytes.len() {
-                return Err(Errno::EIO);
-            }
-            offset = offset.checked_add(read).ok_or(Errno::EFBIG)?;
-            bytes = &mut bytes[read..];
-        }
-        Ok(())
     }
 
     pub(crate) fn sys_munmap(&self, address: usize, length: usize) -> Result<(), Errno> {
@@ -1681,7 +1667,7 @@ mod tests {
             task.global
                 .litebox
                 .descriptor_table()
-                .with_metadata::<litebox::fs::BrokerFile, MachoPatchMetadata, _>(
+                .with_metadata::<FileSubsystem<Platform>, MachoPatchMetadata, _>(
                     &file,
                     |metadata| metadata.0.is_none(),
                 )
@@ -1707,13 +1693,7 @@ mod tests {
             )
             .unwrap();
         let nop = 0xd503_201fu32.to_le_bytes();
-        assert_eq!(
-            task.global
-                .litebox
-                .write_file(&writer, &nop, Some(TEXT), None)
-                .unwrap(),
-            4
-        );
+        assert_eq!(writer.write(&nop, Some(TEXT), None).unwrap(), 4);
         let updated =
             mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
         assert_eq!(
@@ -1728,7 +1708,7 @@ mod tests {
                 .unwrap(),
             &SVC.to_le_bytes(),
         );
-        task.global.litebox.close_file(&writer).unwrap();
+        drop(writer);
         task.sys_munmap(original, PAGE_SIZE).unwrap();
         task.sys_munmap(updated, PAGE_SIZE).unwrap();
     }

@@ -2611,8 +2611,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_metadata!(FileObject);
-        try_metadata!(RegistryKeyObject);
+        try_metadata!(FileObject<Platform>);
+        try_metadata!(RegistryKeyObject<Platform>);
         try_metadata!(EventSubsystem<Platform>);
         try_metadata!(MutantSubsystem<Platform>);
         try_metadata!(SemaphoreSubsystem<Platform>);
@@ -2661,8 +2661,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_set_attributes!(FileObject);
-        try_set_attributes!(RegistryKeyObject);
+        try_set_attributes!(FileObject<Platform>);
+        try_set_attributes!(RegistryKeyObject<Platform>);
         try_set_attributes!(EventSubsystem<Platform>);
         try_set_attributes!(MutantSubsystem<Platform>);
         try_set_attributes!(SemaphoreSubsystem<Platform>);
@@ -2833,8 +2833,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_duplicate!(FileObject);
-        try_duplicate!(RegistryKeyObject);
+        try_duplicate!(FileObject<Platform>);
+        try_duplicate!(RegistryKeyObject<Platform>);
         try_duplicate!(EventSubsystem<Platform>);
         try_duplicate!(MutantSubsystem<Platform>);
         try_duplicate!(SemaphoreSubsystem<Platform>);
@@ -2944,8 +2944,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_close!(FileObject, file);
-        try_close!(RegistryKeyObject, registry_key);
+        try_close!(FileObject<Platform>, file);
+        try_close!(RegistryKeyObject<Platform>, registry_key);
         try_close!(EventSubsystem<Platform>, event);
         try_close!(MutantSubsystem<Platform>, mutant);
         try_close!(SemaphoreSubsystem<Platform>, semaphore);
@@ -3110,9 +3110,9 @@ fn is_api_set_contract(dll_name: &str) -> bool {
 }
 
 trait RawHandleVisitor<Platform: ShimPlatform> {
-    fn file(&self, file: FileObject);
+    fn file(&self, file: FileObject<Platform>);
 
-    fn registry_key(&self, key: RegistryKeyObject);
+    fn registry_key(&self, key: RegistryKeyObject<Platform>);
 
     fn event(&self, event: EventHandleObject<Platform>);
 
@@ -3149,12 +3149,12 @@ struct CloseRawHandleVisitor<'task, Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> RawHandleVisitor<Platform> for CloseRawHandleVisitor<'_, Platform> {
-    fn file(&self, file: FileObject) {
+    fn file(&self, file: FileObject<Platform>) {
         self.task.close_file(file);
     }
 
-    fn registry_key(&self, key: RegistryKeyObject) {
-        self.task.close_registry_key(key);
+    fn registry_key(&self, key: RegistryKeyObject<Platform>) {
+        Task::<Platform>::close_registry_key(key);
     }
 
     fn event(&self, event: EventHandleObject<Platform>) {

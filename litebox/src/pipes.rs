@@ -11,7 +11,6 @@ use litebox_broker_protocol::{
     error::ErrorCode,
     fs::{FileOpenFlags, FileStatusFlags},
     pipe::MAX_PIPE_TRANSFER_SIZE,
-    readiness::ReadinessFlags,
 };
 use litebox_platform::time::TimeProvider;
 use thiserror::Error;
@@ -30,25 +29,11 @@ use crate::{
         wait::{WaitContext, WaitError},
     },
     fs::errors::StatusFlagsError,
+    process::ProcessError,
     sync::RawSyncPrimitivesProvider,
 };
 
-/// Support for unidirectional communication channels
-pub struct Pipes<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    litebox: LiteBox<Platform>,
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
-    /// Construct a new `Pipes` instance.
-    ///
-    /// This function is expected to only be invoked once per platform, as an initialization step,
-    /// and the created `Pipes` handle is expected to be shared across all usage over the system.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        Self {
-            litebox: litebox.clone(),
-        }
-    }
-
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Create a unidirectional communication channel for sending messages of (slices of) bytes.
     ///
     /// This function returns the sender and receiver halves respectively.
@@ -67,134 +52,57 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         capacity: usize,
         flags: FileOpenFlags,
         atomic_slice_guarantee_size: Option<NonZeroUsize>,
-    ) -> Result<(PipeFd<Platform>, PipeFd<Platform>), errors::CreateError> {
-        let broker = self
-            .litebox
-            .broker_control()
-            .ok_or(errors::CreateError::Io)?;
-        let (sender, receiver) = new_broker_pipe(
+    ) -> Result<(PipeEnd<Platform>, PipeEnd<Platform>), errors::CreateError> {
+        let broker = self.broker_control().ok_or(errors::CreateError::Io)?;
+        let atomic_write_size = atomic_slice_guarantee_size
+            .map(NonZeroUsize::get)
+            .unwrap_or_default();
+        if atomic_write_size > MAX_PIPE_TRANSFER_SIZE as usize {
+            return Err(errors::CreateError::ResourceExhausted);
+        }
+        let response = broker
+            .create_pipe(
+                capacity
+                    .try_into()
+                    .map_err(|_| errors::CreateError::ResourceExhausted)?,
+                atomic_write_size
+                    .try_into()
+                    .map_err(|_| errors::CreateError::ResourceExhausted)?,
+                flags,
+            )
+            .map_err(BrokerObjectError::from)
+            .map_err(errors::CreateError::from)?;
+        let mut writer = PipeEnd::new(
+            self,
+            Arc::clone(&broker),
+            response.write_handle,
+            HalfPipeType::SenderHalf,
+        );
+        let mut reader = PipeEnd::new(
+            self,
             broker,
-            self.litebox.broker_pollable_registry(),
-            capacity,
-            flags,
-            atomic_slice_guarantee_size,
-        )?;
-        let mut dt = self.litebox.descriptor_table_mut();
-        let sender = dt.insert(PipeEnd(sender));
-        let receiver = dt.insert(PipeEnd(receiver));
-        Ok((sender, receiver))
+            response.read_handle,
+            HalfPipeType::ReceiverHalf,
+        );
+        writer.peer_pollee = Arc::downgrade(&reader.pollee);
+        reader.peer_pollee = Arc::downgrade(&writer.pollee);
+        Ok((writer, reader))
     }
 
-    /// Close the pipe at `fd`.
+    /// Returns the pipe end of type `endpoint_type` this process inherited
+    /// from its parent as `handle` through
+    /// [`PendingChild::inherit`](crate::process::PendingChild::inherit).
     ///
-    /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close(&self, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
-        // Shutdowns are taken care of automatically by the drop implementations
-        Ok(())
-    }
-
-    /// Read values in the pipe into `buf`, returning the number of elements read.
-    ///
-    /// See [`Self::create_pipe`] for details on blocking behavior.
-    ///
-    /// Note: currently, this function returns `Ok(0)` if the peer end has been shut down, this may
-    /// change in the future to an explicit "peer has shut down" error.
-    pub fn read(
+    /// The end owns `handle`, so callers adopt each handle once and share the
+    /// end for every other use. The end has no peer in this process, so broker
+    /// readiness notifications alone wake its waiters.
+    pub fn adopt_inherited_pipe(
         &self,
-        cx: &WaitContext<'_, Platform>,
-        fd: &PipeFd<Platform>,
-        buf: &mut [u8],
-    ) -> Result<usize, errors::ReadError> {
-        let dt = self.litebox.descriptor_table();
-        let p = {
-            let entry = dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?;
-            if entry.entry.0.endpoint_type != HalfPipeType::ReceiverHalf {
-                return Err(errors::ReadError::NotForReading);
-            }
-            Arc::clone(&entry.entry.0)
-        };
-        drop(dt);
-        p.read(cx, buf).map_err(From::from)
-    }
-
-    /// Write the values in `buf` into the pipe, returning the number of elements written.
-    ///
-    /// See [`Self::create_pipe`] for details on blocking and atomicity of writes.
-    pub fn write(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-        fd: &PipeFd<Platform>,
-        buf: &[u8],
-    ) -> Result<usize, errors::WriteError> {
-        let dt = self.litebox.descriptor_table();
-        let p = {
-            let entry = dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?;
-            if entry.entry.0.endpoint_type != HalfPipeType::SenderHalf {
-                return Err(errors::WriteError::NotForWriting);
-            }
-            Arc::clone(&entry.entry.0)
-        };
-        drop(dt);
-        p.write(cx, buf).map_err(From::from)
-    }
-
-    /// Whether the provided FD points to a reader or a writer end.
-    pub fn half_pipe_type(
-        &self,
-        fd: &PipeFd<Platform>,
-    ) -> Result<HalfPipeType, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
-        Ok(dt
-            .get_entry(fd)
-            .ok_or(errors::ClosedError::ClosedFd)?
-            .entry
-            .0
-            .endpoint_type)
-    }
-
-    /// Returns the access mode and status flags of the pipe half at `fd`.
-    pub fn get_status_flags(
-        &self,
-        fd: &PipeFd<Platform>,
-    ) -> Result<FileStatusFlags, StatusFlagsError> {
-        let end = self
-            .litebox
-            .broker_pipe_end(fd)
-            .ok_or(StatusFlagsError::ClosedFd)?;
-        Ok(end.broker.get_status_flags(end.handle)?)
-    }
-
-    /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`], of the pipe half at
-    /// `fd` to their values in `flags`.
-    ///
-    /// Every descriptor and process sharing the pipe half sees the change.
-    pub fn set_status_flags(
-        &self,
-        fd: &PipeFd<Platform>,
-        mask: FileOpenFlags,
-        flags: FileOpenFlags,
-    ) -> Result<(), StatusFlagsError> {
-        let end = self
-            .litebox
-            .broker_pipe_end(fd)
-            .ok_or(StatusFlagsError::ClosedFd)?;
-        Ok(end.broker.set_status_flags(end.handle, mask, flags)?)
-    }
-
-    /// Perform `f` with the [`IOPollable`] associated with the pipe at `fd`.
-    pub fn with_iopollable<R>(
-        &self,
-        fd: &PipeFd<Platform>,
-        f: impl FnOnce(&dyn IOPollable) -> R,
-    ) -> Result<R, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
-        let p = &dt
-            .get_entry(fd)
-            .ok_or(errors::ClosedError::ClosedFd)?
-            .entry
-            .0;
-        Ok(f(p))
+        handle: ObjectHandle,
+        endpoint_type: HalfPipeType,
+    ) -> Result<PipeEnd<Platform>, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(PipeEnd::new(self, broker, handle, endpoint_type))
     }
 }
 
@@ -205,20 +113,12 @@ pub enum HalfPipeType {
     ReceiverHalf,
 }
 
-struct PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider>(Arc<BrokerPipeEnd<Platform>>);
-
 pub mod errors {
     use crate::event::wait::WaitError;
 
-    #[expect(
-        unused_imports,
-        reason = "used for doc string links to work out, but not for code"
-    )]
-    use super::Pipes;
-
     use thiserror::Error;
 
-    /// Possible errors from [`Pipes::create_pipe`].
+    /// Possible errors from [`crate::LiteBox::create_pipe`].
     #[non_exhaustive]
     #[derive(Error, Debug)]
     pub enum CreateError {
@@ -232,17 +132,10 @@ pub mod errors {
         Io,
     }
 
-    /// Possible errors from [`Pipes::close`]
-    #[non_exhaustive]
-    #[derive(Error, Debug)]
-    pub enum CloseError {}
-
-    /// Possible errors from [`Pipes::read`]
+    /// Possible errors from [`super::PipeEnd::read`]
     #[non_exhaustive]
     #[derive(Error, Debug)]
     pub enum ReadError {
-        #[error("not an open file descriptor")]
-        ClosedFd,
         #[error("not open for reading")]
         NotForReading,
         #[error("read would block")]
@@ -253,12 +146,10 @@ pub mod errors {
         Io,
     }
 
-    /// Possible errors from [`Pipes::write`]
+    /// Possible errors from [`super::PipeEnd::write`]
     #[non_exhaustive]
     #[derive(Error, Debug)]
     pub enum WriteError {
-        #[error("not an open file descriptor")]
-        ClosedFd,
         #[error("the reading end of this pipe is closed")]
         ReadEndClosed,
         #[error("not open for writing")]
@@ -269,13 +160,6 @@ pub mod errors {
         WaitError(WaitError),
         #[error("pipe I/O failed")]
         Io,
-    }
-
-    /// Possible errors from functions that always succeed unless the descriptor is closed.
-    #[derive(Error, Debug)]
-    pub enum ClosedError {
-        #[error("not an open file descriptor")]
-        ClosedFd,
     }
 }
 
@@ -323,118 +207,104 @@ impl From<TryOpError<PipeError>> for PipeError {
     }
 }
 
-/// One end of a broker-owned pipe, which owns its handle.
-pub(crate) struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+/// A reference to one end of a broker-owned pipe, which closes its handle
+/// when dropped.
+pub struct PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
-    peer: Weak<Self>,
+    /// The other end's pollee, if this process created the pipe, which this
+    /// end notifies directly when it changes the other end's readiness.
+    peer_pollee: Weak<Pollee<Platform>>,
     endpoint_type: HalfPipeType,
 }
 
-#[expect(
-    clippy::type_complexity,
-    reason = "a type alias would not make the two pipe endpoint result clearer"
-)]
-fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
-    broker: Arc<dyn BrokerControl>,
-    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
-    capacity: usize,
-    flags: FileOpenFlags,
-    atomic_slice_guarantee_size: Option<NonZeroUsize>,
-) -> Result<(Arc<BrokerPipeEnd<Platform>>, Arc<BrokerPipeEnd<Platform>>), errors::CreateError> {
-    let atomic_write_size = atomic_slice_guarantee_size
-        .map(NonZeroUsize::get)
-        .unwrap_or_default();
-    if atomic_write_size > MAX_PIPE_TRANSFER_SIZE as usize {
-        return Err(errors::CreateError::ResourceExhausted);
-    }
-    let response = broker
-        .create_pipe(
-            capacity
-                .try_into()
-                .map_err(|_| errors::CreateError::ResourceExhausted)?,
-            atomic_write_size
-                .try_into()
-                .map_err(|_| errors::CreateError::ResourceExhausted)?,
-            flags,
-        )
-        .map_err(BrokerObjectError::from)
-        .map_err(errors::CreateError::from)?;
-
-    let mut writer = Arc::new(BrokerPipeEnd {
-        broker: Arc::clone(&broker),
-        handle: response.write_handle,
-        pollable_registry: Arc::clone(&pollable_registry),
-        pollee: Arc::new(Pollee::new()),
-        peer: Weak::new(),
-        endpoint_type: HalfPipeType::SenderHalf,
-    });
-    let reader = Arc::new_cyclic(|weak_reader| {
-        Arc::get_mut(&mut writer)
-            .expect("new pipe writer must be uniquely owned")
-            .peer = weak_reader.clone();
-        BrokerPipeEnd {
-            broker,
-            handle: response.read_handle,
-            pollable_registry: Arc::clone(&pollable_registry),
-            pollee: Arc::new(Pollee::new()),
-            peer: Arc::downgrade(&writer),
-            endpoint_type: HalfPipeType::ReceiverHalf,
-        }
-    });
-
-    pollable_registry.register_pollable(response.write_handle, &writer.pollee);
-    pollable_registry.register_pollable(response.read_handle, &reader.pollee);
-    Ok((writer, reader))
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Returns the pipe end at `fd`, which keeps its handle open while held.
-    pub(crate) fn broker_pipe_end(
-        &self,
-        fd: &PipeFd<Platform>,
-    ) -> Option<Arc<BrokerPipeEnd<Platform>>> {
-        self.descriptor_table()
-            .with_entry(fd, |entry| Arc::clone(&entry.entry.0))
-    }
-
-    /// Returns a descriptor for a pipe end this process inherited from its
-    /// parent through [`PendingChild::inherit`](crate::process::PendingChild::inherit).
-    ///
-    /// The descriptor owns `handle`, so callers adopt each handle once and
-    /// duplicate the descriptor for every other use. The end has no peer in
-    /// this process, so broker readiness notifications alone wake its waiters.
-    pub fn adopt_inherited_pipe(
-        &self,
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
+    fn new(
+        litebox: &LiteBox<Platform>,
+        broker: Arc<dyn BrokerControl>,
         handle: ObjectHandle,
         endpoint_type: HalfPipeType,
-    ) -> Result<PipeFd<Platform>, crate::process::ProcessError> {
-        let broker = self
-            .broker_control()
-            .ok_or(crate::process::ProcessError::Unavailable)?;
-        let pollable_registry = self.broker_pollable_registry();
-        let end = Arc::new(BrokerPipeEnd {
+    ) -> Self {
+        let pollable_registry = litebox.broker_pollable_registry();
+        let pollee = Arc::new(Pollee::new());
+        pollable_registry.register_pollable(handle, &pollee);
+        Self {
             broker,
             handle,
-            pollable_registry: Arc::clone(&pollable_registry),
-            pollee: Arc::new(Pollee::new()),
-            peer: Weak::new(),
+            pollable_registry,
+            pollee,
+            peer_pollee: Weak::new(),
             endpoint_type,
-        });
-        pollable_registry.register_pollable(handle, &end.pollee);
-        Ok(self.descriptor_table_mut().insert(PipeEnd(end)))
+        }
     }
-}
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform> {
     /// The broker handle this end owns.
     pub(crate) fn handle(&self) -> ObjectHandle {
         self.handle
     }
 
-    fn read(&self, cx: &WaitContext<'_, Platform>, buf: &mut [u8]) -> Result<usize, PipeError> {
+    /// Whether this end is the sender half or the receiver half.
+    pub fn endpoint_type(&self) -> HalfPipeType {
+        self.endpoint_type
+    }
+
+    /// Read values in the pipe into `buf`, returning the number of elements read.
+    ///
+    /// Fails with [`errors::ReadError::NotForReading`] on the sender half. See
+    /// [`LiteBox::create_pipe`] for details on blocking behavior.
+    ///
+    /// Note: currently, this function returns `Ok(0)` if the peer end has been shut down, this may
+    /// change in the future to an explicit "peer has shut down" error.
+    pub fn read(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, errors::ReadError> {
+        if self.endpoint_type != HalfPipeType::ReceiverHalf {
+            return Err(errors::ReadError::NotForReading);
+        }
+        self.read_pipe(cx, buf).map_err(From::from)
+    }
+
+    /// Write the values in `buf` into the pipe, returning the number of elements written.
+    ///
+    /// Fails with [`errors::WriteError::NotForWriting`] on the receiver half. See
+    /// [`LiteBox::create_pipe`] for details on blocking and atomicity of writes.
+    pub fn write(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &[u8],
+    ) -> Result<usize, errors::WriteError> {
+        if self.endpoint_type != HalfPipeType::SenderHalf {
+            return Err(errors::WriteError::NotForWriting);
+        }
+        self.write_pipe(cx, buf).map_err(From::from)
+    }
+
+    /// Returns the end's access mode and status flags.
+    pub fn get_status_flags(&self) -> Result<FileStatusFlags, StatusFlagsError> {
+        Ok(self.broker.get_status_flags(self.handle)?)
+    }
+
+    /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`],
+    /// to their values in `flags`.
+    ///
+    /// Every reference to the end, in any process, sees the change.
+    pub fn set_status_flags(
+        &self,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> Result<(), StatusFlagsError> {
+        Ok(self.broker.set_status_flags(self.handle, mask, flags)?)
+    }
+
+    fn read_pipe(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+    ) -> Result<usize, PipeError> {
         let length = buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize);
         if length == 0 {
             return Ok(0);
@@ -456,16 +326,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
                 }
                 buf[..data.len()].copy_from_slice(&data);
                 if !data.is_empty()
-                    && let Some(peer) = self.peer.upgrade()
+                    && let Some(peer_pollee) = self.peer_pollee.upgrade()
                 {
-                    peer.pollee.notify_observers(Events::OUT);
+                    peer_pollee.notify_observers(Events::OUT);
                 }
                 Ok(data.len())
             })
             .map_err(PipeError::from)
     }
 
-    fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, PipeError> {
+    fn write_pipe(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, PipeError> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -500,9 +370,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
             return Err(TryOpError::Other(PipeError::Io));
         }
         if written != 0
-            && let Some(peer) = self.peer.upgrade()
+            && let Some(peer_pollee) = self.peer_pollee.upgrade()
         {
-            peer.pollee.notify_observers(Events::IN);
+            peer_pollee.notify_observers(Events::IN);
         }
         Ok(written)
     }
@@ -517,35 +387,31 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
         }
         error.into()
     }
-
-    fn readiness(&self) -> Result<ReadinessFlags, BrokerControlError> {
-        self.broker.check_readiness(self.handle)
-    }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerPipeEnd<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for PipeEnd<Platform> {
     fn register_observer(&self, observer: Weak<dyn Observer<Events>>, filter: Events) {
         self.pollee.register_observer(observer, filter);
     }
 
     fn check_io_events(&self) -> Events {
-        match self.readiness() {
+        match self.broker.check_readiness(self.handle) {
             Ok(readiness) => readiness_events(readiness),
             Err(_) => Events::ERR,
         }
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for BrokerPipeEnd<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for PipeEnd<Platform> {
     fn drop(&mut self) {
         self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
-        if let Some(peer) = self.peer.upgrade() {
+        if let Some(peer_pollee) = self.peer_pollee.upgrade() {
             let event = match self.endpoint_type {
                 HalfPipeType::SenderHalf => Events::HUP,
                 HalfPipeType::ReceiverHalf => Events::ERR,
             };
-            peer.pollee.notify_observers(event);
+            peer_pollee.notify_observers(event);
         }
     }
 }
@@ -598,7 +464,7 @@ mod tests {
     use litebox_broker_transport::channel::LocalCallChannel;
 
     use crate::{
-        event::{Events, observer::Observer, wait::WaitState},
+        event::{Events, IOPollable, observer::Observer, wait::WaitState},
         pipes::errors::ReadError,
     };
 
@@ -618,28 +484,18 @@ mod tests {
             Arc::new(NoopSharedMemory),
         );
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
-        let pipes = super::Pipes::new(&litebox);
-        let (writer, reader) = pipes.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
+        let (writer, reader) = litebox.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
         let writer_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
         let writer_observer_dyn: Arc<dyn Observer<Events>> = writer_observer.clone();
-        pipes
-            .with_iopollable(&writer, |pollable| {
-                pollable.register_observer(Arc::downgrade(&writer_observer_dyn), Events::ERR);
-            })
-            .unwrap();
+        writer.register_observer(Arc::downgrade(&writer_observer_dyn), Events::ERR);
         let reader_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
         let reader_observer_dyn: Arc<dyn Observer<Events>> = reader_observer.clone();
-        pipes
-            .with_iopollable(&reader, |pollable| {
-                pollable.register_observer(Arc::downgrade(&reader_observer_dyn), Events::ERR);
-            })
-            .unwrap();
+        reader.register_observer(Arc::downgrade(&reader_observer_dyn), Events::ERR);
 
         let mut value = 0;
         assert!(matches!(
-            pipes.read(
+            reader.read(
                 &WaitState::new(platform).context(),
-                &reader,
                 core::slice::from_mut(&mut value),
             ),
             Err(ReadError::Io)
@@ -662,19 +518,16 @@ mod tests {
             },
             Arc::new(NoopSharedMemory),
         );
-        let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));
-        let pipes = super::Pipes::new(&litebox);
-        let (writer, reader) = pipes.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
+        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
+        let (writer, reader) = litebox.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
+        let mut writer = Some(writer);
 
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
-        let read_litebox = Arc::clone(&litebox);
         let read_thread = std::thread::spawn(move || {
-            let pipes = super::Pipes::new(&read_litebox);
             let mut value = 0;
             result_sender
-                .send(pipes.read(
+                .send(reader.read(
                     &WaitState::new(platform).context(),
-                    &reader,
                     core::slice::from_mut(&mut value),
                 ))
                 .unwrap();
@@ -685,7 +538,7 @@ mod tests {
             if std::time::Instant::now() >= deadline {
                 setup_completed = false;
                 force_transport.store(true, Ordering::SeqCst);
-                let _ = pipes.close(&writer);
+                drop(writer.take());
                 break;
             }
             std::thread::yield_now();
@@ -703,7 +556,7 @@ mod tests {
                 if std::time::Instant::now() >= deadline {
                     setup_completed = false;
                     force_transport.store(true, Ordering::SeqCst);
-                    let _ = pipes.close(&writer);
+                    drop(writer.take());
                     break;
                 }
                 std::thread::yield_now();
@@ -719,7 +572,7 @@ mod tests {
         let mut read_result = initial_read_result.ok();
         if read_result.is_none() {
             force_transport.store(true, Ordering::SeqCst);
-            let _ = pipes.close(&writer);
+            drop(writer.take());
             read_result = result_receiver
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .ok();
@@ -740,9 +593,8 @@ mod tests {
     fn pipe_creation_requires_broker() {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = crate::LiteBox::new(platform);
-        let pipes = super::Pipes::new(&litebox);
         assert!(matches!(
-            pipes.create_pipe(2, FileOpenFlags::NONE, None),
+            litebox.create_pipe(2, FileOpenFlags::NONE, None),
             Err(super::errors::CreateError::Io)
         ));
     }
@@ -835,23 +687,5 @@ mod tests {
                 result,
             })
         }
-    }
-}
-
-crate::fd::enable_fds_for_subsystem! {
-    @Platform: { RawSyncPrimitivesProvider + TimeProvider };
-    Pipes<Platform>;
-    @Platform: { RawSyncPrimitivesProvider + TimeProvider };
-    PipeEnd<Platform>;
-    -> PipeFd<Platform>;
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for DescriptorEntry<Platform> {
-    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
-        self.entry.0.register_observer(observer, mask);
-    }
-
-    fn check_io_events(&self) -> Events {
-        self.entry.0.check_io_events()
     }
 }

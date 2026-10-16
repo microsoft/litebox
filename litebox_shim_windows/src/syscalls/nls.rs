@@ -448,8 +448,8 @@ struct MappedNlsSection {
     len: usize,
 }
 
-struct NlsSectionFile {
-    fd: litebox::fs::FileFd,
+struct NlsSectionFile<Platform: ShimPlatform> {
+    fd: litebox::fs::File<Platform>,
     len: usize,
 }
 
@@ -723,15 +723,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<MappedNlsSection, NtStatus> {
         let section_file = self.open_nls_section_file(request)?;
         let section_len = section_file.len;
-        let alloc_len = match nls_section_alloc_len(section_len) {
-            Ok(alloc_len) => alloc_len,
-            Err(status) => {
-                let _ = self.fs.close_file(&section_file.fd);
-                return Err(status);
-            }
-        };
+        let alloc_len = nls_section_alloc_len(section_len)?;
         let Some(page_len) = NonZeroPageSize::<PAGE_SIZE>::new(alloc_len) else {
-            let _ = self.fs.close_file(&section_file.fd);
             return Err(NtStatus::INVALID_PARAMETER);
         };
 
@@ -742,7 +735,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             crate::syscalls::mm::ALLOCATION_GRANULARITY,
             CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
             MemoryRegionPermissions::READ,
-            |ptr| match self.copy_nls_section_file(&section_file.fd, section_len, ptr) {
+            |ptr| match Self::copy_nls_section_file(&section_file.fd, section_len, ptr) {
                 Ok(copied) => Ok(copied),
                 Err(status) => {
                     copy_status = Some(status);
@@ -750,7 +743,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
             },
         );
-        let _ = self.fs.close_file(&section_file.fd);
+        drop(section_file);
         let mapping = mapping.map_err(|_| copy_status.unwrap_or(NtStatus::NO_MEMORY))?;
         Ok(MappedNlsSection {
             address: mapping.as_usize(),
@@ -761,7 +754,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn open_nls_section_file(
         &self,
         request: NlsSectionRequest<Platform>,
-    ) -> Result<NlsSectionFile, NtStatus> {
+    ) -> Result<NlsSectionFile<Platform>, NtStatus> {
         let path = nls_section_file_path(request.section_type, request.section_data)?;
         let fd = self
             .fs
@@ -774,32 +767,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )
             .map_err(map_nls_open_error)?;
 
-        let status = match self.fs.file_status(&fd) {
-            Ok(status) => status,
-            Err(error) => {
-                let _ = self.fs.close_file(&fd);
-                return Err(map_nls_file_status_error(error));
-            }
-        };
+        let status = fd.status().map_err(map_nls_file_status_error)?;
         if status.file_type != FileType::RegularFile {
-            let _ = self.fs.close_file(&fd);
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
         }
         if status.size == 0 {
-            let _ = self.fs.close_file(&fd);
             return Err(NtStatus::OBJECT_NAME_NOT_FOUND);
         }
 
         let Ok(len) = usize::try_from(status.size) else {
-            let _ = self.fs.close_file(&fd);
             return Err(NtStatus::SECTION_TOO_BIG);
         };
         Ok(NlsSectionFile { fd, len })
     }
 
     fn copy_nls_section_file(
-        &self,
-        fd: &litebox::fs::FileFd,
+        fd: &litebox::fs::File<Platform>,
         section_len: usize,
         output: MutPtr<Platform, u8>,
     ) -> Result<usize, NtStatus> {
@@ -808,9 +791,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let mut chunk = [0; PAGE_SIZE];
             let remaining = section_len - offset;
             let chunk_len = remaining.min(PAGE_SIZE);
-            let read = self
-                .fs
-                .read_file(fd, &mut chunk[..chunk_len], Some(offset), None)
+            let read = fd
+                .read(&mut chunk[..chunk_len], Some(offset), None)
                 .map_err(map_nls_read_error)?;
             if read == 0 {
                 return Err(NtStatus::END_OF_FILE);

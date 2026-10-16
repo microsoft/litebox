@@ -50,9 +50,9 @@ bitflags::bitflags! {
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
-    File(Arc<crate::FileFd>),
+    File(Arc<crate::FileFd<Platform>>),
     Inet(Arc<TypedFd<super::inet::InetSocketSubsystem<Platform>>>),
-    Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
+    Pipe(Arc<super::pipe::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform>>>),
     Timerfd(Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
 }
@@ -60,7 +60,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
 impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
     pub fn try_from(files: &FilesState<Platform>, raw_fd: usize) -> Result<Self, Errno> {
         let rds = files.raw_descriptor_store.read();
-        if let Ok(fd) = rds.fd_from_raw_integer::<litebox::fs::BrokerFile>(raw_fd) {
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::file::FileSubsystem<Platform>>(raw_fd) {
             return Ok(EpollDescriptor::File(fd));
         }
         if let Ok(fd) =
@@ -68,7 +68,7 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
         {
             return Ok(EpollDescriptor::Inet(fd));
         }
-        if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::pipe::PipeSubsystem<Platform>>(raw_fd) {
             return Ok(EpollDescriptor::Pipe(fd));
         }
         if let Ok(fd) =
@@ -119,10 +119,7 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
         match self {
             EpollDescriptor::Eventfd(fd) => poll_entry!(fd),
             EpollDescriptor::Epoll(fd) => poll_entry!(fd),
-            EpollDescriptor::File(fd) => {
-                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
-                Some(handle.with_entry(|file| poll(&global.litebox.broker_file_pollable(file))))
-            }
+            EpollDescriptor::File(fd) => poll_entry!(fd),
             EpollDescriptor::Inet(fd) => poll_entry!(fd),
             EpollDescriptor::Pipe(fd) => poll_entry!(fd),
             EpollDescriptor::Unix(fd) => poll_entry!(fd),
@@ -139,8 +136,8 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
         f: impl FnOnce(&ReadinessTarget<'_, Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         match self {
-            EpollDescriptor::File(fd) => f(&ReadinessTarget::File(fd)),
-            EpollDescriptor::Pipe(fd) => f(&ReadinessTarget::Pipe(fd)),
+            EpollDescriptor::File(fd) => f(&ReadinessTarget::File(&*global.file(fd)?)),
+            EpollDescriptor::Pipe(fd) => f(&ReadinessTarget::Pipe(&*global.pipe_end(fd)?)),
             EpollDescriptor::Eventfd(fd) => {
                 global.with_eventfd(fd, |file| f(&ReadinessTarget::EventCounter(file.counter())))
             }
@@ -226,18 +223,18 @@ impl<Platform: ShimPlatform> EpollFile<Platform> {
             EpollOp::EpollCtlAdd => {
                 let interest = readiness_interest(op, event.unwrap())?;
                 file.with_target(global, |target| {
-                    Ok(self.queue.add(&global.litebox, target, key, interest)?)
+                    Ok(self.queue.add(target, key, interest)?)
                 })
             }
             EpollOp::EpollCtlMod => {
                 let interest = readiness_interest(op, event.unwrap())?;
                 file.with_target(global, |target| {
-                    Ok(self.queue.modify(&global.litebox, target, key, interest)?)
+                    Ok(self.queue.modify(target, key, interest)?)
                 })
             }
-            EpollOp::EpollCtlDel => file.with_target(global, |target| {
-                Ok(self.queue.remove(&global.litebox, target, key)?)
-            }),
+            EpollOp::EpollCtlDel => {
+                file.with_target(global, |target| Ok(self.queue.remove(target, key)?))
+            }
         }
     }
 

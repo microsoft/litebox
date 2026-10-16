@@ -3,12 +3,10 @@
 
 //! Guest file operations backed by broker-owned file objects.
 
-use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::any::Any;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
@@ -29,17 +27,12 @@ use crate::path::Arg;
 use crate::{LiteBox, sync};
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, IsTerminalError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError, TruncateError,
-    UnlinkError, WriteError,
+    ChmodError, ChownError, FileStatusError, IsTerminalError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError, TruncateError, UnlinkError,
+    WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    pub(crate) fn broker_file(&self, fd: &FileFd) -> Option<Arc<BrokerFile>> {
-        self.descriptor_table()
-            .with_entry(fd, |entry| Arc::clone(&entry.entry))
-    }
-
     fn broker_path(context: &Context, path: impl Arg) -> Result<String, PathError> {
         Ok(context.resolve(path)?.to_string())
     }
@@ -55,7 +48,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: Mode,
-    ) -> Result<FileFd, OpenError> {
+    ) -> Result<File<Platform>, OpenError> {
         let path = Self::broker_path(context, path)?;
         if FileOpenFlags::from_bits(flags.bits()).is_none() {
             return Err(OpenError::AccessNotAllowed);
@@ -70,132 +63,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
                 mode & Mode::SUPPORTED,
             )
             .map_err(|_| OpenError::Io)??;
-        Ok(self
-            .descriptor_table_mut()
-            .insert(Arc::new(BrokerFile::new(broker, handle))))
+        Ok(File::new(self, broker, handle))
     }
 
-    /// Returns a descriptor for a file this process inherited from its parent
+    /// Returns the file this process inherited from its parent as `handle`
     /// through [`PendingChild::inherit`](crate::process::PendingChild::inherit).
     ///
-    /// The descriptor owns `handle`, so callers adopt each handle once and
-    /// duplicate the descriptor for every other use.
+    /// The file owns `handle`, so callers adopt each handle once and share the
+    /// file for every other use.
     pub fn adopt_inherited_file(
         &self,
         handle: ObjectHandle,
-    ) -> Result<FileFd, crate::process::ProcessError> {
+    ) -> Result<File<Platform>, crate::process::ProcessError> {
         let broker = self
             .broker_control()
             .ok_or(crate::process::ProcessError::Unavailable)?;
-        Ok(self
-            .descriptor_table_mut()
-            .insert(Arc::new(BrokerFile::new(broker, handle))))
-    }
-
-    /// Close the file at `fd`.
-    ///
-    /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close_file(&self, fd: &FileFd) -> Result<(), CloseError> {
-        let mut descriptors = self.descriptor_table_mut();
-        let removed = descriptors.remove(fd);
-        drop(descriptors);
-        drop(removed);
-        Ok(())
-    }
-
-    /// Read from a file descriptor at `offset` into a buffer.
-    ///
-    /// While the file has nothing to read, waits through `wait`, or fails with
-    /// [`ReadError::WouldBlock`] if `wait` is `None` or the file's status flags include
-    /// [`FileOpenFlags::NONBLOCKING`].
-    pub fn read_file(
-        &self,
-        fd: &FileFd,
-        buf: &mut [u8],
-        offset: Option<usize>,
-        wait: Option<&WaitContext<'_, Platform>>,
-    ) -> Result<usize, ReadError> {
-        let file = self.broker_file(fd).ok_or(ReadError::ClosedFd)?;
-        let offset = offset
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| ReadError::Io)?;
-        self.wait_on_file(wait, &file, Events::IN, || {
-            file.broker
-                .read_file(file.handle, buf, offset)?
-                .map_err(|error| TryOpError::Other(error.into()))
-        })
-        .map_err(ReadError::from)
-    }
-
-    /// Write from a buffer to a file descriptor at `offset`.
-    ///
-    /// While the file cannot accept bytes, waits through `wait`, or fails with
-    /// [`WriteError::WouldBlock`] if `wait` is `None` or the file's status flags include
-    /// [`FileOpenFlags::NONBLOCKING`]. Given `wait`, keeps writing until the whole buffer is
-    /// written or a failure or interruption follows partial progress, which then returns the bytes
-    /// written.
-    pub fn write_file(
-        &self,
-        fd: &FileFd,
-        buf: &[u8],
-        offset: Option<usize>,
-        wait: Option<&WaitContext<'_, Platform>>,
-    ) -> Result<usize, WriteError> {
-        let file = self.broker_file(fd).ok_or(WriteError::ClosedFd)?;
-        let offset = offset
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| WriteError::Io)?;
-        let mut written = 0;
-        loop {
-            let rest = &buf[written..];
-            let offset = offset.map(|offset| offset.saturating_add(written as u64));
-            match self.wait_on_file(wait, &file, Events::OUT, || {
-                file.broker
-                    .write_file(file.handle, rest, offset)?
-                    .map_err(|error| TryOpError::Other(error.into()))
-            }) {
-                Ok(count) => {
-                    written += count;
-                    if wait.is_none() || count == 0 || written == buf.len() {
-                        return Ok(written);
-                    }
-                }
-                Err(_) if written != 0 => return Ok(written),
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-
-    /// Reposition the read/write file offset.
-    pub fn seek_file(
-        &self,
-        fd: &FileFd,
-        offset: isize,
-        whence: SeekWhence,
-    ) -> Result<usize, SeekError> {
-        let file = self.broker_file(fd).ok_or(SeekError::ClosedFd)?;
-        let offset = i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?;
-        let offset = file.broker.seek_file(file.handle, offset, whence)??;
-        usize::try_from(offset).map_err(|_| SeekError::InvalidOffset)
-    }
-
-    /// Truncate the file to the specified length.
-    pub fn truncate_file(
-        &self,
-        fd: &FileFd,
-        length: usize,
-        reset_offset: bool,
-    ) -> Result<(), TruncateError> {
-        let file = self.broker_file(fd).ok_or(TruncateError::ClosedFd)?;
-        file.broker
-            .truncate_file(
-                file.handle,
-                u64::try_from(length).map_err(|_| TruncateError::Io)?,
-                reset_offset,
-            )?
-            .map_err(TruncateError::from)
+        Ok(File::new(self, broker, handle))
     }
 
     /// Change the permissions of a file.
@@ -264,17 +147,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(RmdirError::from)
     }
 
-    /// Read directory entries from a directory file descriptor.
-    pub fn read_file_directory(
-        &self,
-        fd: &FileFd,
-    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
-        let file = self.broker_file(fd).ok_or(ReadDirError::ClosedFd)?;
-        file.broker
-            .read_directory(file.handle)?
-            .map_err(ReadDirError::from)
-    }
-
     /// Obtain the status of a path.
     pub fn path_file_status(
         &self,
@@ -287,98 +159,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .path_file_status(&path, context.acting_user())
             .map_err(|_| FileStatusError::Io)?
             .map_err(FileStatusError::from)
-    }
-
-    /// Equivalent to [`Self::path_file_status`], but on an open `fd`.
-    pub fn file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
-        let file = self.broker_file(fd).ok_or(FileStatusError::ClosedFd)?;
-        file.broker
-            .handle_file_status(file.handle)?
-            .map_err(FileStatusError::from)
-    }
-
-    /// Determine whether an open `fd` is connected to a terminal.
-    pub fn is_terminal(&self, fd: &FileFd) -> Result<bool, IsTerminalError> {
-        let file = self.broker_file(fd).ok_or(IsTerminalError::ClosedFd)?;
-        file.broker
-            .is_terminal_file(file.handle)?
-            .map_err(|_| IsTerminalError::Io)
-    }
-
-    /// Returns the access mode and status flags of the open file description at `fd`.
-    pub fn get_file_status_flags(&self, fd: &FileFd) -> Result<FileStatusFlags, StatusFlagsError> {
-        let file = self.broker_file(fd).ok_or(StatusFlagsError::ClosedFd)?;
-        Ok(file.broker.get_status_flags(file.handle)?)
-    }
-
-    /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`], of the open file
-    /// description at `fd` to their values in `flags`.
-    ///
-    /// Every descriptor and process sharing the open file description sees the change.
-    pub fn set_file_status_flags(
-        &self,
-        fd: &FileFd,
-        mask: FileOpenFlags,
-        flags: FileOpenFlags,
-    ) -> Result<(), StatusFlagsError> {
-        let file = self.broker_file(fd).ok_or(StatusFlagsError::ClosedFd)?;
-        Ok(file.broker.set_status_flags(file.handle, mask, flags)?)
-    }
-
-    /// Returns the readiness of the file in a descriptor `entry` for polling.
-    ///
-    /// Files that never wait, such as regular files, report [`Events::OUT`].
-    pub fn broker_file_pollable<'file>(
-        &self,
-        entry: &'file DescriptorEntry,
-    ) -> impl IOPollable + use<'file, Platform> {
-        let file = &*entry.entry;
-        BrokerFilePollable {
-            file,
-            pollee: self.file_pollee(file),
-        }
-    }
-
-    /// Runs `try_op` once, or, given `wait`, until it stops returning [`TryOpError::TryAgain`],
-    /// waiting for `events` on `file` in between.
-    fn wait_on_file<R, E>(
-        &self,
-        wait: Option<&WaitContext<'_, Platform>>,
-        file: &BrokerFile,
-        events: Events,
-        mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
-    ) -> Result<R, TryOpError<E>> {
-        let Some(cx) = wait else {
-            return try_op();
-        };
-        cx.wait_on_events(
-            false,
-            events,
-            |observer, filter| {
-                self.file_pollee(file).register_observer(observer, filter);
-                Ok(())
-            },
-            try_op,
-        )
-    }
-
-    /// Returns `file`'s pollee, registering it on first use to receive the file's broker
-    /// readiness.
-    fn file_pollee<'file>(&self, file: &'file BrokerFile) -> &'file Pollee<Platform> {
-        let pollee = file.pollee.call_once(|| {
-            let registry = self.broker_pollable_registry();
-            let pollee = Arc::new(Pollee::new());
-            registry.register_pollable(file.handle, &pollee);
-            Box::new(FilePollee {
-                registry,
-                handle: file.handle,
-                pollee,
-            })
-        });
-        &pollee
-            .downcast_ref::<FilePollee<Platform>>()
-            .expect("a broker file belongs to one LiteBox")
-            .pollee
     }
 }
 
@@ -468,73 +248,215 @@ impl core::fmt::Display for ResolvedPath {
     }
 }
 
-/// Guest-side reference to a broker-owned file and the subsystem type for [`FileFd`].
+/// A reference to a broker-owned open file, which closes its handle when
+/// dropped.
 ///
-/// The broker object is closed when its last descriptor or in-flight operation releases its
-/// reference.
-pub struct BrokerFile {
+/// The broker owns the open file description, such as its offset and status
+/// flags, so every reference to it, in any process, shares them.
+pub struct File<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
-    /// The owning [`LiteBox`]'s [`FilePollee`], created when the file is first waited on or
-    /// polled.
-    pollee: spin::Once<Box<dyn Any + Send + Sync>>,
+    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
+    /// Waiters on the file, registered when the file is first waited on or
+    /// polled to receive the readiness the broker publishes for it.
+    pollee: spin::Once<Arc<Pollee<Platform>>>,
 }
 
-impl BrokerFile {
-    fn new(broker: Arc<dyn BrokerControl>, handle: ObjectHandle) -> Self {
+impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
+    fn new(
+        litebox: &LiteBox<Platform>,
+        broker: Arc<dyn BrokerControl>,
+        handle: ObjectHandle,
+    ) -> Self {
         Self {
             broker,
             handle,
+            pollable_registry: litebox.broker_pollable_registry(),
             pollee: spin::Once::new(),
         }
     }
 
-    /// Returns the broker file reference, which identifies its open file description.
+    /// The broker handle this file owns, which identifies its open file
+    /// description.
     pub(crate) fn handle(&self) -> ObjectHandle {
         self.handle
     }
-}
 
-impl Drop for BrokerFile {
-    fn drop(&mut self) {
-        // Stop receiving the file's readiness before the broker releases its handle.
-        drop(core::mem::replace(&mut self.pollee, spin::Once::new()));
-        let _ = self.broker.close_object(self.handle);
+    /// Reads from the file at `offset`, or at its offset if `offset` is
+    /// `None`, into `buf`.
+    ///
+    /// While the file has nothing to read, waits through `wait`, or fails with
+    /// [`ReadError::WouldBlock`] if `wait` is `None` or the file's status flags include
+    /// [`FileOpenFlags::NONBLOCKING`].
+    pub fn read(
+        &self,
+        buf: &mut [u8],
+        offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<usize, ReadError> {
+        let offset = offset
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| ReadError::Io)?;
+        self.wait(wait, Events::IN, || {
+            self.broker
+                .read_file(self.handle, buf, offset)?
+                .map_err(|error| TryOpError::Other(error.into()))
+        })
+        .map_err(ReadError::from)
+    }
+
+    /// Writes `buf` to the file at `offset`, or at its offset if `offset` is
+    /// `None`.
+    ///
+    /// While the file cannot accept bytes, waits through `wait`, or fails with
+    /// [`WriteError::WouldBlock`] if `wait` is `None` or the file's status flags include
+    /// [`FileOpenFlags::NONBLOCKING`]. Given `wait`, keeps writing until the whole buffer is
+    /// written or a failure or interruption follows partial progress, which then returns the bytes
+    /// written.
+    pub fn write(
+        &self,
+        buf: &[u8],
+        offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<usize, WriteError> {
+        let offset = offset
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| WriteError::Io)?;
+        let mut written = 0;
+        loop {
+            let rest = &buf[written..];
+            let offset = offset.map(|offset| offset.saturating_add(written as u64));
+            match self.wait(wait, Events::OUT, || {
+                self.broker
+                    .write_file(self.handle, rest, offset)?
+                    .map_err(|error| TryOpError::Other(error.into()))
+            }) {
+                Ok(count) => {
+                    written += count;
+                    if wait.is_none() || count == 0 || written == buf.len() {
+                        return Ok(written);
+                    }
+                }
+                Err(_) if written != 0 => return Ok(written),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Repositions the file's offset.
+    pub fn seek(&self, offset: isize, whence: SeekWhence) -> Result<usize, SeekError> {
+        let offset = i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?;
+        let offset = self.broker.seek_file(self.handle, offset, whence)??;
+        usize::try_from(offset).map_err(|_| SeekError::InvalidOffset)
+    }
+
+    /// Truncates the file to the specified length.
+    pub fn truncate(&self, length: usize, reset_offset: bool) -> Result<(), TruncateError> {
+        self.broker
+            .truncate_file(
+                self.handle,
+                u64::try_from(length).map_err(|_| TruncateError::Io)?,
+                reset_offset,
+            )?
+            .map_err(TruncateError::from)
+    }
+
+    /// Reads the entries of the directory this file opens.
+    pub fn read_directory(&self) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+        self.broker
+            .read_directory(self.handle)?
+            .map_err(ReadDirError::from)
+    }
+
+    /// Equivalent to [`LiteBox::path_file_status`], but on this open file.
+    pub fn status(&self) -> Result<FileStatus, FileStatusError> {
+        self.broker
+            .handle_file_status(self.handle)?
+            .map_err(FileStatusError::from)
+    }
+
+    /// Determines whether the file is connected to a terminal.
+    pub fn is_terminal(&self) -> Result<bool, IsTerminalError> {
+        self.broker
+            .is_terminal_file(self.handle)?
+            .map_err(|_| IsTerminalError::Io)
+    }
+
+    /// Returns the access mode and status flags of the file's open file description.
+    pub fn get_status_flags(&self) -> Result<FileStatusFlags, StatusFlagsError> {
+        Ok(self.broker.get_status_flags(self.handle)?)
+    }
+
+    /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`], of the file's open
+    /// file description to their values in `flags`.
+    ///
+    /// Every reference to the open file description, in any process, sees the change.
+    pub fn set_status_flags(
+        &self,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> Result<(), StatusFlagsError> {
+        Ok(self.broker.set_status_flags(self.handle, mask, flags)?)
+    }
+
+    /// Runs `try_op` once, or, given `wait`, until it stops returning [`TryOpError::TryAgain`],
+    /// waiting for `events` on the file in between.
+    fn wait<R, E>(
+        &self,
+        wait: Option<&WaitContext<'_, Platform>>,
+        events: Events,
+        mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+    ) -> Result<R, TryOpError<E>> {
+        let Some(cx) = wait else {
+            return try_op();
+        };
+        cx.wait_on_events(
+            false,
+            events,
+            |observer, filter| {
+                self.pollee().register_observer(observer, filter);
+                Ok(())
+            },
+            try_op,
+        )
+    }
+
+    /// Returns the file's pollee, registering it on first use to receive the file's broker
+    /// readiness.
+    fn pollee(&self) -> &Pollee<Platform> {
+        self.pollee.call_once(|| {
+            let pollee = Arc::new(Pollee::new());
+            self.pollable_registry
+                .register_pollable(self.handle, &pollee);
+            pollee
+        })
     }
 }
 
-/// Waiters on a broker file, registered to receive the readiness the broker publishes for it.
-struct FilePollee<Platform: sync::RawSyncPrimitivesProvider> {
-    registry: Arc<BrokerPollableRegistry<Platform>>,
-    handle: ObjectHandle,
-    pollee: Arc<Pollee<Platform>>,
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider> Drop for FilePollee<Platform> {
-    fn drop(&mut self) {
-        self.registry.unregister_pollable(self.handle);
-    }
-}
-
-struct BrokerFilePollable<'file, Platform: sync::RawSyncPrimitivesProvider> {
-    file: &'file BrokerFile,
-    pollee: &'file Pollee<Platform>,
-}
-
-impl<Platform> IOPollable for BrokerFilePollable<'_, Platform>
-where
-    Platform: sync::RawSyncPrimitivesProvider + TimeProvider,
-{
+impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable for File<Platform> {
     fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
-        self.pollee.register_observer(observer, mask);
+        self.pollee().register_observer(observer, mask);
     }
 
     fn check_io_events(&self) -> Events {
-        match self.file.broker.check_readiness(self.file.handle) {
+        match self.broker.check_readiness(self.handle) {
             Ok(readiness) => readiness_events(readiness),
+            // Files that never wait, such as regular files, have no readiness.
             Err(BrokerControlError::Broker(ErrorCode::InvalidRights)) => Events::OUT,
             Err(_) => Events::ERR,
         }
+    }
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> Drop for File<Platform> {
+    fn drop(&mut self) {
+        // Stop receiving the file's readiness before the broker releases its handle.
+        if self.pollee.get().is_some() {
+            self.pollable_registry.unregister_pollable(self.handle);
+        }
+        let _ = self.broker.close_object(self.handle);
     }
 }
 
@@ -801,10 +723,4 @@ impl From<FileError> for FileStatusError {
     fn from(error: FileError) -> Self {
         path_error(error).map_or(Self::Io, Into::into)
     }
-}
-
-crate::fd::enable_fds_for_subsystem! {
-    BrokerFile;
-    Arc<BrokerFile>;
-    -> FileFd;
 }

@@ -5,7 +5,7 @@
 
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
 
-use crate::syscalls::file::FilesState;
+use crate::syscalls::file::{FileSubsystem, FilesState};
 use crate::{GlobalState, ShimPlatform};
 
 impl<Platform: ShimPlatform> FilesState<Platform> {
@@ -45,7 +45,11 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             )
             .unwrap();
         let mut rds = self.raw_descriptor_store.write();
-        for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
+        for (raw_fd, file) in [(0, stdin), (1, stdout), (2, stderr)] {
+            let fd = global
+                .litebox
+                .descriptor_table_mut()
+                .insert::<FileSubsystem<Platform>>(file);
             let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
             assert!(success);
         }

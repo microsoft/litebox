@@ -29,9 +29,9 @@ use crate::{
         Events, IOPollable, counter::EventCounter, observer::Observer, polling::Pollee,
         polling::TryOpError, timer::Timer, wait::WaitContext,
     },
-    fs::{FileFd, errors::StatusFlagsError},
+    fs::{File, errors::StatusFlagsError},
     inet_socket::InetSocket,
-    pipes::PipeFd,
+    pipes::PipeEnd,
     process::ProcessError,
     sync::RawSyncPrimitivesProvider,
     unix_socket::UnixSocket,
@@ -45,8 +45,6 @@ pub enum ReadinessQueueError {
     AlreadyRegistered,
     #[error("the queue does not watch the target under this key")]
     NotRegistered,
-    #[error("the target's descriptor is closed")]
-    ClosedTarget,
     #[error("the target cannot be watched")]
     UnsupportedTarget,
     #[error("readiness queue operation would block")]
@@ -66,9 +64,9 @@ pub enum ReadinessQueueError {
 /// An object a [`ReadinessQueue`] can watch.
 pub enum ReadinessTarget<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// A file, which can be watched only if its reads or writes can block.
-    File(&'a FileFd),
+    File(&'a File<Platform>),
     /// A pipe end.
-    Pipe(&'a PipeFd<Platform>),
+    Pipe(&'a PipeEnd<Platform>),
     /// A Unix socket.
     UnixSocket(&'a UnixSocket<Platform>),
     /// An IPv4 socket.
@@ -162,13 +160,12 @@ where
     /// readiness.
     pub fn add(
         &self,
-        litebox: &LiteBox<Platform>,
         target: &ReadinessTarget<'_, Platform>,
         key: u64,
         interest: ReadinessInterest,
     ) -> Result<(), ReadinessQueueError> {
         let interest = broker_interest(interest);
-        with_target_handle(litebox, target, |target| {
+        with_target_handle(target, |target| {
             self.broker
                 .add_readiness_queue_entry(self.handle, target, key, interest)
         })
@@ -181,13 +178,12 @@ where
     /// watch `target` under `key`.
     pub fn modify(
         &self,
-        litebox: &LiteBox<Platform>,
         target: &ReadinessTarget<'_, Platform>,
         key: u64,
         interest: ReadinessInterest,
     ) -> Result<(), ReadinessQueueError> {
         let interest = broker_interest(interest);
-        with_target_handle(litebox, target, |target| {
+        with_target_handle(target, |target| {
             self.broker
                 .modify_readiness_queue_entry(self.handle, target, key, interest)
         })
@@ -199,11 +195,10 @@ where
     /// watch `target` under `key`.
     pub fn remove(
         &self,
-        litebox: &LiteBox<Platform>,
         target: &ReadinessTarget<'_, Platform>,
         key: u64,
     ) -> Result<(), ReadinessQueueError> {
-        with_target_handle(litebox, target, |target| {
+        with_target_handle(target, |target| {
             self.broker
                 .remove_readiness_queue_entry(self.handle, target, key)
         })
@@ -279,23 +274,12 @@ where
 /// Runs `request` with the broker handle of `target`, which stays open
 /// meanwhile.
 fn with_target_handle<Platform: RawSyncPrimitivesProvider + TimeProvider>(
-    litebox: &LiteBox<Platform>,
     target: &ReadinessTarget<'_, Platform>,
     request: impl FnOnce(ObjectHandle) -> Result<Result<(), EntryError>, BrokerControlError>,
 ) -> Result<(), ReadinessQueueError> {
     let result = match target {
-        ReadinessTarget::File(fd) => {
-            let file = litebox
-                .broker_file(fd)
-                .ok_or(ReadinessQueueError::ClosedTarget)?;
-            request(file.handle())
-        }
-        ReadinessTarget::Pipe(fd) => {
-            let pipe = litebox
-                .broker_pipe_end(fd)
-                .ok_or(ReadinessQueueError::ClosedTarget)?;
-            request(pipe.handle())
-        }
+        ReadinessTarget::File(file) => request(file.handle()),
+        ReadinessTarget::Pipe(pipe) => request(pipe.handle()),
         ReadinessTarget::UnixSocket(socket) => request(socket.handle()),
         ReadinessTarget::InetSocket(socket) => request(socket.handle()),
         ReadinessTarget::EventCounter(counter) => request(counter.handle()),

@@ -779,7 +779,7 @@ fn check_stdin(
         .expect("the clock is far from overflowing");
     let mut input = [0u8; 256];
     let len = loop {
-        match litebox.read_file(&stdin, &mut input, None, None) {
+        match stdin.read(&mut input, None, None) {
             Ok(len) => break len,
             Err(ReadError::WouldBlock) => {
                 let dispatch = litebox.broker_notification_dispatcher();
@@ -792,20 +792,18 @@ fn check_stdin(
             Err(error) => panic!("reading standard input: {error:?}"),
         }
     };
-    litebox.close_file(&stdin).expect("closing standard input");
+    drop(stdin);
     if len == 0 {
         log::debug!("stdin check: no input within {WAIT_MS} ms");
         return;
     }
     let stdout = open("/dev/stdout", FileAccessMode::WriteOnly);
     for bytes in [&b"[stdin] "[..], &input[..len]] {
-        litebox
-            .write_file(&stdout, bytes, None, None)
+        stdout
+            .write(bytes, None, None)
             .expect("writing standard output");
     }
-    litebox
-        .close_file(&stdout)
-        .expect("closing standard output");
+    drop(stdout);
     log::info!("stdin check: echoed {len} bytes");
 }
 

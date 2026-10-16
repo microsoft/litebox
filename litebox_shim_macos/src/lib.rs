@@ -95,9 +95,9 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
     }
 
     /// Transfer a LiteBox file into the guest's descriptor namespace.
-    /// `fd` must belong to this builder's LiteBox instance.
-    pub fn inherit_file(&mut self, fd: litebox::fs::FileFd) -> Result<u32, Errno> {
-        self.files.insert_file(fd)
+    /// `file` must belong to this builder's LiteBox instance.
+    pub fn inherit_file(&mut self, file: litebox::fs::File<P>) -> Result<u32, Errno> {
+        self.files.insert_file(file)
     }
 
     pub fn build(self) -> MacosShim<P> {

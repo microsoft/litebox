@@ -56,21 +56,21 @@ use crate::nt_types::{
     read_unicode_string_at,
 };
 
-impl FdEnabledSubsystem for RegistryKeyObject {
+impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for RegistryKeyObject<Platform> {
     type Entry = Self;
 }
 
-impl FdEnabledSubsystemEntry for RegistryKeyObject {}
+impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for RegistryKeyObject<Platform> {}
 
-impl crate::WindowsHandleSubsystem for RegistryKeyObject {
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for RegistryKeyObject<Platform> {
     fn normalize_desired_access(desired_access: u32) -> u32 {
         RegistryKeyAccess::from_desired_access(desired_access).bits()
     }
 }
 
-pub(crate) struct RegistryKeyObject {
+pub(crate) struct RegistryKeyObject<Platform: crate::ShimPlatform> {
     path: String,
-    fd: litebox::fs::FileFd,
+    fd: litebox::fs::File<Platform>,
 }
 
 pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
@@ -632,7 +632,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         &self,
         path: &str,
         desired_access: RegistryKeyAccess,
-    ) -> Result<litebox::fs::FileFd, NtStatus> {
+    ) -> Result<litebox::fs::File<Platform>, NtStatus> {
         let (access, flags) = desired_access.open_flags();
         match self
             .fs()
@@ -691,9 +691,8 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-        let result = read_exact_at(self.fs(), &fd, &mut data);
-        let _ = self.fs().close_file(&fd);
-        result?;
+        read_exact_at(&fd, &mut data)?;
+        drop(fd);
 
         let value_type = u32::from_le_bytes(
             data[..REGISTRY_VALUE_TYPE_SIZE]
@@ -783,7 +782,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         self.notification_pollee.notify_observers(Events::IN);
     }
 
-    fn key_summary(&self, key: &RegistryKeyObject) -> Result<KeySummary, NtStatus> {
+    fn key_summary(&self, key: &RegistryKeyObject<Platform>) -> Result<KeySummary, NtStatus> {
         let mut summary = KeySummary::default();
         for entry in self
             .fs()
@@ -809,7 +808,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .fs()
             .read_file_directory(&self.fs_context, &values_path, &values_fd)
             .map_err(map_read_dir_error);
-        let _ = self.fs().close_file(&values_fd);
+        drop(values_fd);
         for entry in values? {
             if entry.file_type != FileType::RegularFile {
                 continue;
@@ -837,7 +836,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     fn open_values_directory(
         &self,
         key_path: &str,
-    ) -> Result<Option<(String, litebox::fs::FileFd)>, NtStatus> {
+    ) -> Result<Option<(String, litebox::fs::File<Platform>)>, NtStatus> {
         let values_path = values_directory_path(key_path);
         match self.fs().open_file(
             &self.fs_context,
@@ -862,7 +861,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     /// subkey names are sorted before indexing.
     fn nth_subkey_name(
         &self,
-        key: &RegistryKeyObject,
+        key: &RegistryKeyObject<Platform>,
         index: u32,
     ) -> Result<Option<String>, NtStatus> {
         let mut names = Vec::new();
@@ -884,7 +883,11 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     }
 
     /// Computes a [`KeySummary`] for the named direct subkey of `key`.
-    fn subkey_summary(&self, key: &RegistryKeyObject, name: &str) -> Result<KeySummary, NtStatus> {
+    fn subkey_summary(
+        &self,
+        key: &RegistryKeyObject<Platform>,
+        name: &str,
+    ) -> Result<KeySummary, NtStatus> {
         let child_path = format!("{}/{}", key.path.trim_end_matches('/'), name);
         let child_fd = self
             .fs()
@@ -900,9 +903,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             path: child_path,
             fd: child_fd,
         };
-        let summary = self.key_summary(&child);
-        let _ = self.fs().close_file(&child.fd);
-        summary
+        self.key_summary(&child)
     }
 
     /// Returns the deterministically-ordered name of the `index`-th value of
@@ -913,7 +914,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     /// files under the key's `.values` directory) are sorted before indexing.
     fn nth_value_name(
         &self,
-        key: &RegistryKeyObject,
+        key: &RegistryKeyObject<Platform>,
         index: u32,
     ) -> Result<Option<String>, NtStatus> {
         let Some((values_path, values_fd)) = self.open_values_directory(&key.path)? else {
@@ -923,7 +924,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .fs()
             .read_file_directory(&self.fs_context, &values_path, &values_fd)
             .map_err(map_read_dir_error);
-        let _ = self.fs().close_file(&values_fd);
+        drop(values_fd);
         let mut names = Vec::new();
         for entry in entries? {
             if entry.file_type == FileType::RegularFile {
@@ -1108,8 +1109,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn registry_key_entry(
         &self,
         handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, RegistryKeyObject>, NtStatus> {
-        raw_handle_entry::<Platform, RegistryKeyObject>(
+    ) -> Result<litebox::fd::EntryHandle<Platform, RegistryKeyObject<Platform>>, NtStatus> {
+        raw_handle_entry::<Platform, RegistryKeyObject<Platform>>(
             &self.global.litebox,
             &self.process.handles,
             handle,
@@ -1119,22 +1120,22 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
 
     fn insert_registry_key_handle(
         &self,
-        key: RegistryKeyObject,
+        key: RegistryKeyObject<Platform>,
         granted_access: RegistryKeyAccess,
     ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<RegistryKeyObject>(key, granted_access.bits(), |key| {
-            self.close_registry_key(key);
+        self.insert_typed_handle::<RegistryKeyObject<Platform>>(key, granted_access.bits(), |key| {
+            Self::close_registry_key(key);
         })
     }
 
     pub(crate) fn close_registry_key_handle(&self, handle: Handle) {
-        self.close_typed_handle::<RegistryKeyObject>(handle, |key| {
-            self.close_registry_key(key);
+        self.close_typed_handle::<RegistryKeyObject<Platform>>(handle, |key| {
+            Self::close_registry_key(key);
         });
     }
 
-    pub(crate) fn close_registry_key(&self, key: RegistryKeyObject) {
-        let _ = self.global.registry.fs().close_file(&key.fd);
+    pub(crate) fn close_registry_key(key: RegistryKeyObject<Platform>) {
+        drop(key);
     }
 
     pub(crate) fn sys_nt_open_key(
@@ -1425,7 +1426,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        let key = self.typed_handle_entry_with_access::<RegistryKeyObject>(
+        let key = self.typed_handle_entry_with_access::<RegistryKeyObject<Platform>>(
             key_handle,
             RegistryKeyAccess::QUERY_VALUE.bits(),
         )?;
@@ -1471,7 +1472,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         data: Option<ConstPtr<Platform, u8>>,
         data_size: u32,
     ) -> NtStatus {
-        let key = match self.typed_handle_entry_with_access::<RegistryKeyObject>(
+        let key = match self.typed_handle_entry_with_access::<RegistryKeyObject<Platform>>(
             key_handle,
             RegistryKeyAccess::SET_VALUE.bits(),
         ) {
@@ -1517,7 +1518,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         &self,
         params: NtNotifyChangeKeyRequest<Platform>,
     ) -> NtStatus {
-        let key = match self.typed_handle_entry_with_access::<RegistryKeyObject>(
+        let key = match self.typed_handle_entry_with_access::<RegistryKeyObject<Platform>>(
             params.key_handle,
             RegistryKeyAccess::NOTIFY.bits(),
         ) {
@@ -1683,9 +1684,9 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
     ) -> Result<(), NtStatus> {
         let key = if key_information_class == KeyInformationClass::Name {
             // Windows permits KeyNameInformation with any nonzero granted access.
-            self.typed_handle_entry_with_any_access::<RegistryKeyObject>(key_handle)?
+            self.typed_handle_entry_with_any_access::<RegistryKeyObject<Platform>>(key_handle)?
         } else {
-            self.typed_handle_entry_with_access::<RegistryKeyObject>(
+            self.typed_handle_entry_with_access::<RegistryKeyObject<Platform>>(
                 key_handle,
                 RegistryKeyAccess::QUERY_VALUE.bits(),
             )?
@@ -1906,7 +1907,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        let key = self.typed_handle_entry_with_access::<RegistryKeyObject>(
+        let key = self.typed_handle_entry_with_access::<RegistryKeyObject<Platform>>(
             key_handle,
             RegistryKeyAccess::ENUMERATE_SUB_KEYS.bits(),
         )?;
@@ -2016,7 +2017,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        let key = self.typed_handle_entry_with_access::<RegistryKeyObject>(
+        let key = self.typed_handle_entry_with_access::<RegistryKeyObject<Platform>>(
             key_handle,
             RegistryKeyAccess::QUERY_VALUE.bits(),
         )?;
@@ -2322,24 +2323,17 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
             Mode::RUSR | Mode::WUSR | Mode::ROTH | Mode::WOTH,
         )
         .map_err(map_open_error)?;
-    let result = (|| {
-        write_all_at(fs, &fd, &value_type.to_le_bytes(), 0)?;
-        write_all_at(fs, &fd, value, REGISTRY_VALUE_TYPE_SIZE)
-    })();
-    let _ = fs.close_file(&fd);
-    result
+    write_all_at(&fd, &value_type.to_le_bytes(), 0)?;
+    write_all_at(&fd, value, REGISTRY_VALUE_TYPE_SIZE)
 }
 
 fn read_exact_at<Platform: crate::ShimPlatform>(
-    fs: &Fs<Platform>,
-    fd: &litebox::fs::FileFd,
+    fd: &litebox::fs::File<Platform>,
     mut data: &mut [u8],
 ) -> Result<(), NtStatus> {
     let mut offset = 0;
     while !data.is_empty() {
-        let read = fs
-            .read_file(fd, data, Some(offset), None)
-            .map_err(map_read_error)?;
+        let read = fd.read(data, Some(offset), None).map_err(map_read_error)?;
         if read == 0 {
             return Err(NtStatus::UNSUCCESSFUL);
         }
@@ -2350,14 +2344,13 @@ fn read_exact_at<Platform: crate::ShimPlatform>(
 }
 
 fn write_all_at<Platform: crate::ShimPlatform>(
-    fs: &Fs<Platform>,
-    fd: &litebox::fs::FileFd,
+    fd: &litebox::fs::File<Platform>,
     mut data: &[u8],
     mut offset: usize,
 ) -> Result<(), NtStatus> {
     while !data.is_empty() {
-        let written = fs
-            .write_file(fd, data, Some(offset), None)
+        let written = fd
+            .write(data, Some(offset), None)
             .map_err(map_write_error)?;
         if written == 0 {
             return Err(NtStatus::DISK_FULL);

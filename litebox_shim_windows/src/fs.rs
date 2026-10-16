@@ -8,16 +8,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use litebox::LiteBox;
-use litebox::event::wait::WaitContext;
 #[cfg(test)]
 use litebox::fs::errors::ChmodError;
 use litebox::fs::errors::{
-    CloseError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-    RmdirError, SeekError, UnlinkError, WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, RmdirError, UnlinkError,
 };
-use litebox::fs::{Context, FileFd};
+use litebox::fs::{Context, File};
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags, FileSeekWhence, FileStatus,
+    FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags, FileStatus,
 };
 
 /// Broker filesystem subtree reserved for registry storage.
@@ -81,52 +79,19 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
-    ) -> Result<FileFd, OpenError> {
+    ) -> Result<File<Platform>, OpenError> {
         let path = self.resolve_path(context, path)?;
         self.litebox
             .open_file(context, path.as_str(), access, flags, mode)
-    }
-
-    pub(crate) fn close_file(&self, fd: &FileFd) -> Result<(), CloseError> {
-        self.litebox.close_file(fd)
-    }
-
-    pub(crate) fn read_file(
-        &self,
-        fd: &FileFd,
-        buf: &mut [u8],
-        offset: Option<usize>,
-        wait: Option<&WaitContext<'_, Platform>>,
-    ) -> Result<usize, ReadError> {
-        self.litebox.read_file(fd, buf, offset, wait)
-    }
-
-    pub(crate) fn write_file(
-        &self,
-        fd: &FileFd,
-        buf: &[u8],
-        offset: Option<usize>,
-        wait: Option<&WaitContext<'_, Platform>>,
-    ) -> Result<usize, WriteError> {
-        self.litebox.write_file(fd, buf, offset, wait)
-    }
-
-    pub(crate) fn seek_file(
-        &self,
-        fd: &FileFd,
-        offset: isize,
-        whence: FileSeekWhence,
-    ) -> Result<usize, SeekError> {
-        self.litebox.seek_file(fd, offset, whence)
     }
 
     pub(crate) fn read_file_directory(
         &self,
         context: &Context,
         directory_path: &str,
-        fd: &FileFd,
+        file: &File<Platform>,
     ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
-        let mut entries = self.litebox.read_file_directory(fd)?;
+        let mut entries = file.read_directory()?;
         if self.namespace.hides_registry_entry(context, directory_path) {
             entries.retain(|entry| {
                 !entry
@@ -144,10 +109,6 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
     ) -> Result<FileStatus, FileStatusError> {
         let path = self.resolve_path(context, path)?;
         self.litebox.path_file_status(context, path.as_str())
-    }
-
-    pub(crate) fn file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
-        self.litebox.file_status(fd)
     }
 
     #[cfg(test)]

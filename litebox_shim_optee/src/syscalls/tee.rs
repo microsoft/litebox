@@ -65,11 +65,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         if let Some(file) = &self.global.log_file {
             let mut written = 0;
             while written < buf.len() {
-                match self
-                    .global
-                    .litebox
-                    .write_file(file, &buf[written..], None, None)
-                {
+                match file.write(&buf[written..], None, None) {
                     Ok(n) if n != 0 => written += n,
                     _ => break,
                 }

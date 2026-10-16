@@ -149,15 +149,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         }
     }
 
-    /// An explicitly-crate-internal clone method to prevent outside users from cloning the
-    /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
-    /// only create it via [`Self::new`].
-    pub(crate) fn clone(&self) -> Self {
-        Self {
-            x: Arc::clone(&self.x),
-        }
-    }
-
     /// Access to the file descriptor table.
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent

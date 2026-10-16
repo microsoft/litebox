@@ -148,7 +148,6 @@ impl From<litebox::process::ProcessError> for Errno {
             litebox::process::ProcessError::OutOfMemory => Errno::ENOMEM,
             litebox::process::ProcessError::ServiceFailed
             | litebox::process::ProcessError::InvalidChild => Errno::EIO,
-            litebox::process::ProcessError::ClosedDescriptor => Errno::EBADF,
             litebox::process::ProcessError::NoSuchProcess => Errno::ESRCH,
         }
     }
@@ -203,15 +202,6 @@ impl From<litebox::fs::errors::RmdirError> for Errno {
             litebox::fs::errors::RmdirError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::RmdirError::Io => Errno::EIO,
             litebox::fs::errors::RmdirError::PathError(path_error) => path_error.into(),
-            _ => unimplemented!(),
-        }
-    }
-}
-
-impl From<litebox::fs::errors::CloseError> for Errno {
-    fn from(value: litebox::fs::errors::CloseError) -> Self {
-        #[expect(clippy::match_single_binding)]
-        match value {
             _ => unimplemented!(),
         }
     }
@@ -651,7 +641,6 @@ impl From<litebox::event::readiness_queue::ReadinessQueueError> for Errno {
         match value {
             ReadinessQueueError::AlreadyRegistered => Errno::EEXIST,
             ReadinessQueueError::NotRegistered => Errno::ENOENT,
-            ReadinessQueueError::ClosedTarget => Errno::EBADF,
             ReadinessQueueError::UnsupportedTarget | ReadinessQueueError::PermissionDenied => {
                 Errno::EPERM
             }
@@ -690,8 +679,7 @@ impl From<litebox::sync::futex::FutexError> for Errno {
 impl From<litebox::pipes::errors::ReadError> for Errno {
     fn from(value: litebox::pipes::errors::ReadError) -> Self {
         match value {
-            litebox::pipes::errors::ReadError::ClosedFd
-            | litebox::pipes::errors::ReadError::NotForReading => Errno::EBADF,
+            litebox::pipes::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::pipes::errors::ReadError::WouldBlock => Errno::EWOULDBLOCK,
             litebox::pipes::errors::ReadError::WaitError(e) => match e {
                 litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,
@@ -706,7 +694,6 @@ impl From<litebox::pipes::errors::ReadError> for Errno {
 impl From<litebox::pipes::errors::WriteError> for Errno {
     fn from(value: litebox::pipes::errors::WriteError) -> Self {
         match value {
-            litebox::pipes::errors::WriteError::ClosedFd => Errno::EBADF,
             litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
             litebox::pipes::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::pipes::errors::WriteError::WouldBlock => Errno::EWOULDBLOCK,
@@ -729,12 +716,6 @@ impl From<litebox::pipes::errors::CreateError> for Errno {
             litebox::pipes::errors::CreateError::Io => Errno::EIO,
             _ => todo!(),
         }
-    }
-}
-
-impl From<litebox::pipes::errors::CloseError> for Errno {
-    fn from(_value: litebox::pipes::errors::CloseError) -> Self {
-        todo!()
     }
 }
 
@@ -784,14 +765,6 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
     }
 }
 
-impl From<litebox::pipes::errors::ClosedError> for Errno {
-    fn from(value: litebox::pipes::errors::ClosedError) -> Self {
-        match value {
-            litebox::pipes::errors::ClosedError::ClosedFd => Errno::EBADF,
-        }
-    }
-}
-
 impl From<litebox::fs::errors::TruncateError> for Errno {
     fn from(value: litebox::fs::errors::TruncateError) -> Self {
         match value {
@@ -835,7 +808,6 @@ mod tests {
             (ProcessError::OutOfMemory, Errno::ENOMEM),
             (ProcessError::ServiceFailed, Errno::EIO),
             (ProcessError::InvalidChild, Errno::EIO),
-            (ProcessError::ClosedDescriptor, Errno::EBADF),
             (ProcessError::NoSuchProcess, Errno::ESRCH),
         ];
 

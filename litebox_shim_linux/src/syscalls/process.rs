@@ -1214,9 +1214,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         self.write_fork_image(&child, &startup.regions)?;
-        let handles = child
-            .inherit(&self.global.litebox, &objects)
-            .map_err(Errno::from)?;
+        let handles = child.inherit(&objects).map_err(Errno::from)?;
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
@@ -2602,18 +2600,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 litebox_broker_protocol::fs::FileMode::empty(),
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
-            let n = match self
-                .global
-                .litebox
-                .read_file(&file, &mut header, Some(0), None)
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = self.global.litebox.close_file(&file);
-                    return Err(Errno::from(e));
-                }
-            };
-            let _ = self.global.litebox.close_file(&file);
+            let n = file.read(&mut header, Some(0), None)?;
+            drop(file);
 
             match parse_shebang(&header[..n]) {
                 Some((interp, opt_arg)) => {
@@ -2676,9 +2664,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         startup.encode().map_err(|_| Errno::E2BIG)?;
         let vfork = self.vfork.borrow();
         let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
-        let handles = child
-            .inherit(&self.global.litebox, &fds)
-            .map_err(Errno::from)?;
+        let handles = child.inherit(&fds).map_err(Errno::from)?;
         for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
             inherited.handle = handle;
         }

@@ -190,7 +190,7 @@ pub struct OpteeShimBuilder<Platform: OpteeShimPlatform> {
     session_manager: &'static session::SessionManager<Platform>,
     litebox: LiteBox<Platform>,
     ta_signing_cert: &'static [u8],
-    log_file: Option<litebox::fs::FileFd>,
+    log_file: Option<litebox::fs::File<Platform>>,
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
@@ -230,7 +230,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
     /// the log: a file of [`Self::litebox`], such as the broker's
     /// `/dev/stdout`. Messages the file does not take are logged.
     #[must_use]
-    pub fn with_log_file(mut self, log_file: litebox::fs::FileFd) -> Self {
+    pub fn with_log_file(mut self, log_file: litebox::fs::File<Platform>) -> Self {
         self.log_file = Some(log_file);
         self
     }
@@ -298,7 +298,7 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// instead of serialize; revisit if a PTA needs true serialization.
     pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
     /// See [`OpteeShimBuilder::with_log_file`].
-    log_file: Option<litebox::fs::FileFd>,
+    log_file: Option<litebox::fs::File<Platform>>,
     /// Keeps the TA page table alive; declared last to drop after all other shim state.
     // TODO: Replace type erasure with a typed platform page-table handle.
     page_table_keepalive: Option<Box<dyn Send + Sync>>,

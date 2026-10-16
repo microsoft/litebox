@@ -7,11 +7,8 @@ use crate::{ShimPlatform, Task};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use litebox::{
     LiteBox,
-    fd::RawDescriptorStorage,
-    fs::{
-        BrokerFile, FileFd,
-        errors::{FileStatusError, OpenError, PathError, ReadError, TruncateError, WriteError},
-    },
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, RawDescriptorStorage, TypedFd},
+    fs::errors::{FileStatusError, OpenError, PathError, ReadError, TruncateError, WriteError},
     sync::RwLock,
 };
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
@@ -20,6 +17,28 @@ use litebox_common_macos::{
 };
 
 const MAX_FDS: usize = 1024;
+
+pub(crate) struct FileSubsystem<P: ShimPlatform>(core::marker::PhantomData<P>);
+impl<P: ShimPlatform> FdEnabledSubsystem for FileSubsystem<P> {
+    type Entry = File<P>;
+}
+
+impl<P: ShimPlatform> FdEnabledSubsystemEntry for File<P> {}
+
+pub(crate) type FileFd<P> = TypedFd<FileSubsystem<P>>;
+
+/// A file descriptor's open file description.
+pub(crate) struct File<P: ShimPlatform> {
+    file: Arc<litebox::fs::File<P>>,
+}
+
+impl<P: ShimPlatform> From<litebox::fs::File<P>> for File<P> {
+    fn from(file: litebox::fs::File<P>) -> Self {
+        Self {
+            file: Arc::new(file),
+        }
+    }
+}
 
 pub(crate) struct FilesState<P: ShimPlatform> {
     litebox: Arc<LiteBox<P>>,
@@ -34,35 +53,57 @@ impl<P: ShimPlatform> FilesState<P> {
         }
     }
 
-    pub(crate) fn insert_file(&self, fd: FileFd) -> Result<u32, Errno> {
+    pub(crate) fn insert_file(&self, file: litebox::fs::File<P>) -> Result<u32, Errno> {
+        let fd = self
+            .litebox
+            .descriptor_table_mut()
+            .insert::<FileSubsystem<P>>(file);
+        self.insert_fd(fd)
+    }
+
+    fn insert_fd(&self, fd: FileFd<P>) -> Result<u32, Errno> {
         let mut raw = self.raw.write();
         if raw.iter_alive().count() >= MAX_FDS {
             drop(raw);
-            if let Err(error) = self.litebox.close_file(&fd) {
-                litebox_util_log::warn!(error:? = error; "failed to close unpublished descriptor");
-            }
+            self.remove(&fd);
             return Err(Errno::EMFILE);
         }
         Ok(u32::try_from(raw.fd_into_raw_integer(fd)).expect("fd bounded by MAX_FDS"))
     }
 
-    pub(crate) fn typed_fd(&self, fd: i32) -> Result<Arc<FileFd>, Errno> {
+    pub(crate) fn typed_fd(&self, fd: i32) -> Result<Arc<FileFd<P>>, Errno> {
         self.raw
             .read()
-            .fd_from_raw_integer::<BrokerFile>(usize::try_from(fd).map_err(|_| Errno::EBADF)?)
+            .fd_from_raw_integer::<FileSubsystem<P>>(usize::try_from(fd).map_err(|_| Errno::EBADF)?)
             .map_err(|_| Errno::EBADF)
     }
 
-    fn consume(&self, fd: usize) -> Result<Arc<FileFd>, Errno> {
+    /// Returns the file at `fd`, without holding the descriptor table.
+    pub(crate) fn file(&self, fd: &FileFd<P>) -> Result<Arc<litebox::fs::File<P>>, Errno> {
+        self.litebox
+            .descriptor_table()
+            .with_entry(fd, |file| Arc::clone(&file.file))
+            .ok_or(Errno::EBADF)
+    }
+
+    fn consume(&self, fd: usize) -> Result<Arc<FileFd<P>>, Errno> {
         self.raw
             .write()
-            .fd_consume_raw_integer::<BrokerFile>(fd)
+            .fd_consume_raw_integer::<FileSubsystem<P>>(fd)
             .map_err(|_| Errno::EBADF)
+    }
+
+    /// Removes `fd` from the descriptor table, dropping its file once no duplicate refers to it.
+    fn remove(&self, fd: &FileFd<P>) {
+        let entry = self.litebox.descriptor_table_mut().remove(fd);
+        // Drop the file without holding the descriptor table.
+        drop(entry);
     }
 
     pub(crate) fn close(&self, fd: i32) -> Result<(), Errno> {
         let fd = self.consume(usize::try_from(fd).map_err(|_| Errno::EBADF)?)?;
-        self.litebox.close_file(&fd).map_err(|_| Errno::EIO)
+        self.remove(&fd);
+        Ok(())
     }
 
     pub(crate) fn dup(&self, fd: i32) -> Result<u32, Errno> {
@@ -72,7 +113,7 @@ impl<P: ShimPlatform> FilesState<P> {
             .descriptor_table_mut()
             .duplicate(&fd)
             .ok_or(Errno::EBADF)?;
-        self.insert_file(duplicate)
+        self.insert_fd(duplicate)
     }
 }
 
@@ -80,10 +121,8 @@ impl<P: ShimPlatform> Drop for FilesState<P> {
     fn drop(&mut self) {
         let alive: Vec<_> = self.raw.read().iter_alive().collect();
         for raw in alive {
-            if let Ok(fd) = self.consume(raw)
-                && let Err(error) = self.litebox.close_file(&fd)
-            {
-                litebox_util_log::warn!(error:? = error; "failed to close guest descriptor");
+            if let Ok(fd) = self.consume(raw) {
+                self.remove(&fd);
             }
         }
     }
@@ -163,16 +202,15 @@ impl<P: ShimPlatform> Task<P> {
             .litebox
             .open_file(&context, path, access, open_flags, mode)
             .map_err(open_error)?;
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
+        let fd = descriptors.insert::<FileSubsystem<P>>(file);
         if flags.contains(OpenFlags::CLOEXEC) {
             // TODO: honor FD_CLOEXEC when macOS exec is implemented.
-            let old = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
+            let old = descriptors.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        Ok(u32::try_from(raw.fd_into_raw_integer(file)).expect("fd bounded by MAX_FDS"))
+        drop(descriptors);
+        Ok(u32::try_from(raw.fd_into_raw_integer(fd)).expect("fd bounded by MAX_FDS"))
     }
 
     pub(crate) fn read_path(path: UserPtr<core::ffi::c_char>) -> Result<String, Errno> {
@@ -199,14 +237,14 @@ impl<P: ShimPlatform> Task<P> {
     /// and advance the shared offset when `offset` is `None`.
     pub(crate) fn do_read(
         &self,
-        fd: &FileFd,
+        fd: &FileFd<P>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         let size = self
-            .global
-            .litebox
-            .read_file(fd, buf, offset, Some(&self.wait_cx()))
+            .files
+            .file(fd)?
+            .read(buf, offset, Some(&self.wait_cx()))
             .map_err(read_error)?;
         if size > buf.len() {
             return Err(Errno::EIO);
@@ -214,11 +252,11 @@ impl<P: ShimPlatform> Task<P> {
         Ok(size)
     }
 
-    pub(crate) fn do_write(&self, fd: &FileFd, buf: &[u8]) -> Result<usize, Errno> {
+    pub(crate) fn do_write(&self, fd: &FileFd<P>, buf: &[u8]) -> Result<usize, Errno> {
         let size = self
-            .global
-            .litebox
-            .write_file(fd, buf, None, Some(&self.wait_cx()))
+            .files
+            .file(fd)?
+            .write(buf, None, Some(&self.wait_cx()))
             .map_err(write_error)?;
         if size > buf.len() {
             return Err(Errno::EIO);
@@ -416,14 +454,13 @@ mod tests {
         for number in [nr::READ, nr::READ_NOCANCEL, nr::WRITE, nr::WRITE_NOCANCEL] {
             for count in [max_count + 1, usize::MAX] {
                 assert_eq!(invoke(number, 0, count), Err(Errno::EINVAL));
+                let file = task.files.file(&source).unwrap();
                 assert_eq!(
-                    task.global
-                        .litebox
-                        .seek_file(&source, 0, FileSeekWhence::RelativeToCurrentOffset)
+                    file.seek(0, FileSeekWhence::RelativeToCurrentOffset)
                         .unwrap(),
                     0
                 );
-                assert_eq!(task.global.litebox.file_status(&source).unwrap().size, 6);
+                assert_eq!(file.status().unwrap().size, 6);
                 assert_eq!(&*buf.to_owned_slice(untouched.len()).unwrap(), &untouched);
             }
         }
@@ -433,14 +470,7 @@ mod tests {
         assert_eq!(invoke(nr::CLOSE, 0, 0), Ok(0));
         assert_eq!(invoke(nr::READ, 0, 2), Err(Errno::EBADF));
         assert_eq!(task.do_read(&source, &mut [0; 2], None), Err(Errno::EBADF));
-        assert_eq!(
-            task.global
-                .litebox
-                .file_status(&source)
-                .map_err(file_status_error)
-                .unwrap_err(),
-            Errno::EBADF
-        );
+        assert_eq!(task.files.file(&source).err(), Some(Errno::EBADF));
         assert_eq!(invoke(nr::READ, 2, 2), Ok(2));
         assert_eq!(&*buf.to_owned_slice(2).unwrap(), b"cd");
         buf.copy_from_slice(0, b"XY").unwrap();
@@ -486,14 +516,15 @@ mod tests {
         );
         assert_eq!(invoke(nr::CLOSE, duplicate, 0), Ok(0));
         let status = task
-            .global
-            .litebox
-            .file_status(
+            .files
+            .file(
                 &task
                     .files
                     .typed_fd(i32::try_from(created).unwrap())
                     .unwrap(),
             )
+            .unwrap()
+            .status()
             .unwrap();
         assert_eq!(status.mode, FileMode::from_u32_bits_truncate(0o644));
         assert_eq!(
@@ -604,14 +635,10 @@ mod tests {
         );
         let mut contents = [0; 6];
         assert_eq!(
-            task.global
-                .litebox
-                .read_file(
-                    &task.files.typed_fd(1).unwrap(),
-                    &mut contents,
-                    Some(0),
-                    None
-                )
+            task.files
+                .file(&task.files.typed_fd(1).unwrap())
+                .unwrap()
+                .read(&mut contents, Some(0), None)
                 .unwrap(),
             6
         );

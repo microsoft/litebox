@@ -53,9 +53,9 @@ fn read_image<P: ShimPlatform>(task: &Task<P>, path: &str) -> Result<Vec<u8>, Ma
     };
     let fd = task.files.typed_fd(file.fd)?;
     let status = task
-        .global
-        .litebox
-        .file_status(&fd)
+        .files
+        .file(&fd)?
+        .status()
         .map_err(crate::syscalls::file::file_status_error)?;
     let size =
         usize::try_from(status.size).map_err(|_| MachoLoaderError::Unsupported("file size"))?;

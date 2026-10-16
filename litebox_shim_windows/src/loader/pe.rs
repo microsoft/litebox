@@ -1000,8 +1000,8 @@ pub(crate) fn image_section_metadata<Platform: crate::ShimPlatform>(
     let file = PeImageFile::open(fs, path)?;
     let parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
     let file_size = file
-        .fs
-        .file_status(&file.fd)
+        .file
+        .status()
         .map_err(PeImageAccessError::FileStatus)?
         .size;
     Ok(ImageSectionMetadata {
@@ -1131,20 +1131,19 @@ fn is_missing_file_error(error: &WindowsLoadError) -> bool {
 }
 
 struct PeImageFile<Platform: crate::ShimPlatform> {
-    fs: Arc<crate::fs::Fs<Platform>>,
-    fd: litebox::fs::FileFd,
+    file: litebox::fs::File<Platform>,
 }
 
 impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
     fn open(fs: Arc<crate::fs::Fs<Platform>>, path: &str) -> Result<Self, PeImageAccessError> {
-        let fd = fs.open_file(
+        let file = fs.open_file(
             &litebox::fs::Context::new(),
             path,
             FileAccessMode::ReadOnly,
             FileOpenFlags::NONE,
             Mode::empty(),
         )?;
-        Ok(Self { fs, fd })
+        Ok(Self { file })
     }
 
     fn read_exact_at(
@@ -1153,7 +1152,7 @@ impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
         mut buf: &mut [u8],
     ) -> Result<(), PeImageAccessError> {
         while !buf.is_empty() {
-            let bytes_read = self.fs.read_file(&self.fd, buf, Some(offset), None)?;
+            let bytes_read = self.file.read(buf, Some(offset), None)?;
             if bytes_read == 0 {
                 return Err(PeImageAccessError::ShortRead);
             }
@@ -1163,14 +1162,6 @@ impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
             buf = &mut buf[bytes_read..];
         }
         Ok(())
-    }
-}
-
-impl<Platform: crate::ShimPlatform> Drop for PeImageFile<Platform> {
-    fn drop(&mut self) {
-        if let Err(e) = self.fs.close_file(&self.fd) {
-            litebox_util_log::warn!(error:? = e; "failed to close PE image file");
-        }
     }
 }
 
@@ -1187,7 +1178,7 @@ impl<Platform: crate::ShimPlatform> ReadAt for &'_ PeImageFile<Platform> {
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.fs.file_status(&self.fd)?.size)
+        Ok(self.file.status()?.size)
     }
 }
 
