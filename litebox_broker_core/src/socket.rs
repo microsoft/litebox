@@ -949,13 +949,17 @@ fn transport_connect(
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
+        // Another connect may have changed the state since the caller checked it.
+        if socket.listening || socket.connect_reported {
+            return Ok(SocketOutcome::Failed(SocketError::AlreadyConnected));
+        }
+        if socket.view() == SocketConnectionStatus::Connecting {
+            return Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress));
+        }
         if socket.resource_retired {
             return Ok(SocketOutcome::Completed(socket.connection_status));
         }
-        if socket.connect_in_flight {
-            return Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting));
-        }
-        if socket.configuration_in_flight || socket.listening {
+        if socket.configuration_in_flight {
             return Ok(SocketOutcome::Failed(SocketError::Other));
         }
         if socket.connection_status != SocketConnectionStatus::Unconnected {

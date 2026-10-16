@@ -2090,6 +2090,15 @@ fn check_in_flight_connect_preserves_local_address(
             Vec::new()
         )))
     );
+    // A connect that checked the state before this attempt started sees it when claiming the
+    // socket.
+    let object = process
+        .authorized_object(handle, ObjectRights::WRITE)
+        .unwrap();
+    assert_eq!(
+        transport_connect(&process, &object, loopback_address()),
+        Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress))
+    );
     assert_eq!(
         provider.state.connect_calls.load(Ordering::Relaxed),
         connect_calls + 1
@@ -2099,6 +2108,24 @@ fn check_in_flight_connect_preserves_local_address(
         connecting.join().unwrap(),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
     );
+    assert_eq!(
+        transport_connect(&process, &object, loopback_address()),
+        Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress))
+    );
+    provider.return_next_status(SocketConnectionStatus::Connected, None);
+    assert_eq!(
+        check_connect(&process, handle),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        transport_connect(&process, &object, loopback_address()),
+        Ok(SocketOutcome::Failed(SocketError::AlreadyConnected))
+    );
+    assert_eq!(
+        provider.state.connect_calls.load(Ordering::Relaxed),
+        connect_calls + 1
+    );
+    drop(object);
     process.close_object_reference(handle).unwrap();
 }
 
