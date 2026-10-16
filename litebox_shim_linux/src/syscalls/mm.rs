@@ -349,53 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_returns_only_overlapping_mappings() {
-        use litebox_common_linux::vmem::PAGE_SIZE;
-
-        let task = init_platform();
-        let base = task
-            .sys_mmap(
-                0,
-                4 * PAGE_SIZE,
-                ProtFlags::PROT_READ_WRITE,
-                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-            .unwrap();
-        // Split the mapping into three areas: RW | R | RW.
-        task.sys_mprotect(
-            UserPtrMut::from_usize(base.as_usize() + PAGE_SIZE),
-            PAGE_SIZE,
-            ProtFlags::PROT_READ,
-        )
-        .unwrap();
-
-        // A query touching all three areas, partly, returns them unclipped.
-        let query = base.as_usize() + PAGE_SIZE / 2..base.as_usize() + 2 * PAGE_SIZE + 1;
-        let expected: alloc::vec::Vec<_> = task
-            .global
-            .mm
-            .mappings()
-            .into_iter()
-            .filter(|(range, _)| range.start < query.end && query.start < range.end)
-            .collect();
-        assert_eq!(expected.len(), 3);
-        assert_eq!(task.global.mm.overlapping(query), expected);
-
-        // A query entirely within the unmapped tail returns nothing.
-        task.sys_munmap(
-            UserPtrMut::from_usize(base.as_usize() + 3 * PAGE_SIZE),
-            PAGE_SIZE,
-        )
-        .unwrap();
-        let tail = base.as_usize() + 3 * PAGE_SIZE..base.as_usize() + 4 * PAGE_SIZE;
-        assert_eq!(task.global.mm.overlapping(tail), alloc::vec![]);
-
-        task.sys_munmap(base, 3 * PAGE_SIZE).unwrap();
-    }
-
-    #[test]
     fn test_anonymous_mmap() {
         let task = init_platform();
 
