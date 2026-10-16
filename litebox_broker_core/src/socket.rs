@@ -709,6 +709,7 @@ pub fn create(
         readiness_sink: socket_sink,
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(None),
+        error_queries: Mutex::new(()),
         account,
     });
     let socket = SocketObject::new(resource, request, status);
@@ -1262,6 +1263,7 @@ pub fn accept(
         readiness_sink: socket_sink,
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(Some(guest_source_lease)),
+        error_queries: Mutex::new(()),
         account: Arc::clone(&listener_resource.account),
     });
     let accepted_socket = SocketObject::new_connected(
@@ -1983,7 +1985,8 @@ fn transport_shutdown(
 /// Returns a socket's broker-authoritative transport state, consuming at
 /// most one pending platform error, and whether this call found an error.
 ///
-/// With `queue_errors`, a found error is queued on the socket. Stream queries
+/// With `queue_errors`, a found error is queued on the socket, and such
+/// queries of one socket run one at a time. Stream queries
 /// reconcile asynchronous connection completion, and a connection failure
 /// they observe is a found error. Datagram queries preserve broker-owned peer
 /// state while consuming platform errors, refining the local address, and
@@ -1994,7 +1997,11 @@ fn transport_status(
     object: &RwLock<ObjectEntry>,
     queue_errors: bool,
 ) -> Result<(PlatformSocketStatus, bool)> {
-    if read_socket(object, |socket| is_udp(socket.create_request))? {
+    let (resource, udp) = read_socket(object, |socket| {
+        (Arc::clone(&socket.resource), is_udp(socket.create_request))
+    })?;
+    let _error_queries = queue_errors.then(|| resource.error_queries.lock());
+    if udp {
         datagram_status(object, queue_errors)
     } else {
         stream_status(object, queue_errors)
@@ -2983,6 +2990,10 @@ pub(crate) struct SocketResource {
     readiness_sink: Arc<SocketReadinessSink>,
     port_binding: Mutex<Option<Arc<GuestPortBinding>>>,
     guest_source_lease: Mutex<Option<GuestSourceLease>>,
+    /// Serializes queries that queue the transport's pending error, so none
+    /// misses an error another has taken from the transport but not yet
+    /// queued.
+    error_queries: Mutex<()>,
     /// The account the provider charges this socket to, which drops after the
     /// socket retires.
     account: Arc<SocketAccount>,

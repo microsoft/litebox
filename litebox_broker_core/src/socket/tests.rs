@@ -1523,6 +1523,7 @@ pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketP
     check_automatic_bind_retains_reservation_during_retirement(broker, provider);
     check_duplicate_port_binding_retires_socket(broker, provider);
     check_pending_errors_and_readiness(broker, provider);
+    check_error_queries_wait_for_one_in_flight(broker, provider);
 }
 
 fn check_platform_socket_retires_before_last_arc_drop(
@@ -4614,6 +4615,46 @@ fn check_pending_errors_and_readiness(broker: &BrokerCore, provider: &TestSocket
         Ok(SocketOutcome::Completed(1))
     );
     process.close_object_reference(datagram).unwrap();
+    assert!(provider.state.status_responses.lock().unwrap().is_empty());
+}
+
+/// An error taken from the transport by one query is queued before another
+/// query looks for one.
+fn check_error_queries_wait_for_one_in_flight(broker: &BrokerCore, provider: &TestSocketProvider) {
+    let process = Arc::new(
+        broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap(),
+    );
+    let stream = create(
+        &process,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        connect(&process, stream, loopback_address()),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider.return_next_status(
+        SocketConnectionStatus::Connected,
+        Some(SocketError::ConnectionReset),
+    );
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *provider.state.status_block.lock().unwrap() = Some((started_tx, release_rx));
+    let query_session = Arc::clone(&process);
+    let query = std::thread::spawn(move || get_name(&query_session, stream, false));
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let take_session = Arc::clone(&process);
+    let take = std::thread::spawn(move || take_error(&take_session, stream));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!take.is_finished());
+    release_tx.send(()).unwrap();
+    assert!(query.join().unwrap().is_ok());
+    assert_eq!(take.join().unwrap(), Ok(Some(SocketError::ConnectionReset)));
+    process.close_object_reference(stream).unwrap();
     assert!(provider.state.status_responses.lock().unwrap().is_empty());
 }
 

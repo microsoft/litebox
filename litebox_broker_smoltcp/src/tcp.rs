@@ -613,6 +613,9 @@ impl Tcp {
         sockets: &mut Sockets,
         data: &[u8],
     ) -> BrokerResult<SocketOutcome<usize>> {
+        if self.write_shutdown {
+            return Ok(SocketOutcome::Failed(SocketError::Shutdown));
+        }
         if !matches!(self.phase, Phase::Internal(..) | Phase::External(_)) {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
@@ -632,9 +635,6 @@ impl Tcp {
                 .take()
                 .unwrap_or(SocketError::ConnectionReset);
             return Ok(SocketOutcome::Failed(error));
-        }
-        if self.write_shutdown {
-            return Ok(SocketOutcome::Failed(SocketError::Shutdown));
         }
         let sent = match self.phase {
             Phase::Internal(id, end) => {
