@@ -2210,9 +2210,25 @@ mod tests {
         epfd: i32,
         events: &mut [litebox_common_linux::EpollEvent],
     ) -> usize {
+        epoll_wait_with_timeout(task, epfd, events, -1)
+    }
+
+    fn epoll_wait_with_timeout(
+        task: &TestTask,
+        epfd: i32,
+        events: &mut [litebox_common_linux::EpollEvent],
+        timeout_millis: i32,
+    ) -> usize {
         let events_ptr = UserPtrMut::from_usize(events.as_mut_ptr() as usize);
-        task.sys_epoll_pwait(epfd, events_ptr, events.len().trunc(), -1, None, 0)
-            .expect("epoll_wait failed")
+        task.sys_epoll_pwait(
+            epfd,
+            events_ptr,
+            events.len().trunc(),
+            timeout_millis,
+            None,
+            0,
+        )
+        .expect("epoll_wait failed")
     }
 
     fn test_tcp_socket_as_server(
@@ -2735,6 +2751,20 @@ mod tests {
             task.do_getsockname(&server_fd).expect("getsockname failed")
         );
 
+        // A UDP datagram may be dropped by the host or TUN device. Bound the wait and let the
+        // client resend while the server is waiting.
+        if !is_nonblocking {
+            let timeout = litebox_common_linux::TimeVal::from(core::time::Duration::from_secs(4));
+            let optval = UserPtr::from_usize((&raw const timeout).cast::<u8>() as usize);
+            task.do_setsockopt(
+                &server_fd,
+                SocketOptionName::Socket(SocketOption::RCVTIMEO),
+                optval,
+                core::mem::size_of::<litebox_common_linux::TimeVal>(),
+            )
+            .expect("failed to set receive timeout");
+        }
+
         // Create an epoll instance and register the server fd for EPOLLIN
         let epfd = task
             .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
@@ -2743,29 +2773,37 @@ mod tests {
         epoll_add(task, epfd, raw_server_fd, litebox::event::Events::IN);
 
         let msg = "Hello from client";
-        let mut child = std::process::Command::new("nc")
-            .args([
-                "-u", // udp mode
-                "-N", // Shutdown the network socket after EOF on stdin
-                "-q", // quit after EOF on stdin and delay of secs
-                "1",
-                "-p", // Specify local port for remote connects
-                CLIENT_PORT.to_string().as_str(),
-                TUN_IP_ADDR_STR,
-                SERVER_PORT.to_string().as_str(),
-            ])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn client");
-        {
-            use std::io::Write as _;
-            let mut stdin = child.stdin.take().expect("Failed to open stdin");
-            stdin
-                .write_all(msg.as_bytes())
-                .expect("Failed to write to stdin");
-            stdin.flush().ok();
-            drop(stdin);
-        }
+        let received = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let sender_received = received.clone();
+        let child_handle = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let mut child = std::process::Command::new("nc")
+                    .args([
+                        "-u", // udp mode
+                        "-N", // Shutdown the network socket after EOF on stdin
+                        "-q", // quit after EOF on stdin and delay of secs
+                        "1",
+                        "-p", // Specify local port for remote connects
+                        CLIENT_PORT.to_string().as_str(),
+                        TUN_IP_ADDR_STR,
+                        SERVER_PORT.to_string().as_str(),
+                    ])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("Failed to spawn client");
+                {
+                    use std::io::Write as _;
+                    let mut stdin = child.stdin.take().expect("Failed to open stdin");
+                    stdin
+                        .write_all(msg.as_bytes())
+                        .expect("Failed to write to stdin");
+                }
+                child.wait().expect("Failed to wait for client");
+                if sender_received.load(core::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+            }
+        });
 
         // Server receives and inspects sender addr
         let mut recv_buf = [0u8; 48];
@@ -2775,7 +2813,12 @@ mod tests {
         }
         if is_nonblocking {
             let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
-            let n = epoll_wait(task, epfd, &mut events);
+            let n = epoll_wait_with_timeout(task, epfd, &mut events, 4000);
+            if n == 0 {
+                received.store(true, core::sync::atomic::Ordering::Release);
+                child_handle.join().expect("client thread panicked");
+                panic!("timed out waiting for UDP datagram");
+            }
             assert_eq!(n, 1);
             for ev in &events[..n] {
                 assert!(ev.events & litebox::event::Events::IN.bits() != 0);
@@ -2789,7 +2832,7 @@ mod tests {
             recv_buf.len()
         };
         let source_addr = [0u8; core::mem::size_of::<CSockInetAddr>()];
-        let n = match op {
+        let result = match op {
             "recvfrom" => {
                 let mut addrlen = core::mem::size_of::<CSockInetAddr>();
                 task.sys_recvfrom(
@@ -2800,7 +2843,6 @@ mod tests {
                     Some(UserPtrMut::from_usize(source_addr.as_ptr() as usize)),
                     UserPtrMut::from_usize(&raw mut addrlen as usize),
                 )
-                .expect("recvfrom failed")
             }
             "recvmsg" => {
                 let iovec = [litebox_common_linux::IoVec {
@@ -2813,17 +2855,19 @@ mod tests {
                 msg_hdr.msg_name = UserPtrMut::from_usize(source_addr.as_ptr() as usize);
                 msg_hdr.msg_namelen = source_addr.len().trunc();
                 let msg_ptr = UserPtrMut::from_usize(&raw mut msg_hdr as usize);
-                let n = task
-                    .sys_recvmsg(i32::try_from(raw_server_fd).unwrap(), msg_ptr, recv_flags)
-                    .expect("recvmsg failed");
-                if test_trunc {
+                let result =
+                    task.sys_recvmsg(i32::try_from(raw_server_fd).unwrap(), msg_ptr, recv_flags);
+                if result.is_ok() && test_trunc {
                     let flags = msg_hdr.msg_flags;
                     assert!(flags.contains(ReceiveFlags::TRUNC));
                 }
-                n
+                result
             }
             _ => panic!("Unknown operation"),
         };
+        received.store(true, core::sync::atomic::Ordering::Release);
+        child_handle.join().expect("client thread panicked");
+        let n = result.unwrap_or_else(|err| panic!("{op} failed: {err:?}"));
         let sender_addr = read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
             UserPtr::from_usize(source_addr.as_ptr() as usize),
             source_addr.len(),
@@ -2847,8 +2891,6 @@ mod tests {
         assert_eq!(sender_addr.port(), CLIENT_PORT);
 
         close_socket(task, raw_server_fd);
-
-        child.wait().expect("Failed to wait for client");
     }
 
     #[test]
@@ -2931,7 +2973,7 @@ mod tests {
 
         let task = init_platform(Some(TUN_DEVICE_NAME));
         let host = std::net::UdpSocket::bind(("10.0.0.1", CLIENT_PORT)).unwrap();
-        host.set_read_timeout(Some(core::time::Duration::from_secs(5)))
+        host.set_read_timeout(Some(core::time::Duration::from_secs(2)))
             .unwrap();
 
         let raw_fd = task
@@ -2951,6 +2993,15 @@ mod tests {
             .unwrap();
         task.do_connect(&socket, SocketAddress::Inet(host.local_addr().unwrap()))
             .unwrap();
+        let timeout = litebox_common_linux::TimeVal::from(core::time::Duration::from_secs(2));
+        let optval = UserPtr::from_usize((&raw const timeout).cast::<u8>() as usize);
+        task.do_setsockopt(
+            &socket,
+            SocketOptionName::Socket(SocketOption::RCVTIMEO),
+            optval,
+            core::mem::size_of::<litebox_common_linux::TimeVal>(),
+        )
+        .expect("failed to set receive timeout");
         // Use a duplicate, which must still be recognized as a datagram socket.
         let raw_dup_fd = task
             .sys_dup(i32::try_from(raw_fd).unwrap(), None, None)
@@ -2969,13 +3020,26 @@ mod tests {
             },
         ];
         let write_iovs_ptr = UserPtr::from_usize(write_iovs.as_ptr().expose_provenance());
-        assert_eq!(task.sys_writev(fd, write_iovs_ptr, 2), Ok(6));
         let mut received = [0; 16];
-        let (length, _) = host.recv_from(&mut received).unwrap();
+        let length = (1..=3)
+            .find_map(|attempt| {
+                assert_eq!(task.sys_writev(fd, write_iovs_ptr, 2), Ok(6));
+                match host.recv_from(&mut received) {
+                    Ok((length, _)) => Some(length),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) && attempt < 3 =>
+                    {
+                        None
+                    }
+                    Err(err) => panic!("host recv_from failed after {attempt} attempt(s): {err}"),
+                }
+            })
+            .unwrap();
         assert_eq!(&received[..length], b"abcdef");
 
-        host.send_to(b"ghijk", guest_addr).unwrap();
-        host.send_to(b"lm", guest_addr).unwrap();
         let (mut head, mut tail) = ([0; 2], [0; 8]);
         let read_iovs = [
             IoReadVec {
@@ -2988,11 +3052,28 @@ mod tests {
             },
         ];
         let read_iovs_ptr = UserPtr::from_usize(read_iovs.as_ptr().expose_provenance());
-        assert_eq!(task.sys_readv(fd, read_iovs_ptr, 2), Ok(5));
+        for attempt in 1..=3 {
+            host.send_to(b"ghijk", guest_addr).unwrap();
+            match task.sys_readv(fd, read_iovs_ptr, 2) {
+                Ok(5) => break,
+                Err(Errno::EAGAIN | Errno::ETIMEDOUT) if attempt < 3 => {}
+                result => panic!("guest readv failed after {attempt} attempt(s): {result:?}"),
+            }
+        }
         assert_eq!(&head, b"gh");
         assert_eq!(&tail[..3], b"ijk");
         let mut next = [0; 8];
-        assert_eq!(task.sys_read(fd, &mut next, None), Ok(2));
+        for attempt in 1..=3 {
+            host.send_to(b"lm", guest_addr).unwrap();
+            match task.sys_read(fd, &mut next, None) {
+                Ok(2) => break,
+                // A timed-out attempt can still arrive after its retry. Discard that duplicate
+                // first datagram while looking for the second one.
+                Ok(5) if &next[..5] == b"ghijk" && attempt < 3 => {}
+                Err(Errno::EAGAIN | Errno::ETIMEDOUT) if attempt < 3 => {}
+                result => panic!("guest read failed after {attempt} attempt(s): {result:?}"),
+            }
+        }
         assert_eq!(&next[..2], b"lm");
 
         close_socket(&task, raw_dup_fd);
