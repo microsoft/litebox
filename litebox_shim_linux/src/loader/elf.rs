@@ -38,7 +38,7 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
         #[cfg(target_arch = "aarch64")]
-        let Ok(crate::syscalls::file::AnyTypedFd::Fs(file_fd)) = task.typed_fd(fd) else {
+        let Ok(crate::syscalls::file::AnyTypedFd::File(file_fd)) = task.typed_fd(fd) else {
             let _ = task.sys_close(fd);
             return Err(Errno::EBADF);
         };

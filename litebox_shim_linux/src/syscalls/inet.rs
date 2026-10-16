@@ -68,6 +68,8 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for InetSocketSubsystem<Platform
 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for InetSocket<Platform> {}
 
+pub(crate) type InetSocketFd<Platform> = TypedFd<InetSocketSubsystem<Platform>>;
+
 /// An internet socket descriptor's open file description.
 pub(crate) struct InetSocket<Platform: ShimPlatform> {
     socket: Arc<inet_socket::InetSocket<Platform>>,
@@ -781,7 +783,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     /// Runs `f` on the internet socket at `fd`, without holding the descriptor table.
     pub(crate) fn with_inet_socket<R>(
         &self,
-        fd: &TypedFd<InetSocketSubsystem<Platform>>,
+        fd: &InetSocketFd<Platform>,
         f: impl FnOnce(&InetSocket<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         let handle = self
@@ -798,7 +800,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         &self,
         handle: ObjectHandle,
         socket_type: SocketType,
-    ) -> Result<TypedFd<InetSocketSubsystem<Platform>>, ProcessError> {
+    ) -> Result<InetSocketFd<Platform>, ProcessError> {
         let socket = self
             .litebox
             .adopt_inherited_inet_socket(handle, socket_type)?;

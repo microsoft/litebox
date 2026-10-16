@@ -1422,7 +1422,8 @@ mod tests {
     use crate::syscalls::tests::{TestPlatform as Platform, create_file, init_platform};
 
     fn elf_patch_key(task: &Task<Platform>, fd: i32) -> ElfPatchKey<Platform> {
-        let AnyTypedFd::Fs(fd) = task.typed_fd(fd).expect("file descriptor should resolve") else {
+        let AnyTypedFd::File(fd) = task.typed_fd(fd).expect("file descriptor should resolve")
+        else {
             panic!("descriptor should refer to a file");
         };
         ElfPatchKey(fd)

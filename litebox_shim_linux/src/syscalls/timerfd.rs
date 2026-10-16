@@ -33,6 +33,8 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for TimerfdSubsystem<Platform> {
 }
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for TimerFile<Platform> {}
 
+pub(crate) type TimerfdFd<Platform> = TypedFd<TimerfdSubsystem<Platform>>;
+
 /// A timerfd, whose schedule, expirations, and status flags the broker owns,
 /// so processes that share it through `fork` see one timer.
 pub(crate) struct TimerFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -199,7 +201,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     /// Runs `f` on the timerfd at `fd`, without holding the descriptor table.
     pub(crate) fn with_timerfd<R>(
         &self,
-        fd: &TypedFd<TimerfdSubsystem<Platform>>,
+        fd: &TimerfdFd<Platform>,
         f: impl FnOnce(&TimerFile<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         let handle = self
@@ -215,7 +217,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         &self,
         handle: ObjectHandle,
         clock: TimerfdClock,
-    ) -> Result<TypedFd<TimerfdSubsystem<Platform>>, ProcessError> {
+    ) -> Result<TimerfdFd<Platform>, ProcessError> {
         let timer = self.litebox.adopt_inherited_timer(handle)?;
         Ok(self
             .litebox

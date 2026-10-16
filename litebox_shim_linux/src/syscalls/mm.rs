@@ -76,7 +76,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
         let typed_fd = self.typed_fd(fd)?;
-        let AnyTypedFd::Fs(file_fd) = &typed_fd else {
+        let AnyTypedFd::File(file_fd) = &typed_fd else {
             return Err(Errno::ENODEV);
         };
 

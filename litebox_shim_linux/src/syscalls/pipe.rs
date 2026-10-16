@@ -19,7 +19,7 @@ use litebox_broker_protocol::{
     ObjectHandle,
     fs::{FileMode as Mode, FileOpenFlags},
 };
-use litebox_common_linux::{FileDescriptorFlags, InodeType, OFlags, errno::Errno};
+use litebox_common_linux::{InodeType, OFlags, errno::Errno};
 
 use super::file::{linux_status_flags, status_flags_change};
 use crate::{GlobalState, ShimPlatform};
@@ -96,18 +96,13 @@ impl<Platform: ShimPlatform> PipeEnd<Platform> {
     }
 }
 
-/// Both ends of a freshly created Linux pipe, which the caller must either
-/// install as raw descriptors or remove from the descriptor table.
-pub(crate) struct LinuxPipeEnds<Platform: ShimPlatform> {
-    pub(crate) reader: PipeFd<Platform>,
-    pub(crate) writer: PipeFd<Platform>,
-}
-
 impl<Platform: ShimPlatform> GlobalState<Platform> {
+    /// Creates a pipe with the `pipe2` flags `flags`, returning its write and read ends
+    /// respectively.
     pub(crate) fn create_linux_pipe(
         &self,
         flags: OFlags,
-    ) -> Result<LinuxPipeEnds<Platform>, Errno> {
+    ) -> Result<(PipeEnd<Platform>, PipeEnd<Platform>), Errno> {
         if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
             return Err(Errno::EINVAL);
         }
@@ -126,20 +121,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
             NonZero::new(4096),
         )?;
-
-        let mut dt = self.litebox.descriptor_table_mut();
-        let writer = dt.insert::<PipeSubsystem<Platform>>(writer);
-        let reader = dt.insert::<PipeSubsystem<Platform>>(reader);
-        if flags.contains(OFlags::CLOEXEC) {
-            let None = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC) else {
-                unreachable!()
-            };
-            let None = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC) else {
-                unreachable!()
-            };
-        }
-
-        Ok(LinuxPipeEnds { reader, writer })
+        Ok((writer.into(), reader.into()))
     }
 
     /// Runs `f` on the pipe end at `fd`, without holding the descriptor table.
@@ -156,8 +138,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts a pipe end this runner inherited across `execve`.
-    pub(crate) fn adopt_inherited_linux_pipe(
+    /// Adopts a pipe end this process inherited from its parent as `handle`.
+    pub(crate) fn adopt_inherited_pipe_end(
         &self,
         handle: ObjectHandle,
         endpoint_type: HalfPipeType,

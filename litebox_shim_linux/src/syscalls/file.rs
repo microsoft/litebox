@@ -222,6 +222,18 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             .ok_or(Errno::EBADF)?;
         handle.with_entry(f)
     }
+
+    /// Adopts a file this process inherited from its parent as `handle`.
+    pub(crate) fn adopt_inherited_file(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<FileFd<Platform>, litebox::process::ProcessError> {
+        let file = self.litebox.adopt_inherited_file(handle)?;
+        Ok(self
+            .litebox
+            .descriptor_table_mut()
+            .insert::<FileSubsystem<Platform>>(file))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -481,22 +493,18 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             }
             let first_fd = descriptions.get(&inherited.handle).copied();
             let handle = inherited.handle;
-            let adopt_file = || {
-                let file = litebox
-                    .adopt_inherited_file(handle)
-                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
-                Ok(litebox
-                    .descriptor_table_mut()
-                    .insert::<FileSubsystem<Platform>>(file))
-            };
             match inherited.kind {
                 InheritedFdKind::File => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, adopt_file)?;
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_file(handle)
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
                 }
                 InheritedFdKind::Pipe { endpoint } => {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, || {
                         global
-                            .adopt_inherited_linux_pipe(handle, endpoint)
+                            .adopt_inherited_pipe_end(handle, endpoint)
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
@@ -595,13 +603,13 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 
 /// A raw fd resolved once into the subsystem that owns it.
 pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
-    Fs(alloc::sync::Arc<FileFd<Platform>>),
-    Inet(alloc::sync::Arc<TypedFd<super::inet::InetSocketSubsystem<Platform>>>),
-    Pipes(alloc::sync::Arc<super::pipe::PipeFd<Platform>>),
-    Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
-    Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
-    Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform>>>),
-    Timerfd(alloc::sync::Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
+    File(alloc::sync::Arc<FileFd<Platform>>),
+    Inet(alloc::sync::Arc<super::inet::InetSocketFd<Platform>>),
+    Pipe(alloc::sync::Arc<super::pipe::PipeFd<Platform>>),
+    Eventfd(alloc::sync::Arc<super::eventfd::EventfdFd<Platform>>),
+    Epoll(alloc::sync::Arc<super::epoll::EpollFd<Platform>>),
+    Unix(alloc::sync::Arc<super::unix::UnixSocketFd<Platform>>),
+    Timerfd(alloc::sync::Arc<super::timerfd::TimerfdFd<Platform>>),
 }
 
 /// Apply one subsystem-generic expression to whichever subsystem an [`AnyTypedFd`] holds.
@@ -610,9 +618,9 @@ pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
 macro_rules! on_any_fd {
     ($any:expr, |$fd:ident| $body:expr) => {
         match $any {
-            AnyTypedFd::Fs($fd) => $body,
+            AnyTypedFd::File($fd) => $body,
             AnyTypedFd::Inet($fd) => $body,
-            AnyTypedFd::Pipes($fd) => $body,
+            AnyTypedFd::Pipe($fd) => $body,
             AnyTypedFd::Eventfd($fd) => $body,
             AnyTypedFd::Epoll($fd) => $body,
             AnyTypedFd::Unix($fd) => $body,
@@ -625,9 +633,9 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     /// The subsystem backing this fd, for diagnostics.
     pub(crate) fn subsystem_name(&self) -> &'static str {
         match self {
-            Self::Fs(_) => "fs",
+            Self::File(_) => "file",
             Self::Inet(_) => "inet",
-            Self::Pipes(_) => "pipes",
+            Self::Pipe(_) => "pipe",
             Self::Eventfd(_) => "eventfd",
             Self::Epoll(_) => "epoll",
             Self::Unix(_) => "unix",
@@ -635,35 +643,35 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
         }
     }
 
-    /// The filesystem fd behind this descriptor, or `None` for every other subsystem.
-    pub(crate) fn as_fs(&self) -> Option<&FileFd<Platform>> {
+    /// The file fd behind this descriptor, or `None` for every other subsystem.
+    pub(crate) fn as_file(&self) -> Option<&FileFd<Platform>> {
         match self {
-            Self::Fs(fd) => Some(fd),
+            Self::File(fd) => Some(fd),
             _ => None,
         }
     }
 
-    /// Like [`Self::as_fs`], but fails with `otherwise` for non-filesystem descriptors.
-    pub(crate) fn fs_only(&self, otherwise: Errno) -> Result<&FileFd<Platform>, Errno> {
-        self.as_fs().ok_or(otherwise)
+    /// Like [`Self::as_file`], but fails with `otherwise` for non-file descriptors.
+    pub(crate) fn file_only(&self, otherwise: Errno) -> Result<&FileFd<Platform>, Errno> {
+        self.as_file().ok_or(otherwise)
     }
 
     /// Run the handler matching this fd's subsystem.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch<R>(
         &self,
-        fs: impl FnOnce(&FileFd<Platform>) -> R,
-        inet: impl FnOnce(&TypedFd<super::inet::InetSocketSubsystem<Platform>>) -> R,
-        pipes: impl FnOnce(&super::pipe::PipeFd<Platform>) -> R,
-        eventfd: impl FnOnce(&TypedFd<super::eventfd::EventfdSubsystem<Platform>>) -> R,
-        epoll: impl FnOnce(&TypedFd<super::epoll::EpollSubsystem<Platform>>) -> R,
-        unix: impl FnOnce(&TypedFd<super::unix::UnixSocketSubsystem<Platform>>) -> R,
-        timerfd: impl FnOnce(&TypedFd<super::timerfd::TimerfdSubsystem<Platform>>) -> R,
+        file: impl FnOnce(&FileFd<Platform>) -> R,
+        inet: impl FnOnce(&super::inet::InetSocketFd<Platform>) -> R,
+        pipe: impl FnOnce(&super::pipe::PipeFd<Platform>) -> R,
+        eventfd: impl FnOnce(&super::eventfd::EventfdFd<Platform>) -> R,
+        epoll: impl FnOnce(&super::epoll::EpollFd<Platform>) -> R,
+        unix: impl FnOnce(&super::unix::UnixSocketFd<Platform>) -> R,
+        timerfd: impl FnOnce(&super::timerfd::TimerfdFd<Platform>) -> R,
     ) -> R {
         match self {
-            Self::Fs(fd) => fs(fd),
+            Self::File(fd) => file(fd),
             Self::Inet(fd) => inet(fd),
-            Self::Pipes(fd) => pipes(fd),
+            Self::Pipe(fd) => pipe(fd),
             Self::Eventfd(fd) => eventfd(fd),
             Self::Epoll(fd) => epoll(fd),
             Self::Unix(fd) => unix(fd),
@@ -836,11 +844,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return Err(Errno::EAGAIN);
             }
             let (kind, object) = match fd {
-                AnyTypedFd::Fs(file) => (
+                AnyTypedFd::File(file) => (
                     InheritedFdKind::File,
                     InheritableFd::File(self.global.with_file(&file, File::inheritable)?),
                 ),
-                AnyTypedFd::Pipes(pipe) => {
+                AnyTypedFd::Pipe(pipe) => {
                     let pipe = self
                         .global
                         .with_pipe_end(&pipe, |pipe| Ok(Arc::clone(pipe.pipe_end())))?;
@@ -1286,7 +1294,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let rewind = isize::try_from(unread_n).map_err(|_| Errno::EOVERFLOW)?;
-        let fd = in_fd.fs_only(Errno::EINVAL)?;
+        let fd = in_fd.file_only(Errno::EINVAL)?;
         self.global.with_file(fd, |file| {
             file.seek(-rewind, SeekWhence::RelativeToCurrentOffset)?;
             Ok(())
@@ -1327,7 +1335,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } else {
                 Errno::EINVAL
             };
-            let read_result = match typed_in_fd.as_fs() {
+            let read_result = match typed_in_fd.as_file() {
                 Some(fd) => self.global.with_file(fd, |file| {
                     file.read(&mut kernel_buf[..to_read], cur_off, Some(&self.wait_cx()))
                 }),
@@ -1409,7 +1417,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, Errno> {
-        let fd = fd.fs_only(Errno::ESPIPE)?;
+        let fd = fd.file_only(Errno::ESPIPE)?;
         self.global.with_file(fd, |file| file.seek(offset, whence))
     }
 
@@ -1460,7 +1468,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let consumed: AnyTypedFd<Platform> = match rds
             .fd_consume_raw_integer::<FileSubsystem<Platform>>(raw_fd)
         {
-            Ok(fd) => AnyTypedFd::Fs(fd),
+            Ok(fd) => AnyTypedFd::File(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
                 if let Some(new_fd) = replace {
                     let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
@@ -1476,7 +1484,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else if let Ok(fd) =
                     rds.fd_consume_raw_integer::<super::pipe::PipeSubsystem<Platform>>(raw_fd)
                 {
-                    AnyTypedFd::Pipes(fd)
+                    AnyTypedFd::Pipe(fd)
                 } else if let Ok(fd) =
                     rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem<Platform>>(raw_fd)
                 {
@@ -1510,7 +1518,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         drop(rds);
 
         match consumed {
-            AnyTypedFd::Fs(fd) => {
+            AnyTypedFd::File(fd) => {
                 self.remove_and_drop_descriptor(&fd);
                 self.finalize_elf_patch(fd);
                 Ok(())
@@ -1519,7 +1527,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
-            AnyTypedFd::Pipes(fd) => {
+            AnyTypedFd::Pipe(fd) => {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
@@ -2010,7 +2018,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 let files = self.files.borrow();
                 let typed_fd = files.typed_fd(fd)?;
-                if let Some(file) = typed_fd.as_fs() {
+                if let Some(file) = typed_fd.as_file() {
                     let status = self.global.with_file(file, File::status)?;
                     return Self::do_access_mode(status.mode, status.owner.into(), caller, &mode);
                 }
@@ -2109,7 +2117,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
         self.global
-            .with_file(fd.fs_only(Errno::EBADF)?, File::status)
+            .with_file(fd.file_only(Errno::EBADF)?, File::status)
     }
 
     pub(crate) fn do_stat<T>(&self, fd: &AnyTypedFd<Platform>) -> Result<T, Errno>
@@ -2516,7 +2524,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
-        let super::pipe::LinuxPipeEnds { reader, writer } = self.global.create_linux_pipe(flags)?;
+        let (writer, reader) = self.global.create_linux_pipe(flags)?;
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let writer = dt.insert::<super::pipe::PipeSubsystem<Platform>>(writer);
+        let reader = dt.insert::<super::pipe::PipeSubsystem<Platform>>(reader);
+        if flags.contains(OFlags::CLOEXEC) {
+            for fd in [&writer, &reader] {
+                let old = dt.set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                assert!(old.is_none());
+            }
+        }
+        drop(dt);
 
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
@@ -2678,7 +2696,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;
-                let fd = fd.fs_only(Errno::ENOTTY)?;
+                let fd = fd.file_only(Errno::ENOTTY)?;
                 if self.global.with_file(fd, File::is_terminal)? {
                     self.stdio_ioctl(&arg)
                 } else {
@@ -3232,7 +3250,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
-        let file = fd.fs_only(Errno::ENOTDIR)?;
+        let file = fd.file_only(Errno::ENOTDIR)?;
         self.global
             .with_file(file, |file| file.getdents64(dirp, count))
     }

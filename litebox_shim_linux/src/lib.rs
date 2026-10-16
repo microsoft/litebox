@@ -730,9 +730,9 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
             };
         }
 
-        resolve_fd!(syscalls::file::FileSubsystem<Platform>, Fs);
+        resolve_fd!(syscalls::file::FileSubsystem<Platform>, File);
         resolve_fd!(syscalls::inet::InetSocketSubsystem<Platform>, Inet);
-        resolve_fd!(syscalls::pipe::PipeSubsystem<Platform>, Pipes);
+        resolve_fd!(syscalls::pipe::PipeSubsystem<Platform>, Pipe);
         resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);
         resolve_fd!(syscalls::epoll::EpollSubsystem<Platform>, Epoll);
         resolve_fd!(syscalls::unix::UnixSocketSubsystem<Platform>, Unix);

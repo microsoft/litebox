@@ -45,6 +45,8 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for UnixSocketSubsystem<Platform
 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for UnixSocket<Platform> {}
 
+pub(crate) type UnixSocketFd<Platform> = TypedFd<UnixSocketSubsystem<Platform>>;
+
 /// C-compatible structure for Unix socket addresses.
 const UNIX_PATH_MAX: usize = 108;
 #[repr(C)]
@@ -441,7 +443,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     /// Runs `f` on the Unix socket at `fd`, without holding the descriptor table.
     pub(super) fn with_unix_socket<R>(
         &self,
-        fd: &TypedFd<UnixSocketSubsystem<Platform>>,
+        fd: &UnixSocketFd<Platform>,
         f: impl FnOnce(&UnixSocket<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         let handle = self
@@ -458,7 +460,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         &self,
         handle: ObjectHandle,
         socket_type: SocketType,
-    ) -> Result<TypedFd<UnixSocketSubsystem<Platform>>, ProcessError> {
+    ) -> Result<UnixSocketFd<Platform>, ProcessError> {
         let socket = self
             .litebox
             .adopt_inherited_unix_socket(handle, socket_type)?;

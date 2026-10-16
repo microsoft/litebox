@@ -36,6 +36,8 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for EpollSubsystem<Platform> {
 }
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EpollFile<Platform> {}
 
+pub(crate) type EpollFd<Platform> = TypedFd<EpollSubsystem<Platform>>;
+
 bitflags::bitflags! {
     /// Linux's epoll flags.
     #[derive(Clone, Copy, Debug)]
@@ -48,13 +50,13 @@ bitflags::bitflags! {
 }
 
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
-    Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
-    Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
+    Eventfd(Arc<super::eventfd::EventfdFd<Platform>>),
+    Epoll(Arc<EpollFd<Platform>>),
     File(Arc<crate::FileFd<Platform>>),
-    Inet(Arc<TypedFd<super::inet::InetSocketSubsystem<Platform>>>),
+    Inet(Arc<super::inet::InetSocketFd<Platform>>),
     Pipe(Arc<super::pipe::PipeFd<Platform>>),
-    Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform>>>),
-    Timerfd(Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
+    Unix(Arc<crate::syscalls::unix::UnixSocketFd<Platform>>),
+    Timerfd(Arc<super::timerfd::TimerfdFd<Platform>>),
 }
 
 impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
@@ -301,7 +303,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     /// Runs `f` on the epoll instance at `fd`, without holding the descriptor table.
     pub(crate) fn with_epoll<R>(
         &self,
-        fd: &TypedFd<EpollSubsystem<Platform>>,
+        fd: &EpollFd<Platform>,
         f: impl FnOnce(&EpollFile<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         let handle = self
@@ -316,7 +318,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     pub(crate) fn adopt_inherited_epoll(
         &self,
         handle: ObjectHandle,
-    ) -> Result<TypedFd<EpollSubsystem<Platform>>, ProcessError> {
+    ) -> Result<EpollFd<Platform>, ProcessError> {
         let queue = self.litebox.adopt_inherited_readiness_queue(handle)?;
         Ok(self
             .litebox

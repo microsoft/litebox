@@ -29,6 +29,8 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for EventfdSubsystem<Platform> {
 }
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EventFile<Platform> {}
 
+pub(crate) type EventfdFd<Platform> = TypedFd<EventfdSubsystem<Platform>>;
+
 /// An eventfd, whose count and status flags the broker owns, so processes
 /// that share it through `fork` see one counter.
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -114,7 +116,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     /// Runs `f` on the eventfd at `fd`, without holding the descriptor table.
     pub(crate) fn with_eventfd<R>(
         &self,
-        fd: &TypedFd<EventfdSubsystem<Platform>>,
+        fd: &EventfdFd<Platform>,
         f: impl FnOnce(&EventFile<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         let handle = self
@@ -130,7 +132,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         &self,
         handle: ObjectHandle,
         semaphore: bool,
-    ) -> Result<TypedFd<EventfdSubsystem<Platform>>, ProcessError> {
+    ) -> Result<EventfdFd<Platform>, ProcessError> {
         let counter = self.litebox.adopt_inherited_event_counter(handle)?;
         Ok(self
             .litebox
