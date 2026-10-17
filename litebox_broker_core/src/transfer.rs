@@ -13,8 +13,8 @@
 //! memory shared with a runner.
 //!
 //! An operation whose copier or filler fails fails with its error. The
-//! object stays consistent, but may have consumed the bytes, or kept the
-//! room filled, of the parts lent before the failing one.
+//! object stays consistent, but may have consumed any of the bytes it lent,
+//! or kept any of the room it lent, the failing part's included.
 
 use alloc::collections::VecDeque;
 use core::ops::Range;

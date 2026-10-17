@@ -1368,6 +1368,24 @@ fn an_idle_connection_does_not_time_out() {
 }
 
 #[test]
+fn the_last_bytes_before_a_peers_close_are_received_whole() {
+    let wire: &'static Wire = Box::leak(Box::default());
+    let test = Test::new(Some(wire));
+    let mut host = Host::new(wire, &test.clock);
+    let (process, socket) = echo_connection(&test, &mut host);
+    host.close_echo(b"last");
+    run_for(
+        &test,
+        &mut host,
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+    );
+    // One receive takes them all, leaving the stream's end.
+    assert_eq!(receive(&process, socket, 8), received(b"last"));
+    assert_eq!(receive(&process, socket, 8), END);
+}
+
+#[test]
 fn a_peer_with_a_closed_window_that_answers_keeps_the_connection() {
     let wire: &'static Wire = Box::leak(Box::default());
     let test = Test::new(Some(wire));

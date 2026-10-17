@@ -596,6 +596,8 @@ struct TestSocketState {
     closed_processes: StdMutex<std::vec::Vec<ProcessId>>,
     sent: StdMutex<std::vec::Vec<u8>>,
     next_send_count: StdMutex<Option<usize>>,
+    /// Ignores a failing filler or copier, as a faulty platform might.
+    ignore_transfer_failures: core::sync::atomic::AtomicBool,
     connect_calls: AtomicUsize,
     connect_destinations: StdMutex<std::vec::Vec<SocketAddrV4>>,
     connect_source_addresses: StdMutex<std::vec::Vec<Option<SocketAddrV4>>>,
@@ -848,6 +850,15 @@ impl TestPlatformSocket {
             }
         }
     }
+
+    /// Passes on how a filler or copier fared, unless told to ignore its
+    /// failure.
+    fn transferred(&self, result: Result<()>) -> Result<()> {
+        if self.state.ignore_transfer_failures.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        result
+    }
 }
 
 impl PlatformSocket for TestPlatformSocket {
@@ -1021,7 +1032,7 @@ impl PlatformSocket for TestPlatformSocket {
     ) -> Result<SocketOutcome<usize>> {
         self.state.send_calls.fetch_add(1, Ordering::Relaxed);
         let mut data = vec![0; length];
-        fill(&mut data)?;
+        self.transferred(fill(&mut data))?;
         self.state.sent.lock().unwrap().extend_from_slice(&data);
         let sent = self
             .state
@@ -1047,7 +1058,7 @@ impl PlatformSocket for TestPlatformSocket {
             .unwrap()
             .push(destination);
         let mut data = vec![0; length];
-        fill(&mut data)?;
+        self.transferred(fill(&mut data))?;
         self.state.sent.lock().unwrap().extend_from_slice(&data);
         let sent = self
             .state
@@ -1070,11 +1081,11 @@ impl PlatformSocket for TestPlatformSocket {
     ) -> Result<SocketOutcome<PlatformStreamReceive>> {
         self.state.receive_calls.fetch_add(1, Ordering::Relaxed);
         if let Some((lent, received)) = self.state.next_stream_receive.lock().unwrap().take() {
-            copy(&lent)?;
+            self.transferred(copy(&lent))?;
             return Ok(received);
         }
         let received = length.min(2);
-        copy(&[7, 9][..received])?;
+        self.transferred(copy(&[7, 9][..received]))?;
         Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
             received,
         )))
@@ -1090,11 +1101,11 @@ impl PlatformSocket for TestPlatformSocket {
             .receive_from_calls
             .fetch_add(1, Ordering::Relaxed);
         if let Some((lent, received)) = self.state.next_datagram_receive.lock().unwrap().take() {
-            copy(&lent)?;
+            self.transferred(copy(&lent))?;
             return Ok(received);
         }
         let received = length.min(2);
-        copy(&[7, 9][..received])?;
+        self.transferred(copy(&[7, 9][..received]))?;
         Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received,
             datagram_length: 4,
@@ -2561,19 +2572,30 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         send_data(&process, handle, Vec::new(), SendFlags::NONE),
         Ok(SocketOutcome::Completed(0))
     );
-    // A failing filler or copier fails the transfer with its error.
-    assert_eq!(
-        send(&process, handle, 1, SendFlags::NONE, &mut |_| {
+    // A failing filler or copier fails the transfer with its error, even
+    // when the platform ignores it.
+    for ignored in [false, true] {
+        provider
+            .state
+            .ignore_transfer_failures
+            .store(ignored, Ordering::Relaxed);
+        assert_eq!(
+            send(&process, handle, 1, SendFlags::NONE, &mut |_| {
+                Err(BrokerError::OutOfMemory)
+            }),
             Err(BrokerError::OutOfMemory)
-        }),
-        Err(BrokerError::OutOfMemory)
-    );
-    assert_eq!(
-        receive(&process, handle, 1, ReceiveFlags::NONE, 0, 0, &mut |_| {
+        );
+        assert_eq!(
+            receive(&process, handle, 1, ReceiveFlags::NONE, 0, 0, &mut |_| {
+                Err(BrokerError::OutOfMemory)
+            }),
             Err(BrokerError::OutOfMemory)
-        }),
-        Err(BrokerError::OutOfMemory)
-    );
+        );
+    }
+    provider
+        .state
+        .ignore_transfer_failures
+        .store(false, Ordering::Relaxed);
     let sent_before = provider.state.sent.lock().unwrap().len();
     assert_eq!(
         send_data(
@@ -2683,9 +2705,10 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
+    // Ending with the byte sent while ignoring its filler's failure.
     assert_eq!(
         provider.state.sent.lock().unwrap().as_slice(),
-        [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3]
+        [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 0]
     );
     assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 1);
     assert_eq!(provider.state.status_calls.load(Ordering::Relaxed), 1);
@@ -2975,24 +2998,35 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
         ),
         Err(BrokerError::Internal)
     );
-    // A failing filler or copier fails the transfer with its error.
-    assert_eq!(
-        send_to(
-            &process,
-            handle,
-            1,
-            SendFlags::NONE,
-            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
-            &mut |_| Err(BrokerError::OutOfMemory),
-        ),
-        Err(BrokerError::OutOfMemory)
-    );
-    assert_eq!(
-        receive_from(&process, handle, 2, ReceiveFromFlags::NONE, &mut |_| {
+    // A failing filler or copier fails the transfer with its error, even
+    // when the platform ignores it.
+    for ignored in [false, true] {
+        provider
+            .state
+            .ignore_transfer_failures
+            .store(ignored, Ordering::Relaxed);
+        assert_eq!(
+            send_to(
+                &process,
+                handle,
+                1,
+                SendFlags::NONE,
+                Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
+                &mut |_| Err(BrokerError::OutOfMemory),
+            ),
             Err(BrokerError::OutOfMemory)
-        }),
-        Err(BrokerError::OutOfMemory)
-    );
+        );
+        assert_eq!(
+            receive_from(&process, handle, 2, ReceiveFromFlags::NONE, &mut |_| {
+                Err(BrokerError::OutOfMemory)
+            }),
+            Err(BrokerError::OutOfMemory)
+        );
+    }
+    provider
+        .state
+        .ignore_transfer_failures
+        .store(false, Ordering::Relaxed);
     let send_calls = provider.state.send_calls.load(Ordering::Relaxed);
     assert_eq!(
         send_data_to(

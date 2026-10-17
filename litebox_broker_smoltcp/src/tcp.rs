@@ -612,8 +612,12 @@ impl Tcp {
                 let socket = sockets.tcp(handle);
                 let mut received = 0;
                 // smoltcp lends its receive buffer a contiguous part at a time,
-                // and it has two at most.
+                // and it has two at most. Once the peer has closed, a drained
+                // socket fails to lend any more.
                 for _ in 0..2 {
+                    if received == end {
+                        break;
+                    }
                     received += socket
                         .recv(|part| {
                             let len = part.len().min(end - received);
@@ -685,6 +689,9 @@ impl Tcp {
                 // smoltcp lends the room in its send buffer a contiguous part
                 // at a time, and it has two at most.
                 for _ in 0..2 {
+                    if sent == length {
+                        break;
+                    }
                     let filled = socket.send(|part| {
                         let len = part.len().min(length - sent);
                         match fill(&mut part[..len]) {

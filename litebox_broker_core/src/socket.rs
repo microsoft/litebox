@@ -1393,14 +1393,14 @@ fn transport_send(
         .resource
         .platform_socket
         .send(length, flags, &mut |part| {
-            lent.add(part.len())?;
-            fill(part)
-        })
-        .map_err(|error| would_block_error(error, state.nonblocking))?;
+            lent.lend(part.len(), || fill(part))
+        });
+    let lent = lent.finish()?;
+    let outcome = outcome.map_err(|error| would_block_error(error, state.nonblocking))?;
     // A platform may fill in more than it sends, such as one that fills in
     // all of it before learning how much the host takes.
     if let SocketOutcome::Completed(sent) = outcome
-        && (sent > lent.bytes || (length != 0 && sent == 0))
+        && (sent > lent || (length != 0 && sent == 0))
     {
         return Err(BrokerError::Internal);
     }
@@ -1408,25 +1408,48 @@ fn transport_send(
 }
 
 /// Counts the bytes a platform lends a copier or filler, which may be no
-/// more than requested, to check what it reports.
+/// more than requested, to check what it reports, and keeps the first
+/// failure, which fails the operation whatever the platform reports (see
+/// [`crate::transfer`]).
 struct Lent {
     limit: usize,
     bytes: usize,
+    failure: Option<BrokerError>,
 }
 
 impl Lent {
     const fn new(limit: usize) -> Self {
-        Self { limit, bytes: 0 }
+        Self {
+            limit,
+            bytes: 0,
+            failure: None,
+        }
     }
 
-    /// Counts a part of `length` bytes, failing if it exceeds the limit.
-    fn add(&mut self, length: usize) -> Result<()> {
-        self.bytes = self
-            .bytes
-            .checked_add(length)
-            .filter(|&bytes| bytes <= self.limit)
-            .ok_or(BrokerError::Internal)?;
-        Ok(())
+    /// Counts a part of `length` bytes and passes it on with `transfer`,
+    /// failing if it exceeds the limit or an earlier part failed.
+    fn lend(&mut self, length: usize, transfer: impl FnOnce() -> Result<()>) -> Result<()> {
+        let result = match self.failure {
+            Some(failure) => Err(failure),
+            None => self
+                .bytes
+                .checked_add(length)
+                .filter(|&bytes| bytes <= self.limit)
+                .ok_or(BrokerError::Internal)
+                .and_then(|bytes| {
+                    self.bytes = bytes;
+                    transfer()
+                }),
+        };
+        if let Err(error) = result {
+            self.failure.get_or_insert(error);
+        }
+        result
+    }
+
+    /// Returns how many bytes were lent, or the first failure.
+    fn finish(self) -> Result<usize> {
+        self.failure.map_or(Ok(self.bytes), Err)
     }
 }
 
@@ -1601,10 +1624,10 @@ fn transport_send_to(
     let outcome = resource
         .platform_socket
         .send_to(length, flags, destination, &mut |part| {
-            lent.add(part.len())?;
-            fill(part)
-        })
-        .map_err(|error| would_block_error(error, nonblocking))?;
+            lent.lend(part.len(), || fill(part))
+        });
+    lent.finish()?;
+    let outcome = outcome.map_err(|error| would_block_error(error, nonblocking))?;
     // A platform may accept a datagram it then drops without filling it in,
     // as UDP may drop any datagram.
     if let SocketOutcome::Completed(sent) = outcome
@@ -1755,28 +1778,23 @@ fn transport_receive(
         return Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(0)));
     }
     let mut lent = Lent::new(length);
-    let outcome = state
-        .resource
-        .platform_socket
-        .receive(
-            reader,
-            length,
-            flags,
-            peek_offset,
-            peek_length,
-            &mut |part| {
-                lent.add(part.len())?;
-                copy(part)
-            },
-        )
-        .map_err(|error| would_block_error(error, state.nonblocking))?;
+    let outcome = state.resource.platform_socket.receive(
+        reader,
+        length,
+        flags,
+        peek_offset,
+        peek_length,
+        &mut |part| lent.lend(part.len(), || copy(part)),
+    );
+    let lent = lent.finish()?;
+    let outcome = outcome.map_err(|error| would_block_error(error, state.nonblocking))?;
     let received = match outcome {
         SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => received,
         SocketOutcome::Completed(PlatformStreamReceive::EndOfStream) | SocketOutcome::Failed(_) => {
             0
         }
     };
-    if received != lent.bytes
+    if received != lent
         || matches!(
             outcome,
             SocketOutcome::Completed(PlatformStreamReceive::Received(0))
@@ -1851,19 +1869,19 @@ fn transport_receive_from(
         .resource
         .platform_socket
         .receive_from(length, flags, &mut |part| {
-            lent.add(part.len())?;
-            copy(part)
-        })
-        .map_err(|error| would_block_error(error, state.nonblocking))?;
+            lent.lend(part.len(), || copy(part))
+        });
+    let lent = lent.finish()?;
+    let outcome = outcome.map_err(|error| would_block_error(error, state.nonblocking))?;
     let invalid = match &outcome {
         SocketOutcome::Completed(received) => {
-            received.received != lent.bytes
+            received.received != lent
                 || received.received != received.datagram_length.min(length)
                 || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize
                 || normalize_socket_destination(received.source_address)
                     != Ok(received.source_address)
         }
-        SocketOutcome::Failed(_) => lent.bytes != 0,
+        SocketOutcome::Failed(_) => lent != 0,
     };
     if invalid {
         return Err(BrokerError::Internal);
