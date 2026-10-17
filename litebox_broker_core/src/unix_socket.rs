@@ -52,6 +52,7 @@ use crate::fs::File;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::socket::SocketOptions;
+use crate::transfer::copy_from_queue;
 use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a Unix socket operation.
@@ -1245,14 +1246,11 @@ impl Socket {
                 };
             }
             let length = capacity.min(channel.queue.bytes.len());
-            let mut data = Vec::new();
-            data.try_reserve_exact(length)
-                .map_err(|_| BrokerError::OutOfMemory)?;
+            let data = copy_from_queue(&channel.queue.bytes, 0..length)?;
             if peek {
-                data.extend(channel.queue.bytes.iter().take(length));
                 (data, Wakeups::default())
             } else {
-                data.extend(channel.queue.bytes.drain(..length));
+                channel.queue.bytes.drain(..length);
                 if channel.queue.bytes.is_empty() {
                     channel.queue.bytes = VecDeque::new();
                 }

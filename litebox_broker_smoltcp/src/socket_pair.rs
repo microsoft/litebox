@@ -8,6 +8,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use litebox_broker_core::transfer::copy_from_queue;
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 
 use super::Sockets;
@@ -129,10 +130,7 @@ impl Sockets {
     ) -> BrokerResult<Vec<u8>> {
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[1 - end];
-        let mut data = Vec::new();
-        data.try_reserve_exact(stop - start)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        data.extend(queue.range(start..stop));
+        let data = copy_from_queue(queue, start..stop)?;
         if !peek {
             let before = queue.capacity();
             queue.drain(..stop);
