@@ -18,7 +18,6 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-pub mod byte_queue;
 mod channel;
 mod error;
 pub mod event;
@@ -37,6 +36,7 @@ pub mod signal;
 pub mod socket;
 pub mod stdio;
 pub mod timer;
+pub mod transfer;
 pub mod unix_socket;
 
 #[cfg(test)]

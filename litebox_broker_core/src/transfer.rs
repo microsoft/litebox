@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Helpers for the byte queues behind broker streams, such as pipes and
-//! stream sockets.
+//! Copying bytes into and out of broker objects' storage, such as the
+//! queues behind pipes and stream sockets.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -16,7 +16,7 @@ use crate::{BrokerError, Result};
 /// # Panics
 ///
 /// Panics if `range` is out of `queue`'s bounds.
-pub fn copy_queued(queue: &VecDeque<u8>, range: Range<usize>) -> Result<Vec<u8>> {
+pub fn copy_from_queue(queue: &VecDeque<u8>, range: Range<usize>) -> Result<Vec<u8>> {
     let (front, back) = queue.as_slices();
     let split = front.len();
     let mut data = Vec::new();
@@ -44,7 +44,7 @@ mod tests {
         for start in 0..=queue.len() {
             for stop in start..=queue.len() {
                 let expected: Vec<u8> = queue.range(start..stop).copied().collect();
-                assert_eq!(copy_queued(&queue, start..stop), Ok(expected));
+                assert_eq!(copy_from_queue(&queue, start..stop), Ok(expected));
             }
         }
     }

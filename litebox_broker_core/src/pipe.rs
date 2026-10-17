@@ -12,9 +12,9 @@ use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
-use crate::byte_queue::copy_queued;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
+use crate::transfer::copy_from_queue;
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
@@ -152,7 +152,7 @@ impl PipeObject {
         }
 
         let read_len = length.min(state.data.len());
-        let data = copy_queued(&state.data, 0..read_len)?;
+        let data = copy_from_queue(&state.data, 0..read_len)?;
         state.data.drain(..read_len);
         state.publish(PipeEndpoint::Write);
         Ok(data)
