@@ -21,6 +21,7 @@ members = [
     "litebox_common_windows",
     "litebox_common_optee",
     "litebox_common_vm_abi",
+    "litebox_common_vm_control",
     "litebox_common_lvbs",
     "litebox_platform",
     "litebox_egress_proxy",
@@ -56,6 +57,7 @@ members = [
     "litebox_packager",
     "litebox_util_log",
     "litebox_util_log_macros",
+    "litebox_vm_host",
     # The CI tests are not meant to be released (thus are not prefixed with
     # `litebox_`), but exist purely to better manage development on LiteBox.
     "dev_tests",
@@ -82,6 +84,7 @@ default-members = [
     "litebox_common_windows",
     "litebox_common_optee",
     "litebox_common_vm_abi",
+    "litebox_common_vm_control",
     "litebox_common_lvbs",
     "litebox_platform",
     "litebox_egress_proxy",
@@ -108,6 +111,7 @@ default-members = [
     "litebox_packager",
     "litebox_util_log",
     "litebox_util_log_macros",
+    "litebox_vm_host",
     "dev_tests",
     "dev_bench",
 ]
