@@ -312,6 +312,9 @@ impl TerminalEngine {
                         continue;
                     }
                     if Self::matches(byte, cc.kill) {
+                        if self.line.is_empty() {
+                            continue;
+                        }
                         if l.contains(L::ECHO | L::ECHO_KILL | L::ECHO_KILL_ERASE | L::ECHO_ERASE) {
                             while !self.line.is_empty() {
                                 self.erase(&mut result.echo, true);
@@ -806,6 +809,7 @@ mod tests {
                     settings.local.set(L::ECHO_KILL, kill);
                     settings.local.set(L::ECHO_KILL_ERASE, kill_erase);
                     tty.configure(settings).unwrap();
+                    assert!(tty.receive(b"\x15").echo.is_empty());
                     tty.receive(b"foo");
                     let expected = if erase && kill && kill_erase {
                         b"\x08 \x08".repeat(3)
@@ -815,6 +819,7 @@ mod tests {
                         b"^U".to_vec()
                     };
                     assert_eq!(tty.receive(b"\x15").echo, expected);
+                    assert!(tty.receive(b"\x15").echo.is_empty());
                     tty.receive(b"foo");
                     assert_eq!(tty.receive(b"\x17").echo, b"\x08 \x08".repeat(3));
                     tty.receive(b"foo");
@@ -826,6 +831,14 @@ mod tests {
                             b"^?"
                         }
                     );
+                    tty.receive(b"\n");
+                    assert!(tty.receive(b"\x15").echo.is_empty());
+                    tty.receive(b"\x04");
+                    assert!(tty.receive(b"\x15").echo.is_empty());
+                    let mut bytes = [0; 8];
+                    assert_eq!(tty.read(&mut bytes), Some(3));
+                    assert_eq!(&bytes[..3], b"fo\n");
+                    assert_eq!(tty.read(&mut bytes), Some(0));
                 }
             }
         }
