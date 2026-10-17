@@ -13,6 +13,35 @@ use std::vec;
 
 const USER: FileUser = FileUser::ROOT;
 
+/// A receive's result with its bytes.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Message {
+    data: Vec<u8>,
+    length: usize,
+    source: Option<UnixSocketName>,
+}
+
+/// Receives up to `capacity` bytes from a Unix socket into a new vector.
+fn receive_message(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    capacity: usize,
+    peek: bool,
+    source: bool,
+    nonblocking: bool,
+) -> Result<UnixSocketResult<Message>> {
+    let mut data = vec![0; capacity];
+    let result = receive(process, handle, &mut data[..], peek, source, nonblocking)?;
+    Ok(result.map(|received| {
+        data.truncate(received.received);
+        Message {
+            data,
+            length: received.length,
+            source: received.source,
+        }
+    }))
+}
+
 struct Fixture {
     broker: BrokerCore,
     process: Arc<BrokerProcess>,
@@ -115,11 +144,11 @@ impl Fixture {
         send(&self.process, handle, Some(address), data, USER)
     }
 
-    fn receive(&self, handle: ObjectHandle, capacity: u32) -> Result<UnixSocketResult<Received>> {
-        receive(&self.process, handle, capacity, false, true, false)
+    fn receive(&self, handle: ObjectHandle, capacity: usize) -> Result<UnixSocketResult<Message>> {
+        receive_message(&self.process, handle, capacity, false, true, false)
     }
 
-    fn receive_data(&self, handle: ObjectHandle, capacity: u32) -> Vec<u8> {
+    fn receive_data(&self, handle: ObjectHandle, capacity: usize) -> Vec<u8> {
         self.receive(handle, capacity).unwrap().unwrap().data
     }
 
@@ -187,7 +216,7 @@ fn stream_pairs_carry_bytes_in_both_directions() {
     assert!(fixture.take_republished().contains(&second));
     assert!(fixture.readiness(second).contains(ReadinessFlags::READ));
 
-    let peeked = receive(&fixture.process, second, 3, true, true, false)
+    let peeked = receive_message(&fixture.process, second, 3, true, true, false)
         .unwrap()
         .unwrap();
     assert_eq!(peeked.data, b"hel");
@@ -622,7 +651,7 @@ fn datagrams_keep_boundaries_and_sources() {
 
     assert_eq!(
         fixture.receive(receiver, 2).unwrap().unwrap(),
-        Received {
+        Message {
             data: b"ab".to_vec(),
             length: 3,
             source: Some(path("/named").name()),
@@ -630,12 +659,12 @@ fn datagrams_keep_boundaries_and_sources() {
     );
     assert_eq!(
         fixture.receive(receiver, 8).unwrap().unwrap(),
-        Received {
+        Message {
             source: Some(UnixSocketName::Unnamed),
-            ..Received::default()
+            ..Message::default()
         }
     );
-    let peeked = receive(&fixture.process, receiver, 8, true, false, false)
+    let peeked = receive_message(&fixture.process, receiver, 8, true, false, false)
         .unwrap()
         .unwrap();
     assert_eq!(peeked.data, b"defgh");
@@ -738,7 +767,7 @@ fn reconnecting_a_datagram_socket_drops_queued_datagrams() {
     assert_eq!(fixture.queued(), (0, 0));
     assert!(!fixture.readiness(receiver).contains(ReadinessFlags::READ));
     assert_eq!(
-        receive(&fixture.process, receiver, 1, false, false, true),
+        receive_message(&fixture.process, receiver, 1, false, false, true),
         Err(BrokerError::NonBlockingWouldBlock)
     );
 }
@@ -870,7 +899,7 @@ fn duplicated_references_share_one_socket() {
     fixture.close(first);
     assert_eq!(fixture.send(second, b"child").unwrap(), Ok(5));
     assert_eq!(
-        receive(&child, duplicated, 8, false, false, false)
+        receive_message(&child, duplicated, 8, false, false, false)
             .unwrap()
             .unwrap()
             .data,
@@ -910,7 +939,7 @@ fn sockets_connect_to_themselves_only_as_datagram_sockets() {
 #[test]
 fn stream_directions_transfer_in_parallel() {
     const LENGTH: usize = 4 * CAPACITY;
-    const CHUNK: u32 = 4096;
+    const CHUNK: usize = 4096;
     let fixture = Fixture::new();
     let (first, second) = fixture.pair(SocketType::Stream);
     let data: Vec<u8> = (0..LENGTH)
@@ -922,7 +951,7 @@ fn stream_directions_transfer_in_parallel() {
             scope.spawn(move || {
                 let mut sent = 0;
                 while sent < LENGTH {
-                    let end = LENGTH.min(sent + CHUNK as usize);
+                    let end = LENGTH.min(sent + CHUNK);
                     sent += Fixture::retry(|| fixture.send(sender, &data[sent..end])).unwrap();
                 }
             });
