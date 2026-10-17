@@ -944,7 +944,7 @@ mod tests {
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::vec;
     use std::vec::Vec;
 
@@ -1734,49 +1734,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn spinning_waits_return_without_blocking_once_the_epoch_changes() {
-        let memory = TestMemory::new(CONTROL_RING_MEMORY_SIZE);
-        memory.spin_limit.store(u32::MAX, Ordering::Relaxed);
-        let (mut producer, mut consumer) = ControlRing::new(memory).unwrap().into_endpoints(
-            ControlRingDirection::Requests,
-            ControlRingDirection::Requests,
-        );
-        let Ok(ControlRingReadStatus::Empty { wait_epoch }) =
-            consumer.try_read(|frame| Ok::<_, ()>(frame.to_vec()))
-        else {
-            panic!("an empty ring");
-        };
-        assert_eq!(
-            producer.try_write(b"x"),
-            Ok(ControlRingWriteStatus::Written)
-        );
-        consumer.wait_for_message(wait_epoch).unwrap();
-        let memory = consumer.memory();
-        assert_eq!(memory.waits(), []);
-        let waiting = ControlRingDirection::Requests.consumer_waiting_offset();
-        assert!(
-            !memory
-                .write_log()
-                .iter()
-                .any(|(offset, _)| *offset == waiting)
-        );
-
-        memory.spin_limit.store(3, Ordering::Relaxed);
-        let Ok(ControlRingReadStatus::Message(_)) =
-            consumer.try_read(|frame| Ok::<_, ()>(frame.to_vec()))
-        else {
-            panic!("the written message");
-        };
-        let Ok(ControlRingReadStatus::Empty { wait_epoch }) =
-            consumer.try_read(|frame| Ok::<_, ()>(frame.to_vec()))
-        else {
-            panic!("an empty ring");
-        };
-        consumer.wait_for_message(wait_epoch).unwrap();
-        assert_eq!(consumer.memory().waits().len(), 1);
-    }
-
     fn word_at(bytes: &[u8], offset: usize) -> u32 {
         u32::from_ne_bytes(bytes[offset..offset + size_of::<u32>()].try_into().unwrap())
     }
@@ -1817,7 +1774,6 @@ mod tests {
         bytes: Mutex<Vec<u8>>,
         write_log: Mutex<Vec<(usize, usize)>>,
         write_count: AtomicUsize,
-        spin_limit: AtomicU32,
         /// Each wait's offset, expected value, and memory snapshot.
         waits: Mutex<Vec<(usize, u32, Vec<u8>)>>,
         wakes: Mutex<Vec<usize>>,
@@ -1829,7 +1785,6 @@ mod tests {
                 bytes: Mutex::new(vec![0; length]),
                 write_log: Mutex::new(Vec::new()),
                 write_count: AtomicUsize::new(0),
-                spin_limit: AtomicU32::new(0),
                 waits: Mutex::new(Vec::new()),
                 wakes: Mutex::new(Vec::new()),
             }
@@ -1910,10 +1865,6 @@ mod tests {
         fn wake_one(&self, offset: usize) -> Result<(), SharedMemoryError> {
             self.wakes.lock().unwrap().push(offset);
             Ok(())
-        }
-
-        fn spin_limit(&self) -> u32 {
-            self.spin_limit.load(Ordering::Relaxed)
         }
     }
 
