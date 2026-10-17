@@ -493,6 +493,10 @@ jobs:
           # - `litebox_packager` is allowed to have `std` access since it is a
           #   userland CLI tool that packages ELF programs for LiteBox.
           #
+          # - `litebox_vm_host` is allowed to have `std` access since it is a
+          #   host CLI tool that controls the LiteBox VM kernel over its
+          #   control channel's Unix socket.
+          #
           # - `litebox_runner_snp` is `no_std` but requires custom target to build
           # - `litebox_runner_snp` is temporarily disabled until SNP networking
           #   can use a kernel-mode broker
@@ -530,6 +534,7 @@ jobs:
             -not -path './litebox_shim_windows/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
+            -not -path './litebox_vm_host/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
             -not -path './litebox_service_heki/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \

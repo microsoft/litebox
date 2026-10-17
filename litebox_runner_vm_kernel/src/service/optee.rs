@@ -10,9 +10,11 @@ use super::Service;
 use crate::payload::Payload;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use litebox_common_optee::TeeUuid;
 use litebox_common_optee::envelope::{LDELF_IMAGE, TA_IMAGE};
 use litebox_common_vm_abi::{IDENTITY_LEN, WallClock};
+use litebox_common_vm_control::ProcessInfo;
 use litebox_hal::clock::Clock;
 use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_vm_kernel::optee::Completion;
@@ -111,9 +113,21 @@ impl Optee {
         Self { manager }
     }
 
-    /// Live TA instances, for tests.
-    pub fn instance_count(&self) -> usize {
-        self.manager.instance_count()
+    /// Ends a TA instance's process; see [`TaManager::kill`]. False if there
+    /// is no such instance.
+    pub fn kill(&mut self, id: u64) -> bool {
+        self.manager.kill(id)
+    }
+
+    /// Live TA instances' processes.
+    pub fn processes(&self) -> Vec<ProcessInfo> {
+        self.manager
+            .instances()
+            .map(|(id, uuid)| ProcessInfo {
+                id,
+                name: ProcessInfo::ta_name(&uuid.to_bytes()),
+            })
+            .collect()
     }
 }
 
