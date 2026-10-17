@@ -15,7 +15,8 @@ use litebox_common_linux::PtRegs;
 use litebox_platform_macos_userland::{
     GuestAbi, HOST_PAGE_SIZE, MacosUserland, run_thread, set_guest_abi,
 };
-use litebox_syscall_rewriter::{TargetHost, macho::Rewriter};
+use litebox_syscall_rewriter::macho::Rewriter;
+use litebox_trampoline::TargetHost;
 use std::cell::Cell;
 use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;

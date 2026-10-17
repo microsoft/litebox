@@ -67,9 +67,9 @@ fn main() -> anyhow::Result<()> {
     let mut input_binary_bytes = vec![];
     input_binary.read_to_end(&mut input_binary_bytes)?;
     let host = match cli_args.target_host {
-        Some(CliTargetHost::Linux) => litebox_syscall_rewriter::TargetHost::Linux,
-        Some(CliTargetHost::Macos) => litebox_syscall_rewriter::TargetHost::MacOs,
-        Some(CliTargetHost::Windows) => litebox_syscall_rewriter::TargetHost::Windows,
+        Some(CliTargetHost::Linux) => litebox_trampoline::TargetHost::Linux,
+        Some(CliTargetHost::Macos) => litebox_trampoline::TargetHost::MacOs,
+        Some(CliTargetHost::Windows) => litebox_trampoline::TargetHost::Windows,
         None => {
             litebox_syscall_rewriter::RewriteOptions::for_binary(&input_binary_bytes).target_host()
         }

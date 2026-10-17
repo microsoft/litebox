@@ -4,7 +4,7 @@
 //! Single-source AArch64 gate templates.
 //!
 //! [`build`] describes every gate kind exactly once, as a sequence of
-//! instructions. Each instruction carries a [`Role`], which says how slot
+//! instructions. Each instruction carries a `Role`, which says how slot
 //! validation compares that word, and a recovery [`Stage`], which says how a
 //! signal handler canonicalizes a context interrupted *before* that
 //! instruction executes. Everything else derives from this one description:
@@ -12,27 +12,27 @@
 //! * emission builds a slot from the patch site's parameters;
 //! * validation extracts the free parameters from a candidate slot, rebuilds
 //!   it, and compares the two word by word ([`validate`]);
-//! * TLS-offset finalization patches the words tagged [`Role::Tls`];
+//! * TLS-offset finalization patches the words tagged `Role::Tls`;
 //! * signal recovery reads the [`Stage`] of the interrupted instruction.
 //!
-//! Host differences are confined to the anchor macro ([`GateAsm::tls_base`]),
+//! Host differences are confined to the anchor macro (`GateAsm::tls_base`),
 //! so no host-specific offset tables exist. The builder neither allocates nor
 //! panics, because validation also runs inside signal handlers.
 
 use super::{
     ADD_IMM_SHAPE_MASK, ADRP_SHAPE_MASK, Boundary, Frame, FrameBase, GATE_METADATA_BYTES,
     GUEST_TPIDR_OFFSET_ALIGN, GUEST_TPIDR_OFFSET_PLACEHOLDER, GUEST_X18_OFFSET_PLACEHOLDER,
-    GateLayout, GateMetadata, GuestSp, Host, IMM26_BITS, IMM26_MASK, IN_GUEST_OFFSET_FROM_GUEST_TP,
+    GateLayout, GateMetadata, GuestSp, IMM26_BITS, IMM26_MASK, IN_GUEST_OFFSET_FROM_GUEST_TP,
     INSN_BYTES, Insn, LDST_UIMM12_IMM_MASK, LDST_UIMM12_IMM_SHIFT, MAX_GATE_SLOT_BYTES,
     MSR_FRAME_BYTES, MSR_FRAME_OFF_VALUE, NOP, OPCODE_TOP6_MASK, Opcode, PAGE_OFFSET_MASK,
     REG_MASK, RT2_SHIFT, Resume, SP, SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16,
-    Stage, Value, X16, X17, X18_BRANCH_BRK_IMM, X18_FRAME_BYTES, X18BranchKind, X18PcRelative,
-    X18StackWritebackLayout, anchor_mask, classify_x18_stack_writeback, decode_ldr_literal_target,
-    pcrel_bytes, valid_emitted_tpidr_offset, valid_emitted_x18_offset,
+    Stage, TargetHost, Value, X16, X17, X18_BRANCH_BRK_IMM, X18_FRAME_BYTES, X18BranchKind,
+    X18PcRelative, X18StackWritebackLayout, anchor_mask, classify_x18_stack_writeback,
+    decode_ldr_literal_target, pcrel_bytes, valid_emitted_tpidr_offset, valid_emitted_x18_offset,
 };
 
 /// Most words any gate slot holds, including padding and metadata.
-pub(super) const MAX_SLOT_WORDS: usize = MAX_GATE_SLOT_BYTES / INSN_BYTES;
+pub(crate) const MAX_SLOT_WORDS: usize = MAX_GATE_SLOT_BYTES / INSN_BYTES;
 
 impl Boundary {
     const fn new(frame: Frame, sp: GuestSp, value: Value, resume: Resume) -> Self {
@@ -70,7 +70,7 @@ impl Boundary {
 
 /// Runtime-patched guest TLS field in an unsigned-offset `LDR`/`STR`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TlsField {
+pub(crate) enum TlsField {
     /// Guest thread-pointer slot, or the indirect-TLS block pointer.
     Tp,
     /// Direct-TLS guest x18 slot.
@@ -78,7 +78,7 @@ pub(super) enum TlsField {
 }
 
 impl TlsField {
-    pub(super) const fn placeholder(self) -> u16 {
+    pub(crate) const fn placeholder(self) -> u16 {
         match self {
             Self::Tp => GUEST_TPIDR_OFFSET_PLACEHOLDER,
             Self::X18 => GUEST_X18_OFFSET_PLACEHOLDER,
@@ -95,7 +95,7 @@ impl TlsField {
 
 /// How validation compares one slot word against its rebuilt template.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Role {
+pub(crate) enum Role {
     /// Must match exactly.
     Fixed,
     /// Matches except for a runtime-patched TLS offset, which must be the
@@ -124,29 +124,29 @@ pub(super) enum Role {
 
 /// Parameters of one gate instance. Kinds use only the fields they need.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct GateInstance {
-    pub(super) metadata: GateMetadata,
+pub struct GateInstance {
+    pub metadata: GateMetadata,
     /// x18 gates: the scratch holding the host anchor.
-    pub(super) anchor: u8,
+    pub anchor: u8,
     /// x18 gates: the guest instruction with x18 substituted.
-    pub(super) guest: u32,
+    pub guest: u32,
     /// Ordinary x18 gate: relocate a PC-relative guest instruction.
-    pub(super) pc_relative: Option<X18PcRelative>,
+    pub pc_relative: Option<X18PcRelative>,
     /// Compare/test-branch gate: the branch form.
-    pub(super) test: X18BranchKind,
+    pub test: X18BranchKind,
     /// SP-writeback gate: the decoded pair layout.
-    pub(super) stack: X18StackWritebackLayout,
+    pub stack: X18StackWritebackLayout,
     /// Address of the instruction after the original site.
-    pub(super) return_addr: u64,
+    pub return_addr: u64,
     /// Compare/test-branch gate: the taken target.
-    pub(super) taken: u64,
+    pub taken: u64,
     /// `ADR X18` gate: the materialized address.
-    pub(super) adr_target: u64,
+    pub adr_target: u64,
 }
 
 impl GateInstance {
     /// An instance with every kind-specific field at a harmless default.
-    pub(super) const fn new(metadata: GateMetadata, return_addr: u64) -> Self {
+    pub const fn new(metadata: GateMetadata, return_addr: u64) -> Self {
         Self {
             metadata,
             anchor: 0,
@@ -180,7 +180,7 @@ impl GateInstance {
 
 /// Why a gate could not be built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BuildError {
+pub enum BuildError {
     /// A PC-relative reference is out of range; the site must be trapped.
     Unreachable,
     /// An address computation overflowed (`"{context} address overflow"`).
@@ -200,7 +200,7 @@ pub(super) enum BuildError {
 /// One built slot: body, NOP padding and metadata, with per-word roles and
 /// recovery stages. A fixed-size value so that signal handlers can build it.
 #[derive(Clone, Copy)]
-pub(super) struct BuiltSlot {
+pub struct BuiltSlot {
     words: [u32; MAX_SLOT_WORDS],
     roles: [Role; MAX_SLOT_WORDS],
     stages: [Option<Stage>; MAX_SLOT_WORDS],
@@ -208,7 +208,7 @@ pub(super) struct BuiltSlot {
 }
 
 impl BuiltSlot {
-    pub(super) const fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             words: [0; MAX_SLOT_WORDS],
             roles: [Role::Fixed; MAX_SLOT_WORDS],
@@ -217,7 +217,7 @@ impl BuiltSlot {
         }
     }
 
-    pub(super) fn words(&self) -> &[u32] {
+    pub fn words(&self) -> &[u32] {
         &self.words[..self.len]
     }
 
@@ -227,7 +227,7 @@ impl BuiltSlot {
 
     /// Recovery stage of the instruction at byte offset `offset`, or `None`
     /// when that word is not part of the executable body.
-    pub(super) fn stage_at(&self, offset: usize) -> Option<Stage> {
+    pub fn stage_at(&self, offset: usize) -> Option<Stage> {
         if !offset.is_multiple_of(INSN_BYTES) {
             return None;
         }
@@ -238,7 +238,7 @@ impl BuiltSlot {
     }
 
     /// Byte offset of the first word with `role`.
-    pub(super) fn offset_of(&self, role: Role) -> Option<usize> {
+    pub(crate) fn offset_of(&self, role: Role) -> Option<usize> {
         self.roles()
             .iter()
             .position(|candidate| *candidate == role)
@@ -246,7 +246,7 @@ impl BuiltSlot {
     }
 
     /// Byte offsets and fields of every runtime-patched TLS word.
-    pub(super) fn tls_words(&self) -> impl Iterator<Item = (usize, TlsField)> + '_ {
+    pub(crate) fn tls_words(&self) -> impl Iterator<Item = (usize, TlsField)> + '_ {
         self.roles()
             .iter()
             .enumerate()
@@ -256,7 +256,7 @@ impl BuiltSlot {
             })
     }
 
-    pub(super) fn append_to(&self, out: &mut alloc::vec::Vec<u8>) {
+    pub fn append_to(&self, out: &mut alloc::vec::Vec<u8>) {
         for word in self.words() {
             out.extend_from_slice(&word.to_le_bytes());
         }
@@ -268,12 +268,12 @@ impl BuiltSlot {
 /// on signal stacks.
 struct GateAsm<'a> {
     vaddr: u64,
-    host: Host,
+    host: TargetHost,
     slot: &'a mut BuiltSlot,
 }
 
 impl<'a> GateAsm<'a> {
-    fn new(vaddr: u64, host: Host, slot: &'a mut BuiltSlot) -> Self {
+    fn new(vaddr: u64, host: TargetHost, slot: &'a mut BuiltSlot) -> Self {
         slot.len = 0;
         Self { vaddr, host, slot }
     }
@@ -383,7 +383,7 @@ impl<'a> GateAsm<'a> {
         rd: u8,
     ) -> Result<(), BuildError> {
         self.op(stage, self.host.anchor_read(rd))?;
-        if self.host == Host::MacOs {
+        if self.host == TargetHost::MacOs {
             self.op(next, anchor_mask(rd))?;
             self.tls(next, TlsField::Tp, Opcode::LdrUimm, rd, rd)?;
         }
@@ -414,7 +414,7 @@ impl<'a> GateAsm<'a> {
         rt: u8,
         rn: u8,
     ) -> Result<(), BuildError> {
-        if self.host == Host::MacOs {
+        if self.host == TargetHost::MacOs {
             self.op(stage, ldst(opcode, rt, rn, 0))
         } else {
             self.tls(stage, TlsField::Tp, opcode, rt, rn)
@@ -429,7 +429,7 @@ impl<'a> GateAsm<'a> {
         rt: u8,
         rn: u8,
     ) -> Result<(), BuildError> {
-        if self.host == Host::MacOs {
+        if self.host == TargetHost::MacOs {
             self.op(stage, ldst(opcode, rt, rn, GUEST_TPIDR_OFFSET_ALIGN))
         } else {
             self.tls(stage, TlsField::X18, opcode, rt, rn)
@@ -479,7 +479,7 @@ struct Gate<'a> {
 
 /// Builds the slot for `instance` at `slot_vaddr` in a trampoline mapped at
 /// `trampoline_base`. This is the only definition of each gate's code.
-pub(super) fn build(
+pub fn build(
     instance: &GateInstance,
     layout: GateLayout,
     slot_vaddr: u64,
@@ -523,7 +523,7 @@ fn build_into(
     )?;
     asm.finish(
         instance.metadata,
-        instance.metadata.slot_size_for(layout.host),
+        instance.metadata.slot_size_for_host(layout.host),
     )
 }
 
@@ -606,7 +606,7 @@ fn build_host_aware_mrs(asm: &mut GateAsm, gate: &Gate<'_>) -> Result<(), BuildE
     let GateMetadata::HostAwareMrsTpidr { destination: rd } = instance.metadata else {
         return Err(BuildError::Metadata);
     };
-    if asm.host != Host::MacOs {
+    if asm.host != TargetHost::MacOs {
         return Err(BuildError::Unsupported(
             "host-aware TPIDRRO gates require macOS",
         ));
@@ -631,8 +631,8 @@ fn build_host_aware_mrs(asm: &mut GateAsm, gate: &Gate<'_>) -> Result<(), BuildE
     asm.tls(lookup, TlsField::Tp, Opcode::LdrUimm, rd, rd)?;
     asm.op(lookup, ldr(rd, rd, 0))?;
     asm.op(done, Insn::B(8))?;
-    // Host path: reproduce the original instruction, including the CPU
-    // tag. Host signals are forwarded without gate canonicalization,
+    // TargetHost path: reproduce the original instruction, including the CPU
+    // tag. TargetHost signals are forwarded without gate canonicalization,
     // so reaching here from a guest-mode signal is a runtime bug.
     asm.op(Some(Stage::Invalid), Insn::MrsTpidrroEl0(rd))?;
     asm.branch(done, Role::Return, ret)?;
@@ -1055,7 +1055,7 @@ fn decode_test(word: u32, rt: u8) -> Option<X18BranchKind> {
 /// Where a slot being validated lives, which decides how exactly its branch and
 /// literal targets can be checked.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum SlotAddressing {
+pub enum SlotAddressing {
     /// The trampoline has been placed at its final address, so every target
     /// resolves to an absolute address and can be compared exactly.
     Placed {
@@ -1091,7 +1091,7 @@ impl SlotAddressing {
 ///
 /// On success, returns the slot's parameters and leaves the rebuilt slot in
 /// `out`. Allocation-free and panic-free, for use from signal handlers.
-pub(super) fn validate(
+pub fn validate(
     slot: &[u8],
     addressing: SlotAddressing,
     metadata: GateMetadata,
@@ -1100,7 +1100,7 @@ pub(super) fn validate(
 ) -> Option<GateInstance> {
     let (slot_vaddr, trampoline_base) = addressing.origin();
     let placed = matches!(addressing, SlotAddressing::Placed { .. });
-    if slot.len() != metadata.slot_size_for(layout.host)
+    if slot.len() != metadata.slot_size_for_host(layout.host)
         || !slot_vaddr.is_multiple_of(super::GATE_ALIGNMENT as u64)
     {
         return None;
@@ -1256,10 +1256,10 @@ fn branch_target(word: u32, pc: u64, placed: bool) -> Option<u64> {
 
 /// Recovers the trampoline base from a placed SVC slot's callback literal,
 /// using `probe` as scratch.
-pub(super) fn svc_trampoline_base(
+pub(crate) fn svc_trampoline_base(
     slot: &[u8],
     slot_vaddr: u64,
-    host: Host,
+    host: TargetHost,
     probe: &mut BuiltSlot,
 ) -> Option<u64> {
     build_into(
@@ -1275,15 +1275,20 @@ pub(super) fn svc_trampoline_base(
     decode_ldr_literal_target(word, slot_vaddr + offset as u64)
 }
 
-#[cfg(test)]
 impl GateMetadata {
     /// First byte past the executable body of this gate on a Linux host.
-    pub(super) fn executable_end(self) -> usize {
-        self.executable_end_for_host(Host::Linux)
+    ///
+    /// # Panics
+    /// Panics if the metadata cannot describe an encodable gate.
+    pub fn executable_end(self) -> usize {
+        self.executable_end_for_host(TargetHost::Linux)
     }
 
     /// First byte past the executable body of this gate on `host`.
-    pub(super) fn executable_end_for_host(self, host: Host) -> usize {
+    ///
+    /// # Panics
+    /// Panics if the metadata cannot describe an encodable gate for this host.
+    pub fn executable_end_for_host(self, host: TargetHost) -> usize {
         let layout = if matches!(self, GateMetadata::HostAwareMrsTpidr { .. }) {
             GateLayout::darwin(host)
         } else {

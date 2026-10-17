@@ -21,7 +21,7 @@ use litebox_common_linux::{
     },
     mm::MmapPlacement,
 };
-use litebox_syscall_rewriter::trampoline_allocation_range;
+use litebox_trampoline::trampoline_allocation_range;
 
 use crate::ShimPlatform;
 use crate::Task;
@@ -1211,7 +1211,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         state.trampoline_addr = trampoline.as_usize();
 
-        if litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES != 0 {
+        if litebox_trampoline::TRAMPOLINE_ENTRY_POINT_BYTES != 0 {
             if trampoline
                 .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
                 .is_none()
@@ -1220,7 +1220,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let _ = self.sys_munmap_raw(trampoline, state.trampoline_capacity);
                 return false;
             }
-            state.trampoline_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES;
+            state.trampoline_cursor = litebox_trampoline::TRAMPOLINE_ENTRY_POINT_BYTES;
         } else {
             state.trampoline_cursor = 0;
         }
@@ -1255,13 +1255,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let Some(aligned_cursor) = state
             .trampoline_cursor
-            .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN)
+            .checked_next_multiple_of(litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN)
         else {
             return RewriteOutcome::TrapFallback;
         };
         state.trampoline_cursor = aligned_cursor;
         let trampoline_write_vaddr = (state.trampoline_addr + state.trampoline_cursor) as u64;
-        let syscall_entry_addr = if litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES != 0 {
+        let syscall_entry_addr = if litebox_trampoline::TRAMPOLINE_ENTRY_POINT_BYTES != 0 {
             state.trampoline_addr as u64
         } else {
             syscall_entry as u64
@@ -2036,11 +2036,11 @@ mod tests {
                     1 => state.trampoline_capacity = PAGE_SIZE,
                     2 => {
                         state.load_span =
-                            Some(0..2 * litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT);
+                            Some(0..2 * litebox_trampoline::MAX_TRAMPOLINE_DISPLACEMENT);
                     }
                     _ => {
                         state.trampoline_capacity =
-                            2 * litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT;
+                            2 * litebox_trampoline::MAX_TRAMPOLINE_DISPLACEMENT;
                     }
                 }
             }
@@ -2582,7 +2582,7 @@ mod tests {
 
     #[test]
     fn trampoline_range_covers_whole_code_span_and_saturates_at_address_limits() {
-        let distance = litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT;
+        let distance = litebox_trampoline::MAX_TRAMPOLINE_DISPLACEMENT;
         assert_eq!(
             super::trampoline_allocation_range(0..PAGE_SIZE),
             Some(0..distance)

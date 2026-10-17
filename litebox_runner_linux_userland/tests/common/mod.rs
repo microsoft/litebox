@@ -94,20 +94,22 @@ pub fn find_dependencies(prog: &str) -> Vec<String> {
     paths
 }
 
-/// Find all Rust source files in the litebox_syscall_rewriter crate
+/// Find the rewriter and shared trampoline sources that affect emitted code.
 fn find_rewriter_source_files() -> Vec<PathBuf> {
     let mut source_files = Vec::new();
 
-    // Get the absolute path to the workspace root, then to the rewriter crate
+    // Get the absolute path to the workspace root.
     if let Ok(cargo_manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
         let workspace_root = std::path::Path::new(&cargo_manifest_dir).parent().unwrap();
-        let rewriter_dir = workspace_root.join("litebox_syscall_rewriter");
-        let pattern = format!("{}/src/**/*.rs", rewriter_dir.display());
+        for crate_name in ["litebox_syscall_rewriter", "litebox_trampoline"] {
+            let source_dir = workspace_root.join(crate_name);
+            let pattern = format!("{}/src/**/*.rs", source_dir.display());
 
-        if let Ok(paths) = glob(&pattern) {
-            for path in paths.flatten() {
-                if path.is_file() {
-                    source_files.push(path);
+            if let Ok(paths) = glob(&pattern) {
+                for path in paths.flatten() {
+                    if path.is_file() {
+                        source_files.push(path);
+                    }
                 }
             }
         }

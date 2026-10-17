@@ -31,9 +31,10 @@ use litebox_platform::sync::{
 use litebox_platform::time::{
     Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
-use litebox_syscall_rewriter::aarch64::{
-    GUEST_X18_OFFSET_FROM_GUEST_TP, IN_GUEST_OFFSET_FROM_GUEST_TP, SVC_FRAME_BYTES,
-    SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16, is_patchable_guest_tpidr_offset,
+use litebox_trampoline::{
+    aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP, aarch64::IN_GUEST_OFFSET_FROM_GUEST_TP,
+    aarch64::SVC_FRAME_BYTES, aarch64::SVC_FRAME_OFF_RETADDR, aarch64::SVC_FRAME_OFF_STUB,
+    aarch64::SVC_FRAME_OFF_X16, aarch64::is_patchable_guest_tpidr_offset,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -43,7 +44,7 @@ use zerocopy::{FromBytes, IntoBytes};
 #[repr(usize)]
 pub enum GuestAbi {
     Linux = SVC_FRAME_BYTES as usize,
-    Darwin = litebox_syscall_rewriter::aarch64::DARWIN_SVC_FRAME_BYTES as usize,
+    Darwin = litebox_trampoline::aarch64::DARWIN_SVC_FRAME_BYTES as usize,
 }
 
 struct GuestConfiguration {
@@ -3213,7 +3214,7 @@ unsafe extern "C" fn exception_signal_handler(
             thread_ctx.ctx,
             runtime,
             interruption,
-            litebox_syscall_rewriter::TargetHost::MacOs,
+            litebox_trampoline::TargetHost::MacOs,
             true,
             read_guest,
         ),

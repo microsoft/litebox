@@ -22,10 +22,8 @@ use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, VmFlags, VmemPr
 use litebox_common_macos::{
     MmapFlags, PAGE_SIZE, VmProtection, errno::Errno, loader::MAX_IMAGE_SIZE,
 };
-use litebox_syscall_rewriter::{
-    macho::{CodeMetadata, Rewriter},
-    trampoline_allocation_range,
-};
+use litebox_syscall_rewriter::{macho::CodeMetadata, macho::Rewriter};
+use litebox_trampoline::trampoline_allocation_range;
 
 use crate::syscalls::file::{FileFd, FileSubsystem};
 use crate::{SharedCacheRegion, SharedCacheTrampoline, ShimPlatform, Task};
@@ -292,8 +290,7 @@ fn reserve_shared_cache_gates(
     gate_length: usize,
     capacity: usize,
 ) -> Option<Range<usize>> {
-    let start =
-        cursor.checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN)?;
+    let start = cursor.checked_next_multiple_of(litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN)?;
     let end = start.checked_add(gate_length)?;
     (end <= capacity).then_some(start..end)
 }
@@ -407,7 +404,7 @@ impl<P: ShimPlatform> Task<P> {
                     continue;
                 }
                 let cursor = next_cursor
-                    .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN)
+                    .checked_next_multiple_of(litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN)
                     .ok_or(Error::Rewrite)?;
                 let gate_address = trampoline
                     .range
@@ -852,7 +849,7 @@ impl<P: ShimPlatform> Task<P> {
         let range = state.range.clone().expect("trampoline was just allocated");
         let cursor = state
             .cursor
-            .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN)
+            .checked_next_multiple_of(litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN)
             .ok_or(MappingError::OutOfMemory)?;
         let trampoline_address = range
             .start
@@ -1342,7 +1339,7 @@ mod tests {
     use litebox_common_linux::{PtRegs, vmem::VmFlags};
     use litebox_common_macos::{TaskParams, syscall::nr, user_pointers::UserPtr};
     use litebox_platform_macos_userland::MacosUserland as Platform;
-    use litebox_syscall_rewriter::aarch64::{GateMetadata, decode_branch_target};
+    use litebox_trampoline::{aarch64::GateMetadata, aarch64::decode_branch_target};
 
     use crate::{MacosShimBuilder, Process};
 
@@ -1643,7 +1640,7 @@ mod tests {
     #[test]
     fn image_span_beyond_trampoline_reach_uses_traps() {
         assert_unavailable_trampoline_uses_traps(
-            2 * litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT,
+            2 * litebox_trampoline::MAX_TRAMPOLINE_DISPLACEMENT,
             PAGE_SIZE,
         );
     }
@@ -1652,7 +1649,7 @@ mod tests {
     fn trampoline_capacity_beyond_reach_uses_traps() {
         assert_unavailable_trampoline_uses_traps(
             PAGE_SIZE,
-            2 * litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT,
+            2 * litebox_trampoline::MAX_TRAMPOLINE_DISPLACEMENT,
         );
     }
 
@@ -1762,7 +1759,7 @@ mod tests {
         let gate = UserPtr::<u8>::from_usize(target)
             .to_owned_slice::<Platform>(64)
             .unwrap();
-        let classified = Rewriter::new(litebox_syscall_rewriter::TargetHost::MacOs)
+        let classified = Rewriter::new(litebox_trampoline::TargetHost::MacOs)
             .unwrap()
             .classify_gate_slot(&gate, target as u64, target as u64)
             .unwrap();

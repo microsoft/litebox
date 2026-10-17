@@ -1731,6 +1731,7 @@ dependencies = [
  "litebox",
  "litebox_broker_protocol",
  "litebox_syscall_rewriter",
+ "litebox_trampoline",
  "litebox_util_log",
  "rangemap",
  "spin 0.9.8",
@@ -1759,7 +1760,7 @@ dependencies = [
  "litebox",
  "litebox_broker_protocol",
  "litebox_common_linux",
- "litebox_syscall_rewriter",
+ "litebox_trampoline",
  "object",
  "thiserror",
  "zerocopy",
@@ -1824,6 +1825,7 @@ dependencies = [
  "clap",
  "flate2",
  "litebox_syscall_rewriter",
+ "litebox_trampoline",
  "object",
  "oci-client",
  "oci-spec",
@@ -1875,6 +1877,7 @@ dependencies = [
  "litebox_common_optee",
  "litebox_platform",
  "litebox_syscall_rewriter",
+ "litebox_trampoline",
  "seccompiler",
  "spin 0.9.8",
  "syscalls",
@@ -1920,6 +1923,7 @@ dependencies = [
  "litebox_common_macos",
  "litebox_platform",
  "litebox_syscall_rewriter",
+ "litebox_trampoline",
  "zerocopy",
 ]
 
@@ -1982,6 +1986,7 @@ dependencies = [
  "litebox_platform_macos_userland",
  "litebox_shim_linux",
  "litebox_syscall_rewriter",
+ "litebox_trampoline",
  "litebox_util_log",
  "tempfile",
  "tracing-subscriber",
@@ -2077,6 +2082,7 @@ dependencies = [
  "litebox_platform_macos_userland",
  "litebox_shim_macos",
  "litebox_syscall_rewriter",
+ "litebox_trampoline",
  "tempfile",
 ]
 
@@ -2264,6 +2270,7 @@ dependencies = [
  "litebox_platform_macos_userland",
  "litebox_platform_windows_userland",
  "litebox_syscall_rewriter",
+ "litebox_trampoline",
  "litebox_util_log",
  "object",
  "once_cell",
@@ -2288,6 +2295,7 @@ dependencies = [
  "litebox_platform",
  "litebox_platform_macos_userland",
  "litebox_syscall_rewriter",
+ "litebox_trampoline",
  "litebox_util_log",
  "tempfile",
 ]
@@ -2374,9 +2382,18 @@ dependencies = [
  "iced-x86",
  "insta",
  "litebox_common_windows",
+ "litebox_trampoline",
  "object",
  "similar",
  "tempfile",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
+name = "litebox_trampoline"
+version = "0.1.0"
+dependencies = [
  "thiserror",
  "yaxpeax-arch",
  "yaxpeax-arm",

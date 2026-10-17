@@ -8,11 +8,13 @@
 
 use crate::PtRegs;
 use litebox::utils::TruncateExt as _;
-use litebox_syscall_rewriter::TargetHost;
-use litebox_syscall_rewriter::aarch64::{
-    self, Frame, FrameBase, GATE_ALIGNMENT, GATE_PC_CANDIDATE_COUNT, GATE_SLOT_SIZES, GateMetadata,
-    GuestSp, MAX_GATE_SLOT_BYTES, MSR_FRAME_BYTES, MSR_FRAME_OFF_VALUE, Resume, SVC_FRAME_BYTES,
-    SVC_GATE_BYTES, Stage, Value, X18_FRAME_BYTES,
+use litebox_trampoline::TargetHost;
+use litebox_trampoline::{
+    aarch64, aarch64::Frame, aarch64::FrameBase, aarch64::GATE_ALIGNMENT,
+    aarch64::GATE_PC_CANDIDATE_COUNT, aarch64::GATE_SLOT_SIZES, aarch64::GateMetadata,
+    aarch64::GuestSp, aarch64::MAX_GATE_SLOT_BYTES, aarch64::MSR_FRAME_BYTES,
+    aarch64::MSR_FRAME_OFF_VALUE, aarch64::Resume, aarch64::SVC_FRAME_BYTES,
+    aarch64::SVC_GATE_BYTES, aarch64::Stage, aarch64::Value, aarch64::X18_FRAME_BYTES,
 };
 
 // Keep recovered contexts stack-backed: boxing would allocate in a signal handler,
@@ -107,7 +109,7 @@ fn canonicalize_impl(
         GateAbi::Darwin => (
             TargetHost::MacOs,
             false,
-            litebox_syscall_rewriter::aarch64::DARWIN_SVC_FRAME_BYTES,
+            litebox_trampoline::aarch64::DARWIN_SVC_FRAME_BYTES,
         ),
     };
     let svc_frame = usize::from(svc_frame);
@@ -134,7 +136,7 @@ fn canonicalize_impl(
             if !read(slot_end - 4, &mut metadata_bytes) {
                 continue;
             }
-            let Some(metadata) = litebox_syscall_rewriter::aarch64::decode_gate_metadata_word(
+            let Some(metadata) = litebox_trampoline::aarch64::decode_gate_metadata_word(
                 u32::from_le_bytes(metadata_bytes),
             ) else {
                 continue;
@@ -152,17 +154,14 @@ fn canonicalize_impl(
             // slot's padding or metadata: no prologue ran, so retain the
             // interrupted registers.
             let classified = match abi {
-                GateAbi::Darwin => litebox_syscall_rewriter::macho::Rewriter::new(host)
-                    .ok()
-                    .and_then(|rewriter| {
-                        rewriter.classify_gate_slot(
-                            &slot[..slot_size],
-                            slot_start as u64,
-                            pc as u64,
-                        )
-                    }),
+                GateAbi::Darwin => aarch64::classify_copied_gate_slot_with_layout(
+                    &slot[..slot_size],
+                    slot_start as u64,
+                    pc as u64,
+                    aarch64::GateLayout::darwin(host),
+                ),
                 GateAbi::Linux { .. } => {
-                    litebox_syscall_rewriter::aarch64::classify_copied_gate_slot_for_host(
+                    litebox_trampoline::aarch64::classify_copied_gate_slot_for_host(
                         &slot[..slot_size],
                         slot_start as u64,
                         pc as u64,
@@ -194,7 +193,7 @@ fn canonicalize_impl(
         return Aarch64GateSignalResult::NotGate;
     }
     let original = u32::from_le_bytes(original);
-    if litebox_syscall_rewriter::aarch64::decode_branch_target(original, site as u64)
+    if litebox_trampoline::aarch64::decode_branch_target(original, site as u64)
         != Some(slot_start as u64)
     {
         return Aarch64GateSignalResult::NotGate;
@@ -400,7 +399,8 @@ fn canonicalize_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_syscall_rewriter::{aarch64::DARWIN_SVC_FRAME_BYTES, macho::Rewriter};
+    use litebox_syscall_rewriter::macho::Rewriter;
+    use litebox_trampoline::aarch64::DARWIN_SVC_FRAME_BYTES;
 
     #[test]
     #[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]

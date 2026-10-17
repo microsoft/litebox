@@ -544,7 +544,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         let frame_prefix = if action.flags.contains(SaFlags::RESTORER) {
             0
         } else {
-            litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES as usize
+            litebox_trampoline::aarch64::SVC_FRAME_BYTES as usize
         };
         #[cfg(target_arch = "x86_64")]
         let frame_prefix = 0;
@@ -624,7 +624,7 @@ fn syscall_instruction_len(platform: &impl litebox::platform::SystemInfoProvider
     if platform.get_syscall_entry_point() == 0 {
         arch::NATIVE_SYSCALL_INSTRUCTION_LEN
     } else {
-        litebox_syscall_rewriter::SYSCALL_ENTRY_INSTRUCTION_LEN
+        litebox_trampoline::SYSCALL_ENTRY_INSTRUCTION_LEN
     }
 }
 

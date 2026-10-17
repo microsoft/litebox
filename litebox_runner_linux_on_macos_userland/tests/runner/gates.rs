@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 use super::*;
-use litebox_syscall_rewriter::{RewriteOptions, TargetHost, hook_syscalls_in_elf_with_options};
+use litebox_syscall_rewriter::{RewriteOptions, hook_syscalls_in_elf_with_options};
+use litebox_trampoline::TargetHost;
 
 // Exercises TLS, syscalls, x18 spills, SP writeback, and ADR/BLR through x18.
 const X18: &[u32] = &[

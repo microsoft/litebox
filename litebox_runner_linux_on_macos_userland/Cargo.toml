@@ -18,8 +18,9 @@ litebox_util_log = { path = "../litebox_util_log", version = "0.1.0", features =
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
-tempfile = "3"
+litebox_trampoline = { path = "../litebox_trampoline", version = "0.1.0" }
 litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
+tempfile = "3"
 
 [features]
 # Development-only in-process broker fixture.

@@ -20,7 +20,7 @@ use zerocopy::{
     byteorder::{LittleEndian, U32, U64},
 };
 
-const TRAMPOLINE_FILE_ALIGNMENT: usize = 4096;
+use litebox_trampoline::TRAMPOLINE_FILE_ALIGNMENT;
 pub const MACH_HEADER_SIZE: usize = size_of::<macho::MachHeader64<LE>>();
 const ARM_THREAD_STATE64: u32 = 6;
 const LOAD_COMMAND_ALIGNMENT: usize = size_of::<u64>();
@@ -146,7 +146,7 @@ impl MachoParsedFile {
             .ok_or(MachoLoaderError::Unrewritten)?;
         let header = TrampolineHeader64::read_from_bytes(&data[footer_start..])
             .map_err(|_| MachoLoaderError::Rewrite)?;
-        if header.magic != *litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
+        if header.magic != *litebox_trampoline::TRAMPOLINE_MAGIC {
             return Err(if header.magic.starts_with(b"LITEBOX") {
                 MachoLoaderError::Rewrite
             } else {
@@ -181,7 +181,7 @@ impl MachoParsedFile {
             .ok_or(MachoLoaderError::Rewrite)?;
         if !file_offset.is_multiple_of(TRAMPOLINE_FILE_ALIGNMENT)
             || !address.is_multiple_of(PAGE_SIZE)
-            || size < litebox_syscall_rewriter::aarch64::GATE_ALIGNMENT
+            || size < litebox_trampoline::aarch64::GATE_ALIGNMENT
             || !size.is_multiple_of(size_of::<u32>())
             || file_end != footer_start
             || self.segments.iter().any(|s| {
@@ -887,12 +887,12 @@ mod tests {
 
     #[test]
     fn trampoline_footer_is_bounded_and_disjoint() {
-        const TRAMPOLINE_BYTES: usize = litebox_syscall_rewriter::aarch64::GATE_ALIGNMENT;
+        const TRAMPOLINE_BYTES: usize = litebox_trampoline::aarch64::GATE_ALIGNMENT;
         let mut data = image();
         let file_offset = data.len();
         data.extend_from_slice(&[0u8; TRAMPOLINE_BYTES]);
         let header = TrampolineHeader64 {
-            magic: *litebox_syscall_rewriter::TRAMPOLINE_MAGIC,
+            magic: *litebox_trampoline::TRAMPOLINE_MAGIC,
             file_offset: (file_offset as u64).into(),
             vaddr: (IMAGE_BASE + PAGE_SIZE as u64).into(),
             trampoline_size: (TRAMPOLINE_BYTES as u64).into(),
@@ -954,7 +954,7 @@ mod tests {
         let mut sentinel = raw;
         sentinel.extend_from_slice(
             TrampolineHeader64 {
-                magic: *litebox_syscall_rewriter::TRAMPOLINE_MAGIC,
+                magic: *litebox_trampoline::TRAMPOLINE_MAGIC,
                 file_offset: 0.into(),
                 vaddr: 0.into(),
                 trampoline_size: 0.into(),

@@ -1,0 +1,15 @@
+[package]
+name = "litebox_trampoline"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Trampoline definitions shared by LiteBox rewriters and runtimes"
+
+[dependencies]
+thiserror = { version = "2.0.6", default-features = false }
+yaxpeax-arch = { version = "0.3.2", default-features = false }
+yaxpeax-arm = { version = "0.4.0", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true

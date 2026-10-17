@@ -36,45 +36,14 @@ pub mod aarch64;
 pub mod macho;
 pub use macho::{hook_syscalls_in_macho, hook_syscalls_in_macho_with_options};
 
-/// Callback-slot bytes the caller must populate; zero when emitted inline.
-#[cfg(target_arch = "x86_64")]
-pub const TRAMPOLINE_ENTRY_POINT_BYTES: usize = size_of::<u64>();
-#[cfg(target_arch = "aarch64")]
-pub const TRAMPOLINE_ENTRY_POINT_BYTES: usize = 0;
-
-/// Furthest preferred trampoline base from the code segment.
-///
-/// AArch64 runtime reservations may exceed the nominal tail margin; each gate
-/// performs its own reach check.
-#[cfg(target_arch = "x86_64")]
-pub const MAX_TRAMPOLINE_DISPLACEMENT: usize = 0x7FFF_0000;
-#[cfg(target_arch = "aarch64")]
-pub const MAX_TRAMPOLINE_DISPLACEMENT: usize = 0x07FF_0000;
-
-/// Alignment every write cursor into a trampoline must satisfy.
-#[cfg(target_arch = "x86_64")]
-pub const TRAMPOLINE_CURSOR_ALIGN: usize = 1;
-#[cfg(target_arch = "aarch64")]
-pub const TRAMPOLINE_CURSOR_ALIGN: usize = aarch64::GATE_ALIGNMENT;
-
-/// Length of the `JMP [RIP + disp32]` through which an x86-64 ELF trampoline enters the syscall
-/// callback. The preceding `LEA RCX, [RIP + len]` points RCX, the callback's resume PC, just past it.
-const X86_64_SYSCALL_ENTRY_JMP_LEN: u8 = 6;
-
 /// `LEA RCX, [RIP + X86_64_SYSCALL_ENTRY_JMP_LEN]`, which precedes an x86-64 ELF trampoline's
 /// entry `JMP [RIP + disp32]`.
 const X86_64_LEA_RCX_RESUME_PC: [u8; 7] = [0x48, 0x8D, 0x0D, X86_64_SYSCALL_ENTRY_JMP_LEN, 0, 0, 0];
 
-/// Length of the guest instruction through which a rewritten Linux syscall enters the syscall
-/// callback.
-///
-/// The callback's resume PC immediately follows this instruction, so moving the PC back by this
-/// length, with the syscall's registers restored, reissues the syscall. On x86-64 it is the ELF
-/// trampoline's `JMP [RIP + disp32]`; on AArch64 it is the `B` that replaces the `SVC` in place.
-#[cfg(target_arch = "x86_64")]
-pub const SYSCALL_ENTRY_INSTRUCTION_LEN: usize = X86_64_SYSCALL_ENTRY_JMP_LEN as usize;
-#[cfg(target_arch = "aarch64")]
-pub const SYSCALL_ENTRY_INSTRUCTION_LEN: usize = aarch64::INSN_BYTES;
+use litebox_trampoline::{
+    TRAMPOLINE_FILE_ALIGNMENT, TRAMPOLINE_MAGIC, TargetHost, TrampolineHeader64,
+    X86_64_SYSCALL_ENTRY_JMP_LEN,
+};
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -83,23 +52,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-/// Conservative address bounds reachable from the entire nonempty code span.
-///
-/// A runtime trampoline's complete allocation must fit inside the returned
-/// interval. Returns `None` if the span has no common reachable interval.
-pub fn trampoline_allocation_range(code: Range<usize>) -> Option<Range<usize>> {
-    let start = code.end.saturating_sub(MAX_TRAMPOLINE_DISPLACEMENT);
-    let end = code.start.saturating_add(MAX_TRAMPOLINE_DISPLACEMENT);
-    (code.start < code.end && start < end).then_some(start..end)
-}
-
 use litebox_common_windows::{NtSysno, Win32Sysno};
 use object::LittleEndian as LE;
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 use object::read::{Object as _, ObjectSection as _, ObjectSegment as _};
 use thiserror::Error;
-use zerocopy::{FromBytes, Immutable, IntoBytes};
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Possible errors during hooking of `syscall` instructions
 #[derive(Error, Debug)]
@@ -136,6 +95,20 @@ enum InternalError {
     InsufficientBytesBeforeOrAfter,
 }
 
+impl From<litebox_trampoline::Error> for Error {
+    fn from(error: litebox_trampoline::Error) -> Self {
+        match error {
+            litebox_trampoline::Error::AddressOverflow(message) => Self::AddressOverflow(message),
+            litebox_trampoline::Error::TrampolinePatchFailure(message) => {
+                Self::TrampolinePatchFailure(message)
+            }
+            litebox_trampoline::Error::UnsupportedExecutable(message) => {
+                Self::UnsupportedExecutable(message)
+            }
+        }
+    }
+}
+
 impl From<Error> for InternalError {
     fn from(e: Error) -> Self {
         InternalError::Public(e)
@@ -155,26 +128,6 @@ const ELF_E_MACHINE_OFFSET: usize =
     core::mem::offset_of!(object::elf::FileHeader64<object::LittleEndian>, e_machine);
 
 const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
-
-/// The magic bytes used to identify the trampoline data.
-/// This is checked by the loader to verify that the trampoline is valid.
-pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
-
-/// Required file alignment of the appended trampoline payload.
-pub const TRAMPOLINE_FILE_ALIGNMENT: usize = 0x1000;
-
-/// Host operating system for AArch64 guest rewriting.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TargetHost {
-    /// Linux, using `TPIDR_EL0` as the host per-thread anchor.
-    #[default]
-    Linux,
-    /// macOS, using `TPIDRRO_EL0` as the host anchor. Guest x18 is virtualized.
-    MacOs,
-    /// Experimental Windows emission using physical `x18` as the host anchor.
-    /// No in-tree AArch64 Windows runtime consumes these artifacts.
-    Windows,
-}
 
 /// What to do with an x86-64 ELF `syscall` that cannot be redirected to the
 /// trampoline.
@@ -364,16 +317,6 @@ fn is_macho_binary(input_binary: &[u8]) -> bool {
                 | object::macho::FAT_CIGAM_64
         )
     )
-}
-
-/// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
-#[repr(C, packed)]
-#[derive(FromBytes, IntoBytes, Immutable)]
-struct TrampolineHeader64 {
-    magic: [u8; 8],
-    file_offset: u64,
-    vaddr: u64,
-    trampoline_size: u64,
 }
 
 /// Metadata about an executable section, extracted from a read-only object parse.
@@ -1800,7 +1743,7 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
 ///
 /// The region is rewritten for the architecture this crate is running on.
 /// `syscall_entry_addr` means:
-/// * x86-64: the address of the shared [`TRAMPOLINE_ENTRY_POINT_BYTES`]-sized
+/// * x86-64: the address of the shared [`litebox_trampoline::TRAMPOLINE_ENTRY_POINT_BYTES`]-sized
 ///   slot the caller placed at the trampoline base, which holds the callback.
 /// * AArch64: the callback address itself; the emitter writes its callback slot.
 ///
@@ -1821,7 +1764,7 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
 /// The I-cache is not coherent with the D-cache, so the caller **must**
 /// synchronize the instruction stream over the patched `code` and the written
 /// stubs before either is fetched, and must pass the emitted gates through
-/// [`aarch64::finalize_trampoline_gates`]. Neither omission fails cleanly.
+/// [`litebox_trampoline::aarch64::finalize_trampoline_gates`]. Neither omission fails cleanly.
 pub fn patch_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
@@ -1906,7 +1849,7 @@ fn patch_x86_64_code_segment(
 /// the callback address itself, not a slot holding it.
 ///
 /// The caller must pass the returned gates through
-/// [`aarch64::finalize_trampoline_gates`] before making them executable.
+/// [`litebox_trampoline::aarch64::finalize_trampoline_gates`] before making them executable.
 #[cfg(any(test, target_arch = "aarch64"))]
 fn patch_aarch64_code_segment(
     code: &mut [u8],
@@ -3262,14 +3205,14 @@ mod tests {
         .unwrap();
         assert_eq!(trapped, []);
         assert!(
-            aarch64::find_guest_tpidr_placeholder(&trampoline).is_some(),
+            litebox_trampoline::aarch64::find_guest_tpidr_placeholder(&trampoline).is_some(),
             "a runtime-emitted thread-pointer gate must arrive unpatched"
         );
         assert_eq!(
-            aarch64::patch_guest_tpidr_offset(&mut trampoline, 96).unwrap(),
+            litebox_trampoline::aarch64::patch_guest_tpidr_offset(&mut trampoline, 96).unwrap(),
             1
         );
-        assert!(aarch64::find_guest_tpidr_placeholder(&trampoline).is_none());
+        assert!(litebox_trampoline::aarch64::find_guest_tpidr_placeholder(&trampoline).is_none());
     }
 
     #[test]
@@ -3323,8 +3266,12 @@ mod tests {
             for (slot_offset, count) in boundaries {
                 for instruction in 0..count {
                     let pc = trampoline_vaddr + (slot_offset + instruction * 4) as u64;
-                    let gate = aarch64::classify_gate_pc(product, trampoline_vaddr, pc)
-                        .unwrap_or_else(|| panic!("slot {slot_offset} boundary {instruction}"));
+                    let gate = litebox_trampoline::aarch64::classify_gate_pc(
+                        product,
+                        trampoline_vaddr,
+                        pc,
+                    )
+                    .unwrap_or_else(|| panic!("slot {slot_offset} boundary {instruction}"));
                     assert_eq!(gate.slot_offset(), slot_offset);
                     classified += 1;
                 }

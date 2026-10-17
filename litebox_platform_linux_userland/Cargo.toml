@@ -7,6 +7,7 @@ repository = "https://github.com/microsoft/litebox"
 description = "A LiteBox platform for running LiteBox on userland Linux"
 
 [dependencies]
+litebox_trampoline = { path = "../litebox_trampoline", version = "0.1.0" }
 arrayvec = { version = "0.7.6", default-features = false }
 cfg-if = "1.0.0"
 libc = { version = "0.2.169", default-features = false }
@@ -23,7 +24,6 @@ seccompiler = { version = "0.5.0" }
 # PC, so it needs the rewriter's classifier. x86-64 needs no classifier: its
 # gate is a single fixed-length instruction.
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
 
 [features]
 default = ["linux_syscall"]
@@ -33,3 +33,6 @@ aarch64_virtualize_x18 = []
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }

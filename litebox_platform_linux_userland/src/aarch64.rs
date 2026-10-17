@@ -65,7 +65,7 @@ struct TlsBlock {
     /// Guest thread pointer — the slot rewritten guest binaries read and write
     /// in place of the hardware `TPIDR_EL0`.
     ///
-    /// Also part of the `litebox_syscall_rewriter` ABI, but dynamically: the
+    /// Also part of the `litebox_trampoline` ABI, but dynamically: the
     /// loader patches each rewritten binary's gates with this slot's measured
     /// address (see [`guest_thread_pointer_tp_offset`]).
     guest_thread_pointer: usize,
@@ -135,7 +135,7 @@ pub(super) fn guest_thread_pointer_tp_offset() -> u16 {
     let offset = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_THREAD_POINTER;
     u16::try_from(offset)
         .ok()
-        .filter(|off| litebox_syscall_rewriter::aarch64::is_patchable_guest_tpidr_offset(*off))
+        .filter(|off| litebox_trampoline::aarch64::is_patchable_guest_tpidr_offset(*off))
         .expect(
             "guest_thread_pointer must sit at a thread-pointer offset a rewriter gate can reach",
         )
@@ -159,19 +159,19 @@ pub(super) fn assert_tls_block_placement() {
     let guest_x18 = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_X18;
     assert_eq!(
         guest_x18.checked_sub(guest_tp),
-        Some(litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP),
+        Some(litebox_trampoline::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP),
     );
     assert!(guest_x18.is_multiple_of(8) && u16::try_from(guest_x18).is_ok());
     #[cfg(feature = "aarch64_virtualize_x18")]
     assert!(
         u16::try_from(guest_x18)
-            .is_ok_and(litebox_syscall_rewriter::aarch64::is_patchable_guest_x18_offset)
+            .is_ok_and(litebox_trampoline::aarch64::is_patchable_guest_x18_offset)
     );
 }
 
 const _: () = assert!(
     tls_offset::GUEST_X18 - tls_offset::GUEST_THREAD_POINTER
-        == litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP
+        == litebox_trampoline::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP
 );
 const _: () = assert!(tls_offset::GUEST_VECTOR_STATE < (1 << 12));
 
@@ -462,7 +462,7 @@ pub(super) unsafe extern "C-unwind" fn run_thread_arch(
 
     // Entered by `BR X16` from a rewriter-emitted SVC slot when the
     // guest issues a syscall. State on entry (rewriter ABI, see
-    // `litebox_syscall_rewriter::aarch64` module docs):
+    // `litebox_trampoline::aarch64` module docs):
     //
     //   | Item                     | Value                                  |
     //   | ------------------------ | -------------------------------------- |
@@ -654,8 +654,8 @@ interrupt_callback:
     OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
     GUEST_X18 = const tls_offset::GUEST_X18,
     VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
-    SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
-    SVC_FRAME_OFF_STUB = const litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_STUB,
+    SVC_FRAME_BYTES = const litebox_trampoline::aarch64::SVC_FRAME_BYTES,
+    SVC_FRAME_OFF_STUB = const litebox_trampoline::aarch64::SVC_FRAME_OFF_STUB,
     ENOSYS = const libc::ENOSYS,
     init_handler = sym init_handler,
     reenter_handler = sym reenter_handler,
@@ -668,8 +668,8 @@ interrupt_callback:
 /// `ldp x0, x1, [sp]` in `syscall_callback` reads the gate frame's two fields
 /// as a pair, which only works at these offsets.
 const _: () = assert!(
-    litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_X16 == 0
-        && litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_RETADDR == 8
+    litebox_trampoline::aarch64::SVC_FRAME_OFF_X16 == 0
+        && litebox_trampoline::aarch64::SVC_FRAME_OFF_RETADDR == 8
 );
 
 /// The kernel's `struct rt_sigframe`, synthesized by the runtime for the
@@ -1320,8 +1320,8 @@ switch_to_guest_via_outbound_stub_end:
     HOST_FP_STATE = const tls_offset::HOST_FP_STATE,
     GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
-    SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
-    SVC_FRAME_OFF_X16 = const litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_X16,
+    SVC_FRAME_BYTES = const litebox_trampoline::aarch64::SVC_FRAME_BYTES,
+    SVC_FRAME_OFF_X16 = const litebox_trampoline::aarch64::SVC_FRAME_OFF_X16,
     VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
     resume_via_sigreturn = sym switch_to_guest_via_sigreturn,
     );
@@ -1591,7 +1591,7 @@ fn canonicalize_aarch64_gate_signal_context_with_kind_and_copy(
         &registers,
         runtime,
         interruption,
-        litebox_syscall_rewriter::TargetHost::Linux,
+        litebox_trampoline::TargetHost::Linux,
         cfg!(feature = "aarch64_virtualize_x18"),
         read,
     );
@@ -1986,14 +1986,14 @@ mod tests {
     fn test_gate_patching_lands_in_the_runtime_tls_block() {
         const IMM12_SHIFT: u32 = 10;
         const IMM12_MASK: u32 = 0x003F_FC00;
-        const ALIGN: u16 = litebox_syscall_rewriter::aarch64::GUEST_TPIDR_OFFSET_ALIGN;
+        const ALIGN: u16 = litebox_trampoline::aarch64::GUEST_TPIDR_OFFSET_ALIGN;
 
         let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
         let (mut tramp, trapped) =
             litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0).unwrap();
         assert_eq!(trapped, []);
         assert_eq!(
-            litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
+            litebox_trampoline::aarch64::find_guest_tpidr_placeholder(&tramp),
             Some(16 + 4),
             "the emitted gate must be in the unpatched state, or everything below \
              passes vacuously"
@@ -2006,22 +2006,20 @@ mod tests {
         );
         let offset = u16::try_from(offset).expect("the guest slot must sit within a gate's reach");
         assert_eq!(
-            litebox_syscall_rewriter::aarch64::patch_guest_tpidr_offset(&mut tramp, offset)
-                .unwrap(),
+            litebox_trampoline::aarch64::patch_guest_tpidr_offset(&mut tramp, offset).unwrap(),
             1
         );
         assert_eq!(
-            litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
+            litebox_trampoline::aarch64::find_guest_tpidr_placeholder(&tramp),
             None,
             "no gate may still hold the placeholder once the loader has staged the trampoline"
         );
-        let classified =
-            litebox_syscall_rewriter::aarch64::classify_gate_pc(&tramp, 0x400000, 0x400010)
-                .expect("finalized emitted MRS slot must validate");
+        let classified = litebox_trampoline::aarch64::classify_gate_pc(&tramp, 0x400000, 0x400010)
+            .expect("finalized emitted MRS slot must validate");
         assert_eq!(classified.slot_offset(), 16);
         assert!(matches!(
             classified.metadata(),
-            litebox_syscall_rewriter::aarch64::GateMetadata::MrsTpidr { destination: 9, .. }
+            litebox_trampoline::aarch64::GateMetadata::MrsTpidr { destination: 9, .. }
         ));
 
         let patched = u32::from_le_bytes(tramp[16 + 4..16 + 8].try_into().unwrap());
@@ -2457,7 +2455,7 @@ mod tests {
         const NZCV_AFTER: usize = 0x8000_0000;
 
         let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_syscall_rewriter::TargetHost::Linux,
+            litebox_trampoline::TargetHost::Linux,
             true,
         );
         let mut code = 0xaa12_03f2u32.to_le_bytes().to_vec(); // mov x18, x18
@@ -2674,7 +2672,7 @@ mod tests {
         const SAVED_ANCHOR: usize = 0x1616_1616_1616_1616;
 
         let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_syscall_rewriter::TargetHost::Linux,
+            litebox_trampoline::TargetHost::Linux,
             true,
         );
         // stp x18, x19, [sp, #-16]!
@@ -2690,9 +2688,9 @@ mod tests {
         assert_eq!(trapped, []);
 
         let gate =
-            litebox_syscall_rewriter::aarch64::classify_gate_pc(&trampoline, 0x400000, SLOT as u64)
+            litebox_trampoline::aarch64::classify_gate_pc(&trampoline, 0x400000, SLOT as u64)
                 .unwrap();
-        let litebox_syscall_rewriter::aarch64::GateMetadata::X18StackWriteback { scratch } =
+        let litebox_trampoline::aarch64::GateMetadata::X18StackWriteback { scratch } =
             gate.metadata()
         else {
             panic!("expected an x18 stack-writeback gate");
@@ -2805,7 +2803,7 @@ mod tests {
         const SLOT: usize = 0x400010;
         const LOGICAL_X18: usize = 0x1234_5678_9abc_def0;
         let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_syscall_rewriter::TargetHost::Linux,
+            litebox_trampoline::TargetHost::Linux,
             true,
         );
         for (word, name, writes_link) in [
@@ -2880,7 +2878,7 @@ mod tests {
         const SLOT: usize = 0x400010;
         const LOGICAL_X18: usize = 0x1818;
         let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_syscall_rewriter::TargetHost::Linux,
+            litebox_trampoline::TargetHost::Linux,
             true,
         );
         let mut code = 0xaa12_03f2u32.to_le_bytes().to_vec(); // mov x18, x18
@@ -2925,7 +2923,7 @@ mod tests {
         const SLOT: usize = 0x400010;
         const FRAME: usize = 0x8000;
         let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_syscall_rewriter::TargetHost::Linux,
+            litebox_trampoline::TargetHost::Linux,
             true,
         );
         let mut code = 0x3500_0332u32.to_le_bytes().to_vec();
@@ -3014,7 +3012,7 @@ mod tests {
         const GUEST_X18_BEFORE: usize = 0x1818_1818_1818_1818;
 
         let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_syscall_rewriter::TargetHost::Linux,
+            litebox_trampoline::TargetHost::Linux,
             true,
         );
         let mut code = 0x1000_0072u32.to_le_bytes().to_vec(); // adr x18, +0xc
