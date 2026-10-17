@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![cfg(target_os = "linux")]
+
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 

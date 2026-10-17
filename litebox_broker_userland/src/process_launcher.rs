@@ -188,13 +188,12 @@ impl UserlandProcessLauncher {
         let setup_deadline = instance.setup_deadline();
         let broker = self.broker.clone();
         let launcher = Arc::clone(&self);
-        let association_launcher = Arc::clone(&launcher);
         let completion_process = Arc::clone(&process);
         let thread = std::thread::Builder::new()
             .name(format!("litebox-runner-{}", process_id.0))
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    instance.run_process_to_completion(association, broker, association_launcher)
+                    instance.run_process_to_completion(association, broker, Arc::clone(&launcher))
                 }));
                 let (completion, thread_panicked) = match outcome {
                     Ok(completion) => (completion, false),
@@ -256,7 +255,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
         parent_process_id: litebox_broker_protocol::ProcessId,
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
-        launch_descriptor: Vec<u8>,
+        runner_descriptor: Vec<u8>,
     ) -> Result<(), BrokerError> {
         #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
         {
@@ -268,7 +267,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
                     .get(&parent_process_id)
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or(BrokerError::PeerClosed)?;
-                RunnerInstance::adopt(&parent, &launch_descriptor)
+                RunnerInstance::adopt(&parent, &runner_descriptor)
                     .map_err(|_| BrokerError::PolicyDenied)
             })();
             let instance = match adoption {
@@ -288,7 +287,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
         #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
         {
             let _ = startup;
-            let _ = launch_descriptor;
+            let _ = runner_descriptor;
             let _ = process.fail_start(BrokerError::UnsupportedOperation, false, true);
             process.retire(true);
             Err(BrokerError::UnsupportedOperation)

@@ -68,6 +68,11 @@ pub trait ReservationStore {
     type ReleaseTarget;
 
     /// Adopt an existing mapping, retaining its ownership handle if this store tracks handles.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `range` is a valid mapping belonging to
+    /// `platform` and that adopting it does not create overlapping ownership.
     unsafe fn adopt_mapping<Platform, const ALIGN: usize>(
         &mut self,
         platform: &Platform,
@@ -187,6 +192,11 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Unspecified;
 
     /// Takes ownership of an exact range already mapped in this process.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `range` is a valid mapping belonging to
+    /// this provider and that adopting it does not create overlapping ownership.
     unsafe fn adopt_pages(
         &self,
         _range: Range<usize>,

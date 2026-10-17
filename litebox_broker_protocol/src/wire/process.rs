@@ -81,12 +81,12 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
         }
         ProcessRequest::StartChildWithExistingRunner(StartChildWithExistingRunnerRequest {
             child_process_id,
-            launch_descriptor_length,
+            runner_descriptor_length,
             data,
         }) => {
             encoder.u8(PROCESS_REQUEST_TAG_START_CHILD_WITH_EXISTING_RUNNER);
             encoder.process_id(child_process_id);
-            encoder.u32(launch_descriptor_length);
+            encoder.u32(runner_descriptor_length);
             encoder.shared_buffer_sequence(data);
         }
         ProcessRequest::ExitChild(ExitChildProcessRequest {
@@ -155,7 +155,7 @@ pub(super) fn decode_process_request(
         PROCESS_REQUEST_TAG_START_CHILD_WITH_EXISTING_RUNNER => {
             ProcessRequest::StartChildWithExistingRunner(StartChildWithExistingRunnerRequest {
                 child_process_id: decoder.process_id()?,
-                launch_descriptor_length: decoder.u32()?,
+                runner_descriptor_length: decoder.u32()?,
                 data: decoder.shared_buffer_sequence()?,
             })
         }

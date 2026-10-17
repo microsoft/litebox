@@ -13,11 +13,11 @@ use crate::{ProcessGroupId, ProcessId, ThreadId};
 pub const MAX_PROCESS_BOOTSTRAP_SIZE: u32 = 64 * 1024;
 
 /// Maximum size of opaque platform data used to adopt an already-created runner.
-pub const MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE: u32 = 4 * 1024;
+pub const MAX_RUNNER_DESCRIPTOR_SIZE: u32 = 4 * 1024;
 
-/// Maximum combined launch descriptor and process bootstrap size.
+/// Maximum combined runner descriptor and process bootstrap size.
 pub const MAX_EXISTING_RUNNER_START_SIZE: u32 =
-    MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE + MAX_PROCESS_BOOTSTRAP_SIZE;
+    MAX_RUNNER_DESCRIPTOR_SIZE + MAX_PROCESS_BOOTSTRAP_SIZE;
 
 /// Child startup descriptor transported through the broker protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,9 +120,10 @@ pub struct StartChildProcessRequest {
 pub struct StartChildWithExistingRunnerRequest {
     /// Pending child to start.
     pub child_process_id: ProcessId,
-    /// Number of bytes at the beginning of `data` containing the opaque platform descriptor.
-    pub launch_descriptor_length: u32,
-    /// Operation-scoped sequence containing the platform descriptor followed by startup bytes.
+    /// Number of bytes at the beginning of `data` describing the existing host runner's
+    /// platform-specific identity and control endpoint.
+    pub runner_descriptor_length: u32,
+    /// Operation-scoped sequence containing the runner descriptor followed by guest startup bytes.
     pub data: SharedBufferSequence,
 }
 

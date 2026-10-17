@@ -611,12 +611,6 @@ where
         range: Range<usize>,
         flags: VmFlags,
     ) -> Result<(), AllocationError> {
-        if range.is_empty()
-            || !range.start.is_multiple_of(ALIGN)
-            || !range.end.is_multiple_of(ALIGN)
-        {
-            return Err(AllocationError::Unaligned);
-        }
         if range.start < Platform::TASK_ADDR_MIN
             || range.end > Platform::TASK_ADDR_MAX
             || self.vmas.overlaps(&range)

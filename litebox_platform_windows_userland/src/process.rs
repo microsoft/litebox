@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Experimental native Windows process cloning.
+//! Experimental native Windows process operations for broker-adopted runners.
 
 use core::ffi::c_void;
 use core::mem::size_of;
@@ -55,7 +55,7 @@ impl<const ALIGN: usize> ProcessProvider for crate::WindowsUserland<ALIGN> {
         }
     }
 
-    unsafe fn prepare_forked_process() -> Result<()> {
+    unsafe fn prepare_fork_child() -> Result<()> {
         // SAFETY: The caller is the sole cloned thread and never returns to the copied stack.
         unsafe { crate::reset_current_thread_after_process_clone() };
         Ok(())

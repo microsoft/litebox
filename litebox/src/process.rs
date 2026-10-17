@@ -233,14 +233,17 @@ impl PendingChild {
     }
 
     /// Starts this pending child in an already-created platform runner.
+    ///
+    /// `runner_descriptor` encodes the host runner's platform-specific identity and control
+    /// endpoint. `payload` contains the guest startup state, not host runner metadata.
     pub fn start_with_existing_runner(
         &self,
-        launch_descriptor: &[u8],
+        runner_descriptor: &[u8],
         payload: &[u8],
     ) -> Result<(), ProcessError> {
         self.broker.start_child_with_existing_runner(
             self.identity.process_id,
-            launch_descriptor,
+            runner_descriptor,
             payload,
         )?;
         self.pending.store(false, Ordering::Relaxed);

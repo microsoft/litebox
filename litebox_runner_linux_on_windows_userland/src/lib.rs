@@ -16,7 +16,7 @@ use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
 use std::os::windows::io::AsRawHandle;
 
 use litebox_broker_transport_windows_userland::existing_runner::{
-    ExistingRunnerLaunchDescriptor, unique_control_channel,
+    ExistingRunnerDescriptor, unique_control_channel,
 };
 
 type Platform = WindowsUserland<{ litebox_common_linux::PAGE_SIZE }>;
@@ -38,7 +38,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         unique_control_channel()
     }
 
-    fn encode_launch_descriptor(
+    fn encode_runner_descriptor(
         &self,
         process: &<Platform as ProcessProvider>::ProcessHandle,
         control_channel: Self::ControlChannel,
@@ -47,7 +47,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             litebox_util_log::error!("failed to identify native fork child: {error}");
             litebox::process::ProcessError::ServiceFailed
         })?;
-        ExistingRunnerLaunchDescriptor {
+        ExistingRunnerDescriptor {
             process_handle: process.as_raw_handle() as usize as u64,
             process_id,
             control_channel,
@@ -59,7 +59,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     unsafe fn run_child(&self, control_channel: Self::ControlChannel) -> ! {
         // SAFETY: NtCreateUserProcess cloned only this thread, and this path never returns through
         // the copied parent task or its registration guard.
-        let prepared = unsafe { Platform::prepare_forked_process() };
+        let prepared = unsafe { Platform::prepare_fork_child() };
         let result = (|| -> Result<()> {
             prepared.context("failed to prepare native fork child")?;
             let platform = Platform::new();

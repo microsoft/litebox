@@ -38,7 +38,7 @@ extern crate alloc;
 #[cfg_attr(target_arch = "x86_64", path = "x86_64.rs")]
 mod arch;
 mod page_mgmt;
-pub mod process_clone;
+pub mod process;
 
 #[cfg(target_arch = "aarch64")]
 use arch::{

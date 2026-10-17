@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use litebox_broker_local_userland as broker;
 use litebox_broker_transport_linux_userland::existing_runner::{
-    ExistingRunnerLaunchDescriptor, unique_control_channel,
+    ExistingRunnerDescriptor, unique_control_channel,
 };
 use litebox_common_linux::program_startup::{
     LinuxForkStartup, LinuxProcessStartup, LinuxProgramStartup,
@@ -46,7 +46,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         unique_control_channel()
     }
 
-    fn encode_launch_descriptor(
+    fn encode_runner_descriptor(
         &self,
         process: &<Platform as ProcessProvider>::ProcessHandle,
         control_channel: PathBuf,
@@ -55,8 +55,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             litebox_util_log::error!("failed to identify native fork child: {error}");
             litebox::process::ProcessError::ServiceFailed
         })?;
-        ExistingRunnerLaunchDescriptor {
-            parent_process_id: std::process::id(),
+        ExistingRunnerDescriptor {
             process_id,
             control_channel,
         }
@@ -67,7 +66,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     unsafe fn run_child(&self, control_channel: PathBuf) -> ! {
         // SAFETY: The clone contains only this thread, and this function never returns through the
         // copied guest task or its thread-registration guard.
-        if unsafe { Platform::prepare_forked_process() }.is_err() {
+        if unsafe { Platform::prepare_fork_child() }.is_err() {
             // SAFETY: The cloned process cannot safely unwind through copied runtime state.
             unsafe { libc::_exit(127) }
         }

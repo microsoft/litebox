@@ -57,10 +57,10 @@ pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
     /// Creates the rendezvous identifier before forking.
     fn create_control_channel(&self) -> Self::ControlChannel;
 
-    /// Encodes the parent's launch descriptor before resuming a suspended child.
+    /// Encodes the child runner's host identity and control endpoint before resuming it.
     ///
     /// Host process identity lookup failures must return [`ProcessError::ServiceFailed`].
-    fn encode_launch_descriptor(
+    fn encode_runner_descriptor(
         &self,
         process: &Platform::ProcessHandle,
         channel: Self::ControlChannel,
@@ -116,7 +116,7 @@ impl ForkLauncher {
                     Ok(ForkResult::Parent(process)) => {
                         let result = (|| {
                             let descriptor =
-                                runner.encode_launch_descriptor(&process, control_channel)?;
+                                runner.encode_runner_descriptor(&process, control_channel)?;
                             process.resume().map_err(|error| {
                                 litebox_util_log::error!(
                                     "failed to resume native fork child: {error}"
@@ -4264,7 +4264,7 @@ mod fork_tests {
             }
         }
 
-        unsafe fn prepare_forked_process() -> Result<(), ProcessError> {
+        unsafe fn prepare_fork_child() -> Result<(), ProcessError> {
             unreachable!("the mock does not create a child")
         }
     }
@@ -4328,7 +4328,7 @@ mod fork_tests {
             self.channel
         }
 
-        fn encode_launch_descriptor(
+        fn encode_runner_descriptor(
             &self,
             process: &MockHandle,
             channel: u32,

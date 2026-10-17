@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Opaque launch data for a Linux runner created by another runner.
+//! Opaque runner adoption data for a Linux runner created by another runner.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Error, ErrorKind, Result};
@@ -9,63 +9,57 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const HEADER_SIZE: usize = 12;
+const HEADER_SIZE: usize = 8;
 const DIRECTORY_PREFIX: &str = "litebox-native-runner-";
 const SOCKET_NAME: &str = "broker.sock";
 static NEXT_DIRECTORY_NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// Description of an already-created Linux runner process.
-pub struct ExistingRunnerLaunchDescriptor {
-    /// Host process ID of the runner that created the child.
-    pub parent_process_id: u32,
+/// Host identity and control endpoint of an already-created Linux runner process.
+pub struct ExistingRunnerDescriptor {
     /// Host process ID of the cloned child.
     pub process_id: u32,
     /// Dedicated broker control socket for the child.
     pub control_channel: PathBuf,
 }
 
-impl ExistingRunnerLaunchDescriptor {
-    /// Encodes this descriptor for the opaque broker launch field.
+impl ExistingRunnerDescriptor {
+    /// Encodes this descriptor, validating that its control socket belongs to the calling runner.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        validate_control_channel(&self.control_channel, self.parent_process_id)?;
+        validate_control_channel(&self.control_channel, std::process::id())?;
         let path = self.control_channel.as_os_str().as_bytes();
         let path_length = u32::try_from(path.len())
             .map_err(|_| Error::new(ErrorKind::InvalidInput, "control channel is too long"))?;
         let length = HEADER_SIZE
             .checked_add(path.len())
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "launch descriptor is too long"))?;
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "runner descriptor is too long"))?;
         let mut encoded = Vec::new();
         encoded.try_reserve_exact(length)?;
-        encoded.extend_from_slice(&self.parent_process_id.to_le_bytes());
         encoded.extend_from_slice(&self.process_id.to_le_bytes());
         encoded.extend_from_slice(&path_length.to_le_bytes());
         encoded.extend_from_slice(path);
         Ok(encoded)
     }
 
-    /// Decodes and validates an opaque broker launch descriptor.
-    pub fn decode(encoded: &[u8]) -> Result<Self> {
+    /// Decodes a descriptor and validates its socket path against the known parent runner's PID.
+    pub fn decode(encoded: &[u8], parent_process_id: u32) -> Result<Self> {
         let header: &[u8; HEADER_SIZE] = encoded
             .get(..HEADER_SIZE)
             .and_then(|header| header.try_into().ok())
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "launch descriptor is truncated"))?;
-        let parent_process_id = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let process_id = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        let path_length =
-            u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "runner descriptor is truncated"))?;
+        let process_id = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let path_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         if parent_process_id == 0
             || process_id == 0
             || HEADER_SIZE.checked_add(path_length) != Some(encoded.len())
         {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                "invalid launch descriptor",
+                "invalid runner descriptor",
             ));
         }
         let control_channel = PathBuf::from(OsString::from_vec(encoded[HEADER_SIZE..].to_vec()));
         validate_control_channel(&control_channel, parent_process_id)?;
         Ok(Self {
-            parent_process_id,
             process_id,
             control_channel,
         })
@@ -123,16 +117,60 @@ mod tests {
     #[test]
     fn descriptor_round_trips() {
         let control_channel = unique_control_channel();
-        let descriptor = ExistingRunnerLaunchDescriptor {
-            parent_process_id: std::process::id(),
+        let descriptor = ExistingRunnerDescriptor {
             process_id: 42,
             control_channel: control_channel.clone(),
         };
         let encoded = descriptor.encode().unwrap();
-        let decoded = ExistingRunnerLaunchDescriptor::decode(&encoded).unwrap();
-        assert_eq!(decoded.parent_process_id, descriptor.parent_process_id);
+        assert_eq!(
+            encoded.len(),
+            HEADER_SIZE + control_channel.as_os_str().as_bytes().len()
+        );
+        assert_eq!(&encoded[..4], &descriptor.process_id.to_le_bytes());
+        let decoded = ExistingRunnerDescriptor::decode(&encoded, std::process::id()).unwrap();
         assert_eq!(decoded.process_id, descriptor.process_id);
         assert_eq!(decoded.control_channel, descriptor.control_channel);
         remove_control_channel(&control_channel);
+    }
+
+    #[test]
+    fn descriptor_rejects_a_different_parent() {
+        let descriptor = ExistingRunnerDescriptor {
+            process_id: 42,
+            control_channel: unique_control_channel(),
+        };
+        let encoded = descriptor.encode().unwrap();
+        let other_parent = if std::process::id() == 1 { 2 } else { 1 };
+        let error = ExistingRunnerDescriptor::decode(&encoded, other_parent)
+            .err()
+            .expect("a different parent's socket must be rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn descriptor_rejects_invalid_headers_and_lengths() {
+        let descriptor = ExistingRunnerDescriptor {
+            process_id: 42,
+            control_channel: unique_control_channel(),
+        };
+        let encoded = descriptor.encode().unwrap();
+        let mut zero_pid = encoded.clone();
+        zero_pid[..4].copy_from_slice(&0u32.to_le_bytes());
+        let mut wrong_length = encoded.clone();
+        wrong_length[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut trailing_byte = encoded.clone();
+        trailing_byte.push(0);
+        for invalid in [
+            &encoded[..HEADER_SIZE - 1],
+            &zero_pid,
+            &wrong_length,
+            &trailing_byte,
+        ] {
+            let error = ExistingRunnerDescriptor::decode(invalid, std::process::id())
+                .err()
+                .expect("an invalid descriptor must be rejected");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+        }
+        assert!(ExistingRunnerDescriptor::decode(&encoded, 0).is_err());
     }
 }

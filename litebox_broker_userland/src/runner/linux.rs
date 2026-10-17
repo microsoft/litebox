@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::existing_runner::{
-    ExistingRunnerLaunchDescriptor, remove_control_channel,
+    ExistingRunnerDescriptor, remove_control_channel,
 };
 use litebox_broker_transport_linux_userland::memfd::{MemfdProcessImage, MemfdSharedMemory};
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -216,15 +216,9 @@ impl AdoptedProcess {
 
 pub(super) fn adopt_process(
     parent: &Arc<Mutex<RunnerProcess>>,
-    descriptor: &ExistingRunnerLaunchDescriptor,
+    descriptor: &ExistingRunnerDescriptor,
 ) -> IoResult<RunnerProcess> {
-    let parent = parent.lock().expect("parent runner process mutex poisoned");
-    if parent.id() != descriptor.parent_process_id {
-        return Err(IoError::new(
-            ErrorKind::PermissionDenied,
-            "existing runner descriptor does not match its parent",
-        ));
-    }
+    let _parent = parent.lock().expect("parent runner process mutex poisoned");
     let process_id = libc::pid_t::try_from(descriptor.process_id)
         .map_err(|_| IoError::from(ErrorKind::InvalidInput))?;
     let mut status = 0;

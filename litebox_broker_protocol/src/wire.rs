@@ -1119,7 +1119,7 @@ mod tests {
             BrokerOperation::Process(ProcessRequest::StartChildWithExistingRunner(
                 StartChildWithExistingRunnerRequest {
                     child_process_id: process_id(u32::MAX),
-                    launch_descriptor_length: u32::MAX,
+                    runner_descriptor_length: u32::MAX,
                     data: largest_sequence,
                 },
             )),
