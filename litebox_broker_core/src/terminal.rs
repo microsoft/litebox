@@ -258,6 +258,8 @@ impl TerminalEngine {
                 byte &= 0x7f;
             }
             let quoted = core::mem::take(&mut self.quoted);
+            // A CR mapped to NL echoes raw even outside canonical mode.
+            let newline_is_control = byte != b'\r';
             if !quoted {
                 if i.contains(I::SOFTWARE_FLOW_CONTROL) {
                     if Self::matches(byte, cc.start) {
@@ -306,13 +308,13 @@ impl TerminalEngine {
                 }
                 if l.contains(L::CANONICAL) {
                     if Self::matches(byte, cc.erase) {
-                        self.erase(&mut result.echo);
+                        self.erase(&mut result.echo, false);
                         continue;
                     }
                     if Self::matches(byte, cc.kill) {
-                        if l.contains(L::ECHO_KILL_ERASE | L::ECHO_ERASE) {
+                        if l.contains(L::ECHO | L::ECHO_KILL | L::ECHO_KILL_ERASE | L::ECHO_ERASE) {
                             while !self.line.is_empty() {
-                                self.erase(&mut result.echo);
+                                self.erase(&mut result.echo, true);
                             }
                         } else {
                             self.line.clear();
@@ -349,21 +351,19 @@ impl TerminalEngine {
                                     break;
                                 }
                                 seen_word |= word;
-                                self.erase(&mut result.echo);
+                                self.erase(&mut result.echo, true);
                             }
                             continue;
                         }
-                        if Self::matches(byte, cc.reprint) {
+                        if l.contains(L::ECHO) && Self::matches(byte, cc.reprint) {
                             self.echo(byte, true, &mut result.echo);
-                            if l.contains(L::ECHO) {
-                                self.output_byte(b'\n', &mut result.echo);
-                                for index in 0..self.line.len() {
-                                    self.line[index] = self.echo_line_byte(
-                                        self.line[index].byte,
-                                        true,
-                                        &mut result.echo,
-                                    );
-                                }
+                            self.output_byte(b'\n', &mut result.echo);
+                            for index in 0..self.line.len() {
+                                self.line[index] = self.echo_line_byte(
+                                    self.line[index].byte,
+                                    true,
+                                    &mut result.echo,
+                                );
                             }
                             continue;
                         }
@@ -389,7 +389,7 @@ impl TerminalEngine {
                 }
             } else {
                 self.input.push_back(byte);
-                self.echo(byte, false, &mut result.echo);
+                self.echo(byte, newline_is_control, &mut result.echo);
             }
         }
         result
@@ -401,7 +401,7 @@ impl TerminalEngine {
             .extend(self.line.drain(..).map(|entry| entry.byte));
     }
 
-    fn erase(&mut self, echo: &mut Vec<u8>) {
+    fn erase(&mut self, echo: &mut Vec<u8>, force_visual: bool) {
         let Some(start) = self.last_character_start() else {
             return;
         };
@@ -411,7 +411,7 @@ impl TerminalEngine {
             .map(|entry| usize::from(entry.echo_width))
             .sum();
         let l = self.settings.local;
-        if l.contains(L::ECHO | L::ECHO_ERASE) {
+        if l.contains(L::ECHO) && (force_visual || l.contains(L::ECHO_ERASE)) {
             for _ in 0..width {
                 self.output_byte(b'\x08', echo);
                 self.output_byte(b' ', echo);
@@ -793,6 +793,93 @@ mod tests {
         .unwrap();
         assert!(tty.receive(b"\x16\n\x04").echo.is_empty());
         assert_eq!(tty.receive(b"\n").echo, b"\r\n");
+    }
+
+    #[test]
+    fn editing_echo_respects_erase_and_kill_flags() {
+        for erase in [false, true] {
+            for kill in [false, true] {
+                for kill_erase in [false, true] {
+                    let mut tty = TerminalEngine::default();
+                    let mut settings = tty.settings();
+                    settings.local.set(L::ECHO_ERASE, erase);
+                    settings.local.set(L::ECHO_KILL, kill);
+                    settings.local.set(L::ECHO_KILL_ERASE, kill_erase);
+                    tty.configure(settings).unwrap();
+                    tty.receive(b"foo");
+                    let expected = if erase && kill && kill_erase {
+                        b"\x08 \x08".repeat(3)
+                    } else if kill {
+                        b"^U\r\n".to_vec()
+                    } else {
+                        b"^U".to_vec()
+                    };
+                    assert_eq!(tty.receive(b"\x15").echo, expected);
+                    tty.receive(b"foo");
+                    assert_eq!(tty.receive(b"\x17").echo, b"\x08 \x08".repeat(3));
+                    tty.receive(b"foo");
+                    assert_eq!(
+                        tty.receive(b"\x7f").echo,
+                        if erase {
+                            b"\x08 \x08".as_slice()
+                        } else {
+                            b"^?"
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn noncanonical_echo_distinguishes_literal_and_translated_newlines() {
+        for (input, byte, expected, echo) in [
+            (
+                I::CARRIAGE_RETURN_TO_NEWLINE,
+                b'\n',
+                b'\n',
+                b"^J".as_slice(),
+            ),
+            (I::CARRIAGE_RETURN_TO_NEWLINE, b'\r', b'\n', b"\r\n"),
+            (I::empty(), b'\n', b'\n', b"^J"),
+            (I::empty(), b'\r', b'\r', b"^M"),
+            (I::NEWLINE_TO_CARRIAGE_RETURN, b'\n', b'\r', b"^M"),
+            (I::NEWLINE_TO_CARRIAGE_RETURN, b'\r', b'\r', b"^M"),
+        ] {
+            let mut tty = TerminalEngine::default();
+            let mut settings = tty.settings();
+            settings.input = input;
+            settings.local.remove(L::CANONICAL);
+            tty.configure(settings).unwrap();
+            assert_eq!(tty.receive(&[byte]).echo, echo);
+            let mut bytes = [0; 1];
+            assert_eq!(tty.read(&mut bytes), Some(1));
+            assert_eq!(bytes[0], expected);
+        }
+    }
+
+    #[test]
+    fn reprint_is_ordinary_input_when_echo_is_disabled() {
+        let mut tty = TerminalEngine::default();
+        let mut settings = tty.settings();
+        settings.local.remove(L::ECHO);
+        tty.configure(settings).unwrap();
+        assert!(tty.receive(b"a\x12b\n").echo.is_empty());
+        let mut bytes = [0; 8];
+        assert_eq!(tty.read(&mut bytes), Some(4));
+        assert_eq!(&bytes[..4], b"a\x12b\n");
+
+        settings.characters.reprint = b'\n';
+        tty.configure(settings).unwrap();
+        assert!(tty.receive(b"abc\n").echo.is_empty());
+        assert_eq!(tty.read(&mut bytes), Some(4));
+        assert_eq!(&bytes[..4], b"abc\n");
+
+        settings.local.insert(L::ECHO_NEWLINE);
+        tty.configure(settings).unwrap();
+        assert_eq!(tty.receive(b"xyz\n").echo, b"\r\n");
+        assert_eq!(tty.read(&mut bytes), Some(4));
+        assert_eq!(&bytes[..4], b"xyz\n");
     }
 
     #[test]
