@@ -15,13 +15,14 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
 
-/// A console: output, and input if the device receives any. Not internally
-/// synchronized.
+/// A console: numbered ports, each output, and input if the device receives
+/// any. Not internally synchronized. Methods taking a port panic without it
+/// ([`Self::has_port`]).
 pub struct ConsoleDevice(Backend);
 
 enum Backend {
     Virtio(Box<VirtioConsole>),
-    /// The kernel's UART ([`crate::serial`]): output only.
+    /// The kernel's UART ([`crate::serial`]): port 0, output only.
     Serial,
 }
 
@@ -46,6 +47,21 @@ impl ConsoleDevice {
         Self(Backend::Serial)
     }
 
+    /// Whether the driver drives port `port` (e.g., without `MULTIPORT`,
+    /// only port 0); not whether it has a connected backend (see
+    /// [`crate::virtio::console`]).
+    pub fn has_port(&self, port: u32) -> bool {
+        match &self.0 {
+            Backend::Virtio(device) => port < device.ports(),
+            Backend::Serial => port == 0,
+        }
+    }
+
+    #[track_caller]
+    fn check_port(&self, port: u32) {
+        assert!(self.has_port(port), "no console port {port}");
+    }
+
     /// Whether the device receives input at all.
     pub fn receives(&self) -> bool {
         match &self.0 {
@@ -62,10 +78,11 @@ impl ConsoleDevice {
         }
     }
 
-    /// Queues as much of `bytes` as the device takes now; returns how much.
-    pub fn write(&mut self, bytes: &[u8]) -> usize {
+    /// Queues as much of `bytes` as `port` takes now; returns how much.
+    pub fn write(&mut self, port: u32, bytes: &[u8]) -> usize {
+        self.check_port(port);
         match &mut self.0 {
-            Backend::Virtio(device) => device.write(bytes),
+            Backend::Virtio(device) => device.write(port, bytes),
             Backend::Serial => {
                 crate::serial::print_bytes(bytes);
                 bytes.len()
@@ -73,19 +90,30 @@ impl ConsoleDevice {
         }
     }
 
-    /// Whether received input is waiting.
-    pub fn has_input(&mut self) -> bool {
+    /// Whether the device has passed on all of `port`'s output.
+    pub fn flushed(&mut self, port: u32) -> bool {
+        self.check_port(port);
         match &mut self.0 {
-            Backend::Virtio(device) => device.has_input(),
+            Backend::Virtio(device) => device.flushed(port),
+            Backend::Serial => true,
+        }
+    }
+
+    /// Whether input received on `port` is waiting.
+    pub fn has_input(&mut self, port: u32) -> bool {
+        self.check_port(port);
+        match &mut self.0 {
+            Backend::Virtio(device) => device.has_input(port),
             Backend::Serial => false,
         }
     }
 
-    /// Copies received input into `output`; returns how much (zero if none
-    /// is waiting).
-    pub fn read(&mut self, output: &mut [u8]) -> usize {
+    /// Copies input received on `port` into `output`; returns how much (zero
+    /// if none is waiting).
+    pub fn read(&mut self, port: u32, output: &mut [u8]) -> usize {
+        self.check_port(port);
         match &mut self.0 {
-            Backend::Virtio(device) => device.read(output),
+            Backend::Virtio(device) => device.read(port, output),
             Backend::Serial => 0,
         }
     }
@@ -96,9 +124,10 @@ impl fmt::Display for ConsoleDevice {
         match &self.0 {
             Backend::Virtio(device) => write!(
                 f,
-                "virtio (pci {}, interrupts {})",
+                "virtio (pci {}, interrupts {}, ports {})",
                 device.transport().function(),
-                device.transport().interrupts()
+                device.transport().interrupts(),
+                device.ports()
             ),
             Backend::Serial => f.write_str("serial (output only)"),
         }

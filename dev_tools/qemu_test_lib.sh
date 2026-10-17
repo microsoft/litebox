@@ -58,12 +58,23 @@ pass=0
 fail=0
 failed=()
 
+# control_args NAME: the control channel for run NAME, on $WORK/NAME.sock.
+# Needs the caller's virtio-serial device vs0. QEMU starts the VM only once
+# the host client connects.
+control_args() {
+    echo -chardev "socket,id=control,path=$WORK/$1.sock,server=on,wait=on" \
+        -device virtserialport,chardev=control,bus=vs0.0,nr=1
+}
+
 # run_vm NAME KERNEL PAYLOAD [QEMU_ARG]...: boots KERNEL with PAYLOAD as its
 # initrd and records the outcome; with $verbose set, prints passing logs too.
-# If $check names a function, a guest pass also needs `$check NAME` to
+# If $client names a function, `$client NAME SOCKET` runs meanwhile as the
+# host client (see control_args), and a pass needs it to exit 0. Exit status
+# 1 means it shut the VM down; 2 or more that it did not, so the VM is
+# stopped. If $check names a function, a pass also needs `$check NAME` to
 # succeed; it prints why not otherwise.
 run_vm() {
-    local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why
+    local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why qemu client_status=0
     shift 3
     set +e
     # shellcheck disable=SC2086 # QEMU is a command line
@@ -74,23 +85,44 @@ run_vm() {
         -serial stdio -display none -no-reboot \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
         "$@" \
-        </dev/null >"$log" 2>&1
+        </dev/null >"$log" 2>&1 &
+    qemu=$!
+    if [[ -n ${client:-} ]]; then
+        # Bounded by QEMU's run: its end closes the channel.
+        $client "$name" "$WORK/$name.sock" >"$WORK/$name.client" 2>&1
+        client_status=$?
+        # `timeout` passes the signal on to QEMU.
+        [[ $client_status -lt 2 ]] || kill "$qemu" 2>/dev/null
+    fi
+    wait "$qemu"
     status=$?
     set -e
     # isa-debug-exit: QEMU exits with (value << 1) | 1; 33 = pass.
-    if [[ $status -eq 33 ]] && { [[ -z ${check:-} ]] || why=$($check "$name"); }; then
+    if [[ $status -eq 33 && $client_status -eq 0 ]] &&
+        { [[ -z ${check:-} ]] || why=$($check "$name"); }; then
         echo "PASS  $name"
         pass=$((pass + 1))
-        [[ ${verbose:-0} -eq 0 ]] || cat "$log"
+        if [[ ${verbose:-0} -ne 0 ]]; then
+            cat "$log"
+            [[ -z ${client:-} ]] || cat "$WORK/$name.client"
+        fi
     else
-        case $status in
-            33) ;;
-            65) why="guest reported failure" ;;
-            124) why="timed out after ${TIMEOUT}s" ;;
-            *) why="exit status $status" ;;
-        esac
+        if [[ $client_status -ne 0 ]]; then
+            why="host client exit status $client_status"
+        else
+            case $status in
+                33) ;;
+                65) why="guest reported failure" ;;
+                124) why="timed out after ${TIMEOUT}s" ;;
+                *) why="exit status $status" ;;
+            esac
+        fi
         echo "FAIL  $name  ($why)"
         sed 's/^/      | /' "$log" | tail -40
+        if [[ -n ${client:-} ]]; then
+            echo "      host client:"
+            sed 's/^/      > /' "$WORK/$name.client" | tail -20
+        fi
         fail=$((fail + 1))
         failed+=("$name")
     fi

@@ -1,0 +1,17 @@
+[package]
+name = "litebox_vm_host"
+version = "0.1.0"
+edition = "2024"
+description = "Controls the LiteBox VM kernel from the host, over its control channel"
+
+[dependencies]
+anyhow = "1.0.99"
+base64 = "0.22.1"
+clap = { version = "4.5.33", features = ["derive"] }
+litebox_common_optee = { version = "0.1.0", path = "../litebox_common_optee" }
+litebox_common_vm_control = { version = "0.1.0", path = "../litebox_common_vm_control" }
+serde = { version = "1.0.142", features = ["derive"] }
+serde_json = "1.0.142"
+
+[lints]
+workspace = true
