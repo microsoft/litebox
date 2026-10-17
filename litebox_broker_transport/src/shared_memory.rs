@@ -93,6 +93,11 @@ pub trait ControlRingMemory: SharedMemory {
     /// release semantics, wrapping on overflow.
     fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError>;
 
+    /// Writes a naturally aligned native-endian `u32` with release semantics.
+    ///
+    /// On error, the value must not have been stored.
+    fn store_u32_release(&self, offset: usize, value: u32) -> Result<(), SharedMemoryError>;
+
     /// Reads a naturally aligned native-endian `u64` with acquire semantics.
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError>;
 

@@ -113,6 +113,8 @@ impl LocalSetupChannel for KernelBrokerSetup {
 struct Rings {
     requests: ControlRingProducer<KernelControlRing>,
     responses: ControlRingConsumer<KernelControlRing>,
+    /// For the Wake that has the kernel serve requests.
+    words: KernelControlRing,
 }
 
 impl Rings {
@@ -132,7 +134,8 @@ impl Rings {
                 }
             }
         }
-        self.requests.wake_consumer()?;
+        // The kernel announces no waits, so `wake_consumer` would skip this.
+        broker_wake(self.words.start).map_err(ChannelError::Kernel)?;
         let response = loop {
             match self.responses.try_read(wire::decode_response) {
                 Ok(ControlRingReadStatus::Message(response)) => break response,
@@ -294,6 +297,13 @@ impl ControlRingMemory for KernelControlRing {
         Ok(())
     }
 
+    fn store_u32_release(&self, offset: usize, value: u32) -> Result<(), SharedMemoryError> {
+        let address = self.u32_at(offset)?;
+        // Safety: see above.
+        unsafe { peer_memory::store_u32_release(address, value) };
+        Ok(())
+    }
+
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
         let address = self.u64_at(offset)?;
         // Safety: see above.
@@ -336,11 +346,9 @@ impl WaitableSharedMemory for KernelControlRing {
         broker_wait(self.start, offset, expected, None).map_err(ChannelError::Kernel)
     }
 
-    /// The kernel waits on no ring word: only new requests need it.
-    fn wake_one(&self, offset: usize) -> Result<(), ChannelError> {
-        if offset == ControlRingDirection::Requests.producer_epoch_offset() {
-            broker_wake(self.start).map_err(ChannelError::Kernel)?;
-        }
+    /// The kernel waits on no ring word, so it announces no waits for this
+    /// to wake; [`broker_wake`] has it serve new requests.
+    fn wake_one(&self, _offset: usize) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -381,6 +389,7 @@ pub fn connect(
                 rings: litebox_platform::sync::Mutex::new(Some(Rings {
                     requests: request_producer,
                     responses: response_consumer,
+                    words: ring()?,
                 })),
             };
             let shared_memory: Arc<dyn SharedMemory> = Arc::new(KernelSharedMemory {

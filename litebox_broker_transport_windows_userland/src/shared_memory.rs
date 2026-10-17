@@ -8,7 +8,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, ControlRingDirection, MemoryAccessPolicy, WaitableSharedMemory,
+    CONTROL_RING_MEMORY_SIZE, CONTROL_RING_PARALLEL_SPIN_LIMIT, ControlRingDirection,
+    MemoryAccessPolicy, WaitableSharedMemory,
 };
 use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
@@ -62,6 +63,7 @@ pub struct WindowsSharedMemory {
     view: NonNull<u8>,
     length: usize,
     policy: MemoryAccessPolicy,
+    spin_limit: u32,
 }
 
 // SAFETY: The mapping address remains stable until drop. Access is performed by Windows APIs or
@@ -139,12 +141,17 @@ impl WindowsSharedMemory {
         // SAFETY: `mapping` is a live file-mapping handle and `length` is its creation size.
         let view = unsafe { MapViewOfFile(mapping.0, FILE_MAP_ALL_ACCESS, 0, 0, length) };
         let view = NonNull::new(view.Value.cast::<u8>()).ok_or_else(Error::last_os_error)?;
+        let spin_limit = match policy {
+            MemoryAccessPolicy::Bytes => 0,
+            MemoryAccessPolicy::ControlRing => parallel_spin_limit(),
+        };
         Ok(Self {
             mapping,
             wake_handles,
             view,
             length,
             policy,
+            spin_limit,
         })
     }
 
@@ -296,6 +303,15 @@ impl WindowsSharedMemory {
     }
 }
 
+/// [`CONTROL_RING_PARALLEL_SPIN_LIMIT`] if this process can run on more than
+/// one CPU, so its ring peer may run in parallel.
+fn parallel_spin_limit() -> u32 {
+    match std::thread::available_parallelism() {
+        Ok(parallelism) if parallelism.get() > 1 => CONTROL_RING_PARALLEL_SPIN_LIMIT,
+        _ => 0,
+    }
+}
+
 fn create_wake_handles() -> IoResult<[OwnedHandle; CONTROL_RING_WAKE_OFFSETS.len()]> {
     let mut handles = Vec::with_capacity(CONTROL_RING_WAKE_OFFSETS.len());
     for _ in CONTROL_RING_WAKE_OFFSETS {
@@ -419,6 +435,13 @@ impl ControlRingMemory for WindowsSharedMemory {
         Ok(())
     }
 
+    fn store_u32_release(&self, offset: usize, value: u32) -> Result<(), SharedMemoryError> {
+        let address = self.checked_u32(offset)?;
+        // SAFETY: `address` is checked and naturally aligned mapped memory.
+        unsafe { peer_memory::store_u32_release(address, value) };
+        Ok(())
+    }
+
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
         let address = self.checked_u64(offset)?;
         // SAFETY: `address` is checked and naturally aligned mapped memory.
@@ -488,6 +511,10 @@ impl WaitableSharedMemory for WindowsSharedMemory {
             return Err(Error::last_os_error());
         }
         Ok(())
+    }
+
+    fn spin_limit(&self) -> u32 {
+        self.spin_limit
     }
 }
 

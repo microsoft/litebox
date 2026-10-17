@@ -19,7 +19,7 @@ use crate::shared_memory::{ControlRingMemory, SharedMemoryError};
 pub const CONTROL_RING_SLOT_SIZE: usize = 128;
 
 /// Versioned token exchanged before endpoints activate this control-ring ABI.
-pub const CONTROL_RING_READY: &[u8] = b"litebox-control-ring-ready-v1";
+pub const CONTROL_RING_READY: &[u8] = b"litebox-control-ring-ready-v2";
 
 /// Size of the fixed metadata at the start of a control-ring slot.
 pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;
@@ -42,6 +42,11 @@ pub const CONTROL_RING_SLOT_COUNT: u64 = 64;
 /// Number of slots in the broker-to-local notification direction.
 pub const CONTROL_RING_NOTIFICATION_SLOT_COUNT: u64 = 64;
 
+/// A [`WaitableSharedMemory::spin_limit`] for endpoints whose peer can run in
+/// parallel: polling for on the order of 100 µs outlasts a typical broker call
+/// yet is far shorter than a scheduler time slice.
+pub const CONTROL_RING_PARALLEL_SPIN_LIMIT: u32 = 4000;
+
 /// Exact shared-memory size required for all association control directions.
 pub const CONTROL_RING_MEMORY_SIZE: usize =
     CONTROL_RING_DATA_SIZE + CONTROL_RING_SYNC_DIRECTION_SIZE * 3;
@@ -56,10 +61,15 @@ const CONTROL_RING_NOTIFICATION_DIRECTION_SIZE: usize =
     CONTROL_RING_SLOT_SIZE * CONTROL_RING_NOTIFICATION_SLOT_COUNT as usize;
 const CONTROL_RING_DATA_SIZE: usize =
     CONTROL_RING_DIRECTION_SIZE * 2 + CONTROL_RING_NOTIFICATION_DIRECTION_SIZE;
-const CONTROL_RING_SYNC_DIRECTION_SIZE: usize = 16;
+const CONTROL_RING_SYNC_DIRECTION_SIZE: usize = 24;
 const PRODUCER_EPOCH_OFFSET: usize = 0;
 const CONSUMER_EPOCH_OFFSET: usize = 4;
 const CONSUMER_HEAD_OFFSET: usize = 8;
+/// Nonzero while the consumer may block on the producer epoch.
+const CONSUMER_WAITING_OFFSET: usize = 16;
+/// Nonzero while the producer may block on the consumer epoch.
+const PRODUCER_WAITING_OFFSET: usize = 20;
+const _: () = assert!(CONTROL_RING_SYNC_DIRECTION_SIZE.is_multiple_of(size_of::<u64>()));
 
 /// Access model enforced by a concrete shared-memory mapping.
 ///
@@ -133,7 +143,10 @@ pub const fn memory_permits_u32(offset: usize) -> bool {
     relative < CONTROL_RING_SYNC_DIRECTION_SIZE * 3
         && matches!(
             relative % CONTROL_RING_SYNC_DIRECTION_SIZE,
-            PRODUCER_EPOCH_OFFSET | CONSUMER_EPOCH_OFFSET
+            PRODUCER_EPOCH_OFFSET
+                | CONSUMER_EPOCH_OFFSET
+                | CONSUMER_WAITING_OFFSET
+                | PRODUCER_WAITING_OFFSET
         )
 }
 
@@ -215,6 +228,14 @@ impl ControlRingDirection {
     /// Returns the `u64` consumer-head offset for this direction.
     pub const fn consumer_head_offset(self) -> usize {
         self.sync_offset() + CONSUMER_HEAD_OFFSET
+    }
+
+    const fn consumer_waiting_offset(self) -> usize {
+        self.sync_offset() + CONSUMER_WAITING_OFFSET
+    }
+
+    const fn producer_waiting_offset(self) -> usize {
+        self.sync_offset() + PRODUCER_WAITING_OFFSET
     }
 
     const fn sync_offset(self) -> usize {
@@ -518,6 +539,11 @@ pub struct ControlRingWakeHandle<Memory: ControlRingMemory> {
 /// Implementations must publish and observe epoch changes through the same
 /// coherent shared memory the ring uses, so a wake that follows an epoch change
 /// can never be missed by a waiter that sampled the previous epoch.
+///
+/// Ring endpoints first poll the epoch for up to [`Self::spin_limit`]
+/// iterations, then announce in a shared word that they may block, and their
+/// peer wakes them only while that word is set. A peer that clears the word
+/// only loses its own wakes, as it could by never publishing progress.
 pub trait WaitableSharedMemory: ControlRingMemory {
     /// Error reported by blocking operations on this shared memory.
     type Error;
@@ -533,6 +559,15 @@ pub trait WaitableSharedMemory: ControlRingMemory {
 
     /// Wakes one waiter blocked on the naturally aligned `u32` at `offset`.
     fn wake_one(&self, offset: usize) -> Result<(), Self::Error>;
+
+    /// Returns how many times a ring endpoint polls an epoch before blocking.
+    ///
+    /// Polling sees a peer running on another CPU publish progress without the
+    /// cost of blocking and waking, so it pays off only when the peers can run
+    /// in parallel.
+    fn spin_limit(&self) -> u32 {
+        0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -569,11 +604,64 @@ impl<Memory: ControlRingMemory> ControlRingWakeHandle<Memory> {
     }
 }
 
+impl<Memory: WaitableSharedMemory> ControlRing<Memory> {
+    /// Waits while the epoch at `epoch_offset` equals `expected`: polls it,
+    /// then blocks with the wait announced in the `u32` at `waiting_offset`.
+    ///
+    /// Each announcement word has one waiter, as endpoint waits take
+    /// `&mut self`.
+    fn wait_while_equal(
+        &self,
+        epoch_offset: usize,
+        expected: u32,
+        waiting_offset: usize,
+    ) -> Result<(), Memory::Error> {
+        let memory = &self.memory;
+        for _ in 0..memory.spin_limit() {
+            let epoch = memory
+                .load_u32_acquire(epoch_offset)
+                .map_err(Memory::wait_access_error)?;
+            if epoch != expected {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        memory
+            .store_u32_release(waiting_offset, 1)
+            .map_err(Memory::wait_access_error)?;
+        // Orders the announcement before the epoch check in the wait, as
+        // `wake_waiter` orders the epoch change before its announcement check:
+        // the waiter sees the new epoch or the waker sees the announcement.
+        fence(Ordering::SeqCst);
+        let result = memory.wait_while_equal(epoch_offset, expected);
+        memory
+            .store_u32_release(waiting_offset, 0)
+            .map_err(Memory::wait_access_error)?;
+        result
+    }
+
+    /// Wakes the waiter on the epoch at `epoch_offset`, already changed, if
+    /// the `u32` at `waiting_offset` announces it may be blocked.
+    fn wake_waiter(&self, epoch_offset: usize, waiting_offset: usize) -> Result<(), Memory::Error> {
+        // Pairs with the fence in `wait_while_equal`.
+        fence(Ordering::SeqCst);
+        let waiting = self
+            .memory
+            .load_u32_acquire(waiting_offset)
+            .map_err(Memory::wait_access_error)?;
+        if waiting == 0 {
+            return Ok(());
+        }
+        self.memory.wake_one(epoch_offset)
+    }
+}
+
 impl<Memory: WaitableSharedMemory> ControlRingWakeHandle<Memory> {
     /// Changes and wakes the epoch observed by this endpoint's wait operation.
     ///
     /// Incrementing before waking closes the race where cancellation happens
     /// after a ring operation samples its epoch but before it starts to wait.
+    /// The wake ignores the announcement word, which the peer can clear.
     pub fn interrupt_wait(&self) -> Result<(), Memory::Error> {
         self.memory()
             .increment_u32_release(self.wait_epoch_offset())
@@ -612,7 +700,8 @@ impl<Memory: ControlRingMemory> ControlRingProducer<Memory> {
         }
     }
 
-    pub(crate) fn memory(&self) -> &Memory {
+    #[cfg(test)]
+    fn memory(&self) -> &Memory {
         self.ring.memory()
     }
 
@@ -678,14 +767,20 @@ impl<Memory: WaitableSharedMemory> ControlRingProducer<Memory> {
     ///
     /// The caller must retry the write after this possibly spurious wakeup.
     pub fn wait_for_capacity(&mut self, wait_epoch: u32) -> Result<(), Memory::Error> {
-        self.memory()
-            .wait_while_equal(self.direction().consumer_epoch_offset(), wait_epoch)
+        self.ring.wait_while_equal(
+            self.direction.consumer_epoch_offset(),
+            wait_epoch,
+            self.direction.producer_waiting_offset(),
+        )
     }
 
-    /// Wakes the consumer after publishing one or more messages.
+    /// Wakes the consumer, if it may be blocked, after publishing one or more
+    /// messages.
     pub fn wake_consumer(&self) -> Result<(), Memory::Error> {
-        self.memory()
-            .wake_one(self.direction().producer_epoch_offset())
+        self.ring.wake_waiter(
+            self.direction.producer_epoch_offset(),
+            self.direction.consumer_waiting_offset(),
+        )
     }
 }
 
@@ -721,7 +816,8 @@ impl<Memory: ControlRingMemory> ControlRingConsumer<Memory> {
         }
     }
 
-    pub(crate) fn memory(&self) -> &Memory {
+    #[cfg(test)]
+    fn memory(&self) -> &Memory {
         self.ring.memory()
     }
 
@@ -817,14 +913,20 @@ impl<Memory: WaitableSharedMemory> ControlRingConsumer<Memory> {
     ///
     /// The caller must retry the read after this possibly spurious wakeup.
     pub fn wait_for_message(&mut self, wait_epoch: u32) -> Result<(), Memory::Error> {
-        self.memory()
-            .wait_while_equal(self.direction().producer_epoch_offset(), wait_epoch)
+        self.ring.wait_while_equal(
+            self.direction.producer_epoch_offset(),
+            wait_epoch,
+            self.direction.consumer_waiting_offset(),
+        )
     }
 
-    /// Wakes the producer after publishing newly consumed slots.
+    /// Wakes the producer, if it may be blocked, after publishing newly
+    /// consumed slots.
     pub fn wake_producer(&self) -> Result<(), Memory::Error> {
-        self.memory()
-            .wake_one(self.direction().consumer_epoch_offset())
+        self.ring.wake_waiter(
+            self.direction.consumer_epoch_offset(),
+            self.direction.producer_waiting_offset(),
+        )
     }
 }
 
@@ -842,7 +944,7 @@ mod tests {
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::vec;
     use std::vec::Vec;
 
@@ -852,7 +954,7 @@ mod tests {
 
     #[test]
     fn mapping_requires_the_exact_control_ring_size() {
-        assert_eq!(CONTROL_RING_MEMORY_SIZE, 24_624);
+        assert_eq!(CONTROL_RING_MEMORY_SIZE, 24_648);
         assert!(matches!(
             ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE - 1)),
             Err(ControlRingError::MemoryLengthMismatch {
@@ -888,6 +990,10 @@ mod tests {
         assert!(memory_permits_u32(sync_start + PRODUCER_EPOCH_OFFSET));
         assert!(memory_permits_u32(sync_start + CONSUMER_EPOCH_OFFSET));
         assert!(memory_permits_u64(sync_start + CONSUMER_HEAD_OFFSET));
+        assert!(memory_permits_u32(sync_start + CONSUMER_WAITING_OFFSET));
+        assert!(memory_permits_u32(sync_start + PRODUCER_WAITING_OFFSET));
+        assert!(!memory_permits_u64(sync_start + CONSUMER_WAITING_OFFSET));
+        assert!(!memory_permits_u32(sync_start + CONSUMER_HEAD_OFFSET));
         assert!(!memory_permits_byte_range(sync_start, 1));
         assert!(!memory_permits_u32(CONTROL_RING_MEMORY_SIZE));
         assert!(!memory_permits_u64(CONTROL_RING_MEMORY_SIZE));
@@ -932,9 +1038,17 @@ mod tests {
                     .consumer_head_offset()
                     .is_multiple_of(align_of::<u64>())
             );
+            assert_eq!(
+                direction.consumer_waiting_offset(),
+                direction.consumer_head_offset() + size_of::<u64>()
+            );
+            assert_eq!(
+                direction.producer_waiting_offset(),
+                direction.consumer_waiting_offset() + size_of::<u32>()
+            );
         }
         assert_eq!(
-            ControlRingDirection::Notifications.consumer_head_offset() + size_of::<u64>(),
+            ControlRingDirection::Notifications.producer_waiting_offset() + size_of::<u32>(),
             CONTROL_RING_MEMORY_SIZE
         );
     }
@@ -1537,6 +1651,136 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wakes_skip_peers_that_announce_no_wait() {
+        let (mut producer, mut consumer) =
+            ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE))
+                .unwrap()
+                .into_endpoints(
+                    ControlRingDirection::Requests,
+                    ControlRingDirection::Requests,
+                );
+        let direction = ControlRingDirection::Requests;
+        assert_eq!(
+            producer.try_write(b"x"),
+            Ok(ControlRingWriteStatus::Written)
+        );
+        producer.wake_consumer().unwrap();
+        assert!(producer.memory().wakes().is_empty());
+
+        producer
+            .memory()
+            .store_u32_for_test(direction.consumer_waiting_offset(), 1);
+        producer.wake_consumer().unwrap();
+        assert_eq!(
+            producer.memory().wakes(),
+            [direction.producer_epoch_offset()]
+        );
+
+        assert!(matches!(
+            consumer.try_read(|frame| Ok::<_, ()>(frame.to_vec())),
+            Ok(ControlRingReadStatus::Message(_))
+        ));
+        consumer.publish_head().unwrap();
+        consumer.wake_producer().unwrap();
+        assert_eq!(consumer.memory().wakes().len(), 1);
+        consumer
+            .memory()
+            .store_u32_for_test(direction.producer_waiting_offset(), 1);
+        consumer.wake_producer().unwrap();
+        assert_eq!(
+            consumer.memory().wakes()[1..],
+            [direction.consumer_epoch_offset()]
+        );
+    }
+
+    #[test]
+    fn waits_announce_themselves_only_while_blocking() {
+        let (mut producer, mut consumer) =
+            ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE))
+                .unwrap()
+                .into_endpoints(
+                    ControlRingDirection::Responses,
+                    ControlRingDirection::Requests,
+                );
+        let requests = ControlRingDirection::Requests;
+        let responses = ControlRingDirection::Responses;
+        let Ok(ControlRingReadStatus::Empty { wait_epoch }) =
+            consumer.try_read(|frame| Ok::<_, ()>(frame.to_vec()))
+        else {
+            panic!("an empty ring");
+        };
+        consumer.wait_for_message(wait_epoch).unwrap();
+        producer.wait_for_capacity(7).unwrap();
+        let memory = consumer.memory();
+        let waits = memory.waits();
+        assert_eq!(
+            waits
+                .iter()
+                .map(|(offset, expected, _)| (*offset, *expected))
+                .collect::<Vec<_>>(),
+            [
+                (requests.producer_epoch_offset(), wait_epoch),
+                (responses.consumer_epoch_offset(), 7),
+            ]
+        );
+        assert_eq!(word_at(&waits[0].2, requests.consumer_waiting_offset()), 1);
+        assert_eq!(word_at(&waits[1].2, responses.producer_waiting_offset()), 1);
+        for offset in [
+            requests.consumer_waiting_offset(),
+            responses.producer_waiting_offset(),
+        ] {
+            assert_eq!(memory.load_u32_acquire(offset), Ok(0));
+        }
+    }
+
+    #[test]
+    fn spinning_waits_return_without_blocking_once_the_epoch_changes() {
+        let memory = TestMemory::new(CONTROL_RING_MEMORY_SIZE);
+        memory.spin_limit.store(u32::MAX, Ordering::Relaxed);
+        let (mut producer, mut consumer) = ControlRing::new(memory).unwrap().into_endpoints(
+            ControlRingDirection::Requests,
+            ControlRingDirection::Requests,
+        );
+        let Ok(ControlRingReadStatus::Empty { wait_epoch }) =
+            consumer.try_read(|frame| Ok::<_, ()>(frame.to_vec()))
+        else {
+            panic!("an empty ring");
+        };
+        assert_eq!(
+            producer.try_write(b"x"),
+            Ok(ControlRingWriteStatus::Written)
+        );
+        consumer.wait_for_message(wait_epoch).unwrap();
+        let memory = consumer.memory();
+        assert!(memory.waits().is_empty());
+        let waiting = ControlRingDirection::Requests.consumer_waiting_offset();
+        assert!(
+            !memory
+                .write_log()
+                .iter()
+                .any(|(offset, _)| *offset == waiting)
+        );
+
+        memory.spin_limit.store(3, Ordering::Relaxed);
+        let Ok(ControlRingReadStatus::Message(_)) =
+            consumer.try_read(|frame| Ok::<_, ()>(frame.to_vec()))
+        else {
+            panic!("the written message");
+        };
+        let Ok(ControlRingReadStatus::Empty { wait_epoch }) =
+            consumer.try_read(|frame| Ok::<_, ()>(frame.to_vec()))
+        else {
+            panic!("an empty ring");
+        };
+        consumer.wait_for_message(wait_epoch).unwrap();
+        assert_eq!(consumer.memory().waits().len(), 1);
+    }
+
+    fn word_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_ne_bytes(bytes[offset..offset + size_of::<u32>()].try_into().unwrap())
+    }
+
     fn raw_slot(
         sequence: u64,
         length: u32,
@@ -1573,6 +1817,10 @@ mod tests {
         bytes: Mutex<Vec<u8>>,
         write_log: Mutex<Vec<(usize, usize)>>,
         write_count: AtomicUsize,
+        spin_limit: AtomicU32,
+        /// Each wait's offset, expected value, and memory snapshot.
+        waits: Mutex<Vec<(usize, u32, Vec<u8>)>>,
+        wakes: Mutex<Vec<usize>>,
     }
 
     impl TestMemory {
@@ -1581,7 +1829,18 @@ mod tests {
                 bytes: Mutex::new(vec![0; length]),
                 write_log: Mutex::new(Vec::new()),
                 write_count: AtomicUsize::new(0),
+                spin_limit: AtomicU32::new(0),
+                waits: Mutex::new(Vec::new()),
+                wakes: Mutex::new(Vec::new()),
             }
+        }
+
+        fn waits(&self) -> Vec<(usize, u32, Vec<u8>)> {
+            self.waits.lock().unwrap().clone()
+        }
+
+        fn wakes(&self) -> Vec<usize> {
+            self.wakes.lock().unwrap().clone()
         }
 
         fn bytes(&self) -> Vec<u8> {
@@ -1631,6 +1890,33 @@ mod tests {
         }
     }
 
+    /// Records waits, which return at once, and wakes.
+    impl WaitableSharedMemory for TestMemory {
+        type Error = SharedMemoryError;
+
+        fn wait_access_error(error: SharedMemoryError) -> SharedMemoryError {
+            error
+        }
+
+        fn wait_while_equal(&self, offset: usize, expected: u32) -> Result<(), SharedMemoryError> {
+            let snapshot = self.bytes();
+            self.waits
+                .lock()
+                .unwrap()
+                .push((offset, expected, snapshot));
+            Ok(())
+        }
+
+        fn wake_one(&self, offset: usize) -> Result<(), SharedMemoryError> {
+            self.wakes.lock().unwrap().push(offset);
+            Ok(())
+        }
+
+        fn spin_limit(&self) -> u32 {
+            self.spin_limit.load(Ordering::Relaxed)
+        }
+    }
+
     impl ControlRingMemory for TestMemory {
         fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
             test_load_u32_acquire(&self.bytes, offset)
@@ -1638,6 +1924,16 @@ mod tests {
 
         fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
             test_increment_u32_release(&self.bytes, offset)?;
+            self.write_log
+                .lock()
+                .unwrap()
+                .push((offset, size_of::<u32>()));
+            self.write_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn store_u32_release(&self, offset: usize, value: u32) -> Result<(), SharedMemoryError> {
+            test_store_u32_release(&self.bytes, offset, value)?;
             self.write_log
                 .lock()
                 .unwrap()
@@ -1747,6 +2043,10 @@ mod tests {
 
         fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
             test_increment_u32_release(&self.bytes, offset)
+        }
+
+        fn store_u32_release(&self, offset: usize, value: u32) -> Result<(), SharedMemoryError> {
+            test_store_u32_release(&self.bytes, offset, value)
         }
 
         fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
@@ -1862,6 +2162,10 @@ mod tests {
             test_increment_u32_release(&self.bytes, offset)
         }
 
+        fn store_u32_release(&self, offset: usize, value: u32) -> Result<(), SharedMemoryError> {
+            test_store_u32_release(&self.bytes, offset, value)
+        }
+
         fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
             test_load_u64_acquire(&self.bytes, offset)
         }
@@ -1924,6 +2228,26 @@ mod tests {
             .ok_or(SharedMemoryError::InvalidRange)?;
         let previous = u32::from_ne_bytes(destination.try_into().unwrap());
         destination.copy_from_slice(&previous.wrapping_add(1).to_ne_bytes());
+        Ok(())
+    }
+
+    fn test_store_u32_release(
+        bytes: &Mutex<Vec<u8>>,
+        offset: usize,
+        value: u32,
+    ) -> Result<(), SharedMemoryError> {
+        if !offset.is_multiple_of(align_of::<u32>()) {
+            return Err(SharedMemoryError::UnalignedWord);
+        }
+        fence(Ordering::Release);
+        let mut bytes = bytes.lock().unwrap();
+        let end = offset
+            .checked_add(size_of::<u32>())
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        bytes
+            .get_mut(offset..end)
+            .ok_or(SharedMemoryError::InvalidRange)?
+            .copy_from_slice(&value.to_ne_bytes());
         Ok(())
     }
 

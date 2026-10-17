@@ -164,6 +164,13 @@ impl ControlRingMemory for PinnedControlRing {
         Ok(())
     }
 
+    fn store_u32_release(&self, offset: usize, value: u32) -> Result<(), SharedMemoryError> {
+        let address = self.u32_at(offset)?;
+        // Safety: see above.
+        unsafe { peer_memory::store_u32_release(address, value) };
+        Ok(())
+    }
+
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
         let address = self.u64_at(offset)?;
         // Safety: see above.

@@ -84,6 +84,35 @@ pub unsafe fn increment_u32_release(address: *mut u32) {
     }
 }
 
+/// Writes a `u32` with release semantics.
+///
+/// # Safety
+///
+/// `address` must be naturally aligned and writable for the whole call.
+pub unsafe fn store_u32_release(address: *mut u32, value: u32) {
+    // SAFETY: Guaranteed by the caller. `xchg` with memory is indivisible and
+    // fully ordered on x86-64.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        asm!(
+            "xchg dword ptr [{address}], {value:e}",
+            address = in(reg) address,
+            value = inout(reg) value => _,
+            options(nostack, preserves_flags),
+        );
+    }
+    // SAFETY: Guaranteed by the caller.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        asm!(
+            "stlr {value:w}, [{address}]",
+            address = in(reg) address,
+            value = in(reg) value,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Reads a `u64` with acquire semantics.
 ///
 /// # Safety

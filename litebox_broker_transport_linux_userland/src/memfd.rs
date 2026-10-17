@@ -39,7 +39,8 @@ use rustix::net::{
 };
 
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, MemoryAccessPolicy, WaitableSharedMemory,
+    CONTROL_RING_MEMORY_SIZE, CONTROL_RING_PARALLEL_SPIN_LIMIT, MemoryAccessPolicy,
+    WaitableSharedMemory,
 };
 #[cfg(test)]
 use litebox_broker_transport::control_ring::{
@@ -62,6 +63,7 @@ pub struct MemfdSharedMemory {
     fd: OwnedFd,
     mapping: MappedRegion,
     policy: MemoryAccessPolicy,
+    spin_limit: u32,
 }
 
 struct MappedRegion {
@@ -287,11 +289,25 @@ impl MemfdSharedMemory {
         }?;
         let address =
             NonNull::new(address.cast()).ok_or_else(|| invalid_data("mmap returned null"))?;
+        let spin_limit = match policy {
+            MemoryAccessPolicy::Bytes => 0,
+            MemoryAccessPolicy::ControlRing => parallel_spin_limit(),
+        };
         Ok(Self {
             fd,
             mapping: MappedRegion { address, length },
             policy,
+            spin_limit,
         })
+    }
+}
+
+/// [`CONTROL_RING_PARALLEL_SPIN_LIMIT`] if this process can run on more than
+/// one CPU, so its ring peer may run in parallel.
+fn parallel_spin_limit() -> u32 {
+    match std::thread::available_parallelism() {
+        Ok(parallelism) if parallelism.get() > 1 => CONTROL_RING_PARALLEL_SPIN_LIMIT,
+        _ => 0,
     }
 }
 
@@ -328,6 +344,10 @@ impl WaitableSharedMemory for MemfdSharedMemory {
     fn wake_one(&self, offset: usize) -> IoResult<()> {
         let address = checked_u32_address(self, offset).map_err(Self::wait_access_error)?;
         futex_wake_one(address)
+    }
+
+    fn spin_limit(&self) -> u32 {
+        self.spin_limit
     }
 }
 
@@ -376,6 +396,13 @@ impl ControlRingMemory for MemfdSharedMemory {
         let address = checked_u32_address(self, offset)?;
         // SAFETY: The address is aligned and lies within the live mapping.
         unsafe { peer_memory::increment_u32_release(address) };
+        Ok(())
+    }
+
+    fn store_u32_release(&self, offset: usize, value: u32) -> Result<(), SharedMemoryError> {
+        let address = checked_u32_address(self, offset)?;
+        // SAFETY: The address is aligned and lies within the live mapping.
+        unsafe { peer_memory::store_u32_release(address, value) };
         Ok(())
     }
 
@@ -800,6 +827,12 @@ mod tests {
             Ok(0x1112_1314_1516_1718)
         );
         assert_eq!(second.load_u32_acquire(epoch_offset), Ok(2));
+        assert_eq!(first.store_u32_release(epoch_offset, 0x0102_0304), Ok(()));
+        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(0x0102_0304));
+        assert_eq!(
+            first.store_u32_release(sequence_offset, 0),
+            Err(SharedMemoryError::InvalidRange)
+        );
         second.write(body_offset, &[7]).unwrap();
         let mut byte = [0];
         first.read(body_offset, &mut byte).unwrap();
