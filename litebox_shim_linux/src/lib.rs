@@ -1578,7 +1578,7 @@ struct GlobalState<Platform: ShimPlatform> {
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.
     process_id: i32,
-    /// Host-specific process duplication backend, if enabled by the runner.
+    /// Launcher used to start fork children.
     fork_launcher: ForkLauncher,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, loader::patch::ElfPatchCache<Platform>>,

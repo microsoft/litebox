@@ -23,7 +23,7 @@ pub struct ExistingRunnerDescriptor {
 }
 
 impl ExistingRunnerDescriptor {
-    /// Encodes this descriptor, validating that its control socket belongs to the calling runner.
+    /// Encodes this descriptor, validating its socket path against the calling runner's PID.
     pub fn encode(&self) -> Result<Vec<u8>> {
         validate_control_channel(&self.control_channel, std::process::id())?;
         let path = self.control_channel.as_os_str().as_bytes();

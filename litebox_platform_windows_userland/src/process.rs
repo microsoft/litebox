@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Experimental native Windows process operations for broker-adopted runners.
+//! Experimental native Windows process operations.
 
 use core::ffi::c_void;
 use core::mem::size_of;
@@ -15,7 +15,7 @@ use litebox::platform::{
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Threading::{GetProcessId, ResumeThread, TerminateProcess};
 
-/// Owned native child resources used by [`ProcessProvider`].
+/// A handle to a process created by [`ProcessProvider::fork_process`].
 pub struct ClonedProcess {
     process: OwnedHandle,
     thread: OwnedHandle,
@@ -100,7 +100,7 @@ const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 const PROCESS_CREATE_FLAGS_INHERIT_FROM_PARENT: u32 = 0x0000_0100;
 const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
 
-/// Result of cloning the calling process.
+/// Result returned by [`fork_process`].
 pub enum ForkResult {
     /// The original process receives handles for its suspended child.
     Parent {

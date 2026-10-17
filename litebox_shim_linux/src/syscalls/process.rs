@@ -75,11 +75,7 @@ pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
     unsafe fn run_child(&self, channel: Self::ControlChannel) -> !;
 }
 
-/// Starts a natively forked runner using platform process operations and runner-specific hooks.
-///
-/// Descriptor encoding and child bootstrap remain in the runner, keeping this launcher independent
-/// of host transport types. The default launcher requests copy-based startup without invoking the
-/// runner.
+/// Launcher for native fork children.
 pub struct ForkLauncher {
     start_runner: Box<StartRunner>,
 }
@@ -95,8 +91,8 @@ impl Default for ForkLauncher {
 impl ForkLauncher {
     /// Creates a launcher using the runner's transport and bootstrap operations.
     ///
-    /// The parent encodes its descriptor before resuming a suspended child. The child receives its
-    /// copy of the control channel without encoding a descriptor or resuming a process.
+    /// The parent encodes the child runner's descriptor before resuming a suspended child.
+    /// The child receives its copy of the control channel.
     ///
     /// # Safety
     ///

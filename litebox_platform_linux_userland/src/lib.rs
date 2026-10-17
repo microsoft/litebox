@@ -792,7 +792,7 @@ thread_local! {
     static CURRENT_THREAD: std::cell::RefCell<Option<ThreadHandle>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Discards copied guest-thread registration before a natively cloned process reboots LiteBox.
+/// Clears inherited guest-thread registration in the fork child.
 ///
 /// # Panics
 ///

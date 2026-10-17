@@ -427,7 +427,7 @@ pub unsafe fn run_thread(
     run_thread_inner(&shim, ctx);
 }
 
-/// Discards copied managed-thread registration before a natively cloned process reboots LiteBox.
+/// Clears inherited managed-thread registration in the fork child.
 ///
 /// # Panics
 ///

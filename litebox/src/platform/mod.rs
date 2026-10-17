@@ -98,7 +98,7 @@ pub trait ThreadProvider: RawPointerProvider {
     }
 }
 
-/// Result of duplicating the calling process.
+/// Result returned by [`ProcessProvider::fork_process`].
 pub enum ForkResult<Handle> {
     /// The parent owns a handle to the new process.
     Parent(Handle),
@@ -106,10 +106,9 @@ pub enum ForkResult<Handle> {
     Child,
 }
 
-/// Distinguishes unavailable native cloning from failures that must not fall back.
+/// Error returned by [`ProcessProvider::fork_process`].
 #[derive(Debug, Error)]
 pub enum ForkError<E> {
-    /// No child was created and no startup side effects occurred; copying is still possible.
     #[error("native process cloning is unsupported")]
     Unsupported,
     /// Native cloning or startup failed.
@@ -117,17 +116,11 @@ pub enum ForkError<E> {
     Failed(E),
 }
 
-/// Optional host process operations used by runners implementing native `fork`.
-///
-/// This is deliberately not a supertrait of [`Provider`]. A provider may return
-/// [`ForkError::Unsupported`] to request the copy-based path at runtime. Other failures
-/// must propagate instead of retrying process creation.
+/// Process management provider.
 pub trait ProcessProvider {
-    /// Owned host process resources, including any suspended initial thread.
-    ///
-    /// Dropping this handle releases resources but does not terminate the process.
+    /// The process handle type.
     type ProcessHandle: ProcessHandle<Error = Self::ProcessError>;
-    /// Host operation error.
+    /// Error type for process operations.
     type ProcessError: core::error::Error;
 
     /// Duplicates the caller's address space with only the calling thread.
@@ -147,11 +140,6 @@ pub trait ProcessProvider {
 
     /// Prepares platform state in the child created by [`Self::fork_process`].
     ///
-    /// Discards copied platform thread registration and inherited host connections as needed.
-    /// Standard input, output, and error remain available. This is not general initialization
-    /// for a spawned or exec'd process: it does not repair arbitrary inherited runtime locks or
-    /// reconstruct the runner's broker connection or shim state.
-    ///
     /// # Safety
     ///
     /// The caller must be the sole thread in a newly cloned process and must never return
@@ -159,11 +147,11 @@ pub trait ProcessProvider {
     unsafe fn prepare_fork_child() -> Result<(), Self::ProcessError>;
 }
 
-/// Owned native child process resources created by [`ProcessProvider`].
+/// A handle to a process created by [`ProcessProvider::fork_process`].
 ///
 /// Dropping a handle releases resources but does not terminate the process.
 pub trait ProcessHandle {
-    /// Host operation error.
+    /// Error type for process operations.
     type Error: core::error::Error;
 
     /// Returns the host process ID of the clone.
