@@ -103,7 +103,7 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         path: &str,
     ) -> Result<FileStatus, FileStatusError> {
         let path = self.resolve_path(context, path)?;
-        self.litebox.path_file_status(context, path.as_str())
+        self.litebox.path_file_status(context, path.as_str(), true)
     }
 
     #[cfg(test)]

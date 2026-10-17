@@ -376,7 +376,7 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
         assert!(!listed.iter().any(|entry| entry.name == name), "{name}");
     }
     assert!(
-        matches!(local.walk_directories(local.root(), &["sub", "relative"]), Ok(outcome) if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory)
+        matches!(local.walk_directories(local.root(), &["sub", "relative"]), Ok(outcome) if matches!(outcome.stop_reason, WalkStopReason::StoppedAtNonDirectory { .. }))
     );
     for name in ["absolute", "chain_b"] {
         let file = local
@@ -502,7 +502,7 @@ fn resolver_and_composer_use_host_permissions_and_live_positions() {
         .unwrap();
     resolver.write(&mut appended, b"+", None).unwrap();
     assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"Zb!+");
-    let status = resolver.file_status(USER, "/host/file").unwrap();
+    let status = resolver.file_status(USER, "/host/file", true).unwrap();
     assert_eq!(status.size, 4);
     resolver.truncate(&mut file, 2, false).unwrap();
     assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"Zb");

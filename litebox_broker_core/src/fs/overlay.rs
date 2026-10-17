@@ -821,15 +821,16 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     }
 
     fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
-        let current =
-            self.resolve_dir(&dir.as_typed::<Self>().path)
-                .map_err(|error| match error {
-                    OpenError::PathError(error) => WalkError::PathError(error),
-                    _ => WalkError::Io,
-                })?;
-        let entry = current
-            .entries
-            .get(name)
+        let open_to_walk_error = |error| match error {
+            OpenError::PathError(error) => WalkError::PathError(error),
+            _ => WalkError::Io,
+        };
+        let current = self
+            .resolve_dir(&dir.as_typed::<Self>().path)
+            .map_err(open_to_walk_error)?;
+        let entry = self
+            .entry(&current, name)
+            .map_err(open_to_walk_error)?
             .ok_or(PathError::NoSuchFileOrDirectory)?;
         let (backend, parent): (&dyn Backend, _) = if entry.upper {
             (self.upper.as_ref(), current.upper.as_ref())

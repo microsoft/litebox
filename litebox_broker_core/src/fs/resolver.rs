@@ -6,7 +6,6 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
@@ -125,19 +124,31 @@ enum SearchScope {
 }
 
 impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
-    /// Resolve a path to its physical location, following symbolic links.
+    /// Resolve an absolute path to its physical location, following symbolic links.
     pub fn resolve_following_symlinks(
         &self,
-        context: &Context,
+        user: UserInfo,
         path: &str,
-    ) -> Result<ResolvedPath, WalkError> {
-        self.resolve_path(context, path, true, false)
+    ) -> Result<String, WalkError> {
+        let path = self.resolve_path(&Context::new(user), path, true, false)?;
+        if path.components.is_empty() {
+            return Ok(String::from("/"));
+        }
+        Ok(path
+            .components
+            .iter()
+            .fold(String::new(), |path, component| path + "/" + component))
     }
 
     // XXX(jayb): callers rewalk the result, so this is non-atomic and walks twice; returning the
     // final walking handle alongside the path would fix both.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
+    // XXX: broker paths are absolute, so resolution always starts at the root. The client
+    // (`litebox::fs::Context::resolve`) also normalizes paths lexically before sending them: it
+    // collapses `.`/`..` (so `link/..` names the link's parent rather than, as on Linux, its
+    // target's parent) and drops trailing slashes, so `require_directory` and the final `.`/`..`
+    // checks below never trigger for guest paths (e.g. `unlink("link/")` removes the link).
     fn resolve_path(
         &self,
         context: &Context,
@@ -145,16 +156,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         follow_final: bool,
         allow_missing: bool,
     ) -> Result<ResolvedPath, WalkError> {
-        let mut pending: VecDeque<String> = if path.starts_with('/') {
-            VecDeque::new()
-        } else {
-            context.cwd.components.iter().cloned().collect()
-        };
-        pending.extend(
-            path.split('/')
-                .filter(|part| !part.is_empty())
-                .map(String::from),
-        );
+        let mut pending: VecDeque<String> = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(String::from)
+            .collect();
         let mut require_directory = path.ends_with('/');
         let mut resolved = Vec::new();
         let mut from = self.backend.root();
@@ -298,7 +304,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         };
         // Entry mutations resolve the parent but retain the final name, so neither a link nor
         // a final `.`/`..` can redirect a removal to an ordinary target directory.
-        let parent_path = self.resolve_following_symlinks(context, parent_path)?;
+        let parent_path = self.resolve_path(context, parent_path, true, false)?;
         let parent_components: Vec<_> = parent_path.components.iter().map(String::as_str).collect();
         let parent = self.walk_to_directory(
             context,
@@ -310,13 +316,14 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 
     /// Read a symbolic link's stored target, without following the final link.
-    pub fn read_link(&self, context: &Context, path: &str) -> Result<String, WalkError> {
-        let path = self.resolve_path(context, path, false, false)?;
+    pub fn read_link(&self, user: UserInfo, path: &str) -> Result<String, WalkError> {
+        let context = Context::new(user);
+        let path = self.resolve_path(&context, path, false, false)?;
         let Some((components, name)) = path.parent_and_name() else {
             return Err(PathError::InvalidPathname.into());
         };
         let parent =
-            self.walk_to_directory(context, self.backend.root(), &components, &components)?;
+            self.walk_to_directory(&context, self.backend.root(), &components, &components)?;
         let outcome = self.backend.walk_directories(parent.handle, &[name])?;
         match outcome.stop_reason {
             WalkStopReason::StoppedAtNonDirectory {
@@ -962,7 +969,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn chmod(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
         let context = Context::new(user);
         let path = self
-            .resolve_following_symlinks(&context, path)
+            .resolve_path(&context, path, true, false)
             .map_err(|error| match error {
                 WalkError::Io => ChmodError::Io,
                 WalkError::PathError(error) => error.into(),
@@ -989,7 +996,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     ) -> Result<(), ChownError> {
         let context = Context::new(acting_user);
         let path = self
-            .resolve_following_symlinks(&context, path)
+            .resolve_path(&context, path, true, false)
             .map_err(|error| match error {
                 WalkError::Io => ChownError::Io,
                 WalkError::PathError(error) => error.into(),

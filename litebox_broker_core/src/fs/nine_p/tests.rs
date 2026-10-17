@@ -563,8 +563,9 @@ fn test_nine_p_broken_read_after_progress() {
         .collect();
     std::fs::write(server.export_path().join("read_me.bin"), &data).unwrap();
 
-    // 5 writes: version + attach + walk + lopen + the first Tread. The second Tread fails.
-    let fs = connect_9p_broken(&server, 5);
+    // 7 writes: version + attach + resolution walk + clunk + open walk + lopen + the first Tread.
+    // The second Tread fails.
+    let fs = connect_9p_broken(&server, 7);
     let mut fd = fs
         .open(USER, "/read_me.bin", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");

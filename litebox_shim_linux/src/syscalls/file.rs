@@ -1974,10 +1974,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
-        let files = self.files.borrow();
         let fs = self.fs.borrow();
         let context = fs.context.read();
-        Ok(files.fs.read_link(&context, fullpath)?)
+        Ok(self.global.litebox.read_link_file(&context, fullpath)?)
     }
 
     /// Handle syscall `readlink`
@@ -2407,9 +2406,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Resolve relative paths against the CWD, following symlinks and `.` / `..`.
         let target = {
-            let files = self.files.borrow();
             let context = fs.context.read();
-            files.fs.resolve_following_symlinks(&context, pathname)?
+            self.global.litebox.resolve_file_path(&context, pathname)?
         };
 
         // Verify the path exists and is a directory.

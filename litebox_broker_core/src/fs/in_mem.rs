@@ -757,7 +757,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Node<Platform> {
     /// The directory entry for this node, named `name` in its parent.
     fn dir_entry(&self, name: &str) -> DirEntry {
         let (file_type, node_info) = match self {
-            Node::File(file) => (FileType::RegularFile, file.read().node_info),
+            Node::File(file) => {
+                let file = file.read();
+                (file.file_type, file.node_info)
+            }
             Node::Dir(dir) => (FileType::Directory, dir.read().node_info),
         };
         DirEntry {

@@ -31,10 +31,13 @@ use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use super::errors::{
     ChmodError, ChownError, FileStatusError, IsTerminalError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError, TerminalControlError,
-    TruncateError, UnlinkError, WriteError,
+    TruncateError, UnlinkError, WalkError, WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
+    // XXX: lexical normalization diverges from Linux once symlinks exist: `link/..` names the
+    // link's parent rather than its target's, and dropping a trailing slash means `link/` neither
+    // forces the link to be followed nor requires a directory.
     fn broker_path(context: &Context, path: &str) -> String {
         context.resolve(path).to_string()
     }
@@ -140,17 +143,46 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Obtain the status of a path.
+    ///
+    /// If `follow_symlinks` is false, a final symbolic link is described itself.
     pub fn path_file_status(
         &self,
         context: &Context,
         path: &str,
+        follow_symlinks: bool,
     ) -> Result<FileStatus, FileStatusError> {
         let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(FileStatusError::Io)?
-            .path_file_status(&path, context.acting_user())
+            .path_file_status(&path, context.acting_user(), follow_symlinks)
             .map_err(|_| FileStatusError::Io)?
             .map_err(FileStatusError::from)
+    }
+
+    /// Read a symbolic link's stored target, without following the final link.
+    pub fn read_link_file(&self, context: &Context, path: &str) -> Result<String, WalkError> {
+        let path = Self::broker_path(context, path);
+        self.broker_control()
+            .ok_or(WalkError::Io)?
+            .read_link_file(&path, context.acting_user())
+            .map_err(|_| WalkError::Io)?
+            .map_err(WalkError::from)
+    }
+
+    /// Resolve a path to its physical location, following symbolic links.
+    pub fn resolve_file_path(
+        &self,
+        context: &Context,
+        path: &str,
+    ) -> Result<ResolvedPath, WalkError> {
+        let path = Self::broker_path(context, path);
+        let resolved = self
+            .broker_control()
+            .ok_or(WalkError::Io)?
+            .resolve_file_path(&path, context.acting_user())
+            .map_err(|_| WalkError::Io)?
+            .map_err(WalkError::from)?;
+        Ok(Context::new().resolve(&resolved))
     }
 }
 
@@ -632,6 +664,7 @@ fn path_error(error: FileError) -> Option<PathError> {
         FileError::InvalidPathname => Some(PathError::InvalidPathname),
         FileError::MissingComponent => Some(PathError::MissingComponent),
         FileError::ComponentNotDirectory => Some(PathError::ComponentNotADirectory),
+        FileError::TooManySymlinks => Some(PathError::TooManySymlinks),
         _ => None,
     }
 }
@@ -794,5 +827,11 @@ impl From<FileError> for TerminalControlError {
             FileError::InvalidTerminalControl => Self::InvalidControl,
             _ => Self::Io,
         }
+    }
+}
+
+impl From<FileError> for WalkError {
+    fn from(error: FileError) -> Self {
+        path_error(error).map_or(Self::Io, Into::into)
     }
 }

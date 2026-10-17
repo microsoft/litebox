@@ -120,8 +120,6 @@ pub enum ChmodError {
     NotTheOwner,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
-    #[error("the named file is a symbolic link")]
-    IsSymlink,
     #[error("I/O error")]
     Io,
     #[error(transparent)]
@@ -139,8 +137,6 @@ pub enum ChownError {
     NotTheOwner,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
-    #[error("the named file is a symbolic link")]
-    IsSymlink,
     #[error("I/O error")]
     Io,
     #[error(transparent)]
@@ -223,6 +219,17 @@ pub enum ReadDirError {
 pub enum FileStatusError {
     #[error("fd has been closed already")]
     ClosedFd,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`crate::LiteBox::read_link_file`] and
+/// [`crate::LiteBox::resolve_file_path`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum WalkError {
     #[error("I/O error")]
     Io,
     #[error(transparent)]
