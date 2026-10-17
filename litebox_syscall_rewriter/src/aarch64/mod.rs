@@ -2717,6 +2717,7 @@ fn emit_gate(
         },
         instance.metadata,
         layout,
+        &mut gate::BuiltSlot::empty(),
     )
     .is_none()
     {
@@ -2985,7 +2986,8 @@ fn classify_gate_pc_with_candidates<const N: usize>(
             let Some(metadata) = EncodedGateMetadata(metadata_word).decode() else {
                 continue;
             };
-            let Some((slot, instance)) = gate::validate(
+            let mut slot = gate::BuiltSlot::empty();
+            let Some(instance) = gate::validate(
                 &trampoline[start..end],
                 gate::SlotAddressing::Placed {
                     trampoline_base,
@@ -2993,6 +2995,7 @@ fn classify_gate_pc_with_candidates<const N: usize>(
                 },
                 metadata,
                 GateLayout::linux(Host::Linux),
+                &mut slot,
             ) else {
                 continue;
             };
@@ -3036,12 +3039,15 @@ pub(crate) fn classify_copied_gate_slot_with_layout(
     // The SVC gate's base comes from the slot's own literal load, so its
     // callback-target check is a tautology here. The other template checks
     // still do real work; this is structural recognition, not authentication.
+    // One slot buffer serves the base lookup, the probe and the rebuild, which
+    // keeps this signal-handler path's stack small.
+    let mut built = gate::BuiltSlot::empty();
     let trampoline_base = if metadata == GateMetadata::Svc {
-        gate::svc_trampoline_base(slot, slot_vaddr, layout.host)?
+        gate::svc_trampoline_base(slot, slot_vaddr, layout.host, &mut built)?
     } else {
         0
     };
-    let (built, instance) = gate::validate(
+    let instance = gate::validate(
         slot,
         gate::SlotAddressing::Placed {
             trampoline_base,
@@ -3049,6 +3055,7 @@ pub(crate) fn classify_copied_gate_slot_with_layout(
         },
         metadata,
         layout,
+        &mut built,
     )?;
     ClassifiedGate::new(0, &built, &instance, offset)
 }
@@ -3337,16 +3344,20 @@ fn validate_trampoline_offsets_with_layout(
             let Some(metadata) = EncodedGateMetadata(metadata_word).decode() else {
                 continue;
             };
-            let Some((slot, _)) = gate::validate(
+            let mut slot = gate::BuiltSlot::empty();
+            if gate::validate(
                 &trampoline[cursor..end],
                 gate::SlotAddressing::Unplaced {
                     slot_offset: cursor as u64,
                 },
                 metadata,
                 layout,
-            ) else {
+                &mut slot,
+            )
+            .is_none()
+            {
                 continue;
-            };
+            }
             if matched.is_some() {
                 return Err(Error::TrampolinePatchFailure(
                     "ambiguous AArch64 compact slot".into(),
@@ -4303,6 +4314,7 @@ mod tests {
                 },
                 metadata,
                 GateLayout::linux(Host::Linux),
+                &mut gate::BuiltSlot::empty(),
             )
             .is_some()
         );

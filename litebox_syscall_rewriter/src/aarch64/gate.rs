@@ -298,7 +298,7 @@ pub(super) struct BuiltSlot {
 }
 
 impl BuiltSlot {
-    const fn empty() -> Self {
+    pub(super) const fn empty() -> Self {
         Self {
             words: [0; MAX_SLOT_WORDS],
             roles: [Role::Fixed; MAX_SLOT_WORDS],
@@ -353,20 +353,19 @@ impl BuiltSlot {
     }
 }
 
-/// A position-tracking, role- and stage-tagging assembler for one slot.
-struct GateAsm {
+/// A position-tracking, role- and stage-tagging assembler for one slot. It
+/// writes into a caller-owned buffer so that no slot is copied between frames
+/// on signal stacks.
+struct GateAsm<'a> {
     vaddr: u64,
     host: Host,
-    slot: BuiltSlot,
+    slot: &'a mut BuiltSlot,
 }
 
-impl GateAsm {
-    fn new(vaddr: u64, host: Host) -> Self {
-        Self {
-            vaddr,
-            host,
-            slot: BuiltSlot::empty(),
-        }
+impl<'a> GateAsm<'a> {
+    fn new(vaddr: u64, host: Host, slot: &'a mut BuiltSlot) -> Self {
+        slot.len = 0;
+        Self { vaddr, host, slot }
     }
 
     fn here(&self) -> Result<u64, BuildError> {
@@ -528,7 +527,7 @@ impl GateAsm {
     }
 
     /// Pads with NOPs and closes the slot with its metadata word.
-    fn finish(mut self, metadata: GateMetadata, slot_size: usize) -> Result<BuiltSlot, BuildError> {
+    fn finish(mut self, metadata: GateMetadata, slot_size: usize) -> Result<(), BuildError> {
         let body = self.slot.len * INSN_BYTES;
         let metadata_offset = slot_size - GATE_METADATA_BYTES;
         if body > metadata_offset {
@@ -538,8 +537,7 @@ impl GateAsm {
             self.push(None, Role::Fixed, NOP)?;
         }
         let encoded = super::EncodedGateMetadata::encode(metadata).ok_or(BuildError::Metadata)?;
-        self.push(None, Role::Fixed, encoded.0)?;
-        Ok(self.slot)
+        self.push(None, Role::Fixed, encoded.0)
     }
 }
 
@@ -577,6 +575,19 @@ pub(super) fn build(
     slot_vaddr: u64,
     trampoline_base: u64,
 ) -> Result<BuiltSlot, BuildError> {
+    let mut slot = BuiltSlot::empty();
+    build_into(instance, layout, slot_vaddr, trampoline_base, &mut slot)?;
+    Ok(slot)
+}
+
+/// [`build`] into a caller-owned buffer.
+fn build_into(
+    instance: &GateInstance,
+    layout: GateLayout,
+    slot_vaddr: u64,
+    trampoline_base: u64,
+    out: &mut BuiltSlot,
+) -> Result<(), BuildError> {
     let template = match instance.metadata {
         GateMetadata::Svc => build_svc,
         GateMetadata::MrsTpidr { .. } => build_mrs,
@@ -590,7 +601,7 @@ pub(super) fn build(
     };
     // Each template is a separate, non-inlined function so that its frame
     // holds only its own temporaries: this also runs on signal stacks.
-    let mut asm = GateAsm::new(slot_vaddr, layout.host);
+    let mut asm = GateAsm::new(slot_vaddr, layout.host, out);
     template(
         &mut asm,
         &Gate {
@@ -1168,14 +1179,15 @@ impl SlotAddressing {
 /// Validates `slot` as a gate described by `metadata`: extracts the free
 /// parameters, rebuilds the slot from them, and compares every word.
 ///
-/// Returns the rebuilt slot and its instance on success. Allocation-free and
-/// panic-free, for use from signal handlers.
+/// On success, returns the slot's parameters and leaves the rebuilt slot in
+/// `out`. Allocation-free and panic-free, for use from signal handlers.
 pub(super) fn validate(
     slot: &[u8],
     addressing: SlotAddressing,
     metadata: GateMetadata,
     layout: GateLayout,
-) -> Option<(BuiltSlot, GateInstance)> {
+    out: &mut BuiltSlot,
+) -> Option<GateInstance> {
     let (slot_vaddr, trampoline_base) = addressing.origin();
     let placed = matches!(addressing, SlotAddressing::Placed { .. });
     if slot.len() != metadata.slot_size_for(layout.host)
@@ -1189,41 +1201,48 @@ pub(super) fn validate(
         ))
     };
 
-    let instance = extract(slot, metadata, layout, slot_vaddr, trampoline_base, placed)?;
-    let rebuilt = build(&instance, layout, slot_vaddr, trampoline_base).ok()?;
-    let matches =
-        rebuilt
-            .words()
-            .iter()
-            .zip(rebuilt.roles())
-            .enumerate()
-            .all(|(index, (expected, role))| {
-                word_at(index * INSN_BYTES).is_some_and(|actual| match role {
-                    Role::Tls(field) => {
-                        actual & !LDST_UIMM12_IMM_MASK == expected & !LDST_UIMM12_IMM_MASK
-                            && field.accepts(
-                                ((actual & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT)
-                                    * u32::from(GUEST_TPIDR_OFFSET_ALIGN),
-                            )
-                    }
-                    Role::ReturnPage if !placed => {
-                        actual & ADRP_SHAPE_MASK == expected & ADRP_SHAPE_MASK
-                    }
-                    Role::ReturnOffset if !placed => {
-                        actual & ADD_IMM_SHAPE_MASK == expected & ADD_IMM_SHAPE_MASK
-                    }
-                    Role::AdrPage => actual & ADRP_SHAPE_MASK == expected & ADRP_SHAPE_MASK,
-                    Role::AdrOffset => actual & ADD_IMM_SHAPE_MASK == expected & ADD_IMM_SHAPE_MASK,
-                    _ => actual == *expected,
-                })
-            });
-    (matches && rebuilt.words().len() * INSN_BYTES == slot.len()).then_some((rebuilt, instance))
+    let instance = extract(
+        slot,
+        metadata,
+        layout,
+        slot_vaddr,
+        trampoline_base,
+        placed,
+        out,
+    )?;
+    build_into(&instance, layout, slot_vaddr, trampoline_base, out).ok()?;
+    if out.len * INSN_BYTES != slot.len() {
+        return None;
+    }
+    for index in 0..out.len {
+        let expected = out.words[index];
+        let actual = word_at(index * INSN_BYTES)?;
+        let matches = match out.roles[index] {
+            Role::Tls(field) => {
+                actual & !LDST_UIMM12_IMM_MASK == expected & !LDST_UIMM12_IMM_MASK
+                    && field.accepts(
+                        ((actual & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT)
+                            * u32::from(GUEST_TPIDR_OFFSET_ALIGN),
+                    )
+            }
+            Role::ReturnPage if !placed => actual & ADRP_SHAPE_MASK == expected & ADRP_SHAPE_MASK,
+            Role::ReturnOffset if !placed => {
+                actual & ADD_IMM_SHAPE_MASK == expected & ADD_IMM_SHAPE_MASK
+            }
+            Role::AdrPage => actual & ADRP_SHAPE_MASK == expected & ADRP_SHAPE_MASK,
+            Role::AdrOffset => actual & ADD_IMM_SHAPE_MASK == expected & ADD_IMM_SHAPE_MASK,
+            _ => actual == expected,
+        };
+        if !matches {
+            return None;
+        }
+    }
+    Some(instance)
 }
 
 /// Extracts the parameters a slot was built with. Word positions do not
 /// depend on the parameters, so a probe build locates the words carrying them.
-/// Kept out of [`validate`] so that the probe slot's frame is released before
-/// the rebuild.
+/// The probe is built into `scratch`, which the caller reuses for the rebuild.
 #[inline(never)]
 fn extract(
     slot: &[u8],
@@ -1232,17 +1251,19 @@ fn extract(
     slot_vaddr: u64,
     trampoline_base: u64,
     placed: bool,
+    probe: &mut BuiltSlot,
 ) -> Option<GateInstance> {
     let word_at = |offset: usize| -> Option<u32> {
         Some(u32::from_le_bytes(
             slot.get(offset..offset + INSN_BYTES)?.try_into().ok()?,
         ))
     };
-    let probe = build(
+    build_into(
         &probe_instance(metadata, slot_vaddr),
         layout,
         slot_vaddr,
         trampoline_base,
+        probe,
     )
     .ok()?;
     // Start every target at the slot itself, which every PC-relative form can
@@ -1323,13 +1344,20 @@ fn branch_target(word: u32, pc: u64, placed: bool) -> Option<u64> {
     }
 }
 
-/// Recovers the trampoline base from a placed SVC slot's callback literal.
-pub(super) fn svc_trampoline_base(slot: &[u8], slot_vaddr: u64, host: Host) -> Option<u64> {
-    let probe = build(
+/// Recovers the trampoline base from a placed SVC slot's callback literal,
+/// using `probe` as scratch.
+pub(super) fn svc_trampoline_base(
+    slot: &[u8],
+    slot_vaddr: u64,
+    host: Host,
+    probe: &mut BuiltSlot,
+) -> Option<u64> {
+    build_into(
         &probe_instance(GateMetadata::Svc, slot_vaddr),
         GateLayout::linux(host),
         slot_vaddr,
         slot_vaddr,
+        probe,
     )
     .ok()?;
     let offset = probe.offset_of(Role::Callback)?;
