@@ -25,6 +25,7 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
     FileStatusFlags, FileType, FileUser,
 };
+use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_common_linux::{
     AccessFlags, AtFlags, CloseRangeFlags, EfdFlags, EpollCreateFlags, FcntlArg,
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, PAGE_SIZE,
@@ -128,6 +129,19 @@ impl<Platform: ShimPlatform> File<Platform> {
 
     pub(crate) fn status(&self) -> Result<FileStatus, Errno> {
         Ok(self.file.status()?)
+    }
+
+    pub(crate) fn is_terminal(&self) -> Result<bool, Errno> {
+        Ok(self.file.is_terminal()?)
+    }
+
+    /// Controls the shared terminal, waiting interruptibly for output-draining operations.
+    pub(crate) fn terminal_control(
+        &self,
+        operation: TerminalOperation,
+        cx: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<TerminalResponse, Errno> {
+        Ok(self.file.terminal_control(operation, cx)??)
     }
 
     /// Returns the `F_GETFL` flags of the open file description.
@@ -2579,7 +2593,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn terminal_ioctl(&self, file: &File<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
         use litebox_broker_protocol::terminal::{
-            ChangeTiming, TerminalOperation as Op, TerminalResponse, TerminalSettings,
+            ChangeTiming, TerminalOperation as Op, TerminalSettings,
         };
         let operation = match arg {
             IoctlArg::TCGETS(_) => Op::GetSettings,
@@ -2619,9 +2633,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             IoctlArg::TIOCGPTN(_) => return Err(Errno::ENOTTY),
             _ => unreachable!("non-terminal ioctl"),
         };
-        let response = file
-            .file()
-            .terminal_control(operation, Some(&self.wait_cx()))??;
+        let response = file.terminal_control(operation, Some(&self.wait_cx()))?;
         match (arg, response) {
             (IoctlArg::TCGETS(ptr), TerminalResponse::Settings(settings)) => {
                 ptr.write_at_offset::<Platform>(0, settings.into())
@@ -2726,7 +2738,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.file_only(Errno::ENOTTY)?;
                 self.global.with_file(fd, |file| {
-                    if !file.file().is_terminal()? {
+                    if !file.is_terminal()? {
                         return Err(Errno::ENOTTY);
                     }
                     self.terminal_ioctl(file, &arg)
