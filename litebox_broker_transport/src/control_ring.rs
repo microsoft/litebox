@@ -19,7 +19,7 @@ use crate::shared_memory::{ControlRingMemory, SharedMemoryError};
 pub const CONTROL_RING_SLOT_SIZE: usize = 128;
 
 /// Versioned token exchanged before endpoints activate this control-ring ABI.
-pub const CONTROL_RING_READY: &[u8] = b"litebox-control-ring-ready-v2";
+pub const CONTROL_RING_READY: &[u8] = b"litebox-control-ring-ready-v1";
 
 /// Size of the fixed metadata at the start of a control-ring slot.
 pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;

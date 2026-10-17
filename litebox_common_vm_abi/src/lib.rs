@@ -171,7 +171,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 /// Must change with any incompatible change to this crate or to the broker's
 /// control-ring layout.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 1;
 
 /// The section holding the runner's only `syscall` instruction.
 pub const GATE_SECTION: &str = ".kabi_gate";

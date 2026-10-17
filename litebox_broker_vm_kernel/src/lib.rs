@@ -668,7 +668,7 @@ mod tests {
     fn ring_layout_change_needs_an_abi_version_change() {
         assert_eq!(
             (CONTROL_RING_READY, litebox_common_vm_abi::ABI_VERSION),
-            (&b"litebox-control-ring-ready-v2"[..], 2)
+            (&b"litebox-control-ring-ready-v1"[..], 1)
         );
     }
 }
