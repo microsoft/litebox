@@ -706,7 +706,7 @@ mod tests {
             .unwrap();
             let result = tty.receive(&[22, byte, 4]);
             assert_eq!(result.echo, echo);
-            assert!(result.events.is_empty());
+            assert_eq!(result.events, []);
             let mut bytes = [0; 2];
             assert_eq!(tty.read(&mut bytes), Some(1));
             assert_eq!(bytes[0], expected);
@@ -794,7 +794,7 @@ mod tests {
             ..tty.settings()
         })
         .unwrap();
-        assert!(tty.receive(b"\x16\n\x04").echo.is_empty());
+        assert_eq!(tty.receive(b"\x16\n\x04").echo, b"");
         assert_eq!(tty.receive(b"\n").echo, b"\r\n");
     }
 
@@ -809,7 +809,7 @@ mod tests {
                     settings.local.set(L::ECHO_KILL, kill);
                     settings.local.set(L::ECHO_KILL_ERASE, kill_erase);
                     tty.configure(settings).unwrap();
-                    assert!(tty.receive(b"\x15").echo.is_empty());
+                    assert_eq!(tty.receive(b"\x15").echo, b"");
                     tty.receive(b"foo");
                     let expected = if erase && kill && kill_erase {
                         b"\x08 \x08".repeat(3)
@@ -819,7 +819,7 @@ mod tests {
                         b"^U".to_vec()
                     };
                     assert_eq!(tty.receive(b"\x15").echo, expected);
-                    assert!(tty.receive(b"\x15").echo.is_empty());
+                    assert_eq!(tty.receive(b"\x15").echo, b"");
                     tty.receive(b"foo");
                     assert_eq!(tty.receive(b"\x17").echo, b"\x08 \x08".repeat(3));
                     tty.receive(b"foo");
@@ -832,9 +832,9 @@ mod tests {
                         }
                     );
                     tty.receive(b"\n");
-                    assert!(tty.receive(b"\x15").echo.is_empty());
+                    assert_eq!(tty.receive(b"\x15").echo, b"");
                     tty.receive(b"\x04");
-                    assert!(tty.receive(b"\x15").echo.is_empty());
+                    assert_eq!(tty.receive(b"\x15").echo, b"");
                     let mut bytes = [0; 8];
                     assert_eq!(tty.read(&mut bytes), Some(3));
                     assert_eq!(&bytes[..3], b"fo\n");
@@ -877,14 +877,14 @@ mod tests {
         let mut settings = tty.settings();
         settings.local.remove(L::ECHO);
         tty.configure(settings).unwrap();
-        assert!(tty.receive(b"a\x12b\n").echo.is_empty());
+        assert_eq!(tty.receive(b"a\x12b\n").echo, b"");
         let mut bytes = [0; 8];
         assert_eq!(tty.read(&mut bytes), Some(4));
         assert_eq!(&bytes[..4], b"a\x12b\n");
 
         settings.characters.reprint = b'\n';
         tty.configure(settings).unwrap();
-        assert!(tty.receive(b"abc\n").echo.is_empty());
+        assert_eq!(tty.receive(b"abc\n").echo, b"");
         assert_eq!(tty.read(&mut bytes), Some(4));
         assert_eq!(&bytes[..4], b"abc\n");
 
@@ -927,7 +927,7 @@ mod tests {
             ..tty.settings()
         })
         .unwrap();
-        assert!(tty.receive(b"\n").echo.is_empty());
+        assert_eq!(tty.receive(b"\n").echo, b"");
         assert_eq!(tty.read(&mut bytes), Some(1));
         assert_eq!(tty.read(&mut bytes), Some(0));
         tty.configure(TerminalSettings {
