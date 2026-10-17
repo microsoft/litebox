@@ -231,6 +231,10 @@ impl Rewriter {
 
     /// Recovery must verify the original site's branch. SVC frame recovery uses
     /// [`aarch64::DARWIN_SVC_FRAME_BYTES`].
+    ///
+    /// The result's [`aarch64::ClassifiedGate::slot_offset`] is zero, relative
+    /// to the supplied slot slice rather than its containing trampoline. The
+    /// caller must retain `slot_vaddr` separately.
     pub fn classify_gate_slot(
         self,
         slot: &[u8],
