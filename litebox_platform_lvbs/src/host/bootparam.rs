@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use litebox_common_linux::errno::Errno;
-use litebox_common_lvbs::PAGE_SIZE;
 use spin::Once;
 
 static POSSIBLE_CPUS: Once<u32> = Once::new();

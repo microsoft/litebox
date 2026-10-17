@@ -3,7 +3,7 @@
 
 //! VTL1 physical memory layout (LVBS-specific)
 
-use litebox_common_lvbs::PAGE_SIZE;
+pub use litebox_common_lvbs::PAGE_SIZE;
 
 pub const PAGE_SHIFT: usize = 12;
 pub const PTES_PER_PAGE: usize = 512;

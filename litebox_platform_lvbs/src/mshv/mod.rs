@@ -12,8 +12,9 @@ pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use litebox::mm::vmap::{PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager};
-use litebox_common_lvbs::{MAX_CORES, PAGE_SIZE};
+use litebox_common_lvbs::MAX_CORES;
 use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
