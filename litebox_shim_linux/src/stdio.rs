@@ -215,6 +215,49 @@ mod tests {
     }
 
     #[test]
+    fn test_terminal_settings_are_shared_across_reopens_and_dup() {
+        let task = init_platform();
+        let fd = i32::try_from(
+            task.sys_open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        let duplicate = i32::try_from(task.sys_dup(fd, None, None).unwrap()).unwrap();
+        let mut settings = termios();
+        task.sys_ioctl(1, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut settings)))
+            .unwrap();
+        assert_ne!(settings.c_lflag, 0);
+        settings.c_lflag = 0;
+        task.sys_ioctl(
+            fd,
+            IoctlArg::TCSETS(crate::UserPtr::from_ptr(&raw const settings)),
+        )
+        .unwrap();
+        let mut observed = termios();
+        task.sys_ioctl(
+            duplicate,
+            IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut observed)),
+        )
+        .unwrap();
+        assert_eq!(observed.c_lflag, 0);
+        task.sys_ioctl(1, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut observed)))
+            .unwrap();
+        assert_eq!(observed.c_lflag, 0);
+        let path = i32::try_from(
+            task.sys_open("/dev/stdout", OFlags::PATH, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            task.sys_ioctl(
+                path,
+                IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut observed))
+            ),
+            Err(Errno::ENOTTY)
+        );
+    }
+
+    #[test]
     fn test_open_devices_nonblocking() {
         let task = init_platform();
         for (path, access) in [

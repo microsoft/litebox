@@ -33,6 +33,7 @@ const REQUEST_TAG_UNLINK: u8 = 10;
 const REQUEST_TAG_MKDIR: u8 = 11;
 const REQUEST_TAG_RMDIR: u8 = 12;
 const REQUEST_TAG_IS_TERMINAL: u8 = 13;
+const REQUEST_TAG_TERMINAL: u8 = 14;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -48,6 +49,7 @@ const RESPONSE_TAG_UNLINK: u8 = 10;
 const RESPONSE_TAG_MKDIR: u8 = 11;
 const RESPONSE_TAG_RMDIR: u8 = 12;
 const RESPONSE_TAG_IS_TERMINAL: u8 = 13;
+const RESPONSE_TAG_TERMINAL: u8 = 14;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -119,6 +121,11 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::IsTerminal(request) => {
             encoder.u8(REQUEST_TAG_IS_TERMINAL);
             encoder.handle(request.handle);
+        }
+        FileRequest::Terminal(request) => {
+            encoder.u8(REQUEST_TAG_TERMINAL);
+            encoder.handle(request.handle);
+            super::terminal::encode_operation(encoder, request.operation);
         }
         FileRequest::Chmod(request) => {
             encoder.u8(REQUEST_TAG_CHMOD);
@@ -200,6 +207,10 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         REQUEST_TAG_IS_TERMINAL => Ok(FileRequest::IsTerminal(IsTerminalFileRequest {
             handle: decoder.handle()?,
         })),
+        REQUEST_TAG_TERMINAL => Ok(FileRequest::Terminal(crate::terminal::TerminalRequest {
+            handle: decoder.handle()?,
+            operation: super::terminal::decode_operation(decoder)?,
+        })),
         REQUEST_TAG_CHMOD => Ok(FileRequest::Chmod(ChmodFileRequest {
             path: decoder.shared_buffer_sequence()?,
             user: decode_user(decoder)?,
@@ -264,6 +275,10 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_IS_TERMINAL);
             encoder.u8(u8::from(is_terminal));
         }
+        FileResponse::Terminal(result) => {
+            encoder.u8(RESPONSE_TAG_TERMINAL);
+            super::terminal::encode_response(encoder, result);
+        }
         FileResponse::Chmod => encoder.u8(RESPONSE_TAG_CHMOD),
         FileResponse::Chown => encoder.u8(RESPONSE_TAG_CHOWN),
         FileResponse::Unlink => encoder.u8(RESPONSE_TAG_UNLINK),
@@ -302,6 +317,9 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
             1 => true,
             _ => return Err(WireError::InvalidTag),
         })),
+        RESPONSE_TAG_TERMINAL => Ok(FileResponse::Terminal(super::terminal::decode_response(
+            decoder,
+        )?)),
         RESPONSE_TAG_CHMOD => Ok(FileResponse::Chmod),
         RESPONSE_TAG_CHOWN => Ok(FileResponse::Chown),
         RESPONSE_TAG_UNLINK => Ok(FileResponse::Unlink),

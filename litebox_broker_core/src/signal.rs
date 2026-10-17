@@ -111,6 +111,7 @@ impl ObjectEntry {
 pub(crate) struct ProcessSignals(Mutex<ProcessSignalsState>);
 
 struct ProcessSignalsState {
+    terminal_events: u8,
     /// The process that first sent each pending signal, indexed by signal
     /// number minus one.
     senders: [Option<ProcessId>; MAX_SIGNAL as usize],
@@ -130,6 +131,7 @@ struct ProcessSignalsState {
 impl ProcessSignals {
     pub(crate) fn new() -> Self {
         Self(Mutex::new(ProcessSignalsState {
+            terminal_events: 0,
             senders: [None; MAX_SIGNAL as usize],
             child_exit: None,
             child_removed: false,
@@ -164,12 +166,41 @@ impl ProcessSignals {
         if state.child_removed {
             return;
         }
+
         state.child_removed = true;
+        state.republish();
+    }
+
+    pub(crate) fn post_terminal_event(
+        &self,
+        event: litebox_broker_protocol::terminal::TerminalEvent,
+    ) {
+        use litebox_broker_protocol::terminal::TerminalEvent;
+        let bit = match event {
+            TerminalEvent::Interrupt => 1,
+            TerminalEvent::Quit => 2,
+            TerminalEvent::Resize => 4,
+        };
+        let mut state = self.0.lock();
+        state.terminal_events |= bit;
         state.republish();
     }
 
     fn take(&self) -> Result<SignalEvent> {
         let mut state = self.0.lock();
+        for (bit, event) in [
+            (
+                1,
+                litebox_broker_protocol::terminal::TerminalEvent::Interrupt,
+            ),
+            (2, litebox_broker_protocol::terminal::TerminalEvent::Quit),
+            (4, litebox_broker_protocol::terminal::TerminalEvent::Resize),
+        ] {
+            if state.terminal_events & bit != 0 {
+                state.terminal_events &= !bit;
+                return Ok(SignalEvent::Terminal(event));
+            }
+        }
         let signal = state
             .senders
             .iter_mut()
@@ -193,6 +224,7 @@ impl ProcessSignals {
     fn readiness(&self) -> ReadinessFlags {
         let state = self.0.lock();
         if state.child_exit.is_some()
+            || state.terminal_events != 0
             || state.child_removed
             || state.senders.iter().any(Option::is_some)
         {

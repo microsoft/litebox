@@ -35,6 +35,7 @@ pub mod readiness_queue;
 pub mod signal;
 pub mod socket;
 pub mod stdio;
+pub mod terminal;
 pub mod timer;
 pub mod transfer;
 pub mod unix_socket;

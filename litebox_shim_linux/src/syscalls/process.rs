@@ -546,6 +546,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
             };
             match event {
+                SignalEvent::Terminal(event) => {
+                    use litebox_broker_protocol::terminal::TerminalEvent;
+                    let signal = match event {
+                        TerminalEvent::Interrupt => Signal::SIGINT,
+                        TerminalEvent::Quit => Signal::SIGQUIT,
+                        TerminalEvent::Resize => Signal::SIGWINCH,
+                    };
+                    let mut info = siginfo_kill_from(signal, 0, 0);
+                    info.code = litebox_common_linux::signal::SI_KERNEL;
+                    self.send_shared_signal(signal, info);
+                }
                 SignalEvent::Signal(received) => {
                     if let Ok(signal) = Signal::try_from(received.signal.cast_signed()) {
                         self.send_shared_signal(

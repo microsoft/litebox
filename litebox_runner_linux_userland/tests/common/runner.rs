@@ -322,4 +322,40 @@ impl Runner {
             .spawn()
             .expect("Failed to spawn litebox_runner_linux_userland")
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn spawn_with_controlling_tty_alias(
+        &mut self,
+        stdin: std::process::Stdio,
+        stdout: std::process::Stdio,
+        stderr: std::process::Stdio,
+    ) -> std::process::Child {
+        use std::os::unix::process::CommandExt as _;
+
+        self.prepare_command();
+        self.command.stdin(stdin).stdout(stdout).stderr(stderr);
+        // SAFETY: the child only calls async-signal-safe syscalls before exec.
+        // fd 0 is the supplied PTY slave; the path is a static NUL-terminated string.
+        unsafe {
+            self.command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let fd = libc::open(c"/dev/tty".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let result = libc::dup2(fd, libc::STDERR_FILENO);
+                let error = std::io::Error::last_os_error();
+                libc::close(fd);
+                if result < 0 {
+                    return Err(error);
+                }
+                Ok(())
+            });
+        }
+        self.command
+            .spawn()
+            .expect("Failed to spawn runner with a controlling terminal alias")
+    }
 }

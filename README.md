@@ -22,6 +22,31 @@ Example use cases include:
 
 ![LiteBox and related projects](./.figures/litebox.svg)
 
+## Linux userland terminals
+
+The userland broker supports inherited Linux terminals with a shared,
+guest-ABI-independent line discipline in `litebox_broker_core::terminal`.
+Platform adapters supply raw transport, readiness, and geometry; the Linux
+shim translates termios and terminal ioctls and maps typed terminal events to
+guest signals. Terminal settings and input queues are shared across reopened,
+duplicated, forked, and exec-inherited descriptors. Redirected streams remain
+ordinary byte streams.
+
+The initial implementation supports canonical editing and EOF, raw input,
+echo, software flow control, output processing, drain/flush, and window-size
+queries and updates. Interrupt, quit, and resize events target the process
+group initially attached to the endpoint. Host attributes are restored on
+normal broker teardown. Input and output queues are bounded. Raw input is
+backpressured; control-enabled input and echo can overrun with a warning,
+without preventing interrupt or flow-control characters from being processed.
+
+This is not complete POSIX job control: controlling-terminal acquisition,
+foreground-group changes, suspend/continue, and guest PTYs are not implemented.
+Timed reads, `VMIN > 1`, unsupported termios flags/editing characters, and serial
+configuration are rejected rather than silently accepted. Noncanonical reads
+support `VMIN` zero or one with `VTIME` zero. Other platform adapters do not yet
+expose terminal controls.
+
 ## Contributing
 
 See the following files for details:

@@ -986,6 +986,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
+    fn terminal(&self, h: &FileHandle) -> Option<Arc<dyn crate::terminal::TerminalEndpoint>> {
+        self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
+            backend.terminal(handle)
+        })
+    }
+
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
             backend.readiness_source(handle)

@@ -36,6 +36,7 @@ mod process_group;
 mod readiness_queue;
 mod signal;
 mod socket;
+mod terminal;
 mod thread;
 mod timer;
 mod unix_socket;
@@ -942,6 +943,10 @@ mod tests {
                 handle,
             })),
             BrokerOperation::File(FileRequest::IsTerminal(IsTerminalFileRequest { handle })),
+            BrokerOperation::File(FileRequest::Terminal(crate::terminal::TerminalRequest {
+                handle,
+                operation: crate::terminal::TerminalOperation::GetSettings,
+            })),
             BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
                 path: sequence(6, 9),
                 user: FileUser { user: 2, group: 3 },
@@ -1536,6 +1541,15 @@ mod tests {
                 exit_status: ProcessExitStatus::Signaled { signal: 9 },
             }))),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::ChildRemoved)),
+            BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+                crate::terminal::TerminalEvent::Interrupt,
+            ))),
+            BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+                crate::terminal::TerminalEvent::Quit,
+            ))),
+            BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+                crate::terminal::TerminalEvent::Resize,
+            ))),
             BrokerResult::ProcessGroup(ProcessGroupResponse::Set),
             BrokerResult::ProcessGroup(ProcessGroupResponse::CreateSession),
             BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
@@ -1653,6 +1667,14 @@ mod tests {
             })),
             BrokerResult::File(FileResponse::IsTerminal(false)),
             BrokerResult::File(FileResponse::IsTerminal(true)),
+            BrokerResult::File(FileResponse::Terminal(Ok(
+                crate::terminal::TerminalResponse::Settings(
+                    crate::terminal::TerminalSettings::default(),
+                ),
+            ))),
+            BrokerResult::File(FileResponse::Terminal(Err(
+                crate::terminal::TerminalError::NotTerminal,
+            ))),
             BrokerResult::File(FileResponse::Chmod),
             BrokerResult::File(FileResponse::Chown),
             BrokerResult::File(FileResponse::Unlink),

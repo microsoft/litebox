@@ -23,6 +23,29 @@ type FileOperationResult<T> = core::result::Result<T, FileError>;
 type DirectoryReadResult = FileOperationResult<(Vec<FileDirectoryEntry>, Option<u64>)>;
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
+    /// Controls the shared terminal backing an open file.
+    ///
+    /// # Panics
+    /// Panics if the broker responds with another operation's result.
+    pub fn terminal_control(
+        &self,
+        handle: ObjectHandle,
+        operation: litebox_broker_protocol::terminal::TerminalOperation,
+    ) -> Result<
+        core::result::Result<
+            litebox_broker_protocol::terminal::TerminalResponse,
+            litebox_broker_protocol::terminal::TerminalError,
+        >,
+        Channel::Error,
+    > {
+        match self.request_file(FileRequest::Terminal(
+            litebox_broker_protocol::terminal::TerminalRequest { handle, operation },
+        ))? {
+            FileResponse::Terminal(result) => Ok(result),
+            response => panic!("broker returned unexpected terminal response: {response:?}"),
+        }
+    }
+
     /// Opens an absolute fs path.
     ///
     /// # Panics

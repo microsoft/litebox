@@ -846,7 +846,12 @@ pub struct Winsize {
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TCSETSW: u32 = 0x5403;
+pub const TCSETSF: u32 = 0x5404;
+pub const TCSBRK: u32 = 0x5409;
+pub const TCFLSH: u32 = 0x540b;
 pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
@@ -859,8 +864,18 @@ pub enum IoctlArg {
     TCGETS(UserPtrMut<Termios>),
     /// Set the current serial port settings.
     TCSETS(UserPtr<Termios>),
+    /// Set attributes after draining output.
+    TCSETSW(UserPtr<Termios>),
+    /// Set attributes after draining output and discarding input.
+    TCSETSF(UserPtr<Termios>),
+    /// Drain output when nonzero; zero requests an unsupported serial break.
+    TCSBRK(u32),
+    /// Discard input (0), output (1), or both (2).
+    TCFLSH(u32),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
+    /// Set window size.
+    TIOCSWINSZ(UserPtr<Winsize>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(UserPtrMut<u32>),
@@ -2743,7 +2758,12 @@ impl SyscallRequest {
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
+                        TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
+                        TCSBRK => IoctlArg::TCSBRK(ctx.sys_req_arg(2)),
+                        TCFLSH => IoctlArg::TCFLSH(ctx.sys_req_arg(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
+                        TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,

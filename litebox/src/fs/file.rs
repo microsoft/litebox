@@ -373,6 +373,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(|_| IsTerminalError::Io)
     }
 
+    /// Controls the shared terminal, waiting interruptibly for output-draining
+    /// operations through `wait`.
+    pub fn terminal_control(
+        &self,
+        operation: litebox_broker_protocol::terminal::TerminalOperation,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<
+        Result<
+            litebox_broker_protocol::terminal::TerminalResponse,
+            litebox_broker_protocol::terminal::TerminalError,
+        >,
+        ReadError,
+    > {
+        self.wait(wait, Events::OUT, || {
+            Ok(self.broker.terminal_control(self.handle, operation)?)
+        })
+        .map_err(ReadError::from)
+    }
+
     /// Returns the access mode and status flags of the file's open file description.
     pub fn get_status_flags(&self) -> Result<FileStatusFlags, StatusFlagsError> {
         Ok(self.broker.get_status_flags(self.handle)?)

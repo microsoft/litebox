@@ -192,7 +192,8 @@ impl BrokerOperation {
                 FileRequest::Seek(_)
                 | FileRequest::Truncate(_)
                 | FileRequest::HandleStatus(_)
-                | FileRequest::IsTerminal(_),
+                | FileRequest::IsTerminal(_)
+                | FileRequest::Terminal(_),
             )
             | Self::UnixSocket(
                 UnixSocketRequest::Create(_)
@@ -721,6 +722,8 @@ pub enum FileRequest {
     HandleStatus(HandleFileStatusRequest),
     /// Determine whether an open file is connected to a terminal.
     IsTerminal(IsTerminalFileRequest),
+    /// Control the shared terminal backing an open file.
+    Terminal(crate::terminal::TerminalRequest),
     /// Change mode bits by path.
     Chmod(ChmodFileRequest),
     /// Change ownership by path.
@@ -754,6 +757,8 @@ pub enum FileResponse {
     HandleStatus(FileStatus),
     /// Terminal query response.
     IsTerminal(bool),
+    /// Typed terminal-control result.
+    Terminal(Result<crate::terminal::TerminalResponse, crate::terminal::TerminalError>),
     /// Mode change completed.
     Chmod,
     /// Ownership change completed.

@@ -61,6 +61,7 @@ macro_rules! log_unsupported {
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
+mod terminal;
 mod wait;
 
 /// Aggregate bound capturing everything the shim requires of a platform.
