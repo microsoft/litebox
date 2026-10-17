@@ -338,6 +338,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     }
 
     /// Create the default file system with the given in-memory layer and tar data.
+    ///
+    /// Prepend [`default_fs_entries`] when initializing the in-memory layer to provide
+    /// the shim's standard filesystem entries.
     pub fn default_fs(
         &self,
         in_mem: litebox::fs::in_mem::InMem<Platform>,
@@ -501,6 +504,45 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
             syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 128,
         }
     }
+}
+
+/// Initial filesystem entries for the Linux shim.
+///
+/// Prepend these to caller-specific entries passed to [`litebox::fs::in_mem::InMem::new_initialized`].
+// TODO: Might want to have a real procfs instead of static symlinks for the stdio descriptors.
+pub fn default_fs_entries() -> impl Iterator<Item = (&'static str, litebox::fs::in_mem::InitialNode)>
+{
+    use litebox::fs::{Mode, UserInfo, in_mem::InitialNode};
+
+    ["/proc", "/proc/self", "/proc/self/fd"]
+        .into_iter()
+        .map(|path| {
+            (
+                path,
+                InitialNode::Directory {
+                    mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                    owner: UserInfo::ROOT,
+                },
+            )
+        })
+        .chain(
+            [
+                ("/proc/self/fd/0", "/dev/stdin"),
+                ("/proc/self/fd/1", "/dev/stdout"),
+                ("/proc/self/fd/2", "/dev/stderr"),
+            ]
+            .into_iter()
+            .map(|(path, target)| {
+                (
+                    path,
+                    InitialNode::Symlink {
+                        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                        owner: UserInfo::ROOT,
+                        target: target.into(),
+                    },
+                )
+            }),
+        )
 }
 
 /// Create the default file system with the given in-memory layer and tar data.

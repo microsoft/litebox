@@ -288,7 +288,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             ));
         }
 
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized(entries);
+        let in_mem = litebox::fs::in_mem::InMem::new_initialized(
+            litebox_shim_linux::default_fs_entries()
+                .map(|(path, node)| (path.to_owned(), node))
+                .chain(entries),
+        );
         shim_builder.default_fs(in_mem, tar_data.into())
     };
 

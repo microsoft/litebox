@@ -226,15 +226,17 @@ pub extern "C" fn sandbox_process_init(
             };
             litebox::fs::overlay::Overlay::new(
                 litebox,
-                litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
-                    "/tmp",
-                    litebox::fs::in_mem::InitialNode::Directory {
-                        mode: litebox::fs::Mode::RWXU
-                            | litebox::fs::Mode::RWXG
-                            | litebox::fs::Mode::RWXO,
-                        owner: litebox::fs::UserInfo::ROOT,
-                    },
-                )]),
+                litebox::fs::in_mem::InMem::<Platform>::new_initialized(
+                    litebox_shim_linux::default_fs_entries().chain([(
+                        "/tmp",
+                        litebox::fs::in_mem::InitialNode::Directory {
+                            mode: litebox::fs::Mode::RWXU
+                                | litebox::fs::Mode::RWXG
+                                | litebox::fs::Mode::RWXO,
+                            owner: litebox::fs::UserInfo::ROOT,
+                        },
+                    )]),
+                ),
                 nine_p,
                 allocators.next(),
             )

@@ -1401,18 +1401,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Read the target of a symbolic link
     ///
     /// The caller must pass an absolute path.
-    // XXX(jayb): `/proc/self/fd/<fd>` should be backed by the file system rather than hardcoded.
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
-        if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
-            let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-            match fd {
-                0 => return Ok("/dev/stdin".to_string()),
-                1 => return Ok("/dev/stdout".to_string()),
-                2 => return Ok("/dev/stderr".to_string()),
-                _ => unimplemented!(),
-            }
-        }
-
         let files = self.files.borrow();
         let fs = self.fs.borrow();
         let context = fs.context.read();
@@ -1518,18 +1507,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: &str,
         follow_symlink: bool,
     ) -> Result<T, Errno> {
-        // `/proc/self/fd/<fd>` is not backed by the file system, so it is followed here.
-        let path = if follow_symlink && pathname.starts_with("/proc/self/fd/") {
-            self.do_readlink(pathname)
-                .unwrap_or_else(|_| pathname.into())
-        } else {
-            pathname.into()
-        };
         let status = {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            files.fs.file_status(&context, &path, follow_symlink)?
+            files.fs.file_status(&context, pathname, follow_symlink)?
         };
         Ok(T::from(status))
     }

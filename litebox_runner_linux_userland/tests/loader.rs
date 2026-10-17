@@ -25,13 +25,15 @@ impl TestLauncher {
         let platform = Platform::new(tun_device_name);
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
 
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-            "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
-            },
-        )]);
+        let in_mem = litebox::fs::in_mem::InMem::new_initialized(
+            litebox_shim_linux::default_fs_entries().chain([(
+                "/",
+                litebox::fs::in_mem::InitialNode::Directory {
+                    mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                    owner: litebox::fs::UserInfo::ROOT,
+                },
+            )]),
+        );
         let tar_data = if tar_data.is_empty() {
             litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
         } else {

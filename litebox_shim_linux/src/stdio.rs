@@ -8,7 +8,7 @@ mod tests {
     use core::ffi::CStr;
 
     use litebox::fs::{Mode, OFlags};
-    use litebox_common_linux::{FcntlArg, FileDescriptorFlags};
+    use litebox_common_linux::{AtFlags, FcntlArg, FileDescriptorFlags, InodeType, errno::Errno};
 
     use crate::syscalls::tests::init_platform;
 
@@ -56,6 +56,47 @@ mod tests {
         assert_eq!("/dev/stdout", core::str::from_utf8(&buf[..size]).unwrap());
         let size = task.sys_readlink("/proc/self/fd/2", &mut buf).unwrap();
         assert_eq!("/dev/stderr", core::str::from_utf8(&buf[..size]).unwrap());
+
+        for (path, target, flags, stat) in [
+            ("/proc/self/fd/0", "/dev/stdin", OFlags::RDONLY, stdin_stat),
+            (
+                "/proc/self/fd/1",
+                "/dev/stdout",
+                OFlags::WRONLY,
+                stdout_stat,
+            ),
+            (
+                "/proc/self/fd/2",
+                "/dev/stderr",
+                OFlags::WRONLY,
+                stderr_stat,
+            ),
+        ] {
+            let link_stat = task.sys_lstat(path).unwrap();
+            assert_eq!({ link_stat.st_mode }, InodeType::SymLink as u32 | 0o777);
+            assert_eq!({ link_stat.st_size }, target.len());
+            assert_eq!(
+                task.sys_newfstatat(
+                    litebox_common_linux::AT_FDCWD,
+                    path,
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .unwrap(),
+                link_stat
+            );
+            let fd = task.sys_open(path, flags, Mode::empty()).unwrap();
+            assert_eq!(task.sys_fstat(i32::try_from(fd).unwrap()).unwrap(), stat);
+            task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+        }
+
+        for path in ["/proc/self/fd/3", "/proc/self/fd/not-a-fd"] {
+            assert_eq!(task.sys_readlink(path, &mut buf), Err(Errno::ENOENT));
+            assert_eq!(task.sys_stat(path), Err(Errno::ENOENT));
+            assert_eq!(
+                task.sys_open(path, OFlags::RDONLY, Mode::empty()),
+                Err(Errno::ENOENT)
+            );
+        }
     }
 
     #[test]

@@ -50,13 +50,14 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<TestPl
     let platform = test_platform(tun_device_name);
 
     let shim_builder = crate::LinuxShimBuilder::new(platform);
-    let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-        "/",
-        litebox::fs::in_mem::InitialNode::Directory {
-            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: litebox::fs::UserInfo::ROOT,
-        },
-    )]);
+    let in_mem =
+        litebox::fs::in_mem::InMem::new_initialized(crate::default_fs_entries().chain([(
+            "/",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: litebox::fs::UserInfo::ROOT,
+            },
+        )]));
     let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem, TEST_TAR_FILE.into()));
     let task = shim_builder.build().0.new_test_task(fs);
 
@@ -339,6 +340,7 @@ fn test_getdent64() {
             "bar",
             "dev",
             "foo",
+            "proc",
             "test_file1.txt",
             "test_file2.txt"
         ]
@@ -505,6 +507,7 @@ fn test_getdent64() {
             "bar",
             "dev",
             "foo",
+            "proc",
             "test_file1.txt",
             "test_file2.txt"
         ]
