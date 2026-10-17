@@ -418,7 +418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Guest output accepted before the runner exited must reach the host.
     stdio.flush();
     #[cfg(target_os = "linux")]
-    stdio.flush_terminals()?;
+    stdio.close_terminals()?;
     result
 }
 

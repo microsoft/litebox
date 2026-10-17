@@ -110,13 +110,16 @@ impl UserlandStdioProvider {
         Ok((device, mount))
     }
 
-    /// Drains terminal transports before their host settings are restored.
+    /// Drains terminal output and restores host terminal settings. Detached
+    /// broker threads may still hold the terminals at exit, so restoration
+    /// cannot be left to `Drop`.
     #[cfg(target_os = "linux")]
-    pub fn flush_terminals(&self) -> std::io::Result<()> {
+    pub fn close_terminals(&self) -> std::io::Result<()> {
+        let mut result = Ok(());
         for terminal in self.terminals.iter().flatten() {
-            terminal.flush()?;
+            result = result.and(terminal.close());
         }
-        Ok(())
+        result
     }
 
     fn with_host(

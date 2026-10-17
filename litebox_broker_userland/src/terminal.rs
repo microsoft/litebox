@@ -135,8 +135,9 @@ impl Shared {
 /// One host terminal, shared by all inherited streams referring to it.
 pub(crate) struct LinuxTerminal {
     shared: Arc<Shared>,
-    original: libc::termios,
-    worker: Option<JoinHandle<()>>,
+    /// Host attributes to restore, taken by the first `close` or drop.
+    original: Mutex<Option<libc::termios>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl LinuxTerminal {
@@ -164,7 +165,7 @@ impl LinuxTerminal {
             return Err(io::Error::last_os_error());
         }
         // Construct the restoration guard before any further fallible operation.
-        let mut terminal = Self {
+        let terminal = Self {
             shared: Arc::new(Shared {
                 file,
                 wake,
@@ -181,11 +182,11 @@ impl LinuxTerminal {
                 }),
                 changed: Condvar::new(),
             }),
-            original,
-            worker: None,
+            original: Mutex::new(Some(original)),
+            worker: Mutex::new(None),
         };
         let shared = Arc::clone(&terminal.shared);
-        terminal.worker = Some(
+        *terminal.worker.lock().expect("terminal mutex poisoned") = Some(
             std::thread::Builder::new()
                 .name("litebox-broker-terminal".to_owned())
                 .spawn(move || run(&shared))?,
@@ -245,6 +246,37 @@ impl LinuxTerminal {
             Ok(())
         } else {
             Err(io::Error::other("terminal output failed"))
+        }
+    }
+
+    /// Drains output, stops the transport, and restores the host attributes.
+    /// Later calls do nothing.
+    pub(crate) fn close(&self) -> io::Result<()> {
+        let Some(original) = self
+            .original
+            .lock()
+            .expect("terminal mutex poisoned")
+            .take()
+        else {
+            return Ok(());
+        };
+        let flushed = self.flush();
+        self.stop(&original);
+        flushed
+    }
+
+    fn stop(&self, original: &libc::termios) {
+        self.shared.lock().status = Status::Stopping;
+        self.shared.wake();
+        if let Some(worker) = self.worker.lock().expect("terminal mutex poisoned").take()
+            && worker.join().is_err()
+        {
+            litebox_util_log::error!("terminal worker panicked");
+        }
+        // SAFETY: this guard owns the live terminal and saved its original attributes.
+        if unsafe { libc::tcsetattr(self.shared.file.as_raw_fd(), libc::TCSANOW, original) } != 0 {
+            let error = io::Error::last_os_error();
+            litebox_util_log::error!(error:% = error; "restoring host terminal failed");
         }
     }
 }
@@ -375,24 +407,13 @@ impl TerminalEndpoint for LinuxTerminal {
 
 impl Drop for LinuxTerminal {
     fn drop(&mut self) {
-        self.shared.lock().status = Status::Stopping;
-        self.shared.wake();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
+        if let Some(original) = self
+            .original
+            .get_mut()
+            .expect("terminal mutex poisoned")
+            .take()
         {
-            litebox_util_log::error!("terminal worker panicked");
-        }
-        // SAFETY: this guard owns the live terminal and saved its original attributes.
-        if unsafe {
-            libc::tcsetattr(
-                self.shared.file.as_raw_fd(),
-                libc::TCSANOW,
-                &raw const self.original,
-            )
-        } != 0
-        {
-            let error = io::Error::last_os_error();
-            litebox_util_log::error!(error:% = error; "restoring host terminal failed");
+            self.stop(&original);
         }
     }
 }
@@ -657,6 +678,28 @@ mod tests {
     }
 
     #[test]
+    fn close_restores_host_attributes_while_the_terminal_is_shared() {
+        let (_master, terminal) = open_terminal();
+        let terminal = Arc::new(terminal);
+        let _alias = Arc::clone(&terminal);
+        let canonical = || {
+            // SAFETY: zero is a valid initialization for the integer-only termios structure.
+            let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: the terminal file is live and attributes is a writable termios.
+            assert_eq!(
+                unsafe { libc::tcgetattr(terminal.shared.file.as_raw_fd(), &raw mut attributes) },
+                0
+            );
+            attributes.c_lflag & libc::ICANON != 0
+        };
+        assert!(!canonical());
+        assert!(terminal.write(b"output").is_ok());
+        terminal.close().unwrap();
+        assert!(canonical());
+        terminal.close().unwrap();
+    }
+
+    #[test]
     fn terminal_hangup_preserves_buffered_and_pending_input() {
         let (master, terminal) = open_terminal();
         {
@@ -700,7 +743,14 @@ mod tests {
         // Keep the worker from winning the race this test exercises.
         terminal.shared.lock().status = Status::Stopping;
         terminal.shared.wake();
-        terminal.worker.take().unwrap().join().unwrap();
+        terminal
+            .worker
+            .get_mut()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
         for minimum_read in [0, 1] {
             let mut state = terminal.shared.lock();
             let settings = TerminalSettings {
