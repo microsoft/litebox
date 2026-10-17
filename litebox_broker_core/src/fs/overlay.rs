@@ -800,7 +800,9 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 return Ok(WalkOutcome {
                     components: walked,
                     last: WalkingDirHandle::from_typed::<Self>(OverlayWalkingDir { path }),
-                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory {
+                        file_type: entry.entry.file_type,
+                    },
                 });
             }
             let (child, component) = self
@@ -815,6 +817,29 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             last: WalkingDirHandle::from_typed::<Self>(OverlayWalkingDir { path }),
             stop_reason: WalkStopReason::CompleteDirectory,
         })
+    }
+
+    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
+        let open_to_walk_error = |error| match error {
+            OpenError::PathError(error) => WalkError::PathError(error),
+            _ => WalkError::Io,
+        };
+        let current = self
+            .resolve_dir(&dir.as_typed::<Self>().path)
+            .map_err(open_to_walk_error)?;
+        let entry = self
+            .entry(&current, name)
+            .map_err(open_to_walk_error)?
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        let (backend, parent): (&dyn Backend, _) = if entry.upper {
+            (self.upper.as_ref(), current.upper.as_ref())
+        } else {
+            let layer = entry.lower.ok_or(WalkError::Io)?;
+            (self.lowers[layer].as_ref(), current.lowers[layer].as_ref())
+        };
+        let parent = parent.ok_or(WalkError::Io)?;
+        let walking = backend.walking_dir_at(parent).ok_or(WalkError::Io)?;
+        backend.read_link_at(&walking, name)
     }
 
     fn owned_dir_at(
@@ -1199,6 +1224,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     }
 
     fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
+        if let HandleRef::File(_) = h
+            && self.status(h).map_err(|_| ChmodError::Io)?.file_type == FileType::SymbolicLink
+        {
+            return Err(ChmodError::IsSymlink);
+        }
         let locked = self.namespace.lock();
         let handle = self.ensure_upper(locked, h).map_err(|error| match error {
             OpenError::PathError(error) => ChmodError::PathError(error),
@@ -1214,6 +1244,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
+        if let HandleRef::File(_) = h
+            && self.status(h).map_err(|_| ChownError::Io)?.file_type == FileType::SymbolicLink
+        {
+            return Err(ChownError::IsSymlink);
+        }
         let locked = self.namespace.lock();
         let handle = self.ensure_upper(locked, h).map_err(|error| match error {
             OpenError::PathError(error) => ChownError::PathError(error),

@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use alloc::{
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -413,7 +414,20 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         path: &str,
         user: FileUser,
+        follow_symlinks: bool,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError>;
+
+    fn read_link_file(
+        &self,
+        path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
+
+    fn resolve_file_path(
+        &self,
+        path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
 
     fn handle_file_status(
         &self,
@@ -694,6 +708,17 @@ where
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         self.acquire_shared_buffer(path.len())
+    }
+
+    /// Acquires a whole slot that carries `path` to the broker and a resulting path back.
+    fn acquire_file_path_result_buffer(
+        &self,
+        path: &str,
+    ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)
     }
 
     fn fail_association(&self) {
@@ -1325,9 +1350,28 @@ where
         &self,
         path: &str,
         user: FileUser,
+        follow_symlinks: bool,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.path_file_status(lease.sequence(), path, user))
+        self.request(|local| local.path_file_status(lease.sequence(), path, user, follow_symlinks))
+    }
+
+    fn read_link_file(
+        &self,
+        path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError> {
+        let lease = self.acquire_file_path_result_buffer(path)?;
+        self.request(|local| local.read_link_file(lease.sequence(), path, user))
+    }
+
+    fn resolve_file_path(
+        &self,
+        path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError> {
+        let lease = self.acquire_file_path_result_buffer(path)?;
+        self.request(|local| local.resolve_file_path(lease.sequence(), path, user))
     }
 
     fn handle_file_status(

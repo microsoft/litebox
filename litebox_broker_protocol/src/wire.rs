@@ -625,10 +625,11 @@ mod tests {
     };
     use crate::fs::{
         ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileType, FileUser,
-        HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
-        OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-        ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+        FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileType,
+        FileUser, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
+        OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
+        ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+        ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
         SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
         WriteFileResponse,
     };
@@ -937,6 +938,12 @@ mod tests {
             BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
                 path: sequence(5, 9),
                 user: FileUser { user: 2, group: 3 },
+                follow_symlinks: true,
+            })),
+            BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
+                path: sequence(5, 9),
+                user: FileUser { user: 2, group: 3 },
+                follow_symlinks: false,
             })),
             BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
                 handle,
@@ -964,6 +971,16 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::Rmdir(RmdirFileRequest {
                 path: sequence(10, 9),
+                user: FileUser { user: 2, group: 3 },
+            })),
+            BrokerOperation::File(FileRequest::ReadLink(ReadLinkFileRequest {
+                buffer: sequence(11, 256),
+                path_length: 9,
+                user: FileUser { user: 2, group: 3 },
+            })),
+            BrokerOperation::File(FileRequest::ResolvePath(ResolvePathFileRequest {
+                buffer: sequence(12, 256),
+                path_length: 9,
                 user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
@@ -1361,6 +1378,7 @@ mod tests {
             (FileError::Busy, 20),
             (FileError::NotEmpty, 21),
             (FileError::PathOnly, 22),
+            (FileError::TooManySymlinks, 23),
         ] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,
@@ -1658,6 +1676,8 @@ mod tests {
             BrokerResult::File(FileResponse::Unlink),
             BrokerResult::File(FileResponse::Mkdir),
             BrokerResult::File(FileResponse::Rmdir),
+            BrokerResult::File(FileResponse::ReadLink(FilePathResponse { length: 31 })),
+            BrokerResult::File(FileResponse::ResolvePath(FilePathResponse { length: 37 })),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
                 process_id: process_id(19),

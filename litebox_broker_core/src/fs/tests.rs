@@ -152,7 +152,9 @@ mod in_mem {
         fs.write(&mut fd, b"x", None).expect("Failed to write file");
         drop(fd);
 
-        let status = fs.file_status(USER, path).expect("Failed to stat file");
+        let status = fs
+            .file_status(USER, path, true)
+            .expect("Failed to stat file");
         assert_eq!(status.mode, Mode::empty());
         assert!(matches!(
             fs.open(USER, path, OFlags::WRONLY, Mode::empty()),
@@ -545,7 +547,7 @@ mod in_mem {
 
         // Verify it created a regular file, not a directory
         let stat = fs
-            .file_status(USER, "/newfile")
+            .file_status(USER, "/newfile", true)
             .expect("Failed to get file status");
         assert_eq!(stat.file_type, FileType::RegularFile);
 
@@ -1144,7 +1146,9 @@ mod overlay {
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
         drop(fd);
 
-        let stat = fs.file_status(USER, "bar").expect("Failed to file stat");
+        let stat = fs
+            .file_status(USER, "bar", true)
+            .expect("Failed to file stat");
         assert_eq!(stat.file_type, FileType::Directory);
         assert_eq!(stat.mode, Mode::from_bits(0o777).unwrap());
 
@@ -1567,7 +1571,7 @@ mod overlay {
 
         // Verify the directory was created
         let stat = fs
-            .file_status(USER, "/bar/test")
+            .file_status(USER, "/bar/test", true)
             .expect("Failed to get status of /bar/test");
         assert_eq!(stat.file_type, FileType::Directory);
 
@@ -1615,7 +1619,7 @@ mod overlay {
 
         // Verify the file exists and has correct type
         let stat = fs
-            .file_status(USER, "bar/test")
+            .file_status(USER, "bar/test", true)
             .expect("Failed to get status of bar/test");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }
@@ -1650,7 +1654,7 @@ mod overlay {
 
         // Verify the file still exists and has correct type
         let stat = fs
-            .file_status(USER, "bar/baz")
+            .file_status(USER, "bar/baz", true)
             .expect("Failed to get status of bar/baz");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }
@@ -1701,7 +1705,7 @@ mod overlay {
 
         // Verify it no longer exists
         assert!(matches!(
-            fs.file_status(USER, "/upper_empty"),
+            fs.file_status(USER, "/upper_empty", true),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
 
@@ -1746,7 +1750,7 @@ mod overlay {
 
         // Confirm gone
         assert!(matches!(
-            fs.file_status(USER, "/upper_dir"),
+            fs.file_status(USER, "/upper_dir", true),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
@@ -1789,7 +1793,8 @@ mod overlay {
 
         let fs = overlay_fs(upper([]));
 
-        fs.file_status(USER, "foo").expect("Failed to stat foo");
+        fs.file_status(USER, "foo", true)
+            .expect("Failed to stat foo");
 
         // Writing to the lower-layer file triggers copy-up. Run it on a worker thread.
         let (tx, rx) = mpsc::channel();

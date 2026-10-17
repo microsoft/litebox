@@ -2478,6 +2478,7 @@ fn map_path_error(error: PathError, not_found_status: NtStatus) -> NtStatus {
         PathError::ComponentNotADirectory => NtStatus::NOT_A_DIRECTORY,
         PathError::InvalidPathname => NtStatus::INVALID_PARAMETER,
         PathError::NoSearchPerms => NtStatus::ACCESS_DENIED,
+        PathError::TooManySymlinks => NtStatus::REPARSE_POINT_NOT_RESOLVED,
     }
 }
 
@@ -2852,7 +2853,7 @@ mod tests {
         let broker_fs = litebox;
         assert_eq!(
             broker_fs
-                .path_file_status(&litebox::fs::Context::new(), value_path.as_str())
+                .path_file_status(&litebox::fs::Context::new(), value_path.as_str(), true)
                 .unwrap()
                 .file_type,
             FileType::RegularFile

@@ -219,6 +219,17 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`crate::LiteBox::read_link_file`] and
+/// [`crate::LiteBox::resolve_file_path`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum WalkError {
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`super::File::is_terminal`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -245,6 +256,8 @@ pub enum StatusFlagsError {
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {
+    #[error("too many symbolic links encountered")]
+    TooManySymlinks,
     #[error("no such file or directory")]
     NoSuchFileOrDirectory,
     #[error("one of the directories in pathname did not allow search permission")]

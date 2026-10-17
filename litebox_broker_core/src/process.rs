@@ -3761,7 +3761,7 @@ mod tests {
         );
         assert_eq!(source.close_object_reference(event), Ok(()));
         assert_eq!(
-            crate::fs::path_status(&source, "/uncommitted", ROOT),
+            crate::fs::path_status(&source, "/uncommitted", ROOT, true),
             Ok(Err(FileError::NoSuchFileOrDirectory))
         );
 

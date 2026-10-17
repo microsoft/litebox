@@ -161,6 +161,17 @@ impl From<litebox::fs::errors::PathError> for Errno {
             litebox::fs::errors::PathError::InvalidPathname => Errno::EINVAL,
             litebox::fs::errors::PathError::MissingComponent => Errno::ENOENT,
             litebox::fs::errors::PathError::ComponentNotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::PathError::TooManySymlinks => Errno::ELOOP,
+        }
+    }
+}
+
+impl From<litebox::fs::errors::WalkError> for Errno {
+    fn from(value: litebox::fs::errors::WalkError) -> Self {
+        match value {
+            litebox::fs::errors::WalkError::Io => Errno::EIO,
+            litebox::fs::errors::WalkError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
         }
     }
 }

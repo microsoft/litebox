@@ -1,17 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileUser, HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE,
-    MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadFileRequest, RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, try_decode_directory_entries,
+    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FilePathResponse,
+    FileSeekWhence, FileStatus, FileUser, HandleFileStatusRequest, IsTerminalFileRequest,
+    MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -230,11 +232,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         path_buffer: SharedBufferSequence,
         path: &str,
         user: FileUser,
+        follow_symlinks: bool,
     ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::PathStatus(PathFileStatusRequest {
             path: path_buffer,
             user,
+            follow_symlinks,
         }))? {
             FileResponse::PathStatus(status) => Ok(Ok(status)),
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -405,6 +409,93 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Reads the target of the symbolic link at an absolute path.
+    ///
+    /// `buffer` carries the path to the broker and the target back, so it must fit both.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation or an invalid target.
+    pub fn read_link_file(
+        &self,
+        buffer: SharedBufferSequence,
+        path: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<String>, Channel::Error> {
+        let path_length = self.write_path_query_buffer(buffer, path)?;
+        match self.request_file(FileRequest::ReadLink(ReadLinkFileRequest {
+            buffer,
+            path_length,
+            user,
+        }))? {
+            FileResponse::ReadLink(response) => {
+                Ok(Ok(self.read_path_response_buffer(buffer, response)?))
+            }
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file read-link response: {response:?}"),
+        }
+    }
+
+    /// Resolves an absolute path to its physical location, following symbolic links.
+    ///
+    /// `buffer` carries the path to the broker and the resolved path back, so it must fit both.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation or an invalid path.
+    pub fn resolve_file_path(
+        &self,
+        buffer: SharedBufferSequence,
+        path: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<String>, Channel::Error> {
+        let path_length = self.write_path_query_buffer(buffer, path)?;
+        match self.request_file(FileRequest::ResolvePath(ResolvePathFileRequest {
+            buffer,
+            path_length,
+            user,
+        }))? {
+            FileResponse::ResolvePath(response) => {
+                Ok(Ok(self.read_path_response_buffer(buffer, response)?))
+            }
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected file resolve-path response: {response:?}")
+            }
+        }
+    }
+
+    fn write_path_query_buffer(
+        &self,
+        buffer: SharedBufferSequence,
+        path: &str,
+    ) -> Result<u32, Channel::Error> {
+        if buffer.length() > SHARED_BUFFER_SLOT_SIZE {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+        self.write_shared_buffer_at(buffer, 0, path.as_bytes());
+        Ok(u32::try_from(path.len()).expect("path fits its shared-buffer sequence"))
+    }
+
+    fn read_path_response_buffer(
+        &self,
+        buffer: SharedBufferSequence,
+        response: FilePathResponse,
+    ) -> Result<String, Channel::Error> {
+        assert!(
+            response.length <= buffer.length(),
+            "broker returned oversized file path"
+        );
+        let mut path = Vec::new();
+        path.try_reserve_exact(response.length as usize)
+            .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
+        path.resize(response.length as usize, 0);
+        self.read_shared_buffer(buffer, &mut path);
+        Ok(String::from_utf8(path).expect("broker returned a non-UTF-8 file path"))
+    }
+
     fn validate_file_buffer(
         &self,
         buffer: SharedBufferSequence,
@@ -552,7 +643,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .path_file_status(sequence([3], 5), "/file", ROOT)
+                .path_file_status(sequence([3], 5), "/file", ROOT, true)
                 .unwrap(),
             Ok(status)
         );

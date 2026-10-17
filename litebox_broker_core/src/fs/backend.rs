@@ -4,6 +4,7 @@
 //! [`Backend`] for filesystems supported by [`super::resolver`]
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::{Any, TypeId};
@@ -13,7 +14,7 @@ use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
 
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
@@ -63,6 +64,9 @@ pub trait Backend: Send + Sync + Any {
         from: WalkingDirHandle<'a>,
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError>;
+
+    /// Read the unexpanded target of the symlink `name` in `dir`.
+    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError>;
 
     /// Take an owned handle to a `dir` found via a walk, validating any open `flags`.
     fn owned_dir_at(
@@ -295,6 +299,19 @@ impl<'a> WalkingDirHandle<'a> {
         // that the allocation has the expected concrete type.
         unsafe { *Box::from_raw(self.raw.into_raw().cast::<B::WalkingDirHandle<'a>>()) }
     }
+
+    /// Borrowing version of [`Self::into_typed`].
+    pub(super) fn as_typed<B: BackendHandles + 'static>(&self) -> &B::WalkingDirHandle<'a> {
+        assert_eq!(
+            self.backend_type,
+            TypeId::of::<B>(),
+            "backend walking directory handle type mismatch"
+        );
+        // SAFETY: as in `into_typed`, the boxed value is a `B::WalkingDirHandle<'a>`; casting the
+        // trait-object pointer to a thin pointer keeps its data address, and the borrow is tied
+        // to `self`, which owns the allocation.
+        unsafe { &*core::ptr::from_ref(&*self.raw).cast::<B::WalkingDirHandle<'a>>() }
+    }
 }
 
 impl FileHandle {
@@ -380,7 +397,7 @@ pub enum WalkStopReason {
     /// All requested components were walked, and `last` is the requested directory.
     CompleteDirectory,
     /// The next requested component exists but is not a directory; `last` is its parent directory.
-    StoppedAtNonDirectory,
+    StoppedAtNonDirectory { file_type: FileType },
     /// The backend stopped early; the resolver should continue walking from `last`.
     Continue,
 }

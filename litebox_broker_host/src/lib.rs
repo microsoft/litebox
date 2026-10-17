@@ -23,6 +23,7 @@ extern crate std;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
+use litebox_broker_core::fs::FileResult;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::unix_socket::UnixSocketResult;
 use litebox_broker_core::{
@@ -32,9 +33,10 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
-    HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest,
+    FilePathResponse, HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE,
+    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
     SeekFileResponse, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
     encode_directory_entries_chunk,
 };
@@ -812,10 +814,14 @@ fn handle_file_request<Memory: SharedMemory>(
                 next_index,
             }))
         }
-        FileRequest::PathStatus(PathFileStatusRequest { path, user }) => {
+        FileRequest::PathStatus(PathFileStatusRequest {
+            path,
+            user,
+            follow_symlinks,
+        }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::fs::path_status(process, &path, user)
+                match litebox_broker_core::fs::path_status(process, &path, user, follow_symlinks)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(status) => FileResponse::PathStatus(status),
@@ -895,6 +901,36 @@ fn handle_file_request<Memory: SharedMemory>(
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Rmdir,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::ReadLink(ReadLinkFileRequest {
+            buffer,
+            path_length,
+            user,
+        }) => {
+            let path = read_file_path_prefix(shared_buffers, buffer, path_length)?;
+            let target = litebox_broker_core::fs::read_link(process, &path, user)
+                .map_err(RequestFailure::from)?;
+            Ok(
+                match write_file_path_response(shared_buffers, buffer, target)? {
+                    Ok(response) => FileResponse::ReadLink(response),
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::ResolvePath(ResolvePathFileRequest {
+            buffer,
+            path_length,
+            user,
+        }) => {
+            let path = read_file_path_prefix(shared_buffers, buffer, path_length)?;
+            let resolved = litebox_broker_core::fs::resolve_path(process, &path, user)
+                .map_err(RequestFailure::from)?;
+            Ok(
+                match write_file_path_response(shared_buffers, buffer, resolved)? {
+                    Ok(response) => FileResponse::ResolvePath(response),
                     Err(error) => FileResponse::Failed(error),
                 },
             )
@@ -1096,13 +1132,53 @@ fn read_file_path<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     buffer: SharedBufferSequence,
 ) -> RequestResult<alloc::string::String> {
-    let data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
+    read_file_path_prefix(shared_buffers, buffer, buffer.length())
+}
+
+/// Reads the path held by the first `path_length` bytes of `buffer`.
+fn read_file_path_prefix<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferSequence,
+    path_length: u32,
+) -> RequestResult<alloc::string::String> {
+    validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
+    if path_length > buffer.length() {
+        return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+    }
+    let mut data = allocate_zeroed(path_length as usize)?;
+    shared_buffers
+        .read_sequence(buffer, 0, &mut data)
+        .map_err(shared_buffer_access_failure)?;
     let path = alloc::string::String::from_utf8(data)
         .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
     if !path.starts_with('/') {
         return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
     }
     Ok(path)
+}
+
+/// Writes a path query's result over the request path in `buffer`.
+fn write_file_path_response<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferSequence,
+    result: FileResult<alloc::string::String>,
+) -> RequestResult<FileResult<FilePathResponse>> {
+    let path = match result {
+        Ok(path) => path,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Ok(length) = u32::try_from(path.len()) else {
+        return Ok(Err(FileError::Io));
+    };
+    if length > buffer.length() {
+        // The path cannot be returned whole; Linux paths are bounded well below a buffer slot.
+        return Ok(Err(FileError::Io));
+    }
+    validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
+    shared_buffers
+        .write_sequence(buffer, 0, path.as_bytes())
+        .map_err(shared_buffer_access_failure)?;
+    Ok(Ok(FilePathResponse { length }))
 }
 
 fn handle_socket_request<Memory: SharedMemory>(

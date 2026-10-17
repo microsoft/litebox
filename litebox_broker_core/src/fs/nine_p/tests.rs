@@ -305,7 +305,7 @@ fn test_nine_p_file_status() {
 
     // Check file_status via path
     let status = fs
-        .file_status(USER, "/status_test.txt")
+        .file_status(USER, "/status_test.txt", true)
         .expect("failed to stat file");
     assert_eq!(
         status.file_type,
@@ -317,7 +317,7 @@ fn test_nine_p_file_status() {
     // Check directory status
     fs.mkdir(USER, "/stat_dir", Mode::RWXU).unwrap();
     let status = fs
-        .file_status(USER, "/stat_dir")
+        .file_status(USER, "/stat_dir", true)
         .expect("failed to stat dir");
     assert_eq!(
         status.file_type,
@@ -527,12 +527,24 @@ fn test_nine_p_broken_create() {
 fn test_nine_p_broken_read() {
     let server = DiodServer::start();
 
-    std::fs::write(server.export_path().join("read_me.txt"), b"data").unwrap();
+    // A nested path also verifies that the resolution pass batches ordinary components.
+    std::fs::create_dir_all(server.export_path().join("parent/nested")).unwrap();
+    std::fs::write(
+        server.export_path().join("parent/nested/read_me.txt"),
+        b"data",
+    )
+    .unwrap();
 
-    // 4 writes: version + attach + walk + lopen. Then read will fail.
-    let fs = connect_9p_broken(&server, 4);
+    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // Then read will fail.
+    let fs = connect_9p_broken(&server, 6);
     let mut fd = fs
-        .open(USER, "/read_me.txt", OFlags::RDONLY, Mode::empty())
+        .open(
+            USER,
+            "/parent/nested/read_me.txt",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .expect("open should succeed before break");
 
     let mut buf = alloc::vec![0u8; 64];
@@ -545,9 +557,9 @@ fn test_nine_p_broken_read() {
 fn test_nine_p_broken_write() {
     let server = DiodServer::start();
 
-    // 5 writes: version + attach + walk (which reports the file as missing) + the clone of the
-    // parent directory's fid + create. Then write will fail.
-    let fs = connect_9p_broken(&server, 5);
+    // 6 writes: version + attach + resolution walk + open walk (both report the missing file)
+    // + the clone of the parent directory's fid + create. Then write will fail.
+    let fs = connect_9p_broken(&server, 6);
     let mut fd = fs
         .open(
             USER,
@@ -616,7 +628,7 @@ fn test_nine_p_broken_file_status() {
     let server = DiodServer::start();
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.file_status(USER, "/");
+    let result = fs.file_status(USER, "/", true);
     assert!(matches!(result, Err(FileStatusError::Io)));
 }
 
@@ -627,8 +639,9 @@ fn test_nine_p_broken_truncate() {
 
     std::fs::write(server.export_path().join("to_trunc.txt"), b"some data").unwrap();
 
-    // 4 writes: version + attach + walk + lopen. Then truncate will fail.
-    let fs = connect_9p_broken(&server, 4);
+    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // Then truncate will fail.
+    let fs = connect_9p_broken(&server, 6);
     let mut fd = fs
         .open(USER, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
@@ -644,8 +657,9 @@ fn test_nine_p_broken_seek() {
 
     std::fs::write(server.export_path().join("to_seek.txt"), b"data").unwrap();
 
-    // 4 writes: version + attach + walk + lopen. Then the getattr for seek will fail.
-    let fs = connect_9p_broken(&server, 4);
+    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // Then the getattr for seek will fail.
+    let fs = connect_9p_broken(&server, 6);
     let mut fd = fs
         .open(USER, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
@@ -689,7 +703,7 @@ fn test_nine_p_deep_path_walk() {
 
     // Verify file_status works through the deep path
     let status = fs
-        .file_status(USER, &file_path)
+        .file_status(USER, &file_path, true)
         .expect("failed to stat deep file");
     assert_eq!(status.file_type, FileType::RegularFile);
     assert_eq!(status.size, 12);
@@ -728,7 +742,7 @@ fn test_nine_p_chmod() {
 
     // Also verify via 9P file_status
     let status = fs
-        .file_status(USER, "/chmod_test.txt")
+        .file_status(USER, "/chmod_test.txt", true)
         .expect("file_status failed");
     assert!(status.mode.contains(Mode::RUSR), "mode should contain RUSR");
     assert!(
@@ -755,7 +769,7 @@ fn test_nine_p_chown() {
 
     // Get current ownership
     let status_before = fs
-        .file_status(USER, "/chown_test.txt")
+        .file_status(USER, "/chown_test.txt", true)
         .expect("file_status failed");
 
     // Change group to the same value (chown to a different uid/gid requires root)
@@ -769,7 +783,7 @@ fn test_nine_p_chown() {
 
     // Verify ownership hasn't changed
     let status_after = fs
-        .file_status(USER, "/chown_test.txt")
+        .file_status(USER, "/chown_test.txt", true)
         .expect("file_status failed after chown");
     assert_eq!(status_after.owner.user, status_before.owner.user);
     assert_eq!(status_after.owner.group, status_before.owner.group);

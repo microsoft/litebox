@@ -3,7 +3,7 @@
 
 //! Broker-authoritative file operations.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
 use litebox_broker_protocol::ObjectHandle;
@@ -17,7 +17,7 @@ use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 use super::OFlags;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
 use crate::object::{ObjectEntry, ObjectRights};
@@ -95,7 +95,7 @@ impl ObjectEntry {
 mod private {
     use super::{
         BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
-        FileSeekWhence, FileStatus, FileStatusFlags, FileUser, Result, ServiceResult, Vec,
+        FileSeekWhence, FileStatus, FileStatusFlags, FileUser, Result, ServiceResult, String, Vec,
     };
 
     pub trait Service: Send + Sync {
@@ -156,7 +156,20 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn path_status(&self, _path: &str, _user: FileUser) -> ServiceResult<FileStatus> {
+        fn path_status(
+            &self,
+            _path: &str,
+            _user: FileUser,
+            _follow_symlinks: bool,
+        ) -> ServiceResult<FileStatus> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn read_link(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn resolve_path(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -418,13 +431,26 @@ where
         Ok(())
     }
 
-    fn path_status(&self, path: &str, user: FileUser) -> ServiceResult<FileStatus> {
-        let mut status = match Resolver::file_status(self, user, path) {
+    fn path_status(
+        &self,
+        path: &str,
+        user: FileUser,
+        follow_symlinks: bool,
+    ) -> ServiceResult<FileStatus> {
+        let mut status = match Resolver::file_status(self, user, path, follow_symlinks) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
         };
         mask_status_mode(&mut status);
         Ok(Ok(status))
+    }
+
+    fn read_link(&self, path: &str, user: FileUser) -> ServiceResult<String> {
+        Ok(Resolver::read_link(self, user, path).map_err(file_walk_error))
+    }
+
+    fn resolve_path(&self, path: &str, user: FileUser) -> ServiceResult<String> {
+        Ok(Resolver::resolve_following_symlinks(self, user, path).map_err(file_walk_error))
     }
 
     fn chmod(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
@@ -612,12 +638,39 @@ pub fn path_status(
     process: &BrokerProcess,
     path: &str,
     user: FileUser,
+    follow_symlinks: bool,
 ) -> Result<FileResult<FileStatus>> {
     authorize(process, ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.core.fs.path_status(path, user)
+    process.core.fs.path_status(path, user, follow_symlinks)
+}
+
+/// Reads the target of the symbolic link at an absolute path.
+pub fn read_link(
+    process: &BrokerProcess,
+    path: &str,
+    user: FileUser,
+) -> Result<FileResult<String>> {
+    authorize(process, ObjectRights::WAIT)?;
+    if let Err(error) = validate_path(path) {
+        return Ok(Err(error));
+    }
+    process.core.fs.read_link(path, user)
+}
+
+/// Resolves an absolute path to its physical location, following symbolic links.
+pub fn resolve_path(
+    process: &BrokerProcess,
+    path: &str,
+    user: FileUser,
+) -> Result<FileResult<String>> {
+    authorize(process, ObjectRights::WAIT)?;
+    if let Err(error) = validate_path(path) {
+        return Ok(Err(error));
+    }
+    process.core.fs.resolve_path(path, user)
 }
 
 /// Changes mode bits for an absolute path.
@@ -780,6 +833,7 @@ fn mask_status_mode(status: &mut FileStatus) {
 // be removed while retaining operation-specific error sets.
 fn file_path_error(error: PathError) -> FileError {
     match error {
+        PathError::TooManySymlinks => FileError::TooManySymlinks,
         PathError::NoSuchFileOrDirectory => FileError::NoSuchFileOrDirectory,
         PathError::NoSearchPerms => FileError::NoSearchPermissions,
         PathError::InvalidPathname => FileError::InvalidPathname,
@@ -841,7 +895,8 @@ fn file_chmod_error(error: ChmodError) -> FileError {
         ChmodError::NotTheOwner => FileError::NotOwner,
         ChmodError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
         ChmodError::PathError(error) => file_path_error(error),
-        ChmodError::Io => FileError::Io,
+        // Unreachable by path: chmod follows symbolic links.
+        ChmodError::IsSymlink | ChmodError::Io => FileError::Io,
     }
 }
 
@@ -850,7 +905,8 @@ fn file_chown_error(error: ChownError) -> FileError {
         ChownError::NotTheOwner => FileError::NotOwner,
         ChownError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
         ChownError::PathError(error) => file_path_error(error),
-        ChownError::Io => FileError::Io,
+        // Unreachable by path: chown follows symbolic links.
+        ChownError::IsSymlink | ChownError::Io => FileError::Io,
     }
 }
 
@@ -898,6 +954,13 @@ fn file_status_error(error: FileStatusError) -> FileError {
     match error {
         FileStatusError::PathError(error) => file_path_error(error),
         FileStatusError::ClosedFd | FileStatusError::Io => FileError::Io,
+    }
+}
+
+fn file_walk_error(error: WalkError) -> FileError {
+    match error {
+        WalkError::PathError(error) => file_path_error(error),
+        WalkError::Io => FileError::Io,
     }
 }
 

@@ -5,10 +5,11 @@ use core::num::NonZeroU64;
 
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-    FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, HandleFileStatusRequest,
-    IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
+    FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
+    HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
     TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
     file_type_from_raw, file_type_raw,
 };
@@ -33,6 +34,8 @@ const REQUEST_TAG_UNLINK: u8 = 10;
 const REQUEST_TAG_MKDIR: u8 = 11;
 const REQUEST_TAG_RMDIR: u8 = 12;
 const REQUEST_TAG_IS_TERMINAL: u8 = 13;
+const REQUEST_TAG_READ_LINK: u8 = 14;
+const REQUEST_TAG_RESOLVE_PATH: u8 = 15;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -48,6 +51,8 @@ const RESPONSE_TAG_UNLINK: u8 = 10;
 const RESPONSE_TAG_MKDIR: u8 = 11;
 const RESPONSE_TAG_RMDIR: u8 = 12;
 const RESPONSE_TAG_IS_TERMINAL: u8 = 13;
+const RESPONSE_TAG_READ_LINK: u8 = 14;
+const RESPONSE_TAG_RESOLVE_PATH: u8 = 15;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -65,6 +70,8 @@ const _: () = {
     assert!(REQUEST_TAG_MKDIR == RESPONSE_TAG_MKDIR);
     assert!(REQUEST_TAG_RMDIR == RESPONSE_TAG_RMDIR);
     assert!(REQUEST_TAG_IS_TERMINAL == RESPONSE_TAG_IS_TERMINAL);
+    assert!(REQUEST_TAG_READ_LINK == RESPONSE_TAG_READ_LINK);
+    assert!(REQUEST_TAG_RESOLVE_PATH == RESPONSE_TAG_RESOLVE_PATH);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -111,6 +118,7 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.u8(REQUEST_TAG_PATH_STATUS);
             encoder.shared_buffer_sequence(request.path);
             encode_user(encoder, request.user);
+            encoder.u8(u8::from(request.follow_symlinks));
         }
         FileRequest::HandleStatus(request) => {
             encoder.u8(REQUEST_TAG_HANDLE_STATUS);
@@ -147,6 +155,18 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::Rmdir(request) => {
             encoder.u8(REQUEST_TAG_RMDIR);
             encoder.shared_buffer_sequence(request.path);
+            encode_user(encoder, request.user);
+        }
+        FileRequest::ReadLink(request) => {
+            encoder.u8(REQUEST_TAG_READ_LINK);
+            encoder.shared_buffer_sequence(request.buffer);
+            encoder.u32(request.path_length);
+            encode_user(encoder, request.user);
+        }
+        FileRequest::ResolvePath(request) => {
+            encoder.u8(REQUEST_TAG_RESOLVE_PATH);
+            encoder.shared_buffer_sequence(request.buffer);
+            encoder.u32(request.path_length);
             encode_user(encoder, request.user);
         }
     }
@@ -193,6 +213,7 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         REQUEST_TAG_PATH_STATUS => Ok(FileRequest::PathStatus(PathFileStatusRequest {
             path: decoder.shared_buffer_sequence()?,
             user: decode_user(decoder)?,
+            follow_symlinks: decode_bool(decoder)?,
         })),
         REQUEST_TAG_HANDLE_STATUS => Ok(FileRequest::HandleStatus(HandleFileStatusRequest {
             handle: decoder.handle()?,
@@ -222,6 +243,16 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         })),
         REQUEST_TAG_RMDIR => Ok(FileRequest::Rmdir(RmdirFileRequest {
             path: decoder.shared_buffer_sequence()?,
+            user: decode_user(decoder)?,
+        })),
+        REQUEST_TAG_READ_LINK => Ok(FileRequest::ReadLink(ReadLinkFileRequest {
+            buffer: decoder.shared_buffer_sequence()?,
+            path_length: decoder.u32()?,
+            user: decode_user(decoder)?,
+        })),
+        REQUEST_TAG_RESOLVE_PATH => Ok(FileRequest::ResolvePath(ResolvePathFileRequest {
+            buffer: decoder.shared_buffer_sequence()?,
+            path_length: decoder.u32()?,
             user: decode_user(decoder)?,
         })),
         _ => Err(WireError::InvalidTag),
@@ -269,6 +300,14 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
         FileResponse::Unlink => encoder.u8(RESPONSE_TAG_UNLINK),
         FileResponse::Mkdir => encoder.u8(RESPONSE_TAG_MKDIR),
         FileResponse::Rmdir => encoder.u8(RESPONSE_TAG_RMDIR),
+        FileResponse::ReadLink(FilePathResponse { length }) => {
+            encoder.u8(RESPONSE_TAG_READ_LINK);
+            encoder.u32(length);
+        }
+        FileResponse::ResolvePath(FilePathResponse { length }) => {
+            encoder.u8(RESPONSE_TAG_RESOLVE_PATH);
+            encoder.u32(length);
+        }
         FileResponse::Failed(error) => {
             encoder.u8(RESPONSE_TAG_FAILED);
             encode_file_error(encoder, error);
@@ -307,6 +346,12 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_UNLINK => Ok(FileResponse::Unlink),
         RESPONSE_TAG_MKDIR => Ok(FileResponse::Mkdir),
         RESPONSE_TAG_RMDIR => Ok(FileResponse::Rmdir),
+        RESPONSE_TAG_READ_LINK => Ok(FileResponse::ReadLink(FilePathResponse {
+            length: decoder.u32()?,
+        })),
+        RESPONSE_TAG_RESOLVE_PATH => Ok(FileResponse::ResolvePath(FilePathResponse {
+            length: decoder.u32()?,
+        })),
         RESPONSE_TAG_FAILED => Ok(FileResponse::Failed(decode_file_error(decoder)?)),
         _ => Err(WireError::InvalidTag),
     }
@@ -336,6 +381,7 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::Busy => 20,
         FileError::NotEmpty => 21,
         FileError::PathOnly => 22,
+        FileError::TooManySymlinks => 23,
     });
 }
 
@@ -363,6 +409,7 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         20 => Ok(FileError::Busy),
         21 => Ok(FileError::NotEmpty),
         22 => Ok(FileError::PathOnly),
+        23 => Ok(FileError::TooManySymlinks),
         _ => Err(WireError::InvalidTag),
     }
 }

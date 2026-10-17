@@ -431,7 +431,7 @@ impl Backend for LocalFs {
                 return Ok(WalkOutcome {
                     components: walked,
                     last: WalkingDirHandle::from_typed::<Self>(dir),
-                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory { file_type },
                 });
             }
         }
@@ -440,6 +440,11 @@ impl Backend for LocalFs {
             last: WalkingDirHandle::from_typed::<Self>(dir),
             stop_reason: WalkStopReason::CompleteDirectory,
         })
+    }
+
+    fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, _name: &str) -> Result<String, WalkError> {
+        // Host symlinks are followed during `locate`, so walks never stop at one.
+        unimplemented!("symbolic links on the local host filesystem")
     }
 
     fn owned_dir_at(

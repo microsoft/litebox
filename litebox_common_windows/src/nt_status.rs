@@ -220,6 +220,7 @@ impl NtStatus {
             0xC0000235 => "STATUS_HANDLE_NOT_CLOSABLE: Handle not closable",
             0xC00002DF => "STATUS_SAM_NEED_BOOTKEY_PASSWORD: SAM needs boot key password",
             0xC00002E0 => "STATUS_SAM_NEED_BOOTKEY_FLOPPY: SAM needs boot key floppy",
+            0xC0000280 => "STATUS_REPARSE_POINT_NOT_RESOLVED: Reparse point not resolved",
             0xC0000282 => "STATUS_RANGE_LIST_CONFLICT: Range list conflict",
             0xC0000283 => "STATUS_SOURCE_ELEMENT_EMPTY: Source element empty",
             0xC0000284 => "STATUS_DESTINATION_ELEMENT_FULL: Destination element full",
@@ -634,6 +635,9 @@ impl NtStatus {
 
     /// STATUS_SAM_NEED_BOOTKEY_FLOPPY
     pub const SAM_NEED_BOOTKEY_FLOPPY: Self = Self::from_raw(0xC00002E0);
+
+    /// STATUS_REPARSE_POINT_NOT_RESOLVED
+    pub const REPARSE_POINT_NOT_RESOLVED: Self = Self::from_raw(0xC0000280);
 
     /// STATUS_RANGE_LIST_CONFLICT
     pub const RANGE_LIST_CONFLICT: Self = Self::from_raw(0xC0000282);

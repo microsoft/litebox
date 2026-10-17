@@ -49,6 +49,8 @@ pub enum FileType {
     Directory,
     /// Character device.
     CharacterDevice,
+    /// Symbolic link.
+    SymbolicLink,
 }
 
 /// Device and inode identity.
@@ -138,6 +140,8 @@ pub enum FileError {
     NotEmpty,
     #[error("operation is not permitted on an O_PATH file descriptor")]
     PathOnly,
+    #[error("too many symbolic links encountered")]
+    TooManySymlinks,
 }
 
 /// Seek origin.
@@ -435,6 +439,39 @@ pub struct PathFileStatusRequest {
     pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
+    /// Whether a final symbolic link is followed rather than described itself.
+    pub follow_symlinks: bool,
+}
+
+/// Reads the target of a symbolic link by path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadLinkFileRequest {
+    /// Shared-buffer region whose first `path_length` bytes hold one absolute UTF-8 path; the
+    /// broker replaces its contents with the link's target.
+    pub buffer: SharedBufferSequence,
+    /// Length of the path at the start of `buffer`.
+    pub path_length: u32,
+    /// Caller identity for permission checks.
+    pub user: FileUser,
+}
+
+/// Resolves a path to its physical location, following symbolic links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvePathFileRequest {
+    /// Shared-buffer region whose first `path_length` bytes hold one absolute UTF-8 path; the
+    /// broker replaces its contents with the resolved absolute path.
+    pub buffer: SharedBufferSequence,
+    /// Length of the path at the start of `buffer`.
+    pub path_length: u32,
+    /// Caller identity for permission checks.
+    pub user: FileUser,
+}
+
+/// Successful response carrying a path written to the request's shared buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilePathResponse {
+    /// Length of the path written to the start of the request buffer.
+    pub length: u32,
 }
 
 /// Reads status by open handle.
@@ -648,6 +685,7 @@ pub(crate) const fn file_type_raw(file_type: FileType) -> u8 {
         FileType::RegularFile => 0,
         FileType::Directory => 1,
         FileType::CharacterDevice => 2,
+        FileType::SymbolicLink => 3,
     }
 }
 
@@ -656,6 +694,7 @@ pub(crate) const fn file_type_from_raw(raw: u8) -> Option<FileType> {
         0 => Some(FileType::RegularFile),
         1 => Some(FileType::Directory),
         2 => Some(FileType::CharacterDevice),
+        3 => Some(FileType::SymbolicLink),
         _ => None,
     }
 }
@@ -800,6 +839,11 @@ mod tests {
                     ino: 7,
                     rdev: NonZeroU64::new(11),
                 }),
+            },
+            FileDirectoryEntry {
+                name: "link".into(),
+                file_type: FileType::SymbolicLink,
+                ino_info: None,
             },
         ];
 

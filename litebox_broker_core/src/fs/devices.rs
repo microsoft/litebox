@@ -202,7 +202,9 @@ impl Backend for Devices {
                 return Ok(WalkOutcome {
                     components: vec![],
                     last: WalkingDirHandle::from_typed::<Self>(from),
-                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory {
+                        file_type: FileType::CharacterDevice,
+                    },
                 });
             }
             return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
@@ -212,6 +214,10 @@ impl Backend for Devices {
             last: WalkingDirHandle::from_typed::<Self>(from),
             stop_reason: WalkStopReason::CompleteDirectory,
         })
+    }
+
+    fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, _name: &str) -> Result<String, WalkError> {
+        Err(PathError::InvalidPathname.into())
     }
 
     fn owned_dir_at(

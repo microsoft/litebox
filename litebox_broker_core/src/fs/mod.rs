@@ -34,7 +34,8 @@ pub use litebox_broker_protocol::fs::{
 pub(crate) use service::{File, get_status_flags, open_without_reference, set_status_flags};
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chown, handle_status, is_terminal,
-    mkdir, open, path_status, read, read_directory, rmdir, seek, truncate, unlink, write,
+    mkdir, open, path_status, read, read_directory, read_link, resolve_path, rmdir, seek, truncate,
+    unlink, write,
 };
 
 bitflags! {
@@ -82,7 +83,7 @@ bitflags! {
         const NOATIME = 0x40000;
         /// `O_NOCTTY`: do not assign controlling terminal
         const NOCTTY = 0x100;
-        /// `O_NOFOLLOW`: fail if the path does not point to a regular file
+        /// `O_NOFOLLOW`: do not follow a final symlink (open it only with `O_PATH`)
         #[cfg(target_arch = "x86_64")]
         const NOFOLLOW = 0x20000;
         #[cfg(target_arch = "aarch64")]

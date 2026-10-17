@@ -175,6 +175,11 @@ impl Backend for ShareFs {
         self.0.walk_directories(from, components)
     }
 
+    fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, _name: &str) -> Result<String, WalkError> {
+        // The 9P backend does not yet report symbolic links, so walks never stop at one.
+        unimplemented!("symbolic links on the VM share")
+    }
+
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,

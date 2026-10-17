@@ -356,6 +356,7 @@ impl From<FileType> for InodeType {
             FileType::RegularFile => InodeType::File,
             FileType::Directory => InodeType::Dir,
             FileType::CharacterDevice => InodeType::CharDevice,
+            FileType::SymbolicLink => InodeType::SymLink,
             _ => unimplemented!(),
         }
     }
@@ -387,6 +388,7 @@ impl From<FileType> for DirentType {
             FileType::RegularFile => DirentType::Regular,
             FileType::Directory => DirentType::Directory,
             FileType::CharacterDevice => DirentType::CharDevice,
+            FileType::SymbolicLink => DirentType::SymLink,
             _ => unimplemented!(),
         }
     }
