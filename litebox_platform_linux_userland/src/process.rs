@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Native Linux process operations for broker-adopted runners.
+//! Native Linux process operations.
 
 use std::io::{Error, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -10,7 +10,7 @@ use litebox::platform::{
     ForkError, ForkResult as ProviderForkResult, ProcessHandle, ProcessProvider,
 };
 
-/// Owned native child resources used by [`ProcessProvider`].
+/// A handle to a process created by [`ProcessProvider::fork_process`].
 pub struct ClonedProcess {
     process_id: u32,
     process: OwnedFd,
@@ -80,7 +80,7 @@ impl ProcessHandle for ClonedProcess {
     }
 }
 
-/// Result of cloning the calling process.
+/// Result returned by [`fork_process`].
 pub enum ForkResult {
     /// The original process receives the cloned process ID.
     Parent {
