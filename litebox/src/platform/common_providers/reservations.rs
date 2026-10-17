@@ -93,6 +93,17 @@ where
     type Reservation = Reservation;
     type ReleaseTarget = Range<usize>;
 
+    unsafe fn adopt_mapping<Platform, const PAGE_ALIGN: usize>(
+        &mut self,
+        _platform: &Platform,
+        _range: Range<usize>,
+    ) -> Result<(), AllocationError>
+    where
+        Platform: PageManagementProvider<PAGE_ALIGN, Reservations = Self>,
+    {
+        Ok(())
+    }
+
     unsafe fn release_all<Platform, const PAGE_ALIGN: usize, V>(
         &mut self,
         vmas: &rangemap::RangeMap<usize, V>,
@@ -248,6 +259,22 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
 }
 
 impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Reservation> {
+    unsafe fn adopt_mapping<Platform, const ALIGN: usize>(
+        &mut self,
+        platform: &Platform,
+        range: Range<usize>,
+    ) -> Result<(), AllocationError>
+    where
+        Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+    {
+        // SAFETY: The caller guarantees this exact mapping is mapped and exclusively owned.
+        let reservation = unsafe { platform.adopt_pages(range.clone()) }?;
+        let extent = reservation.range();
+        debug_assert_eq!(extent, range);
+        assert!(self.insert(extent.start, reservation).is_none());
+        Ok(())
+    }
+
     type Reservation = Reservation;
     type ReleaseTarget = Reservation;
 

@@ -67,6 +67,15 @@ pub trait ReservationStore {
     /// Ownership representation consumed when this store releases pages.
     type ReleaseTarget;
 
+    /// Adopt an existing mapping, retaining its ownership handle if this store tracks handles.
+    unsafe fn adopt_mapping<Platform, const ALIGN: usize>(
+        &mut self,
+        platform: &Platform,
+        range: Range<usize>,
+    ) -> Result<(), AllocationError>
+    where
+        Platform: PageManagementProvider<ALIGN, Reservations = Self>;
+
     /// Release every extent represented by this store.
     ///
     /// # Safety
@@ -178,11 +187,6 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Unspecified;
 
     /// Takes ownership of an exact range already mapped in this process.
-    ///
-    /// # Safety
-    ///
-    /// `range` must be nonempty, aligned, mapped, exclusively owned by the caller, and not yet
-    /// represented by another reservation handle.
     unsafe fn adopt_pages(
         &self,
         _range: Range<usize>,

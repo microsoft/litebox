@@ -78,7 +78,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             || !range.start.is_multiple_of(ALIGN)
             || !range.end.is_multiple_of(ALIGN)
         {
-            return Err(litebox::platform::page_mgmt::AllocationError::AddressInUse);
+            return Err(litebox::platform::page_mgmt::AllocationError::Unaligned);
         }
         // SAFETY: The caller guarantees this exact inherited range is mapped and exclusively owned.
         Ok(unsafe { LinuxUserlandReservation::new(range) })

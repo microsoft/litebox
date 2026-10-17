@@ -221,7 +221,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
             || !range.start.is_multiple_of(ALIGN)
             || !range.end.is_multiple_of(ALIGN)
         {
-            return Err(AllocationError::AddressInUse);
+            return Err(AllocationError::Unaligned);
         }
         // SAFETY: The caller guarantees this exact inherited range is mapped and exclusively owned.
         Ok(unsafe { WindowsUserlandReservation::new(range) })
