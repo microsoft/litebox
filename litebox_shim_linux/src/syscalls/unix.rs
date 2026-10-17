@@ -136,7 +136,7 @@ impl UnixSocketAddr {
             UnixSocketAddr::Unnamed => Err(Errno::EINVAL),
             UnixSocketAddr::Abstract(name) => Ok(UnixSocketAddress::Abstract(name.clone())),
             UnixSocketAddr::Path(path) => {
-                let resolved = task.fs.borrow().context.read().resolve(path.as_str())?;
+                let resolved = task.fs.borrow().context.read().resolve(path.as_str());
                 Ok(UnixSocketAddress::Path {
                     path: resolved.to_string(),
                     name: path.as_bytes().to_vec(),

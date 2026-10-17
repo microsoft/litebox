@@ -308,7 +308,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
             return Err(Errno::EINVAL);
         }
         let mut context = self.context.write();
-        let cwd = context.resolve(cwd)?;
+        let cwd = context.resolve(cwd);
         context.set_cwd(cwd);
         Ok(())
     }
@@ -976,9 +976,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mode = mode & !self.get_umask();
         let fs = self.fs.borrow();
         let context = fs.context.read();
-        let path = path
-            .as_rust_str()
-            .map_err(litebox::fs::errors::PathError::from)?;
         let (access, open_flags) =
             file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
         let file = self

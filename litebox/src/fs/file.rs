@@ -23,7 +23,6 @@ use crate::event::observer::Observer;
 use crate::event::polling::{Pollee, TryOpError};
 use crate::event::wait::WaitContext;
 use crate::event::{Events, IOPollable};
-use crate::path::Arg;
 use crate::{LiteBox, sync};
 
 use super::errors::{
@@ -33,8 +32,8 @@ use super::errors::{
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    fn broker_path(context: &Context, path: impl Arg) -> Result<String, PathError> {
-        Ok(context.resolve(path)?.to_string())
+    fn broker_path(context: &Context, path: &str) -> String {
+        context.resolve(path).to_string()
     }
 
     /// Opens a file.
@@ -44,12 +43,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     pub fn open_file(
         &self,
         context: &Context,
-        path: impl Arg,
+        path: &str,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: Mode,
     ) -> Result<File<Platform>, OpenError> {
-        let path = Self::broker_path(context, path)?;
+        let path = Self::broker_path(context, path);
         if FileOpenFlags::from_bits(flags.bits()).is_none() {
             return Err(OpenError::AccessNotAllowed);
         }
@@ -82,13 +81,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Change the permissions of a file.
-    pub fn chmod_file(
-        &self,
-        context: &Context,
-        path: impl Arg,
-        mode: Mode,
-    ) -> Result<(), ChmodError> {
-        let path = Self::broker_path(context, path)?;
+    pub fn chmod_file(&self, context: &Context, path: &str, mode: Mode) -> Result<(), ChmodError> {
+        let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(ChmodError::Io)?
             .chmod_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
@@ -100,11 +94,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     pub fn chown_file(
         &self,
         context: &Context,
-        path: impl Arg,
+        path: &str,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let path = Self::broker_path(context, path)?;
+        let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(ChownError::Io)?
             .chown_file(&path, context.acting_user(), user, group)
@@ -113,8 +107,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Unlink a file.
-    pub fn unlink_file(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
-        let path = Self::broker_path(context, path)?;
+    pub fn unlink_file(&self, context: &Context, path: &str) -> Result<(), UnlinkError> {
+        let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(UnlinkError::Io)?
             .unlink_file(&path, context.acting_user())
@@ -123,13 +117,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Create a new directory.
-    pub fn mkdir_file(
-        &self,
-        context: &Context,
-        path: impl Arg,
-        mode: Mode,
-    ) -> Result<(), MkdirError> {
-        let path = Self::broker_path(context, path)?;
+    pub fn mkdir_file(&self, context: &Context, path: &str, mode: Mode) -> Result<(), MkdirError> {
+        let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(MkdirError::Io)?
             .mkdir_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
@@ -138,8 +127,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Remove a directory.
-    pub fn rmdir_file(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
-        let path = Self::broker_path(context, path)?;
+    pub fn rmdir_file(&self, context: &Context, path: &str) -> Result<(), RmdirError> {
+        let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(RmdirError::Io)?
             .rmdir_file(&path, context.acting_user())
@@ -151,9 +140,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     pub fn path_file_status(
         &self,
         context: &Context,
-        path: impl Arg,
+        path: &str,
     ) -> Result<FileStatus, FileStatusError> {
-        let path = Self::broker_path(context, path)?;
+        let path = Self::broker_path(context, path);
         self.broker_control()
             .ok_or(FileStatusError::Io)?
             .path_file_status(&path, context.acting_user())
@@ -205,13 +194,13 @@ impl Context {
     }
 
     /// Resolve `path` against the current context.
-    pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
-        let mut components = if path.as_rust_str()?.starts_with('/') {
+    pub fn resolve(&self, path: &str) -> ResolvedPath {
+        let mut components = if path.starts_with('/') {
             vec![]
         } else {
             self.cwd.components.clone()
         };
-        for component in path.components()? {
+        for component in path.split('/') {
             match component {
                 "" | "." => {}
                 ".." => {
@@ -220,7 +209,7 @@ impl Context {
                 _ => components.push(component.into()),
             }
         }
-        Ok(ResolvedPath { components })
+        ResolvedPath { components }
     }
 }
 

@@ -542,7 +542,7 @@ impl<P: ShimPlatform> Task<P> {
             }
             SyscallRequest::Open { path, flags, mode } => {
                 let path = Self::read_path(path)?;
-                self.sys_open(path, flags, mode).to_syscall_result()
+                self.sys_open(&path, flags, mode).to_syscall_result()
             }
             SyscallRequest::Close { fd } => self.sys_close(fd).to_syscall_result(),
             SyscallRequest::Dup { fd } => self.sys_dup(fd).to_syscall_result(),

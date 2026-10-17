@@ -29,7 +29,7 @@ enum Namespace {
 
 impl Namespace {
     fn resolve_path(self, context: &Context, path: &str) -> Result<String, PathError> {
-        let path = context.resolve(path)?.to_string();
+        let path = context.resolve(path).to_string();
         match (self, is_registry_path(&path)) {
             (Self::Regular, false) | (Self::Registry, true) => Ok(path),
             (Self::Regular, true) => Err(PathError::MissingComponent),
@@ -38,12 +38,7 @@ impl Namespace {
     }
 
     fn hides_registry_entry(self, context: &Context, directory_path: &str) -> bool {
-        self == Self::Regular
-            && context
-                .resolve(directory_path)
-                .expect("resolving a Rust string path cannot fail")
-                .to_string()
-                == "/"
+        self == Self::Regular && context.resolve(directory_path).to_string() == "/"
     }
 }
 

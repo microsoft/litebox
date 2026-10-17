@@ -131,11 +131,10 @@ impl<P: ShimPlatform> Drop for FilesState<P> {
 impl<P: ShimPlatform> Task<P> {
     pub(crate) fn sys_open(
         &self,
-        path: impl litebox::path::Arg,
+        path: &str,
         flags: OpenFlags,
         mode: FileMode,
     ) -> Result<u32, Errno> {
-        let path = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
