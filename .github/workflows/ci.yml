@@ -49,18 +49,6 @@ jobs:
       - name: Install AArch64 binutils
         run: |
           sudo apt install -y binutils-aarch64-linux-gnu
-      - name: Install QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86
-      - name: Enable KVM
-        # GitHub-hosted x64 Linux runners support KVM, but the runner user
-        # cannot open /dev/kvm by default.
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Cache custom out directories
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -84,7 +72,7 @@ jobs:
           # `litebox_runner_optee_on_vm_userland` and `litebox_runner_linux_on_vm_userland` are
           # ring-3 programs for them, all for
           # `x86_64-unknown-none` as set by their `.cargo/config.toml`, so they are linted from
-          # their directories and tested in QEMU below.
+          # their directories and tested in the `test_qemu` job.
           # `litebox_runner_optee_on_linux_userland` conflicts with `litebox_runner_linux_userland` due to
           # feature unification (`optee_syscall` versus `linux_syscall`). Build it separately for now.
       - run: |
@@ -93,6 +81,38 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo nextest
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
+      - run: |
+          ./.github/tools/github_actions_run_cargo test --doc
+          # We need to run `cargo test --doc` separately because doc tests
+          # aren't included in nextest at the moment. See relevant discussion at
+          # https://github.com/nextest-rs/nextest/issues/16
+      - name: Build documentation (fail on warnings)
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_qemu --exclude litebox_runner_optee_on_vm_userland --exclude litebox_runner_linux_on_vm_userland --exclude litebox_runner_vm_kernel --exclude litebox_runner_snp --exclude litebox_runner_linux_on_macos_userland
+
+  test_qemu:
+    name: Build and Test on QEMU (KVM)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-linux-gnu,x86_64-unknown-none
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Enable KVM
+        # GitHub-hosted x64 Linux runners support KVM, but the runner user
+        # cannot open /dev/kvm by default.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
       - name: Run OP-TEE TAs in a QEMU VM (KVM)
         # Also builds the runner.
         run: |
@@ -113,13 +133,6 @@ jobs:
         run: |
           QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
-      - run: |
-          ./.github/tools/github_actions_run_cargo test --doc
-          # We need to run `cargo test --doc` separately because doc tests
-          # aren't included in nextest at the moment. See relevant discussion at
-          # https://github.com/nextest-rs/nextest/issues/16
-      - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_qemu --exclude litebox_runner_optee_on_vm_userland --exclude litebox_runner_linux_on_vm_userland --exclude litebox_runner_vm_kernel --exclude litebox_runner_snp --exclude litebox_runner_linux_on_macos_userland
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
