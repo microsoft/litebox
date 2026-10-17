@@ -22,10 +22,8 @@ extern crate alloc;
 extern crate std;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::ops::Range;
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::transfer::{ByteSink, ByteSource, copy_from_source};
 use litebox_broker_core::unix_socket::UnixSocketResult;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
@@ -930,83 +928,30 @@ fn allocate_zeroed(length: usize) -> RequestResult<Vec<u8>> {
     Ok(data)
 }
 
-/// Bytes of a validated operation-scoped shared-buffer sequence, which
-/// broker objects copy to and from directly.
-struct SharedBufferBytes<'a, Memory: SharedMemory> {
-    shared_buffers: &'a SharedBufferPool<Memory>,
-    sequence: SharedBufferSequence,
-    /// The bytes' offsets in the sequence.
-    range: Range<usize>,
-}
-
-impl<'a, Memory: SharedMemory> SharedBufferBytes<'a, Memory> {
-    /// Validates `sequence` and returns all its bytes.
-    fn new(
-        shared_buffers: &'a SharedBufferPool<Memory>,
-        sequence: SharedBufferSequence,
-        max_length: u32,
-    ) -> RequestResult<Self> {
-        validate_shared_buffer(sequence, max_length)?;
-        Ok(Self {
-            shared_buffers,
-            sequence,
-            range: 0..sequence.length() as usize,
-        })
-    }
-
-    /// Divides the bytes at `mid`, or returns `None` if `mid` is past their
-    /// end.
-    fn split_at_checked(&self, mid: usize) -> Option<(Self, Self)> {
-        let mid = self.range.start.checked_add(mid)?;
-        if mid > self.range.end {
-            return None;
-        }
-        let part = |range| Self {
-            shared_buffers: self.shared_buffers,
-            sequence: self.sequence,
-            range,
-        };
-        Some((part(self.range.start..mid), part(mid..self.range.end)))
-    }
-
-    /// Returns the sequence offset of the `length` bytes at `offset`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the bytes are not all within these bytes.
-    fn sequence_offset(&self, offset: usize, length: usize) -> usize {
-        assert!(
-            offset
-                .checked_add(length)
-                .is_some_and(|end| end <= self.range.len()),
-            "shared-buffer access out of range"
-        );
-        self.range.start + offset
-    }
-}
-
-impl<Memory: SharedMemory> ByteSource for SharedBufferBytes<'_, Memory> {
-    fn len(&self) -> usize {
-        self.range.len()
-    }
-
-    fn read(&self, offset: usize, destination: &mut [u8]) -> litebox_broker_core::Result<()> {
-        let offset = self.sequence_offset(offset, destination.len());
-        self.shared_buffers
-            .read_sequence(self.sequence, offset, destination)
+/// Returns a copier that copies the parts it is lent, one after another,
+/// into the validated sequence `buffer` at `offset`.
+fn copy_to_shared_buffer<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferSequence,
+    offset: usize,
+) -> impl FnOnce(&[&[u8]]) -> litebox_broker_core::Result<()> {
+    move |parts| {
+        shared_buffers
+            .write_sequence_vectored(buffer, offset, parts)
             .map_err(|_| BrokerError::Internal)
     }
 }
 
-impl<Memory: SharedMemory> ByteSink for SharedBufferBytes<'_, Memory> {
-    fn len(&self) -> usize {
-        self.range.len()
-    }
-
-    fn write(&mut self, offset: usize, source: &[u8]) -> litebox_broker_core::Result<()> {
-        let offset = self.sequence_offset(offset, source.len());
-        self.shared_buffers
-            .write_sequence(self.sequence, offset, source)
+/// Returns a filler that fills the parts it is lent, one after another,
+/// from the validated sequence `buffer` at `offset`.
+fn fill_from_shared_buffer<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferSequence,
+    offset: usize,
+) -> impl FnOnce(&mut [&mut [u8]]) -> litebox_broker_core::Result<()> {
+    move |parts| {
+        shared_buffers
+            .read_sequence_vectored(buffer, offset, parts)
             .map_err(|_| BrokerError::Internal)
     }
 }
@@ -1546,10 +1491,14 @@ fn handle_pipe_request<Memory: SharedMemory>(
         })
         .map_err(RequestFailure::from),
         PipeRequest::Read(request) => {
-            let mut output =
-                SharedBufferBytes::new(shared_buffers, request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
-            let read = litebox_broker_core::pipe::read(process, request.handle, &mut output)
-                .map_err(RequestFailure::from)?;
+            validate_shared_buffer(request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
+            let read = litebox_broker_core::pipe::read(
+                process,
+                request.handle,
+                request.buffer.length(),
+                copy_to_shared_buffer(shared_buffers, request.buffer, 0),
+            )
+            .map_err(RequestFailure::from)?;
             Ok(PipeResponse::Read(ReadPipeResponse {
                 read: read
                     .try_into()
@@ -1557,17 +1506,21 @@ fn handle_pipe_request<Memory: SharedMemory>(
             }))
         }
         PipeRequest::Write(request) => {
-            let data =
-                SharedBufferBytes::new(shared_buffers, request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
-            litebox_broker_core::pipe::write(process, request.handle, &data)
-                .map_err(RequestFailure::from)
-                .and_then(|written| {
-                    Ok(PipeResponse::Write(WritePipeResponse {
-                        written: written
-                            .try_into()
-                            .map_err(|_| RequestFailure::Abort(ErrorCode::ResourceExhausted))?,
-                    }))
-                })
+            validate_shared_buffer(request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
+            litebox_broker_core::pipe::write(
+                process,
+                request.handle,
+                request.buffer.length() as usize,
+                fill_from_shared_buffer(shared_buffers, request.buffer, 0),
+            )
+            .map_err(RequestFailure::from)
+            .and_then(|written| {
+                Ok(PipeResponse::Write(WritePipeResponse {
+                    written: written
+                        .try_into()
+                        .map_err(|_| RequestFailure::Abort(ErrorCode::ResourceExhausted))?,
+                }))
+            })
         }
     }
 }
@@ -1638,18 +1591,19 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
             )
         }
         UnixSocketRequest::Send(request) => {
-            let buffer = SharedBufferBytes::new(
-                shared_buffers,
-                request.buffer,
-                MAX_UNIX_SOCKET_TRANSFER_SIZE,
-            )?;
-            let (address, data) = buffer
-                .split_at_checked(request.address_length as usize)
+            validate_shared_buffer(request.buffer, MAX_UNIX_SOCKET_TRANSFER_SIZE)?;
+            let address_length = request.address_length as usize;
+            let length = (request.buffer.length() as usize)
+                .checked_sub(address_length)
                 .ok_or(RequestFailure::Abort(ErrorCode::MalformedRequest))?;
-            let address = if request.address_length == 0 {
+            let address = if address_length == 0 {
                 None
             } else {
-                match UnixSocketAddress::decode(&copy_from_source(&address)?) {
+                let mut address = allocate_zeroed(address_length)?;
+                shared_buffers
+                    .read_sequence(request.buffer, 0, &mut address)
+                    .map_err(shared_buffer_access_failure)?;
+                match UnixSocketAddress::decode(&address) {
                     Ok(address) => Some(address),
                     Err(_) => {
                         return Ok(UnixSocketResponse::Failed(UnixSocketError::InvalidArgument));
@@ -1660,8 +1614,9 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 process,
                 request.handle,
                 address.as_ref(),
-                &data,
+                length,
                 request.user,
+                fill_from_shared_buffer(shared_buffers, request.buffer, address_length),
             )?
             .map_or_else(UnixSocketResponse::Failed, |sent| {
                 UnixSocketResponse::Send(SendUnixSocketResponse {
@@ -1670,11 +1625,7 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
             }))
         }
         UnixSocketRequest::Receive(request) => {
-            let buffer = SharedBufferBytes::new(
-                shared_buffers,
-                request.buffer,
-                MAX_UNIX_SOCKET_TRANSFER_SIZE,
-            )?;
+            validate_shared_buffer(request.buffer, MAX_UNIX_SOCKET_TRANSFER_SIZE)?;
             let name_size = if request.source {
                 MAX_ENCODED_UNIX_SOCKET_NAME_SIZE
             } else {
@@ -1687,16 +1638,14 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let (mut output, _) = buffer
-                .split_at_checked(request.capacity as usize)
-                .ok_or(RequestFailure::Abort(ErrorCode::MalformedRequest))?;
             let received = match unix_socket::receive(
                 process,
                 request.handle,
-                &mut output,
+                request.capacity,
                 request.peek,
                 request.source,
                 request.nonblocking,
+                copy_to_shared_buffer(shared_buffers, request.buffer, 0),
             )? {
                 Ok(received) => received,
                 Err(error) => return Ok(UnixSocketResponse::Failed(error)),

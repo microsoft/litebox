@@ -14,7 +14,7 @@ use spin::rwlock::RwLock;
 
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
-use crate::transfer::{ByteSink, ByteSource, append_to_queue, copy_from_queue_into};
+use crate::transfer::{append_to_queue, queue_parts};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
@@ -66,34 +66,67 @@ pub fn create(
     )
 }
 
-/// Reads from a broker-owned pipe to the start of `output`, returning how
-/// many bytes it read.
-pub fn read<Sink: ByteSink + ?Sized>(
+/// Reads up to `length` bytes from a broker-owned pipe, lending them to
+/// `copy` to copy out, and returns how many it read.
+pub fn read(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    output: &mut Sink,
+    length: u32,
+    copy: impl FnOnce(&[&[u8]]) -> Result<()>,
 ) -> Result<usize> {
-    if output.len() > MAX_PIPE_TRANSFER_SIZE as usize {
+    if length > MAX_PIPE_TRANSFER_SIZE {
         return Err(BrokerError::ResourceExhausted);
     }
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let object = object.read();
-    object.as_pipe()?.read(output)
+    object.as_pipe()?.read(length as usize, copy)
 }
 
-/// Writes bytes from `data` to a broker-owned pipe, returning how many it
-/// wrote.
-pub fn write<Source: ByteSource + ?Sized>(
+/// Writes up to `length` bytes to a broker-owned pipe, lending their room
+/// to `fill` to copy the first of them in, and returns how many it wrote.
+pub fn write(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    data: &Source,
+    length: usize,
+    fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
 ) -> Result<usize> {
-    if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
+    if length > MAX_PIPE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let object = object.read();
-    object.as_pipe()?.write(data)
+    object.as_pipe()?.write(length, fill)
+}
+
+/// Reads up to `length` bytes from a broker-owned pipe into a new vector.
+#[cfg(test)]
+pub(crate) fn read_to_vec(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    length: u32,
+) -> Result<alloc::vec::Vec<u8>> {
+    let mut data = alloc::vec::Vec::new();
+    let read = read(process, handle, length, |parts| {
+        data = parts.concat();
+        Ok(())
+    })?;
+    assert_eq!(read, data.len());
+    Ok(data)
+}
+
+/// Writes `data` to a broker-owned pipe.
+#[cfg(test)]
+pub(crate) fn write_from(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    data: &[u8],
+) -> Result<usize> {
+    write(
+        process,
+        handle,
+        data.len(),
+        crate::transfer::fill_from(data),
+    )
 }
 
 impl ObjectEntry {
@@ -144,11 +177,11 @@ impl PipeObject {
         }
     }
 
-    fn read<Sink: ByteSink + ?Sized>(&self, output: &mut Sink) -> Result<usize> {
+    fn read(&self, length: usize, copy: impl FnOnce(&[&[u8]]) -> Result<()>) -> Result<usize> {
         if !matches!(self.endpoint, PipeEndpoint::Read) {
             return Err(BrokerError::InvalidRights);
         }
-        if output.is_empty() {
+        if length == 0 {
             return Ok(0);
         }
 
@@ -161,18 +194,22 @@ impl PipeObject {
             };
         }
 
-        let read_len = output.len().min(state.data.len());
-        copy_from_queue_into(&state.data, 0..read_len, output)?;
+        let read_len = length.min(state.data.len());
+        copy(&queue_parts(&state.data, 0..read_len))?;
         state.data.drain(..read_len);
         state.publish(PipeEndpoint::Write);
         Ok(read_len)
     }
 
-    fn write<Source: ByteSource + ?Sized>(&self, data: &Source) -> Result<usize> {
+    fn write(
+        &self,
+        length: usize,
+        fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
+    ) -> Result<usize> {
         if !matches!(self.endpoint, PipeEndpoint::Write) {
             return Err(BrokerError::InvalidRights);
         }
-        if data.is_empty() {
+        if length == 0 {
             return Ok(0);
         }
         let mut state = self.state.write();
@@ -181,12 +218,12 @@ impl PipeObject {
         }
 
         let available = state.capacity - state.data.len();
-        if available == 0 || (data.len() <= state.atomic_write_size && available < data.len()) {
+        if available == 0 || (length <= state.atomic_write_size && available < length) {
             return Err(BrokerError::would_block(self.status.nonblocking()));
         }
 
-        let write_len = available.min(data.len());
-        append_to_queue(&mut state.data, data, write_len)?;
+        let write_len = available.min(length);
+        append_to_queue(&mut state.data, write_len, fill)?;
         state.publish(PipeEndpoint::Read);
         Ok(write_len)
     }

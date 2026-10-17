@@ -52,9 +52,7 @@ use crate::fs::File;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::socket::SocketOptions;
-use crate::transfer::{
-    ByteSink, ByteSource, append_to_queue, copy_from_queue_into, copy_from_source,
-};
+use crate::transfer::{append_to_queue, queue_parts};
 use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a Unix socket operation.
@@ -71,10 +69,10 @@ const DATAGRAM_OVERHEAD: usize = 256;
 /// which holds no reference until accepted.
 const CONNECTION_OVERHEAD: usize = 256;
 
-/// What a receive from a Unix socket copied to its output.
+/// Result of receiving from a Unix socket.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Received {
-    /// How many bytes it copied to the start of the output.
+    /// Number of bytes received.
     pub received: usize,
     /// Length of the whole datagram, or `received` for a stream socket.
     pub length: usize,
@@ -324,26 +322,30 @@ pub fn accept(
         .map(Ok)
 }
 
-/// Sends bytes from a Unix socket, to `address` if given or otherwise to
-/// its connected peer, and returns how many were sent.
+/// Sends up to `length` bytes from a Unix socket, to `address` if given or
+/// otherwise to its connected peer, and returns how many were sent.
 ///
-/// A stream socket sends as many bytes as its peer has room for. A datagram
-/// socket sends `data` as one datagram. Fails with [`BrokerError::WouldBlock`]
-/// while the receiving socket is full.
-pub fn send<Source: ByteSource + ?Sized>(
+/// The socket lends the room for the bytes it sends to `fill` to copy the
+/// first of them in. A stream socket sends as many bytes as its peer has
+/// room for. A datagram socket sends all `length` bytes as one datagram.
+/// Fails with [`BrokerError::WouldBlock`] while the receiving socket is full.
+pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
     address: Option<&UnixSocketAddress>,
-    data: &Source,
+    length: usize,
     user: FileUser,
+    fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
 ) -> Result<UnixSocketResult<usize>> {
-    if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
+    if length > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     let socket = &lease.socket;
     match socket.kind {
-        SocketType::Stream => socket.send_stream(address.is_some(), data, lease.nonblocking),
+        SocketType::Stream => {
+            socket.send_stream(address.is_some(), length, fill, lease.nonblocking)
+        }
         SocketType::Datagram => {
             // The node stays open until the send finishes, as for `connect`.
             let (target, _node) = match address {
@@ -359,43 +361,47 @@ pub fn send<Source: ByteSource + ?Sized>(
                 }
                 None => (None, None),
             };
-            socket.send_datagram(target, data, lease.nonblocking)
+            socket.send_datagram(target, length, fill, lease.nonblocking)
         }
         _ => Err(BrokerError::Internal),
     }
 }
 
-/// Receives bytes from a Unix socket to the start of `output`, leaving them
-/// queued if `peek` is set and returning the sender's name if `source` is
-/// set.
+/// Receives up to `capacity` bytes from a Unix socket, lending them to
+/// `copy` to copy out, leaving them queued if `peek` is set and returning
+/// the sender's name if `source` is set.
 ///
 /// A stream socket receives queued bytes. A datagram socket receives one
-/// datagram, discarding the bytes beyond `output`'s length unless peeking.
-/// Receiving nothing with zero length into a nonempty `output` means no more
-/// data can arrive. Fails with [`BrokerError::WouldBlock`] while nothing is
-/// queued.
+/// datagram, discarding the bytes beyond `capacity` unless peeking. No bytes
+/// with zero length for a nonzero `capacity` means no more data can arrive.
+/// Fails with [`BrokerError::WouldBlock`] while nothing is queued.
 ///
 /// If `nonblocking` is set, the receive acts as for a non-blocking socket:
 /// it fails with [`BrokerError::NonBlockingWouldBlock`], and a datagram
 /// socket whose receive direction is shut down fails instead of reporting the
 /// end of data, as Linux does.
-pub fn receive<Sink: ByteSink + ?Sized>(
+pub fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    output: &mut Sink,
+    capacity: u32,
     peek: bool,
     source: bool,
     nonblocking: bool,
+    copy: impl FnOnce(&[&[u8]]) -> Result<()>,
 ) -> Result<UnixSocketResult<Received>> {
-    if output.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
+    if capacity > MAX_UNIX_SOCKET_TRANSFER_SIZE {
         return Err(BrokerError::ResourceExhausted);
     }
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
     let socket = &lease.socket;
     let nonblocking = nonblocking || lease.nonblocking;
     match socket.kind {
-        SocketType::Stream => socket.receive_stream(output, peek, source, nonblocking),
-        SocketType::Datagram => socket.receive_datagram(output, peek, source, nonblocking),
+        SocketType::Stream => {
+            socket.receive_stream(capacity as usize, peek, source, nonblocking, copy)
+        }
+        SocketType::Datagram => {
+            socket.receive_datagram(capacity as usize, peek, source, nonblocking, copy)
+        }
         _ => Err(BrokerError::Internal),
     }
 }
@@ -1054,10 +1060,11 @@ impl Socket {
         channel.wake()
     }
 
-    fn send_stream<Source: ByteSource + ?Sized>(
+    fn send_stream(
         self: &Arc<Self>,
         addressed: bool,
-        data: &Source,
+        length: usize,
+        fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
         let peer = {
@@ -1077,7 +1084,7 @@ impl Socket {
             }
             peer.clone()
         };
-        if data.is_empty() {
+        if length == 0 {
             return Ok(Ok(0));
         }
         let Some(peer) = peer.upgrade() else {
@@ -1093,10 +1100,10 @@ impl Socket {
                 channel.wait(self)?;
                 return Err(BrokerError::would_block(nonblocking));
             }
-            let length = room.min(data.len());
+            let length = room.min(length);
             // Charging first keeps a rejected send from growing the queue.
             self.sockets.charge(&peer.quota, length)?;
-            if let Err(error) = append_to_queue(&mut channel.queue.bytes, data, length) {
+            if let Err(error) = append_to_queue(&mut channel.queue.bytes, length, fill) {
                 self.sockets.refund(&peer.quota, length);
                 return Err(error);
             }
@@ -1107,12 +1114,13 @@ impl Socket {
         Ok(Ok(length))
     }
 
-    /// Sends `data` as one datagram to `target`, or to the connected peer if
-    /// `target` is `None`.
-    fn send_datagram<Source: ByteSource + ?Sized>(
+    /// Sends `length` bytes, which `fill` copies in, as one datagram to
+    /// `target`, or to the connected peer if `target` is `None`.
+    fn send_datagram(
         self: &Arc<Self>,
         target: Option<Arc<Socket>>,
-        data: &Source,
+        length: usize,
+        fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
         let (peer, write_shut, source) = {
@@ -1136,16 +1144,18 @@ impl Socket {
                 _ => return Ok(self.disconnect_from(peer.as_ptr())),
             }
         };
-        if data.len() > CAPACITY {
+        if length > CAPACITY {
             return Ok(Err(UnixSocketError::MessageTooLarge));
         }
         if write_shut {
             return Ok(Err(UnixSocketError::BrokenPipe));
         }
-        let datagram = Datagram {
-            data: copy_from_source(data)?,
-            source,
-        };
+        let mut data = Vec::new();
+        data.try_reserve_exact(length)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        data.resize(length, 0);
+        fill(&mut [&mut data[..]])?;
+        let datagram = Datagram { data, source };
         let charge = datagram.charge();
         // The receiver's state stays locked while the datagram is queued, so
         // connecting it rejects other senders from then on, as in Linux.
@@ -1187,7 +1197,7 @@ impl Socket {
             });
         }
         target.publish();
-        Ok(Ok(data.len()))
+        Ok(Ok(length))
     }
 
     /// Disconnects this datagram socket from `peer`, which closed, and
@@ -1214,12 +1224,13 @@ impl Socket {
         Err(UnixSocketError::ConnectionRefused)
     }
 
-    fn receive_stream<Sink: ByteSink + ?Sized>(
+    fn receive_stream(
         &self,
-        output: &mut Sink,
+        capacity: usize,
         peek: bool,
         source: bool,
         nonblocking: bool,
+        copy: impl FnOnce(&[&[u8]]) -> Result<()>,
     ) -> Result<UnixSocketResult<Received>> {
         let source = match &self.state.lock().connection {
             Connection::Connected { peer_name, .. } => source.then(|| peer_name.clone()),
@@ -1227,13 +1238,13 @@ impl Socket {
                 return Ok(Err(UnixSocketError::InvalidArgument));
             }
         };
-        if output.is_empty() {
+        if capacity == 0 {
             return Ok(Ok(Received {
                 source,
                 ..Received::default()
             }));
         }
-        let (received, wakeups) = {
+        let (length, wakeups) = {
             let mut channel = self.incoming.lock();
             if channel.queue.bytes.is_empty() {
                 return if channel.is_shut() {
@@ -1245,8 +1256,8 @@ impl Socket {
                     Err(BrokerError::would_block(nonblocking))
                 };
             }
-            let length = output.len().min(channel.queue.bytes.len());
-            copy_from_queue_into(&channel.queue.bytes, 0..length, output)?;
+            let length = capacity.min(channel.queue.bytes.len());
+            copy(&queue_parts(&channel.queue.bytes, 0..length))?;
             if peek {
                 (length, Wakeups::default())
             } else {
@@ -1262,18 +1273,19 @@ impl Socket {
         };
         wakeups.wake();
         Ok(Ok(Received {
-            received,
-            length: received,
+            received: length,
+            length,
             source,
         }))
     }
 
-    fn receive_datagram<Sink: ByteSink + ?Sized>(
+    fn receive_datagram(
         &self,
-        output: &mut Sink,
+        capacity: usize,
         peek: bool,
         source: bool,
         nonblocking: bool,
+        copy: impl FnOnce(&[&[u8]]) -> Result<()>,
     ) -> Result<UnixSocketResult<Received>> {
         let (received, wakeups) = {
             let mut channel = self.incoming.lock();
@@ -1288,8 +1300,8 @@ impl Socket {
                 };
             };
             let length = datagram.data.len();
-            let received = output.len().min(length);
-            output.write(0, &datagram.data[..received])?;
+            let received = capacity.min(length);
+            copy(&[&datagram.data[..received]])?;
             if peek {
                 let received = Received {
                     received,

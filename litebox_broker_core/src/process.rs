@@ -2185,7 +2185,7 @@ mod tests {
         child.complete_start().unwrap();
 
         assert_eq!(
-            crate::pipe::write(&child, child_writer, &[1, 2, 3][..]),
+            crate::pipe::write_from(&child, child_writer, &[1, 2, 3]),
             Ok(3)
         );
         assert_eq!(
@@ -2197,12 +2197,13 @@ mod tests {
         // Freeing space that an atomic write still cannot use leaves `WRITE`
         // unchanged but must still wake writers.
         assert_eq!(
-            crate::pipe::write(&parent, writer, &[4, 5][..]),
+            crate::pipe::write_from(&parent, writer, &[4, 5]),
             Err(BrokerError::WouldBlock)
         );
-        let mut data = [0];
-        assert_eq!(crate::pipe::read(&parent, reader, &mut data[..]), Ok(1));
-        assert_eq!(data, [1]);
+        assert_eq!(
+            crate::pipe::read_to_vec(&parent, reader, 1),
+            Ok(std::vec::Vec::from([1]))
+        );
         assert_eq!(
             take_republished(&parent_sink),
             [(writer, ReadinessFlags::WRITE)]
@@ -3688,12 +3689,13 @@ mod tests {
             .unwrap();
         assert_eq!(source.close_object_reference(writer), Ok(()));
         assert_eq!(
-            crate::pipe::write(&target, duplicated_writer, &[1][..]),
+            crate::pipe::write_from(&target, duplicated_writer, &[1]),
             Ok(1)
         );
-        let mut data = [0];
-        assert_eq!(crate::pipe::read(&source, reader, &mut data[..]), Ok(1));
-        assert_eq!(data, [1]);
+        assert_eq!(
+            crate::pipe::read_to_vec(&source, reader, 1),
+            Ok(std::vec::Vec::from([1]))
+        );
 
         let event = crate::event::create(&target, 0, FileOpenFlags::NONE).unwrap();
         assert_eq!(
@@ -4134,29 +4136,34 @@ mod tests {
             Ok(ReadinessFlags::default())
         );
         assert_eq!(
-            crate::pipe::read(&process, reader, &mut [0][..]),
+            crate::pipe::read_to_vec(&process, reader, 1),
             Err(BrokerError::WouldBlock)
         );
-        assert_eq!(crate::pipe::write(&process, writer, &[1, 2][..]), Ok(2));
-        assert_eq!(crate::pipe::write(&process, writer, &[3, 4, 5][..]), Ok(2));
+        assert_eq!(crate::pipe::write_from(&process, writer, &[1, 2]), Ok(2));
+        assert_eq!(crate::pipe::write_from(&process, writer, &[3, 4, 5]), Ok(2));
         assert_eq!(
-            crate::pipe::write(&process, writer, &[5][..]),
+            crate::pipe::write_from(&process, writer, &[5]),
             Err(BrokerError::WouldBlock)
         );
-        let mut data = [0; 3];
-        assert_eq!(crate::pipe::read(&process, reader, &mut data[..]), Ok(3));
-        assert_eq!(data, [1, 2, 3]);
-        assert_eq!(crate::pipe::write(&process, writer, &[5, 6][..]), Ok(2));
+        assert_eq!(
+            crate::pipe::read_to_vec(&process, reader, 3),
+            Ok(std::vec::Vec::from([1, 2, 3]))
+        );
+        assert_eq!(crate::pipe::write_from(&process, writer, &[5, 6]), Ok(2));
         assert_eq!(process.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
             process.check_readiness(reader),
             Ok(ReadinessFlags::READ | ReadinessFlags::CLOSED)
         );
-        let mut data = [0; 4];
-        assert_eq!(crate::pipe::read(&process, reader, &mut data[..]), Ok(3));
-        assert_eq!(data[..3], [4, 5, 6]);
-        assert_eq!(crate::pipe::read(&process, reader, &mut [0][..]), Ok(0));
+        assert_eq!(
+            crate::pipe::read_to_vec(&process, reader, 4),
+            Ok(std::vec::Vec::from([4, 5, 6]))
+        );
+        assert_eq!(
+            crate::pipe::read_to_vec(&process, reader, 1),
+            Ok(std::vec::Vec::new())
+        );
         assert_eq!(process.close_object_reference(reader), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
@@ -4168,9 +4175,9 @@ mod tests {
         let (reader, writer) = crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(process.close_object_reference(reader), Ok(()));
-        assert_eq!(crate::pipe::write(&process, writer, &[][..]), Ok(0));
+        assert_eq!(crate::pipe::write_from(&process, writer, &[]), Ok(0));
         assert_eq!(
-            crate::pipe::write(&process, writer, &[1][..]),
+            crate::pipe::write_from(&process, writer, &[1]),
             Err(BrokerError::PeerClosed)
         );
         assert_eq!(

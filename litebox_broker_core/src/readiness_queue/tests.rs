@@ -94,7 +94,7 @@ fn level_triggered_entries_report_while_their_targets_stay_ready() {
     );
     assert_eq!(woken(), 0);
 
-    crate::pipe::write(&process, write, &b"ab"[..]).unwrap();
+    crate::pipe::write_from(&process, write, b"ab").unwrap();
     assert_eq!(
         *sink.republished.lock().unwrap(),
         [(queue, ReadinessFlags::READ)]
@@ -105,7 +105,7 @@ fn level_triggered_entries_report_while_their_targets_stay_ready() {
     assert_eq!(woken(), 1);
     assert_eq!(take(&process, queue), [event(7, ReadinessFlags::READ)]);
 
-    crate::pipe::read(&process, read, &mut [0; 2][..]).unwrap();
+    crate::pipe::read_to_vec(&process, read, 2).unwrap();
     assert_eq!(take(&process, queue), []);
     assert_eq!(
         process.check_readiness(queue),

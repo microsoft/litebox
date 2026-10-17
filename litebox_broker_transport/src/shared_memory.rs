@@ -278,6 +278,35 @@ impl<Memory: SharedMemory> SharedBufferPool<Memory> {
         Ok(())
     }
 
+    /// Copies the bytes at `offset` in `sequence` into `destinations`, one
+    /// after another.
+    pub fn read_sequence_vectored(
+        &self,
+        sequence: SharedBufferSequence,
+        mut offset: usize,
+        destinations: &mut [&mut [u8]],
+    ) -> Result<(), SharedBufferError> {
+        for destination in destinations {
+            self.read_sequence(sequence, offset, destination)?;
+            offset += destination.len();
+        }
+        Ok(())
+    }
+
+    /// Copies `sources`, one after another, into `sequence` at `offset`.
+    pub fn write_sequence_vectored(
+        &self,
+        sequence: SharedBufferSequence,
+        mut offset: usize,
+        sources: &[&[u8]],
+    ) -> Result<(), SharedBufferError> {
+        for source in sources {
+            self.write_sequence(sequence, offset, source)?;
+            offset += source.len();
+        }
+        Ok(())
+    }
+
     /// Returns the shared-memory ranges holding the `length` bytes at
     /// `offset` in `sequence`, in transfer order.
     fn ranges_at(
@@ -385,6 +414,29 @@ mod tests {
         );
         assert_eq!(
             pool.read_sequence(sequence, usize::MAX, &mut [0; 1]),
+            Err(SharedBufferError::TransferExceedsSequence)
+        );
+    }
+
+    #[test]
+    fn pool_copies_parts_one_after_another() {
+        let layout = SharedBufferLayout::new(4, 3).unwrap();
+        let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
+        let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
+        let sequence =
+            SharedBufferSequence::new(&[SharedBufferSlotIndex(0), SharedBufferSlotIndex(2)], 7)
+                .unwrap();
+
+        pool.write_sequence_vectored(sequence, 1, &[&[1, 2], &[], &[3, 4, 5]])
+            .unwrap();
+        assert_eq!(memory.bytes(), [0, 1, 2, 3, 0, 0, 0, 0, 4, 5, 0, 0]);
+
+        let (mut first, mut second) = ([0; 3], [0; 2]);
+        pool.read_sequence_vectored(sequence, 2, &mut [&mut first, &mut [], &mut second])
+            .unwrap();
+        assert_eq!((first, second), ([2, 3, 4], [5, 0]));
+        assert_eq!(
+            pool.write_sequence_vectored(sequence, 5, &[&[0], &[0; 2]]),
             Err(SharedBufferError::TransferExceedsSequence)
         );
     }

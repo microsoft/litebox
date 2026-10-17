@@ -8,6 +8,7 @@ use crate::fs::resolver::Resolver;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
 use crate::test_support::TestBrokerCoreBuilder;
+use crate::transfer::fill_from;
 use crate::{BrokerCore, CallerCredential, PolicyEngine};
 use std::vec;
 
@@ -25,15 +26,26 @@ struct Message {
 fn receive_message(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    capacity: usize,
+    capacity: u32,
     peek: bool,
     source: bool,
     nonblocking: bool,
 ) -> Result<UnixSocketResult<Message>> {
-    let mut data = vec![0; capacity];
-    let result = receive(process, handle, &mut data[..], peek, source, nonblocking)?;
+    let mut data = Vec::new();
+    let result = receive(
+        process,
+        handle,
+        capacity,
+        peek,
+        source,
+        nonblocking,
+        |parts| {
+            data = parts.concat();
+            Ok(())
+        },
+    )?;
     Ok(result.map(|received| {
-        data.truncate(received.received);
+        assert_eq!(received.received, data.len());
         Message {
             data,
             length: received.length,
@@ -132,7 +144,14 @@ impl Fixture {
     }
 
     fn send(&self, handle: ObjectHandle, data: &[u8]) -> Result<UnixSocketResult<usize>> {
-        send(&self.process, handle, None, data, USER)
+        send(
+            &self.process,
+            handle,
+            None,
+            data.len(),
+            USER,
+            fill_from(data),
+        )
     }
 
     fn send_to(
@@ -141,14 +160,21 @@ impl Fixture {
         address: &UnixSocketAddress,
         data: &[u8],
     ) -> Result<UnixSocketResult<usize>> {
-        send(&self.process, handle, Some(address), data, USER)
+        send(
+            &self.process,
+            handle,
+            Some(address),
+            data.len(),
+            USER,
+            fill_from(data),
+        )
     }
 
-    fn receive(&self, handle: ObjectHandle, capacity: usize) -> Result<UnixSocketResult<Message>> {
+    fn receive(&self, handle: ObjectHandle, capacity: u32) -> Result<UnixSocketResult<Message>> {
         receive_message(&self.process, handle, capacity, false, true, false)
     }
 
-    fn receive_data(&self, handle: ObjectHandle, capacity: usize) -> Vec<u8> {
+    fn receive_data(&self, handle: ObjectHandle, capacity: u32) -> Vec<u8> {
         self.receive(handle, capacity).unwrap().unwrap().data
     }
 
@@ -939,7 +965,7 @@ fn sockets_connect_to_themselves_only_as_datagram_sockets() {
 #[test]
 fn stream_directions_transfer_in_parallel() {
     const LENGTH: usize = 4 * CAPACITY;
-    const CHUNK: usize = 4096;
+    const CHUNK: u32 = 4096;
     let fixture = Fixture::new();
     let (first, second) = fixture.pair(SocketType::Stream);
     let data: Vec<u8> = (0..LENGTH)
@@ -951,7 +977,7 @@ fn stream_directions_transfer_in_parallel() {
             scope.spawn(move || {
                 let mut sent = 0;
                 while sent < LENGTH {
-                    let end = LENGTH.min(sent + CHUNK);
+                    let end = LENGTH.min(sent + CHUNK as usize);
                     sent += Fixture::retry(|| fixture.send(sender, &data[sent..end])).unwrap();
                 }
             });
