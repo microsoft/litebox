@@ -6,7 +6,7 @@
 use crate::Task;
 use aes::{
     Aes128, Aes192, Aes256,
-    cipher::{NewCipher, StreamCipher, generic_array::GenericArray},
+    cipher::{KeyIvInit, StreamCipher, generic_array::GenericArray},
 };
 use ctr::Ctr128BE;
 use litebox::platform::RawMutPointer;
@@ -134,7 +134,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
                 #[cfg(not(debug_assertions))]
                 return Err(TeeResult::NotSupported);
             };
-            tee_cryp_state_map.set_cipher(state, &cipher)?;
+            tee_cryp_state_map.set_cipher(state, cipher)?;
             Ok(())
         } else {
             Err(TeeResult::BadParameters)

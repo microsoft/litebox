@@ -7,8 +7,8 @@ repository = "https://github.com/microsoft/litebox"
 description = "A LiteBox shim that provides an OP-TEE-compatible ABI"
 
 [dependencies]
-aes = { version = "0.7", default-features = false }
-ctr = { version = "0.8", default-features = false }
+aes = { version = "0.8", default-features = false, features = ["zeroize"] }
+ctr = { version = "0.9", default-features = false, features = ["zeroize"] }
 elf = { version = "0.8.0", default-features = false }
 hashbrown = "0.15.2"
 litebox = { path = "../litebox/", version = "0.1.0" }

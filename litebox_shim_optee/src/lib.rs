@@ -33,6 +33,7 @@ use litebox_common_optee::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zerocopy::FromBytes;
+use zeroize::Zeroizing;
 
 pub mod loader;
 pub mod rpc_context;
@@ -795,7 +796,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
                 if blen > 4096 {
                     Err(TeeResult::OutOfMemory)
                 } else {
-                    let mut kernel_buf = vec![0u8; blen];
+                    let mut kernel_buf = Zeroizing::new(vec![0u8; blen]);
                     self.sys_cryp_random_number_generate(&mut kernel_buf)
                         .and_then(|()| {
                             buf.copy_from_slice(0, &kernel_buf)
@@ -967,7 +968,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
                 if num_bytes > 4096 {
                     Err(TeeResult::OutOfMemory)
                 } else {
-                    let mut kernel_buf = vec![0u8; num_bytes];
+                    let mut kernel_buf = Zeroizing::new(vec![0u8; num_bytes]);
                     self.sys_cryp_random_number_generate(&mut kernel_buf)
                         .and_then(|()| {
                             buf.copy_from_slice(0, &kernel_buf)
@@ -1190,12 +1191,12 @@ where
         &mut usize,
     ) -> Result<(), TeeResult>,
 {
-    if let Some(src_slice) = src.to_owned_slice(src_len)
+    if let Some(src_slice) = src.to_owned_slice(src_len).map(Zeroizing::new)
         && let Some(length) = dst_len.read_at_offset(0)
         && length <= MAX_KERNEL_BUF_SIZE as u64
     {
         let mut length: usize = length.trunc();
-        let mut kernel_buf = vec![0u8; length];
+        let mut kernel_buf = Zeroizing::new(vec![0u8; length]);
         let result = syscall_fn(task, state, &src_slice, &mut kernel_buf, &mut length);
         match result {
             Ok(()) => {
@@ -1227,7 +1228,7 @@ where
 pub(crate) struct TeeObj {
     info: TeeObjectInfo,
     busy: bool,
-    key: Option<alloc::boxed::Box<[u8]>>,
+    key: Option<Zeroizing<Box<[u8]>>>,
 }
 
 impl TeeObj {
@@ -1257,8 +1258,8 @@ impl TeeObj {
         self.key = None;
     }
 
-    pub fn set_key(&mut self, key: &[u8]) {
-        self.key = Some(alloc::boxed::Box::from(key));
+    pub fn set_key(&mut self, key: Zeroizing<Box<[u8]>>) {
+        self.key = Some(key);
         self.info
             .handle_flags
             .set(TeeHandleFlag::TEE_HANDLE_FLAG_KEY_SET, true);
@@ -1268,7 +1269,7 @@ impl TeeObj {
         if self.info.handle_flags.contains(
             TeeHandleFlag::TEE_HANDLE_FLAG_INITIALIZED | TeeHandleFlag::TEE_HANDLE_FLAG_KEY_SET,
         ) {
-            self.key.as_deref()
+            self.key.as_deref().map(|k| &**k)
         } else {
             None
         }
@@ -1324,7 +1325,7 @@ impl TeeObjMap {
                 let Some(key_box) = key_ptr.to_owned_slice(key_len) else {
                     return Err(TeeResult::BadParameters);
                 };
-                tee_obj.set_key(&key_box);
+                tee_obj.set_key(Zeroizing::new(key_box));
             } else {
                 #[cfg(debug_assertions)]
                 todo!(
@@ -1423,8 +1424,8 @@ impl TeeCrypState {
     }
 
     #[expect(dead_code)]
-    pub fn set_cipher(&mut self, cipher: &Cipher) {
-        self.cipher = Some(cipher.clone());
+    pub fn set_cipher(&mut self, cipher: Cipher) {
+        self.cipher = Some(cipher);
     }
 
     pub fn get_mut_cipher(&mut self) -> Option<&mut Cipher> {
@@ -1440,6 +1441,16 @@ pub(crate) enum Cipher {
     Aes192Ctr(Ctr128BE<Aes192>),
     Aes256Ctr(Ctr128BE<Aes256>),
 }
+
+const _: () = {
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    #[allow(dead_code)]
+    fn check() {
+        assert_zeroize_on_drop::<Ctr128BE<Aes128>>();
+        assert_zeroize_on_drop::<Ctr128BE<Aes192>>();
+        assert_zeroize_on_drop::<Ctr128BE<Aes256>>();
+    }
+};
 
 /// A data structure to manage `TeeCrypState` per handle.
 ///
@@ -1464,10 +1475,10 @@ impl TeeCrypStateMap {
         Some(handle)
     }
 
-    pub fn set_cipher(&self, handle: TeeCrypStateHandle, cipher: &Cipher) -> Result<(), TeeResult> {
+    pub fn set_cipher(&self, handle: TeeCrypStateHandle, cipher: Cipher) -> Result<(), TeeResult> {
         let mut inner = self.inner.lock();
         if let Some(state) = inner.get_mut(&handle) {
-            state.cipher = Some(cipher.clone());
+            state.cipher = Some(cipher);
             Ok(())
         } else {
             Err(TeeResult::ItemNotFound)
