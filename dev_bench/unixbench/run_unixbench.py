@@ -415,6 +415,13 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
     process.wait()
 
 
+def _broker_policy_args(bench: BenchmarkDef) -> list[str]:
+    """Broker flags that permit what ``bench`` needs; fork is denied by default."""
+    if bench.requires_fork:
+        return ["--unstable", "--allow-process-duplication"]
+    return []
+
+
 def run_litebox(
     pgms_dir: Path,
     bench: BenchmarkDef,
@@ -433,8 +440,8 @@ def run_litebox(
     tar_path, guest_program = prepared
     broker_path = runner_path.with_name("litebox-broker-userland")
 
-    cmd = [
-        str(broker_path),
+    cmd = [str(broker_path), *_broker_policy_args(bench)]
+    cmd += [
         "--fs-initial-files", str(tar_path),
         "--runner", str(runner_path),
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
@@ -486,8 +493,8 @@ def run_litebox_windows(
         return None
 
     broker_path = runner_path.with_name("litebox-broker-userland.exe")
-    cmd = [
-        str(broker_path),
+    cmd = [str(broker_path), *_broker_policy_args(bench)]
+    cmd += [
         "--fs-initial-files", str(tar_path),
         "--runner", str(runner_path),
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",

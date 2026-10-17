@@ -57,7 +57,7 @@ The following benchmarks match the official UnixBench `./Run` script invocations
 
 (\*) `fstime` uses its own `SIGALRM` handler, not `timeit.c`.
 
-(\*\*) Requires `fork`. Runs natively but is skipped under LiteBox (reports N/A) until fork support is added.
+(\*\*) Requires `fork`. Under LiteBox the script runs it with the broker's `--unstable --allow-process-duplication` flags, since the broker denies fork by default. `shell1` and `shell8` still fail under LiteBox because the packaged rootfs lacks `/bin/sh`, the benchmark scripts, and the tools they call.
 
 ### Notes on Alarm-based Benchmarks
 
