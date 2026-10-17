@@ -596,7 +596,14 @@ pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<File
     process.core.fs.is_terminal(&file)
 }
 
-/// Controls a shared terminal through an authorized, non-path-only file handle.
+/// Controls a shared terminal through any open file handle that refers to it.
+///
+/// Like Linux, every operation only requires an open handle, not a particular access mode;
+/// stricter guest rules belong in the guest's shim. Fails with [`BrokerError::InvalidRights`] for
+/// a file opened only for path-based operations and reports [`NotTerminal`] for any other file
+/// that is not a terminal, so a caller can classify a handle with a single request.
+///
+/// [`NotTerminal`]: litebox_broker_protocol::terminal::TerminalError::NotTerminal
 pub fn terminal_control(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -607,23 +614,17 @@ pub fn terminal_control(
         litebox_broker_protocol::terminal::TerminalError,
     >,
 > {
-    use litebox_broker_protocol::terminal::TerminalOperation;
-    let file = match operation {
-        TerminalOperation::GetSettings
-        | TerminalOperation::GetWindowSize
-        | TerminalOperation::Drain => {
-            file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let Some(terminal) = &file.terminal else {
+        let flags = process.core.fs.get_status_flags(&file)?.flags;
+        if flags.contains(FileOpenFlags::PATH) {
+            return Err(BrokerError::InvalidRights);
         }
-        TerminalOperation::SetSettings { .. }
-        | TerminalOperation::SetWindowSize(_)
-        | TerminalOperation::Flush { .. } => file(process, handle, ObjectRights::WRITE)?,
-    };
-    match &file.terminal {
-        Some(terminal) => terminal.control(operation),
-        None => Ok(Err(
+        return Ok(Err(
             litebox_broker_protocol::terminal::TerminalError::NotTerminal,
-        )),
-    }
+        ));
+    };
+    terminal.control(operation)
 }
 
 /// Returns the access mode and status flags of a broker-owned open file.

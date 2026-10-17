@@ -203,6 +203,7 @@ mod tests {
         for (path, flags, expected) in [
             ("/dev/stdin", OFlags::RDONLY, Err(Errno::ENOTTY)),
             ("/dev/stdout", OFlags::WRONLY, Ok(0)),
+            ("/dev/stdout", OFlags::RDONLY, Ok(0)),
             ("/dev/stderr", OFlags::WRONLY, Err(Errno::ENOTTY)),
             ("/dev/./stdout", OFlags::WRONLY, Ok(0)),
         ] {
@@ -211,6 +212,8 @@ mod tests {
                 task.sys_ioctl(fd, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
                 expected
             );
+            // Like Linux, a change needs only an open descriptor, whatever its access mode.
+            assert_eq!(task.sys_ioctl(fd, IoctlArg::TCFLSH(0)), expected);
         }
 
         let path = i32::try_from(
@@ -226,6 +229,11 @@ mod tests {
             Err(Errno::EBADF)
         );
         assert_eq!(task.sys_ioctl(path, IoctlArg::FIOCLEX), Err(Errno::EBADF));
+
+        // Like Linux, the descriptor is checked before the request's argument.
+        for (fd, expected) in [(1, Errno::EINVAL), (0, Errno::ENOTTY), (path, Errno::EBADF)] {
+            assert_eq!(task.sys_ioctl(fd, IoctlArg::TCFLSH(3)), Err(expected));
+        }
     }
 
     #[test]

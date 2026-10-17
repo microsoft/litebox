@@ -131,10 +131,6 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(self.file.status()?)
     }
 
-    pub(crate) fn is_terminal(&self) -> Result<bool, Errno> {
-        Ok(self.file.is_terminal()?)
-    }
-
     /// Controls the shared terminal, waiting interruptibly for output-draining operations.
     pub(crate) fn terminal_control(
         &self,
@@ -2527,6 +2523,49 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
+/// Translates a terminal ioctl into the broker operation it requests.
+fn terminal_operation<Platform: ShimPlatform>(arg: &IoctlArg) -> Result<TerminalOperation, Errno> {
+    use litebox_broker_protocol::terminal::{ChangeTiming, TerminalSettings};
+    Ok(match arg {
+        IoctlArg::TCGETS(_) => TerminalOperation::GetSettings,
+        IoctlArg::TCSETS(ptr) | IoctlArg::TCSETSW(ptr) | IoctlArg::TCSETSF(ptr) => {
+            let termios = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+            let settings = TerminalSettings::try_from(&termios).inspect_err(|_| {
+                log_unsupported!("terminal settings {:?}", termios);
+            })?;
+            TerminalOperation::SetSettings {
+                settings,
+                timing: match arg {
+                    IoctlArg::TCSETSW(_) => ChangeTiming::AfterOutput,
+                    IoctlArg::TCSETSF(_) => ChangeTiming::AfterOutputAndFlushInput,
+                    _ => ChangeTiming::Now,
+                },
+            }
+        }
+        IoctlArg::TIOCGWINSZ(_) => TerminalOperation::GetWindowSize,
+        IoctlArg::TIOCSWINSZ(ptr) => {
+            let size = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+            TerminalOperation::SetWindowSize(size.into())
+        }
+        IoctlArg::TCFLSH(selector) => {
+            if *selector > 2 {
+                return Err(Errno::EINVAL);
+            }
+            TerminalOperation::Flush {
+                input: *selector != 1,
+                output: *selector != 0,
+            }
+        }
+        IoctlArg::TCSBRK(0) => {
+            log_unsupported!("terminal serial break");
+            return Err(Errno::EOPNOTSUPP);
+        }
+        IoctlArg::TCSBRK(_) => TerminalOperation::Drain,
+        IoctlArg::TIOCGPTN(_) => return Err(Errno::ENOTTY),
+        _ => unreachable!("non-terminal ioctl"),
+    })
+}
+
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
@@ -2592,46 +2631,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     fn terminal_ioctl(&self, file: &File<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
-        use litebox_broker_protocol::terminal::{
-            ChangeTiming, TerminalOperation as Op, TerminalSettings,
-        };
-        let operation = match arg {
-            IoctlArg::TCGETS(_) => Op::GetSettings,
-            IoctlArg::TCSETS(ptr) | IoctlArg::TCSETSW(ptr) | IoctlArg::TCSETSF(ptr) => {
-                let termios = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-                let settings = TerminalSettings::try_from(&termios).inspect_err(|_| {
-                    log_unsupported!("terminal settings {:?}", termios);
-                })?;
-                Op::SetSettings {
-                    settings,
-                    timing: match arg {
-                        IoctlArg::TCSETSW(_) => ChangeTiming::AfterOutput,
-                        IoctlArg::TCSETSF(_) => ChangeTiming::AfterOutputAndFlushInput,
-                        _ => ChangeTiming::Now,
-                    },
-                }
+        let operation = match terminal_operation::<Platform>(arg) {
+            Ok(operation) => operation,
+            Err(error) => {
+                // Linux rejects the descriptor (`EBADF` for `O_PATH`, `ENOTTY` for a
+                // non-terminal) before the request's argument.
+                file.terminal_control(TerminalOperation::GetSettings, None)?;
+                return Err(error);
             }
-            IoctlArg::TIOCGWINSZ(_) => Op::GetWindowSize,
-            IoctlArg::TIOCSWINSZ(ptr) => {
-                let size = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-                Op::SetWindowSize(size.into())
-            }
-            IoctlArg::TCFLSH(selector) => {
-                if *selector > 2 {
-                    return Err(Errno::EINVAL);
-                }
-                Op::Flush {
-                    input: *selector != 1,
-                    output: *selector != 0,
-                }
-            }
-            IoctlArg::TCSBRK(0) => {
-                log_unsupported!("terminal serial break");
-                return Err(Errno::EOPNOTSUPP);
-            }
-            IoctlArg::TCSBRK(_) => Op::Drain,
-            IoctlArg::TIOCGPTN(_) => return Err(Errno::ENOTTY),
-            _ => unreachable!("non-terminal ioctl"),
         };
         let response = file.terminal_control(operation, Some(&self.wait_cx()))?;
         match (arg, response) {
@@ -2652,14 +2659,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let files = self.files.borrow();
-        if let Some(file) = files.typed_fd(fd)?.as_file() {
-            self.global.with_file(file, |file| {
-                if file.get_status_flags()?.contains(OFlags::PATH) {
-                    return Err(Errno::EBADF);
-                }
-                Ok(())
-            })?;
-        }
         match arg {
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
@@ -2717,7 +2716,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }};
                 }
                 fd.dispatch(
-                    |fd| set_cloexec!(fd),
+                    |fd| {
+                        // Linux refuses every ioctl on an `O_PATH` descriptor.
+                        let flags = self.global.with_file(fd, File::get_status_flags)?;
+                        if flags.contains(OFlags::PATH) {
+                            return Err(Errno::EBADF);
+                        }
+                        set_cloexec!(fd)
+                    },
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
                     |fd| set_cloexec!(fd),
@@ -2737,12 +2743,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.file_only(Errno::ENOTTY)?;
-                self.global.with_file(fd, |file| {
-                    if !file.is_terminal()? {
-                        return Err(Errno::ENOTTY);
-                    }
-                    self.terminal_ioctl(file, &arg)
-                })
+                self.global
+                    .with_file(fd, |file| self.terminal_ioctl(file, &arg))
             }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
