@@ -120,6 +120,7 @@ pub struct TestStdioProvider {
     stdin_terminal: bool,
     stdout_terminal: bool,
     stderr_terminal: bool,
+    terminal: Arc<TestTerminal>,
 }
 
 impl Default for TestStdioProvider {
@@ -136,6 +137,10 @@ impl Default for TestStdioProvider {
             stdin_terminal: false,
             stdout_terminal: false,
             stderr_terminal: false,
+            terminal: Arc::new(TestTerminal(Mutex::new((
+                litebox_broker_protocol::terminal::TerminalSettings::default(),
+                litebox_broker_protocol::terminal::WindowSize::default(),
+            )))),
         }
     }
 }
@@ -195,6 +200,15 @@ impl TestStdioProvider {
 }
 
 impl StdioProvider for TestStdioProvider {
+    fn terminal(&self, stream: StdioStream) -> Option<Arc<dyn crate::terminal::TerminalEndpoint>> {
+        let connected = match stream {
+            StdioStream::Stdin => self.stdin_terminal,
+            StdioStream::Stdout => self.stdout_terminal,
+            StdioStream::Stderr => self.stderr_terminal,
+        };
+        connected.then(|| Arc::clone(&self.terminal) as Arc<dyn crate::terminal::TerminalEndpoint>)
+    }
+
     fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
         if input.bytes.is_empty() && input.open {
@@ -252,6 +266,57 @@ struct TestStdioInput {
     bytes: VecDeque<u8>,
     open: bool,
     blocked_reads: usize,
+}
+
+struct TestTerminal(
+    Mutex<(
+        litebox_broker_protocol::terminal::TerminalSettings,
+        litebox_broker_protocol::terminal::WindowSize,
+    )>,
+);
+
+impl crate::readiness::ReadinessSource for TestTerminal {
+    fn readiness(&self) -> ReadinessFlags {
+        ReadinessFlags::WRITE
+    }
+    fn watch(&self, _registration: &ReadinessRegistration) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl crate::terminal::TerminalEndpoint for TestTerminal {
+    fn attach(&self, _sink: Arc<dyn crate::terminal::TerminalEventSink>) {}
+
+    fn control(
+        &self,
+        operation: litebox_broker_protocol::terminal::TerminalOperation,
+    ) -> Result<
+        core::result::Result<
+            litebox_broker_protocol::terminal::TerminalResponse,
+            litebox_broker_protocol::terminal::TerminalError,
+        >,
+    > {
+        use litebox_broker_protocol::terminal::{
+            TerminalError, TerminalOperation as Op, TerminalResponse as Response,
+        };
+        let mut state = self.0.lock();
+        Ok(Ok(match operation {
+            Op::GetSettings => Response::Settings(state.0),
+            Op::SetSettings { settings, .. } => {
+                if settings.minimum_read > 1 {
+                    return Ok(Err(TerminalError::InvalidSettings));
+                }
+                state.0 = settings;
+                Response::Done
+            }
+            Op::GetWindowSize => Response::WindowSize(state.1),
+            Op::SetWindowSize(size) => {
+                state.1 = size;
+                Response::Done
+            }
+            Op::Flush { .. } | Op::Drain => Response::Done,
+        }))
+    }
 }
 
 /// Timer provider for tests whose clock advances only through

@@ -150,6 +150,14 @@ pub trait Backend: Send + Sync + Any {
         false
     }
 
+    /// Shared terminal endpoint, independent of this open file description.
+    fn terminal(
+        &self,
+        _h: &FileHandle,
+    ) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {
+        None
+    }
+
     /// Readiness of an open file handle whose reads or writes can fail with `WouldBlock`, or
     /// `None` if they always make progress.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]

@@ -29,6 +29,7 @@ pub mod readiness_queue;
 pub mod shared_buffer;
 pub mod signal;
 pub mod socket;
+pub mod terminal;
 pub mod timer;
 pub mod unix_socket;
 pub mod wire;

@@ -839,6 +839,10 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
+        FileRequest::Terminal(request) => Ok(FileResponse::Terminal(
+            litebox_broker_core::fs::terminal_control(process, request.handle, request.operation)
+                .map_err(RequestFailure::from)?,
+        )),
         FileRequest::Chmod(ChmodFileRequest { path, user, mode }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(

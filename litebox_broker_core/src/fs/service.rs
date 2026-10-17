@@ -39,6 +39,7 @@ pub struct File {
     state: Arc<dyn Any + Send + Sync>,
     /// Readiness of a file whose reads or writes can fail with `WouldBlock`.
     readiness: Option<Arc<dyn ReadinessSource>>,
+    terminal: Option<Arc<dyn crate::terminal::TerminalEndpoint>>,
 }
 
 impl File {
@@ -221,9 +222,11 @@ where
             Err(error) => return Ok(Err(file_open_error(error))),
         };
         let readiness = Resolver::readiness_source(self, &entry);
+        let terminal = Resolver::terminal(self, &entry);
         Ok(Ok(File {
             state: Arc::new(RwLock::<Platform, _>::new(entry)),
             readiness,
+            terminal,
         }))
     }
 
@@ -477,6 +480,9 @@ pub fn open(
         Err(error) => return Ok(Err(error)),
     };
     let readiness = file.watch(reference.handle(), readiness_sink)?;
+    if let Some(terminal) = &file.terminal {
+        crate::terminal::attach(terminal.as_ref(), process);
+    }
     reference
         .commit_with_readiness(ObjectEntry::File(file), readiness)
         .map(Ok)
@@ -588,6 +594,36 @@ pub fn handle_status(
 pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<bool>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     process.core.fs.is_terminal(&file)
+}
+
+/// Controls a shared terminal through an authorized, non-path-only file handle.
+pub fn terminal_control(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    operation: litebox_broker_protocol::terminal::TerminalOperation,
+) -> Result<
+    core::result::Result<
+        litebox_broker_protocol::terminal::TerminalResponse,
+        litebox_broker_protocol::terminal::TerminalError,
+    >,
+> {
+    use litebox_broker_protocol::terminal::TerminalOperation;
+    let file = match operation {
+        TerminalOperation::GetSettings
+        | TerminalOperation::GetWindowSize
+        | TerminalOperation::Drain => {
+            file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?
+        }
+        TerminalOperation::SetSettings { .. }
+        | TerminalOperation::SetWindowSize(_)
+        | TerminalOperation::Flush { .. } => file(process, handle, ObjectRights::WRITE)?,
+    };
+    match &file.terminal {
+        Some(terminal) => terminal.control(operation),
+        None => Ok(Err(
+            litebox_broker_protocol::terminal::TerminalError::NotTerminal,
+        )),
+    }
 }
 
 /// Returns the access mode and status flags of a broker-owned open file.

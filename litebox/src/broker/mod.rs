@@ -425,6 +425,18 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
     ) -> core::result::Result<core::result::Result<bool, FileError>, BrokerControlError>;
 
+    fn terminal_control(
+        &self,
+        handle: ObjectHandle,
+        operation: litebox_broker_protocol::terminal::TerminalOperation,
+    ) -> core::result::Result<
+        core::result::Result<
+            litebox_broker_protocol::terminal::TerminalResponse,
+            litebox_broker_protocol::terminal::TerminalError,
+        >,
+        BrokerControlError,
+    >;
+
     fn chmod_file(
         &self,
         path: &str,
@@ -1342,6 +1354,20 @@ where
         handle: ObjectHandle,
     ) -> core::result::Result<core::result::Result<bool, FileError>, BrokerControlError> {
         self.request(|local| local.is_terminal_file(handle))
+    }
+
+    fn terminal_control(
+        &self,
+        handle: ObjectHandle,
+        operation: litebox_broker_protocol::terminal::TerminalOperation,
+    ) -> core::result::Result<
+        core::result::Result<
+            litebox_broker_protocol::terminal::TerminalResponse,
+            litebox_broker_protocol::terminal::TerminalError,
+        >,
+        BrokerControlError,
+    > {
+        self.request(|local| local.terminal_control(handle, operation))
     }
 
     fn chmod_file(

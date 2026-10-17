@@ -130,10 +130,6 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(self.file.status()?)
     }
 
-    pub(crate) fn is_terminal(&self) -> Result<bool, Errno> {
-        Ok(self.file.is_terminal()?)
-    }
-
     /// Returns the `F_GETFL` flags of the open file description.
     pub(crate) fn get_status_flags(&self) -> Result<OFlags, Errno> {
         linux_status_flags(self.file.get_status_flags()?)
@@ -2581,46 +2577,93 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(raw_fd.try_into().unwrap())
     }
 
-    fn stdio_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
-        match arg {
-            IoctlArg::TCGETS(termios) => {
-                termios
-                    .write_at_offset::<Platform>(
-                        0,
-                        litebox_common_linux::Termios {
-                            c_iflag: 0,
-                            c_oflag: 0,
-                            c_cflag: 0,
-                            c_lflag: 0,
-                            c_line: 0,
-                            c_cc: [0; 19],
-                        },
-                    )
-                    .ok_or(Errno::EFAULT)?;
-                Ok(0)
+    fn terminal_ioctl(&self, file: &File<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
+        use litebox_broker_protocol::terminal::{
+            ChangeTiming, TerminalError, TerminalOperation as Op, TerminalResponse, WindowSize,
+        };
+        let operation = match arg {
+            IoctlArg::TCGETS(_) => Op::GetSettings,
+            IoctlArg::TCSETS(ptr) | IoctlArg::TCSETSW(ptr) | IoctlArg::TCSETSF(ptr) => {
+                let termios = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                Op::SetSettings {
+                    settings: crate::terminal::from_linux(&termios)?,
+                    timing: match arg {
+                        IoctlArg::TCSETSW(_) => ChangeTiming::AfterOutput,
+                        IoctlArg::TCSETSF(_) => ChangeTiming::AfterOutputAndFlushInput,
+                        _ => ChangeTiming::Now,
+                    },
+                }
             }
-            IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
-            IoctlArg::TIOCGWINSZ(ws) => {
-                ws.write_at_offset::<Platform>(
+            IoctlArg::TIOCGWINSZ(_) => Op::GetWindowSize,
+            IoctlArg::TIOCSWINSZ(ptr) => {
+                let size = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                Op::SetWindowSize(WindowSize {
+                    rows: size.row,
+                    columns: size.col,
+                    x_pixels: size.xpixel,
+                    y_pixels: size.ypixel,
+                })
+            }
+            IoctlArg::TCFLSH(selector) => {
+                if *selector > 2 {
+                    return Err(Errno::EINVAL);
+                }
+                Op::Flush {
+                    input: *selector != 1,
+                    output: *selector != 0,
+                }
+            }
+            IoctlArg::TCSBRK(0) => {
+                log_unsupported!("terminal serial break");
+                return Err(Errno::EOPNOTSUPP);
+            }
+            IoctlArg::TCSBRK(_) => Op::Drain,
+            IoctlArg::TIOCGPTN(_) => return Err(Errno::ENOTTY),
+            _ => unreachable!("non-terminal ioctl"),
+        };
+        let response = file
+            .file()
+            .terminal_control(operation, Some(&self.wait_cx()))?
+            .map_err(|error| match error {
+                TerminalError::NotTerminal => Errno::ENOTTY,
+                TerminalError::Unsupported => Errno::EOPNOTSUPP,
+                TerminalError::InvalidSettings => Errno::EINVAL,
+                TerminalError::Io => Errno::EIO,
+            })?;
+        match (arg, response) {
+            (IoctlArg::TCGETS(ptr), TerminalResponse::Settings(settings)) => {
+                ptr.write_at_offset::<Platform>(0, crate::terminal::to_linux(settings))
+                    .ok_or(Errno::EFAULT)?;
+            }
+            (IoctlArg::TIOCGWINSZ(ptr), TerminalResponse::WindowSize(size)) => {
+                ptr.write_at_offset::<Platform>(
                     0,
                     litebox_common_linux::Winsize {
-                        row: 20,
-                        col: 20,
-                        xpixel: 0,
-                        ypixel: 0,
+                        row: size.rows,
+                        col: size.columns,
+                        xpixel: size.x_pixels,
+                        ypixel: size.y_pixels,
                     },
                 )
                 .ok_or(Errno::EFAULT)?;
-                Ok(0)
             }
-            IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
-            _ => todo!(),
+            (_, TerminalResponse::Done) => {}
+            _ => return Err(Errno::EIO),
         }
+        Ok(0)
     }
 
     /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let files = self.files.borrow();
+        if let Some(file) = files.typed_fd(fd)?.as_file() {
+            self.global.with_file(file, |file| {
+                if file.get_status_flags()?.contains(OFlags::PATH) {
+                    return Err(Errno::EBADF);
+                }
+                Ok(())
+            })?;
+        }
         match arg {
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
@@ -2689,15 +2732,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
+            | IoctlArg::TCSETSW(..)
+            | IoctlArg::TCSETSF(..)
+            | IoctlArg::TCSBRK(..)
+            | IoctlArg::TCFLSH(..)
+            | IoctlArg::TIOCSWINSZ(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.file_only(Errno::ENOTTY)?;
-                if self.global.with_file(fd, File::is_terminal)? {
-                    self.stdio_ioctl(&arg)
-                } else {
-                    Err(Errno::ENOTTY)
-                }
+                self.global.with_file(fd, |file| {
+                    if !file.file().is_terminal()? {
+                        return Err(Errno::ENOTTY);
+                    }
+                    self.terminal_ioctl(file, &arg)
+                })
             }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);

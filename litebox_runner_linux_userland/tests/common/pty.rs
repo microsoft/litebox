@@ -78,6 +78,25 @@ impl Pty {
         drop(self.slave.take());
     }
 
+    pub fn slave(&self) -> &std::fs::File {
+        self.slave.as_ref().expect("PTY slave is already closed")
+    }
+
+    pub fn set_window_size(&self, rows: u16, columns: u16) {
+        use std::os::fd::AsRawFd as _;
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: master is a live PTY and size is a valid winsize.
+        assert_eq!(
+            unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &raw const size) },
+            0
+        );
+    }
+
     pub fn write_all(&mut self, bytes: &[u8]) {
         use std::io::Write;
 
