@@ -590,12 +590,17 @@ fn socket_error_queue_takes_only_a_connection_failure() {
     assert_eq!(errors.take(), None);
 }
 
+/// The bytes a test receive lends, and what it then returns.
+type TestReceive<T> = (Vec<u8>, Result<SocketOutcome<T>>);
+
 #[derive(Default)]
 struct TestSocketState {
     creates: StdMutex<std::vec::Vec<(ProcessId, CreateSocketRequest)>>,
     closed_processes: StdMutex<std::vec::Vec<ProcessId>>,
     sent: StdMutex<std::vec::Vec<u8>>,
     next_send_count: StdMutex<Option<usize>>,
+    /// How many bytes the next send fills in, if not all.
+    next_fill_length: StdMutex<Option<usize>>,
     /// Ignores a failing filler or copier, as a faulty platform might.
     ignore_transfer_failures: core::sync::atomic::AtomicBool,
     connect_calls: AtomicUsize,
@@ -606,9 +611,9 @@ struct TestSocketState {
     receive_calls: AtomicUsize,
     receive_from_calls: AtomicUsize,
     /// The bytes the next stream receive lends, and what it reports.
-    next_stream_receive: StdMutex<Option<(Vec<u8>, SocketOutcome<PlatformStreamReceive>)>>,
+    next_stream_receive: StdMutex<Option<TestReceive<PlatformStreamReceive>>>,
     /// The bytes the next datagram receive lends, and what it reports.
-    next_datagram_receive: StdMutex<Option<(Vec<u8>, SocketOutcome<PlatformDatagramReceive>)>>,
+    next_datagram_receive: StdMutex<Option<TestReceive<PlatformDatagramReceive>>>,
     status_calls: AtomicUsize,
     fail_status: core::sync::atomic::AtomicBool,
     status_responses: StdMutex<std::collections::VecDeque<PlatformSocketStatus>>,
@@ -740,10 +745,14 @@ impl TestSocketProvider {
         *self.state.next_send_count.lock().unwrap() = Some(count);
     }
 
+    fn fill_next_send(&self, length: usize) {
+        *self.state.next_fill_length.lock().unwrap() = Some(length);
+    }
+
     fn return_next_stream_receive(
         &self,
         lent: &[u8],
-        received: SocketOutcome<PlatformStreamReceive>,
+        received: Result<SocketOutcome<PlatformStreamReceive>>,
     ) {
         *self.state.next_stream_receive.lock().unwrap() = Some((lent.to_vec(), received));
     }
@@ -751,7 +760,7 @@ impl TestSocketProvider {
     fn return_next_datagram_receive(
         &self,
         lent: &[u8],
-        received: SocketOutcome<PlatformDatagramReceive>,
+        received: Result<SocketOutcome<PlatformDatagramReceive>>,
     ) {
         *self.state.next_datagram_receive.lock().unwrap() = Some((lent.to_vec(), received));
     }
@@ -858,6 +867,21 @@ impl TestPlatformSocket {
             return Ok(());
         }
         result
+    }
+
+    /// Fills in the room for `length` bytes, or as much of it as told to.
+    fn fill(&self, length: usize, fill: &mut Filler<'_>) -> Result<()> {
+        let filled = self
+            .state
+            .next_fill_length
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(length);
+        let mut data = vec![0; filled];
+        self.transferred(fill(&mut data))?;
+        self.state.sent.lock().unwrap().extend_from_slice(&data);
+        Ok(())
     }
 }
 
@@ -1031,9 +1055,7 @@ impl PlatformSocket for TestPlatformSocket {
         fill: &mut Filler<'_>,
     ) -> Result<SocketOutcome<usize>> {
         self.state.send_calls.fetch_add(1, Ordering::Relaxed);
-        let mut data = vec![0; length];
-        self.transferred(fill(&mut data))?;
-        self.state.sent.lock().unwrap().extend_from_slice(&data);
+        self.fill(length, fill)?;
         let sent = self
             .state
             .next_send_count
@@ -1057,9 +1079,7 @@ impl PlatformSocket for TestPlatformSocket {
             .lock()
             .unwrap()
             .push(destination);
-        let mut data = vec![0; length];
-        self.transferred(fill(&mut data))?;
-        self.state.sent.lock().unwrap().extend_from_slice(&data);
+        self.fill(length, fill)?;
         let sent = self
             .state
             .next_send_count
@@ -1082,7 +1102,7 @@ impl PlatformSocket for TestPlatformSocket {
         self.state.receive_calls.fetch_add(1, Ordering::Relaxed);
         if let Some((lent, received)) = self.state.next_stream_receive.lock().unwrap().take() {
             self.transferred(copy(&lent))?;
-            return Ok(received);
+            return received;
         }
         let received = length.min(2);
         self.transferred(copy(&[7, 9][..received]))?;
@@ -1102,7 +1122,7 @@ impl PlatformSocket for TestPlatformSocket {
             .fetch_add(1, Ordering::Relaxed);
         if let Some((lent, received)) = self.state.next_datagram_receive.lock().unwrap().take() {
             self.transferred(copy(&lent))?;
-            return Ok(received);
+            return received;
         }
         let received = length.min(2);
         self.transferred(copy(&[7, 9][..received]))?;
@@ -2568,6 +2588,11 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         send_data(&process, handle, vec![1, 2, 3], SendFlags::NONE),
         Ok(SocketOutcome::Completed(2))
     );
+    provider.fill_next_send(2);
+    assert_eq!(
+        send_data(&process, handle, vec![1, 2, 3], SendFlags::NONE),
+        Err(BrokerError::Internal)
+    );
     assert_eq!(
         send_data(&process, handle, Vec::new(), SendFlags::NONE),
         Ok(SocketOutcome::Completed(0))
@@ -2644,12 +2669,18 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         ),
         (&[7], SocketOutcome::Failed(SocketError::ConnectionReset)),
     ] {
-        provider.return_next_stream_receive(lent, received);
+        provider.return_next_stream_receive(lent, Ok(received));
         assert_eq!(
             receive_data(&process, handle, 1, ReceiveFlags::NONE, 0, 0),
             Err(BrokerError::Internal)
         );
     }
+    // Nor may it lend bytes and then fail.
+    provider.return_next_stream_receive(&[7], Err(BrokerError::WouldBlock));
+    assert_eq!(
+        receive_data(&process, handle, 1, ReceiveFlags::NONE, 0, 0),
+        Err(BrokerError::Internal)
+    );
     assert_eq!(
         receive_data(&process, handle, 1, ReceiveFlags::PEEK, 1, 2),
         Err(BrokerError::UnsupportedOperation)
@@ -2705,10 +2736,11 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
-    // Ending with the byte sent while ignoring its filler's failure.
+    // Including the part of a send filled in, and ending with the byte sent
+    // while ignoring its filler's failure.
     assert_eq!(
         provider.state.sent.lock().unwrap().as_slice(),
-        [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 0]
+        [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 0]
     );
     assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 1);
     assert_eq!(provider.state.status_calls.load(Ordering::Relaxed), 1);
@@ -2998,6 +3030,23 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
         ),
         Err(BrokerError::Internal)
     );
+    // A datagram is filled in whole, unless the platform drops it.
+    for (filled, expected) in [
+        (1, Err(BrokerError::Internal)),
+        (0, Ok(SocketOutcome::Completed(3))),
+    ] {
+        provider.fill_next_send(filled);
+        assert_eq!(
+            send_data_to(
+                &process,
+                handle,
+                b"udp",
+                SendFlags::NONE,
+                Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
+            ),
+            expected
+        );
+    }
     // A failing filler or copier fails the transfer with its error, even
     // when the platform ignores it.
     for ignored in [false, true] {
@@ -3096,11 +3145,11 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
     ] {
         provider.return_next_datagram_receive(
             lent,
-            SocketOutcome::Completed(PlatformDatagramReceive {
+            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
                 received,
                 datagram_length,
                 source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
-            }),
+            })),
         );
         assert_eq!(
             receive_data_from(&process, handle, length, ReceiveFromFlags::NONE),
@@ -3115,30 +3164,34 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
     ] {
         provider.return_next_datagram_receive(
             &[7, 9],
-            SocketOutcome::Completed(PlatformDatagramReceive {
+            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
                 received: 2,
                 datagram_length: 4,
                 source_address: SocketAddrV4::new(source_ip, 49153),
-            }),
+            })),
         );
         assert_eq!(
             receive_data_from(&process, handle, 2, ReceiveFromFlags::NONE),
             Err(BrokerError::Internal)
         );
     }
-    provider
-        .return_next_datagram_receive(&[7], SocketOutcome::Failed(SocketError::ConnectionRefused));
-    assert_eq!(
-        receive_data_from(&process, handle, 2, ReceiveFromFlags::NONE),
-        Err(BrokerError::Internal)
-    );
+    for failure in [
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused)),
+        Err(BrokerError::WouldBlock),
+    ] {
+        provider.return_next_datagram_receive(&[7], failure);
+        assert_eq!(
+            receive_data_from(&process, handle, 2, ReceiveFromFlags::NONE),
+            Err(BrokerError::Internal)
+        );
+    }
     provider.return_next_datagram_receive(
         &[7, 9],
-        SocketOutcome::Completed(PlatformDatagramReceive {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 2,
             datagram_length: 4,
             source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
-        }),
+        })),
     );
     assert_eq!(
         receive_data_from(&process, handle, 2, ReceiveFromFlags::NONE),
@@ -4637,7 +4690,7 @@ fn check_pending_errors_and_readiness(broker: &BrokerCore, provider: &TestSocket
     );
     provider.return_next_stream_receive(
         &[],
-        SocketOutcome::Completed(PlatformStreamReceive::EndOfStream),
+        Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream)),
     );
     assert_eq!(
         receive_data(&process, stream, 2, ReceiveFlags::NONE, 0, 0),

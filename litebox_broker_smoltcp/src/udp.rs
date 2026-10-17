@@ -296,17 +296,14 @@ impl Udp {
         }
         let mut meta = UdpMetadata::from(IpEndpoint::from(destination));
         meta.local_address = Some((*source.ip()).into());
-        let mut filled = Ok(());
-        // smoltcp queues the datagram it lends whatever happens; one whose
-        // filling failed goes out empty rather than with stale bytes.
-        let sent = sockets.udp(handle).send_with(length, meta, |datagram| {
-            filled = fill(datagram);
-            if filled.is_ok() { datagram.len() } else { 0 }
-        });
-        match sent {
-            Ok(_) => {
-                filled?;
+        // Unlike `send_with`, `send` queues a datagram only once it has room
+        // for its metadata too.
+        match sockets.udp(handle).send(length, meta) {
+            Ok(datagram) => {
                 self.blocked = None;
+                // smoltcp sends the datagram whatever happens; one whose
+                // filling failed goes out zeroed rather than with stale bytes.
+                fill(datagram).inspect_err(|_| datagram.fill(0))?;
                 Ok(SocketOutcome::Completed(length))
             }
             Err(udp::SendError::BufferFull) => {

@@ -580,9 +580,9 @@ pub trait PlatformSocket: Send + Sync {
     /// [`normalize_socket_destination`] before choosing a host-socket target.
     /// A temporarily full socket returns [`BrokerError::WouldBlock`], and a
     /// socket shut down for writing fails with `Shutdown`. Partial successful
-    /// sends are invalid, but a datagram the platform drops, as UDP may, need
-    /// not be filled in. Resource failures are broker errors rather than
-    /// ordinary socket failures.
+    /// sends are invalid, and a datagram is filled in whole, but one the
+    /// platform drops, as UDP may, need not be filled in. Resource failures
+    /// are broker errors rather than ordinary socket failures.
     fn send_to(
         &self,
         length: usize,
@@ -592,7 +592,8 @@ pub trait PlatformSocket: Send + Sync {
     ) -> Result<SocketOutcome<usize>>;
 
     /// Receives up to `length` bytes without waiting for platform readiness,
-    /// lending them to `copy` to copy out (see [`crate::transfer`]).
+    /// lending them to `copy` to copy out (see [`crate::transfer`]): exactly
+    /// those it returns, so none when it fails.
     ///
     /// A temporarily empty socket returns [`BrokerError::WouldBlock`]. End of
     /// stream returns [`PlatformStreamReceive::EndOfStream`]. The core handles
@@ -616,7 +617,8 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Receives one datagram without waiting for platform readiness, lending
     /// up to `length` bytes of it to `copy` to copy out (see
-    /// [`crate::transfer`]).
+    /// [`crate::transfer`]): exactly those it returns, so none when it
+    /// fails.
     ///
     /// The original datagram length is returned even when the caller's buffer
     /// is smaller, and zero-length datagrams are successful receives. When no
@@ -1626,12 +1628,12 @@ fn transport_send_to(
         .send_to(length, flags, destination, &mut |part| {
             lent.lend(part.len(), || fill(part))
         });
-    lent.finish()?;
+    let lent = lent.finish()?;
     let outcome = outcome.map_err(|error| would_block_error(error, nonblocking))?;
     // A platform may accept a datagram it then drops without filling it in,
     // as UDP may drop any datagram.
     if let SocketOutcome::Completed(sent) = outcome
-        && sent != length
+        && (sent != length || (lent != 0 && lent != length))
     {
         return Err(BrokerError::Internal);
     }
@@ -1787,22 +1789,19 @@ fn transport_receive(
         &mut |part| lent.lend(part.len(), || copy(part)),
     );
     let lent = lent.finish()?;
-    let outcome = outcome.map_err(|error| would_block_error(error, state.nonblocking))?;
     let received = match outcome {
-        SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => received,
-        SocketOutcome::Completed(PlatformStreamReceive::EndOfStream) | SocketOutcome::Failed(_) => {
-            0
-        }
+        Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(received))) => received,
+        _ => 0,
     };
     if received != lent
         || matches!(
             outcome,
-            SocketOutcome::Completed(PlatformStreamReceive::Received(0))
+            Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(0)))
         )
     {
         return Err(BrokerError::Internal);
     }
-    Ok(outcome)
+    outcome.map_err(|error| would_block_error(error, state.nonblocking))
 }
 
 /// Receives one datagram without waiting for readiness, lending up to
@@ -1872,21 +1871,20 @@ fn transport_receive_from(
             lent.lend(part.len(), || copy(part))
         });
     let lent = lent.finish()?;
-    let outcome = outcome.map_err(|error| would_block_error(error, state.nonblocking))?;
     let invalid = match &outcome {
-        SocketOutcome::Completed(received) => {
+        Ok(SocketOutcome::Completed(received)) => {
             received.received != lent
                 || received.received != received.datagram_length.min(length)
                 || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize
                 || normalize_socket_destination(received.source_address)
                     != Ok(received.source_address)
         }
-        SocketOutcome::Failed(_) => lent != 0,
+        Ok(SocketOutcome::Failed(_)) | Err(_) => lent != 0,
     };
     if invalid {
         return Err(BrokerError::Internal);
     }
-    Ok(outcome)
+    outcome.map_err(|error| would_block_error(error, state.nonblocking))
 }
 
 /// Sets one option of a broker-owned socket.

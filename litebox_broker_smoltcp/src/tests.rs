@@ -69,6 +69,8 @@ struct Wire {
     to_host: Mutex<VecDeque<Vec<u8>>>,
     /// Frames to the host are lost.
     cut: core::sync::atomic::AtomicBool,
+    /// How many more frames the device takes, if limited.
+    budget: Mutex<Option<usize>>,
     /// The link does not interrupt: the stack polls it.
     polled: bool,
 }
@@ -86,11 +88,14 @@ impl Network for Wire {
     }
 
     fn can_transmit(&self) -> bool {
-        true
+        self.budget.lock().is_none_or(|frames| frames > 0)
     }
 
     fn transmit(&self, frame: &[u8]) -> bool {
         assert!(frame.len() <= ETHERNET_MTU);
+        if let Some(frames) = &mut *self.budget.lock() {
+            *frames -= 1;
+        }
         if !self.cut.load(Ordering::Relaxed) {
             self.to_host.lock().push_back(frame.to_vec());
         }
@@ -694,6 +699,66 @@ fn external_udp_goes_through_the_gateway() {
         ),
         Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
+}
+
+#[test]
+fn a_datagram_that_cannot_wrap_around_the_send_queue_leaves_nothing_behind() {
+    use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket};
+    let wire: &'static Wire = Box::leak(Box::default());
+    let test = Test::new(Some(wire));
+    let mut host = Host::new(wire, &test.clock);
+    let buffer = || PacketBuffer::new(vec![PacketMetadata::EMPTY; 64], vec![0; 64 * 1024]);
+    let mut udp = Socket::new(buffer(), buffer());
+    udp.bind(53).unwrap();
+    let host_udp = host.sockets.add(udp);
+    let mut received = Vec::new();
+    let mut receive = |host: &mut Host| {
+        let udp = host.sockets.get_mut::<Socket>(host_udp);
+        while let Ok((data, _)) = udp.recv() {
+            received.push(data.to_vec());
+        }
+        received.len()
+    };
+    let process = test.process();
+    let socket = test.socket(&process, SocketType::Datagram);
+    let gateway = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 53);
+    // Each datagram all of one byte, its own.
+    let send = |byte: u8| {
+        send_data_to(
+            &process,
+            socket,
+            vec![byte; 1000],
+            SendFlags::NONE,
+            Some(gateway),
+        )
+    };
+    assert_eq!(send(0), Ok(SocketOutcome::Completed(1000)));
+    pump(&test, &mut host, |host| receive(host) == 1);
+    let mut accepted = vec![0];
+    // The device takes none: the queue fills, its packet slots first.
+    *wire.budget.lock() = Some(0);
+    let mut byte = 1;
+    while send(byte) == Ok(SocketOutcome::Completed(1000)) {
+        accepted.push(byte);
+        byte += 1;
+    }
+    assert_eq!(accepted.len(), 1 + udp::PACKETS);
+    assert_eq!(send(byte), Err(BrokerError::WouldBlock));
+    // One goes out, freeing a slot, and room at the start of the queue but
+    // too little at its end: the next must wrap around, which takes a slot
+    // too.
+    *wire.budget.lock() = Some(1);
+    test.provider.poll();
+    assert_eq!(*wire.budget.lock(), Some(0));
+    assert_eq!(send(byte), Err(BrokerError::WouldBlock));
+    *wire.budget.lock() = None;
+    pump(&test, &mut host, |host| receive(host) == accepted.len());
+    byte += 1;
+    assert_eq!(send(byte), Ok(SocketOutcome::Completed(1000)));
+    accepted.push(byte);
+    pump(&test, &mut host, |host| receive(host) == accepted.len());
+    let accepted: Vec<Vec<u8>> = accepted.into_iter().map(|byte| vec![byte; 1000]).collect();
+    assert_eq!(received, accepted);
 }
 
 #[test]
