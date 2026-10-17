@@ -96,9 +96,7 @@ impl ProcessHandle for ClonedProcess {
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_PROCESS_CLONED: i32 = 0x0000_0129;
-const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
-const PROCESS_CREATE_FLAGS_INHERIT_FROM_PARENT: u32 = 0x0000_0100;
-const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
+const RTL_CLONE_PROCESS_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
 
 /// Result returned by [`fork_process`].
 pub enum ForkResult {
@@ -114,77 +112,69 @@ pub enum ForkResult {
 }
 
 #[repr(C)]
-struct PsCreateInfo {
-    size: usize,
-    state: u32,
-    padding: u32,
-    data: [u8; 72],
+struct RtlUserProcessInformation {
+    length: u32,
+    process: HANDLE,
+    thread: HANDLE,
+    client_id: [usize; 2],
+    image_information: [u64; 8],
 }
 
-const _: () = assert!(size_of::<PsCreateInfo>() == 0x58);
+const _: () = assert!(size_of::<RtlUserProcessInformation>() == 0x68);
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
-    fn NtCreateUserProcess(
-        process_handle: *mut HANDLE,
-        thread_handle: *mut HANDLE,
-        process_desired_access: u32,
-        thread_desired_access: u32,
-        process_object_attributes: *const c_void,
-        thread_object_attributes: *const c_void,
+    fn RtlCloneUserProcess(
         process_flags: u32,
-        thread_flags: u32,
-        process_parameters: *const c_void,
-        create_info: *mut PsCreateInfo,
-        attribute_list: *const c_void,
+        process_security_descriptor: *const c_void,
+        thread_security_descriptor: *const c_void,
+        debug_port: HANDLE,
+        process_information: *mut RtlUserProcessInformation,
     ) -> i32;
 }
 
-/// Clones the calling process with one suspended thread and no inherited handles.
+/// Clones the calling process with copy-on-write memory, one suspended thread, and no inherited
+/// handles.
 ///
 /// The caller must ensure every other thread is quiescent and that the child immediately enters
 /// a clone-safe bootstrap path. This uses an undocumented NT interface and can fail on Windows
 /// versions whose behavior is incompatible with LiteBox.
+///
+/// The runtime synchronizes its loader, heap, and thread-pool state around the clone.
 ///
 /// # Safety
 ///
 /// The child inherits user-mode synchronization and runtime state without the threads that may
 /// own it. Calling arbitrary code in the child before rebuilding that state can deadlock.
 pub unsafe fn fork_process() -> Result<ForkResult> {
-    let mut process = null_mut();
-    let mut thread = null_mut();
-    let mut create_info = PsCreateInfo {
-        size: size_of::<PsCreateInfo>(),
-        state: 0,
-        padding: 0,
-        data: [0; 72],
+    let mut information = RtlUserProcessInformation {
+        length: 0,
+        process: null_mut(),
+        thread: null_mut(),
+        client_id: [0; 2],
+        image_information: [0; 8],
     };
-    // SAFETY: All output pointers refer to initialized writable storage, optional inputs are null,
-    // and `create_info` has the x64 layout and size required by NtCreateUserProcess.
+    // SAFETY: `information` has the x64 RTL_USER_PROCESS_INFORMATION layout and is writable.
+    // Optional inputs are null. The runtime synchronizes its internal locks before cloning
+    // and repairs them in the child; the caller guarantees a clone-safe bootstrap.
     let status = unsafe {
-        NtCreateUserProcess(
-            &raw mut process,
-            &raw mut thread,
-            MAXIMUM_ALLOWED,
-            MAXIMUM_ALLOWED,
+        RtlCloneUserProcess(
+            RTL_CLONE_PROCESS_FLAGS_CREATE_SUSPENDED,
             null_mut(),
             null_mut(),
-            PROCESS_CREATE_FLAGS_INHERIT_FROM_PARENT,
-            THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
             null_mut(),
-            &raw mut create_info,
-            null_mut(),
+            &raw mut information,
         )
     };
     match status {
         STATUS_SUCCESS => {
-            if process.is_null() || thread.is_null() {
-                return Err(Error::other("NtCreateUserProcess returned null handles"));
+            if information.process.is_null() || information.thread.is_null() {
+                return Err(Error::other("RtlCloneUserProcess returned null handles"));
             }
             // SAFETY: Successful process creation returned owned handles to the parent.
-            let process = unsafe { OwnedHandle::from_raw_handle(process) };
+            let process = unsafe { OwnedHandle::from_raw_handle(information.process) };
             // SAFETY: Successful process creation returned owned handles to the parent.
-            let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+            let thread = unsafe { OwnedHandle::from_raw_handle(information.thread) };
             Ok(ForkResult::Parent { process, thread })
         }
         STATUS_PROCESS_CLONED => Ok(ForkResult::Child),
