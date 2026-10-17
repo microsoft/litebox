@@ -1426,6 +1426,7 @@ struct TlsBlock {
     native_sigreturn_pending: usize,
     vector_state: usize,
     host_fp_state: usize,
+    svc_x16: usize,
     pending_host_signals: AtomicU32,
     wait_waker_addr: AtomicPtr<core::task::Waker>,
     page_recovery_lock: usize,
@@ -1443,6 +1444,7 @@ mod tls_offset {
         core::mem::offset_of!(TlsBlock, native_sigreturn_pending);
     pub const VECTOR_STATE: usize = core::mem::offset_of!(TlsBlock, vector_state);
     pub const HOST_FP_STATE: usize = core::mem::offset_of!(TlsBlock, host_fp_state);
+    pub const SVC_X16: usize = core::mem::offset_of!(TlsBlock, svc_x16);
     pub const PENDING_HOST_SIGNALS: usize = core::mem::offset_of!(TlsBlock, pending_host_signals);
     pub const WAIT_WAKER_ADDR: usize = core::mem::offset_of!(TlsBlock, wait_waker_addr);
     pub const PAGE_RECOVERY_LOCK: usize = core::mem::offset_of!(TlsBlock, page_recovery_lock);
@@ -1451,6 +1453,9 @@ mod tls_offset {
 // The macOS rewriter gates encode these offsets directly after loading the
 // TlsBlock pointer from the pthread key slot.
 const _: () = assert!(tls_offset::GUEST_THREAD_POINTER == 0);
+const _: () = assert!(
+    tls_offset::SVC_X16 == litebox_syscall_rewriter::aarch64::SVC_X16_OFFSET_FROM_GUEST_TP as usize
+);
 const _: () = assert!(tls_offset::GUEST_X18 == GUEST_X18_OFFSET_FROM_GUEST_TP);
 const _: () = assert!(tls_offset::IN_GUEST == IN_GUEST_OFFSET_FROM_GUEST_TP as usize);
 
@@ -1687,6 +1692,7 @@ fn initialize_thread_tls() {
     let block = Box::new(TlsBlock {
         guest_thread_pointer: 0,
         guest_x18: 0,
+        svc_x16: 0,
         active: 0,
         current_thread: 0,
         in_guest: 0,
@@ -1806,7 +1812,6 @@ struct ThreadContext<'a> {
     ctx: &'a mut PtRegs,
     host_sp: usize,
     svc_frame: usize,
-    outbound_x16: usize,
     outbound_pc: usize,
     outbound_stub: usize,
     initial_entry: bool,
@@ -2173,7 +2178,6 @@ unsafe extern "C" fn syscall_callback() {
         "ldr x2, [x16, #{active}]", // ThreadContext
         "mov x3, sp",
         "str x3, [x2, #{thread_svc_frame}]",
-        "str x0, [x2, #{thread_outbound_x16}]",
         "ldr x3, [sp, #{frame_retaddr}]",
         "str x3, [x2, #{thread_outbound_pc}]",
         "ldr x3, [sp, #{frame_stub}]",
@@ -2268,8 +2272,17 @@ unsafe extern "C" fn syscall_callback() {
         "ldr x16, [sp, #{frame_x16}]",
         "ldr x17, [sp, #{frame_scratch}]",
         "svc #0x80",
-        // The outbound stub restores original x16 and SP without changing NZCV.
+        // Do not enter the guest TLS-restoring stub from host execution: TLS
+        // can be absent, or its x16 slot can hold an unrelated guest value.
+        // Old stubs start with LDR (bit 29 set); new macOS stubs start with
+        // MRS (bit 29 clear) and have a native epilogue immediately afterwards.
+        // TBNZ and non-flag-setting ADD preserve the syscall's carry result.
         "ldr x16, [sp, #{frame_stub}]",
+        "ldr w17, [x16]",
+        "tbnz w17, #29, 92f",
+        "add x16, x16, #{native_epilogue_from_stub}",
+        "92:",
+        "ldr x17, [sp, #{frame_scratch}]",
         "br x16",
         ".cfi_endproc",
         tls_key_offset = sym TLS_KEY_OFFSET,
@@ -2282,7 +2295,6 @@ unsafe extern "C" fn syscall_callback() {
         context = const core::mem::offset_of!(ThreadContext, ctx),
         host_sp = const core::mem::offset_of!(ThreadContext, host_sp),
         thread_svc_frame = const core::mem::offset_of!(ThreadContext, svc_frame),
-        thread_outbound_x16 = const core::mem::offset_of!(ThreadContext, outbound_x16),
         thread_outbound_pc = const core::mem::offset_of!(ThreadContext, outbound_pc),
         thread_outbound_stub = const core::mem::offset_of!(ThreadContext, outbound_stub),
         regs_sp = const core::mem::offset_of!(PtRegs, sp),
@@ -2298,6 +2310,7 @@ unsafe extern "C" fn syscall_callback() {
         frame_retaddr = const SVC_FRAME_OFF_RETADDR,
         frame_stub = const SVC_FRAME_OFF_STUB,
         frame_scratch = const MACOS_SVC_FRAME_OFF_SCRATCH,
+        native_epilogue_from_stub = const litebox_syscall_rewriter::aarch64::MACOS_SVC_NATIVE_EPILOGUE_OFFSET_FROM_STUB,
         syscall_handler = sym syscall_handler,
         finish_thread_arch = sym finish_thread_arch,
     );
@@ -2342,11 +2355,13 @@ unsafe extern "C" fn switch_to_guest_via_sigreturn() -> ! {
 macro_rules! restore_guest_registers {
     (
         $name:literal,
+        setup = $setup:literal,
         stack = ($stack_base:literal, $stack_offset:expr),
         branch = ($branch_base:literal, $branch_offset:expr)
     ) => {
         core::arch::naked_asm!(
             "ldr x16, [x0, #{context}]",
+            $setup,
             "mrs x17, tpidrro_el0",
             "and x17, x17, #0xfffffffffffffff8",
             "adrp x1, {tls_key_offset}@PAGE",
@@ -2367,6 +2382,8 @@ macro_rules! restore_guest_registers {
             "str xzr, [x17, #{in_guest}]",
             "b _litebox_macos_interrupt_callback",
             "1:",
+            "ldr x1, [x16, #128]",
+            "str x1, [x17, #{svc_x16}]",
             "ldr x1, [x16, #{regs_x18}]",
             "str x1, [x17, #{guest_x18}]",
             "ldr x1, [x17, #{vector_state}]",
@@ -2419,6 +2436,7 @@ macro_rules! restore_guest_registers {
             context = const core::mem::offset_of!(ThreadContext, ctx),
             in_guest = const tls_offset::IN_GUEST,
             guest_x18 = const tls_offset::GUEST_X18,
+            svc_x16 = const tls_offset::SVC_X16,
             vector_state = const tls_offset::VECTOR_STATE,
             host_fp_state = const tls_offset::HOST_FP_STATE,
             interrupted = const core::mem::offset_of!(ThreadContext, interrupted),
@@ -2447,18 +2465,30 @@ macro_rules! restore_guest_registers {
 unsafe extern "C" fn switch_to_guest_direct(_: &mut ThreadContext) -> ! {
     restore_guest_registers!(
         "switch_to_guest_direct",
+        setup = "",
         stack = ("x16", core::mem::offset_of!(PtRegs, sp)),
         branch = ("x16", core::mem::offset_of!(PtRegs, pc))
     );
 }
 
+/// Runtime-owned restoration copy: keeps the logical PC in the authoritative
+/// ThreadContext while the naked transition carries the outbound branch target.
+#[repr(C)]
+struct OutboundContext {
+    regs: PtRegs,
+    stub: usize,
+}
+
 #[unsafe(naked)]
-unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) -> ! {
-    // Resume at the captured SVC frame; the outbound stub restores x16 and pops it.
+unsafe extern "C" fn switch_to_guest_via_outbound_stub(
+    _: &mut ThreadContext,
+    _: &OutboundContext,
+) -> ! {
     restore_guest_registers!(
         "switch_to_guest_via_outbound_stub",
+        setup = "mov x16, x1",
         stack = ("x0", core::mem::offset_of!(ThreadContext, svc_frame)),
-        branch = ("sp", SVC_FRAME_OFF_STUB)
+        branch = ("x16", core::mem::offset_of!(OutboundContext, stub))
     );
 }
 
@@ -2530,7 +2560,6 @@ fn run_thread_inner_with_process(
         ctx,
         host_sp: 0,
         svc_frame: 0,
-        outbound_x16: 0,
         outbound_pc: 0,
         outbound_stub: 0,
         initial_entry: initial_process_entry,
@@ -2682,30 +2711,25 @@ unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
     if thread_ctx.outbound_stub != 0
         && thread_ctx.ctx.sp == thread_ctx.svc_frame + thread_ctx.guest_abi as usize
         && thread_ctx.ctx.pc == thread_ctx.outbound_pc
-        && thread_ctx.ctx.regs[16] == thread_ctx.outbound_x16
     {
-        let frame = [
-            thread_ctx.outbound_x16,
-            thread_ctx.outbound_pc,
-            thread_ctx.outbound_stub,
-        ];
-        // Restage the frame immediately before use. If the guest stack became
-        // inaccessible during the shim round trip, use generic sigreturn.
-        // SAFETY: frame is readable. Faulting guest writes use the installed
-        // exception-table handler and return failure instead of escaping to XNU.
-        let frame_staged = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                thread_ctx.svc_frame as *mut u8,
-                frame.as_ptr().cast(),
-                core::mem::size_of_val(&frame),
+        let mut instruction = [0u8; 4];
+        if read_guest(thread_ctx.outbound_stub, &mut instruction)
+            && litebox_syscall_rewriter::aarch64::svc_stub_uses_tls(
+                u32::from_le_bytes(instruction),
+                litebox_syscall_rewriter::TargetHost::MacOs,
             )
-            .is_ok()
-        };
-        if frame_staged {
-            // SAFETY: the captured frame still matches the guest context and
-            // was restaged with an exception-table-protected write.
-            unsafe { switch_to_guest_via_outbound_stub(thread_ctx) }
+        {
+            let outbound = OutboundContext {
+                regs: thread_ctx.ctx.clone(),
+                stub: thread_ctx.outbound_stub,
+            };
+            // SAFETY: the stack-local restoration copy stays live through this
+            // non-returning transition. Neither it nor staging x16 uses guest
+            // memory. An interruption uses authoritative ThreadContext.ctx.
+            unsafe { switch_to_guest_via_outbound_stub(thread_ctx, &outbound) }
         }
+        // Old stack-restoring stubs use generic context restore; never restage
+        // their frames into potentially unmapped guest memory.
     }
     if initial_entry && thread_ctx.guest_abi == GuestAbi::Darwin {
         // SAFETY: the caller supplies a live context and initialized TLS/handlers.
@@ -3202,10 +3226,8 @@ unsafe extern "C" fn exception_signal_handler(
     copy_signal_context(thread_ctx.ctx, mc);
     let runtime = GateRuntimeState {
         guest_thread_pointer_addr: tls_address(tls_offset::GUEST_THREAD_POINTER) as usize,
-        // Signal exits have an authoritative XNU context and do not
-        // originate from the direct outbound-stub resume path.
-        expected_outbound_stub: 0,
-        expected_outbound_pc: 0,
+        expected_outbound_stub: thread_ctx.outbound_stub,
+        expected_outbound_pc: thread_ctx.outbound_pc,
     };
     let interruption = gate_interruption(signal, code, esr);
     let recovery = match thread_ctx.guest_abi {
@@ -3233,11 +3255,17 @@ unsafe extern "C" fn exception_signal_handler(
             resume_or_interrupt(mc, thread_ctx);
             return;
         }
+        Aarch64GateSignalResult::WriteThreadPointer { context, value } => {
+            set_guest_thread_pointer(value);
+            *thread_ctx.ctx = context;
+            signal_return.disarm();
+            resume_or_interrupt(mc, thread_ctx);
+            return;
+        }
         Aarch64GateSignalResult::InvalidRuntimeState => {
             fatal_signal(b"invalid AArch64 gate runtime state", pc)
         }
-        // With both expected outbound values zero, canonicalize cannot
-        // classify a macOS signal context as an interrupted outbound stub.
+        // Legacy outbound stubs are never used by this runtime.
         Aarch64GateSignalResult::PreserveSavedContext => {
             fatal_signal(b"unreachable macOS outbound-stub recovery", pc)
         }
@@ -4503,10 +4531,10 @@ mod tests {
             ..switch_to_guest_direct_end as *const () as usize;
         let outbound = switch_to_guest_via_outbound_stub_start as *const () as usize
             ..switch_to_guest_via_outbound_stub_end as *const () as usize;
-        assert_eq!(syscall_prologue.len(), 86 * size_of::<u32>());
+        assert_eq!(syscall_prologue.len(), 85 * size_of::<u32>());
         assert_eq!(sigreturn.len(), 3 * size_of::<u32>());
-        assert_eq!(direct.len(), 51 * size_of::<u32>());
-        assert_eq!(outbound.len(), 51 * size_of::<u32>());
+        assert_eq!(direct.len(), 53 * size_of::<u32>());
+        assert_eq!(outbound.len(), 53 * size_of::<u32>());
     }
 
     #[test]

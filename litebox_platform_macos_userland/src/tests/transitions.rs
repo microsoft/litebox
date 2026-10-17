@@ -36,7 +36,7 @@ fn prepare_code(
     assert!(code.len() <= HOST_PAGE_SIZE / 2);
     let gate_address = (base + HOST_PAGE_SIZE / 2) as u64;
     let callback = platform.get_syscall_entry_point() as u64;
-    let (gates, trapped) = match abi {
+    let (mut gates, trapped) = match abi {
         GuestAbi::Linux => patch_code_segment_with_options(
             &mut code,
             base as u64,
@@ -60,6 +60,19 @@ fn prepare_code(
     }
     .unwrap();
     assert_eq!(trapped, [] as [u64; 0]);
+    if abi == GuestAbi::Linux {
+        // Unlike the Mach-O helper above, raw ELF segment rewriting leaves
+        // TLS placeholders. SVC returns now use TLS even in SVC-only fixtures.
+        let root = u16::try_from(platform.guest_thread_pointer_offset().unwrap()).unwrap();
+        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates_for_host(
+            &mut gates,
+            root,
+            root.checked_add(u16::try_from(GUEST_X18_OFFSET_FROM_GUEST_TP).unwrap())
+                .unwrap(),
+            TargetHost::MacOs,
+        )
+        .unwrap();
+    }
     assert!(gates.len() <= HOST_PAGE_SIZE / 2);
     assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
     assert_eq!(
@@ -156,8 +169,14 @@ fn native_syscall_gate_preserves_registers_and_carry() {
     });
     assert_ne!(tls_block_address(), 0);
     assert_eq!(read_tls(tls_offset::IN_GUEST), 0);
+    let saved_x16 = read_tls(tls_offset::SVC_X16);
+    let _restore_x16 = litebox::utils::defer(|| write_tls(tls_offset::SVC_X16, saved_x16));
+    // A native return must neither restore this unrelated guest value nor
+    // overwrite it. The second caller below has no TLS block at all.
+    write_tls(tls_offset::SVC_X16, usize::MAX);
     // SAFETY: the initialized test stub remains RX until both callers finish.
     unsafe { check(base) };
+    assert_eq!(read_tls(tls_offset::SVC_X16), usize::MAX);
     std::thread::spawn(move || {
         assert_eq!(tls_block_address(), 0);
         // SAFETY: the parent retains the RX stub until this thread is joined.

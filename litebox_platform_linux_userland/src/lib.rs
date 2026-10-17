@@ -1446,6 +1446,11 @@ fn update_aarch64_guest_signal_context(
             *regs = canonical;
             return true;
         }
+        Aarch64GateSignalResult::WriteThreadPointer { context, value } => {
+            arch::set_guest_thread_pointer(value);
+            *regs = context;
+            return true;
+        }
         Aarch64GateSignalResult::PreserveSavedContext => {
             // Saved registers are authoritative, but the outbound stub leaves a stale syscall number.
             regs.syscallno = litebox_common_linux::arch::NO_SYSCALL;
@@ -1471,10 +1476,10 @@ unsafe extern "C" fn exception_signal_handler(
     #[cfg(target_arch = "aarch64")]
     let faulting_pc: usize = context.uc_mcontext.pc.trunc();
 
-    // Staging can raise SIGSEGV/SIGBUS with `in_guest` set; fix up before checking it.
+    // Fault-safe memory operations can run with `in_guest` set (for example
+    // during recovery); honor their registered fixups before checking it.
     #[cfg(target_arch = "aarch64")]
     if let Some(fixup_addr) = signal_exception_fixup(signum, info.si_code, faulting_pc) {
-        // The staging-store assembly fixup clears `in_guest` on resumption.
         context.uc_mcontext.pc = fixup_addr as u64;
         return;
     }

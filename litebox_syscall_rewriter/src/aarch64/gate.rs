@@ -150,6 +150,9 @@ pub enum Stage {
     Recover(Boundary),
     /// The SVC gate's outbound stub, the runtime-owned return path.
     SvcOutbound,
+    /// A TLS-backed SVC outbound instruction. The runtime must first check
+    /// this is its recorded outbound stub; then normal recovery applies.
+    SvcTlsOutbound(Boundary),
     /// Reachable only if a runtime invariant was violated.
     Invalid,
 }
@@ -165,6 +168,8 @@ pub(super) enum TlsField {
     Tp,
     /// Direct-TLS guest x18 slot.
     X18,
+    /// The outbound SVC x16 slot, a fixed displacement from guest TP.
+    SvcX16,
 }
 
 impl TlsField {
@@ -172,6 +177,15 @@ impl TlsField {
         match self {
             Self::Tp => GUEST_TPIDR_OFFSET_PLACEHOLDER,
             Self::X18 => GUEST_X18_OFFSET_PLACEHOLDER,
+            Self::SvcX16 => super::SVC_X16_OFFSET_PLACEHOLDER,
+        }
+    }
+
+    pub(super) fn bias(self) -> u16 {
+        if self == Self::SvcX16 {
+            super::SVC_X16_OFFSET_FROM_GUEST_TP
+        } else {
+            0
         }
     }
 
@@ -179,6 +193,12 @@ impl TlsField {
         match self {
             Self::Tp => valid_emitted_tpidr_offset(offset),
             Self::X18 => valid_emitted_x18_offset(offset),
+            Self::SvcX16 => {
+                offset == u32::from(super::SVC_X16_OFFSET_PLACEHOLDER)
+                    || offset
+                        .checked_sub(u32::from(super::SVC_X16_OFFSET_FROM_GUEST_TP))
+                        .is_some_and(valid_emitted_tpidr_offset)
+            }
         }
     }
 }
@@ -589,7 +609,7 @@ fn build_into(
     out: &mut BuiltSlot,
 ) -> Result<(), BuildError> {
     let template = match instance.metadata {
-        GateMetadata::Svc => build_svc,
+        GateMetadata::Svc | GateMetadata::SvcTls => build_svc,
         GateMetadata::MrsTpidr { .. } => build_mrs,
         GateMetadata::HostAwareMrsTpidr { .. } => build_host_aware_mrs,
         GateMetadata::MsrTpidr { .. } => build_msr,
@@ -656,10 +676,55 @@ fn build_svc(asm: &mut GateAsm, gate: &Gate<'_>) -> Result<(), BuildError> {
     asm.op(saved.stage(), Insn::Br(X16))?;
     debug_assert_eq!(asm.here(), Ok(stub));
     // Outbound stub: restore guest X16 and SP, then return to site+4.
-    let outbound = Some(Stage::SvcOutbound);
-    asm.op(outbound, ldr_sp(X16, SVC_FRAME_OFF_X16))?;
-    asm.op(outbound, Insn::AddSp(frame))?;
-    asm.branch(outbound, Role::Return, ret)?;
+    if instance.metadata == GateMetadata::Svc {
+        let outbound = Some(Stage::SvcOutbound);
+        asm.op(outbound, ldr_sp(X16, SVC_FRAME_OFF_X16))?;
+        asm.op(outbound, Insn::AddSp(frame))?;
+        asm.branch(outbound, Role::Return, ret)?;
+    } else {
+        let pending = Boundary::new(Live(Sp), FrameEnd, Value::Slot, Next);
+        let stage = |boundary| Some(Stage::SvcTlsOutbound(boundary));
+        asm.tls_base(stage(pending), stage(pending.fault()), X16)?;
+        if asm.host == Host::MacOs {
+            asm.op(
+                stage(pending.fault()),
+                ldr(X16, X16, super::SVC_X16_OFFSET_FROM_GUEST_TP),
+            )?;
+        } else {
+            asm.tls(
+                stage(pending.fault()),
+                TlsField::SvcX16,
+                Opcode::LdrUimm,
+                X16,
+                X16,
+            )?;
+        }
+        asm.op(
+            stage(Boundary {
+                value: Value::None,
+                ..pending
+            }),
+            Insn::AddSp(frame),
+        )?;
+        asm.branch(
+            stage(Boundary::new(none, Signal, Value::None, Next)),
+            Role::Return,
+            ret,
+        )?;
+        if asm.host == Host::MacOs {
+            debug_assert_eq!(
+                asm.here()?,
+                stub + super::MACOS_SVC_NATIVE_EPILOGUE_OFFSET_FROM_STUB as u64,
+            );
+            // Rewritten Darwin code can also run on ordinary host threads,
+            // including threads with no LiteBox TLS. The native callback uses
+            // this epilogue, never the guest's TLS-restoring outbound stub.
+            // No guest recovery stages: host signals use the host disposition.
+            asm.op(None, ldr_sp(X16, SVC_FRAME_OFF_X16))?;
+            asm.op(None, Insn::AddSp(frame))?;
+            asm.branch(None, Role::Fixed, ret)?;
+        }
+    }
     Ok(())
 }
 

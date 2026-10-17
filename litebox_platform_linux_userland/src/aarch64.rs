@@ -80,6 +80,7 @@ struct TlsBlock {
     wait_waker_addr: usize,
     outbound_stub: usize,
     outbound_pc: usize,
+    svc_x16: usize,
     resume_frame_initialized: u8,
     host_fp_state: FpState,
     guest_vector_state: GuestVectorState,
@@ -102,6 +103,7 @@ pub(super) mod tls_offset {
     pub(crate) const WAIT_WAKER_ADDR: usize = offset_of!(TlsBlock, wait_waker_addr);
     pub(crate) const OUTBOUND_STUB: usize = offset_of!(TlsBlock, outbound_stub);
     pub(crate) const OUTBOUND_PC: usize = offset_of!(TlsBlock, outbound_pc);
+    pub(crate) const SVC_X16: usize = offset_of!(TlsBlock, svc_x16);
     pub(crate) const RESUME_FRAME_INITIALIZED: usize =
         offset_of!(TlsBlock, resume_frame_initialized);
     pub(super) const HOST_FP_STATE: usize = offset_of!(TlsBlock, host_fp_state);
@@ -154,7 +156,14 @@ pub(super) fn assert_tls_block_placement() {
          reject, failing every guest resume through the generic path",
     );
 
-    let _ = guest_thread_pointer_tp_offset();
+    let root = guest_thread_pointer_tp_offset();
+    assert!(
+        root.checked_add(litebox_syscall_rewriter::aarch64::SVC_X16_OFFSET_FROM_GUEST_TP)
+            .is_some_and(
+                |offset| offset < litebox_syscall_rewriter::aarch64::MAX_GUEST_TPIDR_OFFSET
+            ),
+        "the outbound x16 slot must fit the gate's TLS load"
+    );
     let guest_tp = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_THREAD_POINTER;
     let guest_x18 = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_X18;
     assert_eq!(
@@ -168,6 +177,11 @@ pub(super) fn assert_tls_block_placement() {
             .is_ok_and(litebox_syscall_rewriter::aarch64::is_patchable_guest_x18_offset)
     );
 }
+
+const _: () = assert!(
+    tls_offset::SVC_X16 - tls_offset::GUEST_THREAD_POINTER
+        == litebox_syscall_rewriter::aarch64::SVC_X16_OFFSET_FROM_GUEST_TP as usize
+);
 
 const _: () = assert!(
     tls_offset::GUEST_X18 - tls_offset::GUEST_THREAD_POINTER
@@ -1123,9 +1137,9 @@ pub(super) mod resume_frame {
 ///
 /// The generic resume mechanism restores the complete context through
 /// `rt_sigreturn`. As an optimization, a resume at the most recent rewritten
-/// syscall site uses its recorded outbound stub while that stub's guest-stack
-/// frame remains usable. A fault while staging that frame returns to the
-/// generic mechanism.
+/// syscall site uses its recorded TLS-restoring outbound stub. The frame is
+/// popped arithmetically, without accessing guest-stack memory. Legacy stubs
+/// and unavailable stub mappings use the generic mechanism.
 pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[cfg(feature = "aarch64_virtualize_x18")]
     set_guest_x18(ctx.regs[18]);
@@ -1158,7 +1172,19 @@ pub(super) fn outbound_stub_is_current(ctx: &litebox_common_linux::PtRegs) -> bo
             options(nostack, preserves_flags, readonly)
         );
     }
-    stub != 0 && pc == ctx.pc
+    if stub == 0 || pc != ctx.pc {
+        return false;
+    }
+    let mut word = [0u8; 4];
+    // SAFETY: the recorded stub can have been unmapped by the guest; the
+    // exception-table copy fails safely without dereferencing a Rust reference.
+    (unsafe {
+        litebox::mm::exception_table::memcpy_fallible(word.as_mut_ptr(), stub as *const u8, 4)
+            .is_ok()
+    }) && litebox_syscall_rewriter::aarch64::svc_stub_uses_tls(
+        u32::from_le_bytes(word),
+        litebox_syscall_rewriter::TargetHost::Linux,
+    )
 }
 
 /// Re-enters the guest through the rewriter's per-site outbound stub, for a
@@ -1169,11 +1195,8 @@ pub(super) fn outbound_stub_is_current(ctx: &litebox_common_linux::PtRegs) -> bo
 /// [`tls_offset::OUTBOUND_STUB`] and `ctx.pc` must be the PC it branches to.
 /// [`outbound_stub_is_current`] is the check.
 ///
-/// Stages `PtRegs::regs[16]` in the stub frame before restoring guest state.
-/// If that guest-stack access faults (for example, because the stack was
-/// remapped), control returns to the generic [`switch_to_guest_via_sigreturn`]
-/// path. This is a failure of the syscall-specific optimization, not recovery
-/// of the syscall itself.
+/// Stages `PtRegs::regs[16]` in runtime TLS before restoring guest state.
+/// Legacy stack-restoring stubs use generic context restore instead.
 ///
 /// The `switch_to_guest_via_outbound_stub_start`/`_end` bracket is one of the
 /// two ranges [`in_switch_to_guest`] tests: from before the `in_guest` store to
@@ -1220,30 +1243,12 @@ switch_to_guest_via_outbound_stub_start:
     b    interrupt_callback
 3:
 
-    // Stage x16 while host SP and FP/SIMD state are intact.
-    ldr  x4, [x0, #248]
-    sub  x4, x4, #{SVC_FRAME_BYTES}
+    // Stage x16 in runtime TLS, never in the guest stack. An interrupt in
+    // this transition uses authoritative PtRegs and bypasses the stub.
     ldr  x5, [x0, #128]
 .globl switch_to_guest_stage_x16
 switch_to_guest_stage_x16:
-    str  x5, [x4, #{SVC_FRAME_OFF_X16}]
-.globl switch_to_guest_stage_x16_end
-switch_to_guest_stage_x16_end:
-    b    4f
-.globl switch_to_guest_stage_x16_fixup
-switch_to_guest_stage_x16_fixup:
-    // Leave the syscall-specific fast path and use generic context restore;
-    // selecting the stub again would retry this store.
-    strb wzr, [x17, #{IN_GUEST}]
-    b    {resume_via_sigreturn}
-4:
-    // [start, end) and fixup as self-relative 32-bit offsets.
-    .pushsection ex_table,\"aR\"
-    .balign 4
-    .long switch_to_guest_stage_x16 - .
-    .long switch_to_guest_stage_x16_end - .
-    .long switch_to_guest_stage_x16_fixup - .
-    .popsection
+    str  x5, [x17, #{SVC_X16}]
 
     add  x17, x17, #{GUEST_VECTOR_STATE}
     add  x17, x17, #512
@@ -1321,9 +1326,8 @@ switch_to_guest_via_outbound_stub_end:
     GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
-    SVC_FRAME_OFF_X16 = const litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_X16,
+    SVC_X16 = const tls_offset::SVC_X16,
     VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
-    resume_via_sigreturn = sym switch_to_guest_via_sigreturn,
     );
 }
 
@@ -1331,8 +1335,7 @@ switch_to_guest_via_outbound_stub_end:
 /// contents.
 ///
 /// This is the normal path whenever the syscall-specific outbound-stub
-/// optimization is inapplicable, and its fallback if the guest-stack frame
-/// cannot be used.
+/// optimization is inapplicable, including returns through legacy stubs.
 ///
 /// # Safety
 /// Inherits [`switch_to_guest`]'s contract; the caller must be in host state.
@@ -1489,10 +1492,6 @@ unsafe extern "C" {
     pub(super) fn switch_to_guest_via_sigreturn_end();
     #[cfg(test)]
     fn switch_to_guest_stage_x16();
-    #[cfg(test)]
-    fn switch_to_guest_stage_x16_end();
-    #[cfg(test)]
-    fn switch_to_guest_stage_x16_fixup();
 
     /// The compiler runtime's cache-synchronization helper: cleans the data
     /// cache to the point of unification and invalidates the instruction cache
@@ -2177,9 +2176,60 @@ mod tests {
         litebox_common_linux::PtRegs,
     ) {
         let mut code = original.to_le_bytes().to_vec();
-        let (trampoline, trapped) =
+        let (mut trampoline, trapped) =
             litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0).unwrap();
         assert_eq!(trapped, []);
+        if original & !31 == 0xd51b_d040 {
+            // Persisted v1 MSR fixture. New rewriting emits an in-place trap,
+            // but old binaries must still recover at every gate boundary.
+            let source = original & 31;
+            let branch = |from: u64, to: u64| -> u32 {
+                let displacement = (i64::try_from(to).unwrap() - i64::try_from(from).unwrap()) >> 2;
+                0x1400_0000 | u32::try_from(displacement.cast_unsigned() & 0x03ff_ffff).unwrap()
+            };
+            code.copy_from_slice(&branch(0x1000, 0x400010).to_le_bytes());
+            trampoline = [
+                0,
+                0,
+                0xd503201f,
+                0xd503201f,
+                0xd10083ff,
+                0xa90047f0,
+                0xf9000be0 | source,
+                0xd53bd050,
+                0xf9400bf1,
+                0xf93ffe11,
+                0xa94047f0,
+                0x910083ff,
+                branch(0x400030, 0x1004),
+                branch(0x400034, 0x1004),
+                0xd503201f,
+                (source << 24) | 0x0021b807,
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        }
+        if original == 0xd400_0001 {
+            // Persisted v1 SVC outbound stub (stack-restoring). New stubs use
+            // TLS, but compatibility recovery must still recognize this shape.
+            for (index, word) in [
+                0xf94003f0u32,
+                0x910083ff,
+                0x14000000
+                    | u32::try_from(((-0x3ff038i64) >> 2).cast_unsigned() & 0x03ffffff).unwrap(),
+                0xd503201f,
+                0xd503201f,
+                0xd503201f,
+                0x0001b807,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let offset = 16 + 36 + index * 4;
+                trampoline[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
         let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
         for (index, reg) in context.uc_mcontext.regs.iter_mut().enumerate() {
             *reg = 0xfeed_0000_0000_0000 | index as u64;
@@ -3763,28 +3813,14 @@ mod tests {
         );
     }
 
-    /// The staging-store fixup enables fallback to generic context restore.
-    /// Without it, `in_switch_to_guest` routes the fault to `next_signal_handler`.
     #[test]
-    fn test_switch_to_guest_stage_x16_has_exception_fixup() {
+    fn svc_tls_staging_needs_no_guest_memory_fixup() {
         let stage = super::switch_to_guest_stage_x16 as *const () as usize;
-        let end = super::switch_to_guest_stage_x16_end as *const () as usize;
-        let fixup = super::switch_to_guest_stage_x16_fixup as *const () as usize;
-        assert_eq!(end, stage + 4, "only the staging store may be fixed up");
-        assert_ne!(
-            end, fixup,
-            "successful staging must not fall through into fault recovery"
-        );
         assert_eq!(
             litebox::mm::exception_table::search_exception_tables(stage),
-            Some(fixup),
-            "the guest-stack staging store must fall back to generic context restore"
+            None
         );
-        assert_eq!(
-            litebox::mm::exception_table::search_exception_tables(end),
-            None,
-            "the instruction after the staging store must not be covered"
-        );
+        assert_eq!(tls_offset::SVC_X16, 64);
     }
 
     #[test]
@@ -3943,76 +3979,5 @@ mod tests {
             super::exception_signal_handler(libc::SIGSYS, &mut info, &mut context);
             libc::_exit(3); // The nested exception must have run and exited first.
         }
-    }
-
-    /// Staging faults with `in_guest == 1` must not leak host registers into guest `PtRegs`.
-    /// The assembly fixup clears the flag on resumption; this test stops before that.
-    #[test]
-    fn test_exception_on_guest_stack_store_does_not_leak_host_state() {
-        const SEGV_MAPERR: libc::c_int = 1;
-
-        let stage = super::switch_to_guest_stage_x16 as *const () as usize;
-        let fixup = super::switch_to_guest_stage_x16_fixup as *const () as usize;
-
-        let mut guest = std::boxed::Box::new(PtRegs::default());
-        for (i, r) in guest.regs.iter_mut().enumerate() {
-            *r = 0x6d05_7000_0000_0000 | i;
-        }
-        guest.sp = 0x6d05_7000_5000_0000;
-        guest.pc = 0x6d05_7000_6000_0000;
-        let before = std::format!("{guest:?}");
-
-        let in_guest = (tls_block_base() + tls_offset::IN_GUEST) as *mut u8;
-        let context_top = (tls_block_base() + tls_offset::GUEST_CONTEXT_TOP) as *mut usize;
-
-        // SAFETY: both are this thread's own naturally aligned TLS slots, and
-        // nothing else on this thread is in guest execution, so publishing a
-        // synthetic context here cannot be observed by anything but the call
-        // below. Both are restored before the assertions.
-        unsafe {
-            context_top.write_volatile((&raw mut *guest).add(1) as usize);
-            in_guest.write_volatile(1);
-        }
-
-        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
-        let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
-        info.si_code = SEGV_MAPERR;
-        for (i, r) in context.uc_mcontext.regs.iter_mut().enumerate() {
-            *r = 0xffff_0000_0000_0000 | i as u64;
-        }
-        context.uc_mcontext.pc = stage as u64;
-        context.uc_mcontext.sp = 0xffff_0000_5000_0000;
-        context.uc_mcontext.fault_address = 0xffff_0000_5000_0000;
-
-        // SAFETY: `exception_signal_handler`'s contract is a signal number and
-        // the two pointers a `SA_SIGINFO` handler receives; both are valid
-        // here. It is reentrant with respect to this thread's TLS block, which
-        // is the only state it touches besides the context it is handed.
-        unsafe { super::exception_signal_handler(libc::SIGSEGV, &mut info, &mut context) };
-
-        // SAFETY: as above.
-        let was_in_guest = unsafe {
-            let was = in_guest.read_volatile();
-            in_guest.write_volatile(0);
-            context_top.write_volatile(0);
-            was
-        };
-
-        assert_eq!(
-            std::format!("{guest:?}"),
-            before,
-            "a fault on the guest-stack staging store must not overwrite the guest context \
-             with host register state"
-        );
-        assert_eq!(
-            was_in_guest, 1,
-            "the handler must leave `in_guest` for the assembly fixup to clear"
-        );
-        let fixed_pc: usize = context.uc_mcontext.pc.trunc();
-        assert_eq!(
-            fixed_pc, fixup,
-            "the signal context must be redirected to the store's fixup, not to \
-             `exception_callback`"
-        );
     }
 }

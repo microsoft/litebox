@@ -3311,12 +3311,11 @@ mod tests {
         assert_eq!(runtime, aot.trampoline);
 
         // Exercise the compact classifier independently on both products, not
-        // only equality of their bytes. The three sites emit SVC, MRS, then MSR
-        // slots at fixed aligned starts after the 16-byte trampoline header.
+        // only equality of their bytes. SVC and MRS emit slots; MSR is trapped
+        // in place and emits no slot.
         let boundaries = [
             (16usize, 12usize), // 9 inbound SVC + 3 outbound-stub instructions.
             (80, 3),
-            (96, 9),
         ];
         let mut classified = 0;
         for product in [&runtime, &aot.trampoline] {
@@ -3330,7 +3329,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(classified, 48, "24 boundaries in each emission path");
+        assert_eq!(classified, 30, "15 boundaries in each emission path");
     }
 
     /// The fail-safe: when no trampoline can be placed, every site the hooking

@@ -238,17 +238,22 @@ fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
         .finalize_trampoline_gates(&mut aot_gates, 96)
         .unwrap();
     assert_eq!(gates, aot_gates);
+    let svc_end = 16 + GateMetadata::SvcTls.slot_size_for_host(TargetHost::MacOs);
     let svc = rewriter
-        .classify_gate_slot(&gates[16..80], base + slide + 16, base + slide + 16)
+        .classify_gate_slot(&gates[16..svc_end], base + slide + 16, base + slide + 16)
         .unwrap();
-    assert_eq!(svc.metadata(), GateMetadata::Svc);
+    assert_eq!(svc.metadata(), GateMetadata::SvcTls);
     assert_eq!(svc.original_site(), code_vaddr);
     let tp = rewriter
-        .classify_gate_slot(&gates[80..], base + slide + 80, base + slide + 80)
+        .classify_gate_slot(
+            &gates[svc_end..],
+            base + slide + svc_end as u64,
+            base + slide + svc_end as u64,
+        )
         .unwrap();
     assert_eq!(tp.original_site(), code_vaddr + 4);
-    assert_eq!(u32_at(&gates, 88), 0xf940_3063); // finalized runtime TSD slot
-    assert_eq!(u32_at(&gates, 92), 0xf940_0063); // logical TP within the TLS block
+    assert_eq!(u32_at(&gates, svc_end + 8), 0xf940_3063); // finalized runtime TSD slot
+    assert_eq!(u32_at(&gates, svc_end + 12), 0xf940_0063); // logical TP within the TLS block
 }
 
 #[test]
@@ -328,9 +333,10 @@ fn svc_frame_layout_is_selected_by_the_runner() {
     let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
     let out = hook_syscalls_in_macho(&image(&[SVC]), None).unwrap();
     let (offset, base, _) = footer(&out);
-    let mut slot = out[offset + 16..offset + 80].to_vec();
+    let gate_len = GateMetadata::SvcTls.slot_size_for_host(TargetHost::MacOs);
+    let mut slot = out[offset + 16..offset + 16 + gate_len].to_vec();
     assert_eq!(u32_at(&slot, 0), 0xd102_83ff); // sub sp, sp, #160
-    assert_eq!(u32_at(&slot, 40), 0x9102_83ff); // add sp, sp, #160
+    assert_eq!(u32_at(&slot, 52), 0x9102_83ff); // add sp, sp, #160
     assert!(
         aarch64::classify_copied_gate_slot_for_host(&slot, base + 16, base + 16, TargetHost::MacOs)
             .is_none()
@@ -340,10 +346,11 @@ fn svc_frame_layout_is_selected_by_the_runner() {
             .classify_gate_slot(&slot, base + 16, base + 16)
             .unwrap()
             .metadata(),
-        GateMetadata::Svc
+        GateMetadata::SvcTls
     );
     put32(&mut slot, 0, 0xd100_83ff); // sub sp, sp, #32
-    put32(&mut slot, 40, 0x9100_83ff); // add sp, sp, #32
+    put32(&mut slot, 52, 0x9100_83ff); // guest add sp, sp, #32
+    put32(&mut slot, 64, 0x9100_83ff); // native add sp, sp, #32
     assert!(
         rewriter
             .classify_gate_slot(&slot, base + 16, base + 16)
@@ -353,7 +360,7 @@ fn svc_frame_layout_is_selected_by_the_runner() {
         aarch64::classify_copied_gate_slot_for_host(&slot, base + 16, base + 16, TargetHost::MacOs)
             .unwrap()
             .metadata(),
-        GateMetadata::Svc
+        GateMetadata::SvcTls
     );
 }
 
@@ -373,13 +380,33 @@ fn placement_uses_native_page_holes_and_counts_zerofill() {
 }
 
 #[test]
+fn svc_size_estimates_include_the_native_host_epilogue() {
+    for count in [1, 300] {
+        let input = image(&vec![SVC; count]);
+        let bound = CodeMetadata::parse(&input)
+            .unwrap()
+            .trampoline_size_upper_bound(&input, RewriteOptions::new(TargetHost::MacOs, false))
+            .unwrap();
+        let output = hook_syscalls_in_macho(&input, None).unwrap();
+        let (_, _, actual) = footer(&output);
+        assert!(
+            actual <= bound,
+            "{count} SVCs: {actual} bytes exceed bound {bound}"
+        );
+    }
+}
+
+#[test]
 fn small_hole_retries_past_the_image_without_rewriting_patched_code() {
     let mut input = image(&vec![SVC; 300]); // > 16 KiB of gates
     add_segment(&mut input, BASE + 0x8000, 0x4000);
     let out = hook_syscalls_in_macho(&input, None).unwrap();
     let (_, base, size) = footer(&out);
     assert!(base >= BASE + 0xc000);
-    assert_eq!(size, 16 + 300 * 64);
+    assert_eq!(
+        size,
+        16 + 300 * GateMetadata::SvcTls.slot_size_for_host(TargetHost::MacOs)
+    );
     assert_eq!(
         aarch64::decode_branch_target(u32_at(&out, TEXT), BASE + TEXT as u64),
         Some(base + 16)

@@ -178,7 +178,7 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
                 assert!(trampoline.virtual_range.contains(&target));
                 let gate_offset =
                     trampoline.file_range.start + target - trampoline.virtual_range.start;
-                let gate_len = GateMetadata::Svc.slot_size_for_host(TargetHost::MacOs);
+                let gate_len = GateMetadata::SvcTls.slot_size_for_host(TargetHost::MacOs);
                 let gate = rewriter
                     .classify_gate_slot(
                         &rewritten[gate_offset..gate_offset + gate_len],
@@ -186,7 +186,7 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
                         target as u64,
                     )
                     .unwrap();
-                assert_eq!(gate.metadata(), GateMetadata::Svc);
+                assert_eq!(gate.metadata(), GateMetadata::SvcTls);
                 assert_eq!(gate.original_site(), site as u64);
                 count += 1;
             }

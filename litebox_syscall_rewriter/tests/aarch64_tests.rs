@@ -173,14 +173,12 @@ fn aarch64_hello_world_is_hooked() {
     }
 
     // --- Thread-pointer handling ---
-    // The `MSR TPIDR_EL0` write is virtualized: rewritten to a branch into the
-    // trampoline's MSR gate.
+    // MSR is emulated at a private in-place breakpoint, with its source encoded.
     let msr_off = first_site(HELLO_AARCH64, TPIDR_REG_MASK, MSR_TPIDR_BITS)
         .expect("fixture has an MSR TPIDR_EL0 write");
     assert_eq!(
-        read_u32(&out, msr_off) & 0xFC00_0000,
-        0x1400_0000,
-        "MSR TPIDR_EL0 should be rewritten to B"
+        litebox_syscall_rewriter::aarch64::decode_msr_tpidr_trap(read_u32(&out, msr_off)),
+        Some((read_u32(HELLO_AARCH64, msr_off) & 31) as u8)
     );
 
     // The `MRS TPIDR_EL0` read is virtualized: rewritten to a branch into the

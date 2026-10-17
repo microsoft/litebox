@@ -14,7 +14,9 @@
 //!
 //! * `SVC #imm` — syscall. The gate records the return address and tail-jumps
 //!   through the trampoline header's callback pointer.
-//! * `MSR TPIDR_EL0, Xn` — thread-pointer write, stored to the guest slot.
+//! * `MSR TPIDR_EL0, Xn` — an in-place private breakpoint; the runtime stores
+//!   Xn to the guest slot and resumes at the next instruction. It needs no
+//!   guest stack and handles XZR and virtualized x18 sources.
 //! * `MRS Xd, TPIDR_EL0` — thread-pointer read, loaded from it. `MRS XZR,
 //!   TPIDR_EL0` is a discarded read and is left native.
 //! * Darwin `SVC #0x80` — syscall, preserving the 128-byte red zone.
@@ -44,12 +46,14 @@
 //!
 //! ## Gate scratch storage
 //!
-//! `SVC` and `MSR TPIDR_EL0` clobber no registers, so their gates spill to a
-//! frame carved from the guest stack with `SUB`/`ADD SP` and **require `SP` to
+//! `SVC` clobbers no registers, so its gate spills to a frame carved from
+//! the guest stack with `SUB`/`ADD SP` and **requires `SP` to
 //! address a valid, writable, 16-byte-aligned stack at the patched site** — the
 //! same condition the kernel relies on to write a signal frame. A site reached
 //! with `SP` unmapped faults where the native instruction would not. The MRS
-//! gate uses its destination as scratch and needs no frame.
+//! gate uses its destination as scratch and needs no frame. Persisted old MSR
+//! stack gates remain recognized. Writes in identified exclusive regions keep
+//! that inline form so a breakpoint cannot force every STXR retry to fail.
 //!
 //! X18 gates add memory accesses that can clear the local exclusive monitor, so
 //! the scanner rejects x18 sites lexically bracketed by an exclusive load and
@@ -71,16 +75,19 @@
 //!
 //! ```text
 //! outbound_N:
-//!     ldr x16, [sp, #0]      // restore guest X16
+//!     mrs x16, tpidr_el0    // Linux host anchor (macOS uses TPIDRRO + key)
+//!     ldr x16, [x16, #slot] // restore guest X16 from runtime TLS
 //!     add sp, sp, #32        // pop the gate frame
 //!     b   site+4             // static target; needs no scratch register
 //! ```
 //!
 //! AArch64 has no memory-indirect branch, so a runtime-side branch back into
 //! the guest would burn a register on its target; a static branch in
-//! guest-adjacent code does not. The runtime rewrites `[SP, #0]` from
-//! `PtRegs::regs[16]` before branching rather than relying on the frame
-//! surviving the round trip.
+//! guest-adjacent code does not. Before returning, the runtime stages
+//! `PtRegs::regs[16]` in its own TLS slot. It never restages the guest frame.
+//! A signal in the stub canonicalizes to `site+4` before a guest handler runs,
+//! freeing that slot for nested syscalls. Old stack-restoring stubs remain
+//! recognized; the runtime uses full-context restore instead of entering them.
 //!
 //! The stub only resumes at the original site. A redirected `PC` (signals,
 //! `execve`) or an asynchronous resume is instead handled by synthesizing an
@@ -471,6 +478,25 @@ const TRAP_BRK_IMM: u16 = 0xB10B;
 /// `BRK` immediate used by the transparent `BR X18` trap gate.
 const X18_BRANCH_BRK_IMM: u16 = 0xB18;
 
+/// Private breakpoint namespace for a guest `MSR TPIDR_EL0, Xn`. The low five
+/// immediate bits encode Xn (31 means XZR); no stack or out-of-line gate is
+/// needed. The runtime consumes only a synchronous breakpoint with this tag.
+const MSR_TPIDR_BRK_BASE: u16 = 0xB200;
+
+/// Distinguishes the new TLS-restoring SVC outbound stub from the persisted
+/// stack-restoring one. Callers use this only for a recorded outbound address;
+/// it is a format discriminator, not authentication of guest code.
+pub fn svc_stub_uses_tls(first_word: u32, host: crate::TargetHost) -> bool {
+    Host::from(host).anchor_read(X16).encode() == Some(first_word)
+}
+
+/// Decode an in-place guest thread-pointer-write breakpoint's source register.
+pub fn decode_msr_tpidr_trap(word: u32) -> Option<u8> {
+    let immediate = ((word >> 5) & 0xffff) as u16;
+    (word & 0xffe0_001f == Opcode::Brk.bits() && immediate & !31 == MSR_TPIDR_BRK_BASE)
+        .then_some((immediate & 31) as u8)
+}
+
 /// Alignment every emitted gate slot starts on.
 pub const GATE_ALIGNMENT: usize = 16;
 /// Byte size of a direct-TLS `MRS TPIDR_EL0` gate slot.
@@ -481,7 +507,8 @@ const HOST_AWARE_MRS_SLOT_BYTES: usize = 64;
 pub const IN_GUEST_OFFSET_FROM_GUEST_TP: u16 = 32;
 /// Byte size of a direct-TLS `MSR TPIDR_EL0` gate slot.
 pub const MSR_SLOT_BYTES: usize = 48;
-/// Byte size of an emitted `SVC` gate slot.
+/// Byte size of a Linux or legacy `SVC` gate slot. A macOS TLS-returning
+/// slot adds one alignment unit for its TLS-independent native epilogue.
 pub const SVC_SLOT_BYTES: usize = 64;
 /// Byte size of a direct-TLS ordinary x18 gate slot.
 const X18_SLOT_BYTES: usize = 48;
@@ -534,6 +561,7 @@ enum GateKind {
     X18Branch = 6,
     X18StackWriteback = 7,
     HostAwareMrsTpidr = 8,
+    SvcTls = 9,
 }
 
 impl GateKind {
@@ -552,6 +580,7 @@ impl GateKind {
             Self::X18Branch,
             Self::X18StackWriteback,
             Self::HostAwareMrsTpidr,
+            Self::SvcTls,
         ]
         .into_iter()
         .find(|kind| kind.bits() == bits)
@@ -570,6 +599,9 @@ const GATE_METADATA_USED_MASK: u32 = GATE_METADATA_MAGIC_MASK
 pub enum GateMetadata {
     /// A trapped `SVC`: the shim performs the syscall.
     Svc,
+    /// SVC with an outbound stub restoring x16 from runtime TLS. The separate
+    /// persisted kind keeps old stack-restoring SVC slots unambiguous.
+    SvcTls,
     /// Read the logical guest thread pointer into the destination register.
     MrsTpidr {
         /// Register the guest thread pointer is read into.
@@ -578,7 +610,9 @@ pub enum GateMetadata {
     /// Read TPIDRRO from the physical host or private guest state according to
     /// the current LiteBox execution mode.
     HostAwareMrsTpidr { destination: u8 },
-    /// A trapped `MSR TPIDR_EL0, <Xs>`, writing the guest thread pointer.
+    /// A legacy inline `MSR TPIDR_EL0, <Xs>` gate. Ordinary writes use an
+    /// in-place breakpoint; old slots and writes in recognized exclusive
+    /// regions retain this form.
     MsrTpidr {
         /// Register holding the value to write.
         source: u8,
@@ -634,6 +668,7 @@ impl EncodedGateMetadata {
         }
         let (kind, register) = match metadata {
             GateMetadata::Svc => (GateKind::Svc, 0),
+            GateMetadata::SvcTls => (GateKind::SvcTls, 0),
             GateMetadata::MrsTpidr { destination } => (GateKind::MrsTpidr, destination),
             GateMetadata::HostAwareMrsTpidr { destination } => {
                 (GateKind::HostAwareMrsTpidr, destination)
@@ -673,6 +708,7 @@ impl EncodedGateMetadata {
         }
         match kind {
             GateKind::Svc if register == 0 => Some(GateMetadata::Svc),
+            GateKind::SvcTls if register == 0 => Some(GateMetadata::SvcTls),
             GateKind::MrsTpidr if register != XZR => Some(GateMetadata::MrsTpidr {
                 destination: register,
             }),
@@ -1387,6 +1423,9 @@ pub const GUEST_TPIDR_OFFSET_ALIGN: u16 = LDST_UIMM12_SCALE_64BIT;
 
 /// Guest x18's ABI offset from the guest thread pointer field.
 pub const GUEST_X18_OFFSET_FROM_GUEST_TP: usize = core::mem::size_of::<usize>();
+/// ABI offset of the outbound SVC x16 save slot from the guest-TP field.
+/// Both hosts keep their existing prefix (including `in_guest` at 32).
+pub const SVC_X16_OFFSET_FROM_GUEST_TP: u16 = 64;
 const _: () = assert!(GUEST_X18_OFFSET_FROM_GUEST_TP == GUEST_TPIDR_OFFSET_ALIGN as usize);
 
 /// Largest anchor-relative guest TLS root offset encodable by the gates.
@@ -1413,6 +1452,7 @@ pub(crate) const MIN_GUEST_TPIDR_OFFSET: u16 = 16;
 pub(crate) const GUEST_TPIDR_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET;
 /// Distinct placeholder used by direct-TLS x18 gates.
 const GUEST_X18_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET - 8;
+const SVC_X16_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET;
 
 /// Stack frame used by x18 gates to preserve their two scratch registers.
 pub const X18_FRAME_BYTES: u16 = 16;
@@ -1514,6 +1554,11 @@ const _: () = assert!(
 /// instruction to its outbound stub. The gate is `SUB SP / STR X16 / ADRP /
 /// ADD / STR / ADR / STR / LDR X16 / BR` = 9 instructions.
 pub const SVC_GATE_BYTES: usize = 9 * 4;
+/// The macOS TLS-restoring outbound stub is six instructions. A native-host
+/// epilogue follows it and restores x16 from the stack, without using guest TLS.
+pub const MACOS_SVC_NATIVE_EPILOGUE_OFFSET_FROM_STUB: usize = 6 * INSN_BYTES;
+/// Size of that native epilogue (`LDR X16 / ADD SP / B`).
+pub const MACOS_SVC_NATIVE_EPILOGUE_BYTES: usize = 3 * INSN_BYTES;
 /// Size of the per-site outbound stub (`LDR X16 / ADD SP / B`).
 #[cfg(test)]
 const SVC_OUTBOUND_STUB_BYTES: usize = 3 * 4;
@@ -2134,6 +2179,9 @@ enum PatchKind {
     Svc,
     /// `MSR TPIDR_EL0, Xt`; the `u8` is the source register (0-31).
     MsrTpidr(u8),
+    /// Retain the old inline sequence inside a recognized exclusive region:
+    /// a breakpoint unconditionally clears the host's exclusive reservation.
+    MsrTpidrInline(u8),
     /// Guest thread-pointer read; the `u8` is the destination register (0-30).
     MrsTpidr(u8),
     /// An x18 use detected under explicit virtualization.
@@ -2151,8 +2199,10 @@ enum PatchKind {
 impl PatchKind {
     fn metadata(self) -> Option<GateMetadata> {
         Some(match self {
-            Self::Svc => GateMetadata::Svc,
-            Self::MsrTpidr(source) => GateMetadata::MsrTpidr { source },
+            Self::Svc => GateMetadata::SvcTls,
+            Self::MsrTpidr(source) | Self::MsrTpidrInline(source) => {
+                GateMetadata::MsrTpidr { source }
+            }
             Self::MrsTpidr(destination) => GateMetadata::MrsTpidr { destination },
             Self::X18(X18TransformResult::Supported(transform)) => GateMetadata::X18 {
                 scratch: transform.scratch,
@@ -2217,6 +2267,14 @@ fn find_patch_sites_with_code_ranges(
             ));
         }
         let section_data = &buf[start..end];
+        // Most objects contain no MSR. Preserve the fast exact scan there,
+        // but identify exclusive regions in objects whose writes may trap.
+        let track_exclusives = config.virtualize_x18
+            || section_data
+                .as_chunks::<INSN_BYTES>()
+                .0
+                .iter()
+                .any(|bytes| u32::from_le_bytes(*bytes) & MSR_TPIDR_EL0_MASK == MSR_TPIDR_EL0_BITS);
         let mut inside_exclusive_sequence = false;
         let mut was_known_code = false;
         let mut code_index = 0;
@@ -2230,7 +2288,7 @@ fn find_patch_sites_with_code_ranges(
             // Without x18 virtualization, only these encodings are patch sites.
             // Code-range and exclusive-sequence tracking only qualifies x18
             // sites, so skip other words before doing that bookkeeping.
-            if !config.virtualize_x18
+            if !track_exclusives
                 && (insn & SVC_OPCODE_MASK) != SVC_OPCODE_BITS
                 && (insn & MSR_TPIDR_EL0_MASK) != MSR_TPIDR_EL0_BITS
                 && (insn & MRS_TPIDR_EL0_MASK) != MRS_TPIDR_EL0_BITS
@@ -2276,10 +2334,13 @@ fn find_patch_sites_with_code_ranges(
                     )));
                 }
                 let source = (insn & REG_MASK) as u8;
-                if config.virtualize_x18 && u16::from(source) == X18 {
-                    PatchKind::X18(X18TransformResult::Unsupported(
-                        X18Unsupported::EncodingLayout,
-                    ))
+                if inside_exclusive_sequence {
+                    if source == X18_ENCODED && config.virtualize_x18 {
+                        return Err(Error::UnsupportedExecutable(format!(
+                            "AArch64 virtual x18 MSR inside exclusive sequence at {vaddr:#x}"
+                        )));
+                    }
+                    PatchKind::MsrTpidrInline(source)
                 } else {
                     PatchKind::MsrTpidr(source)
                 }
@@ -2559,6 +2620,14 @@ fn hook_sites(
     let mut trapped_sites: Vec<u64> = Vec::new();
 
     for site in sites {
+        if let PatchKind::MsrTpidr(source) = site.kind {
+            let instruction = Insn::Brk(MSR_TPIDR_BRK_BASE | u16::from(source))
+                .encode()
+                .expect("MSR breakpoint immediate is valid");
+            buf[site.file_offset..site.file_offset + INSN_BYTES]
+                .copy_from_slice(&instruction.to_le_bytes());
+            continue;
+        }
         let gate_offset = trampoline_data.len();
         let gate_vaddr =
             checked_add_u64(trampoline_base_addr, gate_offset as u64, "trampoline gate")?;
@@ -2621,10 +2690,10 @@ fn emit_gate(
     };
     let (instance, layout) = match site.kind {
         PatchKind::Svc => (
-            gate::GateInstance::new(GateMetadata::Svc, next("SVC return")?),
+            gate::GateInstance::new(GateMetadata::SvcTls, next("SVC return")?),
             layout,
         ),
-        PatchKind::MsrTpidr(source) => (
+        PatchKind::MsrTpidr(source) | PatchKind::MsrTpidrInline(source) => (
             gate::GateInstance::new(GateMetadata::MsrTpidr { source }, next("MSR return")?),
             GateLayout::linux(config.host),
         ),
@@ -2802,7 +2871,7 @@ impl GateMetadata {
     /// Byte size of this gate's direct-TLS layout.
     pub const fn slot_size(self) -> usize {
         match self {
-            GateMetadata::Svc => SVC_SLOT_BYTES,
+            GateMetadata::Svc | GateMetadata::SvcTls => SVC_SLOT_BYTES,
             GateMetadata::MrsTpidr { .. } => MRS_SLOT_BYTES,
             GateMetadata::HostAwareMrsTpidr { .. } => HOST_AWARE_MRS_SLOT_BYTES,
             GateMetadata::MsrTpidr { .. } => MSR_SLOT_BYTES,
@@ -2828,6 +2897,7 @@ impl GateMetadata {
             return self.slot_size();
         }
         match self {
+            GateMetadata::SvcTls => SVC_SLOT_BYTES + GATE_ALIGNMENT,
             GateMetadata::MrsTpidr { .. } => MRS_SLOT_BYTES + GATE_ALIGNMENT,
             GateMetadata::MsrTpidr { .. } => MSR_SLOT_BYTES + GATE_ALIGNMENT,
             GateMetadata::X18 { .. } => X18_SLOT_BYTES + GATE_ALIGNMENT,
@@ -3042,7 +3112,7 @@ pub(crate) fn classify_copied_gate_slot_with_layout(
     // One slot buffer serves the base lookup, the probe and the rebuild, which
     // keeps this signal-handler path's stack small.
     let mut built = gate::BuiltSlot::empty();
-    let trampoline_base = if metadata == GateMetadata::Svc {
+    let trampoline_base = if matches!(metadata, GateMetadata::Svc | GateMetadata::SvcTls) {
         gate::svc_trampoline_base(slot, slot_vaddr, layout.host, &mut built)?
     } else {
         0
@@ -3274,17 +3344,18 @@ fn validate_guest_offset(offset: u16, x18: bool) -> Result<()> {
     Ok(())
 }
 
-fn patch_offset_words(trampoline: &mut [u8], patch_offsets: &[usize], offset: u16) {
-    let new_imm = u32::from(offset / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT;
-    for offset in patch_offsets {
-        let word = &mut trampoline[*offset..*offset + INSN_BYTES];
+fn patch_offset_words(trampoline: &mut [u8], patch_offsets: &[(usize, u16)], root: u16) {
+    for &(offset, bias) in patch_offsets {
+        // Validation checked every derived offset before any mutation.
+        let new_imm = u32::from((root + bias) / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT;
+        let word = &mut trampoline[offset..offset + INSN_BYTES];
         let insn = u32::from_le_bytes(word.try_into().expect("four-byte patch offset"));
         word.copy_from_slice(&((insn & !LDST_UIMM12_IMM_MASK) | new_imm).to_le_bytes());
     }
 }
 
 struct TrampolineValidation {
-    patch_offsets: Vec<usize>,
+    patch_offsets: Vec<(usize, u16)>,
     has_x18_gate: bool,
 }
 
@@ -3380,9 +3451,17 @@ fn validate_trampoline_offsets_with_layout(
                     u32::from_le_bytes(trampoline[offset..offset + INSN_BYTES].try_into().unwrap());
                 let encoded = (insn & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT;
                 let gate_offset = encoded * u32::from(GUEST_TPIDR_OFFSET_ALIGN);
+                let derived = expected_offset
+                    .checked_add(field.bias())
+                    .filter(|offset| *offset < MAX_GUEST_TPIDR_OFFSET)
+                    .ok_or_else(|| {
+                        Error::TrampolinePatchFailure(
+                            "derived AArch64 TLS field offset is out of range".into(),
+                        )
+                    })?;
                 if gate_offset == u32::from(field.placeholder()) {
-                    patch_offsets.push(offset);
-                } else if gate_offset != u32::from(expected_offset) {
+                    patch_offsets.push((offset, field.bias()));
+                } else if gate_offset != u32::from(derived) {
                     return Err(Error::TrampolinePatchFailure(format!(
                         "AArch64 gate at byte {offset} uses TLS offset {gate_offset}, which is \
                          neither the placeholder nor the offset being patched in \
@@ -3421,16 +3500,19 @@ fn find_guest_x18_placeholder(trampoline: &[u8]) -> Option<usize> {
 fn find_structured_placeholder(trampoline: &[u8], x18: bool) -> Option<usize> {
     let validation = validate_trampoline_offsets_for_host(
         trampoline,
-        if x18 {
-            GUEST_X18_OFFSET_PLACEHOLDER
-        } else {
-            GUEST_TPIDR_OFFSET_PLACEHOLDER
-        },
+        // A valid hypothetical root lets validation range-check derived TLS
+        // fields too. Placeholder words are returned regardless of that root;
+        // already-finalized words need not be accepted by this inspection API.
+        MIN_GUEST_TPIDR_OFFSET,
         x18,
         Host::Linux,
     )
     .ok()?;
-    validation.patch_offsets.into_iter().next()
+    validation
+        .patch_offsets
+        .into_iter()
+        .next()
+        .map(|(offset, _)| offset)
 }
 
 #[cfg(test)]
@@ -3439,7 +3521,7 @@ mod tests {
 
     #[test]
     fn macos_fallback_traps_use_shared_marker() {
-        let original = 0xd51bd052u32; // MSR TPIDR_EL0, x18: unsupported overlap
+        let original = 0xd53bd052u32; // MRS x18, TPIDR_EL0: unsupported overlap
         let config = RewriteConfig::new(crate::TargetHost::MacOs, true);
         let (patched, outcome) = hook_words_opt_with_config(&[original], 0x1000, 0x400000, config);
         assert_eq!(outcome.unwrap().trapped_sites, [0x1000]);
@@ -3471,7 +3553,7 @@ mod tests {
             msr_tpidr_el0(5),
             SVC_0,
         ];
-        let (_, outcome) = hook_words_opt_with_config(
+        let (_, outcome) = hook_legacy_words_opt_with_config(
             &words,
             0x1000,
             0x400000,
@@ -3680,9 +3762,10 @@ mod tests {
         assert_eq!(
             decode_gate_metadata_word(word_at(
                 &outcome.trampoline,
-                GATES_START_OFFSET + SVC_SLOT_BYTES - GATE_METADATA_BYTES,
+                GATES_START_OFFSET + GateMetadata::SvcTls.slot_size_for(Host::MacOs)
+                    - GATE_METADATA_BYTES,
             )),
-            Some(GateMetadata::Svc)
+            Some(GateMetadata::SvcTls)
         );
     }
 
@@ -3696,7 +3779,7 @@ mod tests {
             0x3500_0332, // cbnz w18, +0x64
             0x1000_0072, // adr x18, +0xc
         ];
-        let (_, outcome) = hook_words_opt_with_config(
+        let (_, outcome) = hook_legacy_words_opt_with_config(
             &words,
             0x1000,
             0x400000,
@@ -3717,7 +3800,8 @@ mod tests {
         }
         assert_eq!(anchors, 8);
 
-        let (_, linux) = hook_words(&[Insn::MrsTpidrEl0(9).encode().unwrap()], 0x1000, 0x400000);
+        let (_, linux) =
+            hook_legacy_words(&[Insn::MrsTpidrEl0(9).encode().unwrap()], 0x1000, 0x400000);
         assert_ne!(
             word_at(&linux, GATES_START_OFFSET + INSN_BYTES),
             anchor_mask(9).encode().unwrap()
@@ -4205,39 +4289,6 @@ mod tests {
         )
     }
 
-    /// Like [`hook_words`] but prefills the trampoline's callback slot, so a
-    /// test can plant arbitrary data there.
-    fn hook_words_with_callback(
-        words: &[u32],
-        base: u64,
-        tramp_base: u64,
-        callback: u64,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for w in words {
-            buf.extend_from_slice(&w.to_le_bytes());
-        }
-        let sections = vec![TextSectionInfo {
-            vaddr: base,
-            file_offset: 0,
-            size: buf.len() as u64,
-        }];
-        hook_syscalls_aarch64(
-            &mut buf,
-            &sections,
-            tramp_base,
-            callback,
-            RewriteConfig {
-                host: Host::Linux,
-                virtualize_x18: false,
-                preserve_host_thread_state: false,
-            },
-        )
-        .unwrap()
-        .expect("expected a trampoline (input has patch sites)")
-        .trampoline
-    }
-
     /// Like [`hook_words`] but returns the raw `Option` outcome so callers can
     /// assert the "no patch sites" (`None`) sentinel and trapped-site cases.
     fn hook_words_opt(words: &[u32], base: u64, tramp_base: u64) -> (Vec<u8>, Option<HookOutcome>) {
@@ -4270,6 +4321,95 @@ mod tests {
         }];
         let outcome = hook_syscalls_aarch64(&mut buf, &sections, tramp_base, 0, config).unwrap();
         (buf, outcome)
+    }
+
+    /// Build persisted version-1 gates for compatibility tests. New rewriting
+    /// uses in-place MSR breakpoints, but these slots must remain recognizable.
+    fn hook_legacy_words_opt_with_config(
+        words: &[u32],
+        base: u64,
+        tramp_base: u64,
+        config: RewriteConfig,
+    ) -> (Vec<u8>, Option<HookOutcome>) {
+        let mut code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let sections = [TextSectionInfo {
+            vaddr: base,
+            file_offset: 0,
+            size: code.len() as u64,
+        }];
+        let sites = find_patch_sites(&sections, &code, config).unwrap();
+        if sites.is_empty() {
+            return (code, None);
+        }
+        let mut trampoline = Vec::new();
+        emit_shared_prologue(&mut trampoline, 0);
+        let mut trapped_sites = Vec::new();
+        for site in sites {
+            let gate = tramp_base + trampoline.len() as u64;
+            let inbound =
+                Insn::B(gate.cast_signed().saturating_sub(site.vaddr.cast_signed())).encode();
+            let emitted = if site.kind == PatchKind::Svc && inbound.is_some() {
+                match gate::build(
+                    &gate::GateInstance::new(GateMetadata::Svc, site.vaddr + 4),
+                    GateLayout::linux(config.host),
+                    gate,
+                    tramp_base,
+                ) {
+                    Ok(slot) => {
+                        slot.append_to(&mut trampoline);
+                        true
+                    }
+                    Err(gate::BuildError::Unreachable) => false,
+                    Err(error) => panic!("legacy SVC: {error:?}"),
+                }
+            } else {
+                inbound.is_some()
+                    && emit_gate(
+                        &mut trampoline,
+                        tramp_base,
+                        gate,
+                        &site,
+                        config,
+                        GateLayout::linux(config.host),
+                    )
+                    .unwrap()
+            };
+            if emitted {
+                code[site.file_offset..site.file_offset + 4]
+                    .copy_from_slice(&inbound.unwrap().to_le_bytes());
+            } else {
+                trap_site(&mut code, site.file_offset);
+                trapped_sites.push(site.vaddr);
+            }
+        }
+        (
+            code,
+            Some(HookOutcome {
+                trampoline,
+                trapped_sites,
+            }),
+        )
+    }
+
+    fn hook_legacy_words_with_callback(
+        words: &[u32],
+        base: u64,
+        tramp: u64,
+        callback: u64,
+    ) -> Vec<u8> {
+        let (_, mut bytes) = hook_legacy_words(words, base, tramp);
+        bytes[..8].copy_from_slice(&callback.to_le_bytes());
+        bytes
+    }
+
+    fn hook_legacy_words(words: &[u32], base: u64, tramp_base: u64) -> (Vec<u8>, Vec<u8>) {
+        let (code, outcome) = hook_legacy_words_opt_with_config(
+            words,
+            base,
+            tramp_base,
+            RewriteConfig::new(crate::TargetHost::Linux, false),
+        );
+        (code, outcome.unwrap().trampoline)
     }
 
     #[test]
@@ -4745,28 +4885,24 @@ mod tests {
             preserve_host_thread_state: false,
         };
         let sites = find_patch_sites(&[section], &bytes, enabled).unwrap();
-        assert!(sites.iter().all(|site| matches!(
-            site.kind,
-            PatchKind::X18(X18TransformResult::Unsupported(
-                X18Unsupported::EncodingLayout
-            ))
-        )));
+        assert_eq!(sites[0].kind, PatchKind::MsrTpidr(18));
+        assert!(matches!(
+            sites[1].kind,
+            PatchKind::X18(X18TransformResult::Unsupported(_))
+        ));
 
         let (patched, outcome) = hook_words_opt_with_config(&words, 0x1000, 0x2000, enabled);
         let trap = Insn::Brk(TRAP_BRK_IMM).encode().unwrap();
-        assert_eq!(word_at(&patched, 0), trap);
+        assert_eq!(decode_msr_tpidr_trap(word_at(&patched, 0)), Some(18));
         assert_eq!(word_at(&patched, 4), trap);
-        assert_eq!(outcome.unwrap().trapped_sites, vec![0x1000, 0x1004]);
+        assert_eq!(outcome.unwrap().trapped_sites, vec![0x1004]);
 
         let (patched, outcome) = hook_words_opt(&words, 0x1000, 0x2000);
         assert_ne!(word_at(&patched, 0), trap);
         assert_ne!(word_at(&patched, 4), trap);
         let outcome = outcome.unwrap();
         assert_eq!(outcome.trapped_sites, []);
-        assert_eq!(
-            outcome.trampoline.len(),
-            GATES_START_OFFSET + MSR_GATE_SIZE + MRS_GATE_SIZE
-        );
+        assert_eq!(outcome.trampoline.len(), GATES_START_OFFSET + MRS_GATE_SIZE);
     }
 
     #[test]
@@ -4849,7 +4985,15 @@ mod tests {
             .unwrap();
             let actual = sites
                 .iter()
-                .map(|site| (site.file_offset, site.vaddr, site.kind))
+                .map(|site| {
+                    // The mandatory site set is independent of code metadata;
+                    // only the MSR execution strategy varies inside exclusives.
+                    let kind = match site.kind {
+                        PatchKind::MsrTpidrInline(source) => PatchKind::MsrTpidr(source),
+                        other => other,
+                    };
+                    (site.file_offset, site.vaddr, kind)
+                })
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected);
         }
@@ -4954,7 +5098,158 @@ mod tests {
             bound,
             3 * GATES_START_OFFSET + SVC_SLOT_BYTES + MSR_SLOT_BYTES + MRS_SLOT_BYTES
         );
-        assert_eq!(emitted, bound);
+        assert!(emitted <= bound);
+    }
+
+    #[test]
+    fn msr_in_exclusive_regions_retains_the_inline_gate() {
+        let words = [0xc85f_7c20, msr_tpidr_el0(5), 0xc802_7c20];
+        for host in [Host::Linux, Host::MacOs] {
+            let (patched, outcome) = hook_words_opt_with_config(
+                &words,
+                0x1000,
+                0x400000,
+                RewriteConfig {
+                    host,
+                    virtualize_x18: false,
+                    preserve_host_thread_state: false,
+                },
+            );
+            let outcome = outcome.unwrap();
+            assert_eq!(outcome.trapped_sites, []);
+            assert_eq!(word_at(&patched, 4) & OPCODE_TOP6_MASK, Opcode::B.bits());
+            let slot = &outcome.trampoline[GATES_START_OFFSET..];
+            assert_eq!(
+                decode_gate_metadata_word(word_at(slot, slot.len() - 4)),
+                Some(GateMetadata::MsrTpidr { source: 5 })
+            );
+        }
+    }
+
+    #[test]
+    fn macos_svc_native_epilogue_needs_no_tls_and_is_not_guest_recovery_code() {
+        const SITE: u64 = 0x7f00_0000_1000;
+        const TRAMP: u64 = SITE + 0x4000;
+        for darwin in [false, true] {
+            let (outcome, layout) = if darwin {
+                let mut code = DARWIN_SVC.to_le_bytes();
+                let sections = [TextSectionInfo {
+                    vaddr: SITE,
+                    file_offset: 0,
+                    size: 4,
+                }];
+                (
+                    hook_macho(
+                        &mut code,
+                        &sections,
+                        TRAMP,
+                        0,
+                        crate::RewriteOptions::macos_host_shared_cache(),
+                    )
+                    .unwrap()
+                    .unwrap(),
+                    GateLayout::darwin(Host::MacOs),
+                )
+            } else {
+                (
+                    hook_words_opt_with_config(&[SVC_0], SITE, TRAMP, x18_config(Host::MacOs))
+                        .1
+                        .unwrap(),
+                    GateLayout::linux(Host::MacOs),
+                )
+            };
+            let slot = &outcome.trampoline[GATES_START_OFFSET..];
+            assert_eq!(slot.len(), 80);
+            // The callback's TBNZ distinguishes the two outbound formats without
+            // modifying carry or using TLS on a native-host return.
+            assert_eq!(word_at(slot, SVC_GATE_BYTES) & (1 << 29), 0);
+            let native = SVC_GATE_BYTES + MACOS_SVC_NATIVE_EPILOGUE_OFFSET_FROM_STUB;
+            assert_eq!(
+                word_at(slot, native),
+                Insn::LdrUimm {
+                    rt: X16,
+                    rn: SP,
+                    imm_bytes: SVC_FRAME_OFF_X16,
+                }
+                .encode()
+                .unwrap()
+            );
+            assert_ne!(word_at(slot, native) & (1 << 29), 0); // legacy first word
+            assert_eq!(
+                word_at(slot, native + 4),
+                Insn::AddSp(layout.svc_frame_bytes).encode().unwrap()
+            );
+            assert_eq!(
+                decode_branch_target(
+                    word_at(slot, native + 8),
+                    TRAMP + GATES_START_OFFSET as u64 + native as u64 + 8
+                ),
+                Some(SITE + 4)
+            );
+            for offset in (native..native + MACOS_SVC_NATIVE_EPILOGUE_BYTES).step_by(INSN_BYTES) {
+                assert!(
+                    classify_copied_gate_slot_with_layout(
+                        slot,
+                        TRAMP + 16,
+                        TRAMP + 16 + offset as u64,
+                        layout
+                    )
+                    .is_none()
+                );
+            }
+            // The native epilogue is validated, not arbitrary padding.
+            let mut corrupted = slot.to_vec();
+            corrupted[native..native + 4].copy_from_slice(&NOP.to_le_bytes());
+            assert!(
+                classify_copied_gate_slot_with_layout(&corrupted, TRAMP + 16, TRAMP + 16, layout)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn svc_tls_finalization_patches_the_derived_slot_transactionally() {
+        let (_, outcome) = hook_words_opt_with_config(
+            &[Insn::MrsTpidrEl0(9).encode().unwrap(), SVC_0],
+            0x1000,
+            0x400000,
+            RewriteConfig::new(crate::TargetHost::Linux, false),
+        );
+        let original = outcome.unwrap().trampoline;
+        // MRS is first, then the 64-byte TLS-backed SVC slot.
+        assert_eq!(find_guest_tpidr_placeholder(&original), Some(20));
+        let svc = 32;
+        assert_eq!(
+            decode_gate_metadata_word(word_at(&original, svc + 60)),
+            Some(GateMetadata::SvcTls)
+        );
+        assert!(svc_stub_uses_tls(
+            word_at(&original, svc + SVC_GATE_BYTES),
+            crate::TargetHost::Linux
+        ));
+        let mut patched = original.clone();
+        assert_eq!(patch_guest_tpidr_offset(&mut patched, 96).unwrap(), 2);
+        assert_eq!(
+            (word_at(&patched, svc + 40) & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT,
+            u32::from((96 + SVC_X16_OFFSET_FROM_GUEST_TP) / GUEST_TPIDR_OFFSET_ALIGN)
+        );
+        assert_eq!(find_guest_tpidr_placeholder(&patched), None);
+        // Finalizing twice at the same root is a no-op; changing it is rejected.
+        let after = patched.clone();
+        assert_eq!(patch_guest_tpidr_offset(&mut patched, 96).unwrap(), 0);
+        assert!(patch_guest_tpidr_offset(&mut patched, 104).is_err());
+        assert_eq!(patched, after);
+        // Even though the earlier MRS root fits, the derived SVC field cannot
+        // use the reserved maximum offset. Failure must not partially patch MRS.
+        let mut invalid = original.clone();
+        assert!(
+            patch_guest_tpidr_offset(
+                &mut invalid,
+                MAX_GUEST_TPIDR_OFFSET - SVC_X16_OFFSET_FROM_GUEST_TP
+            )
+            .is_err()
+        );
+        assert_eq!(invalid, original);
     }
 
     #[test]
@@ -5008,7 +5303,7 @@ mod tests {
             );
             assert_eq!(
                 decode_gate_metadata_word(word_at(&tramp, tramp.len() - 4)),
-                Some(GateMetadata::Svc)
+                Some(GateMetadata::SvcTls)
             );
         }
     }
@@ -5029,7 +5324,7 @@ mod tests {
     }
 
     #[test]
-    fn msr_gate_return_branch_out_of_range_is_trapped() {
+    fn legacy_msr_gate_return_branch_out_of_range_is_trapped() {
         // Boundary window where the site can reach its gate but the gate cannot
         // reach back. The MSR gate's return `B` sits at `gate + 32` and targets
         // `site + 4`, so its displacement magnitude is `b_offset + 28`. Placing
@@ -5040,7 +5335,12 @@ mod tests {
         let base = 0x1004u64;
         let max_fwd = (1u64 << 27) - 4; // largest 4-aligned forward `B` offset
         let tramp_base = base + max_fwd - GATES_START_OFFSET as u64;
-        let (patched, outcome) = hook_words_opt(&[msr_tpidr_el0(5)], base, tramp_base);
+        let (patched, outcome) = hook_legacy_words_opt_with_config(
+            &[msr_tpidr_el0(5)],
+            base,
+            tramp_base,
+            RewriteConfig::new(crate::TargetHost::Linux, false),
+        );
         let outcome = outcome.expect("expected a trampoline (input has patch sites)");
         assert_eq!(
             word_at(&patched, 0),
@@ -5062,12 +5362,12 @@ mod tests {
     }
 
     #[test]
-    fn msr_and_mrs_both_get_gates() {
+    fn legacy_msr_and_mrs_both_get_gates() {
         let base = 0x1000;
         let tramp_base = 0x300000;
         // MSR TPIDR_EL0, X5  then  MRS X9, TPIDR_EL0.
         let words = [msr_tpidr_el0(5), Insn::MrsTpidrEl0(9).encode().unwrap()];
-        let (patched, tramp) = hook_words(&words, base, tramp_base);
+        let (patched, tramp) = hook_legacy_words(&words, base, tramp_base);
         // Both the write and the read are rewritten to a branch into their gate.
         assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
         assert_eq!(word_at(&patched, 4) & OPCODE_TOP6_MASK, Opcode::B.bits());
@@ -5087,10 +5387,10 @@ mod tests {
     }
 
     #[test]
-    fn msr_gate_stores_guest_value_to_slot_for_any_register() {
+    fn legacy_msr_gate_stores_guest_value_to_slot_for_any_register() {
         const BL_TOP6: u32 = 0x9400_0000;
         for n in [5u8, 16, 17, 30, 31] {
-            let (_p, tramp) = hook_words(&[msr_tpidr_el0(n)], 0x1000, 0x500000);
+            let (_p, tramp) = hook_legacy_words(&[msr_tpidr_el0(n)], 0x1000, 0x500000);
             let gate = &tramp[GATES_START_OFFSET..GATES_START_OFFSET + MSR_GATE_SIZE];
             // Self-contained: never BL out.
             assert!(
@@ -5221,7 +5521,7 @@ mod tests {
         // static direct branch that needs no scratch register.
         let base = 0x1000;
         let tramp_base = 0x600000;
-        let (_p, tramp) = hook_words(&[SVC_0], base, tramp_base);
+        let (_p, tramp) = hook_legacy_words(&[SVC_0], base, tramp_base);
         let stub_off = GATES_START_OFFSET + SVC_GATE_BYTES;
         let stub = &tramp[stub_off..stub_off + SVC_OUTBOUND_STUB_BYTES];
 
@@ -5262,7 +5562,7 @@ mod tests {
     #[test]
     fn patch_rewrites_both_gate_shapes_and_leaves_everything_else_alone() {
         // One MSR site and one MRS site, so both patchable shapes are present.
-        let (_p, mut tramp) = hook_words(
+        let (_p, mut tramp) = hook_legacy_words(
             &[msr_tpidr_el0(3), Insn::MrsTpidrEl0(9).encode().unwrap()],
             0x1000,
             0x400000,
@@ -5326,7 +5626,7 @@ mod tests {
         // The SVC gate and its outbound stub are full of `LDR`/`STR` words with
         // an `SP` base. None of them may be mistaken for a thread-pointer
         // access, and the header's callback slot is data that must be skipped.
-        let (_p, mut tramp) = hook_words(&[SVC_0], 0x1000, 0x400000);
+        let (_p, mut tramp) = hook_legacy_words(&[SVC_0], 0x1000, 0x400000);
         let before = tramp.clone();
         assert_eq!(
             patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
@@ -5348,7 +5648,7 @@ mod tests {
         .encode()
         .unwrap();
         let callback = (u64::from(decoy) << 32) | u64::from(decoy);
-        let mut tramp = hook_words_with_callback(&[SVC_0], 0x1000, 0x400000, callback);
+        let mut tramp = hook_legacy_words_with_callback(&[SVC_0], 0x1000, 0x400000, callback);
         assert_eq!(
             patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
             0
@@ -5365,7 +5665,7 @@ mod tests {
     /// `GUEST_TPIDR_OFFSET_PLACEHOLDER`.
     #[test]
     fn find_placeholder_reports_gates_before_patching_and_none_after() {
-        let (_p, mut tramp) = hook_words(
+        let (_p, mut tramp) = hook_legacy_words(
             &[msr_tpidr_el0(3), Insn::MrsTpidrEl0(9).encode().unwrap()],
             0x1000,
             0x400000,
@@ -5389,7 +5689,7 @@ mod tests {
     fn find_placeholder_ignores_svc_gates_and_the_callback_slot() {
         // An SVC-only trampoline has no thread-pointer gate at all, and its
         // `LDR`/`STR` words off `SP` must not be mistaken for one.
-        let (_p, tramp) = hook_words(&[SVC_0], 0x1000, 0x400000);
+        let (_p, tramp) = hook_legacy_words(&[SVC_0], 0x1000, 0x400000);
         assert_eq!(find_guest_tpidr_placeholder(&tramp), None);
 
         // The callback slot is a 64-bit address, i.e. data. Even when it
@@ -5402,7 +5702,7 @@ mod tests {
         .encode()
         .unwrap();
         let callback = (u64::from(decoy) << 32) | u64::from(decoy);
-        let tramp = hook_words_with_callback(&[SVC_0], 0x1000, 0x400000, callback);
+        let tramp = hook_legacy_words_with_callback(&[SVC_0], 0x1000, 0x400000, callback);
         assert_eq!(find_guest_tpidr_placeholder(&tramp), None);
     }
 
@@ -5612,7 +5912,7 @@ mod tests {
                 );
             }
         }
-        for kind in 9..16 {
+        for kind in 10..16 {
             let invalid = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(invalid).decode(), None, "kind {kind}");
         }
@@ -5678,7 +5978,7 @@ mod tests {
 
     #[test]
     fn slot_padding_and_metadata_do_not_false_match_placeholder_scan() {
-        let (_patched, mut tramp) = hook_words(&[SVC_0], 0x1000, 0x400000);
+        let (_patched, mut tramp) = hook_legacy_words(&[SVC_0], 0x1000, 0x400000);
         assert_eq!(find_guest_tpidr_placeholder(&tramp), None);
         let before = tramp.clone();
         assert_eq!(
@@ -5706,7 +6006,7 @@ mod tests {
             SVC_0,
             Insn::MrsTpidrEl0(3).encode().unwrap(),
         ];
-        let (_patched, trampoline) = hook_words(&words, 0x1000, 0x400000);
+        let (_patched, trampoline) = hook_legacy_words(&words, 0x1000, 0x400000);
         let expected = [
             (16, 16, GateMetadata::MrsTpidr { destination: 9 }),
             (32, 48, GateMetadata::MsrTpidr { source: 5 }),
@@ -5791,7 +6091,7 @@ mod tests {
                     start += size;
                     gates += 1;
                 }
-                assert_eq!(gates, words.len());
+                assert_eq!(gates, words.len() - 1); // MSR is an in-place trap.
             }
         }
     }
@@ -5861,7 +6161,7 @@ mod tests {
                 );
             }
         }
-        for kind in 9..16 {
+        for kind in 10..16 {
             let word = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(word).decode(), None, "kind {kind}");
         }
@@ -5891,7 +6191,7 @@ mod tests {
             SVC_0,
         ];
         let base = 0x400000;
-        let (_patched, trampoline) = hook_words(&words, 0x1000, base);
+        let (_patched, trampoline) = hook_legacy_words(&words, 0x1000, base);
         for (start, size, executable_end, metadata) in [
             (
                 16usize,
@@ -5918,7 +6218,7 @@ mod tests {
                                 GateMetadata::MrsTpidr { .. }
                                 | GateMetadata::HostAwareMrsTpidr { .. } => 0,
                                 GateMetadata::MsrTpidr { .. } => 4,
-                                GateMetadata::Svc => 8,
+                                GateMetadata::Svc | GateMetadata::SvcTls => 8,
                                 GateMetadata::X18 { .. }
                                 | GateMetadata::X18StackWriteback { .. }
                                 | GateMetadata::X18CompareBranch { .. }
@@ -6011,7 +6311,7 @@ mod tests {
             SVC_0,
         ];
         let base = 0x400000;
-        let (_patched, trampoline) = hook_words(&words, 0x1000, base);
+        let (_patched, trampoline) = hook_legacy_words(&words, 0x1000, base);
         for (start, size, executable_end, metadata) in [
             (
                 16usize,
@@ -6037,7 +6337,7 @@ mod tests {
             }
         }
 
-        let (_patched, outcome) = hook_words_opt_with_config(
+        let (_patched, outcome) = hook_legacy_words_opt_with_config(
             &[0xa9bf_4ff2], // stp x18, x19, [sp, #-16]!
             0x1000,
             base,
@@ -6070,7 +6370,7 @@ mod tests {
     #[test]
     fn classifier_rejects_forged_metadata_mutations_and_ambiguity() {
         let base = 0x400000;
-        let (_patched, trampoline) = hook_words(
+        let (_patched, trampoline) = hook_legacy_words(
             &[
                 Insn::MrsTpidrEl0(9).encode().unwrap(),
                 msr_tpidr_el0(5),
@@ -6116,7 +6416,7 @@ mod tests {
     #[test]
     fn classifier_validates_tpidr_immediate_policy() {
         let base = 0x400000;
-        let (_patched, trampoline) = hook_words(
+        let (_patched, trampoline) = hook_legacy_words(
             &[Insn::MrsTpidrEl0(9).encode().unwrap(), msr_tpidr_el0(5)],
             0x1000,
             base,
@@ -6177,7 +6477,7 @@ mod tests {
             msr_tpidr_el0(5),
             SVC_0,
         ];
-        let (_, normal) = hook_words_opt_with_config(
+        let (_, normal) = hook_legacy_words_opt_with_config(
             &normal_words,
             0x1000,
             base,
@@ -6191,7 +6491,7 @@ mod tests {
             0xd61f_0240, // br x18
         ];
         let (_, x18) =
-            hook_words_opt_with_config(&x18_words, 0x2000, base, x18_config(Host::MacOs));
+            hook_legacy_words_opt_with_config(&x18_words, 0x2000, base, x18_config(Host::MacOs));
 
         for (trampoline, sizes) in [
             (normal.unwrap().trampoline, vec![32, 64, 64]),
@@ -6253,7 +6553,7 @@ mod tests {
     #[test]
     fn classifier_accepts_only_aligned_executable_instruction_pcs() {
         let base = 0x400000;
-        let (_patched, trampoline) = hook_words(
+        let (_patched, trampoline) = hook_legacy_words(
             &[
                 Insn::MrsTpidrEl0(9).encode().unwrap(),
                 msr_tpidr_el0(5),
@@ -6303,7 +6603,7 @@ mod tests {
 
     #[test]
     fn patch_is_transactional_when_a_later_slot_is_malformed() {
-        let (_patched, mut trampoline) = hook_words(
+        let (_patched, mut trampoline) = hook_legacy_words(
             &[Insn::MrsTpidrEl0(9).encode().unwrap(), msr_tpidr_el0(5)],
             0x1000,
             0x400000,

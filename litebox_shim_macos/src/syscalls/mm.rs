@@ -1781,13 +1781,16 @@ mod tests {
                 && !flags.contains(VmFlags::VM_WRITE)
         }));
         let gate = UserPtr::<u8>::from_usize(target)
-            .to_owned_slice::<Platform>(64)
+            .to_owned_slice::<Platform>(
+                GateMetadata::SvcTls
+                    .slot_size_for_host(litebox_syscall_rewriter::TargetHost::MacOs),
+            )
             .unwrap();
         let classified = Rewriter::new(litebox_syscall_rewriter::TargetHost::MacOs)
             .unwrap()
             .classify_gate_slot(&gate, target as u64, target as u64)
             .unwrap();
-        assert_eq!(classified.metadata(), GateMetadata::Svc);
+        assert_eq!(classified.metadata(), GateMetadata::SvcTls);
         assert_eq!(classified.original_site(), code_address as u64);
         task.sys_munmap(address, PAGE_SIZE).unwrap();
     }

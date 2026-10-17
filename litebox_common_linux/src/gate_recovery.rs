@@ -22,6 +22,13 @@ pub enum Aarch64GateSignalResult {
     NotGate,
     Canonicalized(PtRegs),
     ResumeGuest(PtRegs),
+    /// Consume an in-place MSR breakpoint. The platform commits `value` to its
+    /// own thread's guest-TP slot, then resumes `context` without delivering the
+    /// private breakpoint as a guest signal.
+    WriteThreadPointer {
+        context: PtRegs,
+        value: usize,
+    },
     PreserveSavedContext,
     InvalidRuntimeState,
 }
@@ -99,6 +106,44 @@ fn canonicalize_impl(
     abi: GateAbi,
     mut read: impl FnMut(usize, &mut [u8]) -> bool,
 ) -> Aarch64GateSignalResult {
+    // An asynchronous interruption at this instruction must leave it pending.
+    // Only the actual private breakpoint commits the logical MSR. This path
+    // needs no guest-stack access, and does not apply to native Darwin guests.
+    if matches!(abi, GateAbi::Linux { .. }) && interruption == GateInterruption::Breakpoint {
+        let mut instruction = [0u8; 4];
+        if read(context.pc, &mut instruction)
+            && let Some(source) = aarch64::decode_msr_tpidr_trap(u32::from_le_bytes(instruction))
+        {
+            let value = match source {
+                31 => 0,
+                18 if matches!(
+                    abi,
+                    GateAbi::Linux {
+                        virtualize_x18: true,
+                        ..
+                    }
+                ) =>
+                {
+                    let Some(value) = runtime
+                        .guest_thread_pointer_addr
+                        .checked_add(aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP)
+                        .and_then(|address| read_usize(&mut read, address))
+                    else {
+                        return Aarch64GateSignalResult::InvalidRuntimeState;
+                    };
+                    value
+                }
+                register => context.regs[usize::from(register)],
+            };
+            let mut resumed = context.clone();
+            resumed.pc = context.pc.wrapping_add(4);
+            resumed.orig_x0 = resumed.regs[0];
+            return Aarch64GateSignalResult::WriteThreadPointer {
+                context: resumed,
+                value,
+            };
+        }
+    }
     let (host, virtualize_x18, svc_frame) = match abi {
         GateAbi::Linux {
             host,
@@ -216,6 +261,14 @@ fn canonicalize_impl(
     let boundary = match gate.stage() {
         Stage::Recover(boundary) => boundary,
         Stage::Invalid => return Aarch64GateSignalResult::InvalidRuntimeState,
+        Stage::SvcTlsOutbound(boundary) => {
+            if runtime.expected_outbound_stub != slot_start + SVC_GATE_BYTES
+                || runtime.expected_outbound_pc != site + 4
+            {
+                return Aarch64GateSignalResult::NotGate;
+            }
+            boundary
+        }
         Stage::SvcOutbound => {
             return if runtime.expected_outbound_stub == slot_start + SVC_GATE_BYTES
                 && runtime.expected_outbound_pc == site + 4
@@ -236,6 +289,7 @@ fn canonicalize_impl(
     let (frame_bytes, saved, value_register): (usize, [Option<u8>; 2], Option<u8>) = match metadata
     {
         GateMetadata::Svc => (svc_frame, [Some(16), None], None),
+        GateMetadata::SvcTls => (svc_frame, [Some(16), None], Some(16)),
         GateMetadata::MsrTpidr { .. } => (MSR_FRAME_BYTES.into(), [Some(16), Some(17)], None),
         GateMetadata::MrsTpidr { destination }
         | GateMetadata::HostAwareMrsTpidr { destination } => (0, [None, None], Some(destination)),
@@ -352,6 +406,10 @@ fn canonicalize_impl(
         Value::Slot => {
             let slot = if is_x18 {
                 guest_x18_addr
+            } else if metadata == GateMetadata::SvcTls {
+                runtime
+                    .guest_thread_pointer_addr
+                    .checked_add(aarch64::SVC_X16_OFFSET_FROM_GUEST_TP.into())
             } else {
                 Some(runtime.guest_thread_pointer_addr)
             };
@@ -403,6 +461,199 @@ fn canonicalize_impl(
 mod tests {
     use super::*;
     use litebox_syscall_rewriter::{aarch64::DARWIN_SVC_FRAME_BYTES, macho::Rewriter};
+
+    #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]
+    fn tls_outbound_stubs_recover_without_reading_the_guest_stack() {
+        const SITE: usize = 0x7f00_0000_1000;
+        const TRAMP: usize = SITE + 0x4000;
+        const TLS: usize = 0x5000;
+        const SP: usize = 0x9000;
+        const X16: usize = 0x1616_1234;
+        for (host, darwin) in [
+            (TargetHost::Linux, false),
+            (TargetHost::MacOs, false),
+            (TargetHost::MacOs, true),
+        ] {
+            let mut code = if darwin { 0xd4001001u32 } else { 0xd4000001 }.to_le_bytes();
+            let (mut gates, trapped) = if darwin {
+                Rewriter::new(host)
+                    .unwrap()
+                    .patch_code_segment(&mut code, SITE as u64, &[0..4], TRAMP as u64, 0x1234, 96)
+                    .unwrap()
+            } else {
+                litebox_syscall_rewriter::patch_code_segment_with_options(
+                    &mut code,
+                    SITE as u64,
+                    TRAMP as u64,
+                    0x1234,
+                    litebox_syscall_rewriter::RewriteOptions::new(host, false),
+                )
+                .unwrap()
+            };
+            assert!(trapped.is_empty());
+            if !darwin {
+                aarch64::finalize_trampoline_gates_for_host(&mut gates, 96, 104, host).unwrap();
+            }
+            let runtime = GateRuntimeState {
+                guest_thread_pointer_addr: TLS,
+                expected_outbound_stub: TRAMP + 16 + SVC_GATE_BYTES,
+                expected_outbound_pc: SITE + 4,
+            };
+            let saved_x16 = X16.to_ne_bytes();
+            let read = |address: usize, output: &mut [u8]| {
+                for (base, bytes) in [
+                    (SITE, code.as_slice()),
+                    (TRAMP, gates.as_slice()),
+                    (
+                        TLS + usize::from(aarch64::SVC_X16_OFFSET_FROM_GUEST_TP),
+                        saved_x16.as_slice(),
+                    ),
+                ] {
+                    if let Some(start) = address.checked_sub(base)
+                        && let Some(end) = start.checked_add(output.len())
+                        && let Some(source) = bytes.get(start..end)
+                    {
+                        output.copy_from_slice(source);
+                        return true;
+                    }
+                }
+                false // No guest-stack mapping is supplied.
+            };
+            let pop = if host == TargetHost::MacOs { 52 } else { 44 };
+            let frame = if darwin {
+                DARWIN_SVC_FRAME_BYTES
+            } else {
+                SVC_FRAME_BYTES
+            } as usize;
+            for offset in (SVC_GATE_BYTES..=pop + 4).step_by(4) {
+                let mut ctx = PtRegs {
+                    pc: TRAMP + 16 + offset,
+                    sp: if offset > pop { SP } else { SP - frame },
+                    pstate: 0xa0000000,
+                    ..PtRegs::default()
+                };
+                ctx.regs[16] = if offset < pop { 0xdeadbeef } else { X16 };
+                ctx.regs[17] = 0x1717;
+                let result = if darwin {
+                    canonicalize_darwin(&ctx, runtime, GateInterruption::Asynchronous, read)
+                } else {
+                    canonicalize(
+                        &ctx,
+                        runtime,
+                        GateInterruption::Asynchronous,
+                        host,
+                        false,
+                        read,
+                    )
+                };
+                let Aarch64GateSignalResult::Canonicalized(recovered) = result else {
+                    panic!("{host:?} Darwin={darwin} outbound +{offset}")
+                };
+                assert_eq!(recovered.pc, SITE + 4);
+                assert_eq!(recovered.sp, SP);
+                assert_eq!(recovered.regs[16], X16);
+                assert_eq!(recovered.regs[17], ctx.regs[17]);
+                assert_eq!(recovered.pstate, ctx.pstate);
+            }
+        }
+    }
+
+    #[test]
+    fn msr_breakpoints_preserve_registers_and_commit_only_on_breakpoint() {
+        const SITE: usize = 0x7f00_0000_1000;
+        const TLS: usize = 0x2000;
+        const LOGICAL_X18: usize = 0x1818_1234;
+        let runtime = GateRuntimeState {
+            guest_thread_pointer_addr: TLS,
+            expected_outbound_stub: 0,
+            expected_outbound_pc: 0,
+        };
+        for (host, virtualize_x18) in [
+            (TargetHost::Linux, false),
+            (TargetHost::Linux, true),
+            (TargetHost::MacOs, true),
+        ] {
+            for source in 0..32u32 {
+                let mut code = (0xd51b_d040 | source).to_le_bytes();
+                let (_, unpatched) = litebox_syscall_rewriter::patch_code_segment_with_options(
+                    &mut code,
+                    SITE as u64,
+                    0x7f00_0000_4000,
+                    0,
+                    litebox_syscall_rewriter::RewriteOptions::new(host, virtualize_x18),
+                )
+                .unwrap();
+                assert!(unpatched.is_empty());
+                let saved = PtRegs {
+                    regs: core::array::from_fn(|index| 0x1000 + index),
+                    pc: SITE,
+                    sp: 0, // no guest-stack access is allowed
+                    pstate: 0xa000_0000,
+                    ..PtRegs::default()
+                };
+                let logical_x18 = LOGICAL_X18.to_ne_bytes();
+                let read = |address: usize, out: &mut [u8]| {
+                    let bytes: &[u8] = if address == SITE {
+                        &code
+                    } else if address == TLS + 8 {
+                        &logical_x18
+                    } else {
+                        return false;
+                    };
+                    if out.len() != bytes.len() {
+                        return false;
+                    }
+                    out.copy_from_slice(bytes);
+                    true
+                };
+                for interruption in [
+                    GateInterruption::Asynchronous,
+                    GateInterruption::Synchronous,
+                ] {
+                    assert!(matches!(
+                        canonicalize(&saved, runtime, interruption, host, virtualize_x18, read),
+                        Aarch64GateSignalResult::NotGate
+                    ));
+                }
+                let Aarch64GateSignalResult::WriteThreadPointer { context, value } = canonicalize(
+                    &saved,
+                    runtime,
+                    GateInterruption::Breakpoint,
+                    host,
+                    virtualize_x18,
+                    read,
+                ) else {
+                    panic!("MSR source {source} was not emulated")
+                };
+                assert_eq!(
+                    value,
+                    match source {
+                        31 => 0,
+                        18 if virtualize_x18 => LOGICAL_X18,
+                        _ => saved.regs[source as usize],
+                    }
+                );
+                assert_eq!(context.regs, saved.regs);
+                assert_eq!(context.sp, 0);
+                assert_eq!(context.pstate, saved.pstate);
+                assert_eq!(context.pc, SITE + 4);
+                assert_eq!(context.orig_x0, saved.regs[0]);
+                // A native Darwin guest cannot invoke this Linux-only trap ABI.
+                assert!(matches!(
+                    canonicalize_darwin(&saved, runtime, GateInterruption::Breakpoint, read),
+                    Aarch64GateSignalResult::NotGate
+                ));
+            }
+        }
+        for word in [
+            0xd420_0000u32,
+            0xd420_0000 | (0xb220 << 5),
+            0xd440_0000 | (0xb200 << 5),
+        ] {
+            assert!(aarch64::decode_msr_tpidr_trap(word).is_none());
+        }
+    }
 
     #[test]
     #[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]

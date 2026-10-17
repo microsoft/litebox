@@ -79,6 +79,30 @@ fn test_signals_while_exercising_each_aarch64_gate_kind() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
+fn test_svc_return_with_unmapped_guest_stack() {
+    let target = common::compile(
+        "./tests/svc_unmapped_stack.S",
+        "svc_unmapped_stack_nolibc",
+        true,
+        true,
+    );
+    Runner::new(&target, "svc_unmapped_stack_rewriter").run();
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_msr_without_guest_stack() {
+    let target = common::compile(
+        "./tests/msr_without_stack.S",
+        "msr_without_stack_nolibc",
+        true,
+        true,
+    );
+    Runner::new(&target, "msr_without_stack_rewriter").run();
+}
+
+#[test]
 #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
 fn test_x18_virtualization() {
     let target = common::compile(

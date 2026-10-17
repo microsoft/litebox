@@ -410,7 +410,7 @@ mod tests {
                 )
                 .unwrap()
                 .metadata(),
-                GateMetadata::Svc
+                GateMetadata::SvcTls
             ));
             let mut code = 0xD400_0001u32.to_le_bytes();
             assert!(
