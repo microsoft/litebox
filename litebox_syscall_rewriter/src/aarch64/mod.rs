@@ -1119,7 +1119,7 @@ mod tests {
         decode_adrp_add_target_for, decode_adrp_target, decode_branch_target,
         decode_gate_metadata_word, finalize_macho_trampoline, finalize_trampoline_gates,
         finalize_trampoline_gates_for_host, find_guest_tpidr_placeholder,
-        find_guest_x18_placeholder, patch_guest_tpidr_offset, valid_emitted_tpidr_offset,
+        find_guest_x18_placeholder, valid_emitted_tpidr_offset,
     };
     #[test]
     fn macos_fallback_traps_use_shared_marker() {
@@ -2081,7 +2081,7 @@ mod tests {
         let mut trampoline = outcome.unwrap().trampoline;
         let before = trampoline.clone();
 
-        assert!(patch_guest_tpidr_offset(&mut trampoline, 96).is_err());
+        assert!(finalize_trampoline_gates(&mut trampoline, 96).is_err());
         assert_eq!(trampoline, before);
     }
     #[test]
@@ -2708,7 +2708,7 @@ mod tests {
         );
         let before = tramp.clone();
 
-        let patched = patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap();
+        let patched = finalize_trampoline_gates(&mut tramp, MEASURED_OFFSET).unwrap();
         assert_eq!(patched, 2, "one MSR store and one MRS load");
 
         // Exactly two words changed, and each became the same instruction with
@@ -2755,7 +2755,7 @@ mod tests {
         // Patching is idempotent in the sense that a second pass finds nothing:
         // the placeholder is gone.
         assert_eq!(
-            patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
+            finalize_trampoline_gates(&mut tramp, MEASURED_OFFSET).unwrap(),
             0
         );
     }
@@ -2767,7 +2767,7 @@ mod tests {
         let (_p, mut tramp) = hook_words(&[SVC_0], 0x1000, 0x400000);
         let before = tramp.clone();
         assert_eq!(
-            patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
+            finalize_trampoline_gates(&mut tramp, MEASURED_OFFSET).unwrap(),
             0
         );
         assert_eq!(tramp, before);
@@ -2787,7 +2787,7 @@ mod tests {
         let callback = (u64::from(decoy) << 32) | u64::from(decoy);
         let mut tramp = hook_words_with_callback(&[SVC_0], 0x1000, 0x400000, callback);
         assert_eq!(
-            patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
+            finalize_trampoline_gates(&mut tramp, MEASURED_OFFSET).unwrap(),
             0
         );
         assert_eq!(
@@ -2811,7 +2811,7 @@ mod tests {
         assert!(at >= FIRST_SCANNABLE_OFFSET && at.is_multiple_of(4));
 
         assert_eq!(
-            patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
+            finalize_trampoline_gates(&mut tramp, MEASURED_OFFSET).unwrap(),
             2
         );
         assert_eq!(
@@ -2863,7 +2863,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    patch_guest_tpidr_offset(&mut tramp, bad),
+                    finalize_trampoline_gates(&mut tramp, bad),
                     Err(litebox_trampoline::Error::TrampolinePatchFailure(_))
                 ),
                 "offset {bad} must be rejected"
@@ -2879,7 +2879,7 @@ mod tests {
             let (_p, mut fresh) =
                 hook_words(&[Insn::MrsTpidrEl0(9).encode().unwrap()], 0x1000, 0x400000);
             assert!(
-                patch_guest_tpidr_offset(&mut fresh, good).is_ok(),
+                finalize_trampoline_gates(&mut fresh, good).is_ok(),
                 "offset {good} must be accepted"
             );
         }
@@ -2943,7 +2943,7 @@ mod tests {
         // an executable mapping.
         assert_eq!(find_guest_tpidr_placeholder(&tramp), None);
         assert!(matches!(
-            patch_guest_tpidr_offset(&mut tramp, REQUESTED),
+            finalize_trampoline_gates(&mut tramp, REQUESTED),
             Err(litebox_trampoline::Error::TrampolinePatchFailure(_))
         ));
     }
@@ -2976,7 +2976,7 @@ mod tests {
         assert_eq!(find_guest_tpidr_placeholder(&tramp), None);
         let before = tramp.clone();
         assert_eq!(
-            patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
+            finalize_trampoline_gates(&mut tramp, MEASURED_OFFSET).unwrap(),
             0
         );
         assert_eq!(tramp, before);
@@ -3494,7 +3494,7 @@ mod tests {
         let before = trampoline.clone();
 
         assert!(matches!(
-            patch_guest_tpidr_offset(&mut trampoline, MEASURED_OFFSET),
+            finalize_trampoline_gates(&mut trampoline, MEASURED_OFFSET),
             Err(litebox_trampoline::Error::TrampolinePatchFailure(_))
         ));
         assert_eq!(
@@ -3521,7 +3521,7 @@ mod tests {
             malformed.extend_from_slice(&suffix);
             let before = malformed.clone();
             assert!(matches!(
-                patch_guest_tpidr_offset(&mut malformed, MEASURED_OFFSET),
+                finalize_trampoline_gates(&mut malformed, MEASURED_OFFSET),
                 Err(litebox_trampoline::Error::TrampolinePatchFailure(_))
             ));
             assert_eq!(malformed, before);

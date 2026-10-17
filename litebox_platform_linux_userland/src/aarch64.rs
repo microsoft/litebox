@@ -2018,7 +2018,7 @@ mod tests {
         );
         let offset = u16::try_from(offset).expect("the guest slot must sit within a gate's reach");
         assert_eq!(
-            litebox_trampoline::aarch64::patch_guest_tpidr_offset(&mut tramp, offset).unwrap(),
+            litebox_trampoline::aarch64::finalize_trampoline_gates(&mut tramp, offset).unwrap(),
             1
         );
         assert_eq!(

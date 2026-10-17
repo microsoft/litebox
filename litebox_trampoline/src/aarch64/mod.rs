@@ -1089,7 +1089,7 @@ pub const MIN_GUEST_TPIDR_OFFSET: u16 = 16;
 ///
 /// It is `MAX_GUEST_TPIDR_OFFSET`, the largest value the field can hold, so it
 /// cannot collide with a real runtime offset. That makes scanning for it exact,
-/// which is what lets [`patch_guest_tpidr_offset`] and
+/// which is what lets [`finalize_trampoline_gates`] and
 /// [`find_guest_tpidr_placeholder`] work off the emitted words alone with no
 /// side table of patch sites.
 ///
@@ -2026,17 +2026,15 @@ pub fn classify_copied_gate_slot_with_layout(
 }
 
 pub fn valid_emitted_tpidr_offset(offset: u32) -> bool {
-    offset == u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER)
-        || (offset.is_multiple_of(u32::from(GUEST_TPIDR_OFFSET_ALIGN))
-            && (u32::from(MIN_GUEST_TPIDR_OFFSET)..u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER))
-                .contains(&offset))
+    u16::try_from(offset).is_ok_and(|offset| {
+        offset == GUEST_TPIDR_OFFSET_PLACEHOLDER || is_patchable_guest_tpidr_offset(offset)
+    })
 }
 
 fn valid_emitted_x18_offset(offset: u32) -> bool {
-    offset == u32::from(GUEST_X18_OFFSET_PLACEHOLDER)
-        || (offset.is_multiple_of(u32::from(GUEST_TPIDR_OFFSET_ALIGN))
-            && (u32::from(MIN_GUEST_TPIDR_OFFSET)..u32::from(GUEST_X18_OFFSET_PLACEHOLDER))
-                .contains(&offset))
+    u16::try_from(offset).is_ok_and(|offset| {
+        offset == GUEST_X18_OFFSET_PLACEHOLDER || is_patchable_guest_x18_offset(offset)
+    })
 }
 
 /// Decodes an AArch64 unconditional immediate branch at `pc`.
@@ -2090,11 +2088,14 @@ pub const LDST_UIMM12_IMM_SHIFT: u32 = 10;
 /// Trampolines containing x18 gates must use
 /// [`finalize_trampoline_gates_for_host`].
 ///
+/// Returns the number of instructions patched. Zero is normal for a trampoline
+/// containing only SVC gates. Call this before making the trampoline executable.
+///
 /// # Errors
 ///
 /// Rejects invalid offsets, malformed slots, unexpected field values, and x18
 /// gates before mutating the trampoline.
-pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<()> {
+pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<usize> {
     validate_guest_offset(offset, false)?;
     let validation = validate_trampoline_offsets_with_layout(
         trampoline,
@@ -2110,7 +2111,7 @@ pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<(
         ));
     }
     patch_offset_words(trampoline, &validation.patch_offsets, offset);
-    Ok(())
+    Ok(validation.patch_offsets.len())
 }
 
 /// Validate and finalize an ELF guest's TLS gates for `host`.
@@ -2190,44 +2191,6 @@ pub fn is_patchable_guest_tpidr_offset(offset: u16) -> bool {
 pub fn is_patchable_guest_x18_offset(offset: u16) -> bool {
     offset.is_multiple_of(GUEST_TPIDR_OFFSET_ALIGN)
         && (MIN_GUEST_TPIDR_OFFSET..GUEST_X18_OFFSET_PLACEHOLDER).contains(&offset)
-}
-
-/// Rewrites the guest thread-pointer offset in every Linux gate of one emitted
-/// trampoline. The loader must call this before making the trampoline executable.
-///
-/// Returns the number of instructions patched. Zero is normal: a binary whose
-/// only patch sites are `SVC` has no thread-pointer gate.
-///
-/// # Errors
-///
-/// Fails if `offset` is not a legitimate gate target — a multiple of
-/// [`GUEST_TPIDR_OFFSET_ALIGN`], at least `MIN_GUEST_TPIDR_OFFSET` so it clears
-/// the host's own per-thread state, and strictly below
-/// [`MAX_GUEST_TPIDR_OFFSET`], which is reserved as the placeholder. Also fails
-/// if the blob is not a well-formed trampoline: too short for the shared
-/// prologue, not a whole number of instruction words, or holding a placeholder
-/// in a metadata-designated field with an unexpected value. Trampolines with
-/// x18 gates must instead use [`finalize_trampoline_gates_for_host`].
-///
-/// # Panics
-///
-/// Panics if a validated slot is shorter than its own metadata word, which the
-/// slot templates make impossible.
-pub fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
-    validate_guest_offset(offset, false)?;
-    let validation = validate_trampoline_offsets_with_layout(
-        trampoline,
-        offset,
-        false,
-        GateLayout::linux(TargetHost::Linux),
-    )?;
-    if validation.has_x18_gate {
-        return Err(Error::TrampolinePatchFailure(
-            "AArch64 trampoline contains x18 gates; use finalize_trampoline_gates_for_host".into(),
-        ));
-    }
-    patch_offset_words(trampoline, &validation.patch_offsets, offset);
-    Ok(validation.patch_offsets.len())
 }
 
 fn validate_guest_offset(offset: u16, x18: bool) -> Result<()> {
@@ -2499,6 +2462,32 @@ mod tests {
         assert_eq!(classify_x18(0x5280_0028), X18Classification::None); // mov w8, #1
     }
     #[test]
+    fn emitted_tls_offsets_accept_runtime_values_and_placeholders() {
+        for offset in 0..=u16::MAX {
+            let aligned = offset.is_multiple_of(GUEST_TPIDR_OFFSET_ALIGN);
+            let tp = aligned
+                && (MIN_GUEST_TPIDR_OFFSET..GUEST_TPIDR_OFFSET_PLACEHOLDER).contains(&offset);
+            let x18 =
+                aligned && (MIN_GUEST_TPIDR_OFFSET..GUEST_X18_OFFSET_PLACEHOLDER).contains(&offset);
+            assert_eq!(is_patchable_guest_tpidr_offset(offset), tp);
+            assert_eq!(is_patchable_guest_x18_offset(offset), x18);
+            assert_eq!(
+                valid_emitted_tpidr_offset(u32::from(offset)),
+                tp || offset == GUEST_TPIDR_OFFSET_PLACEHOLDER
+            );
+            assert_eq!(
+                valid_emitted_x18_offset(u32::from(offset)),
+                x18 || offset == GUEST_X18_OFFSET_PLACEHOLDER
+            );
+        }
+        // Values wider than u16 must not wrap into a valid offset.
+        for offset in [0x1_0000, 0x1_0010, 0x1_7ff0, u32::MAX] {
+            assert!(!valid_emitted_tpidr_offset(offset));
+            assert!(!valid_emitted_x18_offset(offset));
+        }
+    }
+
+    #[test]
     fn guest_x18_patchability_excludes_reserved_placeholders() {
         assert!(is_patchable_guest_x18_offset(32744));
         assert!(!is_patchable_guest_x18_offset(32752));
@@ -2613,7 +2602,7 @@ mod tests {
             0xF900_0A11
         );
         // The guest thread-pointer slot is emitted with the placeholder offset
-        // that `patch_guest_tpidr_offset` overwrites at load time; pin both the
+        // that `finalize_trampoline_gates` overwrites at load time; pin both the
         // value and the emitted words. The placeholder saturates the scaled
         // 12-bit immediate (`imm12 = 0xFFF`).
         assert_eq!(GUEST_TPIDR_OFFSET_PLACEHOLDER, 32760);
@@ -2680,14 +2669,14 @@ mod tests {
         // Shorter than the shared prologue.
         let mut short = vec![0u8; GATES_START_OFFSET - 4];
         assert!(matches!(
-            patch_guest_tpidr_offset(&mut short, MEASURED_OFFSET),
+            finalize_trampoline_gates(&mut short, MEASURED_OFFSET),
             Err(Error::TrampolinePatchFailure(_))
         ));
 
         // Not a whole number of instructions.
         let mut ragged = vec![0u8; GATES_START_OFFSET + 2];
         assert!(matches!(
-            patch_guest_tpidr_offset(&mut ragged, MEASURED_OFFSET),
+            finalize_trampoline_gates(&mut ragged, MEASURED_OFFSET),
             Err(Error::TrampolinePatchFailure(_))
         ));
 
@@ -2702,7 +2691,7 @@ mod tests {
         .unwrap();
         foreign[GATES_START_OFFSET..].copy_from_slice(&bogus.to_le_bytes());
         assert!(matches!(
-            patch_guest_tpidr_offset(&mut foreign, MEASURED_OFFSET),
+            finalize_trampoline_gates(&mut foreign, MEASURED_OFFSET),
             Err(Error::TrampolinePatchFailure(_))
         ));
     }

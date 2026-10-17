@@ -11,8 +11,8 @@ use crate::{
     aarch64, aarch64::Frame, aarch64::FrameBase, aarch64::GATE_ALIGNMENT,
     aarch64::GATE_PC_CANDIDATE_COUNT, aarch64::GATE_SLOT_SIZES, aarch64::GateMetadata,
     aarch64::GuestSp, aarch64::MAX_GATE_SLOT_BYTES, aarch64::MSR_FRAME_BYTES,
-    aarch64::MSR_FRAME_OFF_VALUE, aarch64::Resume, aarch64::SVC_FRAME_BYTES,
-    aarch64::SVC_GATE_BYTES, aarch64::Stage, aarch64::Value, aarch64::X18_FRAME_BYTES,
+    aarch64::MSR_FRAME_OFF_VALUE, aarch64::Resume, aarch64::SVC_GATE_BYTES, aarch64::Stage,
+    aarch64::Value, aarch64::X18_FRAME_BYTES,
 };
 
 // Keep recovered contexts stack-backed: boxing would allocate in a signal handler,
@@ -83,18 +83,15 @@ pub fn canonicalize(
     abi: GateAbi,
     mut read: impl FnMut(usize, &mut [u8]) -> bool,
 ) -> Aarch64GateSignalResult {
-    let (host, virtualize_x18, svc_frame) = match abi {
+    let (layout, virtualize_x18) = match abi {
         GateAbi::Linux {
             host,
             virtualize_x18,
-        } => (host, virtualize_x18, SVC_FRAME_BYTES),
-        GateAbi::Darwin => (
-            TargetHost::MacOs,
-            false,
-            crate::aarch64::DARWIN_SVC_FRAME_BYTES,
-        ),
+        } => (aarch64::GateLayout::linux(host), virtualize_x18),
+        GateAbi::Darwin => (aarch64::GateLayout::darwin(TargetHost::MacOs), false),
     };
-    let svc_frame = usize::from(svc_frame);
+    let host = layout.host;
+    let svc_frame = usize::from(layout.svc_frame_bytes);
     let pc = *guest_pc as u64;
     let original_sp = *guest_sp;
     if !pc.is_multiple_of(4) {
@@ -136,20 +133,12 @@ pub fn canonicalize(
             // must not cause the runtime to abort. This includes PCs in a real
             // slot's padding or metadata: no prologue ran, so retain the
             // interrupted registers.
-            let classified = match abi {
-                GateAbi::Darwin => aarch64::classify_copied_gate_slot_with_layout(
-                    &slot[..slot_size],
-                    slot_start as u64,
-                    pc as u64,
-                    aarch64::GateLayout::darwin(host),
-                ),
-                GateAbi::Linux { .. } => crate::aarch64::classify_copied_gate_slot_for_host(
-                    &slot[..slot_size],
-                    slot_start as u64,
-                    pc as u64,
-                    host,
-                ),
-            };
+            let classified = aarch64::classify_copied_gate_slot_with_layout(
+                &slot[..slot_size],
+                slot_start as u64,
+                pc as u64,
+                layout,
+            );
             let Some(classified) = classified else {
                 continue;
             };

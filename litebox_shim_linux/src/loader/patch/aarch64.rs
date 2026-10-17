@@ -96,6 +96,7 @@ pub(super) fn finalize_trampoline(
         .map_err(|e| format!("failed to patch guest offsets {offset}/{x18}: {e}"))
     } else {
         litebox_trampoline::aarch64::finalize_trampoline_gates(trampoline, offset)
+            .map(|_| ())
             .map_err(|e| format!("failed to patch guest thread-pointer offset {offset}: {e}"))
     }
 }

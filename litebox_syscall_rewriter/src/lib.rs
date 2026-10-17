@@ -3209,7 +3209,7 @@ mod tests {
             "a runtime-emitted thread-pointer gate must arrive unpatched"
         );
         assert_eq!(
-            litebox_trampoline::aarch64::patch_guest_tpidr_offset(&mut trampoline, 96).unwrap(),
+            litebox_trampoline::aarch64::finalize_trampoline_gates(&mut trampoline, 96).unwrap(),
             1
         );
         assert!(litebox_trampoline::aarch64::find_guest_tpidr_placeholder(&trampoline).is_none());
