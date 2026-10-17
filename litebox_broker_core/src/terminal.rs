@@ -122,13 +122,18 @@ pub struct InputResult {
     pub input_overrun: bool,
 }
 
+struct LineByte {
+    byte: u8,
+    echo_width: u8,
+}
+
 /// One terminal's line discipline. Access must be serialized by its owner.
 #[derive(Default)]
 pub struct TerminalEngine {
     settings: TerminalSettings,
     input: VecDeque<u8>,
     records: VecDeque<usize>,
-    line: Vec<u8>,
+    line: Vec<LineByte>,
     quoted: bool,
     output_stopped: bool,
     column: usize,
@@ -149,7 +154,8 @@ impl TerminalEngine {
         let was_canonical = self.settings.local.contains(L::CANONICAL);
         let canonical = settings.local.contains(L::CANONICAL);
         if was_canonical && !canonical {
-            self.input.extend(self.line.drain(..));
+            self.input
+                .extend(self.line.drain(..).map(|entry| entry.byte));
             self.records.clear();
         } else if !was_canonical && canonical && !self.input.is_empty() {
             self.records.push_back(self.input.len());
@@ -251,17 +257,17 @@ impl TerminalEngine {
             if i.contains(I::STRIP_HIGH_BIT) {
                 byte &= 0x7f;
             }
-            if byte == b'\r' {
+            let quoted = core::mem::take(&mut self.quoted);
+            if !quoted && byte == b'\r' {
                 if i.contains(I::IGNORE_CARRIAGE_RETURN) {
                     continue;
                 }
                 if i.contains(I::CARRIAGE_RETURN_TO_NEWLINE) {
                     byte = b'\n';
                 }
-            } else if byte == b'\n' && i.contains(I::NEWLINE_TO_CARRIAGE_RETURN) {
+            } else if !quoted && byte == b'\n' && i.contains(I::NEWLINE_TO_CARRIAGE_RETURN) {
                 byte = b'\r';
             }
-            let quoted = core::mem::take(&mut self.quoted);
             if !quoted {
                 if i.contains(I::SOFTWARE_FLOW_CONTROL) {
                     if Self::matches(byte, cc.start) {
@@ -285,12 +291,15 @@ impl TerminalEngine {
                         None
                     };
                     if let Some(event) = event {
+                        if i.contains(I::SOFTWARE_FLOW_CONTROL) {
+                            self.output_stopped = false;
+                        }
                         if !l.contains(L::NO_FLUSH_ON_EVENT) {
                             self.flush_input();
                             result.echo.clear();
                             result.flush_output = true;
                         }
-                        self.echo(byte, &mut result.echo);
+                        self.echo(byte, false, &mut result.echo);
                         result.events.push(event);
                         continue;
                     }
@@ -307,7 +316,7 @@ impl TerminalEngine {
                             }
                         } else {
                             self.line.clear();
-                            self.echo(byte, &mut result.echo);
+                            self.echo(byte, false, &mut result.echo);
                             if l.contains(L::ECHO | L::ECHO_KILL) {
                                 self.output_byte(b'\n', &mut result.echo);
                             }
@@ -328,20 +337,32 @@ impl TerminalEngine {
                             continue;
                         }
                         if Self::matches(byte, cc.word_erase) {
-                            while self.line.last().is_some_and(u8::is_ascii_whitespace) {
+                            while self
+                                .line
+                                .last()
+                                .is_some_and(|entry| entry.byte.is_ascii_whitespace())
+                            {
                                 self.erase(&mut result.echo);
                             }
-                            while self.line.last().is_some_and(|b| !b.is_ascii_whitespace()) {
+                            while self
+                                .line
+                                .last()
+                                .is_some_and(|entry| !entry.byte.is_ascii_whitespace())
+                            {
                                 self.erase(&mut result.echo);
                             }
                             continue;
                         }
                         if Self::matches(byte, cc.reprint) {
-                            self.echo(byte, &mut result.echo);
+                            self.echo(byte, false, &mut result.echo);
                             if l.contains(L::ECHO) {
                                 self.output_byte(b'\n', &mut result.echo);
-                                for byte in self.line.clone() {
-                                    self.echo(byte, &mut result.echo);
+                                for index in 0..self.line.len() {
+                                    self.line[index] = self.echo_line_byte(
+                                        self.line[index].byte,
+                                        true,
+                                        &mut result.echo,
+                                    );
                                 }
                             }
                             continue;
@@ -360,15 +381,15 @@ impl TerminalEngine {
                         || (l.contains(L::EXTENDED_EDITING)
                             && Self::matches(byte, cc.end_of_line2)));
                 if self.line.len() < LINE_CAPACITY - 1 || delimiter {
-                    self.line.push(byte);
-                    self.echo(byte, &mut result.echo);
+                    let entry = self.echo_line_byte(byte, quoted, &mut result.echo);
+                    self.line.push(entry);
                 }
                 if delimiter {
                     self.commit_line();
                 }
             } else {
                 self.input.push_back(byte);
-                self.echo(byte, &mut result.echo);
+                self.echo(byte, false, &mut result.echo);
             }
         }
         result
@@ -376,45 +397,52 @@ impl TerminalEngine {
 
     fn commit_line(&mut self) {
         self.records.push_back(self.line.len());
-        self.input.extend(self.line.drain(..));
+        self.input
+            .extend(self.line.drain(..).map(|entry| entry.byte));
     }
 
     fn erase(&mut self, echo: &mut Vec<u8>) {
-        let Some(mut byte) = self.line.pop() else {
+        let Some(mut entry) = self.line.pop() else {
             return;
         };
+        let mut width = usize::from(entry.echo_width);
         if self.settings.input.contains(I::UTF8_ERASE) {
-            while byte & 0xc0 == 0x80 {
+            while entry.byte & 0xc0 == 0x80 {
                 let Some(previous) = self.line.pop() else {
                     break;
                 };
-                byte = previous;
+                width += usize::from(previous.echo_width);
+                entry = previous;
             }
         }
         let l = self.settings.local;
         if l.contains(L::ECHO | L::ECHO_ERASE) {
-            let width =
-                if byte == b'\t' {
-                    let column = self.line.iter().fold(0, |col, b| {
-                        if *b == b'\t' { (col + 8) & !7 } else { col + 1 }
-                    });
-                    self.column.saturating_sub(column).min(8)
-                } else if byte.is_ascii_control() && l.contains(L::ECHO_CONTROL) {
-                    2
-                } else {
-                    1
-                };
             for _ in 0..width {
                 self.output_byte(b'\x08', echo);
                 self.output_byte(b' ', echo);
                 self.output_byte(b'\x08', echo);
             }
         } else {
-            self.echo(self.settings.characters.erase, echo);
+            self.echo(self.settings.characters.erase, false, echo);
         }
     }
 
-    fn echo(&mut self, byte: u8, output: &mut Vec<u8>) {
+    fn echo_line_byte(&mut self, byte: u8, quoted: bool, output: &mut Vec<u8>) -> LineByte {
+        let column = self.column;
+        self.echo(byte, quoted, output);
+        LineByte {
+            byte,
+            // Remember the actual expansion, including prompt-relative tab stops.
+            echo_width: self
+                .column
+                .saturating_sub(column)
+                .min(8)
+                .try_into()
+                .expect("echo width is bounded by a tab stop"),
+        }
+    }
+
+    fn echo(&mut self, byte: u8, quoted: bool, output: &mut Vec<u8>) {
         let l = self.settings.local;
         if !l.contains(L::ECHO) {
             if byte == b'\n' && l.contains(L::CANONICAL | L::ECHO_NEWLINE) {
@@ -422,7 +450,10 @@ impl TerminalEngine {
             }
             return;
         }
-        if l.contains(L::ECHO_CONTROL) && byte.is_ascii_control() && byte != b'\n' && byte != b'\t'
+        if l.contains(L::ECHO_CONTROL)
+            && byte.is_ascii_control()
+            && (byte != b'\n' || quoted)
+            && byte != b'\t'
         {
             self.output_byte(b'^', output);
             self.output_byte(if byte == 127 { b'?' } else { byte + b'@' }, output);
@@ -626,6 +657,81 @@ mod tests {
         assert!(tty.output_stopped());
         tty.receive(b"\x11");
         assert!(!tty.output_stopped());
+    }
+
+    #[test]
+    fn signal_characters_resume_output_with_or_without_flushing() {
+        for no_flush in [false, true] {
+            for (byte, event) in [(3, TerminalEvent::Interrupt), (28, TerminalEvent::Quit)] {
+                let mut tty = TerminalEngine::default();
+                let mut settings = tty.settings();
+                settings.local.set(L::NO_FLUSH_ON_EVENT, no_flush);
+                tty.configure(settings).unwrap();
+                tty.receive(b"\x13");
+                assert!(tty.output_stopped());
+                let result = tty.receive(&[byte]);
+                assert!(!tty.output_stopped());
+                assert_eq!(result.events, [event]);
+                assert_eq!(result.flush_output, !no_flush);
+            }
+        }
+    }
+
+    #[test]
+    fn literal_next_bypasses_newline_translation_but_not_high_bit_stripping() {
+        for (byte, input, expected, echo) in [
+            (b'\r', I::CARRIAGE_RETURN_TO_NEWLINE, b'\r', b"^M"),
+            (b'\r', I::IGNORE_CARRIAGE_RETURN, b'\r', b"^M"),
+            (b'\n', I::NEWLINE_TO_CARRIAGE_RETURN, b'\n', b"^J"),
+            (
+                0x8d,
+                I::STRIP_HIGH_BIT | I::CARRIAGE_RETURN_TO_NEWLINE,
+                b'\r',
+                b"^M",
+            ),
+        ] {
+            let mut tty = TerminalEngine::default();
+            tty.configure(TerminalSettings {
+                input,
+                ..tty.settings()
+            })
+            .unwrap();
+            let result = tty.receive(&[22, byte, 4]);
+            assert_eq!(result.echo, echo);
+            assert!(result.events.is_empty());
+            let mut bytes = [0; 2];
+            assert_eq!(tty.read(&mut bytes), Some(1));
+            assert_eq!(bytes[0], expected);
+        }
+        let mut tty = TerminalEngine::default();
+        tty.configure(TerminalSettings {
+            input: I::IGNORE_CARRIAGE_RETURN,
+            ..tty.settings()
+        })
+        .unwrap();
+        assert_eq!(
+            tty.receive(b"\x16\r\x03").events,
+            [TerminalEvent::Interrupt]
+        );
+    }
+
+    #[test]
+    fn tab_erasure_uses_its_echoed_width_after_prompts_and_reprints() {
+        for (prefix, width) in [(b"a".as_slice(), 5), (b"\x01", 4), (b"\xc3\xa9", 5)] {
+            let mut tty = TerminalEngine::default();
+            tty.output(b"$ ", 2);
+            tty.receive(prefix);
+            tty.receive(b"\t");
+            assert_eq!(tty.receive(b"\x7f").echo, b"\x08 \x08".repeat(width));
+            tty.receive(b"\n");
+            let mut bytes = [0; 8];
+            assert_eq!(tty.read(&mut bytes), Some(prefix.len() + 1));
+            assert_eq!(&bytes[..prefix.len()], prefix);
+        }
+        let mut tty = TerminalEngine::default();
+        tty.output(b"$ ", 2);
+        tty.receive(b"a\t\x12");
+        assert_eq!(tty.receive(b"\x7f").echo, b"\x08 \x08".repeat(7));
     }
 
     #[test]

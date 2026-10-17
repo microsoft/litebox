@@ -22,7 +22,7 @@ use litebox_broker_protocol::terminal::{
 const OUTPUT_CAPACITY: usize = 64 * 1024;
 const ATOMIC_WRITE_SIZE: usize = 4096;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {
     Active,
     HungUp,
@@ -49,12 +49,12 @@ impl State {
             flags = flags | ReadinessFlags::READ;
         }
         if self.status != Status::Active
-            || (!self.draining && self.output.len() <= OUTPUT_CAPACITY - 2 * ATOMIC_WRITE_SIZE)
+            || self.output.len() <= OUTPUT_CAPACITY - 2 * ATOMIC_WRITE_SIZE
         {
             flags = flags | ReadinessFlags::WRITE;
         }
         if self.status == Status::HungUp {
-            flags = flags | ReadinessFlags::HANGUP;
+            flags = flags | ReadinessFlags::HANGUP | ReadinessFlags::CLOSED;
         }
         if self.status == Status::Failed {
             flags = flags | ReadinessFlags::ERROR;
@@ -65,6 +65,12 @@ impl State {
     fn publish(&mut self) {
         let flags = self.readiness();
         self.watchers.publish(flags);
+    }
+
+    fn hang_up(&mut self) {
+        self.status = Status::HungUp;
+        self.draining = false;
+        self.output.clear();
     }
 }
 
@@ -171,8 +177,7 @@ impl LinuxTerminal {
             return Err(StdioProviderError::Failed);
         }
         let available = (OUTPUT_CAPACITY - state.output.len()) / 2;
-        if state.draining
-            || (available == 0 && !input.is_empty())
+        if (available == 0 && !input.is_empty())
             || (input.len() <= ATOMIC_WRITE_SIZE && input.len() > available)
         {
             return Err(StdioProviderError::WouldBlock);
@@ -240,8 +245,10 @@ impl TerminalEndpoint for LinuxTerminal {
                 }
         );
         if drain && !state.drained {
-            state.draining = true;
-            self.shared.wake();
+            if !state.draining {
+                state.draining = true;
+                self.shared.wake();
+            }
             return Err(litebox_broker_core::BrokerError::WouldBlock);
         }
         let response = match operation {
@@ -381,14 +388,55 @@ fn window_size(file: &File) -> io::Result<WindowSize> {
 }
 
 fn run(shared: &Shared) {
-    let result = pump(shared);
-    if let Err(error) = result {
+    loop {
+        let Err(error) = pump(shared) else {
+            return;
+        };
+        if error.raw_os_error() == Some(libc::EIO) {
+            // Closing a PTY master can race with geometry, drain, or I/O calls
+            // between polls. EIO accompanied by hangup is closure, not failure.
+            match transport_hung_up(&shared.file) {
+                Ok(true) => {
+                    let mut state = shared.lock();
+                    if state.status == Status::Stopping {
+                        return;
+                    }
+                    state.hang_up();
+                    state.publish();
+                    shared.changed.notify_all();
+                    continue;
+                }
+                Ok(false) => {}
+                Err(probe_error) => {
+                    litebox_util_log::error!(error:% = probe_error; "checking terminal hangup failed");
+                }
+            }
+        }
         litebox_util_log::error!(error:% = error; "terminal transport failed");
         let mut state = shared.lock();
         state.status = Status::Failed;
         state.draining = false;
         state.publish();
         shared.changed.notify_all();
+        return;
+    }
+}
+
+fn transport_hung_up(file: &File) -> io::Result<bool> {
+    let mut fd = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: fd is valid storage for one live terminal's poll descriptor.
+        if unsafe { libc::poll(&raw mut fd, 1, 0) } >= 0 {
+            return Ok(fd.revents & (libc::POLLHUP | libc::POLLERR) != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -398,24 +446,6 @@ fn pump(shared: &Shared) -> io::Result<()> {
         let mut state = shared.lock();
         if state.status == Status::Stopping {
             return Ok(());
-        }
-        if state.status == Status::HungUp && state.pending_input.is_empty() {
-            drop(state);
-            let mut wake = [libc::pollfd {
-                fd: shared.wake.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            }];
-            // SAFETY: wake is a valid one-element pollfd array.
-            if unsafe { libc::poll(wake.as_mut_ptr(), 1, -1) } < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            let _count = (&shared.wake).read(&mut [0; 8])?;
-            continue;
         }
         let mut input_overrun = false;
         let mut echo_overrun = false;
@@ -450,6 +480,26 @@ fn pump(shared: &Shared) -> io::Result<()> {
             if echo_overrun {
                 litebox_util_log::warn!("terminal echo buffer overrun");
             }
+        }
+        if state.status == Status::HungUp {
+            state.publish();
+            shared.changed.notify_all();
+            drop(state);
+            let mut wake = [libc::pollfd {
+                fd: shared.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            // SAFETY: wake is a valid one-element pollfd array.
+            if unsafe { libc::poll(wake.as_mut_ptr(), 1, -1) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            let _count = (&shared.wake).read(&mut [0; 8])?;
+            continue;
         }
         if state.draining && state.output.is_empty() {
             drop(state);
@@ -509,12 +559,18 @@ fn pump(shared: &Shared) -> io::Result<()> {
             let _count = (&shared.wake).read(&mut [0; 8])?;
         }
         let mut state = shared.lock();
+        if state.status == Status::Stopping {
+            return Ok(());
+        }
         if fds[0].revents & libc::POLLNVAL != 0 {
             return Err(io::Error::other("terminal descriptor became invalid"));
         }
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            state.hang_up();
+        }
         if fds[0].revents & libc::POLLIN != 0 && state.pending_input.is_empty() {
             match (&shared.file).read(&mut buffer) {
-                Ok(0) => state.status = Status::HungUp,
+                Ok(0) => state.hang_up(),
                 Ok(count) => state.pending_input.extend(&buffer[..count]),
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock
@@ -522,7 +578,10 @@ fn pump(shared: &Shared) -> io::Result<()> {
                 Err(error) => return Err(error),
             }
         }
-        if fds[0].revents & libc::POLLOUT != 0 && !state.engine.output_stopped() {
+        if state.status == Status::Active
+            && fds[0].revents & libc::POLLOUT != 0
+            && !state.engine.output_stopped()
+        {
             let output = state.output.make_contiguous();
             match (&shared.file).write(output) {
                 Ok(0) if !output.is_empty() => {
@@ -541,10 +600,88 @@ fn pump(shared: &Shared) -> io::Result<()> {
                 Err(error) => return Err(error),
             }
         }
-        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            state.status = Status::HungUp;
-        }
         state.publish();
         shared.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::FromRawFd as _;
+    use std::time::Duration;
+
+    fn open_terminal() -> (File, LinuxTerminal) {
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: the descriptors are writable and null optional arguments request defaults.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &raw mut master,
+                    &raw mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned fresh descriptors, each transferred to exactly one File.
+        let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+        let terminal = LinuxTerminal::open(slave.as_raw_fd()).unwrap();
+        (master, terminal)
+    }
+
+    #[test]
+    fn terminal_abandoned_drain_does_not_block_other_writers() {
+        let (_master, terminal) = open_terminal();
+        terminal.shared.lock().engine.receive(b"\x13");
+        assert_eq!(terminal.write(b"first"), Ok(5));
+        assert_eq!(
+            terminal.control(TerminalOperation::Drain),
+            Err(litebox_broker_core::BrokerError::WouldBlock)
+        );
+        assert!(terminal.readiness().contains(ReadinessFlags::WRITE));
+        assert_eq!(terminal.write(b"second"), Ok(6));
+        terminal.shared.lock().engine.receive(b"\x11");
+        terminal.shared.wake();
+        terminal.flush().unwrap();
+    }
+
+    #[test]
+    fn terminal_hangup_preserves_buffered_and_pending_input() {
+        let (master, terminal) = open_terminal();
+        {
+            let mut state = terminal.shared.lock();
+            state.engine.receive(b"buffered\n");
+            state.pending_input.extend(b"tail\n");
+            state.output.extend(b"pending output");
+            state.drained = false;
+            drop(master);
+        }
+        terminal.shared.wake();
+        let (state, timeout) = terminal
+            .shared
+            .changed
+            .wait_timeout_while(terminal.shared.lock(), Duration::from_secs(5), |state| {
+                state.status == Status::Active
+                    || (state.status == Status::HungUp && !state.pending_input.is_empty())
+            })
+            .unwrap();
+        assert!(!timeout.timed_out());
+        assert_eq!(state.status, Status::HungUp);
+        assert!(
+            state
+                .readiness()
+                .contains(ReadinessFlags::HANGUP | ReadinessFlags::CLOSED)
+        );
+        drop(state);
+        let mut bytes = [0; 32];
+        assert_eq!(terminal.read(&mut bytes), Ok(9));
+        assert_eq!(&bytes[..9], b"buffered\n");
+        assert_eq!(terminal.read(&mut bytes), Ok(5));
+        assert_eq!(&bytes[..5], b"tail\n");
+        assert_eq!(terminal.read(&mut bytes), Ok(0));
     }
 }

@@ -2656,6 +2656,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let files = self.files.borrow();
+        if let Some(file) = files.typed_fd(fd)?.as_file() {
+            self.global.with_file(file, |file| {
+                if file.get_status_flags()?.contains(OFlags::PATH) {
+                    return Err(Errno::EBADF);
+                }
+                Ok(())
+            })?;
+        }
         match arg {
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;

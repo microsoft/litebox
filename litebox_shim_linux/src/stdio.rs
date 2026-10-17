@@ -253,8 +253,9 @@ mod tests {
                 path,
                 IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut observed))
             ),
-            Err(Errno::ENOTTY)
+            Err(Errno::EBADF)
         );
+        assert_eq!(task.sys_ioctl(path, IoctlArg::FIOCLEX), Err(Errno::EBADF));
     }
 
     #[test]
