@@ -572,7 +572,16 @@ const X18_BRANCH_BRK_IMM: u16 = 0xB18;
 /// Private breakpoint namespace for a guest `MSR TPIDR_EL0, Xn`. The low five
 /// immediate bits encode Xn (31 means XZR); no stack or out-of-line gate is
 /// needed. The runtime consumes only a synchronous breakpoint with this tag.
-const MSR_TPIDR_BRK_BASE: u16 = 0xB200;
+///
+/// Keep the entire 32-immediate range below 0x1000, near the existing x18 trap.
+/// XNU's `osfmk/arm64/sleh.c::user_brk_descriptors` reserves 0xB000..=0xBFFF
+/// for potentially unrecoverable traps: processes may be killed without signal
+/// delivery, so that range cannot be used for emulation.
+const MSR_TPIDR_BRK_BASE: u16 = 0x0B20;
+/// Previously emitted marker, retained for hosts that deliver it. macOS AOT
+/// binaries using this range must be regenerated; a handler cannot intercept
+/// XNU's unrecoverable-trap termination.
+const LEGACY_MSR_TPIDR_BRK_BASE: u16 = 0xB200;
 
 /// Distinguishes the new TLS-restoring SVC outbound stub from the persisted
 /// stack-restoring one. Callers use this only for a recorded outbound address;
@@ -584,8 +593,12 @@ pub fn svc_stub_uses_tls(first_word: u32, host: crate::TargetHost) -> bool {
 /// Decode an in-place guest thread-pointer-write breakpoint's source register.
 pub fn decode_msr_tpidr_trap(word: u32) -> Option<u8> {
     let immediate = ((word >> 5) & 0xffff) as u16;
-    (word & 0xffe0_001f == Opcode::Brk.bits() && immediate & !31 == MSR_TPIDR_BRK_BASE)
-        .then_some((immediate & 31) as u8)
+    (word & 0xffe0_001f == Opcode::Brk.bits()
+        && matches!(
+            immediate & !31,
+            MSR_TPIDR_BRK_BASE | LEGACY_MSR_TPIDR_BRK_BASE
+        ))
+    .then_some((immediate & 31) as u8)
 }
 
 /// Alignment every emitted gate slot starts on.
@@ -5190,6 +5203,52 @@ mod tests {
             3 * GATES_START_OFFSET + SVC_SLOT_BYTES + MSR_SLOT_BYTES + MRS_SLOT_BYTES
         );
         assert!(emitted <= bound);
+    }
+
+    #[test]
+    fn emitted_msr_traps_avoid_macos_unrecoverable_breakpoints() {
+        let words: Vec<_> = (0..32).map(msr_tpidr_el0).collect();
+        for host in [Host::Linux, Host::MacOs] {
+            let (patched, outcome) =
+                hook_words_opt_with_config(&words, 0x1000, 0x400000, x18_config(host));
+            assert_eq!(outcome.unwrap().trapped_sites, []);
+            for source in 0..32usize {
+                let instruction = word_at(&patched, source * INSN_BYTES);
+                let immediate = (instruction >> 5) & 0xffff;
+                // XNU sleh.c::user_brk_descriptors marks 0xB000..=0xBFFF
+                // potentially unrecoverable: the kernel may SIGKILL instead
+                // of entering our signal handler. Keep every source encoding
+                // below that and the high PAC/other reserved trap ranges.
+                assert!(
+                    immediate < 0x1000,
+                    "{host:?} MSR x{source}: BRK #{immediate:#x}"
+                );
+                assert_eq!(
+                    decode_msr_tpidr_trap(instruction),
+                    Some(u8::try_from(source).unwrap())
+                );
+                // Preserve decoding of previously generated Linux AOT files.
+                let legacy = Insn::Brk(LEGACY_MSR_TPIDR_BRK_BASE | u16::try_from(source).unwrap())
+                    .encode()
+                    .unwrap();
+                assert_eq!(
+                    decode_msr_tpidr_trap(legacy),
+                    Some(u8::try_from(source).unwrap())
+                );
+            }
+        }
+        for immediate in [
+            MSR_TPIDR_BRK_BASE - 1,
+            MSR_TPIDR_BRK_BASE + 32,
+            LEGACY_MSR_TPIDR_BRK_BASE - 1,
+            LEGACY_MSR_TPIDR_BRK_BASE + 32,
+            X18_BRANCH_BRK_IMM,
+        ] {
+            assert_eq!(
+                decode_msr_tpidr_trap(Insn::Brk(immediate).encode().unwrap()),
+                None
+            );
+        }
     }
 
     #[test]

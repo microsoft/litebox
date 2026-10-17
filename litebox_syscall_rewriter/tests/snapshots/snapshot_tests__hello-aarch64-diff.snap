@@ -10,7 +10,7 @@ expression: diff
  0000000000400110 <_start>:
 -  400110:	d51bd045	msr tpidr_el0,x5
 -  400114:	d53bd049	mrs x9,tpidr_el0
-+  400110:	d43640a0	brk #0xb205
++  400110:	d42164a0	brk #0xb25
 +  400114:	<trampoline-b+0x10>
    400118:	d2800808	mov x8,#0x40
    40011c:	d2800020	mov x0,#0x1

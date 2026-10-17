@@ -67,6 +67,57 @@ fn run_x18_fixture(aot: bool) {
     not(feature = "test-broker"),
     ignore = "macOS runner requires broker support"
 )]
+fn msr_traps_return_to_guest_without_a_guest_stack() {
+    // Save SP in x19, clear SP, write and read guest TP, restore SP and exit.
+    // A private BRK in XNU's 0xB000..=0xBFFF range kills the process before
+    // the signal handler can emulate MSR; test both rewriting entry points.
+    let code = [
+        0x910003f3, // mov x19, sp
+        0xd280000a, // mov x10, #0
+        0x9100015f, // mov sp, x10
+        0xd2822229, // mov x9, #0x1111
+        0xd51bd049, // msr tpidr_el0, x9
+        0xd53bd04a, // mrs x10, tpidr_el0
+        0xeb0a013f, // cmp x9, x10
+        0x9100027f, // mov sp, x19
+        0x54000081, // b.ne failure
+        0xd2800540, // mov x0, #42
+        0xd2800bc8, // mov x8, #94 (exit_group)
+        0xd4000001, // svc #0
+        0xd2800020, // failure: mov x0, #1
+        0xd2800bc8, // mov x8, #94
+        0xd4000001, // svc #0
+    ];
+    for aot in [false, true] {
+        let fixture = Fixture::new();
+        let original = elf(&code);
+        let binary = if aot {
+            hook_syscalls_in_elf_with_options(
+                &original,
+                None,
+                RewriteOptions::new(TargetHost::MacOs, false),
+            )
+            .unwrap()
+        } else {
+            original
+        };
+        std::fs::write(fixture.0.join("program"), binary).unwrap();
+        let output = fixture.run(&[]);
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "aot={aot}: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-broker"),
+    ignore = "macOS runner requires broker support"
+)]
 fn runtime_x18_gates_preserve_registers_and_branch_targets() {
     run_x18_fixture(false);
 }
