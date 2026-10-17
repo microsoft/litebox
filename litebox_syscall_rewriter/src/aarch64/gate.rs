@@ -20,98 +20,19 @@
 //! panics, because validation also runs inside signal handlers.
 
 use super::{
-    ADD_IMM_SHAPE_MASK, ADRP_SHAPE_MASK, GATE_METADATA_BYTES, GUEST_TPIDR_OFFSET_ALIGN,
-    GUEST_TPIDR_OFFSET_PLACEHOLDER, GUEST_X18_OFFSET_PLACEHOLDER, GateLayout, GateMetadata, Host,
-    IMM26_BITS, IMM26_MASK, IN_GUEST_OFFSET_FROM_GUEST_TP, INSN_BYTES, Insn, LDST_UIMM12_IMM_MASK,
-    LDST_UIMM12_IMM_SHIFT, MAX_GATE_SLOT_BYTES, MSR_FRAME_BYTES, MSR_FRAME_OFF_VALUE, NOP,
-    OPCODE_TOP6_MASK, Opcode, PAGE_OFFSET_MASK, REG_MASK, RT2_SHIFT, SP, SVC_FRAME_OFF_RETADDR,
-    SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16, X16, X17, X18_BRANCH_BRK_IMM, X18_FRAME_BYTES,
-    X18BranchKind, X18PcRelative, X18StackWritebackLayout, anchor_mask,
-    classify_x18_stack_writeback, decode_ldr_literal_target, pcrel_bytes,
-    valid_emitted_tpidr_offset, valid_emitted_x18_offset,
+    ADD_IMM_SHAPE_MASK, ADRP_SHAPE_MASK, Boundary, Frame, FrameBase, GATE_METADATA_BYTES,
+    GUEST_TPIDR_OFFSET_ALIGN, GUEST_TPIDR_OFFSET_PLACEHOLDER, GUEST_X18_OFFSET_PLACEHOLDER,
+    GateLayout, GateMetadata, GuestSp, Host, IMM26_BITS, IMM26_MASK, IN_GUEST_OFFSET_FROM_GUEST_TP,
+    INSN_BYTES, Insn, LDST_UIMM12_IMM_MASK, LDST_UIMM12_IMM_SHIFT, MAX_GATE_SLOT_BYTES,
+    MSR_FRAME_BYTES, MSR_FRAME_OFF_VALUE, NOP, OPCODE_TOP6_MASK, Opcode, PAGE_OFFSET_MASK,
+    REG_MASK, RT2_SHIFT, Resume, SP, SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16,
+    Stage, Value, X16, X17, X18_BRANCH_BRK_IMM, X18_FRAME_BYTES, X18BranchKind, X18PcRelative,
+    X18StackWritebackLayout, anchor_mask, classify_x18_stack_writeback, decode_ldr_literal_target,
+    pcrel_bytes, valid_emitted_tpidr_offset, valid_emitted_x18_offset,
 };
 
 /// Most words any gate slot holds, including padding and metadata.
 pub(super) const MAX_SLOT_WORDS: usize = MAX_GATE_SLOT_BYTES / INSN_BYTES;
-
-// ============================================================
-// Recovery semantics
-// ============================================================
-
-/// Where gate-saved guest registers live at an instruction boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Frame {
-    /// No gate frame exists.
-    None,
-    /// A frame exists at the given base, but the registers it saves still
-    /// hold their guest values.
-    Live(FrameBase),
-    /// A frame exists at the given base and the registers it saves must be
-    /// restored from it.
-    Restore(FrameBase),
-}
-
-/// Address of the gate frame, relative to the interrupted context.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameBase {
-    /// The interrupted SP.
-    Sp,
-    /// One frame below the interrupted SP (the frame was popped early).
-    BelowSp,
-    /// The value held in the gate's anchor scratch register.
-    Anchor,
-}
-
-/// How recovery reconstructs the guest SP.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GuestSp {
-    /// The interrupted SP is the guest's.
-    Signal,
-    /// The guest SP is the end of the gate frame.
-    FrameEnd,
-    /// The guest SP is the end of the gate frame plus the guest instruction's
-    /// own SP writeback.
-    FrameEndPlusDelta,
-}
-
-/// Source of the logical value the gate virtualizes: guest x18 for x18 gates,
-/// or the MRS destination for thread-pointer reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Value {
-    /// The architectural register already holds the logical value, or the gate
-    /// virtualizes none.
-    None,
-    /// Read it from the runtime's guest slot.
-    Slot,
-    /// Read it from the gate's value scratch register.
-    Scratch,
-}
-
-/// Guest PC reported after recovery.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Resume {
-    /// The original patch site: the guest instruction has not taken effect.
-    Site,
-    /// The instruction after the site: the guest instruction completed.
-    Next,
-    /// The original compare/test branch's taken target.
-    Taken,
-    /// The logical x18 value: an emulated indirect branch through x18.
-    LogicalX18,
-}
-
-/// Recovery semantics for a context interrupted before one gate instruction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Boundary {
-    pub frame: Frame,
-    pub sp: GuestSp,
-    pub value: Value,
-    pub resume: Resume,
-    /// A synchronous fault here belongs to the runtime, not the guest.
-    pub runtime_fault: bool,
-    /// The MSR gate's staged source copy must equal the architectural source.
-    pub check_capture: bool,
-}
 
 impl Boundary {
     const fn new(frame: Frame, sp: GuestSp, value: Value, resume: Resume) -> Self {
@@ -141,20 +62,6 @@ impl Boundary {
     const fn stage(self) -> Option<Stage> {
         Some(Stage::Recover(self))
     }
-}
-
-/// Recovery classification of one executable gate instruction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stage {
-    /// Canonicalize with these semantics.
-    Recover(Boundary),
-    /// The SVC gate's outbound stub, the runtime-owned return path.
-    SvcOutbound,
-    /// A TLS-backed SVC outbound instruction. The runtime must first check
-    /// this is its recorded outbound stub; then normal recovery applies.
-    SvcTlsOutbound(Boundary),
-    /// Reachable only if a runtime invariant was violated.
-    Invalid,
 }
 
 // ============================================================

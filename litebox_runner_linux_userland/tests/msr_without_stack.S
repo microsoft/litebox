@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+/* Copyright (c) Microsoft Corporation.
+   Licensed under the MIT license. */
 
 // MSR emulation must not use the guest stack. Save the entry SP in x9 and
 // verify TLS read-after-write, XZR, native/virtual x18, and scratch preservation.

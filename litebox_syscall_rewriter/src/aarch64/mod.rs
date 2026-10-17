@@ -124,8 +124,6 @@
 
 mod gate;
 
-pub use gate::{Boundary, Frame, FrameBase, GuestSp, Resume, Stage, Value};
-
 use alloc::format;
 use alloc::string::ToString as _;
 use alloc::vec::Vec;
@@ -141,6 +139,99 @@ use crate::{
     Error, InternalError, Result, TextSectionInfo, checked_add_u64, fixup_phdr_alignment,
     text_sections,
 };
+
+// ============================================================
+// Recovery semantics shared by gate templates and platform signal handlers
+// ============================================================
+
+/// Where gate-saved guest registers live at an instruction boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frame {
+    /// No gate frame exists.
+    None,
+    /// A frame exists at the given base, but the registers it saves still
+    /// hold their guest values.
+    Live(FrameBase),
+    /// A frame exists at the given base and the registers it saves must be
+    /// restored from it.
+    Restore(FrameBase),
+}
+
+/// Address of the gate frame, relative to the interrupted context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameBase {
+    /// The interrupted SP.
+    Sp,
+    /// One frame below the interrupted SP (the frame was popped early).
+    BelowSp,
+    /// The value held in the gate's anchor scratch register.
+    Anchor,
+}
+
+/// How recovery reconstructs the guest SP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestSp {
+    /// The interrupted SP is the guest's.
+    Signal,
+    /// The guest SP is the end of the gate frame.
+    FrameEnd,
+    /// The guest SP is the end of the gate frame plus the guest instruction's
+    /// own SP writeback.
+    FrameEndPlusDelta,
+}
+
+/// Source of the logical value the gate virtualizes: guest x18 for x18 gates,
+/// or the MRS destination for thread-pointer reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Value {
+    /// The architectural register already holds the logical value, or the gate
+    /// virtualizes none.
+    None,
+    /// Read it from the runtime's guest slot.
+    Slot,
+    /// Read it from the gate's value scratch register.
+    Scratch,
+}
+
+/// Guest PC reported after recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resume {
+    /// The original patch site: the guest instruction has not taken effect.
+    Site,
+    /// The instruction after the site: the guest instruction completed.
+    Next,
+    /// The original compare/test branch's taken target.
+    Taken,
+    /// The logical x18 value: an emulated indirect branch through x18.
+    LogicalX18,
+}
+
+/// Recovery semantics for a context interrupted before one gate instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Boundary {
+    pub frame: Frame,
+    pub sp: GuestSp,
+    pub value: Value,
+    pub resume: Resume,
+    /// A synchronous fault here belongs to the runtime, not the guest.
+    pub runtime_fault: bool,
+    /// The MSR gate's staged source copy must equal the architectural source.
+    pub check_capture: bool,
+}
+
+/// Recovery classification of one executable gate instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Canonicalize with these semantics.
+    Recover(Boundary),
+    /// The SVC gate's outbound stub, the runtime-owned return path.
+    SvcOutbound,
+    /// A TLS-backed SVC outbound instruction. The runtime must first check
+    /// this is its recorded outbound stub; then normal recovery applies.
+    SvcTlsOutbound(Boundary),
+    /// Reachable only if a runtime invariant was violated.
+    Invalid,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ScanSections<'a> {

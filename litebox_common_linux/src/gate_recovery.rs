@@ -491,7 +491,7 @@ mod tests {
                 )
                 .unwrap()
             };
-            assert!(trapped.is_empty());
+            assert_eq!(trapped, []);
             if !darwin {
                 aarch64::finalize_trampoline_gates_for_host(&mut gates, 96, 104, host).unwrap();
             }
@@ -584,7 +584,7 @@ mod tests {
                     litebox_syscall_rewriter::RewriteOptions::new(host, virtualize_x18),
                 )
                 .unwrap();
-                assert!(unpatched.is_empty());
+                assert_eq!(unpatched, []);
                 let saved = PtRegs {
                     regs: core::array::from_fn(|index| 0x1000 + index),
                     pc: SITE,

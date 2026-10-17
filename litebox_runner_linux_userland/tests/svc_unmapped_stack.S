@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+/* Copyright (c) Microsoft Corporation.
+   Licensed under the MIT license. */
 
 // The SVC frame is writable on entry, but munmap removes it before return.
 // A TLS-restoring outbound stub must not read or restage that guest frame.
