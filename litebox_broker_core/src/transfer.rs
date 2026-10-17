@@ -2,56 +2,53 @@
 // Licensed under the MIT license.
 
 //! Copying bytes into and out of broker objects' storage, such as the
-//! queues behind pipes and stream sockets.
+//! queues behind pipes and sockets.
 //!
-//! While it holds its lock, an object lends its storage to its caller as
-//! contiguous parts, in order: the bytes to read as `&[&[u8]]`, or the room
-//! to write as `&mut [&mut [u8]]`. Some parts may be empty. The caller copies
-//! between the parts and its own buffer, which may be memory the broker
-//! cannot reference, such as memory shared with a runner.
+//! While it holds its lock, an object lends its storage to its caller one
+//! contiguous part at a time, in order: each part of the bytes it reads to a
+//! [`Copier`], which copies them out, or each part of the room it writes to
+//! a [`Filler`], which fills it. Some parts may be empty. The caller copies
+//! between each part and its own buffer, continuing where the previous part
+//! left off. Its buffer may be memory the broker cannot reference, such as
+//! memory shared with a runner.
+//!
+//! An operation whose copier or filler fails fails with its error. The
+//! object stays consistent, but may have consumed the bytes, or kept the
+//! room filled, of the parts lent before the failing one.
 
 use alloc::collections::VecDeque;
-use alloc::vec::Vec;
 use core::ops::Range;
 
 use crate::{BrokerError, Result};
 
-/// Returns `queue[range]` as its contiguous parts.
+/// Copies out each part of the bytes an object reads, in turn.
+pub type Copier<'a> = dyn FnMut(&[u8]) -> Result<()> + 'a;
+
+/// Fills each part of the room an object writes, in turn.
+pub type Filler<'a> = dyn FnMut(&mut [u8]) -> Result<()> + 'a;
+
+/// Lends `queue[range]` to `copy`, one contiguous part at a time.
 ///
 /// # Panics
 ///
 /// Panics if `range` is out of `queue`'s bounds.
-pub(crate) fn queue_parts(queue: &VecDeque<u8>, range: Range<usize>) -> [&[u8]; 2] {
+pub fn lend_from_queue(
+    queue: &VecDeque<u8>,
+    range: Range<usize>,
+    copy: &mut Copier<'_>,
+) -> Result<()> {
     let (front, back) = queue.as_slices();
     let split = front.len();
-    [
-        &front[range.start.min(split)..range.end.min(split)],
-        &back[range.start.saturating_sub(split)..range.end.saturating_sub(split)],
-    ]
+    copy(&front[range.start.min(split)..range.end.min(split)])?;
+    copy(&back[range.start.saturating_sub(split)..range.end.saturating_sub(split)])
 }
 
-/// Copies `queue[range]` into a new vector, a contiguous slice at a time
-/// (extending from the deque's iterator copies a byte at a time).
-///
-/// # Panics
-///
-/// Panics if `range` is out of `queue`'s bounds.
-pub fn copy_from_queue(queue: &VecDeque<u8>, range: Range<usize>) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    data.try_reserve_exact(range.len())
-        .map_err(|_| BrokerError::OutOfMemory)?;
-    for part in queue_parts(queue, range) {
-        data.extend_from_slice(part);
-    }
-    Ok(data)
-}
-
-/// Appends `length` bytes to `queue`, lending their room to `fill` to copy
-/// them in, and leaves `queue` unchanged if `fill` fails.
-pub(crate) fn append_to_queue(
+/// Appends `length` bytes to `queue`, lending their room to `fill` one
+/// contiguous part at a time, and leaves `queue` unchanged if `fill` fails.
+pub fn append_to_queue(
     queue: &mut VecDeque<u8>,
     length: usize,
-    fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
+    fill: &mut Filler<'_>,
 ) -> Result<()> {
     queue
         .try_reserve(length)
@@ -60,36 +57,22 @@ pub(crate) fn append_to_queue(
     queue.resize(start + length, 0);
     let (front, back) = queue.as_mut_slices();
     let split = front.len();
-    let result = fill(&mut [
-        &mut front[start.min(split)..],
-        &mut back[start.saturating_sub(split)..],
-    ]);
+    let result = fill(&mut front[start.min(split)..])
+        .and_then(|()| fill(&mut back[start.saturating_sub(split)..]));
     if result.is_err() {
         queue.truncate(start);
     }
     result
 }
 
-/// Returns a filler that copies the start of `source` into the parts it is
-/// lent, one after another.
-#[cfg(test)]
-pub(crate) fn fill_from(source: &[u8]) -> impl FnOnce(&mut [&mut [u8]]) -> Result<()> + '_ {
-    move |parts| {
-        let mut offset = 0;
-        for part in parts {
-            part.copy_from_slice(&source[offset..][..part.len()]);
-            offset += part.len();
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{copy_into, fill_from};
+    use alloc::vec::Vec;
 
     #[test]
-    fn copies_every_range_of_a_wrapped_queue() {
+    fn lends_every_range_of_a_wrapped_queue() {
         // Pushing onto the front of a queue that starts its buffer wraps it.
         let mut queue: VecDeque<u8> = (3..8).collect();
         for byte in (0..3).rev() {
@@ -99,8 +82,12 @@ mod tests {
         for start in 0..=queue.len() {
             for stop in start..=queue.len() {
                 let expected: Vec<u8> = queue.range(start..stop).copied().collect();
-                assert_eq!(queue_parts(&queue, start..stop).concat(), expected);
-                assert_eq!(copy_from_queue(&queue, start..stop), Ok(expected));
+                let mut copied = Vec::new();
+                assert_eq!(
+                    lend_from_queue(&queue, start..stop, &mut copy_into(&mut copied)),
+                    Ok(())
+                );
+                assert_eq!(copied, expected);
             }
         }
     }
@@ -115,7 +102,7 @@ mod tests {
             queue.extend(0..6);
             queue.drain(..4);
             assert_eq!(
-                append_to_queue(&mut queue, length, fill_from(&source)),
+                append_to_queue(&mut queue, length, &mut fill_from(&source)),
                 Ok(())
             );
             assert!(queue.iter().eq([4, 5].iter().chain(&source[..length])));
@@ -127,11 +114,24 @@ mod tests {
 
     #[test]
     fn failed_appends_leave_the_queue_unchanged() {
-        let mut queue: VecDeque<u8> = (0..4).collect();
+        // The second part fails, after the first was filled.
+        let mut queue = VecDeque::with_capacity(8);
+        queue.extend(0..6);
+        queue.drain(..4);
+        let mut parts = 0;
         assert_eq!(
-            append_to_queue(&mut queue, 4, |_| Err(BrokerError::Internal)),
+            append_to_queue(&mut queue, 6, &mut |part| {
+                parts += 1;
+                if parts == 1 {
+                    part.fill(9);
+                    Ok(())
+                } else {
+                    Err(BrokerError::Internal)
+                }
+            }),
             Err(BrokerError::Internal)
         );
-        assert!(queue.iter().copied().eq(0..4));
+        assert_eq!(parts, 2);
+        assert!(queue.iter().copied().eq(4..6));
     }
 }

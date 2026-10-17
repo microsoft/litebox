@@ -6,7 +6,6 @@
 //! (see `Shared::run`), so what it queued is sent at once.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
 use litebox_broker_core::readiness::ReadinessRegistration;
@@ -15,6 +14,7 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
+use litebox_broker_core::transfer::{Copier, Filler};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -153,22 +153,28 @@ impl PlatformSocket for SmoltcpSocket {
         })
     }
 
-    fn send(&self, data: Vec<u8>, _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
+    fn send(
+        &self,
+        length: usize,
+        _flags: SendFlags,
+        fill: &mut Filler<'_>,
+    ) -> BrokerResult<SocketOutcome<usize>> {
         self.with(
-            |tcp, sockets| tcp.send(sockets, &data),
+            |tcp, sockets| tcp.send(sockets, length, fill),
             |_, _| Ok(invalid()),
         )
     }
 
     fn send_to(
         &self,
-        data: Vec<u8>,
+        length: usize,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
+        fill: &mut Filler<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         self.run(|stack| match stack.parts(self.id)?.0 {
             Kind::Tcp(_) => Ok(invalid()),
-            Kind::Udp(_) => stack.send_udp(self.id, &data, destination),
+            Kind::Udp(_) => stack.send_udp(self.id, length, destination, fill),
         })
     }
 
@@ -179,9 +185,20 @@ impl PlatformSocket for SmoltcpSocket {
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
+        copy: &mut Copier<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         self.with(
-            |tcp, sockets| tcp.receive(sockets, reader, length, flags, peek_offset, peek_length),
+            |tcp, sockets| {
+                tcp.receive(
+                    sockets,
+                    reader,
+                    length,
+                    flags,
+                    peek_offset,
+                    peek_length,
+                    copy,
+                )
+            },
             |_, _| Ok(invalid()),
         )
     }
@@ -190,10 +207,11 @@ impl PlatformSocket for SmoltcpSocket {
         &self,
         length: usize,
         flags: ReceiveFromFlags,
+        copy: &mut Copier<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         self.with(
             |_, _| Ok(invalid()),
-            |udp, sockets| udp.receive_from(sockets, length, flags),
+            |udp, sockets| udp.receive_from(sockets, length, flags, copy),
         )
     }
 

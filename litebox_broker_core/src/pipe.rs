@@ -14,7 +14,7 @@ use spin::rwlock::RwLock;
 
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
-use crate::transfer::{append_to_queue, queue_parts};
+use crate::transfer::{Copier, Filler, append_to_queue, lend_from_queue};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
@@ -72,7 +72,7 @@ pub fn read(
     process: &BrokerProcess,
     handle: ObjectHandle,
     length: u32,
-    copy: impl FnOnce(&[&[u8]]) -> Result<()>,
+    copy: &mut Copier<'_>,
 ) -> Result<usize> {
     if length > MAX_PIPE_TRANSFER_SIZE {
         return Err(BrokerError::ResourceExhausted);
@@ -82,13 +82,14 @@ pub fn read(
     object.as_pipe()?.read(length as usize, copy)
 }
 
-/// Writes up to `length` bytes to a broker-owned pipe, lending their room
-/// to `fill` to copy the first of them in, and returns how many it wrote.
+/// Writes up to `length` bytes to a broker-owned pipe, lending the room for
+/// those it writes to `fill` to copy in (see [`crate::transfer`]), and
+/// returns how many it wrote.
 pub fn write(
     process: &BrokerProcess,
     handle: ObjectHandle,
     length: usize,
-    fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
+    fill: &mut Filler<'_>,
 ) -> Result<usize> {
     if length > MAX_PIPE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
@@ -106,10 +107,12 @@ pub(crate) fn read_to_vec(
     length: u32,
 ) -> Result<alloc::vec::Vec<u8>> {
     let mut data = alloc::vec::Vec::new();
-    let read = read(process, handle, length, |parts| {
-        data = parts.concat();
-        Ok(())
-    })?;
+    let read = read(
+        process,
+        handle,
+        length,
+        &mut crate::test_support::copy_into(&mut data),
+    )?;
     assert_eq!(read, data.len());
     Ok(data)
 }
@@ -125,7 +128,7 @@ pub(crate) fn write_from(
         process,
         handle,
         data.len(),
-        crate::transfer::fill_from(data),
+        &mut crate::test_support::fill_from(data),
     )
 }
 
@@ -177,7 +180,7 @@ impl PipeObject {
         }
     }
 
-    fn read(&self, length: usize, copy: impl FnOnce(&[&[u8]]) -> Result<()>) -> Result<usize> {
+    fn read(&self, length: usize, copy: &mut Copier<'_>) -> Result<usize> {
         if !matches!(self.endpoint, PipeEndpoint::Read) {
             return Err(BrokerError::InvalidRights);
         }
@@ -195,17 +198,13 @@ impl PipeObject {
         }
 
         let read_len = length.min(state.data.len());
-        copy(&queue_parts(&state.data, 0..read_len))?;
+        lend_from_queue(&state.data, 0..read_len, copy)?;
         state.data.drain(..read_len);
         state.publish(PipeEndpoint::Write);
         Ok(read_len)
     }
 
-    fn write(
-        &self,
-        length: usize,
-        fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
-    ) -> Result<usize> {
+    fn write(&self, length: usize, fill: &mut Filler<'_>) -> Result<usize> {
         if !matches!(self.endpoint, PipeEndpoint::Write) {
             return Err(BrokerError::InvalidRights);
         }

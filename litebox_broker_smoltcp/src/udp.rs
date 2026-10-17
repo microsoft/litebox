@@ -21,6 +21,7 @@ use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, PlatformDatagramReceive,
     PlatformSocketStatus, is_internal_socket_address, normalize_socket_destination,
 };
+use litebox_broker_core::transfer::{Copier, Filler};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -170,33 +171,33 @@ impl Udp {
                     && bytes_from_process + len <= MAX_RECEIVED_BYTES_FROM_PROCESS)
     }
 
-    /// Queues `data`, if the socket takes it (see the module's docs), and
-    /// the stack's memory budget has room.
+    /// Queues a datagram of `length` bytes, lending it to `fill` (see
+    /// [`litebox_broker_core::transfer`]), if the socket takes it (see the
+    /// module's docs), and the stack's memory budget has room.
     fn deliver(
         &mut self,
         sockets: &mut Sockets,
-        data: &[u8],
+        length: usize,
+        fill: &mut Filler<'_>,
         source: SocketAddrV4,
         process: Option<ProcessId>,
     ) -> BrokerResult<()> {
         let wanted = !self.read_shutdown
             && self.peer.is_none_or(|peer| peer == source)
-            && self.has_room(data.len(), process)
-            && data.len() <= sockets.room();
+            && self.has_room(length, process)
+            && length <= sockets.room();
         if !wanted {
             return Ok(());
         }
-        let mut copy = Vec::new();
-        copy.try_reserve_exact(data.len())
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        copy.extend_from_slice(data);
+        let mut data = zeroed(length)?;
+        fill(&mut data)?;
         self.received
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        sockets.queued += copy.len();
-        self.received_bytes += copy.len();
+        sockets.queued += data.len();
+        self.received_bytes += data.len();
         self.received.push_back(Datagram {
-            data: copy,
+            data,
             source,
             process,
         });
@@ -279,27 +280,38 @@ impl Udp {
         Ok(source)
     }
 
+    /// Sends a datagram of `length` bytes, lending it to `fill` (see
+    /// [`litebox_broker_core::transfer`]).
     fn send_external(
         &mut self,
         sockets: &mut Sockets,
-        data: &[u8],
+        length: usize,
+        fill: &mut Filler<'_>,
         source: SocketAddrV4,
         destination: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let handle = self.external.ok_or(BrokerError::Internal)?;
-        if data.len() > MAX_EXTERNAL_DATAGRAM {
+        if length > MAX_EXTERNAL_DATAGRAM {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         let mut meta = UdpMetadata::from(IpEndpoint::from(destination));
         meta.local_address = Some((*source.ip()).into());
-        match sockets.udp(handle).send_slice(data, meta) {
-            Ok(()) => {
+        let mut filled = Ok(());
+        // smoltcp queues the datagram it lends whatever happens; one whose
+        // filling failed goes out empty rather than with stale bytes.
+        let sent = sockets.udp(handle).send_with(length, meta, |datagram| {
+            filled = fill(datagram);
+            if filled.is_ok() { datagram.len() } else { 0 }
+        });
+        match sent {
+            Ok(_) => {
+                filled?;
                 self.blocked = None;
-                Ok(SocketOutcome::Completed(data.len()))
+                Ok(SocketOutcome::Completed(length))
             }
             Err(udp::SendError::BufferFull) => {
                 // Writable again once it fits, which publishes the change.
-                self.blocked = Some(data.len());
+                self.blocked = Some(length);
                 Err(BrokerError::WouldBlock)
             }
             Err(udp::SendError::Unaddressable) => {
@@ -318,13 +330,16 @@ impl Udp {
         sockets: &mut Sockets,
         length: usize,
         flags: ReceiveFromFlags,
+        copy: &mut Copier<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         if let Some(error) = self.pending_error.take() {
             return Ok(SocketOutcome::Failed(error));
         }
         let datagram = self.received.front().ok_or(BrokerError::WouldBlock)?;
+        let received = datagram.data.len().min(length);
+        copy(&datagram.data[..received])?;
         let received = PlatformDatagramReceive {
-            data: datagram.data[..datagram.data.len().min(length)].to_vec(),
+            received,
             datagram_length: datagram.data.len(),
             source_address: datagram.source,
         };
@@ -498,11 +513,14 @@ impl Stack {
         Ok(SocketConnectionStatus::Connected)
     }
 
+    /// Sends a datagram of `length` bytes, lending it to `fill` (see
+    /// [`litebox_broker_core::transfer`]).
     pub(super) fn send_udp(
         &mut self,
         id: u64,
-        data: &[u8],
+        length: usize,
         destination: Option<SocketAddrV4>,
+        fill: &mut Filler<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let process = self.entries.get(&id).ok_or(BrokerError::Internal)?.process;
         let udp = self.udp_entry(id)?;
@@ -532,7 +550,7 @@ impl Stack {
             else {
                 return Err(BrokerError::Internal);
             };
-            return udp.send_external(&mut self.sockets, data, source, destination);
+            return udp.send_external(&mut self.sockets, length, fill, source, destination);
         }
         let Some(receiver) = self.udp_bound_to(destination) else {
             return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
@@ -544,7 +562,7 @@ impl Stack {
         else {
             return Err(BrokerError::Internal);
         };
-        receiver.deliver(&mut self.sockets, data, source, Some(process))?;
-        Ok(SocketOutcome::Completed(data.len()))
+        receiver.deliver(&mut self.sockets, length, fill, source, Some(process))?;
+        Ok(SocketOutcome::Completed(length))
     }
 }

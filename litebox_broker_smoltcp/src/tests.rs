@@ -15,9 +15,12 @@ use core::time::Duration;
 
 use litebox_broker_core::BrokerCoreLimits;
 use litebox_broker_core::readiness::ReadinessSink;
+use litebox_broker_core::socket as core_socket;
 use litebox_broker_core::socket::SocketProvider as _;
-use litebox_broker_core::socket::{self as core_socket, PlatformStreamReceive};
-use litebox_broker_core::test_support::{ManualTimerProvider, TestBrokerCoreBuilder};
+use litebox_broker_core::test_support::{
+    ManualTimerProvider, StreamData, TestBrokerCoreBuilder, receive_data, receive_data_from,
+    send_data, send_data_to,
+};
 use litebox_broker_core::timer::TimerProvider as _;
 use litebox_broker_core::{
     BrokerError, BrokerProcess, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr,
@@ -297,19 +300,19 @@ fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
     length: usize,
-) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
-    core_socket::receive(process, handle, length, ReceiveFlags::NONE, 0, 0)
+) -> BrokerResult<SocketOutcome<StreamData>> {
+    receive_data(process, handle, length, ReceiveFlags::NONE, 0, 0)
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "compared with receive results")]
-fn received(data: &[u8]) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
-    Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+fn received(data: &[u8]) -> BrokerResult<SocketOutcome<StreamData>> {
+    Ok(SocketOutcome::Completed(StreamData::Received(
         data.to_vec(),
     )))
 }
 
-const END: BrokerResult<SocketOutcome<PlatformStreamReceive>> =
-    Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream));
+const END: BrokerResult<SocketOutcome<StreamData>> =
+    Ok(SocketOutcome::Completed(StreamData::EndOfStream));
 
 /// A listener in one process, a connection to it from another, accepted.
 struct Pair {
@@ -368,12 +371,7 @@ fn guest_tcp_connections_carry_data_and_half_close() {
     for destination in [[127, 0, 0, 1], GUEST_IPV4_ADDRESS.octets()] {
         let pair = pair(&test, destination);
         assert_eq!(
-            core_socket::send(
-                &pair.client,
-                pair.connector,
-                b"ping".to_vec(),
-                SendFlags::NONE
-            ),
+            send_data(&pair.client, pair.connector, b"ping", SendFlags::NONE),
             Ok(SocketOutcome::Completed(4))
         );
         assert!(
@@ -383,7 +381,7 @@ fn guest_tcp_connections_carry_data_and_half_close() {
         );
         // A peek at an offset leaves the data.
         assert_eq!(
-            core_socket::receive(&pair.server, pair.accepted, 4, ReceiveFlags::PEEK, 0, 4),
+            receive_data(&pair.server, pair.accepted, 4, ReceiveFlags::PEEK, 0, 4),
             received(b"ping")
         );
         assert_eq!(receive(&pair.server, pair.accepted, 2), received(b"pi"));
@@ -405,12 +403,7 @@ fn guest_tcp_connections_carry_data_and_half_close() {
         assert_eq!(receive(&pair.server, pair.accepted, 8), END);
         // The other direction stays open.
         assert_eq!(
-            core_socket::send(
-                &pair.server,
-                pair.accepted,
-                b"pong".to_vec(),
-                SendFlags::NONE
-            ),
+            send_data(&pair.server, pair.accepted, b"pong", SendFlags::NONE),
             Ok(SocketOutcome::Completed(4))
         );
         assert_eq!(receive(&pair.client, pair.connector, 8), received(b"pong"));
@@ -420,7 +413,7 @@ fn guest_tcp_connections_carry_data_and_half_close() {
         // As on the userland broker, which reports its socket pair's `EPIPE`
         // so.
         assert_eq!(
-            core_socket::send(&pair.server, pair.accepted, b"x".to_vec(), SendFlags::NONE),
+            send_data(&pair.server, pair.accepted, b"x", SendFlags::NONE),
             Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
         );
         pair.server.close_object_reference(pair.accepted).unwrap();
@@ -437,7 +430,7 @@ fn an_aborted_guest_connection_resets_its_peer_once() {
     let chunk = litebox_broker_protocol::socket::MAX_SOCKET_TRANSFER_SIZE;
     let data = vec![1; chunk as usize];
     assert_eq!(
-        core_socket::send(&pair.server, pair.accepted, data.clone(), SendFlags::NONE),
+        send_data(&pair.server, pair.accepted, data.clone(), SendFlags::NONE),
         Ok(SocketOutcome::Completed(data.len()))
     );
     assert_eq!(
@@ -452,7 +445,7 @@ fn an_aborted_guest_connection_resets_its_peer_once() {
     );
     // A peek past it ends there, and leaves the reset, as on Linux.
     let peek = |offset| {
-        core_socket::receive(
+        receive_data(
             &pair.client,
             pair.connector,
             chunk as usize,
@@ -464,7 +457,7 @@ fn an_aborted_guest_connection_resets_its_peer_once() {
     assert_eq!(peek(0), received(&data));
     assert_eq!(
         peek(chunk),
-        Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
+        Ok(SocketOutcome::Completed(StreamData::EndOfStream))
     );
     assert_eq!(
         receive(&pair.client, pair.connector, chunk as usize),
@@ -492,12 +485,7 @@ fn a_listener_stops_and_frees_its_port() {
     );
     // The accepted connection outlives its listener.
     assert_eq!(
-        core_socket::send(
-            &pair.client,
-            pair.connector,
-            b"still".to_vec(),
-            SendFlags::NONE
-        ),
+        send_data(&pair.client, pair.connector, b"still", SendFlags::NONE),
         Ok(SocketOutcome::Completed(5))
     );
     assert_eq!(receive(&pair.server, pair.accepted, 8), received(b"still"));
@@ -519,11 +507,11 @@ fn guest_datagrams_carry_their_source_and_respect_the_peer() {
     // Larger than an Ethernet frame: between guest sockets, delivered whole.
     let big = vec![7; 8000];
     assert_eq!(
-        core_socket::send_to(&process, a, big.clone(), SendFlags::NONE, Some(to_b)),
+        send_data_to(&process, a, big.clone(), SendFlags::NONE, Some(to_b)),
         Ok(SocketOutcome::Completed(big.len()))
     );
     let SocketOutcome::Completed(datagram) =
-        core_socket::receive_from(&process, b, 100, ReceiveFromFlags::NONE).unwrap()
+        receive_data_from(&process, b, 100, ReceiveFromFlags::NONE).unwrap()
     else {
         panic!("receive failed");
     };
@@ -538,18 +526,18 @@ fn guest_datagrams_carry_their_source_and_respect_the_peer() {
     );
     for (from, data) in [(c, b"from c"), (a, b"from a")] {
         assert_eq!(
-            core_socket::send_to(&process, from, data.to_vec(), SendFlags::NONE, Some(to_b)),
+            send_data_to(&process, from, data, SendFlags::NONE, Some(to_b)),
             Ok(SocketOutcome::Completed(6))
         );
     }
     let SocketOutcome::Completed(datagram) =
-        core_socket::receive_from(&process, b, 100, ReceiveFromFlags::NONE).unwrap()
+        receive_data_from(&process, b, 100, ReceiveFromFlags::NONE).unwrap()
     else {
         panic!("receive failed");
     };
     assert_eq!(datagram.data, b"from a");
     assert_eq!(
-        core_socket::receive_from(&process, b, 100, ReceiveFromFlags::NONE).map(|_| ()),
+        receive_data_from(&process, b, 100, ReceiveFromFlags::NONE).map(|_| ()),
         Err(BrokerError::WouldBlock)
     );
 }
@@ -565,10 +553,10 @@ fn without_a_link_external_destinations_are_unreachable() {
     );
     let udp = test.socket(&process, SocketType::Datagram);
     assert_eq!(
-        core_socket::send_to(
+        send_data_to(
             &process,
             udp,
-            b"x".to_vec(),
+            b"x",
             SendFlags::NONE,
             Some(address([192, 0, 2, 1], 53))
         ),
@@ -616,15 +604,15 @@ fn external_tcp_reaches_the_host_through_the_link() {
     let mut echoed = Vec::new();
     pump(&test, &mut host, |_| {
         if written < sent.len() {
-            let chunk = sent[written..].iter().take(32 * 1024).copied().collect();
-            match core_socket::send(&process, socket, chunk, SendFlags::NONE) {
+            let chunk: Vec<u8> = sent[written..].iter().take(32 * 1024).copied().collect();
+            match send_data(&process, socket, chunk, SendFlags::NONE) {
                 Ok(SocketOutcome::Completed(n)) => written += n,
                 Err(BrokerError::WouldBlock) => {}
                 other => panic!("send: {other:?}"),
             }
         }
         match receive(&process, socket, 32 * 1024) {
-            Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(data))) => {
+            Ok(SocketOutcome::Completed(StreamData::Received(data))) => {
                 echoed.extend(data);
             }
             Err(BrokerError::WouldBlock) => {}
@@ -657,10 +645,10 @@ fn external_udp_goes_through_the_gateway() {
     let socket = test.socket(&process, SocketType::Datagram);
     let host_address = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 53);
     assert_eq!(
-        core_socket::send_to(
+        send_data_to(
             &process,
             socket,
-            b"query".to_vec(),
+            b"query",
             SendFlags::NONE,
             Some(host_address)
         ),
@@ -688,7 +676,7 @@ fn external_udp_goes_through_the_gateway() {
             .is_some_and(|flags| flags.contains(ReadinessFlags::READ))
     });
     let SocketOutcome::Completed(datagram) =
-        core_socket::receive_from(&process, socket, 100, ReceiveFromFlags::NONE).unwrap()
+        receive_data_from(&process, socket, 100, ReceiveFromFlags::NONE).unwrap()
     else {
         panic!("receive failed");
     };
@@ -697,7 +685,7 @@ fn external_udp_goes_through_the_gateway() {
 
     // Externally, datagrams must fit a frame.
     assert_eq!(
-        core_socket::send_to(
+        send_data_to(
             &process,
             socket,
             vec![0; MAX_EXTERNAL_DATAGRAM + 1],
@@ -946,7 +934,7 @@ fn udp_waits_for_payload_room_and_is_woken_when_it_frees() {
     let datagram = vec![0; MAX_EXTERNAL_DATAGRAM];
     let mut sent = 0;
     loop {
-        match core_socket::send_to(
+        match send_data_to(
             &process,
             socket,
             datagram.clone(),
@@ -973,7 +961,7 @@ fn udp_waits_for_payload_room_and_is_woken_when_it_frees() {
             .is_some_and(|flags| flags.contains(ReadinessFlags::WRITE))
     });
     assert_eq!(
-        core_socket::send_to(
+        send_data_to(
             &process,
             socket,
             datagram,
@@ -1017,7 +1005,7 @@ fn a_peeked_datagram_is_the_next_received() {
         test.published(socket)
             .is_some_and(|flags| flags.contains(ReadinessFlags::READ))
     });
-    let receive = |flags| match core_socket::receive_from(&process, socket, 100, flags).unwrap() {
+    let receive = |flags| match receive_data_from(&process, socket, 100, flags).unwrap() {
         SocketOutcome::Completed(datagram) => datagram.data,
         SocketOutcome::Failed(error) => panic!("receive: {error:?}"),
     };
@@ -1026,10 +1014,10 @@ fn a_peeked_datagram_is_the_next_received() {
     // A guest datagram arriving meanwhile waits its turn.
     let sender = test.socket(&process, SocketType::Datagram);
     assert_eq!(
-        core_socket::send_to(
+        send_data_to(
             &process,
             sender,
-            b"guest".to_vec(),
+            b"guest",
             SendFlags::NONE,
             Some(address([127, 0, 0, 1], 5000))
         ),
@@ -1125,13 +1113,7 @@ fn a_guest_datagram_to_no_socket_is_refused() {
     let closed = address([127, 0, 0, 1], 9);
     // As on the userland broker: at once, connected or not.
     assert_eq!(
-        core_socket::send_to(
-            &process,
-            socket,
-            b"x".to_vec(),
-            SendFlags::NONE,
-            Some(closed)
-        ),
+        send_data_to(&process, socket, b"x", SendFlags::NONE, Some(closed)),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     assert_eq!(
@@ -1168,7 +1150,7 @@ fn a_connected_udp_socket_keeps_its_peers_datagram_from_a_burst() {
     );
     // Resolves the neighbors both ways.
     assert_eq!(
-        core_socket::send_to(&process, socket, b"hello".to_vec(), SendFlags::NONE, None),
+        send_data_to(&process, socket, b"hello", SendFlags::NONE, None),
         Ok(SocketOutcome::Completed(5))
     );
     pump(&test, &mut host, |host| {
@@ -1202,7 +1184,7 @@ fn a_connected_udp_socket_keeps_its_peers_datagram_from_a_burst() {
     assert_eq!(wire.to_guest.lock().len(), 41);
     test.provider.poll();
     let SocketOutcome::Completed(datagram) =
-        core_socket::receive_from(&process, socket, 100, ReceiveFromFlags::NONE).unwrap()
+        receive_data_from(&process, socket, 100, ReceiveFromFlags::NONE).unwrap()
     else {
         panic!("receive failed");
     };
@@ -1297,7 +1279,7 @@ fn unacknowledged_data_to_a_dead_peer_times_out() {
     // The host goes away.
     wire.cut.store(true, Ordering::Relaxed);
     assert_eq!(
-        core_socket::send(&process, socket, b"hello?".to_vec(), SendFlags::NONE),
+        send_data(&process, socket, b"hello?", SendFlags::NONE),
         Ok(SocketOutcome::Completed(6))
     );
     run_for(
@@ -1396,7 +1378,7 @@ fn a_peer_with_a_closed_window_that_answers_keeps_the_connection() {
     let chunk = vec![7; 32 * 1024];
     let mut sent = 0;
     for _ in 0..1000 {
-        match core_socket::send(&process, socket, chunk.clone(), SendFlags::NONE) {
+        match send_data(&process, socket, chunk.clone(), SendFlags::NONE) {
             Ok(SocketOutcome::Completed(n)) => sent += n,
             Err(BrokerError::WouldBlock) => {}
             other => panic!("send: {other:?}"),
@@ -1430,7 +1412,7 @@ fn a_peer_with_a_closed_window_that_answers_keeps_the_connection() {
     host.paused = false;
     let mut echoed = 0;
     pump(&test, &mut host, |_| {
-        if let Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(data))) =
+        if let Ok(SocketOutcome::Completed(StreamData::Received(data))) =
             receive(&process, socket, 32 * 1024)
         {
             echoed += data.len();
@@ -1495,7 +1477,7 @@ fn martian_sources_from_the_link_reach_no_socket() {
         Ok(SocketOutcome::Completed(bound))
     );
     let guest = SocketAddrV4::new(GUEST_IPV4_ADDRESS, 5000);
-    let receive = || core_socket::receive_from(&process, socket, 100, ReceiveFromFlags::NONE);
+    let receive = || receive_data_from(&process, socket, 100, ReceiveFromFlags::NONE);
     // Control: a datagram from the gateway gets through.
     wire.to_guest.lock().push_back(udp_frame(
         wire,
@@ -1612,7 +1594,7 @@ fn a_run_sends_more_than_one_segment_per_connection() {
     wire.to_host.lock().clear();
     // 32 KiB, within the host's window: several segments, in this one run.
     assert_eq!(
-        core_socket::send(&process, socket, vec![1; 32 * 1024], SendFlags::NONE),
+        send_data(&process, socket, vec![1; 32 * 1024], SendFlags::NONE),
         Ok(SocketOutcome::Completed(32 * 1024))
     );
     let segments = wire.to_host.lock().len();
@@ -1625,7 +1607,7 @@ fn a_full_guest_connection_is_writable_again_once_most_of_it_drains() {
     let pair = pair(&test, [127, 0, 0, 1]);
     let chunk = vec![1; 32 * 1024];
     while let Ok(SocketOutcome::Completed(_)) =
-        core_socket::send(&pair.client, pair.connector, chunk.clone(), SendFlags::NONE)
+        send_data(&pair.client, pair.connector, chunk.clone(), SendFlags::NONE)
     {}
     assert!(
         !test
@@ -1637,7 +1619,7 @@ fn a_full_guest_connection_is_writable_again_once_most_of_it_drains() {
     let mut left = capacity;
     let mut drain_to = |rest: usize| {
         while left > rest {
-            let SocketOutcome::Completed(PlatformStreamReceive::Received(data)) =
+            let SocketOutcome::Completed(StreamData::Received(data)) =
                 receive(&pair.server, pair.accepted, (left - rest).min(32 * 1024)).unwrap()
             else {
                 panic!("receive failed");
@@ -1670,14 +1652,7 @@ fn closing_with_unread_data_after_a_read_shutdown_resets_the_peer() {
     // queue it.
     for after_shutdown in [false, true] {
         let pair = pair(&test, [127, 0, 0, 1]);
-        let send = || {
-            core_socket::send(
-                &pair.server,
-                pair.accepted,
-                b"unread".to_vec(),
-                SendFlags::NONE,
-            )
-        };
+        let send = || send_data(&pair.server, pair.accepted, b"unread", SendFlags::NONE);
         if !after_shutdown {
             assert_eq!(send(), Ok(SocketOutcome::Completed(6)));
         }
@@ -1707,13 +1682,7 @@ fn the_networks_broadcast_address_is_refused() {
     let broadcast = address([10, 0, 2, 255], 9);
     let udp = test.socket(&process, SocketType::Datagram);
     assert_eq!(
-        core_socket::send_to(
-            &process,
-            udp,
-            b"x".to_vec(),
-            SendFlags::NONE,
-            Some(broadcast)
-        ),
+        send_data_to(&process, udp, b"x", SendFlags::NONE, Some(broadcast)),
         Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
     );
     assert_eq!(
@@ -1835,12 +1804,7 @@ fn a_guest_connection_discards_data_after_both_shutdowns() {
     // As on the userland broker: discarded, without a reset.
     for _ in 0..2 {
         assert_eq!(
-            core_socket::send(
-                &pair.server,
-                pair.accepted,
-                b"more".to_vec(),
-                SendFlags::NONE
-            ),
+            send_data(&pair.server, pair.accepted, b"more", SendFlags::NONE),
             Ok(SocketOutcome::Completed(4))
         );
     }
@@ -1925,12 +1889,12 @@ fn an_icmp_error_reaches_only_the_socket_that_sent_the_datagram() {
     // as Linux (`__udp4_lib_err`), not this socket's.
     deliver(address([10, 0, 2, 99], 5000));
     assert_eq!(
-        core_socket::receive_from(&process, socket, 100, ReceiveFromFlags::NONE).map(|_| ()),
+        receive_data_from(&process, socket, 100, ReceiveFromFlags::NONE).map(|_| ()),
         Err(BrokerError::WouldBlock)
     );
     deliver(SocketAddrV4::new(GUEST_IPV4_ADDRESS, 5000));
     assert_eq!(
-        core_socket::receive_from(&process, socket, 100, ReceiveFromFlags::NONE),
+        receive_data_from(&process, socket, 100, ReceiveFromFlags::NONE),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
 }
@@ -2018,10 +1982,10 @@ fn a_pending_udp_error_fails_the_next_send() {
         core_socket::connect(&process, socket, closed),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    let send = || core_socket::send_to(&process, socket, b"x".to_vec(), SendFlags::NONE, None);
+    let send = || send_data_to(&process, socket, b"x", SendFlags::NONE, None);
     // Longer than an ICMP error quotes.
     assert_eq!(
-        core_socket::send_to(&process, socket, vec![0; 1000], SendFlags::NONE, None),
+        send_data_to(&process, socket, vec![0; 1000], SendFlags::NONE, None),
         Ok(SocketOutcome::Completed(1000))
     );
     pump(&test, &mut host, |_| {
@@ -2047,7 +2011,7 @@ fn a_guest_connection_carries_what_was_sent_before_it_was_accepted() {
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     assert_eq!(
-        core_socket::send(&client, socket, b"early".to_vec(), SendFlags::NONE),
+        send_data(&client, socket, b"early", SendFlags::NONE),
         Ok(SocketOutcome::Completed(5))
     );
     // Closed before being accepted, gracefully: still queued.
@@ -2097,7 +2061,7 @@ fn one_process_cannot_fill_a_guest_sockets_queue() {
         Ok(SocketOutcome::Completed(bound))
     );
     let send = |process: &BrokerProcess, socket| {
-        core_socket::send_to(process, socket, b"x".to_vec(), SendFlags::NONE, Some(bound))
+        send_data_to(process, socket, b"x", SendFlags::NONE, Some(bound))
     };
     let flooder = test.process();
     let flood = test.socket(&flooder, SocketType::Datagram);
@@ -2110,7 +2074,7 @@ fn one_process_cannot_fill_a_guest_sockets_queue() {
     // As on the userland broker: 16 from the flooder, then the other's.
     let mut count = 0;
     while let Ok(SocketOutcome::Completed(_)) =
-        core_socket::receive_from(&receiver_process, receiver, 8, ReceiveFromFlags::NONE)
+        receive_data_from(&receiver_process, receiver, 8, ReceiveFromFlags::NONE)
     {
         count += 1;
     }
@@ -2124,14 +2088,14 @@ fn guest_connections_count_the_memory_they_hold() {
     let queued = || test.provider.0.stack.lock().sockets.queued;
     let chunk = vec![1; 32 * 1024];
     while let Ok(SocketOutcome::Completed(_)) =
-        core_socket::send(&pair.client, pair.connector, chunk.clone(), SendFlags::NONE)
+        send_data(&pair.client, pair.connector, chunk.clone(), SendFlags::NONE)
     {}
     let full = queued();
     assert!(full >= super::socket_pair::CAPACITY);
     let drain = |len: usize| {
         let mut left = len;
         while left > 0 {
-            let SocketOutcome::Completed(PlatformStreamReceive::Received(data)) =
+            let SocketOutcome::Completed(StreamData::Received(data)) =
                 receive(&pair.server, pair.accepted, left.min(32 * 1024)).unwrap()
             else {
                 panic!("receive failed");
@@ -2161,12 +2125,7 @@ fn guest_connections_count_the_memory_they_hold() {
     assert_eq!(queued(), 0);
     // Held apart by a read shutdown, it counts until read.
     assert_eq!(
-        core_socket::send(
-            &pair.client,
-            pair.connector,
-            b"held".to_vec(),
-            SendFlags::NONE
-        ),
+        send_data(&pair.client, pair.connector, b"held", SendFlags::NONE),
         Ok(SocketOutcome::Completed(4))
     );
     assert_eq!(
@@ -2225,9 +2184,7 @@ fn datagrams_to_a_neighbor_that_never_answers_are_dropped() {
     let host_udp = host.sockets.add(udp);
     let process = test.process();
     let socket = test.socket(&process, SocketType::Datagram);
-    let send = |data: &[u8], to| {
-        core_socket::send_to(&process, socket, data.to_vec(), SendFlags::NONE, Some(to))
-    };
+    let send = |data: &[u8], to| send_data_to(&process, socket, data, SendFlags::NONE, Some(to));
     let gateway = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 53);
     // Nothing answers ARP for it.
     let unanswered = address([10, 0, 2, 77], 9);
@@ -2298,7 +2255,7 @@ fn a_reset_after_both_sides_closed_is_reported_while_data_was_unacknowledged() {
     // The guest's last data and FIN are lost, and the host resets.
     wire.cut.store(true, Ordering::Relaxed);
     assert_eq!(
-        core_socket::send(&process, socket, b"unread".to_vec(), SendFlags::NONE),
+        send_data(&process, socket, b"unread", SendFlags::NONE),
         Ok(SocketOutcome::Completed(6))
     );
     assert_eq!(
@@ -2383,12 +2340,10 @@ fn a_shutdown_while_connecting_ends_the_attempt() {
 fn a_waiting_peek_is_woken_despite_a_receive_meanwhile() {
     let test = Test::new(None);
     let pair = pair(&test, [127, 0, 0, 1]);
-    let send = |data: &[u8]| {
-        core_socket::send(&pair.client, pair.connector, data.to_vec(), SendFlags::NONE)
-    };
+    let send = |data: &[u8]| send_data(&pair.client, pair.connector, data, SendFlags::NONE);
     assert_eq!(send(b"abcd"), Ok(SocketOutcome::Completed(4)));
     assert_eq!(
-        core_socket::receive(
+        receive_data(
             &pair.server,
             pair.accepted,
             8,
@@ -2414,7 +2369,7 @@ fn a_peek_continues_only_for_its_reader() {
     let (first, second) = (vec![0x41; chunk as usize], vec![0x42; chunk as usize]);
     for data in [&first, &second] {
         assert_eq!(
-            core_socket::send(&pair.client, pair.connector, data.clone(), SendFlags::NONE),
+            send_data(&pair.client, pair.connector, data.clone(), SendFlags::NONE),
             Ok(SocketOutcome::Completed(data.len()))
         );
     }
@@ -2424,7 +2379,7 @@ fn a_peek_continues_only_for_its_reader() {
         .duplicate_object_reference_to(pair.accepted, &sharer, ObjectRights::all())
         .unwrap();
     let peek = |process: &BrokerProcess, handle, offset| {
-        core_socket::receive(
+        receive_data(
             process,
             handle,
             chunk as usize,

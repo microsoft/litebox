@@ -7,23 +7,26 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::net::SocketAddrV4;
 use core::time::Duration;
 
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::socket::{ReceiveFlags, ReceiveFromFlags, SendFlags, SocketOutcome};
 use litebox_broker_protocol::terminal::{
     TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
 };
 use spin::Mutex;
 
 use crate::{
-    BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
+    BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, Result,
     fs::{FileResult, FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
     readiness::{
         ReadinessRegistration, ReadinessSource, ReadinessWatchers, SharedReadinessWatchers,
     },
-    socket::{SocketProvider, UnsupportedSocketProvider},
+    socket::{self, PlatformStreamReceive, SocketProvider, UnsupportedSocketProvider},
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
@@ -397,4 +400,140 @@ impl Drop for ManualAlarm {
     fn drop(&mut self) {
         self.state.lock().alarms.remove(&self.id);
     }
+}
+
+/// Returns a filler that fills the parts it is lent from `source`, one
+/// after another (see [`crate::transfer`]).
+///
+/// # Panics
+///
+/// The filler panics if lent more room than `source` has bytes.
+pub fn fill_from(source: &[u8]) -> impl FnMut(&mut [u8]) -> Result<()> + '_ {
+    let mut offset = 0;
+    move |part| {
+        part.copy_from_slice(&source[offset..][..part.len()]);
+        offset += part.len();
+        Ok(())
+    }
+}
+
+/// Returns a copier that appends the parts it is lent to `destination` (see
+/// [`crate::transfer`]).
+pub fn copy_into(destination: &mut Vec<u8>) -> impl FnMut(&[u8]) -> Result<()> + '_ {
+    move |part| {
+        destination.extend_from_slice(part);
+        Ok(())
+    }
+}
+
+/// Sends `data` with [`socket::send`].
+pub fn send_data(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    data: impl AsRef<[u8]>,
+    flags: SendFlags,
+) -> Result<SocketOutcome<usize>> {
+    let data = data.as_ref();
+    socket::send(process, handle, data.len(), flags, &mut fill_from(data))
+}
+
+/// Sends `data` with [`socket::send_to`].
+pub fn send_data_to(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    data: impl AsRef<[u8]>,
+    flags: SendFlags,
+    destination: Option<SocketAddrV4>,
+) -> Result<SocketOutcome<usize>> {
+    let data = data.as_ref();
+    socket::send_to(
+        process,
+        handle,
+        data.len(),
+        flags,
+        destination,
+        &mut fill_from(data),
+    )
+}
+
+/// A stream receive's result, with the bytes received.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StreamData {
+    /// The bytes received.
+    Received(Vec<u8>),
+    /// The peer finished sending.
+    EndOfStream,
+}
+
+/// Receives with [`socket::receive`] into a new vector.
+///
+/// # Panics
+///
+/// Panics if the result does not match what the socket lent.
+pub fn receive_data(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    length: usize,
+    flags: ReceiveFlags,
+    peek_offset: u32,
+    peek_length: u32,
+) -> Result<SocketOutcome<StreamData>> {
+    let mut data = Vec::new();
+    let outcome = socket::receive(
+        process,
+        handle,
+        length,
+        flags,
+        peek_offset,
+        peek_length,
+        &mut copy_into(&mut data),
+    )?;
+    Ok(match outcome {
+        SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
+            assert_eq!(received, data.len());
+            SocketOutcome::Completed(StreamData::Received(data))
+        }
+        SocketOutcome::Completed(PlatformStreamReceive::EndOfStream) => {
+            assert_eq!(data, []);
+            SocketOutcome::Completed(StreamData::EndOfStream)
+        }
+        SocketOutcome::Failed(error) => SocketOutcome::Failed(error),
+    })
+}
+
+/// A datagram receive's result, with the bytes received.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DatagramData {
+    /// The bytes received, at most the length requested.
+    pub data: Vec<u8>,
+    /// The datagram's full length.
+    pub datagram_length: usize,
+    /// Where the datagram came from.
+    pub source_address: SocketAddrV4,
+}
+
+/// Receives with [`socket::receive_from`] into a new vector.
+///
+/// # Panics
+///
+/// Panics if the result does not match what the socket lent.
+pub fn receive_data_from(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    length: usize,
+    flags: ReceiveFromFlags,
+) -> Result<SocketOutcome<DatagramData>> {
+    let mut data = Vec::new();
+    let outcome = socket::receive_from(process, handle, length, flags, &mut copy_into(&mut data))?;
+    Ok(match outcome {
+        SocketOutcome::Completed(received) => {
+            assert_eq!(received.received, data.len());
+            SocketOutcome::Completed(DatagramData {
+                data,
+                datagram_length: received.datagram_length,
+                source_address: received.source_address,
+            })
+        }
+        SocketOutcome::Failed(error) => SocketOutcome::Failed(error),
+    })
 }

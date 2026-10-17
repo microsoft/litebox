@@ -7,8 +7,7 @@ use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
-use crate::test_support::TestBrokerCoreBuilder;
-use crate::transfer::fill_from;
+use crate::test_support::{TestBrokerCoreBuilder, copy_into, fill_from};
 use crate::{BrokerCore, CallerCredential, PolicyEngine};
 use std::vec;
 
@@ -39,10 +38,7 @@ fn receive_message(
         peek,
         source,
         nonblocking,
-        |parts| {
-            data = parts.concat();
-            Ok(())
-        },
+        &mut copy_into(&mut data),
     )?;
     Ok(result.map(|received| {
         assert_eq!(received.received, data.len());
@@ -150,7 +146,7 @@ impl Fixture {
             None,
             data.len(),
             USER,
-            fill_from(data),
+            &mut fill_from(data),
         )
     }
 
@@ -166,7 +162,7 @@ impl Fixture {
             Some(address),
             data.len(),
             USER,
-            fill_from(data),
+            &mut fill_from(data),
         )
     }
 

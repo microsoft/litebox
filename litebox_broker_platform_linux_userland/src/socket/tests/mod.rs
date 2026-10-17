@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
-use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+use litebox_broker_core::test_support::{TestBrokerCoreBuilder, fill_from};
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -69,13 +69,6 @@ fn gateway_tcp_policy() -> SocketPolicy {
 
 fn gateway_address(host_address: SocketAddrV4) -> SocketAddrV4 {
     SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, host_address.port())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReceivedPlatformDatagram {
-    received: usize,
-    datagram_length: usize,
-    source_address: SocketAddrV4,
 }
 
 #[test]
@@ -172,7 +165,7 @@ fn send_bytes(
     data: &[u8],
     flags: SendFlags,
 ) -> BrokerResult<SocketOutcome<usize>> {
-    litebox_broker_core::socket::send(process, handle, data.to_vec(), flags)
+    litebox_broker_core::socket::send(process, handle, data.len(), flags, &mut fill_from(data))
 }
 
 fn send_datagram(
@@ -182,7 +175,14 @@ fn send_datagram(
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
 ) -> BrokerResult<SocketOutcome<usize>> {
-    litebox_broker_core::socket::send_to(process, handle, data.to_vec(), flags, destination)
+    litebox_broker_core::socket::send_to(
+        process,
+        handle,
+        data.len(),
+        flags,
+        destination,
+        &mut fill_from(data),
+    )
 }
 
 fn receive_into(
@@ -200,14 +200,11 @@ fn receive_into(
         flags,
         peek_offset,
         peek_length,
+        &mut copy_to(data),
     )? {
         SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
-            data[..received.len()].copy_from_slice(&received);
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
-                received
-                    .len()
-                    .try_into()
-                    .map_err(|_| BrokerError::Internal)?,
+                received.try_into().map_err(|_| BrokerError::Internal)?,
             )))
         }
         SocketOutcome::Completed(PlatformStreamReceive::EndOfStream) => {
@@ -222,17 +219,24 @@ fn receive_datagram_into(
     handle: ObjectHandle,
     data: &mut [u8],
     flags: ReceiveFromFlags,
-) -> BrokerResult<SocketOutcome<ReceivedPlatformDatagram>> {
-    match litebox_broker_core::socket::receive_from(process, handle, data.len(), flags)? {
-        SocketOutcome::Completed(received) => {
-            data[..received.data.len()].copy_from_slice(&received.data);
-            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-                received: received.data.len(),
-                datagram_length: received.datagram_length,
-                source_address: received.source_address,
-            }))
-        }
-        SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
+) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
+    litebox_broker_core::socket::receive_from(
+        process,
+        handle,
+        data.len(),
+        flags,
+        &mut copy_to(data),
+    )
+}
+
+/// Returns a copier that copies the parts it is lent into `destination`,
+/// one after another.
+fn copy_to(destination: &mut [u8]) -> impl FnMut(&[u8]) -> BrokerResult<()> + '_ {
+    let mut offset = 0;
+    move |part| {
+        destination[offset..][..part.len()].copy_from_slice(part);
+        offset += part.len();
+        Ok(())
     }
 }
 

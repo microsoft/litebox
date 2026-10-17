@@ -52,7 +52,7 @@ use crate::fs::File;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::socket::SocketOptions;
-use crate::transfer::{append_to_queue, queue_parts};
+use crate::transfer::{Copier, Filler, append_to_queue, lend_from_queue};
 use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a Unix socket operation.
@@ -325,8 +325,8 @@ pub fn accept(
 /// Sends up to `length` bytes from a Unix socket, to `address` if given or
 /// otherwise to its connected peer, and returns how many were sent.
 ///
-/// The socket lends the room for the bytes it sends to `fill` to copy the
-/// first of them in. A stream socket sends as many bytes as its peer has
+/// The socket lends the room for the bytes it sends to `fill` to copy in
+/// (see [`crate::transfer`]). A stream socket sends as many bytes as its peer has
 /// room for. A datagram socket sends all `length` bytes as one datagram.
 /// Fails with [`BrokerError::WouldBlock`] while the receiving socket is full.
 pub fn send(
@@ -335,7 +335,7 @@ pub fn send(
     address: Option<&UnixSocketAddress>,
     length: usize,
     user: FileUser,
-    fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
+    fill: &mut Filler<'_>,
 ) -> Result<UnixSocketResult<usize>> {
     if length > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
@@ -387,7 +387,7 @@ pub fn receive(
     peek: bool,
     source: bool,
     nonblocking: bool,
-    copy: impl FnOnce(&[&[u8]]) -> Result<()>,
+    copy: &mut Copier<'_>,
 ) -> Result<UnixSocketResult<Received>> {
     if capacity > MAX_UNIX_SOCKET_TRANSFER_SIZE {
         return Err(BrokerError::ResourceExhausted);
@@ -1064,7 +1064,7 @@ impl Socket {
         self: &Arc<Self>,
         addressed: bool,
         length: usize,
-        fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
+        fill: &mut Filler<'_>,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
         let peer = {
@@ -1120,7 +1120,7 @@ impl Socket {
         self: &Arc<Self>,
         target: Option<Arc<Socket>>,
         length: usize,
-        fill: impl FnOnce(&mut [&mut [u8]]) -> Result<()>,
+        fill: &mut Filler<'_>,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
         let (peer, write_shut, source) = {
@@ -1154,7 +1154,7 @@ impl Socket {
         data.try_reserve_exact(length)
             .map_err(|_| BrokerError::OutOfMemory)?;
         data.resize(length, 0);
-        fill(&mut [&mut data[..]])?;
+        fill(&mut data)?;
         let datagram = Datagram { data, source };
         let charge = datagram.charge();
         // The receiver's state stays locked while the datagram is queued, so
@@ -1230,7 +1230,7 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-        copy: impl FnOnce(&[&[u8]]) -> Result<()>,
+        copy: &mut Copier<'_>,
     ) -> Result<UnixSocketResult<Received>> {
         let source = match &self.state.lock().connection {
             Connection::Connected { peer_name, .. } => source.then(|| peer_name.clone()),
@@ -1257,7 +1257,7 @@ impl Socket {
                 };
             }
             let length = capacity.min(channel.queue.bytes.len());
-            copy(&queue_parts(&channel.queue.bytes, 0..length))?;
+            lend_from_queue(&channel.queue.bytes, 0..length, copy)?;
             if peek {
                 (length, Wakeups::default())
             } else {
@@ -1285,7 +1285,7 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-        copy: impl FnOnce(&[&[u8]]) -> Result<()>,
+        copy: &mut Copier<'_>,
     ) -> Result<UnixSocketResult<Received>> {
         let (received, wakeups) = {
             let mut channel = self.incoming.lock();
@@ -1301,7 +1301,7 @@ impl Socket {
             };
             let length = datagram.data.len();
             let received = capacity.min(length);
-            copy(&[&datagram.data[..received]])?;
+            copy(&datagram.data[..received])?;
             if peek {
                 let received = Received {
                     received,

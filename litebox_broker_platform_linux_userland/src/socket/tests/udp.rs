@@ -84,7 +84,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     payload.fill(0);
     assert_eq!(
         receive_datagram_into(&process, socket, &mut payload[..5], ReceiveFromFlags::NONE,),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 5,
             datagram_length: 5,
             source_address: first_gateway,
@@ -113,7 +113,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     payload.fill(0);
     assert_eq!(
         receive_datagram_into(&process, socket, &mut payload[..6], ReceiveFromFlags::NONE,),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 6,
             datagram_length: 6,
             source_address: second_native,
@@ -168,7 +168,7 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
     let mut response = [0; 8];
     assert_eq!(
         receive_datagram_into(&process, socket, &mut response, ReceiveFromFlags::NONE,),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 8,
             datagram_length: 8,
             source_address: gateway,
@@ -374,7 +374,7 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
             &mut empty,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 0,
             datagram_length: 0,
             source_address: litebox_broker_core::socket::status(&sender_process, sender)
@@ -393,7 +393,7 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
                 &mut byte,
                 ReceiveFromFlags::NONE,
             ),
-            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
                 received: 1,
                 datagram_length: 1,
                 ..
@@ -470,7 +470,7 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
     let mut reply = [0; 5];
     assert_eq!(
         receive_datagram_into(&process, handle, &mut reply, ReceiveFromFlags::NONE,),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 5,
             datagram_length: 5,
             source_address: first_address,
@@ -681,7 +681,7 @@ fn reactor_preserves_udp_datagram_semantics() {
     let mut zero = [];
     assert_eq!(
         receive_datagram_into(&process, handle, &mut zero, ReceiveFromFlags::NONE,),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 0,
             datagram_length: 0,
             source_address: server_address,
@@ -697,7 +697,7 @@ fn reactor_preserves_udp_datagram_semantics() {
     let mut peeked = [0; 3];
     assert_eq!(
         receive_datagram_into(&process, handle, &mut peeked, ReceiveFromFlags::PEEK,),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 3,
             datagram_length: 6,
             source_address: server_address,
@@ -707,7 +707,7 @@ fn reactor_preserves_udp_datagram_semantics() {
     peeked.fill(0);
     assert_eq!(
         receive_datagram_into(&process, handle, &mut peeked, ReceiveFromFlags::PEEK,),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 3,
             datagram_length: 6,
             source_address: server_address,
@@ -717,7 +717,7 @@ fn reactor_preserves_udp_datagram_semantics() {
     let mut truncated = [0; 4];
     assert_eq!(
         receive_datagram_into(&process, handle, &mut truncated, ReceiveFromFlags::NONE,),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 4,
             datagram_length: 6,
             source_address: server_address,
@@ -952,7 +952,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
             &mut request,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 7,
             datagram_length: 7,
             source_address: sender_source_address,
@@ -979,7 +979,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
             &mut response,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 8,
             datagram_length: 8,
             source_address: receiver_guest_address,
@@ -1077,7 +1077,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
             &mut reply,
             ReceiveFromFlags::PEEK,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 5,
             datagram_length: 5,
             source_address: external_address,
@@ -1092,7 +1092,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
             &mut reply,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 5,
             datagram_length: 5,
             source_address: external_address,
@@ -1107,7 +1107,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
             &mut reply,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 5,
             datagram_length: 5,
             source_address: probe_guest_address,
@@ -1190,7 +1190,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_guest_addresses() {
                 &mut received,
                 ReceiveFromFlags::NONE,
             ),
-            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
                 received: payload.len(),
                 datagram_length: payload.len(),
                 source_address: SocketAddrV4::new(
@@ -1240,7 +1240,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_guest_addresses() {
             &mut received,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 4,
             datagram_length: 4,
             ..
@@ -1292,7 +1292,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_guest_addresses() {
             &mut reply,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 4,
             datagram_length: 4,
             source_address,
@@ -1490,7 +1490,7 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
             &mut payload,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 3,
             datagram_length: 3,
             source_address,
@@ -1504,7 +1504,7 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
             &mut payload,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 5,
             datagram_length: 5,
             source_address: replacement_address,
@@ -1599,7 +1599,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
             &mut payload,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 5,
             datagram_length: 5,
             source_address,
@@ -1645,7 +1645,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
             &mut payload,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 6,
             datagram_length: 6,
             source_address,
@@ -1731,7 +1731,7 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
             &mut first_payload,
             ReceiveFromFlags::PEEK,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 3,
             datagram_length: 3,
             source_address: first_address,
@@ -1746,7 +1746,7 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
             &mut first_payload,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 3,
             datagram_length: 3,
             source_address: first_address,
@@ -1771,7 +1771,7 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
             &mut second_payload,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 3,
             datagram_length: 3,
             source_address: second_address,
@@ -1812,7 +1812,7 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
             &mut new_owner_payload,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 9,
             datagram_length: 9,
             source_address: first_address,
@@ -1891,7 +1891,7 @@ fn connected_guest_udp_filters_other_wildcard_peer_aliases() {
             &mut payload[..9],
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 9,
             datagram_length: 9,
             source_address: connected_peer,
@@ -2071,7 +2071,7 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
             &mut guest_payload,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 5,
             datagram_length: 5,
             source_address: internal_source_address,
@@ -2166,7 +2166,7 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
             &mut warmup,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 6,
             datagram_length: 6,
             source_address,
@@ -2247,7 +2247,7 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
             &mut payload,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received: 2,
             datagram_length: 2,
             source_address,

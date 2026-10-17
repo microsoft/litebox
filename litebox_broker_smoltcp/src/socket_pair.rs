@@ -8,7 +8,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use litebox_broker_core::transfer::copy_from_queue;
+use litebox_broker_core::transfer::{Copier, Filler, append_to_queue, lend_from_queue};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 
 use super::Sockets;
@@ -101,25 +101,33 @@ impl Sockets {
         self.pairs.get_mut(&id).ok_or(BrokerError::Internal)
     }
 
-    /// Writes as much of `data` as `end`'s side of the connection, and the
-    /// stack's memory budget, have room for; returns how much.
-    pub(super) fn write_pair(&mut self, id: u64, end: usize, data: &[u8]) -> BrokerResult<usize> {
+    /// Writes as much of `length` bytes as `end`'s side of the connection,
+    /// and the stack's memory budget, have room for, lending the room to
+    /// `fill` (see [`litebox_broker_core::transfer`]); returns how much.
+    pub(super) fn write_pair(
+        &mut self,
+        id: u64,
+        end: usize,
+        length: usize,
+        fill: &mut Filler<'_>,
+    ) -> BrokerResult<usize> {
         let room = self.room();
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[end];
         let before = queue.capacity();
         let spare = before - queue.len();
-        let len = data.len().min(CAPACITY - queue.len()).min(spare + room);
+        let len = length.min(CAPACITY - queue.len()).min(spare + room);
         queue
             .try_reserve_exact(len)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        queue.extend(&data[..len]);
+        let written = append_to_queue(queue, len, fill);
         account(&mut self.queued, queue, before);
-        Ok(len)
+        written.map(|()| len)
     }
 
-    /// What `end` reads from `start` to `stop` (of what it can read); taken,
-    /// unless `peek`, in which case `start` may be past the beginning.
+    /// Lends `copy` what `end` reads from `start` to `stop` (of what it can
+    /// read; see [`litebox_broker_core::transfer`]), and takes it unless
+    /// `peek`, in which case `start` may be past the beginning.
     pub(super) fn read_pair(
         &mut self,
         id: u64,
@@ -127,16 +135,25 @@ impl Sockets {
         start: usize,
         stop: usize,
         peek: bool,
-    ) -> BrokerResult<Vec<u8>> {
+        copy: &mut Copier<'_>,
+    ) -> BrokerResult<()> {
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[1 - end];
-        let data = copy_from_queue(queue, start..stop)?;
+        lend_from_queue(queue, start..stop, copy)?;
         if !peek {
             let before = queue.capacity();
             queue.drain(..stop);
             account(&mut self.queued, queue, before);
         }
-        Ok(data)
+        Ok(())
+    }
+
+    /// Takes all `end` can read.
+    pub(super) fn take_pair(&mut self, id: u64, end: usize) -> BrokerResult<Vec<u8>> {
+        let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
+        let queue = core::mem::take(&mut pair.data[1 - end]);
+        self.queued -= queue.capacity();
+        Ok(Vec::from(queue))
     }
 
     /// Discards what `end` can read; returns how much it was.

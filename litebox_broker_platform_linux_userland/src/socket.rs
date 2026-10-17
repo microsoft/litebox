@@ -20,6 +20,7 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
+use litebox_broker_core::transfer::{Copier, Filler};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -284,7 +285,13 @@ impl PlatformSocket for LinuxSocket {
         self.reactor.connect(self.id, address, guest_source_lease)
     }
 
-    fn send(&self, data: Vec<u8>, _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
+    fn send(
+        &self,
+        length: usize,
+        _flags: SendFlags,
+        fill: &mut Filler<'_>,
+    ) -> BrokerResult<SocketOutcome<usize>> {
+        let data = filled(length, fill)?;
         self.reactor.request(|response| ReactorCommand::Send {
             id: self.id,
             data,
@@ -294,10 +301,12 @@ impl PlatformSocket for LinuxSocket {
 
     fn send_to(
         &self,
-        data: Vec<u8>,
+        length: usize,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
+        fill: &mut Filler<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
+        let data = filled(length, fill)?;
         self.reactor.request(|response| ReactorCommand::SendTo {
             id: self.id,
             data,
@@ -313,6 +322,7 @@ impl PlatformSocket for LinuxSocket {
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
+        copy: &mut Copier<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         let peek_offset =
             usize::try_from(peek_offset).map_err(|_| BrokerError::UnsupportedOperation)?;
@@ -327,9 +337,12 @@ impl PlatformSocket for LinuxSocket {
             peek_length,
             response,
         })? {
-            ReactorReceiveOutcome::Received(received) => Ok(SocketOutcome::Completed(
-                PlatformStreamReceive::Received(received),
-            )),
+            ReactorReceiveOutcome::Received(received) => {
+                copy(&received)?;
+                Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+                    received.len(),
+                )))
+            }
             ReactorReceiveOutcome::EndOfStream => {
                 Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
             }
@@ -341,6 +354,7 @@ impl PlatformSocket for LinuxSocket {
         &self,
         length: usize,
         flags: ReceiveFromFlags,
+        copy: &mut Copier<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         match self
             .reactor
@@ -351,14 +365,17 @@ impl PlatformSocket for LinuxSocket {
                 response,
             })? {
             ReactorReceiveFromOutcome::Received {
-                data: received,
+                data,
                 datagram_length,
                 source_address,
-            } => Ok(SocketOutcome::Completed(PlatformDatagramReceive {
-                data: received,
-                datagram_length,
-                source_address,
-            })),
+            } => {
+                copy(&data)?;
+                Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                    received: data.len(),
+                    datagram_length,
+                    source_address,
+                }))
+            }
             ReactorReceiveFromOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
         }
     }
@@ -1977,6 +1994,14 @@ fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
     data.try_reserve_exact(length)
         .map_err(|_| BrokerError::OutOfMemory)?;
     data.resize(length, 0);
+    Ok(data)
+}
+
+/// `length` bytes for the reactor to send, lent to `fill` (see
+/// [`litebox_broker_core::transfer`]).
+fn filled(length: usize, fill: &mut Filler<'_>) -> BrokerResult<Vec<u8>> {
+    let mut data = zeroed_vec(length)?;
+    fill(&mut data)?;
     Ok(data)
 }
 

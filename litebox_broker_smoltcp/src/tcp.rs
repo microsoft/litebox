@@ -19,6 +19,7 @@ use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
     PlatformStreamReceive, is_internal_socket_address, normalize_socket_destination,
 };
+use litebox_broker_core::transfer::{Copier, Filler};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -513,7 +514,10 @@ impl Tcp {
         Ok(())
     }
 
-    /// The broker core validated the peek window.
+    /// Lends what it receives to `copy` (see
+    /// [`litebox_broker_core::transfer`]). The broker core validated the peek
+    /// window.
+    #[expect(clippy::too_many_arguments, reason = "mirrors PlatformSocket::receive")]
     pub(super) fn receive(
         &mut self,
         sockets: &mut Sockets,
@@ -522,6 +526,7 @@ impl Tcp {
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
+        copy: &mut Copier<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         self.continue_peek(reader, flags, peek_offset)?;
         if !matches!(self.phase, Phase::Internal(..) | Phase::External(_)) {
@@ -576,42 +581,68 @@ impl Tcp {
                 Ok(self.end_of_stream())
             };
         }
-        let data = match (&mut self.saved, &self.phase) {
-            (Some(saved), _) if peek => saved[start..end].to_vec(),
+        let received = match (&mut self.saved, &self.phase) {
+            (Some(saved), _) if peek => {
+                copy(&saved[start..end])?;
+                end - start
+            }
             (Some(saved), _) => {
-                let data = saved.drain(..end).collect();
+                copy(&saved[..end])?;
+                saved.drain(..end);
                 self.release_saved(sockets);
-                data
+                end
             }
             (None, &Phase::Internal(id, pair_end)) => {
-                sockets.read_pair(id, pair_end, start, end, peek)?
+                sockets.read_pair(id, pair_end, start, end, peek, copy)?;
+                end - start
+            }
+            (None, &Phase::External(handle)) if peek => {
+                // smoltcp lends only the first contiguous part of its receive
+                // buffer without taking it, so a peek copies it all out.
+                let mut data = zeroed(end)?;
+                let copied = sockets
+                    .tcp(handle)
+                    .peek_slice(&mut data)
+                    .map_err(|_| BrokerError::Internal)?;
+                let peeked = data.get(start..copied).ok_or(BrokerError::Internal)?;
+                copy(peeked)?;
+                peeked.len()
             }
             (None, &Phase::External(handle)) => {
                 let socket = sockets.tcp(handle);
-                let mut data = zeroed(end)?;
-                let copied = if peek {
-                    socket.peek_slice(&mut data)
-                } else {
-                    socket.recv_slice(&mut data)
+                let mut received = 0;
+                // smoltcp lends its receive buffer a contiguous part at a time,
+                // and it has two at most.
+                for _ in 0..2 {
+                    received += socket
+                        .recv(|part| {
+                            let len = part.len().min(end - received);
+                            match copy(&part[..len]) {
+                                Ok(()) => (len, Ok(len)),
+                                Err(error) => (0, Err(error)),
+                            }
+                        })
+                        .map_err(|_| BrokerError::Internal)??;
                 }
-                .map_err(|_| BrokerError::Internal)?;
-                data.truncate(copied);
-                data.split_off(start)
+                received
             }
             (None, _) => return Err(BrokerError::Internal),
         };
-        if data.is_empty() {
+        if received == 0 {
             return Err(BrokerError::Internal);
         }
         Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
-            data,
+            received,
         )))
     }
 
+    /// Sends what of `length` bytes there is room for, lending the room to
+    /// `fill` (see [`litebox_broker_core::transfer`]).
     pub(super) fn send(
         &mut self,
         sockets: &mut Sockets,
-        data: &[u8],
+        length: usize,
+        fill: &mut Filler<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         if self.write_shutdown {
             return Ok(SocketOutcome::Failed(SocketError::Shutdown));
@@ -643,17 +674,30 @@ impl Tcp {
                 if sockets.pair(id)?.peer_closed(end) {
                     return Ok(SocketOutcome::Failed(SocketError::ConnectionReset));
                 }
-                sockets.write_pair(id, end, data)?
+                sockets.write_pair(id, end, length, fill)?
             }
             Phase::External(handle) => {
                 let socket = sockets.tcp(handle);
                 if !socket.may_send() {
                     return Ok(SocketOutcome::Failed(SocketError::NotConnected));
                 }
-                match socket.send_slice(data) {
-                    Ok(sent) => sent,
-                    Err(_) => return Ok(SocketOutcome::Failed(SocketError::NotConnected)),
+                let mut sent = 0;
+                // smoltcp lends the room in its send buffer a contiguous part
+                // at a time, and it has two at most.
+                for _ in 0..2 {
+                    let filled = socket.send(|part| {
+                        let len = part.len().min(length - sent);
+                        match fill(&mut part[..len]) {
+                            Ok(()) => (len, Ok(len)),
+                            Err(error) => (0, Err(error)),
+                        }
+                    });
+                    match filled {
+                        Ok(filled) => sent += filled?,
+                        Err(_) => return Ok(SocketOutcome::Failed(SocketError::NotConnected)),
+                    }
                 }
+                sent
             }
             _ => return Err(BrokerError::Internal),
         };
@@ -984,10 +1028,7 @@ impl Stack {
         if read && !tcp.read_shutdown {
             if tcp.saved.is_none() {
                 let data = match tcp.phase {
-                    Phase::Internal(pair, end) => {
-                        let available = self.sockets.pair(pair)?.available(end);
-                        self.sockets.read_pair(pair, end, 0, available, false)?
-                    }
+                    Phase::Internal(pair, end) => self.sockets.take_pair(pair, end)?,
                     Phase::External(handle) => take_received(self.sockets.tcp(handle))?,
                     _ => return Err(BrokerError::Internal),
                 };
