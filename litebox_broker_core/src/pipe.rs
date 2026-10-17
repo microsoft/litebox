@@ -128,7 +128,7 @@ pub(crate) fn write_from(
         process,
         handle,
         data.len(),
-        &mut crate::test_support::fill_from(data),
+        &mut crate::transfer::fill_from_slice(data),
     )
 }
 

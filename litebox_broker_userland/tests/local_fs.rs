@@ -28,6 +28,7 @@ use litebox_broker_core::fs::errors::{OpenError, PathError, WalkError};
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::{Mode, OFlags, UserInfo};
+use litebox_broker_core::test_support::{BackendSlices, ResolverSlices};
 use litebox_broker_userland::fs::LocalFs;
 
 const USER: UserInfo = UserInfo {
@@ -54,10 +55,10 @@ fn canonical_root_live_io_and_open_file_handles() {
         .unwrap()
         .item;
     let mut buf = [0; 7];
-    assert_eq!(local.read(&absolute, &mut buf, 0).unwrap(), 7);
+    assert_eq!(local.read_slice(&absolute, &mut buf, 0).unwrap(), 7);
     assert_eq!(&buf, b"initial");
     assert!(matches!(
-        local.write(&absolute, b"x", 0),
+        local.write_slice(&absolute, b"x", 0),
         Err(WriteError::NotForWriting)
     ));
     assert!(matches!(
@@ -72,11 +73,11 @@ fn canonical_root_live_io_and_open_file_handles() {
         .item;
     fs::rename(root.join("file"), root.join("moved_file")).unwrap();
     fs::write(root.join("file"), b"decoy").unwrap();
-    local.write(&file, b"live", 0).unwrap();
+    local.write_slice(&file, b"live", 0).unwrap();
     assert_eq!(fs::read(root.join("moved_file")).unwrap(), b"liveial");
     assert_eq!(fs::read(root.join("file")).unwrap(), b"decoy");
     local.unlink_at(dir, "file").unwrap();
-    assert_eq!(local.read(&file, &mut buf, 0).unwrap(), 7);
+    assert_eq!(local.read_slice(&file, &mut buf, 0).unwrap(), 7);
     local.truncate(&file, 3).unwrap();
     assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 3);
     local.chmod(HandleRef::File(&file), Mode::RUSR).unwrap();
@@ -226,9 +227,9 @@ fn direct_backend_mutations_and_flags() {
         .open_file_at(local.root(), "new", OFlags::RDWR)
         .unwrap()
         .item;
-    local.write(&file, b"x", 4096).unwrap();
+    local.write_slice(&file, b"x", 4096).unwrap();
     let mut hole = [1; 4];
-    assert_eq!(local.read(&file, &mut hole, 64).unwrap(), 4);
+    assert_eq!(local.read_slice(&file, &mut hole, 64).unwrap(), 4);
     assert_eq!(hole, [0; 4]);
     assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 4097);
     local.truncate(&file, 8192).unwrap();
@@ -384,7 +385,7 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
             .unwrap()
             .item;
         let mut buf = [0; 6];
-        assert_eq!(local.read(&file, &mut buf, 0).unwrap(), 6);
+        assert_eq!(local.read_slice(&file, &mut buf, 0).unwrap(), 6);
         assert_eq!(&buf, b"inside");
     }
     for name in ["escape", "cycle_a", "socket"] {
@@ -484,13 +485,13 @@ fn resolver_and_composer_use_host_permissions_and_live_positions() {
         .unwrap();
     assert!(resolver.get_static_backing_data(&file).is_none());
     let mut buf = [0; 3];
-    assert_eq!(resolver.read(&mut file, &mut buf, None).unwrap(), 3);
+    assert_eq!(resolver.read_slice(&mut file, &mut buf, None).unwrap(), 3);
     assert_eq!(&buf, b"abc");
     resolver
         .seek(&mut file, 0, SeekWhence::RelativeToBeginning)
         .unwrap();
-    resolver.write(&mut file, b"Z", None).unwrap();
-    resolver.write(&mut file, b"!", Some(2)).unwrap();
+    resolver.write_slice(&mut file, b"Z", None).unwrap();
+    resolver.write_slice(&mut file, b"!", Some(2)).unwrap();
     assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"Zb!");
     let mut appended = resolver
         .open(
@@ -500,7 +501,7 @@ fn resolver_and_composer_use_host_permissions_and_live_positions() {
             Mode::empty(),
         )
         .unwrap();
-    resolver.write(&mut appended, b"+", None).unwrap();
+    resolver.write_slice(&mut appended, b"+", None).unwrap();
     assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"Zb!+");
     let status = resolver.file_status(USER, "/host/file").unwrap();
     assert_eq!(status.size, 4);

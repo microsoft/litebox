@@ -41,6 +41,7 @@ use litebox_broker_core::fs::errors::{
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use litebox_broker_core::transfer::{Copier, Filler, bounce_buffer};
 
 /// A live host filesystem rooted at a canonical directory path.
 pub struct LocalFs {
@@ -626,7 +627,13 @@ impl Backend for LocalFs {
         Ok(result)
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        offset: usize,
+        copy: &mut Copier<'_>,
+    ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         if !self.valid_file(h) {
             return Err(ReadError::Io);
@@ -637,38 +644,49 @@ impl Backend for LocalFs {
             .filter(|_| h.readable)
             .ok_or(ReadError::NotForReading)?;
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
+        let mut buf = bounce_buffer(length)?;
         let result = {
             #[cfg(unix)]
             {
-                std::os::unix::fs::FileExt::read_at(&**file, buf, offset)
+                std::os::unix::fs::FileExt::read_at(&**file, &mut buf, offset)
             }
             #[cfg(windows)]
             {
-                std::os::windows::fs::FileExt::seek_read(&**file, buf, offset)
+                std::os::windows::fs::FileExt::seek_read(&**file, &mut buf, offset)
             }
         };
-        result.map_err(|_| ReadError::Io)
+        let read = result.map_err(|_| ReadError::Io)?;
+        copy(&buf[..read])?;
+        Ok(read)
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        offset: usize,
+        fill: &mut Filler<'_>,
+    ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         if !self.valid_file(h) {
             return Err(WriteError::Io);
         }
-        let file = h
+        let host_file = h
             .file
             .as_ref()
             .filter(|_| h.writable)
             .ok_or(WriteError::NotForWriting)?;
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
+        let mut buf = bounce_buffer(length)?;
+        fill(&mut buf)?;
         let result = {
             #[cfg(unix)]
             {
-                std::os::unix::fs::FileExt::write_at(&**file, buf, offset)
+                std::os::unix::fs::FileExt::write_at(&**host_file, &buf, offset)
             }
             #[cfg(windows)]
             {
-                std::os::windows::fs::FileExt::seek_write(&**file, buf, offset)
+                std::os::windows::fs::FileExt::seek_write(&**host_file, &buf, offset)
             }
         };
         result.map_err(|_| WriteError::Io)

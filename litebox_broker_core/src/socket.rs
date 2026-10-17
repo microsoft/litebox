@@ -27,7 +27,7 @@ use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
-use crate::transfer::{Copier, Filler};
+use crate::transfer::{Copier, Filler, Lent};
 use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessId, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
@@ -1407,52 +1407,6 @@ fn transport_send(
         return Err(BrokerError::Internal);
     }
     Ok(outcome)
-}
-
-/// Counts the bytes a platform lends a copier or filler, which may be no
-/// more than requested, to check what it reports, and keeps the first
-/// failure, which fails the operation whatever the platform reports (see
-/// [`crate::transfer`]).
-struct Lent {
-    limit: usize,
-    bytes: usize,
-    failure: Option<BrokerError>,
-}
-
-impl Lent {
-    const fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            bytes: 0,
-            failure: None,
-        }
-    }
-
-    /// Counts a part of `length` bytes and passes it on with `transfer`,
-    /// failing if it exceeds the limit or an earlier part failed.
-    fn lend(&mut self, length: usize, transfer: impl FnOnce() -> Result<()>) -> Result<()> {
-        let result = match self.failure {
-            Some(failure) => Err(failure),
-            None => self
-                .bytes
-                .checked_add(length)
-                .filter(|&bytes| bytes <= self.limit)
-                .ok_or(BrokerError::Internal)
-                .and_then(|bytes| {
-                    self.bytes = bytes;
-                    transfer()
-                }),
-        };
-        if let Err(error) = result {
-            self.failure.get_or_insert(error);
-        }
-        result
-    }
-
-    /// Returns how many bytes were lent, or the first failure.
-    fn finish(self) -> Result<usize> {
-        self.failure.map_or(Ok(self.bytes), Err)
-    }
 }
 
 /// Sends one complete datagram of `length` bytes without waiting for

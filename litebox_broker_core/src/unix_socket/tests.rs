@@ -7,7 +7,8 @@ use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
-use crate::test_support::{TestBrokerCoreBuilder, copy_into, fill_from};
+use crate::test_support::{TestBrokerCoreBuilder, copy_into};
+use crate::transfer::fill_from_slice;
 use crate::{BrokerCore, CallerCredential, PolicyEngine};
 use std::vec;
 
@@ -146,7 +147,7 @@ impl Fixture {
             None,
             data.len(),
             USER,
-            &mut fill_from(data),
+            &mut fill_from_slice(data),
         )
     }
 
@@ -162,7 +163,7 @@ impl Fixture {
             Some(address),
             data.len(),
             USER,
-            &mut fill_from(data),
+            &mut fill_from_slice(data),
         )
     }
 

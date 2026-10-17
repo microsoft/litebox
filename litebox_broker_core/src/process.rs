@@ -2014,6 +2014,7 @@ mod tests {
     use crate::stdio::StdioOutputStream;
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
+    use crate::transfer::{copy_to_slice, fill_from_slice};
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -3733,7 +3734,16 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(crate::fs::write(&source, file, b"abcdef", None), Ok(Ok(6)));
+        assert_eq!(
+            crate::fs::write(
+                &source,
+                file,
+                b"abcdef".len(),
+                None,
+                &mut fill_from_slice(b"abcdef")
+            ),
+            Ok(Ok(6))
+        );
         assert_eq!(
             crate::fs::seek(&source, file, 0, FileSeekWhence::RelativeToBeginning),
             Ok(Ok(0))
@@ -3742,7 +3752,13 @@ mod tests {
         let event = crate::event::create(&source, 0, FileOpenFlags::NONE).unwrap();
         let mut byte = [0];
         assert_eq!(
-            crate::fs::read(&source, event, &mut byte, None),
+            crate::fs::read(
+                &source,
+                event,
+                byte.len(),
+                None,
+                &mut copy_to_slice(&mut byte)
+            ),
             Err(BrokerError::InvalidRights)
         );
         assert_eq!(
@@ -3772,7 +3788,16 @@ mod tests {
         );
 
         let mut first = [0; 2];
-        assert_eq!(crate::fs::read(&source, file, &mut first, None), Ok(Ok(2)));
+        assert_eq!(
+            crate::fs::read(
+                &source,
+                file,
+                first.len(),
+                None,
+                &mut copy_to_slice(&mut first)
+            ),
+            Ok(Ok(2))
+        );
         assert_eq!(&first, b"ab");
 
         let duplicate = source
@@ -3780,20 +3805,38 @@ mod tests {
             .unwrap();
         let mut second = [0; 2];
         assert_eq!(
-            crate::fs::read(&target, duplicate, &mut second, None),
+            crate::fs::read(
+                &target,
+                duplicate,
+                second.len(),
+                None,
+                &mut copy_to_slice(&mut second)
+            ),
             Ok(Ok(2))
         );
         assert_eq!(&second, b"cd");
 
         let mut explicit = [0; 2];
         assert_eq!(
-            crate::fs::read(&source, file, &mut explicit, Some(0)),
+            crate::fs::read(
+                &source,
+                file,
+                explicit.len(),
+                Some(0),
+                &mut copy_to_slice(&mut explicit)
+            ),
             Ok(Ok(2))
         );
         assert_eq!(&explicit, b"ab");
         let mut final_bytes = [0; 2];
         assert_eq!(
-            crate::fs::read(&source, file, &mut final_bytes, None),
+            crate::fs::read(
+                &source,
+                file,
+                final_bytes.len(),
+                None,
+                &mut copy_to_slice(&mut final_bytes)
+            ),
             Ok(Ok(2))
         );
         assert_eq!(&final_bytes, b"ef");
@@ -3809,7 +3852,13 @@ mod tests {
             Ok(Ok(0))
         );
         assert_eq!(
-            crate::fs::read(&target, duplicate, &mut byte, None),
+            crate::fs::read(
+                &target,
+                duplicate,
+                byte.len(),
+                None,
+                &mut copy_to_slice(&mut byte)
+            ),
             Ok(Ok(1))
         );
         assert_eq!(&byte, b"a");
@@ -3862,11 +3911,17 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mut random_bytes =
-            vec![0; litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE as usize + 1];
+        let length = litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE as usize + 1;
+        let mut random_bytes = vec![0; length];
         assert_eq!(
-            crate::fs::read(&source, random, &mut random_bytes, None),
-            Ok(Ok(random_bytes.len()))
+            crate::fs::read(
+                &source,
+                random,
+                length,
+                None,
+                &mut copy_to_slice(&mut random_bytes)
+            ),
+            Ok(Ok(length))
         );
         assert!(random_bytes.iter().all(|byte| *byte == 0x5a));
         assert_eq!(source.close_object_reference(random), Ok(()));
@@ -3883,7 +3938,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.read(&write_only_random, &mut [0], None),
+            broker
+                .fs
+                .read(&write_only_random, 1, None, &mut copy_to_slice(&mut [0])),
             Ok(Err(FileError::NotForReading))
         );
 
@@ -3899,7 +3956,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.write(&read_only_null, &[0], None),
+            broker
+                .fs
+                .write(&read_only_null, 1, None, &mut fill_from_slice(&[0])),
             Ok(Err(FileError::NotForWriting))
         );
 
@@ -3918,11 +3977,23 @@ mod tests {
             .duplicate_object_reference_to(stdout, &target, ObjectRights::WRITE)
             .unwrap();
         assert_eq!(
-            crate::fs::write(&source, stdout, b"source", None),
+            crate::fs::write(
+                &source,
+                stdout,
+                b"source".len(),
+                None,
+                &mut fill_from_slice(b"source")
+            ),
             Ok(Ok(6))
         );
         assert_eq!(
-            crate::fs::write(&target, duplicated_stdout, b"target", None),
+            crate::fs::write(
+                &target,
+                duplicated_stdout,
+                b"target".len(),
+                None,
+                &mut fill_from_slice(b"target")
+            ),
             Ok(Ok(6))
         );
         assert_eq!(
@@ -3954,7 +4025,13 @@ mod tests {
             .register_readiness(&(target_sink.clone() as Arc<dyn ReadinessSink>))
             .unwrap();
         assert_eq!(
-            crate::fs::read(&source, stdin, &mut byte, None),
+            crate::fs::read(
+                &source,
+                stdin,
+                byte.len(),
+                None,
+                &mut copy_to_slice(&mut byte)
+            ),
             Err(BrokerError::WouldBlock)
         );
         assert_eq!(source.check_readiness(stdin), Ok(ReadinessFlags::default()));
@@ -3970,12 +4047,27 @@ mod tests {
             Ok(ReadinessFlags::READ)
         );
         assert_eq!(
-            crate::fs::read(&target, duplicated_stdin, &mut byte, None),
+            crate::fs::read(
+                &target,
+                duplicated_stdin,
+                byte.len(),
+                None,
+                &mut copy_to_slice(&mut byte)
+            ),
             Ok(Ok(1))
         );
         assert_eq!(&byte, b"x");
         stdio_provider.close_input();
-        assert_eq!(crate::fs::read(&source, stdin, &mut byte, None), Ok(Ok(0)));
+        assert_eq!(
+            crate::fs::read(
+                &source,
+                stdin,
+                byte.len(),
+                None,
+                &mut copy_to_slice(&mut byte)
+            ),
+            Ok(Ok(0))
+        );
         assert_eq!(source.close_object_reference(stdin), Ok(()));
         assert_eq!(target.close_object_reference(duplicated_stdin), Ok(()));
         assert!(sink.retired.lock().unwrap().contains(&stdin));

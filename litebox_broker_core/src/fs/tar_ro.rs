@@ -30,6 +30,7 @@ use core::ops::Range;
 use hashbrown::HashMap;
 
 use super::{DirEntry, FileType};
+use crate::transfer::{Copier, Filler};
 
 use super::{
     Mode, NodeInfo, OFlags, UserInfo,
@@ -192,17 +193,28 @@ impl super::backend::Backend for TarRo {
             .map(|(name, child)| self.tar_index.dir_entry(name, *child)))
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        offset: usize,
+        copy: &mut Copier<'_>,
+    ) -> Result<usize, ReadError> {
         let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
         let start = offset.min(file.len());
-        let end = offset.checked_add(buf.len()).unwrap().min(file.len());
+        let end = offset.checked_add(length).unwrap().min(file.len());
         debug_assert!(start <= end);
-        let len = end - start;
-        buf[..len].copy_from_slice(&file[start..end]);
-        Ok(len)
+        copy(&file[start..end])?;
+        Ok(end - start)
     }
 
-    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        _h: &FileHandle,
+        _length: usize,
+        _offset: usize,
+        _fill: &mut Filler<'_>,
+    ) -> Result<usize, WriteError> {
         Err(WriteError::NotForWriting)
     }
 

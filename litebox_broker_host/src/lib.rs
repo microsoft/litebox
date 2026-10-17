@@ -716,22 +716,18 @@ fn handle_file_request<Memory: SharedMemory>(
             offset,
         }) => {
             validate_shared_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
-            let mut data = allocate_zeroed(buffer.length() as usize)?;
-            match litebox_broker_core::fs::read(process, handle, &mut data, offset)
-                .map_err(RequestFailure::from)?
+            match litebox_broker_core::fs::read(
+                process,
+                handle,
+                buffer.length() as usize,
+                offset,
+                &mut copy_to_shared_buffer(shared_buffers, buffer, 0),
+            )
+            .map_err(RequestFailure::from)?
             {
-                Ok(read) => {
-                    write_shared_buffer(
-                        shared_buffers,
-                        buffer,
-                        &data[..read],
-                        MAX_FILE_TRANSFER_SIZE,
-                    )?;
-                    Ok(FileResponse::Read(ReadFileResponse {
-                        read: u32::try_from(read)
-                            .expect("validated file read length must fit in u32"),
-                    }))
-                }
+                Ok(read) => Ok(FileResponse::Read(ReadFileResponse {
+                    read: u32::try_from(read).expect("validated file read length must fit in u32"),
+                })),
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
@@ -740,9 +736,15 @@ fn handle_file_request<Memory: SharedMemory>(
             buffer,
             offset,
         }) => {
-            let data = read_shared_buffer(shared_buffers, buffer, MAX_FILE_TRANSFER_SIZE)?;
-            match litebox_broker_core::fs::write(process, handle, &data, offset)
-                .map_err(RequestFailure::from)?
+            validate_shared_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
+            match litebox_broker_core::fs::write(
+                process,
+                handle,
+                buffer.length() as usize,
+                offset,
+                &mut fill_from_shared_buffer(shared_buffers, buffer, 0),
+            )
+            .map_err(RequestFailure::from)?
             {
                 Ok(written) => Ok(FileResponse::Write(WriteFileResponse {
                     written: u32::try_from(written)

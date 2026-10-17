@@ -16,6 +16,7 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
+use crate::transfer::{Copier, Filler};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
 ///
@@ -388,41 +389,39 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     fn read(
         &self,
         h: &super::backend::FileHandle,
-        buf: &mut [u8],
+        length: usize,
         offset: usize,
+        copy: &mut Copier<'_>,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
         let start = offset.min(file.data.len());
-        let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
+        let end = offset.checked_add(length).unwrap().min(file.data.len());
         debug_assert!(start <= end);
-        let len = end - start;
-        buf[..len].copy_from_slice(&file.data[start..end]);
-        Ok(len)
+        copy(&file.data[start..end])?;
+        Ok(end - start)
     }
 
+    /// Fills the file's bytes in place, past its end padded with zeroes first,
+    /// and restores its length if `fill` fails.
     fn write(
         &self,
         h: &super::backend::FileHandle,
-        buf: &[u8],
+        length: usize,
         offset: usize,
+        fill: &mut Filler<'_>,
     ) -> Result<usize, WriteError> {
-        let mut file = h.get_typed::<Self>().file.write();
-        let overwritten_len = match offset.cmp(&file.data.len()) {
-            core::cmp::Ordering::Less => {
-                let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
-                let overwritten_len = end - offset;
-                file.data.to_mut()[offset..end].copy_from_slice(&buf[..overwritten_len]);
-                overwritten_len
-            }
-            core::cmp::Ordering::Equal => 0,
-            core::cmp::Ordering::Greater => {
-                // Need to pad with 0s because the offset was past the end of the file
-                file.data.to_mut().resize(offset, 0);
-                0
-            }
-        };
-        file.data.to_mut().extend(&buf[overwritten_len..]);
-        Ok(buf.len())
+        let mut file_data = h.get_typed::<Self>().file.write();
+        let data = file_data.data.to_mut();
+        let previous_len = data.len();
+        let end = offset.checked_add(length).unwrap();
+        if end > previous_len {
+            data.resize(end, 0);
+        }
+        if let Err(error) = fill(&mut data[offset..end]) {
+            data.truncate(previous_len);
+            return Err(error.into());
+        }
+        Ok(length)
     }
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {

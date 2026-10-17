@@ -17,6 +17,7 @@
 //! or kept any of the room it lent, the failing part's included.
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::ops::Range;
 
 use crate::{BrokerError, Result};
@@ -26,6 +27,95 @@ pub type Copier<'a> = dyn FnMut(&[u8]) -> Result<()> + 'a;
 
 /// Fills each part of the room an object writes, in turn.
 pub type Filler<'a> = dyn FnMut(&mut [u8]) -> Result<()> + 'a;
+
+/// Returns a copier that copies the parts it is lent, one after another,
+/// into `destination`, and fails with [`BrokerError::Internal`] if they
+/// overflow it.
+pub fn copy_to_slice(destination: &mut [u8]) -> impl FnMut(&[u8]) -> Result<()> + '_ {
+    let mut offset = 0;
+    move |part| {
+        let end = offset + part.len();
+        destination
+            .get_mut(offset..end)
+            .ok_or(BrokerError::Internal)?
+            .copy_from_slice(part);
+        offset = end;
+        Ok(())
+    }
+}
+
+/// Returns a filler that fills the parts it is lent, one after another, from
+/// `source`, and fails with [`BrokerError::Internal`] if they overflow it.
+pub fn fill_from_slice(source: &[u8]) -> impl FnMut(&mut [u8]) -> Result<()> + '_ {
+    let mut offset = 0;
+    move |part| {
+        let end = offset + part.len();
+        part.copy_from_slice(source.get(offset..end).ok_or(BrokerError::Internal)?);
+        offset = end;
+        Ok(())
+    }
+}
+
+/// Returns `length` zeroed bytes for an object that cannot lend its own
+/// storage, such as a host file, to stage the bytes it transfers in, or
+/// fails with [`BrokerError::OutOfMemory`].
+pub fn bounce_buffer(length: usize) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| BrokerError::OutOfMemory)?;
+    buffer.resize(length, 0);
+    Ok(buffer)
+}
+
+/// Counts the bytes an object lends a copier or filler, which may be no
+/// more than requested, to check what it reports, and keeps the first
+/// failure, which fails the operation whatever the object reports.
+pub(crate) struct Lent {
+    limit: usize,
+    bytes: usize,
+    failure: Option<BrokerError>,
+}
+
+impl Lent {
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            bytes: 0,
+            failure: None,
+        }
+    }
+
+    /// Counts a part of `length` bytes and passes it on with `transfer`,
+    /// failing if it exceeds the limit or an earlier part failed.
+    pub(crate) fn lend(
+        &mut self,
+        length: usize,
+        transfer: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let result = match self.failure {
+            Some(failure) => Err(failure),
+            None => self
+                .bytes
+                .checked_add(length)
+                .filter(|&bytes| bytes <= self.limit)
+                .ok_or(BrokerError::Internal)
+                .and_then(|bytes| {
+                    self.bytes = bytes;
+                    transfer()
+                }),
+        };
+        if let Err(error) = result {
+            self.failure.get_or_insert(error);
+        }
+        result
+    }
+
+    /// Returns how many bytes were lent, or the first failure.
+    pub(crate) fn finish(self) -> Result<usize> {
+        self.failure.map_or(Ok(self.bytes), Err)
+    }
+}
 
 /// Lends `queue[range]` to `copy`, one contiguous part at a time.
 ///
@@ -68,7 +158,7 @@ pub fn append_to_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{copy_into, fill_from};
+    use crate::test_support::copy_into;
     use alloc::vec::Vec;
 
     #[test]
@@ -102,7 +192,7 @@ mod tests {
             queue.extend(0..6);
             queue.drain(..4);
             assert_eq!(
-                append_to_queue(&mut queue, length, &mut fill_from(&source)),
+                append_to_queue(&mut queue, length, &mut fill_from_slice(&source)),
                 Ok(())
             );
             assert!(queue.iter().eq([4, 5].iter().chain(&source[..length])));

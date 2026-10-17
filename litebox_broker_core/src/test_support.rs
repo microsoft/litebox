@@ -21,7 +21,12 @@ use spin::Mutex;
 
 use crate::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, Result,
-    fs::{FileResult, FileService, UnsupportedFileService},
+    fs::{
+        self, FileResult, FileService, UnsupportedFileService,
+        backend::FileHandle,
+        errors::{ReadError, WriteError},
+        resolver::{Resolver, ResolverEntry},
+    },
     random::{RandomProvider, RandomProviderError},
     readiness::{
         ReadinessRegistration, ReadinessSource, ReadinessWatchers, SharedReadinessWatchers,
@@ -30,7 +35,76 @@ use crate::{
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
+    transfer::{Copier, Filler, copy_to_slice, fill_from_slice, lend_from_queue},
 };
+
+/// Reads into and writes from slices with a resolver, for tests that are not
+/// about lending (see [`crate::transfer`]).
+pub trait ResolverSlices<Backend: fs::backend::Backend> {
+    /// Reads into `buffer` with [`Resolver::read`].
+    fn read_slice(
+        &self,
+        entry: &mut ResolverEntry<Backend>,
+        buffer: &mut [u8],
+        offset: Option<usize>,
+    ) -> core::result::Result<usize, ReadError>;
+
+    /// Writes `data` with [`Resolver::write`].
+    fn write_slice(
+        &self,
+        entry: &mut ResolverEntry<Backend>,
+        data: &[u8],
+        offset: Option<usize>,
+    ) -> core::result::Result<usize, WriteError>;
+}
+
+impl<Platform, Backend: fs::backend::Backend + 'static> ResolverSlices<Backend>
+    for Resolver<Platform, Backend>
+{
+    fn read_slice(
+        &self,
+        entry: &mut ResolverEntry<Backend>,
+        buffer: &mut [u8],
+        offset: Option<usize>,
+    ) -> core::result::Result<usize, ReadError> {
+        self.read(entry, buffer.len(), offset, &mut copy_to_slice(buffer))
+    }
+
+    fn write_slice(
+        &self,
+        entry: &mut ResolverEntry<Backend>,
+        data: &[u8],
+        offset: Option<usize>,
+    ) -> core::result::Result<usize, WriteError> {
+        self.write(entry, data.len(), offset, &mut fill_from_slice(data))
+    }
+}
+
+/// Reads into and writes from slices with a file backend, for tests that are
+/// not about lending (see [`crate::transfer`]).
+pub trait BackendSlices: fs::backend::Backend {
+    /// Reads into `buffer` with [`fs::backend::Backend::read`].
+    fn read_slice(
+        &self,
+        h: &FileHandle,
+        buffer: &mut [u8],
+        offset: usize,
+    ) -> core::result::Result<usize, ReadError> {
+        self.read(h, buffer.len(), offset, &mut copy_to_slice(buffer))
+    }
+
+    /// Writes `data` with [`fs::backend::Backend::write`].
+    fn write_slice(
+        &self,
+        h: &FileHandle,
+        data: &[u8],
+        offset: usize,
+    ) -> core::result::Result<usize, WriteError> {
+        self.write(h, data.len(), offset, &mut fill_from_slice(data))
+    }
+}
+
+impl<Backend: fs::backend::Backend + ?Sized> BackendSlices for Backend {}
 
 /// Builder for a test broker core with strict providers that reject unexpected operations.
 pub struct TestBrokerCoreBuilder {
@@ -229,26 +303,32 @@ impl StdioProvider for TestStdioProvider {
         connected.then(|| Arc::clone(&self.terminal) as Arc<dyn TerminalEndpoint>)
     }
 
-    fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
+    fn read(
+        &self,
+        length: usize,
+        copy: &mut Copier<'_>,
+    ) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
         if input.bytes.is_empty() && input.open {
             input.blocked_reads += 1;
             return Err(StdioProviderError::WouldBlock);
         }
-        let read = input.bytes.len().min(output.len());
-        for (destination, source) in output.iter_mut().zip(input.bytes.drain(..read)) {
-            *destination = source;
-        }
+        let read = input.bytes.len().min(length);
+        lend_from_queue(&input.bytes, 0..read, copy)?;
+        input.bytes.drain(..read);
         Ok(read)
     }
 
     fn write(
         &self,
         stream: StdioOutputStream,
-        input: &[u8],
+        length: usize,
+        fill: &mut Filler<'_>,
     ) -> core::result::Result<usize, StdioProviderError> {
-        self.writes.lock().push((stream, input.to_vec()));
-        Ok(input.len())
+        let mut data = alloc::vec![0; length];
+        fill(&mut data)?;
+        self.writes.lock().push((stream, data));
+        Ok(length)
     }
 
     fn is_terminal(&self, stream: StdioStream) -> bool {
@@ -402,21 +482,6 @@ impl Drop for ManualAlarm {
     }
 }
 
-/// Returns a filler that fills the parts it is lent from `source`, one
-/// after another (see [`crate::transfer`]).
-///
-/// # Panics
-///
-/// The filler panics if lent more room than `source` has bytes.
-pub fn fill_from(source: &[u8]) -> impl FnMut(&mut [u8]) -> Result<()> + '_ {
-    let mut offset = 0;
-    move |part| {
-        part.copy_from_slice(&source[offset..][..part.len()]);
-        offset += part.len();
-        Ok(())
-    }
-}
-
 /// Returns a copier that appends the parts it is lent to `destination` (see
 /// [`crate::transfer`]).
 pub fn copy_into(destination: &mut Vec<u8>) -> impl FnMut(&[u8]) -> Result<()> + '_ {
@@ -434,7 +499,13 @@ pub fn send_data(
     flags: SendFlags,
 ) -> Result<SocketOutcome<usize>> {
     let data = data.as_ref();
-    socket::send(process, handle, data.len(), flags, &mut fill_from(data))
+    socket::send(
+        process,
+        handle,
+        data.len(),
+        flags,
+        &mut fill_from_slice(data),
+    )
 }
 
 /// Sends `data` with [`socket::send_to`].
@@ -452,7 +523,7 @@ pub fn send_data_to(
         data.len(),
         flags,
         destination,
-        &mut fill_from(data),
+        &mut fill_from_slice(data),
     )
 }
 

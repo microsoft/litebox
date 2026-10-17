@@ -5,6 +5,8 @@
 
 use thiserror::Error;
 
+use crate::BrokerError;
+
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
 // order to more correctly support network-attached file systems.
 
@@ -40,6 +42,10 @@ pub enum ReadError {
     Io,
     #[error("no data is available yet")]
     WouldBlock,
+    /// The broker failed the read itself, such as when the copier it lent
+    /// bytes to failed (see [`crate::transfer`]) or it ran out of memory.
+    #[error(transparent)]
+    Broker(#[from] BrokerError),
 }
 
 /// Possible errors from [`super::resolver::Resolver::write`]
@@ -55,6 +61,10 @@ pub enum WriteError {
     Io,
     #[error("no space is available yet")]
     WouldBlock,
+    /// The broker failed the write itself, such as when the filler it lent
+    /// room to failed (see [`crate::transfer`]) or it ran out of memory.
+    #[error(transparent)]
+    Broker(#[from] BrokerError),
 }
 
 /// Possible errors from [`super::resolver::Resolver::seek`]

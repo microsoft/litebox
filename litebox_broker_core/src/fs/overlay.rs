@@ -36,6 +36,7 @@ use super::errors::{
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
+use crate::transfer::{Copier, Filler, copy_to_slice, fill_from_slice};
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
 const MARKER_PREFIX: &str = ".litebox-overlay-";
@@ -315,7 +316,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         let mut buf = [0u8; 4096];
         loop {
             let count = self.lowers[layer]
-                .read(lower, &mut buf, offset)
+                .read(lower, buf.len(), offset, &mut copy_to_slice(&mut buf))
                 .map_err(|_| OpenError::Io)?;
             if count == 0 {
                 return Ok(());
@@ -324,7 +325,12 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             while written < count {
                 let progress = self
                     .upper
-                    .write(upper, &buf[written..count], offset + written)
+                    .write(
+                        upper,
+                        count - written,
+                        offset + written,
+                        &mut fill_from_slice(&buf[written..count]),
+                    )
                     .map_err(|_| OpenError::Io)?;
                 if progress == 0 {
                     return Err(OpenError::Io);
@@ -939,9 +945,15 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         self.entries(&resolved).map_err(|_| ReadDirError::Io)
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        offset: usize,
+        copy: &mut Copier<'_>,
+    ) -> Result<usize, ReadError> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
-            backend.read(handle, buf, offset)
+            backend.read(handle, length, offset, copy)
         })
     }
 
@@ -951,13 +963,19 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
-        let file = h.get_typed::<Self>();
-        if let Some(upper) = self.migrated(file) {
-            return self.upper.write(&upper, buf, offset);
+    fn write(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        offset: usize,
+        fill: &mut Filler<'_>,
+    ) -> Result<usize, WriteError> {
+        let overlay_file = h.get_typed::<Self>();
+        if let Some(upper) = self.migrated(overlay_file) {
+            return self.upper.write(&upper, length, offset, fill);
         }
-        match &file.layer {
-            OverlayFileLayer::Upper(handle) => self.upper.write(handle, buf, offset),
+        match &overlay_file.layer {
+            OverlayFileLayer::Upper(handle) => self.upper.write(handle, length, offset, fill),
             // A writable open copies up first, so a lower-backed handle is read-only.
             OverlayFileLayer::Lower { .. } => Err(WriteError::NotForWriting),
         }

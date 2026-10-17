@@ -25,6 +25,7 @@ use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::random::RandomProvider;
 use crate::readiness::{ReadinessRegistration, ReadinessSource};
 use crate::stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream};
+use crate::transfer::{Copier, Filler, bounce_buffer};
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: u64 = 1024;
@@ -279,38 +280,58 @@ impl Backend for Devices {
             .collect())
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        _offset: usize,
+        copy: &mut Copier<'_>,
+    ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
-            Device::Stdin if buf.is_empty() => Ok(0),
-            Device::Stdin => self.stdio.read(buf).map_err(|error| match error {
+            Device::Stdin if length == 0 => Ok(0),
+            Device::Stdin => self.stdio.read(length, copy).map_err(|error| match error {
                 StdioProviderError::WouldBlock => ReadError::WouldBlock,
+                StdioProviderError::Broker(error) => ReadError::Broker(error),
                 _ => ReadError::Io,
             }),
             Device::URandom => {
-                self.random.fill(buf).map_err(|_| ReadError::Io)?;
-                Ok(buf.len())
+                let mut bytes = bounce_buffer(length)?;
+                self.random.fill(&mut bytes).map_err(|_| ReadError::Io)?;
+                copy(&bytes)?;
+                Ok(length)
             }
         }
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    /// Discards what `/dev/null` and `/dev/urandom` are written without
+    /// lending room for it.
+    fn write(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        _offset: usize,
+        fill: &mut Filler<'_>,
+    ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => StdioOutputStream::Stdout,
             Device::Stderr => StdioOutputStream::Stderr,
-            Device::Null | Device::URandom => return Ok(buf.len()),
+            Device::Null | Device::URandom => return Ok(length),
         };
-        if buf.is_empty() {
+        if length == 0 {
             return Ok(0);
         }
-        self.stdio.write(stream, buf).map_err(|error| match error {
-            StdioProviderError::WouldBlock => WriteError::WouldBlock,
-            _ => WriteError::Io,
-        })
+        self.stdio
+            .write(stream, length, fill)
+            .map_err(|error| match error {
+                StdioProviderError::WouldBlock => WriteError::WouldBlock,
+                StdioProviderError::Broker(error) => WriteError::Broker(error),
+                _ => WriteError::Io,
+            })
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {

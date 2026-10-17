@@ -6,10 +6,12 @@
 //! to be pending.
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use litebox_broker_core::BrokerError;
 use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessWatchers};
 use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
+use litebox_broker_core::transfer::{Copier, Filler, bounce_buffer};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::Mutex;
 
@@ -56,16 +58,27 @@ impl ConsoleStdio {
 }
 
 impl StdioProvider for ConsoleStdio {
-    fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
-        match self.console.read(output) {
+    fn read(&self, length: usize, copy: &mut Copier<'_>) -> Result<usize, StdioProviderError> {
+        let mut output = bounce_buffer(length)?;
+        match self.console.read(&mut output) {
             None => Ok(0),
             Some(0) => Err(StdioProviderError::WouldBlock),
-            Some(read) => Ok(read),
+            Some(read) => {
+                copy(output.get(..read).ok_or(BrokerError::Internal)?)?;
+                Ok(read)
+            }
         }
     }
 
-    fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
-        match self.console.write(stream, input) {
+    fn write(
+        &self,
+        stream: StdioOutputStream,
+        length: usize,
+        fill: &mut Filler<'_>,
+    ) -> Result<usize, StdioProviderError> {
+        let mut input = bounce_buffer(length)?;
+        fill(&mut input)?;
+        match self.console.write(stream, &input) {
             0 => Err(StdioProviderError::WouldBlock),
             written => Ok(written),
         }

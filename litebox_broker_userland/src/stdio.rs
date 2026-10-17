@@ -12,6 +12,7 @@ use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
 use litebox_broker_core::terminal::TerminalTransport;
+use litebox_broker_core::transfer::{Copier, Filler, lend_from_queue};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::terminal::HostTerminal;
@@ -194,11 +195,11 @@ impl StdioProvider for UserlandStdioProvider {
         }
     }
 
-    fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
+    fn read(&self, length: usize, copy: &mut Copier<'_>) -> Result<usize, StdioProviderError> {
         if let Some(terminal) = &self.terminals[0] {
-            return terminal.read(output);
+            return terminal.read(length, copy);
         }
-        if output.is_empty() {
+        if length == 0 {
             return Ok(0);
         }
         let mut state = self.input.lock();
@@ -213,33 +214,37 @@ impl StdioProvider for UserlandStdioProvider {
             }
             return end.map(|()| 0);
         }
-        let count = output.len().min(state.data.len());
-        for (output, input) in output.iter_mut().zip(state.data.drain(..count)) {
-            *output = input;
-        }
+        let count = length.min(state.data.len());
+        lend_from_queue(&state.data, 0..count, copy)?;
+        state.data.drain(..count);
         Ok(count)
     }
 
-    fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
+    fn write(
+        &self,
+        stream: StdioOutputStream,
+        length: usize,
+        fill: &mut Filler<'_>,
+    ) -> Result<usize, StdioProviderError> {
         if let Some(terminal) = &self.terminals[match stream {
             StdioOutputStream::Stdout => 1,
             StdioOutputStream::Stderr => 2,
         }] {
-            return terminal.write(input);
+            return terminal.write(length, fill);
         }
         let index = OutputState::index(stream);
         let mut state = self.output.lock();
         if let Some(error) = state.errors[index] {
             return Err(error);
         }
-        if input.is_empty() {
+        if length == 0 {
             return Ok(0);
         }
         let available = OUTPUT_CAPACITY - state.queued;
-        if available == 0 || (input.len() <= ATOMIC_WRITE_SIZE && available < input.len()) {
+        if available == 0 || (length <= ATOMIC_WRITE_SIZE && available < length) {
             return Err(StdioProviderError::WouldBlock);
         }
-        let count = input.len().min(available);
+        let count = length.min(available);
         if let Some(hosts) = state.hosts.take() {
             let output = Arc::clone(&self.output);
             let spawned = std::thread::Builder::new()
@@ -250,7 +255,9 @@ impl StdioProvider for UserlandStdioProvider {
                 return Err(StdioProviderError::Failed);
             }
         }
-        state.queue.push_back((index, input[..count].to_vec()));
+        let mut chunk = vec![0; count];
+        fill(&mut chunk)?;
+        state.queue.push_back((index, chunk));
         state.queued += count;
         self.output.changed.notify_all();
         Ok(count)
@@ -448,6 +455,7 @@ mod tests {
 
     use litebox_broker_core::stdio::StdioStream;
     use litebox_broker_core::stdio::{StdioOutputStream, StdioProvider, StdioProviderError};
+    use litebox_broker_core::transfer::{copy_to_slice, fill_from_slice};
     use litebox_broker_protocol::readiness::ReadinessFlags;
 
     use super::{ATOMIC_WRITE_SIZE, OUTPUT_CAPACITY, UserlandStdioProvider};
@@ -548,7 +556,7 @@ mod tests {
         let mut output = [0; 4];
 
         assert_eq!(
-            provider.read(&mut output),
+            provider.read(output.len(), &mut copy_to_slice(&mut output)),
             Err(StdioProviderError::WouldBlock)
         );
         assert_eq!(
@@ -557,31 +565,46 @@ mod tests {
         );
         sender.send(b"hi".to_vec()).unwrap();
         wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
-        assert_eq!(provider.read(&mut output), Ok(2));
+        assert_eq!(
+            provider.read(output.len(), &mut copy_to_slice(&mut output)),
+            Ok(2)
+        );
         assert_eq!(&output[..2], b"hi");
         assert_eq!(
-            provider.read(&mut output),
+            provider.read(output.len(), &mut copy_to_slice(&mut output)),
             Err(StdioProviderError::WouldBlock)
         );
 
         sender.send(Vec::new()).unwrap();
         wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
-        assert_eq!(provider.read(&mut output), Ok(0));
         assert_eq!(
-            provider.read(&mut output),
+            provider.read(output.len(), &mut copy_to_slice(&mut output)),
+            Ok(0)
+        );
+        assert_eq!(
+            provider.read(output.len(), &mut copy_to_slice(&mut output)),
             Err(StdioProviderError::WouldBlock)
         );
         sender.send(b"again".to_vec()).unwrap();
         wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
-        assert_eq!(provider.read(&mut output), Ok(4));
+        assert_eq!(
+            provider.read(output.len(), &mut copy_to_slice(&mut output)),
+            Ok(4)
+        );
         assert_eq!(&output, b"agai");
 
         drop(sender);
-        assert_eq!(provider.read(&mut output), Ok(1));
+        assert_eq!(
+            provider.read(output.len(), &mut copy_to_slice(&mut output)),
+            Ok(1)
+        );
         assert_eq!(output[0], b'n');
         for _ in 0..2 {
             wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
-            assert_eq!(provider.read(&mut output), Ok(0));
+            assert_eq!(
+                provider.read(output.len(), &mut copy_to_slice(&mut output)),
+                Ok(0)
+            );
         }
     }
 
@@ -592,15 +615,37 @@ mod tests {
         let provider = gated_provider(receiver, &output);
         let fill = vec![b'x'; OUTPUT_CAPACITY];
 
-        assert_eq!(provider.write(StdioOutputStream::Stdout, b"a"), Ok(1));
-        assert_eq!(provider.write(StdioOutputStream::Stderr, b"b"), Ok(1));
         assert_eq!(
-            provider.write(StdioOutputStream::Stdout, &fill[..OUTPUT_CAPACITY - 4]),
+            provider.write(
+                StdioOutputStream::Stdout,
+                b"a".len(),
+                &mut fill_from_slice(b"a")
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            provider.write(
+                StdioOutputStream::Stderr,
+                b"b".len(),
+                &mut fill_from_slice(b"b")
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            provider.write(
+                StdioOutputStream::Stdout,
+                fill[..OUTPUT_CAPACITY - 4].len(),
+                &mut fill_from_slice(&fill[..OUTPUT_CAPACITY - 4])
+            ),
             Ok(OUTPUT_CAPACITY - 4)
         );
         // Small writes are never split.
         assert_eq!(
-            provider.write(StdioOutputStream::Stderr, b"cde"),
+            provider.write(
+                StdioOutputStream::Stderr,
+                b"cde".len(),
+                &mut fill_from_slice(b"cde")
+            ),
             Err(StdioProviderError::WouldBlock)
         );
         // Streams are writable only when any small write would fit.
@@ -609,11 +654,19 @@ mod tests {
             ReadinessFlags::default()
         );
         assert_eq!(
-            provider.write(StdioOutputStream::Stdout, &fill[..=ATOMIC_WRITE_SIZE]),
+            provider.write(
+                StdioOutputStream::Stdout,
+                fill[..=ATOMIC_WRITE_SIZE].len(),
+                &mut fill_from_slice(&fill[..=ATOMIC_WRITE_SIZE])
+            ),
             Ok(2)
         );
         assert_eq!(
-            provider.write(StdioOutputStream::Stderr, b"c"),
+            provider.write(
+                StdioOutputStream::Stderr,
+                b"c".len(),
+                &mut fill_from_slice(b"c")
+            ),
             Err(StdioProviderError::WouldBlock)
         );
         assert_eq!(

@@ -21,6 +21,7 @@ use litebox_broker_protocol::terminal::{
 
 use crate::fs::FileResult;
 use crate::readiness::ReadinessSource;
+use crate::transfer::{Copier, lend_from_queue};
 
 /// Maximum queued input bytes and canonical record boundaries per terminal.
 pub const INPUT_CAPACITY: usize = 64 * 1024;
@@ -223,31 +224,35 @@ impl TerminalEngine {
         self.output_stopped
     }
 
-    /// Reads one canonical record, or available noncanonical bytes. `None`
-    /// means the caller must wait; `Some(0)` is a single canonical EOF or an
-    /// immediate noncanonical read.
-    pub fn read(&mut self, output: &mut [u8]) -> Option<usize> {
-        if output.is_empty() {
-            return Some(0);
+    /// Reads up to `length` bytes of one canonical record, or of the available
+    /// noncanonical bytes, lending them to `copy` (see [`crate::transfer`]).
+    /// `None` means the caller must wait; `Some(0)` is a single canonical EOF
+    /// or an immediate noncanonical read. If `copy` fails, nothing is read.
+    pub fn read(&mut self, length: usize, copy: &mut Copier<'_>) -> crate::Result<Option<usize>> {
+        if length == 0 {
+            return Ok(Some(0));
         }
-        let count = if self.settings.local.contains(L::CANONICAL) {
-            let record = self.records.front_mut()?;
-            let count = (*record).min(output.len());
+        let canonical = self.settings.local.contains(L::CANONICAL);
+        let count = if canonical {
+            let Some(&record) = self.records.front() else {
+                return Ok(None);
+            };
+            record.min(length)
+        } else {
+            if self.input.is_empty() && self.settings.minimum_read != 0 {
+                return Ok(None);
+            }
+            length.min(self.input.len())
+        };
+        lend_from_queue(&self.input, 0..count, copy)?;
+        if canonical && let Some(record) = self.records.front_mut() {
             *record -= count;
             if *record == 0 {
                 self.records.pop_front();
             }
-            count
-        } else {
-            if self.input.is_empty() && self.settings.minimum_read != 0 {
-                return None;
-            }
-            output.len().min(self.input.len())
-        };
-        for (out, byte) in output.iter_mut().zip(self.input.drain(..count)) {
-            *out = byte;
         }
-        Some(count)
+        self.input.drain(..count);
+        Ok(Some(count))
     }
 
     fn matches(byte: u8, character: u8) -> bool {
@@ -541,20 +546,42 @@ impl TerminalEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transfer::copy_to_slice;
+
+    impl TerminalEngine {
+        /// Reads into `output`, for tests that are not about lending.
+        fn read_slice(&mut self, output: &mut [u8]) -> Option<usize> {
+            self.read(output.len(), &mut copy_to_slice(output)).unwrap()
+        }
+    }
 
     #[test]
     fn canonical_editing_and_record_boundaries() {
         let mut tty = TerminalEngine::default();
         let mut output = [0; 32];
         assert_eq!(tty.receive(b"hellx\x7fo").echo, b"hellx\x08 \x08o");
-        assert_eq!(tty.read(&mut output), None);
+        assert_eq!(tty.read_slice(&mut output), None);
         tty.receive(b"\rsecond\n");
-        assert_eq!(tty.read(&mut output), Some(6));
+        assert_eq!(tty.read_slice(&mut output), Some(6));
         assert_eq!(&output[..6], b"hello\n");
-        assert_eq!(tty.read(&mut output[..3]), Some(3));
+        assert_eq!(tty.read_slice(&mut output[..3]), Some(3));
         assert_eq!(&output[..3], b"sec");
-        assert_eq!(tty.read(&mut output), Some(4));
+        assert_eq!(tty.read_slice(&mut output), Some(4));
         assert_eq!(&output[..4], b"ond\n");
+    }
+
+    #[test]
+    fn failed_copies_read_nothing() {
+        let mut tty = TerminalEngine::default();
+        tty.receive(b"line\n");
+        assert_eq!(
+            tty.read(5, &mut |_| Err(crate::BrokerError::Internal)),
+            Err(crate::BrokerError::Internal)
+        );
+        let mut output = [0; 8];
+        assert_eq!(tty.read_slice(&mut output), Some(5));
+        assert_eq!(&output[..5], b"line\n");
+        assert_eq!(tty.read_slice(&mut output), None);
     }
 
     #[test]
@@ -562,11 +589,11 @@ mod tests {
         let mut tty = TerminalEngine::default();
         tty.receive(b"abc\x04\x04next\n");
         let mut output = [0; 32];
-        assert_eq!(tty.read(&mut output), Some(3));
-        assert_eq!(tty.read(&mut output), Some(0));
-        assert_eq!(tty.read(&mut output), Some(5));
+        assert_eq!(tty.read_slice(&mut output), Some(3));
+        assert_eq!(tty.read_slice(&mut output), Some(0));
+        assert_eq!(tty.read_slice(&mut output), Some(5));
         assert_eq!(&output[..5], b"next\n");
-        assert_eq!(tty.read(&mut output), None);
+        assert_eq!(tty.read_slice(&mut output), None);
     }
 
     #[test]
@@ -581,10 +608,10 @@ mod tests {
         })
         .unwrap();
         let mut output = [0; 32];
-        assert_eq!(tty.read(&mut output), Some(7));
+        assert_eq!(tty.read_slice(&mut output), Some(7));
         let input = tty.receive(b"\x03\x04\r\n");
         assert!(input.echo.is_empty() && input.events.is_empty());
-        assert_eq!(tty.read(&mut output), Some(4));
+        assert_eq!(tty.read_slice(&mut output), Some(4));
         assert_eq!(&output[..4], b"\x03\x04\r\n");
         assert_eq!(tty.output(b"x\n", 2).1, b"x\n");
     }
@@ -661,7 +688,7 @@ mod tests {
             assert_eq!(result.echo, echo);
             assert_eq!(result.events, TerminalEvents::empty());
             let mut bytes = [0; 2];
-            assert_eq!(tty.read(&mut bytes), Some(1));
+            assert_eq!(tty.read_slice(&mut bytes), Some(1));
             assert_eq!(bytes[0], expected);
         }
         let mut tty = TerminalEngine::default();
@@ -731,7 +758,7 @@ mod tests {
             tty.receive(input);
             tty.receive(b"\x17\n");
             let mut bytes = [0; 32];
-            assert_eq!(tty.read(&mut bytes), Some(expected.len()));
+            assert_eq!(tty.read_slice(&mut bytes), Some(expected.len()));
             assert_eq!(&bytes[..expected.len()], expected);
         }
     }
@@ -786,9 +813,9 @@ mod tests {
                     tty.receive(b"\x04");
                     assert_eq!(tty.receive(b"\x15").echo, b"");
                     let mut bytes = [0; 8];
-                    assert_eq!(tty.read(&mut bytes), Some(3));
+                    assert_eq!(tty.read_slice(&mut bytes), Some(3));
                     assert_eq!(&bytes[..3], b"fo\n");
-                    assert_eq!(tty.read(&mut bytes), Some(0));
+                    assert_eq!(tty.read_slice(&mut bytes), Some(0));
                 }
             }
         }
@@ -816,7 +843,7 @@ mod tests {
             tty.configure(settings).unwrap();
             assert_eq!(tty.receive(&[byte]).echo, echo);
             let mut bytes = [0; 1];
-            assert_eq!(tty.read(&mut bytes), Some(1));
+            assert_eq!(tty.read_slice(&mut bytes), Some(1));
             assert_eq!(bytes[0], expected);
         }
     }
@@ -829,19 +856,19 @@ mod tests {
         tty.configure(settings).unwrap();
         assert_eq!(tty.receive(b"a\x12b\n").echo, b"");
         let mut bytes = [0; 8];
-        assert_eq!(tty.read(&mut bytes), Some(4));
+        assert_eq!(tty.read_slice(&mut bytes), Some(4));
         assert_eq!(&bytes[..4], b"a\x12b\n");
 
         settings.characters.reprint = b'\n';
         tty.configure(settings).unwrap();
         assert_eq!(tty.receive(b"abc\n").echo, b"");
-        assert_eq!(tty.read(&mut bytes), Some(4));
+        assert_eq!(tty.read_slice(&mut bytes), Some(4));
         assert_eq!(&bytes[..4], b"abc\n");
 
         settings.local.insert(L::ECHO_NEWLINE);
         tty.configure(settings).unwrap();
         assert_eq!(tty.receive(b"xyz\n").echo, b"\r\n");
-        assert_eq!(tty.read(&mut bytes), Some(4));
+        assert_eq!(tty.read_slice(&mut bytes), Some(4));
         assert_eq!(&bytes[..4], b"xyz\n");
     }
 
@@ -855,7 +882,7 @@ mod tests {
             assert_eq!(tty.receive(b"\x7f").echo, b"\x08".repeat(width));
             tty.receive(b"\n");
             let mut bytes = [0; 8];
-            assert_eq!(tty.read(&mut bytes), Some(prefix.len() + 1));
+            assert_eq!(tty.read_slice(&mut bytes), Some(prefix.len() + 1));
             assert_eq!(&bytes[..prefix.len()], prefix);
         }
         let mut tty = TerminalEngine::default();
@@ -869,7 +896,7 @@ mod tests {
         let mut tty = TerminalEngine::default();
         tty.receive(b"\x16\x03\n");
         let mut bytes = [0; 32];
-        assert_eq!(tty.read(&mut bytes), Some(2));
+        assert_eq!(tty.read_slice(&mut bytes), Some(2));
         assert_eq!(&bytes[..2], b"\x03\n");
         tty.configure(TerminalSettings {
             local: L::ECHO_NEWLINE,
@@ -878,8 +905,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(tty.receive(b"\n").echo, b"");
-        assert_eq!(tty.read(&mut bytes), Some(1));
-        assert_eq!(tty.read(&mut bytes), Some(0));
+        assert_eq!(tty.read_slice(&mut bytes), Some(1));
+        assert_eq!(tty.read_slice(&mut bytes), Some(0));
         tty.configure(TerminalSettings {
             local: L::CANONICAL,
             ..tty.settings()
@@ -887,7 +914,7 @@ mod tests {
         .unwrap();
         tty.receive(b"partial");
         tty.flush_input();
-        assert_eq!(tty.read(&mut bytes), None);
+        assert_eq!(tty.read_slice(&mut bytes), None);
     }
 
     #[test]
@@ -900,7 +927,7 @@ mod tests {
         tty.receive(&alloc::vec![b'x'; LINE_CAPACITY * 2]);
         tty.receive(b"\n");
         assert_eq!(
-            tty.read(&mut alloc::vec![0; LINE_CAPACITY * 2]),
+            tty.read_slice(&mut alloc::vec![0; LINE_CAPACITY * 2]),
             Some(LINE_CAPACITY)
         );
     }
@@ -945,7 +972,7 @@ mod tests {
             let mut received = Vec::new();
             let mut bytes = alloc::vec![0; INPUT_CAPACITY];
             while received.len() < paste.len() {
-                match tty.read(&mut bytes) {
+                match tty.read_slice(&mut bytes) {
                     Some(count) if count != 0 => received.extend_from_slice(&bytes[..count]),
                     _ => {
                         let consumed = tty.receive(&paste[offset..]).consumed;

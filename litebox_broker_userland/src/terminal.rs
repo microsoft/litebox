@@ -20,6 +20,7 @@ use litebox_broker_core::stdio::StdioProviderError;
 use litebox_broker_core::terminal::{
     TerminalEndpoint, TerminalEngine, TerminalEventSink, TerminalTransport, TerminalTransportError,
 };
+use litebox_broker_core::transfer::{Copier, Filler, bounce_buffer};
 use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
@@ -328,7 +329,11 @@ impl HostTerminal {
         })
     }
 
-    pub(crate) fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
+    pub(crate) fn read(
+        &self,
+        length: usize,
+        copy: &mut Copier<'_>,
+    ) -> Result<usize, StdioProviderError> {
         let mut state = self.shared.lock();
         if state.status == Status::Failed {
             return Err(StdioProviderError::Failed);
@@ -336,7 +341,7 @@ impl HostTerminal {
         if state.status == Status::HungUp {
             state.process_input();
         }
-        if let Some(count) = state.engine.read(output) {
+        if let Some(count) = state.engine.read(length, copy)? {
             state.publish_if_changed();
             self.shared.wake();
             return Ok(count);
@@ -347,18 +352,23 @@ impl HostTerminal {
         Err(StdioProviderError::WouldBlock)
     }
 
-    pub(crate) fn write(&self, input: &[u8]) -> Result<usize, StdioProviderError> {
+    pub(crate) fn write(
+        &self,
+        length: usize,
+        fill: &mut Filler<'_>,
+    ) -> Result<usize, StdioProviderError> {
         let mut state = self.shared.lock();
         if state.status != Status::Active {
             return Err(StdioProviderError::Failed);
         }
         let available = (OUTPUT_CAPACITY - state.output.len()) / state.engine.output_expansion();
-        if (available == 0 && !input.is_empty())
-            || (input.len() <= ATOMIC_WRITE_SIZE && input.len() > available)
-        {
+        if (available == 0 && length != 0) || (length <= ATOMIC_WRITE_SIZE && length > available) {
             return Err(StdioProviderError::WouldBlock);
         }
-        let (consumed, bytes) = state.engine.output(input, available);
+        // Output processing rewrites bytes, so stage them first.
+        let mut input = bounce_buffer(length.min(available))?;
+        fill(&mut input)?;
+        let (consumed, bytes) = state.engine.output(&input, available);
         state.output.extend(bytes);
         state.drained = false;
         state.publish_if_changed();
@@ -529,10 +539,21 @@ impl Drop for HostTerminal {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use litebox_broker_core::transfer::{copy_to_slice, fill_from_slice};
     use litebox_broker_platform_linux_userland::terminal::LinuxTerminal;
     use std::fs::File;
     use std::os::fd::{AsFd as _, FromRawFd as _};
     use std::time::Duration;
+
+    impl HostTerminal {
+        fn read_slice(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
+            self.read(output.len(), &mut copy_to_slice(output))
+        }
+
+        fn write_slice(&self, input: &[u8]) -> Result<usize, StdioProviderError> {
+            self.write(input.len(), &mut fill_from_slice(input))
+        }
+    }
 
     /// Returns a PTY's master and a terminal served over its slave.
     fn open_terminal() -> (File, HostTerminal) {
@@ -581,10 +602,10 @@ mod tests {
         let tabs = vec![b'\t'; OUTPUT_CAPACITY];
         assert!(!terminal.readiness().contains(ReadinessFlags::WRITE));
         assert_eq!(
-            terminal.write(&tabs[..ATOMIC_WRITE_SIZE]),
+            terminal.write_slice(&tabs[..ATOMIC_WRITE_SIZE]),
             Err(StdioProviderError::WouldBlock)
         );
-        assert!(terminal.write(&tabs).unwrap() > 0);
+        assert!(terminal.write_slice(&tabs).unwrap() > 0);
         assert!(terminal.shared.lock().output.len() <= OUTPUT_CAPACITY);
     }
 
@@ -592,13 +613,13 @@ mod tests {
     fn terminal_abandoned_drain_does_not_block_other_writers() {
         let (_master, terminal) = open_terminal();
         terminal.shared.lock().engine.receive(b"\x13");
-        assert_eq!(terminal.write(b"first"), Ok(5));
+        assert_eq!(terminal.write_slice(b"first"), Ok(5));
         assert_eq!(
             terminal.control(TerminalOperation::Drain),
             Err(litebox_broker_core::BrokerError::WouldBlock)
         );
         assert!(terminal.readiness().contains(ReadinessFlags::WRITE));
-        assert_eq!(terminal.write(b"second"), Ok(6));
+        assert_eq!(terminal.write_slice(b"second"), Ok(6));
         terminal.shared.lock().engine.receive(b"\x11");
         terminal.shared.wake();
         terminal.flush().unwrap();
@@ -609,7 +630,7 @@ mod tests {
         let (_master, terminal) = open_terminal();
         let terminal = Arc::new(terminal);
         terminal.shared.lock().engine.receive(b"\x13");
-        assert_eq!(terminal.write(b"output"), Ok(6));
+        assert_eq!(terminal.write_slice(b"output"), Ok(6));
         let (sender, receiver) = std::sync::mpsc::channel();
         let flusher = Arc::clone(&terminal);
         std::thread::spawn(move || sender.send(flusher.flush().is_ok()).unwrap());
@@ -658,11 +679,11 @@ mod tests {
         );
         drop(state);
         let mut bytes = [0; 32];
-        assert_eq!(terminal.read(&mut bytes), Ok(9));
+        assert_eq!(terminal.read_slice(&mut bytes), Ok(9));
         assert_eq!(&bytes[..9], b"buffered\n");
-        assert_eq!(terminal.read(&mut bytes), Ok(5));
+        assert_eq!(terminal.read_slice(&mut bytes), Ok(5));
         assert_eq!(&bytes[..5], b"tail\n");
-        assert_eq!(terminal.read(&mut bytes), Ok(0));
+        assert_eq!(terminal.read_slice(&mut bytes), Ok(0));
     }
 
     #[test]
@@ -697,11 +718,11 @@ mod tests {
             state.hang_up();
             drop(state);
             let mut bytes = vec![0; prefix.len()];
-            assert_eq!(terminal.read(&mut bytes), Ok(prefix.len()));
+            assert_eq!(terminal.read_slice(&mut bytes), Ok(prefix.len()));
             assert_eq!(bytes, prefix);
-            assert_eq!(terminal.read(&mut bytes), Ok(4));
+            assert_eq!(terminal.read_slice(&mut bytes), Ok(4));
             assert_eq!(&bytes[..4], b"tail");
-            assert_eq!(terminal.read(&mut bytes), Ok(0));
+            assert_eq!(terminal.read_slice(&mut bytes), Ok(0));
         }
     }
 }

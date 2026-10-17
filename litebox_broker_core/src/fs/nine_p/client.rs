@@ -15,6 +15,7 @@ use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::id_pool::IdPool;
 use super::transport::{self, Read, Write};
+use crate::transfer::{Copier, Filler};
 
 /// Pool of 9P Fid values
 struct FidPool<Platform: RawSyncPrimitivesProvider> {
@@ -196,6 +197,23 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
     {
+        self.exchange(
+            |wbuf, tag| {
+                TaggedFcall { tag, fcall }
+                    .encode_to_buf(wbuf)
+                    .map_err(|_| Error::Io)
+            },
+            f,
+        )
+    }
+
+    /// Send a request that `encode` encodes, given its tag, and wait for the
+    /// response. If `encode` fails, nothing is sent.
+    fn exchange<E, F, R>(&self, encode: E, f: F) -> Result<R, Error>
+    where
+        E: FnOnce(&mut Vec<u8>, u16) -> Result<(), Error>,
+        F: FnOnce(Fcall<'_>) -> Result<R, Error>,
+    {
         if self.transport_failed.load(Ordering::Acquire) {
             return Err(Error::Io);
         }
@@ -204,7 +222,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
         let mut write_state = self.write_state.lock();
         let ClientWriteState { transport, wbuf } = &mut *write_state;
-        if transport::write_message(transport, wbuf, TaggedFcall { tag, fcall }).is_err() {
+        encode(wbuf, tag)?;
+        if transport.write_all(wbuf).is_err() {
             self.transport_failed.store(true, Ordering::Release);
             return Err(Error::Io);
         }
@@ -441,18 +460,19 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         }
     }
 
-    /// Read from a file
+    /// Read up to `length` bytes from a file, lending them to `copy`
     pub(super) fn read(
         &self,
         fid: &Fid<Platform>,
         offset: u64,
-        buf: &mut [u8],
+        length: usize,
+        copy: &mut Copier<'_>,
     ) -> Result<usize, Error> {
         let max_count = self
             .msize
             .checked_sub(fcall::IOHDRSZ)
             .ok_or(Error::InvalidResponse)? as usize;
-        let count = buf.len().min(max_count);
+        let count = length.min(max_count);
         self.fcall(
             Fcall::Tread(fcall::Tread {
                 fid: fid.id(),
@@ -464,7 +484,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                     if data.len() > count {
                         return Err(Error::InvalidResponse);
                     }
-                    buf[..data.len()].copy_from_slice(&data);
+                    copy(&data)?;
                     Ok(data.len())
                 }
                 Fcall::Rlerror(e) => Err(Error::from(e)),
@@ -473,24 +493,25 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
     }
 
-    /// Write to a file
+    /// Write up to `length` bytes to a file, lending the room for them to
+    /// `fill` in the request
     pub(super) fn write(
         &self,
         fid: &Fid<Platform>,
         offset: u64,
-        data: &[u8],
+        length: usize,
+        fill: &mut Filler<'_>,
     ) -> Result<usize, Error> {
         let max_count = self
             .msize
             .checked_sub(fcall::IOHDRSZ)
             .ok_or(Error::InvalidResponse)? as usize;
-        let count = data.len().min(max_count);
-        self.fcall(
-            Fcall::Twrite(fcall::Twrite {
-                fid: fid.id(),
-                offset,
-                data: alloc::borrow::Cow::Borrowed(&data[..count]),
-            }),
+        let count = length.min(max_count);
+        let count_u32 = u32::try_from(count).map_err(|_| Error::InvalidResponse)?;
+        self.exchange(
+            |wbuf, tag| {
+                TaggedFcall::encode_twrite_to_buf(wbuf, tag, fid.id(), offset, count_u32, fill)
+            },
             |response| match response {
                 Fcall::Rwrite(fcall::Rwrite { count: written }) => {
                     let written = written as usize;

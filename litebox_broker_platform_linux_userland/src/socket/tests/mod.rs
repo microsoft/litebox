@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
-use litebox_broker_core::test_support::{TestBrokerCoreBuilder, fill_from};
+use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+use litebox_broker_core::transfer::fill_from_slice;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -165,7 +166,13 @@ fn send_bytes(
     data: &[u8],
     flags: SendFlags,
 ) -> BrokerResult<SocketOutcome<usize>> {
-    litebox_broker_core::socket::send(process, handle, data.len(), flags, &mut fill_from(data))
+    litebox_broker_core::socket::send(
+        process,
+        handle,
+        data.len(),
+        flags,
+        &mut fill_from_slice(data),
+    )
 }
 
 fn send_datagram(
@@ -181,7 +188,7 @@ fn send_datagram(
         data.len(),
         flags,
         destination,
-        &mut fill_from(data),
+        &mut fill_from_slice(data),
     )
 }
 

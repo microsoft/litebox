@@ -28,6 +28,9 @@ use super::errors::{
 };
 use litebox_platform::sync;
 
+use crate::BrokerError;
+use crate::transfer::{Copier, Filler};
+
 mod client;
 mod fcall;
 mod id_pool;
@@ -444,18 +447,30 @@ where
             .collect())
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        offset: usize,
+        copy: &mut Copier<'_>,
+    ) -> Result<usize, ReadError> {
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
         Ok(self
             .client
-            .read(&h.get_typed::<Self>().fid.fid, offset, buf)?)
+            .read(&h.get_typed::<Self>().fid.fid, offset, length, copy)?)
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        offset: usize,
+        fill: &mut Filler<'_>,
+    ) -> Result<usize, WriteError> {
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         Ok(self
             .client
-            .write(&h.get_typed::<Self>().fid.fid, offset, buf)?)
+            .write(&h.get_typed::<Self>().fid.fid, offset, length, fill)?)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
@@ -784,6 +799,11 @@ pub enum Error {
     /// Error reported by the 9P server, carrying the raw errno
     #[error("Remote error (errno={0})")]
     Remote(u32),
+
+    /// The broker failed the operation itself, such as when the copier or
+    /// filler it lent data to failed
+    #[error(transparent)]
+    Broker(#[from] BrokerError),
 }
 
 impl From<Error> for OpenError {
@@ -798,7 +818,7 @@ impl From<Error> for OpenError {
                 ENAMETOOLONG => OpenError::PathError(PathError::InvalidPathname),
                 _ => OpenError::Io,
             },
-            Error::Io | Error::InvalidResponse => OpenError::Io,
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => OpenError::Io,
         }
     }
 }
@@ -812,6 +832,7 @@ impl From<Error> for ReadError {
                 _ => ReadError::Io,
             },
             Error::Io | Error::InvalidResponse | Error::InvalidPathname => ReadError::Io,
+            Error::Broker(error) => ReadError::Broker(error),
         }
     }
 }
@@ -825,6 +846,7 @@ impl From<Error> for WriteError {
                 _ => WriteError::Io,
             },
             Error::Io | Error::InvalidResponse | Error::InvalidPathname => WriteError::Io,
+            Error::Broker(error) => WriteError::Broker(error),
         }
     }
 }
@@ -841,7 +863,7 @@ impl From<Error> for MkdirError {
                 ENAMETOOLONG => MkdirError::PathError(PathError::InvalidPathname),
                 _ => MkdirError::Io,
             },
-            Error::Io | Error::InvalidResponse => MkdirError::Io,
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => MkdirError::Io,
         }
     }
 }
@@ -853,7 +875,9 @@ impl From<Error> for ReadDirError {
                 ENOENT | ENOTDIR => ReadDirError::NotADirectory,
                 _ => ReadDirError::Io,
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => ReadDirError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Broker(_) => {
+                ReadDirError::Io
+            }
         }
     }
 }
@@ -870,7 +894,7 @@ impl From<Error> for UnlinkError {
                 ENAMETOOLONG => UnlinkError::PathError(PathError::InvalidPathname),
                 _ => UnlinkError::Io,
             },
-            Error::Io | Error::InvalidResponse => UnlinkError::Io,
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => UnlinkError::Io,
         }
     }
 }
@@ -887,7 +911,7 @@ impl From<Error> for RmdirError {
                 ENOTEMPTY => RmdirError::NotEmpty,
                 _ => RmdirError::Io,
             },
-            Error::Io | Error::InvalidResponse => RmdirError::Io,
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => RmdirError::Io,
         }
     }
 }
@@ -903,7 +927,7 @@ impl From<Error> for FileStatusError {
                 EPERM | EACCES => FileStatusError::PathError(PathError::NoSearchPerms),
                 _ => FileStatusError::Io,
             },
-            Error::Io | Error::InvalidResponse => FileStatusError::Io,
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => FileStatusError::Io,
         }
     }
 }
@@ -931,7 +955,9 @@ impl From<Error> for TruncateError {
                 EPERM | EACCES => TruncateError::NotForWriting,
                 _ => TruncateError::Io,
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => TruncateError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Broker(_) => {
+                TruncateError::Io
+            }
         }
     }
 }
@@ -946,7 +972,7 @@ impl From<Error> for ChmodError {
                 EPERM | EACCES => ChmodError::NotTheOwner,
                 _ => ChmodError::Io,
             },
-            Error::Io | Error::InvalidResponse => ChmodError::Io,
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => ChmodError::Io,
         }
     }
 }
@@ -961,7 +987,7 @@ impl From<Error> for ChownError {
                 EPERM | EACCES => ChownError::NotTheOwner,
                 _ => ChownError::Io,
             },
-            Error::Io | Error::InvalidResponse => ChownError::Io,
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => ChownError::Io,
         }
     }
 }
@@ -977,7 +1003,7 @@ impl From<Error> for WalkError {
                 EPERM | EACCES => WalkError::PathError(PathError::NoSearchPerms),
                 _ => WalkError::Io,
             },
-            Error::Io | Error::InvalidResponse => WalkError::Io,
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => WalkError::Io,
         }
     }
 }
