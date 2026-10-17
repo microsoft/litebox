@@ -18,6 +18,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod byte_queue;
 mod channel;
 mod error;
 pub mod event;
@@ -43,9 +44,7 @@ mod test_platform;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
-use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
@@ -73,25 +72,6 @@ use timer::TimerProvider;
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
-
-/// Copies `queue[range]` into a new vector, a contiguous slice at a time
-/// (extending from the deque's iterator copies a byte at a time).
-///
-/// # Panics
-///
-/// Panics if `range` is out of `queue`'s bounds.
-pub fn copy_queued(queue: &VecDeque<u8>, range: Range<usize>) -> Result<Vec<u8>> {
-    let (front, back) = queue.as_slices();
-    let split = front.len();
-    let mut data = Vec::new();
-    data.try_reserve_exact(range.len())
-        .map_err(|_| BrokerError::OutOfMemory)?;
-    data.extend_from_slice(&front[range.start.min(split)..range.end.min(split)]);
-    data.extend_from_slice(
-        &back[range.start.saturating_sub(split)..range.end.saturating_sub(split)],
-    );
-    Ok(data)
-}
 
 /// Broker-wide ceilings and per-process quotas for broker-owned authority state.
 ///

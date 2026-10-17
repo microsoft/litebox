@@ -47,12 +47,13 @@ use litebox_broker_protocol::unix_socket::{
 };
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
 
+use crate::byte_queue::copy_queued;
 use crate::channel::{Channel, ChannelState, Waiter, Wakeups};
 use crate::fs::File;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::socket::SocketOptions;
-use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result, copy_queued};
+use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a Unix socket operation.
 pub type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;

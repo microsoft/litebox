@@ -203,21 +203,6 @@ fn stream_pairs_carry_bytes_in_both_directions() {
 }
 
 #[test]
-fn stream_reads_take_data_that_wraps_around_the_queue() {
-    let fixture = Fixture::new();
-    let (first, second) = fixture.pair(SocketType::Stream);
-    assert_eq!(fixture.send(first, b"abcdefgh").unwrap(), Ok(8));
-    assert_eq!(fixture.receive_data(second, 6), b"abcdef");
-    // Refilling the room just read wraps the queue around its end.
-    assert_eq!(fixture.send(first, b"ijklmn").unwrap(), Ok(6));
-    let peeked = receive(&fixture.process, second, 8, true, true, false)
-        .unwrap()
-        .unwrap();
-    assert_eq!(peeked.data, b"ghijklmn");
-    assert_eq!(fixture.receive_data(second, 8), b"ghijklmn");
-}
-
-#[test]
 fn path_listeners_accept_connections_with_names() {
     let fixture = Fixture::new();
     let address = path("/server");

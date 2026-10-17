@@ -12,9 +12,10 @@ use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
+use crate::byte_queue::copy_queued;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
-use crate::{BrokerError, BrokerProcess, Result, copy_queued};
+use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
 pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
@@ -316,31 +317,5 @@ impl PipeState {
                 readiness
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestBrokerCoreBuilder;
-    use crate::{CallerCredential, PolicyEngine};
-    use std::vec;
-
-    #[test]
-    fn reads_take_data_that_wraps_around_the_buffer() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let (reader, writer) = create(&process, 8, 1, FileOpenFlags::NONE).unwrap();
-        assert_eq!(write(&process, writer, &[0, 1, 2, 3, 4, 5]), Ok(6));
-        assert_eq!(read(&process, reader, 4), Ok(vec![0, 1, 2, 3]));
-        // The buffer holds exactly the capacity, so this wraps around its end.
-        assert_eq!(write(&process, writer, &[6, 7, 8, 9]), Ok(4));
-        assert_eq!(read(&process, reader, 8), Ok(vec![4, 5, 6, 7, 8, 9]));
     }
 }

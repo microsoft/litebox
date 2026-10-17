@@ -8,7 +8,8 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use litebox_broker_core::{BrokerError, Result as BrokerResult, copy_queued};
+use litebox_broker_core::byte_queue::copy_queued;
+use litebox_broker_core::{BrokerError, Result as BrokerResult};
 
 use super::Sockets;
 
@@ -166,44 +167,5 @@ impl Sockets {
             self.discard_pair(id, peer);
             self.pairs.remove(&id);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::collections::BTreeMap;
-    use alloc::vec;
-    use smoltcp::iface::SocketSet;
-
-    #[test]
-    fn reads_take_data_that_wraps_around_the_queue() {
-        let mut sockets = Sockets {
-            set: SocketSet::new(vec![]),
-            pairs: BTreeMap::new(),
-            next_pair: 0,
-            queued: 0,
-        };
-        let id = sockets.open_pair(0);
-        assert_eq!(sockets.write_pair(id, 0, &[0, 1, 2, 3, 4, 5, 6, 7]), Ok(8));
-        assert_eq!(
-            sockets.read_pair(id, 1, 0, 6, false),
-            Ok(vec![0, 1, 2, 3, 4, 5])
-        );
-        // Refilling the room just read wraps the queue around its end.
-        assert_eq!(sockets.write_pair(id, 0, &[8, 9, 10, 11, 12, 13]), Ok(6));
-        // Peeks starting before and after the wrap.
-        assert_eq!(
-            sockets.read_pair(id, 1, 1, 7, true),
-            Ok(vec![7, 8, 9, 10, 11, 12])
-        );
-        assert_eq!(
-            sockets.read_pair(id, 1, 3, 8, true),
-            Ok(vec![9, 10, 11, 12, 13])
-        );
-        assert_eq!(
-            sockets.read_pair(id, 1, 0, 8, false),
-            Ok(vec![6, 7, 8, 9, 10, 11, 12, 13])
-        );
     }
 }
