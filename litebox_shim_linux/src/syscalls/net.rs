@@ -3052,29 +3052,54 @@ mod tests {
             },
         ];
         let read_iovs_ptr = UserPtr::from_usize(read_iovs.as_ptr().expose_provenance());
-        for attempt in 1..=3 {
-            host.send_to(b"ghijk", guest_addr).unwrap();
-            match task.sys_readv(fd, read_iovs_ptr, 2) {
-                Ok(5) => break,
-                Err(Errno::EAGAIN | Errno::ETIMEDOUT) if attempt < 3 => {}
-                result => panic!("guest readv failed after {attempt} attempt(s): {result:?}"),
-            }
-        }
-        assert_eq!(&head, b"gh");
-        assert_eq!(&tail[..3], b"ijk");
         let mut next = [0; 8];
-        for attempt in 1..=3 {
+        // Queue both datagrams before reading so a receive path that merges queued datagrams
+        // is caught (it would return 7 bytes). UDP over TUN may drop packets, so a timeout
+        // resends the pair; datagrams from earlier attempts may still arrive late, so stale
+        // copies of either payload are skipped, but anything else fails the test.
+        let send_pair = || {
+            host.send_to(b"ghijk", guest_addr).unwrap();
             host.send_to(b"lm", guest_addr).unwrap();
-            match task.sys_read(fd, &mut next, None) {
-                Ok(2) => break,
-                // A timed-out attempt can still arrive after its retry. Discard that duplicate
-                // first datagram while looking for the second one.
-                Ok(5) if &next[..5] == b"ghijk" && attempt < 3 => {}
-                Err(Errno::EAGAIN | Errno::ETIMEDOUT) if attempt < 3 => {}
-                result => panic!("guest read failed after {attempt} attempt(s): {result:?}"),
+        };
+        let mut attempt = 1;
+        send_pair();
+        let mut retry_or_panic = |result: Result<usize, Errno>| {
+            assert!(
+                matches!(result, Err(Errno::EAGAIN | Errno::ETIMEDOUT)) && attempt < 3,
+                "guest receive failed after {attempt} attempt(s): {result:?}"
+            );
+            attempt += 1;
+            send_pair();
+        };
+        loop {
+            match task.sys_readv(fd, read_iovs_ptr, 2) {
+                Ok(5) => {
+                    assert_eq!(&head, b"gh");
+                    assert_eq!(&tail[..3], b"ijk");
+                }
+                // Late duplicate of the second datagram from an earlier attempt.
+                Ok(2) if &head == b"lm" => continue,
+                result => {
+                    retry_or_panic(result);
+                    continue;
+                }
+            }
+            // A `ghijk` was just read; now read until `lm` arrives. Skip late duplicate copies
+            // of the first datagram so they cannot cause the following `lm` to be discarded.
+            let received_second = loop {
+                match task.sys_read(fd, &mut next, None) {
+                    Ok(2) if &next[..2] == b"lm" => break true,
+                    Ok(5) if &next[..5] == b"ghijk" => {}
+                    result => {
+                        retry_or_panic(result);
+                        break false;
+                    }
+                }
+            };
+            if received_second {
+                break;
             }
         }
-        assert_eq!(&next[..2], b"lm");
 
         close_socket(&task, raw_dup_fd);
         close_socket(&task, raw_fd);
