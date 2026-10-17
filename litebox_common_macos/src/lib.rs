@@ -12,10 +12,7 @@ pub mod errno;
 pub mod loader;
 pub mod syscall;
 
-// Register storage and user-pointer types are shared; syscall decoding and
-// return-value conventions are Darwin-specific.
 pub use litebox::user_pointers;
-pub use litebox_common_linux::PtRegs;
 pub use syscall::SyscallRequest;
 
 /// Return value used by Mach kernel APIs and traps.

@@ -350,10 +350,8 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileUser,
     };
-    use litebox_common_linux::vmem::CreatePagesFlags;
-    use litebox_common_macos::{
-        MmapFlags, PAGE_SIZE, PtRegs, TaskParams, VmProtection, syscall::nr,
-    };
+    use litebox_common_linux::{PtRegs, vmem::CreatePagesFlags};
+    use litebox_common_macos::{MmapFlags, PAGE_SIZE, TaskParams, VmProtection, syscall::nr};
     use litebox_platform_macos_userland::MacosUserland as Platform;
 
     const O_SHLOCK: i32 = 0x10;

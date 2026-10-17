@@ -13,8 +13,9 @@ use core::ops::Range;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::ReinterpretSignedExt as _;
 use litebox_broker_protocol::fs::FileMode;
+use litebox_common_linux::PtRegs;
 use litebox_common_macos::{
-    OpenFlags, PAGE_SIZE, PtRegs, VmProtection,
+    OpenFlags, PAGE_SIZE, VmProtection,
     loader::{MAX_IMAGE_SIZE, MachoParsedFile, TrampolineInfo, arm64_slice},
 };
 use litebox_syscall_rewriter::{

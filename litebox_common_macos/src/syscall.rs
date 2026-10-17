@@ -5,6 +5,8 @@
 
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_broker_protocol::fs::FileMode;
+#[cfg(target_arch = "aarch64")]
+use litebox_common_linux::PtRegs;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
@@ -358,7 +360,7 @@ impl SyscallRequest {
     #[cfg(target_arch = "aarch64")]
     pub fn try_from_raw(
         number: usize,
-        ctx: &crate::PtRegs,
+        ctx: &PtRegs,
         log_unsupported: impl Fn(core::fmt::Arguments<'_>),
     ) -> Result<Self, Errno> {
         Self::from_args(number, core::array::from_fn(|i| ctx.regs[i])).inspect_err(|_| {
@@ -455,7 +457,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn darwin_argument_registers() {
-        let mut ctx = crate::PtRegs::default();
+        let mut ctx = PtRegs::default();
         ctx.regs[0] = 7;
         ctx.orig_x0 = 99;
         ctx.regs[16] = nr::EXIT;

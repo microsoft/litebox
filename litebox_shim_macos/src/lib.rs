@@ -20,9 +20,9 @@ use litebox::{
     platform::PageManagementProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
-use litebox_common_linux::{mm::VmemManager, vmem::VmFlags};
+use litebox_common_linux::{PtRegs, mm::VmemManager, vmem::VmFlags};
 use litebox_common_macos::{
-    KernReturn, PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
+    KernReturn, PAGE_SIZE, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
     VmProtection, errno::Errno, loader::MachoLoaderError,
 };
 use litebox_platform::time::TimeProvider;
