@@ -3137,7 +3137,7 @@ mod tests {
         use litebox::platform::ThreadProvider;
         use litebox_broker_core::BrokerCoreLimits;
         use litebox_broker_protocol::message::ProcessRequest;
-        use litebox_common_linux::{MapFlags, ProtFlags, PtRegs, errno::Errno, vmem::PAGE_SIZE};
+        use litebox_common_linux::{MapFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};
 
         let copies_memory = !matches!(mode, ForkLauncherMode::Failure);
         let platform = crate::syscalls::tests::test_platform();
