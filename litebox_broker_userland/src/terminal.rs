@@ -67,6 +67,43 @@ impl State {
         self.watchers.publish(flags);
     }
 
+    fn process_input(&mut self) {
+        let mut input_overrun = false;
+        let mut echo_overrun = false;
+        while let Some(byte) = self.pending_input.front().copied() {
+            let result = self.engine.receive(&[byte]);
+            if result.consumed == 0 {
+                break;
+            }
+            self.pending_input.pop_front();
+            input_overrun |= result.input_overrun;
+            if result.flush_output {
+                self.output.clear();
+            }
+            // Echo is best-effort under output backpressure, as with a bounded
+            // terminal-driver echo buffer. Guest writes are never discarded.
+            let available = OUTPUT_CAPACITY - self.output.len();
+            if result.echo.len() > available {
+                echo_overrun = true;
+            }
+            self.output.extend(result.echo.into_iter().take(available));
+            if !self.output.is_empty() {
+                self.drained = false;
+            }
+            if let Some(sink) = &self.sink {
+                for event in result.events {
+                    sink.post(event);
+                }
+            }
+        }
+        if input_overrun {
+            litebox_util_log::warn!("terminal input buffer overrun");
+        }
+        if echo_overrun {
+            litebox_util_log::warn!("terminal echo buffer overrun");
+        }
+    }
+
     fn hang_up(&mut self) {
         self.status = Status::HungUp;
         self.draining = false;
@@ -160,6 +197,9 @@ impl LinuxTerminal {
         let mut state = self.shared.lock();
         if state.status == Status::Failed {
             return Err(StdioProviderError::Failed);
+        }
+        if state.status == Status::HungUp {
+            state.process_input();
         }
         if let Some(count) = state.engine.read(output) {
             self.shared.wake();
@@ -447,40 +487,7 @@ fn pump(shared: &Shared) -> io::Result<()> {
         if state.status == Status::Stopping {
             return Ok(());
         }
-        let mut input_overrun = false;
-        let mut echo_overrun = false;
-        while let Some(byte) = state.pending_input.front().copied() {
-            let result = state.engine.receive(&[byte]);
-            if result.consumed == 0 {
-                break;
-            }
-            state.pending_input.pop_front();
-            input_overrun |= result.input_overrun;
-            if result.flush_output {
-                state.output.clear();
-            }
-            // Echo is best-effort under output backpressure, as with a bounded
-            // terminal-driver echo buffer. Guest writes are never discarded.
-            let available = OUTPUT_CAPACITY - state.output.len();
-            if result.echo.len() > available {
-                echo_overrun = true;
-            }
-            state.output.extend(result.echo.into_iter().take(available));
-            if !state.output.is_empty() {
-                state.drained = false;
-            }
-            if let Some(sink) = &state.sink {
-                for event in result.events {
-                    sink.post(event);
-                }
-            }
-            if input_overrun {
-                litebox_util_log::warn!("terminal input buffer overrun");
-            }
-            if echo_overrun {
-                litebox_util_log::warn!("terminal echo buffer overrun");
-            }
-        }
+        state.process_input();
         if state.status == Status::HungUp {
             state.publish();
             shared.changed.notify_all();
@@ -683,5 +690,38 @@ mod tests {
         assert_eq!(terminal.read(&mut bytes), Ok(5));
         assert_eq!(&bytes[..5], b"tail\n");
         assert_eq!(terminal.read(&mut bytes), Ok(0));
+    }
+
+    #[test]
+    fn terminal_hangup_does_not_report_eof_before_a_backpressured_tail() {
+        use litebox_broker_protocol::terminal::{InputFlags, LocalFlags, TerminalSettings};
+
+        let (_master, mut terminal) = open_terminal();
+        // Keep the worker from winning the race this test exercises.
+        terminal.shared.lock().status = Status::Stopping;
+        terminal.shared.wake();
+        terminal.worker.take().unwrap().join().unwrap();
+        for minimum_read in [0, 1] {
+            let mut state = terminal.shared.lock();
+            let settings = TerminalSettings {
+                input: InputFlags::empty(),
+                local: LocalFlags::empty(),
+                minimum_read,
+                ..state.engine.settings()
+            };
+            state.engine.configure(settings).unwrap();
+            let prefix = vec![b'x'; state.engine.input_space() - 1];
+            assert_eq!(state.engine.receive(&prefix).consumed, prefix.len());
+            assert!(!state.engine.accepts_input());
+            state.pending_input.extend(b"tail");
+            state.hang_up();
+            drop(state);
+            let mut bytes = vec![0; prefix.len()];
+            assert_eq!(terminal.read(&mut bytes), Ok(prefix.len()));
+            assert_eq!(bytes, prefix);
+            assert_eq!(terminal.read(&mut bytes), Ok(4));
+            assert_eq!(&bytes[..4], b"tail");
+            assert_eq!(terminal.read(&mut bytes), Ok(0));
+        }
     }
 }
