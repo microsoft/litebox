@@ -1730,7 +1730,6 @@ dependencies = [
  "int-enum",
  "litebox",
  "litebox_broker_protocol",
- "litebox_syscall_rewriter",
  "litebox_trampoline",
  "litebox_util_log",
  "rangemap",

@@ -20,12 +20,8 @@ rangemap = { version = "1.5.1", features = ["const_fn"] }
 syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", features = ["derive", "alloc"] }
 
-[features]
-aarch64_gate_recovery = []
-
 [lints]
 workspace = true
 
 [dev-dependencies]
-litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

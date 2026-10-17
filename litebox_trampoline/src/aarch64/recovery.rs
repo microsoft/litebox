@@ -1,15 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Host-independent recovery for the AArch64 rewriter gate ABI.
+//! Host-independent recovery of interrupted AArch64 gates.
+//!
+//! Platforms retain their OS context types and supply only x0-x30, SP and PC.
+//! Recovery modifies working registers; discard them unless recovery succeeds.
 
-// TODO: Move shared AArch64 gate recovery and register-context types into an
-// OS-neutral module/crate: both Linux and native Darwin guests use them.
-
-use crate::PtRegs;
-use litebox::utils::TruncateExt as _;
-use litebox_trampoline::TargetHost;
-use litebox_trampoline::{
+use crate::TargetHost;
+use crate::{
     aarch64, aarch64::Frame, aarch64::FrameBase, aarch64::GATE_ALIGNMENT,
     aarch64::GATE_PC_CANDIDATE_COUNT, aarch64::GATE_SLOT_SIZES, aarch64::GateMetadata,
     aarch64::GuestSp, aarch64::MAX_GATE_SLOT_BYTES, aarch64::MSR_FRAME_BYTES,
@@ -19,13 +17,28 @@ use litebox_trampoline::{
 
 // Keep recovered contexts stack-backed: boxing would allocate in a signal handler,
 // violating the async-signal-safe contract.
+/// Recovery outcome. The core returns unit payloads; platforms can attach
+/// their own saved-context type to successful outcomes with [`Self::map`].
 #[allow(clippy::large_enum_variant)]
-pub enum Aarch64GateSignalResult {
+pub enum Aarch64GateSignalResult<Context = ()> {
     NotGate,
-    Canonicalized(PtRegs),
-    ResumeGuest(PtRegs),
+    Canonicalized(Context),
+    ResumeGuest(Context),
     PreserveSavedContext,
     InvalidRuntimeState,
+}
+
+impl<Context> Aarch64GateSignalResult<Context> {
+    /// Attach a platform context to successful recovery without changing the outcome.
+    pub fn map<T>(self, context: impl FnOnce(Context) -> T) -> Aarch64GateSignalResult<T> {
+        match self {
+            Self::NotGate => Aarch64GateSignalResult::NotGate,
+            Self::Canonicalized(value) => Aarch64GateSignalResult::Canonicalized(context(value)),
+            Self::ResumeGuest(value) => Aarch64GateSignalResult::ResumeGuest(context(value)),
+            Self::PreserveSavedContext => Aarch64GateSignalResult::PreserveSavedContext,
+            Self::InvalidRuntimeState => Aarch64GateSignalResult::InvalidRuntimeState,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,15 +58,10 @@ pub struct GateRuntimeState {
     pub expected_outbound_pc: usize,
 }
 
-fn read_usize(read: &mut impl FnMut(usize, &mut [u8]) -> bool, address: usize) -> Option<usize> {
-    let mut bytes = [0u8; size_of::<usize>()];
-    read(address, &mut bytes).then(|| usize::from_ne_bytes(bytes))
-}
-
 /// The guest ABI determines which host and register-virtualization options
 /// apply. Darwin gates always target macOS and do not virtualize x18.
 #[derive(Clone, Copy)]
-enum GateAbi {
+pub enum GateAbi {
     Linux {
         host: TargetHost,
         virtualize_x18: bool,
@@ -61,41 +69,15 @@ enum GateAbi {
     Darwin,
 }
 
-/// Recover an interrupted compact gate from normalized registers and fault-safe reads.
-/// Non-gate candidates and invalid runtime state are reported separately.
+/// Recover a gate using working architectural registers and fault-safe reads.
+///
+/// Registers may be modified on failure. Publish the working context only for
+/// `Canonicalized` or `ResumeGuest`; other outcomes must retain the original.
+/// Platform-specific bookkeeping such as Linux `orig_x0` is not handled here.
 pub fn canonicalize(
-    context: &PtRegs,
-    runtime: GateRuntimeState,
-    interruption: GateInterruption,
-    host: TargetHost,
-    virtualize_x18: bool,
-    read: impl FnMut(usize, &mut [u8]) -> bool,
-) -> Aarch64GateSignalResult {
-    canonicalize_impl(
-        context,
-        runtime,
-        interruption,
-        GateAbi::Linux {
-            host,
-            virtualize_x18,
-        },
-        read,
-    )
-}
-
-/// Recover interrupted Darwin Mach-O gates using the macOS host ABI and
-/// Darwin's red-zone-preserving frame layout.
-pub fn canonicalize_darwin(
-    context: &PtRegs,
-    runtime: GateRuntimeState,
-    interruption: GateInterruption,
-    read: impl FnMut(usize, &mut [u8]) -> bool,
-) -> Aarch64GateSignalResult {
-    canonicalize_impl(context, runtime, interruption, GateAbi::Darwin, read)
-}
-
-fn canonicalize_impl(
-    context: &PtRegs,
+    regs: &mut [usize; 31],
+    guest_sp: &mut usize,
+    guest_pc: &mut usize,
     runtime: GateRuntimeState,
     interruption: GateInterruption,
     abi: GateAbi,
@@ -109,15 +91,16 @@ fn canonicalize_impl(
         GateAbi::Darwin => (
             TargetHost::MacOs,
             false,
-            litebox_trampoline::aarch64::DARWIN_SVC_FRAME_BYTES,
+            crate::aarch64::DARWIN_SVC_FRAME_BYTES,
         ),
     };
     let svc_frame = usize::from(svc_frame);
-    let pc = context.pc as u64;
+    let pc = *guest_pc as u64;
+    let original_sp = *guest_sp;
     if !pc.is_multiple_of(4) {
         return Aarch64GateSignalResult::NotGate;
     }
-    let pc: usize = pc.trunc();
+    let pc = *guest_pc;
 
     let aligned = pc & !(GATE_ALIGNMENT - 1);
     let mut found = None;
@@ -136,9 +119,9 @@ fn canonicalize_impl(
             if !read(slot_end - 4, &mut metadata_bytes) {
                 continue;
             }
-            let Some(metadata) = litebox_trampoline::aarch64::decode_gate_metadata_word(
-                u32::from_le_bytes(metadata_bytes),
-            ) else {
+            let Some(metadata) =
+                crate::aarch64::decode_gate_metadata_word(u32::from_le_bytes(metadata_bytes))
+            else {
                 continue;
             };
             if metadata.slot_size_for_host(host) != slot_size {
@@ -160,14 +143,12 @@ fn canonicalize_impl(
                     pc as u64,
                     aarch64::GateLayout::darwin(host),
                 ),
-                GateAbi::Linux { .. } => {
-                    litebox_trampoline::aarch64::classify_copied_gate_slot_for_host(
-                        &slot[..slot_size],
-                        slot_start as u64,
-                        pc as u64,
-                        host,
-                    )
-                }
+                GateAbi::Linux { .. } => crate::aarch64::classify_copied_gate_slot_for_host(
+                    &slot[..slot_size],
+                    slot_start as u64,
+                    pc as u64,
+                    host,
+                ),
             };
             let Some(classified) = classified else {
                 continue;
@@ -187,15 +168,15 @@ fn canonicalize_impl(
     if !site.is_multiple_of(4) {
         return Aarch64GateSignalResult::NotGate;
     }
-    let site: usize = site.trunc();
+    let Ok(site) = usize::try_from(site) else {
+        return Aarch64GateSignalResult::NotGate;
+    };
     let mut original = [0u8; 4];
     if !read(site, &mut original) {
         return Aarch64GateSignalResult::NotGate;
     }
     let original = u32::from_le_bytes(original);
-    if litebox_trampoline::aarch64::decode_branch_target(original, site as u64)
-        != Some(slot_start as u64)
-    {
+    if crate::aarch64::decode_branch_target(original, site as u64) != Some(slot_start as u64) {
         return Aarch64GateSignalResult::NotGate;
     }
 
@@ -265,17 +246,20 @@ fn canonicalize_impl(
         Aarch64GateSignalResult::NotGate
     };
 
-    let mut canonical = context.clone();
+    let scratch_value = match (boundary.value, saved) {
+        (Value::Scratch, [Some(scratch), _]) => Some(regs[usize::from(scratch)]),
+        _ => None,
+    };
     let base = match boundary.frame {
         Frame::None => None,
         Frame::Live(base) | Frame::Restore(base) => Some(match base {
-            FrameBase::Sp => context.sp,
-            FrameBase::BelowSp => context.sp.wrapping_sub(frame_bytes),
+            FrameBase::Sp => original_sp,
+            FrameBase::BelowSp => original_sp.wrapping_sub(frame_bytes),
             FrameBase::Anchor => {
                 let Some(anchor) = anchor else {
                     return Aarch64GateSignalResult::InvalidRuntimeState;
                 };
-                context.regs[usize::from(anchor)].trunc()
+                regs[usize::from(anchor)]
             }
         }),
     };
@@ -312,7 +296,7 @@ fn canonicalize_impl(
     if restore {
         for (register, value) in saved.iter().zip(frame) {
             if let Some(register) = register {
-                canonical.regs[usize::from(*register)] = value;
+                regs[usize::from(*register)] = value;
             }
         }
     }
@@ -321,14 +305,14 @@ fn canonicalize_impl(
         // staged copy must equal the architectural source.
         let architectural = match source {
             31 => 0,
-            register => canonical.regs[usize::from(register)],
+            register => regs[usize::from(register)],
         };
         if frame[usize::from(MSR_FRAME_OFF_VALUE) / size_of::<usize>()] != architectural {
             return Aarch64GateSignalResult::NotGate;
         }
     }
-    canonical.sp = match (boundary.sp, base) {
-        (GuestSp::Signal, _) => context.sp,
+    *guest_sp = match (boundary.sp, base) {
+        (GuestSp::Signal, _) => original_sp,
         (GuestSp::FrameEnd, Some(base)) => base.wrapping_add(frame_bytes),
         (GuestSp::FrameEndPlusDelta, Some(base)) => base
             .wrapping_add(frame_bytes)
@@ -341,10 +325,10 @@ fn canonicalize_impl(
     let value = match boundary.value {
         Value::None => None,
         Value::Scratch => {
-            let [Some(scratch), _] = saved else {
+            let Some(value) = scratch_value else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             };
-            Some(context.regs[usize::from(scratch)].trunc())
+            Some(value)
         }
         Value::Slot => {
             let slot = if is_x18 {
@@ -352,24 +336,31 @@ fn canonicalize_impl(
             } else {
                 Some(runtime.guest_thread_pointer_addr)
             };
-            let Some(value) = slot.and_then(|slot| read_usize(&mut read, slot)) else {
+            let Some(slot) = slot else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             };
-            Some(value)
+            let mut bytes = [0u8; size_of::<usize>()];
+            if !read(slot, &mut bytes) {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            }
+            Some(usize::from_ne_bytes(bytes))
         }
     };
     if let (Some(register), Some(value)) = (value_register, value) {
-        canonical.regs[usize::from(register)] = value;
+        regs[usize::from(register)] = value;
     }
 
-    canonical.pc = match boundary.resume {
+    *guest_pc = match boundary.resume {
         Resume::Site => site,
         Resume::Next => site.wrapping_add(4),
         Resume::Taken => {
-            let Some(target) = gate.conditional_target() else {
+            let Some(target) = gate
+                .conditional_target()
+                .and_then(|target| usize::try_from(target).ok())
+            else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             };
-            target.trunc()
+            target
         }
         Resume::LogicalX18 => {
             // An indirect branch through x18 is emulated at its breakpoint;
@@ -379,51 +370,53 @@ fn canonicalize_impl(
                     return Aarch64GateSignalResult::InvalidRuntimeState;
                 };
                 if kind.writes_link_register() {
-                    canonical.regs[30] = site.wrapping_add(4);
+                    regs[30] = site.wrapping_add(4);
                 }
-                canonical.pc = target;
-                canonical.orig_x0 = canonical.regs[0];
-                return Aarch64GateSignalResult::ResumeGuest(canonical);
+                *guest_pc = target;
+                return Aarch64GateSignalResult::ResumeGuest(());
             } else {
                 site
             }
         }
     };
-    // The caller derived `orig_x0` from the interrupted `regs[0]`, which for
-    // `mrs x0, tpidr_el0` is the host anchor. Re-derive it from the repaired
-    // registers rather than exposing a host address to the guest.
-    canonical.orig_x0 = canonical.regs[0];
-    Aarch64GateSignalResult::Canonicalized(canonical)
+    Aarch64GateSignalResult::Canonicalized(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_syscall_rewriter::macho::Rewriter;
-    use litebox_trampoline::aarch64::DARWIN_SVC_FRAME_BYTES;
+    use crate::aarch64::{self, GateLayout, gate};
+    use alloc::vec::Vec;
+
+    const SITE: usize = 0x1000_0000;
+    const TRAMPOLINE: usize = 0x1000_4000;
+
+    fn darwin_gate(metadata: GateMetadata) -> ([u8; 4], Vec<u8>) {
+        let mut gates = Vec::new();
+        aarch64::emit_shared_prologue(&mut gates, 0x1234);
+        gate::build(
+            &gate::GateInstance::new(metadata, (SITE + 4) as u64),
+            GateLayout::darwin(TargetHost::MacOs),
+            (TRAMPOLINE + 16) as u64,
+            TRAMPOLINE as u64,
+        )
+        .unwrap()
+        .append_to(&mut gates);
+        aarch64::finalize_macho_trampoline(&mut gates, 96, TargetHost::MacOs).unwrap();
+        let branch = aarch64::Insn::B(i64::try_from(TRAMPOLINE + 16 - SITE).unwrap())
+            .encode()
+            .unwrap();
+        (branch.to_le_bytes(), gates)
+    }
 
     #[test]
-    #[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]
     fn host_aware_mrs_recovery_canonicalizes_middle_stages() {
-        const SITE: usize = 0x1000_0000;
-        const TRAMPOLINE: usize = 0x1000_4000;
         const GUEST_TP_SLOT: usize = 0x2000_0000;
         const GUEST_TP: usize = 0xfeed_1234;
         const DESTINATION: usize = 9;
-
-        let mut code = 0xd53b_d069u32.to_le_bytes(); // mrs x9, tpidrro_el0
-        let (gates, trapped) = Rewriter::new(TargetHost::MacOs)
-            .unwrap()
-            .patch_host_shared_cache_code(
-                &mut code,
-                SITE as u64,
-                &[0..4],
-                TRAMPOLINE as u64,
-                0x1234,
-                96,
-            )
-            .unwrap();
-        assert_eq!(trapped, []);
+        let (code, gates) = darwin_gate(GateMetadata::HostAwareMrsTpidr {
+            destination: u8::try_from(DESTINATION).unwrap(),
+        });
         let guest_tp = GUEST_TP.to_ne_bytes();
         let read = |address: usize, output: &mut [u8]| {
             for (base, bytes) in [
@@ -446,57 +439,37 @@ mod tests {
             expected_outbound_stub: 0,
             expected_outbound_pc: 0,
         };
-        for offset in [4, 8, 12, 16, 20, 24, 28, 32, 36] {
-            let mut ctx = PtRegs {
-                pc: TRAMPOLINE + 16 + offset,
-                ..PtRegs::default()
-            };
-            ctx.regs[DESTINATION] = 0xdead;
-            let Aarch64GateSignalResult::Canonicalized(recovered) =
-                canonicalize_darwin(&ctx, runtime, GateInterruption::Asynchronous, read)
-            else {
-                panic!("Darwin MRS recovery failed at offset {offset}")
-            };
-            assert_eq!(recovered.pc, SITE + 4);
-            assert_eq!(recovered.regs[DESTINATION], GUEST_TP);
-        }
-        for offset in [40, 48] {
-            let mut ctx = PtRegs {
-                pc: TRAMPOLINE + 16 + offset,
-                ..PtRegs::default()
-            };
-            ctx.regs[DESTINATION] = GUEST_TP;
-            let Aarch64GateSignalResult::Canonicalized(recovered) =
-                canonicalize_darwin(&ctx, runtime, GateInterruption::Asynchronous, read)
-            else {
-                panic!("Darwin MRS recovery failed at offset {offset}")
-            };
-            assert_eq!(recovered.pc, SITE + 4);
-            assert_eq!(recovered.regs[DESTINATION], GUEST_TP);
+        for offset in [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48] {
+            let mut regs = [0; 31];
+            let mut sp = 0;
+            let mut pc = TRAMPOLINE + 16 + offset;
+            regs[DESTINATION] = if offset >= 40 { GUEST_TP } else { 0xdead };
+            assert!(
+                matches!(
+                    canonicalize(
+                        &mut regs,
+                        &mut sp,
+                        &mut pc,
+                        runtime,
+                        GateInterruption::Asynchronous,
+                        GateAbi::Darwin,
+                        read,
+                    ),
+                    Aarch64GateSignalResult::Canonicalized(())
+                ),
+                "Darwin MRS recovery failed at offset {offset}"
+            );
+            assert_eq!(pc, SITE + 4);
+            assert_eq!(regs[DESTINATION], GUEST_TP);
         }
     }
 
     #[test]
-    #[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]
     fn darwin_svc_recovery_uses_the_real_gate_and_red_zone_frame() {
-        const SITE: usize = 0x1000_0000;
-        const TRAMPOLINE: usize = 0x1000_4000;
         const STACK: usize = 0x2000_0000;
-        const GUEST_SP: usize = STACK + DARWIN_SVC_FRAME_BYTES as usize;
-        let mut code = 0xd4001001u32.to_le_bytes();
-        let (gates, trapped) = Rewriter::new(TargetHost::MacOs)
-            .unwrap()
-            .patch_code_segment(
-                &mut code,
-                SITE as u64,
-                &[0..4],
-                TRAMPOLINE as u64,
-                0x1234,
-                96,
-            )
-            .unwrap();
-        assert_eq!(trapped, []);
-        let mut frame = [0u8; DARWIN_SVC_FRAME_BYTES as usize];
+        const GUEST_SP: usize = STACK + aarch64::DARWIN_SVC_FRAME_BYTES as usize;
+        let (code, gates) = darwin_gate(GateMetadata::Svc);
+        let mut frame = [0u8; aarch64::DARWIN_SVC_FRAME_BYTES as usize];
         frame[..8].copy_from_slice(&20usize.to_ne_bytes());
         let read = |address: usize, output: &mut [u8]| {
             for (base, bytes) in [
@@ -519,41 +492,74 @@ mod tests {
             expected_outbound_stub: 0,
             expected_outbound_pc: 0,
         };
-        for (offset, sp, x16) in [
+        for (offset, interrupted_sp, x16) in [
             (0, GUEST_SP, 20),
             (4, STACK, 20),
             (12, STACK, 0xfeed),
             (32, STACK, 0x1234),
         ] {
-            let mut ctx = PtRegs {
-                pc: TRAMPOLINE + 16 + offset,
-                sp,
-                ..PtRegs::default()
-            };
-            ctx.regs[0] = 77;
-            ctx.regs[16] = x16;
-            let Aarch64GateSignalResult::Canonicalized(recovered) =
-                canonicalize_darwin(&ctx, runtime, GateInterruption::Asynchronous, read)
-            else {
-                panic!("Darwin recovery failed at offset {offset}")
-            };
-            assert_eq!(recovered.pc, SITE);
-            assert_eq!(recovered.sp, GUEST_SP);
-            assert_eq!(recovered.regs[16], 20);
-            assert_eq!(recovered.regs[0], 77);
-            assert_eq!(recovered.orig_x0, 77);
-            // The Linux decoder must not accept a Darwin frame layout.
+            let mut regs = [0; 31];
+            regs[0] = 77;
+            regs[16] = x16;
+            let mut sp = interrupted_sp;
+            let mut pc = TRAMPOLINE + 16 + offset;
+            let mut linux_regs = regs;
+            let mut linux_sp = sp;
+            let mut linux_pc = pc;
+            assert!(
+                matches!(
+                    canonicalize(
+                        &mut regs,
+                        &mut sp,
+                        &mut pc,
+                        runtime,
+                        GateInterruption::Asynchronous,
+                        GateAbi::Darwin,
+                        read,
+                    ),
+                    Aarch64GateSignalResult::Canonicalized(())
+                ),
+                "Darwin recovery failed at offset {offset}"
+            );
+            assert_eq!(pc, SITE);
+            assert_eq!(sp, GUEST_SP);
+            assert_eq!(regs[16], 20);
+            assert_eq!(regs[0], 77);
             assert!(matches!(
                 canonicalize(
-                    &ctx,
+                    &mut linux_regs,
+                    &mut linux_sp,
+                    &mut linux_pc,
                     runtime,
                     GateInterruption::Asynchronous,
-                    TargetHost::MacOs,
-                    true,
-                    read
+                    GateAbi::Linux {
+                        host: TargetHost::MacOs,
+                        virtualize_x18: true
+                    },
+                    read,
                 ),
                 Aarch64GateSignalResult::NotGate
             ));
+        }
+    }
+
+    #[test]
+    fn context_mapping_only_runs_for_successful_recovery() {
+        assert!(matches!(
+            Aarch64GateSignalResult::Canonicalized(()).map(|()| 42),
+            Aarch64GateSignalResult::Canonicalized(42)
+        ));
+        assert!(matches!(
+            Aarch64GateSignalResult::ResumeGuest(()).map(|()| 43),
+            Aarch64GateSignalResult::ResumeGuest(43)
+        ));
+        for result in [
+            Aarch64GateSignalResult::NotGate,
+            Aarch64GateSignalResult::PreserveSavedContext,
+            Aarch64GateSignalResult::InvalidRuntimeState,
+        ] {
+            let _: Aarch64GateSignalResult<()> =
+                result.map(|()| panic!("failure mapped a context"));
         }
     }
 }

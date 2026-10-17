@@ -5,8 +5,10 @@
 //! host anchor; the guest thread pointer is virtualized in memory.
 
 use super::*;
-use litebox_common_linux::gate_recovery::GateRuntimeState;
-pub(super) use litebox_common_linux::gate_recovery::{Aarch64GateSignalResult, GateInterruption};
+pub(super) use litebox_trampoline::aarch64::recovery::GateInterruption;
+use litebox_trampoline::aarch64::recovery::{GateAbi, GateRuntimeState};
+pub(super) type Aarch64GateSignalResult =
+    litebox_trampoline::aarch64::recovery::Aarch64GateSignalResult<litebox_common_linux::PtRegs>;
 use litebox_common_linux::signal::aarch64::GuestVectorState;
 
 /// Overwrites the destination with the TLS control-block address derived from
@@ -1587,14 +1589,24 @@ fn canonicalize_aarch64_gate_signal_context_with_kind_and_copy(
 ) -> (Aarch64GateSignalResult, litebox_common_linux::PtRegs) {
     let mut registers = saved.clone();
     copy_signal_context(&mut registers, context);
-    let result = litebox_common_linux::gate_recovery::canonicalize(
-        &registers,
+    let mut canonical = registers.clone();
+    let result = litebox_trampoline::aarch64::recovery::canonicalize(
+        &mut canonical.regs,
+        &mut canonical.sp,
+        &mut canonical.pc,
         runtime,
         interruption,
-        litebox_trampoline::TargetHost::Linux,
-        cfg!(feature = "aarch64_virtualize_x18"),
+        GateAbi::Linux {
+            host: litebox_trampoline::TargetHost::Linux,
+            virtualize_x18: cfg!(feature = "aarch64_virtualize_x18"),
+        },
         read,
-    );
+    )
+    .map(|()| {
+        // Recovery may repair x0 (for example after a partial MRS into x0).
+        canonical.orig_x0 = canonical.regs[0];
+        canonical
+    });
     (result, registers)
 }
 

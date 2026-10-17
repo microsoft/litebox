@@ -622,14 +622,28 @@ fn build_host_aware_mrs(asm: &mut GateAsm, gate: &Gate<'_>) -> Result<(), BuildE
     asm.op(lookup, anchor_mask(rd))?;
     asm.tls(lookup, TlsField::Tp, Opcode::LdrUimm, rd, rd)?;
     asm.op(lookup, Insn::CbzX { rt: rd, offset: 32 })?;
-    asm.op(lookup, ldr(rd, rd, IN_GUEST_OFFSET_FROM_GUEST_TP))?;
+    asm.op(
+        lookup,
+        Insn::LdrUimm {
+            rt: rd,
+            rn: rd,
+            imm_bytes: IN_GUEST_OFFSET_FROM_GUEST_TP,
+        },
+    )?;
     asm.op(lookup, Insn::CbzX { rt: rd, offset: 24 })?;
     // Guest path: repeat the lookup, since the block pointer was
     // consumed by the mode load.
     asm.op(lookup, Insn::MrsTpidrroEl0(rd))?;
     asm.op(lookup, anchor_mask(rd))?;
     asm.tls(lookup, TlsField::Tp, Opcode::LdrUimm, rd, rd)?;
-    asm.op(lookup, ldr(rd, rd, 0))?;
+    asm.op(
+        lookup,
+        Insn::LdrUimm {
+            rt: rd,
+            rn: rd,
+            imm_bytes: 0,
+        },
+    )?;
     asm.op(done, Insn::B(8))?;
     // TargetHost path: reproduce the original instruction, including the CPU
     // tag. TargetHost signals are forwarded without gate canonicalization,
@@ -986,10 +1000,6 @@ const fn ldr_sp(rt: u8, imm_bytes: u16) -> Insn {
     }
 }
 
-const fn ldr(rt: u8, rn: u8, imm_bytes: u16) -> Insn {
-    Insn::LdrUimm { rt, rn, imm_bytes }
-}
-
 const fn stp(rt: u8, rt2: u8, imm_bytes: i16) -> Insn {
     Insn::Stp {
         rt,
@@ -1276,14 +1286,6 @@ pub(crate) fn svc_trampoline_base(
 }
 
 impl GateMetadata {
-    /// First byte past the executable body of this gate on a Linux host.
-    ///
-    /// # Panics
-    /// Panics if the metadata cannot describe an encodable gate.
-    pub fn executable_end(self) -> usize {
-        self.executable_end_for_host(TargetHost::Linux)
-    }
-
     /// First byte past the executable body of this gate on `host`.
     ///
     /// # Panics

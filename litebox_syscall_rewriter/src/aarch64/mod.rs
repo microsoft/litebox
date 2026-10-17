@@ -3177,7 +3177,9 @@ mod tests {
                 4 => matches!(metadata, GateMetadata::X18Branch { .. }),
                 _ => unreachable!(),
             });
-            for offset in (0..metadata.executable_end()).step_by(INSN_BYTES) {
+            for offset in
+                (0..metadata.executable_end_for_host(TargetHost::Linux)).step_by(INSN_BYTES)
+            {
                 let classified =
                     classify_gate_pc(&trampoline, base, base + (start + offset) as u64)
                         .expect("emitted x18 slot must classify");
@@ -3229,7 +3231,8 @@ mod tests {
         );
         let trampoline = outcome.unwrap().trampoline;
         let slot = &trampoline[GATES_START_OFFSET..];
-        let executable_end = GateMetadata::X18StackWriteback { scratch: 17 }.executable_end();
+        let executable_end = GateMetadata::X18StackWriteback { scratch: 17 }
+            .executable_end_for_host(TargetHost::Linux);
         assert_eq!(executable_end, 52);
         for offset in (0..executable_end).step_by(INSN_BYTES) {
             let classified = classify_copied_gate_slot_for_host(

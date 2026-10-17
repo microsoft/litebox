@@ -8,6 +8,7 @@
 //! discover patch sites in executable images.
 
 pub mod gate;
+pub mod recovery;
 use crate::{Error, Result, TargetHost};
 use alloc::format;
 use alloc::vec::Vec;
@@ -1106,7 +1107,7 @@ pub const X18_FRAME_BYTES: u16 = 16;
 
 /// SVC gate frame size (`SUB/ADD SP, SP, #SVC_FRAME_BYTES`). 16-byte aligned.
 ///
-/// ABI: `switch_to_guest` sets `SP` to `PtRegs::sp - SVC_FRAME_BYTES` before
+/// ABI: guest resume sets `SP` to `guest_sp - SVC_FRAME_BYTES` before
 /// entering an outbound stub, because the stub pops this frame.
 pub const SVC_FRAME_BYTES: u16 = 32;
 
@@ -2095,8 +2096,12 @@ pub const LDST_UIMM12_IMM_SHIFT: u32 = 10;
 /// gates before mutating the trampoline.
 pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<()> {
     validate_guest_offset(offset, false)?;
-    let validation =
-        validate_trampoline_offsets_for_host(trampoline, offset, false, TargetHost::Linux)?;
+    let validation = validate_trampoline_offsets_with_layout(
+        trampoline,
+        offset,
+        false,
+        GateLayout::linux(TargetHost::Linux),
+    )?;
     if validation.has_x18_gate {
         return Err(Error::TrampolinePatchFailure(
             "AArch64 trampoline contains x18 gates or placeholders; use \
@@ -2129,7 +2134,12 @@ pub fn finalize_trampoline_gates_for_host(
         )));
     }
     validate_guest_offset(guest_tpidr_offset, false)?;
-    let tp = validate_trampoline_offsets_for_host(trampoline, guest_tpidr_offset, false, host)?;
+    let tp = validate_trampoline_offsets_with_layout(
+        trampoline,
+        guest_tpidr_offset,
+        false,
+        GateLayout::linux(host),
+    )?;
     validate_guest_offset(guest_x18_offset, true)?;
     // Indirect-TLS gates patch the root pointer load; field offsets are fixed.
     let x18_patch_value = if host == TargetHost::MacOs {
@@ -2137,7 +2147,12 @@ pub fn finalize_trampoline_gates_for_host(
     } else {
         guest_x18_offset
     };
-    let x18 = validate_trampoline_offsets_for_host(trampoline, x18_patch_value, true, host)?;
+    let x18 = validate_trampoline_offsets_with_layout(
+        trampoline,
+        x18_patch_value,
+        true,
+        GateLayout::linux(host),
+    )?;
     // Both sets are validated before mutation, so an error cannot leave a partial patch.
     patch_offset_words(trampoline, &tp.patch_offsets, guest_tpidr_offset);
     patch_offset_words(trampoline, &x18.patch_offsets, x18_patch_value);
@@ -2200,8 +2215,12 @@ pub fn is_patchable_guest_x18_offset(offset: u16) -> bool {
 /// slot templates make impossible.
 pub fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
     validate_guest_offset(offset, false)?;
-    let validation =
-        validate_trampoline_offsets_for_host(trampoline, offset, false, TargetHost::Linux)?;
+    let validation = validate_trampoline_offsets_with_layout(
+        trampoline,
+        offset,
+        false,
+        GateLayout::linux(TargetHost::Linux),
+    )?;
     if validation.has_x18_gate {
         return Err(Error::TrampolinePatchFailure(
             "AArch64 trampoline contains x18 gates; use finalize_trampoline_gates_for_host".into(),
@@ -2246,20 +2265,6 @@ fn patch_offset_words(trampoline: &mut [u8], patch_offsets: &[usize], offset: u1
 struct TrampolineValidation {
     pub patch_offsets: Vec<usize>,
     pub has_x18_gate: bool,
-}
-
-fn validate_trampoline_offsets_for_host(
-    trampoline: &[u8],
-    expected_offset: u16,
-    x18: bool,
-    host: TargetHost,
-) -> Result<TrampolineValidation> {
-    validate_trampoline_offsets_with_layout(
-        trampoline,
-        expected_offset,
-        x18,
-        GateLayout::linux(host),
-    )
 }
 
 fn validate_trampoline_offsets_with_layout(
@@ -2378,7 +2383,7 @@ pub fn find_guest_x18_placeholder(trampoline: &[u8]) -> Option<usize> {
 }
 
 fn find_structured_placeholder(trampoline: &[u8], x18: bool) -> Option<usize> {
-    let validation = validate_trampoline_offsets_for_host(
+    let validation = validate_trampoline_offsets_with_layout(
         trampoline,
         if x18 {
             GUEST_X18_OFFSET_PLACEHOLDER
@@ -2386,7 +2391,7 @@ fn find_structured_placeholder(trampoline: &[u8], x18: bool) -> Option<usize> {
             GUEST_TPIDR_OFFSET_PLACEHOLDER
         },
         x18,
-        TargetHost::Linux,
+        GateLayout::linux(TargetHost::Linux),
     )
     .ok()?;
     validation.patch_offsets.into_iter().next()

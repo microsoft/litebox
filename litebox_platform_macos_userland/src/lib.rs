@@ -19,9 +19,6 @@ use litebox::platform::page_mgmt::{
 use litebox::platform::{ArchSpecificError, ArchSpecificRegister, RawConstPointer as _};
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
-use litebox_common_linux::gate_recovery::{
-    Aarch64GateSignalResult, GateInterruption, GateRuntimeState, canonicalize,
-};
 use litebox_common_linux::{GuestVectorState, PtRegs};
 use litebox_common_macos::{KernReturn, MachClock, syscall::MachTimebaseInfo};
 use litebox_platform::sync::{
@@ -30,6 +27,9 @@ use litebox_platform::sync::{
 };
 use litebox_platform::time::{
     Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
+};
+use litebox_trampoline::aarch64::recovery::{
+    Aarch64GateSignalResult, GateAbi, GateInterruption, GateRuntimeState, canonicalize,
 };
 use litebox_trampoline::{
     aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP, aarch64::IN_GUEST_OFFSET_FROM_GUEST_TP,
@@ -3209,22 +3209,28 @@ unsafe extern "C" fn exception_signal_handler(
         expected_outbound_pc: 0,
     };
     let interruption = gate_interruption(signal, code, esr);
-    let recovery = match thread_ctx.guest_abi {
-        GuestAbi::Linux => canonicalize(
-            thread_ctx.ctx,
-            runtime,
-            interruption,
-            litebox_trampoline::TargetHost::MacOs,
-            true,
-            read_guest,
-        ),
-        GuestAbi::Darwin => litebox_common_linux::gate_recovery::canonicalize_darwin(
-            thread_ctx.ctx,
-            runtime,
-            interruption,
-            read_guest,
-        ),
+    let abi = match thread_ctx.guest_abi {
+        GuestAbi::Linux => GateAbi::Linux {
+            host: litebox_trampoline::TargetHost::MacOs,
+            virtualize_x18: true,
+        },
+        GuestAbi::Darwin => GateAbi::Darwin,
     };
+    let mut canonical = thread_ctx.ctx.clone();
+    let recovery = canonicalize(
+        &mut canonical.regs,
+        &mut canonical.sp,
+        &mut canonical.pc,
+        runtime,
+        interruption,
+        abi,
+        read_guest,
+    )
+    .map(|()| {
+        // Keep the platform's syscall bookkeeping consistent with repaired x0.
+        canonical.orig_x0 = canonical.regs[0];
+        canonical
+    });
     match recovery {
         Aarch64GateSignalResult::NotGate => {}
         Aarch64GateSignalResult::Canonicalized(ctx) => *thread_ctx.ctx = ctx,
