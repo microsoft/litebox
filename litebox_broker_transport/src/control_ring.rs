@@ -1666,7 +1666,7 @@ mod tests {
             Ok(ControlRingWriteStatus::Written)
         );
         producer.wake_consumer().unwrap();
-        assert!(producer.memory().wakes().is_empty());
+        assert_eq!(producer.memory().wakes(), []);
 
         producer
             .memory()
@@ -1753,7 +1753,7 @@ mod tests {
         );
         consumer.wait_for_message(wait_epoch).unwrap();
         let memory = consumer.memory();
-        assert!(memory.waits().is_empty());
+        assert_eq!(memory.waits(), []);
         let waiting = ControlRingDirection::Requests.consumer_waiting_offset();
         assert!(
             !memory
