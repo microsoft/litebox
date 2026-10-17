@@ -11,12 +11,11 @@
 //! PA→VA uniqueness is enforced: each mapping is a private, transient window.
 
 use litebox::utils::TruncateExt;
+use litebox_common_lvbs::PAGE_SIZE;
 use rangemap::RangeSet;
 use spin::Once;
 use spin::mutex::SpinMutex;
 use x86_64::VirtAddr;
-
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 
 /// Errors of `VmapRegionAllocator`
 #[derive(Debug, thiserror::Error)]

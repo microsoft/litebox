@@ -47,7 +47,7 @@ fn ratchet_pub_uses() -> Result<()> {
             ("litebox_common_macos/", 2),
             ("litebox_platform/", 3),
             ("litebox_platform_linux_kernel/", 3),
-            ("litebox_platform_lvbs/", 3),
+            ("litebox_platform_lvbs/", 2),
             ("litebox_platform_vm_kernel/", 1),
             ("litebox_platform_vm_userland/", 1),
             ("litebox_shim_optee/", 2),

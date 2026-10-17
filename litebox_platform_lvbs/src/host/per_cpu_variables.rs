@@ -7,7 +7,6 @@ use crate::{
     arch::{gdt, instrs::rdmsr},
     mshv::{
         HV_REGISTER_VP_INDEX, HvMessage, HvVpAssistPage, vsm::ControlRegMap, vtl_switch::VtlState,
-        vtl1_mem_layout::PAGE_SIZE,
     },
 };
 use aligned_vec::avec;
@@ -21,7 +20,7 @@ use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
 use litebox::arch::x86_64::{rdgsbase, wrgsbase};
 use litebox::utils::TruncateExt;
-use litebox_common_lvbs::MAX_CORES;
+use litebox_common_lvbs::{MAX_CORES, PAGE_SIZE};
 use x86_64::VirtAddr;
 
 // Stack sizes plus 4 guard pages fill a buddy block (128 pages debug, 64 release).
