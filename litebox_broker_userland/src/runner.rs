@@ -16,16 +16,14 @@ use std::time::{Duration, Instant};
 use litebox_broker_core::BrokerCore;
 use litebox_broker_protocol::process::ProcessExitStatus;
 #[cfg(target_os = "linux")]
-use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerLaunchDescriptor;
+use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerLaunchDescriptor;
+use litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerDescriptor;
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
-#[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) use windows::AdoptedProcess;
 
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 #[cfg(target_os = "linux")]
@@ -33,13 +31,13 @@ pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
-use linux::{PlatformRunnerEndpoint, adopt_process};
+use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt_process};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use windows::{PlatformRunnerEndpoint, adopt_process};
+use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt_process};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -144,19 +142,15 @@ enum RunnerShutdownState {
 
 pub(super) enum RunnerProcess {
     Spawned(Child),
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     Adopted(AdoptedProcess),
-    #[cfg(target_os = "linux")]
-    Adopted(linux::AdoptedProcess),
 }
 
 impl RunnerProcess {
     fn id(&self) -> u32 {
         match self {
             Self::Spawned(process) => process.id(),
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            Self::Adopted(process) => process.id(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
             Self::Adopted(process) => process.id(),
         }
     }
@@ -164,9 +158,7 @@ impl RunnerProcess {
     fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
         match self {
             Self::Spawned(process) => process.try_wait(),
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            Self::Adopted(process) => process.try_wait(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
             Self::Adopted(process) => process.try_wait(),
         }
     }
@@ -174,9 +166,7 @@ impl RunnerProcess {
     fn kill(&mut self) -> IoResult<()> {
         match self {
             Self::Spawned(process) => process.kill(),
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            Self::Adopted(process) => process.kill(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
             Self::Adopted(process) => process.kill(),
         }
     }
@@ -330,12 +320,18 @@ impl RunnerInstance {
         })
     }
 
-    /// Decodes launch data and adopts an already-created runner.
+    /// Decodes runner data and adopts an already-created runner.
     pub(crate) fn adopt(
         parent: &Arc<Mutex<RunnerProcess>>,
-        launch_descriptor: &[u8],
+        runner_descriptor: &[u8],
     ) -> IoResult<Self> {
-        let descriptor = ExistingRunnerLaunchDescriptor::decode(launch_descriptor)?;
+        let descriptor = ExistingRunnerDescriptor::decode(
+            runner_descriptor,
+            parent
+                .lock()
+                .expect("parent runner process mutex poisoned")
+                .id(),
+        )?;
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
         let mut endpoint = PlatformRunnerEndpoint::create_at(descriptor.control_channel.clone())?;
         let runner = match adopt_process(parent, &descriptor) {

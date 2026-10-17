@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Native Linux process cloning for broker-adopted runners.
+//! Native Linux process operations for broker-adopted runners.
 
 use std::io::{Error, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -37,7 +37,7 @@ impl ProcessProvider for crate::LinuxUserland {
         }
     }
 
-    unsafe fn prepare_forked_process() -> Result<()> {
+    unsafe fn prepare_fork_child() -> Result<()> {
         // SAFETY: The caller is the sole cloned thread and never returns to the copied stack.
         unsafe { crate::reset_current_thread_after_process_clone() };
         // SAFETY: The clone deliberately retains only standard input, output, and error.

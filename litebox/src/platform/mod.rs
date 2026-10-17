@@ -145,16 +145,18 @@ pub trait ProcessProvider {
         Err(ForkError::Unsupported)
     }
 
-    /// Discards copied platform thread registration and inherited host connections.
+    /// Prepares platform state in the child created by [`Self::fork_process`].
     ///
-    /// Standard input, output, and error remain available. This does not reconstruct the
-    /// runner's broker connection or shim state.
+    /// Discards copied platform thread registration and inherited host connections as needed.
+    /// Standard input, output, and error remain available. This is not general initialization
+    /// for a spawned or exec'd process: it does not repair arbitrary inherited runtime locks or
+    /// reconstruct the runner's broker connection or shim state.
     ///
     /// # Safety
     ///
     /// The caller must be the sole thread in a newly cloned process and must never return
     /// through the copied guest-thread stack, including on failure.
-    unsafe fn prepare_forked_process() -> Result<(), Self::ProcessError>;
+    unsafe fn prepare_fork_child() -> Result<(), Self::ProcessError>;
 }
 
 /// Owned native child process resources created by [`ProcessProvider`].

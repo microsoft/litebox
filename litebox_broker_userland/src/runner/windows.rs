@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerLaunchDescriptor;
+use litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, validate_client_process,
 };
@@ -167,7 +167,7 @@ impl PlatformRunnerEndpoint {
 
 pub(super) fn adopt_process(
     parent: &Arc<Mutex<RunnerProcess>>,
-    descriptor: &ExistingRunnerLaunchDescriptor,
+    descriptor: &ExistingRunnerDescriptor,
 ) -> IoResult<RunnerProcess> {
     let parent = parent.lock().expect("parent runner process mutex poisoned");
     let source_handle = usize::try_from(descriptor.process_handle).map_err(|_| {

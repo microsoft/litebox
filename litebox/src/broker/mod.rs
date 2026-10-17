@@ -78,10 +78,14 @@ pub(crate) trait BrokerControl: Send + Sync {
         payload: &[u8],
     ) -> core::result::Result<(), BrokerControlError>;
 
+    /// Starts the logical guest child using an already-created host runner.
+    ///
+    /// `runner_descriptor` encodes the platform-specific host identity and control endpoint;
+    /// `payload` contains the guest startup state.
     fn start_child_with_existing_runner(
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
-        launch_descriptor: &[u8],
+        runner_descriptor: &[u8],
         payload: &[u8],
     ) -> core::result::Result<(), BrokerControlError>;
 
@@ -751,19 +755,19 @@ where
     fn start_child_with_existing_runner(
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
-        launch_descriptor: &[u8],
+        runner_descriptor: &[u8],
         payload: &[u8],
     ) -> core::result::Result<(), BrokerControlError> {
         use litebox_broker_protocol::process::{
-            MAX_EXISTING_RUNNER_START_SIZE, MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE,
+            MAX_EXISTING_RUNNER_START_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
         };
 
-        if launch_descriptor.len() > MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE as usize
+        if runner_descriptor.len() > MAX_RUNNER_DESCRIPTOR_SIZE as usize
             || payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize
         {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length = launch_descriptor
+        let length = runner_descriptor
             .len()
             .checked_add(payload.len())
             .filter(|length| *length <= MAX_EXISTING_RUNNER_START_SIZE as usize)
@@ -773,7 +777,7 @@ where
             local.start_child_with_existing_runner(
                 child_process_id,
                 shared_buffer_lease.sequence(),
-                launch_descriptor,
+                runner_descriptor,
                 payload,
             )
         })
