@@ -258,11 +258,9 @@ impl ProcessLauncher for UserlandProcessLauncher {
         startup: ProcessStartupData,
         launch_descriptor: Vec<u8>,
     ) -> Result<(), BrokerError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
         {
             let adoption = (|| {
-                let descriptor = litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerLaunchDescriptor::decode(&launch_descriptor)
-                    .map_err(|_| BrokerError::PolicyDenied)?;
                 let parent = self
                     .runners
                     .lock()
@@ -270,35 +268,8 @@ impl ProcessLauncher for UserlandProcessLauncher {
                     .get(&parent_process_id)
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or(BrokerError::PeerClosed)?;
-                RunnerInstance::adopt(&parent, &descriptor).map_err(|_| BrokerError::PolicyDenied)
-            })();
-            let instance = match adoption {
-                Ok(instance) => instance,
-                Err(error) => {
-                    let _ = process.fail_start(error, false, true);
-                    process.retire(true);
-                    return Err(error);
-                }
-            };
-            self.launch_runner_instance(
-                PendingRunnerAssociation::new(process, Some(startup), None),
-                instance,
-                None,
-            )
-        }
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        {
-            let adoption = (|| {
-                let descriptor = litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerLaunchDescriptor::decode(&launch_descriptor)
-                    .map_err(|_| BrokerError::PolicyDenied)?;
-                let parent = self
-                    .runners
-                    .lock()
-                    .expect("runner registry mutex poisoned")
-                    .get(&parent_process_id)
-                    .and_then(std::sync::Weak::upgrade)
-                    .ok_or(BrokerError::PeerClosed)?;
-                RunnerInstance::adopt(&parent, &descriptor).map_err(|_| BrokerError::PolicyDenied)
+                RunnerInstance::adopt(&parent, &launch_descriptor)
+                    .map_err(|_| BrokerError::PolicyDenied)
             })();
             let instance = match adoption {
                 Ok(instance) => instance,

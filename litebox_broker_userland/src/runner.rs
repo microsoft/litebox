@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
 use litebox_broker_protocol::process::ProcessExitStatus;
+#[cfg(target_os = "linux")]
+use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerLaunchDescriptor;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerLaunchDescriptor;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -25,17 +29,17 @@ pub(crate) use windows::AdoptedProcess;
 
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 #[cfg(target_os = "linux")]
-use linux::PlatformRunnerEndpoint;
-#[cfg(target_os = "linux")]
 pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
-#[cfg(all(windows, target_arch = "x86_64"))]
-use windows::PlatformRunnerEndpoint;
+#[cfg(target_os = "linux")]
+use linux::{PlatformRunnerEndpoint, adopt_process};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use windows::{PlatformRunnerEndpoint, adopt_process};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -326,36 +330,15 @@ impl RunnerInstance {
         })
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    /// Decodes launch data and adopts an already-created runner.
     pub(crate) fn adopt(
         parent: &Arc<Mutex<RunnerProcess>>,
-        descriptor: &litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerLaunchDescriptor,
+        launch_descriptor: &[u8],
     ) -> IoResult<Self> {
-        let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-        let endpoint = PlatformRunnerEndpoint::create_at(descriptor.control_channel.clone())?;
-        let runner = Arc::new(Mutex::new(windows::adopt_process(parent, descriptor)?));
-        let shutdown = Arc::new(RunnerShutdown {
-            runner: Arc::clone(&runner),
-            state: Mutex::new(RunnerShutdownState::Active),
-            changed: Condvar::new(),
-            termination_dispatched: AtomicBool::new(false),
-        });
-        Ok(Self {
-            runner,
-            shutdown,
-            endpoint,
-            setup_deadline,
-        })
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn adopt(
-        parent: &Arc<Mutex<RunnerProcess>>,
-        descriptor: &litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerLaunchDescriptor,
-    ) -> IoResult<Self> {
+        let descriptor = ExistingRunnerLaunchDescriptor::decode(launch_descriptor)?;
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
         let mut endpoint = PlatformRunnerEndpoint::create_at(descriptor.control_channel.clone())?;
-        let runner = match linux::adopt_process(parent, descriptor) {
+        let runner = match adopt_process(parent, &descriptor) {
             Ok(runner) => Arc::new(Mutex::new(runner)),
             Err(error) => {
                 endpoint.close();

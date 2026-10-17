@@ -614,7 +614,10 @@ where
         if range.is_empty()
             || !range.start.is_multiple_of(ALIGN)
             || !range.end.is_multiple_of(ALIGN)
-            || range.start < Platform::TASK_ADDR_MIN
+        {
+            return Err(AllocationError::Unaligned);
+        }
+        if range.start < Platform::TASK_ADDR_MIN
             || range.end > Platform::TASK_ADDR_MAX
             || self.vmas.overlaps(&range)
             || self
@@ -626,18 +629,12 @@ where
             return Err(AllocationError::AddressInUse);
         }
         // SAFETY: The caller guarantees this exact inherited range is mapped and unowned.
-        let reservation = unsafe { self.platform.adopt_pages(range.clone()) }?;
-        let extent = reservation.range();
-        if extent != range {
-            return Err(AllocationError::UnsupportedByPlatform);
-        }
-        assert!(
+        unsafe {
             self.reservations
-                .insert(extent.start, reservation)
-                .is_none()
-        );
+                .adopt_mapping(self.platform, range.clone())
+        }?;
         self.vmas.insert(
-            extent,
+            range,
             VmArea {
                 flags,
                 is_file_backed: false,
