@@ -57,7 +57,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     }
 
     unsafe fn run_child(&self, control_channel: Self::ControlChannel) -> ! {
-        // SAFETY: NtCreateUserProcess cloned only this thread, and this path never returns through
+        // SAFETY: RtlCloneUserProcess cloned only this thread, and this path never returns through
         // the copied parent task or its registration guard.
         let prepared = unsafe { Platform::prepare_fork_child() };
         let result = (|| -> Result<()> {
