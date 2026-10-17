@@ -11,7 +11,7 @@ use litebox_broker_local_userland as broker;
 use litebox_common_linux::program_startup::{
     LinuxForkStartup, LinuxProcessStartup, LinuxProgramStartup,
 };
-use litebox_common_linux::signal::SigSet;
+use litebox_common_linux::signal::{SigSet, Signal};
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
 // credentials aligned with packaged guest files and avoids truncating high host IDs.
@@ -133,6 +133,8 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         litebox_platform_linux_userland::with_guest_signals_blocked(|| {
             broker::connect(control_socket_path)
         })?;
+    // The platform replaces some of these dispositions with its own handlers.
+    let inherited_ignored_signals = inherited_ignored_signals();
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new();
     #[cfg(target_arch = "x86_64")]
@@ -252,7 +254,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     gid: u32::from(DEFAULT_GUEST_GID),
                     egid: u32::from(DEFAULT_GUEST_GID),
                     blocked_signals: SigSet::empty(),
-                    ignored_signals: SigSet::empty(),
+                    ignored_signals: inherited_ignored_signals,
                     inherited_fds: None,
                     cwd: None,
                     umask: None,
@@ -272,6 +274,30 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
 
     let program = shim.load_program(task_params, initial_thread, &prog_path, argv, envp)?;
     Ok(run_program(&shim, program))
+}
+
+/// Returns the signals this process inherited as ignored, which the initial program keeps, as it
+/// would across `execve`.
+///
+/// `SIGPIPE` is left out because the Rust runtime ignores it at startup, hiding the launcher's
+/// disposition.
+fn inherited_ignored_signals() -> SigSet {
+    let mut ignored = SigSet::empty();
+    for signal in !SigSet::empty() {
+        if signal == Signal::SIGPIPE {
+            continue;
+        }
+        // SAFETY: `sigaction` is plain data, for which all zeros is valid.
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        // SAFETY: a null new action only reads the current disposition into `action`.
+        let result =
+            unsafe { libc::sigaction(signal.as_i32(), core::ptr::null(), &raw mut action) };
+        // Signals the C library reserves for itself fail and are never ignored.
+        if result == 0 && action.sa_sigaction == libc::SIG_IGN {
+            ignored.add(signal);
+        }
+    }
+    ignored
 }
 
 /// Runs the loaded `program` until it exits, returning its exit code.

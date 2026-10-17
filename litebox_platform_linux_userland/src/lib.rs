@@ -1333,9 +1333,10 @@ fn register_exception_handlers() {
                 libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
                 let mut old_sa = core::mem::zeroed();
                 sigaction(sig, Some(&sa), &mut old_sa);
-                assert_eq!(
-                    old_sa.sa_sigaction,
-                    libc::SIG_DFL,
+                // Launchers may hand down `SIG_IGN` (e.g., to background jobs). Replacing it is
+                // fine because the guest's own disposition decides whether to ignore the signal.
+                assert!(
+                    old_sa.sa_sigaction == libc::SIG_DFL || old_sa.sa_sigaction == libc::SIG_IGN,
                     "signal {sig} handler already installed",
                 );
             }

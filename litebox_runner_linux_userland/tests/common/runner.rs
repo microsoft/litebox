@@ -31,6 +31,8 @@ pub(crate) struct Runner {
     in_process_mode: bool,
     #[cfg(target_os = "linux")]
     allow_process_duplication: bool,
+    #[cfg(target_os = "linux")]
+    ignored_host_signals: Vec<libc::c_int>,
     has_run: bool,
 }
 
@@ -105,6 +107,8 @@ impl Runner {
             in_process_mode: false,
             #[cfg(target_os = "linux")]
             allow_process_duplication: false,
+            #[cfg(target_os = "linux")]
+            ignored_host_signals: Vec::new(),
             has_run: false,
             unique_name: unique_name.to_owned(),
         }
@@ -174,6 +178,13 @@ impl Runner {
     #[cfg(target_os = "linux")]
     pub(crate) fn allow_proxy_host(&mut self, host: impl AsRef<OsStr>) -> &mut Self {
         self.managed_proxy_hosts.push(host.as_ref().to_os_string());
+        self
+    }
+
+    /// Starts the launched process with `signal` ignored, as shells do for background jobs.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ignore_host_signal(&mut self, signal: libc::c_int) -> &mut Self {
+        self.ignored_host_signals.push(signal);
         self
     }
 
@@ -257,6 +268,24 @@ impl Runner {
             }
             command.args(runner_arguments);
             self.command = command;
+        }
+
+        #[cfg(target_os = "linux")]
+        if !self.ignored_host_signals.is_empty() {
+            let signals = self.ignored_host_signals.clone();
+            let ignore_signals = move || {
+                for &signal in &signals {
+                    // SAFETY: `signal` is async-signal-safe, so the forked child may call it.
+                    if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            };
+            // SAFETY: the closure only calls async-signal-safe functions and allocates nothing.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut self.command, ignore_signals);
+            }
         }
     }
 

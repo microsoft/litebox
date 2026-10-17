@@ -69,6 +69,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_inet_parent.c",
     "fork_unix_parent.c",
     "gate_signals.c",
+    "inherited_ignored_signals.c",
     "process_group_parent.c",
     "process_tree_parent.c",
     "sigreturn.c",
@@ -1220,6 +1221,29 @@ fn process_groups_and_sessions_span_processes() {
             .lines()
             .any(|line| line == "process-group failures=0"),
         "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn initial_program_inherits_ignored_signals() {
+    let program = common::compile(
+        "./tests/inherited_ignored_signals.c",
+        "inherited_ignored_signals",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&program, "inherited_ignored_signals");
+    for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGALRM, libc::SIGPIPE] {
+        runner.ignore_host_signal(signal);
+    }
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    // The Rust runtime ignores `SIGPIPE` in every runner, hiding the launcher's choice.
+    assert_eq!(
+        output,
+        "SIGHUP=ignored\nSIGINT=ignored\nSIGALRM=ignored\nSIGPIPE=default\nSIGTERM=default\n\
+         survived SIGINT\n"
     );
 }
 
