@@ -52,7 +52,7 @@ use crate::fs::File;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::socket::SocketOptions;
-use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
+use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result, copy_queued};
 
 /// Guest-visible result of a Unix socket operation.
 pub type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;
@@ -1245,13 +1245,7 @@ impl Socket {
                 };
             }
             let length = capacity.min(channel.queue.bytes.len());
-            let mut data = Vec::new();
-            data.try_reserve_exact(length)
-                .map_err(|_| BrokerError::OutOfMemory)?;
-            let (front, back) = channel.queue.bytes.as_slices();
-            let from_front = length.min(front.len());
-            data.extend_from_slice(&front[..from_front]);
-            data.extend_from_slice(&back[..length - from_front]);
+            let data = copy_queued(&channel.queue.bytes, 0..length)?;
             if peek {
                 (data, Wakeups::default())
             } else {

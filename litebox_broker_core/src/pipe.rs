@@ -14,7 +14,7 @@ use spin::rwlock::RwLock;
 
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
-use crate::{BrokerError, BrokerProcess, Result};
+use crate::{BrokerError, BrokerProcess, Result, copy_queued};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
 pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
@@ -151,13 +151,7 @@ impl PipeObject {
         }
 
         let read_len = length.min(state.data.len());
-        let mut data = Vec::new();
-        data.try_reserve_exact(read_len)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        let (front, back) = state.data.as_slices();
-        let from_front = read_len.min(front.len());
-        data.extend_from_slice(&front[..from_front]);
-        data.extend_from_slice(&back[..read_len - from_front]);
+        let data = copy_queued(&state.data, 0..read_len)?;
         state.data.drain(..read_len);
         state.publish(PipeEndpoint::Write);
         Ok(data)
