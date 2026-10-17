@@ -788,6 +788,18 @@ impl From<litebox::platform::ArchSpecificError> for Errno {
     }
 }
 
+impl From<litebox_broker_protocol::terminal::TerminalError> for Errno {
+    fn from(value: litebox_broker_protocol::terminal::TerminalError) -> Self {
+        use litebox_broker_protocol::terminal::TerminalError;
+        match value {
+            TerminalError::NotTerminal => Errno::ENOTTY,
+            TerminalError::Unsupported => Errno::EOPNOTSUPP,
+            TerminalError::InvalidSettings => Errno::EINVAL,
+            TerminalError::Io => Errno::EIO,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Errno;

@@ -25,13 +25,10 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
     FileStatusFlags, FileType, FileUser,
 };
-use litebox_broker_protocol::terminal::{
-    ControlCharacters, InputFlags, LocalFlags, OutputFlags, TerminalSettings,
-};
 use litebox_common_linux::{
     AccessFlags, AtFlags, CloseRangeFlags, EfdFlags, EpollCreateFlags, FcntlArg,
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, PAGE_SIZE,
-    Statx, StatxMask, Termios, TimeParam,
+    Statx, StatxMask, TimeParam,
     errno::Errno,
     program_startup::{ForkedFd, InheritedFd, InheritedFdKind},
     signal::Signal,
@@ -2516,137 +2513,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
-const TERMIOS_INPUT: &[(u32, InputFlags)] = &[
-    (0x20, InputFlags::STRIP_HIGH_BIT),
-    (0x40, InputFlags::NEWLINE_TO_CARRIAGE_RETURN),
-    (0x80, InputFlags::IGNORE_CARRIAGE_RETURN),
-    (0x100, InputFlags::CARRIAGE_RETURN_TO_NEWLINE),
-    (0x400, InputFlags::SOFTWARE_FLOW_CONTROL),
-    (0x800, InputFlags::RESTART_OUTPUT_ON_INPUT),
-    (0x4000, InputFlags::UTF8_ERASE),
-];
-const TERMIOS_OUTPUT: &[(u32, OutputFlags)] = &[
-    (1, OutputFlags::PROCESS),
-    (4, OutputFlags::NEWLINE_TO_CRLF),
-    (8, OutputFlags::CARRIAGE_RETURN_TO_NEWLINE),
-    (0x10, OutputFlags::OMIT_CARRIAGE_RETURN_AT_COLUMN_ZERO),
-    (0x20, OutputFlags::NEWLINE_RETURNS_CARRIAGE),
-];
-const TERMIOS_LOCAL: &[(u32, LocalFlags)] = &[
-    (1, LocalFlags::GENERATE_EVENTS),
-    (2, LocalFlags::CANONICAL),
-    (8, LocalFlags::ECHO),
-    (0x10, LocalFlags::ECHO_ERASE),
-    (0x20, LocalFlags::ECHO_KILL),
-    (0x40, LocalFlags::ECHO_NEWLINE),
-    (0x80, LocalFlags::NO_FLUSH_ON_EVENT),
-    (0x200, LocalFlags::ECHO_CONTROL),
-    (0x800, LocalFlags::ECHO_KILL_ERASE),
-    (0x8000, LocalFlags::EXTENDED_EDITING),
-];
-// The virtual endpoint transports eight-bit bytes, not a configurable UART:
-// CS8 | CREAD | B38400. Hardware configuration is deliberately unsupported.
-const TERMIOS_CONTROL: u32 = 0x30 | 0x80 | 0xf;
-
-fn termios_from_settings(settings: TerminalSettings) -> Termios {
-    let c = settings.characters;
-    Termios {
-        c_iflag: TERMIOS_INPUT
-            .iter()
-            .filter(|(_, f)| settings.input.contains(*f))
-            .map(|(b, _)| *b)
-            .sum(),
-        c_oflag: TERMIOS_OUTPUT
-            .iter()
-            .filter(|(_, f)| settings.output.contains(*f))
-            .map(|(b, _)| *b)
-            .sum(),
-        c_lflag: TERMIOS_LOCAL
-            .iter()
-            .filter(|(_, f)| settings.local.contains(*f))
-            .map(|(b, _)| *b)
-            .sum(),
-        c_cflag: TERMIOS_CONTROL,
-        c_line: 0,
-        c_cc: [
-            c.interrupt,
-            c.quit,
-            c.erase,
-            c.kill,
-            c.end_of_file,
-            0,
-            settings.minimum_read,
-            0,
-            c.start,
-            c.stop,
-            0,
-            c.end_of_line,
-            c.reprint,
-            0,
-            c.word_erase,
-            c.literal_next,
-            c.end_of_line2,
-            0,
-            0,
-        ],
-    }
-}
-
-fn settings_from_termios(termios: &Termios) -> Result<TerminalSettings, Errno> {
-    if termios.c_line != 0
-        || termios.c_cflag != TERMIOS_CONTROL
-        || termios.c_iflag & !TERMIOS_INPUT.iter().map(|(b, _)| *b).sum::<u32>() != 0
-        || termios.c_oflag & !TERMIOS_OUTPUT.iter().map(|(b, _)| *b).sum::<u32>() != 0
-        || termios.c_lflag & !TERMIOS_LOCAL.iter().map(|(b, _)| *b).sum::<u32>() != 0
-        || [5, 7, 10, 13, 17, 18]
-            .iter()
-            .any(|&index| termios.c_cc[index] != 0)
-        || termios.c_cc[6] > 1
-    {
-        log_unsupported!("terminal settings {:?}", termios);
-        return Err(Errno::EINVAL);
-    }
-    let mut input = InputFlags::empty();
-    let mut output = OutputFlags::empty();
-    let mut local = LocalFlags::empty();
-    for &(bit, flag) in TERMIOS_INPUT {
-        if termios.c_iflag & bit != 0 {
-            input |= flag;
-        }
-    }
-    for &(bit, flag) in TERMIOS_OUTPUT {
-        if termios.c_oflag & bit != 0 {
-            output |= flag;
-        }
-    }
-    for &(bit, flag) in TERMIOS_LOCAL {
-        if termios.c_lflag & bit != 0 {
-            local |= flag;
-        }
-    }
-    let c = termios.c_cc;
-    Ok(TerminalSettings {
-        input,
-        output,
-        local,
-        characters: ControlCharacters {
-            interrupt: c[0],
-            quit: c[1],
-            erase: c[2],
-            kill: c[3],
-            end_of_file: c[4],
-            start: c[8],
-            stop: c[9],
-            end_of_line: c[11],
-            reprint: c[12],
-            word_erase: c[14],
-            literal_next: c[15],
-            end_of_line2: c[16],
-        },
-        minimum_read: c[6],
-    })
-}
-
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
@@ -2713,14 +2579,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn terminal_ioctl(&self, file: &File<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
         use litebox_broker_protocol::terminal::{
-            ChangeTiming, TerminalError, TerminalOperation as Op, TerminalResponse, WindowSize,
+            ChangeTiming, TerminalOperation as Op, TerminalResponse, TerminalSettings,
         };
         let operation = match arg {
             IoctlArg::TCGETS(_) => Op::GetSettings,
             IoctlArg::TCSETS(ptr) | IoctlArg::TCSETSW(ptr) | IoctlArg::TCSETSF(ptr) => {
                 let termios = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                let settings = TerminalSettings::try_from(&termios).inspect_err(|_| {
+                    log_unsupported!("terminal settings {:?}", termios);
+                })?;
                 Op::SetSettings {
-                    settings: settings_from_termios(&termios)?,
+                    settings,
                     timing: match arg {
                         IoctlArg::TCSETSW(_) => ChangeTiming::AfterOutput,
                         IoctlArg::TCSETSF(_) => ChangeTiming::AfterOutputAndFlushInput,
@@ -2731,12 +2600,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             IoctlArg::TIOCGWINSZ(_) => Op::GetWindowSize,
             IoctlArg::TIOCSWINSZ(ptr) => {
                 let size = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-                Op::SetWindowSize(WindowSize {
-                    rows: size.row,
-                    columns: size.col,
-                    x_pixels: size.xpixel,
-                    y_pixels: size.ypixel,
-                })
+                Op::SetWindowSize(size.into())
             }
             IoctlArg::TCFLSH(selector) => {
                 if *selector > 2 {
@@ -2757,29 +2621,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let response = file
             .file()
-            .terminal_control(operation, Some(&self.wait_cx()))?
-            .map_err(|error| match error {
-                TerminalError::NotTerminal => Errno::ENOTTY,
-                TerminalError::Unsupported => Errno::EOPNOTSUPP,
-                TerminalError::InvalidSettings => Errno::EINVAL,
-                TerminalError::Io => Errno::EIO,
-            })?;
+            .terminal_control(operation, Some(&self.wait_cx()))??;
         match (arg, response) {
             (IoctlArg::TCGETS(ptr), TerminalResponse::Settings(settings)) => {
-                ptr.write_at_offset::<Platform>(0, termios_from_settings(settings))
+                ptr.write_at_offset::<Platform>(0, settings.into())
                     .ok_or(Errno::EFAULT)?;
             }
             (IoctlArg::TIOCGWINSZ(ptr), TerminalResponse::WindowSize(size)) => {
-                ptr.write_at_offset::<Platform>(
-                    0,
-                    litebox_common_linux::Winsize {
-                        row: size.rows,
-                        col: size.columns,
-                        xpixel: size.x_pixels,
-                        ypixel: size.y_pixels,
-                    },
-                )
-                .ok_or(Errno::EFAULT)?;
+                ptr.write_at_offset::<Platform>(0, size.into())
+                    .ok_or(Errno::EFAULT)?;
             }
             (_, TerminalResponse::Done) => {}
             _ => return Err(Errno::EIO),
@@ -3441,32 +3291,6 @@ mod tests {
     use core::cell::Cell;
 
     extern crate std;
-
-    #[test]
-    fn supported_settings_round_trip() {
-        let settings = TerminalSettings::default();
-        assert_eq!(
-            settings_from_termios(&termios_from_settings(settings)),
-            Ok(settings)
-        );
-        let mut raw = termios_from_settings(settings);
-        raw.c_iflag = 0;
-        raw.c_oflag = 0;
-        raw.c_lflag = 0;
-        assert!(settings_from_termios(&raw).is_ok());
-    }
-
-    #[test]
-    fn unsupported_modes_are_not_silently_accepted() {
-        for (index, value) in [(5, 1), (6, 2), (10, 26), (13, 15)] {
-            let mut settings = termios_from_settings(TerminalSettings::default());
-            settings.c_cc[index] = value;
-            assert_eq!(settings_from_termios(&settings), Err(Errno::EINVAL));
-        }
-        let mut settings = termios_from_settings(TerminalSettings::default());
-        settings.c_lflag |= 0x100; // TOSTOP requires job control.
-        assert_eq!(settings_from_termios(&settings), Err(Errno::EINVAL));
-    }
 
     #[test]
     fn write_to_iovec_returns_partial_after_later_error() {
