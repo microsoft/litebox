@@ -481,29 +481,14 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             Events::IN,
             || self.receive_timeout(),
             || loop {
-                let mut destination = if wait_all && !peek {
-                    buf.window(received, target_len - received)
-                } else {
-                    buf.window(0, target_len)
-                };
+                let mut destination = buf.window(received, target_len - received);
                 match self.socket.try_read(
                     &mut destination,
                     receive_flags,
                     source_addr.as_deref_mut(),
                 ) {
-                    Ok(n) if !wait_all => return Ok(n),
-                    Ok(n) if peek => {
-                        received = n;
-                        if received == target_len
-                            || self
-                                .socket
-                                .check_io_events()
-                                .intersects(Events::ERR | Events::HUP | Events::RDHUP)
-                        {
-                            return Ok(received);
-                        }
-                        return Err(TryOpError::TryAgain);
-                    }
+                    // A `WAITALL` peek already waited for all its bytes.
+                    Ok(n) if !wait_all || peek => return Ok(n),
                     Ok(n) => {
                         received += n;
                         if received == target_len {

@@ -25,7 +25,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// with one request per transfer.
     ///
     /// A [`ReceiveFlags::DISCARD`] read consumes the bytes without copying
-    /// them into `buffer`.
+    /// them into `buffer`. A [`ReceiveFlags::WAITALL`] peek waits for all the
+    /// bytes it peeks at, so it returns fewer only if the stream ended or
+    /// failed, or a copy faulted.
     pub(super) fn read_stream(
         &self,
         buffer: &mut (impl ReadBuffer + ?Sized),
@@ -114,13 +116,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
                 }
                 Err(error) => {
                     let error = BrokerObjectError::from(error);
-                    // A fault loses only the bytes it would have peeked.
-                    if offset != 0
-                        && matches!(
-                            error,
-                            BrokerObjectError::WouldBlock | BrokerObjectError::Fault
-                        )
-                    {
+                    // A fault loses only the bytes it would have peeked. A
+                    // `WAITALL` peek whose bytes were consumed meanwhile
+                    // waits for them again from the start.
+                    let partial = match error {
+                        BrokerObjectError::Fault => true,
+                        BrokerObjectError::WouldBlock => {
+                            !broker_flags.contains(BrokerReceiveFlags::WAITALL)
+                        }
+                        _ => false,
+                    };
+                    if offset != 0 && partial {
                         return Ok(offset);
                     }
                     return Err(error.into());
