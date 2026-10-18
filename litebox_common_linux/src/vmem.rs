@@ -601,42 +601,6 @@ where
         }
     }
 
-    /// Takes ownership of an existing platform mapping and records its Linux VMA.
-    ///
-    /// # Safety
-    ///
-    /// `range` must identify an exact inherited mapping that has no other owner in this process.
-    pub(super) unsafe fn adopt_mapping(
-        &mut self,
-        range: Range<usize>,
-        flags: VmFlags,
-    ) -> Result<(), AllocationError> {
-        if range.start < Platform::TASK_ADDR_MIN
-            || range.end > Platform::TASK_ADDR_MAX
-            || self.vmas.overlaps(&range)
-            || self
-                .reservations
-                .overlapping(range.clone())
-                .next()
-                .is_some()
-        {
-            return Err(AllocationError::AddressInUse);
-        }
-        // SAFETY: The caller guarantees this exact inherited range is mapped and unowned.
-        unsafe {
-            self.reservations
-                .adopt_mapping(self.platform, range.clone())
-        }?;
-        self.vmas.insert(
-            range,
-            VmArea {
-                flags,
-                is_file_backed: false,
-            },
-        );
-        Ok(())
-    }
-
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
     /// ordered by key range.
     pub(super) fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {

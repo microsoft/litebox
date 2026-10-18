@@ -13,8 +13,8 @@ use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{
-            AllocationDirection, AllocationError, CowAllocationError, DeallocationError,
-            MemoryRegionPermissions, RemapError,
+            AllocationDirection, CowAllocationError, DeallocationError, MemoryRegionPermissions,
+            RemapError,
         },
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
@@ -59,18 +59,15 @@ where
         Self { vmem }
     }
 
-    /// Takes ownership of an existing platform mapping and records its Linux flags.
+    /// Rebinds an inherited memory manager to the native child's platform.
     ///
     /// # Safety
     ///
-    /// `range` must identify an exact inherited mapping that has no other owner in this process.
-    pub unsafe fn adopt_existing_pages(
-        &self,
-        range: Range<usize>,
-        flags: VmFlags,
-    ) -> Result<(), AllocationError> {
-        // SAFETY: The caller supplies the ownership and mapping guarantees required by Vmem.
-        unsafe { self.vmem.write().adopt_mapping(range, flags) }
+    /// The caller must exclusively control the manager after a native clone, with no held locks.
+    /// `platform` must be able to manage every inherited mapping and reservation. The copied
+    /// parent runtime must never use this manager again.
+    pub unsafe fn rebind_platform_after_clone(&self, platform: &'static Platform) {
+        self.vmem.write().platform = platform;
     }
 
     /// Attempt a native copy-on-write mapping backed by static data.
@@ -622,6 +619,14 @@ where
                     | MemoryRegionPermissions::EXEC,
             )
         }
+    }
+
+    /// Returns whether any mapping has shared-memory semantics.
+    pub fn has_shared_mappings(&self) -> bool {
+        self.vmem
+            .read()
+            .iter()
+            .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED))
     }
 
     /// Returns all mappings in a vector.

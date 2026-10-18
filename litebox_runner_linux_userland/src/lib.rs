@@ -7,6 +7,7 @@ use litebox::platform::{ProcessHandle as _, ProcessProvider};
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use litebox_platform_linux_userland::SeccompScope;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use litebox_broker_local_userland as broker;
 use litebox_broker_transport_linux_userland::existing_runner::{
@@ -29,15 +30,9 @@ const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
     "NO_PROXY",
 ];
 
-fn fork_launcher() -> litebox_shim_linux::syscalls::process::ForkLauncher {
-    // SAFETY: The bootstrap abandons the copied task, resets platform state, and reconnects
-    // through its owned control-channel path before running the guest in a fresh shim.
-    unsafe {
-        litebox_shim_linux::syscalls::process::ForkLauncher::new::<Platform>(NativeForkRunner)
-    }
+struct NativeForkRunner {
+    memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
 }
-
-struct NativeForkRunner;
 
 impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkRunner {
     type ControlChannel = PathBuf;
@@ -101,11 +96,27 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
                     litebox.broker_notification_dispatcher(),
                 )
             })?;
-            let shim = litebox_shim_linux::LinuxShimBuilder::new_with_litebox(
-                platform, litebox, process_id,
-            )
-            .with_fork_launcher(fork_launcher())
-            .build();
+            // SAFETY: Sibling guests were paused with memory-manager locks released before the
+            // clone. The fresh platform supports the inherited mappings, and the old runtime
+            // is abandoned.
+            let builder = unsafe {
+                litebox_shim_linux::LinuxShimBuilder::new_for_native_fork(
+                    platform,
+                    litebox,
+                    process_id,
+                    Arc::clone(&self.memory),
+                )
+            };
+            // SAFETY: The bootstrap abandons the copied task, resets platform state, and
+            // reconnects to the broker before running the guest in a fresh shim.
+            let launcher = unsafe {
+                litebox_shim_linux::syscalls::process::ForkLauncher::new::<Platform>(
+                    NativeForkRunner {
+                        memory: Arc::clone(builder.memory_manager()),
+                    },
+                )
+            };
+            let shim = builder.with_fork_launcher(launcher).build();
             let startup = startup.context("native fork child has no startup data")?;
             let LinuxProcessStartup::Fork(startup) = LinuxProcessStartup::decode(&startup.payload)
                 .context("invalid native fork child startup")?
@@ -115,7 +126,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             // SAFETY: The startup describes this clone's inherited guest mappings. The fresh
             // shim takes ownership, and this path never returns to the copied parent runtime.
             let program = unsafe { shim.restore_fork_from_native_clone(*startup, initial_thread) }
-                .context("failed to adopt native fork memory")?;
+                .context("failed to restore native fork state")?;
             Ok(run_program(&shim, program))
         })();
         let status = match result {
@@ -274,7 +285,14 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
     let shim_builder =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
     let shim_builder = if native_fork_enabled {
-        shim_builder.with_fork_launcher(fork_launcher())
+        // SAFETY: The bootstrap abandons the copied task, resets platform state, and
+        // reconnects to the broker before running the guest in a fresh shim.
+        let launcher = unsafe {
+            litebox_shim_linux::syscalls::process::ForkLauncher::new::<Platform>(NativeForkRunner {
+                memory: Arc::clone(shim_builder.memory_manager()),
+            })
+        };
+        shim_builder.with_fork_launcher(launcher)
     } else {
         shim_builder
     };

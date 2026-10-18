@@ -78,11 +78,12 @@ static int wait_for(pid_t child, const char *name, int options) {
 
 // Runs in the child returned by glibc's `fork`.
 static int run_child(pid_t parent, unsigned char *buffer, unsigned long expected_sum, int pipe_fd,
-                     int (*exec_only)(void)) {
+                     int (*exec_only)(void), long expected_break) {
     int failures = 0;
     // The child sees the parent's memory as of the fork.
     failures += global_value != 2;
     failures += checksum(buffer, BUFFER_SIZE) != expected_sum;
+    failures += syscall(SYS_brk, 0) != expected_break;
     // Execute-only memory keeps its code.
     failures += exec_only() != 42;
     // An inaccessible reservation stays reserved and zero-filled.
@@ -169,10 +170,11 @@ int main(void) {
     alarm(ALARM_SECONDS);
     fflush(stdout);
 
+    long program_break = syscall(SYS_brk, 0);
     pid_t child = fork();
     if (child == 0) {
         close(pipe_fds[0]);
-        exit(run_child(parent, buffer, expected_sum, pipe_fds[1], exec_only));
+        exit(run_child(parent, buffer, expected_sum, pipe_fds[1], exec_only, program_break));
     }
     if (child < 0) {
         printf("fork-failed errno=%d\n", errno);
