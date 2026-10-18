@@ -8,13 +8,13 @@
 # litebox_runner_linux_on_vm_userland as a ring-3 process per program run.
 # Every litebox_runner_vm_kernel/tests/linux/<name>.c is compiled three times,
 # as /<name> (static), /<name>-pie (static PIE), and /<name>-dyn (dynamically
-# linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, into rootfs.tar, the
-# broker's read-only root. As in litebox_runner_linux_userland's tests, the
-# root also has the dynamic programs' shared libraries and interpreter, as
-# ldd lists them, and libgcc_s.so.1, at their host paths; as the root has no
-# symbolic links, they are copies of what the links name. The shim patches
-# their syscalls as the programs map them. The root is packed with the
-# userland runner into a tar passed as the initrd.
+# linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, into a host directory
+# that is the guest's read-only root, over virtio-9p (mount tag `/`). As in
+# litebox_runner_linux_userland's tests, the root also has the dynamic
+# programs' shared libraries and interpreter, as ldd lists them, and
+# libgcc_s.so.1, at their host paths; as the broker does not follow symbolic
+# links, they are copies of what the links name. The shim patches their
+# syscalls as the programs map them. The initrd is only the userland runner.
 #
 # A test is litebox_runner_vm_kernel/tests/linux/<test>.json, the runs file of
 # the host client litebox_vm_host (see its src/main.rs), which runs each
@@ -126,9 +126,6 @@ while read -r lib; do
     mkdir -p "$WORK/rootfs$(dirname "$lib")"
     cp -L "$lib" "$WORK/rootfs$lib"
 done <<<"$libs"
-# Files only: the broker's root infers directories from paths.
-(cd "$WORK/rootfs" && find . -type f -printf '%P\n' |
-    tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -T -)
 
 # The virtio console's files for test $1: its output, and the FIFO of its
 # input if it has any (see `feed_input`).
@@ -157,11 +154,13 @@ network_args() {
         -device virtio-net-pci,netdev=n0,disable-legacy=on
 }
 
-# The virtio-9p share for test $1: see the header.
+# The virtio-9p shares for test $1, the root and /mnt/host: see the header.
 share_args() {
     mkdir "$WORK/$1.share"
     echo "hello from the host" >"$WORK/$1.share/greeting.txt"
-    echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
+    echo -fsdev "local,id=root,path=$WORK/rootfs,security_model=none,readonly=on" \
+        -device virtio-9p-pci,fsdev=root,mount_tag=/,disable-legacy=on \
+        -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
         -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
 }
 
@@ -185,8 +184,7 @@ for t in "${tests[@]}"; do
     [[ -f "$TESTS_DIR/$t.json" ]] || { echo "error: no test $TESTS_DIR/$t.json" >&2; exit 2; }
     mkdir -p "$WORK/$t"
     cp "$USERLAND" "$WORK/$t/runner.elf"
-    cp "$WORK/rootfs.tar" "$WORK/$t/rootfs.tar"
-    tar --format=ustar -cf "$WORK/$t.tar" -C "$WORK/$t" runner.elf rootfs.tar
+    tar --format=ustar -cf "$WORK/$t.tar" -C "$WORK/$t" runner.elf
     failed_before=$fail
     : >"$WORK/$t.stdout"
     feeder=

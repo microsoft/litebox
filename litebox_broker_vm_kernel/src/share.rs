@@ -51,10 +51,9 @@ pub struct TransportError;
 /// A host directory mounted, read-only, at `path`.
 pub struct Share {
     /// Must be absolute and normalized, and unlike any other mount's path
-    /// (e.g., `/dev`, or `/` with a root tar), or building the broker's files
-    /// panics. Should also be neither `/` nor in `/dev`, which the broker
-    /// does not check: such a share would be the root, or sit among the
-    /// devices.
+    /// (e.g., `/dev`), or building the broker's files panics. `/` makes the
+    /// share the root. Should not be in `/dev`, which the broker does not
+    /// check: the share would sit among the devices.
     pub path: String,
     pub transport: Box<dyn Transport>,
 }

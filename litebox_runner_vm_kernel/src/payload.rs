@@ -1,8 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The first boot module: a tar of named files. Services take the files they
-//! need; `rootfs.tar`, if any, is the broker's read-only root.
+//! The first boot module: a tar of named files, which services take as they
+//! need. Programs' files are not in it, but on a share (see
+//! [`crate::devices`]).
 
 use alloc::collections::BTreeMap;
 use litebox_bootloader::handoff::BootInfo;

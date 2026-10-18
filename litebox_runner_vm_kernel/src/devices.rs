@@ -14,7 +14,7 @@
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
 //!   `SetTimer` deadline and time slice.
 //! - [`Devices::shares`]: the VM's virtio-9p devices, each a host directory
-//!   mounted at its tag.
+//!   mounted at its tag; the one tagged `/` is the root.
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
@@ -422,10 +422,13 @@ impl Transport for ShareTransport {
 }
 
 /// A mount tag as the path to mount its share at, if the broker can: its
-/// `Composer` panics on paths that are not absolute and normalized, and `/`
-/// and `/dev` (with what is under it) are reserved. Tags come from the host.
+/// `Composer` panics on paths that are not absolute and normalized, and
+/// `/dev` (with what is under it) is reserved. Tags come from the host.
 fn mount_path(tag: &[u8]) -> Option<String> {
     let path = core::str::from_utf8(tag).ok()?;
+    if path == "/" {
+        return Some(String::from(path));
+    }
     let mut components = path.strip_prefix('/')?.split('/');
     let valid = components
         .clone()

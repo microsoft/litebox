@@ -14,8 +14,8 @@
 //! (success) or 65; a kernel panic exits with 65. Runner processes' standard
 //! streams are port 0 of the VM's console device, if there is one, and
 //! their sockets reach the VM's network device, if there is one; programs
-//! also see the host directories of virtio-9p devices, read-only, at their
-//! mount tags ([`devices`]).
+//! see the host directories of virtio-9p devices, read-only, at their mount
+//! tags, the one tagged `/` as the root ([`devices`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -48,7 +48,6 @@ fn kernel_main(kernel: Kernel) -> ! {
             platform: kernel.platform,
             console,
             events: devices,
-            root: payload.file("rootfs.tar"),
             shares,
             network: devices.network(),
         })

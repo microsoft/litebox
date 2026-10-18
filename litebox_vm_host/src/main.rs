@@ -8,8 +8,8 @@
 //!
 //! - `programs <runs.json>` (programs kernel): an array of runs, or of
 //!   `{ "concurrent": [...] }` groups of runs started together. A run:
-//!   - `argv`: `argv[0]` is the program's absolute path (e.g., in the
-//!     payload's `rootfs.tar`).
+//!   - `argv`: `argv[0]` is the program's absolute path (e.g., on the root
+//!     share).
 //!   - `envp`: `KEY=VALUE` strings (default none).
 //!   - `stdin`: the run's standard input, after which it ends (default: none,
 //!     as `/dev/null`).

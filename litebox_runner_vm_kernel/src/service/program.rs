@@ -2,10 +2,9 @@
 // Licensed under the MIT license.
 
 //! Standalone programs in runner processes, one per run, possibly several at
-//! once. From the payload:
-//! `runner.elf`, which decides the guest OS (e.g.,
-//! `litebox_runner_linux_on_vm_userland`); the programs' files are the
-//! broker's (see `rootfs.tar` in [`crate::payload`]).
+//! once. From the payload: `runner.elf`, which decides the guest OS (e.g.,
+//! `litebox_runner_linux_on_vm_userland`). The programs' files are the
+//! broker's, e.g., on the root share (see [`crate::devices`]).
 
 use super::Service;
 use crate::payload::Payload;
