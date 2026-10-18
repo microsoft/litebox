@@ -211,7 +211,7 @@ impl TerminalTransport for LinuxTerminal {
         }
     }
 
-    fn window_size(&self) -> Result<WindowSize, TerminalTransportError> {
+    fn get_window_size(&self) -> Result<WindowSize, TerminalTransportError> {
         let size = rustix::termios::tcgetwinsize(&self.file).map_err(|error| self.error(error))?;
         Ok(WindowSize {
             rows: size.ws_row,

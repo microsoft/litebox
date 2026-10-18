@@ -200,7 +200,7 @@ impl Shared {
                     self.changed.notify_all();
                 }
             }
-            let size = transport.window_size()?;
+            let size = transport.get_window_size()?;
             if size != state.size {
                 state.size = size;
                 if let Some(sink) = &state.sink {
@@ -271,7 +271,7 @@ pub(crate) struct HostTerminal {
 impl HostTerminal {
     /// Serves the host terminal behind `transport`.
     pub(crate) fn new(transport: Arc<dyn TerminalTransport>) -> io::Result<Self> {
-        let size = transport.window_size().map_err(io::Error::other)?;
+        let size = transport.get_window_size().map_err(io::Error::other)?;
         let shared = Arc::new(Shared {
             transport,
             state: Mutex::new(State {
@@ -441,7 +441,7 @@ impl TerminalEndpoint for HostTerminal {
                 }
                 TerminalResponse::Done
             }
-            TerminalOperation::GetWindowSize => match transport.window_size() {
+            TerminalOperation::GetWindowSize => match transport.get_window_size() {
                 Ok(size) => TerminalResponse::WindowSize(size),
                 Err(_) => return Ok(Err(TerminalError::Io)),
             },

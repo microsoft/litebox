@@ -113,7 +113,7 @@ pub trait TerminalTransport: Send + Sync {
     fn wake(&self) -> Result<(), TerminalTransportError>;
 
     /// Returns the host terminal's window size.
-    fn window_size(&self) -> Result<WindowSize, TerminalTransportError>;
+    fn get_window_size(&self) -> Result<WindowSize, TerminalTransportError>;
 
     /// Sets the host terminal's window size.
     fn set_window_size(&self, size: WindowSize) -> Result<(), TerminalTransportError>;
