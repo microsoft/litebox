@@ -64,7 +64,7 @@ fn find_objdump(candidates: &[&str], arch_token: &str) -> Option<String> {
 }
 
 fn trampoline_range(binary: &[u8]) -> Option<std::ops::Range<u64>> {
-    const MAGIC: &[u8; 8] = litebox_syscall_rewriter::TRAMPOLINE_MAGIC;
+    const MAGIC: &[u8; 8] = litebox_trampoline::TRAMPOLINE_MAGIC;
 
     if binary.len() < 32 {
         return None;

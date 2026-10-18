@@ -18,8 +18,8 @@ use litebox_common_linux::{
         aarch64::{GuestVectorState, Sigcontext},
     },
 };
-use litebox_syscall_rewriter::aarch64::{
-    RT_SIGRETURN_TRAMPOLINE_BYTES, emit_rt_sigreturn_trampoline,
+use litebox_trampoline::{
+    aarch64::RT_SIGRETURN_TRAMPOLINE_BYTES, aarch64::emit_rt_sigreturn_trampoline,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 

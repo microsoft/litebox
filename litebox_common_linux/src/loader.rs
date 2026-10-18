@@ -69,8 +69,8 @@ struct TrampolineInfo {
 }
 
 /// The magic number used to identify the LiteBox trampoline.
-/// This must match `TRAMPOLINE_MAGIC` in `litebox_syscall_rewriter`.
-const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
+/// The serialized format is defined by `litebox_trampoline`.
+const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*litebox_trampoline::TRAMPOLINE_MAGIC);
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]

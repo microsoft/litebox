@@ -136,11 +136,8 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
     // AArch64 SVC encoding, ignoring the immediate operand.
     const SVC_MASK: u32 = 0xffe0_001f;
     const SVC_OPCODE: u32 = 0xd400_0001;
-    use litebox_syscall_rewriter::{
-        TargetHost,
-        aarch64::{GateMetadata, decode_branch_target},
-        macho::{CodeMetadata, Rewriter},
-    };
+    use litebox_syscall_rewriter::{macho::CodeMetadata, macho::Rewriter};
+    use litebox_trampoline::{TargetHost, aarch64::GateMetadata, aarch64::decode_branch_target};
     let mut plan = MachoParsedFile::parse(rewritten).unwrap();
     let trampoline = plan.parse_trampoline(rewritten).unwrap().unwrap();
     let metadata = CodeMetadata::parse(original).unwrap();
@@ -440,8 +437,7 @@ fn incompatible_aot_gate_is_rejected_before_execution() {
         .unwrap();
     // Mach-O SVC gates require the Darwin frame layout. Incompatible payloads
     // are rejected during finalization.
-    let first_gate =
-        trampoline.file_range.start + litebox_syscall_rewriter::aarch64::GATE_ALIGNMENT;
+    let first_gate = trampoline.file_range.start + litebox_trampoline::aarch64::GATE_ALIGNMENT;
     data[first_gate..first_gate + size_of::<u32>()]
         .copy_from_slice(&INCOMPATIBLE_GATE_PROLOGUE.to_le_bytes());
     std::fs::write(&hooked, data).unwrap();

@@ -142,9 +142,9 @@ impl Default for CliTargetArch {
 impl CliArgs {
     fn rewrite_options(&self) -> litebox_syscall_rewriter::RewriteOptions {
         let target_host = match self.target_host {
-            CliTargetHost::Linux => litebox_syscall_rewriter::TargetHost::Linux,
-            CliTargetHost::Macos => litebox_syscall_rewriter::TargetHost::MacOs,
-            CliTargetHost::Windows => litebox_syscall_rewriter::TargetHost::Windows,
+            CliTargetHost::Linux => litebox_trampoline::TargetHost::Linux,
+            CliTargetHost::Macos => litebox_trampoline::TargetHost::MacOs,
+            CliTargetHost::Windows => litebox_trampoline::TargetHost::Windows,
         };
         litebox_syscall_rewriter::RewriteOptions::new(target_host, self.virtualize_x18)
     }

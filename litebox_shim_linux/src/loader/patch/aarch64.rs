@@ -83,11 +83,11 @@ pub(super) fn finalize_trampoline(
     if options.virtualizes_x18() {
         let x18 = offset
             .checked_add(
-                u16::try_from(litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP)
+                u16::try_from(litebox_trampoline::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP)
                     .expect("guest x18 slot delta fits in a gate offset"),
             )
             .ok_or_else(|| String::from("guest x18 offset overflow"))?;
-        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates_for_host(
+        litebox_trampoline::aarch64::finalize_trampoline_gates_for_host(
             trampoline,
             offset,
             x18,
@@ -95,7 +95,8 @@ pub(super) fn finalize_trampoline(
         )
         .map_err(|e| format!("failed to patch guest offsets {offset}/{x18}: {e}"))
     } else {
-        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates(trampoline, offset)
+        litebox_trampoline::aarch64::finalize_trampoline_gates(trampoline, offset)
+            .map(|_| ())
             .map_err(|e| format!("failed to patch guest thread-pointer offset {offset}: {e}"))
     }
 }
@@ -197,8 +198,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return (ArchPatchState::default(), PAGE_SIZE);
         };
         let (executable_bytes, identified_bytes) = metadata.coverage_bytes();
-        let initial_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES
-            .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN);
+        let initial_cursor = litebox_trampoline::TRAMPOLINE_ENTRY_POINT_BYTES
+            .checked_next_multiple_of(litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN);
         // Round up to at least one page; a zero estimate would otherwise
         // read as "no runtime trampoline" and force trap fallback.
         let capacity = upper_bound
@@ -296,10 +297,9 @@ mod tests {
     /// Fail closed: an unpatched placeholder executes silently.
     mod trampoline_gates {
         use litebox::platform::SystemInfoProvider;
-        use litebox_syscall_rewriter::{
-            RewriteOptions,
-            aarch64::{GateMetadata, classify_copied_gate_slot_for_host},
-            patch_code_segment_with_options,
+        use litebox_syscall_rewriter::{RewriteOptions, patch_code_segment_with_options};
+        use litebox_trampoline::{
+            aarch64::GateMetadata, aarch64::classify_copied_gate_slot_for_host,
         };
 
         struct StubPlatform(Option<usize>);
@@ -420,10 +420,10 @@ mod tests {
             let mut tramp = unpatched_trampoline();
             super::super::finalize_trampoline(&StubPlatform(Some(96)), &mut tramp).unwrap();
             if crate::aarch64_rewrite_options().target_host()
-                == litebox_syscall_rewriter::TargetHost::Linux
+                == litebox_trampoline::TargetHost::Linux
             {
                 assert_eq!(
-                    litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
+                    litebox_trampoline::aarch64::find_guest_tpidr_placeholder(&tramp),
                     None
                 );
             }

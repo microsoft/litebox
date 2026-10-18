@@ -7,6 +7,7 @@ repository = "https://github.com/microsoft/litebox"
 description = "Package Linux ELF programs and their shared libraries for execution under LiteBox"
 
 [dependencies]
+litebox_trampoline = { path = "../litebox_trampoline", version = "0.1.0" }
 anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }

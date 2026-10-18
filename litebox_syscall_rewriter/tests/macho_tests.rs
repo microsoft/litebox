@@ -5,12 +5,10 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use litebox_syscall_rewriter::{
-    Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost,
-    aarch64::{self, GateMetadata},
-    hook_syscalls_in_macho, hook_syscalls_in_macho_with_options,
-    macho::{CodeMetadata, Rewriter},
-    rewrite_binary,
+    Error, RewriteOptions, hook_syscalls_in_macho, hook_syscalls_in_macho_with_options,
+    macho::CodeMetadata, macho::Rewriter, rewrite_binary,
 };
+use litebox_trampoline::{TRAMPOLINE_MAGIC, TargetHost, aarch64::GateMetadata};
 use object::macho;
 
 const BASE: u64 = 0x1_0000_0000;
@@ -332,8 +330,13 @@ fn svc_frame_layout_is_selected_by_the_runner() {
     assert_eq!(u32_at(&slot, 0), 0xd102_83ff); // sub sp, sp, #160
     assert_eq!(u32_at(&slot, 40), 0x9102_83ff); // add sp, sp, #160
     assert!(
-        aarch64::classify_copied_gate_slot_for_host(&slot, base + 16, base + 16, TargetHost::MacOs)
-            .is_none()
+        litebox_trampoline::aarch64::classify_copied_gate_slot_for_host(
+            &slot,
+            base + 16,
+            base + 16,
+            TargetHost::MacOs
+        )
+        .is_none()
     );
     assert_eq!(
         rewriter
@@ -350,9 +353,14 @@ fn svc_frame_layout_is_selected_by_the_runner() {
             .is_none()
     );
     assert_eq!(
-        aarch64::classify_copied_gate_slot_for_host(&slot, base + 16, base + 16, TargetHost::MacOs)
-            .unwrap()
-            .metadata(),
+        litebox_trampoline::aarch64::classify_copied_gate_slot_for_host(
+            &slot,
+            base + 16,
+            base + 16,
+            TargetHost::MacOs
+        )
+        .unwrap()
+        .metadata(),
         GateMetadata::Svc
     );
 }
@@ -381,7 +389,7 @@ fn small_hole_retries_past_the_image_without_rewriting_patched_code() {
     assert!(base >= BASE + 0xc000);
     assert_eq!(size, 16 + 300 * 64);
     assert_eq!(
-        aarch64::decode_branch_target(u32_at(&out, TEXT), BASE + TEXT as u64),
+        litebox_trampoline::aarch64::decode_branch_target(u32_at(&out, TEXT), BASE + TEXT as u64),
         Some(base + 16)
     );
 }

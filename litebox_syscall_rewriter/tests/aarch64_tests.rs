@@ -13,9 +13,9 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use litebox_syscall_rewriter::{
-    Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost, hook_syscalls_in_elf,
-    hook_syscalls_in_elf_with_options,
+    Error, RewriteOptions, hook_syscalls_in_elf, hook_syscalls_in_elf_with_options,
 };
+use litebox_trampoline::{TRAMPOLINE_MAGIC, TargetHost};
 
 const HELLO_AARCH64: &[u8] = include_bytes!("hello-aarch64");
 

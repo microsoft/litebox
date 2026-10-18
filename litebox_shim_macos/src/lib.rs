@@ -29,9 +29,9 @@ use litebox_platform::time::TimeProvider;
 
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
     #[cfg(target_os = "macos")]
-    let host = litebox_syscall_rewriter::TargetHost::MacOs;
+    let host = litebox_trampoline::TargetHost::MacOs;
     #[cfg(not(target_os = "macos"))]
-    let host = litebox_syscall_rewriter::TargetHost::Linux;
+    let host = litebox_trampoline::TargetHost::Linux;
     litebox_syscall_rewriter::RewriteOptions::new(host, false)
 }
 

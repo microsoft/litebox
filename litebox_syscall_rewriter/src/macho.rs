@@ -3,7 +3,7 @@
 
 //! AArch64 Mach-O rewriting for LiteBox.
 //!
-//! SVC callbacks receive SP decremented by [`aarch64::DARWIN_SVC_FRAME_BYTES`],
+//! SVC callbacks receive SP decremented by [`litebox_trampoline::aarch64::DARWIN_SVC_FRAME_BYTES`],
 //! with saved x16 (the syscall number) at `[SP]`. They must supply Darwin's x0/x1
 //! results and NZCV carry, preserve other registers, and return through the
 //! outbound stub with SP still pointing to the gate frame.
@@ -17,10 +17,12 @@ use object::{LittleEndian as LE, macho};
 use zerocopy::IntoBytes as _;
 
 use crate::{
-    Arch, Error, LoadSegment, MACOS_TRAMPOLINE_PAGE_SIZE, Result, RewriteOptions, TRAMPOLINE_MAGIC,
-    TargetHost, TextSectionInfo, TrampolineHeader64, TrampolinePlacement,
-    aarch64::{self, INSN_BYTES_U64},
-    append_trampoline_footer, checked_add_u64, is_already_hooked, trampoline_placement_for,
+    Arch, Error, LoadSegment, MACOS_TRAMPOLINE_PAGE_SIZE, Result, RewriteOptions, TextSectionInfo,
+    TrampolinePlacement, aarch64, append_trampoline_footer, checked_add_u64, is_already_hooked,
+    trampoline_placement_for,
+};
+use litebox_trampoline::{
+    TRAMPOLINE_MAGIC, TargetHost, TrampolineHeader64, aarch64::INSN_BYTES_U64,
 };
 
 const LOAD_COMMAND_ALIGNMENT: u32 = 8;
@@ -226,22 +228,30 @@ impl Rewriter {
         trampoline: &mut [u8],
         guest_tp_offset: u16,
     ) -> Result<()> {
-        aarch64::finalize_macho_trampoline(trampoline, guest_tp_offset, self.host)
+        Ok(litebox_trampoline::aarch64::finalize_macho_trampoline(
+            trampoline,
+            guest_tp_offset,
+            self.host,
+        )?)
     }
 
     /// Recovery must verify the original site's branch. SVC frame recovery uses
-    /// [`aarch64::DARWIN_SVC_FRAME_BYTES`].
+    /// [`litebox_trampoline::aarch64::DARWIN_SVC_FRAME_BYTES`].
+    ///
+    /// The result's [`litebox_trampoline::aarch64::ClassifiedGate::slot_offset`] is zero, relative
+    /// to the supplied slot slice rather than its containing trampoline. The
+    /// caller must retain `slot_vaddr` separately.
     pub fn classify_gate_slot(
         self,
         slot: &[u8],
         slot_vaddr: u64,
         pc: u64,
-    ) -> Option<aarch64::ClassifiedGate> {
-        aarch64::classify_copied_gate_slot_with_layout(
+    ) -> Option<litebox_trampoline::aarch64::ClassifiedGate> {
+        litebox_trampoline::aarch64::classify_copied_gate_slot_with_layout(
             slot,
             slot_vaddr,
             pc,
-            aarch64::GateLayout::darwin(self.host.into()),
+            litebox_trampoline::aarch64::GateLayout::darwin(self.host),
         )
     }
 }

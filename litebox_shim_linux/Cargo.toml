@@ -7,6 +7,7 @@ repository = "https://github.com/microsoft/litebox"
 description = "A LiteBox shim that provides a Linux-compatible ABI"
 
 [dependencies]
+litebox_trampoline = { path = "../litebox_trampoline", version = "0.1.0" }
 arrayvec = { version = "0.7.6", default-features = false }
 bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
 bitflags = "2.13.1"

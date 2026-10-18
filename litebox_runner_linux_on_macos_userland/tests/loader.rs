@@ -3,7 +3,8 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use litebox_syscall_rewriter::{RewriteOptions, TargetHost, hook_syscalls_in_elf_with_options};
+use litebox_syscall_rewriter::{RewriteOptions, hook_syscalls_in_elf_with_options};
+use litebox_trampoline::TargetHost;
 use std::{path::Path, process::Command};
 
 // Prebuilt AArch64 Linux programs with their dynamic loader and glibc.

@@ -2,9 +2,8 @@
 // Licensed under the MIT license.
 
 use super::*;
-use litebox_syscall_rewriter::{
-    RewriteOptions, TargetHost, macho::Rewriter, patch_code_segment_with_options,
-};
+use litebox_syscall_rewriter::{RewriteOptions, macho::Rewriter, patch_code_segment_with_options};
+use litebox_trampoline::TargetHost;
 
 // The first page contains code and gates; remaining pages are RW stack storage.
 // Darwin gates are host-aware so the native-path test can call them directly.
