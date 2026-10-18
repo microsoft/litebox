@@ -280,6 +280,10 @@ impl SharedBytes<'_> {
 /// Shared memory in a private heap allocation, for endpoints in one address
 /// space, such as an in-process broker and its tests.
 ///
+/// It is intended only for tests and development. Production transports map
+/// shared memory that the broker and LiteBox, in separate processes, both
+/// access.
+///
 /// Its bytes are zeroed and, like a mapping's, page-aligned.
 pub struct HeapSharedMemory {
     address: NonNull<u8>,
@@ -535,7 +539,7 @@ impl<Memory: AsSharedBytes> SharedBufferPool<Memory> {
     /// `sequence`, in transfer order.
     ///
     /// Slots adjacent in memory share one part.
-    pub fn sequence_bytes(
+    pub fn borrow_sequence(
         &self,
         sequence: SharedBufferSequence,
         offset: usize,
@@ -658,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_lends_sequence_bytes_at_offsets_across_slots() {
+    fn pool_borrows_sequence_at_offsets_across_slots() {
         let layout = SharedBufferLayout::new(4, 4).unwrap();
         let memory = Arc::new(HeapSharedMemory::new(layout.total_len()));
         let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
@@ -673,7 +677,7 @@ mod tests {
         .unwrap();
 
         let mut source = 1..;
-        for part in pool.sequence_bytes(sequence, 1, 9).unwrap() {
+        for part in pool.borrow_sequence(sequence, 1, 9).unwrap() {
             let bytes: Vec<u8> = source.by_ref().take(part.len()).collect();
             part.copy_from_slice(&bytes);
         }
@@ -682,7 +686,7 @@ mod tests {
             [8, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7]
         );
         let lengths = |offset, length| {
-            pool.sequence_bytes(sequence, offset, length)
+            pool.borrow_sequence(sequence, offset, length)
                 .unwrap()
                 .map(|part| part.len())
                 .collect::<Vec<_>>()
@@ -691,7 +695,7 @@ mod tests {
         assert_eq!(lengths(8, 3), [3]);
         assert_eq!(lengths(11, 0), [0; 0]);
         assert!(matches!(
-            pool.sequence_bytes(sequence, 4, 8),
+            pool.borrow_sequence(sequence, 4, 8),
             Err(SharedBufferError::TransferExceedsSequence)
         ));
     }

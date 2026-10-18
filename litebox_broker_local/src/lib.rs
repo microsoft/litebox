@@ -280,7 +280,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         );
         for part in self
             .shared_buffers
-            .sequence_bytes(buffer, offset, length)
+            .borrow_sequence(buffer, offset, length)
             .expect("validated shared buffer sequence must be accessible")
         {
             lend(part).map_err(|transfer::CopyFailed| BrokerLocalError::CopyFailed)?;
