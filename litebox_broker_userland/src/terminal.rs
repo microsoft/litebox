@@ -368,12 +368,12 @@ impl HostTerminal {
         // Output processing rewrites bytes, so stage them first.
         let mut input = bounce_buffer(length.min(available))?;
         fill(&mut input)?;
-        let (consumed, bytes) = state.engine.output(&input, available);
-        state.output.extend(bytes);
+        let state = &mut *state;
+        state.engine.output(&input, &mut state.output);
         state.drained = false;
         state.publish_if_changed();
         self.shared.wake();
-        Ok(consumed)
+        Ok(input.len())
     }
 
     pub(crate) fn flush(&self) -> io::Result<()> {
@@ -607,6 +607,21 @@ mod tests {
         );
         assert!(terminal.write_slice(&tabs).unwrap() > 0);
         assert!(terminal.shared.lock().output.len() <= OUTPUT_CAPACITY);
+    }
+
+    #[test]
+    fn terminal_failed_fill_writes_nothing() {
+        let (_master, terminal) = open_terminal();
+        terminal.shared.lock().engine.receive(b"\x13");
+        assert_eq!(
+            terminal.write(5, &mut |_| Err(litebox_broker_core::BrokerError::Internal)),
+            Err(StdioProviderError::Broker(
+                litebox_broker_core::BrokerError::Internal
+            ))
+        );
+        assert!(terminal.shared.lock().output.is_empty());
+        assert_eq!(terminal.write_slice(b"next"), Ok(4));
+        assert_eq!(terminal.shared.lock().output, b"next");
     }
 
     #[test]

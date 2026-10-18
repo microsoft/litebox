@@ -485,7 +485,7 @@ impl TerminalEngine {
         }
     }
 
-    fn output_byte(&mut self, mut byte: u8, output: &mut Vec<u8>) {
+    fn output_byte(&mut self, mut byte: u8, output: &mut impl Extend<u8>) {
         let flags = self.settings.output;
         if flags.contains(O::PROCESS) {
             if byte == b'\r' {
@@ -496,16 +496,16 @@ impl TerminalEngine {
                     byte = b'\n';
                 }
             } else if byte == b'\n' && flags.contains(O::NEWLINE_TO_CRLF) {
-                output.push(b'\r');
+                output.extend(*b"\r");
                 self.column = 0;
             } else if byte == b'\t' && flags.contains(O::EXPAND_TABS) {
                 let spaces = 8 - (self.column & 7);
-                output.resize(output.len() + spaces, b' ');
+                output.extend(core::iter::repeat_n(b' ', spaces));
                 self.column = self.column.saturating_add(spaces);
                 return;
             }
         }
-        output.push(byte);
+        output.extend([byte]);
         match byte {
             b'\r' => self.column = 0,
             b'\n' if flags.contains(O::PROCESS | O::NEWLINE_RETURNS_CARRIAGE) => self.column = 0,
@@ -530,16 +530,12 @@ impl TerminalEngine {
         }
     }
 
-    /// Transforms a bounded prefix of a guest write. Returns consumed input
-    /// bytes and transport output; at most [`Self::output_expansion`] times
-    /// `limit` bytes are generated.
-    pub fn output(&mut self, input: &[u8], limit: usize) -> (usize, Vec<u8>) {
-        let count = input.len().min(limit);
-        let mut output = Vec::with_capacity(count * 2);
-        for &byte in &input[..count] {
-            self.output_byte(byte, &mut output);
+    /// Processes a guest write, appending at most [`Self::output_expansion`]
+    /// transport bytes per input byte to `output`.
+    pub fn output(&mut self, input: &[u8], output: &mut impl Extend<u8>) {
+        for &byte in input {
+            self.output_byte(byte, output);
         }
-        (count, output)
     }
 }
 
@@ -552,6 +548,12 @@ mod tests {
         /// Reads into `output`, for tests that are not about lending.
         fn read_slice(&mut self, output: &mut [u8]) -> Option<usize> {
             self.read(output.len(), &mut copy_to_slice(output)).unwrap()
+        }
+
+        fn processed(&mut self, input: &[u8]) -> Vec<u8> {
+            let mut output = Vec::new();
+            self.output(input, &mut output);
+            output
         }
     }
 
@@ -613,13 +615,13 @@ mod tests {
         assert!(input.echo.is_empty() && input.events.is_empty());
         assert_eq!(tty.read_slice(&mut output), Some(4));
         assert_eq!(&output[..4], b"\x03\x04\r\n");
-        assert_eq!(tty.output(b"x\n", 2).1, b"x\n");
+        assert_eq!(tty.processed(b"x\n"), b"x\n");
     }
 
     #[test]
     fn flow_control_and_output_processing() {
         let mut tty = TerminalEngine::default();
-        assert_eq!(tty.output(b"a\n", 2).1, b"a\r\n");
+        assert_eq!(tty.processed(b"a\n"), b"a\r\n");
         tty.receive(b"\x13");
         assert!(tty.output_stopped());
         tty.receive(b"\x11");
@@ -635,7 +637,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(tty.output_expansion(), 8);
-        assert_eq!(tty.output(b"ab\tc\t\n", 6).1, b"ab      c       \r\n");
+        assert_eq!(tty.processed(b"ab\tc\t\n"), b"ab      c       \r\n");
         assert_eq!(tty.receive(b"\t").echo, b" ".repeat(8));
         assert_eq!(tty.receive(b"\x7f").echo, b"\x08".repeat(8));
         tty.configure(TerminalSettings {
@@ -644,7 +646,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(tty.output_expansion(), 2);
-        assert_eq!(tty.output(b"\t", 1).1, b"\t");
+        assert_eq!(tty.processed(b"\t"), b"\t");
     }
 
     #[test]
@@ -876,7 +878,7 @@ mod tests {
     fn tab_erasure_uses_its_echoed_width_after_prompts_and_reprints() {
         for (prefix, width) in [(b"a".as_slice(), 5), (b"\x01", 4), (b"\xc3\xa9", 5)] {
             let mut tty = TerminalEngine::default();
-            tty.output(b"$ ", 2);
+            tty.processed(b"$ ");
             tty.receive(prefix);
             tty.receive(b"\t");
             assert_eq!(tty.receive(b"\x7f").echo, b"\x08".repeat(width));
@@ -886,7 +888,7 @@ mod tests {
             assert_eq!(&bytes[..prefix.len()], prefix);
         }
         let mut tty = TerminalEngine::default();
-        tty.output(b"$ ", 2);
+        tty.processed(b"$ ");
         tty.receive(b"a\t\x12");
         assert_eq!(tty.receive(b"\x7f").echo, b"\x08".repeat(7));
     }
@@ -940,7 +942,7 @@ mod tests {
         assert!(result.consumed < INPUT_CAPACITY);
         assert!(result.echo.len() <= INPUT_CAPACITY);
         tty.flush_input();
-        tty.output(&alloc::vec![b'x'; INPUT_CAPACITY], INPUT_CAPACITY);
+        tty.processed(&alloc::vec![b'x'; INPUT_CAPACITY]);
         let result = tty.receive(b"\t\x7f");
         assert!(result.echo.len() <= 25);
         for erase in [21, 23] {
