@@ -1831,7 +1831,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if buf.is_empty() {
                 return Ok(0);
             }
-            self.do_write(fd, &buf, offset)
+            if !matches!(fd, AnyTypedFd::Eventfd(_)) {
+                return self.do_write(fd, &buf, offset);
+            }
+            // Like Linux, an eventfd, which has no vectored write, writes each iovec separately,
+            // stopping at a short write and failing only if nothing was written.
+            let mut written = 0;
+            for iov in iovs.iter().filter(|iov| iov.iov_len != 0) {
+                let iov_offset = offset.map(|offset| offset + written);
+                match self.do_write(fd, &GuestWriteBuffer::<Platform>::single(iov), iov_offset) {
+                    Ok(size) => {
+                        written += size;
+                        if size < iov.iov_len {
+                            break;
+                        }
+                    }
+                    Err(_) if written != 0 => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(written)
         })
     }
 }
