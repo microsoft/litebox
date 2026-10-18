@@ -10,7 +10,7 @@ use alloc::string::String;
 use core::ops::Range;
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout,
-    byteorder::{LittleEndian, U32, U64},
+    byteorder::{LittleEndian, U64},
 };
 
 /// Errors constructing or validating a trampoline.
@@ -47,23 +47,8 @@ pub struct TrampolineHeader64 {
     pub trampoline_size: U64<LittleEndian>,
 }
 
-/// On-disk 32-bit footer. The magic remains eight bytes.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-pub struct TrampolineHeader32 {
-    pub magic: [u8; 8],
-    pub file_offset: U32<LittleEndian>,
-    pub vaddr: U32<LittleEndian>,
-    pub trampoline_size: U32<LittleEndian>,
-}
-
-/// Footer size expected by a native loader. Cross-architecture tools must
-/// select the footer width from the input image rather than the build target.
-pub const TRAMPOLINE_HEADER_SIZE: usize = if cfg!(target_pointer_width = "64") {
-    size_of::<TrampolineHeader64>()
-} else {
-    size_of::<TrampolineHeader32>()
-};
+/// Footer size for the supported x86-64 and AArch64 images.
+pub const TRAMPOLINE_HEADER_SIZE: usize = size_of::<TrampolineHeader64>();
 
 /// Errors decoding the shared footer, independent of image admission policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +59,7 @@ pub enum TrampolineHeaderError {
     Malformed,
 }
 
-/// Decode a complete 20- or 32-byte footer into little-endian 64-bit fields.
+/// Decode a complete 32-byte footer with little-endian fields.
 /// Returns `None` for non-LiteBox data. Alignment, mapping bounds and the
 /// interpretation of an empty footer are checked by the image loader.
 ///
@@ -83,20 +68,8 @@ pub enum TrampolineHeaderError {
 pub fn decode_trampoline_header(
     bytes: &[u8],
 ) -> core::result::Result<Option<TrampolineHeader64>, TrampolineHeaderError> {
-    let header = if bytes.len() == size_of::<TrampolineHeader64>() {
-        TrampolineHeader64::read_from_bytes(bytes).map_err(|_| TrampolineHeaderError::Malformed)?
-    } else if bytes.len() == size_of::<TrampolineHeader32>() {
-        let header = TrampolineHeader32::read_from_bytes(bytes)
-            .map_err(|_| TrampolineHeaderError::Malformed)?;
-        TrampolineHeader64 {
-            magic: header.magic,
-            file_offset: u64::from(header.file_offset.get()).into(),
-            vaddr: u64::from(header.vaddr.get()).into(),
-            trampoline_size: u64::from(header.trampoline_size.get()).into(),
-        }
-    } else {
-        return Err(TrampolineHeaderError::Malformed);
-    };
+    let header =
+        TrampolineHeader64::read_from_bytes(bytes).map_err(|_| TrampolineHeaderError::Malformed)?;
     if header.magic == *TRAMPOLINE_MAGIC {
         Ok(Some(header))
     } else if header.magic.starts_with(b"LITEBOX") {
@@ -196,49 +169,26 @@ mod tests {
     }
 
     #[test]
-    fn footer32_has_a_stable_encoding_and_zero_extends_into64() {
-        assert_eq!(size_of::<TrampolineHeader32>(), 20);
-        assert_eq!(align_of::<TrampolineHeader32>(), 1);
-        let header = TrampolineHeader32 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0x1234_5678u32.into(),
-            vaddr: 0xf123_4567u32.into(),
-            trampoline_size: 0xfedc_ba98u32.into(),
-        };
-        let expected = [
-            b'L', b'I', b'T', b'E', b'B', b'O', b'X', b'0', 0x78, 0x56, 0x34, 0x12, 0x67, 0x45,
-            0x23, 0xf1, 0x98, 0xba, 0xdc, 0xfe,
-        ];
-        assert_eq!(header.as_bytes(), expected);
-        let decoded = decode_trampoline_header(&expected).unwrap().unwrap();
-        assert_eq!(decoded.magic, *TRAMPOLINE_MAGIC);
-        assert_eq!(decoded.file_offset.get(), 0x1234_5678);
-        assert_eq!(decoded.vaddr.get(), 0xf123_4567);
-        assert_eq!(decoded.trampoline_size.get(), 0xfedc_ba98);
-    }
+    fn footer_magic_version_and_length_are_checked() {
+        let mut bytes = [0u8; 32];
+        assert_eq!(decode_trampoline_header(&bytes), Ok(None));
+        bytes[..8].copy_from_slice(TRAMPOLINE_MAGIC);
+        let decoded = decode_trampoline_header(&bytes).unwrap().unwrap();
+        assert_eq!(decoded.file_offset.get(), 0);
+        assert_eq!(decoded.vaddr.get(), 0);
+        assert_eq!(decoded.trampoline_size.get(), 0);
+        bytes[7] = b'9';
+        assert_eq!(
+            decode_trampoline_header(&bytes),
+            Err(TrampolineHeaderError::UnsupportedVersion)
+        );
+        bytes[0] = b'X';
+        assert_eq!(decode_trampoline_header(&bytes), Ok(None));
 
-    #[test]
-    fn footer_magic_version_and_length_are_checked_for_both_widths() {
-        for length in [20, 32] {
-            let mut bytes = [0u8; 32];
-            assert_eq!(decode_trampoline_header(&bytes[..length]), Ok(None));
-            bytes[..8].copy_from_slice(TRAMPOLINE_MAGIC);
-            let decoded = decode_trampoline_header(&bytes[..length]).unwrap().unwrap();
-            assert_eq!(decoded.file_offset.get(), 0);
-            assert_eq!(decoded.vaddr.get(), 0);
-            assert_eq!(decoded.trampoline_size.get(), 0);
-            bytes[7] = b'9';
-            assert_eq!(
-                decode_trampoline_header(&bytes[..length]),
-                Err(TrampolineHeaderError::UnsupportedVersion)
-            );
-            bytes[0] = b'X';
-            assert_eq!(decode_trampoline_header(&bytes[..length]), Ok(None));
-        }
         let mut bytes = [0u8; 40];
         bytes[..8].copy_from_slice(TRAMPOLINE_MAGIC);
         for length in 0..=bytes.len() {
-            if length != 20 && length != 32 {
+            if length != 32 {
                 assert_eq!(
                     decode_trampoline_header(&bytes[..length]),
                     Err(TrampolineHeaderError::Malformed)
