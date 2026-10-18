@@ -542,15 +542,21 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     ///
     /// Each recorded guest mapping must already exist at its parent address. This method adopts
     /// ownership of those inherited mappings without allocating, copying, or changing them.
-    pub fn restore_fork_from_native_clone(
+    ///
+    /// # Safety
+    ///
+    /// `startup.regions` must describe valid mappings inherited by a native clone. The caller must
+    /// transfer exclusive ownership of those mappings to this shim; the copied runtime must never
+    /// use or release them again.
+    pub unsafe fn restore_fork_from_native_clone(
         &self,
         startup: litebox_common_linux::program_startup::LinuxForkStartup,
         initial_thread: litebox::thread::Thread,
     ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
         self.restore_fork_with_memory(startup, initial_thread, |mm, regions| {
             for region in regions {
-                // SAFETY: A native clone inherited this exact mapping, and the fresh memory
-                // manager has not adopted any guest ranges yet.
+                // SAFETY: The caller guarantees the inherited mapping is valid and exclusively
+                // owned. The memory manager rejects overlap with ranges already adopted.
                 unsafe { mm.adopt_existing_pages(region.range.clone(), region.flags) }.map_err(
                     |error| {
                         ForkRestoreError::Memory(region.range.start, MappingError::MapError(error))
