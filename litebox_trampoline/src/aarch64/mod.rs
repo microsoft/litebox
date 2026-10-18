@@ -17,6 +17,299 @@ use yaxpeax_arm::armv8::a64::{
     InstDecoder, Instruction as DecodedInstruction, Opcode as DecodedOpcode, Operand,
 };
 
+// Instruction width.
+
+/// A PC-relative immediate counts instructions, so it scales by this many bits
+/// to reach a byte displacement.
+const INSN_BYTES_LOG2: u32 = 2;
+
+/// Bytes in one AArch64 instruction. Every patch site, gate slot and scan
+/// stride is a whole number of these.
+pub const INSN_BYTES: usize = 1 << INSN_BYTES_LOG2;
+
+/// [`INSN_BYTES`] where a virtual address is being measured.
+pub const INSN_BYTES_U64: u64 = 1 << INSN_BYTES_LOG2;
+
+// Register numbers.
+
+const X8: u8 = 8;
+
+/// First scratch register (IP0).
+pub const X16: u8 = 16;
+
+/// Second scratch register (IP1).
+pub const X17: u8 = 17;
+const X18_ENCODED: u8 = 18;
+pub const X18: u16 = 18;
+
+/// Stack pointer (encoded as register 31 in a base-register field).
+pub const SP: u8 = 31;
+
+/// Zero register (register 31 in a transfer-register field, where it reads as
+/// zero / discards writes — distinct from `SP`'s base-register meaning).
+pub const XZR: u8 = 31;
+
+/// Highest register number a 5-bit register field can name.
+const MAX_REGISTER: u8 = 31;
+
+// Instruction patterns and matching masks.
+
+pub const OPCODE_TOP6_MASK: u32 = 0xFC00_0000;
+pub const NOP: u32 = 0xD503_201F;
+
+/// `SVC #0` (supervisor call) — the canonical syscall instruction.
+pub const SVC_0: u32 = 0xD400_0001;
+
+/// `SVC #0x80`, used by Darwin syscall stubs.
+pub const DARWIN_SVC: u32 = 0xD400_1001;
+
+/// Mask/match for *any* `SVC #imm16`. Linux dispatches every `SVC64` exception
+/// to the syscall handler regardless of the immediate (the syscall number comes
+/// from `x8`), so all immediates are rewritten, not just `svc #0`. The `imm16`
+/// field occupies bits \[20:5]; masking it out leaves bits \[4:0] = `0b00001`,
+/// which distinguishes `SVC` from `HVC` (`…0b10`) and `SMC` (`…0b11`).
+pub const SVC_OPCODE_MASK: u32 = 0xFFE0_001F;
+pub const SVC_OPCODE_BITS: u32 = SVC_0;
+
+/// Mask/match for `MRS Xd, TPIDR_EL0` (`0xD53BD04d`, the low 5 bits select Xd).
+pub const MRS_TPIDR_EL0_MASK: u32 = 0xFFFF_FFE0;
+pub const MRS_TPIDR_EL0_BITS: u32 = 0xD53B_D040;
+
+/// Mask/match for `MSR TPIDR_EL0, Xt` (`0xD51BD04t`, the low 5 bits select Xt).
+pub const MSR_TPIDR_EL0_MASK: u32 = 0xFFFF_FFE0;
+pub const MSR_TPIDR_EL0_BITS: u32 = 0xD51B_D040;
+
+/// `ADRP` opcode bits plus `Rd`, ignoring the immediate.
+const ADRP_SHAPE_MASK: u32 = 0x9F00_001F;
+
+/// `ADD (immediate)` opcode bits plus `Rn` and `Rd`, ignoring the immediate.
+const ADD_IMM_SHAPE_MASK: u32 = 0xFFC0_03FF;
+
+/// `LDR (literal)` opcode bits plus `Rt`, ignoring the immediate.
+const LDR_LITERAL_SHAPE_MASK: u32 = 0xFF00_001F;
+
+// Breakpoint markers.
+
+/// `BRK` immediate planted at a patch site whose gate is out of `B` reach.
+/// Executing it raises a synchronous debug exception (`SIGTRAP`) carrying this
+/// immediate instead of letting the unpatched instruction escape to the host
+/// kernel.
+///
+/// TODO: recognize this immediate in the runtime, to tell a rewriter trap from
+/// a guest breakpoint.
+pub const TRAP_BRK_IMM: u16 = 0xB10B;
+
+/// `BRK` immediate used by the transparent `BR X18` trap gate.
+const X18_BRANCH_BRK_IMM: u16 = 0xB18;
+
+// Operand fields and immediate encodings.
+
+/// Register field, bits \[4:0] — `Rd`, `Rt` or the `Rn`/`Rt2` fields once
+/// shifted into place.
+pub const REG_MASK: u32 = 0x1F;
+
+/// `Rn`, and the low bit of a PC-relative `imm19`.
+const RN_SHIFT: u32 = 5;
+
+/// `Rt2` of `STP`/`LDP`, and `imm12` of the add/sub and load/store forms.
+const RT2_SHIFT: u32 = 10;
+
+/// Signed `imm7` of `STP`/`LDP`.
+const IMM7_SHIFT: u32 = 15;
+
+/// Signed 7-bit scaled immediate of `STP`/`LDP`.
+const IMM7_MASK: u16 = 0x7F;
+const IMM19_BITS: u32 = 19;
+
+/// 19-bit `imm19` offset field (`B.cond`/`LDR`-literal/`ADRP` immhi), bits \[18:0].
+const IMM19_MASK: u32 = 0x0007_FFFF;
+const IMM21_BITS: u32 = 21;
+const IMM26_BITS: u32 = 26;
+
+/// 26-bit `imm26` branch-offset field (`B`/`BL`), bits \[25:0].
+pub const IMM26_MASK: u32 = 0x03FF_FFFF;
+
+/// `immlo` of `ADR`/`ADRP`; `immhi` sits at [`RN_SHIFT`].
+const ADR_IMMLO_SHIFT: u32 = 29;
+
+/// `immlo` of an `ADR`/`ADRP` pair, bits \[1:0] of the 21-bit immediate.
+const ADR_IMMLO_MASK: u32 = 0x3;
+
+/// Bits an `ADRP` immediate is scaled by: it addresses 4KiB pages.
+const ADRP_PAGE_SHIFT: u32 = 12;
+
+/// Byte offset within a 4KiB page, the part an `ADRP` does not carry.
+const PAGE_OFFSET_MASK: u64 = 0xFFF;
+
+/// Largest value the `imm12` field of an unsigned-offset `LDR`/`STR` can hold.
+/// The field is 12 bits and unsigned, counting `0..=0xFFF` *scaled units*.
+const LDST_UIMM12_IMM_MAX: u16 = (1 << 12) - 1;
+
+/// Scale the 64-bit form applies to that `imm12`, i.e. the operand width in
+/// bytes. Any offset the gates address must therefore be 8-aligned.
+const LDST_UIMM12_SCALE_64BIT: u16 = 8;
+
+/// Largest byte offset a 64-bit unsigned-offset `LDR`/`STR` can encode
+/// (`0xFFF * 8 = 32760`), derived from the encoding rather than written out.
+const LDR_UIMM12_MAX_BYTE_OFFSET: u16 = LDST_UIMM12_IMM_MAX * LDST_UIMM12_SCALE_64BIT;
+
+/// Bit position of that immediate field.
+pub const LDST_UIMM12_IMM_SHIFT: u32 = 10;
+
+/// The scaled 12-bit immediate field of an unsigned-offset load/store, \[21:10].
+pub const LDST_UIMM12_IMM_MASK: u32 = 0x003F_FC00;
+
+// Trampoline header and compact gate slots.
+
+/// Alignment every emitted gate slot starts on.
+pub const GATE_ALIGNMENT: usize = 16;
+
+/// Callback address slot.
+const HEADER_CALLBACK_OFFSET: usize = 0;
+
+/// First byte past the 8-byte callback slot.
+pub const FIRST_SCANNABLE_OFFSET: usize = HEADER_CALLBACK_OFFSET + 8;
+
+/// First byte of the per-site gates; the callback header is padded with NOPs to
+/// the 16-byte slot alignment.
+pub const GATES_START_OFFSET: usize = GATE_ALIGNMENT;
+
+/// Byte size of a direct-TLS `MRS TPIDR_EL0` gate slot.
+pub const MRS_SLOT_BYTES: usize = 16;
+
+/// Byte size of a host-aware Darwin shared-cache TPIDRRO gate.
+pub const HOST_AWARE_MRS_SLOT_BYTES: usize = 64;
+
+/// Byte size of a direct-TLS `MSR TPIDR_EL0` gate slot.
+pub const MSR_SLOT_BYTES: usize = 48;
+
+/// Byte size of an emitted `SVC` gate slot.
+pub const SVC_SLOT_BYTES: usize = 64;
+
+/// Byte size of a direct-TLS ordinary x18 gate slot.
+pub const X18_SLOT_BYTES: usize = 48;
+
+/// Byte size of a direct-TLS `ADR X18` gate slot.
+pub const X18_ADR_SLOT_BYTES: usize = 32;
+
+/// Byte size of a direct-TLS x18 compare/test-branch gate slot.
+pub const X18_COMPARE_BRANCH_SLOT_BYTES: usize = 48;
+
+/// Byte size of a terminal `BR X18` trap gate slot.
+pub const X18_BRANCH_SLOT_BYTES: usize = 16;
+
+/// Byte size of a direct-TLS immediate SP-writeback pair x18 gate slot.
+pub const X18_STACK_WRITEBACK_SLOT_BYTES: usize = 64;
+
+/// Distinct compact-slot sizes probed by classifiers and finalizers. Metadata
+/// distinguishes gate kinds that share a slot size.
+pub const GATE_SLOT_SIZES: [usize; 5] = [
+    MRS_SLOT_BYTES,
+    X18_ADR_SLOT_BYTES,
+    MSR_SLOT_BYTES,
+    SVC_SLOT_BYTES,
+    X18_STACK_WRITEBACK_SLOT_BYTES + GATE_ALIGNMENT,
+];
+
+/// Largest compact gate slot on any supported host.
+pub const MAX_GATE_SLOT_BYTES: usize = X18_STACK_WRITEBACK_SLOT_BYTES + GATE_ALIGNMENT;
+
+/// Candidate starts required to cover the largest executable gate body.
+pub const GATE_PC_CANDIDATE_COUNT: usize = MAX_GATE_SLOT_BYTES / GATE_ALIGNMENT;
+
+// Runtime TLS fields and patch placeholders.
+
+/// Alignment the runtime-supplied guest TLS offset must satisfy.
+pub const GUEST_TPIDR_OFFSET_ALIGN: u16 = LDST_UIMM12_SCALE_64BIT;
+
+/// The smallest guest-TLS root offset a gate may be patched with.
+///
+/// Rejects zero and the first anchor-relative slot; the runtime separately
+/// validates ownership of its selected slot.
+pub const MIN_GUEST_TPIDR_OFFSET: u16 = 16;
+
+/// Largest anchor-relative guest TLS root offset encodable by the gates.
+pub const MAX_GUEST_TPIDR_OFFSET: u16 = LDR_UIMM12_MAX_BYTE_OFFSET;
+
+/// Placeholder for the runtime-supplied guest TLS offset.
+///
+/// It is `MAX_GUEST_TPIDR_OFFSET`, the largest value the field can hold, so it
+/// cannot collide with a real runtime offset. That makes scanning for it exact,
+/// which is what lets [`finalize_trampoline_gates`] and
+/// [`find_guest_tpidr_placeholder`] work off the emitted words alone with no
+/// side table of patch sites.
+///
+/// It buys **no** run-time safety: an unpatched gate accesses arbitrary
+/// anchor-relative memory. A loader must use [`finalize_trampoline_gates`]
+/// (Linux without x18) or [`finalize_trampoline_gates_for_host`] before making
+/// a trampoline executable.
+pub const GUEST_TPIDR_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET;
+
+/// Distinct placeholder used by direct-TLS x18 gates.
+const GUEST_X18_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET - 8;
+
+/// Guest x18's ABI offset from the guest thread pointer field.
+pub const GUEST_X18_OFFSET_FROM_GUEST_TP: usize = core::mem::size_of::<usize>();
+const _: () = assert!(GUEST_X18_OFFSET_FROM_GUEST_TP == GUEST_TPIDR_OFFSET_ALIGN as usize);
+
+/// Offset of the runtime's guest-mode word from its guest-TP field.
+pub const IN_GUEST_OFFSET_FROM_GUEST_TP: u16 = 32;
+
+/// Bits occupied by Darwin's CPU-number tag in `TPIDRRO_EL0`.
+const DARWIN_TPIDRRO_CPU_TAG_MASK: u64 = 0b111;
+
+// Guest stack frames and return stubs.
+
+/// Stack frame used by x18 gates to preserve their two scratch registers.
+pub const X18_FRAME_BYTES: u16 = 16;
+
+/// MSR gate frame size (`SUB/ADD SP, SP, #MSR_FRAME_BYTES`). 16-byte aligned.
+pub const MSR_FRAME_BYTES: u16 = 32;
+
+/// Captured guest thread-pointer value, staged while all guest registers are
+/// still pristine.
+pub const MSR_FRAME_OFF_VALUE: u16 = 16;
+
+/// SVC gate frame size (`SUB/ADD SP, SP, #SVC_FRAME_BYTES`). 16-byte aligned.
+///
+/// ABI: guest resume sets `SP` to `guest_sp - SVC_FRAME_BYTES` before
+/// entering an outbound stub, because the stub pops this frame.
+pub const SVC_FRAME_BYTES: u16 = 32;
+
+/// Darwin SVC stack decrement, including the 128-byte red zone.
+/// Frame fields use the `SVC_FRAME_OFF_*` offsets.
+pub const DARWIN_SVC_FRAME_BYTES: u16 = SVC_FRAME_BYTES + 128;
+
+/// Saved guest X16. ABI: the outbound stub reloads `X16` from here.
+pub const SVC_FRAME_OFF_X16: u16 = 0;
+
+/// Post-SVC return address. ABI: the runtime's syscall callback reads it and
+/// publishes it as the guest resume PC.
+pub const SVC_FRAME_OFF_RETADDR: u16 = 8;
+
+/// Address of this site's outbound stub. ABI: the runtime's syscall callback
+/// branches here to resume at the original syscall site.
+pub const SVC_FRAME_OFF_STUB: u16 = 16;
+
+/// Size of the SVC gate proper, i.e. the distance from the gate's first
+/// instruction to its outbound stub. The gate is `SUB SP / STR X16 / ADRP /
+/// ADD / STR / ADR / STR / LDR X16 / BR` = 9 instructions.
+pub const SVC_GATE_BYTES: usize = 9 * 4;
+
+/// Size of the per-site outbound stub (`LDR X16 / ADD SP / B`).
+pub const SVC_OUTBOUND_STUB_BYTES: usize = 3 * 4;
+pub const RT_SIGRETURN_TRAMPOLINE_BYTES: usize = 48;
+const _: () = assert!(
+    SVC_FRAME_BYTES.is_multiple_of(16),
+    "the SVC gate frame must keep SP 16-byte aligned"
+);
+const _: () = assert!(
+    SVC_FRAME_OFF_STUB + 8 <= SVC_FRAME_BYTES,
+    "the SVC gate frame must hold the saved X16, the return address and the stub address"
+);
+
+// Recovery semantics.
+
 /// Where gate-saved guest registers live at an instruction boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Frame {
@@ -103,111 +396,23 @@ pub enum Stage {
     Invalid,
 }
 
-/// `SVC #0` (supervisor call) — the canonical syscall instruction.
-pub const SVC_0: u32 = 0xD400_0001;
+// Persisted gate metadata.
 
-/// `SVC #0x80`, used by Darwin syscall stubs.
-pub const DARWIN_SVC: u32 = 0xD400_1001;
-
-/// Mask/match for *any* `SVC #imm16`. Linux dispatches every `SVC64` exception
-/// to the syscall handler regardless of the immediate (the syscall number comes
-/// from `x8`), so all immediates are rewritten, not just `svc #0`. The `imm16`
-/// field occupies bits \[20:5]; masking it out leaves bits \[4:0] = `0b00001`,
-/// which distinguishes `SVC` from `HVC` (`…0b10`) and `SMC` (`…0b11`).
-pub const SVC_OPCODE_MASK: u32 = 0xFFE0_001F;
-
-pub const SVC_OPCODE_BITS: u32 = SVC_0;
-
-/// Mask/match for `MSR TPIDR_EL0, Xt` (`0xD51BD04t`, the low 5 bits select Xt).
-pub const MSR_TPIDR_EL0_MASK: u32 = 0xFFFF_FFE0;
-
-pub const MSR_TPIDR_EL0_BITS: u32 = 0xD51B_D040;
-
-/// Mask/match for `MRS Xd, TPIDR_EL0` (`0xD53BD04d`, the low 5 bits select Xd).
-pub const MRS_TPIDR_EL0_MASK: u32 = 0xFFFF_FFE0;
-
-pub const MRS_TPIDR_EL0_BITS: u32 = 0xD53B_D040;
-
-/// `BRK` immediate planted at a patch site whose gate is out of `B` reach.
-/// Executing it raises a synchronous debug exception (`SIGTRAP`) carrying this
-/// immediate instead of letting the unpatched instruction escape to the host
-/// kernel.
-///
-/// TODO: recognize this immediate in the runtime, to tell a rewriter trap from
-/// a guest breakpoint.
-pub const TRAP_BRK_IMM: u16 = 0xB10B;
-
-/// `BRK` immediate used by the transparent `BR X18` trap gate.
-const X18_BRANCH_BRK_IMM: u16 = 0xB18;
-
-/// Alignment every emitted gate slot starts on.
-pub const GATE_ALIGNMENT: usize = 16;
-
-/// Byte size of a direct-TLS `MRS TPIDR_EL0` gate slot.
-pub const MRS_SLOT_BYTES: usize = 16;
-
-/// Byte size of a host-aware Darwin shared-cache TPIDRRO gate.
-pub const HOST_AWARE_MRS_SLOT_BYTES: usize = 64;
-
-/// Offset of the runtime's guest-mode word from its guest-TP field.
-pub const IN_GUEST_OFFSET_FROM_GUEST_TP: u16 = 32;
-
-/// Byte size of a direct-TLS `MSR TPIDR_EL0` gate slot.
-pub const MSR_SLOT_BYTES: usize = 48;
-
-/// Byte size of an emitted `SVC` gate slot.
-pub const SVC_SLOT_BYTES: usize = 64;
-
-/// Byte size of a direct-TLS ordinary x18 gate slot.
-pub const X18_SLOT_BYTES: usize = 48;
-
-/// Byte size of a direct-TLS x18 compare/test-branch gate slot.
-pub const X18_COMPARE_BRANCH_SLOT_BYTES: usize = 48;
-
-/// Byte size of a direct-TLS `ADR X18` gate slot.
-pub const X18_ADR_SLOT_BYTES: usize = 32;
-
-/// Byte size of a direct-TLS immediate SP-writeback pair x18 gate slot.
-pub const X18_STACK_WRITEBACK_SLOT_BYTES: usize = 64;
-
-/// Byte size of a terminal `BR X18` trap gate slot.
-pub const X18_BRANCH_SLOT_BYTES: usize = 16;
-
-/// Distinct compact-slot sizes probed by classifiers and finalizers. Metadata
-/// distinguishes gate kinds that share a slot size.
-pub const GATE_SLOT_SIZES: [usize; 5] = [
-    MRS_SLOT_BYTES,
-    X18_ADR_SLOT_BYTES,
-    MSR_SLOT_BYTES,
-    SVC_SLOT_BYTES,
-    X18_STACK_WRITEBACK_SLOT_BYTES + GATE_ALIGNMENT,
-];
-
-/// Largest compact gate slot on any supported host.
-pub const MAX_GATE_SLOT_BYTES: usize = X18_STACK_WRITEBACK_SLOT_BYTES + GATE_ALIGNMENT;
-
-/// Candidate starts required to cover the largest executable gate body.
-pub const GATE_PC_CANDIDATE_COUNT: usize = MAX_GATE_SLOT_BYTES / GATE_ALIGNMENT;
-
-pub const NOP: u32 = 0xD503_201F;
-
+/// The metadata word closing every compact gate slot.
+pub const GATE_METADATA_BYTES: usize = 4;
 const GATE_METADATA_MAGIC: u32 = 0xB807;
-
 const GATE_METADATA_VERSION: u32 = 1;
-
 const GATE_METADATA_MAGIC_MASK: u32 = 0xffff;
-
 const GATE_METADATA_VERSION_SHIFT: u32 = 16;
-
 const GATE_METADATA_VERSION_MASK: u32 = 0xf << GATE_METADATA_VERSION_SHIFT;
-
 const GATE_METADATA_KIND_SHIFT: u32 = 20;
-
 const GATE_METADATA_KIND_MASK: u32 = 0xf << GATE_METADATA_KIND_SHIFT;
-
 pub const GATE_METADATA_REGISTER_SHIFT: u32 = 24;
-
 const GATE_METADATA_REGISTER_MASK: u32 = 0x3f << GATE_METADATA_REGISTER_SHIFT;
+const GATE_METADATA_USED_MASK: u32 = GATE_METADATA_MAGIC_MASK
+    | GATE_METADATA_VERSION_MASK
+    | GATE_METADATA_KIND_MASK
+    | GATE_METADATA_REGISTER_MASK;
 
 /// The metadata word's `kind` field.
 ///
@@ -248,14 +453,6 @@ impl GateKind {
         .find(|kind| kind.bits() == bits)
     }
 }
-
-/// Highest register number a 5-bit register field can name.
-const MAX_REGISTER: u8 = 31;
-
-const GATE_METADATA_USED_MASK: u32 = GATE_METADATA_MAGIC_MASK
-    | GATE_METADATA_VERSION_MASK
-    | GATE_METADATA_KIND_MASK
-    | GATE_METADATA_REGISTER_MASK;
 
 /// Which kind of gate a compact slot holds, and the register it acts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -394,25 +591,6 @@ impl EncodedGateMetadata {
         }
     }
 }
-
-/// First scratch register (IP0).
-pub const X16: u8 = 16;
-
-const X8: u8 = 8;
-
-/// Second scratch register (IP1).
-pub const X17: u8 = 17;
-
-/// Stack pointer (encoded as register 31 in a base-register field).
-pub const SP: u8 = 31;
-
-/// Zero register (register 31 in a transfer-register field, where it reads as
-/// zero / discards writes — distinct from `SP`'s base-register meaning).
-pub const XZR: u8 = 31;
-
-pub const X18: u16 = 18;
-
-const X18_ENCODED: u8 = 18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum X18Classification {
@@ -1056,78 +1234,6 @@ fn substitute_x18(word: u32, replacement: u8) -> Option<u32> {
     (decode_instruction(transformed_word)? == expected).then_some(transformed_word)
 }
 
-/// Largest value the `imm12` field of an unsigned-offset `LDR`/`STR` can hold.
-/// The field is 12 bits and unsigned, counting `0..=0xFFF` *scaled units*.
-const LDST_UIMM12_IMM_MAX: u16 = (1 << 12) - 1;
-
-/// Scale the 64-bit form applies to that `imm12`, i.e. the operand width in
-/// bytes. Any offset the gates address must therefore be 8-aligned.
-const LDST_UIMM12_SCALE_64BIT: u16 = 8;
-
-/// Largest byte offset a 64-bit unsigned-offset `LDR`/`STR` can encode
-/// (`0xFFF * 8 = 32760`), derived from the encoding rather than written out.
-const LDR_UIMM12_MAX_BYTE_OFFSET: u16 = LDST_UIMM12_IMM_MAX * LDST_UIMM12_SCALE_64BIT;
-
-/// Alignment the runtime-supplied guest TLS offset must satisfy.
-pub const GUEST_TPIDR_OFFSET_ALIGN: u16 = LDST_UIMM12_SCALE_64BIT;
-
-/// Guest x18's ABI offset from the guest thread pointer field.
-pub const GUEST_X18_OFFSET_FROM_GUEST_TP: usize = core::mem::size_of::<usize>();
-
-const _: () = assert!(GUEST_X18_OFFSET_FROM_GUEST_TP == GUEST_TPIDR_OFFSET_ALIGN as usize);
-
-/// Largest anchor-relative guest TLS root offset encodable by the gates.
-pub const MAX_GUEST_TPIDR_OFFSET: u16 = LDR_UIMM12_MAX_BYTE_OFFSET;
-
-/// The smallest guest-TLS root offset a gate may be patched with.
-///
-/// Rejects zero and the first anchor-relative slot; the runtime separately
-/// validates ownership of its selected slot.
-pub const MIN_GUEST_TPIDR_OFFSET: u16 = 16;
-
-/// Placeholder for the runtime-supplied guest TLS offset.
-///
-/// It is `MAX_GUEST_TPIDR_OFFSET`, the largest value the field can hold, so it
-/// cannot collide with a real runtime offset. That makes scanning for it exact,
-/// which is what lets [`finalize_trampoline_gates`] and
-/// [`find_guest_tpidr_placeholder`] work off the emitted words alone with no
-/// side table of patch sites.
-///
-/// It buys **no** run-time safety: an unpatched gate accesses arbitrary
-/// anchor-relative memory. A loader must use [`finalize_trampoline_gates`]
-/// (Linux without x18) or [`finalize_trampoline_gates_for_host`] before making
-/// a trampoline executable.
-pub const GUEST_TPIDR_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET;
-
-/// Distinct placeholder used by direct-TLS x18 gates.
-const GUEST_X18_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET - 8;
-
-/// Stack frame used by x18 gates to preserve their two scratch registers.
-pub const X18_FRAME_BYTES: u16 = 16;
-
-/// SVC gate frame size (`SUB/ADD SP, SP, #SVC_FRAME_BYTES`). 16-byte aligned.
-///
-/// ABI: guest resume sets `SP` to `guest_sp - SVC_FRAME_BYTES` before
-/// entering an outbound stub, because the stub pops this frame.
-pub const SVC_FRAME_BYTES: u16 = 32;
-
-/// Darwin SVC stack decrement, including the 128-byte red zone.
-/// Frame fields use the `SVC_FRAME_OFF_*` offsets.
-pub const DARWIN_SVC_FRAME_BYTES: u16 = SVC_FRAME_BYTES + 128;
-
-/// Saved guest X16. ABI: the outbound stub reloads `X16` from here.
-pub const SVC_FRAME_OFF_X16: u16 = 0;
-
-/// Post-SVC return address. ABI: the runtime's syscall callback reads it and
-/// publishes it as the guest resume PC.
-pub const SVC_FRAME_OFF_RETADDR: u16 = 8;
-
-/// Address of this site's outbound stub. ABI: the runtime's syscall callback
-/// branches here to resume at the original syscall site.
-pub const SVC_FRAME_OFF_STUB: u16 = 16;
-
-pub const RT_SIGRETURN_TRAMPOLINE_BYTES: usize = 48;
-
 /// Emits a synthetic AArch64 `rt_sigreturn` restorer that dispatches through
 /// `callback` using the rewriter's SVC frame ABI.
 pub fn emit_rt_sigreturn_trampoline(
@@ -1185,84 +1291,6 @@ pub fn emit_rt_sigreturn_trampoline(
     Ok(out)
 }
 
-const _: () = assert!(
-    SVC_FRAME_BYTES.is_multiple_of(16),
-    "the SVC gate frame must keep SP 16-byte aligned"
-);
-
-const _: () = assert!(
-    SVC_FRAME_OFF_STUB + 8 <= SVC_FRAME_BYTES,
-    "the SVC gate frame must hold the saved X16, the return address and the stub address"
-);
-
-/// Size of the SVC gate proper, i.e. the distance from the gate's first
-/// instruction to its outbound stub. The gate is `SUB SP / STR X16 / ADRP /
-/// ADD / STR / ADR / STR / LDR X16 / BR` = 9 instructions.
-pub const SVC_GATE_BYTES: usize = 9 * 4;
-
-/// Size of the per-site outbound stub (`LDR X16 / ADD SP / B`).
-pub const SVC_OUTBOUND_STUB_BYTES: usize = 3 * 4;
-
-/// MSR gate frame size (`SUB/ADD SP, SP, #MSR_FRAME_BYTES`). 16-byte aligned.
-pub const MSR_FRAME_BYTES: u16 = 32;
-
-/// Captured guest thread-pointer value, staged while all guest registers are
-/// still pristine.
-pub const MSR_FRAME_OFF_VALUE: u16 = 16;
-
-/// Callback address slot.
-const HEADER_CALLBACK_OFFSET: usize = 0;
-
-/// First byte past the 8-byte callback slot.
-pub const FIRST_SCANNABLE_OFFSET: usize = HEADER_CALLBACK_OFFSET + 8;
-
-/// First byte of the per-site gates; the callback header is padded with NOPs to
-/// the 16-byte slot alignment.
-pub const GATES_START_OFFSET: usize = GATE_ALIGNMENT;
-
-/// 26-bit `imm26` branch-offset field (`B`/`BL`), bits \[25:0].
-pub const IMM26_MASK: u32 = 0x03FF_FFFF;
-
-pub const OPCODE_TOP6_MASK: u32 = 0xFC00_0000;
-
-/// 19-bit `imm19` offset field (`B.cond`/`LDR`-literal/`ADRP` immhi), bits \[18:0].
-const IMM19_MASK: u32 = 0x0007_FFFF;
-
-/// A PC-relative immediate counts instructions, so it scales by this many bits
-/// to reach a byte displacement.
-const INSN_BYTES_LOG2: u32 = 2;
-
-/// Bytes in one AArch64 instruction. Every patch site, gate slot and scan
-/// stride is a whole number of these.
-pub const INSN_BYTES: usize = 1 << INSN_BYTES_LOG2;
-
-/// [`INSN_BYTES`] where a virtual address is being measured.
-pub const INSN_BYTES_U64: u64 = 1 << INSN_BYTES_LOG2;
-
-/// The metadata word closing every compact gate slot.
-pub const GATE_METADATA_BYTES: usize = 4;
-
-/// `Rn`, and the low bit of a PC-relative `imm19`.
-const RN_SHIFT: u32 = 5;
-
-/// `Rt2` of `STP`/`LDP`, and `imm12` of the add/sub and load/store forms.
-const RT2_SHIFT: u32 = 10;
-
-/// Signed `imm7` of `STP`/`LDP`.
-const IMM7_SHIFT: u32 = 15;
-
-/// `immlo` of `ADR`/`ADRP`; `immhi` sits at [`RN_SHIFT`].
-const ADR_IMMLO_SHIFT: u32 = 29;
-
-/// Bits an `ADRP` immediate is scaled by: it addresses 4KiB pages.
-const ADRP_PAGE_SHIFT: u32 = 12;
-
-const IMM26_BITS: u32 = 26;
-
-const IMM21_BITS: u32 = 21;
-
-const IMM19_BITS: u32 = 19;
-
 /// Sign-extends the low `bits` of `value`.
 const fn sign_extend(value: i64, bits: u32) -> i64 {
     (value << (i64::BITS - bits)) >> (i64::BITS - bits)
@@ -1272,28 +1300,6 @@ const fn sign_extend(value: i64, bits: u32) -> i64 {
 const fn pcrel_bytes(imm: i64, bits: u32) -> i64 {
     sign_extend(imm, bits) << INSN_BYTES_LOG2
 }
-
-/// Register field, bits \[4:0] — `Rd`, `Rt` or the `Rn`/`Rt2` fields once
-/// shifted into place.
-pub const REG_MASK: u32 = 0x1F;
-
-/// `immlo` of an `ADR`/`ADRP` pair, bits \[1:0] of the 21-bit immediate.
-const ADR_IMMLO_MASK: u32 = 0x3;
-
-/// Signed 7-bit scaled immediate of `STP`/`LDP`.
-const IMM7_MASK: u16 = 0x7F;
-
-/// Byte offset within a 4KiB page, the part an `ADRP` does not carry.
-const PAGE_OFFSET_MASK: u64 = 0xFFF;
-
-/// `ADRP` opcode bits plus `Rd`, ignoring the immediate.
-const ADRP_SHAPE_MASK: u32 = 0x9F00_001F;
-
-/// `ADD (immediate)` opcode bits plus `Rn` and `Rd`, ignoring the immediate.
-const ADD_IMM_SHAPE_MASK: u32 = 0xFFC0_03FF;
-
-/// `LDR (literal)` opcode bits plus `Rt`, ignoring the immediate.
-const LDR_LITERAL_SHAPE_MASK: u32 = 0xFF00_001F;
 
 /// Fixed instruction bits with operand fields zeroed, for encoding and matching.
 #[repr(u32)]
@@ -1704,9 +1710,6 @@ impl GateLayout {
     }
 }
 
-/// Bits occupied by Darwin's CPU-number tag in `TPIDRRO_EL0`.
-const DARWIN_TPIDRRO_CPU_TAG_MASK: u64 = 0b111;
-
 pub fn anchor_mask(rd: u8) -> Insn {
     Insn::AndImm {
         rd,
@@ -2077,12 +2080,6 @@ pub fn decode_adrp_target(adrp: u32, pc: u64, rd: u8) -> Option<u64> {
     let page_delta = sign_extend(imm21, IMM21_BITS) << ADRP_PAGE_SHIFT;
     (pc & !PAGE_OFFSET_MASK).checked_add_signed(page_delta)
 }
-
-/// The scaled 12-bit immediate field of an unsigned-offset load/store, \[21:10].
-pub const LDST_UIMM12_IMM_MASK: u32 = 0x003F_FC00;
-
-/// Bit position of that immediate field.
-pub const LDST_UIMM12_IMM_SHIFT: u32 = 10;
 
 /// Validates and patches every thread-pointer gate in a Linux-host trampoline.
 /// Trampolines containing x18 gates must use
