@@ -15,14 +15,18 @@ use litebox_common_linux::PtRegs;
 use litebox_platform_macos_userland::{
     GuestAbi, HOST_PAGE_SIZE, MacosUserland, run_thread, set_guest_abi,
 };
-use litebox_syscall_rewriter::macho::Rewriter;
-use litebox_trampoline::TargetHost;
+use litebox_trampoline::{
+    TargetHost,
+    aarch64::{
+        self, GateLayout, GateMetadata, Insn,
+        gate::{self, GateInstance},
+    },
+};
 use std::cell::Cell;
 use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;
 
 #[test]
-#[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]
 fn spawned_threads_use_configured_darwin_gates() {
     struct Child {
         entry: usize,
@@ -125,22 +129,36 @@ fn spawned_threads_use_configured_darwin_gates() {
         );
     let mut code = [0xd4001001u32.to_le_bytes(); 2].concat();
     let gate_offset = HOST_PAGE_SIZE / 2;
-    let (gates, trapped) = Rewriter::new(TargetHost::MacOs)
-        .unwrap()
-        .patch_code_segment(
-            &mut code,
-            base as u64,
-            &[0..8],
-            (base + gate_offset) as u64,
-            platform.get_syscall_entry_point() as u64,
-            platform
-                .guest_thread_pointer_offset()
-                .unwrap()
-                .try_into()
-                .unwrap(),
+    let gate_address = (base + gate_offset) as u64;
+    let mut gates = Vec::new();
+    aarch64::emit_shared_prologue(&mut gates, platform.get_syscall_entry_point() as u64);
+    for offset in [0, aarch64::INSN_BYTES] {
+        let site = (base + offset) as u64;
+        let slot_address = gate_address + gates.len() as u64;
+        let instance = GateInstance::new(GateMetadata::Svc, site + aarch64::INSN_BYTES_U64);
+        gate::build(
+            &instance,
+            GateLayout::darwin(TargetHost::MacOs),
+            slot_address,
+            gate_address,
         )
-        .unwrap();
-    assert_eq!(trapped, []);
+        .unwrap()
+        .append_to(&mut gates);
+        let branch = Insn::B(slot_address.cast_signed() - site.cast_signed())
+            .encode()
+            .unwrap();
+        code[offset..offset + aarch64::INSN_BYTES].copy_from_slice(&branch.to_le_bytes());
+    }
+    aarch64::finalize_macho_trampoline(
+        &mut gates,
+        platform
+            .guest_thread_pointer_offset()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        TargetHost::MacOs,
+    )
+    .unwrap();
     memory.copy_from_slice(0, &code).unwrap();
     memory.copy_from_slice(gate_offset, &gates).unwrap();
     // SAFETY: code and gates are initialized and have no active users.

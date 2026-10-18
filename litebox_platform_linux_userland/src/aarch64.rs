@@ -1871,6 +1871,13 @@ mod tests {
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::signal::{SigSet, Signal};
+    use litebox_trampoline::{
+        TargetHost,
+        aarch64::{
+            self, GateLayout, GateMetadata, Insn,
+            gate::{self, GateInstance},
+        },
+    };
 
     #[test]
     fn spawned_thread_installs_inherited_vector_state() {
@@ -2000,10 +2007,10 @@ mod tests {
         const IMM12_MASK: u32 = 0x003F_FC00;
         const ALIGN: u16 = litebox_trampoline::aarch64::GUEST_TPIDR_OFFSET_ALIGN;
 
-        let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
-        let (mut tramp, trapped) =
-            litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0).unwrap();
-        assert_eq!(trapped, []);
+        let (_, mut tramp) = gate_bytes(
+            GateInstance::new(GateMetadata::MrsTpidr { destination: 9 }, 0x1004),
+            0x400000,
+        );
         assert_eq!(
             litebox_trampoline::aarch64::find_guest_tpidr_placeholder(&tramp),
             Some(16 + 4),
@@ -2178,18 +2185,36 @@ mod tests {
         );
     }
 
+    // A fixture describes one known gate explicitly; no instruction scanning
+    // or rewriting is involved. Return its inbound branch and shared-header image.
+    fn gate_bytes(instance: GateInstance, trampoline_base: u64) -> (Vec<u8>, Vec<u8>) {
+        let mut trampoline = Vec::new();
+        aarch64::emit_shared_prologue(&mut trampoline, 0);
+        let slot_address = trampoline_base + aarch64::GATES_START_OFFSET as u64;
+        gate::build(
+            &instance,
+            GateLayout::linux(TargetHost::Linux),
+            slot_address,
+            trampoline_base,
+        )
+        .unwrap()
+        .append_to(&mut trampoline);
+        let site = instance.return_addr - aarch64::INSN_BYTES_U64;
+        let branch = Insn::B(slot_address.cast_signed() - site.cast_signed())
+            .encode()
+            .unwrap();
+        (branch.to_le_bytes().to_vec(), trampoline)
+    }
+
     fn gate_fixture(
-        original: u32,
+        metadata: GateMetadata,
     ) -> (
         Vec<u8>,
         Vec<u8>,
         libc::ucontext_t,
         litebox_common_linux::PtRegs,
     ) {
-        let mut code = original.to_le_bytes().to_vec();
-        let (trampoline, trapped) =
-            litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0).unwrap();
-        assert_eq!(trapped, []);
+        let (code, trampoline) = gate_bytes(GateInstance::new(metadata, 0x1004), 0x400000);
         let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
         for (index, reg) in context.uc_mcontext.regs.iter_mut().enumerate() {
             *reg = 0xfeed_0000_0000_0000 | index as u64;
@@ -2303,7 +2328,8 @@ mod tests {
         const UPDATED_GUEST_TP: usize = 0x2345_6789_abcd_ef01;
         let guest_tp = GUEST_TP.to_le_bytes();
 
-        let (code, trampoline, mut context, saved) = gate_fixture(0xd53b_d049);
+        let (code, trampoline, mut context, saved) =
+            gate_fixture(GateMetadata::MrsTpidr { destination: 9 });
         for offset in [0usize, 4, 8] {
             context.uc_mcontext.pc = 0x400010 + offset as u64;
             context.uc_mcontext.regs[9] = match offset {
@@ -2338,7 +2364,8 @@ mod tests {
             assert!(!regs.regs.contains(&HOST_ANCHOR.trunc()));
         }
 
-        let (code, trampoline, mut context, saved) = gate_fixture(0xd51b_d045);
+        let (code, trampoline, mut context, saved) =
+            gate_fixture(GateMetadata::MsrTpidr { source: 5 });
         let mut saved = saved;
         saved.regs[16] = GUEST_X16;
         saved.regs[17] = GUEST_X17;
@@ -2388,7 +2415,7 @@ mod tests {
             assert!(!regs.regs.contains(&HOST_CALLBACK.trunc()));
         }
 
-        let (code, trampoline, mut context, saved) = gate_fixture(0xd400_0001);
+        let (code, trampoline, mut context, saved) = gate_fixture(GateMetadata::Svc);
         let mut saved = saved;
         saved.regs[16] = GUEST_X16;
         saved.regs[17] = GUEST_X17;
@@ -2466,19 +2493,10 @@ mod tests {
         const NZCV_BEFORE: usize = 0x4000_0000;
         const NZCV_AFTER: usize = 0x8000_0000;
 
-        let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_trampoline::TargetHost::Linux,
-            true,
-        );
-        let mut code = 0xaa12_03f2u32.to_le_bytes().to_vec(); // mov x18, x18
-        let (trampoline, _) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
+        let mut instance = GateInstance::new(GateMetadata::X18 { scratch: 17 }, 0x1004);
+        instance.anchor = 16;
+        instance.guest = 0xaa11_03f1; // mov x17, x17
+        let (code, trampoline) = gate_bytes(instance, 0x400000);
 
         let mut saved = PtRegs::default();
         saved.regs[16] = SAVED_ANCHOR;
@@ -2565,6 +2583,25 @@ mod tests {
                 },
                 "+{offset}: NZCV"
             );
+            if offset == 0 {
+                // Only indirect x18 branch gates interpret a breakpoint as an
+                // emulation request. Ordinary gates use normal recovery.
+                let result = canonicalize_aarch64_gate_signal_context_with_kind(
+                    &context,
+                    &saved,
+                    GateRuntimeState {
+                        guest_thread_pointer_addr: 0x500000,
+                        expected_outbound_stub: 0,
+                        expected_outbound_pc: 0,
+                    },
+                    GateInterruption::Breakpoint,
+                    fixture_reader(&code, &trampoline, &frame, &slots),
+                );
+                let Aarch64GateSignalResult::Canonicalized(breakpoint_regs) = result else {
+                    panic!("breakpoint changed ordinary x18 gate recovery");
+                };
+                assert_ptregs_eq(&breakpoint_regs, &regs, "ordinary x18 breakpoint");
+            }
         }
 
         for (offset, signal_sp, frame_address, expected_sp) in [
@@ -2683,21 +2720,18 @@ mod tests {
         const SAVED_SCRATCH: usize = 0x1717_1717_1717_1717;
         const SAVED_ANCHOR: usize = 0x1616_1616_1616_1616;
 
-        let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_trampoline::TargetHost::Linux,
-            true,
-        );
-        // stp x18, x19, [sp, #-16]!
-        let mut code = 0xa9bf_4ff2u32.to_le_bytes().to_vec();
-        let (trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
-        assert_eq!(trapped, []);
+        let mut instance =
+            GateInstance::new(GateMetadata::X18StackWriteback { scratch: 17 }, 0x1004);
+        instance.anchor = 16;
+        instance.guest = 0xa9bf_4ff1; // stp x17, x19, [sp, #-16]!
+        instance.stack = aarch64::X18StackWritebackLayout {
+            rt: 18,
+            rt2: 19,
+            delta: -16,
+            element_bytes: 8,
+            frame_bytes: 32,
+        };
+        let (code, trampoline) = gate_bytes(instance, 0x400000);
 
         let gate =
             litebox_trampoline::aarch64::classify_gate_pc(&trampoline, 0x400000, SLOT as u64)
@@ -2814,25 +2848,15 @@ mod tests {
         const SITE: usize = 0x1000;
         const SLOT: usize = 0x400010;
         const LOGICAL_X18: usize = 0x1234_5678_9abc_def0;
-        let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_trampoline::TargetHost::Linux,
-            true,
-        );
-        for (word, name, writes_link) in [
-            (0xd61f_0240u32, "BR X18", false),
-            (0xd63f_0240, "BLR X18", true),
-            (0xd65f_0240, "RET X18", false),
+        for (kind, name, writes_link) in [
+            (aarch64::X18IndirectBranchKind::Br, "BR X18", false),
+            (aarch64::X18IndirectBranchKind::Blr, "BLR X18", true),
+            (aarch64::X18IndirectBranchKind::Ret, "RET X18", false),
         ] {
-            let mut code = word.to_le_bytes().to_vec();
-            let (trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
-                &mut code,
-                SITE as u64,
+            let (code, trampoline) = gate_bytes(
+                GateInstance::new(GateMetadata::X18Branch { kind }, 0x1004),
                 0x400000,
-                0,
-                options,
-            )
-            .unwrap();
-            assert_eq!(trapped, []);
+            );
 
             let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
             for (index, reg) in context.uc_mcontext.regs.iter_mut().enumerate() {
@@ -2885,68 +2909,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "aarch64_virtualize_x18")]
-    fn breakpoint_at_ordinary_x18_gate_uses_normal_recovery() {
-        const SITE: usize = 0x1000;
-        const SLOT: usize = 0x400010;
-        const LOGICAL_X18: usize = 0x1818;
-        let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_trampoline::TargetHost::Linux,
-            true,
-        );
-        let mut code = 0xaa12_03f2u32.to_le_bytes().to_vec(); // mov x18, x18
-        let (trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
-        assert_eq!(trapped, []);
-        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
-        context.uc_mcontext.pc = SLOT as u64;
-        context.uc_mcontext.sp = 0x8000;
-        let saved = PtRegs::default();
-        let mut slots = [0u8; 16];
-        slots[8..].copy_from_slice(&LOGICAL_X18.to_ne_bytes());
-
-        let result = canonicalize_aarch64_gate_signal_context_with_kind(
-            &context,
-            &saved,
-            GateRuntimeState {
-                guest_thread_pointer_addr: 0x500000,
-                expected_outbound_stub: 0,
-                expected_outbound_pc: 0,
-            },
-            GateInterruption::Breakpoint,
-            fixture_reader(&code, &trampoline, &[], &slots),
-        );
-        let Aarch64GateSignalResult::Canonicalized(regs) = result else {
-            panic!("breakpoint changed ordinary x18 gate recovery");
-        };
-        assert_eq!(regs.pc, SITE);
-        assert_eq!(regs.regs[18], LOGICAL_X18);
-    }
-
-    #[test]
-    #[cfg(feature = "aarch64_virtualize_x18")]
     fn cbnz_w18_gate_canonicalizes_fallthrough_and_taken_paths() {
         const SITE: usize = 0x1000;
         const SLOT: usize = 0x400010;
         const FRAME: usize = 0x8000;
-        let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_trampoline::TargetHost::Linux,
-            true,
-        );
-        let mut code = 0x3500_0332u32.to_le_bytes().to_vec();
-        let (trampoline, _) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
+        let mut instance =
+            GateInstance::new(GateMetadata::X18CompareBranch { scratch: 17 }, 0x1004);
+        instance.anchor = 16;
+        instance.test = aarch64::X18BranchKind::CbnzW;
+        instance.taken = 0x1064;
+        let (code, trampoline) = gate_bytes(instance, 0x400000);
 
         let mut saved = PtRegs::default();
         saved.regs[16] = 0x1616;
@@ -3023,19 +2995,10 @@ mod tests {
         const TARGET: usize = SITE + 12;
         const GUEST_X18_BEFORE: usize = 0x1818_1818_1818_1818;
 
-        let options = litebox_syscall_rewriter::RewriteOptions::new(
-            litebox_trampoline::TargetHost::Linux,
-            true,
-        );
-        let mut code = 0x1000_0072u32.to_le_bytes().to_vec(); // adr x18, +0xc
-        let (trampoline, _) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
+        let mut instance = GateInstance::new(GateMetadata::X18Adr { scratch: 17 }, 0x1004);
+        instance.anchor = 16;
+        instance.adr_target = 0x100c;
+        let (code, trampoline) = gate_bytes(instance, 0x400000);
 
         let mut saved = PtRegs::default();
         saved.regs[16] = 0x1616;
@@ -3098,7 +3061,8 @@ mod tests {
 
     #[test]
     fn invalid_gate_runtime_state_never_mutates_saved_ptregs() {
-        let (code, trampoline, mut context, saved) = gate_fixture(0xd51b_d045);
+        let (code, trampoline, mut context, saved) =
+            gate_fixture(GateMetadata::MsrTpidr { source: 5 });
         context.uc_mcontext.pc = 0x400010 + 20;
         context.uc_mcontext.sp = 0x8000;
         context.uc_mcontext.regs[5] = saved.regs[5] as u64;
@@ -3184,7 +3148,7 @@ mod tests {
 
     #[test]
     fn gate_classifier_and_provenance_negatives_are_failure_atomic() {
-        let (code, trampoline, mut context, saved) = gate_fixture(0xd400_0001);
+        let (code, trampoline, mut context, saved) = gate_fixture(GateMetadata::Svc);
         let before = ptregs_bytes(&saved);
         let mut frame = [0u8; 32];
         frame[..8].copy_from_slice(&(saved.regs[16] as u64).to_ne_bytes());
@@ -3286,19 +3250,12 @@ mod tests {
         // fail closed rather than selecting either one.
         let second_start = 0x400020usize;
         let second_pc = second_start + 8;
-        let (_, second_slot, _, _) = gate_fixture(0xd400_0001);
-        let mut second_slot = second_slot[16..80].to_vec();
         let first_slot = trampoline[16..80].to_vec();
-        let mut source = 0xd400_0001u32.to_le_bytes();
-        let (relocated, trapped) = litebox_syscall_rewriter::patch_code_segment(
-            &mut source,
-            0x1000,
+        let (_, relocated) = gate_bytes(
+            GateInstance::new(GateMetadata::Svc, 0x1004),
             second_start as u64 - 16,
-            0,
-        )
-        .unwrap();
-        assert_eq!(trapped, []);
-        second_slot.copy_from_slice(&relocated[16..80]);
+        );
+        let second_slot = relocated[16..80].to_vec();
         context.uc_mcontext.pc = second_pc as u64;
         let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
@@ -3347,7 +3304,8 @@ mod tests {
 
     #[test]
     fn unreadable_mrs_guest_tp_is_failure_atomic() {
-        let (code, trampoline, mut context, saved) = gate_fixture(0xd53b_d049);
+        let (code, trampoline, mut context, saved) =
+            gate_fixture(GateMetadata::MrsTpidr { destination: 9 });
         context.uc_mcontext.pc = 0x400010 + 4;
         let before = (saved.regs, saved.sp, saved.pc, saved.pstate, saved.orig_x0);
         let result = super::canonicalize_aarch64_gate_signal_context(
@@ -3373,7 +3331,8 @@ mod tests {
         const GUEST_TP: usize = 0x1234_5678_9abc_def0;
         let guest_tp = GUEST_TP.to_ne_bytes();
 
-        let (mrs_code, mrs_slot, mut context, saved) = gate_fixture(0xd53b_d049);
+        let (mrs_code, mrs_slot, mut context, saved) =
+            gate_fixture(GateMetadata::MrsTpidr { destination: 9 });
         for (offset, readable, canonical) in [
             (0usize, false, true),
             (4, false, false),
@@ -3406,7 +3365,8 @@ mod tests {
             );
         }
 
-        let (msr_code, msr_slot, mut context, saved) = gate_fixture(0xd51b_d045);
+        let (msr_code, msr_slot, mut context, saved) =
+            gate_fixture(GateMetadata::MsrTpidr { source: 5 });
         let mut msr_frame = [0u8; 24];
         msr_frame[..8].copy_from_slice(&(saved.regs[16] as u64).to_ne_bytes());
         msr_frame[8..16].copy_from_slice(&(saved.regs[17] as u64).to_ne_bytes());
@@ -3486,7 +3446,7 @@ mod tests {
             );
         }
 
-        let (svc_code, svc_slot, mut context, saved) = gate_fixture(0xd400_0001);
+        let (svc_code, svc_slot, mut context, saved) = gate_fixture(GateMetadata::Svc);
         for offset in (0usize..=32).step_by(4) {
             context.uc_mcontext.pc = 0x400010 + offset as u64;
             context.uc_mcontext.sp = if offset == 0 { 0x8020 } else { 0x8000 };
@@ -3557,7 +3517,8 @@ mod tests {
 
     #[test]
     fn canonicalizer_rejects_mrs_xzr_metadata_without_indexing_x31() {
-        let (code, mut trampoline, mut context, saved) = gate_fixture(0xd53b_d049);
+        let (code, mut trampoline, mut context, saved) =
+            gate_fixture(GateMetadata::MrsTpidr { destination: 9 });
         trampoline[28..32].copy_from_slice(&0x1f11_b807u32.to_le_bytes());
         context.uc_mcontext.pc = 0x400010;
 
@@ -3575,8 +3536,8 @@ mod tests {
     #[test]
     fn msr_special_sources_validate_the_captured_architectural_value() {
         for (source, expected) in [(16u8, 0x1616usize), (17, 0x1717), (31, 0)] {
-            let original = 0xd51b_d040 | u32::from(source);
-            let (code, trampoline, mut context, mut saved) = gate_fixture(original);
+            let (code, trampoline, mut context, mut saved) =
+                gate_fixture(GateMetadata::MsrTpidr { source });
             saved.regs[16] = 0x1616;
             saved.regs[17] = 0x1717;
             context.uc_mcontext.pc = 0x400010 + 20;
