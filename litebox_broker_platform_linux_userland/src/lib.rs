@@ -11,6 +11,7 @@
 
 mod socket;
 mod sync;
+pub mod terminal;
 mod time;
 
 pub use socket::LinuxSocketProvider;

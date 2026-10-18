@@ -15,6 +15,7 @@ use alloc::vec;
 use litebox_broker_protocol::process::ChildExit;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::signal::{MAX_SIGNAL, PendingSignal, SignalEvent, SignalTarget};
+use litebox_broker_protocol::terminal::TerminalEvents;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::Mutex;
 
@@ -111,6 +112,8 @@ impl ObjectEntry {
 pub(crate) struct ProcessSignals(Mutex<ProcessSignalsState>);
 
 struct ProcessSignalsState {
+    /// The terminal events posted since the process last took them.
+    terminal_events: TerminalEvents,
     /// The process that first sent each pending signal, indexed by signal
     /// number minus one.
     senders: [Option<ProcessId>; MAX_SIGNAL as usize],
@@ -130,6 +133,7 @@ struct ProcessSignalsState {
 impl ProcessSignals {
     pub(crate) fn new() -> Self {
         Self(Mutex::new(ProcessSignalsState {
+            terminal_events: TerminalEvents::empty(),
             senders: [None; MAX_SIGNAL as usize],
             child_exit: None,
             child_removed: false,
@@ -164,12 +168,23 @@ impl ProcessSignals {
         if state.child_removed {
             return;
         }
+
         state.child_removed = true;
+        state.republish();
+    }
+
+    pub(crate) fn post_terminal_events(&self, events: TerminalEvents) {
+        let mut state = self.0.lock();
+        state.terminal_events |= events;
         state.republish();
     }
 
     fn take(&self) -> Result<SignalEvent> {
         let mut state = self.0.lock();
+        let terminal_events = core::mem::take(&mut state.terminal_events);
+        if !terminal_events.is_empty() {
+            return Ok(SignalEvent::Terminal(terminal_events));
+        }
         let signal = state
             .senders
             .iter_mut()
@@ -193,6 +208,7 @@ impl ProcessSignals {
     fn readiness(&self) -> ReadinessFlags {
         let state = self.0.lock();
         if state.child_exit.is_some()
+            || !state.terminal_events.is_empty()
             || state.child_removed
             || state.senders.iter().any(Option::is_some)
         {

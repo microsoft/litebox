@@ -53,6 +53,14 @@ pub enum StdioProviderError {
 /// stream's readiness to its watchers. Providers whose operations always make
 /// progress can keep the default readiness methods.
 pub trait StdioProvider: Send + Sync {
+    /// Shared endpoint behind a terminal stream, if terminal control is supported.
+    fn terminal(
+        &self,
+        _stream: StdioStream,
+    ) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {
+        None
+    }
+
     /// Reads available bytes from standard input, returning zero at
     /// end-of-file.
     fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError>;

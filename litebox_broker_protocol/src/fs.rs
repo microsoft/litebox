@@ -138,6 +138,10 @@ pub enum FileError {
     NotEmpty,
     #[error("operation is not permitted on an O_PATH file descriptor")]
     PathOnly,
+    #[error("object is not a terminal")]
+    NotTerminal,
+    #[error("terminal control is invalid or unsupported")]
+    InvalidTerminalControl,
 }
 
 /// Seek origin.
@@ -449,6 +453,15 @@ pub struct HandleFileStatusRequest {
 pub struct IsTerminalFileRequest {
     /// Broker-owned file handle.
     pub handle: ObjectHandle,
+}
+
+/// Controls the shared terminal backing an open file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalControlFileRequest {
+    /// Broker-owned file handle.
+    pub handle: ObjectHandle,
+    /// Typed terminal operation.
+    pub operation: crate::terminal::TerminalOperation,
 }
 
 /// Changes mode bits by path.

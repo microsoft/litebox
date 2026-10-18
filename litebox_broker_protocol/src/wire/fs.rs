@@ -9,8 +9,8 @@ use crate::fs::{
     IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
     PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
     ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
-    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
-    file_type_from_raw, file_type_raw,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -33,6 +33,7 @@ const REQUEST_TAG_UNLINK: u8 = 10;
 const REQUEST_TAG_MKDIR: u8 = 11;
 const REQUEST_TAG_RMDIR: u8 = 12;
 const REQUEST_TAG_IS_TERMINAL: u8 = 13;
+const REQUEST_TAG_TERMINAL_CONTROL: u8 = 14;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -48,6 +49,7 @@ const RESPONSE_TAG_UNLINK: u8 = 10;
 const RESPONSE_TAG_MKDIR: u8 = 11;
 const RESPONSE_TAG_RMDIR: u8 = 12;
 const RESPONSE_TAG_IS_TERMINAL: u8 = 13;
+const RESPONSE_TAG_TERMINAL_CONTROL: u8 = 14;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -119,6 +121,11 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::IsTerminal(request) => {
             encoder.u8(REQUEST_TAG_IS_TERMINAL);
             encoder.handle(request.handle);
+        }
+        FileRequest::TerminalControl(request) => {
+            encoder.u8(REQUEST_TAG_TERMINAL_CONTROL);
+            encoder.handle(request.handle);
+            super::terminal::encode_operation(encoder, request.operation);
         }
         FileRequest::Chmod(request) => {
             encoder.u8(REQUEST_TAG_CHMOD);
@@ -200,6 +207,12 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         REQUEST_TAG_IS_TERMINAL => Ok(FileRequest::IsTerminal(IsTerminalFileRequest {
             handle: decoder.handle()?,
         })),
+        REQUEST_TAG_TERMINAL_CONTROL => {
+            Ok(FileRequest::TerminalControl(TerminalControlFileRequest {
+                handle: decoder.handle()?,
+                operation: super::terminal::decode_operation(decoder)?,
+            }))
+        }
         REQUEST_TAG_CHMOD => Ok(FileRequest::Chmod(ChmodFileRequest {
             path: decoder.shared_buffer_sequence()?,
             user: decode_user(decoder)?,
@@ -264,6 +277,10 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_IS_TERMINAL);
             encoder.u8(u8::from(is_terminal));
         }
+        FileResponse::TerminalControl(response) => {
+            encoder.u8(RESPONSE_TAG_TERMINAL_CONTROL);
+            super::terminal::encode_response(encoder, response);
+        }
         FileResponse::Chmod => encoder.u8(RESPONSE_TAG_CHMOD),
         FileResponse::Chown => encoder.u8(RESPONSE_TAG_CHOWN),
         FileResponse::Unlink => encoder.u8(RESPONSE_TAG_UNLINK),
@@ -302,6 +319,9 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
             1 => true,
             _ => return Err(WireError::InvalidTag),
         })),
+        RESPONSE_TAG_TERMINAL_CONTROL => Ok(FileResponse::TerminalControl(
+            super::terminal::decode_response(decoder)?,
+        )),
         RESPONSE_TAG_CHMOD => Ok(FileResponse::Chmod),
         RESPONSE_TAG_CHOWN => Ok(FileResponse::Chown),
         RESPONSE_TAG_UNLINK => Ok(FileResponse::Unlink),
@@ -336,6 +356,8 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::Busy => 20,
         FileError::NotEmpty => 21,
         FileError::PathOnly => 22,
+        FileError::NotTerminal => 23,
+        FileError::InvalidTerminalControl => 24,
     });
 }
 
@@ -363,6 +385,8 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         20 => Ok(FileError::Busy),
         21 => Ok(FileError::NotEmpty),
         22 => Ok(FileError::PathOnly),
+        23 => Ok(FileError::NotTerminal),
+        24 => Ok(FileError::InvalidTerminalControl),
         _ => Err(WireError::InvalidTag),
     }
 }

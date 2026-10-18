@@ -229,6 +229,26 @@ pub enum IsTerminalError {
     Io,
 }
 
+/// Possible errors from [`super::File::terminal_control`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum TerminalControlError {
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("fd is open only for path-based operations")]
+    PathOnly,
+    #[error("file descriptor does not point to a terminal")]
+    NotATerminal,
+    #[error("terminal control is invalid or unsupported")]
+    InvalidControl,
+    #[error("terminal control would block")]
+    WouldBlock,
+    #[error("wait error: {0}")]
+    WaitError(WaitError),
+    #[error("I/O error")]
+    Io,
+}
+
 /// Possible errors from [`super::File::get_status_flags`] and
 /// [`super::File::set_status_flags`].
 #[non_exhaustive]

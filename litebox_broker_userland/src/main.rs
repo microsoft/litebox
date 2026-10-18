@@ -407,6 +407,12 @@ fn accept_runner_channel<Channel>(
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
+    #[cfg(target_os = "linux")]
+    // Terminal workers are host threads, so guest signals must not reach them.
+    let stdio = Arc::new(litebox_platform_linux_userland::with_guest_signals_blocked(
+        UserlandStdioProvider::open_terminals,
+    )?);
+    #[cfg(not(target_os = "linux"))]
     let stdio = Arc::new(UserlandStdioProvider::default());
     #[cfg(target_os = "linux")]
     let result = linux::run(args, Arc::clone(&stdio));
@@ -414,6 +420,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = windows::run(args, Arc::clone(&stdio));
     // Guest output accepted before the runner exited must reach the host.
     stdio.flush();
+    stdio.close_terminals()?;
     result
 }
 

@@ -35,8 +35,8 @@ use litebox_broker_protocol::fs::{
     HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
     OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
     ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest,
-    SeekFileResponse, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
-    encode_directory_entries_chunk,
+    SeekFileResponse, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -836,6 +836,14 @@ fn handle_file_request<Memory: SharedMemory>(
                 .map_err(RequestFailure::from)?
             {
                 Ok(is_terminal) => Ok(FileResponse::IsTerminal(is_terminal)),
+                Err(error) => Ok(FileResponse::Failed(error)),
+            }
+        }
+        FileRequest::TerminalControl(TerminalControlFileRequest { handle, operation }) => {
+            match litebox_broker_core::fs::terminal_control(process, handle, operation)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(response) => Ok(FileResponse::TerminalControl(response)),
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }

@@ -10,11 +10,12 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
     FileStatus, FileUser, HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE,
     MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadFileRequest, RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, try_decode_directory_entries,
+    ReadFileRequest, RmdirFileRequest, SeekFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
+use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -278,6 +279,28 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Failed(error) => Ok(Err(error)),
             response => {
                 panic!("broker returned unexpected file terminal-query response: {response:?}")
+            }
+        }
+    }
+
+    /// Controls the shared terminal backing an open file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn terminal_control(
+        &self,
+        handle: ObjectHandle,
+        operation: TerminalOperation,
+    ) -> Result<FileOperationResult<TerminalResponse>, Channel::Error> {
+        match self.request_file(FileRequest::TerminalControl(TerminalControlFileRequest {
+            handle,
+            operation,
+        }))? {
+            FileResponse::TerminalControl(response) => Ok(Ok(response)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected file terminal-control response: {response:?}")
             }
         }
     }

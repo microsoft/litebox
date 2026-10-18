@@ -7,7 +7,9 @@ edition = "2024"
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
-rustix = { version = "1.1.2", default-features = false, features = ["event", "net", "std", "thread"] }
+# getpgrp, whose result rustix cannot represent in a foreign PID namespace.
+libc = { version = "0.2.177", default-features = false }
+rustix = { version = "1.1.2", default-features = false, features = ["event", "fs", "net", "std", "termios", "thread"] }
 
 [features]
 lock_tracing = ["litebox_platform/lock_tracing"]

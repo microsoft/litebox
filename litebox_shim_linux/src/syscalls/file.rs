@@ -25,6 +25,7 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
     FileStatusFlags, FileType, FileUser,
 };
+use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_common_linux::{
     AccessFlags, AtFlags, CloseRangeFlags, EfdFlags, EpollCreateFlags, FcntlArg,
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, PAGE_SIZE,
@@ -130,8 +131,13 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(self.file.status()?)
     }
 
-    pub(crate) fn is_terminal(&self) -> Result<bool, Errno> {
-        Ok(self.file.is_terminal()?)
+    /// Controls the shared terminal, waiting interruptibly for output-draining operations.
+    pub(crate) fn terminal_control(
+        &self,
+        operation: TerminalOperation,
+        cx: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<TerminalResponse, Errno> {
+        Ok(self.file.terminal_control(operation, cx)?)
     }
 
     /// Returns the `F_GETFL` flags of the open file description.
@@ -2517,6 +2523,49 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
+/// Translates a terminal ioctl into the broker operation it requests.
+fn terminal_operation<Platform: ShimPlatform>(arg: &IoctlArg) -> Result<TerminalOperation, Errno> {
+    use litebox_broker_protocol::terminal::{ChangeTiming, TerminalSettings};
+    Ok(match arg {
+        IoctlArg::TCGETS(_) => TerminalOperation::GetSettings,
+        IoctlArg::TCSETS(ptr) | IoctlArg::TCSETSW(ptr) | IoctlArg::TCSETSF(ptr) => {
+            let termios = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+            let settings = TerminalSettings::try_from(&termios).inspect_err(|_| {
+                log_unsupported!("terminal settings {:?}", termios);
+            })?;
+            TerminalOperation::SetSettings {
+                settings,
+                timing: match arg {
+                    IoctlArg::TCSETSW(_) => ChangeTiming::AfterOutput,
+                    IoctlArg::TCSETSF(_) => ChangeTiming::AfterOutputAndFlushInput,
+                    _ => ChangeTiming::Now,
+                },
+            }
+        }
+        IoctlArg::TIOCGWINSZ(_) => TerminalOperation::GetWindowSize,
+        IoctlArg::TIOCSWINSZ(ptr) => {
+            let size = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+            TerminalOperation::SetWindowSize(size.into())
+        }
+        IoctlArg::TCFLSH(selector) => {
+            if *selector > 2 {
+                return Err(Errno::EINVAL);
+            }
+            TerminalOperation::Flush {
+                input: *selector != 1,
+                output: *selector != 0,
+            }
+        }
+        IoctlArg::TCSBRK(0) => {
+            log_unsupported!("terminal serial break");
+            return Err(Errno::EOPNOTSUPP);
+        }
+        IoctlArg::TCSBRK(_) => TerminalOperation::Drain,
+        IoctlArg::TIOCGPTN(_) => return Err(Errno::ENOTTY),
+        _ => unreachable!("non-terminal ioctl"),
+    })
+}
+
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
@@ -2581,41 +2630,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(raw_fd.try_into().unwrap())
     }
 
-    fn stdio_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
-        match arg {
-            IoctlArg::TCGETS(termios) => {
-                termios
-                    .write_at_offset::<Platform>(
-                        0,
-                        litebox_common_linux::Termios {
-                            c_iflag: 0,
-                            c_oflag: 0,
-                            c_cflag: 0,
-                            c_lflag: 0,
-                            c_line: 0,
-                            c_cc: [0; 19],
-                        },
-                    )
-                    .ok_or(Errno::EFAULT)?;
-                Ok(0)
+    fn terminal_ioctl(&self, file: &File<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
+        let operation = match terminal_operation::<Platform>(arg) {
+            Ok(operation) => operation,
+            Err(error) => {
+                // Linux rejects the descriptor (`EBADF` for `O_PATH`, `ENOTTY` for a
+                // non-terminal) before the request's argument.
+                file.terminal_control(TerminalOperation::GetSettings, None)?;
+                return Err(error);
             }
-            IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
-            IoctlArg::TIOCGWINSZ(ws) => {
-                ws.write_at_offset::<Platform>(
-                    0,
-                    litebox_common_linux::Winsize {
-                        row: 20,
-                        col: 20,
-                        xpixel: 0,
-                        ypixel: 0,
-                    },
-                )
-                .ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
-            IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
-            _ => todo!(),
+        };
+        let response = file.terminal_control(operation, Some(&self.wait_cx()))?;
+        if matches!(operation, TerminalOperation::SetWindowSize(_)) {
+            // Like Linux, a resize signals the terminal's process group, which may include this
+            // process, before the ioctl returns.
+            self.take_signals(true);
         }
+        match (arg, response) {
+            (IoctlArg::TCGETS(ptr), TerminalResponse::Settings(settings)) => {
+                ptr.write_at_offset::<Platform>(0, settings.into())
+                    .ok_or(Errno::EFAULT)?;
+            }
+            (IoctlArg::TIOCGWINSZ(ptr), TerminalResponse::WindowSize(size)) => {
+                ptr.write_at_offset::<Platform>(0, size.into())
+                    .ok_or(Errno::EFAULT)?;
+            }
+            (_, TerminalResponse::Done) => {}
+            _ => return Err(Errno::EIO),
+        }
+        Ok(0)
     }
 
     /// Handle syscall `ioctl`
@@ -2678,7 +2721,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }};
                 }
                 fd.dispatch(
-                    |fd| set_cloexec!(fd),
+                    |fd| {
+                        // Linux refuses every ioctl on an `O_PATH` descriptor.
+                        let flags = self.global.with_file(fd, File::get_status_flags)?;
+                        if flags.contains(OFlags::PATH) {
+                            return Err(Errno::EBADF);
+                        }
+                        set_cloexec!(fd)
+                    },
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
                     |fd| set_cloexec!(fd),
@@ -2689,15 +2739,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
+            | IoctlArg::TCSETSW(..)
+            | IoctlArg::TCSETSF(..)
+            | IoctlArg::TCSBRK(..)
+            | IoctlArg::TCFLSH(..)
+            | IoctlArg::TIOCSWINSZ(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.file_only(Errno::ENOTTY)?;
-                if self.global.with_file(fd, File::is_terminal)? {
-                    self.stdio_ioctl(&arg)
-                } else {
-                    Err(Errno::ENOTTY)
-                }
+                self.global
+                    .with_file(fd, |file| self.terminal_ioctl(file, &arg))
             }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);

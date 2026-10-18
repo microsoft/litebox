@@ -12,6 +12,9 @@ use litebox_broker_protocol::fs::{
     FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::terminal::{
+    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
+};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
@@ -39,6 +42,7 @@ pub struct File {
     state: Arc<dyn Any + Send + Sync>,
     /// Readiness of a file whose reads or writes can fail with `WouldBlock`.
     readiness: Option<Arc<dyn ReadinessSource>>,
+    terminal: Option<Arc<dyn crate::terminal::TerminalEndpoint>>,
 }
 
 impl File {
@@ -221,9 +225,11 @@ where
             Err(error) => return Ok(Err(file_open_error(error))),
         };
         let readiness = Resolver::readiness_source(self, &entry);
+        let terminal = Resolver::terminal(self, &entry);
         Ok(Ok(File {
             state: Arc::new(RwLock::<Platform, _>::new(entry)),
             readiness,
+            terminal,
         }))
     }
 
@@ -477,6 +483,9 @@ pub fn open(
         Err(error) => return Ok(Err(error)),
     };
     let readiness = file.watch(reference.handle(), readiness_sink)?;
+    if let Some(terminal) = &file.terminal {
+        terminal.attach(crate::process_group::terminal_sink(process));
+    }
     reference
         .commit_with_readiness(ObjectEntry::File(file), readiness)
         .map(Ok)
@@ -588,6 +597,40 @@ pub fn handle_status(
 pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<bool>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     process.core.fs.is_terminal(&file)
+}
+
+/// Controls a shared terminal through any open file handle that refers to it.
+///
+/// Like Linux, every operation only requires an open handle, not a particular access mode;
+/// stricter guest rules belong in the guest's shim. Reports [`FileError::PathOnly`] for a file
+/// opened only for path-based operations and [`FileError::NotTerminal`] for any other file that is
+/// not a terminal, so a caller can classify a handle with a single request.
+///
+/// A terminal without an endpoint, such as a host terminal the broker cannot take over, reports
+/// default settings and an unknown window size, and accepts changes without applying them.
+pub fn terminal_control(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    operation: TerminalOperation,
+) -> Result<FileResult<TerminalResponse>> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let Some(terminal) = &file.terminal else {
+        let flags = process.core.fs.get_status_flags(&file)?.flags;
+        if flags.contains(FileOpenFlags::PATH) {
+            return Ok(Err(FileError::PathOnly));
+        }
+        if !matches!(process.core.fs.is_terminal(&file)?, Ok(true)) {
+            return Ok(Err(FileError::NotTerminal));
+        }
+        return Ok(Ok(match operation {
+            TerminalOperation::GetSettings => {
+                TerminalResponse::Settings(TerminalSettings::default())
+            }
+            TerminalOperation::GetWindowSize => TerminalResponse::WindowSize(WindowSize::default()),
+            _ => TerminalResponse::Done,
+        }));
+    };
+    terminal.control(operation)
 }
 
 /// Returns the access mode and status flags of a broker-owned open file.

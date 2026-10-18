@@ -75,6 +75,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sigreturn.c",
     "sigreturn_simd.c",
     "svc_scratch_regs.c",
+    "tty.c",
     "vfork_fault_parent.c",
     "vfork_exec_child.c",
     "vfork_fd_parent.c",
@@ -2679,6 +2680,143 @@ fn test_runner_with_python_repl_pty() {
         output.lines().any(|line| line.trim() == "hi"),
         "Python REPL did not print a standalone hi line; output:\n{output}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_runner_broker_tty_line_discipline() {
+    check_broker_tty_line_discipline(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_runner_broker_tty_alias() {
+    check_broker_tty_line_discipline(true);
+}
+
+#[cfg(target_os = "linux")]
+fn check_broker_tty_line_discipline(alias: bool) {
+    use std::os::fd::AsRawFd as _;
+    let name = if alias {
+        "tty_alias"
+    } else {
+        "tty_line_discipline"
+    };
+    let target = common::compile("./tests/tty.c", name, true, false);
+    let mut runner = Runner::new(&target, name);
+    runner.allow_process_duplication();
+    let mut pty = common::pty::Pty::open();
+    // SAFETY: termios contains only integer fields and slave is a live descriptor.
+    let mut original: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: original is writable storage for the slave's terminal attributes.
+    assert_eq!(
+        unsafe { libc::tcgetattr(pty.slave().as_raw_fd(), &raw mut original) },
+        0
+    );
+    // SAFETY: slave is a live descriptor and F_GETFL takes no argument.
+    let flags = unsafe { libc::fcntl(pty.slave().as_raw_fd(), libc::F_GETFL) };
+    let (stdin, stdout, stderr) = pty.slave_stdio();
+    let mut child = if alias {
+        runner.spawn_with_controlling_tty_alias(stdin, stdout, stderr)
+    } else {
+        runner.spawn_with_stdio(stdin, stdout, stderr)
+    };
+    let mut output = Vec::new();
+    for (prompt, input) in [
+        (
+            b"CANONICAL READY".as_slice(),
+            b"hellx\x7fo\nsecond\n".as_slice(),
+        ),
+        (b"EOF READY", b"\x04"),
+        (b"POLL READY", b"half"),
+        (b"POLL BLOCKED", b"\n"),
+        (b"RAW READY", b"\r\x03\x04"),
+        (b"INTERRUPT READY", b"\x03"),
+        (b"QUIT READY", b"\x1c"),
+    ] {
+        pty.wait_for_output(&mut output, prompt);
+        pty.write_all(input);
+    }
+    pty.wait_for_output(&mut output, b"RESIZE READY");
+    pty.set_window_size(37, 101);
+    let status = pty.wait_for_child_exit(&mut child, &mut output);
+    assert!(
+        status.success(),
+        "TTY fixture failed with {status}:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(output.windows(8).any(|bytes| bytes == b"TTY DONE"));
+    assert!(output.windows(11).any(|bytes| bytes == b"a       b\r\n"));
+    let mut restored = original;
+    // SAFETY: restored is writable and slave remains live after the broker exits.
+    assert_eq!(
+        unsafe { libc::tcgetattr(pty.slave().as_raw_fd(), &raw mut restored) },
+        0
+    );
+    assert_eq!(
+        (
+            restored.c_iflag,
+            restored.c_oflag,
+            restored.c_cflag,
+            restored.c_lflag,
+            restored.c_cc
+        ),
+        (
+            original.c_iflag,
+            original.c_oflag,
+            original.c_cflag,
+            original.c_lflag,
+            original.c_cc
+        )
+    );
+    // SAFETY: slave is still live; F_GETFL takes no argument.
+    assert_eq!(
+        unsafe { libc::fcntl(pty.slave().as_raw_fd(), libc::F_GETFL) },
+        flags
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_runner_broker_tty_with_redirected_stdout() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    let target = common::compile("./tests/tty.c", "tty_redirect", true, false);
+    let mut runner = Runner::new(&target, "tty_redirect");
+    runner.arg("redirect");
+    let mut pty = common::pty::Pty::open();
+    let (stdin, _stdout, stderr) = pty.slave_stdio();
+    let mut child = runner.spawn_with_stdio(stdin, std::process::Stdio::piped(), stderr);
+    let mut output = Vec::new();
+    pty.wait_for_output(&mut output, b"REDIRECT READY");
+    // SAFETY: termios contains only integer fields and slave is a live descriptor.
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: attributes is writable storage for the slave's terminal attributes.
+    assert_eq!(
+        unsafe { libc::tcgetattr(pty.slave().as_raw_fd(), &raw mut attributes) },
+        0
+    );
+    assert_eq!(
+        attributes.c_lflag & (libc::ICANON | libc::ECHO),
+        libc::ICANON | libc::ECHO,
+        "the broker took over a terminal shared with a redirected stream"
+    );
+    pty.close_slave();
+    pty.write_all(b"input\n");
+    let status = pty.wait_for_child_exit(&mut child, &mut output);
+    assert!(
+        status.success(),
+        "redirected TTY fixture failed with {status}:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    assert_eq!(stdout, b"redirect\n");
 }
 
 #[cfg(target_os = "linux")]

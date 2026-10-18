@@ -36,6 +36,7 @@ mod process_group;
 mod readiness_queue;
 mod signal;
 mod socket;
+mod terminal;
 mod thread;
 mod timer;
 mod unix_socket;
@@ -629,8 +630,8 @@ mod tests {
         HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
         OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
         ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-        SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-        WriteFileResponse,
+        SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+        WriteFileRequest, WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
@@ -942,6 +943,10 @@ mod tests {
                 handle,
             })),
             BrokerOperation::File(FileRequest::IsTerminal(IsTerminalFileRequest { handle })),
+            BrokerOperation::File(FileRequest::TerminalControl(TerminalControlFileRequest {
+                handle,
+                operation: crate::terminal::TerminalOperation::GetSettings,
+            })),
             BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
                 path: sequence(6, 9),
                 user: FileUser { user: 2, group: 3 },
@@ -1361,6 +1366,8 @@ mod tests {
             (FileError::Busy, 20),
             (FileError::NotEmpty, 21),
             (FileError::PathOnly, 22),
+            (FileError::NotTerminal, 23),
+            (FileError::InvalidTerminalControl, 24),
         ] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,
@@ -1536,6 +1543,12 @@ mod tests {
                 exit_status: ProcessExitStatus::Signaled { signal: 9 },
             }))),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::ChildRemoved)),
+            BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+                crate::terminal::TerminalEvents::INTERRUPT,
+            ))),
+            BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+                crate::terminal::TerminalEvents::all(),
+            ))),
             BrokerResult::ProcessGroup(ProcessGroupResponse::Set),
             BrokerResult::ProcessGroup(ProcessGroupResponse::CreateSession),
             BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
@@ -1653,6 +1666,11 @@ mod tests {
             })),
             BrokerResult::File(FileResponse::IsTerminal(false)),
             BrokerResult::File(FileResponse::IsTerminal(true)),
+            BrokerResult::File(FileResponse::TerminalControl(
+                crate::terminal::TerminalResponse::Settings(
+                    crate::terminal::TerminalSettings::default(),
+                ),
+            )),
             BrokerResult::File(FileResponse::Chmod),
             BrokerResult::File(FileResponse::Chown),
             BrokerResult::File(FileResponse::Unlink),
@@ -2571,6 +2589,17 @@ mod tests {
             decode_response(&unknown_signal_event),
             Err(WireError::InvalidTag)
         );
+        for invalid_terminal_events in [0, 0xff] {
+            let mut frame = encode_response(BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+                    crate::terminal::TerminalEvents::INTERRUPT,
+                ))),
+            });
+            assert_eq!(frame.len(), 12);
+            frame[11] = invalid_terminal_events;
+            assert_eq!(decode_response(&frame), Err(WireError::InvalidTag));
+        }
 
         let mut frame = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,

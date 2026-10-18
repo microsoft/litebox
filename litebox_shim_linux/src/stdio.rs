@@ -64,9 +64,10 @@ mod tests {
 
     use litebox::event::Events;
     use litebox_broker_protocol::fs::FileMode as Mode;
+    use litebox_broker_protocol::terminal::TerminalSettings;
     use litebox_common_linux::{
         EpollCreateFlags, EpollEvent, EpollOp, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags,
-        Termios, errno::Errno,
+        Termios, Winsize, errno::Errno,
     };
 
     use crate::{
@@ -203,7 +204,8 @@ mod tests {
         for (path, flags, expected) in [
             ("/dev/stdin", OFlags::RDONLY, Err(Errno::ENOTTY)),
             ("/dev/stdout", OFlags::WRONLY, Ok(0)),
-            ("/dev/stderr", OFlags::WRONLY, Err(Errno::ENOTTY)),
+            ("/dev/stdout", OFlags::RDONLY, Ok(0)),
+            ("/dev/stderr", OFlags::WRONLY, Ok(0)),
             ("/dev/./stdout", OFlags::WRONLY, Ok(0)),
         ] {
             let fd = i32::try_from(task.sys_open(path, flags, Mode::empty()).unwrap()).unwrap();
@@ -211,7 +213,60 @@ mod tests {
                 task.sys_ioctl(fd, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
                 expected
             );
+            // Like Linux, a change needs only an open descriptor, whatever its access mode.
+            assert_eq!(task.sys_ioctl(fd, IoctlArg::TCFLSH(0)), expected);
         }
+
+        let path = i32::try_from(
+            task.sys_open("/dev/stdout", OFlags::PATH, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            task.sys_ioctl(
+                path,
+                IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios))
+            ),
+            Err(Errno::EBADF)
+        );
+        assert_eq!(task.sys_ioctl(path, IoctlArg::FIOCLEX), Err(Errno::EBADF));
+
+        // Like Linux, the descriptor is checked before the request's argument.
+        for (fd, expected) in [
+            (1, Errno::EINVAL),
+            (2, Errno::EINVAL),
+            (0, Errno::ENOTTY),
+            (path, Errno::EBADF),
+        ] {
+            assert_eq!(task.sys_ioctl(fd, IoctlArg::TCFLSH(3)), Err(expected));
+        }
+
+        // A terminal the broker cannot take over keeps default settings and an unknown size.
+        let mut raw = Termios::from(TerminalSettings::default());
+        raw.c_lflag = 0;
+        assert_eq!(
+            task.sys_ioctl(2, IoctlArg::TCSETS(UserPtr::from_ptr(&raw mut raw))),
+            Ok(0)
+        );
+        assert_eq!(
+            task.sys_ioctl(2, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios))),
+            Ok(0)
+        );
+        assert_eq!(
+            TerminalSettings::try_from(&termios),
+            Ok(TerminalSettings::default())
+        );
+        let mut size = Winsize {
+            row: 1,
+            col: 1,
+            xpixel: 1,
+            ypixel: 1,
+        };
+        assert_eq!(
+            task.sys_ioctl(2, IoctlArg::TIOCGWINSZ(UserPtrMut::from_ptr(&raw mut size))),
+            Ok(0)
+        );
+        assert_eq!((size.row, size.col), (0, 0));
     }
 
     #[test]

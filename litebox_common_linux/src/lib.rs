@@ -11,6 +11,9 @@ use core::time::Duration;
 use int_enum::IntEnum;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_broker_protocol::fs::{FileMode, FileNodeInfo, FileStatus, FileType, FileUser};
+use litebox_broker_protocol::terminal::{
+    ControlCharacters, InputFlags, LocalFlags, OutputFlags, TerminalSettings, WindowSize,
+};
 use syscalls::Sysno;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -844,9 +847,234 @@ pub struct Winsize {
     pub ypixel: u16,
 }
 
+const TERMIOS_INPUT: &[(u32, InputFlags)] = &[
+    (0x20, InputFlags::STRIP_HIGH_BIT),
+    (0x40, InputFlags::NEWLINE_TO_CARRIAGE_RETURN),
+    (0x80, InputFlags::IGNORE_CARRIAGE_RETURN),
+    (0x100, InputFlags::CARRIAGE_RETURN_TO_NEWLINE),
+    (0x400, InputFlags::SOFTWARE_FLOW_CONTROL),
+    (0x800, InputFlags::RESTART_OUTPUT_ON_INPUT),
+    (0x4000, InputFlags::UTF8_ERASE),
+];
+const TERMIOS_OUTPUT: &[(u32, OutputFlags)] = &[
+    (1, OutputFlags::PROCESS),
+    (4, OutputFlags::NEWLINE_TO_CRLF),
+    (8, OutputFlags::CARRIAGE_RETURN_TO_NEWLINE),
+    (0x10, OutputFlags::OMIT_CARRIAGE_RETURN_AT_COLUMN_ZERO),
+    (0x20, OutputFlags::NEWLINE_RETURNS_CARRIAGE),
+    // TAB3 is one value of the two-bit TABDLY field; TAB1 and TAB2 are unsupported.
+    (0x1800, OutputFlags::EXPAND_TABS),
+];
+const TERMIOS_LOCAL: &[(u32, LocalFlags)] = &[
+    (1, LocalFlags::GENERATE_EVENTS),
+    (2, LocalFlags::CANONICAL),
+    (8, LocalFlags::ECHO),
+    (0x10, LocalFlags::ECHO_ERASE),
+    (0x20, LocalFlags::ECHO_KILL),
+    (0x40, LocalFlags::ECHO_NEWLINE),
+    (0x80, LocalFlags::NO_FLUSH_ON_EVENT),
+    (0x200, LocalFlags::ECHO_CONTROL),
+    (0x800, LocalFlags::ECHO_KILL_ERASE),
+    (0x8000, LocalFlags::EXTENDED_EDITING),
+];
+// The virtual endpoint transports eight-bit bytes, not a configurable UART:
+// CS8 | CREAD | B38400. Hardware configuration is deliberately unsupported.
+const TERMIOS_CONTROL: u32 = 0x30 | 0x80 | 0xf;
+// IGNBRK | BRKINT | IGNPAR | INPCK | IMAXBEL are accepted but not retained: the
+// virtual endpoint has no breaks or parity errors, and Linux ignores IMAXBEL.
+// POSIX lets `tcsetattr` succeed when only some changes take effect.
+const TERMIOS_INPUT_IGNORED: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x2000;
+
+/// Maps termios mode bits through `table`, matching each entry's whole value;
+/// `None` if any bit is left unmatched.
+fn termios_flags<F: bitflags::Flags + Copy>(bits: u32, table: &[(u32, F)]) -> Option<F> {
+    let mut rest = bits;
+    let mut flags = F::empty();
+    for &(value, flag) in table {
+        if rest & value == value {
+            flags.insert(flag);
+            rest &= !value;
+        }
+    }
+    (rest == 0).then_some(flags)
+}
+
+impl From<TerminalSettings> for Termios {
+    fn from(settings: TerminalSettings) -> Self {
+        let c = settings.characters;
+        Termios {
+            c_iflag: TERMIOS_INPUT
+                .iter()
+                .filter(|(_, f)| settings.input.contains(*f))
+                .map(|(b, _)| *b)
+                .sum(),
+            c_oflag: TERMIOS_OUTPUT
+                .iter()
+                .filter(|(_, f)| settings.output.contains(*f))
+                .map(|(b, _)| *b)
+                .sum(),
+            c_lflag: TERMIOS_LOCAL
+                .iter()
+                .filter(|(_, f)| settings.local.contains(*f))
+                .map(|(b, _)| *b)
+                .sum(),
+            c_cflag: TERMIOS_CONTROL,
+            c_line: 0,
+            c_cc: [
+                c.interrupt,
+                c.quit,
+                c.erase,
+                c.kill,
+                c.end_of_file,
+                0,
+                settings.minimum_read,
+                0,
+                c.start,
+                c.stop,
+                0,
+                c.end_of_line,
+                c.reprint,
+                0,
+                c.word_erase,
+                c.literal_next,
+                c.end_of_line2,
+                0,
+                0,
+            ],
+        }
+    }
+}
+
+impl TryFrom<&Termios> for TerminalSettings {
+    type Error = errno::Errno;
+
+    /// Fails with `EINVAL` for settings the shared terminal does not support.
+    fn try_from(termios: &Termios) -> Result<Self, errno::Errno> {
+        let (Some(input), Some(output), Some(local)) = (
+            termios_flags(termios.c_iflag & !TERMIOS_INPUT_IGNORED, TERMIOS_INPUT),
+            termios_flags(termios.c_oflag, TERMIOS_OUTPUT),
+            termios_flags(termios.c_lflag, TERMIOS_LOCAL),
+        ) else {
+            return Err(errno::Errno::EINVAL);
+        };
+        if termios.c_line != 0
+            || termios.c_cflag != TERMIOS_CONTROL
+            || [5, 7, 10, 13, 17, 18]
+                .iter()
+                .any(|&index| termios.c_cc[index] != 0)
+            || termios.c_cc[6] > 1
+        {
+            return Err(errno::Errno::EINVAL);
+        }
+        let c = termios.c_cc;
+        Ok(Self {
+            input,
+            output,
+            local,
+            characters: ControlCharacters {
+                interrupt: c[0],
+                quit: c[1],
+                erase: c[2],
+                kill: c[3],
+                end_of_file: c[4],
+                start: c[8],
+                stop: c[9],
+                end_of_line: c[11],
+                reprint: c[12],
+                word_erase: c[14],
+                literal_next: c[15],
+                end_of_line2: c[16],
+            },
+            minimum_read: c[6],
+        })
+    }
+}
+
+impl From<WindowSize> for Winsize {
+    fn from(size: WindowSize) -> Self {
+        Self {
+            row: size.rows,
+            col: size.columns,
+            xpixel: size.x_pixels,
+            ypixel: size.y_pixels,
+        }
+    }
+}
+
+impl From<Winsize> for WindowSize {
+    fn from(size: Winsize) -> Self {
+        Self {
+            rows: size.row,
+            columns: size.col,
+            x_pixels: size.xpixel,
+            y_pixels: size.ypixel,
+        }
+    }
+}
+
+#[cfg(test)]
+mod termios_tests {
+    use super::*;
+    use crate::errno::Errno;
+
+    #[test]
+    fn supported_settings_round_trip() {
+        let settings = TerminalSettings::default();
+        assert_eq!(
+            TerminalSettings::try_from(&Termios::from(settings)),
+            Ok(settings)
+        );
+        let mut raw = Termios::from(settings);
+        raw.c_iflag = 0;
+        raw.c_oflag = 0;
+        raw.c_lflag = 0;
+        assert!(TerminalSettings::try_from(&raw).is_ok());
+    }
+
+    #[test]
+    fn inert_input_modes_are_accepted_but_not_retained() {
+        let settings = TerminalSettings::default();
+        let mut termios = Termios::from(settings);
+        termios.c_iflag |= TERMIOS_INPUT_IGNORED;
+        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
+        termios.c_iflag |= 0x8; // PARMRK changes how input is delivered.
+        assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn unsupported_modes_are_not_silently_accepted() {
+        for (index, value) in [(5, 1), (6, 2), (10, 26), (13, 15)] {
+            let mut settings = Termios::from(TerminalSettings::default());
+            settings.c_cc[index] = value;
+            assert_eq!(TerminalSettings::try_from(&settings), Err(Errno::EINVAL));
+        }
+        let mut settings = Termios::from(TerminalSettings::default());
+        settings.c_lflag |= 0x100; // TOSTOP requires job control.
+        assert_eq!(TerminalSettings::try_from(&settings), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn tab_expansion_round_trips_but_tab_delays_are_rejected() {
+        let mut termios = Termios::from(TerminalSettings::default());
+        termios.c_oflag |= 0x1800; // TAB3
+        let settings = TerminalSettings::try_from(&termios).unwrap();
+        assert!(settings.output.contains(OutputFlags::EXPAND_TABS));
+        assert_eq!(Termios::from(settings).c_oflag, termios.c_oflag);
+        for delay in [0x800, 0x1000] {
+            termios.c_oflag = (termios.c_oflag & !0x1800) | delay;
+            assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
+        }
+    }
+}
+
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TCSETSW: u32 = 0x5403;
+pub const TCSETSF: u32 = 0x5404;
+pub const TCSBRK: u32 = 0x5409;
+pub const TCFLSH: u32 = 0x540b;
 pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
@@ -859,8 +1087,18 @@ pub enum IoctlArg {
     TCGETS(UserPtrMut<Termios>),
     /// Set the current serial port settings.
     TCSETS(UserPtr<Termios>),
+    /// Set attributes after draining output.
+    TCSETSW(UserPtr<Termios>),
+    /// Set attributes after draining output and discarding input.
+    TCSETSF(UserPtr<Termios>),
+    /// Drain output when nonzero; zero requests an unsupported serial break.
+    TCSBRK(u32),
+    /// Discard input (0), output (1), or both (2).
+    TCFLSH(u32),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
+    /// Set window size.
+    TIOCSWINSZ(UserPtr<Winsize>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(UserPtrMut<u32>),
@@ -2743,7 +2981,12 @@ impl SyscallRequest {
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
+                        TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
+                        TCSBRK => IoctlArg::TCSBRK(ctx.sys_req_arg(2)),
+                        TCFLSH => IoctlArg::TCFLSH(ctx.sys_req_arg(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
+                        TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,

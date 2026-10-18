@@ -948,6 +948,17 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         }
     }
 
+    /// Shared terminal backing a non-path-only entry.
+    pub fn terminal(
+        &self,
+        entry: &ResolverEntry<Backend>,
+    ) -> Option<Arc<dyn crate::terminal::TerminalEndpoint>> {
+        match &entry.handle {
+            Handle::File(file) if !entry.path_only => self.backend.terminal(file),
+            Handle::File(_) | Handle::Dir(_) => None,
+        }
+    }
+
     /// Readiness of an open entry whose reads or writes can fail with `WouldBlock`, or `None` if
     /// they always make progress. Path-only entries never read or write.
     pub fn readiness_source(

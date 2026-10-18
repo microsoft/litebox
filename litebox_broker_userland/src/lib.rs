@@ -28,6 +28,7 @@ pub mod runtime;
 
 pub mod random;
 pub mod stdio;
+mod terminal;
 mod timer;
 
 /// The maximum number of worker threads that serve one association's requests.

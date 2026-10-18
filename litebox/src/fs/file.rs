@@ -14,6 +14,7 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
 };
+use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
 use litebox_platform::time::TimeProvider;
 
@@ -27,8 +28,8 @@ use crate::{LiteBox, sync};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, IsTerminalError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError, TruncateError, UnlinkError,
-    WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError, TerminalControlError,
+    TruncateError, UnlinkError, WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -373,6 +374,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(|_| IsTerminalError::Io)
     }
 
+    /// Controls the shared terminal, waiting interruptibly for output-draining
+    /// operations through `wait`.
+    pub fn terminal_control(
+        &self,
+        operation: TerminalOperation,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<TerminalResponse, TerminalControlError> {
+        self.wait(wait, Events::OUT, || {
+            self.broker
+                .terminal_control(self.handle, operation)?
+                .map_err(|error| TryOpError::Other(error.into()))
+        })
+        .map_err(TerminalControlError::from)
+    }
+
     /// Returns the access mode and status flags of the file's open file description.
     pub fn get_status_flags(&self) -> Result<FileStatusFlags, StatusFlagsError> {
         Ok(self.broker.get_status_flags(self.handle)?)
@@ -473,6 +489,18 @@ impl From<BrokerControlError> for TryOpError<WriteError> {
     }
 }
 
+impl From<BrokerControlError> for TryOpError<TerminalControlError> {
+    fn from(error: BrokerControlError) -> Self {
+        match error {
+            BrokerControlError::Broker(ErrorCode::WouldBlock) => Self::TryAgain,
+            BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock) => {
+                Self::Other(TerminalControlError::WouldBlock)
+            }
+            error => Self::Other(error.into()),
+        }
+    }
+}
+
 impl From<TryOpError<ReadError>> for ReadError {
     fn from(error: TryOpError<ReadError>) -> Self {
         match error {
@@ -485,6 +513,16 @@ impl From<TryOpError<ReadError>> for ReadError {
 
 impl From<TryOpError<WriteError>> for WriteError {
     fn from(error: TryOpError<WriteError>) -> Self {
+        match error {
+            TryOpError::TryAgain => Self::WouldBlock,
+            TryOpError::WaitError(error) => Self::WaitError(error),
+            TryOpError::Other(error) => error,
+        }
+    }
+}
+
+impl From<TryOpError<TerminalControlError>> for TerminalControlError {
+    fn from(error: TryOpError<TerminalControlError>) -> Self {
         match error {
             TryOpError::TryAgain => Self::WouldBlock,
             TryOpError::WaitError(error) => Self::WaitError(error),
@@ -540,6 +578,12 @@ impl From<BrokerControlError> for FileStatusError {
 impl From<BrokerControlError> for IsTerminalError {
     fn from(error: BrokerControlError) -> Self {
         broker_fd_error(error, Self::ClosedFd, Self::Io, Self::Io)
+    }
+}
+
+impl From<BrokerControlError> for TerminalControlError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::PathOnly, Self::Io)
     }
 }
 
@@ -709,5 +753,16 @@ impl From<FileError> for ReadDirError {
 impl From<FileError> for FileStatusError {
     fn from(error: FileError) -> Self {
         path_error(error).map_or(Self::Io, Into::into)
+    }
+}
+
+impl From<FileError> for TerminalControlError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::PathOnly => Self::PathOnly,
+            FileError::NotTerminal => Self::NotATerminal,
+            FileError::InvalidTerminalControl => Self::InvalidControl,
+            _ => Self::Io,
+        }
     }
 }

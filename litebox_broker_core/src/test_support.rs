@@ -9,16 +9,23 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::terminal::{
+    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
+};
 use spin::Mutex;
 
 use crate::{
     BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
-    fs::{FileService, UnsupportedFileService},
+    fs::{FileResult, FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
-    readiness::{ReadinessRegistration, ReadinessWatchers, SharedReadinessWatchers},
+    readiness::{
+        ReadinessRegistration, ReadinessSource, ReadinessWatchers, SharedReadinessWatchers,
+    },
     socket::{SocketProvider, UnsupportedSocketProvider},
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
+    terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
 };
 
@@ -120,6 +127,8 @@ pub struct TestStdioProvider {
     stdin_terminal: bool,
     stdout_terminal: bool,
     stderr_terminal: bool,
+    uncontrolled_terminal: Option<StdioStream>,
+    terminal: Arc<TestTerminal>,
 }
 
 impl Default for TestStdioProvider {
@@ -136,6 +145,11 @@ impl Default for TestStdioProvider {
             stdin_terminal: false,
             stdout_terminal: false,
             stderr_terminal: false,
+            uncontrolled_terminal: None,
+            terminal: Arc::new(TestTerminal(Mutex::new((
+                TerminalSettings::default(),
+                WindowSize::default(),
+            )))),
         }
     }
 }
@@ -150,6 +164,14 @@ impl TestStdioProvider {
             StdioStream::Stderr => self.stderr_terminal = true,
         }
         self
+    }
+
+    /// Marks `stream` as connected to a terminal without an endpoint, like a
+    /// host terminal the provider cannot take over.
+    #[must_use]
+    pub const fn with_uncontrolled_terminal(mut self, stream: StdioStream) -> Self {
+        self.uncontrolled_terminal = Some(stream);
+        self.with_terminal(stream)
     }
 
     /// Keeps standard input open, so reads of empty input fail with
@@ -195,6 +217,15 @@ impl TestStdioProvider {
 }
 
 impl StdioProvider for TestStdioProvider {
+    fn terminal(&self, stream: StdioStream) -> Option<Arc<dyn TerminalEndpoint>> {
+        let connected = match stream {
+            StdioStream::Stdin => self.stdin_terminal,
+            StdioStream::Stdout => self.stdout_terminal,
+            StdioStream::Stderr => self.stderr_terminal,
+        } && self.uncontrolled_terminal != Some(stream);
+        connected.then(|| Arc::clone(&self.terminal) as Arc<dyn TerminalEndpoint>)
+    }
+
     fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
         if input.bytes.is_empty() && input.open {
@@ -252,6 +283,41 @@ struct TestStdioInput {
     bytes: VecDeque<u8>,
     open: bool,
     blocked_reads: usize,
+}
+
+struct TestTerminal(Mutex<(TerminalSettings, WindowSize)>);
+
+impl ReadinessSource for TestTerminal {
+    fn readiness(&self) -> ReadinessFlags {
+        ReadinessFlags::WRITE
+    }
+    fn watch(&self, _registration: &ReadinessRegistration) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl TerminalEndpoint for TestTerminal {
+    fn attach(&self, _sink: Arc<dyn TerminalEventSink>) {}
+
+    fn control(&self, operation: TerminalOperation) -> Result<FileResult<TerminalResponse>> {
+        let mut state = self.0.lock();
+        Ok(Ok(match operation {
+            TerminalOperation::GetSettings => TerminalResponse::Settings(state.0),
+            TerminalOperation::SetSettings { settings, .. } => {
+                if settings.minimum_read > 1 {
+                    return Ok(Err(FileError::InvalidTerminalControl));
+                }
+                state.0 = settings;
+                TerminalResponse::Done
+            }
+            TerminalOperation::GetWindowSize => TerminalResponse::WindowSize(state.1),
+            TerminalOperation::SetWindowSize(size) => {
+                state.1 = size;
+                TerminalResponse::Done
+            }
+            TerminalOperation::Flush { .. } | TerminalOperation::Drain => TerminalResponse::Done,
+        }))
+    }
 }
 
 /// Timer provider for tests whose clock advances only through

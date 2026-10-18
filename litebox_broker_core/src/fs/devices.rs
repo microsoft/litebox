@@ -186,6 +186,13 @@ impl BackendHandles for Devices {
 }
 
 impl Backend for Devices {
+    fn terminal(&self, h: &FileHandle) -> Option<Arc<dyn crate::terminal::TerminalEndpoint>> {
+        h.get_typed::<Self>()
+            .device
+            .stdio_stream()
+            .and_then(|stream| self.stdio.terminal(stream))
+    }
+
     fn root(&self) -> WalkingDirHandle<'_> {
         WalkingDirHandle::from_typed::<Self>(DeviceDirHandle)
     }

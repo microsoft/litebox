@@ -394,6 +394,24 @@ impl From<litebox::fs::errors::IsTerminalError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::TerminalControlError> for Errno {
+    fn from(value: litebox::fs::errors::TerminalControlError) -> Self {
+        match value {
+            litebox::fs::errors::TerminalControlError::ClosedFd
+            | litebox::fs::errors::TerminalControlError::PathOnly => Errno::EBADF,
+            litebox::fs::errors::TerminalControlError::NotATerminal => Errno::ENOTTY,
+            litebox::fs::errors::TerminalControlError::InvalidControl => Errno::EINVAL,
+            litebox::fs::errors::TerminalControlError::WouldBlock => Errno::EAGAIN,
+            litebox::fs::errors::TerminalControlError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
+            litebox::fs::errors::TerminalControlError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::StatusFlagsError> for Errno {
     fn from(value: litebox::fs::errors::StatusFlagsError) -> Self {
         match value {

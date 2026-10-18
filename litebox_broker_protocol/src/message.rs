@@ -11,8 +11,8 @@ use crate::fs::{
     HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
     OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
     ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse,
+    SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -41,6 +41,7 @@ use crate::socket::{
     SetSocketOptionRequest, ShutdownSocketRequest, SocketError, TakeSocketErrorRequest,
     TakeSocketErrorResponse,
 };
+use crate::terminal::TerminalResponse;
 use crate::timer::{
     CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
     ReadTimerResponse, SetTimerRequest, SetTimerResponse,
@@ -192,7 +193,8 @@ impl BrokerOperation {
                 FileRequest::Seek(_)
                 | FileRequest::Truncate(_)
                 | FileRequest::HandleStatus(_)
-                | FileRequest::IsTerminal(_),
+                | FileRequest::IsTerminal(_)
+                | FileRequest::TerminalControl(_),
             )
             | Self::UnixSocket(
                 UnixSocketRequest::Create(_)
@@ -721,6 +723,8 @@ pub enum FileRequest {
     HandleStatus(HandleFileStatusRequest),
     /// Determine whether an open file is connected to a terminal.
     IsTerminal(IsTerminalFileRequest),
+    /// Control the shared terminal backing an open file.
+    TerminalControl(TerminalControlFileRequest),
     /// Change mode bits by path.
     Chmod(ChmodFileRequest),
     /// Change ownership by path.
@@ -754,6 +758,8 @@ pub enum FileResponse {
     HandleStatus(FileStatus),
     /// Terminal query response.
     IsTerminal(bool),
+    /// Terminal-control response.
+    TerminalControl(TerminalResponse),
     /// Mode change completed.
     Chmod,
     /// Ownership change completed.

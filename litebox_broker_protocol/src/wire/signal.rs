@@ -26,6 +26,7 @@ const SIGNAL_RESPONSE_TAG_TAKE: u8 = 2;
 const SIGNAL_EVENT_TAG_SIGNAL: u8 = 0;
 const SIGNAL_EVENT_TAG_CHILD_EXITED: u8 = 1;
 const SIGNAL_EVENT_TAG_CHILD_REMOVED: u8 = 2;
+const SIGNAL_EVENT_TAG_TERMINAL: u8 = 3;
 
 pub(super) fn encode_signal_request(encoder: &mut Encoder, request: SignalRequest) {
     match request {
@@ -99,6 +100,10 @@ pub(super) fn encode_signal_response(encoder: &mut Encoder, response: SignalResp
                     encode_child_exit(encoder, child_exit);
                 }
                 SignalEvent::ChildRemoved => encoder.u8(SIGNAL_EVENT_TAG_CHILD_REMOVED),
+                SignalEvent::Terminal(events) => {
+                    encoder.u8(SIGNAL_EVENT_TAG_TERMINAL);
+                    encoder.u8(events.bits());
+                }
             }
         }
     }
@@ -119,6 +124,11 @@ pub(super) fn decode_signal_response(
             }),
             SIGNAL_EVENT_TAG_CHILD_EXITED => SignalEvent::ChildExited(decode_child_exit(decoder)?),
             SIGNAL_EVENT_TAG_CHILD_REMOVED => SignalEvent::ChildRemoved,
+            SIGNAL_EVENT_TAG_TERMINAL => SignalEvent::Terminal(
+                crate::terminal::TerminalEvents::from_bits(decoder.u8()?)
+                    .filter(|events| !events.is_empty())
+                    .ok_or(WireError::InvalidTag)?,
+            ),
             _ => return Err(WireError::InvalidTag),
         }),
         _ => return Err(WireError::InvalidTag),
