@@ -930,7 +930,7 @@ fn allocate_zeroed(length: usize) -> RequestResult<Vec<u8>> {
     Ok(data)
 }
 
-/// Returns a `CopyToFn` that copies the parts it is lent, one after another,
+/// Returns a `CopyFromFn` that copies the parts it is lent, one after another,
 /// into the validated sequence `buffer` from `offset` on (see
 /// [`litebox_broker_core::transfer`]).
 fn copy_to_shared_buffer<Memory: SharedMemory>(
@@ -947,7 +947,7 @@ fn copy_to_shared_buffer<Memory: SharedMemory>(
     }
 }
 
-/// Returns a `CopyFromFn` that fills the parts it is lent, one after another,
+/// Returns a `CopyToFn` that fills the parts it is lent, one after another,
 /// from the validated sequence `buffer` from `offset` on (see
 /// [`litebox_broker_core::transfer`]).
 fn copy_from_shared_buffer<Memory: SharedMemory>(
@@ -2158,9 +2158,9 @@ mod tests {
             &self,
             length: usize,
             _flags: SendFlags,
-            copy_from: &mut CopyFromFn<'_>,
+            copy_to: &mut CopyToFn<'_>,
         ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
-            copy_from(&mut vec![0; length])?;
+            copy_to(&mut vec![0; length])?;
             Ok(SocketOutcome::Completed(length))
         }
 
@@ -2169,9 +2169,9 @@ mod tests {
             length: usize,
             _flags: SendFlags,
             _destination: Option<SocketAddrV4>,
-            copy_from: &mut CopyFromFn<'_>,
+            copy_to: &mut CopyToFn<'_>,
         ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
-            copy_from(&mut vec![0; length])?;
+            copy_to(&mut vec![0; length])?;
             Ok(SocketOutcome::Completed(length))
         }
 
@@ -2182,10 +2182,10 @@ mod tests {
             _flags: ReceiveFlags,
             _peek_offset: u32,
             _peek_length: u32,
-            copy_to: &mut CopyToFn<'_>,
+            copy_from: &mut CopyFromFn<'_>,
         ) -> litebox_broker_core::Result<SocketOutcome<PlatformStreamReceive>> {
             let received = length.min(3);
-            copy_to(&[4, 5, 6][..received])?;
+            copy_from(&[4, 5, 6][..received])?;
             Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
                 received,
             )))
@@ -2195,10 +2195,10 @@ mod tests {
             &self,
             length: usize,
             _flags: ReceiveFromFlags,
-            copy_to: &mut CopyToFn<'_>,
+            copy_from: &mut CopyFromFn<'_>,
         ) -> litebox_broker_core::Result<SocketOutcome<PlatformDatagramReceive>> {
             let received = length.min(3);
-            copy_to(&[4, 5, 6][..received])?;
+            copy_from(&[4, 5, 6][..received])?;
             Ok(SocketOutcome::Completed(PlatformDatagramReceive {
                 received,
                 datagram_length: 4,

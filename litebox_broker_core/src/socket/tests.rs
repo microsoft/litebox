@@ -601,7 +601,7 @@ struct TestSocketState {
     next_send_count: StdMutex<Option<usize>>,
     /// How many bytes the next send fills in, if not all.
     next_fill_length: StdMutex<Option<usize>>,
-    /// Ignores a failing `CopyFromFn` or `CopyToFn`, as a faulty platform might.
+    /// Ignores a failing `CopyToFn` or `CopyFromFn`, as a faulty platform might.
     ignore_transfer_failures: core::sync::atomic::AtomicBool,
     connect_calls: AtomicUsize,
     connect_destinations: StdMutex<std::vec::Vec<SocketAddrV4>>,
@@ -860,7 +860,7 @@ impl TestPlatformSocket {
         }
     }
 
-    /// Passes on how a `CopyFromFn` or `CopyToFn` fared, unless told to ignore its
+    /// Passes on how a `CopyToFn` or `CopyFromFn` fared, unless told to ignore its
     /// failure.
     fn transferred(&self, result: Result<()>) -> Result<()> {
         if self.state.ignore_transfer_failures.load(Ordering::Relaxed) {
@@ -870,7 +870,7 @@ impl TestPlatformSocket {
     }
 
     /// Fills in the room for `length` bytes, or as much of it as told to.
-    fn copy_from(&self, length: usize, copy_from: &mut CopyFromFn<'_>) -> Result<()> {
+    fn copy_to(&self, length: usize, copy_to: &mut CopyToFn<'_>) -> Result<()> {
         let filled = self
             .state
             .next_fill_length
@@ -879,7 +879,7 @@ impl TestPlatformSocket {
             .take()
             .unwrap_or(length);
         let mut data = vec![0; filled];
-        self.transferred(copy_from(&mut data))?;
+        self.transferred(copy_to(&mut data))?;
         self.state.sent.lock().unwrap().extend_from_slice(&data);
         Ok(())
     }
@@ -1052,10 +1052,10 @@ impl PlatformSocket for TestPlatformSocket {
         &self,
         length: usize,
         _flags: SendFlags,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<SocketOutcome<usize>> {
         self.state.send_calls.fetch_add(1, Ordering::Relaxed);
-        self.copy_from(length, copy_from)?;
+        self.copy_to(length, copy_to)?;
         let sent = self
             .state
             .next_send_count
@@ -1071,7 +1071,7 @@ impl PlatformSocket for TestPlatformSocket {
         length: usize,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<SocketOutcome<usize>> {
         self.state.send_calls.fetch_add(1, Ordering::Relaxed);
         self.state
@@ -1079,7 +1079,7 @@ impl PlatformSocket for TestPlatformSocket {
             .lock()
             .unwrap()
             .push(destination);
-        self.copy_from(length, copy_from)?;
+        self.copy_to(length, copy_to)?;
         let sent = self
             .state
             .next_send_count
@@ -1097,15 +1097,15 @@ impl PlatformSocket for TestPlatformSocket {
         _flags: ReceiveFlags,
         _peek_offset: u32,
         _peek_length: u32,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<SocketOutcome<PlatformStreamReceive>> {
         self.state.receive_calls.fetch_add(1, Ordering::Relaxed);
         if let Some((lent, received)) = self.state.next_stream_receive.lock().unwrap().take() {
-            self.transferred(copy_to(&lent))?;
+            self.transferred(copy_from(&lent))?;
             return received;
         }
         let received = length.min(2);
-        self.transferred(copy_to(&[7, 9][..received]))?;
+        self.transferred(copy_from(&[7, 9][..received]))?;
         Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
             received,
         )))
@@ -1115,17 +1115,17 @@ impl PlatformSocket for TestPlatformSocket {
         &self,
         length: usize,
         _flags: ReceiveFromFlags,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
         self.state
             .receive_from_calls
             .fetch_add(1, Ordering::Relaxed);
         if let Some((lent, received)) = self.state.next_datagram_receive.lock().unwrap().take() {
-            self.transferred(copy_to(&lent))?;
+            self.transferred(copy_from(&lent))?;
             return received;
         }
         let received = length.min(2);
-        self.transferred(copy_to(&[7, 9][..received]))?;
+        self.transferred(copy_from(&[7, 9][..received]))?;
         Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received,
             datagram_length: 4,
@@ -2597,7 +2597,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         send_data(&process, handle, Vec::new(), SendFlags::NONE),
         Ok(SocketOutcome::Completed(0))
     );
-    // A failing `CopyFromFn` or `CopyToFn` fails the transfer with its error, even
+    // A failing `CopyToFn` or `CopyFromFn` fails the transfer with its error, even
     // when the platform ignores it.
     for ignored in [false, true] {
         provider
@@ -2737,7 +2737,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
     // Including the part of a send filled in, and ending with the byte sent
-    // while ignoring its `CopyFromFn`'s failure.
+    // while ignoring its `CopyToFn`'s failure.
     assert_eq!(
         provider.state.sent.lock().unwrap().as_slice(),
         [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 0]
@@ -3047,7 +3047,7 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
             expected
         );
     }
-    // A failing `CopyFromFn` or `CopyToFn` fails the transfer with its error, even
+    // A failing `CopyToFn` or `CopyFromFn` fails the transfer with its error, even
     // when the platform ignores it.
     for ignored in [false, true] {
         provider

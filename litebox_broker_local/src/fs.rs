@@ -56,7 +56,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
     /// Reads up to `buffer.length()` bytes from an open file into an
     /// operation-scoped shared buffer lease, and lends the bytes read to
-    /// `copy_to`.
+    /// `copy_from`.
     ///
     /// # Panics
     ///
@@ -66,7 +66,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
         self.validate_file_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
@@ -81,7 +81,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     "broker returned oversized file read"
                 );
                 let read = response.read as usize;
-                self.lend_shared_buffer(buffer, 0, read, copy_to)?;
+                self.lend_shared_buffer(buffer, 0, read, copy_from)?;
                 Ok(Ok(read))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -90,7 +90,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Writes up to `buffer.length()` bytes to an open file from an
-    /// operation-scoped shared buffer lease, which `copy_from` fills first.
+    /// operation-scoped shared buffer lease, which `copy_to` fills first.
     ///
     /// # Panics
     ///
@@ -100,11 +100,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
         self.validate_file_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
-        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, copy_from)?;
+        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, copy_to)?;
         match self.request_file(FileRequest::Write(WriteFileRequest {
             handle,
             buffer,

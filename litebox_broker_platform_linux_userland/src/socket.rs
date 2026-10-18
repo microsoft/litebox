@@ -289,9 +289,9 @@ impl PlatformSocket for LinuxSocket {
         &self,
         length: usize,
         _flags: SendFlags,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let data = filled(length, copy_from)?;
+        let data = filled(length, copy_to)?;
         self.reactor.request(|response| ReactorCommand::Send {
             id: self.id,
             data,
@@ -304,9 +304,9 @@ impl PlatformSocket for LinuxSocket {
         length: usize,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let data = filled(length, copy_from)?;
+        let data = filled(length, copy_to)?;
         self.reactor.request(|response| ReactorCommand::SendTo {
             id: self.id,
             data,
@@ -322,7 +322,7 @@ impl PlatformSocket for LinuxSocket {
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         let peek_offset =
             usize::try_from(peek_offset).map_err(|_| BrokerError::UnsupportedOperation)?;
@@ -338,7 +338,7 @@ impl PlatformSocket for LinuxSocket {
             response,
         })? {
             ReactorReceiveOutcome::Received(received) => {
-                copy_to(&received)?;
+                copy_from(&received)?;
                 Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
                     received.len(),
                 )))
@@ -354,7 +354,7 @@ impl PlatformSocket for LinuxSocket {
         &self,
         length: usize,
         flags: ReceiveFromFlags,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         match self
             .reactor
@@ -369,7 +369,7 @@ impl PlatformSocket for LinuxSocket {
                 datagram_length,
                 source_address,
             } => {
-                copy_to(&data)?;
+                copy_from(&data)?;
                 Ok(SocketOutcome::Completed(PlatformDatagramReceive {
                     received: data.len(),
                     datagram_length,
@@ -1997,11 +1997,11 @@ fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
     Ok(data)
 }
 
-/// `length` bytes for the reactor to send, lent to `copy_from` (see
+/// `length` bytes for the reactor to send, lent to `copy_to` (see
 /// [`litebox_broker_core::transfer`]).
-fn filled(length: usize, copy_from: &mut CopyFromFn<'_>) -> BrokerResult<Vec<u8>> {
+fn filled(length: usize, copy_to: &mut CopyToFn<'_>) -> BrokerResult<Vec<u8>> {
     let mut data = zeroed_vec(length)?;
-    copy_from(&mut data)?;
+    copy_to(&mut data)?;
     Ok(data)
 }
 

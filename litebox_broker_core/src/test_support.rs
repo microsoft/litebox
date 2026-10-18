@@ -306,7 +306,7 @@ impl StdioProvider for TestStdioProvider {
     fn read(
         &self,
         length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
         if input.bytes.is_empty() && input.open {
@@ -314,7 +314,7 @@ impl StdioProvider for TestStdioProvider {
             return Err(StdioProviderError::WouldBlock);
         }
         let read = input.bytes.len().min(length);
-        lend_from_queue(&input.bytes, 0..read, copy_to)?;
+        lend_from_queue(&input.bytes, 0..read, copy_from)?;
         input.bytes.drain(..read);
         Ok(read)
     }
@@ -323,10 +323,10 @@ impl StdioProvider for TestStdioProvider {
         &self,
         stream: StdioOutputStream,
         length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError> {
         let mut data = alloc::vec![0; length];
-        copy_from(&mut data)?;
+        copy_to(&mut data)?;
         self.writes.lock().push((stream, data));
         Ok(length)
     }
@@ -482,7 +482,7 @@ impl Drop for ManualAlarm {
     }
 }
 
-/// Returns a `CopyToFn` that appends the parts it is lent to `destination` (see
+/// Returns a `CopyFromFn` that appends the parts it is lent to `destination` (see
 /// [`crate::transfer`]).
 pub fn copy_to_vec(destination: &mut Vec<u8>) -> impl FnMut(&[u8]) -> Result<()> + '_ {
     move |part| {

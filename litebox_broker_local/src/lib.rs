@@ -270,7 +270,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         offset: usize,
         length: usize,
-        lend: &mut transfer::CopyToFn<'_>,
+        lend: &mut transfer::CopyFromFn<'_>,
     ) -> Result<(), Channel::Error> {
         assert!(
             offset

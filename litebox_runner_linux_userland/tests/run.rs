@@ -39,7 +39,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
     fn read(
         &self,
         _length: usize,
-        _copy: &mut litebox_broker_core::transfer::CopyToFn<'_>,
+        _copy: &mut litebox_broker_core::transfer::CopyFromFn<'_>,
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
         Err(litebox_broker_core::stdio::StdioProviderError::Unsupported)
     }
@@ -48,11 +48,11 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
         &self,
         stream: litebox_broker_core::stdio::StdioOutputStream,
         length: usize,
-        copy_from: &mut litebox_broker_core::transfer::CopyFromFn<'_>,
+        copy_to: &mut litebox_broker_core::transfer::CopyToFn<'_>,
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
         if stream == litebox_broker_core::stdio::StdioOutputStream::Stdout {
             let mut output = vec![0; length];
-            copy_from(&mut output)?;
+            copy_to(&mut output)?;
             self.stdout_tx
                 .send(output)
                 .map_err(|_| litebox_broker_core::stdio::StdioProviderError::Failed)?;
@@ -2947,7 +2947,7 @@ fn test_managed_egress_proxy_with_curl() {
         .with_fs_path(|root| {
             let destination = root.join(CA_BUNDLE.trim_start_matches('/'));
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            // `copy_to` keeps a read-only mode, so remove any earlier copy.
+            // `copy_from` keeps a read-only mode, so remove any earlier copy.
             let _ = std::fs::remove_file(&destination);
             std::fs::copy(CA_BUNDLE, destination).unwrap();
         })

@@ -632,7 +632,7 @@ impl Backend for LocalFs {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         if !self.valid_file(h) {
@@ -656,7 +656,7 @@ impl Backend for LocalFs {
             }
         };
         let read = result.map_err(|_| ReadError::Io)?;
-        copy_to(&buf[..read])?;
+        copy_from(&buf[..read])?;
         Ok(read)
     }
 
@@ -665,7 +665,7 @@ impl Backend for LocalFs {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         if !self.valid_file(h) {
@@ -678,7 +678,7 @@ impl Backend for LocalFs {
             .ok_or(WriteError::NotForWriting)?;
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         let mut buf = bounce_buffer(length)?;
-        copy_from(&mut buf)?;
+        copy_to(&mut buf)?;
         let result = {
             #[cfg(unix)]
             {

@@ -198,13 +198,13 @@ impl super::backend::Backend for TarRo {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
         let start = offset.min(file.len());
         let end = offset.checked_add(length).unwrap().min(file.len());
         debug_assert!(start <= end);
-        copy_to(&file[start..end])?;
+        copy_from(&file[start..end])?;
         Ok(end - start)
     }
 
@@ -213,7 +213,7 @@ impl super::backend::Backend for TarRo {
         _h: &FileHandle,
         _length: usize,
         _offset: usize,
-        _fill: &mut CopyFromFn<'_>,
+        _fill: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         Err(WriteError::NotForWriting)
     }

@@ -58,13 +58,17 @@ impl ConsoleStdio {
 }
 
 impl StdioProvider for ConsoleStdio {
-    fn read(&self, length: usize, copy_to: &mut CopyToFn<'_>) -> Result<usize, StdioProviderError> {
+    fn read(
+        &self,
+        length: usize,
+        copy_from: &mut CopyFromFn<'_>,
+    ) -> Result<usize, StdioProviderError> {
         let mut output = bounce_buffer(length)?;
         match self.console.read(&mut output) {
             None => Ok(0),
             Some(0) => Err(StdioProviderError::WouldBlock),
             Some(read) => {
-                copy_to(output.get(..read).ok_or(BrokerError::Internal)?)?;
+                copy_from(output.get(..read).ok_or(BrokerError::Internal)?)?;
                 Ok(read)
             }
         }
@@ -74,10 +78,10 @@ impl StdioProvider for ConsoleStdio {
         &self,
         stream: StdioOutputStream,
         length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, StdioProviderError> {
         let mut input = bounce_buffer(length)?;
-        copy_from(&mut input)?;
+        copy_to(&mut input)?;
         match self.console.write(stream, &input) {
             0 => Err(StdioProviderError::WouldBlock),
             written => Ok(written),

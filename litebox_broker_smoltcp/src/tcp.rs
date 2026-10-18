@@ -514,7 +514,7 @@ impl Tcp {
         Ok(())
     }
 
-    /// Lends what it receives to `copy_to` (see
+    /// Lends what it receives to `copy_from` (see
     /// [`litebox_broker_core::transfer`]). The broker core validated the peek
     /// window.
     #[expect(clippy::too_many_arguments, reason = "mirrors PlatformSocket::receive")]
@@ -526,7 +526,7 @@ impl Tcp {
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         self.continue_peek(reader, flags, peek_offset)?;
         if !matches!(self.phase, Phase::Internal(..) | Phase::External(_)) {
@@ -583,17 +583,17 @@ impl Tcp {
         }
         let received = match (&mut self.saved, &self.phase) {
             (Some(saved), _) if peek => {
-                copy_to(&saved[start..end])?;
+                copy_from(&saved[start..end])?;
                 end - start
             }
             (Some(saved), _) => {
-                copy_to(&saved[..end])?;
+                copy_from(&saved[..end])?;
                 saved.drain(..end);
                 self.release_saved(sockets);
                 end
             }
             (None, &Phase::Internal(id, pair_end)) => {
-                sockets.read_pair(id, pair_end, start, end, peek, copy_to)?;
+                sockets.read_pair(id, pair_end, start, end, peek, copy_from)?;
                 end - start
             }
             (None, &Phase::External(handle)) if peek => {
@@ -605,7 +605,7 @@ impl Tcp {
                     .peek_slice(&mut data)
                     .map_err(|_| BrokerError::Internal)?;
                 let peeked = data.get(start..copied).ok_or(BrokerError::Internal)?;
-                copy_to(peeked)?;
+                copy_from(peeked)?;
                 peeked.len()
             }
             (None, &Phase::External(handle)) => {
@@ -621,7 +621,7 @@ impl Tcp {
                     received += socket
                         .recv(|part| {
                             let len = part.len().min(end - received);
-                            match copy_to(&part[..len]) {
+                            match copy_from(&part[..len]) {
                                 Ok(()) => (len, Ok(len)),
                                 Err(error) => (0, Err(error)),
                             }
@@ -641,12 +641,12 @@ impl Tcp {
     }
 
     /// Sends what of `length` bytes there is room for, lending the room to
-    /// `copy_from` (see [`litebox_broker_core::transfer`]).
+    /// `copy_to` (see [`litebox_broker_core::transfer`]).
     pub(super) fn send(
         &mut self,
         sockets: &mut Sockets,
         length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         if self.write_shutdown {
             return Ok(SocketOutcome::Failed(SocketError::Shutdown));
@@ -678,7 +678,7 @@ impl Tcp {
                 if sockets.pair(id)?.peer_closed(end) {
                     return Ok(SocketOutcome::Failed(SocketError::ConnectionReset));
                 }
-                sockets.write_pair(id, end, length, copy_from)?
+                sockets.write_pair(id, end, length, copy_to)?
             }
             Phase::External(handle) => {
                 let socket = sockets.tcp(handle);
@@ -694,7 +694,7 @@ impl Tcp {
                     }
                     let filled = socket.send(|part| {
                         let len = part.len().min(length - sent);
-                        match copy_from(&mut part[..len]) {
+                        match copy_to(&mut part[..len]) {
                             Ok(()) => (len, Ok(len)),
                             Err(error) => (0, Err(error)),
                         }

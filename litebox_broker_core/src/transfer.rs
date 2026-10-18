@@ -6,15 +6,15 @@
 //!
 //! While it holds its lock, an object lends its storage to its caller one
 //! contiguous part at a time, in order: each part of the bytes it reads to a
-//! [`CopyToFn`], which copies them out, or each part of the room it writes to
-//! a [`CopyFromFn`], which fills it. Some parts may be empty. The caller copies
+//! [`CopyFromFn`], which copies them out, or each part of the room it writes
+//! to a [`CopyToFn`], which fills it. Some parts may be empty. The caller copies
 //! between each part and its own buffer, continuing where the previous part
 //! left off. Its buffer may be memory the broker cannot reference, such as
 //! memory shared with a runner.
 //!
-//! An operation whose [`CopyToFn`] or [`CopyFromFn`] fails fails with its error. The
-//! object stays consistent, but may have consumed any of the bytes it lent,
-//! or kept any of the room it lent, the failing part's included.
+//! An operation whose [`CopyFromFn`] or [`CopyToFn`] fails fails with its
+//! error. The object stays consistent, but may have consumed any of the bytes
+//! it lent, or kept any of the room it lent, the failing part's included.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -22,13 +22,15 @@ use core::ops::Range;
 
 use crate::{BrokerError, Result};
 
-/// Copies out each part of the bytes an object reads, in turn.
-pub type CopyToFn<'a> = dyn FnMut(&[u8]) -> Result<()> + 'a;
+/// Copies from each part of the bytes an object reads, in turn, to the
+/// caller's buffer.
+pub type CopyFromFn<'a> = dyn FnMut(&[u8]) -> Result<()> + 'a;
 
-/// Fills each part of the room an object writes, in turn.
-pub type CopyFromFn<'a> = dyn FnMut(&mut [u8]) -> Result<()> + 'a;
+/// Copies to each part of the room an object writes, in turn, from the
+/// caller's buffer.
+pub type CopyToFn<'a> = dyn FnMut(&mut [u8]) -> Result<()> + 'a;
 
-/// Returns a [`CopyToFn`] that copies the parts it is lent, one after another,
+/// Returns a [`CopyFromFn`] that copies the parts it is lent, one after another,
 /// into `destination`, and fails with [`BrokerError::Internal`] if they
 /// overflow it.
 pub fn copy_to_slice(destination: &mut [u8]) -> impl FnMut(&[u8]) -> Result<()> + '_ {
@@ -44,7 +46,7 @@ pub fn copy_to_slice(destination: &mut [u8]) -> impl FnMut(&[u8]) -> Result<()> 
     }
 }
 
-/// Returns a [`CopyFromFn`] that fills the parts it is lent, one after another, from
+/// Returns a [`CopyToFn`] that fills the parts it is lent, one after another, from
 /// `source`, and fails with [`BrokerError::Internal`] if they overflow it.
 pub fn copy_from_slice(source: &[u8]) -> impl FnMut(&mut [u8]) -> Result<()> + '_ {
     let mut offset = 0;
@@ -68,7 +70,7 @@ pub fn bounce_buffer(length: usize) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-/// Counts the bytes an object lends a [`CopyToFn`] or [`CopyFromFn`], which may be no
+/// Counts the bytes an object lends a [`CopyFromFn`] or [`CopyToFn`], which may be no
 /// more than requested, to check what it reports, and keeps the first
 /// failure, which fails the operation whatever the object reports.
 pub(crate) struct Lent {
@@ -117,7 +119,7 @@ impl Lent {
     }
 }
 
-/// Lends `queue[range]` to `copy_to`, one contiguous part at a time.
+/// Lends `queue[range]` to `copy_from`, one contiguous part at a time.
 ///
 /// # Panics
 ///
@@ -125,20 +127,20 @@ impl Lent {
 pub fn lend_from_queue(
     queue: &VecDeque<u8>,
     range: Range<usize>,
-    copy_to: &mut CopyToFn<'_>,
+    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<()> {
     let (front, back) = queue.as_slices();
     let split = front.len();
-    copy_to(&front[range.start.min(split)..range.end.min(split)])?;
-    copy_to(&back[range.start.saturating_sub(split)..range.end.saturating_sub(split)])
+    copy_from(&front[range.start.min(split)..range.end.min(split)])?;
+    copy_from(&back[range.start.saturating_sub(split)..range.end.saturating_sub(split)])
 }
 
-/// Appends `length` bytes to `queue`, lending their room to `copy_from` one
-/// contiguous part at a time, and leaves `queue` unchanged if `copy_from` fails.
+/// Appends `length` bytes to `queue`, lending their room to `copy_to` one
+/// contiguous part at a time, and leaves `queue` unchanged if `copy_to` fails.
 pub fn append_to_queue(
     queue: &mut VecDeque<u8>,
     length: usize,
-    copy_from: &mut CopyFromFn<'_>,
+    copy_to: &mut CopyToFn<'_>,
 ) -> Result<()> {
     queue
         .try_reserve(length)
@@ -147,8 +149,8 @@ pub fn append_to_queue(
     queue.resize(start + length, 0);
     let (front, back) = queue.as_mut_slices();
     let split = front.len();
-    let result = copy_from(&mut front[start.min(split)..])
-        .and_then(|()| copy_from(&mut back[start.saturating_sub(split)..]));
+    let result = copy_to(&mut front[start.min(split)..])
+        .and_then(|()| copy_to(&mut back[start.saturating_sub(split)..]));
     if result.is_err() {
         queue.truncate(start);
     }

@@ -285,7 +285,7 @@ impl Backend for Devices {
         h: &FileHandle,
         length: usize,
         _offset: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
@@ -294,7 +294,7 @@ impl Backend for Devices {
             Device::Stdin if length == 0 => Ok(0),
             Device::Stdin => self
                 .stdio
-                .read(length, copy_to)
+                .read(length, copy_from)
                 .map_err(|error| match error {
                     StdioProviderError::WouldBlock => ReadError::WouldBlock,
                     StdioProviderError::Broker(error) => ReadError::Broker(error),
@@ -303,7 +303,7 @@ impl Backend for Devices {
             Device::URandom => {
                 let mut bytes = bounce_buffer(length)?;
                 self.random.fill(&mut bytes).map_err(|_| ReadError::Io)?;
-                copy_to(&bytes)?;
+                copy_from(&bytes)?;
                 Ok(length)
             }
         }
@@ -316,7 +316,7 @@ impl Backend for Devices {
         h: &FileHandle,
         length: usize,
         _offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         let stream = match h.device {
@@ -329,7 +329,7 @@ impl Backend for Devices {
             return Ok(0);
         }
         self.stdio
-            .write(stream, length, copy_from)
+            .write(stream, length, copy_to)
             .map_err(|error| match error {
                 StdioProviderError::WouldBlock => WriteError::WouldBlock,
                 StdioProviderError::Broker(error) => WriteError::Broker(error),

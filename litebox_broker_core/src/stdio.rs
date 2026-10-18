@@ -45,8 +45,8 @@ pub enum StdioProviderError {
     /// This broker deployment does not provide standard I/O.
     #[error("standard I/O is unsupported")]
     Unsupported,
-    /// The broker failed the operation itself, such as when the `CopyToFn` or
-    /// `CopyFromFn` it lent bytes or room to failed (see [`crate::transfer`]) or it
+    /// The broker failed the operation itself, such as when the `CopyFromFn` or
+    /// `CopyToFn` it lent bytes or room to failed (see [`crate::transfer`]) or it
     /// ran out of memory.
     #[error(transparent)]
     Broker(#[from] BrokerError),
@@ -68,23 +68,23 @@ pub trait StdioProvider: Send + Sync {
     }
 
     /// Reads up to `length` available bytes from standard input, lending
-    /// them to `copy_to` to copy out (see [`crate::transfer`]), and returns how
+    /// them to `copy_from` to copy out (see [`crate::transfer`]), and returns how
     /// many it read: exactly those it lent, so zero at end-of-file.
     fn read(
         &self,
         length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError>;
 
     /// Writes up to `length` bytes to the selected standard output stream,
-    /// lending room for up to `length` bytes to `copy_from` to copy them in (see
+    /// lending room for up to `length` bytes to `copy_to` to copy them in (see
     /// [`crate::transfer`]), and returns how many it wrote, which may be
     /// fewer than it lent room for.
     fn write(
         &self,
         stream: StdioOutputStream,
         length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError>;
 
     /// Determines whether the selected standard stream is connected to a
@@ -116,7 +116,7 @@ impl StdioProvider for UnsupportedStdioProvider {
     fn read(
         &self,
         _length: usize,
-        _copy: &mut CopyToFn<'_>,
+        _copy: &mut CopyFromFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }
@@ -125,7 +125,7 @@ impl StdioProvider for UnsupportedStdioProvider {
         &self,
         _stream: StdioOutputStream,
         _length: usize,
-        _fill: &mut CopyFromFn<'_>,
+        _fill: &mut CopyToFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }

@@ -105,7 +105,7 @@ pub trait Backend: Send + Sync + Any {
             .find(|entry| entry.name == name))
     }
 
-    /// Read up to `length` bytes at `offset`, lending them to `copy_to` to copy out (see
+    /// Read up to `length` bytes at `offset`, lending them to `copy_from` to copy out (see
     /// [`crate::transfer`]), and return the number of bytes read: exactly those lent, so none when
     /// the read fails.
     ///
@@ -117,7 +117,7 @@ pub trait Backend: Send + Sync + Any {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError>;
 
     /// Optional performance hook: get static backing data for a file, if available and supported.
@@ -132,7 +132,7 @@ pub trait Backend: Send + Sync + Any {
     }
 
     /// Write up to `length` bytes into the file, based on `offset`, lending room for up to `length`
-    /// bytes to `copy_from` to copy them in (see [`crate::transfer`]), and return the number of
+    /// bytes to `copy_to` to copy them in (see [`crate::transfer`]), and return the number of
     /// bytes written, which may be fewer than it lent room for. A backend that discards what it
     /// writes, such as `/dev/null`, need not lend room for it.
     ///
@@ -147,7 +147,7 @@ pub trait Backend: Send + Sync + Any {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError>;
 
     /// Truncate the file to the specified length.

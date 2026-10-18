@@ -220,9 +220,9 @@ impl Backend for ShareFs {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, FsReadError> {
-        self.0.read(h, length, offset, copy_to)
+        self.0.read(h, length, offset, copy_from)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -234,7 +234,7 @@ impl Backend for ShareFs {
         _h: &FileHandle,
         _length: usize,
         _offset: usize,
-        _fill: &mut CopyFromFn<'_>,
+        _fill: &mut CopyToFn<'_>,
     ) -> Result<usize, FsWriteError> {
         Err(FsWriteError::NotForWriting)
     }

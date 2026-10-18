@@ -7,7 +7,7 @@
 //! See <https://9p.io/sys/man/5/intro> and <https://github.com/chaos/diod/blob/master/protocol.md>
 
 use super::transport;
-use crate::transfer::CopyFromFn;
+use crate::transfer::CopyToFn;
 
 // This duplicates `litebox::utilities::macros::repr_enum` because broker core cannot depend on
 // LiteBox. Keep it local unless enough shared macros justify introducing a common home.
@@ -1218,7 +1218,7 @@ impl<'a> TaggedFcall<'a> {
     }
 
     /// Encode to a buffer a `Twrite` message, tagged `tag`, of `count` bytes for `fid` at
-    /// `offset`, lending the room for its data to `copy_from` to fill in place (see
+    /// `offset`, lending the room for its data to `copy_to` to fill in place (see
     /// [`crate::transfer`]).
     pub(super) fn encode_twrite_to_buf(
         buf: &mut Vec<u8>,
@@ -1226,7 +1226,7 @@ impl<'a> TaggedFcall<'a> {
         fid: u32,
         offset: u64,
         count: u32,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<(), super::Error> {
         buf.clear();
         buf.resize(4, 0); // Reserve space for size
@@ -1240,7 +1240,7 @@ impl<'a> TaggedFcall<'a> {
         header(buf).map_err(|_| super::Error::Io)?;
         let start = buf.len();
         buf.resize(start + count as usize, 0);
-        copy_from(&mut buf[start..])?;
+        copy_to(&mut buf[start..])?;
         let size = u32::try_from(buf.len()).map_err(|_| super::Error::Io)?;
         buf[0..4].copy_from_slice(&size.to_le_bytes());
         Ok(())

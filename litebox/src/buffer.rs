@@ -205,7 +205,7 @@ impl<B: WriteBuffer + ?Sized> WriteBuffer for Window<&B> {
     }
 }
 
-/// Returns a `CopyToFn` that copies the parts a broker lends it into `buffer`,
+/// Returns a `CopyFromFn` that copies the parts a broker lends it into `buffer`,
 /// one after another from `offset`.
 pub(crate) fn copy_to_buffer<B: ReadBuffer + ?Sized>(
     buffer: &mut B,
@@ -221,7 +221,7 @@ pub(crate) fn copy_to_buffer<B: ReadBuffer + ?Sized>(
     }
 }
 
-/// Returns a `CopyFromFn` that fills the parts a broker lends it from `buffer`, one
+/// Returns a `CopyToFn` that fills the parts a broker lends it from `buffer`, one
 /// after another from `offset`.
 pub(crate) fn copy_from_buffer<B: WriteBuffer + ?Sized>(
     buffer: &B,
@@ -261,14 +261,14 @@ mod tests {
     fn copy_fns_continue_across_parts() {
         let memory = HeapSharedMemory::new(5);
         let source: &[u8] = &[0, 1, 2, 3, 4, 5];
-        let mut copy_from = copy_from_buffer(source, 1);
-        copy_from(memory.shared_bytes(0, 2).unwrap()).unwrap();
-        copy_from(memory.shared_bytes(2, 3).unwrap()).unwrap();
+        let mut copy_to = copy_from_buffer(source, 1);
+        copy_to(memory.shared_bytes(0, 2).unwrap()).unwrap();
+        copy_to(memory.shared_bytes(2, 3).unwrap()).unwrap();
         let mut destination = [0; 6];
         {
-            let mut copy_to = copy_to_buffer(&mut destination[..], 1);
-            copy_to(memory.shared_bytes(3, 2).unwrap()).unwrap();
-            copy_to(memory.shared_bytes(0, 3).unwrap()).unwrap();
+            let mut copy_from = copy_to_buffer(&mut destination[..], 1);
+            copy_from(memory.shared_bytes(3, 2).unwrap()).unwrap();
+            copy_from(memory.shared_bytes(0, 3).unwrap()).unwrap();
         }
         assert_eq!(destination, [0, 4, 5, 1, 2, 3]);
     }

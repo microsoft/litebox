@@ -61,11 +61,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         loop {
             let length = (target - offset).min(MAX_SOCKET_TRANSFER_SIZE as usize);
             let peek_offset = u32::try_from(offset).map_err(|_| backend_failure())?;
-            let mut copy_to = copy_to_buffer(&mut *buffer, offset);
+            let mut copy_from = copy_to_buffer(&mut *buffer, offset);
             let outcome = self.broker.receive_socket(
                 self.handle,
                 length,
-                &mut |part| if discard { Ok(()) } else { copy_to(part) },
+                &mut |part| if discard { Ok(()) } else { copy_from(part) },
                 broker_flags,
                 peek_offset,
                 peek_length,

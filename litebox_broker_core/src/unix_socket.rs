@@ -325,7 +325,7 @@ pub fn accept(
 /// Sends up to `length` bytes from a Unix socket, to `address` if given or
 /// otherwise to its connected peer, and returns how many were sent.
 ///
-/// The socket lends the room for the bytes it sends to `copy_from` to copy in
+/// The socket lends the room for the bytes it sends to `copy_to` to copy in
 /// (see [`crate::transfer`]). A stream socket sends as many bytes as its peer has
 /// room for. A datagram socket sends all `length` bytes as one datagram.
 /// Fails with [`BrokerError::WouldBlock`] while the receiving socket is full.
@@ -335,7 +335,7 @@ pub fn send(
     address: Option<&UnixSocketAddress>,
     length: usize,
     user: FileUser,
-    copy_from: &mut CopyFromFn<'_>,
+    copy_to: &mut CopyToFn<'_>,
 ) -> Result<UnixSocketResult<usize>> {
     if length > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
@@ -344,7 +344,7 @@ pub fn send(
     let socket = &lease.socket;
     match socket.kind {
         SocketType::Stream => {
-            socket.send_stream(address.is_some(), length, copy_from, lease.nonblocking)
+            socket.send_stream(address.is_some(), length, copy_to, lease.nonblocking)
         }
         SocketType::Datagram => {
             // The node stays open until the send finishes, as for `connect`.
@@ -361,14 +361,14 @@ pub fn send(
                 }
                 None => (None, None),
             };
-            socket.send_datagram(target, length, copy_from, lease.nonblocking)
+            socket.send_datagram(target, length, copy_to, lease.nonblocking)
         }
         _ => Err(BrokerError::Internal),
     }
 }
 
 /// Receives up to `capacity` bytes from a Unix socket, lending them to
-/// `copy_to` to copy out, leaving them queued if `peek` is set and returning
+/// `copy_from` to copy out, leaving them queued if `peek` is set and returning
 /// the sender's name if `source` is set.
 ///
 /// A stream socket receives queued bytes. A datagram socket receives one
@@ -387,7 +387,7 @@ pub fn receive(
     peek: bool,
     source: bool,
     nonblocking: bool,
-    copy_to: &mut CopyToFn<'_>,
+    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<UnixSocketResult<Received>> {
     if capacity > MAX_UNIX_SOCKET_TRANSFER_SIZE {
         return Err(BrokerError::ResourceExhausted);
@@ -397,10 +397,10 @@ pub fn receive(
     let nonblocking = nonblocking || lease.nonblocking;
     match socket.kind {
         SocketType::Stream => {
-            socket.receive_stream(capacity as usize, peek, source, nonblocking, copy_to)
+            socket.receive_stream(capacity as usize, peek, source, nonblocking, copy_from)
         }
         SocketType::Datagram => {
-            socket.receive_datagram(capacity as usize, peek, source, nonblocking, copy_to)
+            socket.receive_datagram(capacity as usize, peek, source, nonblocking, copy_from)
         }
         _ => Err(BrokerError::Internal),
     }
@@ -1064,7 +1064,7 @@ impl Socket {
         self: &Arc<Self>,
         addressed: bool,
         length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
         let peer = {
@@ -1103,7 +1103,7 @@ impl Socket {
             let length = room.min(length);
             // Charging first keeps a rejected send from growing the queue.
             self.sockets.charge(&peer.quota, length)?;
-            if let Err(error) = append_to_queue(&mut channel.queue.bytes, length, copy_from) {
+            if let Err(error) = append_to_queue(&mut channel.queue.bytes, length, copy_to) {
                 self.sockets.refund(&peer.quota, length);
                 return Err(error);
             }
@@ -1114,13 +1114,13 @@ impl Socket {
         Ok(Ok(length))
     }
 
-    /// Sends `length` bytes, which `copy_from` copies in, as one datagram to
+    /// Sends `length` bytes, which `copy_to` copies in, as one datagram to
     /// `target`, or to the connected peer if `target` is `None`.
     fn send_datagram(
         self: &Arc<Self>,
         target: Option<Arc<Socket>>,
         length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
         let (peer, write_shut, source) = {
@@ -1154,7 +1154,7 @@ impl Socket {
         data.try_reserve_exact(length)
             .map_err(|_| BrokerError::OutOfMemory)?;
         data.resize(length, 0);
-        copy_from(&mut data)?;
+        copy_to(&mut data)?;
         let datagram = Datagram { data, source };
         let charge = datagram.charge();
         // The receiver's state stays locked while the datagram is queued, so
@@ -1230,7 +1230,7 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<UnixSocketResult<Received>> {
         let source = match &self.state.lock().connection {
             Connection::Connected { peer_name, .. } => source.then(|| peer_name.clone()),
@@ -1257,7 +1257,7 @@ impl Socket {
                 };
             }
             let length = capacity.min(channel.queue.bytes.len());
-            lend_from_queue(&channel.queue.bytes, 0..length, copy_to)?;
+            lend_from_queue(&channel.queue.bytes, 0..length, copy_from)?;
             if peek {
                 (length, Wakeups::default())
             } else {
@@ -1285,7 +1285,7 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<UnixSocketResult<Received>> {
         let (received, wakeups) = {
             let mut channel = self.incoming.lock();
@@ -1301,7 +1301,7 @@ impl Socket {
             };
             let length = datagram.data.len();
             let received = capacity.min(length);
-            copy_to(&datagram.data[..received])?;
+            copy_from(&datagram.data[..received])?;
             if peek {
                 let received = Received {
                     received,

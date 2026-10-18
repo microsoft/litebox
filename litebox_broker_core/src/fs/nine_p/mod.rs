@@ -452,12 +452,12 @@ where
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
         Ok(self
             .client
-            .read(&h.get_typed::<Self>().fid.fid, offset, length, copy_to)?)
+            .read(&h.get_typed::<Self>().fid.fid, offset, length, copy_from)?)
     }
 
     fn write(
@@ -465,12 +465,12 @@ where
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         Ok(self
             .client
-            .write(&h.get_typed::<Self>().fid.fid, offset, length, copy_from)?)
+            .write(&h.get_typed::<Self>().fid.fid, offset, length, copy_to)?)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
@@ -800,8 +800,8 @@ pub enum Error {
     #[error("Remote error (errno={0})")]
     Remote(u32),
 
-    /// The broker failed the operation itself, such as when the `CopyToFn` or
-    /// `CopyFromFn` it lent data to failed
+    /// The broker failed the operation itself, such as when the `CopyFromFn` or
+    /// `CopyToFn` it lent data to failed
     #[error(transparent)]
     Broker(#[from] BrokerError),
 }

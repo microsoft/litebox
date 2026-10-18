@@ -157,10 +157,10 @@ impl PlatformSocket for SmoltcpSocket {
         &self,
         length: usize,
         _flags: SendFlags,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         self.with(
-            |tcp, sockets| tcp.send(sockets, length, copy_from),
+            |tcp, sockets| tcp.send(sockets, length, copy_to),
             |_, _| Ok(invalid()),
         )
     }
@@ -170,11 +170,11 @@ impl PlatformSocket for SmoltcpSocket {
         length: usize,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         self.run(|stack| match stack.parts(self.id)?.0 {
             Kind::Tcp(_) => Ok(invalid()),
-            Kind::Udp(_) => stack.send_udp(self.id, length, destination, copy_from),
+            Kind::Udp(_) => stack.send_udp(self.id, length, destination, copy_to),
         })
     }
 
@@ -185,7 +185,7 @@ impl PlatformSocket for SmoltcpSocket {
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         self.with(
             |tcp, sockets| {
@@ -196,7 +196,7 @@ impl PlatformSocket for SmoltcpSocket {
                     flags,
                     peek_offset,
                     peek_length,
-                    copy_to,
+                    copy_from,
                 )
             },
             |_, _| Ok(invalid()),
@@ -207,11 +207,11 @@ impl PlatformSocket for SmoltcpSocket {
         &self,
         length: usize,
         flags: ReceiveFromFlags,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         self.with(
             |_, _| Ok(invalid()),
-            |udp, sockets| udp.receive_from(sockets, length, flags, copy_to),
+            |udp, sockets| udp.receive_from(sockets, length, flags, copy_from),
         )
     }
 

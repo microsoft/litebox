@@ -195,9 +195,13 @@ impl StdioProvider for UserlandStdioProvider {
         }
     }
 
-    fn read(&self, length: usize, copy_to: &mut CopyToFn<'_>) -> Result<usize, StdioProviderError> {
+    fn read(
+        &self,
+        length: usize,
+        copy_from: &mut CopyFromFn<'_>,
+    ) -> Result<usize, StdioProviderError> {
         if let Some(terminal) = &self.terminals[0] {
-            return terminal.read(length, copy_to);
+            return terminal.read(length, copy_from);
         }
         if length == 0 {
             return Ok(0);
@@ -215,7 +219,7 @@ impl StdioProvider for UserlandStdioProvider {
             return end.map(|()| 0);
         }
         let count = length.min(state.data.len());
-        lend_from_queue(&state.data, 0..count, copy_to)?;
+        lend_from_queue(&state.data, 0..count, copy_from)?;
         state.data.drain(..count);
         Ok(count)
     }
@@ -224,13 +228,13 @@ impl StdioProvider for UserlandStdioProvider {
         &self,
         stream: StdioOutputStream,
         length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, StdioProviderError> {
         if let Some(terminal) = &self.terminals[match stream {
             StdioOutputStream::Stdout => 1,
             StdioOutputStream::Stderr => 2,
         }] {
-            return terminal.write(length, copy_from);
+            return terminal.write(length, copy_to);
         }
         let index = OutputState::index(stream);
         let mut state = self.output.lock();
@@ -256,7 +260,7 @@ impl StdioProvider for UserlandStdioProvider {
             }
         }
         let mut chunk = vec![0; count];
-        copy_from(&mut chunk)?;
+        copy_to(&mut chunk)?;
         state.queue.push_back((index, chunk));
         state.queued += count;
         self.output.changed.notify_all();
@@ -613,7 +617,7 @@ mod tests {
         let (_sender, receiver) = channel();
         let output = GatedOutput::default();
         let provider = gated_provider(receiver, &output);
-        let copy_from = vec![b'x'; OUTPUT_CAPACITY];
+        let copy_to = vec![b'x'; OUTPUT_CAPACITY];
 
         assert_eq!(
             provider.write(
@@ -634,8 +638,8 @@ mod tests {
         assert_eq!(
             provider.write(
                 StdioOutputStream::Stdout,
-                copy_from[..OUTPUT_CAPACITY - 4].len(),
-                &mut copy_from_slice(&copy_from[..OUTPUT_CAPACITY - 4])
+                copy_to[..OUTPUT_CAPACITY - 4].len(),
+                &mut copy_from_slice(&copy_to[..OUTPUT_CAPACITY - 4])
             ),
             Ok(OUTPUT_CAPACITY - 4)
         );
@@ -656,8 +660,8 @@ mod tests {
         assert_eq!(
             provider.write(
                 StdioOutputStream::Stdout,
-                copy_from[..=ATOMIC_WRITE_SIZE].len(),
-                &mut copy_from_slice(&copy_from[..=ATOMIC_WRITE_SIZE])
+                copy_to[..=ATOMIC_WRITE_SIZE].len(),
+                &mut copy_from_slice(&copy_to[..=ATOMIC_WRITE_SIZE])
             ),
             Ok(2)
         );
@@ -683,9 +687,9 @@ mod tests {
                 (StdioOutputStream::Stderr, b"b".to_vec()),
                 (
                     StdioOutputStream::Stdout,
-                    copy_from[..OUTPUT_CAPACITY - 4].to_vec()
+                    copy_to[..OUTPUT_CAPACITY - 4].to_vec()
                 ),
-                (StdioOutputStream::Stdout, copy_from[..2].to_vec()),
+                (StdioOutputStream::Stdout, copy_to[..2].to_vec()),
             ]
         );
         assert_eq!(

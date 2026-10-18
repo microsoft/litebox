@@ -41,7 +41,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
     /// Reads up to `buffer.length()` bytes from a broker-owned pipe into an
     /// operation-scoped shared buffer lease, and lends the bytes read to
-    /// `copy_to`.
+    /// `copy_from`.
     ///
     /// The caller must retain exclusive ownership of the sequence's slots
     /// until this method returns.
@@ -55,7 +55,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, Channel::Error> {
         if buffer.length() > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
@@ -74,12 +74,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             "broker returned oversized pipe read"
         );
         let read = response.read as usize;
-        self.lend_shared_buffer(buffer, 0, read, copy_to)?;
+        self.lend_shared_buffer(buffer, 0, read, copy_from)?;
         Ok(read)
     }
 
     /// Writes up to `buffer.length()` bytes to a broker-owned pipe from an
-    /// operation-scoped shared buffer lease, which `copy_from` fills first.
+    /// operation-scoped shared buffer lease, which `copy_to` fills first.
     ///
     /// The caller must retain exclusive ownership of the sequence's slots
     /// until this method returns.
@@ -93,14 +93,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, Channel::Error> {
         if buffer.length() > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, copy_from)?;
+        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, copy_to)?;
         let response =
             self.request_pipe(PipeRequest::Write(WritePipeRequest { handle, buffer }))?;
         let PipeResponse::Write(response) = response else {

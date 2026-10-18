@@ -332,7 +332,7 @@ impl HostTerminal {
     pub(crate) fn read(
         &self,
         length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, StdioProviderError> {
         let mut state = self.shared.lock();
         if state.status == Status::Failed {
@@ -341,7 +341,7 @@ impl HostTerminal {
         if state.status == Status::HungUp {
             state.process_input();
         }
-        if let Some(count) = state.engine.read(length, copy_to)? {
+        if let Some(count) = state.engine.read(length, copy_from)? {
             state.publish_if_changed();
             self.shared.wake();
             return Ok(count);
@@ -355,7 +355,7 @@ impl HostTerminal {
     pub(crate) fn write(
         &self,
         length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, StdioProviderError> {
         let mut state = self.shared.lock();
         if state.status != Status::Active {
@@ -367,7 +367,7 @@ impl HostTerminal {
         }
         // Output processing rewrites bytes, so stage them first.
         let mut input = bounce_buffer(length.min(available))?;
-        copy_from(&mut input)?;
+        copy_to(&mut input)?;
         let state = &mut *state;
         state.engine.output(&input, &mut state.output);
         state.drained = false;

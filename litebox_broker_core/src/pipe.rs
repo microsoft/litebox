@@ -67,36 +67,36 @@ pub fn create(
 }
 
 /// Reads up to `length` bytes from a broker-owned pipe, lending them to
-/// `copy_to` to copy out, and returns how many it read.
+/// `copy_from` to copy out, and returns how many it read.
 pub fn read(
     process: &BrokerProcess,
     handle: ObjectHandle,
     length: u32,
-    copy_to: &mut CopyToFn<'_>,
+    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<usize> {
     if length > MAX_PIPE_TRANSFER_SIZE {
         return Err(BrokerError::ResourceExhausted);
     }
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let object = object.read();
-    object.as_pipe()?.read(length as usize, copy_to)
+    object.as_pipe()?.read(length as usize, copy_from)
 }
 
 /// Writes up to `length` bytes to a broker-owned pipe, lending the room for
-/// those it writes to `copy_from` to copy in (see [`crate::transfer`]), and
+/// those it writes to `copy_to` to copy in (see [`crate::transfer`]), and
 /// returns how many it wrote.
 pub fn write(
     process: &BrokerProcess,
     handle: ObjectHandle,
     length: usize,
-    copy_from: &mut CopyFromFn<'_>,
+    copy_to: &mut CopyToFn<'_>,
 ) -> Result<usize> {
     if length > MAX_PIPE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let object = object.read();
-    object.as_pipe()?.write(length, copy_from)
+    object.as_pipe()?.write(length, copy_to)
 }
 
 /// Reads up to `length` bytes from a broker-owned pipe into a new vector.
@@ -180,7 +180,7 @@ impl PipeObject {
         }
     }
 
-    fn read(&self, length: usize, copy_to: &mut CopyToFn<'_>) -> Result<usize> {
+    fn read(&self, length: usize, copy_from: &mut CopyFromFn<'_>) -> Result<usize> {
         if !matches!(self.endpoint, PipeEndpoint::Read) {
             return Err(BrokerError::InvalidRights);
         }
@@ -198,13 +198,13 @@ impl PipeObject {
         }
 
         let read_len = length.min(state.data.len());
-        lend_from_queue(&state.data, 0..read_len, copy_to)?;
+        lend_from_queue(&state.data, 0..read_len, copy_from)?;
         state.data.drain(..read_len);
         state.publish(PipeEndpoint::Write);
         Ok(read_len)
     }
 
-    fn write(&self, length: usize, copy_from: &mut CopyFromFn<'_>) -> Result<usize> {
+    fn write(&self, length: usize, copy_to: &mut CopyToFn<'_>) -> Result<usize> {
         if !matches!(self.endpoint, PipeEndpoint::Write) {
             return Err(BrokerError::InvalidRights);
         }
@@ -222,7 +222,7 @@ impl PipeObject {
         }
 
         let write_len = available.min(length);
-        append_to_queue(&mut state.data, write_len, copy_from)?;
+        append_to_queue(&mut state.data, write_len, copy_to)?;
         state.publish(PipeEndpoint::Read);
         Ok(write_len)
     }

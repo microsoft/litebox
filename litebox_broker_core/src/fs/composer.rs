@@ -667,12 +667,12 @@ impl Backend for Composer {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .read(&h.handle, length, offset, copy_to)
+            .read(&h.handle, length, offset, copy_from)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -687,12 +687,12 @@ impl Backend for Composer {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .write(&h.handle, length, offset, copy_from)
+            .write(&h.handle, length, offset, copy_to)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {

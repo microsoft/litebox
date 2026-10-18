@@ -391,24 +391,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         h: &super::backend::FileHandle,
         length: usize,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
         let start = offset.min(file.data.len());
         let end = offset.checked_add(length).unwrap().min(file.data.len());
         debug_assert!(start <= end);
-        copy_to(&file.data[start..end])?;
+        copy_from(&file.data[start..end])?;
         Ok(end - start)
     }
 
     /// Fills the file's bytes in place, past its end padded with zeroes first,
-    /// and restores its length if `copy_from` fails.
+    /// and restores its length if `copy_to` fails.
     fn write(
         &self,
         h: &super::backend::FileHandle,
         length: usize,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         let mut file_data = h.get_typed::<Self>().file.write();
         let data = file_data.data.to_mut();
@@ -417,7 +417,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         if end > previous_len {
             data.resize(end, 0);
         }
-        if let Err(error) = copy_from(&mut data[offset..end]) {
+        if let Err(error) = copy_to(&mut data[offset..end]) {
             data.truncate(previous_len);
             return Err(error.into());
         }

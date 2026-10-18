@@ -950,10 +950,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
-            backend.read(handle, length, offset, copy_to)
+            backend.read(handle, length, offset, copy_from)
         })
     }
 
@@ -968,14 +968,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         let overlay_file = h.get_typed::<Self>();
         if let Some(upper) = self.migrated(overlay_file) {
-            return self.upper.write(&upper, length, offset, copy_from);
+            return self.upper.write(&upper, length, offset, copy_to);
         }
         match &overlay_file.layer {
-            OverlayFileLayer::Upper(handle) => self.upper.write(handle, length, offset, copy_from),
+            OverlayFileLayer::Upper(handle) => self.upper.write(handle, length, offset, copy_to),
             // A writable open copies up first, so a lower-backed handle is read-only.
             OverlayFileLayer::Lower { .. } => Err(WriteError::NotForWriting),
         }

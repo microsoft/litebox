@@ -6,35 +6,37 @@
 //!
 //! An operation lends its caller the shared bytes it transfers one contiguous
 //! part at a time, in order: each part of the bytes the broker read to a
-//! [`CopyToFn`], which copies them out, or each part of the bytes to write to a
-//! [`CopyFromFn`], which fills it. The caller copies between each part and its
+//! [`CopyFromFn`], which copies them out, or each part of the bytes to write to
+//! a [`CopyToFn`], which fills it. The caller copies between each part and its
 //! own buffer, continuing where the previous part left off, so the bytes move
 //! between its buffer and the broker's with no copy in between.
 //!
-//! An operation whose [`CopyToFn`] or [`CopyFromFn`] fails fails with
+//! An operation whose [`CopyFromFn`] or [`CopyToFn`] fails fails with
 //! [`BrokerLocalError::CopyFailed`](crate::BrokerLocalError::CopyFailed). A
 //! write that fails sends nothing, but a read that fails has already
 //! consumed the bytes it read.
 
 use litebox_broker_transport::shared_memory::SharedBytes;
 
-/// Reports that a [`CopyToFn`] or [`CopyFromFn`] could not copy a part, such as
+/// Reports that a [`CopyFromFn`] or [`CopyToFn`] could not copy a part, such as
 /// because the caller's buffer is inaccessible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CopyFailed;
 
-/// Copies out each part of the bytes the broker read, in turn.
-pub type CopyToFn<'a> = dyn FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + 'a;
-
-/// Fills each part of the bytes to write, in turn.
+/// Copies from each part of the bytes the broker read, in turn, to the
+/// caller's buffer.
 pub type CopyFromFn<'a> = dyn FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + 'a;
 
-/// Returns a [`CopyToFn`] that copies the parts it is lent, one after another,
+/// Copies to each part of the bytes to write, in turn, from the caller's
+/// buffer.
+pub type CopyToFn<'a> = dyn FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + 'a;
+
+/// Returns a [`CopyFromFn`] that copies the parts it is lent, one after another,
 /// into `destination`.
 ///
 /// # Panics
 ///
-/// The [`CopyToFn`] panics if the parts overflow `destination`.
+/// The [`CopyFromFn`] panics if the parts overflow `destination`.
 pub fn copy_to_slice(
     destination: &mut [u8],
 ) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {
@@ -47,12 +49,12 @@ pub fn copy_to_slice(
     }
 }
 
-/// Returns a [`CopyFromFn`] that fills the parts it is lent, one after another, from
+/// Returns a [`CopyToFn`] that fills the parts it is lent, one after another, from
 /// `source`.
 ///
 /// # Panics
 ///
-/// The [`CopyFromFn`] panics if the parts overflow `source`.
+/// The [`CopyToFn`] panics if the parts overflow `source`.
 pub fn copy_from_slice(
     source: &[u8],
 ) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {
