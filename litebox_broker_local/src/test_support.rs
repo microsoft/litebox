@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 
 use litebox_broker_protocol::{ProcessId, ThreadId};
 use litebox_broker_transport::channel::LocalCallChannel;
-use litebox_broker_transport::shared_memory::SharedMemory;
+use litebox_broker_transport::shared_memory::MappedSharedMemory;
 
 use crate::BrokerLocal;
 
@@ -23,7 +23,7 @@ const TEST_THREAD_ID: ThreadId = ThreadId(2);
 /// Panics if `shared_memory` does not have the broker protocol's required size.
 pub fn test_broker_local<Channel>(
     channel: Channel,
-    shared_memory: Arc<dyn SharedMemory>,
+    shared_memory: Arc<dyn MappedSharedMemory>,
 ) -> BrokerLocal<Channel>
 where
     Channel: LocalCallChannel,
@@ -42,7 +42,7 @@ where
 pub fn test_broker_local_with_process_id<Channel>(
     channel: Channel,
     process_id: ProcessId,
-    shared_memory: Arc<dyn SharedMemory>,
+    shared_memory: Arc<dyn MappedSharedMemory>,
 ) -> BrokerLocal<Channel>
 where
     Channel: LocalCallChannel,

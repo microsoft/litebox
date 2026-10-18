@@ -11,6 +11,7 @@ use alloc::sync::{Arc, Weak};
 use core::num::NonZero;
 
 use litebox::{
+    buffer::{ReadBuffer, WriteBuffer},
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     pipes::{self, HalfPipeType},
@@ -64,12 +65,16 @@ impl<Platform: ShimPlatform> PipeEnd<Platform> {
     pub(crate) fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut [u8],
+        buf: &mut (impl ReadBuffer + ?Sized),
     ) -> Result<usize, Errno> {
         Ok(self.end.read(cx, buf)?)
     }
 
-    pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
+    pub(crate) fn write(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &(impl WriteBuffer + ?Sized),
+    ) -> Result<usize, Errno> {
         Ok(self.end.write(cx, buf)?)
     }
 

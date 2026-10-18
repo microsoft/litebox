@@ -535,7 +535,9 @@ fn broker_fd_error<T>(error: BrokerControlError, closed: T, invalid_rights: T, i
     match error {
         BrokerControlError::Broker(ErrorCode::UnknownObject) => closed,
         BrokerControlError::Broker(ErrorCode::InvalidRights) => invalid_rights,
-        BrokerControlError::AssociationFailed | BrokerControlError::Broker(_) => io,
+        BrokerControlError::AssociationFailed
+        | BrokerControlError::Broker(_)
+        | BrokerControlError::Fault => io,
     }
 }
 

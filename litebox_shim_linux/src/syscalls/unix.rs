@@ -14,6 +14,7 @@ use alloc::{
 };
 use core::mem::{offset_of, size_of};
 use litebox::{
+    buffer::{ReadBuffer, WriteBuffer},
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     process::ProcessError,
@@ -258,7 +259,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn sendto(
         &self,
         task: &Task<Platform>,
-        buf: &[u8],
+        buf: &(impl WriteBuffer + ?Sized),
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
@@ -284,7 +285,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn recvfrom(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut [u8],
+        buf: &mut (impl ReadBuffer + ?Sized),
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
@@ -615,7 +616,7 @@ mod tests {
             let n = task
                 .do_recvfrom(
                     &client_fd,
-                    &mut buf,
+                    &mut buf[..],
                     ReceiveFlags::empty(),
                     Some(&mut source),
                 )
@@ -641,7 +642,7 @@ mod tests {
             let n = task
                 .do_recvfrom(
                     &server_fd,
-                    &mut buf,
+                    &mut buf[..],
                     ReceiveFlags::empty(),
                     Some(&mut source),
                 )
@@ -679,7 +680,7 @@ mod tests {
                 SocketAddress::Unix(UnixSocketAddr::Unnamed)
             ));
             assert_eq!(
-                task.do_sendto(&server_conn, &[], SendFlags::empty(), None)
+                task.do_sendto(&server_conn, &[0u8; 0][..], SendFlags::empty(), None)
                     .expect("zero-length sendto failed"),
                 0
             );
@@ -696,12 +697,12 @@ mod tests {
 
             let mut buf = [0u8; 64];
             let n = task
-                .do_recvfrom(&client_fd, &mut buf, ReceiveFlags::PEEK, None)
+                .do_recvfrom(&client_fd, &mut buf[..], ReceiveFlags::PEEK, None)
                 .expect("peek failed");
             assert_eq!(n, msg1.len() + msg2.len());
             assert_eq!(&buf[..n], b"Hello, world!");
             let n = task
-                .do_recvfrom(&client_fd, &mut buf, ReceiveFlags::empty(), None)
+                .do_recvfrom(&client_fd, &mut buf[..], ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(n, msg1.len() + msg2.len());
             assert_eq!(&buf[..n], b"Hello, world!");
@@ -858,7 +859,7 @@ mod tests {
             }
             let server_conn_fd = typed_socket(&task, *raw_server_conn_fd);
             let n = task
-                .do_recvfrom(&server_conn_fd, &mut buf, ReceiveFlags::empty(), None)
+                .do_recvfrom(&server_conn_fd, &mut buf[..], ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(n, msg.len());
             assert_eq!(&buf[..n], msg.as_bytes());
@@ -1021,7 +1022,7 @@ mod tests {
             }
             let sock2 = typed_socket(&task, raw_sock2);
             let n = task
-                .do_recvfrom(&sock2, &mut buf, ReceiveFlags::empty(), None)
+                .do_recvfrom(&sock2, &mut buf[..], ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(&buf[..n], b"Message from sock1");
         });
@@ -1040,7 +1041,7 @@ mod tests {
             }
             let sock1 = typed_socket(&task, raw_sock1);
             let n = task
-                .do_recvfrom(&sock1, &mut buf, ReceiveFlags::empty(), None)
+                .do_recvfrom(&sock1, &mut buf[..], ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(&buf[..n], b"Message from sock2");
         });
@@ -1122,7 +1123,7 @@ mod tests {
         assert_eq!(task.sys_writev(sender_fd, write_iovs_ptr, 2), Ok(6));
 
         let mut short = [0; 3];
-        assert_eq!(task.sys_read(receiver_fd, &mut short, None), Ok(3));
+        assert_eq!(task.sys_read(receiver_fd, &mut short[..], None), Ok(3));
         assert_eq!(&short, b"abc");
 
         let (mut head, mut tail) = ([0; 1], [0; 8]);
@@ -1143,7 +1144,12 @@ mod tests {
 
         let receiver_typed = typed_socket(&task, receiver);
         assert_eq!(
-            task.do_recvfrom(&receiver_typed, &mut short, ReceiveFlags::DONTWAIT, None),
+            task.do_recvfrom(
+                &receiver_typed,
+                &mut short[..],
+                ReceiveFlags::DONTWAIT,
+                None
+            ),
             Err(Errno::EAGAIN)
         );
         close_socket(&task, sender);
@@ -1194,7 +1200,7 @@ mod tests {
         let mut buf = [0u8; 16];
         let start = std::time::Instant::now();
         let err = task
-            .do_recvfrom(&sock1, &mut buf, ReceiveFlags::empty(), None)
+            .do_recvfrom(&sock1, &mut buf[..], ReceiveFlags::empty(), None)
             .unwrap_err();
         let elapsed = start.elapsed();
         // Linux returns EAGAIN (not ETIMEDOUT) when SO_RCVTIMEO expires on a blocking recv.
@@ -1225,7 +1231,10 @@ mod tests {
             let sender_fd = i32::try_from(sender).unwrap();
             task.sys_shutdown(sender_fd, litebox_common_linux::ShutdownHow::Write as i32)
                 .unwrap();
-            assert_eq!(task.sys_write(sender_fd, b"x", None), Err(Errno::EPIPE));
+            assert_eq!(
+                task.sys_write(sender_fd, &b"x"[..], None),
+                Err(Errno::EPIPE)
+            );
             let data = b"y";
             assert_eq!(
                 task.sys_sendto(

@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 
 use core::cell::{Cell, RefCell};
 use core::ops::Deref;
+use guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
     LiteBox,
@@ -30,10 +31,9 @@ use litebox::{
     user_pointers::{UserPtr, UserPtrMut},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
-use litebox_broker_protocol::fs::FileSeekWhence as SeekWhence;
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
-    FcntlArg, PAGE_SIZE, SyscallRequest,
+    FcntlArg, IoReadVec, IoWriteVec, PAGE_SIZE, SyscallRequest,
     errno::Errno,
     mm::VmemManager,
     vmem::{CreatePagesFlags, MappingError, VmemUnmapError},
@@ -58,6 +58,7 @@ macro_rules! log_unsupported {
     };
 }
 
+pub(crate) mod guest_buffer;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -886,46 +887,6 @@ impl ToSyscallResult for Result<u32, Errno> {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    /// A wrapper function around `do_pread_with_user_buf` that copies data in chunks to avoid OOMing.
-    fn pread_with_user_buf(
-        &self,
-        fd: i32,
-        buf: UserPtrMut<u8>,
-        count: usize,
-        offset: i64,
-    ) -> Result<usize, Errno> {
-        self.with_typed_fd(fd, |fd| self.do_pread_with_user_buf(fd, buf, count, offset))
-    }
-
-    fn do_pread_with_user_buf(
-        &self,
-        fd: &syscalls::file::AnyTypedFd<Platform>,
-        buf: UserPtrMut<u8>,
-        count: usize,
-        offset: i64,
-    ) -> Result<usize, Errno> {
-        let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-        let mut read_total = 0;
-        while read_total < count {
-            let to_read = (count - read_total).min(kernel_buf.len());
-            let read_offset = offset
-                .checked_add(read_total.reinterpret_as_signed() as i64)
-                .and_then(|offset| usize::try_from(offset).ok())
-                .ok_or(Errno::EINVAL)?;
-            match self.do_read(fd, &mut kernel_buf[..to_read], Some(read_offset)) {
-                Ok(0) => break, // EOF
-                Ok(size) => {
-                    buf.copy_from_slice::<Platform>(read_total, &kernel_buf[..size])
-                        .ok_or(Errno::EFAULT)?;
-                    read_total += size;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        assert!(read_total <= count);
-        Ok(read_total)
-    }
-
     /// Handle Linux syscalls and dispatch them to LiteBox implementations.
     ///
     /// # Panics
@@ -1037,41 +998,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 envp,
             } => self.sys_execve(pathname, argv, envp, ctx),
             SyscallRequest::Read { fd, buf, count } => {
-                // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
-                // requested indicates EOF.
-                if count <= MAX_KERNEL_BUF_SIZE {
-                    let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-                    self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
-                        buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
-                            .map(|()| size)
-                            .ok_or(Errno::EFAULT)
-                    })
-                } else {
-                    // If the read size is too large, we need to do some extra work to avoid OOMing.
-                    // We read data in chunks and update the file offset ourselves only if the read succeeds.
-                    self.with_typed_fd(fd, |fd| {
-                        let cur_loc = self.do_seek(fd, 0, SeekWhence::RelativeToCurrentOffset)?;
-                        let read_total = self.do_pread_with_user_buf(
-                            fd,
-                            buf,
-                            count,
-                            i64::try_from(cur_loc).map_err(|_| Errno::EOVERFLOW)?,
-                        )?;
-                        let new_loc = cur_loc.checked_add(read_total).ok_or(Errno::EOVERFLOW)?;
-                        self.do_seek(
-                            fd,
-                            isize::try_from(new_loc).map_err(|_| Errno::EOVERFLOW)?,
-                            SeekWhence::RelativeToBeginning,
-                        )?;
-                        Ok(read_total)
-                    })
-                }
+                let iov = IoReadVec {
+                    iov_base: buf,
+                    iov_len: count,
+                };
+                self.sys_read(fd, &mut GuestReadBuffer::<Platform>::single(&iov), None)
             }
-            SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice::<Platform>(count)
-            {
-                Some(buf) => self.sys_write(fd, &buf, None),
-                None => Err(Errno::EFAULT),
-            },
+            SyscallRequest::Write { fd, buf, count } => {
+                let iov = IoWriteVec {
+                    iov_base: buf,
+                    iov_len: count,
+                };
+                self.sys_write(fd, &GuestWriteBuffer::<Platform>::single(&iov), None)
+            }
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::CloseRange { first, last, flags } => {
                 syscall!(sys_close_range(first, last, flags))
@@ -1141,16 +1080,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 buf,
                 count,
                 offset,
-            } => self.pread_with_user_buf(fd, buf, count, offset),
+            } => {
+                let iov = IoReadVec {
+                    iov_base: buf,
+                    iov_len: count,
+                };
+                self.sys_pread64(fd, &mut GuestReadBuffer::<Platform>::single(&iov), offset)
+            }
             SyscallRequest::Pwrite64 {
                 fd,
                 buf,
                 count,
                 offset,
-            } => match buf.to_owned_slice::<Platform>(count) {
-                Some(buf) => self.sys_pwrite64(fd, &buf, offset),
-                None => Err(Errno::EFAULT),
-            },
+            } => {
+                let iov = IoWriteVec {
+                    iov_base: buf,
+                    iov_len: count,
+                };
+                self.sys_pwrite64(fd, &GuestWriteBuffer::<Platform>::single(&iov), offset)
+            }
             SyscallRequest::Sendfile {
                 out_fd,
                 in_fd,

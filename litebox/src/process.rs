@@ -420,6 +420,7 @@ impl From<BrokerControlError> for ProcessError {
             BrokerControlError::Broker(error) => {
                 panic!("process service returned unexpected error: {error}")
             }
+            BrokerControlError::Fault => unreachable!("process requests copy no bytes"),
         }
     }
 }
@@ -436,7 +437,7 @@ mod tests {
     use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
     use litebox_broker_protocol::{ProcessId, ThreadId};
     use litebox_broker_transport::channel::LocalCallChannel;
-    use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
+    use litebox_broker_transport::shared_memory::HeapSharedMemory;
 
     use super::*;
     use crate::platform::mock::MockPlatform;
@@ -446,7 +447,7 @@ mod tests {
         let cancels = Arc::new(AtomicUsize::new(0));
         let litebox = LiteBox::new_with_broker_local(
             MockPlatform::new(),
-            test_broker_local(ChildChannel(cancels.clone()), Arc::new(NoopSharedMemory)),
+            test_broker_local(ChildChannel(cancels.clone()), test_shared_memory()),
         );
 
         drop(litebox.allocate_child_process().unwrap());
@@ -491,20 +492,7 @@ mod tests {
         }
     }
 
-    struct NoopSharedMemory;
-
-    impl SharedMemory for NoopSharedMemory {
-        fn len(&self) -> usize {
-            SHARED_BUFFER_POOL_SIZE
-        }
-
-        fn read(&self, _offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-            destination.fill(0);
-            Ok(())
-        }
-
-        fn write(&self, _offset: usize, _source: &[u8]) -> Result<(), SharedMemoryError> {
-            Ok(())
-        }
+    fn test_shared_memory() -> Arc<HeapSharedMemory> {
+        Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE))
     }
 }

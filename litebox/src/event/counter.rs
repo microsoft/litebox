@@ -247,6 +247,7 @@ mod tests {
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_transport::channel::LocalCallChannel;
+    use litebox_broker_transport::shared_memory::HeapSharedMemory;
 
     use super::*;
     use crate::LiteBox;
@@ -270,7 +271,7 @@ mod tests {
                 request_count,
                 fail_requests: Arc::new(AtomicBool::new(false)),
             },
-            Arc::new(NoopSharedMemory),
+            test_shared_memory(),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
         let counter = Arc::new(EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap());
@@ -326,7 +327,7 @@ mod tests {
                 request_count: Arc::clone(&request_count),
                 fail_requests: Arc::new(AtomicBool::new(false)),
             },
-            Arc::new(NoopSharedMemory),
+            test_shared_memory(),
         );
         let litebox = Arc::new(LiteBox::new_with_broker_local(platform, local));
         let counter = Arc::new(EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap());
@@ -375,7 +376,7 @@ mod tests {
                 request_count: Arc::clone(&request_count),
                 fail_requests: Arc::clone(&fail_requests),
             },
-            Arc::new(NoopSharedMemory),
+            test_shared_memory(),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
         let first = EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap();
@@ -410,7 +411,7 @@ mod tests {
                 request_count: Arc::clone(&request_count),
                 fail_requests: Arc::new(AtomicBool::new(false)),
             },
-            Arc::new(NoopSharedMemory),
+            test_shared_memory(),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
         let counter = EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap();
@@ -462,31 +463,10 @@ mod tests {
         fail_requests: Arc<AtomicBool>,
     }
 
-    struct NoopSharedMemory;
-
-    impl litebox_broker_transport::shared_memory::SharedMemory for NoopSharedMemory {
-        fn len(&self) -> usize {
-            litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE
-        }
-
-        fn read(
-            &self,
-            _offset: usize,
-            destination: &mut [u8],
-        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
-        {
-            destination.fill(0);
-            Ok(())
-        }
-
-        fn write(
-            &self,
-            _offset: usize,
-            _source: &[u8],
-        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
-        {
-            Ok(())
-        }
+    fn test_shared_memory() -> Arc<HeapSharedMemory> {
+        Arc::new(HeapSharedMemory::new(
+            litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
+        ))
     }
 
     impl LocalCallChannel for FakeLocalChannel {

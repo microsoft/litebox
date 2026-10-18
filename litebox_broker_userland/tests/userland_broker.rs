@@ -348,25 +348,33 @@ fn run_fake_runner(args: &[OsString]) {
     let write_buffer =
         SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], data.len().try_into().unwrap())
             .unwrap();
+    let mut unwritten = &data[..];
     assert_eq!(
         local
-            .write_pipe(pipe.write_handle, write_buffer, data)
+            .write_pipe(pipe.write_handle, write_buffer, &mut |part| {
+                let (head, tail) = unwritten.split_at(part.len());
+                part.copy_from_slice(head);
+                unwritten = tail;
+                Ok(())
+            })
             .unwrap(),
         data.len()
     );
-    let mut received = [0; 16];
+    let mut received = Vec::new();
     let read = local
         .read_pipe(
             pipe.read_handle,
-            SharedBufferSequence::new(
-                &[SharedBufferSlotIndex(1)],
-                received.len().try_into().unwrap(),
-            )
-            .unwrap(),
-            &mut received,
+            SharedBufferSequence::new(&[SharedBufferSlotIndex(1)], 16).unwrap(),
+            &mut |part| {
+                let start = received.len();
+                received.resize(start + part.len(), 0);
+                part.copy_to_slice(&mut received[start..]);
+                Ok(())
+            },
         )
         .unwrap();
-    assert_eq!(&received[..read], data);
+    assert_eq!(read, data.len());
+    assert_eq!(received, data);
     drop(local);
 }
 

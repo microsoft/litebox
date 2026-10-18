@@ -483,9 +483,8 @@ mod tests {
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex,
     };
-    use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
+    use litebox_broker_transport::shared_memory::{HeapSharedMemory, SharedMemory};
     use std::collections::VecDeque;
-    use std::sync::Mutex;
 
     use crate::test_support::test_broker_local;
 
@@ -525,7 +524,7 @@ mod tests {
             BrokerResult::File(FileResponse::Failed(FileError::NotForReading)),
             BrokerResult::File(FileResponse::IsTerminal(true)),
         ]);
-        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         memory
             .write(2 * SHARED_BUFFER_SLOT_SIZE as usize, &[4, 5])
             .unwrap();
@@ -615,7 +614,7 @@ mod tests {
     #[test]
     fn file_calls_reject_oversized_transfers_before_request() {
         let channel = ScriptedChannel::new([]);
-        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = test_broker_local(channel, memory);
         let oversized = sequence([0], MAX_FILE_TRANSFER_SIZE + 1);
 
@@ -641,7 +640,7 @@ mod tests {
                 read: u32::try_from(length).unwrap(),
             })),
         ]);
-        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = test_broker_local(channel, memory.clone());
         let data = (0..length)
             .map(|index| u8::try_from(index % 251).unwrap())
@@ -695,54 +694,6 @@ mod tests {
     fn sequence<const N: usize>(slots: [u32; N], length: u32) -> SharedBufferSequence {
         let slots = slots.map(SharedBufferSlotIndex);
         SharedBufferSequence::new(&slots, length).unwrap()
-    }
-
-    #[derive(Clone)]
-    struct TestSharedMemory(Arc<Mutex<std::vec::Vec<u8>>>);
-
-    impl TestSharedMemory {
-        fn new(length: usize) -> Self {
-            Self(Arc::new(Mutex::new(std::vec![0; length])))
-        }
-    }
-
-    impl SharedMemory for TestSharedMemory {
-        fn len(&self) -> usize {
-            self.0.lock().unwrap().len()
-        }
-
-        fn read(
-            &self,
-            offset: usize,
-            destination: &mut [u8],
-        ) -> core::result::Result<(), SharedMemoryError> {
-            let memory = self.0.lock().unwrap();
-            let end = offset
-                .checked_add(destination.len())
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            destination.copy_from_slice(
-                memory
-                    .get(offset..end)
-                    .ok_or(SharedMemoryError::InvalidRange)?,
-            );
-            Ok(())
-        }
-
-        fn write(
-            &self,
-            offset: usize,
-            source: &[u8],
-        ) -> core::result::Result<(), SharedMemoryError> {
-            let mut memory = self.0.lock().unwrap();
-            let end = offset
-                .checked_add(source.len())
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            memory
-                .get_mut(offset..end)
-                .ok_or(SharedMemoryError::InvalidRange)?
-                .copy_from_slice(source);
-            Ok(())
-        }
     }
 
     struct ScriptedChannel {

@@ -13,6 +13,7 @@ use core::{
 };
 
 use litebox::{
+    buffer::{ReadBuffer, WriteBuffer},
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -24,6 +25,7 @@ use litebox::{
         self,
         errors::{AcceptError, ConnectError, ShutdownError, SocketReadError, SocketWriteError},
     },
+    mm::exception_table::Fault,
     process::ProcessError,
     utils::TruncateExt as _,
 };
@@ -207,9 +209,14 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             } else {
                 None
             },
-            // `MSG_TRUNC` discards stream data.
-            copies_data: !(is_stream && flags.contains(ReceiveFlags::TRUNC)),
+            copies_data: !self.discards_data(flags),
         })
+    }
+
+    /// Whether a receive with `flags` discards the data instead of copying it, as `MSG_TRUNC`
+    /// does to stream data.
+    fn discards_data(&self, flags: ReceiveFlags) -> bool {
+        self.is_stream() && flags.contains(ReceiveFlags::TRUNC)
     }
 
     /// Whether the socket is nonblocking, which every descriptor sharing it sees.
@@ -372,6 +379,27 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     pub(crate) fn sendto(
         &self,
         cx: &WaitContext<'_, Platform>,
+        buf: &(impl WriteBuffer + ?Sized),
+        flags: SendFlags,
+        destination: Option<SocketAddr>,
+    ) -> Result<usize, Errno> {
+        // Like Linux, an oversized datagram is rejected before its bytes are read.
+        if !self.is_stream() && buf.len() > inet_socket::MAX_UDP_DATAGRAM_SIZE {
+            return Err(Errno::EMSGSIZE);
+        }
+        let mut staged = alloc::vec::Vec::new();
+        staged
+            .try_reserve_exact(buf.len())
+            .map_err(|_| Errno::ENOMEM)?;
+        staged.resize(buf.len(), 0);
+        buf.copy_to_slice_at(0, &mut staged)
+            .map_err(|Fault| Errno::EFAULT)?;
+        self.send_staged(cx, &staged, flags, destination)
+    }
+
+    fn send_staged(
+        &self,
+        cx: &WaitContext<'_, Platform>,
         buf: &[u8],
         flags: SendFlags,
         destination: Option<SocketAddr>,
@@ -423,7 +451,31 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     /// then ends instead of being reported.
     ///
     /// A datagram socket stores its sender's address in `source_addr` if requested.
+    ///
+    /// Receives at most [`inet_socket::SOCKET_RECEIVE_OPERATION_SIZE`] bytes.
     pub(crate) fn receive(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut (impl ReadBuffer + ?Sized),
+        flags: ReceiveFlags,
+        has_prior_progress: bool,
+        source_addr: Option<&mut Option<SocketAddr>>,
+    ) -> Result<usize, Errno> {
+        let length = buf.len().min(inet_socket::SOCKET_RECEIVE_OPERATION_SIZE);
+        let mut staged = alloc::vec::Vec::new();
+        staged
+            .try_reserve_exact(length)
+            .map_err(|_| Errno::ENOMEM)?;
+        staged.resize(length, 0);
+        let size = self.receive_staged(cx, &mut staged, flags, has_prior_progress, source_addr)?;
+        if !self.discards_data(flags) {
+            buf.copy_from_slice_at(0, &staged[..size.min(length)])
+                .map_err(|Fault| Errno::EFAULT)?;
+        }
+        Ok(size)
+    }
+
+    fn receive_staged(
         &self,
         cx: &WaitContext<'_, Platform>,
         buf: &mut [u8],
@@ -1013,7 +1065,7 @@ mod tests {
                     let mut chunk = [0u8; 64];
                     loop {
                         let n = task
-                            .do_recvfrom(&fd, &mut chunk, ReceiveFlags::empty(), None)
+                            .do_recvfrom(&fd, &mut chunk[..], ReceiveFlags::empty(), None)
                             .expect("client recvfrom failed");
                         if n == 0 {
                             break;
@@ -1118,7 +1170,7 @@ mod tests {
                 };
                 let n = match option {
                     "recvfrom" => task
-                        .do_recvfrom(&client_fd, &mut recv_buf, flags, None)
+                        .do_recvfrom(&client_fd, &mut recv_buf[..], flags, None)
                         .expect("Failed to receive data"),
                     "recvmsg" => {
                         let mapped_buf = task

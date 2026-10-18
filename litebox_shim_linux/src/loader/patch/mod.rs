@@ -233,7 +233,7 @@ fn read_trampoline_layout<Platform: ShimPlatform>(
     };
 
     let mut tail = [0u8; TRAMPOLINE_HEADER_SIZE];
-    match file.read(&mut tail, Some(read_offset), None) {
+    match file.read(&mut tail[..], Some(read_offset), None) {
         Ok(n) if n == TRAMPOLINE_HEADER_SIZE => {}
         _ => return Ok(None),
     }
@@ -661,7 +661,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<ElfPatchMetadata, ElfPatchInit> {
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
-        match file.read(&mut ehdr_buf, Some(0), None) {
+        match file.read(&mut ehdr_buf[..], Some(0), None) {
             Ok(n) if n == ehdr_buf.len() => {}
             _ => return Err(ElfPatchInit::Untracked), // Not readable or short read, skip
         }
@@ -694,7 +694,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(ElfPatchInit::Untracked); // Sanity check
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
-        match file.read(&mut phdrs_buf, Some(e_phoff), None) {
+        match file.read(&mut phdrs_buf[..], Some(e_phoff), None) {
             Ok(n) if n == phdrs_buf.len() => {}
             _ => return Err(ElfPatchInit::Untracked),
         }

@@ -3,7 +3,7 @@
 
 //! In-process broker association support for tests.
 
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, sync::Arc};
 use core::convert::Infallible;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,7 +19,7 @@ use litebox_broker_protocol::{
 };
 use litebox_broker_transport::{
     channel::{HostReceive, HostSetupChannel, LocalCallChannel, LocalSetupChannel, PeerCredential},
-    shared_memory::{SharedBufferPool, SharedMemory, SharedMemoryError},
+    shared_memory::{HeapSharedMemory, MappedSharedMemory, SharedBufferPool},
 };
 use spin::mutex::SpinMutex;
 
@@ -28,9 +28,9 @@ use crate::{BrokerHostAssociation, BrokerHostError};
 /// Local setup endpoint for an in-process broker association.
 pub struct InProcessBrokerSetup {
     broker: BrokerCore,
-    memory: Arc<InProcessSharedMemory>,
+    memory: Arc<HeapSharedMemory>,
     readiness: Arc<InProcessReadinessSink>,
-    association: Option<BrokerHostAssociation<Arc<InProcessSharedMemory>>>,
+    association: Option<BrokerHostAssociation<Arc<HeapSharedMemory>>>,
 }
 
 impl InProcessBrokerSetup {
@@ -38,14 +38,14 @@ impl InProcessBrokerSetup {
     pub fn new(broker: BrokerCore) -> Self {
         Self {
             broker,
-            memory: Arc::new(InProcessSharedMemory::new()),
+            memory: Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE)),
             readiness: Arc::new(InProcessReadinessSink::default()),
             association: None,
         }
     }
 
     /// Returns the shared memory used by both association endpoints.
-    pub fn shared_memory(&self) -> Arc<dyn SharedMemory> {
+    pub fn shared_memory(&self) -> Arc<dyn MappedSharedMemory> {
         self.memory.clone()
     }
 
@@ -120,7 +120,7 @@ impl LocalSetupChannel for InProcessBrokerSetup {
 
 /// Active request channel for an in-process broker association.
 pub struct InProcessBrokerChannel {
-    association: Option<BrokerHostAssociation<Arc<InProcessSharedMemory>>>,
+    association: Option<BrokerHostAssociation<Arc<HeapSharedMemory>>>,
     panicked: AtomicBool,
 }
 
@@ -265,50 +265,8 @@ impl ReadinessSink for InProcessReadinessSink {
 }
 
 /// Creates shared memory backed by an ordinary allocation.
-pub fn shared_memory() -> Arc<dyn SharedMemory> {
-    Arc::new(InProcessSharedMemory::new())
-}
-
-struct InProcessSharedMemory(SpinMutex<Vec<u8>>);
-
-impl InProcessSharedMemory {
-    fn new() -> Self {
-        Self(SpinMutex::new(vec![0; SHARED_BUFFER_POOL_SIZE]))
-    }
-}
-
-impl SharedMemory for InProcessSharedMemory {
-    fn len(&self) -> usize {
-        SHARED_BUFFER_POOL_SIZE
-    }
-
-    fn read(
-        &self,
-        offset: usize,
-        destination: &mut [u8],
-    ) -> core::result::Result<(), SharedMemoryError> {
-        let memory = self.0.lock();
-        let end = offset
-            .checked_add(destination.len())
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        let source = memory
-            .get(offset..end)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        destination.copy_from_slice(source);
-        Ok(())
-    }
-
-    fn write(&self, offset: usize, source: &[u8]) -> core::result::Result<(), SharedMemoryError> {
-        let mut memory = self.0.lock();
-        let end = offset
-            .checked_add(source.len())
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        let destination = memory
-            .get_mut(offset..end)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        destination.copy_from_slice(source);
-        Ok(())
-    }
+pub fn shared_memory() -> Arc<dyn MappedSharedMemory> {
+    Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE))
 }
 
 #[cfg(test)]

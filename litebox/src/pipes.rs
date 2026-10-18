@@ -22,6 +22,7 @@ use crate::{
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
+    buffer::{ReadBuffer, WriteBuffer, copy_into, fill_from},
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -144,6 +145,9 @@ pub mod errors {
         WaitError(WaitError),
         #[error("pipe I/O failed")]
         Io,
+        /// Copying into the buffer faulted; the bytes read are lost.
+        #[error("copying into the buffer faulted")]
+        Fault,
     }
 
     /// Possible errors from [`super::PipeEnd::write`]
@@ -160,6 +164,9 @@ pub mod errors {
         WaitError(WaitError),
         #[error("pipe I/O failed")]
         Io,
+        /// Copying from the buffer faulted before anything was written.
+        #[error("copying from the buffer faulted")]
+        Fault,
     }
 }
 
@@ -174,6 +181,8 @@ enum PipeError {
     WaitError(WaitError),
     #[error("pipe I/O failed")]
     Io,
+    #[error("copying the transferred bytes faulted")]
+    Fault,
 }
 
 impl From<PipeError> for errors::ReadError {
@@ -182,6 +191,7 @@ impl From<PipeError> for errors::ReadError {
             PipeError::PeerShutdown | PipeError::Io => Self::Io,
             PipeError::WouldBlock => Self::WouldBlock,
             PipeError::WaitError(error) => Self::WaitError(error),
+            PipeError::Fault => Self::Fault,
         }
     }
 }
@@ -193,6 +203,7 @@ impl From<PipeError> for errors::WriteError {
             PipeError::WouldBlock => Self::WouldBlock,
             PipeError::WaitError(error) => Self::WaitError(error),
             PipeError::Io => Self::Io,
+            PipeError::Fault => Self::Fault,
         }
     }
 }
@@ -260,7 +271,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     pub fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut [u8],
+        buf: &mut (impl ReadBuffer + ?Sized),
     ) -> Result<usize, errors::ReadError> {
         if self.endpoint_type != HalfPipeType::ReceiverHalf {
             return Err(errors::ReadError::NotForReading);
@@ -275,7 +286,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     pub fn write(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &[u8],
+        buf: &(impl WriteBuffer + ?Sized),
     ) -> Result<usize, errors::WriteError> {
         if self.endpoint_type != HalfPipeType::SenderHalf {
             return Err(errors::WriteError::NotForWriting);
@@ -303,39 +314,39 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     fn read_pipe(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut [u8],
+        buf: &mut (impl ReadBuffer + ?Sized),
     ) -> Result<usize, PipeError> {
         let length = buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize);
         if length == 0 {
             return Ok(0);
         }
-        let request_length = length
-            .try_into()
-            .expect("pipe transfer limit must fit in u32");
 
         // On a non-blocking end, the broker returns `NonBlockingWouldBlock` instead of `WouldBlock`,
         // so the wait returns `PipeError::WouldBlock` instead of blocking.
         self.pollee
             .wait(cx, false, Events::IN, || {
-                let data = self
+                let read = self
                     .broker
-                    .read_pipe(self.handle, request_length)
+                    .read_pipe(self.handle, length, &mut copy_into(&mut *buf, 0))
                     .map_err(|error| self.broker_request_error(error))?;
-                if data.len() > length {
+                if read > length {
                     return Err(TryOpError::Other(PipeError::Io));
                 }
-                buf[..data.len()].copy_from_slice(&data);
-                if !data.is_empty()
+                if read != 0
                     && let Some(peer_pollee) = self.peer_pollee.upgrade()
                 {
                     peer_pollee.notify_observers(Events::OUT);
                 }
-                Ok(data.len())
+                Ok(read)
             })
             .map_err(PipeError::from)
     }
 
-    fn write_pipe(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, PipeError> {
+    fn write_pipe(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &(impl WriteBuffer + ?Sized),
+    ) -> Result<usize, PipeError> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -345,14 +356,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
         // `PipeError::WouldBlock` if nothing was written.
         let mut total_written = 0;
         while total_written < buf.len() {
-            let end = total_written
-                .saturating_add(MAX_PIPE_TRANSFER_SIZE as usize)
-                .min(buf.len());
-            let data = &buf[total_written..end];
-            match self
-                .pollee
-                .wait(cx, false, Events::OUT, || self.try_write(data))
-            {
+            let length = (buf.len() - total_written).min(MAX_PIPE_TRANSFER_SIZE as usize);
+            match self.pollee.wait(cx, false, Events::OUT, || {
+                self.try_write(buf, total_written, length)
+            }) {
                 Ok(written) => total_written += written,
                 Err(_) if total_written != 0 => return Ok(total_written),
                 Err(error) => return Err(PipeError::from(error)),
@@ -361,12 +368,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
         Ok(total_written)
     }
 
-    fn try_write(&self, data: &[u8]) -> Result<usize, TryOpError<PipeError>> {
+    /// Writes the `length` bytes at `offset` in `buf`.
+    fn try_write(
+        &self,
+        buf: &(impl WriteBuffer + ?Sized),
+        offset: usize,
+        length: usize,
+    ) -> Result<usize, TryOpError<PipeError>> {
         let written = self
             .broker
-            .write_pipe(self.handle, data)
+            .write_pipe(self.handle, length, &mut fill_from(buf, offset))
             .map_err(|error| self.broker_request_error(error))?;
-        if written > data.len() || (written == 0 && !data.is_empty()) {
+        if written > length || (written == 0 && length != 0) {
             return Err(TryOpError::Other(PipeError::Io));
         }
         if written != 0
@@ -378,8 +391,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     }
 
     fn broker_request_error(&self, error: BrokerControlError) -> TryOpError<PipeError> {
-        if error == BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock) {
-            return TryOpError::Other(PipeError::WouldBlock);
+        match error {
+            BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock) => {
+                return TryOpError::Other(PipeError::WouldBlock);
+            }
+            // The fault is the caller's buffer's, not the pipe's.
+            BrokerControlError::Fault => return TryOpError::Other(PipeError::Fault),
+            _ => {}
         }
         let error = BrokerObjectError::from(error);
         if error != BrokerObjectError::WouldBlock {
@@ -427,6 +445,7 @@ impl From<BrokerObjectError> for TryOpError<PipeError> {
             | BrokerObjectError::PermissionDenied
             | BrokerObjectError::OutOfMemory
             | BrokerObjectError::UnsupportedOperation => TryOpError::Other(PipeError::Io),
+            BrokerObjectError::Fault => TryOpError::Other(PipeError::Fault),
         }
     }
 }
@@ -441,7 +460,8 @@ impl From<BrokerObjectError> for errors::CreateError {
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::WouldBlock
             | BrokerObjectError::PeerClosed
-            | BrokerObjectError::UnsupportedOperation => Self::Io,
+            | BrokerObjectError::UnsupportedOperation
+            | BrokerObjectError::Fault => Self::Io,
         }
     }
 }
@@ -460,11 +480,17 @@ mod tests {
         PipeRequest, ReadinessNotification,
     };
     use litebox_broker_protocol::pipe::CreatePipeResponse;
+    use litebox_broker_protocol::pipe::ReadPipeResponse;
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_transport::channel::LocalCallChannel;
+    use litebox_broker_transport::shared_memory::HeapSharedMemory;
+
+    use litebox_broker_transport::shared_memory::SharedBytes;
 
     use crate::{
+        buffer::ReadBuffer,
         event::{Events, IOPollable, observer::Observer, wait::WaitState},
+        mm::exception_table::Fault,
         pipes::errors::ReadError,
     };
 
@@ -481,7 +507,7 @@ mod tests {
                 read_failure: ReadFailure::Transport,
                 force_transport,
             },
-            Arc::new(NoopSharedMemory),
+            test_shared_memory(),
         );
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
         let (writer, reader) = litebox.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
@@ -516,7 +542,7 @@ mod tests {
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
             },
-            Arc::new(NoopSharedMemory),
+            test_shared_memory(),
         );
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
         let (writer, reader) = litebox.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
@@ -590,6 +616,30 @@ mod tests {
     }
 
     #[test]
+    fn pipe_read_faults_fail_without_notifying_errors() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let local = test_broker_local(
+            FailingPipeChannel {
+                request_count: Arc::new(AtomicUsize::new(0)),
+                read_failure: ReadFailure::None,
+                force_transport: Arc::new(AtomicBool::new(false)),
+            },
+            test_shared_memory(),
+        );
+        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
+        let (_writer, reader) = litebox.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
+        let observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let observer_dyn: Arc<dyn Observer<Events>> = observer.clone();
+        reader.register_observer(Arc::downgrade(&observer_dyn), Events::ERR);
+
+        assert!(matches!(
+            reader.read(&WaitState::new(platform).context(), &mut FaultingBuffer),
+            Err(ReadError::Fault)
+        ));
+        assert!(!observer.0.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn pipe_creation_requires_broker() {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = crate::LiteBox::new(platform);
@@ -616,31 +666,30 @@ mod tests {
         force_transport: Arc<AtomicBool>,
     }
 
-    #[derive(Clone, Copy)]
-    struct NoopSharedMemory;
+    fn test_shared_memory() -> Arc<HeapSharedMemory> {
+        Arc::new(HeapSharedMemory::new(
+            litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
+        ))
+    }
 
-    impl litebox_broker_transport::shared_memory::SharedMemory for NoopSharedMemory {
+    /// A buffer whose copies always fault.
+    struct FaultingBuffer;
+
+    impl ReadBuffer for FaultingBuffer {
         fn len(&self) -> usize {
-            litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE
+            1
         }
 
-        fn read(
-            &self,
-            _offset: usize,
-            destination: &mut [u8],
-        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
-        {
-            destination.fill(0);
-            Ok(())
+        fn copy_from_slice_at(&mut self, _offset: usize, _source: &[u8]) -> Result<(), Fault> {
+            Err(Fault)
         }
 
-        fn write(
-            &self,
+        fn copy_from_shared_at(
+            &mut self,
             _offset: usize,
-            _source: &[u8],
-        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
-        {
-            Ok(())
+            _source: SharedBytes<'_>,
+        ) -> Result<(), Fault> {
+            Err(Fault)
         }
     }
 
@@ -648,6 +697,7 @@ mod tests {
     enum ReadFailure {
         Transport,
         WouldBlock,
+        None,
     }
 
     impl LocalCallChannel for FailingPipeChannel {
@@ -673,6 +723,11 @@ mod tests {
                 BrokerOperation::Pipe(PipeRequest::Read(_)) => match self.read_failure {
                     ReadFailure::Transport => return Err(()),
                     ReadFailure::WouldBlock => BrokerResult::Error(ErrorCode::WouldBlock),
+                    ReadFailure::None => {
+                        BrokerResult::Pipe(litebox_broker_protocol::message::PipeResponse::Read(
+                            ReadPipeResponse { read: 1 },
+                        ))
+                    }
                 },
                 BrokerOperation::CloseObject(_) => BrokerResult::ObjectClosed,
                 BrokerOperation::CheckReadiness(_) => {

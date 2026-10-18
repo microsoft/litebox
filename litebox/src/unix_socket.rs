@@ -28,6 +28,7 @@ use crate::{
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
+    buffer::{ReadBuffer, WriteBuffer, copy_into, fill_from},
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -219,25 +220,32 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         address: Option<&UnixSocketAddress>,
-        data: &[u8],
+        data: &(impl WriteBuffer + ?Sized),
         user: FileUser,
         nonblock: bool,
     ) -> Result<usize, UnixSocketError> {
         if self.socket_type != SocketType::Stream {
             return self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
-                self.broker
-                    .send_unix_socket(self.handle, address, data, user)
+                self.broker.send_unix_socket(
+                    self.handle,
+                    address,
+                    data.len(),
+                    &mut fill_from(data, 0),
+                    user,
+                )
             });
         }
         let mut sent: usize = 0;
         loop {
-            let end = sent
-                .saturating_add(UNIX_SOCKET_BUFFER_SIZE as usize)
-                .min(data.len());
-            let chunk = &data[sent..end];
+            let length = (data.len() - sent).min(UNIX_SOCKET_BUFFER_SIZE as usize);
             let result = self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
-                self.broker
-                    .send_unix_socket(self.handle, address, chunk, user)
+                self.broker.send_unix_socket(
+                    self.handle,
+                    address,
+                    length,
+                    &mut fill_from(data, sent),
+                    user,
+                )
             });
             match result {
                 Ok(written) => sent += written,
@@ -253,6 +261,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     /// Receives into `buffer`, leaving the data queued if `peek` is set and
     /// returning the sender's name if `source` is set.
     ///
+    /// If copying into `buffer` faults, the operation fails with
+    /// [`UnixSocketError::Fault`] and, unless peeking, the bytes received are
+    /// lost.
+    ///
     /// A stream socket receives queued bytes. A datagram socket receives one
     /// datagram, discarding the bytes that do not fit unless peeking. Waits
     /// while no data is queued, unless `nonblock` is set or the socket is
@@ -263,14 +275,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     pub fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buffer: &mut [u8],
+        buffer: &mut (impl ReadBuffer + ?Sized),
         peek: bool,
         source: bool,
         nonblock: bool,
     ) -> Result<Received, UnixSocketError> {
         self.wait(cx, nonblock, SocketOptionName::ReceiveTimeout, || {
             self.broker
-                .receive_unix_socket(self.handle, buffer, peek, source, nonblock)
+                .receive_unix_socket(
+                    self.handle,
+                    buffer.len(),
+                    &mut copy_into(&mut *buffer, 0),
+                    peek,
+                    source,
+                    nonblock,
+                )
                 .map(|result| {
                     result.map(|(received, source)| Received {
                         received: received.received as usize,
@@ -415,6 +434,7 @@ impl From<BrokerObjectError> for UnixSocketError {
             BrokerObjectError::OutOfMemory => Self::OutOfMemory,
             BrokerObjectError::PermissionDenied => Self::PermissionDenied,
             BrokerObjectError::UnsupportedOperation => Self::Unsupported,
+            BrokerObjectError::Fault => Self::Fault,
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::WouldBlock
@@ -455,5 +475,8 @@ pub mod errors {
         Unsupported,
         #[error("Unix socket broker I/O failed")]
         Io,
+        /// Copying to or from the caller's buffer faulted.
+        #[error("copying the transferred bytes faulted")]
+        Fault,
     }
 }

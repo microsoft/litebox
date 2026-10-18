@@ -722,6 +722,7 @@ impl From<litebox::pipes::errors::ReadError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::pipes::errors::ReadError::Io => Errno::EIO,
+            litebox::pipes::errors::ReadError::Fault => Errno::EFAULT,
             _ => todo!(),
         }
     }
@@ -738,6 +739,7 @@ impl From<litebox::pipes::errors::WriteError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::pipes::errors::WriteError::Io => Errno::EIO,
+            litebox::pipes::errors::WriteError::Fault => Errno::EFAULT,
             _ => todo!(),
         }
     }
@@ -796,6 +798,7 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
             UnixSocketError::OutOfMemory => Errno::ENOMEM,
             UnixSocketError::PermissionDenied => Errno::EACCES,
             UnixSocketError::Unsupported => Errno::EINVAL,
+            UnixSocketError::Fault => Errno::EFAULT,
             _ => Errno::EIO,
         }
     }

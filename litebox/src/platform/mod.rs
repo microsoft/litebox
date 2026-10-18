@@ -261,6 +261,20 @@ where
     /// be invalid.
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>>;
 
+    /// Copy the `len` values `offset` values past the pointer to `dst`.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or such a range is known (in advance) to
+    /// be invalid; in that case there are no guarantees about how many values — if any — have
+    /// been copied.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be valid for writes of `len` values, and must not be referenced during the
+    /// copy. It may be memory that another party accesses concurrently, such as memory shared
+    /// with another process, so implementations must copy without forming references to it.
+    #[must_use]
+    unsafe fn copy_to_raw(self, offset: usize, dst: *mut T, len: usize) -> Option<()>;
+
     /// Read the pointer as an owned C string.
     ///
     /// Returns `None` if the provided pointer is invalid, or such a string is known (in advance) to
@@ -369,6 +383,20 @@ where
             x.copy_from_slice(buf);
         })
     }
+
+    /// Copy `len` values from `src` to `offset` values past the pointer.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or such a range is known (in advance) to
+    /// be invalid; in that case there are no guarantees about how many values — if any — have
+    /// been copied.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `len` values, and must not be referenced during the
+    /// copy. It may be memory that another party accesses concurrently, such as memory shared
+    /// with another process, so implementations must copy without forming references to it.
+    #[must_use]
+    unsafe fn copy_from_raw(self, offset: usize, src: *const T, len: usize) -> Option<()>;
 }
 
 /// A provider for system information.

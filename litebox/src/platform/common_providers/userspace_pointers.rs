@@ -110,27 +110,6 @@ impl<V: ValidateAccess, T> UserConstPtr<V, T> {
         }
     }
 
-    /// Copy data from userspace to a raw pointer.
-    ///
-    /// # Safety
-    ///
-    /// `dst` must be either non-Rust memory or Rust memory with exclusive access.
-    pub unsafe fn copy_to_raw(self, dst: *mut T, len: usize) -> Option<()>
-    where
-        T: FromBytes,
-    {
-        if len == 0 {
-            return Some(());
-        }
-        let byte_len = len.checked_mul(core::mem::size_of::<T>())?;
-        self.inner.checked_add(byte_len)?;
-        let src =
-            V::validate_slice(core::ptr::slice_from_raw_parts(self.as_ptr(), len).cast_mut())?
-                .cast_const();
-        V::with_user_memory_access(|| unsafe { memcpy_fallible(dst.cast(), src.cast(), byte_len) })
-            .ok()
-    }
-
     /// Explicitly-private function.  This particular function exists because we
     /// store the `*const T` that would be stored in this struct instead as a
     /// `usize`.  We store `inner` as a `usize` to support
@@ -234,6 +213,44 @@ fn to_owned_slice<V: ValidateAccess, T: FromBytes>(
     Some(unsafe { data.assume_init() })
 }
 
+/// Returns the user range of the `len` values `offset` values past `ptr`, validated, and its
+/// length in bytes, or `None` if it is invalid or wraps the address space.
+fn user_range<V: ValidateAccess, T>(
+    ptr: *mut T,
+    offset: usize,
+    len: usize,
+) -> Option<(*mut T, usize)> {
+    let byte_offset = offset.checked_mul(size_of::<T>())?;
+    let byte_len = len.checked_mul(size_of::<T>())?;
+    ptr.addr().checked_add(byte_offset)?.checked_add(byte_len)?;
+    let start = ptr.wrapping_add(offset);
+    Some((
+        V::validate_slice(core::ptr::slice_from_raw_parts_mut(start, len))?,
+        byte_len,
+    ))
+}
+
+/// Copies the `len` values `offset` values past `ptr` in user space to `dst`, in a fallible
+/// manner.
+///
+/// # Safety
+///
+/// As for [`RawConstPointer::copy_to_raw`].
+unsafe fn copy_to_raw<V: ValidateAccess, T>(
+    ptr: *const T,
+    offset: usize,
+    dst: *mut T,
+    len: usize,
+) -> Option<()> {
+    if len == 0 {
+        return Some(());
+    }
+    let (src, byte_len) = user_range::<V, T>(ptr.cast_mut(), offset, len)?;
+    // SAFETY: `src` is a validated user range, which is non-Rust memory, and the caller
+    // guarantees `dst`; the copy is fallible and references neither.
+    V::with_user_memory_access(|| unsafe { memcpy_fallible(dst.cast(), src.cast(), byte_len) }).ok()
+}
+
 impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserConstPtr<V, T> {
     fn read_at_offset(self, count: isize) -> Option<T> {
         read_at_offset::<V, T>(self.as_ptr(), count)
@@ -241,6 +258,11 @@ impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserConstPtr<V, T> 
 
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
         to_owned_slice::<V, T>(self.as_ptr(), len)
+    }
+
+    unsafe fn copy_to_raw(self, offset: usize, dst: *mut T, len: usize) -> Option<()> {
+        // SAFETY: The caller upholds the contract.
+        unsafe { copy_to_raw::<V, T>(self.as_ptr(), offset, dst, len) }
     }
 
     fn as_usize(&self) -> usize {
@@ -278,25 +300,6 @@ impl<V: ValidateAccess, T> UserMutPtr<V, T> {
         }
     }
 
-    /// Copy data from a raw pointer to userspace.
-    ///
-    /// # Safety
-    ///
-    /// `src` must be either non-Rust memory or Rust memory without concurrent modification.
-    pub unsafe fn copy_from_raw(self, src: *const T, len: usize) -> Option<()>
-    where
-        T: FromBytes + IntoBytes,
-    {
-        if len == 0 {
-            return Some(());
-        }
-        let byte_len = len.checked_mul(core::mem::size_of::<T>())?;
-        self.inner.checked_add(byte_len)?;
-        let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(self.as_ptr(), len))?;
-        V::with_user_memory_access(|| unsafe { memcpy_fallible(dst.cast(), src.cast(), byte_len) })
-            .ok()
-    }
-
     /// Explicitly-private function.  See equivalent [`UserConstPtr::as_ptr`]
     /// for more details.
     fn as_ptr(&self) -> *mut T {
@@ -325,6 +328,11 @@ impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
 
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
         to_owned_slice::<V, T>(self.as_ptr().cast_const(), len)
+    }
+
+    unsafe fn copy_to_raw(self, offset: usize, dst: *mut T, len: usize) -> Option<()> {
+        // SAFETY: The caller upholds the contract.
+        unsafe { copy_to_raw::<V, T>(self.as_ptr().cast_const(), offset, dst, len) }
     }
 
     fn as_usize(&self) -> usize {
@@ -401,5 +409,16 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
             memcpy_fallible(dst.cast(), buf.as_ptr().cast(), size_of_val(buf))
         })
         .ok()
+    }
+
+    unsafe fn copy_from_raw(self, offset: usize, src: *const T, len: usize) -> Option<()> {
+        if len == 0 {
+            return Some(());
+        }
+        let (dst, byte_len) = user_range::<V, T>(self.as_ptr(), offset, len)?;
+        // SAFETY: `dst` is a validated user range, which is non-Rust memory, and the caller
+        // guarantees `src`; the copy is fallible and references neither.
+        V::with_user_memory_access(|| unsafe { memcpy_fallible(dst.cast(), src.cast(), byte_len) })
+            .ok()
     }
 }

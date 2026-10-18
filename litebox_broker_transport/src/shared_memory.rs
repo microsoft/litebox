@@ -4,12 +4,16 @@
 //! Runtime shared-memory access for broker transports.
 //!
 //! [`SharedMemory`] and [`ControlRingMemory`] abstract a concrete shared-memory
-//! resource. [`SharedBufferPool`] applies the peer-visible fixed-slot layout
-//! from [`litebox_broker_protocol::shared_buffer`] and bounds-checks each slot
-//! access.
+//! resource, and [`MappedSharedMemory`] one mapped locally, whose bytes it
+//! lends as [`SharedBytes`]. [`SharedBufferPool`] applies the peer-visible
+//! fixed-slot layout from [`litebox_broker_protocol::shared_buffer`] and
+//! bounds-checks each slot access.
 
+use alloc::alloc::Layout;
 use alloc::sync::Arc;
+use core::marker::PhantomData;
 use core::ops::Range;
+use core::ptr::NonNull;
 
 use thiserror::Error;
 
@@ -17,6 +21,8 @@ use litebox_broker_protocol::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SharedBufferLayout, SharedBufferLayoutError,
     SharedBufferSequence, SharedBufferSlotIndex,
 };
+
+use crate::peer_memory;
 
 /// Error accessing a shared-memory resource.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -132,6 +138,208 @@ impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
 
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
         (**self).write(offset, source)
+    }
+}
+
+/// Shared memory mapped into the local address space, which lends its bytes
+/// so callers can copy directly between them and memory of their own that
+/// they cannot expose as a slice, such as a guest's memory.
+pub trait MappedSharedMemory: SharedMemory {
+    /// Returns the `length` bytes at `offset`.
+    ///
+    /// The range is validated as for [`SharedMemory::read`] and
+    /// [`SharedMemory::write`].
+    fn bytes(&self, offset: usize, length: usize) -> Result<SharedBytes<'_>, SharedMemoryError>;
+}
+
+impl<Memory: MappedSharedMemory + ?Sized> MappedSharedMemory for Arc<Memory> {
+    fn bytes(&self, offset: usize, length: usize) -> Result<SharedBytes<'_>, SharedMemoryError> {
+        (**self).bytes(offset, length)
+    }
+}
+
+/// A range of mapped shared memory, which a peer may access at any time.
+///
+/// The bytes are readable and writable for `'a`, but never through Rust
+/// references. Copy them with [`Self::copy_to_slice`] and
+/// [`Self::copy_from_slice`], or through [`Self::as_ptr`] with a copy that,
+/// like those in [`crate::peer_memory`], performs its accesses in inline
+/// assembly, so a concurrent peer access cannot make it unsound.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedBytes<'a> {
+    address: NonNull<u8>,
+    length: usize,
+    _memory: PhantomData<&'a ()>,
+}
+
+impl SharedBytes<'_> {
+    /// Returns the `length` bytes at `address`.
+    ///
+    /// # Safety
+    ///
+    /// `address..address + length` must be readable and writable for the
+    /// returned value's lifetime, and must never be accessed through Rust
+    /// references.
+    pub const unsafe fn from_raw_parts(address: NonNull<u8>, length: usize) -> Self {
+        Self {
+            address,
+            length,
+            _memory: PhantomData,
+        }
+    }
+
+    /// Returns the length in bytes.
+    pub const fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Returns whether the range is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Returns the address of the first byte.
+    pub const fn as_ptr(&self) -> *mut u8 {
+        self.address.as_ptr()
+    }
+
+    /// Splits the range in two at `mid`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mid` exceeds the length.
+    pub fn split_at(self, mid: usize) -> (Self, Self) {
+        (self.subrange(0..mid), self.subrange(mid..self.length))
+    }
+
+    /// Returns the bytes at `range` within this range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is reversed or exceeds the length.
+    #[must_use]
+    pub fn subrange(self, range: Range<usize>) -> Self {
+        assert!(
+            range.start <= range.end && range.end <= self.length,
+            "shared byte range {range:?} exceeds length {}",
+            self.length
+        );
+        // SAFETY: The range lies within this one, which is valid as required
+        // for the same lifetime.
+        unsafe { Self::from_raw_parts(self.address.add(range.start), range.len()) }
+    }
+
+    /// Copies the bytes into `destination`, which must be the same length.
+    ///
+    /// The copy is an untrusted snapshot that a concurrent peer write may
+    /// tear.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lengths differ.
+    pub fn copy_to_slice(self, destination: &mut [u8]) {
+        assert_eq!(
+            destination.len(),
+            self.length,
+            "destination must match the shared bytes"
+        );
+        // SAFETY: The bytes are readable and, never being referenced, cannot
+        // overlap the destination.
+        unsafe { peer_memory::copy_from_peer(self.as_ptr(), destination) };
+    }
+
+    /// Copies `source`, which must be the same length, into the bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lengths differ.
+    pub fn copy_from_slice(self, source: &[u8]) {
+        assert_eq!(
+            source.len(),
+            self.length,
+            "source must match the shared bytes"
+        );
+        // SAFETY: The bytes are writable and, never being referenced, cannot
+        // overlap the source.
+        unsafe { peer_memory::copy_to_peer(source, self.as_ptr()) };
+    }
+}
+
+/// Shared memory in a private heap allocation, for endpoints in one address
+/// space, such as an in-process broker and its tests.
+///
+/// Its bytes are zeroed and, like a mapping's, page-aligned.
+pub struct HeapSharedMemory {
+    address: NonNull<u8>,
+    length: usize,
+    layout: Layout,
+}
+
+// SAFETY: The allocation is accessed only through peer-memory copies and
+// `SharedBytes`, which tolerate concurrent access from any thread.
+unsafe impl Send for HeapSharedMemory {}
+// SAFETY: As for `Send`.
+unsafe impl Sync for HeapSharedMemory {}
+
+impl HeapSharedMemory {
+    const ALIGNMENT: usize = 4096;
+
+    /// Allocates `length` zeroed bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `length` exceeds the allocator's limits, or aborts if the
+    /// allocation fails.
+    pub fn new(length: usize) -> Self {
+        let layout = Layout::from_size_align(length.max(1), Self::ALIGNMENT)
+            .expect("shared memory length must fit an allocation");
+        // SAFETY: The layout has a nonzero size.
+        let address = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        let Some(address) = NonNull::new(address) else {
+            alloc::alloc::handle_alloc_error(layout);
+        };
+        Self {
+            address,
+            length,
+            layout,
+        }
+    }
+}
+
+impl Drop for HeapSharedMemory {
+    fn drop(&mut self) {
+        // SAFETY: The allocation was made with this layout and is no longer
+        // lent, since lent bytes borrow `self`.
+        unsafe { alloc::alloc::dealloc(self.address.as_ptr(), self.layout) };
+    }
+}
+
+impl SharedMemory for HeapSharedMemory {
+    fn len(&self) -> usize {
+        self.length
+    }
+
+    fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
+        self.bytes(offset, destination.len())?
+            .copy_to_slice(destination);
+        Ok(())
+    }
+
+    fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
+        self.bytes(offset, source.len())?.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+impl MappedSharedMemory for HeapSharedMemory {
+    fn bytes(&self, offset: usize, length: usize) -> Result<SharedBytes<'_>, SharedMemoryError> {
+        offset
+            .checked_add(length)
+            .filter(|&end| end <= self.len())
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        // SAFETY: The range lies within the allocation, which lives as long as
+        // `self` and is accessed only through peer-memory copies.
+        Ok(unsafe { SharedBytes::from_raw_parts(self.address.add(offset), length) })
     }
 }
 
@@ -305,21 +513,38 @@ impl<Memory: SharedMemory> SharedBufferPool<Memory> {
     }
 }
 
+impl<Memory: MappedSharedMemory> SharedBufferPool<Memory> {
+    /// Returns the shared bytes holding the `length` bytes at `offset` in
+    /// `sequence`, in transfer order.
+    ///
+    /// Slots adjacent in memory share one part.
+    pub fn sequence_bytes(
+        &self,
+        sequence: SharedBufferSequence,
+        offset: usize,
+        length: usize,
+    ) -> Result<impl Iterator<Item = SharedBytes<'_>>, SharedBufferError> {
+        let memory = self.memory.bytes(0, self.memory.len())?;
+        Ok(self
+            .ranges_at(sequence, offset, length)?
+            .map(move |range| memory.subrange(range)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
-    use std::sync::Mutex;
 
     #[test]
     fn pool_checks_backing_length_and_slot_boundaries() {
         let layout = SharedBufferLayout::new(8, 3).unwrap();
         assert!(matches!(
-            SharedBufferPool::new(TestSharedMemory::new(23), layout),
+            SharedBufferPool::new(HeapSharedMemory::new(23), layout),
             Err(SharedBufferError::MemoryLengthMismatch)
         ));
-        let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
+        let memory = Arc::new(HeapSharedMemory::new(layout.total_len()));
         let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
 
         pool.write(SharedBufferSlotIndex(0), &[1, 2, 3]).unwrap();
@@ -327,7 +552,7 @@ mod tests {
         let mut first = [0; 3];
         pool.read(SharedBufferSlotIndex(0), &mut first).unwrap();
         assert_eq!(first, [1, 2, 3]);
-        assert_eq!(&memory.bytes()[8..16], &[0; 8]);
+        assert_eq!(&contents(&memory)[8..16], &[0; 8]);
         assert_eq!(
             pool.write(SharedBufferSlotIndex(2), &[0; 9]),
             Err(SharedBufferError::Layout(
@@ -339,7 +564,7 @@ mod tests {
     #[test]
     fn pool_copies_sequence_prefixes_across_slots() {
         let layout = SharedBufferLayout::new(4, 3).unwrap();
-        let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
+        let memory = Arc::new(HeapSharedMemory::new(layout.total_len()));
         let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
         let sequence =
             SharedBufferSequence::new(&[SharedBufferSlotIndex(0), SharedBufferSlotIndex(2)], 6)
@@ -347,7 +572,7 @@ mod tests {
 
         pool.write_sequence(sequence, 0, &[1, 2, 3, 4, 5, 6])
             .unwrap();
-        assert_eq!(memory.bytes(), [1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 0, 0]);
+        assert_eq!(contents(&memory), [1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 0, 0]);
 
         let mut destination = [0; 5];
         pool.read_sequence(sequence, 0, &mut destination).unwrap();
@@ -365,7 +590,7 @@ mod tests {
     #[test]
     fn pool_copies_sequence_ranges_at_offsets_across_slots() {
         let layout = SharedBufferLayout::new(4, 3).unwrap();
-        let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
+        let memory = Arc::new(HeapSharedMemory::new(layout.total_len()));
         let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
         let sequence =
             SharedBufferSequence::new(&[SharedBufferSlotIndex(0), SharedBufferSlotIndex(2)], 7)
@@ -373,7 +598,7 @@ mod tests {
 
         pool.write_sequence(sequence, 2, &[1, 2, 3, 4]).unwrap();
         pool.write_sequence(sequence, 6, &[5]).unwrap();
-        assert_eq!(memory.bytes(), [0, 0, 1, 2, 0, 0, 0, 0, 3, 4, 5, 0]);
+        assert_eq!(contents(&memory), [0, 0, 1, 2, 0, 0, 0, 0, 3, 4, 5, 0]);
 
         let mut destination = [0; 3];
         pool.read_sequence(sequence, 3, &mut destination).unwrap();
@@ -393,7 +618,7 @@ mod tests {
     fn pool_merges_slots_adjacent_in_memory() {
         let layout = SharedBufferLayout::new(4, 4).unwrap();
         let pool =
-            SharedBufferPool::new(TestSharedMemory::new(layout.total_len()), layout).unwrap();
+            SharedBufferPool::new(HeapSharedMemory::new(layout.total_len()), layout).unwrap();
         let sequence = SharedBufferSequence::new(
             &[
                 SharedBufferSlotIndex(1),
@@ -415,45 +640,95 @@ mod tests {
         assert_eq!(ranges(0), []);
     }
 
-    struct TestSharedMemory(Mutex<Vec<u8>>);
+    #[test]
+    fn pool_lends_sequence_bytes_at_offsets_across_slots() {
+        let layout = SharedBufferLayout::new(4, 4).unwrap();
+        let memory = Arc::new(HeapSharedMemory::new(layout.total_len()));
+        let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
+        let sequence = SharedBufferSequence::new(
+            &[
+                SharedBufferSlotIndex(2),
+                SharedBufferSlotIndex(3),
+                SharedBufferSlotIndex(0),
+            ],
+            11,
+        )
+        .unwrap();
 
-    impl TestSharedMemory {
-        fn new(length: usize) -> Self {
-            Self(Mutex::new(vec![0; length]))
+        let mut source = 1..;
+        for part in pool.sequence_bytes(sequence, 1, 9).unwrap() {
+            let bytes: Vec<u8> = source.by_ref().take(part.len()).collect();
+            part.copy_from_slice(&bytes);
         }
-
-        fn bytes(&self) -> Vec<u8> {
-            self.0.lock().unwrap().clone()
-        }
+        assert_eq!(
+            contents(&memory),
+            [8, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        let lengths = |offset, length| {
+            pool.sequence_bytes(sequence, offset, length)
+                .unwrap()
+                .map(|part| part.len())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lengths(1, 9), [7, 2]);
+        assert_eq!(lengths(8, 3), [3]);
+        assert_eq!(lengths(11, 0), [0; 0]);
+        assert!(matches!(
+            pool.sequence_bytes(sequence, 4, 8),
+            Err(SharedBufferError::TransferExceedsSequence)
+        ));
     }
 
-    impl SharedMemory for TestSharedMemory {
-        fn len(&self) -> usize {
-            self.0.lock().unwrap().len()
-        }
+    #[test]
+    fn shared_bytes_split_and_copy_within_their_range() {
+        let memory = HeapSharedMemory::new(8);
+        let bytes = memory.bytes(2, 5).unwrap();
+        let (front, back) = bytes.split_at(2);
+        assert_eq!((front.len(), back.len()), (2, 3));
+        front.copy_from_slice(&[1, 2]);
+        back.subrange(1..3).copy_from_slice(&[3, 4]);
+        let mut copied = [0; 5];
+        bytes.copy_to_slice(&mut copied);
+        assert_eq!(copied, [1, 2, 0, 3, 4]);
+        assert_eq!(contents(&memory), [0, 0, 1, 2, 0, 3, 4, 0]);
+        assert!(bytes.subrange(5..5).is_empty());
+        assert_eq!(memory.bytes(8, 0).unwrap().len(), 0);
+        assert_eq!(
+            memory.bytes(4, 5).map(|bytes| bytes.len()),
+            Err(SharedMemoryError::InvalidRange)
+        );
+        assert_eq!(
+            memory.bytes(usize::MAX, 2).map(|bytes| bytes.len()),
+            Err(SharedMemoryError::InvalidRange)
+        );
+    }
 
-        fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-            let memory = self.0.lock().unwrap();
-            let end = offset
-                .checked_add(destination.len())
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            let source = memory
-                .get(offset..end)
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            destination.copy_from_slice(source);
-            Ok(())
-        }
+    #[test]
+    #[should_panic(expected = "exceeds length")]
+    fn shared_bytes_reject_subranges_past_their_end() {
+        let memory = HeapSharedMemory::new(8);
+        let _ = memory.bytes(0, 4).unwrap().subrange(2..5);
+    }
 
-        fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-            let mut memory = self.0.lock().unwrap();
-            let end = offset
-                .checked_add(source.len())
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            let destination = memory
-                .get_mut(offset..end)
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            destination.copy_from_slice(source);
-            Ok(())
-        }
+    #[test]
+    fn heap_shared_memory_is_zeroed_and_page_aligned() {
+        let memory = HeapSharedMemory::new(5000);
+        assert_eq!(memory.len(), 5000);
+        assert!(contents(&memory).iter().all(|&byte| byte == 0));
+        assert!(
+            memory
+                .bytes(0, 1)
+                .unwrap()
+                .as_ptr()
+                .addr()
+                .is_multiple_of(4096)
+        );
+        assert!(HeapSharedMemory::new(0).is_empty());
+    }
+
+    fn contents(memory: &HeapSharedMemory) -> Vec<u8> {
+        let mut contents = vec![0; memory.len()];
+        memory.read(0, &mut contents).unwrap();
+        contents
     }
 }

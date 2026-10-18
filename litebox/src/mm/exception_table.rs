@@ -64,6 +64,7 @@ macro_rules! ex_table_entry {
 }
 
 /// Represents a fault during a fallible memory operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fault;
 
 /// Copies `size` bytes from `src` to `dst` in a fallible manner.

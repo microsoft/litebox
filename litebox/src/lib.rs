@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod arch;
+pub mod buffer;
 pub mod event;
 pub mod fd;
 pub mod fs;

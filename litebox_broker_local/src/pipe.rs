@@ -11,6 +11,7 @@ use litebox_broker_protocol::pipe::{
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_transport::channel::LocalCallChannel;
 
+use crate::transfer::{Copier, Filler};
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
@@ -38,8 +39,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         Ok(response)
     }
 
-    /// Reads bytes from a broker-owned pipe into an operation-scoped shared
-    /// buffer lease.
+    /// Reads up to `buffer.length()` bytes from a broker-owned pipe into an
+    /// operation-scoped shared buffer lease, and lends the bytes read to
+    /// `copy`.
     ///
     /// The caller must retain exclusive ownership of the sequence's slots
     /// until this method returns.
@@ -48,23 +50,18 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
     /// response that does not match the issued pipe request, or if `buffer` is
-    /// not a valid lease whose length matches `data`.
+    /// not a valid lease.
     pub fn read_pipe(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        destination: &mut [u8],
+        copy: &mut Copier<'_>,
     ) -> Result<usize, Channel::Error> {
         if buffer.length() > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        assert_eq!(
-            destination.len(),
-            buffer.length() as usize,
-            "shared data must match its buffer sequence"
-        );
         let _ = buffer
             .descriptors(self.shared_buffers.layout())
             .expect("shared buffer sequence must identify valid slot ranges");
@@ -77,12 +74,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             "broker returned oversized pipe read"
         );
         let read = response.read as usize;
-        self.read_shared_buffer(buffer, &mut destination[..read]);
+        self.lend_shared_buffer(buffer, 0, read, copy)?;
         Ok(read)
     }
 
-    /// Writes bytes to a broker-owned pipe from an operation-scoped shared
-    /// buffer lease.
+    /// Writes up to `buffer.length()` bytes to a broker-owned pipe from an
+    /// operation-scoped shared buffer lease, which `fill` fills first.
     ///
     /// The caller must retain exclusive ownership of the sequence's slots
     /// until this method returns.
@@ -90,19 +87,20 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
-    /// response that does not match the issued pipe request.
+    /// response that does not match the issued pipe request, or if `buffer` is
+    /// not a valid lease.
     pub fn write_pipe(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        data: &[u8],
+        fill: &mut Filler<'_>,
     ) -> Result<usize, Channel::Error> {
         if buffer.length() > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        self.write_shared_buffer(buffer, data);
+        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, fill)?;
         let response =
             self.request_pipe(PipeRequest::Write(WritePipeRequest { handle, buffer }))?;
         let PipeResponse::Write(response) = response else {
@@ -110,7 +108,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         };
         let written = response.written as usize;
         assert!(
-            written <= data.len(),
+            written <= buffer.length() as usize,
             "broker returned oversized shared pipe write"
         );
         Ok(written)
@@ -134,7 +132,6 @@ mod tests {
     use alloc::vec::Vec;
     use core::{cell::RefCell, convert::Infallible};
     use std::collections::VecDeque;
-    use std::sync::Mutex;
 
     use litebox_broker_protocol::message::{
         BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -144,15 +141,16 @@ mod tests {
         SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex,
     };
     use litebox_broker_transport::channel::LocalCallChannel;
-    use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
+    use litebox_broker_transport::shared_memory::{HeapSharedMemory, SharedBytes, SharedMemory};
 
     use crate::test_support::test_broker_local;
+    use crate::transfer::CopyFailed;
 
     #[test]
     fn pipe_uses_the_sequence_slot_for_data_operations() {
         let read_handle = ObjectHandle(1);
         let write_handle = ObjectHandle(2);
-        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([
             BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
                 read_handle,
@@ -168,7 +166,7 @@ mod tests {
         local.create_pipe(64, 16, FileOpenFlags::NONE).unwrap();
         assert_eq!(
             local
-                .write_pipe(write_handle, write_buffer, &[1, 2, 3])
+                .write_pipe(write_handle, write_buffer, &mut fill_from(&[1, 2, 3]))
                 .unwrap(),
             2
         );
@@ -181,12 +179,12 @@ mod tests {
         memory
             .write(4 * SHARED_BUFFER_SLOT_SIZE as usize, &[4, 5, 6])
             .unwrap();
-        let mut read_data = [0; 3];
+        let mut read_data = Vec::new();
         let read = local
-            .read_pipe(read_handle, read_buffer, &mut read_data)
+            .read_pipe(read_handle, read_buffer, &mut copy_into(&mut read_data))
             .unwrap();
         assert_eq!(read, 2);
-        assert_eq!(&read_data[..read], &[4, 5]);
+        assert_eq!(read_data, [4, 5]);
         assert_eq!(
             local.channel.sent_operations.borrow().as_slice(),
             &[
@@ -209,19 +207,19 @@ mod tests {
 
     #[test]
     fn pipe_rejects_oversized_transfers_before_request() {
-        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([]);
         let local = test_broker_local(channel, memory);
         let oversized = sequence(0, MAX_PIPE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
-            local.read_pipe(ObjectHandle(1), oversized, &mut []),
+            local.read_pipe(ObjectHandle(1), oversized, &mut |_| unreachable!()),
             Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted
             ))
         ));
         assert!(matches!(
-            local.write_pipe(ObjectHandle(2), oversized, &[]),
+            local.write_pipe(ObjectHandle(2), oversized, &mut |_| unreachable!()),
             Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted
             ))
@@ -236,11 +234,9 @@ mod tests {
             ScriptedChannel::new([BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
                 read: 2,
             }))]);
-        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = test_broker_local(channel, memory);
-        let mut destination = [0];
-
-        let _ = local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut destination);
+        let _ = local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut |_| unreachable!());
     }
 
     #[test]
@@ -250,61 +246,57 @@ mod tests {
             ScriptedChannel::new([BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
                 written: 2,
             }))]);
-        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = test_broker_local(channel, memory);
 
-        let _ = local.write_pipe(ObjectHandle(1), sequence(0, 1), &[0]);
+        let _ = local.write_pipe(ObjectHandle(1), sequence(0, 1), &mut fill_from(&[0]));
+    }
+
+    #[test]
+    fn pipe_copy_failures_fail_the_transfer() {
+        let channel =
+            ScriptedChannel::new([BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
+                read: 1,
+            }))]);
+        let memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let local = test_broker_local(channel, memory);
+
+        assert!(matches!(
+            local.write_pipe(ObjectHandle(2), sequence(0, 1), &mut |_| Err(CopyFailed)),
+            Err(BrokerLocalError::CopyFailed)
+        ));
+        assert!(local.channel.sent_operations.borrow().is_empty());
+        assert!(matches!(
+            local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut |_| Err(CopyFailed)),
+            Err(BrokerLocalError::CopyFailed)
+        ));
+    }
+
+    fn fill_from(
+        data: &[u8],
+    ) -> impl FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed> + '_ {
+        let mut data = data;
+        move |part| {
+            let (head, tail) = data.split_at(part.len());
+            part.copy_from_slice(head);
+            data = tail;
+            Ok(())
+        }
+    }
+
+    fn copy_into(
+        destination: &mut Vec<u8>,
+    ) -> impl FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed> + '_ {
+        move |part| {
+            let start = destination.len();
+            destination.resize(start + part.len(), 0);
+            part.copy_to_slice(&mut destination[start..]);
+            Ok(())
+        }
     }
 
     fn sequence(slot: u32, length: u32) -> SharedBufferSequence {
         SharedBufferSequence::new(&[SharedBufferSlotIndex(slot)], length).unwrap()
-    }
-
-    #[derive(Clone)]
-    struct TestSharedMemory(Arc<Mutex<Vec<u8>>>);
-
-    impl TestSharedMemory {
-        fn new(length: usize) -> Self {
-            Self(Arc::new(Mutex::new(std::vec![0; length])))
-        }
-    }
-
-    impl SharedMemory for TestSharedMemory {
-        fn len(&self) -> usize {
-            self.0.lock().unwrap().len()
-        }
-
-        fn read(
-            &self,
-            offset: usize,
-            destination: &mut [u8],
-        ) -> core::result::Result<(), SharedMemoryError> {
-            let memory = self.0.lock().unwrap();
-            let end = offset
-                .checked_add(destination.len())
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            let source = memory
-                .get(offset..end)
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            destination.copy_from_slice(source);
-            Ok(())
-        }
-
-        fn write(
-            &self,
-            offset: usize,
-            source: &[u8],
-        ) -> core::result::Result<(), SharedMemoryError> {
-            let mut memory = self.0.lock().unwrap();
-            let end = offset
-                .checked_add(source.len())
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            let destination = memory
-                .get_mut(offset..end)
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            destination.copy_from_slice(source);
-            Ok(())
-        }
     }
 
     struct ScriptedChannel {

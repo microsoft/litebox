@@ -39,6 +39,7 @@ use crate::mm::vmap::{
 use crate::platform::common_providers::userspace_pointers::{
     UserConstPtr, UserMutPtr, ValidateAccess,
 };
+use crate::platform::{RawConstPointer as _, RawMutPointer as _};
 use core::marker::PhantomData;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -426,7 +427,7 @@ impl<V: VmapManager<ALIGN>, T, const ALIGN: usize> MappedGuard<'_, V, T, ALIGN> 
         dst: UserMutPtr<U, u8>,
     ) -> Result<(), PhysPointerError> {
         // SAFETY: `PhysConstPtr`/`PhysMutPtr` only point to non-Rust memory.
-        unsafe { dst.copy_from_raw(self.ptr.cast::<u8>().cast_const(), self.size) }
+        unsafe { dst.copy_from_raw(0, self.ptr.cast::<u8>().cast_const(), self.size) }
             .ok_or(PhysPointerError::CopyFailed)
     }
 
@@ -435,7 +436,7 @@ impl<V: VmapManager<ALIGN>, T, const ALIGN: usize> MappedGuard<'_, V, T, ALIGN> 
         src: UserConstPtr<U, u8>,
     ) -> Result<(), PhysPointerError> {
         // SAFETY: `PhysMutPtr` only points to non-Rust memory.
-        unsafe { src.copy_to_raw(self.ptr.cast::<u8>(), self.size) }
+        unsafe { src.copy_to_raw(0, self.ptr.cast::<u8>(), self.size) }
             .ok_or(PhysPointerError::CopyFailed)
     }
 

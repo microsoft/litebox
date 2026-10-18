@@ -9,6 +9,7 @@ use core::net::SocketAddrV4;
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_local::transfer::{Copier, Filler};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
@@ -41,8 +42,8 @@ use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_protocol::unix_socket::{
     CreateUnixSocketPairResponse, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE,
-    ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
-    UnixSocketName,
+    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE,
+    UnixSocketAddress, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
@@ -364,16 +365,22 @@ pub(crate) trait BrokerControl: Send + Sync {
         flags: FileOpenFlags,
     ) -> core::result::Result<CreatePipeResponse, BrokerControlError>;
 
+    /// Reads up to `length` bytes, at most [`MAX_PIPE_TRANSFER_SIZE`], from
+    /// a pipe, lending the bytes read to `copy`.
     fn read_pipe(
         &self,
         handle: ObjectHandle,
-        length: u32,
-    ) -> core::result::Result<Vec<u8>, BrokerControlError>;
+        length: usize,
+        copy: &mut Copier<'_>,
+    ) -> core::result::Result<usize, BrokerControlError>;
 
+    /// Writes up to `length` bytes, at most [`MAX_PIPE_TRANSFER_SIZE`], to a
+    /// pipe, which `fill` fills first.
     fn write_pipe(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        length: usize,
+        fill: &mut Filler<'_>,
     ) -> core::result::Result<usize, BrokerControlError>;
 
     fn open_file(
@@ -516,8 +523,8 @@ pub(crate) trait BrokerControl: Send + Sync {
         flags: FileOpenFlags,
     ) -> core::result::Result<core::result::Result<ObjectHandle, UnixSocketError>, BrokerControlError>;
 
-    /// Sends `data` to `address`, or to the connected peer if `address` is
-    /// `None`.
+    /// Sends `length` bytes, which `fill` fills first, to `address`, or to
+    /// the connected peer if `address` is `None`.
     ///
     /// Data that does not fit in one transfer fails with
     /// [`UnixSocketError::MessageTooLarge`], so stream callers send it in
@@ -526,17 +533,19 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
-        data: &[u8],
+        length: usize,
+        fill: &mut Filler<'_>,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>;
 
-    /// Receives into at most [`UNIX_SOCKET_BUFFER_SIZE`] bytes of `data`, as
-    /// for a non-blocking socket if `nonblocking` is set, returning the
-    /// sender's name if `source` is set.
+    /// Receives up to `capacity` bytes, at most [`UNIX_SOCKET_BUFFER_SIZE`],
+    /// lending the bytes received to `copy`, as for a non-blocking socket if
+    /// `nonblocking` is set, returning the sender's name if `source` is set.
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        capacity: usize,
+        copy: &mut Copier<'_>,
         peek: bool,
         source: bool,
         nonblocking: bool,
@@ -1256,31 +1265,27 @@ where
     fn read_pipe(
         &self,
         handle: ObjectHandle,
-        length: u32,
-    ) -> core::result::Result<Vec<u8>, BrokerControlError> {
-        if length > MAX_PIPE_TRANSFER_SIZE {
+        length: usize,
+        copy: &mut Copier<'_>,
+    ) -> core::result::Result<usize, BrokerControlError> {
+        if length > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let mut data = Vec::new();
-        data.try_reserve_exact(length as usize)
-            .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
-        data.resize(length as usize, 0);
-        let lease = self.acquire_shared_buffer(length as usize)?;
-        let read = self.request(|local| local.read_pipe(handle, lease.sequence(), &mut data))?;
-        data.truncate(read);
-        Ok(data)
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.read_pipe(handle, lease.sequence(), copy))
     }
 
     fn write_pipe(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        length: usize,
+        fill: &mut Filler<'_>,
     ) -> core::result::Result<usize, BrokerControlError> {
-        if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
+        if length > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let lease = self.acquire_shared_buffer(data.len())?;
-        self.request(|local| local.write_pipe(handle, lease.sequence(), data))
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.write_pipe(handle, lease.sequence(), fill))
     }
 
     fn open_file(
@@ -1515,7 +1520,8 @@ where
         &self,
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
-        data: &[u8],
+        length: usize,
+        fill: &mut Filler<'_>,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>
     {
@@ -1526,17 +1532,20 @@ where
             },
             None => Vec::new(),
         };
-        if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize - address.len() {
+        if length > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize - address.len() {
             return Ok(Err(UnixSocketError::MessageTooLarge));
         }
-        let lease = self.acquire_shared_buffer(address.len() + data.len())?;
-        self.request(|local| local.send_unix_socket(handle, lease.sequence(), &address, data, user))
+        let lease = self.acquire_shared_buffer(address.len() + length)?;
+        self.request(|local| {
+            local.send_unix_socket(handle, lease.sequence(), &address, length, fill, user)
+        })
     }
 
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        capacity: usize,
+        copy: &mut Copier<'_>,
         peek: bool,
         source: bool,
         nonblocking: bool,
@@ -1544,17 +1553,22 @@ where
         core::result::Result<(ReceiveUnixSocketResponse, Option<UnixSocketName>), UnixSocketError>,
         BrokerControlError,
     > {
-        let capacity = data.len().min(UNIX_SOCKET_BUFFER_SIZE as usize);
-        let data = &mut data[..capacity];
+        let capacity = capacity.min(UNIX_SOCKET_BUFFER_SIZE as usize);
         let name_size = if source {
             MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize
         } else {
             0
         };
         let lease = self.acquire_shared_buffer(capacity + name_size)?;
-        self.request(|local| {
-            local.receive_unix_socket(handle, lease.sequence(), data, peek, source, nonblocking)
-        })
+        let request = ReceiveUnixSocketRequest {
+            handle,
+            buffer: lease.sequence(),
+            capacity: u32::try_from(capacity).expect("capacity is capped below u32::MAX"),
+            peek,
+            source,
+            nonblocking,
+        };
+        self.request(|local| local.receive_unix_socket(request, copy))
     }
 
     fn shutdown_unix_socket(
@@ -1633,7 +1647,9 @@ mod tests {
         SharedBufferSequence,
     };
     use litebox_broker_transport::channel::LocalCallChannel;
-    use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
+    use litebox_broker_transport::shared_memory::{HeapSharedMemory, SharedMemory as _};
+
+    use crate::buffer::{copy_into, fill_from};
 
     use litebox_broker_local::test_support::test_broker_local;
 
@@ -1641,7 +1657,7 @@ mod tests {
 
     #[test]
     fn concurrent_pipe_writes_use_distinct_shared_buffer_leases() {
-        let memory = TestSharedMemory::new();
+        let memory = test_shared_memory();
         let (observed_sender, observed_receiver) = mpsc::sync_channel(2);
         let release = StdArc::new((StdMutex::new(false), StdCondvar::new()));
         let channel = ConcurrentPipeChannel {
@@ -1649,16 +1665,19 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let local = test_broker_local(channel, Arc::new(memory));
+        let local = test_broker_local(channel, memory);
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
             local,
             Arc::new(BrokerPollableRegistry::new()),
         ));
         let first_control = Arc::clone(&control);
-        let first = std::thread::spawn(move || first_control.write_pipe(ObjectHandle(1), b"first"));
+        let first = std::thread::spawn(move || {
+            first_control.write_pipe(ObjectHandle(1), 5, &mut fill_from(&b"first"[..], 0))
+        });
         let second_control = Arc::clone(&control);
-        let second =
-            std::thread::spawn(move || second_control.write_pipe(ObjectHandle(2), b"second"));
+        let second = std::thread::spawn(move || {
+            second_control.write_pipe(ObjectHandle(2), 6, &mut fill_from(&b"second"[..], 0))
+        });
 
         let first_observed = observed_receiver
             .recv_timeout(Duration::from_secs(1))
@@ -1684,7 +1703,7 @@ mod tests {
 
     #[test]
     fn concurrent_pipe_reads_retain_distinct_shared_buffer_data() {
-        let memory = TestSharedMemory::new();
+        let memory = test_shared_memory();
         let (observed_sender, observed_receiver) = mpsc::sync_channel(2);
         let release = StdArc::new((StdMutex::new(false), StdCondvar::new()));
         let channel = ConcurrentPipeReadChannel {
@@ -1692,15 +1711,20 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let local = test_broker_local(channel, Arc::new(memory));
+        let local = test_broker_local(channel, memory);
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
             local,
             Arc::new(BrokerPollableRegistry::new()),
         ));
         let first_control = Arc::clone(&control);
-        let first = std::thread::spawn(move || first_control.read_pipe(ObjectHandle(1), 3));
+        let read = |control: Arc<BrokerLocalControl<MockPlatform, _>>, handle| {
+            let mut data = [0; 3];
+            let read = control.read_pipe(handle, 3, &mut copy_into(&mut data[..], 0));
+            read.map(|read| data[..read].to_vec())
+        };
+        let first = std::thread::spawn(move || read(first_control, ObjectHandle(1)));
         let second_control = Arc::clone(&control);
-        let second = std::thread::spawn(move || second_control.read_pipe(ObjectHandle(2), 3));
+        let second = std::thread::spawn(move || read(second_control, ObjectHandle(2)));
 
         let first_buffer = observed_receiver
             .recv_timeout(Duration::from_secs(1))
@@ -1721,65 +1745,18 @@ mod tests {
         assert_eq!(second.join().unwrap().unwrap(), [2; 3]);
     }
 
-    #[derive(Clone)]
-    struct TestSharedMemory(StdArc<StdMutex<std::vec::Vec<u8>>>);
-
-    impl TestSharedMemory {
-        fn new() -> Self {
-            Self(StdArc::new(StdMutex::new(std::vec![
-                0;
-                SHARED_BUFFER_POOL_SIZE
-            ])))
-        }
-    }
-
-    impl SharedMemory for TestSharedMemory {
-        fn len(&self) -> usize {
-            self.0.lock().unwrap().len()
-        }
-
-        fn read(
-            &self,
-            offset: usize,
-            destination: &mut [u8],
-        ) -> core::result::Result<(), SharedMemoryError> {
-            let memory = self.0.lock().unwrap();
-            let end = offset
-                .checked_add(destination.len())
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            destination.copy_from_slice(
-                memory
-                    .get(offset..end)
-                    .ok_or(SharedMemoryError::InvalidRange)?,
-            );
-            Ok(())
-        }
-
-        fn write(
-            &self,
-            offset: usize,
-            source: &[u8],
-        ) -> core::result::Result<(), SharedMemoryError> {
-            let mut memory = self.0.lock().unwrap();
-            let end = offset
-                .checked_add(source.len())
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            memory
-                .get_mut(offset..end)
-                .ok_or(SharedMemoryError::InvalidRange)?
-                .copy_from_slice(source);
-            Ok(())
-        }
+    fn test_shared_memory() -> StdArc<HeapSharedMemory> {
+        StdArc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE))
     }
 
     struct ConcurrentPipeChannel {
-        memory: TestSharedMemory,
+        memory: StdArc<HeapSharedMemory>,
         observed_sender: mpsc::SyncSender<(SharedBufferSequence, std::vec::Vec<u8>)>,
         release: StdArc<(StdMutex<bool>, StdCondvar)>,
     }
 
     struct ConcurrentPipeReadChannel {
-        memory: TestSharedMemory,
+        memory: StdArc<HeapSharedMemory>,
         observed_sender: mpsc::SyncSender<SharedBufferSequence>,
         release: StdArc<(StdMutex<bool>, StdCondvar)>,
     }

@@ -103,6 +103,31 @@ impl<T: FromBytes> UserPtr<T> {
     ) -> Option<alloc::boxed::Box<[T]>> {
         self.to_platform_ptr::<P>().to_owned_slice(len)
     }
+
+    /// See [`RawConstPointer::copy_to_raw`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`RawConstPointer::copy_to_raw`].
+    #[must_use]
+    pub unsafe fn copy_to_raw<P: RawPointerProvider>(
+        self,
+        offset: usize,
+        dst: *mut T,
+        len: usize,
+    ) -> Option<()> {
+        // SAFETY: The caller upholds the contract.
+        unsafe { self.to_platform_ptr::<P>().copy_to_raw(offset, dst, len) }
+    }
+
+    /// Copies `dst.len()` values starting `offset` elements past this pointer
+    /// into `dst`, returning `None` if the user memory is inaccessible.
+    #[must_use]
+    pub fn copy_to_slice<P: RawPointerProvider>(self, offset: usize, dst: &mut [T]) -> Option<()> {
+        // SAFETY: An exclusively borrowed slice is valid for writes of its
+        // length and is not otherwise accessed during the copy.
+        unsafe { self.copy_to_raw::<P>(offset, dst.as_mut_ptr(), dst.len()) }
+    }
 }
 
 impl UserPtr<core::ffi::c_char> {
@@ -226,5 +251,37 @@ impl<T: FromBytes + IntoBytes> UserPtrMut<T> {
     {
         self.to_platform_ptr::<P>()
             .copy_from_slice(start_offset, buf)
+    }
+
+    /// See [`RawConstPointer::copy_to_raw`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`RawConstPointer::copy_to_raw`].
+    #[must_use]
+    pub unsafe fn copy_to_raw<P: RawPointerProvider>(
+        self,
+        offset: usize,
+        dst: *mut T,
+        len: usize,
+    ) -> Option<()> {
+        // SAFETY: The caller upholds the contract.
+        unsafe { self.to_platform_ptr::<P>().copy_to_raw(offset, dst, len) }
+    }
+
+    /// See [`RawMutPointer::copy_from_raw`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`RawMutPointer::copy_from_raw`].
+    #[must_use]
+    pub unsafe fn copy_from_raw<P: RawPointerProvider>(
+        self,
+        offset: usize,
+        src: *const T,
+        len: usize,
+    ) -> Option<()> {
+        // SAFETY: The caller upholds the contract.
+        unsafe { self.to_platform_ptr::<P>().copy_from_raw(offset, src, len) }
     }
 }

@@ -23,6 +23,8 @@ pub enum BrokerLocalError<E> {
     },
     #[error("broker rejected request: {0}")]
     Broker(#[source] ErrorCode),
+    #[error("copying the transferred bytes failed")]
+    CopyFailed,
 }
 
 /// Broker-local control adapter result type.

@@ -223,7 +223,10 @@ fn test_fcntl() {
         (OFlags::RDWR | OFlags::NONBLOCK).bits()
     );
     let mut buf = [0u8; 8];
-    assert_eq!(task.sys_read(eventfd, &mut buf, None), Err(Errno::EAGAIN));
+    assert_eq!(
+        task.sys_read(eventfd, &mut buf[..], None),
+        Err(Errno::EAGAIN)
+    );
 
     // Test fcntl with DUPFD
     let fd = task
@@ -255,16 +258,16 @@ fn test_file_status_flags() {
 
     // Appending writes go to the end regardless of the file offset.
     let fd = open(OFlags::CREAT | OFlags::RDWR);
-    assert_eq!(task.sys_write(fd, b"ab", None), Ok(2));
+    assert_eq!(task.sys_write(fd, &b"ab"[..], None), Ok(2));
     assert_eq!(task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::APPEND)), Ok(0));
     assert_eq!(getfl(fd), OFlags::RDWR | OFlags::APPEND);
     assert_eq!(
         task.sys_lseek(fd, 0, SeekWhence::RelativeToBeginning),
         Ok(0)
     );
-    assert_eq!(task.sys_write(fd, b"c", None), Ok(1));
+    assert_eq!(task.sys_write(fd, &b"c"[..], None), Ok(1));
     let mut buf = [0; 4];
-    assert_eq!(task.sys_read(fd, &mut buf, Some(0)), Ok(3));
+    assert_eq!(task.sys_read(fd, &mut buf[..], Some(0)), Ok(3));
     assert_eq!(&buf[..3], b"abc");
 
     // Status flags of an `O_PATH` descriptor cannot change.

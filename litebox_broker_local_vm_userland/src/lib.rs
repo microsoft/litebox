@@ -28,6 +28,7 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_local::BrokerLocal;
@@ -45,7 +46,9 @@ use litebox_broker_transport::control_ring::{
     MemoryAccessPolicy, WaitableSharedMemory,
 };
 use litebox_broker_transport::peer_memory;
-use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
+use litebox_broker_transport::shared_memory::{
+    ControlRingMemory, MappedSharedMemory, SharedBytes, SharedMemory, SharedMemoryError,
+};
 use litebox_common_vm_abi::{
     BrokerHandshakeFrame, FutexRequest, StartupInfo, Status, UserRange, WireFrame,
 };
@@ -219,6 +222,20 @@ impl SharedMemory for KernelSharedMemory {
         // Safety: as in `read`.
         unsafe { peer_memory::copy_to_peer(source, destination as *mut u8) };
         Ok(())
+    }
+}
+
+impl MappedSharedMemory for KernelSharedMemory {
+    fn bytes(&self, offset: usize, length: usize) -> Result<SharedBytes<'_>, SharedMemoryError> {
+        let address = checked(self.region.start.trunc(), self.len(), offset, length)?;
+        // Safety: in bounds of a region mapped for the process's lifetime,
+        // disjoint from private memory and never referenced.
+        Ok(unsafe {
+            SharedBytes::from_raw_parts(
+                NonNull::new(address as *mut u8).expect("the region is never at address zero"),
+                length,
+            )
+        })
     }
 }
 
@@ -402,7 +419,7 @@ pub fn connect(
                     words: ring()?,
                 })),
             };
-            let shared_memory: Arc<dyn SharedMemory> = Arc::new(KernelSharedMemory {
+            let shared_memory: Arc<dyn MappedSharedMemory> = Arc::new(KernelSharedMemory {
                 region: info.broker_shared_memory,
             });
             Ok((channel, shared_memory, notifications))

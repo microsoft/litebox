@@ -498,7 +498,8 @@ impl From<BrokerObjectError> for SocketError {
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::WouldBlock
             | BrokerObjectError::PeerClosed
-            | BrokerObjectError::UnsupportedOperation => Self::BackendFailure,
+            | BrokerObjectError::UnsupportedOperation
+            | BrokerObjectError::Fault => Self::BackendFailure,
         }
     }
 }
@@ -529,7 +530,8 @@ impl From<BrokerObjectError> for SocketAsyncError {
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::PeerClosed
-            | BrokerObjectError::WouldBlock => Self::BackendFailure,
+            | BrokerObjectError::WouldBlock
+            | BrokerObjectError::Fault => Self::BackendFailure,
             BrokerObjectError::ResourceExhausted | BrokerObjectError::OutOfMemory => {
                 Self::ResourceExhausted
             }

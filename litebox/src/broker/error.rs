@@ -17,6 +17,8 @@ pub(crate) enum BrokerControlError {
     AssociationFailed,
     #[error("broker returned operation error: {0}")]
     Broker(#[source] ErrorCode),
+    #[error("copying the transferred bytes faulted")]
+    Fault,
 }
 
 /// Internal normalized error for broker-backed object adapters.
@@ -41,6 +43,8 @@ pub(crate) enum BrokerObjectError {
     OutOfMemory,
     #[error("broker object operation is unsupported")]
     UnsupportedOperation,
+    #[error("copying the transferred bytes faulted")]
+    Fault,
 }
 
 impl From<BrokerControlError> for BrokerObjectError {
@@ -48,6 +52,7 @@ impl From<BrokerControlError> for BrokerObjectError {
         match error {
             BrokerControlError::AssociationFailed => Self::Control,
             BrokerControlError::Broker(error) => error.into(),
+            BrokerControlError::Fault => Self::Fault,
         }
     }
 }
@@ -79,6 +84,7 @@ impl<E> From<BrokerLocalError<E>> for BrokerControlError {
             | BrokerLocalError::RequestIdExhausted
             | BrokerLocalError::UnexpectedResponseId { .. } => Self::AssociationFailed,
             BrokerLocalError::Broker(error) => Self::Broker(error),
+            BrokerLocalError::CopyFailed => Self::Fault,
         }
     }
 }
@@ -103,7 +109,8 @@ impl From<BrokerObjectError> for EventCounterError {
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::PeerClosed
-            | BrokerObjectError::UnsupportedOperation => Self::Io,
+            | BrokerObjectError::UnsupportedOperation
+            | BrokerObjectError::Fault => Self::Io,
         }
     }
 }
@@ -129,7 +136,9 @@ impl From<BrokerObjectError> for ReadinessQueueError {
             BrokerObjectError::InvalidObject | BrokerObjectError::UnsupportedOperation => {
                 Self::UnsupportedTarget
             }
-            BrokerObjectError::Control | BrokerObjectError::PeerClosed => Self::Io,
+            BrokerObjectError::Control
+            | BrokerObjectError::PeerClosed
+            | BrokerObjectError::Fault => Self::Io,
         }
     }
 }
@@ -154,7 +163,8 @@ impl From<BrokerObjectError> for TimerError {
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::PeerClosed
-            | BrokerObjectError::UnsupportedOperation => Self::Io,
+            | BrokerObjectError::UnsupportedOperation
+            | BrokerObjectError::Fault => Self::Io,
         }
     }
 }
