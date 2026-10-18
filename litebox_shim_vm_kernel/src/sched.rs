@@ -44,8 +44,10 @@ const QUANTUM_NANOS: u64 = 10_000_000;
 pub const QUANTUM: Duration = Duration::from_nanos(QUANTUM_NANOS);
 
 /// The kernel's scheduler, which every runner process runs in from its
-/// creation ([`crate::Process::spawn`]) until it dies. Like Linux's run queue,
-/// it belongs to the kernel, not to a caller: a caller runs it until what it
+/// creation until it dies, whether a service spawned it
+/// ([`crate::Process::spawn`]) or it is a launched process (see
+/// [`crate::ProcessConfig::started_runner`]). Like Linux's run queue, it
+/// belongs to the kernel, not to a caller: a caller runs it until what it
 /// waits for happens (e.g., a reply), and every process runs meanwhile. Clones
 /// share it.
 #[derive(Clone, Default)]
@@ -71,6 +73,12 @@ impl Scheduler {
     pub fn run_until(&self, mut done: impl FnMut() -> bool) {
         let mut queue = self.0.borrow_mut();
         while !done() && queue.step() {}
+    }
+
+    /// Runs the processes until each waits for a request or is dead, as the
+    /// userland broker waits for its runners to drain.
+    pub fn run_until_idle(&self) {
+        self.run_until(|| false);
     }
 
     pub(crate) fn add(&self, process: Rc<Inner>) {
@@ -104,9 +112,20 @@ impl RunQueue {
 
     /// Serves the broker, then runs one thread for a slice, or halts until
     /// one can run. False once each process waits for a request or is dead,
-    /// and the worker is not suspended.
+    /// and the worker is not suspended. Once children were started (even if
+    /// their runner processes could not be created), runs no thread, so the
+    /// next step resumes the worker, which waits for them.
     fn schedule(&mut self) -> bool {
         self.serve();
+        let mut spawned = Vec::new();
+        let mut started = false;
+        for process in &self.processes {
+            started |= process.spawn_launched(&mut spawned);
+        }
+        if started {
+            self.processes.extend(spawned);
+            return true;
+        }
         let Self {
             processes,
             next,

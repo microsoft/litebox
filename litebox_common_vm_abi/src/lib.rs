@@ -22,11 +22,13 @@
 //! | `r10`    | reply size      | preserved          |
 //!
 //! - `rcx` and `r11` are clobbered; [`CallId::Ready`] and
-//!   [`CallId::ReplyAndWait`] also reset extended state and the GS base.
+//!   [`CallId::ReplyAndWait`] also reset extended state and the GS base
+//!   (but for a launched process's `Ready`; see [Messages](crate#messages)).
 //! - The reply is meaningful only on success; a failed call may have
 //!   written part of it. [`CallId::Ready`] and [`CallId::ReplyAndWait`]
 //!   write their reply when the next message is delivered, and an
-//!   inaccessible reply buffer then kills the process.
+//!   inaccessible reply buffer then kills the process (but a launched
+//!   process's `Ready` writes it at once).
 //! - Reserved fields must be zero ([`Status::InvalidArgument`]), so that they
 //!   can gain a meaning later. Their type, `Reserved`, decodes only zero.
 //! - Only a `syscall` in the runner's [`GATE_SECTION`] is a call; any other,
@@ -72,6 +74,16 @@
 //! [`StartupInfo::message_window`] that wraps the service's own ABI. The
 //! kernel checks a reply's framing, not its parts.
 //!
+//! A *launched process* is a child process, which the kernel creates when
+//! another process starts one (`StartChild`, e.g., for a Linux `execve` after
+//! `vfork`). It serves no requests: its broker handshake returns its startup
+//! data, which says what to run (see [Broker](crate#broker)). Its
+//! [`CallId::Ready`], with the same checks, registers the upcall entry and
+//! returns at once with an empty message, resetting neither extended state
+//! nor the GS base. From then on, the process is as if serving a request,
+//! until [`CallId::Exit`]; its [`CallId::ReplyAndWait`] is
+//! [`Status::Denied`].
+//!
 //! # Memory
 //!
 //! - [`RUNNER_MANAGED_MIN`]..[`RUNNER_MANAGED_MAX`]: the low user space, as
@@ -86,7 +98,8 @@
 //! # Threads
 //!
 //! A process starts with one thread, its main thread, which alone serves
-//! [Messages](crate#messages). While it serves a request, any thread can
+//! [Messages](crate#messages). While it serves a request (in a launched
+//! process, after [`CallId::Ready`]), any thread can
 //! [`CallId::Clone`] another, as Linux's `clone` does (`copy_thread`):
 //!
 //! - [`CloneKind::Thread`]: in the same process, sharing everything but its
@@ -131,7 +144,8 @@
 //!   control ring (`litebox_broker_transport::control_ring`) at the start of
 //!   [`StartupInfo::broker_control_ring`] and the shared buffers in
 //!   [`StartupInfo::broker_shared_memory`]. [`ABI_VERSION`] covers the ring
-//!   layout.
+//!   layout. A launched process's handshake also writes its startup data
+//!   into the shared buffers, which its reply locates.
 //! - The runner publishes requests and consumes responses, with
 //!   [`CallId::Futex`] on ring words, as the userland transport uses the
 //!   host's futex. The kernel's broker changes the ring words, and serves the
@@ -152,7 +166,8 @@
 //!   epoch.
 //! - The kernel pins the control ring and accesses it through its own mapping.
 //!   The shared buffers stay lazily populated and are touched only while
-//!   executing a request that names them.
+//!   executing a request that names them, or by a launched process's
+//!   handshake.
 //! - If the response ring is full, the kernel holds one response and consumes
 //!   no further request.
 //! - A malformed ring or request kills the process. Before the handshake, a
@@ -342,10 +357,12 @@ macro_rules! kernel_calls {
 
 kernel_calls! {
     /// Waits for the first request. Allowed once, at startup; `abi_version`
-    /// must equal [`ABI_VERSION`].
+    /// must equal [`ABI_VERSION`]. In a launched process, returns at once
+    /// with an empty message (see [Messages](crate#messages)).
     1 => Ready(ReadyRequest) -> Message;
     /// Replies to the request being served and waits for the next. Allowed
-    /// only while serving a request.
+    /// only while serving a request, and never in a launched process (see
+    /// [Messages](crate#messages)).
     2 => ReplyAndWait(Message) -> Message;
     /// Zeroed anonymous pages. Writable and executable together is
     /// [`Status::Denied`].
@@ -377,7 +394,8 @@ kernel_calls! {
     /// e.g. while running kernel code on the process's behalf, but not
     /// early.
     12 => SetTimer(SetTimerRequest) -> ();
-    /// Creates a thread. Allowed only while serving a request (see
+    /// Creates a thread. Allowed only while serving a request (in a launched
+    /// process, after `Ready`; see
     /// [Threads](crate#threads)); [`Status::NoMemory`] at the kernel's thread
     /// limit.
     13 => Clone(CloneRequest) -> CloneReply;

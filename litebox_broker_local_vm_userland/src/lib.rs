@@ -35,6 +35,7 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
     BrokerResponse,
 };
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::wire::{self, WireError};
 use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
 use litebox_broker_transport::control_ring::{
@@ -360,6 +361,8 @@ pub struct Notifications {
     words: KernelControlRing,
 }
 
+/// Returns the broker's local endpoint, the startup data of a launched
+/// process (see `litebox_common_vm_abi`, Messages), and the notifications.
 /// Call at most once per process.
 ///
 /// # Errors
@@ -367,8 +370,15 @@ pub struct Notifications {
 /// The kernel rejects the association or negotiation fails.
 pub fn connect(
     info: &StartupInfo,
-) -> litebox_broker_local::Result<(BrokerLocal<KernelBrokerChannel>, Notifications), ChannelError> {
-    let (local, _startup, notifications) =
+) -> litebox_broker_local::Result<
+    (
+        BrokerLocal<KernelBrokerChannel>,
+        Option<ProcessStartupData>,
+        Notifications,
+    ),
+    ChannelError,
+> {
+    let (local, startup, notifications) =
         BrokerLocal::negotiate(KernelBrokerSetup::default(), |_setup| {
             let ring = || {
                 KernelControlRing::new(info.broker_control_ring)
@@ -397,7 +407,7 @@ pub fn connect(
             });
             Ok((channel, shared_memory, notifications))
         })?;
-    Ok((local, notifications))
+    Ok((local, startup, notifications))
 }
 
 impl Notifications {

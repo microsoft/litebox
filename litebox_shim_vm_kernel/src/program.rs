@@ -19,7 +19,10 @@ pub enum RunError {
 }
 
 /// Runs each program in its process, all at once, in `scheduler`, and returns
-/// their exit statuses, in order. A malformed reply kills the process.
+/// their exit statuses, in order, once every process waits for a request or
+/// is dead (e.g., their descendants exited too). Each process is
+/// [finished](Process::finish) as soon as it replies. A malformed reply kills
+/// the process.
 ///
 /// # Panics
 ///
@@ -32,10 +35,13 @@ pub fn run_all(
         .iter_mut()
         .map(|(process, program)| submit(process, program).err().map(Err))
         .collect();
+    // One program per process: release what it holds (e.g., a pipe end) as
+    // soon as it replies, as its children may wait on it.
     let mut collect = || {
         for ((process, _), reply) in runs.iter_mut().zip(&mut replies) {
             if reply.is_none() && process.is_stopped() {
                 *reply = Some(self::reply(process));
+                process.finish();
             }
         }
         replies.iter().all(Option::is_some)
@@ -43,6 +49,11 @@ pub fn run_all(
     scheduler.run_until(&mut collect);
     // The last step may have stopped some (e.g., killed them).
     collect();
+    // Including those whose program was not submitted.
+    for (process, _) in runs.iter_mut() {
+        process.finish();
+    }
+    scheduler.run_until_idle();
     replies
         .into_iter()
         .map(|reply| reply.expect("a submitted process ran to a wait"))

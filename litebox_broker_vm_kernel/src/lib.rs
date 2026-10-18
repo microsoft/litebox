@@ -21,6 +21,15 @@
 //! As in the userland broker, requests are served apart from the runner's
 //! calls ([`Association::serve`]), and a wait blocks only its process: the
 //! kernel's scheduler polls it ([`Association::poll_wait`]).
+//!
+//! A process can start a child process (`StartChild`). Its association queues a
+//! [`PendingRunnerAssociation`] ([`Association::take_pending_associations`]),
+//! for which the kernel creates a runner process and associates it
+//! ([`Broker::associate`]); the child's handshake returns its startup data.
+//! Memory images (`WriteChildMemory`) are not supported.
+//!
+//! When a process ends ([`Association::exited`]), its association ends and
+//! its broker process exits, releasing what it holds (e.g., pipe ends).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -38,13 +47,15 @@ mod timers;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, OnceCell, RefCell};
 use core::convert::Infallible;
 use core::sync::atomic::{AtomicBool, Ordering};
-use litebox_broker_core::BrokerCore;
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_host::BrokerHostAssociation;
+use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, ChildImage, ProcessImage};
+use litebox_broker_host::{BrokerHostAssociation, ProcessLauncher, handle_process_operation};
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
+use litebox_broker_protocol::process::ProcessExitStatus;
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_protocol::wire;
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -96,6 +107,10 @@ pub struct Config {
     pub shares: Vec<share::Share>,
     /// The network sockets reach beyond the guest, if any.
     pub network: Option<&'static dyn Network>,
+    /// Whether processes may start child processes (process duplication), as
+    /// the userland broker's `allow_process_duplication`; the kernel then
+    /// creates their runner processes (see [`PendingRunnerAssociation`]).
+    pub allow_process_duplication: bool,
 }
 
 /// The kernel's broker; clones share it.
@@ -136,6 +151,7 @@ impl Broker {
                 timers.clone(),
                 sockets.clone(),
                 config.network.is_some(),
+                config.allow_process_duplication,
             ),
             platform: config.platform,
             events: config.events,
@@ -148,7 +164,8 @@ impl Broker {
 
     /// A process's association, before its handshake. `shared_memory` is in
     /// the process's user mapping; `control_ring` is at the start of
-    /// `control_ring_pages`.
+    /// `control_ring_pages`. With `launch`, the process is a launched one,
+    /// and its handshake attaches it to `launch`'s broker process.
     ///
     /// # Panics
     ///
@@ -157,6 +174,7 @@ impl Broker {
         &self,
         shared_memory: UserRange,
         control_ring_pages: PinnedUserPages,
+        launch: Option<PendingRunnerAssociation>,
     ) -> Association {
         let memory =
             PinnedControlRing::new(control_ring_pages).expect("the pages hold the control ring");
@@ -165,7 +183,14 @@ impl Broker {
             broker: self.clone(),
             shared_memory,
             readiness: Arc::new(KernelReadiness::new(self.woken.clone())),
-            state: RefCell::new(State::New(ring)),
+            launched: launch.is_some(),
+            process: launch
+                .as_ref()
+                .map(|launch| OnceCell::from(launch.process.clone()))
+                .unwrap_or_default(),
+            exit_status: Cell::new(None),
+            launcher: Arc::new(KernelProcessLauncher::default()),
+            state: RefCell::new(State::New(ring, launch)),
             submitted: Cell::new(false),
         }
     }
@@ -217,8 +242,12 @@ impl HostSetupChannel for KernelHostSetup {
 }
 
 enum State {
-    /// Before the handshake, with the ring it would activate.
-    New(ControlRing<PinnedControlRing>),
+    /// Before the handshake, with the ring it would activate, and, for a
+    /// launched process, its pending association.
+    New(
+        ControlRing<PinnedControlRing>,
+        Option<PendingRunnerAssociation>,
+    ),
     Active(Box<Active>),
     /// The handshake did not activate one, or it failed.
     Ended,
@@ -243,6 +272,16 @@ pub struct Association {
     broker: Broker,
     shared_memory: UserRange,
     readiness: Arc<KernelReadiness>,
+    /// See [`Broker::associate`].
+    launched: bool,
+    /// The broker process: a launched process's from the start, another's
+    /// once its handshake creates it. The process's end completes its exit.
+    process: OnceCell<Arc<BrokerProcess>>,
+    /// Once the process ended (see [`Self::exited`]); the association ends
+    /// as soon as the worker is not using it.
+    exit_status: Cell<Option<ProcessExitStatus>>,
+    /// Queues the child processes the process starts, for the kernel.
+    launcher: Arc<KernelProcessLauncher>,
     state: RefCell<State>,
     /// See [`Association::has_submitted`].
     submitted: Cell<bool>,
@@ -343,15 +382,23 @@ impl Association {
 
     /// [`BrokerHandshake`](litebox_common_vm_abi::CallId::BrokerHandshake):
     /// one attempt, successful or not; success activates the control ring.
+    /// Needs the process's address space, as a launched process's handshake
+    /// writes its startup data into its shared buffers.
     ///
     /// # Errors
     ///
     /// The status for the runner.
     pub fn handshake(&self, request: &WireFrame) -> Result<WireFrame, Status> {
         let mut state = self.state.borrow_mut();
-        let State::New(ring) = core::mem::replace(&mut *state, State::Ended) else {
+        let State::New(ring, mut launch) = core::mem::replace(&mut *state, State::Ended) else {
             return Err(Status::Denied);
         };
+        let (process, startup) = match &mut launch {
+            Some(launch) => (Some(launch.process.clone()), launch.startup.take()),
+            None => (None, None),
+        };
+        // `launch` lives until the end, so a failed handshake fails the start
+        // (see `PendingRunnerAssociation`'s `Drop`).
         let request =
             wire::decode_handshake_request(request.as_slice().ok_or(Status::InvalidArgument)?)
                 .map_err(|_| Status::InvalidArgument)?;
@@ -367,12 +414,15 @@ impl Association {
         let readiness: Arc<dyn ReadinessSink> = self.readiness.clone();
         let result = litebox_broker_host::setup_connection(
             &self.broker.core,
-            None,
-            None,
+            process,
+            startup,
             &mut setup,
             Arc::new(shared_buffers),
             readiness,
-            |_| false,
+            |process| {
+                let _ = self.process.set(process.clone());
+                false
+            },
             |_| Ok(()),
         );
         if let Ok(Ok(host)) = result {
@@ -453,15 +503,83 @@ impl Association {
     /// Serves the published requests, unless the response ring fills up.
     /// Needs the process's address space, for the shared buffers.
     ///
+    /// Must run on the kernel's worker
+    /// ([`litebox_platform_vm_kernel::worker`]), as a request may suspend it:
+    /// one waiting for a device, or one starting a child process, which waits
+    /// until the child's handshake or failure. While the worker is suspended,
+    /// the caller must keep creating what [`Self::take_pending_associations`]
+    /// returns, running the processes, and resuming the worker, or the request
+    /// never completes. Elsewhere, a request waiting for a device halts the
+    /// CPU, and one starting a child process panics.
+    ///
     /// # Errors
     ///
     /// [`EnterError::Failed`], which ended the association.
     pub fn serve(&self) -> Result<(), EnterError> {
         self.submitted.set(false);
         self.with_active(|active| {
-            active.serve().map_err(|Failed| EnterError::Failed)?;
+            active
+                .serve(&self.launcher)
+                .map_err(|Failed| EnterError::Failed)?;
             self.flush_readiness()
         })
+    }
+
+    /// The child processes the process started since the last call, in order,
+    /// for the caller to create a runner process for each (see
+    /// [`Broker::associate`]) or fail ([`PendingRunnerAssociation::fail`]). The
+    /// request that started one keeps the worker suspended until the child
+    /// starts or fails (see [`Self::serve`]); dropping a pending association
+    /// fails it too.
+    pub fn take_pending_associations(&self) -> Vec<PendingRunnerAssociation> {
+        core::mem::take(&mut *self.launcher.pending.lock())
+    }
+
+    /// The broker, e.g., to associate the process's children.
+    pub fn broker(&self) -> &Broker {
+        &self.broker
+    }
+
+    /// Whether the process is a launched one (see [`Broker::associate`]).
+    pub fn is_launched(&self) -> bool {
+        self.launched
+    }
+
+    /// The process ended (e.g., it exited, or the kernel killed it) with
+    /// `status`, unless it reported its own: ends the association and
+    /// completes the broker process's exit, or fails its start if it never
+    /// started. If the worker is using the association (e.g., suspended in a
+    /// request), this happens once the worker is done. Only the first call
+    /// counts.
+    pub fn exited(&self, status: ProcessExitStatus) {
+        if self.exit_status.get().is_none() {
+            self.exit_status.set(Some(status));
+        }
+        self.end_if_ended();
+    }
+
+    /// Does what [`Self::exited`] recorded, unless the worker is using the
+    /// association (its state is borrowed); [`Self::with_active`] then calls
+    /// this again.
+    fn end_if_ended(&self) {
+        let Some(status) = self.exit_status.get() else {
+            return;
+        };
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return;
+        };
+        // A pending association that never started fails (see
+        // `PendingRunnerAssociation`'s `Drop`).
+        let previous = core::mem::replace(&mut *state, State::Ended);
+        drop(state);
+        if let State::Active(active) = previous {
+            end(active.association, &self.readiness);
+        }
+        if let Some(process) = self.process.get() {
+            // Only the first completion counts; a process that never started
+            // has none.
+            let _ = process.complete_exit(status);
+        }
     }
 
     /// Where `wait` stands, after firing due timers and publishing readiness.
@@ -535,20 +653,25 @@ impl Association {
     }
 
     /// Runs `f` on the active association, ending it if `f` fails it.
+    /// Then ends it if the process ended meanwhile (see [`Self::exited`]).
     fn with_active<T>(
         &self,
         f: impl FnOnce(&mut Active) -> Result<T, EnterError>,
     ) -> Result<T, EnterError> {
-        let mut state = self.state.borrow_mut();
-        let State::Active(active) = &mut *state else {
-            return Err(EnterError::Status(Status::Denied));
+        let result = {
+            let mut state = self.state.borrow_mut();
+            let State::Active(active) = &mut *state else {
+                return Err(EnterError::Status(Status::Denied));
+            };
+            let result = f(active);
+            if let Err(EnterError::Failed) = result
+                && let State::Active(active) = core::mem::replace(&mut *state, State::Ended)
+            {
+                end(active.association, &self.readiness);
+            }
+            result
         };
-        let result = f(active);
-        if let Err(EnterError::Failed) = result
-            && let State::Active(active) = core::mem::replace(&mut *state, State::Ended)
-        {
-            end(active.association, &self.readiness);
-        }
+        self.end_if_ended();
         result
     }
 
@@ -571,7 +694,7 @@ impl Association {
 }
 
 impl Active {
-    fn serve(&mut self) -> Result<(), Failed> {
+    fn serve(&mut self, launcher: &Arc<KernelProcessLauncher>) -> Result<(), Failed> {
         if let Some(response) = self.overflow.take()
             && !self.publish(response)?
         {
@@ -585,10 +708,16 @@ impl Active {
         {
             let mut response = None;
             self.association
-                .execute_request(request, |r| {
-                    response = Some(wire::encode_response(r.clone()));
-                    Ok::<(), Infallible>(())
-                })
+                .execute_request_with(
+                    request,
+                    |parent, operation, shared_buffers| {
+                        handle_process_operation(launcher, parent, operation, shared_buffers)
+                    },
+                    |r| {
+                        response = Some(wire::encode_response(r.clone()));
+                        Ok::<(), Infallible>(())
+                    },
+                )
                 .map_err(failure("request execution"))?;
             served += 1;
             let response = response
@@ -651,10 +780,85 @@ fn end(association: BrokerHostAssociation<UserSharedMemory>, readiness: &KernelR
 }
 
 impl Drop for Association {
+    /// Ends the association if the process's end did not (see
+    /// [`Self::exited`]).
     fn drop(&mut self) {
-        if let State::Active(active) = core::mem::replace(self.state.get_mut(), State::Ended) {
-            end(active.association, &self.readiness);
+        self.exited(ProcessExitStatus::Unknown);
+    }
+}
+
+/// A child process to start (`StartChild`), for which the kernel creates a
+/// runner process (see [`Association::take_pending_associations`]). Dropping it
+/// before the child's handshake fails the start.
+pub struct PendingRunnerAssociation {
+    process: Arc<BrokerProcess>,
+    /// Until the handshake takes it.
+    startup: Option<ProcessStartupData>,
+}
+
+impl PendingRunnerAssociation {
+    /// Fails to start the process, e.g., if its runner process cannot be
+    /// created.
+    pub fn fail(self, error: BrokerError) {
+        let _ = self.process.fail_start(error, false, true);
+    }
+}
+
+impl Drop for PendingRunnerAssociation {
+    /// Retires the process unless it started; `fail_start` keeps an earlier
+    /// failure's error.
+    fn drop(&mut self) {
+        if !matches!(self.process.startup_result(), Some(Ok(()))) {
+            let _ = self
+                .process
+                .fail_start(BrokerError::PeerClosed, false, true);
+            self.process.retire(true);
         }
+    }
+}
+
+/// An association's [`ProcessLauncher`]: queues each child process for the
+/// kernel, and suspends the worker until the child starts or fails.
+#[derive(Default)]
+struct KernelProcessLauncher {
+    pending: spin::Mutex<Vec<PendingRunnerAssociation>>,
+}
+
+impl ProcessLauncher for KernelProcessLauncher {
+    fn launch(
+        self: Arc<Self>,
+        process: Arc<BrokerProcess>,
+        startup: ProcessStartupData,
+        image: Option<ChildImage>,
+    ) -> Result<(), BrokerError> {
+        if image.is_some() {
+            // Only from `create_image`, which creates none.
+            PendingRunnerAssociation {
+                process,
+                startup: Some(startup),
+            }
+            .fail(BrokerError::UnsupportedOperation);
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        self.pending.lock().push(PendingRunnerAssociation {
+            process: process.clone(),
+            startup: Some(startup),
+        });
+        // The kernel creates its runner process while the worker is
+        // suspended; the request completes once it started or failed.
+        loop {
+            if let Some(result) = process.startup_result() {
+                return result;
+            }
+            assert!(
+                litebox_platform_vm_kernel::worker::suspend(None),
+                "requests are served on the worker"
+            );
+        }
+    }
+
+    fn create_image(&self, _capacity: u64) -> Result<Box<dyn ProcessImage>, BrokerError> {
+        Err(BrokerError::UnsupportedOperation)
     }
 }
 

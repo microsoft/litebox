@@ -136,7 +136,7 @@ pub fn serve(info: &StartupInfo) -> ! {
     let platform: &'static Platform = Box::leak(Box::new(VmUserland::new(info)));
     let session_manager: &'static SessionManager<Platform> =
         Box::leak(Box::new(SessionManager::new()));
-    let (local, mut notifications) = litebox_broker_local_vm_userland::connect(info)
+    let (local, _startup, mut notifications) = litebox_broker_local_vm_userland::connect(info)
         .unwrap_or_else(|e| panic!("broker association: {e:?}"));
     kcall::restrict(CallSet::ALL.without(CallId::BrokerHandshake), ProtSet::ALL)
         .unwrap_or_else(|status| panic!("lockdown: {status:?}"));

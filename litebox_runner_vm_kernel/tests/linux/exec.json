@@ -1,0 +1,31 @@
+[
+  {
+    "argv": ["/exec", "exec"],
+    "expect_exit_code": 7,
+    "expect_stdout": "exec\nargv[0] = /args\nargv[1] = exit\nargv[2] = 7\n",
+    "expect_stderr": "to stderr\n"
+  },
+  {
+    "argv": ["/exec", "spawn"],
+    "expect_stdout": "piped: argv[0] = /args\nargv[1] = exit\nargv[2] = 7\nchild exited: 7\nargv[0] = /args\nargv[1] = abort\nchild killed: 6\n",
+    "expect_stderr": "to stderr\nto stderr\n"
+  },
+  {
+    "argv": ["/exec-dyn", "spawn"],
+    "expect_stdout": "piped: argv[0] = /args\nargv[1] = exit\nargv[2] = 7\nchild exited: 7\nargv[0] = /args\nargv[1] = abort\nchild killed: 6\n",
+    "expect_stderr": "to stderr\nto stderr\n"
+  },
+  {
+    "argv": ["/exec-pie", "vfork"],
+    "expect_stdout": "argv[0] = /args\nargv[1] = exit\nargv[2] = 3\nchild exited: 3\n",
+    "expect_stderr": "to stderr\n"
+  },
+  { "argv": ["/exec", "orphan"], "expect_stdout": "spawned\nlingered\n" },
+  { "argv": ["/exec", "eof"], "expect_stdout": "drained 5 bytes\n" },
+  {
+    "concurrent": [
+      { "argv": ["/exec", "relay", "7001"] },
+      { "argv": ["/exec", "collect", "7001"] }
+    ]
+  }
+]

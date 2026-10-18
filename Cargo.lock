@@ -2333,6 +2333,8 @@ dependencies = [
  "elf",
  "hmac",
  "litebox",
+ "litebox_broker_core",
+ "litebox_broker_protocol",
  "litebox_broker_vm_kernel",
  "litebox_common_linux",
  "litebox_common_optee",
