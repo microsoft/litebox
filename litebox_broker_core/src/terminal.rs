@@ -15,7 +15,7 @@ use core::time::Duration;
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
-    InputFlags as I, LocalFlags as L, OutputFlags as O, TerminalError, TerminalEvent,
+    InputFlags as I, LocalFlags as L, OutputFlags as O, TerminalError, TerminalEvents,
     TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
 };
 use spin::Mutex;
@@ -31,8 +31,8 @@ pub const LINE_CAPACITY: usize = 4096;
 
 /// Receives ABI-neutral terminal actions.
 pub trait TerminalEventSink: Send + Sync {
-    /// Posts an action without blocking on guest execution.
-    fn post(&self, event: TerminalEvent);
+    /// Posts actions without blocking on guest execution.
+    fn post(&self, events: TerminalEvents);
 }
 
 /// A shared terminal endpoint implemented over a platform transport.
@@ -140,7 +140,7 @@ struct ProcessGroupSink {
 }
 
 impl TerminalEventSink for ProcessGroupSink {
-    fn post(&self, event: TerminalEvent) {
+    fn post(&self, events: TerminalEvents) {
         let targets = {
             let _tree = self.tree_lock.lock();
             let Some(processes) = self.processes.upgrade() else {
@@ -157,7 +157,7 @@ impl TerminalEventSink for ProcessGroupSink {
                 .collect::<Vec<_>>()
         };
         for process in targets {
-            process.signals.post_terminal_event(event);
+            process.signals.post_terminal_events(events);
         }
     }
 }
@@ -196,8 +196,8 @@ pub struct InputResult {
     pub consumed: usize,
     /// Echo to append to the transport's output queue in order.
     pub echo: Vec<u8>,
-    /// Coalescible actions to publish to the attached process group.
-    pub events: Vec<TerminalEvent>,
+    /// Actions to publish to the attached process group.
+    pub events: TerminalEvents,
     /// A signal-generating character discarded previously queued output.
     pub flush_output: bool,
     /// Input was discarded because a control-enabled terminal's queue was full.
@@ -358,9 +358,9 @@ impl TerminalEngine {
                 }
                 if l.contains(L::GENERATE_EVENTS) {
                     let event = if Self::matches(byte, cc.interrupt) {
-                        Some(TerminalEvent::Interrupt)
+                        Some(TerminalEvents::INTERRUPT)
                     } else if Self::matches(byte, cc.quit) {
-                        Some(TerminalEvent::Quit)
+                        Some(TerminalEvents::QUIT)
                     } else {
                         None
                     };
@@ -374,7 +374,7 @@ impl TerminalEngine {
                             result.flush_output = true;
                         }
                         self.echo(byte, true, &mut result.echo);
-                        result.events.push(event);
+                        result.events |= event;
                         continue;
                     }
                 }
@@ -657,18 +657,16 @@ mod tests {
         attach(&endpoint, &root);
         attach(&endpoint, &background);
         let sink = endpoint.0.lock().clone().unwrap();
-        sink.post(TerminalEvent::Interrupt);
-        sink.post(TerminalEvent::Interrupt);
-        sink.post(TerminalEvent::Resize);
+        sink.post(TerminalEvents::INTERRUPT);
+        sink.post(TerminalEvents::INTERRUPT);
+        sink.post(TerminalEvents::RESIZE);
         for (process, handle) in [(&root, handles[0]), (&child, handles[1])] {
             assert_eq!(process.check_readiness(handle), Ok(ReadinessFlags::READ));
             assert_eq!(
                 crate::signal::take(process, handle),
-                Ok(SignalEvent::Terminal(TerminalEvent::Interrupt))
-            );
-            assert_eq!(
-                crate::signal::take(process, handle),
-                Ok(SignalEvent::Terminal(TerminalEvent::Resize))
+                Ok(SignalEvent::Terminal(
+                    TerminalEvents::INTERRUPT | TerminalEvents::RESIZE
+                ))
             );
             assert_eq!(
                 crate::signal::take(process, handle),
@@ -729,17 +727,6 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_flushes_input_and_emits_an_abi_neutral_event() {
-        let mut tty = TerminalEngine::default();
-        tty.receive(b"queued\npending");
-        let result = tty.receive(b"\x03");
-        assert_eq!(result.events, [TerminalEvent::Interrupt]);
-        assert_eq!(result.echo, b"^C");
-        assert!(result.flush_output);
-        assert!(!tty.readable());
-    }
-
-    #[test]
     fn flow_control_and_output_processing() {
         let mut tty = TerminalEngine::default();
         assert_eq!(tty.output(b"a\n", 2).1, b"a\r\n");
@@ -752,7 +739,7 @@ mod tests {
     #[test]
     fn signal_characters_resume_output_with_or_without_flushing() {
         for no_flush in [false, true] {
-            for (byte, event) in [(3, TerminalEvent::Interrupt), (28, TerminalEvent::Quit)] {
+            for (byte, event) in [(3, TerminalEvents::INTERRUPT), (28, TerminalEvents::QUIT)] {
                 let mut tty = TerminalEngine::default();
                 let mut settings = tty.settings();
                 settings.local.set(L::NO_FLUSH_ON_EVENT, no_flush);
@@ -761,7 +748,7 @@ mod tests {
                 assert!(tty.output_stopped());
                 let result = tty.receive(&[byte]);
                 assert!(!tty.output_stopped());
-                assert_eq!(result.events, [event]);
+                assert_eq!(result.events, event);
                 assert_eq!(result.flush_output, !no_flush);
             }
         }
@@ -788,7 +775,7 @@ mod tests {
             .unwrap();
             let result = tty.receive(&[22, byte, 4]);
             assert_eq!(result.echo, echo);
-            assert_eq!(result.events, []);
+            assert_eq!(result.events, TerminalEvents::empty());
             let mut bytes = [0; 2];
             assert_eq!(tty.read(&mut bytes), Some(1));
             assert_eq!(bytes[0], expected);
@@ -799,10 +786,7 @@ mod tests {
             ..tty.settings()
         })
         .unwrap();
-        assert_eq!(
-            tty.receive(b"\x16\r\x03").events,
-            [TerminalEvent::Interrupt]
-        );
+        assert_eq!(tty.receive(b"\x16\r\x03").events, TerminalEvents::INTERRUPT);
     }
 
     #[test]
@@ -822,18 +806,18 @@ mod tests {
             tty.receive(&[byte]);
             assert!(!tty.output_stopped());
             assert!(!tty.readable());
-            for event in [TerminalEvent::Interrupt, TerminalEvent::Quit] {
+            for event in [TerminalEvents::INTERRUPT, TerminalEvents::QUIT] {
                 let mut tty = TerminalEngine::default();
                 let mut settings = tty.settings();
                 settings.input = flags;
-                match event {
-                    TerminalEvent::Interrupt => settings.characters.interrupt = byte,
-                    TerminalEvent::Quit => settings.characters.quit = byte,
-                    TerminalEvent::Resize => unreachable!(),
+                if event == TerminalEvents::INTERRUPT {
+                    settings.characters.interrupt = byte;
+                } else {
+                    settings.characters.quit = byte;
                 }
                 tty.configure(settings).unwrap();
                 let result = tty.receive(&[byte]);
-                assert_eq!(result.events, [event]);
+                assert_eq!(result.events, event);
                 assert_eq!(result.echo, if byte == b'\n' { b"^J" } else { b"^M" });
             }
         }
@@ -1062,7 +1046,7 @@ mod tests {
         tty.receive(&alloc::vec![b'\n'; INPUT_CAPACITY]);
         assert!(tty.input_space() < 2);
         assert!(tty.receive(b"x").input_overrun);
-        assert_eq!(tty.receive(b"\x03").events, [TerminalEvent::Interrupt]);
+        assert_eq!(tty.receive(b"\x03").events, TerminalEvents::INTERRUPT);
         assert_eq!(tty.input_space(), INPUT_CAPACITY);
         tty.configure(TerminalSettings {
             input: I::empty(),

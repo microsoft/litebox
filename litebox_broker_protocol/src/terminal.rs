@@ -204,16 +204,19 @@ pub enum TerminalError {
     Io,
 }
 
-/// Terminal actions delivered to the initially attached process group.
-///
-/// These are not guest signal numbers. Foreground-group switching and
-/// stop/continue are deliberately outside this initial terminal interface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalEvent {
-    /// The interrupt character was received with action generation enabled.
-    Interrupt,
-    /// The quit character was received with action generation enabled.
-    Quit,
-    /// Transport geometry changed.
-    Resize,
+bitflags::bitflags! {
+    /// Terminal actions delivered to the initially attached process group.
+    ///
+    /// Repeated actions coalesce. These are not guest signal numbers.
+    /// Foreground-group switching and stop/continue are deliberately outside
+    /// this initial terminal interface.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct TerminalEvents: u8 {
+        /// The interrupt character was received with action generation enabled.
+        const INTERRUPT = 1 << 0;
+        /// The quit character was received with action generation enabled.
+        const QUIT = 1 << 1;
+        /// Transport geometry changed.
+        const RESIZE = 1 << 2;
+    }
 }

@@ -100,13 +100,9 @@ pub(super) fn encode_signal_response(encoder: &mut Encoder, response: SignalResp
                     encode_child_exit(encoder, child_exit);
                 }
                 SignalEvent::ChildRemoved => encoder.u8(SIGNAL_EVENT_TAG_CHILD_REMOVED),
-                SignalEvent::Terminal(event) => {
+                SignalEvent::Terminal(events) => {
                     encoder.u8(SIGNAL_EVENT_TAG_TERMINAL);
-                    encoder.u8(match event {
-                        crate::terminal::TerminalEvent::Interrupt => 0,
-                        crate::terminal::TerminalEvent::Quit => 1,
-                        crate::terminal::TerminalEvent::Resize => 2,
-                    });
+                    encoder.u8(events.bits());
                 }
             }
         }
@@ -128,12 +124,11 @@ pub(super) fn decode_signal_response(
             }),
             SIGNAL_EVENT_TAG_CHILD_EXITED => SignalEvent::ChildExited(decode_child_exit(decoder)?),
             SIGNAL_EVENT_TAG_CHILD_REMOVED => SignalEvent::ChildRemoved,
-            SIGNAL_EVENT_TAG_TERMINAL => SignalEvent::Terminal(match decoder.u8()? {
-                0 => crate::terminal::TerminalEvent::Interrupt,
-                1 => crate::terminal::TerminalEvent::Quit,
-                2 => crate::terminal::TerminalEvent::Resize,
-                _ => return Err(WireError::InvalidTag),
-            }),
+            SIGNAL_EVENT_TAG_TERMINAL => SignalEvent::Terminal(
+                crate::terminal::TerminalEvents::from_bits(decoder.u8()?)
+                    .filter(|events| !events.is_empty())
+                    .ok_or(WireError::InvalidTag)?,
+            ),
             _ => return Err(WireError::InvalidTag),
         }),
         _ => return Err(WireError::InvalidTag),

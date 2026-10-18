@@ -62,8 +62,9 @@ pub struct TakeSignalRequest {
 /// One event taken from the caller's signals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignalEvent {
-    /// An ABI-neutral terminal action for the initially attached process group.
-    Terminal(crate::terminal::TerminalEvent),
+    /// The ABI-neutral terminal actions posted to the caller's initially
+    /// attached process group since the caller last took them.
+    Terminal(crate::terminal::TerminalEvents),
     /// A signal another process sent.
     Signal(PendingSignal),
     /// The earliest child exit since the caller last took one.

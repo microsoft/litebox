@@ -1542,13 +1542,10 @@ mod tests {
             }))),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::ChildRemoved)),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
-                crate::terminal::TerminalEvent::Interrupt,
+                crate::terminal::TerminalEvents::INTERRUPT,
             ))),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
-                crate::terminal::TerminalEvent::Quit,
-            ))),
-            BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
-                crate::terminal::TerminalEvent::Resize,
+                crate::terminal::TerminalEvents::all(),
             ))),
             BrokerResult::ProcessGroup(ProcessGroupResponse::Set),
             BrokerResult::ProcessGroup(ProcessGroupResponse::CreateSession),
@@ -2593,6 +2590,17 @@ mod tests {
             decode_response(&unknown_signal_event),
             Err(WireError::InvalidTag)
         );
+        for invalid_terminal_events in [0, 0xff] {
+            let mut frame = encode_response(BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+                    crate::terminal::TerminalEvents::INTERRUPT,
+                ))),
+            });
+            assert_eq!(frame.len(), 12);
+            frame[11] = invalid_terminal_events;
+            assert_eq!(decode_response(&frame), Err(WireError::InvalidTag));
+        }
 
         let mut frame = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,

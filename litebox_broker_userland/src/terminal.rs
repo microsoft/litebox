@@ -21,7 +21,7 @@ use litebox_broker_core::terminal::{
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
-    ChangeTiming, TerminalError, TerminalEvent, TerminalOperation, TerminalResponse, WindowSize,
+    ChangeTiming, TerminalError, TerminalEvents, TerminalOperation, TerminalResponse, WindowSize,
 };
 
 /// How often the worker rechecks the window size. Hosts need not report
@@ -100,10 +100,10 @@ impl State {
             if !self.output.is_empty() {
                 self.drained = false;
             }
-            if let Some(sink) = &self.sink {
-                for event in result.events {
-                    sink.post(event);
-                }
+            if let Some(sink) = &self.sink
+                && !result.events.is_empty()
+            {
+                sink.post(result.events);
             }
         }
         if input_overrun {
@@ -204,7 +204,7 @@ impl Shared {
             if size != state.size {
                 state.size = size;
                 if let Some(sink) = &state.sink {
-                    sink.post(TerminalEvent::Resize);
+                    sink.post(TerminalEvents::RESIZE);
                 }
             }
             state.publish();
@@ -452,7 +452,7 @@ impl TerminalEndpoint for HostTerminal {
                 if state.size != size {
                     state.size = size;
                     if let Some(sink) = &state.sink {
-                        sink.post(TerminalEvent::Resize);
+                        sink.post(TerminalEvents::RESIZE);
                     }
                 }
                 TerminalResponse::Done
