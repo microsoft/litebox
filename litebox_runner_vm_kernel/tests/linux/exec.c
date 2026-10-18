@@ -7,7 +7,8 @@
 //   standard output on a pipe this relays, then as one that dies of a
 //   signal, and waits for each.
 // - "vfork": /args as a child (vfork and execve), after a failed execve,
-//   which the child sees, as Linux's does.
+//   which the child sees, as Linux's does. The child changes its SSE
+//   rounding mode first, which the parent's, once it resumes, is not.
 // - "orphan": starts itself as a child that lingers ("linger"), which it
 //   leaves running as it exits; the run ends only once the orphan, which
 //   then prints, exits too.
@@ -32,6 +33,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <xmmintrin.h>
 
 extern char **environ;
 
@@ -87,12 +89,14 @@ static int spawn(void) {
 
 static int vfork_exec(void) {
     char *exits[] = {"/args", "exit", "3", NULL};
+    _MM_SET_ROUNDING_MODE(_MM_ROUND_UP);
     pid_t pid = vfork();
     if (pid < 0) {
         perror("vfork");
         return 1;
     }
     if (pid == 0) {
+        _MM_SET_ROUNDING_MODE(_MM_ROUND_DOWN);
         execve("/missing", exits, environ);
         if (errno != ENOENT) {
             _exit(126);
@@ -100,7 +104,10 @@ static int vfork_exec(void) {
         execve(exits[0], exits, environ);
         _exit(127);
     }
-    return report(pid);
+    int rounding_up = _MM_GET_ROUNDING_MODE() == _MM_ROUND_UP;
+    int failed = report(pid);
+    printf("rounding up: %d\n", rounding_up);
+    return failed;
 }
 
 static int orphan(void) {

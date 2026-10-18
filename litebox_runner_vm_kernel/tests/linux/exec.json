@@ -17,7 +17,7 @@
   },
   {
     "argv": ["/exec-pie", "vfork"],
-    "expect_stdout": "argv[0] = /args\nargv[1] = exit\nargv[2] = 3\nchild exited: 3\n",
+    "expect_stdout": "argv[0] = /args\nargv[1] = exit\nargv[2] = 3\nchild exited: 3\nrounding up: 1\n",
     "expect_stderr": "to stderr\n"
   },
   { "argv": ["/exec", "orphan"], "expect_stdout": "spawned\nlingered\n" },
