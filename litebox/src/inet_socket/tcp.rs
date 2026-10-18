@@ -15,6 +15,7 @@ use super::{
     errors::{SocketAsyncError, SocketReadError, SocketWriteError},
     is_nonblocking_would_block,
 };
+use crate::buffer::{ReadBuffer, WriteBuffer, copy_into, fill_from};
 use crate::{broker::error::BrokerObjectError, sync::RawSyncPrimitivesProvider};
 
 const _: () = assert!(MAX_SOCKET_PEEK_SIZE as usize == super::SOCKET_RECEIVE_OPERATION_SIZE);
@@ -22,9 +23,12 @@ const _: () = assert!(MAX_SOCKET_PEEK_SIZE as usize == super::SOCKET_RECEIVE_OPE
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// Reads stream bytes, peeking at up to [`MAX_SOCKET_PEEK_SIZE`] bytes
     /// with one request per transfer.
+    ///
+    /// A [`ReceiveFlags::DISCARD`] read consumes the bytes without copying
+    /// them into `buffer`.
     pub(super) fn read_stream(
         &self,
-        buffer: &mut [u8],
+        buffer: &mut (impl ReadBuffer + ?Sized),
         flags: ReceiveFlags,
     ) -> Result<usize, SocketReadError> {
         if buffer.is_empty() {
@@ -54,13 +58,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         let mut offset = 0;
         loop {
             let length = (target - offset).min(MAX_SOCKET_TRANSFER_SIZE as usize);
+            let peek_offset = u32::try_from(offset).map_err(|_| backend_failure())?;
+            let mut copy = copy_into(&mut *buffer, offset);
             let outcome = self.broker.receive_socket(
                 self.handle,
-                &mut buffer[offset..offset + length],
+                length,
+                &mut |part| if discard { Ok(()) } else { copy(part) },
                 broker_flags,
-                u32::try_from(offset).map_err(|_| backend_failure())?,
+                peek_offset,
                 peek_length,
-                discard,
             );
             match outcome {
                 Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(received))) => {
@@ -108,7 +114,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
                 }
                 Err(error) => {
                     let error = BrokerObjectError::from(error);
-                    if offset != 0 && error == BrokerObjectError::WouldBlock {
+                    // A fault loses only the bytes it would have peeked.
+                    if offset != 0
+                        && matches!(
+                            error,
+                            BrokerObjectError::WouldBlock | BrokerObjectError::Fault
+                        )
+                    {
                         return Ok(offset);
                     }
                     return Err(error.into());
@@ -118,12 +130,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     }
 
     /// Writes up to [`MAX_SOCKET_TRANSFER_SIZE`] stream bytes.
-    pub(super) fn write_stream(&self, buffer: &[u8]) -> Result<usize, SocketWriteError> {
+    pub(super) fn write_stream(
+        &self,
+        buffer: &(impl WriteBuffer + ?Sized),
+    ) -> Result<usize, SocketWriteError> {
         let length = buffer.len().min(MAX_SOCKET_TRANSFER_SIZE as usize);
-        match self
-            .broker
-            .send_socket(self.handle, &buffer[..length], BrokerSendFlags::NONE)
-        {
+        match self.broker.send_socket(
+            self.handle,
+            length,
+            &mut fill_from(buffer, 0),
+            BrokerSendFlags::NONE,
+        ) {
             Ok(SocketOutcome::Completed(sent)) => Ok(sent),
             Ok(SocketOutcome::Failed(BrokerSocketError::Shutdown)) => {
                 Err(SocketWriteError::WriteShutdown)

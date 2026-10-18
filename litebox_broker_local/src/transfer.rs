@@ -28,3 +28,39 @@ pub type Copier<'a> = dyn FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + 'a;
 
 /// Fills each part of the bytes to write, in turn.
 pub type Filler<'a> = dyn FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + 'a;
+
+/// Returns a copier that copies the parts it is lent, one after another,
+/// into `destination`.
+///
+/// # Panics
+///
+/// The copier panics if the parts overflow `destination`.
+pub fn copy_to_slice(
+    destination: &mut [u8],
+) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {
+    let mut offset = 0;
+    move |part| {
+        let end = offset + part.len();
+        part.copy_to_slice(&mut destination[offset..end]);
+        offset = end;
+        Ok(())
+    }
+}
+
+/// Returns a filler that fills the parts it is lent, one after another, from
+/// `source`.
+///
+/// # Panics
+///
+/// The filler panics if the parts overflow `source`.
+pub fn fill_from_slice(
+    source: &[u8],
+) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {
+    let mut offset = 0;
+    move |part| {
+        let end = offset + part.len();
+        part.copy_from_slice(&source[offset..end]);
+        offset = end;
+        Ok(())
+    }
+}

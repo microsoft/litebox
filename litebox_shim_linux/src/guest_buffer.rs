@@ -3,9 +3,8 @@
 
 //! Guest memory as the buffers that LiteBox objects read into and write from.
 //!
-//! A guest buffer is a window onto the concatenation of guest iovecs, which
-//! objects copy into and out of directly, without staging the bytes in a
-//! kernel buffer.
+//! A guest buffer is the concatenation of guest iovecs, which objects copy
+//! into and out of directly, without staging the bytes in a kernel buffer.
 
 use core::{marker::PhantomData, ops::Range};
 
@@ -53,30 +52,24 @@ fn for_each_part<Base: Copy>(
         done += part;
         offset = 0;
     }
-    assert_eq!(done, length, "the window exceeds its iovecs");
+    assert_eq!(done, length, "the bytes exceed their iovecs");
     Ok(())
 }
 
-/// Returns the start, within a window's iovecs, of the `length` bytes at
-/// `offset` in a window that starts at `start` and has `window_length` bytes.
-///
-/// # Panics
-///
-/// Panics if the bytes exceed the window.
-fn start_of(start: usize, window_length: usize, offset: usize, length: usize) -> usize {
+/// Asserts that the `length` bytes at `offset` lie within a guest buffer of
+/// `buffer_length` bytes.
+fn assert_within(buffer_length: usize, offset: usize, length: usize) {
     assert!(
         offset
             .checked_add(length)
-            .is_some_and(|end| end <= window_length),
-        "{length} bytes at {offset} exceed a guest buffer of {window_length} bytes"
+            .is_some_and(|end| end <= buffer_length),
+        "{length} bytes at {offset} exceed a guest buffer of {buffer_length} bytes"
     );
-    start + offset
 }
 
 /// Guest memory, scattered across iovecs, that a read fills.
 pub(crate) struct GuestReadBuffer<'a, Platform> {
     iovs: &'a [IoReadVec],
-    start: usize,
     length: usize,
     platform: PhantomData<fn(Platform)>,
 }
@@ -87,7 +80,6 @@ impl<'a, Platform: ShimPlatform> GuestReadBuffer<'a, Platform> {
     pub(crate) fn new(iovs: &'a [IoReadVec]) -> Result<Self, Errno> {
         Ok(Self {
             iovs,
-            start: 0,
             length: total_length(iovs.iter().map(|iov| iov.iov_len))?,
             platform: PhantomData,
         })
@@ -97,22 +89,7 @@ impl<'a, Platform: ShimPlatform> GuestReadBuffer<'a, Platform> {
     pub(crate) fn single(iov: &'a IoReadVec) -> Self {
         Self {
             iovs: core::slice::from_ref(iov),
-            start: 0,
             length: iov.iov_len,
-            platform: PhantomData,
-        }
-    }
-
-    /// Returns the window of the `length` bytes at `offset` in this one.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the bytes exceed this window.
-    pub(crate) fn range(&self, offset: usize, length: usize) -> Self {
-        Self {
-            iovs: self.iovs,
-            start: start_of(self.start, self.length, offset, length),
-            length,
             platform: PhantomData,
         }
     }
@@ -128,15 +105,15 @@ impl<Platform: ShimPlatform> ReadBuffer for GuestReadBuffer<'_, Platform> {
     }
 
     fn copy_from_slice_at(&mut self, offset: usize, source: &[u8]) -> Result<(), Fault> {
-        let start = start_of(self.start, self.length, offset, source.len());
-        for_each_part(self.parts(), start, source.len(), |base, at, range| {
+        assert_within(self.length, offset, source.len());
+        for_each_part(self.parts(), offset, source.len(), |base, at, range| {
             base.copy_from_slice::<Platform>(at, &source[range])
         })
     }
 
     fn copy_from_shared_at(&mut self, offset: usize, source: SharedBytes<'_>) -> Result<(), Fault> {
-        let start = start_of(self.start, self.length, offset, source.len());
-        for_each_part(self.parts(), start, source.len(), |base, at, range| {
+        assert_within(self.length, offset, source.len());
+        for_each_part(self.parts(), offset, source.len(), |base, at, range| {
             let part = source.subrange(range);
             // SAFETY: Shared bytes are readable for their length and never
             // referenced.
@@ -183,20 +160,28 @@ impl<Platform: ShimPlatform> WriteBuffer for GuestWriteBuffer<'_, Platform> {
     }
 
     fn copy_to_slice_at(&self, offset: usize, destination: &mut [u8]) -> Result<(), Fault> {
-        let start = start_of(0, self.length, offset, destination.len());
-        for_each_part(self.parts(), start, destination.len(), |base, at, range| {
-            base.copy_to_slice::<Platform>(at, &mut destination[range])
-        })
+        assert_within(self.length, offset, destination.len());
+        for_each_part(
+            self.parts(),
+            offset,
+            destination.len(),
+            |base, at, range| base.copy_to_slice::<Platform>(at, &mut destination[range]),
+        )
     }
 
     fn copy_to_shared_at(&self, offset: usize, destination: SharedBytes<'_>) -> Result<(), Fault> {
-        let start = start_of(0, self.length, offset, destination.len());
-        for_each_part(self.parts(), start, destination.len(), |base, at, range| {
-            let part = destination.subrange(range);
-            // SAFETY: Shared bytes are writable for their length and never
-            // referenced.
-            unsafe { base.copy_to_raw::<Platform>(at, part.as_ptr(), part.len()) }
-        })
+        assert_within(self.length, offset, destination.len());
+        for_each_part(
+            self.parts(),
+            offset,
+            destination.len(),
+            |base, at, range| {
+                let part = destination.subrange(range);
+                // SAFETY: Shared bytes are writable for their length and never
+                // referenced.
+                unsafe { base.copy_to_raw::<Platform>(at, part.as_ptr(), part.len()) }
+            },
+        )
     }
 }
 
@@ -230,8 +215,7 @@ mod tests {
         let memory = HeapSharedMemory::new(2);
         let shared = memory.bytes(0, 2).unwrap();
         shared.copy_from_slice(&[3, 4]);
-        let mut window = buffer.range(2, 3);
-        window.copy_from_shared_at(1, shared).unwrap();
+        buffer.window(2, 3).copy_from_shared_at(1, shared).unwrap();
         assert_eq!((a, c), ([0, 1], [2, 3, 4]));
     }
 
@@ -284,9 +268,9 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "exceed a guest buffer")]
-    fn windows_past_the_end_panic() {
+    fn copies_past_the_end_panic() {
         let mut bytes = [0u8; 2];
         let iov = read_iov(&mut bytes);
-        let _ = GuestReadBuffer::<TestPlatform>::single(&iov).range(1, 2);
+        let _ = GuestReadBuffer::<TestPlatform>::single(&iov).copy_from_slice_at(1, &[0; 2]);
     }
 }

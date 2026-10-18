@@ -90,80 +90,28 @@ impl<Platform: ShimPlatform> File<Platform> {
 
     /// Reads into `buf` at `offset`, or at the file offset if `offset` is `None`.
     ///
-    /// Reads through a kernel buffer, a chunk at a time until the file runs short. Only the first
-    /// chunk waits through `cx`, and a failure after progress ends the read instead of being
-    /// reported.
+    /// Reads a chunk at a time until the file runs short. Only the first chunk waits through
+    /// `cx`, and a failure after progress ends the read instead of being reported.
     pub(crate) fn read(
         &self,
         buf: &mut (impl ReadBuffer + ?Sized),
         offset: Option<usize>,
         cx: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, Errno> {
-        let mut chunk = vec![0; buf.len().min(crate::MAX_KERNEL_BUF_SIZE)];
-        let mut read = 0;
-        loop {
-            let length = (buf.len() - read).min(chunk.len());
-            let chunk = &mut chunk[..length];
-            let result = offset
-                .map(|offset| offset.checked_add(read).ok_or(Errno::EOVERFLOW))
-                .transpose()
-                .and_then(|offset| {
-                    let cx = if read == 0 { cx } else { None };
-                    Ok(self.file.read(chunk, offset, cx)?)
-                })
-                .and_then(|size| {
-                    buf.copy_from_slice_at(read, &chunk[..size])
-                        .map_err(|Fault| Errno::EFAULT)?;
-                    Ok(size)
-                });
-            match result {
-                Ok(size) => {
-                    read += size;
-                    if size < length || read == buf.len() {
-                        return Ok(read);
-                    }
-                }
-                Err(_) if read != 0 => return Ok(read),
-                Err(error) => return Err(error),
-            }
-        }
+        Ok(self.file.read(buf, offset, cx)?)
     }
 
     /// Writes `buf` at `offset`, or at the file offset if `offset` is `None`.
     ///
-    /// Writes through a kernel buffer, a chunk at a time until the file takes a chunk short, and
-    /// a failure after progress ends the write instead of being reported.
+    /// Writes a chunk at a time until the file takes a chunk short, and a failure after progress
+    /// ends the write instead of being reported.
     pub(crate) fn write(
         &self,
         buf: &(impl WriteBuffer + ?Sized),
         offset: Option<usize>,
         cx: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, Errno> {
-        let mut chunk = vec![0; buf.len().min(crate::MAX_KERNEL_BUF_SIZE)];
-        let mut written = 0;
-        loop {
-            let length = (buf.len() - written).min(chunk.len());
-            let chunk = &mut chunk[..length];
-            let result = buf
-                .copy_to_slice_at(written, chunk)
-                .map_err(|Fault| Errno::EFAULT)
-                .and_then(|()| {
-                    offset
-                        .map(|offset| offset.checked_add(written).ok_or(Errno::EOVERFLOW))
-                        .transpose()
-                })
-                .and_then(|offset| Ok(self.file.write(chunk, offset, cx)?));
-            match result {
-                Ok(size) => {
-                    written += size;
-                    if size < length || written == buf.len() {
-                        return Ok(written);
-                    }
-                }
-                Err(_) if written != 0 => return Ok(written),
-                Err(error) => return Err(error),
-            }
-        }
+        Ok(self.file.write(buf, offset, cx)?)
     }
 
     /// Moves the file offset, or a directory's position in its entries, as `lseek` does.

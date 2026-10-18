@@ -30,6 +30,7 @@ use crate::{
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
+    buffer::{ReadBuffer, WriteBuffer},
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
     fs::errors::StatusFlagsError,
     process::ProcessError,
@@ -335,7 +336,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// sender's address in `source_addr` if requested.
     pub fn try_read(
         &self,
-        buf: &mut [u8],
+        buf: &mut (impl ReadBuffer + ?Sized),
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, SocketReadError> {
@@ -355,7 +356,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// A TCP socket ignores `destination`.
     pub fn try_write(
         &self,
-        buf: &[u8],
+        buf: &(impl WriteBuffer + ?Sized),
         flags: SendFlags,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
@@ -509,6 +510,7 @@ impl From<BrokerObjectError> for SocketReadError {
         match error {
             BrokerObjectError::WouldBlock => Self::WouldBlock,
             BrokerObjectError::PeerClosed => Self::ConnectionClosed,
+            BrokerObjectError::Fault => Self::Fault,
             error => Self::Socket(error.into()),
         }
     }
@@ -519,6 +521,7 @@ impl From<BrokerObjectError> for SocketWriteError {
         match error {
             BrokerObjectError::WouldBlock => Self::BufferFull,
             BrokerObjectError::PeerClosed => Self::ConnectionClosed,
+            BrokerObjectError::Fault => Self::Fault,
             error => Self::Socket(error.into()),
         }
     }

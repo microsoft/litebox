@@ -2772,7 +2772,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 litebox_broker_protocol::fs::FileMode::empty(),
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
-            let n = file.read(&mut header, Some(0), None)?;
+            let n = file.read(&mut header[..], Some(0), None)?;
             drop(file);
 
             match parse_shebang(&header[..n]) {

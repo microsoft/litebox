@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_local::transfer::{copy_to_slice, fill_from_slice};
 use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -222,7 +223,7 @@ fn run_fake_runner(args: &[OsString]) {
                         request.len().try_into().unwrap(),
                     )
                     .unwrap(),
-                    request,
+                    &mut fill_from_slice(request),
                     SendFlags::NONE,
                     Some(std::net::SocketAddrV4::new(gateway, udp_port)),
                 )
@@ -254,7 +255,7 @@ fn run_fake_runner(args: &[OsString]) {
                     reply.len().try_into().unwrap(),
                 )
                 .unwrap(),
-                &mut reply,
+                &mut copy_to_slice(&mut reply),
                 ReceiveFromFlags::NONE,
             )
             .unwrap()

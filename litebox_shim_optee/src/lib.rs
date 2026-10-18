@@ -1034,7 +1034,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
                 ElfLoaderError::MappingError(litebox_common_linux::vmem::MappingError::OutOfMemory),
             )?;
         let mut stack_canary = [0; 16];
-        self.global.litebox.fill_random(&mut stack_canary)?;
+        self.global.litebox.fill_random(&mut stack_canary[..])?;
         let memref_addresses = ta_stack
             .init(self.global.platform, params, shm_info, stack_canary)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;

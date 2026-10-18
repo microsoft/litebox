@@ -910,7 +910,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             iov_base: buf,
             iov_len: len,
         };
-        let guest = GuestReadBuffer::<Platform>::single(&iov);
+        let mut guest = GuestReadBuffer::<Platform>::single(&iov);
         let mut received = 0;
         let reported = loop {
             let requested_chunk_len = (len - received).min(SOCKET_RECEIVE_OPERATION_SIZE);
@@ -943,7 +943,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             let size = match socket.receive(
                 &cx,
-                &mut guest.range(received, chunk_len),
+                &mut guest.window(received, chunk_len),
                 flags,
                 received != 0,
                 if addr.is_some() {
@@ -1049,7 +1049,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .to_owned_slice::<Platform>(msg_iovlen)
             .ok_or(Errno::EFAULT)?;
 
-        let guest = GuestReadBuffer::<Platform>::new(&iovs)?;
+        let mut guest = GuestReadBuffer::<Platform>::new(&iovs)?;
         let total_iov_capacity = guest.len();
 
         let want_source = msg_name.as_usize() != 0;
@@ -1092,7 +1092,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             let size = match socket.receive(
                 &cx,
-                &mut guest.range(total_received, chunk_len),
+                &mut guest.window(total_received, chunk_len),
                 flags,
                 total_received != 0,
                 if want_source {

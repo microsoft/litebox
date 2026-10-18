@@ -779,7 +779,7 @@ fn check_stdin(
         .expect("the clock is far from overflowing");
     let mut input = [0u8; 256];
     let len = loop {
-        match stdin.read(&mut input, None, None) {
+        match stdin.read(&mut input[..], None, None) {
             Ok(len) => break len,
             Err(ReadError::WouldBlock) => {
                 let dispatch = litebox.broker_notification_dispatcher();

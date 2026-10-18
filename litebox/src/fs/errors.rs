@@ -46,6 +46,9 @@ pub enum ReadError {
     WaitError(WaitError),
     #[error("I/O error")]
     Io,
+    /// Copying into the buffer faulted; the bytes read are lost.
+    #[error("copying into the buffer faulted")]
+    Fault,
 }
 
 /// Possible errors from [`super::File::write`].
@@ -64,6 +67,9 @@ pub enum WriteError {
     WaitError(WaitError),
     #[error("I/O error")]
     Io,
+    /// Copying from the buffer faulted before anything was written.
+    #[error("copying from the buffer faulted")]
+    Fault,
 }
 
 /// Possible errors from [`super::File::seek`].

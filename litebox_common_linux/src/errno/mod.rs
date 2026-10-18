@@ -243,6 +243,7 @@ impl From<litebox::fs::errors::ReadError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::fs::errors::ReadError::Io => Errno::EIO,
+            litebox::fs::errors::ReadError::Fault => Errno::EFAULT,
             _ => unimplemented!(),
         }
     }
@@ -259,6 +260,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::fs::errors::WriteError::Io => Errno::EIO,
+            litebox::fs::errors::WriteError::Fault => Errno::EFAULT,
             _ => unimplemented!(),
         }
     }
@@ -618,6 +620,7 @@ impl From<litebox::inet_socket::errors::SocketWriteError> for Errno {
             litebox::inet_socket::errors::SocketWriteError::DestinationAddressRequired => {
                 Errno::EDESTADDRREQ
             }
+            litebox::inet_socket::errors::SocketWriteError::Fault => Errno::EFAULT,
             litebox::inet_socket::errors::SocketWriteError::Socket(error) => error.into(),
         }
     }

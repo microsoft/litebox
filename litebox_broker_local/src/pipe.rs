@@ -141,10 +141,10 @@ mod tests {
         SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex,
     };
     use litebox_broker_transport::channel::LocalCallChannel;
-    use litebox_broker_transport::shared_memory::{HeapSharedMemory, SharedBytes, SharedMemory};
+    use litebox_broker_transport::shared_memory::{HeapSharedMemory, SharedMemory};
 
     use crate::test_support::test_broker_local;
-    use crate::transfer::CopyFailed;
+    use crate::transfer::{CopyFailed, copy_to_slice, fill_from_slice};
 
     #[test]
     fn pipe_uses_the_sequence_slot_for_data_operations() {
@@ -166,7 +166,7 @@ mod tests {
         local.create_pipe(64, 16, FileOpenFlags::NONE).unwrap();
         assert_eq!(
             local
-                .write_pipe(write_handle, write_buffer, &mut fill_from(&[1, 2, 3]))
+                .write_pipe(write_handle, write_buffer, &mut fill_from_slice(&[1, 2, 3]))
                 .unwrap(),
             2
         );
@@ -179,12 +179,12 @@ mod tests {
         memory
             .write(4 * SHARED_BUFFER_SLOT_SIZE as usize, &[4, 5, 6])
             .unwrap();
-        let mut read_data = Vec::new();
+        let mut read_data = [0; 3];
         let read = local
-            .read_pipe(read_handle, read_buffer, &mut copy_into(&mut read_data))
+            .read_pipe(read_handle, read_buffer, &mut copy_to_slice(&mut read_data))
             .unwrap();
         assert_eq!(read, 2);
-        assert_eq!(read_data, [4, 5]);
+        assert_eq!(read_data, [4, 5, 0]);
         assert_eq!(
             local.channel.sent_operations.borrow().as_slice(),
             &[
@@ -249,7 +249,7 @@ mod tests {
         let memory = Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = test_broker_local(channel, memory);
 
-        let _ = local.write_pipe(ObjectHandle(1), sequence(0, 1), &mut fill_from(&[0]));
+        let _ = local.write_pipe(ObjectHandle(1), sequence(0, 1), &mut fill_from_slice(&[0]));
     }
 
     #[test]
@@ -270,29 +270,6 @@ mod tests {
             local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut |_| Err(CopyFailed)),
             Err(BrokerLocalError::CopyFailed)
         ));
-    }
-
-    fn fill_from(
-        data: &[u8],
-    ) -> impl FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed> + '_ {
-        let mut data = data;
-        move |part| {
-            let (head, tail) = data.split_at(part.len());
-            part.copy_from_slice(head);
-            data = tail;
-            Ok(())
-        }
-    }
-
-    fn copy_into(
-        destination: &mut Vec<u8>,
-    ) -> impl FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed> + '_ {
-        move |part| {
-            let start = destination.len();
-            destination.resize(start + part.len(), 0);
-            part.copy_to_slice(&mut destination[start..]);
-            Ok(())
-        }
     }
 
     fn sequence(slot: u32, length: u32) -> SharedBufferSequence {

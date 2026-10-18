@@ -21,6 +21,7 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
+use crate::transfer::{Copier, Filler};
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
@@ -102,6 +103,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::test_support::test_broker_local;
+    use crate::transfer::{copy_to_slice, fill_from_slice};
 
     #[test]
     fn udp_operations_stage_complete_datagrams() {
@@ -131,7 +133,7 @@ mod tests {
                 .send_to_socket(
                     handle,
                     sequence(0, 3),
-                    &[1, 2, 3],
+                    &mut fill_from_slice(&[1, 2, 3]),
                     SendFlags::NONE,
                     Some(SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, 53)),
                 )
@@ -151,7 +153,7 @@ mod tests {
                 .receive_from_socket(
                     handle,
                     sequence(1, 2),
-                    &mut received,
+                    &mut copy_to_slice(&mut received),
                     ReceiveFromFlags::PEEK,
                 )
                 .unwrap(),
@@ -450,55 +452,59 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         Ok(response.value)
     }
 
-    /// Sends bytes from an operation-scoped shared-buffer lease.
+    /// Sends up to `buffer.length()` bytes from an operation-scoped
+    /// shared-buffer lease, which `fill` fills first.
     ///
     /// The caller must retain exclusive ownership of the sequence's slots
     /// until this method returns.
     ///
     /// # Panics
     ///
-    /// Panics if the sequence does not match `data`, or if the broker
-    /// returns a mismatched or oversized response.
+    /// Panics if the sequence is invalid or exceeds the transfer limit, or if
+    /// the broker returns a mismatched or oversized response.
     pub fn send_socket(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        data: &[u8],
+        fill: &mut Filler<'_>,
         flags: SendFlags,
     ) -> Result<core::result::Result<usize, SocketError>, Channel::Error> {
         assert!(
             buffer.length() <= MAX_SOCKET_TRANSFER_SIZE,
             "shared socket sequence exceeds the transfer limit"
         );
-        self.write_shared_buffer(buffer, data);
+        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, fill)?;
         match self.request_socket(SocketRequest::Send(SendSocketRequest {
             handle,
             buffer,
             flags,
         }))? {
             SocketResponse::Send(response) => {
-                let sent = response.sent as usize;
-                assert!(sent <= data.len(), "broker returned oversized socket send");
-                Ok(Ok(sent))
+                assert!(
+                    response.sent <= buffer.length(),
+                    "broker returned oversized socket send"
+                );
+                Ok(Ok(response.sent as usize))
             }
             SocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected socket send response: {response:?}"),
         }
     }
 
-    /// Sends one datagram from an operation-scoped shared-buffer lease.
+    /// Sends the `buffer.length()` bytes of an operation-scoped shared-buffer
+    /// lease, which `fill` fills first, as one datagram.
     ///
     /// The destination is omitted only for a connected UDP socket.
     ///
     /// # Panics
     ///
-    /// Panics if the sequence does not match `data`, or if the broker
-    /// returns a mismatched or non-atomic response.
+    /// Panics if the sequence is invalid or exceeds the datagram limit, or if
+    /// the broker returns a mismatched or non-atomic response.
     pub fn send_to_socket(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        data: &[u8],
+        fill: &mut Filler<'_>,
         flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> Result<core::result::Result<usize, SocketError>, Channel::Error> {
@@ -506,7 +512,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() <= MAX_UDP_DATAGRAM_SIZE,
             "shared UDP sequence exceeds the datagram limit"
         );
-        self.write_shared_buffer(buffer, data);
+        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, fill)?;
         match self.request_socket(SocketRequest::SendTo(SendToSocketRequest {
             handle,
             buffer,
@@ -514,31 +520,35 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             destination,
         }))? {
             SocketResponse::SendTo(response) => {
-                let sent = response.sent as usize;
-                assert_eq!(sent, data.len(), "broker returned partial UDP send");
-                Ok(Ok(sent))
+                assert_eq!(
+                    response.sent,
+                    buffer.length(),
+                    "broker returned partial UDP send"
+                );
+                Ok(Ok(response.sent as usize))
             }
             SocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected UDP send response: {response:?}"),
         }
     }
 
-    /// Receives bytes into an operation-scoped shared-buffer lease.
+    /// Receives up to `request.buffer.length()` bytes into an
+    /// operation-scoped shared-buffer lease, and lends the bytes received to
+    /// `copy`.
     ///
     /// The caller must retain exclusive ownership of the sequence's slots
     /// until this method returns.
     ///
     /// # Panics
     ///
-    /// Panics if the sequence does not match `destination`, or if the broker
-    /// returns a mismatched or oversized response.
+    /// Panics if the sequence is invalid or exceeds the transfer limit, or if
+    /// the broker returns a mismatched or oversized response.
     pub fn receive_socket(
         &self,
         request: ReceiveSocketRequest,
-        destination: &mut [u8],
-        copy_received: bool,
+        copy: &mut Copier<'_>,
     ) -> Result<core::result::Result<ReceiveSocketResponse, SocketError>, Channel::Error> {
-        self.validate_socket_buffer(request.buffer, destination.len());
+        self.validate_socket_buffer(request.buffer, MAX_SOCKET_TRANSFER_SIZE);
         match self.request_socket(SocketRequest::Receive(request))? {
             SocketResponse::Receive(response) => {
                 if let ReceiveSocketResponse::Received(received) = response {
@@ -546,10 +556,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         received <= request.buffer.length(),
                         "broker returned oversized socket receive"
                     );
-                    if copy_received {
-                        let received = received as usize;
-                        self.read_shared_buffer(request.buffer, &mut destination[..received]);
-                    }
+                    self.lend_shared_buffer(request.buffer, 0, received as usize, copy)?;
                 }
                 Ok(Ok(response))
             }
@@ -558,20 +565,22 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Receives one datagram into an operation-scoped shared-buffer lease.
+    /// Receives one datagram, up to `buffer.length()` bytes of it, into an
+    /// operation-scoped shared-buffer lease, and lends the bytes received to
+    /// `copy`.
     ///
     /// # Panics
     ///
-    /// Panics if the sequence does not match `destination`, or if the broker
-    /// returns inconsistent datagram lengths.
+    /// Panics if the sequence is invalid or exceeds the datagram limit, or if
+    /// the broker returns inconsistent datagram lengths.
     pub fn receive_from_socket(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        destination: &mut [u8],
+        copy: &mut Copier<'_>,
         flags: ReceiveFromFlags,
     ) -> Result<core::result::Result<ReceiveFromSocketResponse, SocketError>, Channel::Error> {
-        self.validate_udp_buffer(buffer, destination.len());
+        self.validate_socket_buffer(buffer, MAX_UDP_DATAGRAM_SIZE);
         match self.request_socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
             handle,
             buffer,
@@ -590,8 +599,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     response.datagram_length <= MAX_UDP_DATAGRAM_SIZE,
                     "broker returned oversized UDP datagram length"
                 );
-                let received = response.received as usize;
-                self.read_shared_buffer(buffer, &mut destination[..received]);
+                self.lend_shared_buffer(buffer, 0, response.received as usize, copy)?;
                 Ok(Ok(response))
             }
             SocketResponse::Failed(error) => Ok(Err(error)),
@@ -619,30 +627,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    fn validate_socket_buffer(&self, buffer: SharedBufferSequence, data_len: usize) {
+    fn validate_socket_buffer(&self, buffer: SharedBufferSequence, max_length: u32) {
         assert!(
-            buffer.length() <= MAX_SOCKET_TRANSFER_SIZE,
+            buffer.length() <= max_length,
             "shared socket sequence exceeds the transfer limit"
-        );
-        assert_eq!(
-            data_len,
-            buffer.length() as usize,
-            "shared data must match its buffer sequence"
-        );
-        let _ = buffer
-            .descriptors(self.shared_buffers.layout())
-            .expect("shared buffer sequence must identify valid slot ranges");
-    }
-
-    fn validate_udp_buffer(&self, buffer: SharedBufferSequence, data_len: usize) {
-        assert!(
-            buffer.length() <= MAX_UDP_DATAGRAM_SIZE,
-            "shared UDP sequence exceeds the datagram limit"
-        );
-        assert_eq!(
-            data_len,
-            buffer.length() as usize,
-            "shared data must match its buffer sequence"
         );
         let _ = buffer
             .descriptors(self.shared_buffers.layout())

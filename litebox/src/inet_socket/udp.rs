@@ -16,6 +16,7 @@ use super::{
     errors::{SocketAsyncError, SocketReadError, SocketWriteError},
     is_nonblocking_would_block,
 };
+use crate::buffer::{ReadBuffer, WriteBuffer, copy_into, fill_from};
 use crate::{broker::error::BrokerObjectError, sync::RawSyncPrimitivesProvider};
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
@@ -23,7 +24,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// sender's address in `source_address` if requested.
     pub(super) fn read_datagram(
         &self,
-        buffer: &mut [u8],
+        buffer: &mut (impl ReadBuffer + ?Sized),
         flags: ReceiveFlags,
         source_address: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, SocketReadError> {
@@ -36,10 +37,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         } else {
             buffer.len().min(MAX_UDP_DATAGRAM_SIZE as usize)
         };
-        match self
-            .broker
-            .receive_from_socket(self.handle, &mut buffer[..length], broker_flags)
-        {
+        match self.broker.receive_from_socket(
+            self.handle,
+            length,
+            &mut copy_into(buffer, 0),
+            broker_flags,
+        ) {
             Ok(SocketOutcome::Completed(received)) => {
                 if let Some(source_address) = source_address {
                     *source_address = Some(SocketAddr::V4(received.source_address));
@@ -60,7 +63,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// otherwise to the connected peer.
     pub(super) fn write_datagram(
         &self,
-        buffer: &[u8],
+        buffer: &(impl WriteBuffer + ?Sized),
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
         if buffer.len() > MAX_UDP_DATAGRAM_SIZE as usize {
@@ -71,10 +74,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
             Some(SocketAddr::V6(_)) => return Err(SocketWriteError::Unaddressable),
             None => None,
         };
-        match self
-            .broker
-            .send_to_socket(self.handle, buffer, BrokerSendFlags::NONE, destination)
-        {
+        match self.broker.send_to_socket(
+            self.handle,
+            buffer.len(),
+            &mut fill_from(buffer, 0),
+            BrokerSendFlags::NONE,
+            destination,
+        ) {
             Ok(SocketOutcome::Completed(sent)) => Ok(sent),
             Ok(SocketOutcome::Failed(BrokerSocketError::Shutdown)) => {
                 Err(SocketWriteError::WriteShutdown)

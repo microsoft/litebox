@@ -18,6 +18,7 @@ use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBuff
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_transport::channel::LocalCallChannel;
 
+use crate::transfer::{Copier, Filler};
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 type FileOperationResult<T> = core::result::Result<T, FileError>;
@@ -53,7 +54,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Reads from an open file.
+    /// Reads up to `buffer.length()` bytes from an open file into an
+    /// operation-scoped shared buffer lease, and lends the bytes read to
+    /// `copy`.
     ///
     /// # Panics
     ///
@@ -63,10 +66,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        destination: &mut [u8],
+        copy: &mut Copier<'_>,
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
-        self.validate_file_buffer(buffer, destination.len(), MAX_FILE_TRANSFER_SIZE)?;
+        self.validate_file_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
         match self.request_file(FileRequest::Read(ReadFileRequest {
             handle,
             buffer,
@@ -78,7 +81,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     "broker returned oversized file read"
                 );
                 let read = response.read as usize;
-                self.read_shared_buffer(buffer, &mut destination[..read]);
+                self.lend_shared_buffer(buffer, 0, read, copy)?;
                 Ok(Ok(read))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -86,7 +89,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Writes to an open file.
+    /// Writes up to `buffer.length()` bytes to an open file from an
+    /// operation-scoped shared buffer lease, which `fill` fills first.
     ///
     /// # Panics
     ///
@@ -96,10 +100,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        data: &[u8],
+        fill: &mut Filler<'_>,
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
-        self.write_file_buffer(buffer, data, MAX_FILE_TRANSFER_SIZE)?;
+        self.validate_file_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
+        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, fill)?;
         match self.request_file(FileRequest::Write(WriteFileRequest {
             handle,
             buffer,
@@ -173,7 +178,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         start_index: u64,
     ) -> Result<DirectoryReadResult, Channel::Error> {
-        self.validate_file_buffer(buffer, buffer.length() as usize, SHARED_BUFFER_SLOT_SIZE)?;
+        self.validate_file_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
             buffer,
@@ -431,17 +436,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     fn validate_file_buffer(
         &self,
         buffer: SharedBufferSequence,
-        expected_length: usize,
         max_length: u32,
     ) -> Result<(), Channel::Error> {
         if buffer.length() > max_length {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
-        assert_eq!(
-            expected_length,
-            buffer.length() as usize,
-            "shared data must match its buffer sequence"
-        );
         let _ = buffer
             .descriptors(self.shared_buffers.layout())
             .expect("shared buffer sequence must identify valid slot ranges");
@@ -487,6 +486,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::test_support::test_broker_local;
+    use crate::transfer::{copy_to_slice, fill_from_slice};
 
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
 
@@ -548,7 +548,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .write_file(handle, sequence([1], 3), b"abc", None)
+                .write_file(handle, sequence([1], 3), &mut fill_from_slice(b"abc"), None)
                 .unwrap(),
             Ok(3)
         );
@@ -561,7 +561,12 @@ mod tests {
         let mut output = [0; 2];
         assert_eq!(
             local
-                .read_file(handle, sequence([2], 2), &mut output, Some(1))
+                .read_file(
+                    handle,
+                    sequence([2], 2),
+                    &mut copy_to_slice(&mut output),
+                    Some(1)
+                )
                 .unwrap(),
             Ok(2)
         );
@@ -619,11 +624,11 @@ mod tests {
         let oversized = sequence([0], MAX_FILE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
-            local.read_file(ObjectHandle(1), oversized, &mut [], None),
+            local.read_file(ObjectHandle(1), oversized, &mut |_| unreachable!(), None),
             Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))
         ));
         assert!(matches!(
-            local.write_file(ObjectHandle(1), oversized, &[], None),
+            local.write_file(ObjectHandle(1), oversized, &mut |_| unreachable!(), None),
             Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))
         ));
         assert!(local.channel.sent_operations.borrow().is_empty());
@@ -649,7 +654,7 @@ mod tests {
 
         assert_eq!(
             local
-                .write_file(ObjectHandle(1), buffer, &data, None)
+                .write_file(ObjectHandle(1), buffer, &mut fill_from_slice(&data), None)
                 .unwrap(),
             Ok(length)
         );
@@ -682,7 +687,7 @@ mod tests {
                 .read_file(
                     ObjectHandle(1),
                     sequence([4, 7], u32::try_from(length).unwrap()),
-                    &mut output,
+                    &mut copy_to_slice(&mut output),
                     None,
                 )
                 .unwrap(),

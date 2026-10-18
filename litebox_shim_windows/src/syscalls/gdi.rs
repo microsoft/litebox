@@ -34,7 +34,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let mut cookie_bytes = [0_u8; size_of::<usize>()];
-        if self.global.litebox.fill_random(&mut cookie_bytes).is_err() {
+        if self
+            .global
+            .litebox
+            .fill_random(&mut cookie_bytes[..])
+            .is_err()
+        {
             return 0;
         }
         let cookie = usize::from_ne_bytes(cookie_bytes).max(1);
