@@ -1,119 +1,35 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! AArch64 syscall and thread-pointer gates.
+//! AArch64 patch-site discovery and rewrite orchestration.
 //!
-//! Instructions are a fixed 4 bytes and `B imm26` reaches ±128MB, so a site is
-//! replaced in place by a branch into its trampoline gate. A site out of that
-//! reach becomes a breakpoint and is reported as trapped, which makes
-//! the ELF-level caller reject the binary with `Error::UnpatchableSyscalls`.
-//! Executing the `BRK` faults the guest instead of letting an unpatched
-//! instruction reach the host kernel.
+//! Discovers sites, supplies parameters to the shared builder and installs
+//! inbound branches. The gate ABI, validation and recovery are defined in
+//! [`litebox_trampoline::aarch64`].
 //!
-//! Gated forms:
+//! # Patch-site selection
 //!
-//! * `SVC #imm` — syscall. The gate records the return address and tail-jumps
-//!   through the trampoline header's callback pointer.
-//! * `MSR TPIDR_EL0, Xn` — thread-pointer write, stored to the guest slot.
-//! * `MRS Xd, TPIDR_EL0` — thread-pointer read, loaded from it. `MRS XZR,
-//!   TPIDR_EL0` is a discarded read and is left native.
-//! * Darwin `SVC #0x80` — syscall, preserving the 128-byte red zone.
-//! * `MRS Xd, TPIDRRO_EL0` — Darwin thread-pointer read.
+//! Scans executable ranges at four-byte boundaries for SVC/TPIDR_EL0 encodings.
+//! Linux accepts any SVC immediate; `MRS XZR, TPIDR_EL0` reads stay native.
+//! Darwin rewriting handles `SVC #0x80` and TPIDRRO_EL0 reads.
 //!
-//! ### Assumption: executable sections contain only instructions
+//! x18 rewriting uses identified code ranges from object metadata or the caller;
+//! Linux enables it only on request. Unsupported forms reject AOT rewriting or
+//! become runtime-rewriting traps.
 //!
-//! The scan walks each executable section word-by-word and cannot tell inline
-//! data — literal pools, jump tables — from code, so a data word matching a
-//! gated encoding inside `.text` is rewritten. Default AArch64 codegen puts
-//! constants in `.rodata`. TODO: bound the scan to `STT_FUNC` extents.
+//! Executable inline data can still resemble mandatory SVC/TP instructions.
+//! Lexical exclusive-load/store tracking rejects x18 gates inside recognized
+//! reservation sequences; it does not analyze noncontiguous control flow.
 //!
-//! ## Thread-pointer virtualization
+//! # Placement and publication
 //!
-//! TLS gates access runtime-owned guest state through the selected host anchor.
-//! Direct-TLS gates access anchor-relative fields; indirect-TLS gates load a
-//! block pointer from an anchor-relative runtime slot first.
+//! `B imm26` reaches ±128 MiB. Unreachable inbound/return branches produce
+//! breakpoints reported in `HookOutcome::trapped_sites`, rather than leaving
+//! native syscalls or TLS accesses unpatched.
 //!
-//! Guest thread-pointer reads use `TPIDR_EL0` for ELF or `TPIDRRO_EL0` for
-//! Mach-O. `TPIDRRO_EL0` is read-only at EL0, so there is no userspace write
-//! to virtualize.
-//!
-//! ELF callers must finalize placeholders with [`litebox_trampoline::aarch64::finalize_trampoline_gates`]
-//! (Linux without x18) or [`litebox_trampoline::aarch64::finalize_trampoline_gates_for_host`] before execution.
+//! ELF AOT output leaves callback/TLS fields for the loader to finalize before
+//! execution; images without patch sites get a zero-size footer. Mach-O runtime
 //! [`crate::macho::Rewriter::patch_code_segment`] returns finalized gates.
-//! Unpatched gates can corrupt host memory without faulting.
-//!
-//! ## Gate scratch storage
-//!
-//! `SVC` and `MSR TPIDR_EL0` clobber no registers, so their gates spill to a
-//! frame carved from the guest stack with `SUB`/`ADD SP` and **require `SP` to
-//! address a valid, writable, 16-byte-aligned stack at the patched site** — the
-//! same condition the kernel relies on to write a signal frame. A site reached
-//! with `SP` unmapped faults where the native instruction would not. The MRS
-//! gate uses its destination as scratch and needs no frame.
-//!
-//! X18 gates add memory accesses that can clear the local exclusive monitor, so
-//! the scanner rejects x18 sites lexically bracketed by an exclusive load and
-//! store. TODO: use function metadata and control flow to cover noncontiguous
-//! exclusive sequences.
-//!
-//! X18 gates require writable stack below SP. SP-writeback pairs may spill as
-//! deep as `align_up(16 + max(0, -writeback), 16)`. This extra spill can fault
-//! even when the native guest instruction would succeed; such a runtime spill
-//! fault is not attributed to the guest instruction. Arbitrary-register
-//! aliasing is unsupported; SP-pair accesses are checked not to overlap it.
-//!
-//! ## `X16` is preserved across an `SVC`
-//!
-//! Linux preserves every register but `x0` across an `SVC`, and `X16` is the
-//! SVC gate's only scratch. The gate spills guest `X16` to `[SP, #0]`, records
-//! the return address and this site's *outbound stub* in the frame, then enters
-//! the callback. The runtime returns through the stub:
-//!
-//! ```text
-//! outbound_N:
-//!     ldr x16, [sp, #0]      // restore guest X16
-//!     add sp, sp, #32        // pop the gate frame
-//!     b   site+4             // static target; needs no scratch register
-//! ```
-//!
-//! AArch64 has no memory-indirect branch, so a runtime-side branch back into
-//! the guest would burn a register on its target; a static branch in
-//! guest-adjacent code does not. The runtime rewrites `[SP, #0]` from
-//! `PtRegs::regs[16]` before branching rather than relying on the frame
-//! surviving the round trip.
-//!
-//! The stub only resumes at the original site. A redirected `PC` (signals,
-//! `execve`) or an asynchronous resume is instead handled by synthesizing an
-//! `rt_sigreturn` frame, restoring all 31 GPRs, `PC` and `PSTATE` at once.
-//!
-//! ## Gate templates
-//!
-//! Each gate kind's code is defined once, in the `gate` submodule. Every
-//! emitted instruction carries a validation role and a recovery
-//! [`litebox_trampoline::aarch64::Stage`]; slot validation, TLS-offset finalization and signal recovery all
-//! derive from that one definition rather than from per-kind offset tables.
-//!
-//! ## Trampoline layout
-//!
-//! A callback address slot, then gate-aligned per-site slots each ending in a
-//! metadata word; `HEADER_CALLBACK_OFFSET`, `GATES_START_OFFSET` and the
-//! `*_SLOT_BYTES` constants define the offsets and sizes.
-//! [`crate::hook_syscalls_in_elf`] writes zero into the callback slot when its
-//! caller supplies no address, leaving the loader to fill it in before the
-//! trampoline is executable. A binary with no patch sites gets no trampoline,
-//! only a size-0 sentinel header, matching the x86-64 path.
-//!
-//! `rt_sigreturn` needs no gate: the runtime installs its own trampoline
-//! address into the signal frame, and an absolute address is reachable
-//! regardless of branch range.
-//!
-//! ## Guest x18 limits
-//!
-//! X18 virtualization handles ordinary register substitutions, `CBZ`/`CBNZ`,
-//! `TBZ`/`TBNZ`, `ADC`/`SBC`, `UDIV`/`SDIV`, `ADR`/`ADRP`, and unauthenticated
-//! `BR`/`BLR`/`RET` through x18. Other unsupported decoder layouts, other
-//! PC-relative forms, and authenticated control flow through x18 reject AOT
-//! rewriting and become traps during runtime rewriting.
 
 use crate::{
     Error, InternalError, Result, TextSectionInfo, checked_add_u64, fixup_phdr_alignment,
@@ -1119,7 +1035,7 @@ mod tests {
         decode_adrp_add_target_for, decode_adrp_target, decode_branch_target,
         decode_gate_metadata_word, finalize_macho_trampoline, finalize_trampoline_gates,
         finalize_trampoline_gates_for_host, find_guest_tpidr_placeholder,
-        find_guest_x18_placeholder, valid_emitted_tpidr_offset,
+        find_guest_x18_placeholder,
     };
     #[test]
     fn macos_fallback_traps_use_shared_marker() {
@@ -3338,18 +3254,6 @@ mod tests {
             assert_eq!(
                 classify_gate_pc(&non_aligned, base, base + slot_start as u64),
                 None
-            );
-        }
-
-        for invalid in [
-            4,
-            12,
-            u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER) + 8,
-            u32::MAX,
-        ] {
-            assert!(
-                !valid_emitted_tpidr_offset(invalid),
-                "accepted impossible byte offset {invalid}"
             );
         }
     }

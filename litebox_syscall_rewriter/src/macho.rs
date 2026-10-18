@@ -585,9 +585,9 @@ fn rewrite_at(
     else {
         let header = TrampolineHeader64 {
             magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0,
-            vaddr: 0,
-            trampoline_size: 0,
+            file_offset: 0.into(),
+            vaddr: 0.into(),
+            trampoline_size: 0.into(),
         };
         out.extend_from_slice(header.as_bytes());
         return Ok(out);

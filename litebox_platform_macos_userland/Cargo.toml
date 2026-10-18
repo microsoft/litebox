@@ -18,6 +18,3 @@ subpage_compat = []
 
 [lints]
 workspace = true
-
-[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
-litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }

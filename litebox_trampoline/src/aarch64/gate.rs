@@ -32,7 +32,7 @@ use super::{
 };
 
 /// Most words any gate slot holds, including padding and metadata.
-pub(crate) const MAX_SLOT_WORDS: usize = MAX_GATE_SLOT_BYTES / INSN_BYTES;
+const MAX_SLOT_WORDS: usize = MAX_GATE_SLOT_BYTES / INSN_BYTES;
 
 impl Boundary {
     const fn new(frame: Frame, sp: GuestSp, value: Value, resume: Resume) -> Self {
@@ -70,7 +70,7 @@ impl Boundary {
 
 /// Runtime-patched guest TLS field in an unsigned-offset `LDR`/`STR`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TlsField {
+pub(super) enum TlsField {
     /// Guest thread-pointer slot, or the indirect-TLS block pointer.
     Tp,
     /// Direct-TLS guest x18 slot.
@@ -78,7 +78,7 @@ pub(crate) enum TlsField {
 }
 
 impl TlsField {
-    pub(crate) const fn placeholder(self) -> u16 {
+    pub(super) const fn placeholder(self) -> u16 {
         match self {
             Self::Tp => GUEST_TPIDR_OFFSET_PLACEHOLDER,
             Self::X18 => GUEST_X18_OFFSET_PLACEHOLDER,
@@ -95,7 +95,7 @@ impl TlsField {
 
 /// How validation compares one slot word against its rebuilt template.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Role {
+enum Role {
     /// Must match exactly.
     Fixed,
     /// Matches except for a runtime-patched TLS offset, which must be the
@@ -238,7 +238,7 @@ impl BuiltSlot {
     }
 
     /// Byte offset of the first word with `role`.
-    pub(crate) fn offset_of(&self, role: Role) -> Option<usize> {
+    fn offset_of(&self, role: Role) -> Option<usize> {
         self.roles()
             .iter()
             .position(|candidate| *candidate == role)
@@ -246,7 +246,7 @@ impl BuiltSlot {
     }
 
     /// Byte offsets and fields of every runtime-patched TLS word.
-    pub(crate) fn tls_words(&self) -> impl Iterator<Item = (usize, TlsField)> + '_ {
+    pub(super) fn tls_words(&self) -> impl Iterator<Item = (usize, TlsField)> + '_ {
         self.roles()
             .iter()
             .enumerate()
@@ -645,8 +645,8 @@ fn build_host_aware_mrs(asm: &mut GateAsm, gate: &Gate<'_>) -> Result<(), BuildE
         },
     )?;
     asm.op(done, Insn::B(8))?;
-    // TargetHost path: reproduce the original instruction, including the CPU
-    // tag. TargetHost signals are forwarded without gate canonicalization,
+    // Native host path: reproduce the original instruction, including the CPU
+    // tag. Host signals are forwarded without gate canonicalization,
     // so reaching here from a guest-mode signal is a runtime bug.
     asm.op(Some(Stage::Invalid), Insn::MrsTpidrroEl0(rd))?;
     asm.branch(done, Role::Return, ret)?;
@@ -1266,7 +1266,7 @@ fn branch_target(word: u32, pc: u64, placed: bool) -> Option<u64> {
 
 /// Recovers the trampoline base from a placed SVC slot's callback literal,
 /// using `probe` as scratch.
-pub(crate) fn svc_trampoline_base(
+pub(super) fn svc_trampoline_base(
     slot: &[u8],
     slot_vaddr: u64,
     host: TargetHost,
@@ -1287,6 +1287,8 @@ pub(crate) fn svc_trampoline_base(
 
 impl GateMetadata {
     /// First byte past the executable body of this gate on `host`.
+    /// This template-inspection helper does not validate guest-supplied bytes;
+    /// use a slot classifier for that.
     ///
     /// # Panics
     /// Panics if the metadata cannot describe an encodable gate for this host.

@@ -20,7 +20,7 @@ use zerocopy::{
     byteorder::{LittleEndian, U32, U64},
 };
 
-use litebox_trampoline::TRAMPOLINE_FILE_ALIGNMENT;
+use litebox_trampoline::{TRAMPOLINE_FILE_ALIGNMENT, TrampolineHeader64, decode_trampoline_header};
 pub const MACH_HEADER_SIZE: usize = size_of::<macho::MachHeader64<LE>>();
 const ARM_THREAD_STATE64: u32 = 6;
 const LOAD_COMMAND_ALIGNMENT: usize = size_of::<u64>();
@@ -46,16 +46,6 @@ struct UnixThreadCommand64 {
     flavor: U32<LittleEndian>,
     count: U32<LittleEndian>,
     state: Aarch64ThreadState64,
-}
-
-/// On-disk AOT footer, with explicitly little-endian fields.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
-struct TrampolineHeader64 {
-    magic: [u8; 8],
-    file_offset: U64<LittleEndian>,
-    vaddr: U64<LittleEndian>,
-    trampoline_size: U64<LittleEndian>,
 }
 
 /// Shared admission limit for runner reads, shim snapshots and parsed virtual spans.
@@ -144,15 +134,9 @@ impl MachoParsedFile {
             .len()
             .checked_sub(size_of::<TrampolineHeader64>())
             .ok_or(MachoLoaderError::Unrewritten)?;
-        let header = TrampolineHeader64::read_from_bytes(&data[footer_start..])
-            .map_err(|_| MachoLoaderError::Rewrite)?;
-        if header.magic != *litebox_trampoline::TRAMPOLINE_MAGIC {
-            return Err(if header.magic.starts_with(b"LITEBOX") {
-                MachoLoaderError::Rewrite
-            } else {
-                MachoLoaderError::Unrewritten
-            });
-        }
+        let header = decode_trampoline_header(&data[footer_start..])
+            .map_err(|_| MachoLoaderError::Rewrite)?
+            .ok_or(MachoLoaderError::Unrewritten)?;
         let file_offset =
             usize::try_from(header.file_offset.get()).map_err(|_| MachoLoaderError::Rewrite)?;
         let address = usize::try_from(header.vaddr.get()).map_err(|_| MachoLoaderError::Rewrite)?;

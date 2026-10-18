@@ -2,14 +2,20 @@
 // Licensed under the MIT license.
 
 use super::*;
-use litebox_syscall_rewriter::{RewriteOptions, macho::Rewriter, patch_code_segment_with_options};
-use litebox_trampoline::TargetHost;
+use litebox_trampoline::{
+    TargetHost,
+    aarch64::{
+        self, GateLayout, GateMetadata, Insn,
+        gate::{self, GateInstance},
+    },
+};
 
 // The first page contains code and gates; remaining pages are RW stack storage.
-// Darwin gates are host-aware so the native-path test can call them directly.
+// Fixtures declare their SVC sites explicitly, without scanning instructions.
 fn prepare_code(
     platform: &MacosUserland,
     words: &[u32],
+    svc_offsets: &[usize],
     pages: usize,
     abi: GuestAbi,
 ) -> MacosUserlandReservation<HOST_PAGE_SIZE> {
@@ -35,30 +41,32 @@ fn prepare_code(
     assert!(code.len() <= HOST_PAGE_SIZE / 2);
     let gate_address = (base + HOST_PAGE_SIZE / 2) as u64;
     let callback = platform.get_syscall_entry_point() as u64;
-    let (gates, trapped) = match abi {
-        GuestAbi::Linux => patch_code_segment_with_options(
-            &mut code,
-            base as u64,
-            gate_address,
-            callback,
-            RewriteOptions::new(TargetHost::MacOs, true),
-        ),
-        GuestAbi::Darwin => {
-            let range = 0..code.len();
-            Rewriter::new(TargetHost::MacOs)
-                .unwrap()
-                .patch_host_shared_cache_code(
-                    &mut code,
-                    base as u64,
-                    core::slice::from_ref(&range),
-                    gate_address,
-                    callback,
-                    u16::try_from(platform.guest_thread_pointer_offset().unwrap()).unwrap(),
-                )
-        }
+    let layout = match abi {
+        GuestAbi::Linux => GateLayout::linux(TargetHost::MacOs),
+        GuestAbi::Darwin => GateLayout::darwin(TargetHost::MacOs),
+    };
+    let mut gates = Vec::new();
+    aarch64::emit_shared_prologue(&mut gates, callback);
+    for &offset in svc_offsets {
+        let site = (base + offset) as u64;
+        let slot_address = gate_address + gates.len() as u64;
+        let instance = GateInstance::new(GateMetadata::Svc, site + aarch64::INSN_BYTES_U64);
+        gate::build(&instance, layout, slot_address, gate_address)
+            .unwrap()
+            .append_to(&mut gates);
+        let branch = Insn::B(slot_address.cast_signed() - site.cast_signed())
+            .encode()
+            .unwrap();
+        code[offset..offset + aarch64::INSN_BYTES].copy_from_slice(&branch.to_le_bytes());
     }
-    .unwrap();
-    assert_eq!(trapped, [] as [u64; 0]);
+    if abi == GuestAbi::Darwin {
+        aarch64::finalize_macho_trampoline(
+            &mut gates,
+            u16::try_from(platform.guest_thread_pointer_offset().unwrap()).unwrap(),
+            TargetHost::MacOs,
+        )
+        .unwrap();
+    }
     assert!(gates.len() <= HOST_PAGE_SIZE / 2);
     assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
     assert_eq!(
@@ -145,6 +153,7 @@ fn native_syscall_gate_preserves_registers_and_carry() {
             0xa901_0051, // stp x17, x0, [x2, #16]
             0xd65f_03c0, // ret
         ],
+        &[12],
         1,
         GuestAbi::Darwin,
     );
@@ -219,7 +228,7 @@ fn child_inherits_vector_state_and_dispatches_on_host_stack() {
 
     set_guest_abi(GuestAbi::Linux);
     let platform = MacosUserland::new();
-    let reservation = prepare_code(platform, &[0xd400_0001], 3, GuestAbi::Linux); // svc #0
+    let reservation = prepare_code(platform, &[0xd400_0001], &[0], 3, GuestAbi::Linux); // svc #0
     let base = reservation.range().start;
     let original = get_guest_vector_state();
     let _restore = litebox::utils::defer(|| set_guest_vector_state(&original));
