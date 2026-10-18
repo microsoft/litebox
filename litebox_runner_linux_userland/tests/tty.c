@@ -132,6 +132,8 @@ int main(int argc, char **argv) {
     size.ws_row = 42;
     size.ws_col = 110;
     assert(ioctl(1, TIOCSWINSZ, &size) == 0);
+    // Like Linux, the resize signals this foreground process before the ioctl returns.
+    assert(resizes == 2);
     assert(ioctl(2, TIOCGWINSZ, &size) == 0 && size.ws_row == 42 && size.ws_col == 110);
 
     attributes = original;

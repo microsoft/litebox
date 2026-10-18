@@ -2641,6 +2641,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         };
         let response = file.terminal_control(operation, Some(&self.wait_cx()))?;
+        if matches!(operation, TerminalOperation::SetWindowSize(_)) {
+            // Like Linux, a resize signals the terminal's process group, which may include this
+            // process, before the ioctl returns.
+            self.take_signals(true);
+        }
         match (arg, response) {
             (IoctlArg::TCGETS(ptr), TerminalResponse::Settings(settings)) => {
                 ptr.write_at_offset::<Platform>(0, settings.into())
