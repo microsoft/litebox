@@ -56,7 +56,7 @@ use litebox_broker_protocol::{
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
-use litebox_broker_transport::shared_memory::{MappedSharedMemory, SharedBufferPool};
+use litebox_broker_transport::shared_memory::{AsSharedBytes, SharedBufferPool};
 
 pub use error::{BrokerLocalError, Result};
 
@@ -68,7 +68,7 @@ pub struct BrokerLocal<Channel: LocalCallChannel> {
     channel: Channel,
     process_id: ProcessId,
     initial_thread_id: ThreadId,
-    shared_buffers: SharedBufferPool<Arc<dyn MappedSharedMemory>>,
+    shared_buffers: SharedBufferPool<Arc<dyn AsSharedBytes>>,
     next_request_id: AtomicU64,
 }
 
@@ -82,7 +82,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         channel: Channel,
         process_id: ProcessId,
         initial_thread_id: ThreadId,
-        shared_memory: Arc<dyn MappedSharedMemory>,
+        shared_memory: Arc<dyn AsSharedBytes>,
     ) -> Self {
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
             .expect("broker association shared memory has an invalid size");
@@ -116,7 +116,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         activate: impl FnOnce(
             Setup,
         ) -> core::result::Result<
-            (Channel, Arc<dyn MappedSharedMemory>, Activated),
+            (Channel, Arc<dyn AsSharedBytes>, Activated),
             Channel::Error,
         >,
     ) -> Result<(Self, Option<ProcessStartupData>, Activated), Channel::Error> {
@@ -686,7 +686,7 @@ mod tests {
 
         assert!(matches!(
             BrokerLocal::<FakeControlChannel>::negotiate(channel, |_| {
-                Err::<(FakeControlChannel, Arc<dyn MappedSharedMemory>, ()), _>(
+                Err::<(FakeControlChannel, Arc<dyn AsSharedBytes>, ()), _>(
                     FakeChannelError::SharedMemoryReceive,
                 )
             }),
@@ -714,7 +714,7 @@ mod tests {
                 channel,
                 Arc::new(HeapSharedMemory::new(
                     litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE - 1,
-                )) as Arc<dyn MappedSharedMemory>,
+                )) as Arc<dyn AsSharedBytes>,
                 (),
             ))
         });
@@ -748,7 +748,7 @@ mod tests {
         SharedMemoryReceive,
     }
 
-    pub(crate) fn test_shared_memory() -> Arc<dyn MappedSharedMemory> {
+    pub(crate) fn test_shared_memory() -> Arc<dyn AsSharedBytes> {
         Arc::new(HeapSharedMemory::new(
             litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
         ))

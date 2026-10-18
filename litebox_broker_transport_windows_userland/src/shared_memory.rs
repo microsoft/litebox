@@ -13,7 +13,7 @@ use litebox_broker_transport::control_ring::{
 };
 use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{
-    ControlRingMemory, MappedSharedMemory, SharedBytes, SharedMemory, SharedMemoryError,
+    AsSharedBytes, ControlRingMemory, SharedBytes, SharedMemory, SharedMemoryError,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
@@ -425,8 +425,12 @@ impl SharedMemory for WindowsSharedMemory {
     }
 }
 
-impl MappedSharedMemory for WindowsSharedMemory {
-    fn bytes(&self, offset: usize, length: usize) -> Result<SharedBytes<'_>, SharedMemoryError> {
+impl AsSharedBytes for WindowsSharedMemory {
+    fn shared_bytes(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> Result<SharedBytes<'_>, SharedMemoryError> {
         if !self.policy.permits_byte_range(offset, length) {
             return Err(SharedMemoryError::InvalidRange);
         }

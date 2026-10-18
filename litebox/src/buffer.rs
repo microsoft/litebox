@@ -240,12 +240,12 @@ pub(crate) fn fill_from<B: WriteBuffer + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_transport::shared_memory::{HeapSharedMemory, MappedSharedMemory as _};
+    use litebox_broker_transport::shared_memory::{AsSharedBytes as _, HeapSharedMemory};
 
     #[test]
     fn slices_copy_at_offsets() {
         let memory = HeapSharedMemory::new(4);
-        let shared = memory.bytes(0, 4).unwrap();
+        let shared = memory.shared_bytes(0, 4).unwrap();
         let source: &[u8] = &[1, 2, 3, 4, 5, 6];
         source.copy_to_shared_at(1, shared).unwrap();
         let mut destination = [0; 6];
@@ -262,13 +262,13 @@ mod tests {
         let memory = HeapSharedMemory::new(5);
         let source: &[u8] = &[0, 1, 2, 3, 4, 5];
         let mut fill = fill_from(source, 1);
-        fill(memory.bytes(0, 2).unwrap()).unwrap();
-        fill(memory.bytes(2, 3).unwrap()).unwrap();
+        fill(memory.shared_bytes(0, 2).unwrap()).unwrap();
+        fill(memory.shared_bytes(2, 3).unwrap()).unwrap();
         let mut destination = [0; 6];
         {
             let mut copy = copy_into(&mut destination[..], 1);
-            copy(memory.bytes(3, 2).unwrap()).unwrap();
-            copy(memory.bytes(0, 3).unwrap()).unwrap();
+            copy(memory.shared_bytes(3, 2).unwrap()).unwrap();
+            copy(memory.shared_bytes(0, 3).unwrap()).unwrap();
         }
         assert_eq!(destination, [0, 4, 5, 1, 2, 3]);
     }
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn windows_copy_within_their_buffers() {
         let memory = HeapSharedMemory::new(2);
-        let shared = memory.bytes(0, 2).unwrap();
+        let shared = memory.shared_bytes(0, 2).unwrap();
         let source: &[u8] = &[1, 2, 3, 4, 5];
         let window = WriteBuffer::window(source, 1, 4);
         let window = window.window(1, 3);
@@ -309,6 +309,6 @@ mod tests {
     fn slices_reject_copies_past_their_end() {
         let memory = HeapSharedMemory::new(4);
         let source: &[u8] = &[1, 2, 3];
-        let _ = source.copy_to_shared_at(1, memory.bytes(0, 3).unwrap());
+        let _ = source.copy_to_shared_at(1, memory.shared_bytes(0, 3).unwrap());
     }
 }

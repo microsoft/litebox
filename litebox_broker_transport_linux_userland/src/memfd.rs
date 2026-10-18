@@ -50,7 +50,7 @@ use litebox_broker_transport::control_ring::{
 };
 use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{
-    ControlRingMemory, MappedSharedMemory, SharedBytes, SharedMemory, SharedMemoryError,
+    AsSharedBytes, ControlRingMemory, SharedBytes, SharedMemory, SharedMemoryError,
 };
 
 use crate::unix_io::{
@@ -378,8 +378,12 @@ impl SharedMemory for MemfdSharedMemory {
     }
 }
 
-impl MappedSharedMemory for MemfdSharedMemory {
-    fn bytes(&self, offset: usize, length: usize) -> Result<SharedBytes<'_>, SharedMemoryError> {
+impl AsSharedBytes for MemfdSharedMemory {
+    fn shared_bytes(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> Result<SharedBytes<'_>, SharedMemoryError> {
         let address = shared_address(&self.mapping, offset, length, 1)?;
         if !self.policy.permits_byte_range(offset, length) {
             return Err(SharedMemoryError::InvalidRange);

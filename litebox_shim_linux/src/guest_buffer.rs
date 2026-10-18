@@ -189,7 +189,7 @@ impl<Platform: ShimPlatform> WriteBuffer for GuestWriteBuffer<'_, Platform> {
 mod tests {
     use super::*;
     use crate::syscalls::tests::TestPlatform;
-    use litebox_broker_transport::shared_memory::{HeapSharedMemory, MappedSharedMemory as _};
+    use litebox_broker_transport::shared_memory::{AsSharedBytes as _, HeapSharedMemory};
 
     fn read_iov(bytes: &mut [u8]) -> IoReadVec {
         IoReadVec {
@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(buffer.len(), 5);
         buffer.copy_from_slice_at(1, &[1, 2]).unwrap();
         let memory = HeapSharedMemory::new(2);
-        let shared = memory.bytes(0, 2).unwrap();
+        let shared = memory.shared_bytes(0, 2).unwrap();
         shared.copy_from_slice(&[3, 4]);
         buffer.window(2, 3).copy_from_shared_at(1, shared).unwrap();
         assert_eq!((a, c), ([0, 1], [2, 3, 4]));
@@ -228,7 +228,7 @@ mod tests {
         buffer.copy_to_slice_at(1, &mut gathered).unwrap();
         assert_eq!(gathered, [2, 3, 4]);
         let memory = HeapSharedMemory::new(4);
-        let shared = memory.bytes(0, 4).unwrap();
+        let shared = memory.shared_bytes(0, 4).unwrap();
         buffer.copy_to_shared_at(1, shared).unwrap();
         let mut copied = [0; 4];
         shared.copy_to_slice(&mut copied);

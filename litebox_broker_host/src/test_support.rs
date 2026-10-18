@@ -19,7 +19,7 @@ use litebox_broker_protocol::{
 };
 use litebox_broker_transport::{
     channel::{HostReceive, HostSetupChannel, LocalCallChannel, LocalSetupChannel, PeerCredential},
-    shared_memory::{HeapSharedMemory, MappedSharedMemory, SharedBufferPool},
+    shared_memory::{AsSharedBytes, HeapSharedMemory, SharedBufferPool},
 };
 use spin::mutex::SpinMutex;
 
@@ -45,7 +45,7 @@ impl InProcessBrokerSetup {
     }
 
     /// Returns the shared memory used by both association endpoints.
-    pub fn shared_memory(&self) -> Arc<dyn MappedSharedMemory> {
+    pub fn shared_memory(&self) -> Arc<dyn AsSharedBytes> {
         self.memory.clone()
     }
 
@@ -265,7 +265,7 @@ impl ReadinessSink for InProcessReadinessSink {
 }
 
 /// Creates shared memory backed by an ordinary allocation.
-pub fn shared_memory() -> Arc<dyn MappedSharedMemory> {
+pub fn shared_memory() -> Arc<dyn AsSharedBytes> {
     Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE))
 }
 

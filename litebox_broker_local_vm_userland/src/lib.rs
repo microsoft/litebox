@@ -47,7 +47,7 @@ use litebox_broker_transport::control_ring::{
 };
 use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{
-    ControlRingMemory, MappedSharedMemory, SharedBytes, SharedMemory, SharedMemoryError,
+    AsSharedBytes, ControlRingMemory, SharedBytes, SharedMemory, SharedMemoryError,
 };
 use litebox_common_vm_abi::{
     BrokerHandshakeFrame, FutexRequest, StartupInfo, Status, UserRange, WireFrame,
@@ -225,8 +225,12 @@ impl SharedMemory for KernelSharedMemory {
     }
 }
 
-impl MappedSharedMemory for KernelSharedMemory {
-    fn bytes(&self, offset: usize, length: usize) -> Result<SharedBytes<'_>, SharedMemoryError> {
+impl AsSharedBytes for KernelSharedMemory {
+    fn shared_bytes(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> Result<SharedBytes<'_>, SharedMemoryError> {
         let address = checked(self.region.start.trunc(), self.len(), offset, length)?;
         // Safety: in bounds of a region mapped for the process's lifetime,
         // disjoint from private memory and never referenced.
@@ -419,7 +423,7 @@ pub fn connect(
                     words: ring()?,
                 })),
             };
-            let shared_memory: Arc<dyn MappedSharedMemory> = Arc::new(KernelSharedMemory {
+            let shared_memory: Arc<dyn AsSharedBytes> = Arc::new(KernelSharedMemory {
                 region: info.broker_shared_memory,
             });
             Ok((channel, shared_memory, notifications))
