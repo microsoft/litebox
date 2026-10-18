@@ -451,6 +451,15 @@ pub struct IsTerminalFileRequest {
     pub handle: ObjectHandle,
 }
 
+/// Controls the shared terminal backing an open file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalControlFileRequest {
+    /// Broker-owned file handle.
+    pub handle: ObjectHandle,
+    /// Typed terminal operation.
+    pub operation: crate::terminal::TerminalOperation,
+}
+
 /// Changes mode bits by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChmodFileRequest {

@@ -630,8 +630,8 @@ mod tests {
         HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
         OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
         ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-        SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-        WriteFileResponse,
+        SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+        WriteFileRequest, WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
@@ -943,7 +943,7 @@ mod tests {
                 handle,
             })),
             BrokerOperation::File(FileRequest::IsTerminal(IsTerminalFileRequest { handle })),
-            BrokerOperation::File(FileRequest::Terminal(crate::terminal::TerminalRequest {
+            BrokerOperation::File(FileRequest::TerminalControl(TerminalControlFileRequest {
                 handle,
                 operation: crate::terminal::TerminalOperation::GetSettings,
             })),
@@ -1667,12 +1667,12 @@ mod tests {
             })),
             BrokerResult::File(FileResponse::IsTerminal(false)),
             BrokerResult::File(FileResponse::IsTerminal(true)),
-            BrokerResult::File(FileResponse::Terminal(Ok(
+            BrokerResult::File(FileResponse::TerminalControl(Ok(
                 crate::terminal::TerminalResponse::Settings(
                     crate::terminal::TerminalSettings::default(),
                 ),
             ))),
-            BrokerResult::File(FileResponse::Terminal(Err(
+            BrokerResult::File(FileResponse::TerminalControl(Err(
                 crate::terminal::TerminalError::NotTerminal,
             ))),
             BrokerResult::File(FileResponse::Chmod),

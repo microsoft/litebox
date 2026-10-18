@@ -3,8 +3,6 @@
 
 //! Guest-ABI-independent controls for shared terminal endpoints.
 
-use crate::ObjectHandle;
-
 bitflags::bitflags! {
     /// Transformations applied to incoming bytes.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -180,15 +178,6 @@ pub enum TerminalOperation {
     },
     /// Wait for accepted output to reach the transport.
     Drain,
-}
-
-/// A terminal control addressed through an existing file capability.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TerminalRequest {
-    /// Existing file capability.
-    pub handle: ObjectHandle,
-    /// Typed operation.
-    pub operation: TerminalOperation,
 }
 
 /// Result of a terminal control.

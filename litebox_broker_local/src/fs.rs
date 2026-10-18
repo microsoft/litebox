@@ -10,8 +10,8 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
     FileStatus, FileUser, HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE,
     MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadFileRequest, RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, try_decode_directory_entries,
+    ReadFileRequest, RmdirFileRequest, SeekFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -38,10 +38,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         >,
         Channel::Error,
     > {
-        match self.request_file(FileRequest::Terminal(
-            litebox_broker_protocol::terminal::TerminalRequest { handle, operation },
-        ))? {
-            FileResponse::Terminal(result) => Ok(result),
+        match self.request_file(FileRequest::TerminalControl(TerminalControlFileRequest {
+            handle,
+            operation,
+        }))? {
+            FileResponse::TerminalControl(result) => Ok(result),
             response => panic!("broker returned unexpected terminal response: {response:?}"),
         }
     }

@@ -839,7 +839,7 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
-        FileRequest::Terminal(request) => Ok(FileResponse::Terminal(
+        FileRequest::TerminalControl(request) => Ok(FileResponse::TerminalControl(
             litebox_broker_core::fs::terminal_control(process, request.handle, request.operation)
                 .map_err(RequestFailure::from)?,
         )),

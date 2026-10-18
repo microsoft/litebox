@@ -11,8 +11,8 @@ use crate::fs::{
     HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
     OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
     ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse,
+    SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -193,7 +193,7 @@ impl BrokerOperation {
                 | FileRequest::Truncate(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::IsTerminal(_)
-                | FileRequest::Terminal(_),
+                | FileRequest::TerminalControl(_),
             )
             | Self::UnixSocket(
                 UnixSocketRequest::Create(_)
@@ -723,7 +723,7 @@ pub enum FileRequest {
     /// Determine whether an open file is connected to a terminal.
     IsTerminal(IsTerminalFileRequest),
     /// Control the shared terminal backing an open file.
-    Terminal(crate::terminal::TerminalRequest),
+    TerminalControl(TerminalControlFileRequest),
     /// Change mode bits by path.
     Chmod(ChmodFileRequest),
     /// Change ownership by path.
@@ -757,8 +757,8 @@ pub enum FileResponse {
     HandleStatus(FileStatus),
     /// Terminal query response.
     IsTerminal(bool),
-    /// Typed terminal-control result.
-    Terminal(Result<crate::terminal::TerminalResponse, crate::terminal::TerminalError>),
+    /// Terminal-control result.
+    TerminalControl(Result<crate::terminal::TerminalResponse, crate::terminal::TerminalError>),
     /// Mode change completed.
     Chmod,
     /// Ownership change completed.
