@@ -8,14 +8,18 @@
 //! process starts in its creator's group and session, while a root process
 //! leads its own. A group or session exists while any process, including an
 //! exited one whose exit is not yet collected, belongs to it, and its ID is
-//! not reused until then.
+//! not reused until then, nor while a terminal can still signal the group.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
+use litebox_broker_protocol::terminal::TerminalEvents;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId};
+use spin::Mutex;
 
-use crate::{BrokerError, BrokerProcess, Result};
+use crate::id::IdAllocator;
+use crate::terminal::TerminalEventSink;
+use crate::{BrokerError, BrokerProcess, ProcessRegistry, Result};
 
 /// Moves the process `target` into `process_group`, creating the group if it
 /// is `target`'s ID.
@@ -88,15 +92,75 @@ pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> 
     }
 }
 
+/// Delivers a terminal's events to the process group that attached it.
+///
+/// The sink keeps the group's and session's IDs reserved, so they cannot name
+/// another group or session while the terminal can still signal this one.
+struct TerminalSink {
+    processes: Weak<ProcessRegistry>,
+    tree_lock: Arc<Mutex<()>>,
+    ids: Arc<Mutex<IdAllocator>>,
+    membership: ProcessGroupMembership,
+}
+
+impl TerminalEventSink for TerminalSink {
+    fn post(&self, events: TerminalEvents) {
+        let targets = {
+            // Members cannot move between groups while they are selected.
+            let _tree = self.tree_lock.lock();
+            let Some(processes) = self.processes.upgrade() else {
+                return;
+            };
+            let mut targets = crate::registered_processes(&processes);
+            targets.retain(|target| target.membership() == self.membership);
+            targets
+        };
+        for target in targets {
+            target.signals.post_terminal_events(events);
+        }
+    }
+}
+
+impl Drop for TerminalSink {
+    fn drop(&mut self) {
+        let mut ids = self.ids.lock();
+        ids.release(self.membership.process_group.0);
+        ids.release(self.membership.session.0);
+    }
+}
+
+/// Returns a sink that delivers terminal events to `process`'s current process
+/// group.
+pub(crate) fn terminal_sink(process: &BrokerProcess) -> Arc<dyn TerminalEventSink> {
+    // The group's IDs cannot be released before they are retained.
+    let _tree = process.core.process_tree_lock.lock();
+    let membership = process.membership();
+    {
+        let mut ids = process.core.ids.lock();
+        ids.retain(membership.process_group.0);
+        ids.retain(membership.session.0);
+    }
+    Arc::new(TerminalSink {
+        processes: Arc::downgrade(&process.core.processes),
+        tree_lock: Arc::clone(&process.core.process_tree_lock),
+        ids: Arc::clone(&process.core.ids),
+        membership,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
 
     use litebox_broker_protocol::process::ProcessExitStatus;
     use litebox_broker_protocol::process_group::ProcessGroupMembership;
+    use litebox_broker_protocol::readiness::ReadinessFlags;
+    use litebox_broker_protocol::signal::SignalEvent;
+    use litebox_broker_protocol::terminal::TerminalEvents;
     use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 
     use crate::id::IdAllocator;
+    use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::TestBrokerCoreBuilder;
     use crate::{
         BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
@@ -257,5 +321,38 @@ mod tests {
         );
         super::create_session(&member, member.id()).unwrap();
         assert_eq!(allocate(None).unwrap().id(), leader_id);
+    }
+
+    #[test]
+    fn terminal_events_reach_only_the_attached_group_and_coalesce() {
+        let broker = broker();
+        let root = process(&broker, None);
+        let child = process(&broker, Some(&root));
+        let background = process(&broker, Some(&root));
+        super::set(&root, background.id(), background.id().into()).unwrap();
+        let handles = [&root, &child, &background].map(|process| {
+            crate::signal::open(process, Arc::new(TestReadinessSink::default())).unwrap()
+        });
+        let sink = super::terminal_sink(&root);
+        sink.post(TerminalEvents::INTERRUPT);
+        sink.post(TerminalEvents::INTERRUPT);
+        sink.post(TerminalEvents::RESIZE);
+        for (process, handle) in [(&root, handles[0]), (&child, handles[1])] {
+            assert_eq!(process.check_readiness(handle), Ok(ReadinessFlags::READ));
+            assert_eq!(
+                crate::signal::take(process, handle),
+                Ok(SignalEvent::Terminal(
+                    TerminalEvents::INTERRUPT | TerminalEvents::RESIZE
+                ))
+            );
+            assert_eq!(
+                crate::signal::take(process, handle),
+                Err(BrokerError::WouldBlock)
+            );
+        }
+        assert_eq!(
+            crate::signal::take(&background, handles[2]),
+            Err(BrokerError::WouldBlock)
+        );
     }
 }

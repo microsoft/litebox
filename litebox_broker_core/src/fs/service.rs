@@ -484,7 +484,7 @@ pub fn open(
     };
     let readiness = file.watch(reference.handle(), readiness_sink)?;
     if let Some(terminal) = &file.terminal {
-        crate::terminal::attach(terminal.as_ref(), process);
+        terminal.attach(crate::process_group::terminal_sink(process));
     }
     reference
         .commit_with_readiness(ObjectEntry::File(file), readiness)

@@ -291,6 +291,23 @@ impl Default for BrokerCoreLimits {
     }
 }
 
+/// Every registered process by ID. A process removes itself when it finally
+/// drops.
+pub(crate) type ProcessRegistry = RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>;
+
+/// Returns every existing process in `registry`.
+pub(crate) fn registered_processes(registry: &ProcessRegistry) -> Vec<Arc<BrokerProcess>> {
+    // The registry lock is released before any process can drop, since a
+    // final process drop removes itself from the registry.
+    let mut processes = registry
+        .read()
+        .values()
+        .filter_map(Weak::upgrade)
+        .collect::<Vec<_>>();
+    processes.retain(|process| !process.is_released());
+    processes
+}
+
 /// Channel-independent broker authority handle.
 ///
 /// A broker process may construct only one broker core for its process
@@ -301,7 +318,7 @@ pub struct BrokerCore {
     pub(crate) policy: Arc<PolicyEngine>,
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) ids: Arc<Mutex<IdAllocator>>,
-    pub(crate) processes: Arc<RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>>,
+    pub(crate) processes: Arc<ProcessRegistry>,
     /// Every live broker thread.
     ///
     /// Lock order: a process's thread set, then this lock, then the ID
@@ -423,16 +440,7 @@ impl BrokerCore {
 
     /// Returns every existing process.
     pub(crate) fn registered_processes(&self) -> Vec<Arc<BrokerProcess>> {
-        // The registry lock is released before any process can drop, since a
-        // final process drop removes itself from the registry.
-        let mut processes = self
-            .processes
-            .read()
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
-        processes.retain(|process| !process.is_released());
-        processes
+        registered_processes(&self.processes)
     }
 
     /// Returns whether any broker process remains registered.

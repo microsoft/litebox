@@ -8,23 +8,19 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
 use litebox_broker_protocol::fs::FileError;
-use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
     InputFlags as I, LocalFlags as L, OutputFlags as O, TerminalEvents, TerminalOperation,
     TerminalResponse, TerminalSettings, WindowSize,
 };
-use spin::Mutex;
 
 use crate::fs::FileResult;
-use crate::id::IdAllocator;
 use crate::readiness::ReadinessSource;
-use crate::{BrokerCore, BrokerProcess};
 
 /// Maximum queued input bytes and canonical record boundaries per terminal.
 pub const INPUT_CAPACITY: usize = 64 * 1024;
@@ -125,67 +121,6 @@ pub trait TerminalTransport: Send + Sync {
 
     /// Restores the host terminal's original state. Later calls do nothing.
     fn restore(&self) -> Result<(), TerminalTransportError>;
-}
-
-struct ProcessGroupSink {
-    processes: Weak<
-        spin::rwlock::RwLock<
-            hashbrown::HashMap<litebox_broker_protocol::ProcessId, Weak<BrokerProcess>>,
-        >,
-    >,
-    tree_lock: Arc<Mutex<()>>,
-    ids: Arc<Mutex<IdAllocator>>,
-    membership: ProcessGroupMembership,
-}
-
-impl TerminalEventSink for ProcessGroupSink {
-    fn post(&self, events: TerminalEvents) {
-        let targets = {
-            let _tree = self.tree_lock.lock();
-            let Some(processes) = self.processes.upgrade() else {
-                return;
-            };
-            let processes = processes
-                .read()
-                .values()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
-            processes
-                .into_iter()
-                .filter(|process| process.membership() == self.membership)
-                .collect::<Vec<_>>()
-        };
-        for process in targets {
-            process.signals.post_terminal_events(events);
-        }
-    }
-}
-
-impl Drop for ProcessGroupSink {
-    fn drop(&mut self) {
-        let mut ids = self.ids.lock();
-        ids.release(self.membership.process_group.0);
-        ids.release(self.membership.session.0);
-    }
-}
-
-pub(crate) fn attach(endpoint: &dyn TerminalEndpoint, process: &BrokerProcess) {
-    let core: &BrokerCore = &process.core;
-    let tree = core.process_tree_lock.lock();
-    let membership = process.membership();
-    {
-        let mut ids = core.ids.lock();
-        ids.retain(membership.process_group.0);
-        ids.retain(membership.session.0);
-    }
-    let sink = Arc::new(ProcessGroupSink {
-        processes: Arc::downgrade(&core.processes),
-        tree_lock: Arc::clone(&core.process_tree_lock),
-        ids: Arc::clone(&core.ids),
-        membership,
-    });
-    drop(tree);
-    endpoint.attach(sink);
 }
 
 /// Effects of processing incoming transport bytes.
@@ -606,88 +541,6 @@ impl TerminalEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct Endpoint(Mutex<Option<Arc<dyn TerminalEventSink>>>);
-
-    impl ReadinessSource for Endpoint {
-        fn readiness(&self) -> litebox_broker_protocol::readiness::ReadinessFlags {
-            litebox_broker_protocol::readiness::ReadinessFlags::default()
-        }
-
-        fn watch(
-            &self,
-            _registration: &crate::readiness::ReadinessRegistration,
-        ) -> crate::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl TerminalEndpoint for Endpoint {
-        fn control(
-            &self,
-            _operation: TerminalOperation,
-        ) -> crate::Result<FileResult<TerminalResponse>> {
-            unreachable!("event tests never control the terminal")
-        }
-
-        fn attach(&self, sink: Arc<dyn TerminalEventSink>) {
-            let mut existing = self.0.lock();
-            if existing.is_none() {
-                *existing = Some(sink);
-            }
-        }
-    }
-
-    #[test]
-    fn terminal_events_target_only_the_initial_group_and_coalesce() {
-        use crate::readiness::tests::TestReadinessSink;
-        use crate::test_support::TestBrokerCoreBuilder;
-        use crate::{BrokerError, CallerCredential, ObjectRights, PolicyEngine};
-        use litebox_broker_protocol::readiness::ReadinessFlags;
-        use litebox_broker_protocol::signal::SignalEvent;
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let root = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let child = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
-            .unwrap();
-        let background = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
-            .unwrap();
-        crate::process_group::set(&root, background.id(), background.id().into()).unwrap();
-        let handles = [&root, &child, &background].map(|process| {
-            crate::signal::open(process, Arc::new(TestReadinessSink::default())).unwrap()
-        });
-        let endpoint = Endpoint(Mutex::new(None));
-        attach(&endpoint, &root);
-        attach(&endpoint, &background);
-        let sink = endpoint.0.lock().clone().unwrap();
-        sink.post(TerminalEvents::INTERRUPT);
-        sink.post(TerminalEvents::INTERRUPT);
-        sink.post(TerminalEvents::RESIZE);
-        for (process, handle) in [(&root, handles[0]), (&child, handles[1])] {
-            assert_eq!(process.check_readiness(handle), Ok(ReadinessFlags::READ));
-            assert_eq!(
-                crate::signal::take(process, handle),
-                Ok(SignalEvent::Terminal(
-                    TerminalEvents::INTERRUPT | TerminalEvents::RESIZE
-                ))
-            );
-            assert_eq!(
-                crate::signal::take(process, handle),
-                Err(BrokerError::WouldBlock)
-            );
-        }
-        assert_eq!(
-            crate::signal::take(&background, handles[2]),
-            Err(BrokerError::WouldBlock)
-        );
-    }
 
     #[test]
     fn canonical_editing_and_record_boundaries() {
