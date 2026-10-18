@@ -862,6 +862,8 @@ const TERMIOS_OUTPUT: &[(u32, OutputFlags)] = &[
     (8, OutputFlags::CARRIAGE_RETURN_TO_NEWLINE),
     (0x10, OutputFlags::OMIT_CARRIAGE_RETURN_AT_COLUMN_ZERO),
     (0x20, OutputFlags::NEWLINE_RETURNS_CARRIAGE),
+    // TAB3 is one value of the two-bit TABDLY field; TAB1 and TAB2 are unsupported.
+    (0x1800, OutputFlags::EXPAND_TABS),
 ];
 const TERMIOS_LOCAL: &[(u32, LocalFlags)] = &[
     (1, LocalFlags::GENERATE_EVENTS),
@@ -878,6 +880,24 @@ const TERMIOS_LOCAL: &[(u32, LocalFlags)] = &[
 // The virtual endpoint transports eight-bit bytes, not a configurable UART:
 // CS8 | CREAD | B38400. Hardware configuration is deliberately unsupported.
 const TERMIOS_CONTROL: u32 = 0x30 | 0x80 | 0xf;
+// IGNBRK | BRKINT | IGNPAR | INPCK | IMAXBEL are accepted but not retained: the
+// virtual endpoint has no breaks or parity errors, and Linux ignores IMAXBEL.
+// POSIX lets `tcsetattr` succeed when only some changes take effect.
+const TERMIOS_INPUT_IGNORED: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x2000;
+
+/// Maps termios mode bits through `table`, matching each entry's whole value;
+/// `None` if any bit is left unmatched.
+fn termios_flags<F: bitflags::Flags + Copy>(bits: u32, table: &[(u32, F)]) -> Option<F> {
+    let mut rest = bits;
+    let mut flags = F::empty();
+    for &(value, flag) in table {
+        if rest & value == value {
+            flags.insert(flag);
+            rest &= !value;
+        }
+    }
+    (rest == 0).then_some(flags)
+}
 
 impl From<TerminalSettings> for Termios {
     fn from(settings: TerminalSettings) -> Self {
@@ -930,35 +950,21 @@ impl TryFrom<&Termios> for TerminalSettings {
 
     /// Fails with `EINVAL` for settings the shared terminal does not support.
     fn try_from(termios: &Termios) -> Result<Self, errno::Errno> {
+        let (Some(input), Some(output), Some(local)) = (
+            termios_flags(termios.c_iflag & !TERMIOS_INPUT_IGNORED, TERMIOS_INPUT),
+            termios_flags(termios.c_oflag, TERMIOS_OUTPUT),
+            termios_flags(termios.c_lflag, TERMIOS_LOCAL),
+        ) else {
+            return Err(errno::Errno::EINVAL);
+        };
         if termios.c_line != 0
             || termios.c_cflag != TERMIOS_CONTROL
-            || termios.c_iflag & !TERMIOS_INPUT.iter().map(|(b, _)| *b).sum::<u32>() != 0
-            || termios.c_oflag & !TERMIOS_OUTPUT.iter().map(|(b, _)| *b).sum::<u32>() != 0
-            || termios.c_lflag & !TERMIOS_LOCAL.iter().map(|(b, _)| *b).sum::<u32>() != 0
             || [5, 7, 10, 13, 17, 18]
                 .iter()
                 .any(|&index| termios.c_cc[index] != 0)
             || termios.c_cc[6] > 1
         {
             return Err(errno::Errno::EINVAL);
-        }
-        let mut input = InputFlags::empty();
-        let mut output = OutputFlags::empty();
-        let mut local = LocalFlags::empty();
-        for &(bit, flag) in TERMIOS_INPUT {
-            if termios.c_iflag & bit != 0 {
-                input |= flag;
-            }
-        }
-        for &(bit, flag) in TERMIOS_OUTPUT {
-            if termios.c_oflag & bit != 0 {
-                output |= flag;
-            }
-        }
-        for &(bit, flag) in TERMIOS_LOCAL {
-            if termios.c_lflag & bit != 0 {
-                local |= flag;
-            }
         }
         let c = termios.c_cc;
         Ok(Self {
@@ -1026,6 +1032,16 @@ mod termios_tests {
     }
 
     #[test]
+    fn inert_input_modes_are_accepted_but_not_retained() {
+        let settings = TerminalSettings::default();
+        let mut termios = Termios::from(settings);
+        termios.c_iflag |= TERMIOS_INPUT_IGNORED;
+        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
+        termios.c_iflag |= 0x8; // PARMRK changes how input is delivered.
+        assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
+    }
+
+    #[test]
     fn unsupported_modes_are_not_silently_accepted() {
         for (index, value) in [(5, 1), (6, 2), (10, 26), (13, 15)] {
             let mut settings = Termios::from(TerminalSettings::default());
@@ -1035,6 +1051,19 @@ mod termios_tests {
         let mut settings = Termios::from(TerminalSettings::default());
         settings.c_lflag |= 0x100; // TOSTOP requires job control.
         assert_eq!(TerminalSettings::try_from(&settings), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn tab_expansion_round_trips_but_tab_delays_are_rejected() {
+        let mut termios = Termios::from(TerminalSettings::default());
+        termios.c_oflag |= 0x1800; // TAB3
+        let settings = TerminalSettings::try_from(&termios).unwrap();
+        assert!(settings.output.contains(OutputFlags::EXPAND_TABS));
+        assert_eq!(Termios::from(settings).c_oflag, termios.c_oflag);
+        for delay in [0x800, 0x1000] {
+            termios.c_oflag = (termios.c_oflag & !0x1800) | delay;
+            assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
+        }
     }
 }
 

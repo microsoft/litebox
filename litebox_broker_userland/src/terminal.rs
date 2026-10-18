@@ -50,6 +50,8 @@ struct State {
     status: Status,
     draining: bool,
     drained: bool,
+    /// The readiness flags last published.
+    published: ReadinessFlags,
 }
 
 impl State {
@@ -59,7 +61,8 @@ impl State {
             flags = flags | ReadinessFlags::READ;
         }
         if self.status != Status::Active
-            || self.output.len() <= OUTPUT_CAPACITY - 2 * ATOMIC_WRITE_SIZE
+            || self.output.len()
+                <= OUTPUT_CAPACITY - self.engine.output_expansion() * ATOMIC_WRITE_SIZE
         {
             flags = flags | ReadinessFlags::WRITE;
         }
@@ -72,23 +75,38 @@ impl State {
         flags
     }
 
+    /// Wakes every watcher, even if the readiness flags are unchanged.
     fn publish(&mut self) {
-        let flags = self.readiness();
-        self.watchers.publish(flags);
+        self.published = self.readiness();
+        self.watchers.publish(self.published);
     }
 
-    fn process_input(&mut self) {
-        let mut input_overrun = false;
+    /// Publishes the readiness flags if they changed, so the worker's periodic
+    /// resize checks do not wake watchers, including edge-triggered readiness
+    /// queue entries. Guest reads and writes publish too, so a later return to
+    /// the published flags is not mistaken for no change.
+    fn publish_if_changed(&mut self) {
+        let flags = self.readiness();
+        if flags != self.published {
+            self.published = flags;
+            self.watchers.publish_if_changed(flags);
+        }
+    }
+
+    /// Processes pending input and returns whether it discarded pending output,
+    /// which the host may also be holding.
+    fn process_input(&mut self) -> bool {
         let mut echo_overrun = false;
+        let mut flushed = false;
         while let Some(byte) = self.pending_input.front().copied() {
             let result = self.engine.receive(&[byte]);
             if result.consumed == 0 {
                 break;
             }
             self.pending_input.pop_front();
-            input_overrun |= result.input_overrun;
             if result.flush_output {
                 self.output.clear();
+                flushed = true;
             }
             // Echo is best-effort under output backpressure, as with a bounded
             // terminal-driver echo buffer. Guest writes are never discarded.
@@ -106,12 +124,10 @@ impl State {
                 sink.post(result.events);
             }
         }
-        if input_overrun {
-            litebox_util_log::warn!("terminal input buffer overrun");
-        }
         if echo_overrun {
             litebox_util_log::warn!("terminal echo buffer overrun");
         }
+        flushed
     }
 
     fn hang_up(&mut self) {
@@ -176,9 +192,13 @@ impl Shared {
             if state.status == Status::Stopping {
                 return Ok(());
             }
-            state.process_input();
+            // Also discard output the host has yet to send. Echo of the
+            // processed input is still queued here, so it survives.
+            if state.process_input() && state.status == Status::Active {
+                transport.flush(false, true)?;
+            }
             if state.status == Status::HungUp {
-                state.publish();
+                state.publish_if_changed();
                 self.changed.notify_all();
                 drop(state);
                 transport.wait(ReadinessFlags::default(), None)?;
@@ -197,6 +217,11 @@ impl Shared {
                 if drained {
                     state.drained = state.output.is_empty();
                     state.draining = !state.drained;
+                    if state.drained {
+                        // Draining waiters wait for writability, which was
+                        // already published.
+                        state.publish();
+                    }
                     self.changed.notify_all();
                 }
             }
@@ -207,7 +232,7 @@ impl Shared {
                     sink.post(TerminalEvents::RESIZE);
                 }
             }
-            state.publish();
+            state.publish_if_changed();
             let mut interest = ReadinessFlags::HANGUP;
             if state.sink.is_some()
                 && state.pending_input.is_empty()
@@ -254,7 +279,7 @@ impl Shared {
                     Err(error) => return Err(error),
                 }
             }
-            state.publish();
+            state.publish_if_changed();
             self.changed.notify_all();
         }
     }
@@ -284,6 +309,7 @@ impl HostTerminal {
                 status: Status::Active,
                 draining: false,
                 drained: true,
+                published: ReadinessFlags::default(),
             }),
             changed: Condvar::new(),
         });
@@ -309,6 +335,7 @@ impl HostTerminal {
             state.process_input();
         }
         if let Some(count) = state.engine.read(output) {
+            state.publish_if_changed();
             self.shared.wake();
             return Ok(count);
         }
@@ -323,7 +350,7 @@ impl HostTerminal {
         if state.status != Status::Active {
             return Err(StdioProviderError::Failed);
         }
-        let available = (OUTPUT_CAPACITY - state.output.len()) / 2;
+        let available = (OUTPUT_CAPACITY - state.output.len()) / state.engine.output_expansion();
         if (available == 0 && !input.is_empty())
             || (input.len() <= ATOMIC_WRITE_SIZE && input.len() > available)
         {
@@ -332,16 +359,21 @@ impl HostTerminal {
         let (consumed, bytes) = state.engine.output(input, available);
         state.output.extend(bytes);
         state.drained = false;
+        state.publish_if_changed();
         self.shared.wake();
         Ok(consumed)
     }
 
     pub(crate) fn flush(&self) -> io::Result<()> {
         let mut state = self.shared.lock();
-        state.draining = true;
         state.drained = false;
-        self.shared.wake();
         while !state.drained && state.status == Status::Active {
+            // Output such as echo can follow a completed drain before this
+            // thread wakes, so drain again.
+            if !state.draining {
+                state.draining = true;
+                self.shared.wake();
+            }
             state = self
                 .shared
                 .changed
@@ -525,6 +557,36 @@ mod tests {
     }
 
     #[test]
+    fn terminal_tab_expansion_stays_within_output_capacity() {
+        use litebox_broker_protocol::terminal::{OutputFlags, TerminalSettings};
+
+        let (_master, terminal) = open_terminal();
+        let mut state = terminal.shared.lock();
+        state.engine.receive(b"\x13");
+        let settings = state.engine.settings();
+        state
+            .engine
+            .configure(TerminalSettings {
+                output: settings.output | OutputFlags::EXPAND_TABS,
+                ..settings
+            })
+            .unwrap();
+        state
+            .output
+            .extend(vec![b'x'; OUTPUT_CAPACITY - 4 * ATOMIC_WRITE_SIZE]);
+        drop(state);
+        // Writability promises room for a whole atomic write.
+        let tabs = vec![b'\t'; OUTPUT_CAPACITY];
+        assert!(!terminal.readiness().contains(ReadinessFlags::WRITE));
+        assert_eq!(
+            terminal.write(&tabs[..ATOMIC_WRITE_SIZE]),
+            Err(StdioProviderError::WouldBlock)
+        );
+        assert!(terminal.write(&tabs).unwrap() > 0);
+        assert!(terminal.shared.lock().output.len() <= OUTPUT_CAPACITY);
+    }
+
+    #[test]
     fn terminal_abandoned_drain_does_not_block_other_writers() {
         let (_master, terminal) = open_terminal();
         terminal.shared.lock().engine.receive(b"\x13");
@@ -538,6 +600,31 @@ mod tests {
         terminal.shared.lock().engine.receive(b"\x11");
         terminal.shared.wake();
         terminal.flush().unwrap();
+    }
+
+    #[test]
+    fn terminal_flush_drains_output_queued_after_a_completed_drain() {
+        let (_master, terminal) = open_terminal();
+        let terminal = Arc::new(terminal);
+        terminal.shared.lock().engine.receive(b"\x13");
+        assert_eq!(terminal.write(b"output"), Ok(6));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let flusher = Arc::clone(&terminal);
+        std::thread::spawn(move || sender.send(flusher.flush().is_ok()).unwrap());
+        let mut state = terminal.shared.lock();
+        while !state.draining {
+            drop(state);
+            std::thread::sleep(Duration::from_millis(1));
+            state = terminal.shared.lock();
+        }
+        // Act as the worker would after a drain completed just before echo
+        // was queued.
+        state.draining = false;
+        terminal.shared.changed.notify_all();
+        state.engine.receive(b"\x11");
+        drop(state);
+        terminal.shared.wake();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok(true));
     }
 
     #[test]

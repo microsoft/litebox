@@ -23,52 +23,75 @@ use rustix::termios::{OptionalActions, QueueSelector, Termios, Winsize};
 /// separate devpts instances may reuse device numbers.
 type Identity = (c_uint, Option<u64>);
 
-/// Opens the host terminals behind the inherited standard input, output, and
-/// error, in that order. Redirected streams yield `None`, and streams referring
-/// to the same terminal share one transport.
+/// Opens the host terminal that both the inherited standard input and output
+/// refer to, returning it for each of standard input, output, and error that
+/// refers to it, in that order.
+///
+/// Every stream yields `None` unless standard input and output are the same
+/// terminal and it is not the controlling terminal of a background job.
+/// Otherwise the terminal may be shared with other processes, such as the rest
+/// of a shell pipeline, which would lose input to the broker and find the
+/// terminal in raw mode.
 pub fn open_stdio_terminals() -> io::Result<[Option<Arc<LinuxTerminal>>; 3]> {
     let (stdin, stdout, stderr) = (io::stdin(), io::stdout(), io::stderr());
-    let mut terminals: [Option<(Identity, Arc<LinuxTerminal>)>; 3] = Default::default();
-    for (index, fd) in [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()]
-        .into_iter()
-        .enumerate()
-    {
-        if !rustix::termios::isatty(fd) {
-            continue;
-        }
-        let identity = identity(fd)?;
-        // Opening one terminal twice would save its raw attributes as the
-        // original ones.
-        let existing = terminals[..index]
-            .iter()
-            .flatten()
-            .find(|(other, _)| *other == identity)
-            .map(|(_, terminal)| Arc::clone(terminal));
-        let terminal = match existing {
-            Some(terminal) => terminal,
-            None => Arc::new(LinuxTerminal::open(fd)?),
-        };
-        terminals[index] = Some((identity, terminal));
+    let terminal = identity(stdin.as_fd())?;
+    if terminal.is_none() || identity(stdout.as_fd())? != terminal {
+        return Ok([None, None, None]);
     }
-    Ok(terminals.map(|terminal| terminal.map(|(_, terminal)| terminal)))
+    let stderr_shared = identity(stderr.as_fd())? == terminal;
+    // Any alias can open the terminal when an earlier one cannot, as /dev/tty
+    // can after a user switch denies reopening /dev/pts/N.
+    let mut opened = LinuxTerminal::open(stdin.as_fd());
+    for (fd, shared) in [(stdout.as_fd(), true), (stderr.as_fd(), stderr_shared)] {
+        if opened.is_err() && shared {
+            opened = LinuxTerminal::open(fd);
+        }
+    }
+    let opened = Arc::new(opened?);
+    Ok([
+        Some(Arc::clone(&opened)),
+        Some(Arc::clone(&opened)),
+        stderr_shared.then_some(opened),
+    ])
 }
 
-fn identity(fd: BorrowedFd<'_>) -> io::Result<Identity> {
+/// Identifies the terminal `fd` refers to, or returns `None` if it is not a
+/// terminal this process may take over.
+fn identity(fd: BorrowedFd<'_>) -> io::Result<Option<Identity>> {
     const TIOCGDEV: rustix::ioctl::Opcode = rustix::ioctl::opcode::read::<c_uint>(b'T', 0x32);
+    if !rustix::termios::isatty(fd) {
+        return Ok(None);
+    }
     // SAFETY: TIOCGDEV is `_IOR('T', 0x32, unsigned int)`, so the kernel
     // writes exactly the getter's `c_uint` output.
     let device =
         unsafe { rustix::ioctl::ioctl(fd, rustix::ioctl::Getter::<TIOCGDEV, c_uint>::new()) }?;
-    let mount = match rustix::termios::tcgetsid(fd) {
-        // /dev/tty and its direct device node can live on different mounts.
-        // A process has only one controlling terminal, so both aliases agree.
-        Ok(_) => None,
+    let mount = match rustix::termios::tcgetpgrp(fd) {
         Err(Errno::NOTTY) => {
             Some(std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd()))?.dev())
         }
+        // A background job leaves its controlling terminal to the foreground
+        // job: changing it would stop this process with SIGTTOU.
+        Ok(foreground) if foreground.as_raw_nonzero().get() != process_group() => {
+            return Ok(None);
+        }
+        // This process's controlling terminal, whose foreground process group
+        // is this process's or, failing with OPNOTSUPP, is not visible in
+        // this PID namespace. /dev/tty and its direct device node can live on
+        // different mounts. A process has only one controlling terminal, so
+        // both aliases agree.
+        Ok(_) | Err(Errno::OPNOTSUPP) => None,
         Err(error) => return Err(error.into()),
     };
-    Ok((device, mount))
+    Ok(Some((device, mount)))
+}
+
+/// This process's group ID, or 0 if the group lies outside this process's PID
+/// namespace, as under `unshare --pid --fork`. Rustix's nonzero `Pid` cannot
+/// represent the latter.
+fn process_group() -> libc::pid_t {
+    // SAFETY: getpgrp has no preconditions and cannot fail.
+    unsafe { libc::getpgrp() }
 }
 
 /// A Linux host terminal in raw mode.

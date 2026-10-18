@@ -26,6 +26,7 @@ bitflags::bitflags! {
         const CARRIAGE_RETURN_TO_NEWLINE = 1 << 2;
         const OMIT_CARRIAGE_RETURN_AT_COLUMN_ZERO = 1 << 3;
         const NEWLINE_RETURNS_CARRIAGE = 1 << 4;
+        const EXPAND_TABS = 1 << 5;
     }
 }
 
@@ -194,7 +195,7 @@ pub enum TerminalResponse {
 /// A terminal failure that a shim translates to its own ABI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalError {
-    /// The file does not expose a terminal endpoint.
+    /// The file is not a terminal.
     NotTerminal,
     /// The endpoint does not implement this capability.
     Unsupported,

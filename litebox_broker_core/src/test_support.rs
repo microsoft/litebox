@@ -120,6 +120,7 @@ pub struct TestStdioProvider {
     stdin_terminal: bool,
     stdout_terminal: bool,
     stderr_terminal: bool,
+    uncontrolled_terminal: Option<StdioStream>,
     terminal: Arc<TestTerminal>,
 }
 
@@ -137,6 +138,7 @@ impl Default for TestStdioProvider {
             stdin_terminal: false,
             stdout_terminal: false,
             stderr_terminal: false,
+            uncontrolled_terminal: None,
             terminal: Arc::new(TestTerminal(Mutex::new((
                 litebox_broker_protocol::terminal::TerminalSettings::default(),
                 litebox_broker_protocol::terminal::WindowSize::default(),
@@ -155,6 +157,14 @@ impl TestStdioProvider {
             StdioStream::Stderr => self.stderr_terminal = true,
         }
         self
+    }
+
+    /// Marks `stream` as connected to a terminal without an endpoint, like a
+    /// host terminal the provider cannot take over.
+    #[must_use]
+    pub const fn with_uncontrolled_terminal(mut self, stream: StdioStream) -> Self {
+        self.uncontrolled_terminal = Some(stream);
+        self.with_terminal(stream)
     }
 
     /// Keeps standard input open, so reads of empty input fail with
@@ -205,7 +215,7 @@ impl StdioProvider for TestStdioProvider {
             StdioStream::Stdin => self.stdin_terminal,
             StdioStream::Stdout => self.stdout_terminal,
             StdioStream::Stderr => self.stderr_terminal,
-        };
+        } && self.uncontrolled_terminal != Some(stream);
         connected.then(|| Arc::clone(&self.terminal) as Arc<dyn crate::terminal::TerminalEndpoint>)
     }
 

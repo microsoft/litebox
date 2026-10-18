@@ -2746,6 +2746,7 @@ fn check_broker_tty_line_discipline(alias: bool) {
         String::from_utf8_lossy(&output)
     );
     assert!(output.windows(8).any(|bytes| bytes == b"TTY DONE"));
+    assert!(output.windows(11).any(|bytes| bytes == b"a       b\r\n"));
     let mut restored = original;
     // SAFETY: restored is writable and slave remains live after the broker exits.
     assert_eq!(
@@ -2779,16 +2780,29 @@ fn check_broker_tty_line_discipline(alias: bool) {
 #[test]
 fn test_runner_broker_tty_with_redirected_stdout() {
     use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
     let target = common::compile("./tests/tty.c", "tty_redirect", true, false);
     let mut runner = Runner::new(&target, "tty_redirect");
     runner.arg("redirect");
     let mut pty = common::pty::Pty::open();
     let (stdin, _stdout, stderr) = pty.slave_stdio();
     let mut child = runner.spawn_with_stdio(stdin, std::process::Stdio::piped(), stderr);
-    pty.close_slave();
     let mut output = Vec::new();
     pty.wait_for_output(&mut output, b"REDIRECT READY");
-    pty.write_all(b"\r\x03\x04");
+    // SAFETY: termios contains only integer fields and slave is a live descriptor.
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: attributes is writable storage for the slave's terminal attributes.
+    assert_eq!(
+        unsafe { libc::tcgetattr(pty.slave().as_raw_fd(), &raw mut attributes) },
+        0
+    );
+    assert_eq!(
+        attributes.c_lflag & (libc::ICANON | libc::ECHO),
+        libc::ICANON | libc::ECHO,
+        "the broker took over a terminal shared with a redirected stream"
+    );
+    pty.close_slave();
+    pty.write_all(b"input\n");
     let status = pty.wait_for_child_exit(&mut child, &mut output);
     assert!(
         status.success(),

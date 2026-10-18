@@ -200,8 +200,6 @@ pub struct InputResult {
     pub events: TerminalEvents,
     /// A signal-generating character discarded previously queued output.
     pub flush_output: bool,
-    /// Input was discarded because a control-enabled terminal's queue was full.
-    pub input_overrun: bool,
 }
 
 struct LineByte {
@@ -264,17 +262,12 @@ impl TerminalEngine {
         INPUT_CAPACITY.saturating_sub(self.input.len() + self.line.len() + self.records.len())
     }
 
-    /// Whether the transport should continue receiving. Control-enabled
-    /// terminals must still recognize interrupt and flow-control characters
-    /// when their ordinary input queue is full.
+    /// Whether the transport should continue receiving. A full queue holds
+    /// readable input, so control characters behind it wait for the reader
+    /// rather than discarding ordinary input.
     #[must_use]
     pub fn accepts_input(&self) -> bool {
         self.input_space() >= 2
-            || self
-                .settings
-                .local
-                .intersects(L::CANONICAL | L::GENERATE_EVENTS)
-            || self.settings.input.contains(I::SOFTWARE_FLOW_CONTROL)
     }
 
     #[must_use]
@@ -328,7 +321,9 @@ impl TerminalEngine {
     pub fn receive(&mut self, bytes: &[u8]) -> InputResult {
         let mut result = InputResult::default();
         for &byte in bytes {
-            if !self.accepts_input() || result.echo.len() > INPUT_CAPACITY - 6 * LINE_CAPACITY {
+            // One byte echoes at most eight bytes per line entry, when killing
+            // a line of tabs, so a batch's echo stays within `INPUT_CAPACITY`.
+            if !self.accepts_input() || result.echo.len() > INPUT_CAPACITY - 8 * LINE_CAPACITY {
                 break;
             }
             result.consumed += 1;
@@ -411,11 +406,7 @@ impl TerminalEngine {
                         continue;
                     }
                     if Self::matches(byte, cc.end_of_file) {
-                        if self.input_space() != 0 {
-                            self.commit_line();
-                        } else {
-                            result.input_overrun = true;
-                        }
+                        self.commit_line();
                         continue;
                     }
                     if l.contains(L::EXTENDED_EDITING) {
@@ -455,10 +446,6 @@ impl TerminalEngine {
                     }
                 }
             }
-            if self.input_space() < 2 {
-                result.input_overrun = true;
-                continue;
-            }
             if l.contains(L::CANONICAL) {
                 let delimiter = !quoted
                     && (byte == b'\n'
@@ -490,6 +477,7 @@ impl TerminalEngine {
         let Some(start) = self.last_character_start() else {
             return;
         };
+        let tab = self.line[start].byte == b'\t';
         let width: usize = self
             .line
             .drain(start..)
@@ -499,8 +487,11 @@ impl TerminalEngine {
         if l.contains(L::ECHO) && (force_visual || l.contains(L::ECHO_ERASE)) {
             for _ in 0..width {
                 self.output_byte(b'\x08', echo);
-                self.output_byte(b' ', echo);
-                self.output_byte(b'\x08', echo);
+                // Like Linux, erase a tab by only moving back over its columns.
+                if !tab {
+                    self.output_byte(b' ', echo);
+                    self.output_byte(b'\x08', echo);
+                }
             }
         } else {
             self.echo(self.settings.characters.erase, true, echo);
@@ -565,6 +556,11 @@ impl TerminalEngine {
             } else if byte == b'\n' && flags.contains(O::NEWLINE_TO_CRLF) {
                 output.push(b'\r');
                 self.column = 0;
+            } else if byte == b'\t' && flags.contains(O::EXPAND_TABS) {
+                let spaces = 8 - (self.column & 7);
+                output.resize(output.len() + spaces, b' ');
+                self.column = self.column.saturating_add(spaces);
+                return;
             }
         }
         output.push(byte);
@@ -581,8 +577,20 @@ impl TerminalEngine {
         }
     }
 
+    #[must_use]
+    /// Most transport bytes that [`Self::output`] can generate per input byte
+    /// under the current settings.
+    pub fn output_expansion(&self) -> usize {
+        if self.settings.output.contains(O::PROCESS | O::EXPAND_TABS) {
+            8
+        } else {
+            2
+        }
+    }
+
     /// Transforms a bounded prefix of a guest write. Returns consumed input
-    /// bytes and transport output; at most twice `limit` bytes are generated.
+    /// bytes and transport output; at most [`Self::output_expansion`] times
+    /// `limit` bytes are generated.
     pub fn output(&mut self, input: &[u8], limit: usize) -> (usize, Vec<u8>) {
         let count = input.len().min(limit);
         let mut output = Vec::with_capacity(count * 2);
@@ -734,6 +742,27 @@ mod tests {
         assert!(tty.output_stopped());
         tty.receive(b"\x11");
         assert!(!tty.output_stopped());
+    }
+
+    #[test]
+    fn tabs_expand_to_the_next_stop_only_when_processed() {
+        let mut tty = TerminalEngine::default();
+        tty.configure(TerminalSettings {
+            output: tty.settings().output | O::EXPAND_TABS,
+            ..tty.settings()
+        })
+        .unwrap();
+        assert_eq!(tty.output_expansion(), 8);
+        assert_eq!(tty.output(b"ab\tc\t\n", 6).1, b"ab      c       \r\n");
+        assert_eq!(tty.receive(b"\t").echo, b" ".repeat(8));
+        assert_eq!(tty.receive(b"\x7f").echo, b"\x08".repeat(8));
+        tty.configure(TerminalSettings {
+            output: O::EXPAND_TABS,
+            ..tty.settings()
+        })
+        .unwrap();
+        assert_eq!(tty.output_expansion(), 2);
+        assert_eq!(tty.output(b"\t", 1).1, b"\t");
     }
 
     #[test]
@@ -968,7 +997,7 @@ mod tests {
             tty.output(b"$ ", 2);
             tty.receive(prefix);
             tty.receive(b"\t");
-            assert_eq!(tty.receive(b"\x7f").echo, b"\x08 \x08".repeat(width));
+            assert_eq!(tty.receive(b"\x7f").echo, b"\x08".repeat(width));
             tty.receive(b"\n");
             let mut bytes = [0; 8];
             assert_eq!(tty.read(&mut bytes), Some(prefix.len() + 1));
@@ -977,7 +1006,7 @@ mod tests {
         let mut tty = TerminalEngine::default();
         tty.output(b"$ ", 2);
         tty.receive(b"a\t\x12");
-        assert_eq!(tty.receive(b"\x7f").echo, b"\x08 \x08".repeat(7));
+        assert_eq!(tty.receive(b"\x7f").echo, b"\x08".repeat(7));
     }
 
     #[test]
@@ -1010,8 +1039,7 @@ mod tests {
     fn input_and_empty_eof_records_are_bounded() {
         let mut tty = TerminalEngine::default();
         let eof = alloc::vec![4; INPUT_CAPACITY * 2];
-        let result = tty.receive(&eof);
-        assert!(result.input_overrun);
+        assert!(tty.receive(&eof).consumed < eof.len());
         assert!(tty.records.len() <= INPUT_CAPACITY);
         tty.flush_input();
         tty.receive(&alloc::vec![b'x'; LINE_CAPACITY * 2]);
@@ -1033,29 +1061,45 @@ mod tests {
         tty.output(&alloc::vec![b'x'; INPUT_CAPACITY], INPUT_CAPACITY);
         let result = tty.receive(b"\t\x7f");
         assert!(result.echo.len() <= 25);
+        for erase in [21, 23] {
+            let mut input = alloc::vec![b'\t'; LINE_CAPACITY - 1];
+            input.push(erase);
+            let result = tty.receive(&input);
+            assert_eq!(result.consumed, input.len());
+            assert!(tty.line.is_empty());
+            assert!(result.echo.len() <= INPUT_CAPACITY);
+        }
     }
 
     #[test]
-    fn full_input_does_not_block_interrupts_but_raw_input_is_backpressured() {
-        let mut tty = TerminalEngine::default();
-        tty.configure(TerminalSettings {
-            local: L::CANONICAL | L::GENERATE_EVENTS,
-            ..tty.settings()
-        })
-        .unwrap();
-        tty.receive(&alloc::vec![b'\n'; INPUT_CAPACITY]);
-        assert!(tty.input_space() < 2);
-        assert!(tty.receive(b"x").input_overrun);
-        assert_eq!(tty.receive(b"\x03").events, TerminalEvents::INTERRUPT);
-        assert_eq!(tty.input_space(), INPUT_CAPACITY);
-        tty.configure(TerminalSettings {
-            input: I::empty(),
-            local: L::empty(),
-            ..tty.settings()
-        })
-        .unwrap();
-        tty.receive(&alloc::vec![b'x'; INPUT_CAPACITY]);
-        assert!(!tty.accepts_input());
-        assert_eq!(tty.receive(b"more").consumed, 0);
+    fn full_input_is_backpressured_without_loss() {
+        let paste: Vec<u8> = (0..INPUT_CAPACITY * 2)
+            .map(|index| if index % 64 == 63 { b'\n' } else { b'x' })
+            .collect();
+        for local in [L::CANONICAL | L::GENERATE_EVENTS, L::GENERATE_EVENTS] {
+            let mut tty = TerminalEngine::default();
+            tty.configure(TerminalSettings {
+                local,
+                ..tty.settings()
+            })
+            .unwrap();
+            let mut offset = tty.receive(&paste).consumed;
+            assert!(offset < paste.len());
+            assert!(!tty.accepts_input());
+            assert_eq!(tty.receive(b"\x03").consumed, 0);
+            let mut received = Vec::new();
+            let mut bytes = alloc::vec![0; INPUT_CAPACITY];
+            while received.len() < paste.len() {
+                match tty.read(&mut bytes) {
+                    Some(count) if count != 0 => received.extend_from_slice(&bytes[..count]),
+                    _ => {
+                        let consumed = tty.receive(&paste[offset..]).consumed;
+                        assert_ne!(consumed, 0);
+                        offset += consumed;
+                    }
+                }
+            }
+            assert_eq!(received, paste);
+        }
     }
 }

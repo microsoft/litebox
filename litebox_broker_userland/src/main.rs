@@ -408,7 +408,10 @@ fn accept_runner_channel<Channel>(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
     #[cfg(target_os = "linux")]
-    let stdio = Arc::new(UserlandStdioProvider::open_terminals()?);
+    // Terminal workers are host threads, so guest signals must not reach them.
+    let stdio = Arc::new(litebox_platform_linux_userland::with_guest_signals_blocked(
+        UserlandStdioProvider::open_terminals,
+    )?);
     #[cfg(not(target_os = "linux"))]
     let stdio = Arc::new(UserlandStdioProvider::default());
     #[cfg(target_os = "linux")]

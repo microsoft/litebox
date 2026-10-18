@@ -50,20 +50,31 @@ impl Default for UserlandStdioProvider {
 }
 
 impl UserlandStdioProvider {
-    /// Opens the host terminals behind the inherited standard streams in raw
-    /// mode. Redirected streams keep the ordinary stdio path. Call
-    /// [`close_terminals`](Self::close_terminals) to restore the terminals.
+    /// Opens the host terminal behind the inherited standard input and output
+    /// in raw mode. Streams not referring to it, and all streams unless
+    /// standard input and output share a terminal the broker can take over,
+    /// keep the ordinary stdio path. Call
+    /// [`close_terminals`](Self::close_terminals) to restore the terminal.
     // Only Linux hosts have a terminal transport so far; other hosts pass
     // their standard streams through without terminal control until support
     // for them is added.
     #[cfg(target_os = "linux")]
     pub fn open_terminals() -> std::io::Result<Self> {
-        let transports = litebox_broker_platform_linux_userland::terminal::open_stdio_terminals()?;
-        Self::with_terminals(
-            transports.map(|transport| {
-                transport.map(|transport| transport as Arc<dyn TerminalTransport>)
-            }),
-        )
+        let transports =
+            match litebox_broker_platform_linux_userland::terminal::open_stdio_terminals() {
+                Ok(transports) => transports.map(|transport| {
+                    transport.map(|transport| transport as Arc<dyn TerminalTransport>)
+                }),
+                Err(error) => {
+                    // For example, a terminal owned by another user after `su`.
+                    litebox_util_log::warn!(
+                        error:% = error;
+                        "serving the standard streams without terminal control"
+                    );
+                    Default::default()
+                }
+            };
+        Self::with_terminals(transports)
     }
 
     /// Serves the standard streams with host terminals in place of

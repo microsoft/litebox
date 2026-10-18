@@ -603,6 +603,9 @@ pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<File
 /// a file opened only for path-based operations and reports [`NotTerminal`] for any other file
 /// that is not a terminal, so a caller can classify a handle with a single request.
 ///
+/// A terminal without an endpoint, such as a host terminal the broker cannot take over, reports
+/// default settings and an unknown window size, and accepts changes without applying them.
+///
 /// [`NotTerminal`]: litebox_broker_protocol::terminal::TerminalError::NotTerminal
 pub fn terminal_control(
     process: &BrokerProcess,
@@ -614,15 +617,25 @@ pub fn terminal_control(
         litebox_broker_protocol::terminal::TerminalError,
     >,
 > {
+    use litebox_broker_protocol::terminal::{
+        TerminalError, TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
+    };
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     let Some(terminal) = &file.terminal else {
         let flags = process.core.fs.get_status_flags(&file)?.flags;
         if flags.contains(FileOpenFlags::PATH) {
             return Err(BrokerError::InvalidRights);
         }
-        return Ok(Err(
-            litebox_broker_protocol::terminal::TerminalError::NotTerminal,
-        ));
+        if !matches!(process.core.fs.is_terminal(&file)?, Ok(true)) {
+            return Ok(Err(TerminalError::NotTerminal));
+        }
+        return Ok(Ok(match operation {
+            TerminalOperation::GetSettings => {
+                TerminalResponse::Settings(TerminalSettings::default())
+            }
+            TerminalOperation::GetWindowSize => TerminalResponse::WindowSize(WindowSize::default()),
+            _ => TerminalResponse::Done,
+        }));
     };
     terminal.control(operation)
 }
