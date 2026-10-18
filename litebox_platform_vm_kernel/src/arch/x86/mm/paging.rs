@@ -1,8 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use arrayvec::ArrayVec;
 use core::ops::Range;
+use hashbrown::HashMap;
 use litebox::mm::page::PageRange;
 use litebox::platform::page_mgmt;
 use litebox::utils::TruncateExt;
@@ -16,8 +19,8 @@ use x86_64::{
             PageTableFlags, PhysFrame, Size4KiB, Translate,
             frame::PhysFrameRange,
             mapper::{
-                CleanUp, FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
-                UnmapError as X64UnmapError,
+                CleanUp, FlagUpdateError, MapToError, MappedFrame, PageTableFrameMapping,
+                TranslateResult,
             },
             page_table::PageTableEntry,
         },
@@ -27,7 +30,7 @@ use x86_64::{
 use crate::UserMutPtr;
 use crate::mm::{
     MemoryProvider,
-    pgtable::{PROT_NONE, PageTableAllocator, PageTableImpl},
+    pgtable::{COW, PROT_NONE, PageTableAllocator, PageTableImpl},
 };
 
 /// Above this many pages, a full TLB flush is cheaper than `invlpg` per page
@@ -45,6 +48,10 @@ const PML4_INDEX_MASK: u64 = (1 << PAGE_TABLE_LEVEL_BITS) - 1;
 /// Kernel slots share fixed P3/P2/P1 tables; lower slots must be privately owned.
 pub(crate) const KERNEL_PML4_START: usize =
     ((crate::KERNEL_OFFSET >> PML4_SHIFT) & PML4_INDEX_MASK) as usize;
+
+/// The end of the user PML4 slots: the lower canonical half. The private
+/// slots above it, up to [`KERNEL_PML4_START`], hold no user address.
+const USER_PML4_END: usize = (1 << PAGE_TABLE_LEVEL_BITS) / 2;
 
 /// Flush the local TLB only; correct for a single CPU.
 /// TODO(SMP): shoot down other cores.
@@ -85,8 +92,192 @@ fn leaf_entry<M: MemoryProvider>(
     Some(&mut table[page.p1_index()])
 }
 
+/// Calls `f` with each leaf entry of the user PML4 slots (below
+/// [`USER_PML4_END`]) and its page.
+fn for_each_user_leaf<'a, M: MemoryProvider>(
+    p4: &'a mut PageTable,
+    mut f: impl FnMut(Page<Size4KiB>, &mut PageTableEntry),
+) {
+    let next = |entry: &PageTableEntry| -> Option<&'a mut PageTable> {
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            litebox_util_log::error!("BUG: huge pages are not supported");
+            debug_assert!(false, "huge pages are not supported");
+            return None;
+        }
+        // Safety: a live intermediate table of the page table whose P4 the
+        // caller holds exclusively.
+        Some(unsafe { &mut *frame_to_pointer::<M>(entry.frame().ok()?) })
+    };
+    for (p4_index, p4_entry) in p4.iter().enumerate().take(USER_PML4_END) {
+        let Some(p3) = next(p4_entry) else { continue };
+        for (p3_index, p3_entry) in p3.iter().enumerate() {
+            let Some(p2) = next(p3_entry) else { continue };
+            for (p2_index, p2_entry) in p2.iter().enumerate() {
+                let Some(p1) = next(p2_entry) else { continue };
+                for (p1_index, p1_entry) in p1.iter_mut().enumerate() {
+                    let address = (p4_index << PML4_SHIFT)
+                        | (p3_index << P3_SHIFT)
+                        | (p2_index << P2_SHIFT)
+                        | (p1_index << PAGE_SHIFT);
+                    let page = Page::from_start_address(VirtAddr::new(address as u64))
+                        .expect("lower-half indices make an aligned canonical address");
+                    f(page, p1_entry);
+                }
+            }
+        }
+    }
+}
+
+/// The frames that more than one user leaf maps, each with [`COW`], and how
+/// many leaves map each. A frame it does not count belongs to its one leaf.
+static SHARED_FRAMES: spin::Once<spin::Mutex<SharedFrames>> = spin::Once::new();
+
+/// [`SHARED_FRAMES`], locked.
+pub(crate) fn shared_frames() -> spin::MutexGuard<'static, SharedFrames> {
+    SHARED_FRAMES.call_once(Default::default).lock()
+}
+
+/// Frames per block of [`SharedFrames`]: a page of counts, for 4 MiB of RAM.
+const BLOCK_FRAMES: usize = (1 << PAGE_SHIFT) / size_of::<u32>();
+
+/// Leaf counts by frame number, in blocks of a page: the kernel heap, which
+/// page frames come from too, may have no larger free block. A block lives
+/// only while one of its frames is shared. Room to count a leaf is reserved,
+/// fallibly, before a second leaf maps a frame ([`Self::reserve`]); nothing
+/// else allocates.
+#[derive(Default)]
+pub(crate) struct SharedFrames {
+    /// By frame number divided by [`BLOCK_FRAMES`].
+    blocks: HashMap<u64, Block>,
+}
+
+struct Block {
+    /// How many of its frames are shared.
+    shared: usize,
+    /// By frame number modulo [`BLOCK_FRAMES`]: a shared frame's leaves (at
+    /// least 2), or 0.
+    leaves: Vec<u32>,
+}
+
+impl Block {
+    /// With no frame shared; `None` if the heap is exhausted.
+    fn new() -> Option<Self> {
+        let mut leaves = Vec::new();
+        leaves.try_reserve_exact(BLOCK_FRAMES).ok()?;
+        leaves.resize(BLOCK_FRAMES, 0);
+        Some(Self { shared: 0, leaves })
+    }
+}
+
+/// The key of `frame`'s block in [`SharedFrames`], and its index there.
+fn block_index(frame: PhysFrame) -> (u64, usize) {
+    let number = frame.start_address().as_u64() / Size4KiB::SIZE;
+    let frames = BLOCK_FRAMES as u64;
+    (number / frames, (number % frames).trunc())
+}
+
+impl SharedFrames {
+    /// Whether more than one leaf maps `frame`.
+    fn contains(&self, frame: PhysFrame) -> bool {
+        let (key, index) = block_index(frame);
+        self.blocks
+            .get(&key)
+            .is_some_and(|block| block.leaves[index] != 0)
+    }
+
+    /// Makes room for [`Self::add_leaf`] to count one more leaf of `frame`.
+    /// If `frame` has no block, returns a new one, with room for it in the
+    /// map, which `add_leaf` adds: until then, dropping it frees it.
+    ///
+    /// # Errors
+    ///
+    /// `OutOfMemory` if the heap is exhausted, or `frame`'s count is at its
+    /// maximum.
+    fn reserve(&mut self, frame: PhysFrame) -> Result<Option<Block>, page_mgmt::AllocationError> {
+        let (key, index) = block_index(frame);
+        if let Some(block) = self.blocks.get(&key) {
+            return if block.leaves[index] == u32::MAX {
+                Err(page_mgmt::AllocationError::OutOfMemory)
+            } else {
+                Ok(None)
+            };
+        }
+        self.blocks
+            .try_reserve(1)
+            .map_err(|_| page_mgmt::AllocationError::OutOfMemory)?;
+        Block::new()
+            .map(Some)
+            .ok_or(page_mgmt::AllocationError::OutOfMemory)
+    }
+
+    /// Counts one more leaf of `frame`, with the `room` that [`Self::reserve`]
+    /// made.
+    fn add_leaf(&mut self, frame: PhysFrame, room: Option<Block>) {
+        let (key, index) = block_index(frame);
+        let block = match room {
+            Some(new) => self.blocks.entry(key).or_insert(new),
+            None => self
+                .blocks
+                .get_mut(&key)
+                .expect("a reserved frame has a block"),
+        };
+        let leaves = &mut block.leaves[index];
+        if *leaves == 0 {
+            // Its first leaf, and this one.
+            *leaves = 2;
+            block.shared += 1;
+        } else {
+            *leaves += 1;
+        }
+    }
+
+    /// Counts one leaf of `frame` fewer; false if no other leaf maps it, so
+    /// it was the leaf's alone.
+    fn remove_leaf(&mut self, frame: PhysFrame) -> bool {
+        let (key, index) = block_index(frame);
+        let Some(block) = self.blocks.get_mut(&key) else {
+            return false;
+        };
+        match block.leaves[index] {
+            0 => return false,
+            2 => {
+                block.leaves[index] = 0;
+                block.shared -= 1;
+                if block.shared == 0 {
+                    self.blocks.remove(&key);
+                }
+            }
+            _ => block.leaves[index] -= 1,
+        }
+        true
+    }
+
+    /// Whether no block is left, as none is once no frame is shared.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// Releases a user leaf's frame, mapped with `flags`, which the leaf no
+/// longer maps: frees it unless another leaf maps it.
+///
+/// # Safety
+///
+/// No access or stale translation through the leaf may remain.
+unsafe fn release_user_frame<M: MemoryProvider>(frame: PhysFrame, flags: PageTableFlags) {
+    if flags.contains(COW) && shared_frames().remove_leaf(frame) {
+        return;
+    }
+    // Safety: the leaf was the frame's only one, and the caller guarantees
+    // nothing reaches it through it anymore.
+    unsafe { PageTableAllocator::<M>::new().deallocate_frame(frame) };
+}
+
 pub(crate) struct X64PageTable<'a, M: MemoryProvider, const ALIGN: usize> {
     inner: spin::mutex::SpinMutex<MappedPageTable<'a, FrameMapping<M>>>,
+    /// The ranges of [`Self::pin`]: their frames are never shared.
+    pinned: spin::Mutex<Vec<Range<usize>>>,
 }
 
 struct FrameMapping<M: MemoryProvider> {
@@ -223,29 +414,15 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         let mut inner = self.inner.lock();
 
-        let mut unmap_one = |page: Page<Size4KiB>| -> Option<PhysFrame<Size4KiB>> {
-            match inner.unmap(page) {
-                Ok((frame, _)) => Some(frame),
-                Err(X64UnmapError::PageNotMapped) => {
-                    // The mapper's unmap requires PRESENT; retained PROT_NONE
-                    // leaves must be cleared without making them accessible.
-                    let entry = leaf_entry::<M>(inner.level_4_table_mut(), page)?;
-                    if !entry.flags().contains(PROT_NONE) {
-                        return None;
-                    }
-                    let frame = PhysFrame::containing_address(entry.addr());
-                    entry.set_unused();
-                    Some(frame)
-                }
-                Err(X64UnmapError::ParentEntryHugePage) => {
-                    litebox_util_log::error!("BUG: attempt to unmap a huge page");
-                    None
-                }
-                Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                    litebox_util_log::error!(pa:? = pa; "BUG: attempt to unmap an invalid frame address");
-                    None
-                }
+        // Present and retained PROT_NONE leaves alike.
+        let mut unmap_one = |page: Page<Size4KiB>| -> Option<(PhysFrame, PageTableFlags)> {
+            let entry = leaf_entry::<M>(inner.level_4_table_mut(), page)?;
+            if entry.is_unused() {
+                return None;
             }
+            let leaf = (PhysFrame::containing_address(entry.addr()), entry.flags());
+            entry.set_unused();
+            Some(leaf)
         };
 
         match (options.free_frames, options.flush_tlb) {
@@ -264,43 +441,43 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
             (true, false) => {
                 for page in Page::range(start, end) {
-                    if let Some(frame) = unmap_one(page) {
+                    if let Some((frame, flags)) = unmap_one(page) {
                         // Safety: unmapped, and the caller guarantees no use or
                         // stale translation remains.
-                        unsafe { allocator.deallocate_frame(frame) };
+                        unsafe { release_user_frame::<M>(frame, flags) };
                     }
                 }
             }
             (true, true) => {
                 // Flush stale translations before any frame can be reused.
-                let mut unmapped_frames: ArrayVec<PhysFrame<Size4KiB>, UNMAP_BATCH> =
+                let mut unmapped: ArrayVec<(PhysFrame, PageTableFlags), UNMAP_BATCH> =
                     ArrayVec::new();
                 let mut flush_start = start;
                 for (i, page) in Page::range(start, end).enumerate() {
-                    if let Some(frame) = unmap_one(page) {
-                        unmapped_frames.push(frame);
+                    if let Some(leaf) = unmap_one(page) {
+                        unmapped.push(leaf);
                     }
                     if (i + 1) % UNMAP_BATCH == 0 {
-                        if !unmapped_frames.is_empty() {
+                        if !unmapped.is_empty() {
                             flush_tlb_range(flush_start, UNMAP_BATCH);
-                            for frame in unmapped_frames.drain(..) {
+                            for (frame, flags) in unmapped.drain(..) {
                                 // Safety: unmapped and flushed; the caller
                                 // guarantees nothing else uses it.
-                                unsafe { allocator.deallocate_frame(frame) };
+                                unsafe { release_user_frame::<M>(frame, flags) };
                             }
                         }
                         flush_start = page + 1;
                     }
                 }
 
-                if !unmapped_frames.is_empty() {
+                if !unmapped.is_empty() {
                     let count = ((end.start_address() - flush_start.start_address())
                         / Size4KiB::SIZE)
                         .trunc();
                     flush_tlb_range(flush_start, count);
-                    for frame in unmapped_frames.drain(..) {
+                    for (frame, flags) in unmapped.drain(..) {
                         // Safety: as above.
-                        unsafe { allocator.deallocate_frame(frame) };
+                        unsafe { release_user_frame::<M>(frame, flags) };
                     }
                 }
             }
@@ -337,9 +514,13 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     offset: _,
                     flags,
                 } => {
-                    // COW is unsupported: install WRITABLE eagerly. Teardown
-                    // assumes exclusive frame ownership, not refcounts.
-                    if flags != new_flags {
+                    // A shared frame becomes writable only through a write fault.
+                    let new_flags = if flags.contains(COW) {
+                        new_flags - PageTableFlags::WRITABLE
+                    } else {
+                        new_flags
+                    };
+                    if flags & Self::MPROTECT_PTE_MASK != new_flags {
                         // Safety: retains the owned frame, including PROT_NONE
                         // leaves; stale translations are flushed below.
                         match unsafe {
@@ -383,24 +564,112 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
-    /// The frame of the present, user-accessible, writable page at `addr`.
-    pub(crate) fn user_writable_frame(&self, addr: VirtAddr) -> Option<PhysFrame<Size4KiB>> {
-        let page = Page::<Size4KiB>::containing_address(addr);
-        match self.inner.lock().translate(page.start_address()) {
-            TranslateResult::Mapped {
-                frame: x86_64::structures::paging::mapper::MappedFrame::Size4KiB(frame),
-                offset: _,
-                flags,
-            } if flags.contains(
-                PageTableFlags::PRESENT
-                    | PageTableFlags::USER_ACCESSIBLE
-                    | PageTableFlags::WRITABLE,
-            ) =>
+    /// The frames of `range`, all present, user-accessible, and writable
+    /// (so none shared), which [`Self::clone_user_mappings`] leaves out of
+    /// clones (so they are never shared), until [`Self::unpin`]; `None` if
+    /// any is not.
+    pub(crate) fn pin(&self, range: PageRange<ALIGN>) -> Option<Box<[PhysFrame]>> {
+        let inner = self.inner.lock();
+        let frames = range
+            .into_iter()
+            .map(|addr| match inner.translate(VirtAddr::new(addr as u64)) {
+                TranslateResult::Mapped {
+                    frame: MappedFrame::Size4KiB(frame),
+                    offset: _,
+                    flags,
+                } if flags.contains(
+                    PageTableFlags::PRESENT
+                        | PageTableFlags::USER_ACCESSIBLE
+                        | PageTableFlags::WRITABLE,
+                ) =>
+                {
+                    Some(frame)
+                }
+                _ => None,
+            })
+            .collect::<Option<Box<_>>>()?;
+        self.pinned.lock().push(range.start()..range.end());
+        Some(frames)
+    }
+
+    /// Ends one [`Self::pin`] of `range`.
+    pub(crate) fn unpin(&self, range: PageRange<ALIGN>) {
+        let mut pinned = self.pinned.lock();
+        let index = pinned
+            .iter()
+            .position(|pin| *pin == (range.start()..range.end()))
+            .expect("unpinning a pinned range");
+        pinned.swap_remove(index);
+    }
+
+    /// Maps every user leaf of `self` but those of pinned ranges (see
+    /// [`Self::pin`]) in `dst`, which has none. Pinned ranges are the
+    /// kernel's (e.g., a broker control ring), and `dst`'s owner maps its own.
+    /// Any other frame is shared: both leaves map it, [`COW`] (and so not
+    /// writable).
+    ///
+    /// # Errors
+    ///
+    /// `OutOfMemory`, for frames of `dst`'s page tables or for room in
+    /// [`SHARED_FRAMES`]; `dst` then maps only some of the leaves, which
+    /// dropping it releases.
+    pub(crate) fn clone_user_mappings(&self, dst: &Self) -> Result<(), page_mgmt::AllocationError> {
+        let pinned = self.pinned.lock().clone();
+        let mut allocator = PageTableAllocator::<M>::new();
+        // ACCESSED and DIRTY are preset so the page walker never has to set them.
+        let table_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::ACCESSED
+            | PageTableFlags::DIRTY;
+        let mut src = self.inner.lock();
+        let mut dst = dst.inner.lock();
+        let mut shared = shared_frames();
+        let mut result = Ok(());
+        for_each_user_leaf::<M>(src.level_4_table_mut(), |page, entry| {
+            let addr: usize = page.start_address().as_u64().trunc();
+            if result.is_err()
+                || entry.is_unused()
+                || pinned.iter().any(|range| range.contains(&addr))
             {
-                Some(frame)
+                return;
             }
-            _ => None,
-        }
+            let frame = PhysFrame::containing_address(entry.addr());
+            let flags = (entry.flags() | COW) - PageTableFlags::WRITABLE;
+            // Room to count it below, before `dst` maps it.
+            let room = match shared.reserve(frame) {
+                Ok(room) => room,
+                Err(error) => {
+                    result = Err(error);
+                    return;
+                }
+            };
+            // Safety: `dst` has no user leaves, and the frame is shared as COW
+            // by both leaves.
+            match unsafe {
+                dst.map_to_with_table_flags(page, frame, flags, table_flags, &mut allocator)
+            } {
+                Ok(flush) => flush.ignore(),
+                Err(MapToError::FrameAllocationFailed) => {
+                    result = Err(page_mgmt::AllocationError::OutOfMemory);
+                    return;
+                }
+                Err(error) => panic!("BUG: mapping a leaf in an empty table: {error:?}"),
+            }
+            entry.set_flags(flags);
+            shared.add_leaf(frame, room);
+        });
+        drop(shared);
+        drop(dst);
+        drop(src);
+        // The leaves made read-only may be cached writable.
+        let start =
+            Page::<Size4KiB>::containing_address(VirtAddr::new(crate::USER_ADDR_MIN as u64));
+        flush_tlb_range(
+            start,
+            ((crate::USER_ADDR_MAX - crate::USER_ADDR_MIN) as u64 / Size4KiB::SIZE).trunc(),
+        );
+        result
     }
 
     /// Maps `frame_range` at `PA + offset`: frames in `text` RX, in
@@ -501,15 +770,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
-    /// # Panics
-    ///
-    /// Panics if the frame allocation fails.
-    pub(crate) fn new_top_level() -> Self {
-        let frame = PageTableAllocator::<M>::allocate_frame()
-            .expect("Failed to allocate a new page table frame");
+    /// `None` if the frame allocation fails.
+    pub(crate) fn new_top_level() -> Option<Self> {
+        let frame = PageTableAllocator::<M>::allocate_frame()?;
         // Safety: a fresh zeroed frame is a valid, empty top-level table, owned
         // by the returned object.
-        unsafe { Self::init(frame.start_address()) }
+        Some(unsafe { Self::init(frame.start_address()) })
     }
 
     /// Share `source`'s kernel P3/P2/P1 tables (see [`KERNEL_PML4_START`]).
@@ -561,82 +827,28 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 }
 
 impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> {
-    /// Requires exclusive user frames and a prior non-PCID CR3 reload.
+    /// Requires a prior non-PCID CR3 reload.
     #[expect(clippy::similar_names, reason = "p4_va/p4_pa name the same table")]
     fn drop(&mut self) {
         let mut allocator = PageTableAllocator::<M>::new();
         let mut inner = self.inner.lock();
-        let p4 = inner.level_4_table_mut();
-
-        // Skip the shared kernel PML4 entries.
-        for (p4_index, p4_entry) in p4.iter_mut().enumerate().take(KERNEL_PML4_START) {
-            let Ok(p3_frame) = p4_entry.frame() else {
-                p4_entry.set_unused();
-                continue;
-            };
-            // Safety: a private intermediate table of this page table, which
-            // is being dropped, so nothing else references it.
-            let p3 = unsafe { &mut *frame_to_pointer::<M>(p3_frame) };
-
-            for (p3_index, p3_entry) in p3.iter_mut().enumerate() {
-                if p3_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                    litebox_util_log::error!("BUG: huge pages are not supported");
-                    debug_assert!(false, "huge pages are not supported");
-                    p3_entry.set_unused();
-                    continue;
-                }
-                let Ok(p2_frame) = p3_entry.frame() else {
-                    p3_entry.set_unused();
-                    continue;
-                };
-                // Safety: as for P3.
-                let p2 = unsafe { &mut *frame_to_pointer::<M>(p2_frame) };
-
-                for (p2_index, p2_entry) in p2.iter_mut().enumerate() {
-                    if p2_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                        litebox_util_log::error!("BUG: huge pages are not supported");
-                        debug_assert!(false, "huge pages are not supported");
-                        p2_entry.set_unused();
-                        continue;
-                    }
-                    let Ok(p1_frame) = p2_entry.frame() else {
-                        p2_entry.set_unused();
-                        continue;
-                    };
-                    // Safety: as for P3.
-                    let p1 = unsafe { &mut *frame_to_pointer::<M>(p1_frame) };
-
-                    for (p1_index, p1_entry) in p1.iter_mut().enumerate() {
-                        // Indices >= 256 cannot fall in the user range.
-                        let page_address = (p4_index << PML4_SHIFT)
-                            | (p3_index << P3_SHIFT)
-                            | (p2_index << P2_SHIFT)
-                            | (p1_index << PAGE_SHIFT);
-                        if (crate::USER_ADDR_MIN..crate::USER_ADDR_MAX).contains(&page_address) {
-                            let frame = if p1_entry.flags().contains(PROT_NONE) {
-                                Ok(PhysFrame::containing_address(p1_entry.addr()))
-                            } else {
-                                p1_entry.frame()
-                            };
-                            match frame {
-                                Ok(frame) => {
-                                    // Safety: task user leaf frames are exclusively owned.
-                                    unsafe { allocator.deallocate_frame(frame) };
-                                }
-                                Err(_) if !p1_entry.is_unused() => {
-                                    litebox_util_log::error!(
-                                        "BUG: leaking malformed task leaf during destruction"
-                                    );
-                                    debug_assert!(false, "malformed task leaf during destruction");
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                        p1_entry.set_unused();
-                    }
-                }
+        for_each_user_leaf::<M>(inner.level_4_table_mut(), |page, entry| {
+            let flags = entry.flags();
+            let addr: usize = page.start_address().as_u64().trunc();
+            if (crate::USER_ADDR_MIN..crate::USER_ADDR_MAX).contains(&addr)
+                && flags.intersects(PageTableFlags::PRESENT | PROT_NONE)
+            {
+                let frame = PhysFrame::containing_address(entry.addr());
+                // Safety: the table is being dropped, so nothing reaches the
+                // frame through this leaf anymore.
+                unsafe { release_user_frame::<M>(frame, flags) };
+            } else if !entry.is_unused() {
+                litebox_util_log::error!("BUG: leaking malformed task leaf during destruction");
+                debug_assert!(false, "malformed task leaf during destruction");
             }
-        }
+            entry.set_unused();
+        });
+        let p4 = inner.level_4_table_mut();
 
         let p4_va = core::ptr::from_mut::<PageTable>(p4).cast::<u8>();
         let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
@@ -644,7 +856,8 @@ impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> 
         let end = Page::<Size4KiB>::containing_address(VirtAddr::new(crate::KERNEL_OFFSET - 1));
         debug_assert_eq!(usize::from(end.p4_index()), KERNEL_PML4_START - 1);
 
-        // Safety: all private leaves were cleared above.
+        // Safety: the range covers only the private slots, whose tables only
+        // this table uses.
         unsafe {
             inner.clean_up_addr_range(Page::range_inclusive(start, end), &mut allocator);
         }
@@ -678,6 +891,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
             // Safety: `mapping` translates every frame of this table (see
             // `FrameMapping`).
             inner: unsafe { MappedPageTable::new(p4, mapping) }.into(),
+            pinned: spin::Mutex::new(Vec::new()),
         }
     }
 
@@ -695,25 +909,51 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
         let mut inner = self.inner.lock();
         match inner.translate(page.start_address()) {
             TranslateResult::Mapped {
-                frame: _,
+                frame,
                 offset: _,
-                flags,
+                flags: current,
             } => {
-                if flags.contains(PROT_NONE) {
+                if current.contains(PROT_NONE) {
                     return Err(PageFaultError::AccessError("PROT_NONE"));
                 }
                 if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
-                    if flags.contains(PageTableFlags::WRITABLE) {
+                    if current.contains(PageTableFlags::WRITABLE) {
                         return Ok(());
-                    } else {
-                        #[cfg(debug_assertions)]
-                        todo!("COW");
-                        #[cfg(not(debug_assertions))]
-                        {
-                            litebox_util_log::error!("BUG: Copy-on-Write not implemented");
-                            return Err(PageFaultError::AllocationFailed);
-                        }
                     }
+                    // The caller checked that `flags` allow the write.
+                    if !current.contains(COW) || !flags.contains(PageTableFlags::WRITABLE) {
+                        litebox_util_log::error!(addr:? = page.start_address(); "BUG: write fault on a read-only page");
+                        return Err(PageFaultError::AccessError("write to a read-only page"));
+                    }
+                    let MappedFrame::Size4KiB(frame) = frame else {
+                        return Err(PageFaultError::HugePage);
+                    };
+                    let entry = leaf_entry::<M>(inner.level_4_table_mut(), page)
+                        .expect("a mapped page has a leaf");
+                    if shared_frames().contains(frame) {
+                        let copy = PageTableAllocator::<M>::allocate_frame()
+                            .ok_or(PageFaultError::AllocationFailed)?;
+                        // Safety: both frames are whole pages in the kernel
+                        // mapping, and the copy is fresh. No leaf maps the
+                        // shared frame writable.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                frame_to_pointer::<M>(frame).cast::<u8>(),
+                                frame_to_pointer::<M>(copy).cast::<u8>(),
+                                Size4KiB::SIZE.trunc(),
+                            );
+                        }
+                        entry.set_frame(copy, flags);
+                        flush_tlb_range(page, 1);
+                        // Safety: the leaf maps the copy now, and its stale
+                        // translation is flushed.
+                        unsafe { release_user_frame::<M>(frame, current) };
+                    } else {
+                        // No other leaf maps the frame anymore.
+                        entry.set_flags(flags);
+                        flush_tlb_range(page, 1);
+                    }
+                    return Ok(());
                 }
 
                 if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {

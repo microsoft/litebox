@@ -283,12 +283,25 @@ impl PageTableManager {
         Ok(())
     }
 
-    /// Shares the base table's kernel P3/P2/P1 tables.
-    pub(crate) fn create_task_page_table(&self) -> AddressSpaceId {
-        let pt = mm::PageTable::new_top_level();
+    /// Shares the base table's kernel P3/P2/P1 tables, and has `source`'s user
+    /// mappings, if any (see [`VmKernel::clone_address_space`]).
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM`, as for [`VmKernel::clone_address_space`].
+    pub(crate) fn create_task_page_table(
+        &self,
+        source: Option<&mm::PageTable<PAGE_SIZE>>,
+    ) -> Result<AddressSpaceId, Errno> {
+        let pt = mm::PageTable::new_top_level().ok_or(Errno::ENOMEM)?;
 
         // Sharing is safe because the kernel mappings are fixed after boot.
         pt.copy_pml4_entries_from(&self.base_page_table);
+        if let Some(source) = source {
+            // Not registered yet: on failure, dropping it releases what it
+            // maps.
+            source.clone_user_mappings(&pt).map_err(|_| Errno::ENOMEM)?;
+        }
 
         let pt = Arc::new(pt);
         let task_pt_id = AddressSpaceId(pt.physical_frame().start_address().as_u64().trunc());
@@ -296,15 +309,32 @@ impl PageTableManager {
         let mut task_pts = self.task_page_tables.write();
         task_pts.insert(task_pt_id, pt);
 
-        task_pt_id
+        Ok(task_pt_id)
+    }
+
+    /// See [`VmKernel::clone_address_space`].
+    pub(crate) fn clone_task_page_table(
+        &self,
+        source: AddressSpaceId,
+    ) -> Result<AddressSpaceId, Errno> {
+        if source == AddressSpaceId::KERNEL {
+            return Err(Errno::EINVAL);
+        }
+        let source = Arc::clone(
+            self.task_page_tables
+                .read()
+                .get(&source)
+                .ok_or(Errno::ENOENT)?,
+        );
+        self.create_task_page_table(Some(&source))
     }
 
     /// Unregisters a task table; retained handles keep it alive.
     ///
     /// # Safety
     ///
-    /// The caller must ensure final destruction is safe: user leaf frames are
-    /// exclusively owned and no access outlives all remaining handles.
+    /// The caller must ensure final destruction is safe: no access outlives
+    /// all remaining handles.
     ///
     /// Returns `EINVAL` for the base ID and `ENOENT` if it is not registered.
     pub(crate) unsafe fn unregister_task_page_table(
@@ -475,7 +505,8 @@ impl VmKernel {
                 .all(|r| KERNEL_OFFSET + r.end.start_address().as_u64() <= IOREMAP.start),
             "guest RAM extends past the direct map"
         );
-        let base_pt = mm::PageTable::new_top_level();
+        let base_pt =
+            mm::PageTable::new_top_level().expect("Failed to allocate a new page table frame");
         base_pt.preallocate_kernel_slot(VirtAddr::new(IOREMAP.start));
         let image_frames = PhysFrame::range(
             PhysFrame::containing_address(image.start),
@@ -565,15 +596,17 @@ impl VmKernel {
     ///
     /// Panics if the page allocator is exhausted.
     pub fn create_address_space(&self) -> AddressSpaceId {
-        self.page_table_manager.create_task_page_table()
+        self.page_table_manager
+            .create_task_page_table(None)
+            .expect("Failed to allocate a new page table frame")
     }
 
     /// Unregisters a task table; retained handles keep it alive.
     ///
     /// # Safety
     ///
-    /// The caller must ensure final destruction is safe: user leaf frames are
-    /// exclusively owned and no access outlives all remaining handles.
+    /// The caller must ensure final destruction is safe: no access outlives
+    /// all remaining handles.
     ///
     /// Returns `EINVAL` for the base ID and `ENOENT` if it is not registered.
     pub unsafe fn unregister_address_space(&self, task_pt_id: AddressSpaceId) -> Result<(), Errno> {
@@ -637,19 +670,31 @@ impl VmKernel {
                 .get(&address_space)
                 .ok_or(Errno::ENOENT)?,
         );
-        let pages = range
-            .into_iter()
-            .map(|addr| {
-                let frame = page_table
-                    .user_writable_frame(VirtAddr::new(addr as u64))
-                    .ok_or(Errno::EFAULT)?;
-                Ok(Self::pa_to_va(frame.start_address()).as_u64().trunc())
-            })
-            .collect::<Result<_, Errno>>()?;
+        let pages = page_table
+            .pin(range)
+            .ok_or(Errno::EFAULT)?
+            .iter()
+            .map(|frame| Self::pa_to_va(frame.start_address()).as_u64().trunc())
+            .collect();
         Ok(PinnedUserPages {
-            _page_table: page_table,
+            page_table,
+            range,
             pages,
         })
+    }
+
+    /// A new address space with `source`'s user mappings, whose frames the
+    /// two share copy-on-write: each gets its own copy of a page once either
+    /// writes it. Pinned pages (see [`Self::pin_user_pages`]) are not cloned:
+    /// the new address space leaves them unmapped.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` for [`AddressSpaceId::KERNEL`], `ENOENT` for an unknown ID,
+    /// and `ENOMEM` if frames run out (for the new address space's page
+    /// tables), or the kernel heap does (to count the shared frames).
+    pub fn clone_address_space(&self, source: AddressSpaceId) -> Result<AddressSpaceId, Errno> {
+        self.page_table_manager.clone_task_page_table(source)
     }
 }
 
@@ -658,9 +703,16 @@ impl VmKernel {
 /// references.
 pub struct PinnedUserPages {
     /// Keeps the frames alive.
-    _page_table: Arc<mm::PageTable<PAGE_SIZE>>,
+    page_table: Arc<mm::PageTable<PAGE_SIZE>>,
+    range: PageRange<PAGE_SIZE>,
     /// Kernel address of each page.
     pages: alloc::boxed::Box<[usize]>,
+}
+
+impl Drop for PinnedUserPages {
+    fn drop(&mut self) {
+        self.page_table.unpin(self.range);
+    }
 }
 
 impl PinnedUserPages {
