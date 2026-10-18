@@ -1,11 +1,69 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! AArch64 trampoline definitions shared by the rewriter and runtimes.
+//! AArch64 gate ABI shared by the rewriter and platform runtimes.
 //!
-//! Emission, byte validation, TLS finalization and recovery classification use
-//! the same instruction templates. This module does not parse binary files or
-//! discover patch sites in executable images.
+//! [`gate`] defines instructions, validation roles and recovery stages together
+//! for emission, TLS finalization and [`recovery`]. Binary parsing and patch-site
+//! discovery belong to the rewriter.
+//!
+//! # Thread-pointer and x18 state
+//!
+//! Linux anchors runtime-owned state at `TPIDR_EL0`. macOS strips the CPU tag
+//! from `TPIDRRO_EL0` and loads a block pointer from its TSD slot. Experimental
+//! Windows emission anchors at physical x18. macOS/Windows never depend on
+//! `TPIDR_EL0` retaining guest state across host execution.
+//!
+//! Direct-TLS gates address anchor-relative fields; indirect-TLS gates access
+//! fixed fields through the block pointer. Read gates return logical `TPIDR_EL0`
+//! for Linux guests or `TPIDRRO_EL0` for Darwin guests. Host-aware TPIDRRO gates
+//! preserve native reads outside guest execution.
+//!
+//! Linux normally leaves guest x18 native; Linux guests on macOS virtualize it.
+//!
+//! Runtime-selected TLS offsets must be finalized before execution:
+//! [`finalize_trampoline_gates`] for Linux-host TP-only gates,
+//! [`finalize_trampoline_gates_for_host`] for ELF gates with host-specific TLS,
+//! or [`finalize_macho_trampoline`] for native Darwin gates. An unpatched
+//! placeholder can access unrelated host memory without faulting.
+//!
+//! # Guest stack requirements
+//!
+//! SVC/MSR scratch frames require a writable, 16-byte-aligned guest stack,
+//! unlike the original instructions. MRS uses its destination and needs no frame.
+//! x18 scratch frames need writable memory below SP; writeback pairs may spill as
+//! deep as `align_up(16 + max(0, -writeback), 16)`. Recovery distinguishes faults
+//! in these runtime spills from faults in the guest instruction.
+//!
+//! # SVC return protocol
+//!
+//! The frame holds x16, the post-SVC PC and the outbound-stub address at
+//! [`SVC_FRAME_OFF_X16`], [`SVC_FRAME_OFF_RETADDR`] and [`SVC_FRAME_OFF_STUB`].
+//! The runtime restages guest x16 before entering the site's outbound stub:
+//!
+//! ```text
+//! ldr x16, [sp, #0]
+//! add sp, sp, #frame_bytes
+//! b   original_site+4
+//! ```
+//!
+//! Frame sizes are [`SVC_FRAME_BYTES`] for Linux and [`DARWIN_SVC_FRAME_BYTES`]
+//! for Darwin, including its red zone. The static branch consumes no scratch.
+//! Redirected PCs and asynchronous resumes use a full-context restore instead.
+//!
+//! # Slot layout and recovery
+//!
+//! An eight-byte callback slot and NOP padding precede [`GATES_START_OFFSET`].
+//! Each [`GATE_ALIGNMENT`]-aligned gate ends with [`GATE_METADATA_BYTES`] of
+//! metadata. Kinds and [`GATE_SLOT_SIZES`] are a persisted ABI.
+//!
+//! Each instruction's [`Stage`] describes recovery *before* execution; padding
+//! and provenance words have none. Classification validates the whole template,
+//! and recovery checks the site's inbound branch. Metadata alone proves nothing.
+//!
+//! Signal paths use bounded caller-supplied reads and fixed buffers, without
+//! allocating or locking. Platforms own signal-context conversion, host TLS
+//! access and final context restore.
 
 pub mod gate;
 pub mod recovery;
@@ -433,11 +491,11 @@ enum GateKind {
 }
 
 impl GateKind {
-    pub const fn bits(self) -> u32 {
+    const fn bits(self) -> u32 {
         self as u32
     }
 
-    pub fn from_bits(bits: u32) -> Option<Self> {
+    fn from_bits(bits: u32) -> Option<Self> {
         [
             Self::Svc,
             Self::MrsTpidr,
@@ -457,7 +515,7 @@ impl GateKind {
 /// Which kind of gate a compact slot holds, and the register it acts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateMetadata {
-    /// A trapped `SVC`: the shim performs the syscall.
+    /// An `SVC` site redirected through the runtime callback.
     Svc,
     /// Read the logical guest thread pointer into the destination register.
     MrsTpidr {
@@ -467,7 +525,7 @@ pub enum GateMetadata {
     /// Read TPIDRRO from the physical host or private guest state according to
     /// the current LiteBox execution mode.
     HostAwareMrsTpidr { destination: u8 },
-    /// A trapped `MSR TPIDR_EL0, <Xs>`, writing the guest thread pointer.
+    /// An inline gate writes the logical guest thread pointer from `<Xs>`.
     MsrTpidr {
         /// Register holding the value to write.
         source: u8,
@@ -508,6 +566,8 @@ impl X18IndirectBranchKind {
     }
 }
 
+/// Raw persisted metadata word. Decoding it does not validate a gate's code;
+/// use a slot classifier before treating guest-controlled bytes as a gate.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EncodedGateMetadata(pub u32);
@@ -1235,7 +1295,7 @@ fn substitute_x18(word: u32, replacement: u8) -> Option<u32> {
 }
 
 /// Emits a synthetic AArch64 `rt_sigreturn` restorer that dispatches through
-/// `callback` using the rewriter's SVC frame ABI.
+/// `callback` using the shared SVC frame ABI.
 pub fn emit_rt_sigreturn_trampoline(
     callback: usize,
 ) -> Result<[u8; RT_SIGRETURN_TRAMPOLINE_BYTES]> {
@@ -1710,6 +1770,7 @@ impl GateLayout {
     }
 }
 
+/// Strip Darwin's CPU-number tag before using TPIDRRO_EL0 as a TLS anchor.
 pub fn anchor_mask(rd: u8) -> Insn {
     Insn::AndImm {
         rd,
@@ -1721,7 +1782,7 @@ pub fn anchor_mask(rd: u8) -> Insn {
 impl TargetHost {
     /// The instruction a gate uses to read this host's per-thread anchor into
     /// `rd`.
-    pub fn anchor_read(self, rd: u8) -> Insn {
+    fn anchor_read(self, rd: u8) -> Insn {
         match self {
             TargetHost::Linux => Insn::MrsTpidrEl0(rd),
             TargetHost::MacOs => Insn::MrsTpidrroEl0(rd),
@@ -1928,6 +1989,9 @@ pub fn classify_gate_pc(
     classify_gate_pc_with_candidates(trampoline, trampoline_base, pc, candidates)
 }
 
+/// Inspect explicit candidate offsets within a complete Linux-host trampoline.
+/// Duplicate or overlapping matches are ambiguous and return `None`, just like
+/// no match. The known trampoline base is used to validate callback references.
 pub fn classify_gate_pc_with_candidates<const N: usize>(
     trampoline: &[u8],
     trampoline_base: u64,
@@ -2028,7 +2092,7 @@ pub fn classify_copied_gate_slot_with_layout(
     ClassifiedGate::new(0, &built, &instance, offset)
 }
 
-pub fn valid_emitted_tpidr_offset(offset: u32) -> bool {
+fn valid_emitted_tpidr_offset(offset: u32) -> bool {
     u16::try_from(offset).is_ok_and(|offset| {
         offset == GUEST_TPIDR_OFFSET_PLACEHOLDER || is_patchable_guest_tpidr_offset(offset)
     })
@@ -2223,8 +2287,8 @@ fn patch_offset_words(trampoline: &mut [u8], patch_offsets: &[usize], offset: u1
 }
 
 struct TrampolineValidation {
-    pub patch_offsets: Vec<usize>,
-    pub has_x18_gate: bool,
+    patch_offsets: Vec<usize>,
+    has_x18_gate: bool,
 }
 
 fn validate_trampoline_offsets_with_layout(
