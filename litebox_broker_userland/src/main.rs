@@ -408,7 +408,7 @@ fn accept_runner_channel<Channel>(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
     #[cfg(target_os = "linux")]
-    let stdio = Arc::new(UserlandStdioProvider::try_new()?);
+    let stdio = Arc::new(UserlandStdioProvider::open_terminals()?);
     #[cfg(not(target_os = "linux"))]
     let stdio = Arc::new(UserlandStdioProvider::default());
     #[cfg(target_os = "linux")]

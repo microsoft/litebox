@@ -50,13 +50,14 @@ impl Default for UserlandStdioProvider {
 }
 
 impl UserlandStdioProvider {
-    /// Acquires inherited host terminals in raw transport mode. Redirected
-    /// streams keep the ordinary stdio path.
+    /// Opens the host terminals behind the inherited standard streams in raw
+    /// mode. Redirected streams keep the ordinary stdio path. Call
+    /// [`close_terminals`](Self::close_terminals) to restore the terminals.
     // Only Linux hosts have a terminal transport so far; other hosts pass
     // their standard streams through without terminal control until support
     // for them is added.
     #[cfg(target_os = "linux")]
-    pub fn try_new() -> std::io::Result<Self> {
+    pub fn open_terminals() -> std::io::Result<Self> {
         let transports = litebox_broker_platform_linux_userland::terminal::open_stdio_terminals()?;
         Self::with_terminals(
             transports.map(|transport| {

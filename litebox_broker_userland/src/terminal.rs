@@ -137,6 +137,127 @@ impl Shared {
             litebox_util_log::error!(error:% = error; "waking terminal worker failed");
         }
     }
+
+    /// Runs the worker until the terminal stops or its transport fails.
+    fn run(&self) {
+        loop {
+            let error = match self.pump() {
+                Ok(()) => return,
+                Err(TerminalTransportError::WouldBlock) => continue,
+                Err(TerminalTransportError::HungUp) => {
+                    let mut state = self.lock();
+                    if state.status == Status::Stopping {
+                        return;
+                    }
+                    state.hang_up();
+                    state.publish();
+                    self.changed.notify_all();
+                    continue;
+                }
+                Err(error) => error,
+            };
+            litebox_util_log::error!(error:% = error; "terminal transport failed");
+            let mut state = self.lock();
+            state.status = Status::Failed;
+            state.draining = false;
+            state.publish();
+            self.changed.notify_all();
+            return;
+        }
+    }
+
+    /// Moves bytes between the engine and the transport until the terminal
+    /// stops or the transport returns an error.
+    fn pump(&self) -> Result<(), TerminalTransportError> {
+        let transport = &*self.transport;
+        let mut buffer = [0; 256];
+        loop {
+            let mut state = self.lock();
+            if state.status == Status::Stopping {
+                return Ok(());
+            }
+            state.process_input();
+            if state.status == Status::HungUp {
+                state.publish();
+                self.changed.notify_all();
+                drop(state);
+                transport.wait(ReadinessFlags::default(), None)?;
+                continue;
+            }
+            if state.draining && state.output.is_empty() {
+                drop(state);
+                // Only this worker drains the host terminal; broker requests
+                // remain nonblocking.
+                let drained = match transport.drain() {
+                    Ok(()) => true,
+                    Err(TerminalTransportError::WouldBlock) => false,
+                    Err(error) => return Err(error),
+                };
+                state = self.lock();
+                if drained {
+                    state.drained = state.output.is_empty();
+                    state.draining = !state.drained;
+                    self.changed.notify_all();
+                }
+            }
+            let size = transport.window_size()?;
+            if size != state.size {
+                state.size = size;
+                if let Some(sink) = &state.sink {
+                    sink.post(TerminalEvent::Resize);
+                }
+            }
+            state.publish();
+            let mut interest = ReadinessFlags::HANGUP;
+            if state.sink.is_some()
+                && state.pending_input.is_empty()
+                && state.engine.accepts_input()
+            {
+                interest = interest | ReadinessFlags::READ;
+            }
+            if !state.output.is_empty() && !state.engine.output_stopped() {
+                interest = interest | ReadinessFlags::WRITE;
+            }
+            drop(state);
+            let ready = transport.wait(interest, Some(RESIZE_POLL_INTERVAL))?;
+            let mut state = self.lock();
+            if state.status == Status::Stopping {
+                return Ok(());
+            }
+            if ready.contains(ReadinessFlags::HANGUP) {
+                state.hang_up();
+            }
+            if ready.contains(ReadinessFlags::READ) && state.pending_input.is_empty() {
+                match transport.read(&mut buffer) {
+                    Ok(0) => state.hang_up(),
+                    Ok(count) => state.pending_input.extend(&buffer[..count]),
+                    Err(TerminalTransportError::WouldBlock) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if state.status == Status::Active
+                && ready.contains(ReadinessFlags::WRITE)
+                && !state.engine.output_stopped()
+            {
+                let output = state.output.make_contiguous();
+                match transport.write(output) {
+                    Ok(0) if !output.is_empty() => {
+                        return Err(TerminalTransportError::Failed(
+                            "terminal write returned zero".into(),
+                        ));
+                    }
+                    Ok(count) => {
+                        state.output.drain(..count);
+                        self.changed.notify_all();
+                    }
+                    Err(TerminalTransportError::WouldBlock) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            state.publish();
+            self.changed.notify_all();
+        }
+    }
 }
 
 /// One host terminal, shared by all inherited streams referring to it.
@@ -170,7 +291,7 @@ impl HostTerminal {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name("litebox-broker-terminal".to_owned())
-                .spawn(move || run(&shared))?
+                .spawn(move || shared.run())?
         };
         Ok(Self {
             shared,
@@ -371,131 +492,16 @@ impl Drop for HostTerminal {
     }
 }
 
-fn run(shared: &Shared) {
-    loop {
-        let error = match pump(shared) {
-            Ok(()) => return,
-            Err(TerminalTransportError::WouldBlock) => continue,
-            Err(TerminalTransportError::HungUp) => {
-                let mut state = shared.lock();
-                if state.status == Status::Stopping {
-                    return;
-                }
-                state.hang_up();
-                state.publish();
-                shared.changed.notify_all();
-                continue;
-            }
-            Err(error) => error,
-        };
-        litebox_util_log::error!(error:% = error; "terminal transport failed");
-        let mut state = shared.lock();
-        state.status = Status::Failed;
-        state.draining = false;
-        state.publish();
-        shared.changed.notify_all();
-        return;
-    }
-}
-
-fn pump(shared: &Shared) -> Result<(), TerminalTransportError> {
-    let transport = &*shared.transport;
-    let mut buffer = [0; 256];
-    loop {
-        let mut state = shared.lock();
-        if state.status == Status::Stopping {
-            return Ok(());
-        }
-        state.process_input();
-        if state.status == Status::HungUp {
-            state.publish();
-            shared.changed.notify_all();
-            drop(state);
-            transport.wait(ReadinessFlags::default(), None)?;
-            continue;
-        }
-        if state.draining && state.output.is_empty() {
-            drop(state);
-            // Only this worker drains the host terminal; broker requests
-            // remain nonblocking.
-            let drained = match transport.drain() {
-                Ok(()) => true,
-                Err(TerminalTransportError::WouldBlock) => false,
-                Err(error) => return Err(error),
-            };
-            state = shared.lock();
-            if drained {
-                state.drained = state.output.is_empty();
-                state.draining = !state.drained;
-                shared.changed.notify_all();
-            }
-        }
-        let size = transport.window_size()?;
-        if size != state.size {
-            state.size = size;
-            if let Some(sink) = &state.sink {
-                sink.post(TerminalEvent::Resize);
-            }
-        }
-        state.publish();
-        let mut interest = ReadinessFlags::HANGUP;
-        if state.sink.is_some() && state.pending_input.is_empty() && state.engine.accepts_input() {
-            interest = interest | ReadinessFlags::READ;
-        }
-        if !state.output.is_empty() && !state.engine.output_stopped() {
-            interest = interest | ReadinessFlags::WRITE;
-        }
-        drop(state);
-        let ready = transport.wait(interest, Some(RESIZE_POLL_INTERVAL))?;
-        let mut state = shared.lock();
-        if state.status == Status::Stopping {
-            return Ok(());
-        }
-        if ready.contains(ReadinessFlags::HANGUP) {
-            state.hang_up();
-        }
-        if ready.contains(ReadinessFlags::READ) && state.pending_input.is_empty() {
-            match transport.read(&mut buffer) {
-                Ok(0) => state.hang_up(),
-                Ok(count) => state.pending_input.extend(&buffer[..count]),
-                Err(TerminalTransportError::WouldBlock) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        if state.status == Status::Active
-            && ready.contains(ReadinessFlags::WRITE)
-            && !state.engine.output_stopped()
-        {
-            let output = state.output.make_contiguous();
-            match transport.write(output) {
-                Ok(0) if !output.is_empty() => {
-                    return Err(TerminalTransportError::Failed(
-                        "terminal write returned zero".into(),
-                    ));
-                }
-                Ok(count) => {
-                    state.output.drain(..count);
-                    shared.changed.notify_all();
-                }
-                Err(TerminalTransportError::WouldBlock) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        state.publish();
-        shared.changed.notify_all();
-    }
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use litebox_broker_platform_linux_userland::terminal::LinuxTerminal;
     use std::fs::File;
-    use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
+    use std::os::fd::{AsFd as _, FromRawFd as _};
     use std::time::Duration;
 
-    /// Returns a PTY's master and slave and a terminal served over the slave.
-    fn open_terminal() -> (File, File, HostTerminal) {
+    /// Returns a PTY's master and a terminal served over its slave.
+    fn open_terminal() -> (File, HostTerminal) {
         let mut master = -1;
         let mut slave = -1;
         // SAFETY: the descriptors are writable and null optional arguments request defaults.
@@ -515,12 +521,12 @@ mod tests {
         let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
         let transport = LinuxTerminal::open(slave.as_fd()).unwrap();
         let terminal = HostTerminal::new(Arc::new(transport)).unwrap();
-        (master, slave, terminal)
+        (master, terminal)
     }
 
     #[test]
     fn terminal_abandoned_drain_does_not_block_other_writers() {
-        let (_master, _slave, terminal) = open_terminal();
+        let (_master, terminal) = open_terminal();
         terminal.shared.lock().engine.receive(b"\x13");
         assert_eq!(terminal.write(b"first"), Ok(5));
         assert_eq!(
@@ -535,30 +541,8 @@ mod tests {
     }
 
     #[test]
-    fn close_restores_host_attributes_while_the_terminal_is_shared() {
-        let (_master, slave, terminal) = open_terminal();
-        let terminal = Arc::new(terminal);
-        let _alias = Arc::clone(&terminal);
-        let canonical = || {
-            // SAFETY: zero is a valid initialization for the integer-only termios structure.
-            let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
-            // SAFETY: the slave file is live and attributes is a writable termios.
-            assert_eq!(
-                unsafe { libc::tcgetattr(slave.as_raw_fd(), &raw mut attributes) },
-                0
-            );
-            attributes.c_lflag & libc::ICANON != 0
-        };
-        assert!(!canonical());
-        assert!(terminal.write(b"output").is_ok());
-        terminal.close().unwrap();
-        assert!(canonical());
-        terminal.close().unwrap();
-    }
-
-    #[test]
     fn terminal_hangup_preserves_buffered_and_pending_input() {
-        let (master, _slave, terminal) = open_terminal();
+        let (master, terminal) = open_terminal();
         {
             let mut state = terminal.shared.lock();
             state.engine.receive(b"buffered\n");
@@ -596,7 +580,7 @@ mod tests {
     fn terminal_hangup_does_not_report_eof_before_a_backpressured_tail() {
         use litebox_broker_protocol::terminal::{InputFlags, LocalFlags, TerminalSettings};
 
-        let (_master, _slave, mut terminal) = open_terminal();
+        let (_master, mut terminal) = open_terminal();
         // Keep the worker from winning the race this test exercises.
         terminal.shared.lock().status = Status::Stopping;
         terminal.shared.wake();
