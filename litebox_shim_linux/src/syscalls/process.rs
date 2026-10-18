@@ -46,8 +46,14 @@ use litebox_common_linux::{
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
 
-type StartRunner =
-    dyn Fn(&PendingChild, &[u8]) -> Result<(), ForkError<ProcessError>> + Send + Sync;
+trait StartRunner: Send + Sync {
+    /// Requires the same guarantees as [`ForkLauncher::start`].
+    unsafe fn start(
+        &self,
+        child: &PendingChild,
+        startup: &[u8],
+    ) -> Result<(), ForkError<ProcessError>>;
+}
 
 /// Runner-specific transport and bootstrap operations used by [`ForkLauncher`].
 pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
@@ -75,24 +81,62 @@ pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
     unsafe fn run_child(&self, channel: Self::ControlChannel) -> !;
 }
 
-/// Launcher for native fork children.
-pub struct ForkLauncher {
-    start_runner: Box<StartRunner>,
+struct RunnerLauncher<Platform, Runner> {
+    runner: Runner,
+    _platform: core::marker::PhantomData<fn() -> Platform>,
 }
 
-impl Default for ForkLauncher {
-    fn default() -> Self {
-        Self {
-            start_runner: Box::new(|_, _| Err(ForkError::Unsupported)),
+impl<Platform: ProcessProvider, Runner: ForkRunner<Platform>> StartRunner
+    for RunnerLauncher<Platform, Runner>
+{
+    unsafe fn start(
+        &self,
+        child: &PendingChild,
+        startup: &[u8],
+    ) -> Result<(), ForkError<ProcessError>> {
+        let control_channel = self.runner.create_control_channel();
+        // SAFETY: The caller keeps sibling guest threads paused. ForkLauncher::new guarantees
+        // a clone-safe runner whose child bootstrap never returns or unwinds.
+        match unsafe { Platform::fork_process() } {
+            Ok(ForkResult::Parent(process)) => {
+                let result = (|| {
+                    let descriptor = self
+                        .runner
+                        .encode_runner_descriptor(&process, control_channel)?;
+                    process.resume().map_err(|error| {
+                        litebox_util_log::error!("failed to resume native fork child: {error}");
+                        ProcessError::ServiceFailed
+                    })?;
+                    child.start_with_existing_runner(&descriptor, startup)
+                })();
+                if result.is_err()
+                    && let Err(error) = process.terminate()
+                {
+                    litebox_util_log::error!("failed to terminate native fork child: {error}");
+                }
+                result.map_err(ForkError::Failed)
+            }
+            // SAFETY: This is the new child, under the bootstrap contract of ForkLauncher::new.
+            Ok(ForkResult::Child) => unsafe { self.runner.run_child(control_channel) },
+            Err(ForkError::Unsupported) => Err(ForkError::Unsupported),
+            Err(ForkError::Failed(error)) => {
+                litebox_util_log::error!("native process cloning failed: {error}");
+                Err(ForkError::Failed(ProcessError::Unavailable))
+            }
         }
     }
+}
+
+/// Launcher for native fork children.
+pub struct ForkLauncher {
+    runner: Box<dyn StartRunner>,
 }
 
 impl ForkLauncher {
     /// Creates a launcher using the runner's transport and bootstrap operations.
     ///
     /// The parent encodes the child runner's descriptor before resuming a suspended child.
-    /// The child receives its copy of the control channel.
+    /// The child receives its copy of the control channel and the runner's inherited state.
     ///
     /// # Safety
     ///
@@ -104,40 +148,9 @@ impl ForkLauncher {
         runner: impl ForkRunner<Platform>,
     ) -> Self {
         Self {
-            start_runner: Box::new(move |child, startup| {
-                let control_channel = runner.create_control_channel();
-                // SAFETY: Only `start` invokes this callback, with sibling guest threads paused.
-                // The constructor guarantees a clone-safe child bootstrap that never unwinds.
-                match unsafe { Platform::fork_process() } {
-                    Ok(ForkResult::Parent(process)) => {
-                        let result = (|| {
-                            let descriptor =
-                                runner.encode_runner_descriptor(&process, control_channel)?;
-                            process.resume().map_err(|error| {
-                                litebox_util_log::error!(
-                                    "failed to resume native fork child: {error}"
-                                );
-                                ProcessError::ServiceFailed
-                            })?;
-                            child.start_with_existing_runner(&descriptor, startup)
-                        })();
-                        if result.is_err()
-                            && let Err(error) = process.terminate()
-                        {
-                            litebox_util_log::error!(
-                                "failed to terminate native fork child: {error}"
-                            );
-                        }
-                        result.map_err(ForkError::Failed)
-                    }
-                    // SAFETY: This is the new child, under the bootstrap contract of `new`.
-                    Ok(ForkResult::Child) => unsafe { runner.run_child(control_channel) },
-                    Err(ForkError::Unsupported) => Err(ForkError::Unsupported),
-                    Err(ForkError::Failed(error)) => {
-                        litebox_util_log::error!("native process cloning failed: {error}");
-                        Err(ForkError::Failed(ProcessError::Unavailable))
-                    }
-                }
+            runner: Box::new(RunnerLauncher::<Platform, _> {
+                runner,
+                _platform: core::marker::PhantomData,
             }),
         }
     }
@@ -151,12 +164,15 @@ impl ForkLauncher {
     ///
     /// All other relevant guest threads must remain paused until this call returns. The startup
     /// payload must describe the calling thread and its process's current, stable guest state.
+    /// Any memory state retained by the runner must describe the same process and have no held
+    /// locks or users that survive only in the copied runtime.
     pub unsafe fn start(
         &self,
         child: &PendingChild,
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>> {
-        (self.start_runner)(child, startup)
+        // SAFETY: The caller supplies the pause and snapshot guarantees required by start.
+        unsafe { self.runner.start(child, startup) }
     }
 }
 
@@ -1286,15 +1302,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let pause = self.pause_other_threads()?;
         if !self.thread.process.limits.has_default_state()
             || !self.global.elf_patch_cache.lock().is_empty()
+            || self.global.mm.has_shared_mappings()
         {
             return Err(Errno::EAGAIN);
-        }
-        let mut regions = Vec::new();
-        for (range, flags) in self.global.mm.mappings() {
-            if flags.contains(VmFlags::VM_SHARED) {
-                return Err(Errno::EAGAIN);
-            }
-            regions.push(ForkMemoryRegion { range, flags });
         }
         let (fds, objects): (Vec<_>, Vec<_>) =
             self.fds_inherited_across_fork()?.into_iter().unzip();
@@ -1303,7 +1313,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let umask = u32::from(fs.umask().bits());
         drop(fs);
         let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
-        let (initial_program_break, program_break) = self.global.mm.program_break();
         let mut startup = LinuxForkStartup {
             uid: self.credentials.uid,
             euid: self.credentials.euid,
@@ -1324,9 +1333,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             syscall_entry_point: self.global.platform.get_syscall_entry_point(),
             set_child_tid,
             clear_child_tid,
-            initial_program_break,
-            program_break,
-            regions,
+            initial_program_break: 0,
+            program_break: 0,
+            regions: Vec::new(),
             fds,
         };
         // The child keeps the references it inherits until it exits, so check the size first.
@@ -1344,18 +1353,29 @@ impl<Platform: ShimPlatform> Task<Platform> {
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
-        let payload = startup
-            .encode()
-            .expect("the startup fit with placeholder handles");
-        // SAFETY: Sibling guest threads remain paused, and the payload snapshots this
-        // calling thread and the stable process state.
-        match unsafe { self.global.fork_launcher.start(&child, &payload) } {
-            Ok(()) => return Ok(child_pid.cast_unsigned() as usize),
-            Err(litebox::platform::ForkError::Unsupported) => {}
-            Err(litebox::platform::ForkError::Failed(error)) => {
-                return Err(Errno::from(error));
+        if let Some(launcher) = &self.global.fork_launcher {
+            let payload = startup
+                .encode()
+                .expect("the startup fit with placeholder handles");
+            // SAFETY: Sibling guest threads remain paused, and the payload snapshots this
+            // calling thread and the stable process state.
+            match unsafe { launcher.start(&child, &payload) } {
+                Ok(()) => return Ok(child_pid.cast_unsigned() as usize),
+                Err(litebox::platform::ForkError::Unsupported) => {}
+                Err(litebox::platform::ForkError::Failed(error)) => {
+                    return Err(Errno::from(error));
+                }
             }
         }
+        (startup.initial_program_break, startup.program_break) = self.global.mm.program_break();
+        startup.regions = self
+            .global
+            .mm
+            .mappings()
+            .into_iter()
+            .map(|(range, flags)| ForkMemoryRegion { range, flags })
+            .collect();
+        let payload = startup.encode().map_err(|_| Errno::ENOMEM)?;
         self.write_fork_image(&child, &startup.regions)?;
         // The child's memory and objects are copied, so the other threads may go on.
         drop(pause);
@@ -3137,11 +3157,12 @@ mod tests {
     #[derive(Clone, Copy)]
     enum ForkLauncherMode {
         Default,
+        Native,
         Unsupported,
         Failure,
     }
 
-    fn check_fork_launcher_fallback(mode: ForkLauncherMode) {
+    fn check_fork_launcher_fallback(mode: ForkLauncherMode, shared: bool) {
         use crate::syscalls::tests::TestPlatform;
         use alloc::sync::Arc;
         use litebox::platform::ThreadProvider;
@@ -3149,7 +3170,11 @@ mod tests {
         use litebox_broker_protocol::message::ProcessRequest;
         use litebox_common_linux::{MapFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};
 
-        let copies_memory = !matches!(mode, ForkLauncherMode::Failure);
+        let copies_memory = !shared
+            && matches!(
+                mode,
+                ForkLauncherMode::Default | ForkLauncherMode::Unsupported
+            );
         let platform = crate::syscalls::tests::test_platform();
         TestPlatform::run_test_thread(|| {
             let requests = Arc::new(StdMutex::new(alloc::vec::Vec::new()));
@@ -3168,6 +3193,9 @@ mod tests {
             let builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
             let builder = match mode {
                 ForkLauncherMode::Default => builder,
+                ForkLauncherMode::Native => {
+                    builder.with_fork_launcher(super::fork_tests::checking_native_launcher())
+                }
                 ForkLauncherMode::Unsupported => {
                     builder.with_fork_launcher(super::fork_tests::failing_launcher(true))
                 }
@@ -3176,29 +3204,51 @@ mod tests {
                 }
             };
             let shim = builder.build();
+            assert_eq!(
+                shim.0.fork_launcher.is_some(),
+                !matches!(mode, ForkLauncherMode::Default)
+            );
             let task = shim.0.new_test_task();
             let mapping = task
                 .sys_mmap(
                     0,
                     PAGE_SIZE,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                    if shared {
+                        MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS
+                    } else {
+                        MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS
+                    },
                     -1,
                     0,
                 )
                 .unwrap();
             mapping.write_at_offset::<TestPlatform>(0, 42).unwrap();
+            let program_break = (mapping.as_usize() + 64, mapping.as_usize() + 128);
+            task.global
+                .mm
+                .restore_program_break(program_break.0, program_break.1);
+            assert_eq!(task.global.mm.has_shared_mappings(), shared);
 
             let result = task.sys_fork(&PtRegs::default());
-            assert_eq!(
-                result,
-                Err(if copies_memory {
-                    Errno::EPERM
-                } else {
-                    Errno::ENOSYS
-                }),
-            );
+            if shared {
+                assert_eq!(result, Err(Errno::EAGAIN));
+            } else if matches!(mode, ForkLauncherMode::Native) {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    result,
+                    Err(if copies_memory {
+                        Errno::EPERM
+                    } else {
+                        Errno::ENOSYS
+                    }),
+                );
+            }
             let requests = requests.lock().unwrap();
+            if shared {
+                assert_eq!(*requests, []);
+            }
             let writes = requests
                 .iter()
                 .filter(|request| matches!(request, ProcessRequest::WriteChildMemory(_)))
@@ -3209,6 +3259,7 @@ mod tests {
                 .count();
             assert_eq!(writes, usize::from(copies_memory));
             assert_eq!(starts, usize::from(copies_memory));
+            assert_eq!(task.global.mm.program_break(), program_break);
             drop(requests);
             task.sys_munmap(mapping, PAGE_SIZE).unwrap();
         });
@@ -3216,17 +3267,37 @@ mod tests {
 
     #[test]
     fn fork_launcher_default_copies_memory_and_starts_fresh_runner() {
-        check_fork_launcher_fallback(ForkLauncherMode::Default);
+        check_fork_launcher_fallback(ForkLauncherMode::Default, false);
     }
 
     #[test]
     fn fork_launcher_unsupported_copies_memory_and_starts_fresh_runner() {
-        check_fork_launcher_fallback(ForkLauncherMode::Unsupported);
+        check_fork_launcher_fallback(ForkLauncherMode::Unsupported, false);
     }
 
     #[test]
     fn fork_launcher_failure_does_not_copy_memory_or_retry_startup() {
-        check_fork_launcher_fallback(ForkLauncherMode::Failure);
+        check_fork_launcher_fallback(ForkLauncherMode::Failure, false);
+    }
+
+    #[test]
+    fn fork_launcher_native_omits_memory_metadata() {
+        check_fork_launcher_fallback(ForkLauncherMode::Native, false);
+    }
+
+    #[test]
+    fn fork_launcher_native_rejects_shared_memory() {
+        check_fork_launcher_fallback(ForkLauncherMode::Native, true);
+    }
+
+    #[test]
+    fn fork_launcher_default_rejects_shared_memory() {
+        check_fork_launcher_fallback(ForkLauncherMode::Default, true);
+    }
+
+    #[test]
+    fn fork_launcher_unsupported_rejects_shared_memory() {
+        check_fork_launcher_fallback(ForkLauncherMode::Unsupported, true);
     }
 
     struct BlockingThreadExitChannel {
@@ -4222,7 +4293,73 @@ mod fork_tests {
         ProcessResponse,
     };
     use litebox_broker_transport::channel::LocalCallChannel;
+    use litebox_common_linux::program_startup::LinuxProcessStartup;
     use std::sync::Mutex;
+
+    #[test]
+    fn native_fork_retains_memory_manager() {
+        use crate::syscalls::tests::{TestPlatform, test_platform};
+        use litebox::platform::ThreadProvider;
+        use litebox_common_linux::{MapFlags, ProtFlags};
+
+        let platform = test_platform();
+        TestPlatform::run_test_thread(|| {
+            let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+            let builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
+            let memory = Arc::clone(builder.memory_manager());
+            let parent = builder.build();
+            assert!(Arc::ptr_eq(&memory, &parent.0.mm));
+            let task = parent.0.clone().new_test_task();
+            let mapping = task
+                .sys_mmap(
+                    0,
+                    2 * PAGE_SIZE,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+                .unwrap();
+            mapping.write_at_offset::<TestPlatform>(0, 42).unwrap();
+            let initial_break = mapping.as_usize() + 64;
+            parent.0.mm.set_initial_brk(initial_break);
+            // SAFETY: The requested break remains inside the exclusively owned first page.
+            unsafe { parent.0.mm.brk(initial_break + 64) }.unwrap();
+            let mappings = parent.0.mm.mappings();
+            drop(task);
+            drop(parent);
+
+            let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+            // SAFETY: The old task and shim are gone, no locks are held, and this test transfers
+            // the manager to a single fresh shim using the same live platform.
+            let builder = unsafe {
+                crate::LinuxShimBuilder::new_for_native_fork(
+                    platform,
+                    litebox,
+                    process_id,
+                    Arc::clone(&memory),
+                )
+            };
+            assert!(Arc::ptr_eq(&memory, builder.memory_manager()));
+            let child = builder.build();
+            assert!(Arc::ptr_eq(&memory, &child.0.mm));
+            assert_eq!(child.0.mm.mappings(), mappings);
+            assert_eq!(
+                child.0.mm.program_break(),
+                (initial_break, initial_break + 64)
+            );
+            assert_eq!(mapping.read_at_offset::<TestPlatform>(0), Some(42));
+            child
+                .memory_manager()
+                .sys_mprotect(mapping, PAGE_SIZE, ProtFlags::PROT_READ)
+                .unwrap();
+            child
+                .memory_manager()
+                .sys_munmap(mapping, 2 * PAGE_SIZE)
+                .unwrap();
+            assert_eq!(child.0.mm.mappings(), vec![]);
+        });
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Stage {
@@ -4369,6 +4506,31 @@ mod fork_tests {
             events: Vec::new(),
         };
         launcher()
+    }
+
+    struct NativeStartupRunner;
+
+    impl StartRunner for NativeStartupRunner {
+        unsafe fn start(
+            &self,
+            _child: &PendingChild,
+            startup: &[u8],
+        ) -> Result<(), ForkError<ProcessError>> {
+            let LinuxProcessStartup::Fork(startup) = LinuxProcessStartup::decode(startup).unwrap()
+            else {
+                panic!("expected fork startup");
+            };
+            assert_eq!(startup.regions, vec![]);
+            assert_eq!(startup.initial_program_break, 0);
+            assert_eq!(startup.program_break, 0);
+            Ok(())
+        }
+    }
+
+    pub(super) fn checking_native_launcher() -> ForkLauncher {
+        ForkLauncher {
+            runner: Box::new(NativeStartupRunner),
+        }
     }
 
     fn check_start(
