@@ -16,12 +16,12 @@ use core::ops::Range;
 use litebox_common_linux::{
     MapFlags, PAGE_SIZE, ProtFlags,
     errno::Errno,
-    loader::{
-        TRAMPOLINE_HEADER_SIZE, TrampolineHeaderError, TrampolineLayout, parse_trampoline_header,
-    },
+    loader::{TrampolineLayout, parse_trampoline_header},
     mm::MmapPlacement,
 };
-use litebox_trampoline::trampoline_allocation_range;
+use litebox_trampoline::{
+    TRAMPOLINE_HEADER_SIZE, TrampolineHeaderError, trampoline_allocation_range,
+};
 
 use crate::ShimPlatform;
 use crate::Task;

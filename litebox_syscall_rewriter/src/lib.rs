@@ -58,7 +58,7 @@ use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 use object::read::{Object as _, ObjectSection as _, ObjectSegment as _};
 use thiserror::Error;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::IntoBytes;
 
 /// Possible errors during hooking of `syscall` instructions
 #[derive(Error, Debug)]
@@ -527,9 +527,9 @@ fn hook_syscalls_in_elf_inner(
         let mut out = input_binary.to_vec();
         let header = TrampolineHeader64 {
             magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0,
-            vaddr: 0,
-            trampoline_size: 0,
+            file_offset: 0.into(),
+            vaddr: 0.into(),
+            trampoline_size: 0.into(),
         };
         out.extend_from_slice(header.as_bytes());
         return Ok(out);
@@ -1055,9 +1055,9 @@ fn append_trampoline_footer(
 
     let header = TrampolineHeader64 {
         magic: *TRAMPOLINE_MAGIC,
-        file_offset: trampoline_file_offset,
-        vaddr: header_vaddr,
-        trampoline_size: trampoline_size as u64,
+        file_offset: trampoline_file_offset.into(),
+        vaddr: header_vaddr.into(),
+        trampoline_size: (trampoline_size as u64).into(),
     };
     out.extend_from_slice(header.as_bytes());
 }
@@ -1149,9 +1149,9 @@ fn hook_aarch64_elf_at(
         let mut out = input_binary.to_vec();
         let header = TrampolineHeader64 {
             magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0,
-            vaddr: 0,
-            trampoline_size: 0,
+            file_offset: 0.into(),
+            vaddr: 0.into(),
+            trampoline_size: 0.into(),
         };
         out.extend_from_slice(header.as_bytes());
         return Ok(out);
@@ -1227,13 +1227,14 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     let header_start = input_binary.len() - header_size;
     let header = &input_binary[header_start..];
 
-    if &header[..TRAMPOLINE_MAGIC.len()] != TRAMPOLINE_MAGIC {
+    let Ok(Some(header)) = litebox_trampoline::decode_trampoline_header(header) else {
         return false;
-    }
-
-    let header = TrampolineHeader64::read_from_bytes(header).unwrap();
-    let (file_offset, vaddr, trampoline_size) =
-        (header.file_offset, header.vaddr, header.trampoline_size);
+    };
+    let (file_offset, vaddr, trampoline_size) = (
+        header.file_offset.get(),
+        header.vaddr.get(),
+        header.trampoline_size.get(),
+    );
 
     if trampoline_size == 0 {
         // Size=0 sentinel: the rewriter processed this binary but found nothing
@@ -2546,6 +2547,7 @@ fn hook_syscall_and_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zerocopy::FromBytes as _;
 
     /// A lone `syscall` leaves no room for a jump to the trampoline.
     fn hook_lone_syscall(unpatchable: UnpatchableSyscalls) -> (Vec<u8>, Vec<u64>) {
@@ -2620,7 +2622,7 @@ mod tests {
         )
         .unwrap();
         let footer = TrampolineHeader64::read_from_bytes(&output[output.len() - 32..]).unwrap();
-        let vaddr = footer.vaddr;
+        let vaddr = footer.vaddr.get();
         assert_eq!(vaddr, 0x184000);
 
         // A larger 4 KiB gap need not contain any complete 16 KiB page.

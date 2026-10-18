@@ -1789,6 +1789,7 @@ dependencies = [
 name = "litebox_common_windows"
 version = "0.1.0"
 dependencies = [
+ "litebox_trampoline",
  "object",
  "thiserror",
  "zerocopy",

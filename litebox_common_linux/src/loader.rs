@@ -14,8 +14,8 @@ use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
+use litebox_trampoline::{TRAMPOLINE_HEADER_SIZE, TrampolineHeaderError, decode_trampoline_header};
 use thiserror::Error;
-use zerocopy::FromBytes;
 
 use crate::{HOST_PAGE_SIZE, PAGE_SIZE, errno::Errno};
 
@@ -68,41 +68,6 @@ struct TrampolineInfo {
     syscall_entry_point: usize,
 }
 
-/// The magic number used to identify the LiteBox trampoline.
-/// The serialized format is defined by `litebox_trampoline`.
-const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*litebox_trampoline::TRAMPOLINE_MAGIC);
-
-/// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
-#[repr(C, packed)]
-#[derive(FromBytes)]
-pub struct TrampolineHeader64 {
-    /// The format magic and version.
-    pub magic: u64,
-    /// The file offset of the trampoline code.
-    pub file_offset: u64,
-    /// The virtual address of the trampoline code.
-    pub vaddr: u64,
-    /// The size of the trampoline code.
-    pub trampoline_size: u64,
-}
-
-/// Trampoline header for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
-#[repr(C, packed)]
-#[derive(FromBytes)]
-struct TrampolineHeader32 {
-    magic: u64,
-    file_offset: u32,
-    vaddr: u32,
-    trampoline_size: u32,
-}
-
-/// Size in bytes of the trampoline header for the target pointer width.
-pub const TRAMPOLINE_HEADER_SIZE: usize = if cfg!(target_pointer_width = "64") {
-    size_of::<TrampolineHeader64>()
-} else {
-    size_of::<TrampolineHeader32>()
-};
-
 /// Address space left free past an unpatched ELF image for its runtime trampoline.
 pub const RUNTIME_TRAMPOLINE_RESERVATION_SIZE: usize = 0x100_0000; // 16 MiB
 
@@ -127,15 +92,6 @@ pub struct TrampolineLayout {
     pub size: usize,
 }
 
-/// Errors from decoding a LiteBox trampoline header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrampolineHeaderError {
-    /// The header has the LiteBox prefix but an unsupported version.
-    UnsupportedVersion,
-    /// The header fields do not describe a valid trampoline layout.
-    Malformed,
-}
-
 /// Decodes and validates a LiteBox trampoline header read from `header_offset`,
 /// which must be the last [`TRAMPOLINE_HEADER_SIZE`] bytes of the file.
 ///
@@ -145,33 +101,14 @@ pub fn parse_trampoline_header(
     header: &[u8; TRAMPOLINE_HEADER_SIZE],
     header_offset: u64,
 ) -> Result<Option<TrampolineLayout>, TrampolineHeaderError> {
-    fn malformed<E>(_: E) -> TrampolineHeaderError {
-        TrampolineHeaderError::Malformed
-    }
-
-    // Format: "LITEBOX" + version byte.
-    if !header.starts_with(&TRAMPOLINE_MAGIC.to_le_bytes()) {
-        return if header.starts_with(b"LITEBOX") {
-            Err(TrampolineHeaderError::UnsupportedVersion)
-        } else {
-            Ok(None)
-        };
-    }
-
-    let layout = if cfg!(target_pointer_width = "64") {
-        let header = TrampolineHeader64::read_from_bytes(header).map_err(malformed)?;
-        TrampolineLayout {
-            file_offset: header.file_offset,
-            vaddr: usize::try_from(header.vaddr).map_err(malformed)?,
-            size: usize::try_from(header.trampoline_size).map_err(malformed)?,
-        }
-    } else {
-        let header = TrampolineHeader32::read_from_bytes(header).map_err(malformed)?;
-        TrampolineLayout {
-            file_offset: u64::from(header.file_offset),
-            vaddr: header.vaddr as usize,
-            size: header.trampoline_size as usize,
-        }
+    let Some(header) = decode_trampoline_header(header)? else {
+        return Ok(None);
+    };
+    let layout = TrampolineLayout {
+        file_offset: header.file_offset.get(),
+        vaddr: usize::try_from(header.vaddr.get()).map_err(|_| TrampolineHeaderError::Malformed)?,
+        size: usize::try_from(header.trampoline_size.get())
+            .map_err(|_| TrampolineHeaderError::Malformed)?,
     };
 
     if layout.size == 0 {

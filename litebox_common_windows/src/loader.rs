@@ -7,6 +7,7 @@
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::cmp;
 use core::mem::size_of;
+use litebox_trampoline::{TrampolineHeader64, TrampolineHeaderError, decode_trampoline_header};
 use object::read::pe::ImageOptionalHeader as _;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -66,17 +67,6 @@ struct PeTrampolineInfo {
     file_offset: u64,
     syscall_entry_point: usize,
 }
-
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
-struct TrampolineHeader64 {
-    magic: [u8; 8],
-    file_offset: u64,
-    rva: u64,
-    trampoline_size: u64,
-}
-
-const TRAMPOLINE_MAGIC: [u8; 8] = *b"LITEBOX0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeDataDirectory {
@@ -870,19 +860,17 @@ impl PeParsedFile {
         let mut header_buf = [0u8; size_of::<TrampolineHeader64>()];
         file.read_at(header_offset, &mut header_buf)
             .map_err(PeParseError::Io)?;
-        let header = TrampolineHeader64::read_from_bytes(&header_buf)
-            .map_err(|_| PeParseError::BadTrampoline)?;
-        let magic = header.magic;
-        if magic != TRAMPOLINE_MAGIC {
-            if &magic[0..7] == b"LITEBOX" {
+        let header = match decode_trampoline_header(&header_buf) {
+            Ok(Some(header)) => header,
+            Ok(None) => return Ok(()),
+            Err(TrampolineHeaderError::UnsupportedVersion) => {
                 return Err(PeParseError::BadTrampolineVersion);
             }
-            return Ok(());
-        }
-
-        let file_offset = header.file_offset;
-        let rva = usize_from_u64(header.rva)?;
-        let trampoline_size = usize_from_u64(header.trampoline_size)?;
+            Err(TrampolineHeaderError::Malformed) => return Err(PeParseError::BadTrampoline),
+        };
+        let file_offset = header.file_offset.get();
+        let rva = usize_from_u64(header.vaddr.get())?;
+        let trampoline_size = usize_from_u64(header.trampoline_size.get())?;
         let image_size = checked_next_multiple_of!(
             self.image.size_of_image,
             PAGE_SIZE,
