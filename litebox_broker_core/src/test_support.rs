@@ -35,7 +35,7 @@ use crate::{
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
-    transfer::{Copier, Filler, copy_to_slice, fill_from_slice, lend_from_queue},
+    transfer::{CopyFromFn, CopyToFn, copy_from_slice, copy_to_slice, lend_from_queue},
 };
 
 /// Reads into and writes from slices with a resolver, for tests that are not
@@ -76,7 +76,7 @@ impl<Platform, Backend: fs::backend::Backend + 'static> ResolverSlices<Backend>
         data: &[u8],
         offset: Option<usize>,
     ) -> core::result::Result<usize, WriteError> {
-        self.write(entry, data.len(), offset, &mut fill_from_slice(data))
+        self.write(entry, data.len(), offset, &mut copy_from_slice(data))
     }
 }
 
@@ -100,7 +100,7 @@ pub trait BackendSlices: fs::backend::Backend {
         data: &[u8],
         offset: usize,
     ) -> core::result::Result<usize, WriteError> {
-        self.write(h, data.len(), offset, &mut fill_from_slice(data))
+        self.write(h, data.len(), offset, &mut copy_from_slice(data))
     }
 }
 
@@ -306,7 +306,7 @@ impl StdioProvider for TestStdioProvider {
     fn read(
         &self,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
         if input.bytes.is_empty() && input.open {
@@ -314,7 +314,7 @@ impl StdioProvider for TestStdioProvider {
             return Err(StdioProviderError::WouldBlock);
         }
         let read = input.bytes.len().min(length);
-        lend_from_queue(&input.bytes, 0..read, copy)?;
+        lend_from_queue(&input.bytes, 0..read, copy_to)?;
         input.bytes.drain(..read);
         Ok(read)
     }
@@ -323,10 +323,10 @@ impl StdioProvider for TestStdioProvider {
         &self,
         stream: StdioOutputStream,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError> {
         let mut data = alloc::vec![0; length];
-        fill(&mut data)?;
+        copy_from(&mut data)?;
         self.writes.lock().push((stream, data));
         Ok(length)
     }
@@ -482,9 +482,9 @@ impl Drop for ManualAlarm {
     }
 }
 
-/// Returns a copier that appends the parts it is lent to `destination` (see
+/// Returns a `CopyToFn` that appends the parts it is lent to `destination` (see
 /// [`crate::transfer`]).
-pub fn copy_into(destination: &mut Vec<u8>) -> impl FnMut(&[u8]) -> Result<()> + '_ {
+pub fn copy_to_vec(destination: &mut Vec<u8>) -> impl FnMut(&[u8]) -> Result<()> + '_ {
     move |part| {
         destination.extend_from_slice(part);
         Ok(())
@@ -504,7 +504,7 @@ pub fn send_data(
         handle,
         data.len(),
         flags,
-        &mut fill_from_slice(data),
+        &mut copy_from_slice(data),
     )
 }
 
@@ -523,7 +523,7 @@ pub fn send_data_to(
         data.len(),
         flags,
         destination,
-        &mut fill_from_slice(data),
+        &mut copy_from_slice(data),
     )
 }
 
@@ -557,7 +557,7 @@ pub fn receive_data(
         flags,
         peek_offset,
         peek_length,
-        &mut copy_into(&mut data),
+        &mut copy_to_vec(&mut data),
     )?;
     Ok(match outcome {
         SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
@@ -595,7 +595,8 @@ pub fn receive_data_from(
     flags: ReceiveFromFlags,
 ) -> Result<SocketOutcome<DatagramData>> {
     let mut data = Vec::new();
-    let outcome = socket::receive_from(process, handle, length, flags, &mut copy_into(&mut data))?;
+    let outcome =
+        socket::receive_from(process, handle, length, flags, &mut copy_to_vec(&mut data))?;
     Ok(match outcome {
         SocketOutcome::Completed(received) => {
             assert_eq!(received.received, data.len());

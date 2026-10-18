@@ -22,7 +22,7 @@ use crate::{
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
-    buffer::{ReadBuffer, WriteBuffer, copy_into, fill_from},
+    buffer::{ReadBuffer, WriteBuffer, copy_from_buffer, copy_to_buffer},
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -327,7 +327,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
             .wait(cx, false, Events::IN, || {
                 let read = self
                     .broker
-                    .read_pipe(self.handle, length, &mut copy_into(&mut *buf, 0))
+                    .read_pipe(self.handle, length, &mut copy_to_buffer(&mut *buf, 0))
                     .map_err(|error| self.broker_request_error(error))?;
                 if read > length {
                     return Err(TryOpError::Other(PipeError::Io));
@@ -377,7 +377,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     ) -> Result<usize, TryOpError<PipeError>> {
         let written = self
             .broker
-            .write_pipe(self.handle, length, &mut fill_from(buf, offset))
+            .write_pipe(self.handle, length, &mut copy_from_buffer(buf, offset))
             .map_err(|error| self.broker_request_error(error))?;
         if written > length || (written == 0 && length != 0) {
             return Err(TryOpError::Other(PipeError::Io));

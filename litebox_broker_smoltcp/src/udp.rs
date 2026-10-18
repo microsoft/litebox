@@ -21,7 +21,7 @@ use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, PlatformDatagramReceive,
     PlatformSocketStatus, is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::transfer::{Copier, Filler};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -171,14 +171,14 @@ impl Udp {
                     && bytes_from_process + len <= MAX_RECEIVED_BYTES_FROM_PROCESS)
     }
 
-    /// Queues a datagram of `length` bytes, lending it to `fill` (see
+    /// Queues a datagram of `length` bytes, lending it to `copy_from` (see
     /// [`litebox_broker_core::transfer`]), if the socket takes it (see the
     /// module's docs), and the stack's memory budget has room.
     fn deliver(
         &mut self,
         sockets: &mut Sockets,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         source: SocketAddrV4,
         process: Option<ProcessId>,
     ) -> BrokerResult<()> {
@@ -190,7 +190,7 @@ impl Udp {
             return Ok(());
         }
         let mut data = zeroed(length)?;
-        fill(&mut data)?;
+        copy_from(&mut data)?;
         self.received
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
@@ -280,13 +280,13 @@ impl Udp {
         Ok(source)
     }
 
-    /// Sends a datagram of `length` bytes, lending it to `fill` (see
+    /// Sends a datagram of `length` bytes, lending it to `copy_from` (see
     /// [`litebox_broker_core::transfer`]).
     fn send_external(
         &mut self,
         sockets: &mut Sockets,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         source: SocketAddrV4,
         destination: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<usize>> {
@@ -303,7 +303,7 @@ impl Udp {
                 self.blocked = None;
                 // smoltcp sends the datagram whatever happens; one whose
                 // filling failed goes out zeroed rather than with stale bytes.
-                fill(datagram).inspect_err(|_| datagram.fill(0))?;
+                copy_from(datagram).inspect_err(|_| datagram.fill(0))?;
                 Ok(SocketOutcome::Completed(length))
             }
             Err(udp::SendError::BufferFull) => {
@@ -327,14 +327,14 @@ impl Udp {
         sockets: &mut Sockets,
         length: usize,
         flags: ReceiveFromFlags,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         if let Some(error) = self.pending_error.take() {
             return Ok(SocketOutcome::Failed(error));
         }
         let datagram = self.received.front().ok_or(BrokerError::WouldBlock)?;
         let received = datagram.data.len().min(length);
-        copy(&datagram.data[..received])?;
+        copy_to(&datagram.data[..received])?;
         let received = PlatformDatagramReceive {
             received,
             datagram_length: datagram.data.len(),
@@ -510,14 +510,14 @@ impl Stack {
         Ok(SocketConnectionStatus::Connected)
     }
 
-    /// Sends a datagram of `length` bytes, lending it to `fill` (see
+    /// Sends a datagram of `length` bytes, lending it to `copy_from` (see
     /// [`litebox_broker_core::transfer`]).
     pub(super) fn send_udp(
         &mut self,
         id: u64,
         length: usize,
         destination: Option<SocketAddrV4>,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let process = self.entries.get(&id).ok_or(BrokerError::Internal)?.process;
         let udp = self.udp_entry(id)?;
@@ -547,7 +547,7 @@ impl Stack {
             else {
                 return Err(BrokerError::Internal);
             };
-            return udp.send_external(&mut self.sockets, length, fill, source, destination);
+            return udp.send_external(&mut self.sockets, length, copy_from, source, destination);
         }
         let Some(receiver) = self.udp_bound_to(destination) else {
             return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
@@ -559,7 +559,7 @@ impl Stack {
         else {
             return Err(BrokerError::Internal);
         };
-        receiver.deliver(&mut self.sockets, length, fill, source, Some(process))?;
+        receiver.deliver(&mut self.sockets, length, copy_from, source, Some(process))?;
         Ok(SocketOutcome::Completed(length))
     }
 }

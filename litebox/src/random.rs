@@ -7,7 +7,7 @@ use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use thiserror::Error;
 
 use crate::broker::error::BrokerControlError;
-use crate::buffer::{ReadBuffer, copy_into};
+use crate::buffer::{ReadBuffer, copy_to_buffer};
 use crate::{LiteBox, sync::RawSyncPrimitivesProvider};
 
 /// A broker could not fill a random-byte request.
@@ -35,7 +35,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         while filled < buf.len() {
             let length = (buf.len() - filled).min(MAX_RANDOM_TRANSFER_SIZE as usize);
             broker
-                .fill_random(length, &mut copy_into(&mut *buf, filled))
+                .fill_random(length, &mut copy_to_buffer(&mut *buf, filled))
                 .map_err(|error| match error {
                     BrokerControlError::Fault => FillRandomError::Fault,
                     _ => FillRandomError::Unavailable,

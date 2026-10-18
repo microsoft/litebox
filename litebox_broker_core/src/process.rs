@@ -2014,7 +2014,7 @@ mod tests {
     use crate::stdio::StdioOutputStream;
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
-    use crate::transfer::{copy_to_slice, fill_from_slice};
+    use crate::transfer::{copy_from_slice, copy_to_slice};
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -3740,7 +3740,7 @@ mod tests {
                 file,
                 b"abcdef".len(),
                 None,
-                &mut fill_from_slice(b"abcdef")
+                &mut copy_from_slice(b"abcdef")
             ),
             Ok(Ok(6))
         );
@@ -3958,7 +3958,7 @@ mod tests {
         assert_eq!(
             broker
                 .fs
-                .write(&read_only_null, 1, None, &mut fill_from_slice(&[0])),
+                .write(&read_only_null, 1, None, &mut copy_from_slice(&[0])),
             Ok(Err(FileError::NotForWriting))
         );
 
@@ -3982,7 +3982,7 @@ mod tests {
                 stdout,
                 b"source".len(),
                 None,
-                &mut fill_from_slice(b"source")
+                &mut copy_from_slice(b"source")
             ),
             Ok(Ok(6))
         );
@@ -3992,7 +3992,7 @@ mod tests {
                 duplicated_stdout,
                 b"target".len(),
                 None,
-                &mut fill_from_slice(b"target")
+                &mut copy_from_slice(b"target")
             ),
             Ok(Ok(6))
         );

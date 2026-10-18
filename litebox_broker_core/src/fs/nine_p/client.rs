@@ -15,7 +15,7 @@ use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::id_pool::IdPool;
 use super::transport::{self, Read, Write};
-use crate::transfer::{Copier, Filler};
+use crate::transfer::{CopyFromFn, CopyToFn};
 
 /// Pool of 9P Fid values
 struct FidPool<Platform: RawSyncPrimitivesProvider> {
@@ -460,13 +460,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         }
     }
 
-    /// Read up to `length` bytes from a file, lending them to `copy`
+    /// Read up to `length` bytes from a file, lending them to `copy_to`
     pub(super) fn read(
         &self,
         fid: &Fid<Platform>,
         offset: u64,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, Error> {
         let max_count = self
             .msize
@@ -484,7 +484,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                     if data.len() > count {
                         return Err(Error::InvalidResponse);
                     }
-                    copy(&data)?;
+                    copy_to(&data)?;
                     Ok(data.len())
                 }
                 Fcall::Rlerror(e) => Err(Error::from(e)),
@@ -494,13 +494,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Write up to `length` bytes to a file, lending the room for them to
-    /// `fill` in the request
+    /// `copy_from` in the request
     pub(super) fn write(
         &self,
         fid: &Fid<Platform>,
         offset: u64,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, Error> {
         let max_count = self
             .msize
@@ -510,7 +510,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         let count_u32 = u32::try_from(count).map_err(|_| Error::InvalidResponse)?;
         self.exchange(
             |wbuf, tag| {
-                TaggedFcall::encode_twrite_to_buf(wbuf, tag, fid.id(), offset, count_u32, fill)
+                TaggedFcall::encode_twrite_to_buf(wbuf, tag, fid.id(), offset, count_u32, copy_from)
             },
             |response| match response {
                 Fcall::Rwrite(fcall::Rwrite { count: written }) => {

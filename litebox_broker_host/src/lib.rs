@@ -742,7 +742,7 @@ fn handle_file_request<Memory: SharedMemory>(
                 handle,
                 buffer.length() as usize,
                 offset,
-                &mut fill_from_shared_buffer(shared_buffers, buffer, 0),
+                &mut copy_from_shared_buffer(shared_buffers, buffer, 0),
             )
             .map_err(RequestFailure::from)?
             {
@@ -930,7 +930,7 @@ fn allocate_zeroed(length: usize) -> RequestResult<Vec<u8>> {
     Ok(data)
 }
 
-/// Returns a copier that copies the parts it is lent, one after another,
+/// Returns a `CopyToFn` that copies the parts it is lent, one after another,
 /// into the validated sequence `buffer` from `offset` on (see
 /// [`litebox_broker_core::transfer`]).
 fn copy_to_shared_buffer<Memory: SharedMemory>(
@@ -947,10 +947,10 @@ fn copy_to_shared_buffer<Memory: SharedMemory>(
     }
 }
 
-/// Returns a filler that fills the parts it is lent, one after another,
+/// Returns a `CopyFromFn` that fills the parts it is lent, one after another,
 /// from the validated sequence `buffer` from `offset` on (see
 /// [`litebox_broker_core::transfer`]).
-fn fill_from_shared_buffer<Memory: SharedMemory>(
+fn copy_from_shared_buffer<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     buffer: SharedBufferSequence,
     mut offset: usize,
@@ -1293,7 +1293,7 @@ fn handle_socket_request<Memory: SharedMemory>(
                 request.handle,
                 request.buffer.length() as usize,
                 request.flags,
-                &mut fill_from_shared_buffer(shared_buffers, request.buffer, 0),
+                &mut copy_from_shared_buffer(shared_buffers, request.buffer, 0),
             )
             .map_err(RequestFailure::from)?
             {
@@ -1319,7 +1319,7 @@ fn handle_socket_request<Memory: SharedMemory>(
                 request.buffer.length() as usize,
                 request.flags,
                 request.destination,
-                &mut fill_from_shared_buffer(shared_buffers, request.buffer, 0),
+                &mut copy_from_shared_buffer(shared_buffers, request.buffer, 0),
             )
             .map_err(RequestFailure::from)?
             {
@@ -1513,7 +1513,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
                 process,
                 request.handle,
                 request.buffer.length() as usize,
-                &mut fill_from_shared_buffer(shared_buffers, request.buffer, 0),
+                &mut copy_from_shared_buffer(shared_buffers, request.buffer, 0),
             )
             .map_err(RequestFailure::from)
             .and_then(|written| {
@@ -1618,7 +1618,7 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 address.as_ref(),
                 length,
                 request.user,
-                &mut fill_from_shared_buffer(shared_buffers, request.buffer, address_length),
+                &mut copy_from_shared_buffer(shared_buffers, request.buffer, address_length),
             )?
             .map_or_else(UnixSocketResponse::Failed, |sent| {
                 UnixSocketResponse::Send(SendUnixSocketResponse {
@@ -1912,7 +1912,7 @@ mod tests {
     use litebox_broker_core::test_support::{
         ManualTimerProvider, TestBrokerCoreBuilder, TestStdioProvider,
     };
-    use litebox_broker_core::transfer::{Copier, Filler};
+    use litebox_broker_core::transfer::{CopyFromFn, CopyToFn};
     use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
@@ -2158,9 +2158,9 @@ mod tests {
             &self,
             length: usize,
             _flags: SendFlags,
-            fill: &mut Filler<'_>,
+            copy_from: &mut CopyFromFn<'_>,
         ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
-            fill(&mut vec![0; length])?;
+            copy_from(&mut vec![0; length])?;
             Ok(SocketOutcome::Completed(length))
         }
 
@@ -2169,9 +2169,9 @@ mod tests {
             length: usize,
             _flags: SendFlags,
             _destination: Option<SocketAddrV4>,
-            fill: &mut Filler<'_>,
+            copy_from: &mut CopyFromFn<'_>,
         ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
-            fill(&mut vec![0; length])?;
+            copy_from(&mut vec![0; length])?;
             Ok(SocketOutcome::Completed(length))
         }
 
@@ -2182,10 +2182,10 @@ mod tests {
             _flags: ReceiveFlags,
             _peek_offset: u32,
             _peek_length: u32,
-            copy: &mut Copier<'_>,
+            copy_to: &mut CopyToFn<'_>,
         ) -> litebox_broker_core::Result<SocketOutcome<PlatformStreamReceive>> {
             let received = length.min(3);
-            copy(&[4, 5, 6][..received])?;
+            copy_to(&[4, 5, 6][..received])?;
             Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
                 received,
             )))
@@ -2195,10 +2195,10 @@ mod tests {
             &self,
             length: usize,
             _flags: ReceiveFromFlags,
-            copy: &mut Copier<'_>,
+            copy_to: &mut CopyToFn<'_>,
         ) -> litebox_broker_core::Result<SocketOutcome<PlatformDatagramReceive>> {
             let received = length.min(3);
-            copy(&[4, 5, 6][..received])?;
+            copy_to(&[4, 5, 6][..received])?;
             Ok(SocketOutcome::Completed(PlatformDatagramReceive {
                 received,
                 datagram_length: 4,

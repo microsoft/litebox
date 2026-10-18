@@ -18,7 +18,7 @@ use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBuff
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_transport::channel::LocalCallChannel;
 
-use crate::transfer::{Copier, Filler};
+use crate::transfer::{CopyFromFn, CopyToFn};
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 type FileOperationResult<T> = core::result::Result<T, FileError>;
@@ -56,7 +56,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
     /// Reads up to `buffer.length()` bytes from an open file into an
     /// operation-scoped shared buffer lease, and lends the bytes read to
-    /// `copy`.
+    /// `copy_to`.
     ///
     /// # Panics
     ///
@@ -66,7 +66,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
         self.validate_file_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
@@ -81,7 +81,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     "broker returned oversized file read"
                 );
                 let read = response.read as usize;
-                self.lend_shared_buffer(buffer, 0, read, copy)?;
+                self.lend_shared_buffer(buffer, 0, read, copy_to)?;
                 Ok(Ok(read))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -90,7 +90,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Writes up to `buffer.length()` bytes to an open file from an
-    /// operation-scoped shared buffer lease, which `fill` fills first.
+    /// operation-scoped shared buffer lease, which `copy_from` fills first.
     ///
     /// # Panics
     ///
@@ -100,11 +100,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
         self.validate_file_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
-        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, fill)?;
+        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, copy_from)?;
         match self.request_file(FileRequest::Write(WriteFileRequest {
             handle,
             buffer,
@@ -486,7 +486,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::test_support::test_broker_local;
-    use crate::transfer::{copy_to_slice, fill_from_slice};
+    use crate::transfer::{copy_from_slice, copy_to_slice};
 
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
 
@@ -548,7 +548,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .write_file(handle, sequence([1], 3), &mut fill_from_slice(b"abc"), None)
+                .write_file(handle, sequence([1], 3), &mut copy_from_slice(b"abc"), None)
                 .unwrap(),
             Ok(3)
         );
@@ -654,7 +654,7 @@ mod tests {
 
         assert_eq!(
             local
-                .write_file(ObjectHandle(1), buffer, &mut fill_from_slice(&data), None)
+                .write_file(ObjectHandle(1), buffer, &mut copy_from_slice(&data), None)
                 .unwrap(),
             Ok(length)
         );

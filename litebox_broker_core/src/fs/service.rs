@@ -25,7 +25,7 @@ use super::errors::{
 use super::resolver::{Resolver, ResolverEntry};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
-use crate::transfer::{Copier, Filler, Lent};
+use crate::transfer::{CopyFromFn, CopyToFn, Lent};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a broker file operation.
@@ -99,8 +99,9 @@ impl ObjectEntry {
 
 mod private {
     use super::{
-        BrokerError, Copier, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
-        FileSeekWhence, FileStatus, FileStatusFlags, FileUser, Filler, Result, ServiceResult, Vec,
+        BrokerError, CopyFromFn, CopyToFn, File, FileAccessMode, FileDirectoryEntry, FileMode,
+        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, Result,
+        ServiceResult, Vec,
     };
 
     pub trait Service: Send + Sync {
@@ -120,7 +121,7 @@ mod private {
             _file: &File,
             _length: usize,
             _offset: Option<u64>,
-            _copy: &mut Copier<'_>,
+            _copy: &mut CopyToFn<'_>,
         ) -> ServiceResult<usize> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -130,7 +131,7 @@ mod private {
             _file: &File,
             _length: usize,
             _offset: Option<u64>,
-            _fill: &mut Filler<'_>,
+            _fill: &mut CopyFromFn<'_>,
         ) -> ServiceResult<usize> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -248,7 +249,7 @@ where
         file: &File,
         length: usize,
         offset: Option<u64>,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> ServiceResult<usize> {
         let Ok(offset) = checked_offset(offset, length) else {
             return Ok(Err(FileError::InvalidOffset));
@@ -257,7 +258,7 @@ where
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
         let mut lent = Lent::new(length);
-        let counted = &mut |part: &[u8]| lent.lend(part.len(), || copy(part));
+        let counted = &mut |part: &[u8]| lent.lend(part.len(), || copy_to(part));
         let read = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
@@ -284,16 +285,12 @@ where
     /// lent no more room than that. What it lent may differ from what it
     /// reports writing: a short write keeps less than it filled, and
     /// `/dev/null` discards what it is written without lending room.
-    #[expect(
-        clippy::similar_names,
-        reason = "`file` and `fill` follow the service and lending conventions"
-    )]
     fn write(
         &self,
         file: &File,
         length: usize,
         offset: Option<u64>,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> ServiceResult<usize> {
         let Ok(offset) = checked_offset(offset, length) else {
             return Ok(Err(FileError::InvalidOffset));
@@ -302,7 +299,7 @@ where
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
         let mut lent = Lent::new(length);
-        let counted = &mut |part: &mut [u8]| lent.lend(part.len(), || fill(part));
+        let counted = &mut |part: &mut [u8]| lent.lend(part.len(), || copy_from(part));
         let written = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
@@ -547,7 +544,7 @@ pub(crate) fn open_without_reference(
     Ok(Ok((file, status)))
 }
 
-/// Reads up to `length` bytes from a broker-owned open file, lending them to `copy` (see
+/// Reads up to `length` bytes from a broker-owned open file, lending them to `copy_to` (see
 /// [`crate::transfer`]).
 ///
 /// Fails with [`BrokerError::WouldBlock`] while a file that publishes readiness has nothing to
@@ -557,17 +554,17 @@ pub fn read(
     handle: ObjectHandle,
     length: usize,
     offset: Option<u64>,
-    copy: &mut Copier<'_>,
+    copy_to: &mut CopyToFn<'_>,
 ) -> Result<FileResult<usize>> {
     if length > MAX_FILE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.core.fs.read(&file, length, offset, copy)
+    process.core.fs.read(&file, length, offset, copy_to)
 }
 
-/// Writes up to `length` bytes to a broker-owned open file, lending the room for them to `fill`
-/// (see [`crate::transfer`]).
+/// Writes up to `length` bytes to a broker-owned open file, lending the room for them to
+/// `copy_from` (see [`crate::transfer`]).
 ///
 /// Fails with [`BrokerError::WouldBlock`] while a file that publishes readiness cannot accept
 /// bytes, or with [`BrokerError::NonBlockingWouldBlock`] if the file is also non-blocking.
@@ -576,7 +573,7 @@ pub fn write(
     handle: ObjectHandle,
     length: usize,
     offset: Option<u64>,
-    fill: &mut Filler<'_>,
+    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<FileResult<usize>> {
     if length > MAX_FILE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
@@ -585,7 +582,7 @@ pub fn write(
         &file(process, handle, ObjectRights::WRITE)?,
         length,
         offset,
-        fill,
+        copy_from,
     )
 }
 
@@ -992,7 +989,7 @@ mod tests {
     use crate::random::TestRandomProvider;
     use crate::stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream};
     use crate::test_platform::TestPlatform;
-    use crate::transfer::{copy_to_slice, fill_from_slice};
+    use crate::transfer::{copy_from_slice, copy_to_slice};
     use core::num::NonZeroU64;
     use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
 
@@ -1007,9 +1004,9 @@ mod tests {
         fn read(
             &self,
             _length: usize,
-            copy: &mut Copier<'_>,
+            copy_to: &mut CopyToFn<'_>,
         ) -> core::result::Result<usize, StdioProviderError> {
-            let _ = copy(&[b'x'; 8][..self.lent]);
+            let _ = copy_to(&[b'x'; 8][..self.lent]);
             self.reported
         }
 
@@ -1017,9 +1014,9 @@ mod tests {
             &self,
             _stream: StdioOutputStream,
             _length: usize,
-            fill: &mut Filler<'_>,
+            copy_from: &mut CopyFromFn<'_>,
         ) -> core::result::Result<usize, StdioProviderError> {
-            let _ = fill(&mut [0; 8][..self.lent]);
+            let _ = copy_from(&mut [0; 8][..self.lent]);
             self.reported
         }
 
@@ -1064,26 +1061,26 @@ mod tests {
         lent: usize,
         reported: core::result::Result<usize, StdioProviderError>,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> ServiceResult<usize> {
         let (fs, stdin) =
             misreporting_device(lent, reported, "/dev/stdin", FileAccessMode::ReadOnly);
-        private::Service::read(&fs, &stdin, length, None, copy)
+        private::Service::read(&fs, &stdin, length, None, copy_to)
     }
 
     fn write_misreporting(
         lent: usize,
         reported: core::result::Result<usize, StdioProviderError>,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> ServiceResult<usize> {
         let (fs, stdout) =
             misreporting_device(lent, reported, "/dev/stdout", FileAccessMode::WriteOnly);
-        private::Service::write(&fs, &stdout, length, None, fill)
+        private::Service::write(&fs, &stdout, length, None, copy_from)
     }
 
     /// A read must lend exactly the bytes it reports reading, and none if it
-    /// fails, and fails with its copier's failure even if the backend
+    /// fails, and fails with its `CopyToFn`'s failure even if the backend
     /// swallowed it.
     #[test]
     fn reads_report_what_they_lend() {
@@ -1127,25 +1124,25 @@ mod tests {
 
     /// A write may lend more room than it reports writing, as a short write
     /// does, or less, as `/dev/null` does, but no more than requested, and
-    /// fails with its filler's failure even if the backend swallowed it.
+    /// fails with its `CopyFromFn`'s failure even if the backend swallowed it.
     #[test]
     fn writes_lend_no_more_than_requested() {
         let source = [b'y'; 8];
         assert_eq!(
-            write_misreporting(4, Ok(4), 4, &mut fill_from_slice(&source)),
+            write_misreporting(4, Ok(4), 4, &mut copy_from_slice(&source)),
             Ok(Ok(4))
         );
         assert_eq!(
-            write_misreporting(4, Ok(2), 4, &mut fill_from_slice(&source)),
+            write_misreporting(4, Ok(2), 4, &mut copy_from_slice(&source)),
             Ok(Ok(2))
         );
         assert_eq!(
-            write_misreporting(0, Ok(4), 4, &mut fill_from_slice(&source)),
+            write_misreporting(0, Ok(4), 4, &mut copy_from_slice(&source)),
             Ok(Ok(4))
         );
         for (lent, reported, length) in [(4, Ok(5), 4), (4, Ok(2), 2)] {
             assert_eq!(
-                write_misreporting(lent, reported, length, &mut fill_from_slice(&source)),
+                write_misreporting(lent, reported, length, &mut copy_from_slice(&source)),
                 Err(BrokerError::Internal)
             );
         }

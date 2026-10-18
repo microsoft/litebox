@@ -19,7 +19,7 @@ use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
     PlatformStreamReceive, is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::transfer::{Copier, Filler};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -514,7 +514,7 @@ impl Tcp {
         Ok(())
     }
 
-    /// Lends what it receives to `copy` (see
+    /// Lends what it receives to `copy_to` (see
     /// [`litebox_broker_core::transfer`]). The broker core validated the peek
     /// window.
     #[expect(clippy::too_many_arguments, reason = "mirrors PlatformSocket::receive")]
@@ -526,7 +526,7 @@ impl Tcp {
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         self.continue_peek(reader, flags, peek_offset)?;
         if !matches!(self.phase, Phase::Internal(..) | Phase::External(_)) {
@@ -583,17 +583,17 @@ impl Tcp {
         }
         let received = match (&mut self.saved, &self.phase) {
             (Some(saved), _) if peek => {
-                copy(&saved[start..end])?;
+                copy_to(&saved[start..end])?;
                 end - start
             }
             (Some(saved), _) => {
-                copy(&saved[..end])?;
+                copy_to(&saved[..end])?;
                 saved.drain(..end);
                 self.release_saved(sockets);
                 end
             }
             (None, &Phase::Internal(id, pair_end)) => {
-                sockets.read_pair(id, pair_end, start, end, peek, copy)?;
+                sockets.read_pair(id, pair_end, start, end, peek, copy_to)?;
                 end - start
             }
             (None, &Phase::External(handle)) if peek => {
@@ -605,7 +605,7 @@ impl Tcp {
                     .peek_slice(&mut data)
                     .map_err(|_| BrokerError::Internal)?;
                 let peeked = data.get(start..copied).ok_or(BrokerError::Internal)?;
-                copy(peeked)?;
+                copy_to(peeked)?;
                 peeked.len()
             }
             (None, &Phase::External(handle)) => {
@@ -621,7 +621,7 @@ impl Tcp {
                     received += socket
                         .recv(|part| {
                             let len = part.len().min(end - received);
-                            match copy(&part[..len]) {
+                            match copy_to(&part[..len]) {
                                 Ok(()) => (len, Ok(len)),
                                 Err(error) => (0, Err(error)),
                             }
@@ -641,12 +641,12 @@ impl Tcp {
     }
 
     /// Sends what of `length` bytes there is room for, lending the room to
-    /// `fill` (see [`litebox_broker_core::transfer`]).
+    /// `copy_from` (see [`litebox_broker_core::transfer`]).
     pub(super) fn send(
         &mut self,
         sockets: &mut Sockets,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         if self.write_shutdown {
             return Ok(SocketOutcome::Failed(SocketError::Shutdown));
@@ -678,7 +678,7 @@ impl Tcp {
                 if sockets.pair(id)?.peer_closed(end) {
                     return Ok(SocketOutcome::Failed(SocketError::ConnectionReset));
                 }
-                sockets.write_pair(id, end, length, fill)?
+                sockets.write_pair(id, end, length, copy_from)?
             }
             Phase::External(handle) => {
                 let socket = sockets.tcp(handle);
@@ -694,7 +694,7 @@ impl Tcp {
                     }
                     let filled = socket.send(|part| {
                         let len = part.len().min(length - sent);
-                        match fill(&mut part[..len]) {
+                        match copy_from(&mut part[..len]) {
                             Ok(()) => (len, Ok(len)),
                             Err(error) => (0, Err(error)),
                         }

@@ -9,7 +9,7 @@ use core::net::SocketAddrV4;
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_local::transfer::{Copier, Filler};
+use litebox_broker_local::transfer::{CopyFromFn, CopyToFn};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
@@ -165,11 +165,11 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn exit_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
 
     /// Reads `length` random bytes, at most [`MAX_RANDOM_TRANSFER_SIZE`],
-    /// lending them to `copy`.
+    /// lending them to `copy_to`.
     fn fill_random(
         &self,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn create_tcp_socket(
@@ -229,45 +229,45 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<(), BrokerControlError>;
 
     /// Sends up to `length` bytes, at most [`MAX_SOCKET_TRANSFER_SIZE`], on
-    /// a stream socket, which `fill` fills first.
+    /// a stream socket, which `copy_from` fills first.
     fn send_socket(
         &self,
         handle: ObjectHandle,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         flags: BrokerSendFlags,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
 
     /// Receives up to `length` bytes, at most [`MAX_SOCKET_TRANSFER_SIZE`],
-    /// from a stream socket, lending the bytes received to `copy`.
+    /// from a stream socket, lending the bytes received to `copy_to`.
     fn receive_socket(
         &self,
         handle: ObjectHandle,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
         flags: BrokerReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
     ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError>;
 
-    /// Sends `length` bytes, at most [`MAX_UDP_DATAGRAM_SIZE`], which `fill`
+    /// Sends `length` bytes, at most [`MAX_UDP_DATAGRAM_SIZE`], which `copy_from`
     /// fills first, as one datagram.
     fn send_to_socket(
         &self,
         handle: ObjectHandle,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         flags: BrokerSendFlags,
         destination: Option<SocketAddrV4>,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
 
     /// Receives one datagram, up to `length` bytes of it, at most
-    /// [`MAX_UDP_DATAGRAM_SIZE`], lending the bytes received to `copy`.
+    /// [`MAX_UDP_DATAGRAM_SIZE`], lending the bytes received to `copy_to`.
     fn receive_from_socket(
         &self,
         handle: ObjectHandle,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
         flags: BrokerReceiveFromFlags,
     ) -> core::result::Result<SocketOutcome<ReceiveFromSocketResponse>, BrokerControlError>;
 
@@ -383,21 +383,21 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<CreatePipeResponse, BrokerControlError>;
 
     /// Reads up to `length` bytes, at most [`MAX_PIPE_TRANSFER_SIZE`], from
-    /// a pipe, lending the bytes read to `copy`.
+    /// a pipe, lending the bytes read to `copy_to`.
     fn read_pipe(
         &self,
         handle: ObjectHandle,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> core::result::Result<usize, BrokerControlError>;
 
     /// Writes up to `length` bytes, at most [`MAX_PIPE_TRANSFER_SIZE`], to a
-    /// pipe, which `fill` fills first.
+    /// pipe, which `copy_from` fills first.
     fn write_pipe(
         &self,
         handle: ObjectHandle,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> core::result::Result<usize, BrokerControlError>;
 
     fn open_file(
@@ -410,22 +410,22 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>;
 
     /// Reads up to `length` bytes, at most [`MAX_FILE_TRANSFER_SIZE`], from
-    /// a file, lending the bytes read to `copy`.
+    /// a file, lending the bytes read to `copy_to`.
     fn read_file(
         &self,
         handle: ObjectHandle,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError>;
 
     /// Writes up to `length` bytes, at most [`MAX_FILE_TRANSFER_SIZE`], to a
-    /// file, which `fill` fills first.
+    /// file, which `copy_from` fills first.
     fn write_file(
         &self,
         handle: ObjectHandle,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError>;
 
@@ -546,7 +546,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         flags: FileOpenFlags,
     ) -> core::result::Result<core::result::Result<ObjectHandle, UnixSocketError>, BrokerControlError>;
 
-    /// Sends `length` bytes, which `fill` fills first, to `address`, or to
+    /// Sends `length` bytes, which `copy_from` fills first, to `address`, or to
     /// the connected peer if `address` is `None`.
     ///
     /// Data that does not fit in one transfer fails with
@@ -557,18 +557,18 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>;
 
     /// Receives up to `capacity` bytes, at most [`UNIX_SOCKET_BUFFER_SIZE`],
-    /// lending the bytes received to `copy`, as for a non-blocking socket if
+    /// lending the bytes received to `copy_to`, as for a non-blocking socket if
     /// `nonblocking` is set, returning the sender's name if `source` is set.
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
         capacity: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
         peek: bool,
         source: bool,
         nonblocking: bool,
@@ -939,13 +939,13 @@ where
     fn fill_random(
         &self,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> core::result::Result<(), BrokerControlError> {
         if length > MAX_RANDOM_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.fill_random(lease.sequence(), copy))
+        self.request(|local| local.fill_random(lease.sequence(), copy_to))
     }
 
     fn create_tcp_socket(
@@ -1048,14 +1048,14 @@ where
         &self,
         handle: ObjectHandle,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         flags: BrokerSendFlags,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
         if length > MAX_SOCKET_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.send_socket(handle, lease.sequence(), fill, flags))
+        self.request(|local| local.send_socket(handle, lease.sequence(), copy_from, flags))
             .map(|result| match result {
                 Ok(sent) => SocketOutcome::Completed(sent),
                 Err(error) => SocketOutcome::Failed(error),
@@ -1066,7 +1066,7 @@ where
         &self,
         handle: ObjectHandle,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
         flags: BrokerReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
@@ -1084,7 +1084,7 @@ where
                     peek_offset,
                     peek_length,
                 },
-                copy,
+                copy_to,
             )
         })
         .map(|result| match result {
@@ -1097,7 +1097,7 @@ where
         &self,
         handle: ObjectHandle,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         flags: BrokerSendFlags,
         destination: Option<SocketAddrV4>,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
@@ -1106,7 +1106,7 @@ where
         }
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| {
-            local.send_to_socket(handle, lease.sequence(), fill, flags, destination)
+            local.send_to_socket(handle, lease.sequence(), copy_from, flags, destination)
         })
         .map(|result| match result {
             Ok(sent) => SocketOutcome::Completed(sent),
@@ -1118,14 +1118,14 @@ where
         &self,
         handle: ObjectHandle,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
         flags: BrokerReceiveFromFlags,
     ) -> core::result::Result<SocketOutcome<ReceiveFromSocketResponse>, BrokerControlError> {
         if length > MAX_UDP_DATAGRAM_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.receive_from_socket(handle, lease.sequence(), copy, flags))
+        self.request(|local| local.receive_from_socket(handle, lease.sequence(), copy_to, flags))
             .map(|result| match result {
                 Ok(received) => SocketOutcome::Completed(received),
                 Err(error) => SocketOutcome::Failed(error),
@@ -1295,26 +1295,26 @@ where
         &self,
         handle: ObjectHandle,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> core::result::Result<usize, BrokerControlError> {
         if length > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.read_pipe(handle, lease.sequence(), copy))
+        self.request(|local| local.read_pipe(handle, lease.sequence(), copy_to))
     }
 
     fn write_pipe(
         &self,
         handle: ObjectHandle,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> core::result::Result<usize, BrokerControlError> {
         if length > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.write_pipe(handle, lease.sequence(), fill))
+        self.request(|local| local.write_pipe(handle, lease.sequence(), copy_from))
     }
 
     fn open_file(
@@ -1334,28 +1334,28 @@ where
         &self,
         handle: ObjectHandle,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         if length > MAX_FILE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.read_file(handle, lease.sequence(), copy, offset))
+        self.request(|local| local.read_file(handle, lease.sequence(), copy_to, offset))
     }
 
     fn write_file(
         &self,
         handle: ObjectHandle,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         if length > MAX_FILE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.write_file(handle, lease.sequence(), fill, offset))
+        self.request(|local| local.write_file(handle, lease.sequence(), copy_from, offset))
     }
 
     fn seek_file(
@@ -1554,7 +1554,7 @@ where
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>
     {
@@ -1570,7 +1570,7 @@ where
         }
         let lease = self.acquire_shared_buffer(address.len() + length)?;
         self.request(|local| {
-            local.send_unix_socket(handle, lease.sequence(), &address, length, fill, user)
+            local.send_unix_socket(handle, lease.sequence(), &address, length, copy_from, user)
         })
     }
 
@@ -1578,7 +1578,7 @@ where
         &self,
         handle: ObjectHandle,
         capacity: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
         peek: bool,
         source: bool,
         nonblocking: bool,
@@ -1601,7 +1601,7 @@ where
             source,
             nonblocking,
         };
-        self.request(|local| local.receive_unix_socket(request, copy))
+        self.request(|local| local.receive_unix_socket(request, copy_to))
     }
 
     fn shutdown_unix_socket(
@@ -1682,7 +1682,7 @@ mod tests {
     use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::{HeapSharedMemory, SharedMemory as _};
 
-    use crate::buffer::{copy_into, fill_from};
+    use crate::buffer::{copy_from_buffer, copy_to_buffer};
 
     use litebox_broker_local::test_support::test_broker_local;
 
@@ -1705,11 +1705,11 @@ mod tests {
         ));
         let first_control = Arc::clone(&control);
         let first = std::thread::spawn(move || {
-            first_control.write_pipe(ObjectHandle(1), 5, &mut fill_from(&b"first"[..], 0))
+            first_control.write_pipe(ObjectHandle(1), 5, &mut copy_from_buffer(&b"first"[..], 0))
         });
         let second_control = Arc::clone(&control);
         let second = std::thread::spawn(move || {
-            second_control.write_pipe(ObjectHandle(2), 6, &mut fill_from(&b"second"[..], 0))
+            second_control.write_pipe(ObjectHandle(2), 6, &mut copy_from_buffer(&b"second"[..], 0))
         });
 
         let first_observed = observed_receiver
@@ -1752,7 +1752,7 @@ mod tests {
         let first_control = Arc::clone(&control);
         let read = |control: Arc<BrokerLocalControl<MockPlatform, _>>, handle| {
             let mut data = [0; 3];
-            let read = control.read_pipe(handle, 3, &mut copy_into(&mut data[..], 0));
+            let read = control.read_pipe(handle, 3, &mut copy_to_buffer(&mut data[..], 0));
             read.map(|read| data[..read].to_vec())
         };
         let first = std::thread::spawn(move || read(first_control, ObjectHandle(1)));

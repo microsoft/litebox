@@ -16,7 +16,7 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
-use crate::transfer::{Copier, Filler};
+use crate::transfer::{CopyFromFn, CopyToFn};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
 ///
@@ -391,24 +391,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         h: &super::backend::FileHandle,
         length: usize,
         offset: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
         let start = offset.min(file.data.len());
         let end = offset.checked_add(length).unwrap().min(file.data.len());
         debug_assert!(start <= end);
-        copy(&file.data[start..end])?;
+        copy_to(&file.data[start..end])?;
         Ok(end - start)
     }
 
     /// Fills the file's bytes in place, past its end padded with zeroes first,
-    /// and restores its length if `fill` fails.
+    /// and restores its length if `copy_from` fails.
     fn write(
         &self,
         h: &super::backend::FileHandle,
         length: usize,
         offset: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, WriteError> {
         let mut file_data = h.get_typed::<Self>().file.write();
         let data = file_data.data.to_mut();
@@ -417,7 +417,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         if end > previous_len {
             data.resize(end, 0);
         }
-        if let Err(error) = fill(&mut data[offset..end]) {
+        if let Err(error) = copy_from(&mut data[offset..end]) {
             data.truncate(previous_len);
             return Err(error.into());
         }

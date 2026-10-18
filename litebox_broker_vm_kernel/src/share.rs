@@ -24,7 +24,7 @@ use litebox_broker_core::fs::nine_p::transport::{Read, ReadError, Write, WriteEr
 use litebox_broker_core::fs::nine_p::{self, NineP};
 use litebox_broker_core::fs::{DirEntry, FileStatus, Mode, OFlags};
 use litebox_broker_core::readiness::ReadinessSource;
-use litebox_broker_core::transfer::{Copier, Filler};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn};
 use litebox_platform_vm_kernel::VmKernel;
 
 /// Carries 9P messages to a server, one request at a time: whole messages,
@@ -220,9 +220,9 @@ impl Backend for ShareFs {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, FsReadError> {
-        self.0.read(h, length, offset, copy)
+        self.0.read(h, length, offset, copy_to)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -234,7 +234,7 @@ impl Backend for ShareFs {
         _h: &FileHandle,
         _length: usize,
         _offset: usize,
-        _fill: &mut Filler<'_>,
+        _fill: &mut CopyFromFn<'_>,
     ) -> Result<usize, FsWriteError> {
         Err(FsWriteError::NotForWriting)
     }

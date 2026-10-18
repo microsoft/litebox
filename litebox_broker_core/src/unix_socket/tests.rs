@@ -7,8 +7,8 @@ use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
-use crate::test_support::{TestBrokerCoreBuilder, copy_into};
-use crate::transfer::fill_from_slice;
+use crate::test_support::{TestBrokerCoreBuilder, copy_to_vec};
+use crate::transfer::copy_from_slice;
 use crate::{BrokerCore, CallerCredential, PolicyEngine};
 use std::vec;
 
@@ -39,7 +39,7 @@ fn receive_message(
         peek,
         source,
         nonblocking,
-        &mut copy_into(&mut data),
+        &mut copy_to_vec(&mut data),
     )?;
     Ok(result.map(|received| {
         assert_eq!(received.received, data.len());
@@ -147,7 +147,7 @@ impl Fixture {
             None,
             data.len(),
             USER,
-            &mut fill_from_slice(data),
+            &mut copy_from_slice(data),
         )
     }
 
@@ -163,7 +163,7 @@ impl Fixture {
             Some(address),
             data.len(),
             USER,
-            &mut fill_from_slice(data),
+            &mut copy_from_slice(data),
         )
     }
 

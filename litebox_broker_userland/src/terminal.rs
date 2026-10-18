@@ -20,7 +20,7 @@ use litebox_broker_core::stdio::StdioProviderError;
 use litebox_broker_core::terminal::{
     TerminalEndpoint, TerminalEngine, TerminalEventSink, TerminalTransport, TerminalTransportError,
 };
-use litebox_broker_core::transfer::{Copier, Filler, bounce_buffer};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
 use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
@@ -332,7 +332,7 @@ impl HostTerminal {
     pub(crate) fn read(
         &self,
         length: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, StdioProviderError> {
         let mut state = self.shared.lock();
         if state.status == Status::Failed {
@@ -341,7 +341,7 @@ impl HostTerminal {
         if state.status == Status::HungUp {
             state.process_input();
         }
-        if let Some(count) = state.engine.read(length, copy)? {
+        if let Some(count) = state.engine.read(length, copy_to)? {
             state.publish_if_changed();
             self.shared.wake();
             return Ok(count);
@@ -355,7 +355,7 @@ impl HostTerminal {
     pub(crate) fn write(
         &self,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, StdioProviderError> {
         let mut state = self.shared.lock();
         if state.status != Status::Active {
@@ -367,7 +367,7 @@ impl HostTerminal {
         }
         // Output processing rewrites bytes, so stage them first.
         let mut input = bounce_buffer(length.min(available))?;
-        fill(&mut input)?;
+        copy_from(&mut input)?;
         let state = &mut *state;
         state.engine.output(&input, &mut state.output);
         state.drained = false;
@@ -539,7 +539,7 @@ impl Drop for HostTerminal {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use litebox_broker_core::transfer::{copy_to_slice, fill_from_slice};
+    use litebox_broker_core::transfer::{copy_from_slice, copy_to_slice};
     use litebox_broker_platform_linux_userland::terminal::LinuxTerminal;
     use std::fs::File;
     use std::os::fd::{AsFd as _, FromRawFd as _};
@@ -551,7 +551,7 @@ mod tests {
         }
 
         fn write_slice(&self, input: &[u8]) -> Result<usize, StdioProviderError> {
-            self.write(input.len(), &mut fill_from_slice(input))
+            self.write(input.len(), &mut copy_from_slice(input))
         }
     }
 

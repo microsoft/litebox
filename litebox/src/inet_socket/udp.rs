@@ -16,7 +16,7 @@ use super::{
     errors::{SocketAsyncError, SocketReadError, SocketWriteError},
     is_nonblocking_would_block,
 };
-use crate::buffer::{ReadBuffer, WriteBuffer, copy_into, fill_from};
+use crate::buffer::{ReadBuffer, WriteBuffer, copy_from_buffer, copy_to_buffer};
 use crate::{broker::error::BrokerObjectError, sync::RawSyncPrimitivesProvider};
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
@@ -40,7 +40,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         match self.broker.receive_from_socket(
             self.handle,
             length,
-            &mut copy_into(buffer, 0),
+            &mut copy_to_buffer(buffer, 0),
             broker_flags,
         ) {
             Ok(SocketOutcome::Completed(received)) => {
@@ -77,7 +77,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         match self.broker.send_to_socket(
             self.handle,
             buffer.len(),
-            &mut fill_from(buffer, 0),
+            &mut copy_from_buffer(buffer, 0),
             BrokerSendFlags::NONE,
             destination,
         ) {

@@ -28,7 +28,7 @@ use crate::{
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
-    buffer::{ReadBuffer, WriteBuffer, copy_into, fill_from},
+    buffer::{ReadBuffer, WriteBuffer, copy_from_buffer, copy_to_buffer},
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -230,7 +230,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                     self.handle,
                     address,
                     data.len(),
-                    &mut fill_from(data, 0),
+                    &mut copy_from_buffer(data, 0),
                     user,
                 )
             });
@@ -243,7 +243,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                     self.handle,
                     address,
                     length,
-                    &mut fill_from(data, sent),
+                    &mut copy_from_buffer(data, sent),
                     user,
                 )
             });
@@ -285,7 +285,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                 .receive_unix_socket(
                     self.handle,
                     buffer.len(),
-                    &mut copy_into(&mut *buffer, 0),
+                    &mut copy_to_buffer(&mut *buffer, 0),
                     peek,
                     source,
                     nonblock,

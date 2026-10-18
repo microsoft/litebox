@@ -21,7 +21,7 @@ use litebox_platform::time::TimeProvider;
 
 use crate::broker::error::BrokerControlError;
 use crate::broker::{BrokerControl, BrokerPollableRegistry, readiness_events};
-use crate::buffer::{ReadBuffer, WriteBuffer, copy_into, fill_from};
+use crate::buffer::{ReadBuffer, WriteBuffer, copy_from_buffer, copy_to_buffer};
 use crate::event::observer::Observer;
 use crate::event::polling::{Pollee, TryOpError};
 use crate::event::wait::WaitContext;
@@ -298,7 +298,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             let wait = if read == 0 { wait } else { None };
             match self.wait(wait, Events::IN, || {
                 self.broker
-                    .read_file(self.handle, length, &mut copy_into(&mut *buf, read), offset)?
+                    .read_file(
+                        self.handle,
+                        length,
+                        &mut copy_to_buffer(&mut *buf, read),
+                        offset,
+                    )?
                     .map_err(|error| TryOpError::Other(error.into()))
             }) {
                 Ok(count) => {
@@ -338,7 +343,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             let offset = offset.map(|offset| offset.saturating_add(written as u64));
             match self.wait(wait, Events::OUT, || {
                 self.broker
-                    .write_file(self.handle, length, &mut fill_from(buf, written), offset)?
+                    .write_file(
+                        self.handle,
+                        length,
+                        &mut copy_from_buffer(buf, written),
+                        offset,
+                    )?
                     .map_err(|error| TryOpError::Other(error.into()))
             }) {
                 Ok(count) => {

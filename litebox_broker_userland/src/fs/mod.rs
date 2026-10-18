@@ -41,7 +41,7 @@ use litebox_broker_core::fs::errors::{
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
-use litebox_broker_core::transfer::{Copier, Filler, bounce_buffer};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
 
 /// A live host filesystem rooted at a canonical directory path.
 pub struct LocalFs {
@@ -632,7 +632,7 @@ impl Backend for LocalFs {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         if !self.valid_file(h) {
@@ -656,7 +656,7 @@ impl Backend for LocalFs {
             }
         };
         let read = result.map_err(|_| ReadError::Io)?;
-        copy(&buf[..read])?;
+        copy_to(&buf[..read])?;
         Ok(read)
     }
 
@@ -665,7 +665,7 @@ impl Backend for LocalFs {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         if !self.valid_file(h) {
@@ -678,7 +678,7 @@ impl Backend for LocalFs {
             .ok_or(WriteError::NotForWriting)?;
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         let mut buf = bounce_buffer(length)?;
-        fill(&mut buf)?;
+        copy_from(&mut buf)?;
         let result = {
             #[cfg(unix)]
             {

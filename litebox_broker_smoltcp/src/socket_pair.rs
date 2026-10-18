@@ -8,7 +8,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use litebox_broker_core::transfer::{Copier, Filler, append_to_queue, lend_from_queue};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, append_to_queue, lend_from_queue};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 
 use super::Sockets;
@@ -103,13 +103,13 @@ impl Sockets {
 
     /// Writes as much of `length` bytes as `end`'s side of the connection,
     /// and the stack's memory budget, have room for, lending the room to
-    /// `fill` (see [`litebox_broker_core::transfer`]); returns how much.
+    /// `copy_from` (see [`litebox_broker_core::transfer`]); returns how much.
     pub(super) fn write_pair(
         &mut self,
         id: u64,
         end: usize,
         length: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<usize> {
         let room = self.room();
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
@@ -120,12 +120,12 @@ impl Sockets {
         queue
             .try_reserve_exact(len)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        let written = append_to_queue(queue, len, fill);
+        let written = append_to_queue(queue, len, copy_from);
         account(&mut self.queued, queue, before);
         written.map(|()| len)
     }
 
-    /// Lends `copy` what `end` reads from `start` to `stop` (of what it can
+    /// Lends `copy_to` what `end` reads from `start` to `stop` (of what it can
     /// read; see [`litebox_broker_core::transfer`]), and takes it unless
     /// `peek`, in which case `start` may be past the beginning.
     pub(super) fn read_pair(
@@ -135,11 +135,11 @@ impl Sockets {
         start: usize,
         stop: usize,
         peek: bool,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<()> {
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[1 - end];
-        lend_from_queue(queue, start..stop, copy)?;
+        lend_from_queue(queue, start..stop, copy_to)?;
         if !peek {
             let before = queue.capacity();
             queue.drain(..stop);

@@ -15,7 +15,7 @@ use super::errors::{
 };
 use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
-use crate::transfer::{Copier, Filler};
+use crate::transfer::{CopyFromFn, CopyToFn};
 
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
 // broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
@@ -105,7 +105,7 @@ pub trait Backend: Send + Sync + Any {
             .find(|entry| entry.name == name))
     }
 
-    /// Read up to `length` bytes at `offset`, lending them to `copy` to copy out (see
+    /// Read up to `length` bytes at `offset`, lending them to `copy_to` to copy out (see
     /// [`crate::transfer`]), and return the number of bytes read: exactly those lent, so none when
     /// the read fails.
     ///
@@ -117,7 +117,7 @@ pub trait Backend: Send + Sync + Any {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, ReadError>;
 
     /// Optional performance hook: get static backing data for a file, if available and supported.
@@ -132,9 +132,9 @@ pub trait Backend: Send + Sync + Any {
     }
 
     /// Write up to `length` bytes into the file, based on `offset`, lending room for up to `length`
-    /// bytes to `fill` to copy them in (see [`crate::transfer`]), and return the number of bytes
-    /// written, which may be fewer than it lent room for. A backend that discards what it writes,
-    /// such as `/dev/null`, need not lend room for it.
+    /// bytes to `copy_from` to copy them in (see [`crate::transfer`]), and return the number of
+    /// bytes written, which may be fewer than it lent room for. A backend that discards what it
+    /// writes, such as `/dev/null`, need not lend room for it.
     ///
     /// See [`Self::read`] on internal offset storage for backends.
     // XXX(jayb): I need to think more about how we set up some sort of "intend to write" flag that
@@ -147,7 +147,7 @@ pub trait Backend: Send + Sync + Any {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, WriteError>;
 
     /// Truncate the file to the specified length.

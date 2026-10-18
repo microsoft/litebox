@@ -25,7 +25,7 @@ use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::random::RandomProvider;
 use crate::readiness::{ReadinessRegistration, ReadinessSource};
 use crate::stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream};
-use crate::transfer::{Copier, Filler, bounce_buffer};
+use crate::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: u64 = 1024;
@@ -285,22 +285,25 @@ impl Backend for Devices {
         h: &FileHandle,
         length: usize,
         _offset: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
             Device::Stdin if length == 0 => Ok(0),
-            Device::Stdin => self.stdio.read(length, copy).map_err(|error| match error {
-                StdioProviderError::WouldBlock => ReadError::WouldBlock,
-                StdioProviderError::Broker(error) => ReadError::Broker(error),
-                _ => ReadError::Io,
-            }),
+            Device::Stdin => self
+                .stdio
+                .read(length, copy_to)
+                .map_err(|error| match error {
+                    StdioProviderError::WouldBlock => ReadError::WouldBlock,
+                    StdioProviderError::Broker(error) => ReadError::Broker(error),
+                    _ => ReadError::Io,
+                }),
             Device::URandom => {
                 let mut bytes = bounce_buffer(length)?;
                 self.random.fill(&mut bytes).map_err(|_| ReadError::Io)?;
-                copy(&bytes)?;
+                copy_to(&bytes)?;
                 Ok(length)
             }
         }
@@ -313,7 +316,7 @@ impl Backend for Devices {
         h: &FileHandle,
         length: usize,
         _offset: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         let stream = match h.device {
@@ -326,7 +329,7 @@ impl Backend for Devices {
             return Ok(0);
         }
         self.stdio
-            .write(stream, length, fill)
+            .write(stream, length, copy_from)
             .map_err(|error| match error {
                 StdioProviderError::WouldBlock => WriteError::WouldBlock,
                 StdioProviderError::Broker(error) => WriteError::Broker(error),

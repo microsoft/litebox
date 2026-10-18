@@ -30,7 +30,7 @@ use core::ops::Range;
 use hashbrown::HashMap;
 
 use super::{DirEntry, FileType};
-use crate::transfer::{Copier, Filler};
+use crate::transfer::{CopyFromFn, CopyToFn};
 
 use super::{
     Mode, NodeInfo, OFlags, UserInfo,
@@ -198,13 +198,13 @@ impl super::backend::Backend for TarRo {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, ReadError> {
         let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
         let start = offset.min(file.len());
         let end = offset.checked_add(length).unwrap().min(file.len());
         debug_assert!(start <= end);
-        copy(&file[start..end])?;
+        copy_to(&file[start..end])?;
         Ok(end - start)
     }
 
@@ -213,7 +213,7 @@ impl super::backend::Backend for TarRo {
         _h: &FileHandle,
         _length: usize,
         _offset: usize,
-        _fill: &mut Filler<'_>,
+        _fill: &mut CopyFromFn<'_>,
     ) -> Result<usize, WriteError> {
         Err(WriteError::NotForWriting)
     }

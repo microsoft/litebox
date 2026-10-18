@@ -61,7 +61,7 @@ mod in_mem {
     type InMemFs = Resolver<TestPlatform, InMem<TestPlatform>>;
     type InMemEntry = ResolverEntry<InMem<TestPlatform>>;
 
-    /// A write that extends a file restores its length if its filler fails.
+    /// A write that extends a file restores its length if its `CopyFromFn` fails.
     #[test]
     fn failed_extending_write_restores_length() {
         let fs = in_mem_fs();

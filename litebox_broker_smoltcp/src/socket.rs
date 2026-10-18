@@ -14,7 +14,7 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
-use litebox_broker_core::transfer::{Copier, Filler};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -157,10 +157,10 @@ impl PlatformSocket for SmoltcpSocket {
         &self,
         length: usize,
         _flags: SendFlags,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         self.with(
-            |tcp, sockets| tcp.send(sockets, length, fill),
+            |tcp, sockets| tcp.send(sockets, length, copy_from),
             |_, _| Ok(invalid()),
         )
     }
@@ -170,11 +170,11 @@ impl PlatformSocket for SmoltcpSocket {
         length: usize,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         self.run(|stack| match stack.parts(self.id)?.0 {
             Kind::Tcp(_) => Ok(invalid()),
-            Kind::Udp(_) => stack.send_udp(self.id, length, destination, fill),
+            Kind::Udp(_) => stack.send_udp(self.id, length, destination, copy_from),
         })
     }
 
@@ -185,7 +185,7 @@ impl PlatformSocket for SmoltcpSocket {
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         self.with(
             |tcp, sockets| {
@@ -196,7 +196,7 @@ impl PlatformSocket for SmoltcpSocket {
                     flags,
                     peek_offset,
                     peek_length,
-                    copy,
+                    copy_to,
                 )
             },
             |_, _| Ok(invalid()),
@@ -207,11 +207,11 @@ impl PlatformSocket for SmoltcpSocket {
         &self,
         length: usize,
         flags: ReceiveFromFlags,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         self.with(
             |_, _| Ok(invalid()),
-            |udp, sockets| udp.receive_from(sockets, length, flags, copy),
+            |udp, sockets| udp.receive_from(sockets, length, flags, copy_to),
         )
     }
 

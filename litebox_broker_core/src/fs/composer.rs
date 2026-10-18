@@ -22,7 +22,7 @@ use super::errors::{
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
-use crate::transfer::{Copier, Filler};
+use crate::transfer::{CopyFromFn, CopyToFn};
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -667,12 +667,12 @@ impl Backend for Composer {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        copy: &mut Copier<'_>,
+        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .read(&h.handle, length, offset, copy)
+            .read(&h.handle, length, offset, copy_to)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -687,12 +687,12 @@ impl Backend for Composer {
         h: &FileHandle,
         length: usize,
         offset: usize,
-        fill: &mut Filler<'_>,
+        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .write(&h.handle, length, offset, fill)
+            .write(&h.handle, length, offset, copy_from)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {

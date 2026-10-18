@@ -11,7 +11,7 @@ use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::test_support::TestBrokerCoreBuilder;
-use litebox_broker_core::transfer::fill_from_slice;
+use litebox_broker_core::transfer::copy_from_slice;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -171,7 +171,7 @@ fn send_bytes(
         handle,
         data.len(),
         flags,
-        &mut fill_from_slice(data),
+        &mut copy_from_slice(data),
     )
 }
 
@@ -188,7 +188,7 @@ fn send_datagram(
         data.len(),
         flags,
         destination,
-        &mut fill_from_slice(data),
+        &mut copy_from_slice(data),
     )
 }
 
@@ -207,7 +207,7 @@ fn receive_into(
         flags,
         peek_offset,
         peek_length,
-        &mut copy_to(data),
+        &mut copy_to_slice(data),
     )? {
         SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
@@ -232,13 +232,13 @@ fn receive_datagram_into(
         handle,
         data.len(),
         flags,
-        &mut copy_to(data),
+        &mut copy_to_slice(data),
     )
 }
 
-/// Returns a copier that copies the parts it is lent into `destination`,
+/// Returns a `CopyToFn` that copies the parts it is lent into `destination`,
 /// one after another.
-fn copy_to(destination: &mut [u8]) -> impl FnMut(&[u8]) -> BrokerResult<()> + '_ {
+fn copy_to_slice(destination: &mut [u8]) -> impl FnMut(&[u8]) -> BrokerResult<()> + '_ {
     let mut offset = 0;
     move |part| {
         destination[offset..][..part.len()].copy_from_slice(part);
