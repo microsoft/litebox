@@ -12,14 +12,16 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
-    InputFlags as I, LocalFlags as L, OutputFlags as O, TerminalError, TerminalEvents,
-    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
+    InputFlags as I, LocalFlags as L, OutputFlags as O, TerminalEvents, TerminalOperation,
+    TerminalResponse, TerminalSettings, WindowSize,
 };
 use spin::Mutex;
 
+use crate::fs::FileResult;
 use crate::id::IdAllocator;
 use crate::readiness::ReadinessSource;
 use crate::{BrokerCore, BrokerProcess};
@@ -39,10 +41,7 @@ pub trait TerminalEventSink: Send + Sync {
 pub trait TerminalEndpoint: ReadinessSource {
     /// Controls the endpoint without blocking. Output-draining operations may
     /// return `WouldBlock` and later publish writable readiness.
-    fn control(
-        &self,
-        operation: TerminalOperation,
-    ) -> crate::Result<Result<TerminalResponse, TerminalError>>;
+    fn control(&self, operation: TerminalOperation) -> crate::Result<FileResult<TerminalResponse>>;
 
     /// Attaches the initial process group once. Later opens must not replace
     /// this association.
@@ -227,9 +226,12 @@ impl TerminalEngine {
     }
 
     /// Changes settings without discarding buffered input.
-    pub fn configure(&mut self, settings: TerminalSettings) -> Result<(), TerminalError> {
+    ///
+    /// Fails with [`FileError::InvalidTerminalControl`] if the settings need
+    /// more than one byte to satisfy a noncanonical read.
+    pub fn configure(&mut self, settings: TerminalSettings) -> FileResult<()> {
         if settings.minimum_read > 1 {
-            return Err(TerminalError::InvalidSettings);
+            return Err(FileError::InvalidTerminalControl);
         }
         let was_canonical = self.settings.local.contains(L::CANONICAL);
         let canonical = settings.local.contains(L::CANONICAL);
@@ -624,8 +626,8 @@ mod tests {
         fn control(
             &self,
             _operation: TerminalOperation,
-        ) -> crate::Result<Result<TerminalResponse, TerminalError>> {
-            Ok(Err(TerminalError::Unsupported))
+        ) -> crate::Result<FileResult<TerminalResponse>> {
+            unreachable!("event tests never control the terminal")
         }
 
         fn attach(&self, sink: Arc<dyn TerminalEventSink>) {

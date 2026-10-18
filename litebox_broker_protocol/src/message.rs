@@ -41,6 +41,7 @@ use crate::socket::{
     SetSocketOptionRequest, ShutdownSocketRequest, SocketError, TakeSocketErrorRequest,
     TakeSocketErrorResponse,
 };
+use crate::terminal::TerminalResponse;
 use crate::timer::{
     CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
     ReadTimerResponse, SetTimerRequest, SetTimerResponse,
@@ -757,8 +758,8 @@ pub enum FileResponse {
     HandleStatus(FileStatus),
     /// Terminal query response.
     IsTerminal(bool),
-    /// Terminal-control result.
-    TerminalControl(Result<crate::terminal::TerminalResponse, crate::terminal::TerminalError>),
+    /// Terminal-control response.
+    TerminalControl(TerminalResponse),
     /// Mode change completed.
     Chmod,
     /// Ownership change completed.

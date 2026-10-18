@@ -37,6 +37,7 @@ use litebox_broker_protocol::socket::{
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
     SocketType,
 };
+use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_protocol::unix_socket::{
     CreateUnixSocketPairResponse, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE,
@@ -428,14 +429,8 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn terminal_control(
         &self,
         handle: ObjectHandle,
-        operation: litebox_broker_protocol::terminal::TerminalOperation,
-    ) -> core::result::Result<
-        core::result::Result<
-            litebox_broker_protocol::terminal::TerminalResponse,
-            litebox_broker_protocol::terminal::TerminalError,
-        >,
-        BrokerControlError,
-    >;
+        operation: TerminalOperation,
+    ) -> core::result::Result<core::result::Result<TerminalResponse, FileError>, BrokerControlError>;
 
     fn chmod_file(
         &self,
@@ -1359,14 +1354,9 @@ where
     fn terminal_control(
         &self,
         handle: ObjectHandle,
-        operation: litebox_broker_protocol::terminal::TerminalOperation,
-    ) -> core::result::Result<
-        core::result::Result<
-            litebox_broker_protocol::terminal::TerminalResponse,
-            litebox_broker_protocol::terminal::TerminalError,
-        >,
-        BrokerControlError,
-    > {
+        operation: TerminalOperation,
+    ) -> core::result::Result<core::result::Result<TerminalResponse, FileError>, BrokerControlError>
+    {
         self.request(|local| local.terminal_control(handle, operation))
     }
 

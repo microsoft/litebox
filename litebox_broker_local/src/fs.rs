@@ -15,6 +15,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
+use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -23,30 +24,6 @@ type FileOperationResult<T> = core::result::Result<T, FileError>;
 type DirectoryReadResult = FileOperationResult<(Vec<FileDirectoryEntry>, Option<u64>)>;
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Controls the shared terminal backing an open file.
-    ///
-    /// # Panics
-    /// Panics if the broker responds with another operation's result.
-    pub fn terminal_control(
-        &self,
-        handle: ObjectHandle,
-        operation: litebox_broker_protocol::terminal::TerminalOperation,
-    ) -> Result<
-        core::result::Result<
-            litebox_broker_protocol::terminal::TerminalResponse,
-            litebox_broker_protocol::terminal::TerminalError,
-        >,
-        Channel::Error,
-    > {
-        match self.request_file(FileRequest::TerminalControl(TerminalControlFileRequest {
-            handle,
-            operation,
-        }))? {
-            FileResponse::TerminalControl(result) => Ok(result),
-            response => panic!("broker returned unexpected terminal response: {response:?}"),
-        }
-    }
-
     /// Opens an absolute fs path.
     ///
     /// # Panics
@@ -302,6 +279,28 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Failed(error) => Ok(Err(error)),
             response => {
                 panic!("broker returned unexpected file terminal-query response: {response:?}")
+            }
+        }
+    }
+
+    /// Controls the shared terminal backing an open file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn terminal_control(
+        &self,
+        handle: ObjectHandle,
+        operation: TerminalOperation,
+    ) -> Result<FileOperationResult<TerminalResponse>, Channel::Error> {
+        match self.request_file(FileRequest::TerminalControl(TerminalControlFileRequest {
+            handle,
+            operation,
+        }))? {
+            FileResponse::TerminalControl(response) => Ok(Ok(response)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected file terminal-control response: {response:?}")
             }
         }
     }

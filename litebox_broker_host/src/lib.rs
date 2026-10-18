@@ -35,8 +35,8 @@ use litebox_broker_protocol::fs::{
     HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
     OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
     ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest,
-    SeekFileResponse, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
-    encode_directory_entries_chunk,
+    SeekFileResponse, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -839,10 +839,14 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
-        FileRequest::TerminalControl(request) => Ok(FileResponse::TerminalControl(
-            litebox_broker_core::fs::terminal_control(process, request.handle, request.operation)
-                .map_err(RequestFailure::from)?,
-        )),
+        FileRequest::TerminalControl(TerminalControlFileRequest { handle, operation }) => {
+            match litebox_broker_core::fs::terminal_control(process, handle, operation)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(response) => Ok(FileResponse::TerminalControl(response)),
+                Err(error) => Ok(FileResponse::Failed(error)),
+            }
+        }
         FileRequest::Chmod(ChmodFileRequest { path, user, mode }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(

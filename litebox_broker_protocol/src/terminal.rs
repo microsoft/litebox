@@ -192,19 +192,6 @@ pub enum TerminalResponse {
     Done,
 }
 
-/// A terminal failure that a shim translates to its own ABI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalError {
-    /// The file is not a terminal.
-    NotTerminal,
-    /// The endpoint does not implement this capability.
-    Unsupported,
-    /// The requested configuration is invalid or unsupported.
-    InvalidSettings,
-    /// The transport failed.
-    Io,
-}
-
 bitflags::bitflags! {
     /// Terminal actions delivered to the initially attached process group.
     ///

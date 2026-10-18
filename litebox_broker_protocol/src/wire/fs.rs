@@ -277,9 +277,9 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_IS_TERMINAL);
             encoder.u8(u8::from(is_terminal));
         }
-        FileResponse::TerminalControl(result) => {
+        FileResponse::TerminalControl(response) => {
             encoder.u8(RESPONSE_TAG_TERMINAL_CONTROL);
-            super::terminal::encode_response(encoder, result);
+            super::terminal::encode_response(encoder, response);
         }
         FileResponse::Chmod => encoder.u8(RESPONSE_TAG_CHMOD),
         FileResponse::Chown => encoder.u8(RESPONSE_TAG_CHOWN),
@@ -356,6 +356,8 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::Busy => 20,
         FileError::NotEmpty => 21,
         FileError::PathOnly => 22,
+        FileError::NotTerminal => 23,
+        FileError::InvalidTerminalControl => 24,
     });
 }
 
@@ -383,6 +385,8 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         20 => Ok(FileError::Busy),
         21 => Ok(FileError::NotEmpty),
         22 => Ok(FileError::PathOnly),
+        23 => Ok(FileError::NotTerminal),
+        24 => Ok(FileError::InvalidTerminalControl),
         _ => Err(WireError::InvalidTag),
     }
 }

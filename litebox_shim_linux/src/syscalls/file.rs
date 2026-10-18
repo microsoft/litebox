@@ -137,7 +137,7 @@ impl<Platform: ShimPlatform> File<Platform> {
         operation: TerminalOperation,
         cx: Option<&WaitContext<'_, Platform>>,
     ) -> Result<TerminalResponse, Errno> {
-        Ok(self.file.terminal_control(operation, cx)??)
+        Ok(self.file.terminal_control(operation, cx)?)
     }
 
     /// Returns the `F_GETFL` flags of the open file description.

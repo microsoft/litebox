@@ -9,16 +9,23 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::terminal::{
+    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
+};
 use spin::Mutex;
 
 use crate::{
     BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
-    fs::{FileService, UnsupportedFileService},
+    fs::{FileResult, FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
-    readiness::{ReadinessRegistration, ReadinessWatchers, SharedReadinessWatchers},
+    readiness::{
+        ReadinessRegistration, ReadinessSource, ReadinessWatchers, SharedReadinessWatchers,
+    },
     socket::{SocketProvider, UnsupportedSocketProvider},
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
+    terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
 };
 
@@ -140,8 +147,8 @@ impl Default for TestStdioProvider {
             stderr_terminal: false,
             uncontrolled_terminal: None,
             terminal: Arc::new(TestTerminal(Mutex::new((
-                litebox_broker_protocol::terminal::TerminalSettings::default(),
-                litebox_broker_protocol::terminal::WindowSize::default(),
+                TerminalSettings::default(),
+                WindowSize::default(),
             )))),
         }
     }
@@ -210,13 +217,13 @@ impl TestStdioProvider {
 }
 
 impl StdioProvider for TestStdioProvider {
-    fn terminal(&self, stream: StdioStream) -> Option<Arc<dyn crate::terminal::TerminalEndpoint>> {
+    fn terminal(&self, stream: StdioStream) -> Option<Arc<dyn TerminalEndpoint>> {
         let connected = match stream {
             StdioStream::Stdin => self.stdin_terminal,
             StdioStream::Stdout => self.stdout_terminal,
             StdioStream::Stderr => self.stderr_terminal,
         } && self.uncontrolled_terminal != Some(stream);
-        connected.then(|| Arc::clone(&self.terminal) as Arc<dyn crate::terminal::TerminalEndpoint>)
+        connected.then(|| Arc::clone(&self.terminal) as Arc<dyn TerminalEndpoint>)
     }
 
     fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
@@ -278,14 +285,9 @@ struct TestStdioInput {
     blocked_reads: usize,
 }
 
-struct TestTerminal(
-    Mutex<(
-        litebox_broker_protocol::terminal::TerminalSettings,
-        litebox_broker_protocol::terminal::WindowSize,
-    )>,
-);
+struct TestTerminal(Mutex<(TerminalSettings, WindowSize)>);
 
-impl crate::readiness::ReadinessSource for TestTerminal {
+impl ReadinessSource for TestTerminal {
     fn readiness(&self) -> ReadinessFlags {
         ReadinessFlags::WRITE
     }
@@ -294,37 +296,26 @@ impl crate::readiness::ReadinessSource for TestTerminal {
     }
 }
 
-impl crate::terminal::TerminalEndpoint for TestTerminal {
-    fn attach(&self, _sink: Arc<dyn crate::terminal::TerminalEventSink>) {}
+impl TerminalEndpoint for TestTerminal {
+    fn attach(&self, _sink: Arc<dyn TerminalEventSink>) {}
 
-    fn control(
-        &self,
-        operation: litebox_broker_protocol::terminal::TerminalOperation,
-    ) -> Result<
-        core::result::Result<
-            litebox_broker_protocol::terminal::TerminalResponse,
-            litebox_broker_protocol::terminal::TerminalError,
-        >,
-    > {
-        use litebox_broker_protocol::terminal::{
-            TerminalError, TerminalOperation as Op, TerminalResponse as Response,
-        };
+    fn control(&self, operation: TerminalOperation) -> Result<FileResult<TerminalResponse>> {
         let mut state = self.0.lock();
         Ok(Ok(match operation {
-            Op::GetSettings => Response::Settings(state.0),
-            Op::SetSettings { settings, .. } => {
+            TerminalOperation::GetSettings => TerminalResponse::Settings(state.0),
+            TerminalOperation::SetSettings { settings, .. } => {
                 if settings.minimum_read > 1 {
-                    return Ok(Err(TerminalError::InvalidSettings));
+                    return Ok(Err(FileError::InvalidTerminalControl));
                 }
                 state.0 = settings;
-                Response::Done
+                TerminalResponse::Done
             }
-            Op::GetWindowSize => Response::WindowSize(state.1),
-            Op::SetWindowSize(size) => {
+            TerminalOperation::GetWindowSize => TerminalResponse::WindowSize(state.1),
+            TerminalOperation::SetWindowSize(size) => {
                 state.1 = size;
-                Response::Done
+                TerminalResponse::Done
             }
-            Op::Flush { .. } | Op::Drain => Response::Done,
+            TerminalOperation::Flush { .. } | TerminalOperation::Drain => TerminalResponse::Done,
         }))
     }
 }

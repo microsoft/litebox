@@ -14,14 +14,16 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use litebox_broker_core::fs::FileResult;
 use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessSource, ReadinessWatchers};
 use litebox_broker_core::stdio::StdioProviderError;
 use litebox_broker_core::terminal::{
     TerminalEndpoint, TerminalEngine, TerminalEventSink, TerminalTransport, TerminalTransportError,
 };
+use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
-    ChangeTiming, TerminalError, TerminalEvents, TerminalOperation, TerminalResponse, WindowSize,
+    ChangeTiming, TerminalEvents, TerminalOperation, TerminalResponse, WindowSize,
 };
 
 /// How often the worker rechecks the window size. Hosts need not report
@@ -434,11 +436,11 @@ impl TerminalEndpoint for HostTerminal {
     fn control(
         &self,
         operation: TerminalOperation,
-    ) -> litebox_broker_core::Result<Result<TerminalResponse, TerminalError>> {
+    ) -> litebox_broker_core::Result<FileResult<TerminalResponse>> {
         let transport = &*self.shared.transport;
         let mut state = self.shared.lock();
         if state.status != Status::Active {
-            return Ok(Err(TerminalError::Io));
+            return Ok(Err(FileError::Io));
         }
         let drain = matches!(
             operation,
@@ -459,11 +461,11 @@ impl TerminalEndpoint for HostTerminal {
             TerminalOperation::GetSettings => TerminalResponse::Settings(state.engine.settings()),
             TerminalOperation::SetSettings { settings, timing } => {
                 if settings.minimum_read > 1 {
-                    return Ok(Err(TerminalError::InvalidSettings));
+                    return Ok(Err(FileError::InvalidTerminalControl));
                 }
                 if timing == ChangeTiming::AfterOutputAndFlushInput {
                     if transport.flush(true, false).is_err() {
-                        return Ok(Err(TerminalError::Io));
+                        return Ok(Err(FileError::Io));
                     }
                     state.pending_input.clear();
                     state.engine.flush_input();
@@ -475,11 +477,11 @@ impl TerminalEndpoint for HostTerminal {
             }
             TerminalOperation::GetWindowSize => match transport.get_window_size() {
                 Ok(size) => TerminalResponse::WindowSize(size),
-                Err(_) => return Ok(Err(TerminalError::Io)),
+                Err(_) => return Ok(Err(FileError::Io)),
             },
             TerminalOperation::SetWindowSize(size) => {
                 if transport.set_window_size(size).is_err() {
-                    return Ok(Err(TerminalError::Io));
+                    return Ok(Err(FileError::Io));
                 }
                 if state.size != size {
                     state.size = size;
@@ -491,10 +493,10 @@ impl TerminalEndpoint for HostTerminal {
             }
             TerminalOperation::Flush { input, output } => {
                 if !input && !output {
-                    return Ok(Err(TerminalError::InvalidSettings));
+                    return Ok(Err(FileError::InvalidTerminalControl));
                 }
                 if transport.flush(input, output).is_err() {
-                    return Ok(Err(TerminalError::Io));
+                    return Ok(Err(FileError::Io));
                 }
                 if input {
                     state.pending_input.clear();

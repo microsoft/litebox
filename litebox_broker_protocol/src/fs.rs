@@ -138,6 +138,10 @@ pub enum FileError {
     NotEmpty,
     #[error("operation is not permitted on an O_PATH file descriptor")]
     PathOnly,
+    #[error("object is not a terminal")]
+    NotTerminal,
+    #[error("terminal control is invalid or unsupported")]
+    InvalidTerminalControl,
 }
 
 /// Seek origin.

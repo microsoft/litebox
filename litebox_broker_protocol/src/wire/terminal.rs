@@ -6,8 +6,8 @@ use super::{
     primitive::{Decoder, Encoder},
 };
 use crate::terminal::{
-    ChangeTiming, ControlCharacters, InputFlags, LocalFlags, OutputFlags, TerminalError,
-    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
+    ChangeTiming, ControlCharacters, InputFlags, LocalFlags, OutputFlags, TerminalOperation,
+    TerminalResponse, TerminalSettings, WindowSize,
 };
 
 fn boolean(decoder: &mut Decoder<'_>) -> Result<bool, WireError> {
@@ -129,43 +129,25 @@ pub(super) fn decode_operation(d: &mut Decoder<'_>) -> Result<TerminalOperation,
     })
 }
 
-pub(super) fn encode_response(e: &mut Encoder, result: Result<TerminalResponse, TerminalError>) {
-    match result {
-        Ok(TerminalResponse::Settings(settings)) => {
+pub(super) fn encode_response(e: &mut Encoder, response: TerminalResponse) {
+    match response {
+        TerminalResponse::Settings(settings) => {
             e.u8(0);
             encode_settings(e, settings);
         }
-        Ok(TerminalResponse::WindowSize(size)) => {
+        TerminalResponse::WindowSize(size) => {
             e.u8(1);
             encode_size(e, size);
         }
-        Ok(TerminalResponse::Done) => e.u8(2),
-        Err(error) => {
-            e.u8(3);
-            e.u8(match error {
-                TerminalError::NotTerminal => 0,
-                TerminalError::Unsupported => 1,
-                TerminalError::InvalidSettings => 2,
-                TerminalError::Io => 3,
-            });
-        }
+        TerminalResponse::Done => e.u8(2),
     }
 }
 
-pub(super) fn decode_response(
-    d: &mut Decoder<'_>,
-) -> Result<Result<TerminalResponse, TerminalError>, WireError> {
+pub(super) fn decode_response(d: &mut Decoder<'_>) -> Result<TerminalResponse, WireError> {
     Ok(match d.u8()? {
-        0 => Ok(TerminalResponse::Settings(decode_settings(d)?)),
-        1 => Ok(TerminalResponse::WindowSize(decode_size(d)?)),
-        2 => Ok(TerminalResponse::Done),
-        3 => Err(match d.u8()? {
-            0 => TerminalError::NotTerminal,
-            1 => TerminalError::Unsupported,
-            2 => TerminalError::InvalidSettings,
-            3 => TerminalError::Io,
-            _ => return Err(WireError::InvalidTag),
-        }),
+        0 => TerminalResponse::Settings(decode_settings(d)?),
+        1 => TerminalResponse::WindowSize(decode_size(d)?),
+        2 => TerminalResponse::Done,
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -214,19 +196,19 @@ mod tests {
             }
         }
         for response in [
-            Ok(TerminalResponse::Settings(TerminalSettings::default())),
-            Ok(TerminalResponse::WindowSize(WindowSize::default())),
-            Ok(TerminalResponse::Done),
-            Err(TerminalError::NotTerminal),
-            Err(TerminalError::Unsupported),
-            Err(TerminalError::InvalidSettings),
-            Err(TerminalError::Io),
+            TerminalResponse::Settings(TerminalSettings::default()),
+            TerminalResponse::WindowSize(WindowSize::default()),
+            TerminalResponse::Done,
         ] {
             let mut e = Encoder::default();
             encode_response(&mut e, response);
             let bytes = e.finish();
             assert_eq!(decode_response(&mut Decoder::new(&bytes)), Ok(response));
         }
+        assert_eq!(
+            decode_response(&mut Decoder::new(&[3])),
+            Err(WireError::InvalidTag)
+        );
         assert_eq!(
             decode_operation(&mut Decoder::new(&[4, 2, 0])),
             Err(WireError::InvalidTag)

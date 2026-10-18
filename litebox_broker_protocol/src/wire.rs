@@ -1366,6 +1366,8 @@ mod tests {
             (FileError::Busy, 20),
             (FileError::NotEmpty, 21),
             (FileError::PathOnly, 22),
+            (FileError::NotTerminal, 23),
+            (FileError::InvalidTerminalControl, 24),
         ] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,
@@ -1664,14 +1666,11 @@ mod tests {
             })),
             BrokerResult::File(FileResponse::IsTerminal(false)),
             BrokerResult::File(FileResponse::IsTerminal(true)),
-            BrokerResult::File(FileResponse::TerminalControl(Ok(
+            BrokerResult::File(FileResponse::TerminalControl(
                 crate::terminal::TerminalResponse::Settings(
                     crate::terminal::TerminalSettings::default(),
                 ),
-            ))),
-            BrokerResult::File(FileResponse::TerminalControl(Err(
-                crate::terminal::TerminalError::NotTerminal,
-            ))),
+            )),
             BrokerResult::File(FileResponse::Chmod),
             BrokerResult::File(FileResponse::Chown),
             BrokerResult::File(FileResponse::Unlink),
