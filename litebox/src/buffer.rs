@@ -8,6 +8,11 @@
 //! bytes: a slice, or [`SharedBytes`] shared with the broker that owns the
 //! object. A buffer need not be memory LiteBox can reference, such as a
 //! guest's memory, so its copies may [`Fault`].
+//!
+//! A copy reports no progress when it faults, so objects count progress a
+//! chunk at a time: a fault reports only the bytes of earlier chunks, where
+//! Linux also counts the bytes copied before the fault. A write does not send
+//! the faulting chunk, and a read has already consumed it, so it is lost.
 
 use litebox_broker_local::transfer::CopyFailed;
 
