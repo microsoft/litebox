@@ -417,7 +417,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = windows::run(args, Arc::clone(&stdio));
     // Guest output accepted before the runner exited must reach the host.
     stdio.flush();
-    #[cfg(target_os = "linux")]
     stdio.close_terminals()?;
     result
 }

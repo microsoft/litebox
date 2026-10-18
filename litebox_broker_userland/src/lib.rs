@@ -28,7 +28,6 @@ pub mod runtime;
 
 pub mod random;
 pub mod stdio;
-#[cfg(target_os = "linux")]
 mod terminal;
 mod timer;
 

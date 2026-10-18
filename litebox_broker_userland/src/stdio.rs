@@ -11,7 +11,10 @@ use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessWatchers};
 use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
+use litebox_broker_core::terminal::TerminalTransport;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+
+use crate::terminal::HostTerminal;
 
 /// Largest single host standard-input read.
 const INPUT_CHUNK_SIZE: usize = 64 * 1024;
@@ -37,8 +40,7 @@ const ATOMIC_WRITE_SIZE: usize = 4096;
 pub struct UserlandStdioProvider {
     input: Arc<HostIo<InputState>>,
     output: Arc<HostIo<OutputState>>,
-    #[cfg(target_os = "linux")]
-    terminals: [Option<Arc<crate::terminal::LinuxTerminal>>; 3],
+    terminals: [Option<Arc<HostTerminal>>; 3],
 }
 
 impl Default for UserlandStdioProvider {
@@ -48,72 +50,52 @@ impl Default for UserlandStdioProvider {
 }
 
 impl UserlandStdioProvider {
-    /// Acquires inherited Linux terminals in raw transport mode. Redirected
+    /// Acquires inherited host terminals in raw transport mode. Redirected
     /// streams keep the ordinary stdio path.
+    // Only Linux hosts have a terminal transport so far; other hosts pass
+    // their standard streams through without terminal control until support
+    // for them is added.
     #[cfg(target_os = "linux")]
     pub fn try_new() -> std::io::Result<Self> {
-        use std::io::IsTerminal as _;
-        let mut provider = Self::default();
-        let connected = [
-            (0, libc::STDIN_FILENO, std::io::stdin().is_terminal()),
-            (1, libc::STDOUT_FILENO, std::io::stdout().is_terminal()),
-            (2, libc::STDERR_FILENO, std::io::stderr().is_terminal()),
-        ];
-        let mut identities = [None; 3];
-        for (index, fd, connected) in connected {
-            if !connected {
-                continue;
-            }
-            let identity = Self::terminal_identity(fd)?;
-            let existing = identities[..index]
-                .iter()
-                .zip(&provider.terminals[..index])
-                .find_map(|(candidate, terminal)| {
-                    if *candidate == Some(identity) {
-                        terminal.clone()
-                    } else {
-                        None
-                    }
-                });
-            provider.terminals[index] = Some(match existing {
-                Some(existing) => existing,
-                None => Arc::new(crate::terminal::LinuxTerminal::open(fd)?),
-            });
-            identities[index] = Some(identity);
-        }
-        Ok(provider)
+        let transports = litebox_broker_platform_linux_userland::terminal::open_stdio_terminals()?;
+        Self::with_terminals(
+            transports.map(|transport| {
+                transport.map(|transport| transport as Arc<dyn TerminalTransport>)
+            }),
+        )
     }
 
-    #[cfg(target_os = "linux")]
-    fn terminal_identity(fd: i32) -> std::io::Result<(libc::c_uint, Option<u64>)> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let mut device: libc::c_uint = 0;
-        // SAFETY: fd is an inherited terminal and device is writable ioctl storage.
-        if unsafe { libc::ioctl(fd, libc::TIOCGDEV, &raw mut device) } != 0 {
-            return Err(std::io::Error::last_os_error());
+    /// Serves the standard streams with host terminals in place of
+    /// `transports`, indexed standard input, output, and error. Streams sharing
+    /// a transport share one terminal.
+    pub fn with_terminals(
+        transports: [Option<Arc<dyn TerminalTransport>>; 3],
+    ) -> std::io::Result<Self> {
+        let mut provider = Self::default();
+        for (index, transport) in transports.iter().enumerate() {
+            let Some(transport) = transport else {
+                continue;
+            };
+            let existing = transports[..index]
+                .iter()
+                .zip(&provider.terminals)
+                .find_map(|(other, terminal)| {
+                    other
+                        .as_ref()
+                        .filter(|other| Arc::ptr_eq(other, transport))
+                        .and(terminal.clone())
+                });
+            provider.terminals[index] = Some(match existing {
+                Some(terminal) => terminal,
+                None => Arc::new(HostTerminal::new(Arc::clone(transport))?),
+            });
         }
-        let mut session: libc::pid_t = 0;
-        // SAFETY: session is writable storage for the terminal's session identifier.
-        let mount = if unsafe { libc::ioctl(fd, libc::TIOCGSID, &raw mut session) } == 0 {
-            // /dev/tty and its direct device node can live on different mounts.
-            // A process has only one controlling terminal, so both aliases agree.
-            None
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ENOTTY) {
-                return Err(error);
-            }
-            // Separate devpts instances may reuse device numbers.
-            Some(std::fs::metadata(format!("/proc/self/fd/{fd}"))?.dev())
-        };
-        Ok((device, mount))
+        Ok(provider)
     }
 
     /// Drains terminal output and restores host terminal settings. Detached
     /// broker threads may still hold the terminals at exit, so restoration
     /// cannot be left to `Drop`.
-    #[cfg(target_os = "linux")]
     pub fn close_terminals(&self) -> std::io::Result<()> {
         let mut result = Ok(());
         for terminal in self.terminals.iter().flatten() {
@@ -128,8 +110,7 @@ impl UserlandStdioProvider {
         stderr: impl Write + Send + 'static,
     ) -> Self {
         Self {
-            #[cfg(target_os = "linux")]
-            terminals: core::array::from_fn(|_| None),
+            terminals: Default::default(),
             input: Arc::new(HostIo::new(InputState {
                 host: Some(Box::new(stdin)),
                 data: VecDeque::new(),
@@ -181,22 +162,14 @@ impl StdioProvider for UserlandStdioProvider {
         &self,
         stream: StdioStream,
     ) -> Option<Arc<dyn litebox_broker_core::terminal::TerminalEndpoint>> {
-        #[cfg(target_os = "linux")]
-        {
-            let index = match stream {
-                StdioStream::Stdin => 0,
-                StdioStream::Stdout => 1,
-                StdioStream::Stderr => 2,
-            };
-            self.terminals[index].as_ref().map(|terminal| {
-                Arc::clone(terminal) as Arc<dyn litebox_broker_core::terminal::TerminalEndpoint>
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = stream;
-            None
-        }
+        let index = match stream {
+            StdioStream::Stdin => 0,
+            StdioStream::Stdout => 1,
+            StdioStream::Stderr => 2,
+        };
+        self.terminals[index].as_ref().map(|terminal| {
+            Arc::clone(terminal) as Arc<dyn litebox_broker_core::terminal::TerminalEndpoint>
+        })
     }
 
     fn is_terminal(&self, stream: StdioStream) -> bool {
@@ -210,7 +183,6 @@ impl StdioProvider for UserlandStdioProvider {
     }
 
     fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
-        #[cfg(target_os = "linux")]
         if let Some(terminal) = &self.terminals[0] {
             return terminal.read(output);
         }
@@ -237,7 +209,6 @@ impl StdioProvider for UserlandStdioProvider {
     }
 
     fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
-        #[cfg(target_os = "linux")]
         if let Some(terminal) = &self.terminals[match stream {
             StdioOutputStream::Stdout => 1,
             StdioOutputStream::Stderr => 2,

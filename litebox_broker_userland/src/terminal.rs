@@ -1,23 +1,33 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux raw terminal transport. All line processing lives in the broker core.
+//! Broker terminal endpoints over raw host terminal transports.
+//!
+//! The broker core's engine does all line processing and a platform
+//! [`TerminalTransport`] does all host I/O. A worker thread per terminal moves
+//! bytes between them, so broker requests never block on the host.
 
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessSource, ReadinessWatchers};
 use litebox_broker_core::stdio::StdioProviderError;
-use litebox_broker_core::terminal::{TerminalEndpoint, TerminalEngine, TerminalEventSink};
+use litebox_broker_core::terminal::{
+    TerminalEndpoint, TerminalEngine, TerminalEventSink, TerminalTransport, TerminalTransportError,
+};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalError, TerminalEvent, TerminalOperation, TerminalResponse, WindowSize,
 };
+
+/// How often the worker rechecks the window size. Hosts need not report
+/// resizes; Linux, for one, signals them only to the terminal's foreground
+/// process group.
+const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 const OUTPUT_CAPACITY: usize = 64 * 1024;
 const ATOMIC_WRITE_SIZE: usize = 4096;
@@ -112,8 +122,7 @@ impl State {
 }
 
 struct Shared {
-    file: File,
-    wake: File,
+    transport: Arc<dyn TerminalTransport>,
     state: Mutex<State>,
     changed: Condvar,
 }
@@ -124,74 +133,50 @@ impl Shared {
     }
 
     fn wake(&self) {
-        match (&self.wake).write(&1u64.to_ne_bytes()) {
-            Ok(8) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            result => litebox_util_log::error!(result:? = result; "waking terminal worker failed"),
+        if let Err(error) = self.transport.wake() {
+            litebox_util_log::error!(error:% = error; "waking terminal worker failed");
         }
     }
 }
 
 /// One host terminal, shared by all inherited streams referring to it.
-pub(crate) struct LinuxTerminal {
+pub(crate) struct HostTerminal {
     shared: Arc<Shared>,
-    /// Host attributes to restore, taken by the first `close` or drop.
-    original: Mutex<Option<libc::termios>>,
+    /// Set by the first `close`.
+    closed: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl LinuxTerminal {
-    pub(crate) fn open(fd: i32) -> io::Result<Self> {
-        // Reopen rather than dup: O_NONBLOCK must not change the parent's
-        // inherited open file description.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
-            .open(format!("/proc/self/fd/{fd}"))?;
-        // SAFETY: zero is a valid initialization for the integer-only termios structure.
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        // SAFETY: file is live and original is a writable termios.
-        if unsafe { libc::tcgetattr(file.as_raw_fd(), &raw mut original) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut raw = original;
-        let wake = eventfd()?;
-        let size = window_size(&file)?;
-        // SAFETY: raw is a valid initialized termios.
-        unsafe { libc::cfmakeraw(&raw mut raw) };
-        // SAFETY: file is a terminal and raw is valid for tcsetattr.
-        if unsafe { libc::tcsetattr(file.as_raw_fd(), libc::TCSANOW, &raw const raw) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Construct the restoration guard before any further fallible operation.
-        let terminal = Self {
-            shared: Arc::new(Shared {
-                file,
-                wake,
-                state: Mutex::new(State {
-                    engine: TerminalEngine::default(),
-                    output: VecDeque::new(),
-                    pending_input: VecDeque::new(),
-                    watchers: ReadinessWatchers::default(),
-                    sink: None,
-                    size,
-                    status: Status::Active,
-                    draining: false,
-                    drained: true,
-                }),
-                changed: Condvar::new(),
+impl HostTerminal {
+    /// Serves the host terminal behind `transport`.
+    pub(crate) fn new(transport: Arc<dyn TerminalTransport>) -> io::Result<Self> {
+        let size = transport.window_size().map_err(io::Error::other)?;
+        let shared = Arc::new(Shared {
+            transport,
+            state: Mutex::new(State {
+                engine: TerminalEngine::default(),
+                output: VecDeque::new(),
+                pending_input: VecDeque::new(),
+                watchers: ReadinessWatchers::default(),
+                sink: None,
+                size,
+                status: Status::Active,
+                draining: false,
+                drained: true,
             }),
-            original: Mutex::new(Some(original)),
-            worker: Mutex::new(None),
-        };
-        let shared = Arc::clone(&terminal.shared);
-        *terminal.worker.lock().expect("terminal mutex poisoned") = Some(
+            changed: Condvar::new(),
+        });
+        let worker = {
+            let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name("litebox-broker-terminal".to_owned())
-                .spawn(move || run(&shared))?,
-        );
-        Ok(terminal)
+                .spawn(move || run(&shared))?
+        };
+        Ok(Self {
+            shared,
+            closed: AtomicBool::new(false),
+            worker: Mutex::new(Some(worker)),
+        })
     }
 
     pub(crate) fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
@@ -249,23 +234,18 @@ impl LinuxTerminal {
         }
     }
 
-    /// Drains output, stops the transport, and restores the host attributes.
-    /// Later calls do nothing.
+    /// Drains output, stops the worker, and restores the host terminal. Later
+    /// calls do nothing.
     pub(crate) fn close(&self) -> io::Result<()> {
-        let Some(original) = self
-            .original
-            .lock()
-            .expect("terminal mutex poisoned")
-            .take()
-        else {
+        if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
-        };
+        }
         let flushed = self.flush();
-        self.stop(&original);
+        self.stop();
         flushed
     }
 
-    fn stop(&self, original: &libc::termios) {
+    fn stop(&self) {
         self.shared.lock().status = Status::Stopping;
         self.shared.wake();
         if let Some(worker) = self.worker.lock().expect("terminal mutex poisoned").take()
@@ -273,15 +253,13 @@ impl LinuxTerminal {
         {
             litebox_util_log::error!("terminal worker panicked");
         }
-        // SAFETY: this guard owns the live terminal and saved its original attributes.
-        if unsafe { libc::tcsetattr(self.shared.file.as_raw_fd(), libc::TCSANOW, original) } != 0 {
-            let error = io::Error::last_os_error();
+        if let Err(error) = self.shared.transport.restore() {
             litebox_util_log::error!(error:% = error; "restoring host terminal failed");
         }
     }
 }
 
-impl ReadinessSource for LinuxTerminal {
+impl ReadinessSource for HostTerminal {
     fn readiness(&self) -> ReadinessFlags {
         self.shared.lock().readiness()
     }
@@ -291,7 +269,7 @@ impl ReadinessSource for LinuxTerminal {
     }
 }
 
-impl TerminalEndpoint for LinuxTerminal {
+impl TerminalEndpoint for HostTerminal {
     fn attach(&self, sink: Arc<dyn TerminalEventSink>) {
         let mut state = self.shared.lock();
         if state.sink.is_none() {
@@ -304,6 +282,7 @@ impl TerminalEndpoint for LinuxTerminal {
         &self,
         operation: TerminalOperation,
     ) -> litebox_broker_core::Result<Result<TerminalResponse, TerminalError>> {
+        let transport = &*self.shared.transport;
         let mut state = self.shared.lock();
         if state.status != Status::Active {
             return Ok(Err(TerminalError::Io));
@@ -330,8 +309,7 @@ impl TerminalEndpoint for LinuxTerminal {
                     return Ok(Err(TerminalError::InvalidSettings));
                 }
                 if timing == ChangeTiming::AfterOutputAndFlushInput {
-                    // SAFETY: the file is a live terminal and TCIFLUSH takes no pointer.
-                    if unsafe { libc::tcflush(self.shared.file.as_raw_fd(), libc::TCIFLUSH) } != 0 {
+                    if transport.flush(true, false).is_err() {
                         return Ok(Err(TerminalError::Io));
                     }
                     state.pending_input.clear();
@@ -342,26 +320,12 @@ impl TerminalEndpoint for LinuxTerminal {
                 }
                 TerminalResponse::Done
             }
-            TerminalOperation::GetWindowSize => match window_size(&self.shared.file) {
+            TerminalOperation::GetWindowSize => match transport.window_size() {
                 Ok(size) => TerminalResponse::WindowSize(size),
                 Err(_) => return Ok(Err(TerminalError::Io)),
             },
             TerminalOperation::SetWindowSize(size) => {
-                let native = libc::winsize {
-                    ws_row: size.rows,
-                    ws_col: size.columns,
-                    ws_xpixel: size.x_pixels,
-                    ws_ypixel: size.y_pixels,
-                };
-                // SAFETY: native is a valid winsize and file is a live terminal.
-                if unsafe {
-                    libc::ioctl(
-                        self.shared.file.as_raw_fd(),
-                        libc::TIOCSWINSZ,
-                        &raw const native,
-                    )
-                } != 0
-                {
+                if transport.set_window_size(size).is_err() {
                     return Ok(Err(TerminalError::Io));
                 }
                 if state.size != size {
@@ -376,13 +340,7 @@ impl TerminalEndpoint for LinuxTerminal {
                 if !input && !output {
                     return Ok(Err(TerminalError::InvalidSettings));
                 }
-                let which = match (input, output) {
-                    (true, true) => libc::TCIOFLUSH,
-                    (true, false) => libc::TCIFLUSH,
-                    _ => libc::TCOFLUSH,
-                };
-                // SAFETY: file is a live terminal and which is a valid flush selector.
-                if unsafe { libc::tcflush(self.shared.file.as_raw_fd(), which) } != 0 {
+                if transport.flush(input, output).is_err() {
                     return Ok(Err(TerminalError::Io));
                 }
                 if input {
@@ -405,74 +363,31 @@ impl TerminalEndpoint for LinuxTerminal {
     }
 }
 
-impl Drop for LinuxTerminal {
+impl Drop for HostTerminal {
     fn drop(&mut self) {
-        if let Some(original) = self
-            .original
-            .get_mut()
-            .expect("terminal mutex poisoned")
-            .take()
-        {
-            self.stop(&original);
+        if !*self.closed.get_mut() {
+            self.stop();
         }
     }
-}
-
-fn eventfd() -> io::Result<File> {
-    use std::os::fd::FromRawFd;
-    // SAFETY: eventfd takes only scalar arguments.
-    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: eventfd returned a fresh, owned descriptor.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn window_size(file: &File) -> io::Result<WindowSize> {
-    let mut size = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: size is writable storage for the ioctl's winsize result.
-    if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCGWINSZ, &raw mut size) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(WindowSize {
-        rows: size.ws_row,
-        columns: size.ws_col,
-        x_pixels: size.ws_xpixel,
-        y_pixels: size.ws_ypixel,
-    })
 }
 
 fn run(shared: &Shared) {
     loop {
-        let Err(error) = pump(shared) else {
-            return;
-        };
-        if error.raw_os_error() == Some(libc::EIO) {
-            // Closing a PTY master can race with geometry, drain, or I/O calls
-            // between polls. EIO accompanied by hangup is closure, not failure.
-            match transport_hung_up(&shared.file) {
-                Ok(true) => {
-                    let mut state = shared.lock();
-                    if state.status == Status::Stopping {
-                        return;
-                    }
-                    state.hang_up();
-                    state.publish();
-                    shared.changed.notify_all();
-                    continue;
+        let error = match pump(shared) {
+            Ok(()) => return,
+            Err(TerminalTransportError::WouldBlock) => continue,
+            Err(TerminalTransportError::HungUp) => {
+                let mut state = shared.lock();
+                if state.status == Status::Stopping {
+                    return;
                 }
-                Ok(false) => {}
-                Err(probe_error) => {
-                    litebox_util_log::error!(error:% = probe_error; "checking terminal hangup failed");
-                }
+                state.hang_up();
+                state.publish();
+                shared.changed.notify_all();
+                continue;
             }
-        }
+            Err(error) => error,
+        };
         litebox_util_log::error!(error:% = error; "terminal transport failed");
         let mut state = shared.lock();
         state.status = Status::Failed;
@@ -483,25 +398,8 @@ fn run(shared: &Shared) {
     }
 }
 
-fn transport_hung_up(file: &File) -> io::Result<bool> {
-    let mut fd = libc::pollfd {
-        fd: file.as_raw_fd(),
-        events: 0,
-        revents: 0,
-    };
-    loop {
-        // SAFETY: fd is valid storage for one live terminal's poll descriptor.
-        if unsafe { libc::poll(&raw mut fd, 1, 0) } >= 0 {
-            return Ok(fd.revents & (libc::POLLHUP | libc::POLLERR) != 0);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-fn pump(shared: &Shared) -> io::Result<()> {
+fn pump(shared: &Shared) -> Result<(), TerminalTransportError> {
+    let transport = &*shared.transport;
     let mut buffer = [0; 256];
     loop {
         let mut state = shared.lock();
@@ -513,42 +411,26 @@ fn pump(shared: &Shared) -> io::Result<()> {
             state.publish();
             shared.changed.notify_all();
             drop(state);
-            let mut wake = [libc::pollfd {
-                fd: shared.wake.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            }];
-            // SAFETY: wake is a valid one-element pollfd array.
-            if unsafe { libc::poll(wake.as_mut_ptr(), 1, -1) } < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            let _count = (&shared.wake).read(&mut [0; 8])?;
+            transport.wait(ReadinessFlags::default(), None)?;
             continue;
         }
         if state.draining && state.output.is_empty() {
             drop(state);
-            // SAFETY: file is a live terminal. Only the transport thread drains
-            // it; broker requests remain nonblocking.
-            if unsafe { libc::tcdrain(shared.file.as_raw_fd()) } != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::WouldBlock
-                    && error.kind() != io::ErrorKind::Interrupted
-                {
-                    return Err(error);
-                }
-                state = shared.lock();
-            } else {
-                state = shared.lock();
+            // Only this worker drains the host terminal; broker requests
+            // remain nonblocking.
+            let drained = match transport.drain() {
+                Ok(()) => true,
+                Err(TerminalTransportError::WouldBlock) => false,
+                Err(error) => return Err(error),
+            };
+            state = shared.lock();
+            if drained {
                 state.drained = state.output.is_empty();
                 state.draining = !state.drained;
                 shared.changed.notify_all();
             }
         }
-        let size = window_size(&shared.file)?;
+        let size = transport.window_size()?;
         if size != state.size {
             state.size = size;
             if let Some(sink) = &state.sink {
@@ -556,75 +438,46 @@ fn pump(shared: &Shared) -> io::Result<()> {
             }
         }
         state.publish();
-        let input =
-            state.sink.is_some() && state.pending_input.is_empty() && state.engine.accepts_input();
-        let output = !state.output.is_empty() && !state.engine.output_stopped();
+        let mut interest = ReadinessFlags::HANGUP;
+        if state.sink.is_some() && state.pending_input.is_empty() && state.engine.accepts_input() {
+            interest = interest | ReadinessFlags::READ;
+        }
+        if !state.output.is_empty() && !state.engine.output_stopped() {
+            interest = interest | ReadinessFlags::WRITE;
+        }
         drop(state);
-        let mut fds = [
-            libc::pollfd {
-                fd: shared.file.as_raw_fd(),
-                events: (if input { libc::POLLIN } else { 0 })
-                    | (if output { libc::POLLOUT } else { 0 }),
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: shared.wake.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        // A PTY inherited without being our controlling terminal does not send
-        // us SIGWINCH. Periodically query its geometry as well as polling I/O.
-        // SAFETY: fds is a valid pollfd array for the duration of poll.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, 100) } < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if fds[1].revents & libc::POLLIN != 0 {
-            let _count = (&shared.wake).read(&mut [0; 8])?;
-        }
+        let ready = transport.wait(interest, Some(RESIZE_POLL_INTERVAL))?;
         let mut state = shared.lock();
         if state.status == Status::Stopping {
             return Ok(());
         }
-        if fds[0].revents & libc::POLLNVAL != 0 {
-            return Err(io::Error::other("terminal descriptor became invalid"));
-        }
-        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        if ready.contains(ReadinessFlags::HANGUP) {
             state.hang_up();
         }
-        if fds[0].revents & libc::POLLIN != 0 && state.pending_input.is_empty() {
-            match (&shared.file).read(&mut buffer) {
+        if ready.contains(ReadinessFlags::READ) && state.pending_input.is_empty() {
+            match transport.read(&mut buffer) {
                 Ok(0) => state.hang_up(),
                 Ok(count) => state.pending_input.extend(&buffer[..count]),
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.kind() == io::ErrorKind::Interrupted => {}
+                Err(TerminalTransportError::WouldBlock) => {}
                 Err(error) => return Err(error),
             }
         }
         if state.status == Status::Active
-            && fds[0].revents & libc::POLLOUT != 0
+            && ready.contains(ReadinessFlags::WRITE)
             && !state.engine.output_stopped()
         {
             let output = state.output.make_contiguous();
-            match (&shared.file).write(output) {
+            match transport.write(output) {
                 Ok(0) if !output.is_empty() => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "terminal write returned zero",
+                    return Err(TerminalTransportError::Failed(
+                        "terminal write returned zero".into(),
                     ));
                 }
                 Ok(count) => {
                     state.output.drain(..count);
                     shared.changed.notify_all();
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.kind() == io::ErrorKind::Interrupted => {}
+                Err(TerminalTransportError::WouldBlock) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -633,13 +486,16 @@ fn pump(shared: &Shared) -> io::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::os::fd::FromRawFd as _;
+    use litebox_broker_platform_linux_userland::terminal::LinuxTerminal;
+    use std::fs::File;
+    use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
     use std::time::Duration;
 
-    fn open_terminal() -> (File, LinuxTerminal) {
+    /// Returns a PTY's master and slave and a terminal served over the slave.
+    fn open_terminal() -> (File, File, HostTerminal) {
         let mut master = -1;
         let mut slave = -1;
         // SAFETY: the descriptors are writable and null optional arguments request defaults.
@@ -657,13 +513,14 @@ mod tests {
         );
         // SAFETY: openpty returned fresh descriptors, each transferred to exactly one File.
         let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
-        let terminal = LinuxTerminal::open(slave.as_raw_fd()).unwrap();
-        (master, terminal)
+        let transport = LinuxTerminal::open(slave.as_fd()).unwrap();
+        let terminal = HostTerminal::new(Arc::new(transport)).unwrap();
+        (master, slave, terminal)
     }
 
     #[test]
     fn terminal_abandoned_drain_does_not_block_other_writers() {
-        let (_master, terminal) = open_terminal();
+        let (_master, _slave, terminal) = open_terminal();
         terminal.shared.lock().engine.receive(b"\x13");
         assert_eq!(terminal.write(b"first"), Ok(5));
         assert_eq!(
@@ -679,15 +536,15 @@ mod tests {
 
     #[test]
     fn close_restores_host_attributes_while_the_terminal_is_shared() {
-        let (_master, terminal) = open_terminal();
+        let (_master, slave, terminal) = open_terminal();
         let terminal = Arc::new(terminal);
         let _alias = Arc::clone(&terminal);
         let canonical = || {
             // SAFETY: zero is a valid initialization for the integer-only termios structure.
             let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
-            // SAFETY: the terminal file is live and attributes is a writable termios.
+            // SAFETY: the slave file is live and attributes is a writable termios.
             assert_eq!(
-                unsafe { libc::tcgetattr(terminal.shared.file.as_raw_fd(), &raw mut attributes) },
+                unsafe { libc::tcgetattr(slave.as_raw_fd(), &raw mut attributes) },
                 0
             );
             attributes.c_lflag & libc::ICANON != 0
@@ -701,7 +558,7 @@ mod tests {
 
     #[test]
     fn terminal_hangup_preserves_buffered_and_pending_input() {
-        let (master, terminal) = open_terminal();
+        let (master, _slave, terminal) = open_terminal();
         {
             let mut state = terminal.shared.lock();
             state.engine.receive(b"buffered\n");
@@ -739,7 +596,7 @@ mod tests {
     fn terminal_hangup_does_not_report_eof_before_a_backpressured_tail() {
         use litebox_broker_protocol::terminal::{InputFlags, LocalFlags, TerminalSettings};
 
-        let (_master, mut terminal) = open_terminal();
+        let (_master, _slave, mut terminal) = open_terminal();
         // Keep the worker from winning the race this test exercises.
         terminal.shared.lock().status = Status::Stopping;
         terminal.shared.wake();

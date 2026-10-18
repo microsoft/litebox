@@ -6,14 +6,17 @@
 //! A provider serializes a terminal's engine with its transport queues. The
 //! engine never calls host APIs or knows guest ioctl or signal numbers.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
     InputFlags as I, LocalFlags as L, OutputFlags as O, TerminalError, TerminalEvent,
-    TerminalOperation, TerminalResponse, TerminalSettings,
+    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
 };
 use spin::Mutex;
 
@@ -44,6 +47,85 @@ pub trait TerminalEndpoint: ReadinessSource {
     /// Attaches the initial process group once. Later opens must not replace
     /// this association.
     fn attach(&self, sink: Arc<dyn TerminalEventSink>);
+}
+
+/// Why a host terminal transport operation did not complete.
+#[derive(Debug)]
+pub enum TerminalTransportError {
+    /// The operation cannot complete now. Retry after
+    /// [`TerminalTransport::wait`].
+    WouldBlock,
+    /// The host side of the terminal hung up.
+    HungUp,
+    /// The transport failed and cannot continue.
+    Failed(Box<dyn core::error::Error + Send + Sync>),
+}
+
+impl core::fmt::Display for TerminalTransportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::WouldBlock => f.write_str("terminal operation would block"),
+            Self::HungUp => f.write_str("terminal hung up"),
+            Self::Failed(error) => write!(f, "terminal transport failed: {error}"),
+        }
+    }
+}
+
+impl core::error::Error for TerminalTransportError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Failed(error) => Some(&**error),
+            Self::WouldBlock | Self::HungUp => None,
+        }
+    }
+}
+
+/// Raw I/O with one host terminal, which a platform provides beneath a
+/// [`TerminalEndpoint`].
+///
+/// A transport performs no line processing; the endpoint's
+/// [`TerminalEngine`] interprets every byte. Acquiring a transport switches
+/// the host terminal to raw mode, and [`restore`](Self::restore) returns it to
+/// its original state.
+pub trait TerminalTransport: Send + Sync {
+    /// Reads available input without blocking. `Ok(0)` means the host side
+    /// hung up.
+    fn read(&self, buffer: &mut [u8]) -> Result<usize, TerminalTransportError>;
+
+    /// Writes output without blocking and returns the bytes written.
+    fn write(&self, buffer: &[u8]) -> Result<usize, TerminalTransportError>;
+
+    /// Blocks until the terminal has readiness in `interest`, `timeout`
+    /// elapses, or [`wake`](Self::wake) is called, and returns the readiness
+    /// found, which may be empty.
+    ///
+    /// `interest` may contain [`READ`](ReadinessFlags::READ),
+    /// [`WRITE`](ReadinessFlags::WRITE), and
+    /// [`HANGUP`](ReadinessFlags::HANGUP). An empty interest waits only for a
+    /// wake or the timeout.
+    fn wait(
+        &self,
+        interest: ReadinessFlags,
+        timeout: Option<Duration>,
+    ) -> Result<ReadinessFlags, TerminalTransportError>;
+
+    /// Ends the current or next [`wait`](Self::wait) early.
+    fn wake(&self) -> Result<(), TerminalTransportError>;
+
+    /// Returns the host terminal's window size.
+    fn window_size(&self) -> Result<WindowSize, TerminalTransportError>;
+
+    /// Sets the host terminal's window size.
+    fn set_window_size(&self, size: WindowSize) -> Result<(), TerminalTransportError>;
+
+    /// Discards host input not yet read, output not yet transmitted, or both.
+    fn flush(&self, input: bool, output: bool) -> Result<(), TerminalTransportError>;
+
+    /// Blocks until all written output has been transmitted.
+    fn drain(&self) -> Result<(), TerminalTransportError>;
+
+    /// Restores the host terminal's original state. Later calls do nothing.
+    fn restore(&self) -> Result<(), TerminalTransportError>;
 }
 
 struct ProcessGroupSink {
