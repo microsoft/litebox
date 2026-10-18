@@ -97,6 +97,8 @@ pub enum ForkResult {
 ///
 /// `CLONE_PARENT` makes an out-of-process runner's broker the clone's host parent, allowing the
 /// broker to supervise and reap the process directly. The clone contains only the calling thread.
+/// This does not run libc's fork handlers or repair its cached thread identity; child-side thread
+/// interruption must use fresh kernel thread IDs rather than inherited pthread identities.
 ///
 /// # Safety
 ///

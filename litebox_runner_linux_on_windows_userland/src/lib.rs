@@ -93,12 +93,15 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             else {
                 anyhow::bail!("native fork child received program startup");
             };
-            let program = shim
-                .restore_fork_from_native_clone(*startup, initial_thread)
+            // SAFETY: The startup describes this clone's inherited guest mappings. The fresh
+            // shim takes ownership, and this path never returns to the copied parent runtime.
+            let program = unsafe { shim.restore_fork_from_native_clone(*startup, initial_thread) }
                 .context("failed to adopt native fork memory")?;
             run_program(&shim, program)
         })();
-        let _ = result;
+        if let Err(error) = result {
+            litebox_util_log::error!("native fork child bootstrap failed: {error:#}");
+        }
         std::process::exit(127)
     }
 }

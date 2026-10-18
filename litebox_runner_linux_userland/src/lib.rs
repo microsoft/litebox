@@ -66,12 +66,10 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     unsafe fn run_child(&self, control_channel: PathBuf) -> ! {
         // SAFETY: The clone contains only this thread, and this function never returns through the
         // copied guest task or its thread-registration guard.
-        if unsafe { Platform::prepare_fork_child() }.is_err() {
-            // SAFETY: The cloned process cannot safely unwind through copied runtime state.
-            unsafe { libc::_exit(127) }
-        }
+        let prepared = unsafe { Platform::prepare_fork_child() };
         let result = (|| -> Result<i32> {
-            // SAFETY: clone3 copied only this thread, the inherited handlers remain installed, and
+            prepared.context("failed to prepare native fork child")?;
+            // SAFETY: clone copied only this thread, the inherited handlers remain installed, and
             // this path never returns through or destroys the copied parent runtime.
             let platform = unsafe { Platform::new_after_process_clone() };
             #[cfg(target_arch = "x86_64")]
@@ -114,14 +112,22 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             else {
                 anyhow::bail!("native fork child received program startup");
             };
-            let program = shim
-                .restore_fork_from_native_clone(*startup, initial_thread)
+            // SAFETY: The startup describes this clone's inherited guest mappings. The fresh
+            // shim takes ownership, and this path never returns to the copied parent runtime.
+            let program = unsafe { shim.restore_fork_from_native_clone(*startup, initial_thread) }
                 .context("failed to adopt native fork memory")?;
             Ok(run_program(&shim, program))
         })();
+        let status = match result {
+            Ok(status) => status,
+            Err(error) => {
+                litebox_util_log::error!("native fork child bootstrap failed: {error:#}");
+                127
+            }
+        };
         // Do not run destructors or atexit handlers copied from the multithreaded parent runtime.
         // SAFETY: `_exit` terminates this process immediately with a conventional shell status.
-        unsafe { libc::_exit(result.unwrap_or(127)) }
+        unsafe { libc::_exit(status) }
     }
 }
 
