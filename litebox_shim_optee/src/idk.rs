@@ -37,9 +37,15 @@ const MAX_KEYGEN_ATTEMPT: u32 = 256;
 const IDKS_ENDORSEMENT_DATA_MAX_SIZE: usize = 1024 * 1024;
 const IDKS_ENDORSEMENT_MAGIC: &[u8; 4] = b"IDKS";
 const IDKS_ENDORSEMENT_VERSION: u32 = 1;
-#[cfg(not(feature = "idks-production"))]
+#[cfg(any(
+    not(feature = "idks-production"),
+    feature = "allow-unsigned-dynamic-ta"
+))]
 const IDKS_DEBUG_FLAG: u8 = 1;
-#[cfg(feature = "idks-production")]
+#[cfg(all(
+    feature = "idks-production",
+    not(feature = "allow-unsigned-dynamic-ta")
+))]
 const IDKS_DEBUG_FLAG: u8 = 0;
 const ISOLATION_SOLUTION: &[u8] = b"LVBS";
 const IDKS_TA_DIGEST_ALGORITHM: &[u8] = b"SHA256";
@@ -693,6 +699,12 @@ mod tests {
         assert!(endorsement_data_len(u32::MAX as usize + 1, 0).is_none());
         assert!(endorsement_data_len(0, u32::MAX as usize).is_some());
     }
+
+    #[cfg(feature = "allow-unsigned-dynamic-ta")]
+    const _: () = assert!(
+        IDKS_DEBUG_FLAG == 1,
+        "unsigned dynamic TAs require a debug build",
+    );
 
     #[test]
     fn identity_signing_key_depends_on_root_and_context() {

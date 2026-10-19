@@ -30,6 +30,8 @@ ecdsa = { version = "0.16.9", default-features = false, features = ["signing"] }
 
 [features]
 idks-production = []
+# Also accept raw ELF dynamic TAs; signed TAs still require certificate verification.
+allow-unsigned-dynamic-ta = []
 
 [lints]
 workspace = true

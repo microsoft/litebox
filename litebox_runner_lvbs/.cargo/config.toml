@@ -5,7 +5,14 @@ build-std = ["core", "compiler_builtins", "alloc"]
 
 [build]
 target = "x86_64_vtl1.json"
+
 # No jump/lookup tables: a mispredicted bounds check on an attacker-controlled
 # `match` value (e.g., a syscall number) could otherwise load a branch target
 # from out of bounds (Spectre v1). `RUSTFLAGS` overrides this; CI sets it too.
 rustflags = ["-Cjump-tables=no"]
+
+[alias]
+lvbs-debug = "build"
+lvbs-test = "build --release --features allow-unsigned-dynamic-ta"
+lvbs-test-debug =  "build --features allow-unsigned-dynamic-ta"
+lvbs-production = "build --release --features idks-production"

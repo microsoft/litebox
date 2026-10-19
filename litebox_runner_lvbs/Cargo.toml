@@ -29,6 +29,8 @@ preemption_test_quantum = ["litebox_platform_lvbs/preemption_test_quantum"]
 vault-slots-8 = ["litebox_platform_lvbs/vault-slots-8"]
 vault-slots-16 = ["litebox_platform_lvbs/vault-slots-16"]
 vault-slots-32 = ["litebox_platform_lvbs/vault-slots-32"]
+idks-production = ["litebox_shim_optee/idks-production"]
+allow-unsigned-dynamic-ta = ["litebox_shim_optee/allow-unsigned-dynamic-ta"]
 
 [lints]
 workspace = true

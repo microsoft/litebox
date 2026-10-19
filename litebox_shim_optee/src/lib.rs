@@ -316,11 +316,16 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
             .insert(ta_uuid, ta_elf.into(), ta_svn)
     }
 
-    /// Verify and store a signed dynamic TA.
+    /// Verify and store a signed dynamic TA, also allowing raw ELF in unsigned test builds.
     pub(crate) fn store_ta_bin(&self, expected_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        let Some((ta_uuid, ta_svn, ta_elf)) =
+        let parsed = if cfg!(feature = "allow-unsigned-dynamic-ta")
+            && !ta_bin.starts_with(&SHDR_MAGIC.to_le_bytes())
+        {
+            litebox_common_optee::parse_ta_head(ta_bin).map(|head| (head.uuid, 0, ta_bin))
+        } else {
             verify_signed_ta(ta_bin, self.ta_signing_key.as_ref())
-        else {
+        };
+        let Some((ta_uuid, ta_svn, ta_elf)) = parsed else {
             return false;
         };
         if ta_uuid != *expected_uuid {
@@ -475,6 +480,9 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     }
 
     /// Verify and store a signed dynamic TA.
+    ///
+    /// With `allow-unsigned-dynamic-ta`, raw ELF TAs are also accepted. Signed TAs
+    /// still require a valid signature and a configured signing certificate.
     ///
     /// Returns `true` if the binary was successfully stored, `false` if the signature
     /// is invalid, the signed UUID doesn't match the provided UUID, or parsing failed.
@@ -1972,5 +1980,136 @@ mod test_utils {
                 tls_base_addr: Cell::new(0),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dynamic_ta_tests {
+    use super::*;
+    use litebox::platform::CrngProvider;
+    use rsa::{
+        RsaPrivateKey,
+        pkcs8::EncodePublicKey,
+        rand_core::{CryptoRng, RngCore, impls},
+        traits::PublicKeyParts,
+    };
+    use zerocopy::IntoBytes;
+
+    const HELLO_TA: &[u8] =
+        include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
+
+    struct TestRng(&'static litebox_platform_linux_userland::LinuxUserland);
+
+    impl RngCore for TestRng {
+        fn next_u32(&mut self) -> u32 {
+            impls::next_u32_via_fill(self)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            impls::next_u64_via_fill(self)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.0.fill_bytes_crng(dest);
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for TestRng {}
+
+    #[test]
+    fn raw_elf_requires_unsigned_feature_and_matching_uuid() {
+        let uuid = litebox_common_optee::parse_ta_head(HELLO_TA).unwrap().uuid;
+        for cert in [&[][..], b"invalid certificate".as_slice()] {
+            let shim = crate::syscalls::tests::shim_builder()
+                .with_ta_signing_cert(cert)
+                .build();
+            assert!(!shim.store_ta_bin(&TeeUuid::NIL, HELLO_TA));
+            assert_eq!(
+                shim.store_ta_bin(&uuid, HELLO_TA),
+                cfg!(feature = "allow-unsigned-dynamic-ta")
+            );
+            if cfg!(feature = "allow-unsigned-dynamic-ta") {
+                let (elf, _, svn) = shim.0.dynamic_ta_uuid_map.get_with_flags(&uuid).unwrap();
+                assert_eq!(&*elf, HELLO_TA);
+                assert_eq!(svn, 0);
+            } else {
+                assert!(!shim.0.dynamic_ta_uuid_map.contains(&uuid));
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_signed_container() {
+        let shim = crate::syscalls::tests::shim_builder().build();
+        let uuid = litebox_common_optee::parse_ta_head(HELLO_TA).unwrap().uuid;
+        let mut signed_like = SHDR_MAGIC.to_le_bytes().to_vec();
+        signed_like.extend_from_slice(HELLO_TA);
+        assert!(!shim.store_ta_bin(&uuid, &signed_like));
+        assert!(!shim.0.dynamic_ta_uuid_map.contains(&uuid));
+    }
+
+    #[test]
+    fn signed_ta_requires_valid_signature_certificate_and_matching_uuid() {
+        let builder = crate::syscalls::tests::shim_builder();
+        let mut rng = TestRng(builder.platform);
+        let private_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let cert = private_key.to_public_key().to_public_key_der().unwrap();
+        let cert = Box::leak(cert.as_bytes().to_vec().into_boxed_slice());
+        let uuid = litebox_common_optee::parse_ta_head(HELLO_TA).unwrap().uuid;
+        let svn = 7u32;
+        let header = Shdr {
+            magic: SHDR_MAGIC,
+            img_type: SHDR_BOOTSTRAP_TA,
+            img_size: u32::try_from(HELLO_TA.len()).unwrap(),
+            algo: TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256,
+            hash_size: 32,
+            sig_size: u16::try_from(private_key.size()).unwrap(),
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(header.as_bytes());
+        hasher.update(uuid.to_bytes());
+        hasher.update(svn.to_le_bytes());
+        hasher.update(HELLO_TA);
+        let digest = hasher.finalize();
+        let signature = private_key
+            .sign_with_rng(&mut rng, rsa::Pss::new::<Sha256>(), &digest)
+            .unwrap();
+        let mut signed_ta = header.as_bytes().to_vec();
+        signed_ta.extend_from_slice(&digest);
+        signed_ta.extend_from_slice(&signature);
+        signed_ta.extend_from_slice(&uuid.to_bytes());
+        signed_ta.extend_from_slice(&svn.to_le_bytes());
+        signed_ta.extend_from_slice(HELLO_TA);
+
+        for missing_or_invalid_cert in [&[][..], b"invalid certificate".as_slice()] {
+            let shim = crate::syscalls::tests::shim_builder()
+                .with_ta_signing_cert(missing_or_invalid_cert)
+                .build();
+            assert!(!shim.store_ta_bin(&uuid, &signed_ta));
+            assert!(!shim.0.dynamic_ta_uuid_map.contains(&uuid));
+        }
+
+        let shim = builder.with_ta_signing_cert(cert).build();
+        assert_eq!(shim.0.ta_signing_cert, cert);
+        assert!(shim.0.ta_signing_key.is_some());
+        assert!(!shim.store_ta_bin(&TeeUuid::NIL, &signed_ta));
+        let sig_offset = core::mem::size_of::<Shdr>() + usize::from(header.hash_size);
+        signed_ta[sig_offset] ^= 1;
+        assert!(!shim.store_ta_bin(&uuid, &signed_ta));
+        assert!(!shim.0.dynamic_ta_uuid_map.contains(&uuid));
+        signed_ta[sig_offset] ^= 1;
+        assert!(shim.store_ta_bin(&uuid, &signed_ta));
+        let (elf, _, stored_svn) = shim.0.dynamic_ta_uuid_map.get_with_flags(&uuid).unwrap();
+        assert_eq!(&*elf, HELLO_TA);
+        assert_eq!(stored_svn, svn);
+        assert_eq!(
+            shim.store_ta_bin(&uuid, HELLO_TA),
+            cfg!(feature = "allow-unsigned-dynamic-ta")
+        );
     }
 }
