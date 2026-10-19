@@ -1387,7 +1387,7 @@ pub(crate) struct TeeCrypState {
     algo: TeeAlgorithm,
     mode: TeeOperationMode,
     objs: [Option<TeeObjHandle>; 2],
-    cipher: Option<Cipher>,
+    cipher: Option<Box<Cipher>>,
 }
 
 impl TeeCrypState {
@@ -1424,12 +1424,12 @@ impl TeeCrypState {
     }
 
     #[expect(dead_code)]
-    pub fn set_cipher(&mut self, cipher: Cipher) {
+    pub fn set_cipher(&mut self, cipher: Box<Cipher>) {
         self.cipher = Some(cipher);
     }
 
     pub fn get_mut_cipher(&mut self) -> Option<&mut Cipher> {
-        self.cipher.as_mut()
+        self.cipher.as_deref_mut()
     }
 }
 
@@ -1475,7 +1475,11 @@ impl TeeCrypStateMap {
         Some(handle)
     }
 
-    pub fn set_cipher(&self, handle: TeeCrypStateHandle, cipher: Cipher) -> Result<(), TeeResult> {
+    pub fn set_cipher(
+        &self,
+        handle: TeeCrypStateHandle,
+        cipher: Box<Cipher>,
+    ) -> Result<(), TeeResult> {
         let mut inner = self.inner.lock();
         if let Some(state) = inner.get_mut(&handle) {
             state.cipher = Some(cipher);
