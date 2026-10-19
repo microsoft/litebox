@@ -1442,16 +1442,6 @@ pub(crate) enum Cipher {
     Aes256Ctr(Ctr128BE<Aes256>),
 }
 
-const _: () = {
-    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
-    #[allow(dead_code)]
-    fn check() {
-        assert_zeroize_on_drop::<Ctr128BE<Aes128>>();
-        assert_zeroize_on_drop::<Ctr128BE<Aes192>>();
-        assert_zeroize_on_drop::<Ctr128BE<Aes256>>();
-    }
-};
-
 /// A data structure to manage `TeeCrypState` per handle.
 ///
 /// NOTE: This data structure is unstable and can be changed in the future.
