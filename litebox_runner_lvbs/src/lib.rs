@@ -356,7 +356,12 @@ fn vtlcall_dispatch(platform: &'static Platform, params: &[u64; NUM_VTLCALL_PARA
             {
                 return Errno::EFAULT.as_neg().into();
             }
-            0
+
+            if let Err(error) =
+                heki(platform).allocate_ringbuffer_memory(request.ringbuffer_pa, request.ringbuffer_size)
+            {
+                return vsm_error_to_errno(error).as_neg().into();
+            }
         }
         _ => vsm_dispatch(platform, func_id, &params[1..]),
     }
@@ -406,9 +411,6 @@ fn vsm_dispatch(platform: &'static Platform, func_id: VsmFunction, params: &[u64
             params[0],
             params[1],
         ),
-        VsmFunction::AllocateRingbufferMemory => {
-            heki.allocate_ringbuffer_memory(params[0], params[1])
-        }
         VsmFunction::ExchangeSecrets => vtl1
             .set_platform_root_key(params[0])
             .and_then(|()| {
