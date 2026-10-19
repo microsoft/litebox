@@ -183,8 +183,8 @@ impl UserlandProcessLauncher {
     ) -> Result<(), BrokerError> {
         let process = Arc::clone(&association.process);
         let instance = {
-            // Registration under the lock that adoption and reaping hold keeps the new runner's
-            // host process ID from ever appearing unsupervised.
+            // Registration under the lock that adoption holds keeps the new runner's host
+            // process ID from appearing unsupervised to a concurrent adoption.
             let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
             RunnerInstance::start(config).inspect(|instance| {
                 runners.host_process_ids.insert(instance.host_process_id());
@@ -233,6 +233,19 @@ impl UserlandProcessLauncher {
                     abnormal,
                 );
                 // The instance reaped its runner before being consumed or dropped.
+                // TODO: Release the host process ID only after deregistering it. The runner is
+                // reaped before this removal, outside the registry lock, so the OS can reuse its
+                // PID in between: a spawned runner's registration is then erased here (allowing
+                // a forged adoption of it), and a native fork clone given that PID is refused.
+                // Observe the exit without reaping (`WNOWAIT` on Linux; keep the handle open on
+                // Windows), then reap and remove under the registry lock.
+                // This is tolerable for now: the window spans only in-memory bookkeeping, and
+                // Linux allocates PIDs sequentially, so reuse within it requires cycling through
+                // `pid_max`. Windows reuses PIDs sooner, but adoption there duplicates the
+                // clone's handle from the parent runner's handle table, which never holds a
+                // handle to another runner. Exploiting the gap also requires a compromised
+                // runner, and the impact stays within this broker's runners, while an honest
+                // clone that hits it only sees its fork fail.
                 launcher
                     .runners
                     .lock()
