@@ -8,9 +8,8 @@
 
 use core::{marker::PhantomData, ops::Range};
 
-use litebox::buffer::{ReadBuffer, WriteBuffer};
+use litebox::buffer::{RawBytes, ReadBuffer, WriteBuffer};
 use litebox::mm::exception_table::Fault;
-use litebox_broker_transport::shared_memory::SharedBytes;
 use litebox_common_linux::{IoReadVec, IoWriteVec, errno::Errno};
 
 use crate::{ShimPlatform, UserPtr, UserPtrMut};
@@ -111,11 +110,11 @@ impl<Platform: ShimPlatform> ReadBuffer for GuestReadBuffer<'_, Platform> {
         })
     }
 
-    fn copy_from_shared_at(&mut self, offset: usize, source: SharedBytes<'_>) -> Result<(), Fault> {
+    fn copy_from_raw_at(&mut self, offset: usize, source: RawBytes<'_>) -> Result<(), Fault> {
         assert_within(self.length, offset, source.len());
         for_each_part(self.parts(), offset, source.len(), |base, at, range| {
             let part = source.subrange(range);
-            // SAFETY: Shared bytes are readable for their length and never
+            // SAFETY: Raw bytes are readable for their length and never
             // referenced.
             unsafe { base.copy_from_raw::<Platform>(at, part.as_ptr(), part.len()) }
         })
@@ -169,7 +168,7 @@ impl<Platform: ShimPlatform> WriteBuffer for GuestWriteBuffer<'_, Platform> {
         )
     }
 
-    fn copy_to_shared_at(&self, offset: usize, destination: SharedBytes<'_>) -> Result<(), Fault> {
+    fn copy_to_raw_at(&self, offset: usize, destination: RawBytes<'_>) -> Result<(), Fault> {
         assert_within(self.length, offset, destination.len());
         for_each_part(
             self.parts(),
@@ -177,7 +176,7 @@ impl<Platform: ShimPlatform> WriteBuffer for GuestWriteBuffer<'_, Platform> {
             destination.len(),
             |base, at, range| {
                 let part = destination.subrange(range);
-                // SAFETY: Shared bytes are writable for their length and never
+                // SAFETY: Raw bytes are writable for their length and never
                 // referenced.
                 unsafe { base.copy_to_raw::<Platform>(at, part.as_ptr(), part.len()) }
             },
@@ -215,7 +214,10 @@ mod tests {
         let memory = HeapSharedMemory::new(2);
         let shared = memory.shared_bytes(0, 2).unwrap();
         shared.copy_from_slice(&[3, 4]);
-        buffer.window(2, 3).copy_from_shared_at(1, shared).unwrap();
+        buffer
+            .window(2, 3)
+            .copy_from_raw_at(1, shared.into())
+            .unwrap();
         assert_eq!((a, c), ([0, 1], [2, 3, 4]));
     }
 
@@ -229,7 +231,7 @@ mod tests {
         assert_eq!(gathered, [2, 3, 4]);
         let memory = HeapSharedMemory::new(4);
         let shared = memory.shared_bytes(0, 4).unwrap();
-        buffer.copy_to_shared_at(1, shared).unwrap();
+        buffer.copy_to_raw_at(1, shared.into()).unwrap();
         let mut copied = [0; 4];
         shared.copy_to_slice(&mut copied);
         assert_eq!(copied, [2, 3, 4, 5]);

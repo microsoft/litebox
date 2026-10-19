@@ -485,10 +485,8 @@ mod tests {
     use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::HeapSharedMemory;
 
-    use litebox_broker_transport::shared_memory::SharedBytes;
-
     use crate::{
-        buffer::ReadBuffer,
+        buffer::{RawBytes, ReadBuffer},
         event::{Events, IOPollable, observer::Observer, wait::WaitState},
         mm::exception_table::Fault,
         pipes::errors::ReadError,
@@ -684,11 +682,7 @@ mod tests {
             Err(Fault)
         }
 
-        fn copy_from_shared_at(
-            &mut self,
-            _offset: usize,
-            _source: SharedBytes<'_>,
-        ) -> Result<(), Fault> {
+        fn copy_from_raw_at(&mut self, _offset: usize, _source: RawBytes<'_>) -> Result<(), Fault> {
             Err(Fault)
         }
     }
