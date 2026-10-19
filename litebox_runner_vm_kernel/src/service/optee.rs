@@ -18,6 +18,7 @@ use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_vm_kernel::optee::Completion;
 use litebox_shim_vm_kernel::optee::Invocation;
 use litebox_shim_vm_kernel::optee::ta_manager::{InstancePolicy, TaManager};
+use litebox_shim_vm_kernel::sched::Scheduler;
 use litebox_shim_vm_kernel::{Process, ProcessConfig, ProcessTimer};
 use zerocopy::IntoBytes as _;
 
@@ -38,6 +39,7 @@ impl Optee {
     ///
     /// On a missing or malformed payload file.
     pub fn new(
+        scheduler: Scheduler,
         platform: &'static VmKernel,
         clock: Clock,
         wall_clock: WallClock,
@@ -85,6 +87,7 @@ impl Optee {
             let mut identity = [0u8; IDENTITY_LEN];
             identity[..size_of::<TeeUuid>()].copy_from_slice(uuid.as_bytes());
             let mut process = Process::spawn(
+                &scheduler,
                 platform,
                 &broker,
                 &ProcessConfig {
