@@ -125,8 +125,9 @@ pub trait ProcessProvider {
 
     /// Duplicates the caller's address space with only the calling thread.
     ///
-    /// The parent must call [`ProcessHandle::resume`] before waiting for child startup. The
-    /// child may already be running before that call, depending on the host.
+    /// Depending on the host, the child starts either suspended or already running. A suspended
+    /// child runs nothing until the parent calls [`ProcessHandle::resume`], so the parent must
+    /// resume it before anything that waits on the child.
     ///
     /// # Safety
     ///
@@ -148,8 +149,6 @@ pub trait ProcessProvider {
 }
 
 /// A handle to a process created by [`ProcessProvider::fork_process`].
-///
-/// Dropping a handle releases resources but does not terminate the process.
 pub trait ProcessHandle {
     /// Error type for process operations.
     type Error: core::error::Error;
@@ -158,6 +157,7 @@ pub trait ProcessHandle {
     fn process_id(&self) -> Result<u32, Self::Error>;
 
     /// Releases the clone's initial suspension, or succeeds if it was created running.
+    /// See [`ProcessProvider::fork_process`].
     fn resume(&self) -> Result<(), Self::Error>;
 
     /// Terminates the clone after startup fails.
