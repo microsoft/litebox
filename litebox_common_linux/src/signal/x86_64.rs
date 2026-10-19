@@ -3,10 +3,10 @@
 
 //! Definitions for x86_64 signal context structures.
 
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, Immutable, IntoBytes)]
 pub struct FpxSwBytes {
     pub magic1: u32,
     pub extended_size: u32,

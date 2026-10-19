@@ -4,6 +4,7 @@
 //! Host-independent x86-64 XSAVE layout discovery and aligned state storage.
 
 use alloc::{boxed::Box, vec, vec::Vec};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// Size of the architectural legacy x87/SSE save area.
 const XSAVE_LEGACY_SIZE: usize = core::mem::size_of::<XsaveLegacyArea>();
@@ -14,7 +15,7 @@ const XSAVE_HEADER_SIZE: usize = core::mem::size_of::<XsaveHeader>();
 
 /// Architectural x86-64 FXSAVE area at the start of a standard XSAVE area.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct XsaveLegacyArea {
     pub control_word: u16,
     pub status_word: u16,

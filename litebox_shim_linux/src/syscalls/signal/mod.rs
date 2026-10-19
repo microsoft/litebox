@@ -717,7 +717,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // machine context. A malformed context therefore still changes it.
         self.signals.set_signal_mask(uctx.sigmask);
 
-        #[cfg(target_arch = "aarch64")]
         let result = {
             let Some(result) = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext)
             else {
@@ -726,8 +725,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             result
         };
-        #[cfg(target_arch = "x86_64")]
-        let result = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext);
         // Restore the alternate signal stack, ignoring errors.
         self.signals.set_sigaltstack(uctx.stack).ok();
         Ok(result)
