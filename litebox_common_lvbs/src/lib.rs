@@ -38,6 +38,8 @@ pub const IDKS_PUB_MAX_LEN: usize = 97;
 pub struct ExchangeSecretsRequest {
     pub prk: [u8; PRK_LEN],
     pub idks_seed: [u8; CRNG_SEED_LEN],
+    pub ringbuffer_pa: u64,
+    pub ringbuffer_size: u64,
     pub key_alg_variant: u32,
     pub idks_pub_len: u32,
     pub idks_pub: [u8; IDKS_PUB_MAX_LEN],
@@ -62,10 +64,8 @@ pub const VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE: u32 = 0x1_ffe8;
 pub const VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY: u32 = 0x1_ffe9;
 pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
 pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
-pub const VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY: u32 = 0x1_ffec;
-
 // This VSM function ID for exchanging secrets is subject to change
-pub const VSM_VTL_CALL_FUNC_ID_EXCHANGE_SECRETS: u32 = 0x1_ffed;
+pub const VSM_VTL_CALL_FUNC_ID_EXCHANGE_SECRETS: u32 = 0x1_ffec;
 
 // This VSM function ID for OP-TEE messages is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
@@ -88,7 +88,6 @@ pub enum VsmFunction {
     KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
     PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
     OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
-    AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
     ExchangeSecrets = VSM_VTL_CALL_FUNC_ID_EXCHANGE_SECRETS,
 }
 
