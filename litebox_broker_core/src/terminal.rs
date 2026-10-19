@@ -21,7 +21,7 @@ use litebox_broker_protocol::terminal::{
 
 use crate::fs::FileResult;
 use crate::readiness::ReadinessSource;
-use crate::transfer::{CopyFromFn, lend_from_queue};
+use crate::transfer::{CopyFromFn, copy_from_queue};
 
 /// Maximum queued input bytes and canonical record boundaries per terminal.
 pub const INPUT_CAPACITY: usize = 64 * 1024;
@@ -225,7 +225,7 @@ impl TerminalEngine {
     }
 
     /// Reads up to `length` bytes of one canonical record, or of the available
-    /// noncanonical bytes, lending them to `copy_from` (see [`crate::transfer`]).
+    /// noncanonical bytes, passing them to `copy_from` (see [`crate::transfer`]).
     /// `None` means the caller must wait; `Some(0)` is a single canonical EOF
     /// or an immediate noncanonical read. If `copy_from` fails, nothing is read.
     pub fn read(
@@ -248,7 +248,7 @@ impl TerminalEngine {
             }
             length.min(self.input.len())
         };
-        lend_from_queue(&self.input, 0..count, copy_from)?;
+        copy_from_queue(&self.input, 0..count, copy_from)?;
         if canonical && let Some(record) = self.records.front_mut() {
             *record -= count;
             if *record == 0 {
@@ -549,7 +549,7 @@ mod tests {
     use crate::transfer::copy_to_slice;
 
     impl TerminalEngine {
-        /// Reads into `output`, for tests that are not about lending.
+        /// Reads into `output`, for tests that are not about copying.
         fn read_slice(&mut self, output: &mut [u8]) -> Option<usize> {
             self.read(output.len(), &mut copy_to_slice(output)).unwrap()
         }

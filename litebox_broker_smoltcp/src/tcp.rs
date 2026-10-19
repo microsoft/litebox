@@ -514,7 +514,7 @@ impl Tcp {
         Ok(())
     }
 
-    /// Lends what it receives to `copy_from` (see
+    /// Passes what it receives to `copy_from` (see
     /// [`litebox_broker_core::transfer`]). The broker core validated the peek
     /// window.
     #[expect(clippy::too_many_arguments, reason = "mirrors PlatformSocket::receive")]
@@ -597,7 +597,7 @@ impl Tcp {
                 end - start
             }
             (None, &Phase::External(handle)) if peek => {
-                // smoltcp lends only the first contiguous part of its receive
+                // smoltcp passes only the first contiguous part of its receive
                 // buffer without taking it, so a peek copies it all out.
                 let mut data = zeroed(end)?;
                 let copied = sockets
@@ -611,9 +611,9 @@ impl Tcp {
             (None, &Phase::External(handle)) => {
                 let socket = sockets.tcp(handle);
                 let mut received = 0;
-                // smoltcp lends its receive buffer a contiguous part at a time,
-                // and it has two at most. Once the peer has closed, a drained
-                // socket fails to lend any more.
+                // smoltcp passes its receive buffer's bytes one contiguous part at
+                // a time, and there are two parts at most. Once the peer has
+                // closed, a drained socket fails to pass any more.
                 for _ in 0..2 {
                     if received == end {
                         break;
@@ -640,7 +640,7 @@ impl Tcp {
         )))
     }
 
-    /// Sends what of `length` bytes there is room for, lending the room to
+    /// Sends what of `length` bytes there is room for, passing the room to
     /// `copy_to` (see [`litebox_broker_core::transfer`]).
     pub(super) fn send(
         &mut self,
@@ -686,7 +686,7 @@ impl Tcp {
                     return Ok(SocketOutcome::Failed(SocketError::NotConnected));
                 }
                 let mut sent = 0;
-                // smoltcp lends the room in its send buffer a contiguous part
+                // smoltcp passes the room in its send buffer a contiguous part
                 // at a time, and it has two at most.
                 for _ in 0..2 {
                     if sent == length {

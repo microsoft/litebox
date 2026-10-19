@@ -930,7 +930,7 @@ fn allocate_zeroed(length: usize) -> RequestResult<Vec<u8>> {
     Ok(data)
 }
 
-/// Returns a `CopyFromFn` that copies the parts it is lent, one after another,
+/// Returns a `CopyFromFn` that copies the parts it is passed, one after another,
 /// into the validated sequence `buffer` from `offset` on (see
 /// [`litebox_broker_core::transfer`]).
 fn copy_to_shared_buffer<Memory: SharedMemory>(
@@ -947,7 +947,7 @@ fn copy_to_shared_buffer<Memory: SharedMemory>(
     }
 }
 
-/// Returns a `CopyToFn` that fills the parts it is lent, one after another,
+/// Returns a `CopyToFn` that fills the parts it is passed, one after another,
 /// from the validated sequence `buffer` from `offset` on (see
 /// [`litebox_broker_core::transfer`]).
 fn copy_from_shared_buffer<Memory: SharedMemory>(

@@ -263,27 +263,27 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .expect("validated shared buffer sequence must be accessible");
     }
 
-    /// Lends the `length` bytes at `offset` in `buffer` to `lend`, one
+    /// Passes the `length` bytes at `offset` in `buffer` to `copy`, one
     /// contiguous part at a time.
-    fn lend_shared_buffer(
+    fn copy_shared_buffer(
         &self,
         buffer: SharedBufferSequence,
         offset: usize,
         length: usize,
-        lend: &mut transfer::CopyFromFn<'_>,
+        copy: &mut transfer::CopyFromFn<'_>,
     ) -> Result<(), Channel::Error> {
         assert!(
             offset
                 .checked_add(length)
                 .is_some_and(|end| end <= buffer.length() as usize),
-            "shared buffer sequence must cover the lent bytes"
+            "shared buffer sequence must cover the copied bytes"
         );
         for part in self
             .shared_buffers
             .borrow_sequence(buffer, offset, length)
             .expect("validated shared buffer sequence must be accessible")
         {
-            lend(part).map_err(|transfer::CopyFailed| BrokerLocalError::CopyFailed)?;
+            copy(part).map_err(|transfer::CopyFailed| BrokerLocalError::CopyFailed)?;
         }
         Ok(())
     }

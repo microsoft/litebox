@@ -233,8 +233,8 @@ impl<B: WriteBuffer + ?Sized> WriteBuffer for Window<&B> {
     }
 }
 
-/// Returns a `CopyFromFn` that copies the parts a broker lends it into `buffer`,
-/// one after another from `offset`.
+/// Returns a `CopyFromFn` that copies into `buffer`, from `offset` on, the parts
+/// a broker passes it.
 pub(crate) fn copy_to_buffer<B: ReadBuffer + ?Sized>(
     buffer: &mut B,
     mut offset: usize,
@@ -249,8 +249,8 @@ pub(crate) fn copy_to_buffer<B: ReadBuffer + ?Sized>(
     }
 }
 
-/// Returns a `CopyToFn` that fills the parts a broker lends it from `buffer`, one
-/// after another from `offset`.
+/// Returns a `CopyToFn` that fills the parts a broker passes it with `buffer`'s
+/// bytes from `offset` on.
 pub(crate) fn copy_from_buffer<B: WriteBuffer + ?Sized>(
     buffer: &B,
     mut offset: usize,

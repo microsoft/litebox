@@ -52,7 +52,7 @@ use crate::fs::File;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::socket::SocketOptions;
-use crate::transfer::{CopyFromFn, CopyToFn, append_to_queue, lend_from_queue};
+use crate::transfer::{CopyFromFn, CopyToFn, append_to_queue, copy_from_queue};
 use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a Unix socket operation.
@@ -325,7 +325,7 @@ pub fn accept(
 /// Sends up to `length` bytes from a Unix socket, to `address` if given or
 /// otherwise to its connected peer, and returns how many were sent.
 ///
-/// The socket lends the room for the bytes it sends to `copy_to` to copy in
+/// The socket passes the room for the bytes it sends to `copy_to` to copy in
 /// (see [`crate::transfer`]). A stream socket sends as many bytes as its peer has
 /// room for. A datagram socket sends all `length` bytes as one datagram.
 /// Fails with [`BrokerError::WouldBlock`] while the receiving socket is full.
@@ -367,7 +367,7 @@ pub fn send(
     }
 }
 
-/// Receives up to `capacity` bytes from a Unix socket, lending them to
+/// Receives up to `capacity` bytes from a Unix socket, passing them to
 /// `copy_from` to copy out, leaving them queued if `peek` is set and returning
 /// the sender's name if `source` is set.
 ///
@@ -1257,7 +1257,7 @@ impl Socket {
                 };
             }
             let length = capacity.min(channel.queue.bytes.len());
-            lend_from_queue(&channel.queue.bytes, 0..length, copy_from)?;
+            copy_from_queue(&channel.queue.bytes, 0..length, copy_from)?;
             if peek {
                 (length, Wakeups::default())
             } else {

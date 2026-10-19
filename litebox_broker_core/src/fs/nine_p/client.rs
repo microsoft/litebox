@@ -460,7 +460,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         }
     }
 
-    /// Read up to `length` bytes from a file, lending them to `copy_from`
+    /// Read up to `length` bytes from a file, passing them to `copy_from`
     pub(super) fn read(
         &self,
         fid: &Fid<Platform>,
@@ -493,7 +493,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
     }
 
-    /// Write up to `length` bytes to a file, lending the room for them to
+    /// Write up to `length` bytes to a file, passing the room for them to
     /// `copy_to` in the request
     pub(super) fn write(
         &self,

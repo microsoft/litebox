@@ -1989,7 +1989,7 @@ impl Reactor {
     }
 }
 
-/// `length` bytes for the reactor to send, lent to `copy_to` (see
+/// `length` bytes for the reactor to send, passed to `copy_to` (see
 /// [`litebox_broker_core::transfer`]).
 fn filled(length: usize, copy_to: &mut CopyToFn<'_>) -> BrokerResult<Vec<u8>> {
     let mut data = bounce_buffer(length)?;

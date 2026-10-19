@@ -236,7 +236,7 @@ fn receive_datagram_into(
     )
 }
 
-/// Returns a `CopyFromFn` that copies the parts it is lent into `destination`,
+/// Returns a `CopyFromFn` that copies the parts it is passed into `destination`,
 /// one after another.
 fn copy_to_slice(destination: &mut [u8]) -> impl FnMut(&[u8]) -> BrokerResult<()> + '_ {
     let mut offset = 0;

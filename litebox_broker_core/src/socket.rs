@@ -27,7 +27,7 @@ use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
-use crate::transfer::{CopyFromFn, CopyToFn, Lent};
+use crate::transfer::{CopyCount, CopyFromFn, CopyToFn};
 use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessId, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
@@ -434,7 +434,7 @@ pub struct AcceptedBrokerSocket {
 /// Platform result for one stream receive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlatformStreamReceive {
-    /// Number of bytes received from the stream and lent to the `CopyFromFn`: no
+    /// Number of bytes received from the stream and passed to the `CopyFromFn`: no
     /// more than requested, and nonzero if any were.
     Received(usize),
     /// The stream's receive direction reached end of stream.
@@ -444,7 +444,7 @@ pub enum PlatformStreamReceive {
 /// Platform result for one datagram receive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlatformDatagramReceive {
-    /// Number of bytes received and lent to the `CopyFromFn`: the datagram's
+    /// Number of bytes received and passed to the `CopyFromFn`: the datagram's
     /// prefix, the lesser of its length and the requested length.
     pub received: usize,
     /// Original datagram length, no greater than [`MAX_UDP_DATAGRAM_SIZE`].
@@ -556,7 +556,7 @@ pub trait PlatformSocket: Send + Sync {
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError>;
 
     /// Sends up to `length` bytes without waiting for platform readiness,
-    /// lending the room for them to `copy_to` to copy in (see
+    /// passing the room for them to `copy_to` to copy in (see
     /// [`crate::transfer`]), and returns how many it sent: the first of
     /// those it filled in, which may be more.
     ///
@@ -571,7 +571,7 @@ pub trait PlatformSocket: Send + Sync {
     ) -> Result<SocketOutcome<usize>>;
 
     /// Sends one complete datagram of `length` bytes without waiting for
-    /// platform readiness, lending its room to `copy_to` to copy in (see
+    /// platform readiness, passing its room to `copy_to` to copy in (see
     /// [`crate::transfer`]).
     ///
     /// A destination is required for an unconnected socket and omitted to use
@@ -592,7 +592,7 @@ pub trait PlatformSocket: Send + Sync {
     ) -> Result<SocketOutcome<usize>>;
 
     /// Receives up to `length` bytes without waiting for platform readiness,
-    /// lending them to `copy_from` to copy out (see [`crate::transfer`]): exactly
+    /// passing them to `copy_from` to copy out (see [`crate::transfer`]): exactly
     /// those it returns, so none when it fails.
     ///
     /// A temporarily empty socket returns [`BrokerError::WouldBlock`]. End of
@@ -615,7 +615,7 @@ pub trait PlatformSocket: Send + Sync {
         copy_from: &mut CopyFromFn<'_>,
     ) -> Result<SocketOutcome<PlatformStreamReceive>>;
 
-    /// Receives one datagram without waiting for platform readiness, lending
+    /// Receives one datagram without waiting for platform readiness, passing
     /// up to `length` bytes of it to `copy_from` to copy out (see
     /// [`crate::transfer`]): exactly those it returns, so none when it
     /// fails.
@@ -1306,7 +1306,7 @@ pub fn accept(
 }
 
 /// Sends up to `length` TCP stream bytes without waiting for readiness,
-/// lending the room for those it sends to `copy_to` to copy in (see
+/// passing the room for those it sends to `copy_to` to copy in (see
 /// [`crate::transfer`]), and returns how many it sent.
 ///
 /// A socket shut down for writing fails with `Shutdown` once any connection
@@ -1390,19 +1390,19 @@ fn transport_send(
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let mut lent = Lent::new(length);
+    let mut copied = CopyCount::new(length);
     let outcome = state
         .resource
         .platform_socket
         .send(length, flags, &mut |part| {
-            lent.lend(part.len(), || copy_to(part))
+            copied.count(part.len(), || copy_to(part))
         });
-    let lent = lent.finish()?;
+    let copied = copied.finish()?;
     let outcome = outcome.map_err(|error| would_block_error(error, state.nonblocking))?;
     // A platform may fill in more than it sends, such as one that fills in
     // all of it before learning how much the host takes.
     if let SocketOutcome::Completed(sent) = outcome
-        && (sent > lent || (length != 0 && sent == 0))
+        && (sent > copied || (length != 0 && sent == 0))
     {
         return Err(BrokerError::Internal);
     }
@@ -1410,7 +1410,7 @@ fn transport_send(
 }
 
 /// Sends one complete datagram of `length` bytes without waiting for
-/// readiness, lending its room to `copy_to` to copy in (see
+/// readiness, passing its room to `copy_to` to copy in (see
 /// [`crate::transfer`]).
 ///
 /// A pending error fails the send and is consumed, and a socket shut down for
@@ -1576,18 +1576,18 @@ fn transport_send_to(
     }) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let mut lent = Lent::new(length);
+    let mut copied = CopyCount::new(length);
     let outcome = resource
         .platform_socket
         .send_to(length, flags, destination, &mut |part| {
-            lent.lend(part.len(), || copy_to(part))
+            copied.count(part.len(), || copy_to(part))
         });
-    let lent = lent.finish()?;
+    let copied = copied.finish()?;
     let outcome = outcome.map_err(|error| would_block_error(error, nonblocking))?;
     // A platform may accept a datagram it then drops without filling it in,
     // as UDP may drop any datagram.
     if let SocketOutcome::Completed(sent) = outcome
-        && (sent != length || (lent != 0 && lent != length))
+        && (sent != length || (copied != 0 && copied != length))
     {
         return Err(BrokerError::Internal);
     }
@@ -1595,7 +1595,7 @@ fn transport_send_to(
 }
 
 /// Receives up to `length` TCP stream bytes without waiting for readiness,
-/// lending them to `copy_from` to copy out (see [`crate::transfer`]).
+/// passing them to `copy_from` to copy out (see [`crate::transfer`]).
 ///
 /// An unconnected socket fails with `NotConnected`, or with `Shutdown` if it
 /// was shut down for reading and has no pending error, and a failed
@@ -1733,21 +1733,21 @@ fn transport_receive(
     if length == 0 {
         return Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(0)));
     }
-    let mut lent = Lent::new(length);
+    let mut copied = CopyCount::new(length);
     let outcome = state.resource.platform_socket.receive(
         reader,
         length,
         flags,
         peek_offset,
         peek_length,
-        &mut |part| lent.lend(part.len(), || copy_from(part)),
+        &mut |part| copied.count(part.len(), || copy_from(part)),
     );
-    let lent = lent.finish()?;
+    let copied = copied.finish()?;
     let received = match outcome {
         Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(received))) => received,
         _ => 0,
     };
-    if received != lent
+    if received != copied
         || matches!(
             outcome,
             Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(0)))
@@ -1758,7 +1758,7 @@ fn transport_receive(
     outcome.map_err(|error| would_block_error(error, state.nonblocking))
 }
 
-/// Receives one datagram without waiting for readiness, lending up to
+/// Receives one datagram without waiting for readiness, passing up to
 /// `length` bytes of it to `copy_from` to copy out (see [`crate::transfer`]).
 ///
 /// A pending error fails the receive and is consumed, and a socket shut down
@@ -1817,23 +1817,23 @@ fn transport_receive_from(
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let mut lent = Lent::new(length);
+    let mut copied = CopyCount::new(length);
     let outcome = state
         .resource
         .platform_socket
         .receive_from(length, flags, &mut |part| {
-            lent.lend(part.len(), || copy_from(part))
+            copied.count(part.len(), || copy_from(part))
         });
-    let lent = lent.finish()?;
+    let copied = copied.finish()?;
     let invalid = match &outcome {
         Ok(SocketOutcome::Completed(received)) => {
-            received.received != lent
+            received.received != copied
                 || received.received != received.datagram_length.min(length)
                 || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize
                 || normalize_socket_destination(received.source_address)
                     != Ok(received.source_address)
         }
-        Ok(SocketOutcome::Failed(_)) | Err(_) => lent != 0,
+        Ok(SocketOutcome::Failed(_)) | Err(_) => copied != 0,
     };
     if invalid {
         return Err(BrokerError::Internal);

@@ -46,7 +46,7 @@ pub enum StdioProviderError {
     #[error("standard I/O is unsupported")]
     Unsupported,
     /// The broker failed the operation itself, such as when the `CopyFromFn` or
-    /// `CopyToFn` it lent bytes or room to failed (see [`crate::transfer`]) or it
+    /// `CopyToFn` it passed bytes or room to failed (see [`crate::transfer`]) or it
     /// ran out of memory.
     #[error(transparent)]
     Broker(#[from] BrokerError),
@@ -67,9 +67,9 @@ pub trait StdioProvider: Send + Sync {
         None
     }
 
-    /// Reads up to `length` available bytes from standard input, lending
+    /// Reads up to `length` available bytes from standard input, passing
     /// them to `copy_from` to copy out (see [`crate::transfer`]), and returns how
-    /// many it read: exactly those it lent, so zero at end-of-file.
+    /// many it read: exactly those it passed, so zero at end-of-file.
     fn read(
         &self,
         length: usize,
@@ -77,9 +77,9 @@ pub trait StdioProvider: Send + Sync {
     ) -> core::result::Result<usize, StdioProviderError>;
 
     /// Writes up to `length` bytes to the selected standard output stream,
-    /// lending room for up to `length` bytes to `copy_to` to copy them in (see
+    /// passing room for up to `length` bytes to `copy_to` to copy them in (see
     /// [`crate::transfer`]), and returns how many it wrote, which may be
-    /// fewer than it lent room for.
+    /// fewer than it passed room for.
     fn write(
         &self,
         stream: StdioOutputStream,

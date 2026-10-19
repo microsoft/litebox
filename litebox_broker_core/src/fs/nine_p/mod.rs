@@ -801,7 +801,7 @@ pub enum Error {
     Remote(u32),
 
     /// The broker failed the operation itself, such as when the `CopyFromFn` or
-    /// `CopyToFn` it lent data to failed
+    /// `CopyToFn` it passed data to failed
     #[error(transparent)]
     Broker(#[from] BrokerError),
 }

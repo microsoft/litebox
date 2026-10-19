@@ -4,7 +4,7 @@
 //! Runtime shared-memory access for broker transports.
 //!
 //! [`SharedMemory`] and [`ControlRingMemory`] abstract a concrete shared-memory
-//! resource, and [`AsSharedBytes`] one that also lends its bytes as
+//! resource, and [`AsSharedBytes`] one that also exposes its bytes as
 //! [`SharedBytes`]. [`SharedBufferPool`] applies the peer-visible
 //! fixed-slot layout from [`litebox_broker_protocol::shared_buffer`] and
 //! bounds-checks each slot access.
@@ -141,7 +141,7 @@ impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
     }
 }
 
-/// Shared memory that lends its bytes as [`SharedBytes`], stably addressable
+/// Shared memory that exposes its bytes as [`SharedBytes`], stably addressable
 /// for as long as it is borrowed, so callers can copy directly between them
 /// and memory of their own that they cannot expose as a slice, such as a
 /// guest's memory.
@@ -325,7 +325,7 @@ impl HeapSharedMemory {
 impl Drop for HeapSharedMemory {
     fn drop(&mut self) {
         // SAFETY: The allocation was made with this layout and is no longer
-        // lent, since lent bytes borrow `self`.
+        // borrowed, since the `SharedBytes` it exposes borrow `self`.
         unsafe { alloc::alloc::dealloc(self.address.as_ptr(), self.layout) };
     }
 }

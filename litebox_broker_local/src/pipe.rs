@@ -40,7 +40,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Reads up to `buffer.length()` bytes from a broker-owned pipe into an
-    /// operation-scoped shared buffer lease, and lends the bytes read to
+    /// operation-scoped shared buffer lease, and passes the bytes read to
     /// `copy_from`.
     ///
     /// The caller must retain exclusive ownership of the sequence's slots
@@ -74,7 +74,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             "broker returned oversized pipe read"
         );
         let read = response.read as usize;
-        self.lend_shared_buffer(buffer, 0, read, copy_from)?;
+        self.copy_shared_buffer(buffer, 0, read, copy_from)?;
         Ok(read)
     }
 
@@ -100,7 +100,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, copy_to)?;
+        self.copy_shared_buffer(buffer, 0, buffer.length() as usize, copy_to)?;
         let response =
             self.request_pipe(PipeRequest::Write(WritePipeRequest { handle, buffer }))?;
         let PipeResponse::Write(response) = response else {

@@ -473,7 +473,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() <= MAX_SOCKET_TRANSFER_SIZE,
             "shared socket sequence exceeds the transfer limit"
         );
-        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, copy_to)?;
+        self.copy_shared_buffer(buffer, 0, buffer.length() as usize, copy_to)?;
         match self.request_socket(SocketRequest::Send(SendSocketRequest {
             handle,
             buffer,
@@ -512,7 +512,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() <= MAX_UDP_DATAGRAM_SIZE,
             "shared UDP sequence exceeds the datagram limit"
         );
-        self.lend_shared_buffer(buffer, 0, buffer.length() as usize, copy_to)?;
+        self.copy_shared_buffer(buffer, 0, buffer.length() as usize, copy_to)?;
         match self.request_socket(SocketRequest::SendTo(SendToSocketRequest {
             handle,
             buffer,
@@ -533,7 +533,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Receives up to `request.buffer.length()` bytes into an
-    /// operation-scoped shared-buffer lease, and lends the bytes received to
+    /// operation-scoped shared-buffer lease, and passes the bytes received to
     /// `copy_from`.
     ///
     /// The caller must retain exclusive ownership of the sequence's slots
@@ -556,7 +556,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         received <= request.buffer.length(),
                         "broker returned oversized socket receive"
                     );
-                    self.lend_shared_buffer(request.buffer, 0, received as usize, copy_from)?;
+                    self.copy_shared_buffer(request.buffer, 0, received as usize, copy_from)?;
                 }
                 Ok(Ok(response))
             }
@@ -566,7 +566,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Receives one datagram, up to `buffer.length()` bytes of it, into an
-    /// operation-scoped shared-buffer lease, and lends the bytes received to
+    /// operation-scoped shared-buffer lease, and passes the bytes received to
     /// `copy_from`.
     ///
     /// # Panics
@@ -599,7 +599,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     response.datagram_length <= MAX_UDP_DATAGRAM_SIZE,
                     "broker returned oversized UDP datagram length"
                 );
-                self.lend_shared_buffer(buffer, 0, response.received as usize, copy_from)?;
+                self.copy_shared_buffer(buffer, 0, response.received as usize, copy_from)?;
                 Ok(Ok(response))
             }
             SocketResponse::Failed(error) => Ok(Err(error)),

@@ -35,11 +35,11 @@ use crate::{
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
-    transfer::{CopyFromFn, CopyToFn, copy_from_slice, copy_to_slice, lend_from_queue},
+    transfer::{CopyFromFn, CopyToFn, copy_from_queue, copy_from_slice, copy_to_slice},
 };
 
 /// Reads into and writes from slices with a resolver, for tests that are not
-/// about lending (see [`crate::transfer`]).
+/// about copying (see [`crate::transfer`]).
 pub trait ResolverSlices<Backend: fs::backend::Backend> {
     /// Reads into `buffer` with [`Resolver::read`].
     fn read_slice(
@@ -81,7 +81,7 @@ impl<Platform, Backend: fs::backend::Backend + 'static> ResolverSlices<Backend>
 }
 
 /// Reads into and writes from slices with a file backend, for tests that are
-/// not about lending (see [`crate::transfer`]).
+/// not about copying (see [`crate::transfer`]).
 pub trait BackendSlices: fs::backend::Backend {
     /// Reads into `buffer` with [`fs::backend::Backend::read`].
     fn read_slice(
@@ -314,7 +314,7 @@ impl StdioProvider for TestStdioProvider {
             return Err(StdioProviderError::WouldBlock);
         }
         let read = input.bytes.len().min(length);
-        lend_from_queue(&input.bytes, 0..read, copy_from)?;
+        copy_from_queue(&input.bytes, 0..read, copy_from)?;
         input.bytes.drain(..read);
         Ok(read)
     }
@@ -482,7 +482,7 @@ impl Drop for ManualAlarm {
     }
 }
 
-/// Returns a `CopyFromFn` that appends the parts it is lent to `destination` (see
+/// Returns a `CopyFromFn` that appends the parts it is passed to `destination` (see
 /// [`crate::transfer`]).
 pub fn copy_to_vec(destination: &mut Vec<u8>) -> impl FnMut(&[u8]) -> Result<()> + '_ {
     move |part| {
@@ -540,7 +540,7 @@ pub enum StreamData {
 ///
 /// # Panics
 ///
-/// Panics if the result does not match what the socket lent.
+/// Panics if the result does not match what the socket passed.
 pub fn receive_data(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -587,7 +587,7 @@ pub struct DatagramData {
 ///
 /// # Panics
 ///
-/// Panics if the result does not match what the socket lent.
+/// Panics if the result does not match what the socket passed.
 pub fn receive_data_from(
     process: &BrokerProcess,
     handle: ObjectHandle,

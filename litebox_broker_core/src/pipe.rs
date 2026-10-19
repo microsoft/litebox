@@ -14,7 +14,7 @@ use spin::rwlock::RwLock;
 
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
-use crate::transfer::{CopyFromFn, CopyToFn, append_to_queue, lend_from_queue};
+use crate::transfer::{CopyFromFn, CopyToFn, append_to_queue, copy_from_queue};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
@@ -66,7 +66,7 @@ pub fn create(
     )
 }
 
-/// Reads up to `length` bytes from a broker-owned pipe, lending them to
+/// Reads up to `length` bytes from a broker-owned pipe, passing them to
 /// `copy_from` to copy out, and returns how many it read.
 pub fn read(
     process: &BrokerProcess,
@@ -82,7 +82,7 @@ pub fn read(
     object.as_pipe()?.read(length as usize, copy_from)
 }
 
-/// Writes up to `length` bytes to a broker-owned pipe, lending the room for
+/// Writes up to `length` bytes to a broker-owned pipe, passing the room for
 /// those it writes to `copy_to` to copy in (see [`crate::transfer`]), and
 /// returns how many it wrote.
 pub fn write(
@@ -198,7 +198,7 @@ impl PipeObject {
         }
 
         let read_len = length.min(state.data.len());
-        lend_from_queue(&state.data, 0..read_len, copy_from)?;
+        copy_from_queue(&state.data, 0..read_len, copy_from)?;
         state.data.drain(..read_len);
         state.publish(PipeEndpoint::Write);
         Ok(read_len)

@@ -1218,7 +1218,7 @@ impl<'a> TaggedFcall<'a> {
     }
 
     /// Encode to a buffer a `Twrite` message, tagged `tag`, of `count` bytes for `fid` at
-    /// `offset`, lending the room for its data to `copy_to` to fill in place (see
+    /// `offset`, passing the room for its data to `copy_to` to fill in place (see
     /// [`crate::transfer`]).
     pub(super) fn encode_twrite_to_buf(
         buf: &mut Vec<u8>,

@@ -42,7 +42,7 @@ pub enum ReadError {
     Io,
     #[error("no data is available yet")]
     WouldBlock,
-    /// The broker failed the read itself, such as when the `CopyFromFn` it lent
+    /// The broker failed the read itself, such as when the `CopyFromFn` it passed
     /// bytes to failed (see [`crate::transfer`]) or it ran out of memory.
     #[error(transparent)]
     Broker(#[from] BrokerError),
@@ -61,7 +61,7 @@ pub enum WriteError {
     Io,
     #[error("no space is available yet")]
     WouldBlock,
-    /// The broker failed the write itself, such as when the `CopyToFn` it lent
+    /// The broker failed the write itself, such as when the `CopyToFn` it passed
     /// room to failed (see [`crate::transfer`]) or it ran out of memory.
     #[error(transparent)]
     Broker(#[from] BrokerError),

@@ -4,7 +4,7 @@
 //! Copying bytes between a caller's buffer and the shared buffers a broker
 //! object reads into or writes from.
 //!
-//! An operation lends its caller the shared bytes it transfers one contiguous
+//! An operation passes its caller the shared bytes it transfers one contiguous
 //! part at a time, in order: each part of the bytes the broker read to a
 //! [`CopyFromFn`], which copies from it, or each part of the bytes to write to
 //! a [`CopyToFn`], which copies to it. Their names give the direction relative
@@ -33,7 +33,7 @@ pub type CopyFromFn<'a> = dyn FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> +
 /// buffer.
 pub type CopyToFn<'a> = dyn FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + 'a;
 
-/// Returns a [`CopyFromFn`] that copies the parts it is lent, one after another,
+/// Returns a [`CopyFromFn`] that copies the parts it is passed, one after another,
 /// into `destination`.
 ///
 /// # Panics
@@ -51,7 +51,7 @@ pub fn copy_to_slice(
     }
 }
 
-/// Returns a [`CopyToFn`] that fills the parts it is lent, one after another, from
+/// Returns a [`CopyToFn`] that fills the parts it is passed, one after another, from
 /// `source`.
 ///
 /// # Panics

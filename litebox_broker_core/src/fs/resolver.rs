@@ -569,7 +569,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Ok((read, read_offset))
     }
 
-    /// Read up to `length` bytes from a file descriptor at `offset`, lending
+    /// Read up to `length` bytes from a file descriptor at `offset`, passing
     /// them to `copy_from` (see [`crate::transfer`])
     ///
     /// If `offset` is None, the read will start at the current file offset and update the file
@@ -632,7 +632,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         Ok((written, write_offset))
     }
 
-    /// Write up to `length` bytes to a file descriptor at `offset`, lending the
+    /// Write up to `length` bytes to a file descriptor at `offset`, passing the
     /// room for them to `copy_to` (see [`crate::transfer`])
     ///
     /// If `offset` is None, the write will start at the current file offset and update the file

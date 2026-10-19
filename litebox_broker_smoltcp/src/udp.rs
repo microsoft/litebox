@@ -171,7 +171,7 @@ impl Udp {
                     && bytes_from_process + len <= MAX_RECEIVED_BYTES_FROM_PROCESS)
     }
 
-    /// Queues a datagram of `length` bytes, lending it to `copy_to` (see
+    /// Queues a datagram of `length` bytes, passing it to `copy_to` (see
     /// [`litebox_broker_core::transfer`]), if the socket takes it (see the
     /// module's docs), and the stack's memory budget has room.
     fn deliver(
@@ -280,7 +280,7 @@ impl Udp {
         Ok(source)
     }
 
-    /// Sends a datagram of `length` bytes, lending it to `copy_to` (see
+    /// Sends a datagram of `length` bytes, passing it to `copy_to` (see
     /// [`litebox_broker_core::transfer`]).
     fn send_external(
         &mut self,
@@ -510,7 +510,7 @@ impl Stack {
         Ok(SocketConnectionStatus::Connected)
     }
 
-    /// Sends a datagram of `length` bytes, lending it to `copy_to` (see
+    /// Sends a datagram of `length` bytes, passing it to `copy_to` (see
     /// [`litebox_broker_core::transfer`]).
     pub(super) fn send_udp(
         &mut self,

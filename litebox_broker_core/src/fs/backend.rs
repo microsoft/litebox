@@ -105,9 +105,9 @@ pub trait Backend: Send + Sync + Any {
             .find(|entry| entry.name == name))
     }
 
-    /// Read up to `length` bytes at `offset`, lending them to `copy_from` to copy out (see
-    /// [`crate::transfer`]), and return the number of bytes read: exactly those lent, so none when
-    /// the read fails.
+    /// Read up to `length` bytes at `offset`, passing them to `copy_from` to copy out (see
+    /// [`crate::transfer`]), and return the number of bytes read: exactly those passed, so none
+    /// when the read fails.
     ///
     /// Backends do not have an internal notion of offsets; instead the resolver maintains offsets
     /// as needed. For files with non-position-based [`SeekBehavior`], such as `stdin`, the resolver
@@ -131,10 +131,10 @@ pub trait Backend: Send + Sync + Any {
         None
     }
 
-    /// Write up to `length` bytes into the file, based on `offset`, lending room for up to `length`
+    /// Write up to `length` bytes into the file, based on `offset`, passing room for up to `length`
     /// bytes to `copy_to` to copy them in (see [`crate::transfer`]), and return the number of
-    /// bytes written, which may be fewer than it lent room for. A backend that discards what it
-    /// writes, such as `/dev/null`, need not lend room for it.
+    /// bytes written, which may be fewer than it passed room for. A backend that discards what it
+    /// writes, such as `/dev/null`, need not pass room for it.
     ///
     /// See [`Self::read`] on internal offset storage for backends.
     // XXX(jayb): I need to think more about how we set up some sort of "intend to write" flag that

@@ -11,7 +11,7 @@ use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Fills an operation-scoped shared-buffer lease from a broker-provided
-    /// random source, and lends its bytes to `copy_from`.
+    /// random source, and passes its bytes to `copy_from`.
     ///
     /// # Panics
     ///
@@ -31,7 +31,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .expect("shared buffer sequence must identify valid slot ranges");
         match self.request(BrokerOperation::FillRandom(buffer))? {
             BrokerResult::RandomFilled => {
-                self.lend_shared_buffer(buffer, 0, buffer.length() as usize, copy_from)
+                self.copy_shared_buffer(buffer, 0, buffer.length() as usize, copy_from)
             }
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected random response: {response:?}"),

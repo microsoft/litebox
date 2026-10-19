@@ -165,7 +165,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn exit_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
 
     /// Reads `length` random bytes, at most [`MAX_RANDOM_TRANSFER_SIZE`],
-    /// lending them to `copy_from`.
+    /// passing them to `copy_from`.
     fn fill_random(
         &self,
         length: usize,
@@ -239,7 +239,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
 
     /// Receives up to `length` bytes, at most [`MAX_SOCKET_TRANSFER_SIZE`],
-    /// from a stream socket, lending the bytes received to `copy_from`.
+    /// from a stream socket, passing the bytes received to `copy_from`.
     fn receive_socket(
         &self,
         handle: ObjectHandle,
@@ -262,7 +262,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
 
     /// Receives one datagram, up to `length` bytes of it, at most
-    /// [`MAX_UDP_DATAGRAM_SIZE`], lending the bytes received to `copy_from`.
+    /// [`MAX_UDP_DATAGRAM_SIZE`], passing the bytes received to `copy_from`.
     fn receive_from_socket(
         &self,
         handle: ObjectHandle,
@@ -383,7 +383,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<CreatePipeResponse, BrokerControlError>;
 
     /// Reads up to `length` bytes, at most [`MAX_PIPE_TRANSFER_SIZE`], from
-    /// a pipe, lending the bytes read to `copy_from`.
+    /// a pipe, passing the bytes read to `copy_from`.
     fn read_pipe(
         &self,
         handle: ObjectHandle,
@@ -410,7 +410,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>;
 
     /// Reads up to `length` bytes, at most [`MAX_FILE_TRANSFER_SIZE`], from
-    /// a file, lending the bytes read to `copy_from`.
+    /// a file, passing the bytes read to `copy_from`.
     fn read_file(
         &self,
         handle: ObjectHandle,
@@ -562,7 +562,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>;
 
     /// Receives up to `capacity` bytes, at most [`UNIX_SOCKET_BUFFER_SIZE`],
-    /// lending the bytes received to `copy_from`, as for a non-blocking socket if
+    /// passing the bytes received to `copy_from`, as for a non-blocking socket if
     /// `nonblocking` is set, returning the sender's name if `source` is set.
     fn receive_unix_socket(
         &self,

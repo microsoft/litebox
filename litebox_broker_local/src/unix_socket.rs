@@ -182,7 +182,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             MAX_UNIX_SOCKET_TRANSFER_SIZE,
         )?;
         self.write_shared_buffer_at(buffer, 0, address);
-        self.lend_shared_buffer(buffer, address.len(), length, copy_to)?;
+        self.copy_shared_buffer(buffer, address.len(), length, copy_to)?;
         match self.request_unix_socket(UnixSocketRequest::Send(SendUnixSocketRequest {
             handle,
             buffer,
@@ -203,7 +203,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Performs `request` and lends the bytes received to `copy_from`.
+    /// Performs `request` and passes the bytes received to `copy_from`.
     ///
     /// Returns the received lengths, and the sender's name if the request's
     /// `source` is set.
@@ -246,7 +246,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         && source_length <= name_size,
                     "broker returned inconsistent Unix socket receive lengths"
                 );
-                self.lend_shared_buffer(buffer, 0, received, copy_from)?;
+                self.copy_shared_buffer(buffer, 0, received, copy_from)?;
                 let name = source.then(|| {
                     let mut name = [0; MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize];
                     self.read_shared_buffer_at(buffer, received, &mut name[..source_length]);

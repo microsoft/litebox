@@ -8,7 +8,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, append_to_queue, lend_from_queue};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, append_to_queue, copy_from_queue};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 
 use super::Sockets;
@@ -102,7 +102,7 @@ impl Sockets {
     }
 
     /// Writes as much of `length` bytes as `end`'s side of the connection,
-    /// and the stack's memory budget, have room for, lending the room to
+    /// and the stack's memory budget, have room for, passing the room to
     /// `copy_to` (see [`litebox_broker_core::transfer`]); returns how much.
     pub(super) fn write_pair(
         &mut self,
@@ -125,7 +125,7 @@ impl Sockets {
         written.map(|()| len)
     }
 
-    /// Lends `copy_from` what `end` reads from `start` to `stop` (of what it can
+    /// Passes `copy_from` what `end` reads from `start` to `stop` (of what it can
     /// read; see [`litebox_broker_core::transfer`]), and takes it unless
     /// `peek`, in which case `start` may be past the beginning.
     pub(super) fn read_pair(
@@ -139,7 +139,7 @@ impl Sockets {
     ) -> BrokerResult<()> {
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[1 - end];
-        lend_from_queue(queue, start..stop, copy_from)?;
+        copy_from_queue(queue, start..stop, copy_from)?;
         if !peek {
             let before = queue.capacity();
             queue.drain(..stop);
