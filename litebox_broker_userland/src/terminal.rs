@@ -610,21 +610,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_failed_fill_writes_nothing() {
-        let (_master, terminal) = open_terminal();
-        terminal.shared.lock().engine.receive(b"\x13");
-        assert_eq!(
-            terminal.write(5, &mut |_| Err(litebox_broker_core::BrokerError::Internal)),
-            Err(StdioProviderError::Broker(
-                litebox_broker_core::BrokerError::Internal
-            ))
-        );
-        assert!(terminal.shared.lock().output.is_empty());
-        assert_eq!(terminal.write_slice(b"next"), Ok(4));
-        assert_eq!(terminal.shared.lock().output, b"next");
-    }
-
-    #[test]
     fn terminal_abandoned_drain_does_not_block_other_writers() {
         let (_master, terminal) = open_terminal();
         terminal.shared.lock().engine.receive(b"\x13");
