@@ -41,7 +41,7 @@ fn kernel_main(kernel: Kernel) -> ! {
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
-    let broker = |console, shares| {
+    let broker = |console, shares, allow_process_duplication| {
         litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
             platform: kernel.platform,
             console,
@@ -49,6 +49,7 @@ fn kernel_main(kernel: Kernel) -> ! {
             root: payload.file("rootfs.tar"),
             shares,
             network: devices.network(),
+            allow_process_duplication,
         })
     };
     // The kernel's one scheduler, which every runner process runs in.
@@ -63,7 +64,8 @@ fn kernel_main(kernel: Kernel) -> ! {
             wall_clock,
             devices,
             &payload,
-            broker(stdio, devices.shares()),
+            // Programs may start child processes.
+            broker(stdio, devices.shares(), true),
         );
         client::program::run(programs, &mut service, stdio);
     } else {
@@ -76,7 +78,7 @@ fn kernel_main(kernel: Kernel) -> ! {
             &payload,
             // No shares: TA storage (OP-TEE secure storage) needs a file
             // system of its own, not provided yet.
-            broker(devices, alloc::vec::Vec::new()),
+            broker(devices, alloc::vec::Vec::new(), false),
         );
         client::script::run(&payload, &mut service);
     }

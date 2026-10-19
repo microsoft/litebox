@@ -17,6 +17,11 @@
 //!
 //! Generic over the service a runner provides: standalone [`program`]s, and
 //! `optee` (feature `optee`, on by default).
+//!
+//! When a process starts a child process (`StartChild`), the scheduler
+//! creates a launched process for it (see `litebox_common_vm_abi`, Messages)
+//! with [`ProcessConfig::started_runner`], and runs it with the others (see
+//! [`sched::Scheduler`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -45,7 +50,9 @@ use core::ops::Range;
 use core::time::Duration;
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::utils::TruncateExt as _;
-use litebox_broker_vm_kernel::{Association, Broker, Wait};
+use litebox_broker_core::BrokerError;
+use litebox_broker_protocol::process::ProcessExitStatus;
+use litebox_broker_vm_kernel::{Association, Broker, PendingRunnerAssociation, Wait};
 use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::envelope::Envelope;
 use litebox_common_vm_abi::{
@@ -79,6 +86,10 @@ pub struct ProcessConfig<'a> {
     pub wall_clock: WallClock,
     /// For the process's [`CallId::SetTimer`] deadline.
     pub timer: &'static dyn ProcessTimer,
+    /// The runner for the process's children and their descendants, which get
+    /// no images and otherwise this configuration. Without one, the process
+    /// cannot start children.
+    pub started_runner: Option<&'static [u8]>,
 }
 
 /// The kernel's one-shot hardware timer, which processes' [`CallId::SetTimer`]
@@ -157,6 +168,9 @@ struct Inner {
     mappings: Mappings,
     broker: Association,
     timer: &'static dyn ProcessTimer,
+    /// The configuration of its children's runner processes (see
+    /// [`ProcessConfig::started_runner`]).
+    started_runner_config: Option<ProcessConfig<'static>>,
     /// Borrowed briefly: killing the process replaces it.
     state: RefCell<State>,
     lockdown: Cell<lockdown::Lockdown>,
@@ -229,7 +243,7 @@ impl Process {
     ) -> Result<Self, SpawnError> {
         // Frees the memory of those that died (e.g., dropped ones) first.
         scheduler.reap();
-        let inner = Rc::new(Inner::spawn(platform, broker, config)?);
+        let inner = Rc::new(Inner::spawn(platform, broker, config, None)?);
         scheduler.add(inner.clone());
         Ok(Self {
             inner,
@@ -338,8 +352,9 @@ impl Process {
     }
 
     /// For services: ends a process that has served all it will (e.g., its one
-    /// program) at once, as its runner's exit would. A dead process keeps its
-    /// cause of death.
+    /// program) at once, as its runner's exit would. Its broker process exits,
+    /// releasing what it holds (e.g., pipe ends its children may wait on). A
+    /// dead process keeps its cause of death.
     pub fn finish(&mut self) {
         if self.inner.dead().is_none() {
             self.inner.die(Dead::Finished);
@@ -377,16 +392,19 @@ impl Drop for Process {
 }
 
 impl Inner {
+    /// With `launch`, the process is a launched one (see
+    /// [`Broker::associate`]).
     fn spawn(
         platform: &'static VmKernel,
         broker: &Broker,
         config: &ProcessConfig<'_>,
+        launch: Option<PendingRunnerAssociation>,
     ) -> Result<Self, SpawnError> {
         let address_space = platform.create_address_space();
         // Safety: the kernel holds no references into user memory.
         unsafe { platform.switch_address_space(address_space) }
             .expect("a freshly created address space is registered");
-        Self::populate(platform, address_space, broker, config).inspect_err(|_| {
+        Self::populate(platform, address_space, broker, config, launch).inspect_err(|_| {
             // Safety: nothing references the half-built process's memory, and
             // it never ran, so its frames are exclusively owned.
             unsafe { release_address_space(platform, address_space) };
@@ -398,6 +416,7 @@ impl Inner {
         address_space: AddressSpaceId,
         broker: &Broker,
         config: &ProcessConfig<'_>,
+        launch: Option<PendingRunnerAssociation>,
     ) -> Result<Self, SpawnError> {
         let mappings = Mappings::new(platform);
         let runner = loader::load(config.runner, &mappings).map_err(SpawnError::Load)?;
@@ -418,7 +437,7 @@ impl Inner {
         lazy(layout::BROKER_SHARED_MEMORY)?;
         lazy(layout::HEAP)?;
         let control_ring = pin_control_ring(platform, address_space, &mappings)?;
-        let broker = broker.associate(layout::BROKER_SHARED_MEMORY, control_ring);
+        let broker = broker.associate(layout::BROKER_SHARED_MEMORY, control_ring, launch);
         let images = map_images(&mappings, config.images)?;
 
         let info = StartupInfo {
@@ -447,6 +466,15 @@ impl Inner {
             mappings,
             broker,
             timer: config.timer,
+            started_runner_config: config.started_runner.map(|runner| ProcessConfig {
+                runner,
+                images: &[],
+                identity: config.identity,
+                clock_khz: config.clock_khz,
+                wall_clock: config.wall_clock,
+                timer: config.timer,
+                started_runner: Some(runner),
+            }),
             state: RefCell::new(State::New),
             lockdown: Cell::new(lockdown::Lockdown::OPEN),
             entries: Cell::new(0),
@@ -505,6 +533,30 @@ impl Inner {
             State::Dead(dead) => Some(dead),
             _ => None,
         }
+    }
+
+    /// Creates a runner process for each child this process started since the
+    /// last call (see [`Association::take_pending_associations`]), adding it to
+    /// `spawned`, and fails the start of those it cannot create. Returns
+    /// whether there were any: either way, the requests that started them can
+    /// complete. Leaves another address space current.
+    pub(crate) fn spawn_launched(&self, spawned: &mut Vec<Rc<Self>>) -> bool {
+        let broker = self.broker.broker();
+        let launches = self.broker.take_pending_associations();
+        let started = !launches.is_empty();
+        for launch in launches {
+            let Some(config) = &self.started_runner_config else {
+                log::warn!("a process without a child runner started a child process");
+                launch.fail(BrokerError::UnsupportedOperation);
+                continue;
+            };
+            // `spawn` fails it if it cannot create the process.
+            match Self::spawn(self.platform, broker, config, Some(launch)) {
+                Ok(process) => spawned.push(Rc::new(process)),
+                Err(error) => log::warn!("failed to spawn a launched process: {error}"),
+            }
+        }
+        started
     }
 }
 
@@ -660,6 +712,17 @@ impl Inner {
     /// left for the scheduler.
     fn die(&self, dead: Dead) {
         *self.state.borrow_mut() = State::Dead(dead);
+        self.broker.exited(match dead {
+            Dead::Exited(code) => ProcessExitStatus::Exited { code },
+            // As a host kills a runner process.
+            Dead::Killed(_) => ProcessExitStatus::Signaled {
+                signal: litebox_common_linux::signal::Signal::SIGKILL
+                    .as_i32()
+                    .cast_unsigned(),
+            },
+            // Its runner reported the guest's (see `Process::finish`).
+            Dead::Finished => ProcessExitStatus::Unknown,
+        });
         for thread in self.threads.borrow().iter() {
             thread.suspended.set(Suspended::No);
         }
@@ -754,10 +817,16 @@ impl Inner {
                 if entry != 0 && !self.executable.iter().any(|seg| seg.contains(&entry)) {
                     return Flow::Return(Err(Status::InvalidArgument));
                 }
+                let upcall_entry = (entry != 0).then_some(entry);
+                if self.broker.is_launched() {
+                    // It has no request: it serves until it exits.
+                    *self.state.borrow_mut() = State::Serving { upcall_entry };
+                    return respond(&ready, slot, Ok(Message { len: 0 }));
+                }
                 *self.state.borrow_mut() = State::Waiting {
                     waiter: Waiter {
                         reply_slot: slot,
-                        upcall_entry: (entry != 0).then_some(entry),
+                        upcall_entry,
                     },
                     reply: None,
                 };
@@ -767,6 +836,10 @@ impl Inner {
                 let State::Serving { upcall_entry } = *self.state.borrow() else {
                     return Flow::Return(Err(Status::Denied));
                 };
+                if self.broker.is_launched() {
+                    // It has no request to reply to.
+                    return Flow::Return(Err(Status::Denied));
+                }
                 match Self::complete(reply) {
                     Ok(reply) => {
                         *self.state.borrow_mut() = State::Waiting {

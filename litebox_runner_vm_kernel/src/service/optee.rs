@@ -97,6 +97,7 @@ impl Optee {
                     clock_khz: clock.khz(),
                     wall_clock,
                     timer,
+                    started_runner: None,
                 },
             )
             .map_err(|error| {

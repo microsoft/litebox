@@ -46,6 +46,7 @@ use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
     RawPointerProvider, common_providers::reservations::NoTrackedReservations,
 };
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     PAGE_SIZE,
     vmem::{PageFaultError, VmFlags, VmemPageFaultHandler},
@@ -667,20 +668,55 @@ pub struct ThreadHandle(u64);
 
 /// The guest's vector state stays in the registers: the runner never touches
 /// them (soft-float), and the kernel preserves them across its calls, and
-/// keeps them per thread. The shim snapshots and replaces them only for
-/// `fork` and `vfork`, which the runner does not have, so, as on SNP, a
-/// snapshot is the initial state (as a new thread starts with) and a
-/// replacement does nothing.
+/// keeps them per thread. So a snapshot saves the registers, and a
+/// replacement loads them at once.
 impl litebox::platform::GuestVectorStateProvider for VmUserland {
     type GuestVectorState = litebox_common_linux::GuestVectorState;
 
     fn get_guest_vector_state(&self) -> Self::GuestVectorState {
-        litebox_common_linux::GuestVectorState::initial(
-            litebox::arch::x86_64::xstate::XsaveLayout::get(),
-        )
+        let layout = litebox::arch::x86_64::xstate::XsaveLayout::get();
+        let mut state = litebox_common_linux::GuestVectorState::initial(layout);
+        let (low, high): (u32, u32) = (layout.mask.trunc(), (layout.mask >> 32).trunc());
+        // Safety: `state` is an aligned standard-layout area of the size
+        // `layout` requires for its mask, which the kernel enables.
+        unsafe {
+            core::arch::asm!(
+                "xsave64 [{state}]",
+                state = in(reg) state.as_mut_ptr(),
+                in("eax") low,
+                in("edx") high,
+                options(nostack, preserves_flags),
+            );
+        }
+        state
     }
 
-    fn set_guest_vector_state(&self, _state: &Self::GuestVectorState) {}
+    fn set_guest_vector_state(&self, state: &Self::GuestVectorState) {
+        let layout = litebox::arch::x86_64::xstate::XsaveLayout::get();
+        let (low, high): (u32, u32) = (layout.mask.trunc(), (layout.mask >> 32).trunc());
+        // Safety: `state` is a valid standard-layout area for `layout` (as
+        // `GuestVectorState` guarantees), and the runner keeps no state of its
+        // own in the registers it replaces.
+        unsafe {
+            core::arch::asm!(
+                "xrstor64 [{state}]",
+                state = in(reg) state.as_ptr(),
+                in("eax") low,
+                in("edx") high,
+                // It loads the x87 stack, and the x87 status word and MXCSR
+                // flags, which `preserves_flags` covers.
+                out("st(0)") _,
+                out("st(1)") _,
+                out("st(2)") _,
+                out("st(3)") _,
+                out("st(4)") _,
+                out("st(5)") _,
+                out("st(6)") _,
+                out("st(7)") _,
+                options(nostack, readonly),
+            );
+        }
+    }
 }
 
 /// Requires a shim KDF, which runs on a kernel-derived key bound to the

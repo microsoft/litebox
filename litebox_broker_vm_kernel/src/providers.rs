@@ -91,9 +91,10 @@ pub(crate) fn seed() -> u64 {
     u64::from_ne_bytes(seed)
 }
 
-/// Runner processes, which the kernel vouches for, may open and use files:
-/// the devices, `root`'s, if any, and the shares' (read-only); and sockets
-/// (see [`socket_policy`]).
+/// Runner processes, which the kernel vouches for, may open and use files: the
+/// devices, `root`'s, if any, and the shares' (read-only); sockets (see
+/// [`socket_policy`]); and, if `allow_process_duplication`, start child
+/// processes.
 ///
 /// # Panics
 ///
@@ -106,11 +107,13 @@ pub(crate) fn core(
     timers: Arc<dyn TimerProvider>,
     sockets: Arc<dyn SocketProvider>,
     external: bool,
+    allow_process_duplication: bool,
 ) -> BrokerCore {
     let random: Arc<dyn RandomProvider> = Arc::new(HardwareRandom(litebox_hal::rng::hardware()));
     BrokerCore::new_with_limits(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::WAIT | ObjectRights::WRITE)
-            .with_socket_policy(socket_policy(external)),
+            .with_socket_policy(socket_policy(external))
+            .with_process_duplication_enabled(allow_process_duplication),
         LIMITS,
         sockets,
         Arc::clone(&random),

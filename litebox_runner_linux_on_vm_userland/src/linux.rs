@@ -5,9 +5,15 @@
 //! [`litebox_common_vm_abi::program`], and replies with its exit status.
 //! The program's files, including standard streams, are the broker's.
 //!
+//! In a launched process (see `litebox_common_vm_abi`, Messages), runs
+//! instead the program its startup data names, with the descriptors,
+//! credentials, and directory it inherits, and exits; its parent learns its
+//! exit status from the broker.
+//!
 //! Lockdown: after the broker connects, no new association; once serving,
-//! only [`SERVING_CALLS`]. Executable memory stays allowed, as a Linux
-//! program may map code (W^X still holds).
+//! only [`SERVING_CALLS`] ([`LAUNCHED_CALLS`] in a launched process, after
+//! `Ready`). Executable memory stays allowed, as a Linux program may map code
+//! (W^X still holds).
 //!
 //! Time: monotonic clocks are the kernel clock; the wall clock (`time`,
 //! `gettimeofday`, `CLOCK_REALTIME`) is the kernel's, read from kvm-clock at
@@ -33,12 +39,15 @@
 //!   block forever.
 
 use alloc::boxed::Box;
+use alloc::ffi::CString;
+use alloc::vec::Vec;
 use litebox::utils::TruncateExt as _;
-use litebox_broker_protocol::process::ProcessExitStatus;
+use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
+use litebox_common_linux::program_startup::{LinuxProcessStartup, LinuxProgramStartup};
 use litebox_common_vm_abi::program::{self, ExitStatus, Program};
 use litebox_common_vm_abi::{CallId, CallSet, Message, ProtSet, StartupInfo, UserRange};
 use litebox_platform_vm_userland::{VmUserland, kcall};
-use litebox_shim_linux::{LinuxShim, LoadedProgram};
+use litebox_shim_linux::{LinuxShim, LinuxShimProcess, LoadedProgram};
 
 type Platform = VmUserland;
 
@@ -59,9 +68,13 @@ const SERVING_CALLS: CallSet = CallSet::EMPTY
     .with(CallId::Futex)
     .with(CallId::InterruptThread);
 
+/// [`SERVING_CALLS`] without `ReplyAndWait`, for a launched process, which has
+/// no request to reply to.
+const LAUNCHED_CALLS: CallSet = SERVING_CALLS.without(CallId::ReplyAndWait);
+
 pub fn serve(info: &StartupInfo) -> ! {
     let platform: &'static Platform = Box::leak(Box::new(VmUserland::new(info)));
-    let (local, notifications) = litebox_broker_local_vm_userland::connect(info)
+    let (local, startup, notifications) = litebox_broker_local_vm_userland::connect(info)
         .unwrap_or_else(|e| panic!("broker association: {e:?}"));
     kcall::restrict(CallSet::ALL.without(CallId::BrokerHandshake), ProtSet::ALL)
         .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
@@ -75,7 +88,19 @@ pub fn serve(info: &StartupInfo) -> ! {
     let shim =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
             .build();
+    match startup {
+        Some(startup) => run_launched(&shim, process_id, initial_thread, &startup),
+        None => serve_requests(info, &shim, process_id, initial_thread),
+    }
+}
 
+/// Runs the program the kernel asks for, and replies with its exit status.
+fn serve_requests(
+    info: &StartupInfo,
+    shim: &LinuxShim<Platform>,
+    process_id: i32,
+    initial_thread: litebox::thread::Thread,
+) -> ! {
     let request = kcall::ready(VmUserland::upcall_entry_address())
         .unwrap_or_else(|status| panic!("ready: {status:?}"));
     kcall::restrict(SERVING_CALLS, ProtSet::ALL)
@@ -83,39 +108,10 @@ pub fn serve(info: &StartupInfo) -> ! {
     // Safety: mapped for the process's lifetime; the kernel writes it only
     // while the runner waits for a request.
     let window = unsafe { window(info.message_window) };
-    let program = window
+    let Program { path, argv, envp } = window
         .get(..request.len.trunc())
         .and_then(program::decode_request)
         .expect("the kernel sends a well-formed program");
-
-    let status = run(&shim, process_id, initial_thread, program);
-    let reply = program::encode_reply(status);
-    window[..reply.len()].copy_from_slice(&reply);
-    let _ = kcall::reply_and_wait(&Message {
-        len: reply.len() as u64,
-    });
-    // One program per process.
-    panic!("a request after the program's exit status")
-}
-
-/// # Safety
-///
-/// `region` must be mapped for the process's lifetime, and accessed only
-/// through the returned slice.
-unsafe fn window(region: UserRange) -> &'static mut [u8] {
-    let start: usize = region.start.trunc();
-    // Safety: forwarded to the caller.
-    unsafe { core::slice::from_raw_parts_mut(start as *mut u8, region.len.trunc()) }
-}
-
-/// Exits the runner if the program cannot be loaded.
-fn run(
-    shim: &LinuxShim<Platform>,
-    process_id: i32,
-    initial_thread: litebox::thread::Thread,
-    program: Program,
-) -> ExitStatus {
-    let Program { path, argv, envp } = program;
     let task = litebox_common_linux::TaskParams {
         pid: process_id,
         uid: GUEST_UID,
@@ -128,11 +124,102 @@ fn run(
         cwd: None,
         umask: None,
     };
+    let status = run(shim, initial_thread, task, &path, argv, envp).wait_for_exit_status();
+    // For the broker process, whose exit the kernel completes once the runner
+    // replies.
+    let _ = shim.litebox().report_exit_status(status);
+    let status = match status {
+        ProcessExitStatus::Exited { code } => ExitStatus::Exited { code },
+        ProcessExitStatus::Signaled { signal } => ExitStatus::Signaled { signal },
+        _ => ExitStatus::Unknown,
+    };
+    let reply = program::encode_reply(status);
+    window[..reply.len()].copy_from_slice(&reply);
+    let _ = kcall::reply_and_wait(&Message {
+        len: reply.len() as u64,
+    });
+    // One program per process.
+    panic!("a request after the program's exit status")
+}
+
+/// Runs the program `startup` names, in a launched process, and exits.
+fn run_launched(
+    shim: &LinuxShim<Platform>,
+    process_id: i32,
+    initial_thread: litebox::thread::Thread,
+    startup: &ProcessStartupData,
+) -> ! {
+    // No request comes; this registers the upcall entry.
+    kcall::ready(VmUserland::upcall_entry_address())
+        .unwrap_or_else(|status| panic!("ready: {status:?}"));
+    kcall::restrict(LAUNCHED_CALLS, ProtSet::ALL)
+        .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
+    let LinuxProgramStartup {
+        uid,
+        euid,
+        gid,
+        egid,
+        blocked_signals,
+        ignored_signals,
+        umask,
+        path,
+        cwd,
+        argv,
+        envp,
+        inherited_fds,
+    } = match LinuxProcessStartup::decode(&startup.payload) {
+        Ok(LinuxProcessStartup::Program(startup)) => startup,
+        // The kernel supports no memory image.
+        Ok(LinuxProcessStartup::Fork(_)) => panic!("a fork startup without a memory image"),
+        Err(error) => panic!("invalid Linux process startup: {error:?}"),
+    };
+    let task = litebox_common_linux::TaskParams {
+        pid: process_id,
+        uid,
+        euid,
+        gid,
+        egid,
+        blocked_signals,
+        ignored_signals,
+        inherited_fds: Some(inherited_fds),
+        cwd: Some(cwd),
+        umask: Some(umask),
+    };
+    let process = run(shim, initial_thread, task, &path, argv, envp);
+    // Takes precedence over the runner's exit code, which cannot tell a
+    // signal death from an exit.
+    let _ = shim
+        .litebox()
+        .report_exit_status(process.wait_for_exit_status());
+    kcall::exit(process.wait_for_unix_shell_exit_code().cast_unsigned())
+}
+
+/// # Safety
+///
+/// `region` must be mapped for the process's lifetime, and accessed only
+/// through the returned slice.
+unsafe fn window(region: UserRange) -> &'static mut [u8] {
+    let start: usize = region.start.trunc();
+    // Safety: forwarded to the caller.
+    unsafe { core::slice::from_raw_parts_mut(start as *mut u8, region.len.trunc()) }
+}
+
+/// Runs the program at `path` until the guest process and all its threads
+/// exit, and returns the process. Exits the runner if the program cannot be
+/// loaded.
+fn run(
+    shim: &LinuxShim<Platform>,
+    initial_thread: litebox::thread::Thread,
+    task: litebox_common_linux::TaskParams,
+    path: &str,
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+) -> LinuxShimProcess<Platform> {
     let LoadedProgram {
         entrypoints,
         process,
     } = shim
-        .load_program(task, initial_thread, &path, argv, envp)
+        .load_program(task, initial_thread, path, argv, envp)
         .unwrap_or_else(|error| panic!("loading {path}: {error}"));
     // Safety: the guest's other threads are on other runner threads.
     unsafe {
@@ -143,12 +230,8 @@ fn run(
     }
     // Detaches the thread, which ends the process once the others exit.
     drop(entrypoints);
-    let status = match process.wait_for_exit_status() {
-        ProcessExitStatus::Exited { code } => ExitStatus::Exited { code },
-        ProcessExitStatus::Signaled { signal } => ExitStatus::Signaled { signal },
-        _ => ExitStatus::Unknown,
-    };
-    // The main thread replies alone.
+    process.wait_for_exit_status();
+    // The main thread replies, or exits, alone.
     litebox_platform_vm_userland::thread::join_all();
-    status
+    process
 }

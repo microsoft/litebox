@@ -95,6 +95,8 @@ impl Programs {
                 clock_khz: self.clock.khz(),
                 wall_clock: self.wall_clock,
                 timer: self.timer,
+                // Programs may start child processes.
+                started_runner: Some(self.runner),
             },
         )
         .unwrap_or_else(|error| panic!("failed to spawn a program runner: {error}"));
