@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::Result as IoResult;
 use std::ops::Range;
@@ -128,14 +129,13 @@ impl PlatformRunnerEndpoint {
         Self::create_at(pipe_name)
     }
 
-    pub(super) fn create_at(pipe_name: OsString) -> IoResult<Self> {
+    fn create_at(pipe_name: OsString) -> IoResult<Self> {
         let listener = WindowsNamedPipeListener::bind(&pipe_name)?;
         Ok(Self {
             pipe_name,
             listener: Some(listener),
         })
     }
-
     pub(super) fn control_channel(&self) -> &std::ffi::OsStr {
         &self.pipe_name
     }
@@ -165,11 +165,23 @@ impl PlatformRunnerEndpoint {
     }
 }
 
-pub(super) fn adopt_process(
+/// Adopts a runner natively cloned by `parent` and binds the control pipe it will connect to.
+///
+/// The clone's handle is duplicated from `parent`'s handle table, and the clone must not be
+/// supervised already (`supervised` holds the host process IDs of supervised runners).
+pub(super) fn adopt(
     parent: &Arc<Mutex<RunnerProcess>>,
-    descriptor: &ExistingRunnerDescriptor,
-) -> IoResult<RunnerProcess> {
+    runner_descriptor: &[u8],
+    supervised: &HashSet<u32>,
+) -> IoResult<(RunnerProcess, PlatformRunnerEndpoint)> {
     let parent = parent.lock().expect("parent runner process mutex poisoned");
+    let descriptor = ExistingRunnerDescriptor::decode(runner_descriptor, parent.id())?;
+    if supervised.contains(&descriptor.process_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "runner process is already supervised",
+        ));
+    }
     let source_handle = usize::try_from(descriptor.process_handle).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -205,9 +217,11 @@ pub(super) fn adopt_process(
             "existing runner process ID does not match its handle",
         ));
     }
-    Ok(RunnerProcess::Adopted(AdoptedProcess::new(
-        duplicated, process_id,
-    )))
+    let endpoint = PlatformRunnerEndpoint::create_at(descriptor.control_channel)?;
+    Ok((
+        RunnerProcess::Adopted(AdoptedProcess::new(duplicated, process_id)),
+        endpoint,
+    ))
 }
 
 fn serve_association(
@@ -303,4 +317,42 @@ fn unique_control_pipe_name() -> OsString {
         .unwrap_or_default()
         .as_nanos();
     format!(r"\\.\pipe\litebox-broker-{process_id}-{nonce}").into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spawn_waiting_child() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn adoption_rejects_supervised_processes() {
+        let parent = Arc::new(Mutex::new(RunnerProcess::Spawned(spawn_waiting_child())));
+        let parent_id = parent.lock().unwrap().id();
+        let descriptor = ExistingRunnerDescriptor {
+            process_handle: 4,
+            process_id: parent_id,
+            control_channel: format!(
+                r"\\.\pipe\litebox-native-runner-{parent_id}-{}",
+                "0".repeat(32)
+            )
+            .into(),
+        }
+        .encode()
+        .unwrap();
+        let error = adopt(&parent, &descriptor, &HashSet::from([parent_id]))
+            .err()
+            .expect("a supervised runner must not be adopted again");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
+            unreachable!();
+        };
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+    }
 }

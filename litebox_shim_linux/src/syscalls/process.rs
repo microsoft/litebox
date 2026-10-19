@@ -57,13 +57,19 @@ trait StartRunner: Send + Sync {
 
 /// Runner-specific transport and bootstrap operations used by [`ForkLauncher`].
 pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
-    /// Owned rendezvous identifier used to connect the forked runner to its broker.
+    /// Owned rendezvous state, such as the child's pre-established broker connection, created
+    /// immediately before forking.
+    ///
+    /// The parent releases its copy when [`Self::encode_runner_descriptor`] consumes it, and the
+    /// child receives its own copy in [`Self::run_child`].
     type ControlChannel;
 
-    /// Creates the rendezvous identifier before forking.
-    fn create_control_channel(&self) -> Self::ControlChannel;
+    /// Creates the rendezvous state immediately before forking.
+    ///
+    /// Returning [`ForkError::Unsupported`] requests copy-based startup instead.
+    fn create_control_channel(&self) -> Result<Self::ControlChannel, ForkError<ProcessError>>;
 
-    /// Encodes the child runner's host identity and control endpoint before resuming it.
+    /// Encodes the child runner's host identity and control endpoint for broker adoption.
     ///
     /// Host process identity lookup failures must return [`ProcessError::ServiceFailed`].
     fn encode_runner_descriptor(
@@ -94,21 +100,25 @@ impl<Platform: ProcessProvider, Runner: ForkRunner<Platform>> StartRunner
         child: &PendingChild,
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>> {
-        let control_channel = self.runner.create_control_channel();
+        let control_channel = self.runner.create_control_channel()?;
+        // TODO: Quiesce runner helper threads, such as the broker notification receiver, across
+        // the clone so the child never inherits a lock one of them held mid-update.
         // SAFETY: The caller keeps sibling guest threads paused. ForkLauncher::new guarantees
         // a clone-safe runner whose child bootstrap never returns or unwinds.
         match unsafe { Platform::fork_process() } {
             Ok(ForkResult::Parent(process)) => {
-                let result = (|| {
-                    let descriptor = self
-                        .runner
-                        .encode_runner_descriptor(&process, control_channel)?;
-                    process.resume().map_err(|error| {
-                        litebox_util_log::error!("failed to resume native fork child: {error}");
-                        ProcessError::ServiceFailed
-                    })?;
-                    child.start_with_existing_runner(&descriptor, startup)
-                })();
+                // The broker waits for the clone to associate before answering, so the clone is
+                // resumed first; it authenticates the broker endpoint it connects to.
+                let result = self
+                    .runner
+                    .encode_runner_descriptor(&process, control_channel)
+                    .and_then(|descriptor| {
+                        process.resume().map_err(|error| {
+                            litebox_util_log::error!("failed to resume native fork child: {error}");
+                            ProcessError::ServiceFailed
+                        })?;
+                        child.start_with_existing_runner(&descriptor, startup)
+                    });
                 if result.is_err()
                     && let Err(error) = process.terminate()
                 {
@@ -118,10 +128,15 @@ impl<Platform: ProcessProvider, Runner: ForkRunner<Platform>> StartRunner
             }
             // SAFETY: This is the new child, under the bootstrap contract of ForkLauncher::new.
             Ok(ForkResult::Child) => unsafe { self.runner.run_child(control_channel) },
-            Err(ForkError::Unsupported) => Err(ForkError::Unsupported),
-            Err(ForkError::Failed(error)) => {
-                litebox_util_log::error!("native process cloning failed: {error}");
-                Err(ForkError::Failed(ProcessError::Unavailable))
+            Err(error) => {
+                drop(control_channel);
+                match error {
+                    ForkError::Unsupported => Err(ForkError::Unsupported),
+                    ForkError::Failed(error) => {
+                        litebox_util_log::error!("native process cloning failed: {error}");
+                        Err(ForkError::Failed(ProcessError::Unavailable))
+                    }
+                }
             }
         }
     }
@@ -135,8 +150,9 @@ pub struct ForkLauncher {
 impl ForkLauncher {
     /// Creates a launcher using the runner's transport and bootstrap operations.
     ///
-    /// The parent encodes the child runner's descriptor before resuming a suspended child.
-    /// The child receives its copy of the control channel and the runner's inherited state.
+    /// The parent encodes the child runner's descriptor and resumes a suspended child before the
+    /// broker adopts it. The child receives its copy of the control channel and the runner's
+    /// inherited state.
     ///
     /// # Safety
     ///
@@ -4293,8 +4309,6 @@ mod fork_tests {
         ProcessResponse,
     };
     use litebox_broker_transport::channel::LocalCallChannel;
-    use litebox_common_linux::program_startup::LinuxProcessStartup;
-    use std::sync::Mutex;
 
     #[test]
     fn native_fork_retains_memory_manager() {
@@ -4306,7 +4320,7 @@ mod fork_tests {
         TestPlatform::run_test_thread(|| {
             let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
             let builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
-            let memory = Arc::clone(builder.memory_manager());
+            let memory = Arc::clone(&builder.memory_manager);
             let parent = builder.build();
             assert!(Arc::ptr_eq(&memory, &parent.0.mm));
             let task = parent.0.clone().new_test_task();
@@ -4340,7 +4354,7 @@ mod fork_tests {
                     Arc::clone(&memory),
                 )
             };
-            assert!(Arc::ptr_eq(&memory, builder.memory_manager()));
+            assert!(Arc::ptr_eq(&memory, &builder.memory_manager));
             let child = builder.build();
             assert!(Arc::ptr_eq(&memory, &child.0.mm));
             assert_eq!(child.0.mm.mappings(), mappings);
@@ -4379,20 +4393,36 @@ mod fork_tests {
         events: Vec<Stage>,
     }
 
-    static STATE: Mutex<State> = Mutex::new(State {
-        unsupported: false,
-        failure: None,
-        events: Vec::new(),
-    });
+    std::thread_local! {
+        // Per-thread state keeps concurrently running tests from observing each other's events.
+        static STATE: core::cell::RefCell<State> = const {
+            core::cell::RefCell::new(State {
+                unsupported: false,
+                failure: None,
+                events: Vec::new(),
+            })
+        };
+    }
+
+    fn reset_state(unsupported: bool, failure: Option<Stage>) {
+        STATE.with_borrow_mut(|state| {
+            *state = State {
+                unsupported,
+                failure,
+                events: Vec::new(),
+            };
+        });
+    }
 
     fn record(event: Stage) -> Result<(), ProcessError> {
-        let mut state = STATE.lock().unwrap();
-        state.events.push(event);
-        if state.failure == Some(event) {
-            Err(ProcessError::OutOfMemory)
-        } else {
-            Ok(())
-        }
+        STATE.with_borrow_mut(|state| {
+            state.events.push(event);
+            if state.failure == Some(event) {
+                Err(ProcessError::OutOfMemory)
+            } else {
+                Ok(())
+            }
+        })
     }
 
     struct MockPlatform;
@@ -4404,7 +4434,7 @@ mod fork_tests {
 
         unsafe fn fork_process() -> Result<ForkResult<MockHandle>, ForkError<ProcessError>> {
             record(Stage::Fork).map_err(ForkError::Failed)?;
-            if STATE.lock().unwrap().unsupported {
+            if STATE.with_borrow(|state| state.unsupported) {
                 Err(ForkError::Unsupported)
             } else {
                 Ok(ForkResult::Parent(MockHandle))
@@ -4470,9 +4500,10 @@ mod fork_tests {
     impl ForkRunner<MockPlatform> for MockRunner {
         type ControlChannel = u32;
 
-        fn create_control_channel(&self) -> u32 {
-            record(Stage::Channel).unwrap();
-            self.channel
+        fn create_control_channel(&self) -> Result<u32, ForkError<ProcessError>> {
+            // A runner that cannot prepare its rendezvous requests copy-based startup.
+            record(Stage::Channel).map_err(|_| ForkError::Unsupported)?;
+            Ok(self.channel)
         }
 
         fn encode_runner_descriptor(
@@ -4500,11 +4531,10 @@ mod fork_tests {
     }
 
     pub(super) fn failing_launcher(unsupported: bool) -> ForkLauncher {
-        *STATE.lock().unwrap() = State {
+        reset_state(
             unsupported,
-            failure: if unsupported { None } else { Some(Stage::Fork) },
-            events: Vec::new(),
-        };
+            if unsupported { None } else { Some(Stage::Fork) },
+        );
         launcher()
     }
 
@@ -4516,13 +4546,21 @@ mod fork_tests {
             _child: &PendingChild,
             startup: &[u8],
         ) -> Result<(), ForkError<ProcessError>> {
-            let LinuxProcessStartup::Fork(startup) = LinuxProcessStartup::decode(startup).unwrap()
-            else {
-                panic!("expected fork startup");
-            };
-            assert_eq!(startup.regions, vec![]);
-            assert_eq!(startup.initial_program_break, 0);
-            assert_eq!(startup.program_break, 0);
+            let native = crate::decode_native_fork_startup(startup).unwrap();
+            assert_eq!(native.regions, vec![]);
+            assert_eq!(native.initial_program_break, 0);
+            assert_eq!(native.program_break, 0);
+            // Copy-based state must never be mistaken for native startup.
+            let mut copy_based = native;
+            copy_based.program_break = PAGE_SIZE;
+            assert!(matches!(
+                crate::decode_native_fork_startup(&copy_based.encode().unwrap()),
+                Err(crate::ForkRestoreError::InvalidStartup)
+            ));
+            assert!(matches!(
+                crate::decode_native_fork_startup(b"not a startup"),
+                Err(crate::ForkRestoreError::InvalidStartup)
+            ));
             Ok(())
         }
     }
@@ -4538,11 +4576,7 @@ mod fork_tests {
         failure: Option<Stage>,
         expected_events: &[Stage],
     ) -> Result<(), ForkError<ProcessError>> {
-        *STATE.lock().unwrap() = State {
-            unsupported,
-            failure,
-            events: Vec::new(),
-        };
+        reset_state(unsupported, failure);
         let platform = crate::syscalls::tests::test_platform();
         let limits = BrokerCoreLimits::new(
             crate::syscalls::test_broker::MAX_TEST_BROKER_REFERENCES,
@@ -4554,7 +4588,7 @@ mod fork_tests {
         let launcher = launcher();
         // SAFETY: No native child is created and no guest threads or guest startup state exist.
         let result = unsafe { launcher.start(&child, b"startup") };
-        assert_eq!(STATE.lock().unwrap().events, expected_events);
+        STATE.with_borrow(|state| assert_eq!(state.events, expected_events));
         result
     }
 
@@ -4580,6 +4614,14 @@ mod fork_tests {
     fn native_fork_unsupported_has_no_child_startup_side_effects() {
         assert!(matches!(
             check_start(true, None, &[Stage::Channel, Stage::Fork]),
+            Err(ForkError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn native_fork_unavailable_rendezvous_requests_fallback_without_cloning() {
+        assert!(matches!(
+            check_start(false, Some(Stage::Channel), &[Stage::Channel]),
             Err(ForkError::Unsupported)
         ));
     }

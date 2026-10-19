@@ -97,6 +97,9 @@ impl ExistingRunnerDescriptor {
 }
 
 /// Creates a process-unique control-channel name for a cloned runner.
+// TODO: Make native fork control-pipe names unpredictable, bind them as the first pipe instance
+// rejecting remote clients, and have the child verify the server is the broker, so another local
+// process cannot pre-create the name and pose as the broker.
 pub fn unique_control_channel() -> OsString {
     let nonce = NEXT_PIPE_NONCE.fetch_add(1, Ordering::Relaxed);
     format!("{PIPE_PREFIX}{}-{nonce}", std::process::id()).into()

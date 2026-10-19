@@ -3,6 +3,7 @@
 
 //! Reusable ownership for one out-of-process LiteBox runner.
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::path::PathBuf;
@@ -15,10 +16,6 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
 use litebox_broker_protocol::process::ProcessExitStatus;
-#[cfg(target_os = "linux")]
-use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
-#[cfg(all(windows, target_arch = "x86_64"))]
-use litebox_broker_transport_windows_userland::existing_runner::ExistingRunnerDescriptor;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -31,13 +28,13 @@ pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
-use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt_process};
+use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt_process};
+use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -140,9 +137,9 @@ enum RunnerShutdownState {
     Retired,
 }
 
+/// A runner process spawned by this broker or natively cloned by another runner.
 pub(super) enum RunnerProcess {
     Spawned(Child),
-    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     Adopted(AdoptedProcess),
 }
 
@@ -150,7 +147,6 @@ impl RunnerProcess {
     fn id(&self) -> u32 {
         match self {
             Self::Spawned(process) => process.id(),
-            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
             Self::Adopted(process) => process.id(),
         }
     }
@@ -158,7 +154,6 @@ impl RunnerProcess {
     fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
         match self {
             Self::Spawned(process) => process.try_wait(),
-            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
             Self::Adopted(process) => process.try_wait(),
         }
     }
@@ -166,7 +161,6 @@ impl RunnerProcess {
     fn kill(&mut self) -> IoResult<()> {
         match self {
             Self::Spawned(process) => process.kill(),
-            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
             Self::Adopted(process) => process.kill(),
         }
     }
@@ -320,27 +314,18 @@ impl RunnerInstance {
         })
     }
 
-    /// Decodes runner data and adopts an already-created runner.
+    /// Adopts a runner natively cloned by `parent` from the runner's encoded descriptor.
+    ///
+    /// `supervised` holds the host process IDs of every runner the broker supervises, none of
+    /// which may be adopted again.
     pub(crate) fn adopt(
         parent: &Arc<Mutex<RunnerProcess>>,
         runner_descriptor: &[u8],
+        supervised: &HashSet<u32>,
     ) -> IoResult<Self> {
-        let descriptor = ExistingRunnerDescriptor::decode(
-            runner_descriptor,
-            parent
-                .lock()
-                .expect("parent runner process mutex poisoned")
-                .id(),
-        )?;
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-        let mut endpoint = PlatformRunnerEndpoint::create_at(descriptor.control_channel.clone())?;
-        let runner = match adopt_process(parent, &descriptor) {
-            Ok(runner) => Arc::new(Mutex::new(runner)),
-            Err(error) => {
-                endpoint.close();
-                return Err(error);
-            }
-        };
+        let (runner, endpoint) = adopt(parent, runner_descriptor, supervised)?;
+        let runner = Arc::new(Mutex::new(runner));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),
@@ -355,6 +340,13 @@ impl RunnerInstance {
         })
     }
 
+    /// Returns the runner's host process ID.
+    pub(crate) fn host_process_id(&self) -> u32 {
+        self.runner
+            .lock()
+            .expect("runner process mutex poisoned")
+            .id()
+    }
     pub(crate) fn runner_process(&self) -> Arc<Mutex<RunnerProcess>> {
         Arc::clone(&self.runner)
     }

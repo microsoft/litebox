@@ -9,7 +9,8 @@
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    BrokerAssociationFailureCoordinator, BrokerConnection, connect, start_notification_receiver,
+    BrokerAssociationFailureCoordinator, BrokerConnection, connect, connect_stream,
+    start_notification_receiver,
 };
 
 #[cfg(all(windows, target_arch = "x86_64"))]

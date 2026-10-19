@@ -3,6 +3,7 @@
 
 use std::{
     os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
+    os::unix::net::UnixStream,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -59,6 +60,25 @@ pub fn connect(
             control_socket_path.display()
         )
     })?;
+    negotiate(setup_channel, setup_deadline)
+}
+
+/// Negotiates an association over a stream whose peer end the broker already holds, as in a
+/// natively cloned runner.
+pub fn connect_stream(
+    stream: UnixStream,
+) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
+    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+    negotiate(
+        UnixStreamLocalSetupChannel::from_connected_with_setup_deadline(stream, setup_deadline),
+        setup_deadline,
+    )
+}
+
+fn negotiate(
+    setup_channel: UnixStreamLocalSetupChannel,
+    setup_deadline: Instant,
+) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
     let (local, startup, (notification_channel, positional_io_fds, shutdown_fd, process_image)) =
         BrokerLocal::negotiate(setup_channel, |mut setup| {

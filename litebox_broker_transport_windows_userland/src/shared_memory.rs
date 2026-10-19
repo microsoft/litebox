@@ -138,6 +138,8 @@ impl WindowsSharedMemory {
         length: usize,
         policy: MemoryAccessPolicy,
     ) -> IoResult<Self> {
+        // TODO: Map views that natively cloned runners do not inherit (ViewUnmap), so a clone,
+        // which negotiates its own association, cannot observe its parent's.
         // SAFETY: `mapping` is a live file-mapping handle and `length` is its creation size.
         let view = unsafe { MapViewOfFile(mapping.0, FILE_MAP_ALL_ACCESS, 0, 0, length) };
         let view = NonNull::new(view.Value.cast::<u8>()).ok_or_else(Error::last_os_error)?;
