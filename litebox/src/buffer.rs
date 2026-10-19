@@ -10,6 +10,10 @@
 //! a guest's memory, so its copies may [`Fault`]. A [`Window`] onto part of a
 //! buffer is a buffer too.
 //!
+//! As with `std::io::Read` and `std::io::Write`, functions take buffers by
+//! value. A reference to a buffer is a buffer too, so a caller passes
+//! `&mut buf` (or `&buf`) to keep using `buf`.
+//!
 //! A copy reports no progress when it faults, so objects count progress a
 //! chunk at a time: a fault reports only the bytes of earlier chunks, where
 //! Linux also counts the bytes copied before the fault. A write does not send
@@ -179,6 +183,34 @@ impl WriteBuffer for [u8] {
     }
 }
 
+impl<B: ReadBuffer + ?Sized> ReadBuffer for &mut B {
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+
+    fn copy_from_slice_at(&mut self, offset: usize, source: &[u8]) -> Result<(), Fault> {
+        (**self).copy_from_slice_at(offset, source)
+    }
+
+    fn copy_from_raw_at(&mut self, offset: usize, source: RawBytes<'_>) -> Result<(), Fault> {
+        (**self).copy_from_raw_at(offset, source)
+    }
+}
+
+impl<B: WriteBuffer + ?Sized> WriteBuffer for &B {
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+
+    fn copy_to_slice_at(&self, offset: usize, destination: &mut [u8]) -> Result<(), Fault> {
+        (**self).copy_to_slice_at(offset, destination)
+    }
+
+    fn copy_to_raw_at(&self, offset: usize, destination: RawBytes<'_>) -> Result<(), Fault> {
+        (**self).copy_to_raw_at(offset, destination)
+    }
+}
+
 impl<const N: usize> ReadBuffer for [u8; N] {
     fn len(&self) -> usize {
         N
@@ -305,7 +337,7 @@ impl<B> Window<B> {
     }
 }
 
-impl<B: ReadBuffer + ?Sized> ReadBuffer for Window<&mut B> {
+impl<B: ReadBuffer> ReadBuffer for Window<B> {
     fn len(&self) -> usize {
         self.length
     }
@@ -321,7 +353,7 @@ impl<B: ReadBuffer + ?Sized> ReadBuffer for Window<&mut B> {
     }
 }
 
-impl<B: WriteBuffer + ?Sized> WriteBuffer for Window<&B> {
+impl<B: WriteBuffer> WriteBuffer for Window<B> {
     fn len(&self) -> usize {
         self.length
     }
@@ -339,10 +371,10 @@ impl<B: WriteBuffer + ?Sized> WriteBuffer for Window<&B> {
 
 /// Returns a `CopyFromFn` that copies into `buffer`, from `offset` on, the parts
 /// a broker passes it.
-pub(crate) fn copy_to_buffer<B: ReadBuffer + ?Sized>(
-    buffer: &mut B,
+pub(crate) fn copy_to_buffer(
+    mut buffer: impl ReadBuffer,
     mut offset: usize,
-) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {
+) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> {
     move |part| {
         let length = part.len();
         buffer
@@ -355,10 +387,10 @@ pub(crate) fn copy_to_buffer<B: ReadBuffer + ?Sized>(
 
 /// Returns a `CopyToFn` that fills the parts a broker passes it with `buffer`'s
 /// bytes from `offset` on.
-pub(crate) fn copy_from_buffer<B: WriteBuffer + ?Sized>(
-    buffer: &B,
+pub(crate) fn copy_from_buffer(
+    buffer: impl WriteBuffer,
     mut offset: usize,
-) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {
+) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> {
     move |part| {
         let length = part.len();
         buffer

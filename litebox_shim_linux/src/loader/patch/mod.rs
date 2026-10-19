@@ -207,7 +207,7 @@ fn read_file_exact_at<Platform: ShimPlatform>(
     mut offset: usize,
 ) -> Result<(), Errno> {
     while !data.is_empty() {
-        let read = file.read(data, Some(offset), None)?;
+        let read = file.read(&mut *data, Some(offset), None)?;
         if read == 0 {
             return Err(Errno::EIO);
         }

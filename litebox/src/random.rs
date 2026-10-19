@@ -25,7 +25,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Fills `buf` completely with cryptographically secure random bytes.
     ///
     /// Non-empty requests require a negotiated broker.
-    pub fn fill_random(&self, buf: &mut (impl ReadBuffer + ?Sized)) -> Result<(), FillRandomError> {
+    pub fn fill_random(&self, mut buf: impl ReadBuffer) -> Result<(), FillRandomError> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -34,7 +34,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         while filled < buf.len() {
             let length = (buf.len() - filled).min(MAX_RANDOM_TRANSFER_SIZE as usize);
             broker
-                .fill_random(length, &mut copy_to_buffer(&mut *buf, filled))
+                .fill_random(length, &mut copy_to_buffer(&mut buf, filled))
                 .map_err(|error| match error {
                     BrokerControlError::Fault => FillRandomError::Fault,
                     _ => FillRandomError::Unavailable,

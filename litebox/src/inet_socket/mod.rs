@@ -336,7 +336,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// sender's address in `source_addr` if requested.
     pub fn try_read(
         &self,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        buf: impl ReadBuffer,
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, SocketReadError> {
@@ -356,7 +356,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// A TCP socket ignores `destination`.
     pub fn try_write(
         &self,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         flags: SendFlags,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {

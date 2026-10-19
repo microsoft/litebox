@@ -243,7 +243,7 @@ impl<P: ShimPlatform> Task<P> {
         let size = self
             .files
             .file(fd)?
-            .read(buf, offset, Some(&self.wait_cx()))
+            .read(&mut *buf, offset, Some(&self.wait_cx()))
             .map_err(read_error)?;
         if size > buf.len() {
             return Err(Errno::EIO);

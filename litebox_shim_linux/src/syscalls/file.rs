@@ -91,7 +91,7 @@ impl<Platform: ShimPlatform> File<Platform> {
     /// Reads into `buf` at `offset`, or at the file offset if `offset` is `None`.
     pub(crate) fn read(
         &self,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        buf: impl ReadBuffer,
         offset: Option<usize>,
         cx: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, Errno> {
@@ -101,7 +101,7 @@ impl<Platform: ShimPlatform> File<Platform> {
     /// Writes `buf` at `offset`, or at the file offset if `offset` is `None`.
     pub(crate) fn write(
         &self,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         offset: Option<usize>,
         cx: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, Errno> {
@@ -1191,26 +1191,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub fn sys_read(
         &self,
         fd: i32,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        buf: impl ReadBuffer,
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         let fd = self.typed_fd(fd)?;
         self.do_read(&fd, buf, offset)
     }
 
-    pub(crate) fn do_read<B: ReadBuffer + ?Sized>(
+    pub(crate) fn do_read(
         &self,
         fd: &AnyTypedFd<Platform>,
-        buf: &mut B,
+        buf: impl ReadBuffer,
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
-        let buf: core::cell::RefCell<&mut B> = core::cell::RefCell::new(buf);
+        let buf = core::cell::RefCell::new(buf);
         let result = fd.dispatch(
             |fd| {
                 self.global.with_file(fd, |file| {
-                    file.read(&mut **buf.borrow_mut(), offset, Some(&self.wait_cx()))
+                    file.read(&mut *buf.borrow_mut(), offset, Some(&self.wait_cx()))
                 })
             },
             |fd| {
@@ -1222,7 +1222,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }
                     let received = socket.receive(
                         &self.wait_cx(),
-                        &mut **buf,
+                        &mut *buf,
                         litebox_common_linux::ReceiveFlags::empty(),
                         false,
                         None,
@@ -1233,7 +1233,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global.with_pipe_end(fd, |pipe| {
-                    pipe.read(&self.wait_cx(), &mut **buf.borrow_mut())
+                    pipe.read(&self.wait_cx(), &mut *buf.borrow_mut())
                 })
             },
             |fd| {
@@ -1255,7 +1255,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.global.with_unix_socket(fd, |socket| {
                     socket.recvfrom(
                         &self.wait_cx(),
-                        &mut **buf.borrow_mut(),
+                        &mut *buf.borrow_mut(),
                         litebox_common_linux::ReceiveFlags::empty(),
                         None,
                     )
@@ -1287,7 +1287,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub fn sys_write(
         &self,
         fd: i32,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         let fd = self.typed_fd(fd)?;
@@ -1297,14 +1297,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn do_write(
         &self,
         fd: &AnyTypedFd<Platform>,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         let is_datagram = core::cell::Cell::new(false);
         let result = fd.dispatch(
             |fd| {
                 self.global
-                    .with_file(fd, |file| file.write(buf, offset, Some(&self.wait_cx())))
+                    .with_file(fd, |file| file.write(&buf, offset, Some(&self.wait_cx())))
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -1312,7 +1312,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     is_datagram.set(!socket.is_stream());
                     socket.sendto(
                         &self.wait_cx(),
-                        buf,
+                        &buf,
                         litebox_common_linux::SendFlags::empty(),
                         None,
                     )
@@ -1321,7 +1321,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global
-                    .with_pipe_end(fd, |pipe| pipe.write(&self.wait_cx(), buf))
+                    .with_pipe_end(fd, |pipe| pipe.write(&self.wait_cx(), &buf))
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -1340,7 +1340,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global.with_unix_socket(fd, |socket| {
                     is_datagram.set(!socket.is_stream());
-                    socket.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+                    socket.sendto(self, &buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
             |_fd| Err(Errno::EINVAL),
@@ -1355,12 +1355,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Handle syscall `pread64`
-    pub fn sys_pread64(
-        &self,
-        fd: i32,
-        buf: &mut (impl ReadBuffer + ?Sized),
-        offset: i64,
-    ) -> Result<usize, Errno> {
+    pub fn sys_pread64(&self, fd: i32, buf: impl ReadBuffer, offset: i64) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         self.sys_read(fd, buf, Some(pos))
     }
@@ -1369,7 +1364,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub fn sys_pwrite64(
         &self,
         fd: i32,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         offset: i64,
     ) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
@@ -1749,12 +1744,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         self.with_typed_fd(fd, |fd| {
             let iovs = read_iovs::<Platform, _>(iovec, iovcnt)?;
-            let mut buf = GuestReadBuffer::<Platform>::new(&iovs)?;
+            let buf = GuestReadBuffer::<Platform>::new(&iovs)?;
             // Like Linux, an empty vector reads nothing without reaching the file.
             if buf.is_empty() {
                 return Ok(0);
             }
-            self.do_read(fd, &mut buf, offset)
+            self.do_read(fd, buf, offset)
         })
     }
 
@@ -1774,14 +1769,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return Ok(0);
             }
             if !matches!(fd, AnyTypedFd::Eventfd(_)) {
-                return self.do_write(fd, &buf, offset);
+                return self.do_write(fd, buf, offset);
             }
             // Like Linux, an eventfd, which has no vectored write, writes each iovec separately,
             // stopping at a short write and failing only if nothing was written.
             let mut written = 0;
             for iov in iovs.iter().filter(|iov| iov.iov_len != 0) {
                 let iov_offset = offset.map(|offset| offset + written);
-                match self.do_write(fd, &GuestWriteBuffer::<Platform>::single(iov), iov_offset) {
+                match self.do_write(fd, GuestWriteBuffer::<Platform>::single(iov), iov_offset) {
                     Ok(size) => {
                         written += size;
                         if size < iov.iov_len {

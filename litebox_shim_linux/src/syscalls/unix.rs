@@ -259,7 +259,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn sendto(
         &self,
         task: &Task<Platform>,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
@@ -285,7 +285,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn recvfrom(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        buf: impl ReadBuffer,
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {

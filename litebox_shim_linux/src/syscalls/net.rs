@@ -83,7 +83,7 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
     fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        buf: impl ReadBuffer,
         flags: ReceiveFlags,
         has_prior_progress: bool,
         source_addr: Option<&mut Option<SocketAddress>>,
@@ -724,7 +724,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         self.do_sendto(
             &socket,
-            &GuestWriteBuffer::<Platform>::single(&iov),
+            GuestWriteBuffer::<Platform>::single(&iov),
             flags,
             sockaddr,
         )
@@ -732,7 +732,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(super) fn do_sendto(
         &self,
         socket: &AnyTypedFd<Platform>,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
@@ -746,7 +746,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                socket.sendto(&self.wait_cx(), buf, flags, sockaddr)
+                socket.sendto(&self.wait_cx(), &buf, flags, sockaddr)
             },
             |file| {
                 let addr = sockaddr
@@ -754,7 +754,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 is_datagram.set(!file.is_stream());
-                file.sendto(self, buf, flags, addr)
+                file.sendto(self, &buf, flags, addr)
             },
         );
         // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
@@ -943,7 +943,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             let size = match socket.receive(
                 &cx,
-                &mut guest.window(received, chunk_len),
+                guest.window(received, chunk_len),
                 flags,
                 received != 0,
                 if addr.is_some() {
@@ -989,7 +989,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(super) fn do_recvfrom(
         &self,
         socket: &AnyTypedFd<Platform>,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        buf: impl ReadBuffer,
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
@@ -1092,7 +1092,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             let size = match socket.receive(
                 &cx,
-                &mut guest.window(total_received, chunk_len),
+                guest.window(total_received, chunk_len),
                 flags,
                 total_received != 0,
                 if want_source {

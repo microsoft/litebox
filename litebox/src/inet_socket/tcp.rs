@@ -30,7 +30,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// failed, or a copy faulted.
     pub(super) fn read_stream(
         &self,
-        buffer: &mut (impl ReadBuffer + ?Sized),
+        mut buffer: impl ReadBuffer,
         flags: ReceiveFlags,
     ) -> Result<usize, SocketReadError> {
         if buffer.is_empty() {
@@ -61,7 +61,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         loop {
             let length = (target - offset).min(MAX_SOCKET_TRANSFER_SIZE as usize);
             let peek_offset = u32::try_from(offset).map_err(|_| backend_failure())?;
-            let mut copy_from = copy_to_buffer(&mut *buffer, offset);
+            let mut copy_from = copy_to_buffer(&mut buffer, offset);
             let outcome = self.broker.receive_socket(
                 self.handle,
                 length,
@@ -136,15 +136,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     }
 
     /// Writes up to [`MAX_SOCKET_TRANSFER_SIZE`] stream bytes.
-    pub(super) fn write_stream(
-        &self,
-        buffer: &(impl WriteBuffer + ?Sized),
-    ) -> Result<usize, SocketWriteError> {
+    pub(super) fn write_stream(&self, buffer: impl WriteBuffer) -> Result<usize, SocketWriteError> {
         let length = buffer.len().min(MAX_SOCKET_TRANSFER_SIZE as usize);
         match self.broker.send_socket(
             self.handle,
             length,
-            &mut copy_from_buffer(buffer, 0),
+            &mut copy_from_buffer(&buffer, 0),
             BrokerSendFlags::NONE,
         ) {
             Ok(SocketOutcome::Completed(sent)) => Ok(sent),

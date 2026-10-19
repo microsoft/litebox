@@ -271,7 +271,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     pub fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        buf: impl ReadBuffer,
     ) -> Result<usize, errors::ReadError> {
         if self.endpoint_type != HalfPipeType::ReceiverHalf {
             return Err(errors::ReadError::NotForReading);
@@ -286,7 +286,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     pub fn write(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
     ) -> Result<usize, errors::WriteError> {
         if self.endpoint_type != HalfPipeType::SenderHalf {
             return Err(errors::WriteError::NotForWriting);
@@ -314,7 +314,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     fn read_pipe(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        mut buf: impl ReadBuffer,
     ) -> Result<usize, PipeError> {
         let length = buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize);
         if length == 0 {
@@ -327,7 +327,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
             .wait(cx, false, Events::IN, || {
                 let read = self
                     .broker
-                    .read_pipe(self.handle, length, &mut copy_to_buffer(&mut *buf, 0))
+                    .read_pipe(self.handle, length, &mut copy_to_buffer(&mut buf, 0))
                     .map_err(|error| self.broker_request_error(error))?;
                 if read > length {
                     return Err(TryOpError::Other(PipeError::Io));
@@ -345,7 +345,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     fn write_pipe(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
     ) -> Result<usize, PipeError> {
         if buf.is_empty() {
             return Ok(0);
@@ -358,7 +358,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
         while total_written < buf.len() {
             let length = (buf.len() - total_written).min(MAX_PIPE_TRANSFER_SIZE as usize);
             match self.pollee.wait(cx, false, Events::OUT, || {
-                self.try_write(buf, total_written, length)
+                self.try_write(&buf, total_written, length)
             }) {
                 Ok(written) => total_written += written,
                 Err(_) if total_written != 0 => return Ok(total_written),
@@ -371,13 +371,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
     /// Writes the `length` bytes at `offset` in `buf`.
     fn try_write(
         &self,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         offset: usize,
         length: usize,
     ) -> Result<usize, TryOpError<PipeError>> {
         let written = self
             .broker
-            .write_pipe(self.handle, length, &mut copy_from_buffer(buf, offset))
+            .write_pipe(self.handle, length, &mut copy_from_buffer(&buf, offset))
             .map_err(|error| self.broker_request_error(error))?;
         if written > length || (written == 0 && length != 0) {
             return Err(TryOpError::Other(PipeError::Io));

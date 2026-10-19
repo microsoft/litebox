@@ -70,7 +70,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFil
             }
             // Try to read the remaining bytes
             let file_offset = usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
-            let bytes_read = self.task.sys_read(self.fd, buf, Some(file_offset))?;
+            let bytes_read = self.task.sys_read(self.fd, &mut *buf, Some(file_offset))?;
             if bytes_read == 0 {
                 // reached the end of the file
                 return Err(Errno::ENODATA);

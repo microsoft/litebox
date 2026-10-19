@@ -1002,14 +1002,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     iov_base: buf,
                     iov_len: count,
                 };
-                self.sys_read(fd, &mut GuestReadBuffer::<Platform>::single(&iov), None)
+                self.sys_read(fd, GuestReadBuffer::<Platform>::single(&iov), None)
             }
             SyscallRequest::Write { fd, buf, count } => {
                 let iov = IoWriteVec {
                     iov_base: buf,
                     iov_len: count,
                 };
-                self.sys_write(fd, &GuestWriteBuffer::<Platform>::single(&iov), None)
+                self.sys_write(fd, GuestWriteBuffer::<Platform>::single(&iov), None)
             }
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::CloseRange { first, last, flags } => {
@@ -1085,7 +1085,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     iov_base: buf,
                     iov_len: count,
                 };
-                self.sys_pread64(fd, &mut GuestReadBuffer::<Platform>::single(&iov), offset)
+                self.sys_pread64(fd, GuestReadBuffer::<Platform>::single(&iov), offset)
             }
             SyscallRequest::Pwrite64 {
                 fd,
@@ -1097,7 +1097,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     iov_base: buf,
                     iov_len: count,
                 };
-                self.sys_pwrite64(fd, &GuestWriteBuffer::<Platform>::single(&iov), offset)
+                self.sys_pwrite64(fd, GuestWriteBuffer::<Platform>::single(&iov), offset)
             }
             SyscallRequest::Sendfile {
                 out_fd,

@@ -65,7 +65,7 @@ impl<Platform: ShimPlatform> PipeEnd<Platform> {
     pub(crate) fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        buf: impl ReadBuffer,
     ) -> Result<usize, Errno> {
         Ok(self.end.read(cx, buf)?)
     }
@@ -73,7 +73,7 @@ impl<Platform: ShimPlatform> PipeEnd<Platform> {
     pub(crate) fn write(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
     ) -> Result<usize, Errno> {
         Ok(self.end.write(cx, buf)?)
     }

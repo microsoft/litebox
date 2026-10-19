@@ -220,7 +220,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         address: Option<&UnixSocketAddress>,
-        data: &(impl WriteBuffer + ?Sized),
+        data: impl WriteBuffer,
         user: FileUser,
         nonblock: bool,
     ) -> Result<usize, UnixSocketError> {
@@ -230,7 +230,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                     self.handle,
                     address,
                     data.len(),
-                    &mut copy_from_buffer(data, 0),
+                    &mut copy_from_buffer(&data, 0),
                     user,
                 )
             });
@@ -243,7 +243,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                     self.handle,
                     address,
                     length,
-                    &mut copy_from_buffer(data, sent),
+                    &mut copy_from_buffer(&data, sent),
                     user,
                 )
             });
@@ -275,7 +275,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     pub fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buffer: &mut (impl ReadBuffer + ?Sized),
+        mut buffer: impl ReadBuffer,
         peek: bool,
         source: bool,
         nonblock: bool,
@@ -285,7 +285,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                 .receive_unix_socket(
                     self.handle,
                     buffer.len(),
-                    &mut copy_to_buffer(&mut *buffer, 0),
+                    &mut copy_to_buffer(&mut buffer, 0),
                     peek,
                     source,
                     nonblock,

@@ -283,7 +283,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// [`FileOpenFlags::NONBLOCKING`]. A failure after partial progress returns the bytes read.
     pub fn read(
         &self,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        mut buf: impl ReadBuffer,
         offset: Option<usize>,
         wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, ReadError> {
@@ -301,7 +301,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
                     .read_file(
                         self.handle,
                         length,
-                        &mut copy_to_buffer(&mut *buf, read),
+                        &mut copy_to_buffer(&mut buf, read),
                         offset,
                     )?
                     .map_err(|error| TryOpError::Other(error.into()))
@@ -329,7 +329,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// written.
     pub fn write(
         &self,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         offset: Option<usize>,
         wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, WriteError> {
@@ -346,7 +346,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
                     .write_file(
                         self.handle,
                         length,
-                        &mut copy_from_buffer(buf, written),
+                        &mut copy_from_buffer(&buf, written),
                         offset,
                     )?
                     .map_err(|error| TryOpError::Other(error.into()))

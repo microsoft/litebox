@@ -24,7 +24,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// sender's address in `source_address` if requested.
     pub(super) fn read_datagram(
         &self,
-        buffer: &mut (impl ReadBuffer + ?Sized),
+        buffer: impl ReadBuffer,
         flags: ReceiveFlags,
         source_address: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, SocketReadError> {
@@ -63,7 +63,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// otherwise to the connected peer.
     pub(super) fn write_datagram(
         &self,
-        buffer: &(impl WriteBuffer + ?Sized),
+        buffer: impl WriteBuffer,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
         if buffer.len() > MAX_UDP_DATAGRAM_SIZE as usize {
@@ -77,7 +77,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         match self.broker.send_to_socket(
             self.handle,
             buffer.len(),
-            &mut copy_from_buffer(buffer, 0),
+            &mut copy_from_buffer(&buffer, 0),
             BrokerSendFlags::NONE,
             destination,
         ) {

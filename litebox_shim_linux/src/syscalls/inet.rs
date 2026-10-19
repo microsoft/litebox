@@ -378,7 +378,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     pub(crate) fn sendto(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &(impl WriteBuffer + ?Sized),
+        buf: impl WriteBuffer,
         flags: SendFlags,
         destination: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
@@ -402,7 +402,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             flags.contains(SendFlags::DONTWAIT),
             Events::OUT,
             || self.timeout(socket::SocketOptionName::SendTimeout),
-            || match self.socket.try_write(buf, send_flags, destination) {
+            || match self.socket.try_write(&buf, send_flags, destination) {
                 Ok(0) if buf.is_empty() => Ok(0),
                 Ok(0) => Err(TryOpError::TryAgain),
                 Ok(n) => Ok(n),
@@ -438,7 +438,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     pub(crate) fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut (impl ReadBuffer + ?Sized),
+        mut buf: impl ReadBuffer,
         flags: ReceiveFlags,
         has_prior_progress: bool,
         mut source_addr: Option<&mut Option<SocketAddr>>,
@@ -557,11 +557,10 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             }
             Err(error @ TryOpError::WaitError(_)) if wait_all && peek => {
                 receive_flags.remove(inet_socket::ReceiveFlags::WAITALL);
-                match self.socket.try_read(
-                    &mut buf.window(0, target_len),
-                    receive_flags,
-                    source_addr,
-                ) {
+                match self
+                    .socket
+                    .try_read(buf.window(0, target_len), receive_flags, source_addr)
+                {
                     Ok(received) => Ok(received),
                     Err(SocketReadError::Fault) => Err(Errno::EFAULT),
                     Err(SocketReadError::ReadShutdown) => Ok(0),
