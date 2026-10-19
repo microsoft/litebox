@@ -6,11 +6,12 @@
 //!
 //! While it holds its lock, an object lends its storage to its caller one
 //! contiguous part at a time, in order: each part of the bytes it reads to a
-//! [`CopyFromFn`], which copies them out, or each part of the room it writes
-//! to a [`CopyToFn`], which fills it. Some parts may be empty. The caller copies
-//! between each part and its own buffer, continuing where the previous part
-//! left off. Its buffer may be memory the broker cannot reference, such as
-//! memory shared with a runner.
+//! [`CopyFromFn`], which copies from it, or each part of the room it writes to
+//! a [`CopyToFn`], which copies to it. Their names give the direction relative
+//! to that part, the closure's argument, not to the caller's buffer. Some parts
+//! may be empty. The caller copies between each part and its own buffer,
+//! continuing where the previous part left off. Its buffer may be memory the
+//! broker cannot reference, such as memory shared with a runner.
 //!
 //! An operation whose [`CopyFromFn`] or [`CopyToFn`] fails fails with its
 //! error. The object stays consistent, but may have consumed any of the bytes

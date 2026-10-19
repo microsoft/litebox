@@ -6,10 +6,12 @@
 //!
 //! An operation lends its caller the shared bytes it transfers one contiguous
 //! part at a time, in order: each part of the bytes the broker read to a
-//! [`CopyFromFn`], which copies them out, or each part of the bytes to write to
-//! a [`CopyToFn`], which fills it. The caller copies between each part and its
-//! own buffer, continuing where the previous part left off, so the bytes move
-//! between its buffer and the broker's with no copy in between.
+//! [`CopyFromFn`], which copies from it, or each part of the bytes to write to
+//! a [`CopyToFn`], which copies to it. Their names give the direction relative
+//! to that part, the closure's argument, not to the caller's buffer, as they do
+//! on the broker. The caller copies between each part and its own buffer,
+//! continuing where the previous part left off, so the bytes move between its
+//! buffer and the broker's with no copy in between.
 //!
 //! An operation whose [`CopyFromFn`] or [`CopyToFn`] fails fails with
 //! [`BrokerLocalError::CopyFailed`](crate::BrokerLocalError::CopyFailed). A
