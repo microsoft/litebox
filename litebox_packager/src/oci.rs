@@ -124,6 +124,9 @@ pub fn pull_and_extract(
     let image_data = rt.block_on(async {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
+            // oci-client 0.16 returns layers in download-completion order.
+            // Download sequentially to preserve manifest order for extraction.
+            max_concurrent_download: 1,
             platform_resolver: Some(Box::new(move |entries| {
                 select_manifest(entries, target_arch)
             })),
@@ -559,14 +562,13 @@ fn extract_tar<R: Read>(
         }
 
         // Normal file/directory: use the standard unpack.
-        // If a previous layer recorded a symlink at this path, as a child of
-        // this path, or as an ancestor of this path, the real file/directory
-        // from an upper layer takes precedence — remove the stale symlink
-        // entries. The ancestor check prevents stale symlinks from being
-        // resolved during scan_rootfs and incorrectly pulling in lower-layer
-        // content.
+        // Directories merge with lower layers, so retain their child symlinks.
+        // Other entries replace the subtree. Remove symlinks at this path or
+        // its ancestors so replaced aliases cannot resurrect lower-layer data.
         symlinks.retain(|s| {
-            s.rel_path != path && !s.rel_path.starts_with(&path) && !path.starts_with(&s.rel_path)
+            s.rel_path != path
+                && (entry_type.is_dir() || !s.rel_path.starts_with(&path))
+                && !path.starts_with(&s.rel_path)
         });
         entry
             .unpack(&target)
@@ -1020,6 +1022,69 @@ fn resolve_in_rootfs(path: &Path, rootfs: &Path, max_depth: u32) -> Option<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upper_layer_directories_preserve_lower_layer_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        let mut symlinks = Vec::new();
+        let mut permissions = HashMap::new();
+        let mut lower = tar::Builder::new(Vec::new());
+        let mut executable = tar::Header::new_ustar();
+        executable.set_size(3);
+        executable.set_mode(0o755);
+        lower
+            .append_data(&mut executable, "usr/bin/python3.12", &b"elf"[..])
+            .unwrap();
+        let mut alias = tar::Header::new_ustar();
+        alias.set_entry_type(tar::EntryType::Symlink);
+        alias.set_size(0);
+        alias.set_mode(0o777);
+        lower
+            .append_link(&mut alias, "usr/bin/python3", "python3.12")
+            .unwrap();
+        extract_tar(
+            lower.into_inner().unwrap().as_slice(),
+            rootfs,
+            &mut symlinks,
+            &mut permissions,
+        )
+        .unwrap();
+
+        let mut upper = tar::Builder::new(Vec::new());
+        for path in [".", "usr", "usr/bin"] {
+            let mut directory = tar::Header::new_ustar();
+            directory.set_entry_type(tar::EntryType::Directory);
+            directory.set_size(0);
+            directory.set_mode(0o755);
+            upper
+                .append_data(&mut directory, path, std::io::empty())
+                .unwrap();
+        }
+        upper
+            .append_link(&mut alias, "usr/bin/python", "python3")
+            .unwrap();
+        extract_tar(
+            upper.into_inner().unwrap().as_slice(),
+            rootfs,
+            &mut symlinks,
+            &mut permissions,
+        )
+        .unwrap();
+
+        let symlink_map = symlinks
+            .into_iter()
+            .map(|s| (s.rel_path, s.link_target))
+            .collect();
+        materialize_symlinks(&symlink_map, rootfs, &mut permissions, false).unwrap();
+        let file_map = scan_rootfs(rootfs, &symlink_map, &permissions, false).unwrap();
+        for path in ["usr/bin/python", "usr/bin/python3", "usr/bin/python3.12"] {
+            let entry = &file_map.files[&rootfs.join(path)];
+            assert_eq!(std::fs::read(&entry.read_path).unwrap(), b"elf");
+            assert_eq!(entry.mode, 0o755);
+            assert!(entry.is_executable);
+        }
+    }
 
     #[test]
     fn resolve_symlink_in_rootfs_happy_paths() {

@@ -345,7 +345,22 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --locked --verbose --all-targets --all-features ($env:WINDOWS_CRATES -split ' ')
       - run: cargo build --locked --verbose ($env:WINDOWS_CRATES -split ' ')
+      - name: Cache packaged Linux Python
+        id: linux-python-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tmp/windows_python_rewriter/rootfs.tar
+          key: linux-python-rootfs-${{ runner.os }}-${{ runner.arch }}-x86-64-windows-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_runner_linux_on_windows_userland/tests/run.rs') }}
+      - name: Cache packaged Linux Node.js
+        id: linux-node-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tmp/windows_node_rewriter/rootfs.tar
+          key: linux-node-rootfs-${{ runner.os }}-${{ runner.arch }}-x86-64-windows-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_runner_linux_on_windows_userland/tests/run.rs') }}
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
+        env:
+          LITEBOX_PYTHON_ROOTFS_CACHE_HIT: ${{ steps.linux-python-cache.outputs.cache-hit }}
+          LITEBOX_NODE_ROOTFS_CACHE_HIT: ${{ steps.linux-node-cache.outputs.cache-hit }}
       - run: |
           cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')
           # We need to run `cargo test --doc` separately because doc tests
