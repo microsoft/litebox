@@ -129,6 +129,24 @@ where
         self.instances.len()
     }
 
+    /// Live instances, as their IDs, which are not reused, and their TAs.
+    pub fn instances(&self) -> impl Iterator<Item = (u64, &TeeUuid)> {
+        self.instances
+            .iter()
+            .map(|(id, instance)| (*id, &instance.uuid))
+    }
+
+    /// Ends instance `id` as if it died: its sessions fail with
+    /// `TARGET_DEAD` until closed. False if there is no such instance.
+    pub fn kill(&mut self, id: u64) -> bool {
+        if !self.instances.contains_key(&id) {
+            return false;
+        }
+        log::info!("killing TA instance {id}");
+        self.end_dead_instance(id);
+        true
+    }
+
     /// `uuid` is used only for [`EntryFunc::OpenSession`], whose completion
     /// carries the new session; otherwise `invocation.session` names it.
     pub fn call(&mut self, uuid: &TeeUuid, invocation: Invocation) -> Completion {
@@ -544,6 +562,26 @@ mod tests {
         assert_eq!(invoke(&mut m, b.session).result, tee::ERROR_TARGET_DEAD);
         assert_eq!(close(&mut m, b.session).result, tee::SUCCESS);
         assert_eq!(open(&mut m, &SHARED).result, tee::SUCCESS);
+    }
+
+    #[test]
+    fn a_killed_instance_takes_its_sessions_with_it() {
+        let (mut m, log) = manager();
+        let a = open(&mut m, &KEPT);
+        let b = open(&mut m, &KEPT);
+        let other = open(&mut m, &MULTI);
+        let (id, _) = m.instances().find(|(_, uuid)| **uuid == KEPT).unwrap();
+        assert!(m.kill(id));
+        assert!(!m.kill(id));
+        assert_eq!(log.borrow().dropped, [1]);
+        for session in [a.session, b.session] {
+            assert_eq!(invoke(&mut m, session).result, tee::ERROR_TARGET_DEAD);
+            assert_eq!(close(&mut m, session).result, tee::SUCCESS);
+        }
+        assert_eq!(invoke(&mut m, other.session).result, tee::SUCCESS);
+        // A fresh instance replaces the killed one, though it was kept alive.
+        assert_eq!(open(&mut m, &KEPT).result, tee::SUCCESS);
+        assert_eq!(m.instance_count(), 2);
     }
 
     #[test]

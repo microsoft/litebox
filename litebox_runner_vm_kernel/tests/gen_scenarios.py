@@ -76,11 +76,20 @@ class Scenario:
 
     def die(self, label):
         """The next command kills `label`'s instance; its sessions stay until closed."""
-        instance = self.sessions[label]
+        self.die_instance(self.sessions[label])
+
+    def kill(self, ta):
+        """The host kills every live instance of `ta`; their sessions stay
+        until closed."""
+        for instance in [i for i, (t, _) in self.instances.items() if t == ta]:
+            self.die_instance(instance)
+        self.emit({"kill": ta})
+
+    def die_instance(self, instance):
         del self.instances[instance]
-        for other, i in self.sessions.items():
+        for label, i in self.sessions.items():
             if i == instance:
-                self.sessions[other] = None
+                self.sessions[label] = None
 
     def close(self, label):
         instance = self.sessions.pop(label)
@@ -282,6 +291,39 @@ def ta_death():
     s.write("ta-death")
 
 
+def kill():
+    """The host kills TA instances mid-stream, a kept-alive one too; the
+    others carry on, and fresh instances replace the killed ones."""
+    s = Scenario()
+    a1 = Aes(s, "a1", K128, IV1, encrypt=True)
+    s.open("aes-ta", "a1")
+    s.open("aes-ta", "a2")
+    s.open("hello3seg-ta", "h")
+    kmpp_open(s, "k")
+    a1.setup()
+    a1.cipher(blocks(2, 1))
+    hello(s, "h", 0, 1)
+    s.kill("aes-ta")
+    s.invoke("a1", 3, expect=TARGET_DEAD, check_instances=True)
+    s.invoke("a2", 3, expect=TARGET_DEAD)
+    hello(s, "h", 1, 2)
+    kmpp(s, "k", 0)
+    s.close("a1")
+    s.close("a2")
+    s.open("aes-ta", "a3")
+    a3 = Aes(s, "a3", K256, IV2, encrypt=True)
+    a3.setup()
+    a3.cipher(blocks(2, 3))
+    s.close("k")
+    s.kill("kmpp-ta")
+    kmpp_open(s, "k2")
+    kmpp(s, "k2", 1)
+    s.close("k2")
+    s.close("h")
+    s.close("a3")
+    s.write("kill")
+
+
 def instance_churn():
     """Rounds of filling every instance slot, overflowing, and closing half,
     with work in every live session between them."""
@@ -328,4 +370,5 @@ def instance_churn():
 
 concurrent_sessions()
 ta_death()
+kill()
 instance_churn()

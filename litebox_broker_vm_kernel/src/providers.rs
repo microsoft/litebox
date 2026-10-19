@@ -3,8 +3,7 @@
 
 //! The broker core's providers: hardware randomness, timers, `/dev` (standard
 //! streams from the runner's [`StdioProvider`], `null`, `urandom`),
-//! optionally, a read-only root from a tar, read-only host directories
-//! ([`Share`]s) over 9P, and sockets.
+//! read-only host directories ([`Share`]s) over 9P, and sockets.
 
 use crate::share::{Share, ShareFs};
 use alloc::sync::Arc;
@@ -12,7 +11,7 @@ use alloc::vec::Vec;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
-    fs::{FileService, composer::Composer, devices::Devices, resolver::Resolver, tar_ro::TarRo},
+    fs::{FileService, composer::Composer, devices::Devices, resolver::Resolver},
     random::{RandomProvider, RandomProviderError},
     socket::SocketProvider,
     stdio::StdioProvider,
@@ -34,16 +33,12 @@ impl RandomProvider for HardwareRandom {
 ///
 /// If a share cannot be mounted, as `--mount` fails userland's broker.
 fn file_service(
-    root: Option<&'static [u8]>,
     shares: Vec<Share>,
     stdio: Arc<dyn StdioProvider>,
     random: Arc<dyn RandomProvider>,
 ) -> Arc<dyn FileService> {
-    let mut composer = Composer::builder();
-    if let Some(root) = root {
-        composer = composer.mount("/", |allocator| TarRo::new(root.into(), allocator));
-    }
-    composer = composer.mount("/dev", |allocator| Devices::new(allocator, stdio, random));
+    let mut composer =
+        Composer::builder().mount("/dev", |allocator| Devices::new(allocator, stdio, random));
     for share in shares {
         composer = composer
             .try_mount(&share.path, |allocator| {
@@ -92,7 +87,7 @@ pub(crate) fn seed() -> u64 {
 }
 
 /// Runner processes, which the kernel vouches for, may open and use files:
-/// the devices, `root`'s, if any, and the shares' (read-only); and sockets
+/// the devices and the shares' (read-only); and sockets
 /// (see [`socket_policy`]).
 ///
 /// # Panics
@@ -100,7 +95,6 @@ pub(crate) fn seed() -> u64 {
 /// Without a hardware CSPRNG, on a second call, or if a share cannot be
 /// mounted.
 pub(crate) fn core(
-    root: Option<&'static [u8]>,
     shares: Vec<Share>,
     stdio: Arc<dyn StdioProvider>,
     timers: Arc<dyn TimerProvider>,
@@ -115,7 +109,7 @@ pub(crate) fn core(
         sockets,
         Arc::clone(&random),
         timers,
-        file_service(root, shares, stdio, random),
+        file_service(shares, stdio, random),
     )
     .unwrap_or_else(|error| panic!("broker core: {error:?}"))
 }

@@ -9,8 +9,8 @@
 //! buffers.
 //!
 //! Files are the devices under `/dev`, with standard streams on the
-//! runner's [`stdio::Console`], those of an optional read-only root
-//! ([`Config::root`]), and read-only host directories ([`Config::shares`]).
+//! runner's [`stdio::Console`], and read-only host directories
+//! ([`Config::shares`]), one of which may be the root.
 //! Timers are on the kernel clock. IPv4 TCP and UDP
 //! sockets are `litebox_broker_smoltcp`'s, which mediates their traffic:
 //! between runner processes directly, and, with the runner's [`Network`]
@@ -90,8 +90,6 @@ pub struct Config {
     /// Behind `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
     pub console: &'static dyn stdio::Console,
     pub events: &'static dyn Events,
-    /// A tar, read-only at `/`, e.g., a Linux program's files.
-    pub root: Option<&'static [u8]>,
     /// Host directories, each mounted read-only at its path.
     pub shares: Vec<share::Share>,
     /// The network sockets reach beyond the guest, if any.
@@ -130,7 +128,6 @@ impl Broker {
         ));
         Self {
             core: providers::core(
-                config.root,
                 config.shares,
                 stdio.clone(),
                 timers.clone(),

@@ -2,19 +2,20 @@
 // Licensed under the MIT license.
 
 //! QEMU guest kernel: a [service](service::Service) in ring-3 runner
-//! processes, and a [client](client) for it, chosen by the payload:
-//! - With `programs.json`: standalone programs in `runner.elf` processes
+//! processes, which a host controls over the kernel's
+//! [control channel](control), chosen by the payload:
+//! - With `ldelf.elf`: OP-TEE TAs in `litebox_runner_optee_on_vm_userland`
+//!   processes, one per TA instance ([`service::optee`]).
+//! - Otherwise: standalone programs in `runner.elf` processes
 //!   ([`service::program`]), e.g., Linux programs in
-//!   `litebox_runner_linux_on_vm_userland`, driven by [`client::program`].
-//! - Otherwise: OP-TEE TAs in `litebox_runner_optee_on_vm_userland`
-//!   processes, one per TA instance ([`service::optee`]), driven by a test
-//!   client ([`client::script`]).
+//!   `litebox_runner_linux_on_vm_userland`.
 //!
-//! QEMU exits with 33 if all tests pass, 65 otherwise. Runner processes'
-//! standard streams are the VM's console device, if there is one, and their
-//! sockets reach the VM's network device, if there is one; programs also see
-//! the host directories of virtio-9p devices, read-only, at their mount tags
-//! ([`devices`]).
+//! The host shuts the VM down, and says whether QEMU exits with 33
+//! (success) or 65; a kernel panic exits with 65. Runner processes' standard
+//! streams are port 0 of the VM's console device, if there is one, and
+//! their sockets reach the VM's network device, if there is one; programs
+//! see the host directories of virtio-9p devices, read-only, at their mount
+//! tags, the one tagged `/` as the root ([`devices`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -23,14 +24,15 @@
 
 extern crate alloc;
 
-mod client;
+mod control;
 mod devices;
 mod payload;
 mod service;
+mod stdio;
 
 use core::panic::PanicInfo;
 use litebox_bootloader::Kernel;
-use litebox_hal::{power, serial, serial_println};
+use litebox_hal::{power, serial};
 use litebox_platform_vm_kernel::providers::set_platform_root_key;
 
 litebox_bootloader::entry!(kernel_main, &SerialLogger);
@@ -46,25 +48,12 @@ fn kernel_main(kernel: Kernel) -> ! {
             platform: kernel.platform,
             console,
             events: devices,
-            root: payload.file("rootfs.tar"),
             shares,
             network: devices.network(),
         })
     };
-    if let Some(programs) = payload.file("programs.json") {
-        let stdio: &'static client::program::Stdio =
-            alloc::boxed::Box::leak(alloc::boxed::Box::new(client::program::Stdio::new(devices)));
-        let mut service = service::program::Programs::new(
-            kernel.platform,
-            kernel.clock,
-            wall_clock,
-            devices,
-            &payload,
-            broker(stdio, devices.shares()),
-        );
-        client::program::run(programs, &mut service, stdio);
-    } else {
-        let mut service = service::optee::Optee::new(
+    let server = if payload.file("ldelf.elf").is_some() {
+        control::Server::Optee(service::optee::Optee::new(
             kernel.platform,
             kernel.clock,
             wall_clock,
@@ -73,11 +62,23 @@ fn kernel_main(kernel: Kernel) -> ! {
             // No shares: TA storage (OP-TEE secure storage) needs a file
             // system of its own, not provided yet.
             broker(devices, alloc::vec::Vec::new()),
-        );
-        client::script::run(&payload, &mut service);
-    }
-    serial_println!("[litebox] ALL TESTS PASSED");
-    power::exit(true)
+        ))
+    } else {
+        let stdio: &'static stdio::Stdio =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(stdio::Stdio::new(devices)));
+        control::Server::Programs(
+            alloc::boxed::Box::new(service::program::Programs::new(
+                kernel.platform,
+                kernel.clock,
+                wall_clock,
+                devices,
+                &payload,
+                broker(stdio, devices.shares()),
+            )),
+            stdio,
+        )
+    };
+    control::serve(devices, server)
 }
 
 struct SerialLogger;

@@ -4,15 +4,17 @@
 //! Devices the kernel drives, from `litebox_hal`, for the broker
 //! ([`litebox_broker_vm_kernel::Config`]) and processes:
 //!
-//! - [`Console`]: the VM's console device, else output to the serial port
-//!   and no input.
+//! - [`Console`]: port 0 of the VM's console device, else output to the
+//!   serial port and no input.
+//! - The [control channel](crate::control): port
+//!   [`litebox_common_vm_control::PORT`] of the console device.
 //! - [`Network`]: the VM's network device, if any.
 //! - [`Events`]: the devices' interrupt, and the local APIC's timer for
 //!   deadlines.
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
 //!   `SetTimer` deadline and time slice.
 //! - [`Devices::shares`]: the VM's virtio-9p devices, each a host directory
-//!   mounted at its tag.
+//!   mounted at its tag; the one tagged `/` is the root.
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
@@ -48,6 +50,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const SHARE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a share that does not interrupt is polled.
 const SHARE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// How often a console that does not interrupt is polled.
+const CONSOLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// The console port of the standard streams.
+const STDIO_PORT: u32 = 0;
+const CONTROL_PORT: u32 = litebox_common_vm_control::PORT;
 
 /// The local APIC's timer.
 const TIMER_VECTOR: u8 = 0x30;
@@ -94,7 +103,7 @@ impl Devices {
                 ConsoleDevice::serial()
             }
         };
-        litebox_util_log::info!(device:% = console; "standard streams");
+        litebox_util_log::info!(device:% = console; "console");
         let network = match NetworkDevice::probe(platform, apic.target(DEVICE_VECTOR)) {
             Ok(device) => device,
             Err(error) => {
@@ -175,6 +184,48 @@ impl Devices {
             });
         }
         shares
+    }
+
+    /// Whether the device supports the port; not whether a host is on it.
+    pub fn has_control_port(&self) -> bool {
+        self.console.lock().has_port(CONTROL_PORT)
+    }
+
+    pub fn control_write(&self, bytes: &[u8]) -> usize {
+        self.console.lock().write(CONTROL_PORT, bytes)
+    }
+
+    pub fn control_read(&self, output: &mut [u8]) -> usize {
+        self.console.lock().read(CONTROL_PORT, output)
+    }
+
+    /// Whether the device passed on all of the control port's output within
+    /// `timeout`.
+    pub fn flush_control(&self, timeout: Duration) -> bool {
+        let deadline = self
+            .platform
+            .now()
+            .checked_add(timeout)
+            .expect("the clock is far from overflowing");
+        while !self.console.lock().flushed(CONTROL_PORT) {
+            if self.platform.now() >= deadline {
+                return false;
+            }
+            self.wait_for_console(Some(deadline));
+        }
+        true
+    }
+
+    /// Halts until the console may have changed, or `deadline`. Not on the
+    /// worker, which must suspend instead (see [`Self::block`]).
+    pub fn wait_for_console(&self, deadline: Option<Instant>) {
+        let poll = (!self.console_interrupts).then(|| {
+            self.platform
+                .now()
+                .checked_add(CONSOLE_POLL_INTERVAL)
+                .expect("the clock is far from overflowing")
+        });
+        self.halt(poll.into_iter().chain(deadline).min());
     }
 
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
@@ -270,12 +321,12 @@ pub fn wall_clock(platform: &'static VmKernel, clock: Clock) -> litebox_common_v
 impl Console for Devices {
     fn read(&self, output: &mut [u8]) -> Option<usize> {
         let mut console = self.console.lock();
-        console.receives().then(|| console.read(output))
+        console.receives().then(|| console.read(STDIO_PORT, output))
     }
 
     fn has_input(&self) -> bool {
         let mut console = self.console.lock();
-        !console.receives() || console.has_input()
+        !console.receives() || console.has_input(STDIO_PORT)
     }
 
     /// Waits (bounded) for the device to take all of `input`; both streams
@@ -288,7 +339,7 @@ impl Console for Devices {
             .expect("the clock is far from overflowing");
         let mut written = 0;
         loop {
-            written += self.console.lock().write(&input[written..]);
+            written += self.console.lock().write(STDIO_PORT, &input[written..]);
             if written == input.len() || self.platform.now() >= deadline {
                 return written;
             }
@@ -371,10 +422,13 @@ impl Transport for ShareTransport {
 }
 
 /// A mount tag as the path to mount its share at, if the broker can: its
-/// `Composer` panics on paths that are not absolute and normalized, and `/`
-/// and `/dev` (with what is under it) are reserved. Tags come from the host.
+/// `Composer` panics on paths that are not absolute and normalized, and
+/// `/dev` (with what is under it) is reserved. Tags come from the host.
 fn mount_path(tag: &[u8]) -> Option<String> {
     let path = core::str::from_utf8(tag).ok()?;
+    if path == "/" {
+        return Some(String::from(path));
+    }
     let mut components = path.strip_prefix('/')?.split('/');
     let valid = components
         .clone()
