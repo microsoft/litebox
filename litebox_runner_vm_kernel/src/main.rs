@@ -51,10 +51,13 @@ fn kernel_main(kernel: Kernel) -> ! {
             network: devices.network(),
         })
     };
+    // The kernel's one scheduler, which every runner process runs in.
+    let scheduler = litebox_shim_vm_kernel::sched::Scheduler::default();
     if let Some(programs) = payload.file("programs.json") {
         let stdio: &'static client::program::Stdio =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(client::program::Stdio::new(devices)));
         let mut service = service::program::Programs::new(
+            scheduler,
             kernel.platform,
             kernel.clock,
             wall_clock,
@@ -65,6 +68,7 @@ fn kernel_main(kernel: Kernel) -> ! {
         client::program::run(programs, &mut service, stdio);
     } else {
         let mut service = service::optee::Optee::new(
+            scheduler,
             kernel.platform,
             kernel.clock,
             wall_clock,

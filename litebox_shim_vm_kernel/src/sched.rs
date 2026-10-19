@@ -27,10 +27,11 @@
 //! only when nothing can run.
 
 use crate::thread::{FutexState, Thread};
-use crate::{Inner, Process, Running, Suspended};
+use crate::{Inner, Running, Suspended};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::time::Duration;
 use litebox_broker_vm_kernel::{EnterError, WaitState};
 use litebox_common_vm_abi::Status;
@@ -42,24 +43,87 @@ const QUANTUM_NANOS: u64 = 10_000_000;
 /// The length of a slice.
 pub const QUANTUM: Duration = Duration::from_nanos(QUANTUM_NANOS);
 
-/// Runs `processes` until each one waits for a request (see
-/// [`Process::submit`]) or is dead.
-pub fn run(processes: &mut [&mut Process]) {
-    let mut next = 0;
-    // The least CPU time of the threads that could run, as of the last slice.
-    let mut floor: u64 = 0;
-    // The process whose request the worker is suspended in.
-    let mut serving = None;
-    loop {
-        serve(processes, &mut serving);
-        for (index, process) in processes.iter().enumerate() {
-            process.inner.broker_busy.set(serving == Some(index));
+/// The kernel's scheduler, which every runner process runs in from its
+/// creation ([`crate::Process::spawn`]) until it dies. Like Linux's run queue,
+/// it belongs to the kernel, not to a caller: a caller runs it until what it
+/// waits for happens (e.g., a reply), and every process runs meanwhile. Clones
+/// share it.
+#[derive(Clone, Default)]
+pub struct Scheduler(Rc<RefCell<RunQueue>>);
+
+#[derive(Default)]
+struct RunQueue {
+    /// The live processes, and the dead one the worker is serving, if any.
+    processes: Vec<Rc<Inner>>,
+    /// Where the round-robin for ties starts.
+    next: usize,
+    /// The least CPU time of the threads that could run, as of the last
+    /// slice.
+    floor: u64,
+    /// The process whose request the worker is suspended in.
+    serving: Option<Rc<Inner>>,
+}
+
+impl Scheduler {
+    /// Runs the processes until `done`, checked between steps, or until each
+    /// waits for a request or is dead, without checking `done` after that
+    /// last step.
+    pub fn run_until(&self, mut done: impl FnMut() -> bool) {
+        let mut queue = self.0.borrow_mut();
+        while !done() && queue.step() {}
+    }
+
+    pub(crate) fn add(&self, process: Rc<Inner>) {
+        self.0.borrow_mut().processes.push(process);
+    }
+
+    /// See [`RunQueue::reap`].
+    pub(crate) fn reap(&self) {
+        self.0.borrow_mut().reap();
+    }
+}
+
+impl RunQueue {
+    /// [`Self::reap`], then [`Self::schedule`].
+    fn step(&mut self) -> bool {
+        self.reap();
+        self.schedule()
+    }
+
+    /// Drops the dead processes, but the one the worker is serving, which
+    /// releases their address spaces unless a [`crate::Process`] holds them.
+    fn reap(&mut self) {
+        let serving = self.serving.clone();
+        self.processes.retain(|process| {
+            !process.is_dead()
+                || serving
+                    .as_ref()
+                    .is_some_and(|serving| Rc::ptr_eq(serving, process))
+        });
+    }
+
+    /// Serves the broker, then runs one thread for a slice, or halts until
+    /// one can run. False once each process waits for a request or is dead,
+    /// and the worker is not suspended.
+    fn schedule(&mut self) -> bool {
+        self.serve();
+        let Self {
+            processes,
+            next,
+            floor,
+            serving,
+        } = self;
+        for process in processes.iter() {
+            let busy = serving
+                .as_ref()
+                .is_some_and(|serving| Rc::ptr_eq(serving, process));
+            process.broker_busy.set(busy);
         }
         let threads: Vec<(usize, Rc<Thread>)> = processes
             .iter()
             .enumerate()
             .flat_map(|(index, process)| {
-                let threads = process.inner.threads.borrow().clone();
+                let threads = process.threads.borrow().clone();
                 threads.into_iter().map(move |thread| (index, thread))
             })
             .collect();
@@ -67,21 +131,21 @@ pub fn run(processes: &mut [&mut Process]) {
         // polled already; after, as polling ended waits.
         let mark_notification_waiters = || {
             for process in processes.iter() {
-                process.inner.mark_notification_waiter();
+                process.mark_notification_waiter();
             }
         };
         mark_notification_waiters();
         let turns: Vec<Turn> = threads
             .iter()
-            .map(|(index, thread)| processes[*index].inner.turn(thread))
+            .map(|(index, thread)| processes[*index].turn(thread))
             .collect();
         mark_notification_waiters();
         // Polling published to a wait already polled.
         if processes
             .first()
-            .is_some_and(|process| process.inner.broker.take_woken())
+            .is_some_and(|process| process.broker.take_woken())
         {
-            continue;
+            return true;
         }
         let worker_wake = match worker::state() {
             worker::State::Suspended { wake } => wake,
@@ -97,37 +161,37 @@ pub fn run(processes: &mut [&mut Process]) {
         }
         // The one that used the least CPU; round-robin from `next` for ties.
         let Some(index) = (0..count)
-            .map(|offset| (next + offset) % count)
+            .map(|offset| (*next + offset) % count)
             .filter(|&index| turns[index] == Turn::Runnable)
             .min_by_key(|&index| threads[index].1.cpu_time.get())
         else {
             let blocked = turns.iter().any(|turn| matches!(turn, Turn::Blocked(_)));
             if !blocked && serving.is_none() {
-                return;
+                return false;
             }
             let wake = turns
                 .iter()
                 .filter_map(|turn| turn.wake())
                 .chain(worker_wake)
                 .min();
-            if !processes[0].inner.broker.halt(wake) && serving.is_none() {
+            if !processes[0].broker.halt(wake) && serving.is_none() {
                 // Nothing could end a wait without a deadline.
                 for ((owner, thread), turn) in threads.iter().zip(&turns) {
                     if *turn == Turn::Blocked(None) {
-                        processes[*owner].inner.broker.abandon_wait();
+                        processes[*owner].broker.abandon_wait();
                         thread.suspended.set(Suspended::Woken(Err(Status::Stalled)));
                     }
                 }
             }
-            continue;
+            return true;
         };
         let others = || (0..count).filter(move |&other| other != index);
         let (owner, thread) = &threads[index];
-        let process = &mut *processes[*owner];
+        let process = &processes[*owner];
         let slice = others()
             .any(|other| turns[other] == Turn::Runnable)
             .then(|| {
-                let now = process.inner.platform.now();
+                let now = process.platform.now();
                 now.checked_add(QUANTUM)
                     .unwrap_or(Instant::from_nanos(u64::MAX))
             });
@@ -141,30 +205,51 @@ pub fn run(processes: &mut [&mut Process]) {
         loop {
             process.run_slice(thread, slice_end);
             // The slice may have been cut short (see `Inner::share_cpu`).
-            slice_end = process.inner.slice_end.get();
+            slice_end = process.slice_end.get();
             if thread.suspended.get() != Suspended::Yielded || serving.is_some() {
                 break;
             }
             // Served at once, it keeps the rest of its slice, unless the
             // request waits for a device, or another may run now.
             if process.work(false) == Ran::Suspended {
-                serving = Some(*owner);
+                *serving = Some(process.clone());
                 break;
             }
-            let now = process.inner.platform.now();
-            if process.inner.is_stopped()
+            let now = process.platform.now();
+            if process.is_stopped()
                 || slice_end.is_some_and(|slice_end| now >= slice_end)
-                || process.inner.others_due()
+                || process.others_due()
             {
                 break;
             }
         }
-        next = index + 1;
+        *next = index + 1;
         // Including that slice, but not threads that were waiting.
         let least = runnable()
             .map(|index| threads[index].1.cpu_time.get())
             .min();
-        floor = floor.max(least.unwrap_or(0));
+        *floor = (*floor).max(least.unwrap_or(0));
+        true
+    }
+
+    /// The broker's worker: resumes the request it was suspended in, if any,
+    /// then serves what processes submitted, until a request suspends it.
+    fn serve(&mut self) {
+        if let Some(process) = &self.serving {
+            if process.work(true) == Ran::Suspended {
+                return;
+            }
+            self.serving = None;
+        }
+        for process in &self.processes {
+            if process.broker.has_submitted()
+                && !process.is_dead()
+                && process.work(false) == Ran::Suspended
+            {
+                self.serving = Some(process.clone());
+                return;
+            }
+        }
     }
 }
 
@@ -177,26 +262,6 @@ fn waits_for_notifications(thread: &Thread) -> bool {
         Suspended::Futex(_) => true,
         Suspended::Waiting(wait) => wait.is_for_notifications(),
         _ => false,
-    }
-}
-
-/// The broker's worker: resumes the request it was suspended in, if any,
-/// then serves what processes submitted, until a request suspends it.
-fn serve(processes: &mut [&mut Process], serving: &mut Option<usize>) {
-    if let Some(index) = *serving {
-        if processes[index].work(true) == Ran::Suspended {
-            return;
-        }
-        *serving = None;
-    }
-    for (index, process) in processes.iter_mut().enumerate() {
-        if process.inner.broker.has_submitted()
-            && !process.inner.is_dead()
-            && process.work(false) == Ran::Suspended
-        {
-            *serving = Some(index);
-            return;
-        }
     }
 }
 
@@ -309,18 +374,18 @@ impl Inner {
     }
 }
 
-impl Process {
+impl Inner {
     /// Runs `thread` until it stops, blocks, or `slice_end` passes (none:
     /// until it stops or blocks).
-    fn run_slice(&mut self, thread: &Thread, slice_end: Option<Instant>) {
-        let start = self.inner.platform.now();
-        self.inner.slice_end.set(slice_end);
-        let new = self.inner.is_new();
+    fn run_slice(&self, thread: &Thread, slice_end: Option<Instant>) {
+        let start = self.platform.now();
+        self.slice_end.set(slice_end);
+        let new = self.is_new();
         let resume = thread.suspended.get() != Suspended::No;
         self.activate_thread(thread);
         {
             let running = Running {
-                inner: &self.inner,
+                inner: self,
                 thread,
             };
             let mut ctx = thread.ctx.borrow_mut();
@@ -339,11 +404,11 @@ impl Process {
             }
         }
         self.deactivate_thread(thread);
-        thread.charge(self.inner.platform, start);
+        thread.charge(self.platform, start);
         if thread.exited.get() {
-            self.inner.reap(thread);
-        } else if thread.suspended.get() == Suspended::No && !self.inner.is_stopped() {
-            self.inner.kill("returned to the kernel without waiting");
+            self.reap(thread);
+        } else if thread.suspended.get() == Suspended::No && !self.is_stopped() {
+            self.kill("returned to the kernel without waiting");
         }
     }
 
@@ -352,19 +417,18 @@ impl Process {
     /// thread that made the last broker call (see
     /// [`Inner::broker_requester`]): the requests of several at once are
     /// charged to one.
-    fn work(&mut self, resume: bool) -> Ran {
-        let start = self.inner.platform.now();
+    fn work(self: &Rc<Self>, resume: bool) -> Ran {
+        let start = self.platform.now();
         self.activate();
         // The work looks at the devices itself.
-        let _ = self.inner.broker.take_device_interrupt();
+        let _ = self.broker.take_device_interrupt();
         let ran = if resume {
             worker::resume()
         } else {
-            // Its own reference: the scheduler takes `&mut Process`es while
-            // the work is suspended.
-            let inner = self.inner.clone();
+            // Its own reference: the work may outlast the step.
+            let inner = self.clone();
             worker::start(
-                self.inner.platform,
+                self.platform,
                 Box::new(move || {
                     let main = inner.main_thread();
                     let running = Running {
@@ -382,9 +446,7 @@ impl Process {
             )
         };
         self.deactivate();
-        self.inner
-            .broker_requester()
-            .charge(self.inner.platform, start);
+        self.broker_requester().charge(self.platform, start);
         ran
     }
 }

@@ -15,9 +15,11 @@ use litebox_common_vm_abi::program::{ExitStatus, Program};
 use litebox_hal::clock::Clock;
 use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_vm_kernel::program::RunError;
+use litebox_shim_vm_kernel::sched::Scheduler;
 use litebox_shim_vm_kernel::{Process, ProcessConfig, ProcessTimer};
 
 pub struct Programs {
+    scheduler: Scheduler,
     platform: &'static VmKernel,
     clock: Clock,
     wall_clock: WallClock,
@@ -38,6 +40,7 @@ impl Programs {
     ///
     /// Without `runner.elf` in the payload.
     pub fn new(
+        scheduler: Scheduler,
         platform: &'static VmKernel,
         clock: Clock,
         wall_clock: WallClock,
@@ -46,6 +49,7 @@ impl Programs {
         broker: litebox_broker_vm_kernel::Broker,
     ) -> Self {
         Self {
+            scheduler,
             platform,
             clock,
             wall_clock,
@@ -66,7 +70,7 @@ impl Programs {
         let statuses = {
             let mut runs: Vec<(&mut Process, &Program)> =
                 processes.iter_mut().zip(programs).collect();
-            litebox_shim_vm_kernel::program::run_all(&mut runs)
+            litebox_shim_vm_kernel::program::run_all(&self.scheduler, &mut runs)
         };
         processes
             .iter()
@@ -81,6 +85,7 @@ impl Programs {
     /// A runner process, started: dead if it did not get that far.
     fn start(&self) -> Process {
         let mut process = Process::spawn(
+            &self.scheduler,
             self.platform,
             &self.broker,
             &ProcessConfig {

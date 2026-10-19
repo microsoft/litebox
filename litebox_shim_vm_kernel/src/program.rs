@@ -5,6 +5,7 @@
 //! [`litebox_common_vm_abi::program`]: a process runs one program, on
 //! whichever guest OS its runner provides, then replies with its exit status.
 
+use crate::sched::Scheduler;
 use crate::{Dead, Process};
 use alloc::vec::Vec;
 use litebox_common_vm_abi::program::{self, ExitStatus, Program};
@@ -17,42 +18,34 @@ pub enum RunError {
     Dead(Dead),
 }
 
-/// Runs `program` in `process` and returns its exit status. A malformed reply
-/// kills the process.
-///
-/// # Errors
-///
-/// See [`RunError`].
-///
-/// # Panics
-///
-/// If the process was not started.
-pub fn run(process: &mut Process, program: &Program) -> Result<ExitStatus, RunError> {
-    run_all(&mut [(process, program)]).remove(0)
-}
-
-/// Runs each program in its process, all at once (see [`crate::sched`]), and
-/// returns their exit statuses, in order. A malformed reply kills the
-/// process.
+/// Runs each program in its process, all at once, in `scheduler`, and returns
+/// their exit statuses, in order. A malformed reply kills the process.
 ///
 /// # Panics
 ///
 /// If a process was not started.
-pub fn run_all(runs: &mut [(&mut Process, &Program)]) -> Vec<Result<ExitStatus, RunError>> {
-    let submitted: Vec<_> = runs
+pub fn run_all(
+    scheduler: &Scheduler,
+    runs: &mut [(&mut Process, &Program)],
+) -> Vec<Result<ExitStatus, RunError>> {
+    let mut replies: Vec<Option<Result<ExitStatus, RunError>>> = runs
         .iter_mut()
-        .map(|(process, program)| submit(process, program))
+        .map(|(process, program)| submit(process, program).err().map(Err))
         .collect();
-    let mut running: Vec<&mut Process> = runs
-        .iter_mut()
-        .zip(&submitted)
-        .filter(|(_, submitted)| submitted.is_ok())
-        .map(|((process, _), _)| &mut **process)
-        .collect();
-    crate::sched::run(&mut running);
-    runs.iter_mut()
-        .zip(submitted)
-        .map(|((process, _), submitted)| submitted.and_then(|()| reply(process)))
+    let mut collect = || {
+        for ((process, _), reply) in runs.iter_mut().zip(&mut replies) {
+            if reply.is_none() && process.is_stopped() {
+                *reply = Some(self::reply(process));
+            }
+        }
+        replies.iter().all(Option::is_some)
+    };
+    scheduler.run_until(&mut collect);
+    // The last step may have stopped some (e.g., killed them).
+    collect();
+    replies
+        .into_iter()
+        .map(|reply| reply.expect("a submitted process ran to a wait"))
         .collect()
 }
 
