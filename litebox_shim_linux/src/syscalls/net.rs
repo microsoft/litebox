@@ -127,7 +127,7 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
         let mut probe = [0];
         self.receive(
             cx,
-            &mut probe[..],
+            &mut probe,
             flags | ReceiveFlags::PEEK,
             has_prior_progress,
             None,
@@ -1452,9 +1452,9 @@ mod tests {
         let old_sender_typed = typed_socket(&task, old_sender);
         let old_receiver_typed = typed_socket(&task, old_receiver);
         let new_sender_typed = typed_socket(&task, new_sender);
-        task.do_sendto(&old_sender_typed, &b"old"[..], SendFlags::empty(), None)
+        task.do_sendto(&old_sender_typed, b"old", SendFlags::empty(), None)
             .unwrap();
-        task.do_sendto(&new_sender_typed, &b"new"[..], SendFlags::empty(), None)
+        task.do_sendto(&new_sender_typed, b"new", SendFlags::empty(), None)
             .unwrap();
 
         let socket = task
@@ -1476,7 +1476,7 @@ mod tests {
         let received = socket
             .receive(
                 &task.wait_cx(),
-                &mut old[..],
+                &mut old,
                 ReceiveFlags::empty(),
                 false,
                 None,
@@ -1488,7 +1488,7 @@ mod tests {
         let mut new = [0; 3];
         let replacement = typed_socket(&task, old_receiver);
         let received = task
-            .do_recvfrom(&replacement, &mut new[..], ReceiveFlags::empty(), None)
+            .do_recvfrom(&replacement, &mut new, ReceiveFlags::empty(), None)
             .unwrap();
         assert_eq!(received, new.len());
         assert_eq!(&new, b"new");

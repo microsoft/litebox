@@ -1016,7 +1016,7 @@ mod tests {
                     let mut chunk = [0u8; 64];
                     loop {
                         let n = task
-                            .do_recvfrom(&fd, &mut chunk[..], ReceiveFlags::empty(), None)
+                            .do_recvfrom(&fd, &mut chunk, ReceiveFlags::empty(), None)
                             .expect("client recvfrom failed");
                         if n == 0 {
                             break;
@@ -1121,7 +1121,7 @@ mod tests {
                 };
                 let n = match option {
                     "recvfrom" => task
-                        .do_recvfrom(&client_fd, &mut recv_buf[..], flags, None)
+                        .do_recvfrom(&client_fd, &mut recv_buf, flags, None)
                         .expect("Failed to receive data"),
                     "recvmsg" => {
                         let mapped_buf = task

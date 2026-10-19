@@ -1705,11 +1705,11 @@ mod tests {
         ));
         let first_control = Arc::clone(&control);
         let first = std::thread::spawn(move || {
-            first_control.write_pipe(ObjectHandle(1), 5, &mut copy_from_buffer(&b"first"[..], 0))
+            first_control.write_pipe(ObjectHandle(1), 5, &mut copy_from_buffer(b"first", 0))
         });
         let second_control = Arc::clone(&control);
         let second = std::thread::spawn(move || {
-            second_control.write_pipe(ObjectHandle(2), 6, &mut copy_from_buffer(&b"second"[..], 0))
+            second_control.write_pipe(ObjectHandle(2), 6, &mut copy_from_buffer(b"second", 0))
         });
 
         let first_observed = observed_receiver
@@ -1752,7 +1752,7 @@ mod tests {
         let first_control = Arc::clone(&control);
         let read = |control: Arc<BrokerLocalControl<MockPlatform, _>>, handle| {
             let mut data = [0; 3];
-            let read = control.read_pipe(handle, 3, &mut copy_to_buffer(&mut data[..], 0));
+            let read = control.read_pipe(handle, 3, &mut copy_to_buffer(&mut data, 0));
             read.map(|read| data[..read].to_vec())
         };
         let first = std::thread::spawn(move || read(first_control, ObjectHandle(1)));

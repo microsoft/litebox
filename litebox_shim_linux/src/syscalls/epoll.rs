@@ -531,14 +531,14 @@ mod test {
 
         let writer = task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
-            assert_eq!(task.sys_write(wfd, &[1, 2][..], None).unwrap(), 2);
+            assert_eq!(task.sys_write(wfd, &[1, 2], None).unwrap(), 2);
         });
         assert_eq!(
             epoll_wait(&task, epfd, -1),
             [(u64::try_from(rfd).unwrap(), Events::IN.bits())]
         );
         let mut buf = [0; 2];
-        assert_eq!(task.sys_read(rfd, &mut buf[..], None).unwrap(), 2);
+        assert_eq!(task.sys_read(rfd, &mut buf, None).unwrap(), 2);
         assert_eq!(buf, [1, 2]);
         writer.join().unwrap();
         assert_eq!(epoll_wait(&task, epfd, 0), []);
@@ -575,13 +575,13 @@ mod test {
             .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
-        task.sys_write(wfd, &[1][..], None).unwrap();
+        task.sys_write(wfd, &[1], None).unwrap();
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
         let mut buf = [0; 1];
-        assert_eq!(task.sys_read(rfd, &mut buf[..], None).unwrap(), 1);
+        assert_eq!(task.sys_read(rfd, &mut buf, None).unwrap(), 1);
         assert_eq!(buf, [1]);
         set.wait(
             &task.global,
@@ -595,7 +595,7 @@ mod test {
 
         let writer = task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
-            assert_eq!(task.sys_write(wfd, &[1][..], None).unwrap(), 1);
+            assert_eq!(task.sys_write(wfd, &[1], None).unwrap(), 1);
         });
 
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
@@ -621,7 +621,7 @@ mod test {
             std::thread::sleep(core::time::Duration::from_millis(100));
             // write a byte
             let buf = [0x41u8];
-            let written = task.sys_write(wfd, &buf[..], None).expect("write failed");
+            let written = task.sys_write(wfd, &buf, None).expect("write failed");
             assert_eq!(written, 1);
         });
 
@@ -638,7 +638,7 @@ mod test {
 
         // read
         let mut out = [0u8; 8];
-        let n = task.sys_read(rfd, &mut out[..], None).expect("read failed");
+        let n = task.sys_read(rfd, &mut out, None).expect("read failed");
         assert_eq!(n, 1);
         assert_eq!(out[0], 0x41);
 
@@ -682,7 +682,7 @@ mod test {
 
         // read should return 0 (EOF)
         let mut out = [0u8; 8];
-        let n = task.sys_read(rfd, &mut out[..], None).expect("read failed");
+        let n = task.sys_read(rfd, &mut out, None).expect("read failed");
         assert_eq!(n, 0, "read should return 0 on EOF");
 
         let _ = task.sys_close(rfd);

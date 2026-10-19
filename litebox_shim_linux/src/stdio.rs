@@ -300,7 +300,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = [0; 1];
-        assert_eq!(task.sys_read(fd, &mut buf[..], None), Err(Errno::EAGAIN));
+        assert_eq!(task.sys_read(fd, &mut buf, None), Err(Errno::EAGAIN));
         // Standard input opened at startup is a different open file description.
         assert_eq!(
             task.sys_fcntl(0, FcntlArg::GETFL),
@@ -323,7 +323,7 @@ mod tests {
         });
 
         let mut buf = [0; 4];
-        assert_eq!(task.sys_read(0, &mut buf[..], None), Ok(2));
+        assert_eq!(task.sys_read(0, &mut buf, None), Ok(2));
         assert_eq!(&buf[..2], b"hi");
         input.join().unwrap();
     }
@@ -336,7 +336,7 @@ mod tests {
 
         task.sys_fcntl(0, FcntlArg::SETFL(flags | OFlags::NONBLOCK))
             .unwrap();
-        assert_eq!(task.sys_read(0, &mut buf[..], None), Err(Errno::EAGAIN));
+        assert_eq!(task.sys_read(0, &mut buf, None), Err(Errno::EAGAIN));
 
         let disable = 0i32;
         let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const disable as usize));
@@ -346,12 +346,12 @@ mod tests {
         let enable = 1i32;
         let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const enable as usize));
         assert_eq!(task.sys_ioctl(0, arg), Ok(0));
-        assert_eq!(task.sys_read(0, &mut buf[..], None), Err(Errno::EAGAIN));
+        assert_eq!(task.sys_read(0, &mut buf, None), Err(Errno::EAGAIN));
 
         test_broker::stdio().push_input(b"x");
-        assert_eq!(task.sys_read(0, &mut buf[..], None), Ok(1));
+        assert_eq!(task.sys_read(0, &mut buf, None), Ok(1));
         assert_eq!(buf[0], b'x');
-        assert_eq!(task.sys_read(0, &mut buf[..], None), Err(Errno::EAGAIN));
+        assert_eq!(task.sys_read(0, &mut buf, None), Err(Errno::EAGAIN));
     }
 
     #[test]
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(wait(-1), [(0, Events::IN.bits())]);
 
         let mut buf = [0; 1];
-        assert_eq!(task.sys_read(0, &mut buf[..], None), Ok(1));
+        assert_eq!(task.sys_read(0, &mut buf, None), Ok(1));
         add(1, Events::IN | Events::OUT).unwrap();
         assert_eq!(wait(0), [(1, Events::OUT.bits())]);
     }

@@ -636,7 +636,7 @@ mod tests {
             task.files
                 .file(&task.files.typed_fd(1).unwrap())
                 .unwrap()
-                .read(&mut contents[..], Some(0), None)
+                .read(&mut contents, Some(0), None)
                 .unwrap(),
             6
         );

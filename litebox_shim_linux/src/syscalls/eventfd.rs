@@ -171,7 +171,7 @@ mod tests {
         };
         let read = || {
             let mut value = [0u8; 8];
-            task.sys_read(fd, &mut value[..], None)
+            task.sys_read(fd, &mut value, None)
                 .map(|_| u64::from_le_bytes(value))
         };
 

@@ -1689,7 +1689,7 @@ mod tests {
             )
             .unwrap();
         let nop = 0xd503_201fu32.to_le_bytes();
-        assert_eq!(writer.write(&nop[..], Some(TEXT), None).unwrap(), 4);
+        assert_eq!(writer.write(&nop, Some(TEXT), None).unwrap(), 4);
         let updated =
             mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
         assert_eq!(

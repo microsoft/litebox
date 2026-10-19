@@ -3393,7 +3393,7 @@ mod tests {
                 )
                 .unwrap();
             let mut contents = [0; 5];
-            assert_eq!(fd.read(&mut contents[..], Some(0), None).unwrap(), 5);
+            assert_eq!(fd.read(&mut contents, Some(0), None).unwrap(), 5);
             assert_eq!(&contents, b"data!");
         });
     }

@@ -131,6 +131,34 @@ impl WriteBuffer for [u8] {
     }
 }
 
+impl<const N: usize> ReadBuffer for [u8; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn copy_from_slice_at(&mut self, offset: usize, source: &[u8]) -> Result<(), Fault> {
+        ReadBuffer::copy_from_slice_at(self.as_mut_slice(), offset, source)
+    }
+
+    fn copy_from_shared_at(&mut self, offset: usize, source: SharedBytes<'_>) -> Result<(), Fault> {
+        ReadBuffer::copy_from_shared_at(self.as_mut_slice(), offset, source)
+    }
+}
+
+impl<const N: usize> WriteBuffer for [u8; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn copy_to_slice_at(&self, offset: usize, destination: &mut [u8]) -> Result<(), Fault> {
+        WriteBuffer::copy_to_slice_at(self.as_slice(), offset, destination)
+    }
+
+    fn copy_to_shared_at(&self, offset: usize, destination: SharedBytes<'_>) -> Result<(), Fault> {
+        WriteBuffer::copy_to_shared_at(self.as_slice(), offset, destination)
+    }
+}
+
 /// The bytes at an offset in a buffer, as a buffer of their own.
 ///
 /// [`ReadBuffer::window`] and [`WriteBuffer::window`] return windows.
@@ -251,9 +279,9 @@ mod tests {
         let mut destination = [0; 6];
         destination.copy_from_shared_at(2, shared).unwrap();
         assert_eq!(destination, [0, 0, 2, 3, 4, 5]);
-        ReadBuffer::copy_from_slice_at(&mut destination[..], 0, &[9]).unwrap();
+        ReadBuffer::copy_from_slice_at(&mut destination, 0, &[9]).unwrap();
         let mut copied = [0; 2];
-        WriteBuffer::copy_to_slice_at(&destination[..], 4, &mut copied).unwrap();
+        WriteBuffer::copy_to_slice_at(&destination, 4, &mut copied).unwrap();
         assert_eq!((destination[0], copied), (9, [4, 5]));
     }
 
@@ -266,7 +294,7 @@ mod tests {
         copy_to(memory.shared_bytes(2, 3).unwrap()).unwrap();
         let mut destination = [0; 6];
         {
-            let mut copy_from = copy_to_buffer(&mut destination[..], 1);
+            let mut copy_from = copy_to_buffer(&mut destination, 1);
             copy_from(memory.shared_bytes(3, 2).unwrap()).unwrap();
             copy_from(memory.shared_bytes(0, 3).unwrap()).unwrap();
         }
@@ -283,7 +311,7 @@ mod tests {
         assert_eq!(window.len(), 3);
         window.copy_to_shared_at(1, shared).unwrap();
         let mut destination = [0; 6];
-        let mut outer = ReadBuffer::window(&mut destination[..], 2, 4);
+        let mut outer = ReadBuffer::window(&mut destination, 2, 4);
         let mut inner = outer.window(1, 3);
         inner.copy_from_shared_at(1, shared).unwrap();
         inner.copy_from_slice_at(0, &[9]).unwrap();
@@ -294,7 +322,7 @@ mod tests {
     #[should_panic(expected = "exceed a buffer")]
     fn windows_past_their_buffer_panic() {
         let mut bytes = [0; 4];
-        let _ = ReadBuffer::window(&mut bytes[..], 3, 2);
+        let _ = ReadBuffer::window(&mut bytes, 3, 2);
     }
 
     #[test]
