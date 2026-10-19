@@ -21,7 +21,7 @@ use litebox_broker_protocol::terminal::{
 
 use crate::fs::FileResult;
 use crate::readiness::ReadinessSource;
-use crate::transfer::{CopyFromFn, copy_from_queue};
+use crate::transfer::{CopyFromFn, take_from_queue};
 
 /// Maximum queued input bytes and canonical record boundaries per terminal.
 pub const INPUT_CAPACITY: usize = 64 * 1024;
@@ -248,14 +248,13 @@ impl TerminalEngine {
             }
             length.min(self.input.len())
         };
-        copy_from_queue(&self.input, 0..count, copy_from)?;
+        take_from_queue(&mut self.input, count, copy_from)?;
         if canonical && let Some(record) = self.records.front_mut() {
             *record -= count;
             if *record == 0 {
                 self.records.pop_front();
             }
         }
-        self.input.drain(..count);
         Ok(Some(count))
     }
 

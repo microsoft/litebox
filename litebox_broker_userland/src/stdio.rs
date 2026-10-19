@@ -12,7 +12,7 @@ use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
 use litebox_broker_core::terminal::TerminalTransport;
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer, copy_from_queue};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer, take_from_queue};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::terminal::HostTerminal;
@@ -219,8 +219,7 @@ impl StdioProvider for UserlandStdioProvider {
             return end.map(|()| 0);
         }
         let count = length.min(state.data.len());
-        copy_from_queue(&state.data, 0..count, copy_from)?;
-        state.data.drain(..count);
+        take_from_queue(&mut state.data, count, copy_from)?;
         Ok(count)
     }
 

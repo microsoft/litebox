@@ -14,7 +14,7 @@ use spin::rwlock::RwLock;
 
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
-use crate::transfer::{CopyFromFn, CopyToFn, append_to_queue, copy_from_queue};
+use crate::transfer::{CopyFromFn, CopyToFn, append_to_queue, take_from_queue};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
@@ -198,8 +198,7 @@ impl PipeObject {
         }
 
         let read_len = length.min(state.data.len());
-        copy_from_queue(&state.data, 0..read_len, copy_from)?;
-        state.data.drain(..read_len);
+        take_from_queue(&mut state.data, read_len, copy_from)?;
         state.publish(PipeEndpoint::Write);
         Ok(read_len)
     }

@@ -35,7 +35,7 @@ use crate::{
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
-    transfer::{CopyFromFn, CopyToFn, copy_from_queue, copy_from_slice, copy_to_slice},
+    transfer::{CopyFromFn, CopyToFn, copy_from_slice, copy_to_slice, take_from_queue},
 };
 
 /// Reads into and writes from slices with a resolver, for tests that are not
@@ -314,8 +314,7 @@ impl StdioProvider for TestStdioProvider {
             return Err(StdioProviderError::WouldBlock);
         }
         let read = input.bytes.len().min(length);
-        copy_from_queue(&input.bytes, 0..read, copy_from)?;
-        input.bytes.drain(..read);
+        take_from_queue(&mut input.bytes, read, copy_from)?;
         Ok(read)
     }
 

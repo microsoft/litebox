@@ -120,7 +120,8 @@ impl CopyCount {
     }
 }
 
-/// Passes `queue[range]` to `copy_from`, one contiguous part at a time.
+/// Passes `queue[range]` to `copy_from`, one contiguous part at a time, without
+/// taking them (see [`take_from_queue`]).
 ///
 /// # Panics
 ///
@@ -134,6 +135,22 @@ pub fn copy_from_queue(
     let split = front.len();
     copy_from(&front[range.start.min(split)..range.end.min(split)])?;
     copy_from(&back[range.start.saturating_sub(split)..range.end.saturating_sub(split)])
+}
+
+/// Passes the first `length` bytes of `queue` to `copy_from`, one contiguous
+/// part at a time, and takes them from `queue` unless `copy_from` fails.
+///
+/// # Panics
+///
+/// Panics if `queue` holds fewer than `length` bytes.
+pub fn take_from_queue(
+    queue: &mut VecDeque<u8>,
+    length: usize,
+    copy_from: &mut CopyFromFn<'_>,
+) -> Result<()> {
+    copy_from_queue(queue, 0..length, copy_from)?;
+    queue.drain(..length);
+    Ok(())
 }
 
 /// Appends `length` bytes to `queue`, passing their room to `copy_to` one
@@ -164,14 +181,21 @@ mod tests {
     use crate::test_support::copy_to_vec;
     use alloc::vec::Vec;
 
-    #[test]
-    fn copies_every_range_of_a_wrapped_queue() {
+    /// Returns the bytes `0..8` in a queue whose storage wraps them.
+    fn wrapped_queue() -> VecDeque<u8> {
         // Pushing onto the front of a queue that starts its buffer wraps it.
         let mut queue: VecDeque<u8> = (3..8).collect();
         for byte in (0..3).rev() {
             queue.push_front(byte);
         }
+        assert_ne!(queue.as_slices().0, []);
         assert_ne!(queue.as_slices().1, []);
+        queue
+    }
+
+    #[test]
+    fn copies_every_range_of_a_wrapped_queue() {
+        let queue = wrapped_queue();
         for start in 0..=queue.len() {
             for stop in start..=queue.len() {
                 let expected: Vec<u8> = queue.range(start..stop).copied().collect();
@@ -183,6 +207,44 @@ mod tests {
                 assert_eq!(copied, expected);
             }
         }
+    }
+
+    #[test]
+    fn takes_every_length_of_a_wrapped_queue() {
+        for length in 0..=8 {
+            let mut queue = wrapped_queue();
+            let mut taken = Vec::new();
+            assert_eq!(
+                take_from_queue(
+                    &mut queue,
+                    usize::from(length),
+                    &mut copy_to_vec(&mut taken)
+                ),
+                Ok(())
+            );
+            assert!(taken.iter().copied().eq(0..length));
+            assert!(queue.iter().copied().eq(length..8));
+        }
+    }
+
+    #[test]
+    fn failed_takes_leave_the_queue_unchanged() {
+        // The second part fails, after the first was copied.
+        let mut queue = wrapped_queue();
+        let mut parts = 0;
+        assert_eq!(
+            take_from_queue(&mut queue, 8, &mut |_| {
+                parts += 1;
+                if parts == 1 {
+                    Ok(())
+                } else {
+                    Err(BrokerError::Internal)
+                }
+            }),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(parts, 2);
+        assert!(queue.iter().copied().eq(0..8));
     }
 
     #[test]

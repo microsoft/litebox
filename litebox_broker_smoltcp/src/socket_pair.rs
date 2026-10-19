@@ -8,7 +8,9 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, append_to_queue, copy_from_queue};
+use litebox_broker_core::transfer::{
+    CopyFromFn, CopyToFn, append_to_queue, copy_from_queue, take_from_queue,
+};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 
 use super::Sockets;
@@ -139,13 +141,14 @@ impl Sockets {
     ) -> BrokerResult<()> {
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[1 - end];
-        copy_from_queue(queue, start..stop, copy_from)?;
-        if !peek {
+        if peek {
+            copy_from_queue(queue, start..stop, copy_from)
+        } else {
             let before = queue.capacity();
-            queue.drain(..stop);
+            take_from_queue(queue, stop, copy_from)?;
             account(&mut self.queued, queue, before);
+            Ok(())
         }
-        Ok(())
     }
 
     /// Takes all `end` can read.
