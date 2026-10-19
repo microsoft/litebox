@@ -30,6 +30,15 @@
 //!
 //! When a process ends ([`Association::exited`]), its association ends and
 //! its broker process exits, releasing what it holds (e.g., pipe ends).
+//!
+//! With child processes enabled ([`Config::allow_process_duplication`]), the
+//! broker has a virtual init: process 1, a broker process with no runner
+//! process, that never exits. Each process the kernel starts on its own (a
+//! root) is init's child and leads its own session and process group. Init
+//! adopts orphans, as on Linux, and keeps no exit statuses, so its children
+//! are reaped as they exit, as `tini` does. Otherwise, a root's handshake
+//! creates its broker process with no parent, as the userland broker does for
+//! its root runner.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -51,8 +60,12 @@ use core::cell::{Cell, OnceCell, RefCell};
 use core::convert::Infallible;
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, ChildImage, ProcessImage};
+use litebox_broker_core::{
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
+    process_group,
+};
 use litebox_broker_host::{BrokerHostAssociation, ProcessLauncher, handle_process_operation};
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_broker_protocol::process::ProcessStartupData;
@@ -109,7 +122,8 @@ pub struct Config {
     pub network: Option<&'static dyn Network>,
     /// Whether processes may start child processes (process duplication), as
     /// the userland broker's `allow_process_duplication`; the kernel then
-    /// creates their runner processes (see [`PendingRunnerAssociation`]).
+    /// creates their runner processes (see [`PendingRunnerAssociation`]). Roots
+    /// then run under a virtual init (see the [crate] docs).
     pub allow_process_duplication: bool,
 }
 
@@ -124,6 +138,8 @@ pub struct Broker {
     /// See [`Association::take_woken`].
     woken: Arc<AtomicBool>,
     sockets: Arc<SmoltcpSocketProvider>,
+    /// The virtual init, with [`Config::allow_process_duplication`].
+    init: Option<Arc<BrokerProcess>>,
 }
 
 impl Broker {
@@ -131,8 +147,8 @@ impl Broker {
     ///
     /// # Panics
     ///
-    /// Without a hardware CSPRNG, on a second call, or if a share cannot be
-    /// mounted.
+    /// Without a hardware CSPRNG, on a second call, if a share cannot be
+    /// mounted, or if the virtual init cannot be created as process 1.
     pub fn new(config: Config) -> Self {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
         let timers = Arc::new(KernelTimers::new(config.platform));
@@ -143,29 +159,53 @@ impl Broker {
             config.network,
             providers::seed(),
         ));
+        let core = providers::core(
+            config.root,
+            config.shares,
+            stdio.clone(),
+            timers.clone(),
+            sockets.clone(),
+            config.network.is_some(),
+            config.allow_process_duplication,
+        );
+        let init = config.allow_process_duplication.then(|| {
+            let init = core
+                .create_process(CallerCredential::HostGuaranteed, None)
+                .expect("the first process can be created");
+            assert_eq!(
+                init.id(),
+                ProcessId(1),
+                "the virtual init is the first process"
+            );
+            init.complete_start().expect("a new process can start");
+            init.set_orphan_adoption(true)
+                .and_then(|()| init.set_child_exit_retention(false))
+                .expect("a running process can change its place in the tree");
+            init
+        });
         Self {
-            core: providers::core(
-                config.root,
-                config.shares,
-                stdio.clone(),
-                timers.clone(),
-                sockets.clone(),
-                config.network.is_some(),
-                config.allow_process_duplication,
-            ),
+            core,
             platform: config.platform,
             events: config.events,
             stdio,
             timers,
             woken: Arc::new(AtomicBool::new(false)),
             sockets,
+            init,
         }
     }
 
     /// A process's association, before its handshake. `shared_memory` is in
     /// the process's user mapping; `control_ring` is at the start of
     /// `control_ring_pages`. With `launch`, the process is a launched one,
-    /// and its handshake attaches it to `launch`'s broker process.
+    /// and its handshake attaches it to `launch`'s broker process. Otherwise,
+    /// it is a root; under the virtual init, its broker process is created
+    /// here (see the [crate] docs).
+    ///
+    /// # Errors
+    ///
+    /// If the root's broker process cannot be created (e.g., too many
+    /// processes).
     ///
     /// # Panics
     ///
@@ -175,15 +215,33 @@ impl Broker {
         shared_memory: UserRange,
         control_ring_pages: PinnedUserPages,
         launch: Option<PendingRunnerAssociation>,
-    ) -> Association {
+    ) -> Result<Association, BrokerError> {
+        let launched = launch.is_some();
+        let launch = match (launch, &self.init) {
+            (None, Some(init)) => {
+                let id = init.allocate_child_process()?.process_id;
+                // Its own session, as without init, so that, e.g., a root's
+                // `kill(0, ..)` reaches no other root.
+                let process = process_group::create_session(init, id)
+                    .and_then(|()| init.take_child_process(id))
+                    .inspect_err(|_| {
+                        let _ = init.cancel_child_process(id);
+                    })?;
+                Some(PendingRunnerAssociation {
+                    process,
+                    startup: None,
+                })
+            }
+            (launch, _) => launch,
+        };
         let memory =
             PinnedControlRing::new(control_ring_pages).expect("the pages hold the control ring");
         let ring = ControlRing::new(memory).expect("a pinned control ring has the exact size");
-        Association {
+        Ok(Association {
             broker: self.clone(),
             shared_memory,
             readiness: Arc::new(KernelReadiness::new(self.woken.clone())),
-            launched: launch.is_some(),
+            launched,
             process: launch
                 .as_ref()
                 .map(|launch| OnceCell::from(launch.process.clone()))
@@ -192,7 +250,7 @@ impl Broker {
             launcher: Arc::new(KernelProcessLauncher::default()),
             state: RefCell::new(State::New(ring, launch)),
             submitted: Cell::new(false),
-        }
+        })
     }
 
     /// Looks at what changes outside requests: standard input, timers, and
@@ -242,8 +300,9 @@ impl HostSetupChannel for KernelHostSetup {
 }
 
 enum State {
-    /// Before the handshake, with the ring it would activate, and, for a
-    /// launched process, its pending association.
+    /// Before the handshake, with the ring it would activate, and the pending
+    /// association, if the broker process already exists (see
+    /// [`Broker::associate`]).
     New(
         ControlRing<PinnedControlRing>,
         Option<PendingRunnerAssociation>,
@@ -274,8 +333,8 @@ pub struct Association {
     readiness: Arc<KernelReadiness>,
     /// See [`Broker::associate`].
     launched: bool,
-    /// The broker process: a launched process's from the start, another's
-    /// once its handshake creates it. The process's end completes its exit.
+    /// The broker process: from the start, or once the handshake creates it
+    /// (see [`Broker::associate`]). The process's end completes its exit.
     process: OnceCell<Arc<BrokerProcess>>,
     /// Once the process ended (see [`Self::exited`]); the association ends
     /// as soon as the worker is not using it.
@@ -788,11 +847,12 @@ impl Drop for Association {
 }
 
 /// A child process to start (`StartChild`), for which the kernel creates a
-/// runner process (see [`Association::take_pending_associations`]). Dropping it
-/// before the child's handshake fails the start.
+/// runner process (see [`Association::take_pending_associations`]), or a root
+/// under the virtual init (see [`Broker::associate`]). Dropping it before the
+/// process's handshake fails the start.
 pub struct PendingRunnerAssociation {
     process: Arc<BrokerProcess>,
-    /// Until the handshake takes it.
+    /// Until the handshake takes it; a root has none.
     startup: Option<ProcessStartupData>,
 }
 
