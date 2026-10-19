@@ -14,6 +14,7 @@ use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, host_socket_destination,
     is_internal_socket_address, normalize_socket_destination,
 };
+use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -34,7 +35,6 @@ use super::{
     Reactor, SocketEntry, SocketKind, SocketLifecycle, SocketSnapshot, SocketTransportState,
     broker_error_from_errno, can_consume_synchronous_error, retain_process_state,
     socket_error_from_errno, socket_operation_error_from_errno, take_socket_error, update_snapshot,
-    zeroed_vec,
 };
 
 pub(super) struct AcceptedEndpoints {
@@ -715,7 +715,7 @@ pub(super) fn receive_socket(
         {
             *peek_cache = None;
         }
-        return receive_socket_once(socket, zeroed_vec(length)?, LinuxRecvFlags::empty());
+        return receive_socket_once(socket, bounce_buffer(length)?, LinuxRecvFlags::empty());
     }
 
     let peek_end = validate_peek_window(length, peek_offset, peek_length)?;
@@ -765,7 +765,7 @@ pub(super) fn receive_socket(
         } else {
             LinuxRecvFlags::PEEK
         };
-        match receive_socket_once(socket, zeroed_vec(peek_length)?, flags)? {
+        match receive_socket_once(socket, bounce_buffer(peek_length)?, flags)? {
             ReactorReceiveOutcome::Received(data) => {
                 *peek_cache = Some(PeekCache {
                     socket_id,
@@ -1086,7 +1086,7 @@ pub(super) fn shutdown_tcp_socket(
                 .map_err(broker_error_from_errno)?
                 .try_into()
                 .map_err(|_| BrokerError::Internal)?;
-            Some(zeroed_vec(available)?)
+            Some(bounce_buffer(available)?)
         } else {
             None
         };

@@ -12,7 +12,7 @@ use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
 use litebox_broker_core::terminal::TerminalTransport;
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, lend_from_queue};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer, lend_from_queue};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::terminal::HostTerminal;
@@ -259,7 +259,7 @@ impl StdioProvider for UserlandStdioProvider {
                 return Err(StdioProviderError::Failed);
             }
         }
-        let mut chunk = vec![0; count];
+        let mut chunk = bounce_buffer(count)?;
         copy_to(&mut chunk)?;
         state.queue.push_back((index, chunk));
         state.queued += count;
@@ -617,7 +617,7 @@ mod tests {
         let (_sender, receiver) = channel();
         let output = GatedOutput::default();
         let provider = gated_provider(receiver, &output);
-        let copy_to = vec![b'x'; OUTPUT_CAPACITY];
+        let fill = vec![b'x'; OUTPUT_CAPACITY];
 
         assert_eq!(
             provider.write(
@@ -638,8 +638,8 @@ mod tests {
         assert_eq!(
             provider.write(
                 StdioOutputStream::Stdout,
-                copy_to[..OUTPUT_CAPACITY - 4].len(),
-                &mut copy_from_slice(&copy_to[..OUTPUT_CAPACITY - 4])
+                fill[..OUTPUT_CAPACITY - 4].len(),
+                &mut copy_from_slice(&fill[..OUTPUT_CAPACITY - 4])
             ),
             Ok(OUTPUT_CAPACITY - 4)
         );
@@ -660,8 +660,8 @@ mod tests {
         assert_eq!(
             provider.write(
                 StdioOutputStream::Stdout,
-                copy_to[..=ATOMIC_WRITE_SIZE].len(),
-                &mut copy_from_slice(&copy_to[..=ATOMIC_WRITE_SIZE])
+                fill[..=ATOMIC_WRITE_SIZE].len(),
+                &mut copy_from_slice(&fill[..=ATOMIC_WRITE_SIZE])
             ),
             Ok(2)
         );
@@ -687,9 +687,9 @@ mod tests {
                 (StdioOutputStream::Stderr, b"b".to_vec()),
                 (
                     StdioOutputStream::Stdout,
-                    copy_to[..OUTPUT_CAPACITY - 4].to_vec()
+                    fill[..OUTPUT_CAPACITY - 4].to_vec()
                 ),
-                (StdioOutputStream::Stdout, copy_to[..2].to_vec()),
+                (StdioOutputStream::Stdout, fill[..2].to_vec()),
             ]
         );
         assert_eq!(

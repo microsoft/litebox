@@ -20,7 +20,7 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -1989,18 +1989,10 @@ impl Reactor {
     }
 }
 
-fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
-    let mut data = Vec::new();
-    data.try_reserve_exact(length)
-        .map_err(|_| BrokerError::OutOfMemory)?;
-    data.resize(length, 0);
-    Ok(data)
-}
-
 /// `length` bytes for the reactor to send, lent to `copy_to` (see
 /// [`litebox_broker_core::transfer`]).
 fn filled(length: usize, copy_to: &mut CopyToFn<'_>) -> BrokerResult<Vec<u8>> {
-    let mut data = zeroed_vec(length)?;
+    let mut data = bounce_buffer(length)?;
     copy_to(&mut data)?;
     Ok(data)
 }
