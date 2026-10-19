@@ -19,14 +19,32 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    PAGE_READWRITE, UnmapViewOfFile,
+    CreateFileMappingW, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE, UnmapViewOfFile,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject,
 };
 
 const CONTROL_RING_WAIT_RECHECK_TIMEOUT_MS: u32 = 100;
+
+/// `SECTION_INHERIT::ViewUnmap`: the view is not mapped into cloned child processes.
+const VIEW_UNMAP: u32 = 2;
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtMapViewOfSection(
+        section_handle: HANDLE,
+        process_handle: HANDLE,
+        base_address: *mut *mut core::ffi::c_void,
+        zero_bits: usize,
+        commit_size: usize,
+        section_offset: *mut i64,
+        view_size: *mut usize,
+        inherit_disposition: u32,
+        allocation_type: u32,
+        win32_protect: u32,
+    ) -> i32;
+}
 
 const CONTROL_RING_WAKE_OFFSETS: [usize; 6] = [
     ControlRingDirection::Requests.producer_epoch_offset(),
@@ -138,11 +156,32 @@ impl WindowsSharedMemory {
         length: usize,
         policy: MemoryAccessPolicy,
     ) -> IoResult<Self> {
-        // TODO: Map views that natively cloned runners do not inherit (ViewUnmap), so a clone,
-        // which negotiates its own association, cannot observe its parent's.
-        // SAFETY: `mapping` is a live file-mapping handle and `length` is its creation size.
-        let view = unsafe { MapViewOfFile(mapping.0, FILE_MAP_ALL_ACCESS, 0, 0, length) };
-        let view = NonNull::new(view.Value.cast::<u8>()).ok_or_else(Error::last_os_error)?;
+        let mut base = std::ptr::null_mut();
+        let mut view_size = length;
+        // SAFETY: `mapping` is a live section handle at least `length` bytes long, `base` and
+        // `view_size` are writable, and a null offset maps from the start. `VIEW_UNMAP` keeps the
+        // view out of processes cloned from this one, which negotiate their own association.
+        let status = unsafe {
+            NtMapViewOfSection(
+                mapping.0,
+                GetCurrentProcess(),
+                &raw mut base,
+                0,
+                0,
+                std::ptr::null_mut(),
+                &raw mut view_size,
+                VIEW_UNMAP,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        if status < 0 {
+            return Err(Error::other(format!(
+                "failed to map broker shared memory: {status:#x}"
+            )));
+        }
+        let view = NonNull::new(base.cast::<u8>())
+            .ok_or_else(|| Error::other("NtMapViewOfSection returned a null view"))?;
         let spin_limit = match policy {
             MemoryAccessPolicy::Bytes => 0,
             MemoryAccessPolicy::ControlRing => parallel_spin_limit(),
@@ -362,7 +401,7 @@ pub(crate) fn duplicate_handle_to_process(
 
 impl Drop for WindowsSharedMemory {
     fn drop(&mut self) {
-        // SAFETY: `view` is the live address returned by MapViewOfFile for this owner.
+        // SAFETY: `view` is the live address of the view mapped for this owner.
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                 Value: self.view.as_ptr().cast(),

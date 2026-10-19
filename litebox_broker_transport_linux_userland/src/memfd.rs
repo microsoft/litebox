@@ -34,7 +34,7 @@ use rustix::fs::{
     MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, ftruncate, memfd_create,
 };
 use rustix::io::{Errno, pwrite};
-use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
+use rustix::mm::{Advice, MapFlags, ProtFlags, madvise, mmap, munmap};
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags,
@@ -278,15 +278,18 @@ impl MemfdSharedMemory {
         }?;
         let address =
             NonNull::new(address.cast()).ok_or_else(|| invalid_data("mmap returned null"))?;
-        // TODO: Keep natively cloned runners from inheriting this mapping (`MADV_DONTFORK`), so a
-        // clone, which negotiates its own association, cannot observe its parent's.
+        let mapping = MappedRegion { address, length };
+        // A natively cloned runner must not inherit, and so cannot observe or corrupt, its
+        // parent's association memory; it negotiates its own.
+        // SAFETY: The range is exactly the mapping created above and owned by `mapping`.
+        unsafe { madvise(address.as_ptr().cast(), length, Advice::LinuxDontFork) }?;
         let spin_limit = match policy {
             MemoryAccessPolicy::Bytes => 0,
             MemoryAccessPolicy::ControlRing => parallel_spin_limit(),
         };
         Ok(Self {
             fd,
-            mapping: MappedRegion { address, length },
+            mapping,
             policy,
             spin_limit,
         })
