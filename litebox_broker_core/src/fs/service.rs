@@ -121,7 +121,7 @@ mod private {
             _file: &File,
             _length: usize,
             _offset: Option<u64>,
-            _copy: &mut CopyFromFn<'_>,
+            _copy_from: &mut CopyFromFn<'_>,
         ) -> ServiceResult<usize> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -131,7 +131,7 @@ mod private {
             _file: &File,
             _length: usize,
             _offset: Option<u64>,
-            _fill: &mut CopyToFn<'_>,
+            _copy_to: &mut CopyToFn<'_>,
         ) -> ServiceResult<usize> {
             Err(BrokerError::UnsupportedOperation)
         }

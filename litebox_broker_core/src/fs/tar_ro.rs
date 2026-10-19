@@ -213,7 +213,7 @@ impl super::backend::Backend for TarRo {
         _h: &FileHandle,
         _length: usize,
         _offset: usize,
-        _fill: &mut CopyToFn<'_>,
+        _copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         Err(WriteError::NotForWriting)
     }

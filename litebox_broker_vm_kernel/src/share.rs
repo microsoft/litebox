@@ -234,7 +234,7 @@ impl Backend for ShareFs {
         _h: &FileHandle,
         _length: usize,
         _offset: usize,
-        _fill: &mut CopyToFn<'_>,
+        _copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, FsWriteError> {
         Err(FsWriteError::NotForWriting)
     }

@@ -116,7 +116,7 @@ impl StdioProvider for UnsupportedStdioProvider {
     fn read(
         &self,
         _length: usize,
-        _copy: &mut CopyFromFn<'_>,
+        _copy_from: &mut CopyFromFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }
@@ -125,7 +125,7 @@ impl StdioProvider for UnsupportedStdioProvider {
         &self,
         _stream: StdioOutputStream,
         _length: usize,
-        _fill: &mut CopyToFn<'_>,
+        _copy_to: &mut CopyToFn<'_>,
     ) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }

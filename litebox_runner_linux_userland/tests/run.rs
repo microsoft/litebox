@@ -39,7 +39,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
     fn read(
         &self,
         _length: usize,
-        _copy: &mut litebox_broker_core::transfer::CopyFromFn<'_>,
+        _copy_from: &mut litebox_broker_core::transfer::CopyFromFn<'_>,
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
         Err(litebox_broker_core::stdio::StdioProviderError::Unsupported)
     }
