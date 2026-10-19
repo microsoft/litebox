@@ -694,7 +694,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(ElfPatchInit::Untracked); // Sanity check
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
-        match file.read(&mut phdrs_buf[..], Some(e_phoff), None) {
+        match file.read(&mut phdrs_buf, Some(e_phoff), None) {
             Ok(n) if n == phdrs_buf.len() => {}
             _ => return Err(ElfPatchInit::Untracked),
         }

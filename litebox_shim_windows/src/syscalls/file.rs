@@ -1464,10 +1464,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                         if *is_directory {
                             return Err(WriteError::NotAFile);
                         }
-                        fd.write(&bytes[..], chunk_offset, Some(cx))
+                        fd.write(&bytes, chunk_offset, Some(cx))
                     }
                     FileObjectBacking::CondrvStream { fd, .. } => {
-                        fd.write(&bytes[..], chunk_offset, Some(cx))
+                        fd.write(&bytes, chunk_offset, Some(cx))
                     }
                     FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
                         Err(WriteError::NotAFile)

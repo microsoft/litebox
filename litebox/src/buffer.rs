@@ -15,6 +15,8 @@
 //! Linux also counts the bytes copied before the fault. A write does not send
 //! the faulting chunk, and a read has already consumed it, so it is lost.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use litebox_broker_local::transfer::CopyFailed;
 
 use crate::mm::exception_table::Fault;
@@ -156,6 +158,62 @@ impl<const N: usize> WriteBuffer for [u8; N] {
 
     fn copy_to_shared_at(&self, offset: usize, destination: SharedBytes<'_>) -> Result<(), Fault> {
         WriteBuffer::copy_to_shared_at(self.as_slice(), offset, destination)
+    }
+}
+
+impl ReadBuffer for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn copy_from_slice_at(&mut self, offset: usize, source: &[u8]) -> Result<(), Fault> {
+        ReadBuffer::copy_from_slice_at(self.as_mut_slice(), offset, source)
+    }
+
+    fn copy_from_shared_at(&mut self, offset: usize, source: SharedBytes<'_>) -> Result<(), Fault> {
+        ReadBuffer::copy_from_shared_at(self.as_mut_slice(), offset, source)
+    }
+}
+
+impl WriteBuffer for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn copy_to_slice_at(&self, offset: usize, destination: &mut [u8]) -> Result<(), Fault> {
+        WriteBuffer::copy_to_slice_at(self.as_slice(), offset, destination)
+    }
+
+    fn copy_to_shared_at(&self, offset: usize, destination: SharedBytes<'_>) -> Result<(), Fault> {
+        WriteBuffer::copy_to_shared_at(self.as_slice(), offset, destination)
+    }
+}
+
+impl ReadBuffer for Box<[u8]> {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn copy_from_slice_at(&mut self, offset: usize, source: &[u8]) -> Result<(), Fault> {
+        ReadBuffer::copy_from_slice_at(&mut **self, offset, source)
+    }
+
+    fn copy_from_shared_at(&mut self, offset: usize, source: SharedBytes<'_>) -> Result<(), Fault> {
+        ReadBuffer::copy_from_shared_at(&mut **self, offset, source)
+    }
+}
+
+impl WriteBuffer for Box<[u8]> {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn copy_to_slice_at(&self, offset: usize, destination: &mut [u8]) -> Result<(), Fault> {
+        WriteBuffer::copy_to_slice_at(&**self, offset, destination)
+    }
+
+    fn copy_to_shared_at(&self, offset: usize, destination: SharedBytes<'_>) -> Result<(), Fault> {
+        WriteBuffer::copy_to_shared_at(&**self, offset, destination)
     }
 }
 
