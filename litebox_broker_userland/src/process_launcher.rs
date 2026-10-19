@@ -3,7 +3,8 @@
 
 //! Runner launch support backed by broker-owned process lifecycle state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::{Error as IoError, Result as IoResult};
 use std::process::ExitStatus;
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -17,7 +18,9 @@ use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
 
-use crate::runner::{RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess};
+use crate::runner::{
+    RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess, SupervisedRunners,
+};
 
 /// Userland implementation that starts one out-of-process runner per process.
 pub(crate) struct UserlandProcessLauncher {
@@ -30,17 +33,28 @@ pub(crate) struct UserlandProcessLauncher {
 /// Runners this broker supervises.
 ///
 /// A host process ID is registered from the moment its runner is spawned or adopted until the
-/// runner has been reaped, so adoption can never claim a supervised runner.
+/// runner has been reaped, so adoption can never claim a supervised runner. Registrations are
+/// counted per host process ID, because the OS may reuse a reaped runner's ID for a new runner
+/// before the old registration is removed.
 #[derive(Default)]
 struct RunnerRegistry {
     by_process: HashMap<ProcessId, std::sync::Weak<Mutex<RunnerProcess>>>,
-    host_process_ids: HashSet<u32>,
+    host_process_ids: SupervisedRunners,
 }
 
 impl RunnerRegistry {
+    fn register(&mut self, host_process_id: u32) {
+        *self.host_process_ids.entry(host_process_id).or_default() += 1;
+    }
+
     fn remove(&mut self, process_id: ProcessId, host_process_id: u32) {
         self.by_process.remove(&process_id);
-        self.host_process_ids.remove(&host_process_id);
+        if let Entry::Occupied(mut registrations) = self.host_process_ids.entry(host_process_id) {
+            *registrations.get_mut() -= 1;
+            if *registrations.get() == 0 {
+                registrations.remove();
+            }
+        }
     }
 }
 
@@ -187,7 +201,7 @@ impl UserlandProcessLauncher {
             // process ID from appearing unsupervised to a concurrent adoption.
             let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
             RunnerInstance::start(config).inspect(|instance| {
-                runners.host_process_ids.insert(instance.host_process_id());
+                runners.register(instance.host_process_id());
             })
         };
         let Ok(instance) = instance else {
@@ -235,17 +249,11 @@ impl UserlandProcessLauncher {
                 // The instance reaped its runner before being consumed or dropped.
                 // TODO: Release the host process ID only after deregistering it. The runner is
                 // reaped before this removal, outside the registry lock, so the OS can reuse its
-                // PID in between: a spawned runner's registration is then erased here (allowing
-                // a forged adoption of it), and a native fork clone given that PID is refused.
-                // Observe the exit without reaping (`WNOWAIT` on Linux; keep the handle open on
-                // Windows), then reap and remove under the registry lock.
-                // This is tolerable for now: the window spans only in-memory bookkeeping, and
-                // Linux allocates PIDs sequentially, so reuse within it requires cycling through
-                // `pid_max`. Windows reuses PIDs sooner, but adoption there duplicates the
-                // clone's handle from the parent runner's handle table, which never holds a
-                // handle to another runner. Exploiting the gap also requires a compromised
-                // runner, and the impact stays within this broker's runners, while an honest
-                // clone that hits it only sees its fork fail.
+                // PID in between. Counted registrations keep a runner spawned with that PID
+                // registered, but a native fork clone given it is refused adoption and its fork
+                // fails. This is tolerable for now: Linux allocates PIDs sequentially, so reuse
+                // within the window requires cycling through `pid_max`, and the window spans
+                // only in-memory bookkeeping.
                 launcher
                     .runners
                     .lock()
@@ -316,7 +324,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
             // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
             // broker's children, so their parent runner's cleanup leaves zombies here.
             if let Ok(instance) = &adoption {
-                runners.host_process_ids.insert(instance.host_process_id());
+                runners.register(instance.host_process_id());
             }
             adoption
         };

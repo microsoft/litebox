@@ -2,7 +2,6 @@
 // Licensed under the MIT license.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
@@ -25,8 +24,8 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 };
 
 use super::{
-    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerProcess, UserlandProcessLauncher,
-    accept_runner_channel, runner_has_exited,
+    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerProcess, SupervisedRunners,
+    UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -206,10 +205,10 @@ impl AdoptedProcess {
 pub(super) fn adopt(
     _parent: &Arc<Mutex<RunnerProcess>>,
     runner_descriptor: &[u8],
-    supervised: &HashSet<u32>,
+    supervised: &SupervisedRunners,
 ) -> IoResult<(RunnerProcess, PlatformRunnerEndpoint)> {
     let descriptor = ExistingRunnerDescriptor::decode(runner_descriptor)?;
-    if supervised.contains(&descriptor.process_id) {
+    if supervised.contains_key(&descriptor.process_id) {
         return Err(IoError::new(
             ErrorKind::PermissionDenied,
             "runner process is already supervised",
@@ -436,13 +435,13 @@ mod tests {
         let error = adopt(
             &parent,
             &descriptor(parent_id, 3),
-            &HashSet::from([parent_id]),
+            &SupervisedRunners::from([(parent_id, 1)]),
         )
         .err()
         .expect("a supervised runner must not be adopted again");
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
         // PID 1 is never this broker's child.
-        assert!(adopt(&parent, &descriptor(1, 3), &HashSet::new()).is_err());
+        assert!(adopt(&parent, &descriptor(1, 3), &SupervisedRunners::new()).is_err());
         let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
             unreachable!();
         };

@@ -2,7 +2,6 @@
 // Licensed under the MIT license.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::Result as IoResult;
 use std::ops::Range;
@@ -22,8 +21,8 @@ use litebox_broker_transport_windows_userland::process_image::WindowsProcessImag
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 
 use super::{
-    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerProcess, UserlandProcessLauncher,
-    accept_runner_channel, runner_has_exited,
+    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerProcess, SupervisedRunners,
+    UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -182,11 +181,11 @@ impl PlatformRunnerEndpoint {
 pub(super) fn adopt(
     parent: &Arc<Mutex<RunnerProcess>>,
     runner_descriptor: &[u8],
-    supervised: &HashSet<u32>,
+    supervised: &SupervisedRunners,
 ) -> IoResult<(RunnerProcess, PlatformRunnerEndpoint)> {
     let parent = parent.lock().expect("parent runner process mutex poisoned");
     let descriptor = ExistingRunnerDescriptor::decode(runner_descriptor, parent.id())?;
-    if supervised.contains(&descriptor.process_id) {
+    if supervised.contains_key(&descriptor.process_id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "runner process is already supervised",
@@ -355,9 +354,13 @@ mod tests {
         }
         .encode()
         .unwrap();
-        let error = adopt(&parent, &descriptor, &HashSet::from([parent_id]))
-            .err()
-            .expect("a supervised runner must not be adopted again");
+        let error = adopt(
+            &parent,
+            &descriptor,
+            &SupervisedRunners::from([(parent_id, 1)]),
+        )
+        .err()
+        .expect("a supervised runner must not be adopted again");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
             unreachable!();

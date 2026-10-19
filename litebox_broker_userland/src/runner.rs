@@ -3,7 +3,7 @@
 
 //! Reusable ownership for one out-of-process LiteBox runner.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::path::PathBuf;
@@ -111,6 +111,9 @@ impl RunnerConfig {
         }
     }
 }
+
+/// Registration counts of supervised runners, keyed by host process ID.
+pub(crate) type SupervisedRunners = HashMap<u32, usize>;
 
 /// One out-of-process runner and its dedicated broker control endpoint.
 ///
@@ -321,7 +324,7 @@ impl RunnerInstance {
     pub(crate) fn adopt(
         parent: &Arc<Mutex<RunnerProcess>>,
         runner_descriptor: &[u8],
-        supervised: &HashSet<u32>,
+        supervised: &SupervisedRunners,
     ) -> IoResult<Self> {
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
         let (runner, endpoint) = adopt(parent, runner_descriptor, supervised)?;
