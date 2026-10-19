@@ -7,11 +7,9 @@ use alloc::sync::Arc;
 
 use litebox_broker_protocol::{ProcessId, ThreadId};
 use litebox_broker_transport::channel::LocalCallChannel;
-use litebox_broker_transport::shared_memory::AsSharedBytes;
+use litebox_broker_transport::shared_memory::{AsSharedBytes, SharedBytes};
 
-use crate::BrokerLocal;
-
-pub use crate::transfer::{copy_from_slice, copy_to_slice};
+use crate::{BrokerLocal, CopyFailed};
 
 const TEST_PROCESS_ID: ProcessId = ProcessId(1);
 const TEST_THREAD_ID: ThreadId = ThreadId(2);
@@ -50,4 +48,40 @@ where
     Channel: LocalCallChannel,
 {
     BrokerLocal::new(channel, process_id, TEST_THREAD_ID, shared_memory)
+}
+
+/// Returns a [`CopyFromFn`](crate::CopyFromFn) that copies the parts it is
+/// passed, one after another, into `destination`.
+///
+/// # Panics
+///
+/// The closure panics if the parts overflow `destination`.
+pub fn copy_to_slice(
+    destination: &mut [u8],
+) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {
+    let mut offset = 0;
+    move |part| {
+        let end = offset + part.len();
+        part.copy_to_slice(&mut destination[offset..end]);
+        offset = end;
+        Ok(())
+    }
+}
+
+/// Returns a [`CopyToFn`](crate::CopyToFn) that fills the parts it is passed,
+/// one after another, from `source`.
+///
+/// # Panics
+///
+/// The closure panics if the parts overflow `source`.
+pub fn copy_from_slice(
+    source: &[u8],
+) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {
+    let mut offset = 0;
+    move |part| {
+        let end = offset + part.len();
+        part.copy_from_slice(&source[offset..end]);
+        offset = end;
+        Ok(())
+    }
 }

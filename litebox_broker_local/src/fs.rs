@@ -18,8 +18,7 @@ use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBuff
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_transport::channel::LocalCallChannel;
 
-use crate::transfer::{CopyFromFn, CopyToFn};
-use crate::{BrokerLocal, BrokerLocalError, Result};
+use crate::{BrokerLocal, BrokerLocalError, CopyFromFn, CopyToFn, Result};
 
 type FileOperationResult<T> = core::result::Result<T, FileError>;
 type DirectoryReadResult = FileOperationResult<(Vec<FileDirectoryEntry>, Option<u64>)>;
@@ -485,8 +484,7 @@ mod tests {
     use litebox_broker_transport::shared_memory::{HeapSharedMemory, SharedMemory};
     use std::collections::VecDeque;
 
-    use crate::test_support::test_broker_local;
-    use crate::transfer::{copy_from_slice, copy_to_slice};
+    use crate::test_support::{copy_from_slice, copy_to_slice, test_broker_local};
 
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
 

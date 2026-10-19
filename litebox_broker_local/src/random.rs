@@ -6,8 +6,7 @@ use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_transport::channel::LocalCallChannel;
 
-use crate::transfer::CopyFromFn;
-use crate::{BrokerLocal, BrokerLocalError, Result};
+use crate::{BrokerLocal, BrokerLocalError, CopyFromFn, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Fills an operation-scoped shared-buffer lease from a broker-provided

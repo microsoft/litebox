@@ -32,7 +32,6 @@ mod signal;
 mod socket;
 mod thread;
 mod timer;
-mod transfer;
 mod unix_socket;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -59,7 +58,27 @@ use litebox_broker_transport::channel::{
 use litebox_broker_transport::shared_memory::{AsSharedBytes, SharedBufferPool, SharedBytes};
 
 pub use error::{BrokerLocalError, Result};
-pub use transfer::{CopyFailed, CopyFromFn, CopyToFn};
+
+/// Copies from each part of the bytes the broker read, in turn, to the
+/// caller's buffer.
+///
+/// Its name gives the direction relative to the part, as on the broker. If it
+/// fails, the read fails with [`BrokerLocalError::CopyFailed`], having already
+/// consumed the bytes it read.
+pub type CopyFromFn<'a> = dyn FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed> + 'a;
+
+/// Copies to each part of the bytes to write, in turn, from the caller's
+/// buffer.
+///
+/// Its name gives the direction relative to the part, as on the broker. If it
+/// fails, the write fails with [`BrokerLocalError::CopyFailed`] and sends
+/// nothing.
+pub type CopyToFn<'a> = dyn FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed> + 'a;
+
+/// Reports that a [`CopyFromFn`] or [`CopyToFn`] could not copy a part, such as
+/// because the caller's buffer is inaccessible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyFailed;
 
 /// Typed broker-local control adapter for broker operations.
 ///
@@ -271,7 +290,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         offset: usize,
         length: usize,
-        copy: &mut dyn FnMut(SharedBytes<'_>) -> core::result::Result<(), transfer::CopyFailed>,
+        copy: &mut dyn FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed>,
     ) -> Result<(), Channel::Error> {
         assert!(
             offset
@@ -284,7 +303,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .borrow_sequence(buffer, offset, length)
             .expect("validated shared buffer sequence must be accessible")
         {
-            copy(part).map_err(|transfer::CopyFailed| BrokerLocalError::CopyFailed)?;
+            copy(part).map_err(|CopyFailed| BrokerLocalError::CopyFailed)?;
         }
         Ok(())
     }

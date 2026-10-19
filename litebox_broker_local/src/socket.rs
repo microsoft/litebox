@@ -21,8 +21,7 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
-use crate::transfer::{CopyFromFn, CopyToFn};
-use crate::{BrokerLocal, BrokerLocalError, Result};
+use crate::{BrokerLocal, BrokerLocalError, CopyFromFn, CopyToFn, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned IPv4 TCP stream socket with the status flags
@@ -102,8 +101,7 @@ mod tests {
     use litebox_broker_transport::shared_memory::{HeapSharedMemory, SharedMemory};
     use std::collections::VecDeque;
 
-    use crate::test_support::test_broker_local;
-    use crate::transfer::{copy_from_slice, copy_to_slice};
+    use crate::test_support::{copy_from_slice, copy_to_slice, test_broker_local};
 
     #[test]
     fn udp_operations_stage_complete_datagrams() {

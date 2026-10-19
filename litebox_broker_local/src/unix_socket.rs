@@ -21,8 +21,7 @@ use litebox_broker_protocol::unix_socket::{
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
-use crate::transfer::{CopyFromFn, CopyToFn};
-use crate::{BrokerLocal, BrokerLocalError, Result};
+use crate::{BrokerLocal, BrokerLocalError, CopyFromFn, CopyToFn, Result};
 
 type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;
 
