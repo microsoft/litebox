@@ -52,7 +52,9 @@ use crate::fs::File;
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::socket::SocketOptions;
-use crate::transfer::{CopyFromFn, CopyToFn, append_to_queue, copy_from_queue, take_from_queue};
+use crate::transfer::{
+    CopyFromFn, CopyToFn, append_to_queue, bounce_buffer, copy_from_queue, take_from_queue,
+};
 use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a Unix socket operation.
@@ -1150,10 +1152,7 @@ impl Socket {
         if write_shut {
             return Ok(Err(UnixSocketError::BrokenPipe));
         }
-        let mut data = Vec::new();
-        data.try_reserve_exact(length)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        data.resize(length, 0);
+        let mut data = bounce_buffer(length)?;
         copy_to(&mut data)?;
         let datagram = Datagram { data, source };
         let charge = datagram.charge();

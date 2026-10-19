@@ -19,7 +19,7 @@ use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
     PlatformStreamReceive, is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -599,7 +599,7 @@ impl Tcp {
             (None, &Phase::External(handle)) if peek => {
                 // smoltcp passes only the first contiguous part of its receive
                 // buffer without taking it, so a peek copies it all out.
-                let mut data = zeroed(end)?;
+                let mut data = bounce_buffer(end)?;
                 let copied = sockets
                     .tcp(handle)
                     .peek_slice(&mut data)

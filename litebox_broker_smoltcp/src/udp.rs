@@ -21,7 +21,7 @@ use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, PlatformDatagramReceive,
     PlatformSocketStatus, is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn};
+use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -189,7 +189,7 @@ impl Udp {
         if !wanted {
             return Ok(());
         }
-        let mut data = zeroed(length)?;
+        let mut data = bounce_buffer(length)?;
         copy_to(&mut data)?;
         self.received
             .try_reserve(1)
