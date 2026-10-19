@@ -100,10 +100,12 @@ jobs:
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-linux-gnu,x86_64-unknown-none
-      - name: Install QEMU
+      - name: Install QEMU and virtiofsd
+        # virtiofsd serves the virtio-fs share (in /usr/libexec, not on PATH).
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 virtiofsd
+          /usr/libexec/virtiofsd --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Enable KVM
         # GitHub-hosted x64 Linux runners support KVM, but the runner user
@@ -133,6 +135,11 @@ jobs:
         run: |
           QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
+      - name: Run the host share test over virtio-fs in a QEMU VM with stacked runners (KVM)
+        # The other runs share /mnt/host over virtio-9p; only `share` uses it.
+        run: |
+          QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_linux_on_vm_userland.sh -s virtiofs -t share
 
   build_and_test_arm64:
     name: Build and Test (AArch64)

@@ -33,24 +33,30 @@
 # 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
 # A fresh host directory per test, with greeting.txt, is mounted read-only at
-# /mnt/host over virtio-9p (its mount tag).
+# /mnt/host (its tag) over virtio-9p, or, with -s virtiofs, over virtio-fs,
+# served by a virtiofsd per test (which needs the guest's RAM shared with it).
 #
-# Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
+# Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v] [-s <share>]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
 #   -r   build and run the release kernel and runner
 #   -v   print the full guest log and console output for passing runs too
+#   -s   how /mnt/host is shared: 9p (default) or virtiofs
 #
 # Environment:
 #   CC            C compiler with a static and a shared glibc (default: cc)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
+#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G); with -s virtiofs, a
+#                 plain size (a bare number is MiB, as for -m), not -m's
+#                 size=...,maxmem=... form
 #   TIMEOUT       per-run timeout in seconds (default: 120)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners, run in their directories
 #                 (default: "cargo build"; CI uses
 #                 ".github/tools/github_actions_run_cargo build")
+#   VIRTIOFSD     virtiofsd binary, for -s virtiofs (default: virtiofsd on
+#                 PATH, else /usr/libexec/virtiofsd)
 
 set -euo pipefail
 
@@ -66,14 +72,24 @@ tests=()
 profile=debug
 cargo_flags=()
 verbose=0
-while getopts "t:rvh" opt; do
+share=9p
+while getopts "t:rvs:h" opt; do
     case $opt in
         t) tests+=("$OPTARG") ;;
         r) profile=release; cargo_flags+=(--release) ;;
         v) verbose=1 ;;
+        s) share=$OPTARG ;;
         *) awk 'NR >= 6 { if (!/^#/) exit; print }' "$0"; exit 2 ;;
     esac
 done
+case $share in
+    9p) ;;
+    virtiofs)
+        VIRTIOFSD=${VIRTIOFSD:-$(command -v virtiofsd || echo /usr/libexec/virtiofsd)}
+        [[ -x $VIRTIOFSD ]] || { echo "error: no virtiofsd (set VIRTIOFSD)" >&2; exit 2; }
+        ;;
+    *) echo "error: unknown share '$share' (9p or virtiofs)" >&2; exit 2 ;;
+esac
 if [[ ${#tests[@]} -eq 0 ]]; then
     for f in "$TESTS_DIR"/*.json; do tests+=("$(basename "$f" .json)"); done
 fi
@@ -150,12 +166,61 @@ network_args() {
         -device virtio-net-pci,netdev=n0,disable-legacy=on
 }
 
-# The virtio-9p share for test $1: see the header.
-share_args() {
+# Creates test $1's share directory and, for virtio-fs, starts its virtiofsd
+# (setting $virtiofsd), which serves one connection, then exits.
+start_share() {
     mkdir "$WORK/$1.share"
     echo "hello from the host" >"$WORK/$1.share/greeting.txt"
-    echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
-        -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
+    virtiofsd=
+    [[ $share == virtiofs ]] || return 0
+    local socket="$WORK/$1.vfs.sock"
+    # Unprivileged: no sandbox, and files are created as this user.
+    "$VIRTIOFSD" --socket-path="$socket" --shared-dir="$WORK/$1.share" \
+        --sandbox=none --cache=never >"$WORK/$1.virtiofsd.log" 2>&1 &
+    virtiofsd=$!
+    local i
+    for ((i = 0; i < 100; i++)); do
+        [[ -S $socket ]] && return 0
+        kill -0 "$virtiofsd" 2>/dev/null || break
+        sleep 0.1
+    done
+    echo "error: virtiofsd did not start:" >&2
+    cat "$WORK/$1.virtiofsd.log" >&2
+    exit 2
+}
+
+stop_share() {
+    [[ -n $virtiofsd ]] || return 0
+    kill "$virtiofsd" 2>/dev/null || true
+    wait "$virtiofsd" 2>/dev/null || true
+    virtiofsd=
+}
+
+# However this script exits (e.g., killed, or virtiofsd failing to start),
+# stop the test's virtiofsd, then remove $WORK, as qemu_test_lib.sh's own
+# trap, which this replaces, does.
+virtiofsd=
+trap 'stop_share; rm -rf "$WORK"' EXIT
+
+# The share's devices for test $1: see the header.
+share_args() {
+    case $share in
+        9p)
+            echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
+                -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
+            ;;
+        virtiofs)
+            # vhost-user: virtiofsd accesses the guest's RAM directly. The
+            # backend's size must equal -m's, but a bare number is bytes
+            # there and MiB to -m.
+            local mem=$QEMU_MEM
+            [[ ! $mem =~ ^[0-9]+$ ]] || mem=${mem}M
+            echo -object "memory-backend-memfd,id=mem,size=$mem,share=on" \
+                -numa node,memdev=mem \
+                -chardev "socket,id=vfs0,path=$WORK/$1.vfs.sock" \
+                -device vhost-user-fs-pci,chardev=vfs0,tag=/mnt/host
+            ;;
+    esac
 }
 
 # The kernel checks the output; this only shows it.
@@ -186,8 +251,10 @@ for t in "${tests[@]}"; do
         feed_input "$t" "$input_fd" &
         feeder=$!
     fi
+    start_share "$t"
     # shellcheck disable=SC2046 # these print separate arguments
     run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args) $(share_args "$t")
+    stop_share
     if [[ -n $feeder ]]; then
         kill "$feeder" 2>/dev/null || true
         wait "$feeder" 2>/dev/null || true

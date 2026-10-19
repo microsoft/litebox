@@ -2,13 +2,14 @@
 // Licensed under the MIT license.
 
 //! Devices behind device-neutral types ([`ConsoleDevice`],
-//! [`NetworkDevice`], [`NinePDevice`]), each probing
+//! [`NetworkDevice`], [`NinePDevice`], [`FuseDevice`]), each probing
 //! the drivers the HAL has for its kind. Runners choose which devices to
 //! probe, where they interrupt, and what to do without one.
 
 use crate::dma::Hal;
 use crate::interrupt::InterruptTarget;
 use crate::virtio::console::VirtioConsole;
+use crate::virtio::fs::VirtioFs;
 use crate::virtio::net::VirtioNet;
 use crate::virtio::nine_p::Virtio9p;
 use alloc::boxed::Box;
@@ -224,6 +225,87 @@ impl fmt::Display for NinePDevice {
         write!(
             f,
             "virtio (pci {}, interrupts {})",
+            self.0.transport().function(),
+            self.interrupts()
+        )
+    }
+}
+
+/// A host directory served over FUSE, one request at a time. Not internally
+/// synchronized.
+pub struct FuseDevice(Box<VirtioFs>);
+
+impl FuseDevice {
+    /// The largest message either way: this driver's cap of 128 KiB of data
+    /// per request (FUSE allows more, by negotiation), plus a page for
+    /// headers.
+    pub const MAX_MESSAGE_SIZE: usize = crate::virtio::fs::MAX_MESSAGE_SIZE;
+    /// The largest message without a reply (see [`Self::transmit_oneway`]).
+    pub const MAX_ONEWAY_MESSAGE_SIZE: usize = crate::virtio::fs::MAX_HIPRIO_MESSAGE_SIZE;
+
+    /// The VM's FUSE devices, interrupting `interrupt` if they can (see
+    /// [`Self::interrupts`]), or why one cannot be driven.
+    pub fn probe_all(
+        hal: &'static dyn Hal,
+        interrupt: InterruptTarget,
+    ) -> Vec<Result<Self, crate::virtio::Error>> {
+        // Virtio over PCI.
+        VirtioFs::probe_all(hal, interrupt.msi_message())
+            .into_iter()
+            .map(|device| device.map(|device| Self(Box::new(device))))
+            .collect()
+    }
+
+    /// Whether the device raises its interrupt; else it must be polled.
+    pub fn interrupts(&self) -> bool {
+        self.0.transport().interrupts()
+    }
+
+    /// The file system's name: untrusted bytes from the host.
+    pub fn tag(&self) -> &[u8] {
+        self.0.tag()
+    }
+
+    /// Queues `message`, one whole FUSE request, with room for a reply of
+    /// `reply_len` bytes (at most [`Self::MAX_MESSAGE_SIZE`]), which should be
+    /// no more than the largest valid reply: servers may fill it all. False if
+    /// one is in flight.
+    ///
+    /// # Panics
+    ///
+    /// If `message` is empty or longer than [`Self::MAX_MESSAGE_SIZE`].
+    pub fn transmit(&mut self, message: &[u8], reply_len: usize) -> bool {
+        self.0.transmit(message, reply_len)
+    }
+
+    /// The reply's length, once the device answered, its bytes copied into
+    /// `response` (truncated); unchecked as FUSE.
+    pub fn receive(&mut self, response: &mut [u8]) -> Option<usize> {
+        self.0.receive(response)
+    }
+
+    /// Queues `message`, one whole FUSE request without a reply (e.g.,
+    /// `FUSE_FORGET`); false if such a request is in flight.
+    ///
+    /// # Panics
+    ///
+    /// If `message` is empty or longer than [`Self::MAX_ONEWAY_MESSAGE_SIZE`].
+    pub fn transmit_oneway(&mut self, message: &[u8]) -> bool {
+        self.0.transmit_high_priority(message)
+    }
+
+    /// Whether the device took the request without a reply in flight (or
+    /// there is none).
+    pub fn oneway_done(&mut self) -> bool {
+        self.0.high_priority_done()
+    }
+}
+
+impl fmt::Display for FuseDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "virtio-fs (pci {}, interrupts {})",
             self.0.transport().function(),
             self.interrupts()
         )

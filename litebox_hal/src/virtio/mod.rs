@@ -6,7 +6,7 @@
 //! [`crate::dma::Hal`]) and interrupts by MSI-X. Split virtqueues
 //! ([`queue`]).
 //!
-//! Devices: [`console`], [`net`], and [`nine_p`]. The transport and queues
+//! Devices: [`console`], [`net`], [`nine_p`], and [`fs`]. The transport and queues
 //! are device-independent, for further devices.
 //!
 //! Devices are not trusted: the capability list, BAR ranges, queue sizes and
@@ -15,6 +15,7 @@
 
 mod buffers;
 pub mod console;
+pub mod fs;
 pub mod net;
 pub mod nine_p;
 pub mod pci;

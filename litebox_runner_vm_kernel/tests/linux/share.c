@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// A host directory over virtio-9p, read-only at /mnt/host (see
+// A host directory over virtio-9p or virtio-fs, read-only at /mnt/host (see
 // dev_tools/run_linux_on_vm_userland.sh): reads the host's greeting.txt and
 // lists the directory; writing, creating, and removing fail with EROFS.
 

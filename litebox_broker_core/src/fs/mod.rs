@@ -16,6 +16,7 @@ pub mod backend;
 pub mod composer;
 pub mod devices;
 pub mod errors;
+pub mod fuse;
 pub mod in_mem;
 #[doc(hidden)]
 pub mod inode_allocator;
