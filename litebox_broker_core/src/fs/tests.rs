@@ -430,6 +430,67 @@ mod in_mem {
     }
 
     #[test]
+    fn root_passes_permission_checks() {
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
+        let other = UserInfo {
+            user: 500,
+            group: 500,
+        };
+
+        // A user's private directory holding a file no one may read or write, and a read-only
+        // directory of its own.
+        fs.mkdir(USER, "/private", Mode::RWXU)
+            .expect("Failed to create directory");
+        drop(
+            fs.open(
+                USER,
+                "/private/secret",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::empty(),
+            )
+            .expect("Failed to create file"),
+        );
+        fs.mkdir(USER, "/private/sealed", Mode::RUSR | Mode::XUSR)
+            .expect("Failed to create directory");
+
+        // Other users may not search the directory, nor may the owner open the file.
+        assert!(
+            fs.open(other, "/private/secret", OFlags::RDONLY, Mode::empty())
+                .is_err()
+        );
+        assert!(
+            fs.open(USER, "/private/secret", OFlags::RDWR, Mode::empty())
+                .is_err()
+        );
+        assert!(matches!(
+            fs.mkdir(USER, "/private/sealed/sub", Mode::RWXU),
+            Err(MkdirError::NoWritePerms)
+        ));
+
+        // Root may do all of it, as on Linux.
+        let mut fd = fs
+            .open(ROOT, "/private/secret", OFlags::RDWR, Mode::empty())
+            .expect("root failed to open a file it has no permissions on");
+        assert!(matches!(fs.write(&mut fd, b"root", None), Ok(4)));
+        let dir = fs
+            .open(
+                ROOT,
+                "/private",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .expect("root failed to open a private directory");
+        assert!(fs.read_dir(&dir).is_ok());
+        fs.mkdir(ROOT, "/private/sealed/sub", Mode::RWXU)
+            .expect("root failed to create in a read-only directory");
+        fs.rmdir(ROOT, "/private/sealed/sub")
+            .expect("root failed to remove from a read-only directory");
+        fs.unlink(ROOT, "/private/secret")
+            .expect("root failed to unlink a private file");
+    }
+
+    #[test]
     fn chown_test() {
         let fs = in_mem_fs();
 

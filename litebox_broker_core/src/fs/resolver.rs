@@ -70,7 +70,18 @@ impl Context {
         ResolvedPath { components }
     }
 
+    /// Whether the acting user is root, which, like Linux root with its default capabilities,
+    /// passes read, write, and search permission checks: what root may reach is bounded by what
+    /// the file system serves, not by modes.
+    fn is_root(&self) -> bool {
+        self.user_info.user == UserInfo::ROOT.user
+    }
+
+    /// Whether the acting user may search a directory. Root always may, as on Linux.
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
+        if self.is_root() {
+            return true;
+        }
         if self.user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::XUSR)
         } else if self.user_info.group == permissions.owner.group {
@@ -81,6 +92,9 @@ impl Context {
     }
 
     fn can_read(&self, permissions: &PermissionInfo) -> bool {
+        if self.is_root() {
+            return true;
+        }
         if self.user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::RUSR)
         } else if self.user_info.group == permissions.owner.group {
@@ -91,6 +105,9 @@ impl Context {
     }
 
     fn can_write(&self, permissions: &PermissionInfo) -> bool {
+        if self.is_root() {
+            return true;
+        }
         if self.user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::WUSR)
         } else if self.user_info.group == permissions.owner.group {
@@ -756,7 +773,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return true;
         };
         let acting = context.acting_user();
-        acting.user == UserInfo::ROOT.user || acting.user == permissions.owner.user
+        context.is_root() || acting.user == permissions.owner.user
     }
 
     /// Change the permissions of a file
