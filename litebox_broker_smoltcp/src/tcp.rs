@@ -19,7 +19,6 @@ use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
     PlatformStreamReceive, is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -27,6 +26,7 @@ use litebox_broker_protocol::socket::{
     SocketOptionValue, SocketOutcome,
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::storage::RingBuffer;
@@ -515,17 +515,16 @@ impl Tcp {
     }
 
     /// The broker core validated the peek window.
-    #[expect(clippy::too_many_arguments, reason = "mirrors PlatformSocket::receive")]
     pub(super) fn receive(
         &mut self,
         sockets: &mut Sockets,
         reader: ObjectHandle,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
+        let length = output.len();
         self.continue_peek(reader, flags, peek_offset)?;
         if !matches!(self.phase, Phase::Internal(..) | Phase::External(_)) {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
@@ -581,36 +580,36 @@ impl Tcp {
         }
         let received = match (&mut self.saved, &self.phase) {
             (Some(saved), _) if peek => {
-                copy_from(&saved[start..end])?;
+                output.copy_from_slice_at(0, &saved[start..end])?;
                 end - start
             }
             (Some(saved), _) => {
-                copy_from(&saved[..end])?;
+                output.copy_from_slice_at(0, &saved[..end])?;
                 saved.drain(..end);
                 self.release_saved(sockets);
                 end
             }
             (None, &Phase::Internal(id, pair_end)) => {
-                sockets.read_pair(id, pair_end, start, end, peek, copy_from)?;
+                sockets.read_pair(id, pair_end, start, end, peek, output)?;
                 end - start
             }
             (None, &Phase::External(handle)) if peek => {
-                // smoltcp passes only the first contiguous part of its receive
-                // buffer without taking it, so a peek copies it all out.
-                let mut data = bounce_buffer(end)?;
+                // smoltcp peeks past the first contiguous part of its receive
+                // buffer only into a slice, so a peek stages the bytes.
+                let mut data = zeroed(end)?;
                 let copied = sockets
                     .tcp(handle)
                     .peek_slice(&mut data)
                     .map_err(|_| BrokerError::Internal)?;
                 let peeked = data.get(start..copied).ok_or(BrokerError::Internal)?;
-                copy_from(peeked)?;
+                output.copy_from_slice_at(0, peeked)?;
                 peeked.len()
             }
             (None, &Phase::External(handle)) => {
                 let socket = sockets.tcp(handle);
                 let mut received = 0;
-                // smoltcp passes its receive buffer's bytes one contiguous part at
-                // a time, and there are two parts at most. Once the peer has
+                // smoltcp passes its receive buffer's bytes one contiguous part
+                // at a time, and there are two parts at most. Once the peer has
                 // closed, a drained socket fails to pass any more.
                 for _ in 0..2 {
                     if received == end {
@@ -619,9 +618,9 @@ impl Tcp {
                     received += socket
                         .recv(|part| {
                             let len = part.len().min(end - received);
-                            match copy_from(&part[..len]) {
+                            match output.copy_from_slice_at(received, &part[..len]) {
                                 Ok(()) => (len, Ok(len)),
-                                Err(error) => (0, Err(error)),
+                                Err(fault) => (0, Err(fault)),
                             }
                         })
                         .map_err(|_| BrokerError::Internal)??;
@@ -641,8 +640,7 @@ impl Tcp {
     pub(super) fn send(
         &mut self,
         sockets: &mut Sockets,
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        data: &dyn WriteBuffer,
     ) -> BrokerResult<SocketOutcome<usize>> {
         if self.write_shutdown {
             return Ok(SocketOutcome::Failed(SocketError::Shutdown));
@@ -674,7 +672,7 @@ impl Tcp {
                 if sockets.pair(id)?.peer_closed(end) {
                     return Ok(SocketOutcome::Failed(SocketError::ConnectionReset));
                 }
-                sockets.write_pair(id, end, length, copy_to)?
+                sockets.write_pair(id, end, data)?
             }
             Phase::External(handle) => {
                 let socket = sockets.tcp(handle);
@@ -685,14 +683,14 @@ impl Tcp {
                 // smoltcp passes the room in its send buffer a contiguous part
                 // at a time, and it has two at most.
                 for _ in 0..2 {
-                    if sent == length {
+                    if sent == data.len() {
                         break;
                     }
                     let filled = socket.send(|part| {
-                        let len = part.len().min(length - sent);
-                        match copy_to(&mut part[..len]) {
+                        let len = part.len().min(data.len() - sent);
+                        match data.copy_to_slice_at(sent, &mut part[..len]) {
                             Ok(()) => (len, Ok(len)),
-                            Err(error) => (0, Err(error)),
+                            Err(fault) => (0, Err(fault)),
                         }
                     });
                     match filled {
@@ -1031,7 +1029,13 @@ impl Stack {
         if read && !tcp.read_shutdown {
             if tcp.saved.is_none() {
                 let data = match tcp.phase {
-                    Phase::Internal(pair, end) => self.sockets.take_pair(pair, end)?,
+                    Phase::Internal(pair, end) => {
+                        let available = self.sockets.pair(pair)?.available(end);
+                        let mut data = zeroed(available)?;
+                        self.sockets
+                            .read_pair(pair, end, 0, available, false, &mut data)?;
+                        data
+                    }
                     Phase::External(handle) => take_received(self.sockets.tcp(handle))?,
                     _ => return Err(BrokerError::Internal),
                 };

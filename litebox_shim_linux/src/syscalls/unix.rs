@@ -14,7 +14,6 @@ use alloc::{
 };
 use core::mem::{offset_of, size_of};
 use litebox::{
-    buffer::{ReadBuffer, WriteBuffer},
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     process::ProcessError,
@@ -30,6 +29,7 @@ use litebox_common_linux::{
     AddressFamily, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType,
     SocketOption, SocketOptionName, UnixProtocol, errno::Errno,
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::{
     GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,

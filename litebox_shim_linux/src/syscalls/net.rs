@@ -14,7 +14,6 @@ use core::{
 };
 
 use litebox::{
-    buffer::{ReadBuffer, WriteBuffer},
     event::wait::WaitContext,
     fd::{EntryHandle, FdEnabledSubsystem},
     inet_socket::SOCKET_RECEIVE_OPERATION_SIZE,
@@ -31,6 +30,7 @@ use litebox_common_linux::{
     errno::Errno, signal::Signal,
 };
 use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use litebox_platform::time::Instant as _;
 
 use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
@@ -943,7 +943,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             let size = match socket.receive(
                 &cx,
-                guest.sub_buffer(received, chunk_len),
+                (&mut guest).sub_buffer(received, chunk_len),
                 flags,
                 received != 0,
                 if addr.is_some() {
@@ -1092,7 +1092,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             let size = match socket.receive(
                 &cx,
-                guest.sub_buffer(total_received, chunk_len),
+                (&mut guest).sub_buffer(total_received, chunk_len),
                 flags,
                 total_received != 0,
                 if want_source {

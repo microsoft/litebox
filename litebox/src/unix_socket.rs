@@ -28,7 +28,6 @@ use crate::{
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
-    buffer::{ReadBuffer, WriteBuffer, copy_from_buffer, copy_to_buffer},
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -39,6 +38,7 @@ use crate::{
     process::ProcessError,
     sync::RawSyncPrimitivesProvider,
 };
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use errors::UnixSocketError;
 
@@ -226,26 +226,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     ) -> Result<usize, UnixSocketError> {
         if self.socket_type != SocketType::Stream {
             return self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
-                self.broker.send_unix_socket(
-                    self.handle,
-                    address,
-                    data.len(),
-                    &mut copy_from_buffer(&data, 0),
-                    user,
-                )
+                self.broker
+                    .send_unix_socket(self.handle, address, &data, user)
             });
         }
         let mut sent: usize = 0;
         loop {
             let length = (data.len() - sent).min(UNIX_SOCKET_BUFFER_SIZE as usize);
+            let chunk = &(&data).sub_buffer(sent, length);
             let result = self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
-                self.broker.send_unix_socket(
-                    self.handle,
-                    address,
-                    length,
-                    &mut copy_from_buffer(&data, sent),
-                    user,
-                )
+                self.broker
+                    .send_unix_socket(self.handle, address, chunk, user)
             });
             match result {
                 Ok(written) => sent += written,
@@ -282,14 +273,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     ) -> Result<Received, UnixSocketError> {
         self.wait(cx, nonblock, SocketOptionName::ReceiveTimeout, || {
             self.broker
-                .receive_unix_socket(
-                    self.handle,
-                    buffer.len(),
-                    &mut copy_to_buffer(&mut buffer, 0),
-                    peek,
-                    source,
-                    nonblock,
-                )
+                .receive_unix_socket(self.handle, &mut buffer, peek, source, nonblock)
                 .map(|result| {
                     result.map(|(received, source)| Received {
                         received: received.received as usize,

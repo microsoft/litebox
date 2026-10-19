@@ -15,6 +15,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
     TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
@@ -25,7 +26,7 @@ use super::errors::{
 use super::resolver::{Resolver, ResolverEntry};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
-use crate::transfer::{CopyCount, CopyFromFn, CopyToFn};
+use crate::transfer::CopyCount;
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a broker file operation.
@@ -99,9 +100,9 @@ impl ObjectEntry {
 
 mod private {
     use super::{
-        BrokerError, CopyFromFn, CopyToFn, File, FileAccessMode, FileDirectoryEntry, FileMode,
-        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, Result,
-        ServiceResult, Vec,
+        BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
+        FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result, ServiceResult,
+        Vec, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -119,9 +120,8 @@ mod private {
         fn read(
             &self,
             _file: &File,
-            _length: usize,
+            _output: &mut dyn ReadBuffer,
             _offset: Option<u64>,
-            _copy_from: &mut CopyFromFn<'_>,
         ) -> ServiceResult<usize> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -129,9 +129,8 @@ mod private {
         fn write(
             &self,
             _file: &File,
-            _length: usize,
+            _input: &dyn WriteBuffer,
             _offset: Option<u64>,
-            _copy_to: &mut CopyToFn<'_>,
         ) -> ServiceResult<usize> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -242,28 +241,26 @@ where
         }))
     }
 
-    /// Checks that the backend passed exactly the bytes it reports reading, and
-    /// none if it failed.
+    /// Checks that the backend copied exactly the bytes it reports reading,
+    /// and none if it failed.
     fn read(
         &self,
         file: &File,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         offset: Option<u64>,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> ServiceResult<usize> {
-        let Ok(offset) = checked_offset(offset, length) else {
+        let Ok(offset) = checked_offset(offset, output.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
-        let mut copied = CopyCount::new(length);
-        let counted = &mut |part: &[u8]| copied.count(part.len(), || copy_from(part));
+        let mut output = CopyCount::new(output);
         let read = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.read_without_position_update(&entry, length, offset, counted)
+            self.read_without_position_update(&entry, &mut output, offset)
                 .map(|(read, _)| read)
         } else {
             drop(entry);
@@ -271,40 +268,43 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::read(self, &mut entry, length, offset, counted)
+            Resolver::read(self, &mut entry, &mut output, offset)
         };
-        let copied = copied.finish()?;
-        match read {
-            Ok(read) if read == copied => Ok(Ok(read)),
-            Err(error) if copied == 0 => read_failure(error, nonblocking),
-            _ => Err(BrokerError::Internal),
+        let copied = output.finish()?;
+        let read = match read {
+            Ok(read) => read,
+            Err(_) if copied != 0 => return Err(BrokerError::Internal),
+            Err(ReadError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
+            Err(ReadError::Broker(error)) => return Err(error),
+            Err(error) => return Ok(Err(file_read_error(error))),
+        };
+        if read != copied {
+            return Err(BrokerError::Internal);
         }
+        Ok(Ok(read))
     }
 
-    /// Checks that the backend reports writing no more than requested, and
-    /// passed no more room than that. What it passed may differ from what it
-    /// reports writing: a short write keeps less than it filled, and
-    /// `/dev/null` discards what it is written without passing room.
+    /// Checks that the backend reports writing no more than requested. It may
+    /// copy more than it reports writing, as a short write does, or less, as
+    /// `/dev/null` does.
     fn write(
         &self,
         file: &File,
-        length: usize,
+        input: &dyn WriteBuffer,
         offset: Option<u64>,
-        copy_to: &mut CopyToFn<'_>,
     ) -> ServiceResult<usize> {
-        let Ok(offset) = checked_offset(offset, length) else {
+        let Ok(offset) = checked_offset(offset, input.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
-        let mut copied = CopyCount::new(length);
-        let counted = &mut |part: &mut [u8]| copied.count(part.len(), || copy_to(part));
+        let counted = CopyCount::new(input);
         let written = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.write_without_position_update(&entry, length, offset, counted)
+            self.write_without_position_update(&entry, &counted, offset)
                 .map(|(written, _)| written)
         } else {
             drop(entry);
@@ -312,14 +312,19 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::write(self, &mut entry, length, offset, counted)
+            Resolver::write(self, &mut entry, &counted, offset)
         };
-        copied.finish()?;
-        match written {
-            Ok(written) if written <= length => Ok(Ok(written)),
-            Ok(_) => Err(BrokerError::Internal),
-            Err(error) => write_failure(error, nonblocking),
+        counted.finish()?;
+        let written = match written {
+            Ok(written) => written,
+            Err(WriteError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
+            Err(WriteError::Broker(error)) => return Err(error),
+            Err(error) => return Ok(Err(file_write_error(error))),
+        };
+        if written > input.len() {
+            return Err(BrokerError::Internal);
         }
+        Ok(Ok(written))
     }
 
     fn seek(&self, file: &File, offset: i64, whence: FileSeekWhence) -> ServiceResult<u64> {
@@ -544,46 +549,38 @@ pub(crate) fn open_without_reference(
     Ok(Ok((file, status)))
 }
 
-/// Reads up to `length` bytes from a broker-owned open file, passing them to `copy_from` (see
-/// [`crate::transfer`]).
+/// Reads bytes from a broker-owned open file.
 ///
 /// Fails with [`BrokerError::WouldBlock`] while a file that publishes readiness has nothing to
 /// read, or with [`BrokerError::NonBlockingWouldBlock`] if the file is also non-blocking.
 pub fn read(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    length: usize,
+    output: &mut dyn ReadBuffer,
     offset: Option<u64>,
-    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<FileResult<usize>> {
-    if length > MAX_FILE_TRANSFER_SIZE as usize {
+    if output.len() > MAX_FILE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.core.fs.read(&file, length, offset, copy_from)
+    process.core.fs.read(&file, output, offset)
 }
 
-/// Writes up to `length` bytes to a broker-owned open file, passing the room for them to
-/// `copy_to` (see [`crate::transfer`]).
+/// Writes bytes to a broker-owned open file.
 ///
 /// Fails with [`BrokerError::WouldBlock`] while a file that publishes readiness cannot accept
 /// bytes, or with [`BrokerError::NonBlockingWouldBlock`] if the file is also non-blocking.
 pub fn write(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    length: usize,
+    input: &dyn WriteBuffer,
     offset: Option<u64>,
-    copy_to: &mut CopyToFn<'_>,
 ) -> Result<FileResult<usize>> {
-    if length > MAX_FILE_TRANSFER_SIZE as usize {
+    if input.len() > MAX_FILE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    process.core.fs.write(
-        &file(process, handle, ObjectRights::WRITE)?,
-        length,
-        offset,
-        copy_to,
-    )
+    let file = file(process, handle, ObjectRights::WRITE)?;
+    process.core.fs.write(&file, input, offset)
 }
 
 /// Repositions the shared offset of a broker-owned open file.
@@ -876,24 +873,24 @@ fn file_open_error(error: OpenError) -> FileError {
     }
 }
 
-fn read_failure<T>(error: ReadError, nonblocking: bool) -> ServiceResult<T> {
-    Ok(Err(match error {
-        ReadError::WouldBlock => return Err(BrokerError::would_block(nonblocking)),
-        ReadError::Broker(error) => return Err(error),
+fn file_read_error(error: ReadError) -> FileError {
+    match error {
         ReadError::NotAFile => FileError::NotFile,
         ReadError::NotForReading => FileError::NotForReading,
-        ReadError::ClosedFd | ReadError::Io => FileError::Io,
-    }))
+        ReadError::ClosedFd | ReadError::Io | ReadError::WouldBlock | ReadError::Broker(_) => {
+            FileError::Io
+        }
+    }
 }
 
-fn write_failure<T>(error: WriteError, nonblocking: bool) -> ServiceResult<T> {
-    Ok(Err(match error {
-        WriteError::WouldBlock => return Err(BrokerError::would_block(nonblocking)),
-        WriteError::Broker(error) => return Err(error),
+fn file_write_error(error: WriteError) -> FileError {
+    match error {
         WriteError::NotAFile => FileError::NotFile,
         WriteError::NotForWriting => FileError::NotForWriting,
-        WriteError::ClosedFd | WriteError::Io => FileError::Io,
-    }))
+        WriteError::ClosedFd | WriteError::Io | WriteError::WouldBlock | WriteError::Broker(_) => {
+            FileError::Io
+        }
+    }
 }
 
 fn file_seek_error(error: SeekError) -> FileError {
@@ -989,12 +986,13 @@ mod tests {
     use crate::random::TestRandomProvider;
     use crate::stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream};
     use crate::test_platform::TestPlatform;
-    use crate::transfer::{copy_from_slice, copy_to_slice};
+    use crate::test_support::FaultingBuffer;
     use core::num::NonZeroU64;
     use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
+    use litebox_platform::buffer::Fault;
 
-    /// Standard streams that pass `copied` bytes, or bytes of room, ignoring
-    /// whether that fails, and report `reported`.
+    /// Standard streams that copy `copied` bytes, ignoring whether that
+    /// faults, and report `reported`.
     struct MisreportingStdio {
         copied: usize,
         reported: core::result::Result<usize, StdioProviderError>,
@@ -1003,20 +1001,18 @@ mod tests {
     impl StdioProvider for MisreportingStdio {
         fn read(
             &self,
-            _length: usize,
-            copy_from: &mut CopyFromFn<'_>,
+            output: &mut dyn ReadBuffer,
         ) -> core::result::Result<usize, StdioProviderError> {
-            let _ = copy_from(&[b'x'; 8][..self.copied]);
+            let _ = output.copy_from_slice_at(0, &[b'x'; 8][..self.copied]);
             self.reported
         }
 
         fn write(
             &self,
             _stream: StdioOutputStream,
-            _length: usize,
-            copy_to: &mut CopyToFn<'_>,
+            input: &dyn WriteBuffer,
         ) -> core::result::Result<usize, StdioProviderError> {
-            let _ = copy_to(&mut [0; 8][..self.copied]);
+            let _ = input.copy_to_slice_at(0, &mut [0; 8][..self.copied]);
             self.reported
         }
 
@@ -1060,95 +1056,62 @@ mod tests {
     fn read_misreporting(
         copied: usize,
         reported: core::result::Result<usize, StdioProviderError>,
-        length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        output: &mut dyn ReadBuffer,
     ) -> ServiceResult<usize> {
         let (fs, stdin) =
             misreporting_device(copied, reported, "/dev/stdin", FileAccessMode::ReadOnly);
-        private::Service::read(&fs, &stdin, length, None, copy_from)
+        private::Service::read(&fs, &stdin, output, None)
     }
 
     fn write_misreporting(
         copied: usize,
         reported: core::result::Result<usize, StdioProviderError>,
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        input: &dyn WriteBuffer,
     ) -> ServiceResult<usize> {
         let (fs, stdout) =
             misreporting_device(copied, reported, "/dev/stdout", FileAccessMode::WriteOnly);
-        private::Service::write(&fs, &stdout, length, None, copy_to)
+        private::Service::write(&fs, &stdout, input, None)
     }
 
-    /// A read must pass exactly the bytes it reports reading, and none if it
-    /// fails, and fails with its `CopyFromFn`'s failure even if the backend
-    /// swallowed it.
+    /// A read must copy exactly the bytes it reports reading, and none if it
+    /// fails, and fails if copying faults even if the backend ignores that.
     #[test]
     fn reads_report_what_they_copy() {
         let mut buffer = [0; 4];
-        assert_eq!(
-            read_misreporting(2, Ok(2), 4, &mut copy_to_slice(&mut buffer)),
-            Ok(Ok(2))
-        );
+        assert_eq!(read_misreporting(2, Ok(2), &mut buffer), Ok(Ok(2)));
         assert_eq!(&buffer[..2], b"xx");
-
-        let mut buffer = [0; 8];
-        for (copied, reported, length) in [(2, Ok(3), 4), (2, Ok(1), 4), (4, Ok(4), 2)] {
+        for reported in [Ok(3), Ok(1), Err(StdioProviderError::Failed)] {
             assert_eq!(
-                read_misreporting(copied, reported, length, &mut copy_to_slice(&mut buffer)),
+                read_misreporting(2, reported, &mut [0; 4]),
                 Err(BrokerError::Internal)
             );
         }
         assert_eq!(
-            read_misreporting(
-                2,
-                Err(StdioProviderError::Failed),
-                4,
-                &mut copy_to_slice(&mut buffer)
-            ),
-            Err(BrokerError::Internal)
-        );
-        assert_eq!(
-            read_misreporting(
-                0,
-                Err(StdioProviderError::Failed),
-                4,
-                &mut copy_to_slice(&mut buffer)
-            ),
+            read_misreporting(0, Err(StdioProviderError::Failed), &mut [0; 4]),
             Ok(Err(FileError::Io))
         );
         assert_eq!(
-            read_misreporting(2, Ok(2), 4, &mut |_| Err(BrokerError::OutOfMemory)),
-            Err(BrokerError::OutOfMemory)
+            read_misreporting(2, Ok(2), &mut FaultingBuffer::new(4, 0)),
+            Err(Fault.into())
         );
     }
 
-    /// A write may pass more room than it reports writing, as a short write
-    /// does, or less, as `/dev/null` does, but no more than requested, and
-    /// fails with its `CopyToFn`'s failure even if the backend swallowed it.
+    /// A write may copy more than it reports writing, as a short write does,
+    /// or less, as `/dev/null` does, but must not report more than requested,
+    /// and fails if copying faults even if the backend ignores that.
     #[test]
-    fn writes_copy_no_more_than_requested() {
-        let source = [b'y'; 8];
+    fn writes_report_no_more_than_requested() {
+        let input = [b'y'; 4];
+        assert_eq!(write_misreporting(4, Ok(4), &input), Ok(Ok(4)));
+        assert_eq!(write_misreporting(4, Ok(2), &input), Ok(Ok(2)));
+        assert_eq!(write_misreporting(0, Ok(4), &input), Ok(Ok(4)));
         assert_eq!(
-            write_misreporting(4, Ok(4), 4, &mut copy_from_slice(&source)),
-            Ok(Ok(4))
+            write_misreporting(4, Ok(5), &input),
+            Err(BrokerError::Internal)
         );
         assert_eq!(
-            write_misreporting(4, Ok(2), 4, &mut copy_from_slice(&source)),
-            Ok(Ok(2))
-        );
-        assert_eq!(
-            write_misreporting(0, Ok(4), 4, &mut copy_from_slice(&source)),
-            Ok(Ok(4))
-        );
-        for (copied, reported, length) in [(4, Ok(5), 4), (4, Ok(2), 2)] {
-            assert_eq!(
-                write_misreporting(copied, reported, length, &mut copy_from_slice(&source)),
-                Err(BrokerError::Internal)
-            );
-        }
-        assert_eq!(
-            write_misreporting(4, Ok(4), 4, &mut |_| Err(BrokerError::OutOfMemory)),
-            Err(BrokerError::OutOfMemory)
+            write_misreporting(4, Ok(4), &FaultingBuffer::new(4, 0)),
+            Err(Fault.into())
         );
     }
 

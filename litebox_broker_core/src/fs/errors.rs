@@ -3,6 +3,7 @@
 
 //! Possible errors from the broker-core filesystem engine.
 
+use litebox_platform::buffer::Fault;
 use thiserror::Error;
 
 use crate::BrokerError;
@@ -42,10 +43,16 @@ pub enum ReadError {
     Io,
     #[error("no data is available yet")]
     WouldBlock,
-    /// The broker failed the read itself, such as when the `CopyFromFn` it passed
-    /// bytes to failed (see [`crate::transfer`]) or it ran out of memory.
+    /// The broker failed the read itself, such as when copying into the
+    /// caller's buffer faulted or it ran out of memory.
     #[error(transparent)]
     Broker(#[from] BrokerError),
+}
+
+impl From<Fault> for ReadError {
+    fn from(fault: Fault) -> Self {
+        Self::Broker(fault.into())
+    }
 }
 
 /// Possible errors from [`super::resolver::Resolver::write`]
@@ -61,10 +68,16 @@ pub enum WriteError {
     Io,
     #[error("no space is available yet")]
     WouldBlock,
-    /// The broker failed the write itself, such as when the `CopyToFn` it passed
-    /// room to failed (see [`crate::transfer`]) or it ran out of memory.
+    /// The broker failed the write itself, such as when copying from the
+    /// caller's buffer faulted or it ran out of memory.
     #[error(transparent)]
     Broker(#[from] BrokerError),
+}
+
+impl From<Fault> for WriteError {
+    fn from(fault: Fault) -> Self {
+        Self::Broker(fault.into())
+    }
 }
 
 /// Possible errors from [`super::resolver::Resolver::seek`]

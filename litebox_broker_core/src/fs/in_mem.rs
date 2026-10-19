@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
 use super::errors::{
@@ -16,7 +17,6 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
-use crate::transfer::{CopyFromFn, CopyToFn};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
 ///
@@ -389,37 +389,37 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     fn read(
         &self,
         h: &super::backend::FileHandle,
-        length: usize,
+        buf: &mut dyn ReadBuffer,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
         let start = offset.min(file.data.len());
-        let end = offset.checked_add(length).unwrap().min(file.data.len());
+        let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
         debug_assert!(start <= end);
-        copy_from(&file.data[start..end])?;
-        Ok(end - start)
+        let len = end - start;
+        buf.copy_from_slice_at(0, &file.data[start..end])?;
+        Ok(len)
     }
 
     fn write(
         &self,
         h: &super::backend::FileHandle,
-        length: usize,
+        buf: &dyn WriteBuffer,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
-        let mut file_data = h.get_typed::<Self>().file.write();
-        let data = file_data.data.to_mut();
+        let mut file = h.get_typed::<Self>().file.write();
+        let data = file.data.to_mut();
         let previous_len = data.len();
-        let end = offset.checked_add(length).unwrap();
+        let end = offset.checked_add(buf.len()).unwrap();
         if end > previous_len {
+            // Pads with 0s if the offset is past the end of the file.
             data.resize(end, 0);
         }
-        if let Err(error) = copy_to(&mut data[offset..end]) {
+        if let Err(fault) = buf.copy_to_slice_at(0, &mut data[offset..end]) {
             data.truncate(previous_len);
-            return Err(error.into());
+            return Err(fault.into());
         }
-        Ok(length)
+        Ok(buf.len())
     }
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {

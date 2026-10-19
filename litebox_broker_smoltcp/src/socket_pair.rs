@@ -7,11 +7,9 @@
 //! the accepted socket's (queued at its listener until accepted).
 
 use alloc::collections::VecDeque;
-use alloc::vec::Vec;
-use litebox_broker_core::transfer::{
-    CopyFromFn, CopyToFn, append_to_queue, copy_from_queue, take_from_queue,
-};
+use litebox_broker_core::transfer::{append_to_queue, copy_from_queue};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::Sockets;
 
@@ -103,33 +101,31 @@ impl Sockets {
         self.pairs.get_mut(&id).ok_or(BrokerError::Internal)
     }
 
-    /// Writes as much of `length` bytes as `end`'s side of the connection,
-    /// and the stack's memory budget, have room for, passing the room to
-    /// `copy_to` (see [`litebox_broker_core::transfer`]); returns how much.
+    /// Writes as much of `data` as `end`'s side of the connection, and the
+    /// stack's memory budget, have room for; returns how much.
     pub(super) fn write_pair(
         &mut self,
         id: u64,
         end: usize,
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        data: &dyn WriteBuffer,
     ) -> BrokerResult<usize> {
         let room = self.room();
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[end];
         let before = queue.capacity();
         let spare = before - queue.len();
-        let len = length.min(CAPACITY - queue.len()).min(spare + room);
+        let len = data.len().min(CAPACITY - queue.len()).min(spare + room);
         queue
             .try_reserve_exact(len)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        let written = append_to_queue(queue, len, copy_to);
+        let written = append_to_queue(queue, len, data);
         account(&mut self.queued, queue, before);
         written.map(|()| len)
     }
 
-    /// Passes `copy_from` what `end` reads from `start` to `stop` (of what it can
-    /// read; see [`litebox_broker_core::transfer`]), and takes it unless
-    /// `peek`, in which case `start` may be past the beginning.
+    /// Copies what `end` reads from `start` to `stop` (of what it can read)
+    /// into `output`, and takes it unless `peek`, in which case `start` may be
+    /// past the beginning.
     pub(super) fn read_pair(
         &mut self,
         id: u64,
@@ -137,26 +133,17 @@ impl Sockets {
         start: usize,
         stop: usize,
         peek: bool,
-        copy_from: &mut CopyFromFn<'_>,
+        output: &mut dyn ReadBuffer,
     ) -> BrokerResult<()> {
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[1 - end];
-        if peek {
-            copy_from_queue(queue, start..stop, copy_from)
-        } else {
+        copy_from_queue(queue, start..stop, output)?;
+        if !peek {
             let before = queue.capacity();
-            take_from_queue(queue, stop, copy_from)?;
+            queue.drain(..stop);
             account(&mut self.queued, queue, before);
-            Ok(())
         }
-    }
-
-    /// Takes all `end` can read.
-    pub(super) fn take_pair(&mut self, id: u64, end: usize) -> BrokerResult<Vec<u8>> {
-        let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
-        let queue = core::mem::take(&mut pair.data[1 - end]);
-        self.queued -= queue.capacity();
-        Ok(Vec::from(queue))
+        Ok(())
     }
 
     /// Discards what `end` can read; returns how much it was.

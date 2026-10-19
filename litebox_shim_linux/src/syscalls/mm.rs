@@ -6,7 +6,6 @@
 //!
 //! Runtime ELF syscall patching of file mappings lives in [`crate::loader::patch`].
 
-use litebox::buffer::ReadBuffer as _;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
@@ -15,6 +14,7 @@ use litebox_common_linux::{
     mm::MmapPlacement,
     vmem::{MappingError, VmemProtectError},
 };
+use litebox_platform::buffer::Buffer as _;
 
 use crate::ShimPlatform;
 use crate::Task;
@@ -119,7 +119,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let size = self
                     .do_read(
                         fd,
-                        buffer.sub_buffer(copied, len - copied),
+                        (&mut buffer).sub_buffer(copied, len - copied),
                         Some(offset + copied),
                     )
                     .map_err(|e| match e {

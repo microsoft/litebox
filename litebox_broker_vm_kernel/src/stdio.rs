@@ -11,8 +11,9 @@ use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessWatchers};
 use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
+use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::Mutex;
 
 /// A byte-stream device behind the standard streams.
@@ -58,17 +59,13 @@ impl ConsoleStdio {
 }
 
 impl StdioProvider for ConsoleStdio {
-    fn read(
-        &self,
-        length: usize,
-        copy_from: &mut CopyFromFn<'_>,
-    ) -> Result<usize, StdioProviderError> {
-        let mut output = bounce_buffer(length)?;
-        match self.console.read(&mut output) {
+    fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize, StdioProviderError> {
+        let mut staged = bounce_buffer(output.len())?;
+        match self.console.read(&mut staged) {
             None => Ok(0),
             Some(0) => Err(StdioProviderError::WouldBlock),
             Some(read) => {
-                copy_from(output.get(..read).ok_or(BrokerError::Internal)?)?;
+                output.copy_from_slice_at(0, staged.get(..read).ok_or(BrokerError::Internal)?)?;
                 Ok(read)
             }
         }
@@ -77,12 +74,11 @@ impl StdioProvider for ConsoleStdio {
     fn write(
         &self,
         stream: StdioOutputStream,
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        input: &dyn WriteBuffer,
     ) -> Result<usize, StdioProviderError> {
-        let mut input = bounce_buffer(length)?;
-        copy_to(&mut input)?;
-        match self.console.write(stream, &input) {
+        let mut staged = bounce_buffer(input.len())?;
+        input.copy_to_slice_at(0, &mut staged)?;
+        match self.console.write(stream, &staged) {
             0 => Err(StdioProviderError::WouldBlock),
             written => Ok(written),
         }

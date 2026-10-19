@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Test-only helpers for broker-local associations.
+//! Test-only construction helpers for active broker-local associations.
 
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::{ProcessId, ThreadId};
 use litebox_broker_transport::channel::LocalCallChannel;
-use litebox_broker_transport::shared_memory::{AsSharedBytes, SharedBytes};
+use litebox_broker_transport::shared_memory::SharedMemory;
 
 use crate::BrokerLocal;
 
@@ -23,7 +23,7 @@ const TEST_THREAD_ID: ThreadId = ThreadId(2);
 /// Panics if `shared_memory` does not have the broker protocol's required size.
 pub fn test_broker_local<Channel>(
     channel: Channel,
-    shared_memory: Arc<dyn AsSharedBytes>,
+    shared_memory: Arc<dyn SharedMemory>,
 ) -> BrokerLocal<Channel>
 where
     Channel: LocalCallChannel,
@@ -42,42 +42,10 @@ where
 pub fn test_broker_local_with_process_id<Channel>(
     channel: Channel,
     process_id: ProcessId,
-    shared_memory: Arc<dyn AsSharedBytes>,
+    shared_memory: Arc<dyn SharedMemory>,
 ) -> BrokerLocal<Channel>
 where
     Channel: LocalCallChannel,
 {
     BrokerLocal::new(channel, process_id, TEST_THREAD_ID, shared_memory)
-}
-
-/// Returns a [`CopyFromFn`](crate::CopyFromFn) that copies the parts it is
-/// passed, one after another, into `destination`.
-///
-/// # Panics
-///
-/// The closure panics if the parts overflow `destination`.
-pub fn copy_to_slice(destination: &mut [u8]) -> impl FnMut(SharedBytes<'_>) -> Option<()> + '_ {
-    let mut offset = 0;
-    move |part| {
-        let end = offset + part.len();
-        part.copy_to_slice(&mut destination[offset..end]);
-        offset = end;
-        Some(())
-    }
-}
-
-/// Returns a [`CopyToFn`](crate::CopyToFn) that fills the parts it is passed,
-/// one after another, from `source`.
-///
-/// # Panics
-///
-/// The closure panics if the parts overflow `source`.
-pub fn copy_from_slice(source: &[u8]) -> impl FnMut(SharedBytes<'_>) -> Option<()> + '_ {
-    let mut offset = 0;
-    move |part| {
-        let end = offset + part.len();
-        part.copy_from_slice(&source[offset..end]);
-        offset = end;
-        Some(())
-    }
 }

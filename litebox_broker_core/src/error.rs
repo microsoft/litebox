@@ -4,6 +4,7 @@
 use thiserror::Error;
 
 use litebox_broker_protocol::error::ErrorCode;
+use litebox_platform::buffer::Fault;
 
 /// Broker authority error category.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
@@ -44,6 +45,13 @@ impl BrokerError {
         } else {
             Self::WouldBlock
         }
+    }
+}
+
+/// A copy to or from a caller's buffer faulted, which fails the operation.
+impl From<Fault> for BrokerError {
+    fn from(Fault: Fault) -> Self {
+        Self::Internal
     }
 }
 

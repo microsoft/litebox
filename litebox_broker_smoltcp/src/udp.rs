@@ -21,7 +21,6 @@ use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, PlatformDatagramReceive,
     PlatformSocketStatus, is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -29,6 +28,7 @@ use litebox_broker_protocol::socket::{
     MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, ShutdownMode, SocketConnectionStatus, SocketError,
     SocketOutcome,
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata, UdpMetadata};
 use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
@@ -171,32 +171,31 @@ impl Udp {
                     && bytes_from_process + len <= MAX_RECEIVED_BYTES_FROM_PROCESS)
     }
 
-    /// Queues a datagram of `length` bytes from `copy_to`, if the socket takes
-    /// it (see the module's docs), and the stack's memory budget has room.
+    /// Queues `data`, if the socket takes it (see the module's docs), and
+    /// the stack's memory budget has room.
     fn deliver(
         &mut self,
         sockets: &mut Sockets,
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        data: &dyn WriteBuffer,
         source: SocketAddrV4,
         process: Option<ProcessId>,
     ) -> BrokerResult<()> {
         let wanted = !self.read_shutdown
             && self.peer.is_none_or(|peer| peer == source)
-            && self.has_room(length, process)
-            && length <= sockets.room();
+            && self.has_room(data.len(), process)
+            && data.len() <= sockets.room();
         if !wanted {
             return Ok(());
         }
-        let mut data = bounce_buffer(length)?;
-        copy_to(&mut data)?;
+        let mut copy = zeroed(data.len())?;
+        data.copy_to_slice_at(0, &mut copy)?;
         self.received
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        sockets.queued += data.len();
-        self.received_bytes += data.len();
+        sockets.queued += copy.len();
+        self.received_bytes += copy.len();
         self.received.push_back(Datagram {
-            data,
+            data: copy,
             source,
             process,
         });
@@ -282,30 +281,30 @@ impl Udp {
     fn send_external(
         &mut self,
         sockets: &mut Sockets,
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        data: &dyn WriteBuffer,
         source: SocketAddrV4,
         destination: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let handle = self.external.ok_or(BrokerError::Internal)?;
-        if length > MAX_EXTERNAL_DATAGRAM {
+        if data.len() > MAX_EXTERNAL_DATAGRAM {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         let mut meta = UdpMetadata::from(IpEndpoint::from(destination));
         meta.local_address = Some((*source.ip()).into());
         // Unlike `send_with`, `send` queues a datagram only once it has room
         // for its metadata too.
-        match sockets.udp(handle).send(length, meta) {
+        match sockets.udp(handle).send(data.len(), meta) {
             Ok(datagram) => {
                 self.blocked = None;
-                // smoltcp sends the datagram whatever happens; one whose
-                // filling failed goes out zeroed rather than with stale bytes.
-                copy_to(datagram).inspect_err(|_| datagram.fill(0))?;
-                Ok(SocketOutcome::Completed(length))
+                // smoltcp sends the datagram whatever happens; one whose copy
+                // faulted goes out zeroed rather than with stale bytes.
+                data.copy_to_slice_at(0, datagram)
+                    .inspect_err(|_| datagram.fill(0))?;
+                Ok(SocketOutcome::Completed(data.len()))
             }
             Err(udp::SendError::BufferFull) => {
                 // Writable again once it fits, which publishes the change.
-                self.blocked = Some(length);
+                self.blocked = Some(data.len());
                 Err(BrokerError::WouldBlock)
             }
             Err(udp::SendError::Unaddressable) => {
@@ -322,16 +321,15 @@ impl Udp {
     pub(super) fn receive_from(
         &mut self,
         sockets: &mut Sockets,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFromFlags,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         if let Some(error) = self.pending_error.take() {
             return Ok(SocketOutcome::Failed(error));
         }
         let datagram = self.received.front().ok_or(BrokerError::WouldBlock)?;
-        let received = datagram.data.len().min(length);
-        copy_from(&datagram.data[..received])?;
+        let received = datagram.data.len().min(output.len());
+        output.copy_from_slice_at(0, &datagram.data[..received])?;
         let received = PlatformDatagramReceive {
             received,
             datagram_length: datagram.data.len(),
@@ -510,9 +508,8 @@ impl Stack {
     pub(super) fn send_udp(
         &mut self,
         id: u64,
-        length: usize,
+        data: &dyn WriteBuffer,
         destination: Option<SocketAddrV4>,
-        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let process = self.entries.get(&id).ok_or(BrokerError::Internal)?.process;
         let udp = self.udp_entry(id)?;
@@ -542,7 +539,7 @@ impl Stack {
             else {
                 return Err(BrokerError::Internal);
             };
-            return udp.send_external(&mut self.sockets, length, copy_to, source, destination);
+            return udp.send_external(&mut self.sockets, data, source, destination);
         }
         let Some(receiver) = self.udp_bound_to(destination) else {
             return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
@@ -554,7 +551,7 @@ impl Stack {
         else {
             return Err(BrokerError::Internal);
         };
-        receiver.deliver(&mut self.sockets, length, copy_to, source, Some(process))?;
-        Ok(SocketOutcome::Completed(length))
+        receiver.deliver(&mut self.sockets, data, source, Some(process))?;
+        Ok(SocketOutcome::Completed(data.len()))
     }
 }

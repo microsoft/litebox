@@ -26,10 +26,10 @@ use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
+use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
 use crate::BrokerError;
-use crate::transfer::{CopyFromFn, CopyToFn};
 
 mod client;
 mod fcall;
@@ -450,27 +450,25 @@ where
     fn read(
         &self,
         h: &FileHandle,
-        length: usize,
+        buf: &mut dyn ReadBuffer,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
         Ok(self
             .client
-            .read(&h.get_typed::<Self>().fid.fid, offset, length, copy_from)?)
+            .read(&h.get_typed::<Self>().fid.fid, offset, buf)?)
     }
 
     fn write(
         &self,
         h: &FileHandle,
-        length: usize,
+        buf: &dyn WriteBuffer,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         Ok(self
             .client
-            .write(&h.get_typed::<Self>().fid.fid, offset, length, copy_to)?)
+            .write(&h.get_typed::<Self>().fid.fid, offset, buf)?)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
@@ -800,10 +798,16 @@ pub enum Error {
     #[error("Remote error (errno={0})")]
     Remote(u32),
 
-    /// The broker failed the operation itself, such as when the `CopyFromFn` or
-    /// `CopyToFn` it passed data to failed
+    /// The broker failed the operation itself, such as when copying to or from
+    /// the caller's buffer faulted or it ran out of memory
     #[error(transparent)]
     Broker(#[from] BrokerError),
+}
+
+impl From<Fault> for Error {
+    fn from(fault: Fault) -> Self {
+        Self::Broker(fault.into())
+    }
 }
 
 impl From<Error> for OpenError {

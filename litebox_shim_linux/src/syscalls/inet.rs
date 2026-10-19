@@ -13,7 +13,6 @@ use core::{
 };
 
 use litebox::{
-    buffer::{ReadBuffer, WriteBuffer},
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -37,6 +36,7 @@ use litebox_common_linux::{
     AddressFamily, IPProtocol, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
     SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
 };
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{
@@ -476,7 +476,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             Events::IN,
             || self.receive_timeout(),
             || loop {
-                let mut destination = buf.sub_buffer(received, target_len - received);
+                let mut destination = (&mut buf).sub_buffer(received, target_len - received);
                 match self.socket.try_read(
                     &mut destination,
                     receive_flags,

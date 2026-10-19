@@ -48,10 +48,9 @@ use litebox_broker_transport::control_ring::{
 use litebox_broker_transport::control_ring::{
     memory_permits_byte_range, memory_permits_u32, memory_permits_u64,
 };
-use litebox_broker_transport::peer_memory;
-use litebox_broker_transport::shared_memory::{
-    AsSharedBytes, ControlRingMemory, SharedBytes, SharedMemory, SharedMemoryError,
-};
+use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
+use litebox_platform::buffer::RawBytes;
+use litebox_platform::peer_memory;
 
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
@@ -376,27 +375,14 @@ impl SharedMemory for MemfdSharedMemory {
         unsafe { peer_memory::copy_to_peer(source, destination) };
         Ok(())
     }
-}
 
-impl AsSharedBytes for MemfdSharedMemory {
-    fn shared_bytes(
-        &self,
-        offset: usize,
-        length: usize,
-    ) -> Result<SharedBytes<'_>, SharedMemoryError> {
-        let address = shared_address(&self.mapping, offset, length, 1)?;
-        if !self.policy.permits_byte_range(offset, length) {
-            return Err(SharedMemoryError::InvalidRange);
+    fn raw_bytes(&self) -> Option<RawBytes<'_>> {
+        if self.policy != MemoryAccessPolicy::Bytes {
+            return None;
         }
-        // SAFETY: The range lies within the mapping, which lives as long as
-        // `self`, cannot be truncated because the memfd is sealed, and is
-        // never referenced.
-        Ok(unsafe {
-            SharedBytes::from_raw_parts(
-                NonNull::new(address).expect("a mapping is never at address zero"),
-                length,
-            )
-        })
+        // SAFETY: The mapping lives as long as `self`, cannot be truncated
+        // because the memfd is sealed, and is never referenced.
+        Some(unsafe { RawBytes::from_raw_parts(self.mapping.address, self.mapping.length) })
     }
 }
 

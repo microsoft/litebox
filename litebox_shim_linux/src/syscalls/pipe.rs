@@ -11,7 +11,6 @@ use alloc::sync::{Arc, Weak};
 use core::num::NonZero;
 
 use litebox::{
-    buffer::{ReadBuffer, WriteBuffer},
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     pipes::{self, HalfPipeType},
@@ -21,6 +20,7 @@ use litebox_broker_protocol::{
     fs::{FileMode as Mode, FileOpenFlags},
 };
 use litebox_common_linux::{InodeType, OFlags, errno::Errno};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::file::{linux_status_flags, status_flags_change};
 use crate::{GlobalState, ShimPlatform};

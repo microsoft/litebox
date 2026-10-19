@@ -5,32 +5,37 @@ use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_transport::channel::LocalCallChannel;
+use litebox_platform::buffer::ReadBuffer;
 
-use crate::{BrokerLocal, BrokerLocalError, CopyFromFn, Result};
+use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Fills an operation-scoped shared-buffer lease from a broker-provided
-    /// random source, and passes its bytes to `copy_from`.
+    /// Fills `output` from a broker-provided random source.
     ///
     /// # Panics
     ///
-    /// Panics if the sequence is invalid or exceeds the transfer limit, or if
-    /// the broker returns a response for a different operation.
+    /// Panics if `output` does not match the shared-buffer sequence or the
+    /// broker returns a response for a different operation.
     pub fn fill_random(
         &self,
         buffer: SharedBufferSequence,
-        copy_from: &mut CopyFromFn<'_>,
+        output: &mut dyn ReadBuffer,
     ) -> Result<(), Channel::Error> {
         assert!(
             buffer.length() <= MAX_RANDOM_TRANSFER_SIZE,
             "shared random sequence exceeds the transfer limit"
+        );
+        assert_eq!(
+            output.len(),
+            buffer.length() as usize,
+            "shared data must match its buffer sequence"
         );
         let _ = buffer
             .descriptors(self.shared_buffers.layout())
             .expect("shared buffer sequence must identify valid slot ranges");
         match self.request(BrokerOperation::FillRandom(buffer))? {
             BrokerResult::RandomFilled => {
-                self.copy_shared_buffer(buffer, 0, buffer.length() as usize, copy_from)
+                self.copy_from_shared_buffer(buffer, output.len(), output)
             }
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected random response: {response:?}"),

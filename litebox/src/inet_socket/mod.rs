@@ -30,12 +30,12 @@ use crate::{
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
-    buffer::{ReadBuffer, WriteBuffer},
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
     fs::errors::StatusFlagsError,
     process::ProcessError,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 pub mod errors;
 mod tcp;

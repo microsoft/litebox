@@ -2014,7 +2014,6 @@ mod tests {
     use crate::stdio::StdioOutputStream;
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
-    use crate::transfer::{copy_from_slice, copy_to_slice};
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -2185,10 +2184,7 @@ mod tests {
         }
         child.complete_start().unwrap();
 
-        assert_eq!(
-            crate::pipe::write_from(&child, child_writer, &[1, 2, 3]),
-            Ok(3)
-        );
+        assert_eq!(crate::pipe::write(&child, child_writer, &[1, 2, 3]), Ok(3));
         assert_eq!(
             take_republished(&parent_sink),
             [(reader, ReadinessFlags::READ)]
@@ -2198,7 +2194,7 @@ mod tests {
         // Freeing space that an atomic write still cannot use leaves `WRITE`
         // unchanged but must still wake writers.
         assert_eq!(
-            crate::pipe::write_from(&parent, writer, &[4, 5]),
+            crate::pipe::write(&parent, writer, &[4, 5]),
             Err(BrokerError::WouldBlock)
         );
         assert_eq!(
@@ -3689,10 +3685,7 @@ mod tests {
             .duplicate_object_reference_to(writer, &target, ObjectRights::WRITE)
             .unwrap();
         assert_eq!(source.close_object_reference(writer), Ok(()));
-        assert_eq!(
-            crate::pipe::write_from(&target, duplicated_writer, &[1]),
-            Ok(1)
-        );
+        assert_eq!(crate::pipe::write(&target, duplicated_writer, &[1]), Ok(1));
         assert_eq!(
             crate::pipe::read_to_vec(&source, reader, 1),
             Ok(std::vec::Vec::from([1]))
@@ -3734,16 +3727,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(
-            crate::fs::write(
-                &source,
-                file,
-                b"abcdef".len(),
-                None,
-                &mut copy_from_slice(b"abcdef")
-            ),
-            Ok(Ok(6))
-        );
+        assert_eq!(crate::fs::write(&source, file, b"abcdef", None), Ok(Ok(6)));
         assert_eq!(
             crate::fs::seek(&source, file, 0, FileSeekWhence::RelativeToBeginning),
             Ok(Ok(0))
@@ -3752,13 +3736,7 @@ mod tests {
         let event = crate::event::create(&source, 0, FileOpenFlags::NONE).unwrap();
         let mut byte = [0];
         assert_eq!(
-            crate::fs::read(
-                &source,
-                event,
-                byte.len(),
-                None,
-                &mut copy_to_slice(&mut byte)
-            ),
+            crate::fs::read(&source, event, &mut byte, None),
             Err(BrokerError::InvalidRights)
         );
         assert_eq!(
@@ -3788,16 +3766,7 @@ mod tests {
         );
 
         let mut first = [0; 2];
-        assert_eq!(
-            crate::fs::read(
-                &source,
-                file,
-                first.len(),
-                None,
-                &mut copy_to_slice(&mut first)
-            ),
-            Ok(Ok(2))
-        );
+        assert_eq!(crate::fs::read(&source, file, &mut first, None), Ok(Ok(2)));
         assert_eq!(&first, b"ab");
 
         let duplicate = source
@@ -3805,38 +3774,20 @@ mod tests {
             .unwrap();
         let mut second = [0; 2];
         assert_eq!(
-            crate::fs::read(
-                &target,
-                duplicate,
-                second.len(),
-                None,
-                &mut copy_to_slice(&mut second)
-            ),
+            crate::fs::read(&target, duplicate, &mut second, None),
             Ok(Ok(2))
         );
         assert_eq!(&second, b"cd");
 
         let mut explicit = [0; 2];
         assert_eq!(
-            crate::fs::read(
-                &source,
-                file,
-                explicit.len(),
-                Some(0),
-                &mut copy_to_slice(&mut explicit)
-            ),
+            crate::fs::read(&source, file, &mut explicit, Some(0)),
             Ok(Ok(2))
         );
         assert_eq!(&explicit, b"ab");
         let mut final_bytes = [0; 2];
         assert_eq!(
-            crate::fs::read(
-                &source,
-                file,
-                final_bytes.len(),
-                None,
-                &mut copy_to_slice(&mut final_bytes)
-            ),
+            crate::fs::read(&source, file, &mut final_bytes, None),
             Ok(Ok(2))
         );
         assert_eq!(&final_bytes, b"ef");
@@ -3852,13 +3803,7 @@ mod tests {
             Ok(Ok(0))
         );
         assert_eq!(
-            crate::fs::read(
-                &target,
-                duplicate,
-                byte.len(),
-                None,
-                &mut copy_to_slice(&mut byte)
-            ),
+            crate::fs::read(&target, duplicate, &mut byte, None),
             Ok(Ok(1))
         );
         assert_eq!(&byte, b"a");
@@ -3911,17 +3856,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let length = litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE as usize + 1;
-        let mut random_bytes = vec![0; length];
+        let mut random_bytes =
+            vec![0; litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE as usize + 1];
         assert_eq!(
-            crate::fs::read(
-                &source,
-                random,
-                length,
-                None,
-                &mut copy_to_slice(&mut random_bytes)
-            ),
-            Ok(Ok(length))
+            crate::fs::read(&source, random, &mut random_bytes, None),
+            Ok(Ok(random_bytes.len()))
         );
         assert!(random_bytes.iter().all(|byte| *byte == 0x5a));
         assert_eq!(source.close_object_reference(random), Ok(()));
@@ -3938,9 +3877,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker
-                .fs
-                .read(&write_only_random, 1, None, &mut copy_to_slice(&mut [0])),
+            broker.fs.read(&write_only_random, &mut [0], None),
             Ok(Err(FileError::NotForReading))
         );
 
@@ -3956,9 +3893,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker
-                .fs
-                .write(&read_only_null, 1, None, &mut copy_from_slice(&[0])),
+            broker.fs.write(&read_only_null, &[0], None),
             Ok(Err(FileError::NotForWriting))
         );
 
@@ -3977,23 +3912,11 @@ mod tests {
             .duplicate_object_reference_to(stdout, &target, ObjectRights::WRITE)
             .unwrap();
         assert_eq!(
-            crate::fs::write(
-                &source,
-                stdout,
-                b"source".len(),
-                None,
-                &mut copy_from_slice(b"source")
-            ),
+            crate::fs::write(&source, stdout, b"source", None),
             Ok(Ok(6))
         );
         assert_eq!(
-            crate::fs::write(
-                &target,
-                duplicated_stdout,
-                b"target".len(),
-                None,
-                &mut copy_from_slice(b"target")
-            ),
+            crate::fs::write(&target, duplicated_stdout, b"target", None),
             Ok(Ok(6))
         );
         assert_eq!(
@@ -4025,13 +3948,7 @@ mod tests {
             .register_readiness(&(target_sink.clone() as Arc<dyn ReadinessSink>))
             .unwrap();
         assert_eq!(
-            crate::fs::read(
-                &source,
-                stdin,
-                byte.len(),
-                None,
-                &mut copy_to_slice(&mut byte)
-            ),
+            crate::fs::read(&source, stdin, &mut byte, None),
             Err(BrokerError::WouldBlock)
         );
         assert_eq!(source.check_readiness(stdin), Ok(ReadinessFlags::default()));
@@ -4047,27 +3964,12 @@ mod tests {
             Ok(ReadinessFlags::READ)
         );
         assert_eq!(
-            crate::fs::read(
-                &target,
-                duplicated_stdin,
-                byte.len(),
-                None,
-                &mut copy_to_slice(&mut byte)
-            ),
+            crate::fs::read(&target, duplicated_stdin, &mut byte, None),
             Ok(Ok(1))
         );
         assert_eq!(&byte, b"x");
         stdio_provider.close_input();
-        assert_eq!(
-            crate::fs::read(
-                &source,
-                stdin,
-                byte.len(),
-                None,
-                &mut copy_to_slice(&mut byte)
-            ),
-            Ok(Ok(0))
-        );
+        assert_eq!(crate::fs::read(&source, stdin, &mut byte, None), Ok(Ok(0)));
         assert_eq!(source.close_object_reference(stdin), Ok(()));
         assert_eq!(target.close_object_reference(duplicated_stdin), Ok(()));
         assert!(sink.retired.lock().unwrap().contains(&stdin));
@@ -4231,17 +4133,17 @@ mod tests {
             crate::pipe::read_to_vec(&process, reader, 1),
             Err(BrokerError::WouldBlock)
         );
-        assert_eq!(crate::pipe::write_from(&process, writer, &[1, 2]), Ok(2));
-        assert_eq!(crate::pipe::write_from(&process, writer, &[3, 4, 5]), Ok(2));
+        assert_eq!(crate::pipe::write(&process, writer, &[1, 2]), Ok(2));
+        assert_eq!(crate::pipe::write(&process, writer, &[3, 4, 5]), Ok(2));
         assert_eq!(
-            crate::pipe::write_from(&process, writer, &[5]),
+            crate::pipe::write(&process, writer, &[5]),
             Err(BrokerError::WouldBlock)
         );
         assert_eq!(
             crate::pipe::read_to_vec(&process, reader, 3),
             Ok(std::vec::Vec::from([1, 2, 3]))
         );
-        assert_eq!(crate::pipe::write_from(&process, writer, &[5, 6]), Ok(2));
+        assert_eq!(crate::pipe::write(&process, writer, &[5, 6]), Ok(2));
         assert_eq!(process.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
@@ -4267,9 +4169,9 @@ mod tests {
         let (reader, writer) = crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(process.close_object_reference(reader), Ok(()));
-        assert_eq!(crate::pipe::write_from(&process, writer, &[]), Ok(0));
+        assert_eq!(crate::pipe::write(&process, writer, &[]), Ok(0));
         assert_eq!(
-            crate::pipe::write_from(&process, writer, &[1]),
+            crate::pipe::write(&process, writer, &[1]),
             Err(BrokerError::PeerClosed)
         );
         assert_eq!(

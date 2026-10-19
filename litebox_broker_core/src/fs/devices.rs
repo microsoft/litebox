@@ -11,6 +11,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
@@ -25,7 +26,7 @@ use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::random::RandomProvider;
 use crate::readiness::{ReadinessRegistration, ReadinessSource};
 use crate::stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream};
-use crate::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
+use crate::transfer::bounce_buffer;
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: u64 = 1024;
@@ -283,28 +284,24 @@ impl Backend for Devices {
     fn read(
         &self,
         h: &FileHandle,
-        length: usize,
+        buf: &mut dyn ReadBuffer,
         _offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
-            Device::Stdin if length == 0 => Ok(0),
-            Device::Stdin => self
-                .stdio
-                .read(length, copy_from)
-                .map_err(|error| match error {
-                    StdioProviderError::WouldBlock => ReadError::WouldBlock,
-                    StdioProviderError::Broker(error) => ReadError::Broker(error),
-                    _ => ReadError::Io,
-                }),
+            Device::Stdin if buf.is_empty() => Ok(0),
+            Device::Stdin => self.stdio.read(buf).map_err(|error| match error {
+                StdioProviderError::WouldBlock => ReadError::WouldBlock,
+                StdioProviderError::Broker(error) => ReadError::Broker(error),
+                _ => ReadError::Io,
+            }),
             Device::URandom => {
-                let mut bytes = bounce_buffer(length)?;
+                let mut bytes = bounce_buffer(buf.len())?;
                 self.random.fill(&mut bytes).map_err(|_| ReadError::Io)?;
-                copy_from(&bytes)?;
-                Ok(length)
+                buf.copy_from_slice_at(0, &bytes)?;
+                Ok(bytes.len())
             }
         }
     }
@@ -312,27 +309,24 @@ impl Backend for Devices {
     fn write(
         &self,
         h: &FileHandle,
-        length: usize,
+        buf: &dyn WriteBuffer,
         _offset: usize,
-        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => StdioOutputStream::Stdout,
             Device::Stderr => StdioOutputStream::Stderr,
-            Device::Null | Device::URandom => return Ok(length),
+            Device::Null | Device::URandom => return Ok(buf.len()),
         };
-        if length == 0 {
+        if buf.is_empty() {
             return Ok(0);
         }
-        self.stdio
-            .write(stream, length, copy_to)
-            .map_err(|error| match error {
-                StdioProviderError::WouldBlock => WriteError::WouldBlock,
-                StdioProviderError::Broker(error) => WriteError::Broker(error),
-                _ => WriteError::Io,
-            })
+        self.stdio.write(stream, buf).map_err(|error| match error {
+            StdioProviderError::WouldBlock => WriteError::WouldBlock,
+            StdioProviderError::Broker(error) => WriteError::Broker(error),
+            _ => WriteError::Io,
+        })
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {

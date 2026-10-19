@@ -4,14 +4,14 @@
 //! Runtime shared-memory access for broker transports.
 //!
 //! [`SharedMemory`] and [`ControlRingMemory`] abstract a concrete shared-memory
-//! resource, and [`AsSharedBytes`] one that also exposes its bytes as
-//! [`SharedBytes`]. [`SharedBufferPool`] applies the peer-visible
-//! fixed-slot layout from [`litebox_broker_protocol::shared_buffer`] and
-//! bounds-checks each slot access.
+//! resource. [`SharedBufferPool`] applies the peer-visible fixed-slot layout
+//! from [`litebox_broker_protocol::shared_buffer`] and bounds-checks each slot
+//! access, and a [`SharedBuffer`] is a sequence of its slots as a buffer that
+//! objects read into and write from.
 
 use alloc::alloc::Layout;
 use alloc::sync::Arc;
-use core::marker::PhantomData;
+use core::convert::Infallible;
 use core::ops::Range;
 use core::ptr::NonNull;
 
@@ -21,8 +21,7 @@ use litebox_broker_protocol::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SharedBufferLayout, SharedBufferLayoutError,
     SharedBufferSequence, SharedBufferSlotIndex,
 };
-
-use crate::peer_memory;
+use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer};
 
 /// Error accessing a shared-memory resource.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -74,6 +73,18 @@ pub trait SharedMemory: Send + Sync + 'static {
     ///
     /// The entire range must be validated before any bytes are copied.
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError>;
+
+    /// Returns the resource's bytes, if they are mapped for as long as it is
+    /// borrowed, so callers can transfer them directly, such as with a system
+    /// call, or copy them to and from memory of their own that they cannot
+    /// expose as a slice, such as a guest's memory.
+    ///
+    /// A resource reachable only through fault-recovering copies, such as a
+    /// user mapping accessed from a kernel, or whose copies are limited to
+    /// some ranges, such as control-ring memory, returns `None`.
+    fn raw_bytes(&self) -> Option<RawBytes<'_>> {
+        None
+    }
 }
 
 /// Ordered access to shared control-ring synchronization values.
@@ -139,141 +150,9 @@ impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
         (**self).write(offset, source)
     }
-}
 
-/// Shared memory that exposes its bytes as [`SharedBytes`], stably addressable
-/// for as long as it is borrowed, so callers can copy directly between them
-/// and memory of their own that they cannot expose as a slice, such as a
-/// guest's memory.
-///
-/// A resource that is reachable only through fault-recovering copies, such
-/// as a user mapping accessed from a kernel, provides only [`SharedMemory`].
-pub trait AsSharedBytes: SharedMemory {
-    /// Returns the `length` bytes at `offset`.
-    ///
-    /// The range is validated as for [`SharedMemory::read`] and
-    /// [`SharedMemory::write`].
-    fn shared_bytes(
-        &self,
-        offset: usize,
-        length: usize,
-    ) -> Result<SharedBytes<'_>, SharedMemoryError>;
-}
-
-impl<Memory: AsSharedBytes + ?Sized> AsSharedBytes for Arc<Memory> {
-    fn shared_bytes(
-        &self,
-        offset: usize,
-        length: usize,
-    ) -> Result<SharedBytes<'_>, SharedMemoryError> {
-        (**self).shared_bytes(offset, length)
-    }
-}
-
-/// A range of mapped shared memory, which a peer may access at any time.
-///
-/// The bytes are readable and writable for `'a`, but never through Rust
-/// references. Copy them with [`Self::copy_to_slice`] and
-/// [`Self::copy_from_slice`], or through [`Self::as_ptr`] with a copy that,
-/// like those in [`crate::peer_memory`], performs its accesses in inline
-/// assembly, so a concurrent peer access cannot make it unsound.
-#[derive(Clone, Copy, Debug)]
-pub struct SharedBytes<'a> {
-    address: NonNull<u8>,
-    length: usize,
-    _memory: PhantomData<&'a ()>,
-}
-
-impl SharedBytes<'_> {
-    /// Returns the `length` bytes at `address`.
-    ///
-    /// # Safety
-    ///
-    /// `address..address + length` must be readable and writable for the
-    /// returned value's lifetime, and must never be accessed through Rust
-    /// references.
-    pub const unsafe fn from_raw_parts(address: NonNull<u8>, length: usize) -> Self {
-        Self {
-            address,
-            length,
-            _memory: PhantomData,
-        }
-    }
-
-    /// Returns the length in bytes.
-    pub const fn len(&self) -> usize {
-        self.length
-    }
-
-    /// Returns whether the range is empty.
-    pub const fn is_empty(&self) -> bool {
-        self.length == 0
-    }
-
-    /// Returns the address of the first byte.
-    pub const fn as_ptr(&self) -> *mut u8 {
-        self.address.as_ptr()
-    }
-
-    /// Splits the range in two at `mid`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `mid` exceeds the length.
-    pub fn split_at(self, mid: usize) -> (Self, Self) {
-        (self.subrange(0..mid), self.subrange(mid..self.length))
-    }
-
-    /// Returns the bytes at `range` within this range.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `range` is reversed or exceeds the length.
-    #[must_use]
-    pub fn subrange(self, range: Range<usize>) -> Self {
-        assert!(
-            range.start <= range.end && range.end <= self.length,
-            "shared byte range {range:?} exceeds length {}",
-            self.length
-        );
-        // SAFETY: The range lies within this one, which is valid as required
-        // for the same lifetime.
-        unsafe { Self::from_raw_parts(self.address.add(range.start), range.len()) }
-    }
-
-    /// Copies the bytes into `destination`, which must be the same length.
-    ///
-    /// The copy is an untrusted snapshot that a concurrent peer write may
-    /// tear.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lengths differ.
-    pub fn copy_to_slice(self, destination: &mut [u8]) {
-        assert_eq!(
-            destination.len(),
-            self.length,
-            "destination must match the shared bytes"
-        );
-        // SAFETY: The bytes are readable and, never being referenced, cannot
-        // overlap the destination.
-        unsafe { peer_memory::copy_from_peer(self.as_ptr(), destination) };
-    }
-
-    /// Copies `source`, which must be the same length, into the bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lengths differ.
-    pub fn copy_from_slice(self, source: &[u8]) {
-        assert_eq!(
-            source.len(),
-            self.length,
-            "source must match the shared bytes"
-        );
-        // SAFETY: The bytes are writable and, never being referenced, cannot
-        // overlap the source.
-        unsafe { peer_memory::copy_to_peer(source, self.as_ptr()) };
+    fn raw_bytes(&self) -> Option<RawBytes<'_>> {
+        (**self).raw_bytes()
     }
 }
 
@@ -291,8 +170,8 @@ pub struct HeapSharedMemory {
     layout: Layout,
 }
 
-// SAFETY: The allocation is accessed only through peer-memory copies and
-// `SharedBytes`, which tolerate concurrent access from any thread.
+// SAFETY: The allocation is accessed only as `RawBytes`, which tolerate
+// concurrent access from any thread.
 unsafe impl Send for HeapSharedMemory {}
 // SAFETY: As for `Send`.
 unsafe impl Sync for HeapSharedMemory {}
@@ -320,12 +199,27 @@ impl HeapSharedMemory {
             layout,
         }
     }
+
+    /// Returns the `length` bytes at `offset`.
+    fn range(&self, offset: usize, length: usize) -> Result<RawBytes<'_>, SharedMemoryError> {
+        let end = offset
+            .checked_add(length)
+            .filter(|&end| end <= self.length)
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        Ok(self.bytes().subrange(offset..end))
+    }
+
+    fn bytes(&self) -> RawBytes<'_> {
+        // SAFETY: The allocation lives as long as `self` and is accessed only
+        // as `RawBytes`.
+        unsafe { RawBytes::from_raw_parts(self.address, self.length) }
+    }
 }
 
 impl Drop for HeapSharedMemory {
     fn drop(&mut self) {
         // SAFETY: The allocation was made with this layout and is no longer
-        // borrowed, since the `SharedBytes` it exposes borrow `self`.
+        // borrowed, since the `RawBytes` it exposes borrow `self`.
         unsafe { alloc::alloc::dealloc(self.address.as_ptr(), self.layout) };
     }
 }
@@ -336,31 +230,18 @@ impl SharedMemory for HeapSharedMemory {
     }
 
     fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-        self.shared_bytes(offset, destination.len())?
+        self.range(offset, destination.len())?
             .copy_to_slice(destination);
         Ok(())
     }
 
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-        self.shared_bytes(offset, source.len())?
-            .copy_from_slice(source);
+        self.range(offset, source.len())?.copy_from_slice(source);
         Ok(())
     }
-}
 
-impl AsSharedBytes for HeapSharedMemory {
-    fn shared_bytes(
-        &self,
-        offset: usize,
-        length: usize,
-    ) -> Result<SharedBytes<'_>, SharedMemoryError> {
-        offset
-            .checked_add(length)
-            .filter(|&end| end <= self.len())
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        // SAFETY: The range lies within the allocation, which lives as long as
-        // `self` and is accessed only through peer-memory copies.
-        Ok(unsafe { SharedBytes::from_raw_parts(self.address.add(offset), length) })
+    fn raw_bytes(&self) -> Option<RawBytes<'_>> {
+        Some(self.bytes())
     }
 }
 
@@ -534,21 +415,206 @@ impl<Memory: SharedMemory> SharedBufferPool<Memory> {
     }
 }
 
-impl<Memory: AsSharedBytes> SharedBufferPool<Memory> {
-    /// Returns the shared bytes holding the `length` bytes at `offset` in
-    /// `sequence`, in transfer order.
-    ///
-    /// Slots adjacent in memory share one part.
-    pub fn borrow_sequence(
+/// The first bytes of a shared-buffer sequence, as a buffer that objects read
+/// into and write from.
+///
+/// [`SharedBufferPool::buffer`] returns one. Its bytes are transferred
+/// directly if the memory has [`SharedMemory::raw_bytes`], and its copies
+/// fault only if the memory cannot be accessed.
+pub struct SharedBuffer<'a> {
+    memory: &'a dyn SharedMemory,
+    /// The memory ranges holding the bytes, in order; `ranges[..parts]` are
+    /// used.
+    ranges: [Range<usize>; MAX_SHARED_BUFFER_SEQUENCE_SLOTS],
+    parts: usize,
+    length: usize,
+}
+
+impl<Memory: SharedMemory> SharedBufferPool<Memory> {
+    /// Returns the first `length` bytes of `sequence` as a buffer.
+    pub fn buffer(
         &self,
         sequence: SharedBufferSequence,
+        length: usize,
+    ) -> Result<SharedBuffer<'_>, SharedBufferError> {
+        let mut ranges: [Range<usize>; MAX_SHARED_BUFFER_SEQUENCE_SLOTS] =
+            core::array::from_fn(|_| 0..0);
+        let mut parts = 0;
+        for range in self.sequence_ranges(sequence, length)? {
+            ranges[parts] = range;
+            parts += 1;
+        }
+        Ok(SharedBuffer {
+            memory: &self.memory,
+            ranges,
+            parts,
+            length,
+        })
+    }
+}
+
+impl SharedBuffer<'_> {
+    /// Calls `part` with each part of the `length` bytes at `offset` in the
+    /// buffer, in order: its offset in the memory, and its range within those
+    /// bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bytes exceed the buffer.
+    fn for_each_part<E>(
+        &self,
         offset: usize,
         length: usize,
-    ) -> Result<impl Iterator<Item = SharedBytes<'_>>, SharedBufferError> {
-        let memory = self.memory.shared_bytes(0, self.memory.len())?;
-        Ok(self
-            .ranges_at(sequence, offset, length)?
-            .map(move |range| memory.subrange(range)))
+        mut part: impl FnMut(usize, Range<usize>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.assert_within(offset, length);
+        let mut skip = offset;
+        let mut done = 0;
+        for range in &self.ranges[..self.parts] {
+            if done == length {
+                break;
+            }
+            if skip >= range.len() {
+                skip -= range.len();
+                continue;
+            }
+            let start = range.start + skip;
+            skip = 0;
+            let end = done + (range.end - start).min(length - done);
+            part(start, done..end)?;
+            done = end;
+        }
+        Ok(())
+    }
+
+    /// Passes the `length` bytes at `offset` in the buffer to `transfer` as
+    /// raw bytes, if the memory has them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bytes exceed the buffer.
+    fn transfer_direct_at(
+        &self,
+        offset: usize,
+        length: usize,
+        transfer: &mut dyn FnMut(&[RawBytes<'_>]) -> usize,
+    ) -> Option<usize> {
+        self.assert_within(offset, length);
+        let memory = self.memory.raw_bytes()?;
+        let mut parts = [memory.subrange(0..0); MAX_SHARED_BUFFER_SEQUENCE_SLOTS];
+        let mut count = 0;
+        let Ok(()) = self.for_each_part(offset, length, |at, range| {
+            parts[count] = memory.subrange(at..at + range.len());
+            count += 1;
+            Ok::<_, Infallible>(())
+        });
+        Some(transfer(&parts[..count]))
+    }
+
+    /// Panics unless the `length` bytes at `offset` lie within the buffer.
+    fn assert_within(&self, offset: usize, length: usize) {
+        assert!(
+            offset
+                .checked_add(length)
+                .is_some_and(|end| end <= self.length),
+            "{length} bytes at {offset} exceed a shared buffer of {} bytes",
+            self.length
+        );
+    }
+}
+
+/// Copies `length` bytes a chunk at a time through a stack buffer: `fill`
+/// fills each chunk from its offset in the bytes, and `drain` copies it on.
+fn copy_staged(
+    length: usize,
+    mut fill: impl FnMut(usize, &mut [u8]) -> Result<(), SharedMemoryError>,
+    mut drain: impl FnMut(usize, &[u8]) -> Result<(), SharedMemoryError>,
+) -> Result<(), SharedMemoryError> {
+    const STAGING_SIZE: usize = 256;
+    let mut staging = [0; STAGING_SIZE];
+    let mut offset = 0;
+    while offset < length {
+        let staged = &mut staging[..STAGING_SIZE.min(length - offset)];
+        fill(offset, staged)?;
+        drain(offset, staged)?;
+        offset += staged.len();
+    }
+    Ok(())
+}
+
+impl Buffer for SharedBuffer<'_> {
+    fn len(&self) -> usize {
+        self.length
+    }
+}
+
+impl ReadBuffer for SharedBuffer<'_> {
+    fn copy_from_slice_at(&mut self, offset: usize, source: &[u8]) -> Result<(), Fault> {
+        self.for_each_part(offset, source.len(), |at, range| {
+            self.memory.write(at, &source[range])
+        })
+        .map_err(|_| Fault)
+    }
+
+    fn copy_from_raw_at(&mut self, offset: usize, source: RawBytes<'_>) -> Result<(), Fault> {
+        self.for_each_part(offset, source.len(), |at, range| {
+            copy_staged(
+                range.len(),
+                |copied, chunk| {
+                    let start = range.start + copied;
+                    source
+                        .subrange(start..start + chunk.len())
+                        .copy_to_slice(chunk);
+                    Ok(())
+                },
+                |copied, chunk| self.memory.write(at + copied, chunk),
+            )
+        })
+        .map_err(|_| Fault)
+    }
+
+    fn read_direct_at(
+        &mut self,
+        offset: usize,
+        length: usize,
+        read: &mut dyn FnMut(&[RawBytes<'_>]) -> usize,
+    ) -> Option<usize> {
+        self.transfer_direct_at(offset, length, read)
+    }
+}
+
+impl WriteBuffer for SharedBuffer<'_> {
+    fn copy_to_slice_at(&self, offset: usize, destination: &mut [u8]) -> Result<(), Fault> {
+        self.for_each_part(offset, destination.len(), |at, range| {
+            self.memory.read(at, &mut destination[range])
+        })
+        .map_err(|_| Fault)
+    }
+
+    fn copy_to_raw_at(&self, offset: usize, destination: RawBytes<'_>) -> Result<(), Fault> {
+        self.for_each_part(offset, destination.len(), |at, range| {
+            copy_staged(
+                range.len(),
+                |copied, chunk| self.memory.read(at + copied, chunk),
+                |copied, chunk| {
+                    let start = range.start + copied;
+                    destination
+                        .subrange(start..start + chunk.len())
+                        .copy_from_slice(chunk);
+                    Ok(())
+                },
+            )
+        })
+        .map_err(|_| Fault)
+    }
+
+    fn write_direct_at(
+        &self,
+        offset: usize,
+        length: usize,
+        write: &mut dyn FnMut(&[RawBytes<'_>]) -> usize,
+    ) -> Option<usize> {
+        self.transfer_direct_at(offset, length, write)
     }
 }
 
@@ -661,11 +727,14 @@ mod tests {
         assert_eq!(ranges(0), []);
     }
 
-    #[test]
-    fn pool_borrows_sequence_at_offsets_across_slots() {
+    /// Returns a pool of four four-byte slots, with a buffer sequence of
+    /// slots 2, 3, and 0, which hold 11 bytes at memory offsets 8..16 and
+    /// 0..3.
+    fn pool_with_sequence<Memory: SharedMemory>(
+        memory: Memory,
+    ) -> (SharedBufferPool<Memory>, SharedBufferSequence) {
         let layout = SharedBufferLayout::new(4, 4).unwrap();
-        let memory = Arc::new(HeapSharedMemory::new(layout.total_len()));
-        let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
+        let pool = SharedBufferPool::new(memory, layout).unwrap();
         let sequence = SharedBufferSequence::new(
             &[
                 SharedBufferSlotIndex(2),
@@ -675,60 +744,127 @@ mod tests {
             11,
         )
         .unwrap();
+        (pool, sequence)
+    }
 
-        let mut source = 1..;
-        for part in pool.borrow_sequence(sequence, 1, 9).unwrap() {
-            let bytes: Vec<u8> = source.by_ref().take(part.len()).collect();
-            part.copy_from_slice(&bytes);
-        }
+    #[test]
+    fn shared_buffers_copy_at_offsets_across_slots() {
+        let memory = Arc::new(HeapSharedMemory::new(16));
+        let (pool, sequence) = pool_with_sequence(Arc::clone(&memory));
+        let mut buffer = pool.buffer(sequence, 10).unwrap();
+        assert_eq!(buffer.len(), 10);
+
+        buffer
+            .copy_from_slice_at(1, &[1, 2, 3, 4, 5, 6, 7, 8, 9])
+            .unwrap();
         assert_eq!(
             contents(&memory),
             [8, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7]
         );
-        let lengths = |offset, length| {
-            pool.borrow_sequence(sequence, offset, length)
-                .unwrap()
-                .map(|part| part.len())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(lengths(1, 9), [7, 2]);
-        assert_eq!(lengths(8, 3), [3]);
-        assert_eq!(lengths(11, 0), [0; 0]);
+        let mut copied = [0; 3];
+        buffer.copy_to_slice_at(6, &mut copied).unwrap();
+        assert_eq!(copied, [6, 7, 8]);
+        let mut private = [0; 4];
+        buffer
+            .copy_to_raw_at(7, RawBytes::from(&mut private[..3]))
+            .unwrap();
+        assert_eq!(private, [7, 8, 9, 0]);
+        buffer
+            .copy_from_raw_at(6, RawBytes::from(&mut [10, 11][..]))
+            .unwrap();
+        assert_eq!(&contents(&memory)[14..], [10, 11]);
         assert!(matches!(
-            pool.borrow_sequence(sequence, 4, 8),
+            pool.buffer(sequence, 12),
             Err(SharedBufferError::TransferExceedsSequence)
         ));
     }
 
     #[test]
-    fn shared_bytes_split_and_copy_within_their_range() {
-        let memory = HeapSharedMemory::new(8);
-        let bytes = memory.shared_bytes(2, 5).unwrap();
-        let (front, back) = bytes.split_at(2);
-        assert_eq!((front.len(), back.len()), (2, 3));
-        front.copy_from_slice(&[1, 2]);
-        back.subrange(1..3).copy_from_slice(&[3, 4]);
-        let mut copied = [0; 5];
-        bytes.copy_to_slice(&mut copied);
-        assert_eq!(copied, [1, 2, 0, 3, 4]);
-        assert_eq!(contents(&memory), [0, 0, 1, 2, 0, 3, 4, 0]);
-        assert!(bytes.subrange(5..5).is_empty());
-        assert_eq!(memory.shared_bytes(8, 0).unwrap().len(), 0);
-        assert_eq!(
-            memory.shared_bytes(4, 5).map(|bytes| bytes.len()),
-            Err(SharedMemoryError::InvalidRange)
-        );
-        assert_eq!(
-            memory.shared_bytes(usize::MAX, 2).map(|bytes| bytes.len()),
-            Err(SharedMemoryError::InvalidRange)
-        );
+    fn shared_buffers_transfer_directly_in_parts() {
+        let memory = Arc::new(HeapSharedMemory::new(16));
+        let (pool, sequence) = pool_with_sequence(Arc::clone(&memory));
+        let mut buffer = pool.buffer(sequence, 11).unwrap();
+        let lengths = |buffer: &SharedBuffer<'_>, offset, length| {
+            let mut lengths = Vec::new();
+            let written = buffer.write_direct_at(offset, length, &mut |parts| {
+                lengths.extend(parts.iter().map(RawBytes::len));
+                1
+            });
+            assert_eq!(written, Some(1));
+            lengths
+        };
+        assert_eq!(lengths(&buffer, 1, 9), [7, 2]);
+        assert_eq!(lengths(&buffer, 8, 3), [3]);
+        assert_eq!(lengths(&buffer, 11, 0), [0; 0]);
+
+        let read = buffer.read_direct_at(6, 3, &mut |parts| {
+            parts[0].copy_from_slice(&[1, 2]);
+            parts[1].copy_from_slice(&[3]);
+            3
+        });
+        assert_eq!(read, Some(3));
+        assert_eq!(&contents(&memory)[..2], [3, 0]);
+        assert_eq!(&contents(&memory)[14..], [1, 2]);
     }
 
     #[test]
-    #[should_panic(expected = "exceeds length")]
-    fn shared_bytes_reject_subranges_past_their_end() {
+    #[should_panic(expected = "exceed a shared buffer")]
+    fn shared_buffers_reject_transfers_past_their_end() {
+        let (pool, sequence) = pool_with_sequence(HeapSharedMemory::new(16));
+        let buffer = pool.buffer(sequence, 4).unwrap();
+        let _ = buffer.write_direct_at(2, 3, &mut |_| 0);
+    }
+
+    /// Shared memory reachable only through copies.
+    struct CopiedSharedMemory(HeapSharedMemory);
+
+    impl SharedMemory for CopiedSharedMemory {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
+            self.0.read(offset, destination)
+        }
+
+        fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
+            self.0.write(offset, source)
+        }
+    }
+
+    #[test]
+    fn shared_buffers_without_raw_bytes_only_copy() {
+        let (pool, sequence) = pool_with_sequence(CopiedSharedMemory(HeapSharedMemory::new(16)));
+        let mut buffer = pool.buffer(sequence, 11).unwrap();
+        assert_eq!(buffer.read_direct_at(0, 11, &mut |_| unreachable!()), None);
+        let source: Vec<u8> = (1..=11).collect();
+        buffer
+            .copy_from_raw_at(0, RawBytes::from(&mut source.clone()[..]))
+            .unwrap();
+        let mut copied = vec![0; 11];
+        buffer
+            .copy_to_raw_at(0, RawBytes::from(&mut copied[..]))
+            .unwrap();
+        assert_eq!(copied, source);
+    }
+
+    #[test]
+    fn heap_shared_memory_exposes_its_bytes() {
         let memory = HeapSharedMemory::new(8);
-        let _ = memory.shared_bytes(0, 4).unwrap().subrange(2..5);
+        memory.write(2, &[1, 2]).unwrap();
+        let bytes = memory.raw_bytes().unwrap();
+        assert_eq!(bytes.len(), 8);
+        let mut copied = [0; 3];
+        bytes.subrange(1..4).copy_to_slice(&mut copied);
+        assert_eq!(copied, [0, 1, 2]);
+        assert_eq!(
+            memory.write(7, &[0; 2]),
+            Err(SharedMemoryError::InvalidRange)
+        );
+        assert_eq!(
+            memory.read(usize::MAX, &mut [0; 2]),
+            Err(SharedMemoryError::InvalidRange)
+        );
     }
 
     #[test]
@@ -738,7 +874,7 @@ mod tests {
         assert!(contents(&memory).iter().all(|&byte| byte == 0));
         assert!(
             memory
-                .shared_bytes(0, 1)
+                .raw_bytes()
                 .unwrap()
                 .as_ptr()
                 .addr()

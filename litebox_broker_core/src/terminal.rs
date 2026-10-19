@@ -18,10 +18,11 @@ use litebox_broker_protocol::terminal::{
     InputFlags as I, LocalFlags as L, OutputFlags as O, TerminalEvents, TerminalOperation,
     TerminalResponse, TerminalSettings, WindowSize,
 };
+use litebox_platform::buffer::ReadBuffer;
 
 use crate::fs::FileResult;
 use crate::readiness::ReadinessSource;
-use crate::transfer::{CopyFromFn, take_from_queue};
+use crate::transfer::take_from_queue;
 
 /// Maximum queued input bytes and canonical record boundaries per terminal.
 pub const INPUT_CAPACITY: usize = 64 * 1024;
@@ -224,16 +225,12 @@ impl TerminalEngine {
         self.output_stopped
     }
 
-    /// Reads up to `length` bytes of one canonical record, or of the available
-    /// noncanonical bytes, passing them to `copy_from` (see [`crate::transfer`]).
-    /// `None` means the caller must wait; `Some(0)` is a single canonical EOF
-    /// or an immediate noncanonical read. If `copy_from` fails, nothing is read.
-    pub fn read(
-        &mut self,
-        length: usize,
-        copy_from: &mut CopyFromFn<'_>,
-    ) -> crate::Result<Option<usize>> {
-        if length == 0 {
+    /// Reads one canonical record, or available noncanonical bytes, into the
+    /// start of `output`. `None` means the caller must wait; `Some(0)` is a
+    /// single canonical EOF or an immediate noncanonical read. If copying
+    /// faults, nothing is read.
+    pub fn read(&mut self, output: &mut dyn ReadBuffer) -> crate::Result<Option<usize>> {
+        if output.is_empty() {
             return Ok(Some(0));
         }
         let canonical = self.settings.local.contains(L::CANONICAL);
@@ -241,14 +238,14 @@ impl TerminalEngine {
             let Some(&record) = self.records.front() else {
                 return Ok(None);
             };
-            record.min(length)
+            record.min(output.len())
         } else {
             if self.input.is_empty() && self.settings.minimum_read != 0 {
                 return Ok(None);
             }
-            length.min(self.input.len())
+            output.len().min(self.input.len())
         };
-        take_from_queue(&mut self.input, count, copy_from)?;
+        take_from_queue(&mut self.input, count, output)?;
         if canonical && let Some(record) = self.records.front_mut() {
             *record -= count;
             if *record == 0 {
@@ -545,12 +542,13 @@ impl TerminalEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transfer::copy_to_slice;
+    use crate::test_support::FaultingBuffer;
+    use litebox_platform::buffer::Fault;
 
     impl TerminalEngine {
         /// Reads into `output`, for tests that are not about copying.
-        fn read_slice(&mut self, output: &mut [u8]) -> Option<usize> {
-            self.read(output.len(), &mut copy_to_slice(output)).unwrap()
+        fn read_slice(&mut self, mut output: &mut [u8]) -> Option<usize> {
+            self.read(&mut output).unwrap()
         }
 
         fn processed(&mut self, input: &[u8]) -> Vec<u8> {
@@ -579,10 +577,7 @@ mod tests {
     fn failed_copies_read_nothing() {
         let mut tty = TerminalEngine::default();
         tty.receive(b"line\n");
-        assert_eq!(
-            tty.read(5, &mut |_| Err(crate::BrokerError::Internal)),
-            Err(crate::BrokerError::Internal)
-        );
+        assert_eq!(tty.read(&mut FaultingBuffer::new(5, 0)), Err(Fault.into()));
         let mut output = [0; 8];
         assert_eq!(tty.read_slice(&mut output), Some(5));
         assert_eq!(&output[..5], b"line\n");

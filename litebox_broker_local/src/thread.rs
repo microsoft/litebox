@@ -54,7 +54,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::test_broker_local;
-    use crate::tests::{FakeControlChannel, test_shared_memory};
+    use crate::tests::{FakeControlChannel, noop_shared_memory};
 
     #[test]
     fn thread_lifecycle_sends_owned_id() {
@@ -63,7 +63,7 @@ mod tests {
             None,
             Some(BrokerResult::Thread(ThreadResponse::Create(thread_id))),
         );
-        let local = test_broker_local(channel, test_shared_memory());
+        let local = test_broker_local(channel, noop_shared_memory());
 
         assert_eq!(local.create_thread().unwrap(), thread_id);
         assert_eq!(

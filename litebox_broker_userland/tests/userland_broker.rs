@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_local::test_support::{copy_from_slice, copy_to_slice};
 use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -223,7 +222,7 @@ fn run_fake_runner(args: &[OsString]) {
                         request.len().try_into().unwrap(),
                     )
                     .unwrap(),
-                    &mut copy_from_slice(request),
+                    request,
                     SendFlags::NONE,
                     Some(std::net::SocketAddrV4::new(gateway, udp_port)),
                 )
@@ -255,7 +254,7 @@ fn run_fake_runner(args: &[OsString]) {
                     reply.len().try_into().unwrap(),
                 )
                 .unwrap(),
-                &mut copy_to_slice(&mut reply),
+                &mut reply,
                 ReceiveFromFlags::NONE,
             )
             .unwrap()
@@ -349,33 +348,25 @@ fn run_fake_runner(args: &[OsString]) {
     let write_buffer =
         SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], data.len().try_into().unwrap())
             .unwrap();
-    let mut unwritten = &data[..];
     assert_eq!(
         local
-            .write_pipe(pipe.write_handle, write_buffer, &mut |part| {
-                let (head, tail) = unwritten.split_at(part.len());
-                part.copy_from_slice(head);
-                unwritten = tail;
-                Some(())
-            })
+            .write_pipe(pipe.write_handle, write_buffer, data)
             .unwrap(),
         data.len()
     );
-    let mut received = Vec::new();
+    let mut received = [0; 16];
     let read = local
         .read_pipe(
             pipe.read_handle,
-            SharedBufferSequence::new(&[SharedBufferSlotIndex(1)], 16).unwrap(),
-            &mut |part| {
-                let start = received.len();
-                received.resize(start + part.len(), 0);
-                part.copy_to_slice(&mut received[start..]);
-                Some(())
-            },
+            SharedBufferSequence::new(
+                &[SharedBufferSlotIndex(1)],
+                received.len().try_into().unwrap(),
+            )
+            .unwrap(),
+            &mut received,
         )
         .unwrap();
-    assert_eq!(read, data.len());
-    assert_eq!(received, data);
+    assert_eq!(&received[..read], data);
     drop(local);
 }
 

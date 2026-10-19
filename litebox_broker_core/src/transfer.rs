@@ -1,67 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Copying bytes into and out of broker objects' storage, such as the
-//! queues behind pipes and sockets.
+//! Copying bytes between broker objects' storage, such as the queues behind
+//! pipes and sockets, and their callers' buffers.
 //!
-//! While it holds its lock, an object passes its storage to its caller one
-//! contiguous part at a time, in order: each part of the bytes it reads to a
-//! [`CopyFromFn`], which copies from it, or each part of the room it writes to
-//! a [`CopyToFn`], which copies to it. Their names give the direction relative
-//! to that part, the closure's argument, not to the caller's buffer. Some parts
-//! may be empty. The caller copies between each part and its own buffer,
-//! continuing where the previous part left off. Its buffer may be memory the
-//! broker cannot reference, such as memory shared with a runner.
-//!
-//! An operation whose [`CopyFromFn`] or [`CopyToFn`] fails fails with its
-//! error. The object stays consistent, but may have consumed any of the bytes
-//! it passed, or kept any of the room it passed, the failing part's included.
+//! An object reads into a caller's [`ReadBuffer`] and writes from a caller's
+//! [`WriteBuffer`]. Either may be memory the broker cannot reference, such as
+//! memory shared with a runner, so copying it may [`Fault`]. An operation
+//! whose copy faults fails with the fault's [`BrokerError`]. The object stays
+//! consistent, but may have consumed any of the bytes it read, or kept any of
+//! the bytes it wrote.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::ops::Range;
+
+use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer};
 
 use crate::{BrokerError, Result};
 
-/// Copies from each part of the bytes an object reads, in turn, to the
-/// caller's buffer.
-pub type CopyFromFn<'a> = dyn FnMut(&[u8]) -> Result<()> + 'a;
-
-/// Copies to each part of the room an object writes, in turn, from the
-/// caller's buffer.
-pub type CopyToFn<'a> = dyn FnMut(&mut [u8]) -> Result<()> + 'a;
-
-/// Returns a [`CopyFromFn`] that copies the parts it is passed, one after another,
-/// into `destination`, and fails with [`BrokerError::Internal`] if they
-/// overflow it.
-pub fn copy_to_slice(destination: &mut [u8]) -> impl FnMut(&[u8]) -> Result<()> + '_ {
-    let mut offset = 0;
-    move |part| {
-        let end = offset + part.len();
-        destination
-            .get_mut(offset..end)
-            .ok_or(BrokerError::Internal)?
-            .copy_from_slice(part);
-        offset = end;
-        Ok(())
-    }
-}
-
-/// Returns a [`CopyToFn`] that fills the parts it is passed, one after another, from
-/// `source`, and fails with [`BrokerError::Internal`] if they overflow it.
-pub fn copy_from_slice(source: &[u8]) -> impl FnMut(&mut [u8]) -> Result<()> + '_ {
-    let mut offset = 0;
-    move |part| {
-        let end = offset + part.len();
-        part.copy_from_slice(source.get(offset..end).ok_or(BrokerError::Internal)?);
-        offset = end;
-        Ok(())
-    }
-}
-
-/// Returns `length` zeroed bytes for an object that cannot pass its own
-/// storage, such as a host file, to stage the bytes it transfers in, or
-/// fails with [`BrokerError::OutOfMemory`].
+/// Returns `length` zeroed bytes for an object that cannot copy directly
+/// between its storage, such as a host file, and a caller's buffer, to stage
+/// the bytes it transfers in, or fails with [`BrokerError::OutOfMemory`].
 pub fn bounce_buffer(length: usize) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     buffer
@@ -71,94 +32,55 @@ pub fn bounce_buffer(length: usize) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-/// Counts the bytes an object passes to a [`CopyFromFn`] or [`CopyToFn`],
-/// which may be no more than requested, to check what it reports, and keeps
-/// the first failure, which fails the operation whatever the object reports.
-pub(crate) struct CopyCount {
-    limit: usize,
-    bytes: usize,
-    failure: Option<BrokerError>,
-}
-
-impl CopyCount {
-    pub(crate) const fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            bytes: 0,
-            failure: None,
-        }
-    }
-
-    /// Counts a part of `length` bytes and passes it on with `transfer`,
-    /// failing if it exceeds the limit or an earlier part failed.
-    pub(crate) fn count(
-        &mut self,
-        length: usize,
-        transfer: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
-        let result = match self.failure {
-            Some(failure) => Err(failure),
-            None => self
-                .bytes
-                .checked_add(length)
-                .filter(|&bytes| bytes <= self.limit)
-                .ok_or(BrokerError::Internal)
-                .and_then(|bytes| {
-                    self.bytes = bytes;
-                    transfer()
-                }),
-        };
-        if let Err(error) = result {
-            self.failure.get_or_insert(error);
-        }
-        result
-    }
-
-    /// Returns how many bytes were passed, or the first failure.
-    pub(crate) fn finish(self) -> Result<usize> {
-        self.failure.map_or(Ok(self.bytes), Err)
-    }
-}
-
-/// Passes `queue[range]` to `copy_from`, one contiguous part at a time, without
-/// taking them (see [`take_from_queue`]).
+/// Copies `queue[range]` into the start of `destination`, a contiguous part at
+/// a time, without taking them (see [`take_from_queue`]).
 ///
 /// # Panics
 ///
-/// Panics if `range` is out of `queue`'s bounds.
+/// Panics if `range` is out of `queue`'s bounds or exceeds `destination`.
 pub fn copy_from_queue(
     queue: &VecDeque<u8>,
     range: Range<usize>,
-    copy_from: &mut CopyFromFn<'_>,
+    destination: &mut dyn ReadBuffer,
 ) -> Result<()> {
     let (front, back) = queue.as_slices();
     let split = front.len();
-    copy_from(&front[range.start.min(split)..range.end.min(split)])?;
-    copy_from(&back[range.start.saturating_sub(split)..range.end.saturating_sub(split)])
+    let front = &front[range.start.min(split)..range.end.min(split)];
+    destination.copy_from_slice_at(0, front)?;
+    destination.copy_from_slice_at(
+        front.len(),
+        &back[range.start.saturating_sub(split)..range.end.saturating_sub(split)],
+    )?;
+    Ok(())
 }
 
-/// Passes the first `length` bytes of `queue` to `copy_from`, one contiguous
-/// part at a time, and takes them from `queue` unless `copy_from` fails.
+/// Copies the first `length` bytes of `queue` into the start of
+/// `destination`, and takes them from `queue` unless copying faults.
 ///
 /// # Panics
 ///
-/// Panics if `queue` holds fewer than `length` bytes.
+/// Panics if `queue` holds fewer than `length` bytes or they exceed
+/// `destination`.
 pub fn take_from_queue(
     queue: &mut VecDeque<u8>,
     length: usize,
-    copy_from: &mut CopyFromFn<'_>,
+    destination: &mut dyn ReadBuffer,
 ) -> Result<()> {
-    copy_from_queue(queue, 0..length, copy_from)?;
+    copy_from_queue(queue, 0..length, destination)?;
     queue.drain(..length);
     Ok(())
 }
 
-/// Appends `length` bytes to `queue`, passing their room to `copy_to` one
-/// contiguous part at a time, and leaves `queue` unchanged if `copy_to` fails.
+/// Appends the first `length` bytes of `source` to `queue`, a contiguous part
+/// at a time, and leaves `queue` unchanged if copying faults.
+///
+/// # Panics
+///
+/// Panics if `source` holds fewer than `length` bytes.
 pub fn append_to_queue(
     queue: &mut VecDeque<u8>,
     length: usize,
-    copy_to: &mut CopyToFn<'_>,
+    source: &dyn WriteBuffer,
 ) -> Result<()> {
     queue
         .try_reserve(length)
@@ -167,19 +89,152 @@ pub fn append_to_queue(
     queue.resize(start + length, 0);
     let (front, back) = queue.as_mut_slices();
     let split = front.len();
-    let result = copy_to(&mut front[start.min(split)..])
-        .and_then(|()| copy_to(&mut back[start.saturating_sub(split)..]));
+    let front = &mut front[start.min(split)..];
+    let result = source.copy_to_slice_at(0, front).and_then(|()| {
+        source.copy_to_slice_at(front.len(), &mut back[start.saturating_sub(split)..])
+    });
     if result.is_err() {
         queue.truncate(start);
     }
-    result
+    Ok(result?)
+}
+
+/// Wraps a caller's buffer to check what a backend, such as a file system or
+/// a socket provider, reports about copying to or from it.
+///
+/// Counts the bytes copied, which must run on from one another from the
+/// buffer's start, and keeps any fault, which fails the operation whatever
+/// the backend reports.
+pub(crate) struct CopyCount<B> {
+    buffer: B,
+    copied: Cell<usize>,
+    failed: Cell<bool>,
+}
+
+impl<B> CopyCount<B> {
+    pub(crate) const fn new(buffer: B) -> Self {
+        Self {
+            buffer,
+            copied: Cell::new(0),
+            failed: Cell::new(false),
+        }
+    }
+
+    /// Returns how many bytes were copied, or fails if a copy faulted or did
+    /// not run on from the one before.
+    pub(crate) fn finish(self) -> Result<usize> {
+        if self.failed.get() {
+            return Err(Fault.into());
+        }
+        Ok(self.copied.get())
+    }
+
+    /// Checks that a copy at `offset` runs on from the one before, which did
+    /// not fault.
+    fn start(&self, offset: usize) -> core::result::Result<(), Fault> {
+        if self.failed.get() || offset != self.copied.get() {
+            self.failed.set(true);
+            return Err(Fault);
+        }
+        Ok(())
+    }
+
+    /// Counts the `copied` bytes at `offset`, unless copying them faulted.
+    fn end(
+        &self,
+        offset: usize,
+        copied: usize,
+        result: core::result::Result<(), Fault>,
+    ) -> core::result::Result<(), Fault> {
+        match result {
+            Ok(()) => self.copied.set(offset + copied),
+            Err(Fault) => self.failed.set(true),
+        }
+        result
+    }
+}
+
+impl<B: Buffer> Buffer for CopyCount<B> {
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+impl<B: ReadBuffer> ReadBuffer for CopyCount<B> {
+    fn copy_from_slice_at(
+        &mut self,
+        offset: usize,
+        source: &[u8],
+    ) -> core::result::Result<(), Fault> {
+        self.start(offset)?;
+        let result = self.buffer.copy_from_slice_at(offset, source);
+        self.end(offset, source.len(), result)
+    }
+
+    fn copy_from_raw_at(
+        &mut self,
+        offset: usize,
+        source: RawBytes<'_>,
+    ) -> core::result::Result<(), Fault> {
+        self.start(offset)?;
+        let result = self.buffer.copy_from_raw_at(offset, source);
+        self.end(offset, source.len(), result)
+    }
+
+    fn read_direct_at(
+        &mut self,
+        offset: usize,
+        length: usize,
+        read: &mut dyn FnMut(&[RawBytes<'_>]) -> usize,
+    ) -> Option<usize> {
+        // Copying without the direct path then fails too.
+        self.start(offset).ok()?;
+        let read = self.buffer.read_direct_at(offset, length, read)?;
+        self.copied.set(offset + read);
+        Some(read)
+    }
+}
+
+impl<B: WriteBuffer> WriteBuffer for CopyCount<B> {
+    fn copy_to_slice_at(
+        &self,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> core::result::Result<(), Fault> {
+        self.start(offset)?;
+        let result = self.buffer.copy_to_slice_at(offset, destination);
+        self.end(offset, destination.len(), result)
+    }
+
+    fn copy_to_raw_at(
+        &self,
+        offset: usize,
+        destination: RawBytes<'_>,
+    ) -> core::result::Result<(), Fault> {
+        self.start(offset)?;
+        let result = self.buffer.copy_to_raw_at(offset, destination);
+        self.end(offset, destination.len(), result)
+    }
+
+    fn write_direct_at(
+        &self,
+        offset: usize,
+        length: usize,
+        write: &mut dyn FnMut(&[RawBytes<'_>]) -> usize,
+    ) -> Option<usize> {
+        // Copying without the direct path then fails too.
+        self.start(offset).ok()?;
+        let written = self.buffer.write_direct_at(offset, length, write)?;
+        self.copied.set(offset + written);
+        Some(written)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::copy_to_vec;
-    use alloc::vec::Vec;
+    use crate::test_support::FaultingBuffer;
+    use alloc::vec;
 
     /// Returns the bytes `0..8` in a queue whose storage wraps them.
     fn wrapped_queue() -> VecDeque<u8> {
@@ -199,11 +254,8 @@ mod tests {
         for start in 0..=queue.len() {
             for stop in start..=queue.len() {
                 let expected: Vec<u8> = queue.range(start..stop).copied().collect();
-                let mut copied = Vec::new();
-                assert_eq!(
-                    copy_from_queue(&queue, start..stop, &mut copy_to_vec(&mut copied)),
-                    Ok(())
-                );
+                let mut copied = vec![0; stop - start];
+                assert_eq!(copy_from_queue(&queue, start..stop, &mut copied), Ok(()));
                 assert_eq!(copied, expected);
             }
         }
@@ -213,37 +265,25 @@ mod tests {
     fn takes_every_length_of_a_wrapped_queue() {
         for length in 0..=8 {
             let mut queue = wrapped_queue();
-            let mut taken = Vec::new();
+            let mut taken = [0; 8];
             assert_eq!(
-                take_from_queue(
-                    &mut queue,
-                    usize::from(length),
-                    &mut copy_to_vec(&mut taken)
-                ),
+                take_from_queue(&mut queue, usize::from(length), &mut taken),
                 Ok(())
             );
-            assert!(taken.iter().copied().eq(0..length));
+            assert!(taken[..usize::from(length)].iter().copied().eq(0..length));
             assert!(queue.iter().copied().eq(length..8));
         }
     }
 
     #[test]
     fn failed_takes_leave_the_queue_unchanged() {
-        // The second part fails, after the first was copied.
+        // The second part faults, after the first was copied.
         let mut queue = wrapped_queue();
-        let mut parts = 0;
+        let mut destination = FaultingBuffer::new(8, 4);
         assert_eq!(
-            take_from_queue(&mut queue, 8, &mut |_| {
-                parts += 1;
-                if parts == 1 {
-                    Ok(())
-                } else {
-                    Err(BrokerError::Internal)
-                }
-            }),
-            Err(BrokerError::Internal)
+            take_from_queue(&mut queue, 8, &mut destination),
+            Err(Fault.into())
         );
-        assert_eq!(parts, 2);
         assert!(queue.iter().copied().eq(0..8));
     }
 
@@ -256,10 +296,7 @@ mod tests {
             let mut queue = VecDeque::with_capacity(8);
             queue.extend(0..6);
             queue.drain(..4);
-            assert_eq!(
-                append_to_queue(&mut queue, length, &mut copy_from_slice(&source)),
-                Ok(())
-            );
+            assert_eq!(append_to_queue(&mut queue, length, &source), Ok(()));
             assert!(queue.iter().eq([4, 5].iter().chain(&source[..length])));
             if length == source.len() {
                 assert_ne!(queue.as_slices().1, []);
@@ -269,24 +306,41 @@ mod tests {
 
     #[test]
     fn failed_appends_leave_the_queue_unchanged() {
-        // The second part fails, after the first was filled.
+        // The second part faults, after the first was filled.
         let mut queue = VecDeque::with_capacity(8);
         queue.extend(0..6);
         queue.drain(..4);
-        let mut parts = 0;
-        assert_eq!(
-            append_to_queue(&mut queue, 6, &mut |part| {
-                parts += 1;
-                if parts == 1 {
-                    part.fill(9);
-                    Ok(())
-                } else {
-                    Err(BrokerError::Internal)
-                }
-            }),
-            Err(BrokerError::Internal)
-        );
-        assert_eq!(parts, 2);
+        let source = FaultingBuffer::new(6, 4);
+        assert_eq!(append_to_queue(&mut queue, 6, &source), Err(Fault.into()));
         assert!(queue.iter().copied().eq(4..6));
+    }
+
+    #[test]
+    fn copy_counts_count_copies_that_run_on() {
+        let mut destination = [0; 4];
+        let mut counted = CopyCount::new(&mut destination[..]);
+        assert_eq!(counted.copy_from_slice_at(0, &[1]), Ok(()));
+        assert_eq!(counted.copy_from_slice_at(1, &[2, 3]), Ok(()));
+        assert_eq!(counted.finish(), Ok(3));
+        assert_eq!(destination, [1, 2, 3, 0]);
+
+        let source = [1, 2, 3, 4];
+        let counted = CopyCount::new(&source[..]);
+        assert_eq!(counted.copy_to_slice_at(0, &mut [0; 4]), Ok(()));
+        assert_eq!(counted.finish(), Ok(4));
+    }
+
+    #[test]
+    fn copy_counts_fail_copies_that_skip_or_fault() {
+        let mut destination = [0; 4];
+        let mut counted = CopyCount::new(&mut destination[..]);
+        assert_eq!(counted.copy_from_slice_at(1, &[2]), Err(Fault));
+        assert_eq!(counted.copy_from_slice_at(0, &[1]), Err(Fault));
+        assert_eq!(counted.finish(), Err(Fault.into()));
+
+        let mut counted = CopyCount::new(FaultingBuffer::new(4, 2));
+        assert_eq!(counted.copy_from_slice_at(0, &[1, 2]), Ok(()));
+        assert_eq!(counted.copy_from_slice_at(2, &[3]), Err(Fault));
+        assert_eq!(counted.finish(), Err(Fault.into()));
     }
 }

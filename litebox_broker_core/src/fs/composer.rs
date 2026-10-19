@@ -11,6 +11,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
@@ -22,7 +24,6 @@ use super::errors::{
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
-use crate::transfer::{CopyFromFn, CopyToFn};
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -665,14 +666,13 @@ impl Backend for Composer {
     fn read(
         &self,
         h: &FileHandle,
-        length: usize,
+        buf: &mut dyn ReadBuffer,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .read(&h.handle, length, offset, copy_from)
+            .read(&h.handle, buf, offset)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -685,14 +685,13 @@ impl Backend for Composer {
     fn write(
         &self,
         h: &FileHandle,
-        length: usize,
+        buf: &dyn WriteBuffer,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .write(&h.handle, length, offset, copy_to)
+            .write(&h.handle, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {

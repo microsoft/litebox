@@ -16,8 +16,8 @@ use super::{
     errors::{SocketAsyncError, SocketReadError, SocketWriteError},
     is_nonblocking_would_block,
 };
-use crate::buffer::{ReadBuffer, WriteBuffer, copy_from_buffer, copy_to_buffer};
 use crate::{broker::error::BrokerObjectError, sync::RawSyncPrimitivesProvider};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// Receives one datagram, returning its whole length, and stores its
@@ -39,8 +39,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         };
         match self.broker.receive_from_socket(
             self.handle,
-            length,
-            &mut copy_to_buffer(buffer, 0),
+            &mut buffer.sub_buffer(0, length),
             broker_flags,
         ) {
             Ok(SocketOutcome::Completed(received)) => {
@@ -74,13 +73,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
             Some(SocketAddr::V6(_)) => return Err(SocketWriteError::Unaddressable),
             None => None,
         };
-        match self.broker.send_to_socket(
-            self.handle,
-            buffer.len(),
-            &mut copy_from_buffer(&buffer, 0),
-            BrokerSendFlags::NONE,
-            destination,
-        ) {
+        match self
+            .broker
+            .send_to_socket(self.handle, &buffer, BrokerSendFlags::NONE, destination)
+        {
             Ok(SocketOutcome::Completed(sent)) => Ok(sent),
             Ok(SocketOutcome::Failed(BrokerSocketError::Shutdown)) => {
                 Err(SocketWriteError::WriteShutdown)

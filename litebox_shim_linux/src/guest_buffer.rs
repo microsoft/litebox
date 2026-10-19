@@ -8,9 +8,8 @@
 
 use core::{marker::PhantomData, ops::Range};
 
-use litebox::buffer::{RawBytes, ReadBuffer, WriteBuffer};
-use litebox::mm::exception_table::Fault;
 use litebox_common_linux::{IoReadVec, IoWriteVec, errno::Errno};
+use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer};
 
 use crate::{ShimPlatform, UserPtr, UserPtrMut};
 
@@ -98,11 +97,13 @@ impl<'a, Platform: ShimPlatform> GuestReadBuffer<'a, Platform> {
     }
 }
 
-impl<Platform: ShimPlatform> ReadBuffer for GuestReadBuffer<'_, Platform> {
+impl<Platform: ShimPlatform> Buffer for GuestReadBuffer<'_, Platform> {
     fn len(&self) -> usize {
         self.length
     }
+}
 
+impl<Platform: ShimPlatform> ReadBuffer for GuestReadBuffer<'_, Platform> {
     fn copy_from_slice_at(&mut self, offset: usize, source: &[u8]) -> Result<(), Fault> {
         assert_within(self.length, offset, source.len());
         for_each_part(self.parts(), offset, source.len(), |base, at, range| {
@@ -153,11 +154,13 @@ impl<'a, Platform: ShimPlatform> GuestWriteBuffer<'a, Platform> {
     }
 }
 
-impl<Platform: ShimPlatform> WriteBuffer for GuestWriteBuffer<'_, Platform> {
+impl<Platform: ShimPlatform> Buffer for GuestWriteBuffer<'_, Platform> {
     fn len(&self) -> usize {
         self.length
     }
+}
 
+impl<Platform: ShimPlatform> WriteBuffer for GuestWriteBuffer<'_, Platform> {
     fn copy_to_slice_at(&self, offset: usize, destination: &mut [u8]) -> Result<(), Fault> {
         assert_within(self.length, offset, destination.len());
         for_each_part(
@@ -188,7 +191,6 @@ impl<Platform: ShimPlatform> WriteBuffer for GuestWriteBuffer<'_, Platform> {
 mod tests {
     use super::*;
     use crate::syscalls::tests::TestPlatform;
-    use litebox_broker_transport::shared_memory::{AsSharedBytes as _, HeapSharedMemory};
 
     fn read_iov(bytes: &mut [u8]) -> IoReadVec {
         IoReadVec {
@@ -211,12 +213,10 @@ mod tests {
         let mut buffer = GuestReadBuffer::<TestPlatform>::new(&iovs).unwrap();
         assert_eq!(buffer.len(), 5);
         buffer.copy_from_slice_at(1, &[1, 2]).unwrap();
-        let memory = HeapSharedMemory::new(2);
-        let shared = memory.shared_bytes(0, 2).unwrap();
-        shared.copy_from_slice(&[3, 4]);
-        buffer
+        let mut raw = [3, 4];
+        (&mut buffer)
             .sub_buffer(2, 3)
-            .copy_from_raw_at(1, shared.into())
+            .copy_from_raw_at(1, (&mut raw[..]).into())
             .unwrap();
         assert_eq!((a, c), ([0, 1], [2, 3, 4]));
     }
@@ -229,12 +229,9 @@ mod tests {
         let mut gathered = [0; 3];
         buffer.copy_to_slice_at(1, &mut gathered).unwrap();
         assert_eq!(gathered, [2, 3, 4]);
-        let memory = HeapSharedMemory::new(4);
-        let shared = memory.shared_bytes(0, 4).unwrap();
-        buffer.copy_to_raw_at(1, shared.into()).unwrap();
-        let mut copied = [0; 4];
-        shared.copy_to_slice(&mut copied);
-        assert_eq!(copied, [2, 3, 4, 5]);
+        let mut raw = [0; 4];
+        buffer.copy_to_raw_at(1, (&mut raw[..]).into()).unwrap();
+        assert_eq!(raw, [2, 3, 4, 5]);
     }
 
     // Signal support for Windows is not ready yet.

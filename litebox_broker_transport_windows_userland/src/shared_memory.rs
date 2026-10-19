@@ -11,10 +11,9 @@ use litebox_broker_transport::control_ring::{
     CONTROL_RING_MEMORY_SIZE, CONTROL_RING_PARALLEL_SPIN_LIMIT, ControlRingDirection,
     MemoryAccessPolicy, WaitableSharedMemory,
 };
-use litebox_broker_transport::peer_memory;
-use litebox_broker_transport::shared_memory::{
-    AsSharedBytes, ControlRingMemory, SharedBytes, SharedMemory, SharedMemoryError,
-};
+use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
+use litebox_platform::buffer::RawBytes;
+use litebox_platform::peer_memory;
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -423,26 +422,14 @@ impl SharedMemory for WindowsSharedMemory {
         }
         Ok(())
     }
-}
 
-impl AsSharedBytes for WindowsSharedMemory {
-    fn shared_bytes(
-        &self,
-        offset: usize,
-        length: usize,
-    ) -> Result<SharedBytes<'_>, SharedMemoryError> {
-        if !self.policy.permits_byte_range(offset, length) {
-            return Err(SharedMemoryError::InvalidRange);
+    fn raw_bytes(&self) -> Option<RawBytes<'_>> {
+        if self.policy != MemoryAccessPolicy::Bytes {
+            return None;
         }
-        let address = self.checked_address(offset, length, 1)?;
-        // SAFETY: The range lies within the committed read-write view, which
-        // stays mapped as long as `self` and is never referenced.
-        Ok(unsafe {
-            SharedBytes::from_raw_parts(
-                NonNull::new(address).expect("a view is never at address zero"),
-                length,
-            )
-        })
+        // SAFETY: The committed read-write view stays mapped as long as
+        // `self` and is never referenced.
+        Some(unsafe { RawBytes::from_raw_parts(self.view, self.length) })
     }
 }
 

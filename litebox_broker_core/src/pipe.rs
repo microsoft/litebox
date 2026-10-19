@@ -10,11 +10,12 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::rwlock::RwLock;
 
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
-use crate::transfer::{CopyFromFn, CopyToFn, append_to_queue, take_from_queue};
+use crate::transfer::{append_to_queue, take_from_queue};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
@@ -66,37 +67,34 @@ pub fn create(
     )
 }
 
-/// Reads up to `length` bytes from a broker-owned pipe, passing them to
-/// `copy_from` to copy out, and returns how many it read.
+/// Reads bytes from a broker-owned pipe into the start of `output`, and
+/// returns how many it read.
 pub fn read(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    length: u32,
-    copy_from: &mut CopyFromFn<'_>,
+    output: &mut dyn ReadBuffer,
 ) -> Result<usize> {
-    if length > MAX_PIPE_TRANSFER_SIZE {
+    if output.len() > MAX_PIPE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let object = object.read();
-    object.as_pipe()?.read(length as usize, copy_from)
+    object.as_pipe()?.read(output)
 }
 
-/// Writes up to `length` bytes to a broker-owned pipe, passing the room for
-/// those it writes to `copy_to` to copy in (see [`crate::transfer`]), and
-/// returns how many it wrote.
+/// Writes bytes from the start of `data` to a broker-owned pipe, and returns
+/// how many it wrote.
 pub fn write(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    length: usize,
-    copy_to: &mut CopyToFn<'_>,
+    data: &dyn WriteBuffer,
 ) -> Result<usize> {
-    if length > MAX_PIPE_TRANSFER_SIZE as usize {
+    if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let object = object.read();
-    object.as_pipe()?.write(length, copy_to)
+    object.as_pipe()?.write(data)
 }
 
 /// Reads up to `length` bytes from a broker-owned pipe into a new vector.
@@ -104,32 +102,12 @@ pub fn write(
 pub(crate) fn read_to_vec(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    length: u32,
+    length: usize,
 ) -> Result<alloc::vec::Vec<u8>> {
-    let mut data = alloc::vec::Vec::new();
-    let read = read(
-        process,
-        handle,
-        length,
-        &mut crate::test_support::copy_to_vec(&mut data),
-    )?;
-    assert_eq!(read, data.len());
+    let mut data = alloc::vec![0; length];
+    let read = read(process, handle, &mut data)?;
+    data.truncate(read);
     Ok(data)
-}
-
-/// Writes `data` to a broker-owned pipe.
-#[cfg(test)]
-pub(crate) fn write_from(
-    process: &BrokerProcess,
-    handle: ObjectHandle,
-    data: &[u8],
-) -> Result<usize> {
-    write(
-        process,
-        handle,
-        data.len(),
-        &mut crate::transfer::copy_from_slice(data),
-    )
 }
 
 impl ObjectEntry {
@@ -180,11 +158,11 @@ impl PipeObject {
         }
     }
 
-    fn read(&self, length: usize, copy_from: &mut CopyFromFn<'_>) -> Result<usize> {
+    fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize> {
         if !matches!(self.endpoint, PipeEndpoint::Read) {
             return Err(BrokerError::InvalidRights);
         }
-        if length == 0 {
+        if output.is_empty() {
             return Ok(0);
         }
 
@@ -197,17 +175,17 @@ impl PipeObject {
             };
         }
 
-        let read_len = length.min(state.data.len());
-        take_from_queue(&mut state.data, read_len, copy_from)?;
+        let read_len = output.len().min(state.data.len());
+        take_from_queue(&mut state.data, read_len, output)?;
         state.publish(PipeEndpoint::Write);
         Ok(read_len)
     }
 
-    fn write(&self, length: usize, copy_to: &mut CopyToFn<'_>) -> Result<usize> {
+    fn write(&self, data: &dyn WriteBuffer) -> Result<usize> {
         if !matches!(self.endpoint, PipeEndpoint::Write) {
             return Err(BrokerError::InvalidRights);
         }
-        if length == 0 {
+        if data.is_empty() {
             return Ok(0);
         }
         let mut state = self.state.write();
@@ -216,12 +194,12 @@ impl PipeObject {
         }
 
         let available = state.capacity - state.data.len();
-        if available == 0 || (length <= state.atomic_write_size && available < length) {
+        if available == 0 || (data.len() <= state.atomic_write_size && available < data.len()) {
             return Err(BrokerError::would_block(self.status.nonblocking()));
         }
 
-        let write_len = available.min(length);
-        append_to_queue(&mut state.data, write_len, copy_to)?;
+        let write_len = available.min(data.len());
+        append_to_queue(&mut state.data, write_len, data)?;
         state.publish(PipeEndpoint::Read);
         Ok(write_len)
     }

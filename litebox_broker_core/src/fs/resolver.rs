@@ -9,6 +9,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -22,7 +24,6 @@ use super::{
 };
 use super::{SeekWhence, UserInfo};
 use crate::readiness::ReadinessSource;
-use crate::transfer::{CopyFromFn, CopyToFn};
 
 /// The broker-core filesystem resolver, generic over its synchronization platform and
 /// [`Backend`](super::backend::Backend).
@@ -545,9 +546,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub(crate) fn read_without_position_update(
         &self,
         entry: &ResolverEntry<Backend>,
-        length: usize,
+        buf: &mut dyn ReadBuffer,
         offset: Option<usize>,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<(usize, usize), ReadError> {
         if entry.path_only {
             return Err(ReadError::NotForReading);
@@ -565,12 +565,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let read = self.backend.read(file, length, read_offset, copy_from)?;
+        let read = self.backend.read(file, buf, read_offset)?;
         Ok((read, read_offset))
     }
 
-    /// Read up to `length` bytes from a file descriptor at `offset`, passing
-    /// them to `copy_from` (see [`crate::transfer`])
+    /// Read from a file descriptor at `offset` into a buffer
     ///
     /// If `offset` is None, the read will start at the current file offset and update the file
     /// offset to the end of the read.
@@ -582,12 +581,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn read(
         &self,
         entry: &mut ResolverEntry<Backend>,
-        length: usize,
+        buf: &mut dyn ReadBuffer,
         offset: Option<usize>,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError> {
-        let (read, read_offset) =
-            self.read_without_position_update(entry, length, offset, copy_from)?;
+        let (read, read_offset) = self.read_without_position_update(entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
             entry.position = read_offset.checked_add(read).unwrap();
         }
@@ -597,15 +594,14 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub(crate) fn write_without_position_update(
         &self,
         entry: &ResolverEntry<Backend>,
-        length: usize,
+        buf: &dyn WriteBuffer,
         offset: Option<usize>,
-        copy_to: &mut CopyToFn<'_>,
     ) -> Result<(usize, usize), WriteError> {
         if entry.path_only {
             return Err(WriteError::NotForWriting);
         }
-        let file_handle = match &entry.handle {
-            Handle::File(file_handle) => file_handle,
+        let file = match &entry.handle {
+            Handle::File(file) => file,
             Handle::Dir(_) => return Err(WriteError::NotAFile),
         };
         let seek_behavior = entry.seek_behavior;
@@ -618,7 +614,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::PositionBased if entry.append_mode && offset.is_none() => {
                 usize::try_from(
                     self.backend
-                        .status(HandleRef::File(file_handle))
+                        .status(HandleRef::File(file))
                         .map_err(|_| WriteError::Io)?
                         .size,
                 )
@@ -626,14 +622,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             }
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let written = self
-            .backend
-            .write(file_handle, length, write_offset, copy_to)?;
+        let written = self.backend.write(file, buf, write_offset)?;
         Ok((written, write_offset))
     }
 
-    /// Write up to `length` bytes to a file descriptor at `offset`, passing the
-    /// room for them to `copy_to` (see [`crate::transfer`])
+    /// Write from a buffer to a file descriptor at `offset`
     ///
     /// If `offset` is None, the write will start at the current file offset and update the file
     /// offset to the end of the write.
@@ -645,12 +638,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn write(
         &self,
         entry: &mut ResolverEntry<Backend>,
-        length: usize,
+        buf: &dyn WriteBuffer,
         offset: Option<usize>,
-        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError> {
-        let (written, write_offset) =
-            self.write_without_position_update(entry, length, offset, copy_to)?;
+        let (written, write_offset) = self.write_without_position_update(entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
             entry.position = write_offset.checked_add(written).unwrap();
         }

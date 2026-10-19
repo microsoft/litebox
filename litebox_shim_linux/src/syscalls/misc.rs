@@ -6,11 +6,11 @@
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
 use crate::{ShimPlatform, Task, guest_buffer::GuestReadBuffer};
-use litebox::buffer::ReadBuffer as _;
 use litebox::random::FillRandomError;
 use litebox::user_pointers::UserPtrMut;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{IoReadVec, errno::Errno};
+use litebox_platform::buffer::Buffer as _;
 use litebox_platform::time::Instant as _;
 
 impl<Platform: ShimPlatform> Task<Platform> {
@@ -32,7 +32,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut offset = 0;
         while offset < count {
             let len = (count - offset).min(CHUNK_LEN);
-            match self.global.litebox.fill_random(buf.sub_buffer(offset, len)) {
+            match self
+                .global
+                .litebox
+                .fill_random((&mut buf).sub_buffer(offset, len))
+            {
                 Ok(()) => offset += len,
                 // Like Linux, a failure after progress ends the call with that progress.
                 Err(_) if offset != 0 => break,

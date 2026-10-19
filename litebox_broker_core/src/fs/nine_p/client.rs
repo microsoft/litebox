@@ -9,13 +9,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{Mutex, RawSyncPrimitivesProvider};
 
 use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::id_pool::IdPool;
 use super::transport::{self, Read, Write};
-use crate::transfer::{CopyFromFn, CopyToFn};
+use crate::transfer::bounce_buffer;
 
 /// Pool of 9P Fid values
 struct FidPool<Platform: RawSyncPrimitivesProvider> {
@@ -197,23 +198,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
     {
-        self.exchange(
-            |wbuf, tag| {
-                TaggedFcall { tag, fcall }
-                    .encode_to_buf(wbuf)
-                    .map_err(|_| Error::Io)
-            },
-            f,
-        )
-    }
-
-    /// Send a request that `encode` encodes, given its tag, and wait for the
-    /// response. If `encode` fails, nothing is sent.
-    fn exchange<E, F, R>(&self, encode: E, f: F) -> Result<R, Error>
-    where
-        E: FnOnce(&mut Vec<u8>, u16) -> Result<(), Error>,
-        F: FnOnce(Fcall<'_>) -> Result<R, Error>,
-    {
         if self.transport_failed.load(Ordering::Acquire) {
             return Err(Error::Io);
         }
@@ -222,8 +206,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
         let mut write_state = self.write_state.lock();
         let ClientWriteState { transport, wbuf } = &mut *write_state;
-        encode(wbuf, tag)?;
-        if transport.write_all(wbuf).is_err() {
+        if transport::write_message(transport, wbuf, TaggedFcall { tag, fcall }).is_err() {
             self.transport_failed.store(true, Ordering::Release);
             return Err(Error::Io);
         }
@@ -465,14 +448,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         &self,
         fid: &Fid<Platform>,
         offset: u64,
-        length: usize,
-        copy_from: &mut CopyFromFn<'_>,
+        buf: &mut dyn ReadBuffer,
     ) -> Result<usize, Error> {
         let max_count = self
             .msize
             .checked_sub(fcall::IOHDRSZ)
             .ok_or(Error::InvalidResponse)? as usize;
-        let count = length.min(max_count);
+        let count = buf.len().min(max_count);
         self.fcall(
             Fcall::Tread(fcall::Tread {
                 fid: fid.id(),
@@ -484,7 +466,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                     if data.len() > count {
                         return Err(Error::InvalidResponse);
                     }
-                    copy_from(&data)?;
+                    buf.copy_from_slice_at(0, &data)?;
                     Ok(data.len())
                 }
                 Fcall::Rlerror(e) => Err(Error::from(e)),
@@ -498,19 +480,21 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         &self,
         fid: &Fid<Platform>,
         offset: u64,
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        data: &dyn WriteBuffer,
     ) -> Result<usize, Error> {
         let max_count = self
             .msize
             .checked_sub(fcall::IOHDRSZ)
             .ok_or(Error::InvalidResponse)? as usize;
-        let count = length.min(max_count);
-        let count_u32 = u32::try_from(count).map_err(|_| Error::InvalidResponse)?;
-        self.exchange(
-            |wbuf, tag| {
-                TaggedFcall::encode_twrite_to_buf(wbuf, tag, fid.id(), offset, count_u32, copy_to)
-            },
+        let count = data.len().min(max_count);
+        let mut bytes = bounce_buffer(count)?;
+        data.copy_to_slice_at(0, &mut bytes)?;
+        self.fcall(
+            Fcall::Twrite(fcall::Twrite {
+                fid: fid.id(),
+                offset,
+                data: alloc::borrow::Cow::Owned(bytes),
+            }),
             |response| match response {
                 Fcall::Rwrite(fcall::Rwrite { count: written }) => {
                     let written = written as usize;

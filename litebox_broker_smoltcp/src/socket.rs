@@ -14,7 +14,6 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -23,6 +22,7 @@ use litebox_broker_protocol::socket::{
     SocketOutcome, SocketType,
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::tcp::Tcp;
 use super::udp::Udp;
@@ -155,63 +155,46 @@ impl PlatformSocket for SmoltcpSocket {
 
     fn send(
         &self,
-        length: usize,
+        data: &dyn WriteBuffer,
         _flags: SendFlags,
-        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        self.with(
-            |tcp, sockets| tcp.send(sockets, length, copy_to),
-            |_, _| Ok(invalid()),
-        )
+        self.with(|tcp, sockets| tcp.send(sockets, data), |_, _| Ok(invalid()))
     }
 
     fn send_to(
         &self,
-        length: usize,
+        data: &dyn WriteBuffer,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
-        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         self.run(|stack| match stack.parts(self.id)?.0 {
             Kind::Tcp(_) => Ok(invalid()),
-            Kind::Udp(_) => stack.send_udp(self.id, length, destination, copy_to),
+            Kind::Udp(_) => stack.send_udp(self.id, data, destination),
         })
     }
 
     fn receive(
         &self,
         reader: ObjectHandle,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         self.with(
-            |tcp, sockets| {
-                tcp.receive(
-                    sockets,
-                    reader,
-                    length,
-                    flags,
-                    peek_offset,
-                    peek_length,
-                    copy_from,
-                )
-            },
+            |tcp, sockets| tcp.receive(sockets, reader, output, flags, peek_offset, peek_length),
             |_, _| Ok(invalid()),
         )
     }
 
     fn receive_from(
         &self,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFromFlags,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         self.with(
             |_, _| Ok(invalid()),
-            |udp, sockets| udp.receive_from(sockets, length, flags, copy_from),
+            |udp, sockets| udp.receive_from(sockets, output, flags),
         )
     }
 

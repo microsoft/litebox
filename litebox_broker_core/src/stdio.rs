@@ -4,10 +4,10 @@
 //! Host standard streams behind the `/dev` stdio devices.
 
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use thiserror::Error;
 
 use crate::readiness::ReadinessRegistration;
-use crate::transfer::{CopyFromFn, CopyToFn};
 use crate::{BrokerError, Result};
 
 /// Standard stream selected by a terminal query.
@@ -45,11 +45,16 @@ pub enum StdioProviderError {
     /// This broker deployment does not provide standard I/O.
     #[error("standard I/O is unsupported")]
     Unsupported,
-    /// The broker failed the operation itself, such as when the `CopyFromFn` or
-    /// `CopyToFn` it passed bytes or room to failed (see [`crate::transfer`]) or it
-    /// ran out of memory.
+    /// The broker failed the operation itself, such as when copying to or
+    /// from the caller's buffer faulted or it ran out of memory.
     #[error(transparent)]
     Broker(#[from] BrokerError),
+}
+
+impl From<Fault> for StdioProviderError {
+    fn from(fault: Fault) -> Self {
+        Self::Broker(fault.into())
+    }
 }
 
 /// Trusted provider of standard-I/O operations.
@@ -67,24 +72,17 @@ pub trait StdioProvider: Send + Sync {
         None
     }
 
-    /// Reads up to `length` available bytes from standard input, passing
-    /// them to `copy_from` to copy out (see [`crate::transfer`]), and returns how
-    /// many it read: exactly those it passed, so zero at end-of-file.
-    fn read(
-        &self,
-        length: usize,
-        copy_from: &mut CopyFromFn<'_>,
-    ) -> core::result::Result<usize, StdioProviderError>;
+    /// Reads available bytes from standard input, returning zero at
+    /// end-of-file, which it copies into `output` in order from its start
+    /// (see [`crate::transfer`]).
+    fn read(&self, output: &mut dyn ReadBuffer) -> core::result::Result<usize, StdioProviderError>;
 
-    /// Writes up to `length` bytes to the selected standard output stream,
-    /// passing room for up to `length` bytes to `copy_to` to copy them in (see
-    /// [`crate::transfer`]), and returns how many it wrote, which may be
-    /// fewer than it passed room for.
+    /// Writes bytes to the selected standard output stream, which it copies
+    /// out of `input` in order from its start (see [`crate::transfer`]).
     fn write(
         &self,
         stream: StdioOutputStream,
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        input: &dyn WriteBuffer,
     ) -> core::result::Result<usize, StdioProviderError>;
 
     /// Determines whether the selected standard stream is connected to a
@@ -115,8 +113,7 @@ pub struct UnsupportedStdioProvider;
 impl StdioProvider for UnsupportedStdioProvider {
     fn read(
         &self,
-        _length: usize,
-        _copy_from: &mut CopyFromFn<'_>,
+        _output: &mut dyn ReadBuffer,
     ) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }
@@ -124,8 +121,7 @@ impl StdioProvider for UnsupportedStdioProvider {
     fn write(
         &self,
         _stream: StdioOutputStream,
-        _length: usize,
-        _copy_to: &mut CopyToFn<'_>,
+        _input: &dyn WriteBuffer,
     ) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }

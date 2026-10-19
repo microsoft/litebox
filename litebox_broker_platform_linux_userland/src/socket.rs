@@ -20,7 +20,6 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
-use litebox_broker_core::transfer::{CopyFromFn, CopyToFn, bounce_buffer};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -29,6 +28,7 @@ use litebox_broker_protocol::socket::{
     SocketOptionName, SocketOptionValue, SocketOutcome, SocketType,
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, epoll, eventfd};
 use rustix::io::{Errno, read, write};
@@ -287,31 +287,29 @@ impl PlatformSocket for LinuxSocket {
 
     fn send(
         &self,
-        length: usize,
+        data: &dyn WriteBuffer,
         _flags: SendFlags,
-        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let mut data = bounce_buffer(length)?;
-        copy_to(&mut data)?;
+        let mut staged = zeroed_vec(data.len())?;
+        data.copy_to_slice_at(0, &mut staged)?;
         self.reactor.request(|response| ReactorCommand::Send {
             id: self.id,
-            data,
+            data: staged,
             response,
         })
     }
 
     fn send_to(
         &self,
-        length: usize,
+        data: &dyn WriteBuffer,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
-        copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let mut data = bounce_buffer(length)?;
-        copy_to(&mut data)?;
+        let mut staged = zeroed_vec(data.len())?;
+        data.copy_to_slice_at(0, &mut staged)?;
         self.reactor.request(|response| ReactorCommand::SendTo {
             id: self.id,
-            data,
+            data: staged,
             destination,
             response,
         })
@@ -320,12 +318,12 @@ impl PlatformSocket for LinuxSocket {
     fn receive(
         &self,
         reader: ObjectHandle,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
+        let length = output.len();
         let peek_offset =
             usize::try_from(peek_offset).map_err(|_| BrokerError::UnsupportedOperation)?;
         let peek_length =
@@ -340,7 +338,7 @@ impl PlatformSocket for LinuxSocket {
             response,
         })? {
             ReactorReceiveOutcome::Received(received) => {
-                copy_from(&received)?;
+                output.copy_from_slice_at(0, &received)?;
                 Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
                     received.len(),
                 )))
@@ -354,15 +352,14 @@ impl PlatformSocket for LinuxSocket {
 
     fn receive_from(
         &self,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFromFlags,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         match self
             .reactor
             .request(|response| ReactorCommand::ReceiveFrom {
                 id: self.id,
-                length,
+                length: output.len(),
                 flags,
                 response,
             })? {
@@ -371,7 +368,7 @@ impl PlatformSocket for LinuxSocket {
                 datagram_length,
                 source_address,
             } => {
-                copy_from(&data)?;
+                output.copy_from_slice_at(0, &data)?;
                 Ok(SocketOutcome::Completed(PlatformDatagramReceive {
                     received: data.len(),
                     datagram_length,
@@ -1989,6 +1986,14 @@ impl Reactor {
         self.udp.clear_live_state();
         self.processes.clear();
     }
+}
+
+fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(length)
+        .map_err(|_| BrokerError::OutOfMemory)?;
+    data.resize(length, 0);
+    Ok(data)
 }
 
 fn take_socket_error(socket: &SocketEntry) -> BrokerResult<Option<SocketError>> {

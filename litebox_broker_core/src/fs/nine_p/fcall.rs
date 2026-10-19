@@ -7,7 +7,6 @@
 //! See <https://9p.io/sys/man/5/intro> and <https://github.com/chaos/diod/blob/master/protocol.md>
 
 use super::transport;
-use crate::transfer::CopyToFn;
 
 // This duplicates `litebox::utilities::macros::repr_enum` because broker core cannot depend on
 // LiteBox. Keep it local unless enough shared macros justify introducing a common home.
@@ -1217,35 +1216,6 @@ impl<'a> TaggedFcall<'a> {
         Ok(())
     }
 
-    /// Encode to a buffer a `Twrite` message, tagged `tag`, of `count` bytes for `fid` at
-    /// `offset`, passing the room for its data to `copy_to` to fill in place (see
-    /// [`crate::transfer`]).
-    pub(super) fn encode_twrite_to_buf(
-        buf: &mut Vec<u8>,
-        tag: u16,
-        fid: u32,
-        offset: u64,
-        count: u32,
-        copy_to: &mut CopyToFn<'_>,
-    ) -> Result<(), super::Error> {
-        buf.clear();
-        buf.resize(4, 0); // Reserve space for size
-        let header = |buf: &mut Vec<u8>| -> Result<(), transport::WriteError> {
-            encode_le(buf, FcallType::Twrite as u8)?;
-            encode_le(buf, tag)?;
-            encode_le(buf, fid)?;
-            encode_le(buf, offset)?;
-            encode_le(buf, count)
-        };
-        header(buf).map_err(|_| super::Error::Io)?;
-        let start = buf.len();
-        buf.resize(start + count as usize, 0);
-        copy_to(&mut buf[start..])?;
-        let size = u32::try_from(buf.len()).map_err(|_| super::Error::Io)?;
-        buf[0..4].copy_from_slice(&size.to_le_bytes());
-        Ok(())
-    }
-
     /// Decode a message from a buffer
     pub(super) fn decode(buf: &'a [u8]) -> Result<TaggedFcall<'a>, super::Error> {
         if buf.len() < 7 {
@@ -1411,54 +1381,5 @@ impl<'b> FcallDecoder<'b> {
         } else {
             Err(super::Error::InvalidResponse)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use alloc::borrow::Cow;
-    use alloc::vec;
-    use alloc::vec::Vec;
-
-    use super::{Fcall, TaggedFcall, Twrite};
-    use crate::BrokerError;
-    use crate::transfer::copy_from_slice;
-
-    /// A `Twrite` encoded in place is the same as one serialized from its data.
-    #[test]
-    fn twrite_encoded_in_place_matches_serialized() {
-        let data = b"in place";
-        let mut serialized = Vec::new();
-        TaggedFcall {
-            tag: 7,
-            fcall: Fcall::Twrite(Twrite {
-                fid: 3,
-                offset: 1 << 40,
-                data: Cow::Borrowed(data),
-            }),
-        }
-        .encode_to_buf(&mut serialized)
-        .ok()
-        .unwrap();
-
-        let mut in_place = vec![0xff; 64];
-        let count = u32::try_from(data.len()).unwrap();
-        TaggedFcall::encode_twrite_to_buf(
-            &mut in_place,
-            7,
-            3,
-            1 << 40,
-            count,
-            &mut copy_from_slice(data),
-        )
-        .unwrap();
-        assert_eq!(in_place, serialized);
-
-        assert!(matches!(
-            TaggedFcall::encode_twrite_to_buf(&mut in_place, 7, 3, 0, count, &mut |_| Err(
-                BrokerError::OutOfMemory
-            )),
-            Err(super::super::Error::Broker(BrokerError::OutOfMemory))
-        ));
     }
 }

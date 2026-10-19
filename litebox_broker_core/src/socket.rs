@@ -20,6 +20,7 @@ use litebox_broker_protocol::socket::{
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
     SocketType,
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, RwLock};
 
 use crate::id::IdAllocator;
@@ -27,7 +28,7 @@ use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
-use crate::transfer::{CopyCount, CopyFromFn, CopyToFn};
+use crate::transfer::CopyCount;
 use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessId, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
@@ -434,8 +435,8 @@ pub struct AcceptedBrokerSocket {
 /// Platform result for one stream receive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlatformStreamReceive {
-    /// Number of bytes received from the stream and passed to the `CopyFromFn`: no
-    /// more than requested, and nonzero if any were.
+    /// Nonzero number of bytes received from the stream into the start of the
+    /// caller's buffer.
     Received(usize),
     /// The stream's receive direction reached end of stream.
     EndOfStream,
@@ -444,8 +445,8 @@ pub enum PlatformStreamReceive {
 /// Platform result for one datagram receive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlatformDatagramReceive {
-    /// Number of bytes received and passed to the `CopyFromFn`: the datagram's
-    /// prefix, the lesser of its length and the requested length.
+    /// Number of bytes of the datagram's prefix received into the start of the
+    /// caller's buffer: the lesser of the datagram's and the buffer's lengths.
     pub received: usize,
     /// Original datagram length, no greater than [`MAX_UDP_DATAGRAM_SIZE`].
     pub datagram_length: usize,
@@ -555,24 +556,17 @@ pub trait PlatformSocket: Send + Sync {
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError>;
 
-    /// Sends up to `length` bytes without waiting for platform readiness,
-    /// passing the room for them to `copy_to` to copy in (see
-    /// [`crate::transfer`]), and returns how many it sent: the first of
-    /// those it filled in, which may be more.
+    /// Sends bytes from the start of `data`, copied in order (see
+    /// [`crate::transfer`]), without waiting for platform readiness, and
+    /// returns how many it sent, which may be fewer than it copied.
     ///
     /// A temporarily full socket returns [`BrokerError::WouldBlock`]. A socket
     /// shut down for writing fails with `Shutdown`. Ordinary network failures
     /// return [`SocketOutcome::Failed`].
-    fn send(
-        &self,
-        length: usize,
-        flags: SendFlags,
-        copy_to: &mut CopyToFn<'_>,
-    ) -> Result<SocketOutcome<usize>>;
+    fn send(&self, data: &dyn WriteBuffer, flags: SendFlags) -> Result<SocketOutcome<usize>>;
 
-    /// Sends one complete datagram of `length` bytes without waiting for
-    /// platform readiness, passing its room to `copy_to` to copy in (see
-    /// [`crate::transfer`]).
+    /// Sends `data` as one complete datagram, copied in order (see
+    /// [`crate::transfer`]), without waiting for platform readiness.
     ///
     /// A destination is required for an unconnected socket and omitted to use
     /// the socket's connected peer. An explicit destination is normalized but
@@ -580,19 +574,18 @@ pub trait PlatformSocket: Send + Sync {
     /// [`normalize_socket_destination`] before choosing a host-socket target.
     /// A temporarily full socket returns [`BrokerError::WouldBlock`], and a
     /// socket shut down for writing fails with `Shutdown`. Partial successful
-    /// sends are invalid, and a datagram is filled in whole, but one the
-    /// platform drops, as UDP may, need not be filled in. Resource failures
-    /// are broker errors rather than ordinary socket failures.
+    /// sends are invalid, and a datagram is copied whole, but one the platform
+    /// drops, as UDP may, need not be copied. Resource failures are broker
+    /// errors rather than ordinary socket failures.
     fn send_to(
         &self,
-        length: usize,
+        data: &dyn WriteBuffer,
         flags: SendFlags,
         destination: Option<SocketAddrV4>,
-        copy_to: &mut CopyToFn<'_>,
     ) -> Result<SocketOutcome<usize>>;
 
-    /// Receives up to `length` bytes without waiting for platform readiness,
-    /// passing them to `copy_from` to copy out (see [`crate::transfer`]): exactly
+    /// Receives bytes into the start of `output`, copied in order (see
+    /// [`crate::transfer`]), without waiting for platform readiness: exactly
     /// those it returns, so none when it fails.
     ///
     /// A temporarily empty socket returns [`BrokerError::WouldBlock`]. End of
@@ -608,17 +601,15 @@ pub trait PlatformSocket: Send + Sync {
     fn receive(
         &self,
         reader: ObjectHandle,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<SocketOutcome<PlatformStreamReceive>>;
 
-    /// Receives one datagram without waiting for platform readiness, passing
-    /// up to `length` bytes of it to `copy_from` to copy out (see
-    /// [`crate::transfer`]): exactly those it returns, so none when it
-    /// fails.
+    /// Receives a prefix of one datagram into the start of `output`, copied in
+    /// order (see [`crate::transfer`]), without waiting for platform
+    /// readiness: exactly the bytes it returns, so none when it fails.
     ///
     /// The original datagram length is returned even when the caller's buffer
     /// is smaller, and zero-length datagrams are successful receives. When no
@@ -626,9 +617,8 @@ pub trait PlatformSocket: Send + Sync {
     /// address follows [`PlatformDatagramReceive::source_address`].
     fn receive_from(
         &self,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFromFlags,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<SocketOutcome<PlatformDatagramReceive>>;
 
     /// Applies a directional or TCP lifecycle shutdown mode.
@@ -1305,9 +1295,7 @@ pub fn accept(
     }))
 }
 
-/// Sends up to `length` TCP stream bytes without waiting for readiness,
-/// passing the room for those it sends to `copy_to` to copy in (see
-/// [`crate::transfer`]), and returns how many it sent.
+/// Sends TCP stream bytes without waiting for readiness.
 ///
 /// A socket shut down for writing fails with `Shutdown` once any connection
 /// attempt has finished, and an unconnected socket fails with `NotConnected`.
@@ -1317,24 +1305,22 @@ pub fn accept(
 pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    length: usize,
+    data: &dyn WriteBuffer,
     flags: SendFlags,
-    copy_to: &mut CopyToFn<'_>,
 ) -> Result<SocketOutcome<usize>> {
-    if flags.has_unsupported_bits() || length > MAX_SOCKET_TRANSFER_SIZE as usize {
+    if flags.has_unsupported_bits() || data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
-    let result = send_stream(&object, length, flags, copy_to);
+    let result = send_stream(&object, data, flags);
     sync_readiness(&object);
     result
 }
 
 fn send_stream(
     object: &RwLock<ObjectEntry>,
-    length: usize,
+    data: &dyn WriteBuffer,
     flags: SendFlags,
-    copy_to: &mut CopyToFn<'_>,
 ) -> Result<SocketOutcome<usize>> {
     let (create_request, write_shutdown, view, connect_in_flight, nonblocking) =
         read_socket(object, |socket| {
@@ -1373,7 +1359,7 @@ fn send_stream(
     if connect_in_flight {
         return Err(would_block_error(BrokerError::WouldBlock, nonblocking));
     }
-    let outcome = transport_send(object, length, flags, copy_to)?;
+    let outcome = transport_send(object, data, flags)?;
     if let SocketOutcome::Failed(_) = outcome {
         refresh_after_failure(object);
     }
@@ -1382,25 +1368,20 @@ fn send_stream(
 
 fn transport_send(
     object: &RwLock<ObjectEntry>,
-    length: usize,
+    data: &dyn WriteBuffer,
     flags: SendFlags,
-    copy_to: &mut CopyToFn<'_>,
 ) -> Result<SocketOutcome<usize>> {
+    let length = data.len();
     let state = socket_state(object)?;
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let mut copied = CopyCount::new(length);
-    let outcome = state
-        .resource
-        .platform_socket
-        .send(length, flags, &mut |part| {
-            copied.count(part.len(), || copy_to(part))
-        });
-    let copied = copied.finish()?;
+    let data = CopyCount::new(data);
+    let outcome = state.resource.platform_socket.send(&data, flags);
+    let copied = data.finish()?;
     let outcome = outcome.map_err(|error| would_block_error(error, state.nonblocking))?;
-    // A platform may fill in more than it sends, such as one that fills in
-    // all of it before learning how much the host takes.
+    // A platform may copy more than it sends, such as one that copies all of
+    // it before learning how much the host takes.
     if let SocketOutcome::Completed(sent) = outcome
         && (sent > copied || (length != 0 && sent == 0))
     {
@@ -1409,9 +1390,7 @@ fn transport_send(
     Ok(outcome)
 }
 
-/// Sends one complete datagram of `length` bytes without waiting for
-/// readiness, passing its room to `copy_to` to copy in (see
-/// [`crate::transfer`]).
+/// Sends `data` as one complete datagram without waiting for readiness.
 ///
 /// A pending error fails the send and is consumed, and a socket shut down for
 /// writing fails with `Shutdown`. Without `destination`, an unconnected
@@ -1424,16 +1403,15 @@ fn transport_send(
 pub fn send_to(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    length: usize,
+    data: &dyn WriteBuffer,
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
-    copy_to: &mut CopyToFn<'_>,
 ) -> Result<SocketOutcome<usize>> {
-    if flags.has_unsupported_bits() || length > MAX_UDP_DATAGRAM_SIZE as usize {
+    if flags.has_unsupported_bits() || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
-    let result = send_datagram(process, &object, length, flags, destination, copy_to);
+    let result = send_datagram(process, &object, data, flags, destination);
     sync_readiness(&object);
     result
 }
@@ -1441,10 +1419,9 @@ pub fn send_to(
 fn send_datagram(
     process: &BrokerProcess,
     object: &RwLock<ObjectEntry>,
-    length: usize,
+    data: &dyn WriteBuffer,
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
-    copy_to: &mut CopyToFn<'_>,
 ) -> Result<SocketOutcome<usize>> {
     if !read_socket(object, |socket| is_udp(socket.create_request))? {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
@@ -1464,7 +1441,7 @@ fn send_datagram(
     }
     finish_datagram_transfer(
         object,
-        transport_send_to(process, object, length, flags, destination, copy_to),
+        transport_send_to(process, object, data, flags, destination),
     )
 }
 
@@ -1493,11 +1470,11 @@ fn finish_datagram_transfer<T>(
 fn transport_send_to(
     process: &BrokerProcess,
     object: &RwLock<ObjectEntry>,
-    length: usize,
+    data: &dyn WriteBuffer,
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
-    copy_to: &mut CopyToFn<'_>,
 ) -> Result<SocketOutcome<usize>> {
+    let length = data.len();
     let create_request = read_socket(object, |socket| socket.create_request)?;
     let destination = match destination {
         Some(destination) if destination.port() == 0 => {
@@ -1576,16 +1553,12 @@ fn transport_send_to(
     }) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let mut copied = CopyCount::new(length);
-    let outcome = resource
-        .platform_socket
-        .send_to(length, flags, destination, &mut |part| {
-            copied.count(part.len(), || copy_to(part))
-        });
-    let copied = copied.finish()?;
+    let data = CopyCount::new(data);
+    let outcome = resource.platform_socket.send_to(&data, flags, destination);
+    let copied = data.finish()?;
     let outcome = outcome.map_err(|error| would_block_error(error, nonblocking))?;
-    // A platform may accept a datagram it then drops without filling it in,
-    // as UDP may drop any datagram.
+    // A platform may accept a datagram it then drops without copying it, as
+    // UDP may drop any datagram.
     if let SocketOutcome::Completed(sent) = outcome
         && (sent != length || (copied != 0 && copied != length))
     {
@@ -1594,8 +1567,8 @@ fn transport_send_to(
     Ok(outcome)
 }
 
-/// Receives up to `length` TCP stream bytes without waiting for readiness,
-/// passing them to `copy_from` to copy out (see [`crate::transfer`]).
+/// Receives TCP stream bytes into the start of `output` without waiting for
+/// readiness.
 ///
 /// An unconnected socket fails with `NotConnected`, or with `Shutdown` if it
 /// was shut down for reading and has no pending error, and a failed
@@ -1607,12 +1580,12 @@ fn transport_send_to(
 pub fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    length: usize,
+    output: &mut dyn ReadBuffer,
     flags: ReceiveFlags,
     peek_offset: u32,
     peek_length: u32,
-    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<SocketOutcome<PlatformStreamReceive>> {
+    let length = output.len();
     if flags.has_unsupported_bits() || length > MAX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
@@ -1632,15 +1605,7 @@ pub fn receive(
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
-    let result = receive_stream(
-        &object,
-        handle,
-        length,
-        flags,
-        peek_offset,
-        peek_length,
-        copy_from,
-    );
+    let result = receive_stream(&object, handle, output, flags, peek_offset, peek_length);
     sync_readiness(&object);
     result
 }
@@ -1648,11 +1613,10 @@ pub fn receive(
 fn receive_stream(
     object: &RwLock<ObjectEntry>,
     reader: ObjectHandle,
-    length: usize,
+    output: &mut dyn ReadBuffer,
     mut flags: ReceiveFlags,
     peek_offset: u32,
     peek_length: u32,
-    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<SocketOutcome<PlatformStreamReceive>> {
     let (create_request, read_shutdown, connect_in_flight, nonblocking, precheck) =
         read_socket(object, |socket| {
@@ -1692,18 +1656,10 @@ fn receive_stream(
         flags = ReceiveFlags(flags.0 & !ReceiveFlags::WAITALL.0);
     }
     // The transport may not have started connecting yet.
-    let result = if connect_in_flight && length != 0 {
+    let result = if connect_in_flight && !output.is_empty() {
         Err(would_block_error(BrokerError::WouldBlock, nonblocking))
     } else {
-        transport_receive(
-            object,
-            reader,
-            length,
-            flags,
-            peek_offset,
-            peek_length,
-            copy_from,
-        )
+        transport_receive(object, reader, output, flags, peek_offset, peek_length)
     };
     match result {
         Err(BrokerError::WouldBlock | BrokerError::NonBlockingWouldBlock) if read_shutdown => {
@@ -1720,29 +1676,27 @@ fn receive_stream(
 fn transport_receive(
     object: &RwLock<ObjectEntry>,
     reader: ObjectHandle,
-    length: usize,
+    output: &mut dyn ReadBuffer,
     flags: ReceiveFlags,
     peek_offset: u32,
     peek_length: u32,
-    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<SocketOutcome<PlatformStreamReceive>> {
     let state = socket_state(object)?;
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    if length == 0 {
+    if output.is_empty() {
         return Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(0)));
     }
-    let mut copied = CopyCount::new(length);
+    let mut output = CopyCount::new(output);
     let outcome = state.resource.platform_socket.receive(
         reader,
-        length,
+        &mut output,
         flags,
         peek_offset,
         peek_length,
-        &mut |part| copied.count(part.len(), || copy_from(part)),
     );
-    let copied = copied.finish()?;
+    let copied = output.finish()?;
     let received = match outcome {
         Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(received))) => received,
         _ => 0,
@@ -1758,8 +1712,8 @@ fn transport_receive(
     outcome.map_err(|error| would_block_error(error, state.nonblocking))
 }
 
-/// Receives one datagram without waiting for readiness, passing up to
-/// `length` bytes of it to `copy_from` to copy out (see [`crate::transfer`]).
+/// Receives a prefix of one datagram into the start of `output` without
+/// waiting for readiness.
 ///
 /// A pending error fails the receive and is consumed, and a socket shut down
 /// for reading fails with `Shutdown`. When no datagram is available, fails
@@ -1769,24 +1723,22 @@ fn transport_receive(
 pub fn receive_from(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    length: usize,
+    output: &mut dyn ReadBuffer,
     flags: ReceiveFromFlags,
-    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
-    if flags.has_unsupported_bits() || length > MAX_UDP_DATAGRAM_SIZE as usize {
+    if flags.has_unsupported_bits() || output.len() > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
-    let result = receive_datagram(&object, length, flags, copy_from);
+    let result = receive_datagram(&object, output, flags);
     sync_readiness(&object);
     result
 }
 
 fn receive_datagram(
     object: &RwLock<ObjectEntry>,
-    length: usize,
+    output: &mut dyn ReadBuffer,
     flags: ReceiveFromFlags,
-    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
     if !read_socket(object, |socket| is_udp(socket.create_request))? {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
@@ -1797,7 +1749,7 @@ fn receive_datagram(
     if read_socket(object, |socket| socket.read_shutdown)? {
         return Ok(SocketOutcome::Failed(SocketError::Shutdown));
     }
-    match transport_receive_from(object, length, flags, copy_from) {
+    match transport_receive_from(object, output, flags) {
         Ok(SocketOutcome::Failed(SocketError::NotConnected))
             if read_socket(object, |socket| socket.read_shutdown)? =>
         {
@@ -1809,22 +1761,20 @@ fn receive_datagram(
 
 fn transport_receive_from(
     object: &RwLock<ObjectEntry>,
-    length: usize,
+    output: &mut dyn ReadBuffer,
     flags: ReceiveFromFlags,
-    copy_from: &mut CopyFromFn<'_>,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
+    let length = output.len();
     let state = socket_state(object)?;
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let mut copied = CopyCount::new(length);
+    let mut output = CopyCount::new(output);
     let outcome = state
         .resource
         .platform_socket
-        .receive_from(length, flags, &mut |part| {
-            copied.count(part.len(), || copy_from(part))
-        });
-    let copied = copied.finish()?;
+        .receive_from(&mut output, flags);
+    let copied = output.finish()?;
     let invalid = match &outcome {
         Ok(SocketOutcome::Completed(received)) => {
             received.received != copied

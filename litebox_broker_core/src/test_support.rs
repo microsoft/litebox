@@ -13,20 +13,16 @@ use core::time::Duration;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::socket::{ReceiveFlags, ReceiveFromFlags, SendFlags, SocketOutcome};
+use litebox_broker_protocol::socket::{ReceiveFlags, ReceiveFromFlags, SocketOutcome};
 use litebox_broker_protocol::terminal::{
     TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
 };
+use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer};
 use spin::Mutex;
 
 use crate::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, Result,
-    fs::{
-        self, FileResult, FileService, UnsupportedFileService,
-        backend::FileHandle,
-        errors::{ReadError, WriteError},
-        resolver::{Resolver, ResolverEntry},
-    },
+    fs::{FileResult, FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
     readiness::{
         ReadinessRegistration, ReadinessSource, ReadinessWatchers, SharedReadinessWatchers,
@@ -35,76 +31,8 @@ use crate::{
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
-    transfer::{CopyFromFn, CopyToFn, copy_from_slice, copy_to_slice, take_from_queue},
+    transfer::take_from_queue,
 };
-
-/// Reads into and writes from slices with a resolver, for tests that are not
-/// about copying (see [`crate::transfer`]).
-pub trait ResolverSlices<Backend: fs::backend::Backend> {
-    /// Reads into `buffer` with [`Resolver::read`].
-    fn read_slice(
-        &self,
-        entry: &mut ResolverEntry<Backend>,
-        buffer: &mut [u8],
-        offset: Option<usize>,
-    ) -> core::result::Result<usize, ReadError>;
-
-    /// Writes `data` with [`Resolver::write`].
-    fn write_slice(
-        &self,
-        entry: &mut ResolverEntry<Backend>,
-        data: &[u8],
-        offset: Option<usize>,
-    ) -> core::result::Result<usize, WriteError>;
-}
-
-impl<Platform, Backend: fs::backend::Backend + 'static> ResolverSlices<Backend>
-    for Resolver<Platform, Backend>
-{
-    fn read_slice(
-        &self,
-        entry: &mut ResolverEntry<Backend>,
-        buffer: &mut [u8],
-        offset: Option<usize>,
-    ) -> core::result::Result<usize, ReadError> {
-        self.read(entry, buffer.len(), offset, &mut copy_to_slice(buffer))
-    }
-
-    fn write_slice(
-        &self,
-        entry: &mut ResolverEntry<Backend>,
-        data: &[u8],
-        offset: Option<usize>,
-    ) -> core::result::Result<usize, WriteError> {
-        self.write(entry, data.len(), offset, &mut copy_from_slice(data))
-    }
-}
-
-/// Reads into and writes from slices with a file backend, for tests that are
-/// not about copying (see [`crate::transfer`]).
-pub trait BackendSlices: fs::backend::Backend {
-    /// Reads into `buffer` with [`fs::backend::Backend::read`].
-    fn read_slice(
-        &self,
-        h: &FileHandle,
-        buffer: &mut [u8],
-        offset: usize,
-    ) -> core::result::Result<usize, ReadError> {
-        self.read(h, buffer.len(), offset, &mut copy_to_slice(buffer))
-    }
-
-    /// Writes `data` with [`fs::backend::Backend::write`].
-    fn write_slice(
-        &self,
-        h: &FileHandle,
-        data: &[u8],
-        offset: usize,
-    ) -> core::result::Result<usize, WriteError> {
-        self.write(h, data.len(), offset, &mut copy_from_slice(data))
-    }
-}
-
-impl<Backend: fs::backend::Backend + ?Sized> BackendSlices for Backend {}
 
 /// Builder for a test broker core with strict providers that reject unexpected operations.
 pub struct TestBrokerCoreBuilder {
@@ -303,31 +231,26 @@ impl StdioProvider for TestStdioProvider {
         connected.then(|| Arc::clone(&self.terminal) as Arc<dyn TerminalEndpoint>)
     }
 
-    fn read(
-        &self,
-        length: usize,
-        copy_from: &mut CopyFromFn<'_>,
-    ) -> core::result::Result<usize, StdioProviderError> {
+    fn read(&self, output: &mut dyn ReadBuffer) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
         if input.bytes.is_empty() && input.open {
             input.blocked_reads += 1;
             return Err(StdioProviderError::WouldBlock);
         }
-        let read = input.bytes.len().min(length);
-        take_from_queue(&mut input.bytes, read, copy_from)?;
+        let read = input.bytes.len().min(output.len());
+        take_from_queue(&mut input.bytes, read, output)?;
         Ok(read)
     }
 
     fn write(
         &self,
         stream: StdioOutputStream,
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        input: &dyn WriteBuffer,
     ) -> core::result::Result<usize, StdioProviderError> {
-        let mut data = alloc::vec![0; length];
-        copy_to(&mut data)?;
+        let mut data = alloc::vec![0; input.len()];
+        input.copy_to_slice_at(0, &mut data)?;
         self.writes.lock().push((stream, data));
-        Ok(length)
+        Ok(input.len())
     }
 
     fn is_terminal(&self, stream: StdioStream) -> bool {
@@ -481,49 +404,76 @@ impl Drop for ManualAlarm {
     }
 }
 
-/// Returns a `CopyFromFn` that appends the parts it is passed to `destination` (see
-/// [`crate::transfer`]).
-pub fn copy_to_vec(destination: &mut Vec<u8>) -> impl FnMut(&[u8]) -> Result<()> + '_ {
-    move |part| {
-        destination.extend_from_slice(part);
+/// A buffer of `length` bytes whose copies fault from `fault_at` on, and
+/// otherwise copy nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct FaultingBuffer {
+    length: usize,
+    fault_at: usize,
+}
+
+impl FaultingBuffer {
+    /// Creates a buffer of `length` bytes whose copies fault from `fault_at`
+    /// on.
+    pub const fn new(length: usize, fault_at: usize) -> Self {
+        Self { length, fault_at }
+    }
+
+    /// Checks a copy of `length` bytes at `offset`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the copy is out of bounds, as for any buffer.
+    fn check(&self, offset: usize, length: usize) -> core::result::Result<(), Fault> {
+        let end = offset.checked_add(length).unwrap();
+        assert!(end <= self.length, "copy out of bounds");
+        if end > self.fault_at {
+            return Err(Fault);
+        }
         Ok(())
     }
 }
 
-/// Sends `data` with [`socket::send`].
-pub fn send_data(
-    process: &BrokerProcess,
-    handle: ObjectHandle,
-    data: impl AsRef<[u8]>,
-    flags: SendFlags,
-) -> Result<SocketOutcome<usize>> {
-    let data = data.as_ref();
-    socket::send(
-        process,
-        handle,
-        data.len(),
-        flags,
-        &mut copy_from_slice(data),
-    )
+impl Buffer for FaultingBuffer {
+    fn len(&self) -> usize {
+        self.length
+    }
 }
 
-/// Sends `data` with [`socket::send_to`].
-pub fn send_data_to(
-    process: &BrokerProcess,
-    handle: ObjectHandle,
-    data: impl AsRef<[u8]>,
-    flags: SendFlags,
-    destination: Option<SocketAddrV4>,
-) -> Result<SocketOutcome<usize>> {
-    let data = data.as_ref();
-    socket::send_to(
-        process,
-        handle,
-        data.len(),
-        flags,
-        destination,
-        &mut copy_from_slice(data),
-    )
+impl ReadBuffer for FaultingBuffer {
+    fn copy_from_slice_at(
+        &mut self,
+        offset: usize,
+        source: &[u8],
+    ) -> core::result::Result<(), Fault> {
+        self.check(offset, source.len())
+    }
+
+    fn copy_from_raw_at(
+        &mut self,
+        offset: usize,
+        source: RawBytes<'_>,
+    ) -> core::result::Result<(), Fault> {
+        self.check(offset, source.len())
+    }
+}
+
+impl WriteBuffer for FaultingBuffer {
+    fn copy_to_slice_at(
+        &self,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> core::result::Result<(), Fault> {
+        self.check(offset, destination.len())
+    }
+
+    fn copy_to_raw_at(
+        &self,
+        offset: usize,
+        destination: RawBytes<'_>,
+    ) -> core::result::Result<(), Fault> {
+        self.check(offset, destination.len())
+    }
 }
 
 /// A stream receive's result, with the bytes received.
@@ -535,11 +485,7 @@ pub enum StreamData {
     EndOfStream,
 }
 
-/// Receives with [`socket::receive`] into a new vector.
-///
-/// # Panics
-///
-/// Panics if the result does not match what the socket passed.
+/// Receives up to `length` bytes with [`socket::receive`] into a new vector.
 pub fn receive_data(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -548,23 +494,14 @@ pub fn receive_data(
     peek_offset: u32,
     peek_length: u32,
 ) -> Result<SocketOutcome<StreamData>> {
-    let mut data = Vec::new();
-    let outcome = socket::receive(
-        process,
-        handle,
-        length,
-        flags,
-        peek_offset,
-        peek_length,
-        &mut copy_to_vec(&mut data),
-    )?;
+    let mut data = alloc::vec![0; length];
+    let outcome = socket::receive(process, handle, &mut data, flags, peek_offset, peek_length)?;
     Ok(match outcome {
         SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
-            assert_eq!(received, data.len());
+            data.truncate(received);
             SocketOutcome::Completed(StreamData::Received(data))
         }
         SocketOutcome::Completed(PlatformStreamReceive::EndOfStream) => {
-            assert_eq!(data, []);
             SocketOutcome::Completed(StreamData::EndOfStream)
         }
         SocketOutcome::Failed(error) => SocketOutcome::Failed(error),
@@ -582,23 +519,19 @@ pub struct DatagramData {
     pub source_address: SocketAddrV4,
 }
 
-/// Receives with [`socket::receive_from`] into a new vector.
-///
-/// # Panics
-///
-/// Panics if the result does not match what the socket passed.
+/// Receives up to `length` bytes with [`socket::receive_from`] into a new
+/// vector.
 pub fn receive_data_from(
     process: &BrokerProcess,
     handle: ObjectHandle,
     length: usize,
     flags: ReceiveFromFlags,
 ) -> Result<SocketOutcome<DatagramData>> {
-    let mut data = Vec::new();
-    let outcome =
-        socket::receive_from(process, handle, length, flags, &mut copy_to_vec(&mut data))?;
+    let mut data = alloc::vec![0; length];
+    let outcome = socket::receive_from(process, handle, &mut data, flags)?;
     Ok(match outcome {
         SocketOutcome::Completed(received) => {
-            assert_eq!(received.received, data.len());
+            data.truncate(received.received);
             SocketOutcome::Completed(DatagramData {
                 data,
                 datagram_length: received.datagram_length,

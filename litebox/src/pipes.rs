@@ -22,7 +22,6 @@ use crate::{
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
-    buffer::{ReadBuffer, WriteBuffer, copy_from_buffer, copy_to_buffer},
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -33,6 +32,7 @@ use crate::{
     process::ProcessError,
     sync::RawSyncPrimitivesProvider,
 };
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Create a unidirectional communication channel for sending messages of (slices of) bytes.
@@ -327,7 +327,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
             .wait(cx, false, Events::IN, || {
                 let read = self
                     .broker
-                    .read_pipe(self.handle, length, &mut copy_to_buffer(&mut buf, 0))
+                    .read_pipe(self.handle, &mut (&mut buf).sub_buffer(0, length))
                     .map_err(|error| self.broker_request_error(error))?;
                 if read > length {
                     return Err(TryOpError::Other(PipeError::Io));
@@ -357,9 +357,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
         let mut total_written = 0;
         while total_written < buf.len() {
             let length = (buf.len() - total_written).min(MAX_PIPE_TRANSFER_SIZE as usize);
-            match self.pollee.wait(cx, false, Events::OUT, || {
-                self.try_write(&buf, total_written, length)
-            }) {
+            let data = &(&buf).sub_buffer(total_written, length);
+            match self
+                .pollee
+                .wait(cx, false, Events::OUT, || self.try_write(data))
+            {
                 Ok(written) => total_written += written,
                 Err(_) if total_written != 0 => return Ok(total_written),
                 Err(error) => return Err(PipeError::from(error)),
@@ -368,18 +370,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
         Ok(total_written)
     }
 
-    /// Writes the `length` bytes at `offset` in `buf`.
-    fn try_write(
-        &self,
-        buf: impl WriteBuffer,
-        offset: usize,
-        length: usize,
-    ) -> Result<usize, TryOpError<PipeError>> {
+    fn try_write(&self, data: &dyn WriteBuffer) -> Result<usize, TryOpError<PipeError>> {
         let written = self
             .broker
-            .write_pipe(self.handle, length, &mut copy_from_buffer(&buf, offset))
+            .write_pipe(self.handle, data)
             .map_err(|error| self.broker_request_error(error))?;
-        if written > length || (written == 0 && length != 0) {
+        if written > data.len() || (written == 0 && !data.is_empty()) {
             return Err(TryOpError::Other(PipeError::Io));
         }
         if written != 0
@@ -483,14 +479,12 @@ mod tests {
     use litebox_broker_protocol::pipe::ReadPipeResponse;
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_transport::channel::LocalCallChannel;
-    use litebox_broker_transport::shared_memory::HeapSharedMemory;
 
     use crate::{
-        buffer::{RawBytes, ReadBuffer},
         event::{Events, IOPollable, observer::Observer, wait::WaitState},
-        mm::exception_table::Fault,
         pipes::errors::ReadError,
     };
+    use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer};
 
     extern crate std;
 
@@ -505,7 +499,7 @@ mod tests {
                 read_failure: ReadFailure::Transport,
                 force_transport,
             },
-            test_shared_memory(),
+            Arc::new(NoopSharedMemory),
         );
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
         let (writer, reader) = litebox.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
@@ -540,7 +534,7 @@ mod tests {
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
             },
-            test_shared_memory(),
+            Arc::new(NoopSharedMemory),
         );
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
         let (writer, reader) = litebox.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
@@ -622,7 +616,7 @@ mod tests {
                 read_failure: ReadFailure::None,
                 force_transport: Arc::new(AtomicBool::new(false)),
             },
-            test_shared_memory(),
+            Arc::new(NoopSharedMemory),
         );
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
         let (_writer, reader) = litebox.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
@@ -664,20 +658,44 @@ mod tests {
         force_transport: Arc<AtomicBool>,
     }
 
-    fn test_shared_memory() -> Arc<HeapSharedMemory> {
-        Arc::new(HeapSharedMemory::new(
-            litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
-        ))
+    #[derive(Clone, Copy)]
+    struct NoopSharedMemory;
+
+    impl litebox_broker_transport::shared_memory::SharedMemory for NoopSharedMemory {
+        fn len(&self) -> usize {
+            litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE
+        }
+
+        fn read(
+            &self,
+            _offset: usize,
+            destination: &mut [u8],
+        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
+        {
+            destination.fill(0);
+            Ok(())
+        }
+
+        fn write(
+            &self,
+            _offset: usize,
+            _source: &[u8],
+        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
+        {
+            Ok(())
+        }
     }
 
     /// A buffer whose copies always fault.
     struct FaultingBuffer;
 
-    impl ReadBuffer for FaultingBuffer {
+    impl Buffer for FaultingBuffer {
         fn len(&self) -> usize {
             1
         }
+    }
 
+    impl ReadBuffer for FaultingBuffer {
         fn copy_from_slice_at(&mut self, _offset: usize, _source: &[u8]) -> Result<(), Fault> {
             Err(Fault)
         }

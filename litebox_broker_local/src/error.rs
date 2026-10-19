@@ -3,6 +3,7 @@
 
 use litebox_broker_protocol::RequestId;
 use litebox_broker_protocol::error::ErrorCode;
+use litebox_platform::buffer::Fault;
 use thiserror::Error;
 
 /// Errors returned by active broker-local control requests.
@@ -25,6 +26,12 @@ pub enum BrokerLocalError<E> {
     Broker(#[source] ErrorCode),
     #[error("copying the transferred bytes failed")]
     CopyFailed,
+}
+
+impl<E> From<Fault> for BrokerLocalError<E> {
+    fn from(Fault: Fault) -> Self {
+        Self::CopyFailed
+    }
 }
 
 /// Broker-local control adapter result type.

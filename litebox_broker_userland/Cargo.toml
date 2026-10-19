@@ -48,7 +48,7 @@ harness = false
 [dev-dependencies]
 tempfile = { version = "3", default-features = false }
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"] }
-litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0", features = ["test-support"] }
+litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
 
 [lints]
 workspace = true

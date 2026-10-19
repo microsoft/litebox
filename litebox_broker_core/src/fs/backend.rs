@@ -9,13 +9,14 @@ use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
-use crate::transfer::{CopyFromFn, CopyToFn};
 
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
 // broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
@@ -105,9 +106,8 @@ pub trait Backend: Send + Sync + Any {
             .find(|entry| entry.name == name))
     }
 
-    /// Read up to `length` bytes at `offset`, passing them to `copy_from` to copy out (see
-    /// [`crate::transfer`]), and return the number of bytes read: exactly those passed, so none
-    /// when the read fails.
+    /// Read at `offset` into `buf`, returning the number of bytes read, which it copies into `buf`
+    /// in order from its start (see [`crate::transfer`]).
     ///
     /// Backends do not have an internal notion of offsets; instead the resolver maintains offsets
     /// as needed. For files with non-position-based [`SeekBehavior`], such as `stdin`, the resolver
@@ -115,9 +115,8 @@ pub trait Backend: Send + Sync + Any {
     fn read(
         &self,
         h: &FileHandle,
-        length: usize,
+        buf: &mut dyn ReadBuffer,
         offset: usize,
-        copy_from: &mut CopyFromFn<'_>,
     ) -> Result<usize, ReadError>;
 
     /// Optional performance hook: get static backing data for a file, if available and supported.
@@ -131,10 +130,9 @@ pub trait Backend: Send + Sync + Any {
         None
     }
 
-    /// Write up to `length` bytes into the file, based on `offset`, passing room for up to `length`
-    /// bytes to `copy_to` to copy them in (see [`crate::transfer`]), and return the number of
-    /// bytes written, which may be fewer than it passed room for. A backend that discards what it
-    /// writes, such as `/dev/null`, need not pass room for it.
+    /// Write `buf` into the file, based on `offset`, returning the number of bytes written, which it
+    /// copies out of `buf` in order from its start (see [`crate::transfer`]). A backend that discards
+    /// what it writes, such as `/dev/null`, need not copy it.
     ///
     /// See [`Self::read`] on internal offset storage for backends.
     // XXX(jayb): I need to think more about how we set up some sort of "intend to write" flag that
@@ -145,9 +143,8 @@ pub trait Backend: Send + Sync + Any {
     fn write(
         &self,
         h: &FileHandle,
-        length: usize,
+        buf: &dyn WriteBuffer,
         offset: usize,
-        copy_to: &mut CopyToFn<'_>,
     ) -> Result<usize, WriteError>;
 
     /// Truncate the file to the specified length.

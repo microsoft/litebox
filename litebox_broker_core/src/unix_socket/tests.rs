@@ -7,8 +7,7 @@ use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
 use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
-use crate::test_support::{TestBrokerCoreBuilder, copy_to_vec};
-use crate::transfer::copy_from_slice;
+use crate::test_support::TestBrokerCoreBuilder;
 use crate::{BrokerCore, CallerCredential, PolicyEngine};
 use std::vec;
 
@@ -31,18 +30,10 @@ fn receive_message(
     source: bool,
     nonblocking: bool,
 ) -> Result<UnixSocketResult<Message>> {
-    let mut data = Vec::new();
-    let result = receive(
-        process,
-        handle,
-        capacity,
-        peek,
-        source,
-        nonblocking,
-        &mut copy_to_vec(&mut data),
-    )?;
+    let mut data = vec![0; capacity as usize];
+    let result = receive(process, handle, &mut data, peek, source, nonblocking)?;
     Ok(result.map(|received| {
-        assert_eq!(received.received, data.len());
+        data.truncate(received.received);
         Message {
             data,
             length: received.length,
@@ -141,14 +132,7 @@ impl Fixture {
     }
 
     fn send(&self, handle: ObjectHandle, data: &[u8]) -> Result<UnixSocketResult<usize>> {
-        send(
-            &self.process,
-            handle,
-            None,
-            data.len(),
-            USER,
-            &mut copy_from_slice(data),
-        )
+        send(&self.process, handle, None, &data, USER)
     }
 
     fn send_to(
@@ -157,14 +141,7 @@ impl Fixture {
         address: &UnixSocketAddress,
         data: &[u8],
     ) -> Result<UnixSocketResult<usize>> {
-        send(
-            &self.process,
-            handle,
-            Some(address),
-            data.len(),
-            USER,
-            &mut copy_from_slice(data),
-        )
+        send(&self.process, handle, Some(address), &data, USER)
     }
 
     fn receive(&self, handle: ObjectHandle, capacity: u32) -> Result<UnixSocketResult<Message>> {

@@ -20,8 +20,9 @@ use litebox_broker_protocol::unix_socket::{
     ShutdownUnixSocketRequest, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-use crate::{BrokerLocal, BrokerLocalError, CopyFromFn, CopyToFn, Result};
+use crate::{BrokerLocal, BrokerLocalError, Result};
 
 type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;
 
@@ -156,32 +157,31 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Sends `length` bytes from a Unix socket to `address`, an encoded
-    /// destination address that is empty for the connected peer, staging
-    /// both in `buffer`, which `copy_to` fills with the bytes after the address.
+    /// Sends `data` from a Unix socket to `address`, an encoded destination
+    /// address that is empty for the connected peer, staging both in
+    /// `buffer`.
     ///
     /// Returns the number of data bytes sent.
     ///
     /// # Panics
     ///
-    /// Panics if `buffer` does not match `address` and `length`, or the
-    /// broker returns an invalid response.
+    /// Panics if `buffer` does not match `address` and `data`, or the broker
+    /// returns an invalid response.
     pub fn send_unix_socket(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         address: &[u8],
-        length: usize,
-        copy_to: &mut CopyToFn<'_>,
+        data: &dyn WriteBuffer,
         user: FileUser,
     ) -> Result<UnixSocketResult<usize>, Channel::Error> {
         self.validate_unix_socket_buffer(
             buffer,
-            address.len() + length,
+            address.len() + data.len(),
             MAX_UNIX_SOCKET_TRANSFER_SIZE,
         )?;
         self.write_shared_buffer_at(buffer, 0, address);
-        self.copy_shared_buffer(buffer, address.len(), length, copy_to)?;
+        self.copy_to_shared_buffer(buffer, address.len(), data)?;
         match self.request_unix_socket(UnixSocketRequest::Send(SendUnixSocketRequest {
             handle,
             buffer,
@@ -192,7 +192,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             UnixSocketResponse::Send(response) => {
                 let sent = response.sent as usize;
                 assert!(
-                    sent <= length && (sent != 0 || length == 0),
+                    sent <= data.len() && (sent != 0 || data.is_empty()),
                     "broker returned an invalid Unix socket send length"
                 );
                 Ok(Ok(sent))
@@ -202,29 +202,28 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Performs `request` and passes the bytes received to `copy_from`.
+    /// Receives data from a Unix socket into `destination` through
+    /// `buffer`, as for a non-blocking socket if `nonblocking` is set.
     ///
-    /// Returns the received lengths, and the sender's name if the request's
-    /// `source` is set.
+    /// Returns the received lengths, and the sender's name if `source` is
+    /// set.
     ///
     /// # Panics
     ///
-    /// Panics if the request's `buffer` is not `capacity` bytes, plus
+    /// Panics if `buffer` is not `destination.len()` bytes, plus
     /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set, or the broker
     /// returns an invalid response.
     pub fn receive_unix_socket(
         &self,
-        request: ReceiveUnixSocketRequest,
-        copy_from: &mut CopyFromFn<'_>,
+        handle: ObjectHandle,
+        buffer: SharedBufferSequence,
+        destination: &mut dyn ReadBuffer,
+        peek: bool,
+        source: bool,
+        nonblocking: bool,
     ) -> Result<UnixSocketResult<(ReceiveUnixSocketResponse, Option<UnixSocketName>)>, Channel::Error>
     {
-        let ReceiveUnixSocketRequest {
-            buffer,
-            capacity,
-            source,
-            ..
-        } = request;
-        let capacity = capacity as usize;
+        let capacity = destination.len();
         let name_size = if source {
             MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize
         } else {
@@ -235,7 +234,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             capacity + name_size,
             MAX_UNIX_SOCKET_TRANSFER_SIZE,
         )?;
-        match self.request_unix_socket(UnixSocketRequest::Receive(request))? {
+        match self.request_unix_socket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
+            handle,
+            buffer,
+            capacity: u32::try_from(capacity).expect("validated capacity fits in u32"),
+            peek,
+            source,
+            nonblocking,
+        }))? {
             UnixSocketResponse::Receive(response) => {
                 let received = response.received as usize;
                 let source_length = response.source_length as usize;
@@ -245,7 +251,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         && source_length <= name_size,
                     "broker returned inconsistent Unix socket receive lengths"
                 );
-                self.copy_shared_buffer(buffer, 0, received, copy_from)?;
+                self.copy_from_shared_buffer(buffer, received, destination)?;
                 let name = source.then(|| {
                     let mut name = [0; MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize];
                     self.read_shared_buffer_at(buffer, received, &mut name[..source_length]);

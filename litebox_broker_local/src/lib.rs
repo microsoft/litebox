@@ -55,27 +55,10 @@ use litebox_broker_protocol::{
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
-use litebox_broker_transport::shared_memory::{AsSharedBytes, SharedBufferPool, SharedBytes};
+use litebox_broker_transport::shared_memory::{SharedBuffer, SharedBufferPool, SharedMemory};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 pub use error::{BrokerLocalError, Result};
-
-/// Copies from each part of the bytes the broker read, in turn, to the
-/// caller's buffer.
-///
-/// Its name gives the direction relative to the part, as on the broker. It
-/// returns `None` if it cannot copy a part, such as because the caller's buffer
-/// is inaccessible; the read then fails with [`BrokerLocalError::CopyFailed`],
-/// having already consumed the bytes it read.
-pub type CopyFromFn<'a> = dyn FnMut(SharedBytes<'_>) -> Option<()> + 'a;
-
-/// Copies to each part of the bytes to write, in turn, from the caller's
-/// buffer.
-///
-/// Its name gives the direction relative to the part, as on the broker. It
-/// returns `None` if it cannot copy a part, such as because the caller's buffer
-/// is inaccessible; the write then fails with [`BrokerLocalError::CopyFailed`]
-/// and sends nothing.
-pub type CopyToFn<'a> = dyn FnMut(SharedBytes<'_>) -> Option<()> + 'a;
 
 /// Typed broker-local control adapter for broker operations.
 ///
@@ -85,7 +68,7 @@ pub struct BrokerLocal<Channel: LocalCallChannel> {
     channel: Channel,
     process_id: ProcessId,
     initial_thread_id: ThreadId,
-    shared_buffers: SharedBufferPool<Arc<dyn AsSharedBytes>>,
+    shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
     next_request_id: AtomicU64,
 }
 
@@ -99,7 +82,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         channel: Channel,
         process_id: ProcessId,
         initial_thread_id: ThreadId,
-        shared_memory: Arc<dyn AsSharedBytes>,
+        shared_memory: Arc<dyn SharedMemory>,
     ) -> Self {
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
             .expect("broker association shared memory has an invalid size");
@@ -133,7 +116,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         activate: impl FnOnce(
             Setup,
         ) -> core::result::Result<
-            (Channel, Arc<dyn AsSharedBytes>, Activated),
+            (Channel, Arc<dyn SharedMemory>, Activated),
             Channel::Error,
         >,
     ) -> Result<(Self, Option<ProcessStartupData>, Activated), Channel::Error> {
@@ -280,28 +263,39 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .expect("validated shared buffer sequence must be accessible");
     }
 
-    /// Passes the `length` bytes at `offset` in `buffer` to `copy`, one
-    /// contiguous part at a time.
-    fn copy_shared_buffer(
+    /// Returns the first `length` bytes of `buffer` as a buffer.
+    fn shared_buffer(&self, buffer: SharedBufferSequence, length: usize) -> SharedBuffer<'_> {
+        self.shared_buffers
+            .buffer(buffer, length)
+            .expect("shared buffer sequence must cover the bytes")
+    }
+
+    /// Copies `source` into `buffer` at `offset`, filling the rest of it.
+    fn copy_to_shared_buffer(
         &self,
         buffer: SharedBufferSequence,
         offset: usize,
-        length: usize,
-        copy: &mut dyn FnMut(SharedBytes<'_>) -> Option<()>,
+        source: &dyn WriteBuffer,
     ) -> Result<(), Channel::Error> {
-        assert!(
-            offset
-                .checked_add(length)
-                .is_some_and(|end| end <= buffer.length() as usize),
-            "shared buffer sequence must cover the copied bytes"
+        assert_eq!(
+            offset.checked_add(source.len()),
+            Some(buffer.length() as usize),
+            "shared data must fill its buffer sequence"
         );
-        for part in self
-            .shared_buffers
-            .borrow_sequence(buffer, offset, length)
-            .expect("validated shared buffer sequence must be accessible")
-        {
-            copy(part).ok_or(BrokerLocalError::CopyFailed)?;
-        }
+        self.shared_buffer(buffer, buffer.length() as usize)
+            .copy_from_buffer_at(offset, source)?;
+        Ok(())
+    }
+
+    /// Copies the first `length` bytes of `buffer` into the start of
+    /// `destination`.
+    fn copy_from_shared_buffer(
+        &self,
+        buffer: SharedBufferSequence,
+        length: usize,
+        destination: &mut dyn ReadBuffer,
+    ) -> Result<(), Channel::Error> {
+        destination.copy_from_buffer_at(0, &self.shared_buffer(buffer, length))?;
         Ok(())
     }
 
@@ -426,7 +420,6 @@ mod tests {
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, ThreadId};
     use litebox_broker_transport::channel::LocalNotificationChannel;
-    use litebox_broker_transport::shared_memory::HeapSharedMemory;
     use std::sync::Mutex;
 
     use crate::test_support::test_broker_local;
@@ -452,7 +445,7 @@ mod tests {
             assert!(channel.handshake_response.is_none());
             assert!(channel.sent_request.borrow().is_none());
             setup_calls.set(setup_calls.get() + 1);
-            Ok((channel, test_shared_memory(), ()))
+            Ok((channel, noop_shared_memory(), ()))
         })
         .unwrap();
 
@@ -474,7 +467,7 @@ mod tests {
         let request = BrokerOperation::CloseObject(handle);
         let response = BrokerResult::ObjectClosed;
         let channel = FakeControlChannel::new(None, Some(response.clone()));
-        let local = test_broker_local(channel, test_shared_memory());
+        let local = test_broker_local(channel, noop_shared_memory());
 
         assert!(local.close_object(handle).is_ok());
         assert_eq!(
@@ -490,7 +483,7 @@ mod tests {
     fn active_requests_use_monotonic_identifiers() {
         let handle = ObjectHandle(7);
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
-        let local = test_broker_local(channel, test_shared_memory());
+        let local = test_broker_local(channel, noop_shared_memory());
 
         local.close_object(handle).unwrap();
         assert_eq!(
@@ -524,7 +517,7 @@ mod tests {
             ConcurrentCallChannel {
                 request_ids: Mutex::new(std::vec::Vec::new()),
             },
-            test_shared_memory(),
+            noop_shared_memory(),
         ));
         let callers = (0..16)
             .map(|handle| {
@@ -547,7 +540,7 @@ mod tests {
     #[test]
     fn active_request_rejects_mismatched_response_identifier() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
-        let local = test_broker_local(channel, test_shared_memory());
+        let local = test_broker_local(channel, noop_shared_memory());
         local.channel.response_id.set(Some(RequestId(9)));
 
         assert!(matches!(
@@ -562,7 +555,7 @@ mod tests {
     #[test]
     fn active_request_identifier_exhaustion_does_not_wrap() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
-        let local = test_broker_local(channel, test_shared_memory());
+        let local = test_broker_local(channel, noop_shared_memory());
         local.next_request_id.store(u64::MAX, Ordering::Relaxed);
 
         assert!(matches!(
@@ -576,7 +569,7 @@ mod tests {
     fn active_request_returns_recoverable_broker_errors() {
         for error in [ErrorCode::WouldBlock, ErrorCode::UnsupportedOperation] {
             let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(error)));
-            let local = test_broker_local(channel, test_shared_memory());
+            let local = test_broker_local(channel, noop_shared_memory());
 
             assert!(matches!(
                 local.create_event_with_count(0, FileOpenFlags::NONE),
@@ -589,7 +582,7 @@ mod tests {
     #[should_panic(expected = "broker returned unrecoverable error")]
     fn active_request_panics_on_unrecoverable_broker_error() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::Internal)));
-        let local = test_broker_local(channel, test_shared_memory());
+        let local = test_broker_local(channel, noop_shared_memory());
 
         let _ = local.create_event_with_count(0, FileOpenFlags::NONE);
     }
@@ -611,7 +604,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = BrokerLocal::negotiate(channel, |channel| {
                 setup_called.set(true);
-                Ok((channel, test_shared_memory(), ()))
+                Ok((channel, noop_shared_memory(), ()))
             });
         }));
         assert_panic_contains(result, "broker returned unexpected negotiation response");
@@ -646,7 +639,7 @@ mod tests {
         assert!(matches!(
             BrokerLocal::negotiate(channel, |channel| {
                 setup_called.set(true);
-                Ok((channel, test_shared_memory(), ()))
+                Ok((channel, noop_shared_memory(), ()))
             }),
             Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
         ));
@@ -663,7 +656,7 @@ mod tests {
             assert!(matches!(
                 BrokerLocal::negotiate(channel, |channel| {
                     setup_called.set(true);
-                    Ok((channel, test_shared_memory(), ()))
+                    Ok((channel, noop_shared_memory(), ()))
                 }),
                 Err(BrokerLocalError::Broker(reported)) if reported == error
             ));
@@ -682,7 +675,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = BrokerLocal::negotiate(channel, |channel| {
                 setup_called.set(true);
-                Ok((channel, test_shared_memory(), ()))
+                Ok((channel, noop_shared_memory(), ()))
             });
         }));
         assert_panic_contains(result, "broker returned unrecoverable error");
@@ -703,7 +696,7 @@ mod tests {
 
         assert!(matches!(
             BrokerLocal::<FakeControlChannel>::negotiate(channel, |_| {
-                Err::<(FakeControlChannel, Arc<dyn AsSharedBytes>, ()), _>(
+                Err::<(FakeControlChannel, Arc<dyn SharedMemory>, ()), _>(
                     FakeChannelError::SharedMemoryReceive,
                 )
             }),
@@ -729,9 +722,9 @@ mod tests {
         let _ = BrokerLocal::negotiate(channel, |channel| {
             Ok((
                 channel,
-                Arc::new(HeapSharedMemory::new(
-                    litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE - 1,
-                )) as Arc<dyn AsSharedBytes>,
+                Arc::new(NoopSharedMemory {
+                    length: litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE - 1,
+                }) as Arc<dyn SharedMemory>,
                 (),
             ))
         });
@@ -765,10 +758,39 @@ mod tests {
         SharedMemoryReceive,
     }
 
-    pub(crate) fn test_shared_memory() -> Arc<dyn AsSharedBytes> {
-        Arc::new(HeapSharedMemory::new(
-            litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
-        ))
+    struct NoopSharedMemory {
+        length: usize,
+    }
+
+    impl SharedMemory for NoopSharedMemory {
+        fn len(&self) -> usize {
+            self.length
+        }
+
+        fn read(
+            &self,
+            _offset: usize,
+            destination: &mut [u8],
+        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
+        {
+            destination.fill(0);
+            Ok(())
+        }
+
+        fn write(
+            &self,
+            _offset: usize,
+            _source: &[u8],
+        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
+        {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn noop_shared_memory() -> Arc<dyn SharedMemory> {
+        Arc::new(NoopSharedMemory {
+            length: litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
+        })
     }
 
     impl FakeControlChannel {

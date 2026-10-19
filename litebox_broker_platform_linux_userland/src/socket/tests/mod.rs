@@ -11,7 +11,6 @@ use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::test_support::TestBrokerCoreBuilder;
-use litebox_broker_core::transfer::{copy_from_slice, copy_to_slice};
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -166,13 +165,7 @@ fn send_bytes(
     data: &[u8],
     flags: SendFlags,
 ) -> BrokerResult<SocketOutcome<usize>> {
-    litebox_broker_core::socket::send(
-        process,
-        handle,
-        data.len(),
-        flags,
-        &mut copy_from_slice(data),
-    )
+    litebox_broker_core::socket::send(process, handle, &data, flags)
 }
 
 fn send_datagram(
@@ -182,20 +175,13 @@ fn send_datagram(
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
 ) -> BrokerResult<SocketOutcome<usize>> {
-    litebox_broker_core::socket::send_to(
-        process,
-        handle,
-        data.len(),
-        flags,
-        destination,
-        &mut copy_from_slice(data),
-    )
+    litebox_broker_core::socket::send_to(process, handle, &data, flags, destination)
 }
 
 fn receive_into(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    data: &mut [u8],
+    mut data: &mut [u8],
     flags: ReceiveFlags,
     peek_offset: u32,
     peek_length: u32,
@@ -203,11 +189,10 @@ fn receive_into(
     match litebox_broker_core::socket::receive(
         process,
         handle,
-        data.len(),
+        &mut data,
         flags,
         peek_offset,
         peek_length,
-        &mut copy_to_slice(data),
     )? {
         SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
@@ -224,16 +209,10 @@ fn receive_into(
 fn receive_datagram_into(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    data: &mut [u8],
+    mut data: &mut [u8],
     flags: ReceiveFromFlags,
 ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
-    litebox_broker_core::socket::receive_from(
-        process,
-        handle,
-        data.len(),
-        flags,
-        &mut copy_to_slice(data),
-    )
+    litebox_broker_core::socket::receive_from(process, handle, &mut data, flags)
 }
 
 #[test]

@@ -15,8 +15,8 @@ use super::{
     errors::{SocketAsyncError, SocketReadError, SocketWriteError},
     is_nonblocking_would_block,
 };
-use crate::buffer::{ReadBuffer, WriteBuffer, copy_from_buffer, copy_to_buffer};
 use crate::{broker::error::BrokerObjectError, sync::RawSyncPrimitivesProvider};
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 const _: () = assert!(MAX_SOCKET_PEEK_SIZE as usize == super::SOCKET_RECEIVE_OPERATION_SIZE);
 
@@ -60,15 +60,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         let mut offset = 0;
         loop {
             let length = (target - offset).min(MAX_SOCKET_TRANSFER_SIZE as usize);
-            let peek_offset = u32::try_from(offset).map_err(|_| backend_failure())?;
-            let mut copy_from = copy_to_buffer(&mut buffer, offset);
             let outcome = self.broker.receive_socket(
                 self.handle,
-                length,
-                &mut |part| if discard { Some(()) } else { copy_from(part) },
+                &mut (&mut buffer).sub_buffer(offset, length),
                 broker_flags,
-                peek_offset,
+                u32::try_from(offset).map_err(|_| backend_failure())?,
                 peek_length,
+                discard,
             );
             match outcome {
                 Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(received))) => {
@@ -140,8 +138,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         let length = buffer.len().min(MAX_SOCKET_TRANSFER_SIZE as usize);
         match self.broker.send_socket(
             self.handle,
-            length,
-            &mut copy_from_buffer(&buffer, 0),
+            &buffer.sub_buffer(0, length),
             BrokerSendFlags::NONE,
         ) {
             Ok(SocketOutcome::Completed(sent)) => Ok(sent),

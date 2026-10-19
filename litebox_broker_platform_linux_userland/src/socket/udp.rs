@@ -16,7 +16,6 @@ use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, host_socket_destination,
     is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -36,7 +35,7 @@ use rustix::net::{
 use super::{
     PlatformSocketStatus, Reactor, ReactorReceiveFromOutcome, SocketKind, broker_error_from_errno,
     local_socket_address, socket_error_from_errno, socket_operation_error_from_errno,
-    update_snapshot,
+    update_snapshot, zeroed_vec,
 };
 
 pub(super) const MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND: usize = 64;
@@ -1793,7 +1792,7 @@ fn receive_datagram_fd(
             SocketError::InvalidArgument,
         ));
     }
-    let mut data = bounce_buffer(length)?;
+    let mut data = zeroed_vec(length)?;
     let mut linux_flags = LinuxRecvFlags::TRUNC;
     if flags.contains(ReceiveFromFlags::PEEK) {
         linux_flags |= LinuxRecvFlags::PEEK;

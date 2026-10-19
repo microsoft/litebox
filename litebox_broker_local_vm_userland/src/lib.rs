@@ -45,13 +45,12 @@ use litebox_broker_transport::control_ring::{
     ControlRingReadError, ControlRingReadStatus, ControlRingWriteStatus, LocalControlRingEndpoints,
     MemoryAccessPolicy, WaitableSharedMemory,
 };
-use litebox_broker_transport::peer_memory;
-use litebox_broker_transport::shared_memory::{
-    AsSharedBytes, ControlRingMemory, SharedBytes, SharedMemory, SharedMemoryError,
-};
+use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use litebox_common_vm_abi::{
     BrokerHandshakeFrame, FutexRequest, StartupInfo, Status, UserRange, WireFrame,
 };
+use litebox_platform::buffer::RawBytes;
+use litebox_platform::peer_memory;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_userland::{Instant, NotificationReceiver, VmUserland, kcall};
 
@@ -223,23 +222,13 @@ impl SharedMemory for KernelSharedMemory {
         unsafe { peer_memory::copy_to_peer(source, destination as *mut u8) };
         Ok(())
     }
-}
 
-impl AsSharedBytes for KernelSharedMemory {
-    fn shared_bytes(
-        &self,
-        offset: usize,
-        length: usize,
-    ) -> Result<SharedBytes<'_>, SharedMemoryError> {
-        let address = checked(self.region.start.trunc(), self.len(), offset, length)?;
-        // Safety: in bounds of a region mapped for the process's lifetime,
-        // disjoint from private memory and never referenced.
-        Ok(unsafe {
-            SharedBytes::from_raw_parts(
-                NonNull::new(address as *mut u8).expect("the region is never at address zero"),
-                length,
-            )
-        })
+    fn raw_bytes(&self) -> Option<RawBytes<'_>> {
+        let start: usize = self.region.start.trunc();
+        let start = NonNull::new(start as *mut u8).expect("the region is never at address zero");
+        // Safety: the region is mapped for the process's lifetime, disjoint
+        // from private memory, and never referenced.
+        Some(unsafe { RawBytes::from_raw_parts(start, self.len()) })
     }
 }
 
@@ -423,7 +412,7 @@ pub fn connect(
                     words: ring()?,
                 })),
             };
-            let shared_memory: Arc<dyn AsSharedBytes> = Arc::new(KernelSharedMemory {
+            let shared_memory: Arc<dyn SharedMemory> = Arc::new(KernelSharedMemory {
                 region: info.broker_shared_memory,
             });
             Ok((channel, shared_memory, notifications))

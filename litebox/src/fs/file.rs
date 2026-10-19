@@ -21,12 +21,12 @@ use litebox_platform::time::TimeProvider;
 
 use crate::broker::error::BrokerControlError;
 use crate::broker::{BrokerControl, BrokerPollableRegistry, readiness_events};
-use crate::buffer::{ReadBuffer, WriteBuffer, copy_from_buffer, copy_to_buffer};
 use crate::event::observer::Observer;
 use crate::event::polling::{Pollee, TryOpError};
 use crate::event::wait::WaitContext;
 use crate::event::{Events, IOPollable};
 use crate::{LiteBox, sync};
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, IsTerminalError, MkdirError, OpenError, PathError,
@@ -300,8 +300,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
                 self.broker
                     .read_file(
                         self.handle,
-                        length,
-                        &mut copy_to_buffer(&mut buf, read),
+                        &mut (&mut buf).sub_buffer(read, length),
                         offset,
                     )?
                     .map_err(|error| TryOpError::Other(error.into()))
@@ -343,12 +342,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             let offset = offset.map(|offset| offset.saturating_add(written as u64));
             match self.wait(wait, Events::OUT, || {
                 self.broker
-                    .write_file(
-                        self.handle,
-                        length,
-                        &mut copy_from_buffer(&buf, written),
-                        offset,
-                    )?
+                    .write_file(self.handle, &(&buf).sub_buffer(written, length), offset)?
                     .map_err(|error| TryOpError::Other(error.into()))
             }) {
                 Ok(count) => {

@@ -9,7 +9,6 @@ use alloc::{
     vec,
 };
 use litebox::{
-    buffer::{ReadBuffer, WriteBuffer},
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -17,7 +16,6 @@ use litebox::{
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     fs::errors::OpenError,
-    mm::exception_table::Fault,
     process::InheritableFd,
     sync::Mutex,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
@@ -36,6 +34,7 @@ use litebox_common_linux::{
     program_startup::{ForkedFd, InheritedFd, InheritedFdKind},
     signal::Signal,
 };
+use litebox_platform::buffer::{Buffer as _, Fault, ReadBuffer, WriteBuffer};
 use thiserror::Error;
 
 use super::{
