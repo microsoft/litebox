@@ -22,7 +22,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::Range;
-use litebox_broker_local::transfer::CopyFailed;
+use litebox_broker_local::CopyFailed;
 
 use crate::mm::exception_table::Fault;
 use litebox_broker_transport::shared_memory::SharedBytes;

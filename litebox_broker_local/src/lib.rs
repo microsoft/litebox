@@ -32,7 +32,7 @@ mod signal;
 mod socket;
 mod thread;
 mod timer;
-pub mod transfer;
+mod transfer;
 mod unix_socket;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -56,9 +56,10 @@ use litebox_broker_protocol::{
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
-use litebox_broker_transport::shared_memory::{AsSharedBytes, SharedBufferPool};
+use litebox_broker_transport::shared_memory::{AsSharedBytes, SharedBufferPool, SharedBytes};
 
 pub use error::{BrokerLocalError, Result};
+pub use transfer::{CopyFailed, CopyFromFn, CopyToFn};
 
 /// Typed broker-local control adapter for broker operations.
 ///
@@ -270,7 +271,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         offset: usize,
         length: usize,
-        copy: &mut transfer::CopyFromFn<'_>,
+        copy: &mut dyn FnMut(SharedBytes<'_>) -> core::result::Result<(), transfer::CopyFailed>,
     ) -> Result<(), Channel::Error> {
         assert!(
             offset

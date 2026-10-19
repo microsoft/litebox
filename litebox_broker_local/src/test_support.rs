@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Test-only construction helpers for active broker-local associations.
+//! Test-only helpers for broker-local associations.
 
 use alloc::sync::Arc;
 
@@ -10,6 +10,8 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_broker_transport::shared_memory::AsSharedBytes;
 
 use crate::BrokerLocal;
+
+pub use crate::transfer::{copy_from_slice, copy_to_slice};
 
 const TEST_PROCESS_ID: ProcessId = ProcessId(1);
 const TEST_THREAD_ID: ThreadId = ThreadId(2);

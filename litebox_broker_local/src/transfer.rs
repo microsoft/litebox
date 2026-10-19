@@ -39,6 +39,7 @@ pub type CopyToFn<'a> = dyn FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '
 /// # Panics
 ///
 /// The [`CopyFromFn`] panics if the parts overflow `destination`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn copy_to_slice(
     destination: &mut [u8],
 ) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {
@@ -57,6 +58,7 @@ pub fn copy_to_slice(
 /// # Panics
 ///
 /// The [`CopyToFn`] panics if the parts overflow `source`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn copy_from_slice(
     source: &[u8],
 ) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> + '_ {

@@ -8,8 +8,7 @@ use alloc::{
 use core::net::SocketAddrV4;
 
 use hashbrown::HashMap;
-use litebox_broker_local::BrokerLocal;
-use litebox_broker_local::transfer::{CopyFromFn, CopyToFn};
+use litebox_broker_local::{BrokerLocal, CopyFromFn, CopyToFn};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
