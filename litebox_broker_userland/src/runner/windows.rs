@@ -42,6 +42,19 @@ impl AdoptedProcess {
     }
 
     pub(super) fn try_wait(&self) -> IoResult<Option<ExitStatus>> {
+        // A process can exit with `STILL_ACTIVE` as its code, so check the handle's signaled
+        // state rather than comparing the exit code against that sentinel.
+        // SAFETY: `handle` owns a live process handle; a zero timeout only polls.
+        match unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(
+                self.handle.as_raw_handle(),
+                0,
+            )
+        } {
+            windows_sys::Win32::Foundation::WAIT_OBJECT_0 => {}
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT => return Ok(None),
+            _ => return Err(std::io::Error::last_os_error()),
+        }
         let mut exit_code = 0;
         // SAFETY: `handle` owns a live process handle and `exit_code` is writable.
         if unsafe {
@@ -53,10 +66,7 @@ impl AdoptedProcess {
         {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(
-            (exit_code != windows_sys::Win32::Foundation::STILL_ACTIVE.cast_unsigned())
-                .then(|| ExitStatus::from_raw(exit_code)),
-        )
+        Ok(Some(ExitStatus::from_raw(exit_code)))
     }
 
     pub(super) fn kill(&self) -> IoResult<()> {
@@ -354,5 +364,24 @@ mod tests {
         };
         parent.kill().unwrap();
         parent.wait().unwrap();
+    }
+
+    #[test]
+    fn adopted_process_reports_still_active_exit_code() {
+        let child = std::process::Command::new("cmd")
+            .args(["/c", "exit 259"])
+            .spawn()
+            .unwrap();
+        let process_id = child.id();
+        let process = AdoptedProcess::new(OwnedHandle::from(child), process_id);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = process.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "exited process was never reaped");
+            std::thread::sleep(RUNNER_POLL_INTERVAL);
+        };
+        assert_eq!(status.code(), Some(259));
     }
 }
