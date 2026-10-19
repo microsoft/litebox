@@ -33,7 +33,8 @@ pub(crate) struct UserlandProcessLauncher {
 /// Runners this broker supervises.
 ///
 /// A host process ID is registered from the moment its runner is spawned or adopted until the
-/// runner has been reaped, so adoption can never claim a supervised runner. Registrations are
+/// runner has been reaped, so adoption can never claim, and the zombie reaper can never reap, a
+/// supervised runner. Registrations are
 /// counted per host process ID, because the OS may reuse a reaped runner's ID for a new runner
 /// before the old registration is removed.
 #[derive(Default)]
@@ -55,6 +56,9 @@ impl RunnerRegistry {
                 registrations.remove();
             }
         }
+        // A runner that exits may leave clones it never had adopted.
+        #[cfg(target_os = "linux")]
+        crate::runner::reap_unsupervised_children(&self.host_process_ids);
     }
 }
 
@@ -321,10 +325,17 @@ impl ProcessLauncher for UserlandProcessLauncher {
                             BrokerError::PolicyDenied
                         })
                 });
-            // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
-            // broker's children, so their parent runner's cleanup leaves zombies here.
-            if let Ok(instance) = &adoption {
-                runners.register(instance.host_process_id());
+            match &adoption {
+                Ok(instance) => {
+                    runners.register(instance.host_process_id());
+                }
+                // CLONE_PARENT makes clones this broker's children. Reap any that already exited
+                // unadopted; the clone rejected here is killed by its parent afterwards and is
+                // reaped on a later failed adoption or when a runner finishes.
+                #[cfg(target_os = "linux")]
+                Err(_) => crate::runner::reap_unsupervised_children(&runners.host_process_ids),
+                #[cfg(not(target_os = "linux"))]
+                Err(_) => {}
             }
             adoption
         };

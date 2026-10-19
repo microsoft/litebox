@@ -277,6 +277,51 @@ fn owned_fd_from_syscall(result: libc::c_long) -> IoResult<OwnedFd> {
     }
 }
 
+/// Reaps exited children of this broker that no runner instance supervises.
+///
+/// A runner may clone itself and then fail, or decline, to have the clone adopted. The clone is
+/// this broker's child, so without this it would remain a zombie. Supervised runners are
+/// reaped by their owners and are skipped.
+pub(crate) fn reap_unsupervised_children(supervised: &SupervisedRunners) {
+    let broker_process_id = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(process_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if supervised.contains_key(&process_id) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // The command name may contain spaces and parentheses; fields resume after its end.
+        let mut fields = stat
+            .rsplit_once(')')
+            .map(|(_, fields)| fields.split_ascii_whitespace())
+            .into_iter()
+            .flatten();
+        let (Some(state), Some(parent)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if state != "Z" || parent.parse::<u32>().ok() != Some(broker_process_id) {
+            continue;
+        }
+        let Ok(process_id) = libc::pid_t::try_from(process_id) else {
+            continue;
+        };
+        let mut status = 0;
+        // SAFETY: `process_id` is an exited, unsupervised child of this process, and `status`
+        // is writable.
+        unsafe { libc::waitpid(process_id, &raw mut status, libc::WNOHANG) };
+    }
+}
 fn serve_association(
     control_channel: IoResult<UnixStreamHostSetupChannel>,
     runner: &Arc<Mutex<RunnerProcess>>,
@@ -447,5 +492,53 @@ mod tests {
         };
         parent.kill().unwrap();
         parent.wait().unwrap();
+    }
+
+    #[test]
+    fn reaping_skips_supervised_children() {
+        let exited = |child: Child| {
+            let id = child.id();
+            // SAFETY: A zeroed siginfo_t is valid output storage for waitid.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            // Wait for the child to become a zombie without reaping it.
+            // SAFETY: `info` is writable, and WNOWAIT leaves the child unreaped.
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        id,
+                        &raw mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            std::mem::forget(child);
+            id
+        };
+        let unsupervised = exited(Command::new("true").spawn().unwrap());
+        let supervised = exited(Command::new("true").spawn().unwrap());
+        reap_unsupervised_children(&SupervisedRunners::from([(supervised, 1)]));
+        let wait = |id: u32| {
+            let mut status = 0;
+            // SAFETY: `status` is writable.
+            unsafe {
+                libc::waitpid(
+                    libc::pid_t::try_from(id).unwrap(),
+                    &raw mut status,
+                    libc::WNOHANG,
+                )
+            }
+        };
+        assert_eq!(
+            wait(unsupervised),
+            -1,
+            "an unsupervised zombie must be reaped"
+        );
+        assert_eq!(
+            wait(supervised),
+            libc::pid_t::try_from(supervised).unwrap(),
+            "a supervised runner is left for its owner"
+        );
     }
 }

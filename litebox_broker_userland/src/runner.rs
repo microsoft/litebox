@@ -26,6 +26,8 @@ use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher}
 #[cfg(target_os = "linux")]
 pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
+pub(crate) use linux::reap_unsupervised_children;
+#[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
 #[cfg(target_os = "linux")]
 use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
