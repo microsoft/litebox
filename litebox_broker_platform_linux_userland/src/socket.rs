@@ -291,7 +291,8 @@ impl PlatformSocket for LinuxSocket {
         _flags: SendFlags,
         copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let data = filled(length, copy_to)?;
+        let mut data = bounce_buffer(length)?;
+        copy_to(&mut data)?;
         self.reactor.request(|response| ReactorCommand::Send {
             id: self.id,
             data,
@@ -306,7 +307,8 @@ impl PlatformSocket for LinuxSocket {
         destination: Option<SocketAddrV4>,
         copy_to: &mut CopyToFn<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let data = filled(length, copy_to)?;
+        let mut data = bounce_buffer(length)?;
+        copy_to(&mut data)?;
         self.reactor.request(|response| ReactorCommand::SendTo {
             id: self.id,
             data,
@@ -1987,14 +1989,6 @@ impl Reactor {
         self.udp.clear_live_state();
         self.processes.clear();
     }
-}
-
-/// `length` bytes for the reactor to send, passed to `copy_to` (see
-/// [`litebox_broker_core::transfer`]).
-fn filled(length: usize, copy_to: &mut CopyToFn<'_>) -> BrokerResult<Vec<u8>> {
-    let mut data = bounce_buffer(length)?;
-    copy_to(&mut data)?;
-    Ok(data)
 }
 
 fn take_socket_error(socket: &SocketEntry) -> BrokerResult<Option<SocketError>> {
