@@ -309,8 +309,6 @@ impl Backend for Devices {
         }
     }
 
-    /// Discards what `/dev/null` and `/dev/urandom` are written without
-    /// passing room for it.
     fn write(
         &self,
         h: &FileHandle,

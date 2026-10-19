@@ -514,9 +514,7 @@ impl Tcp {
         Ok(())
     }
 
-    /// Passes what it receives to `copy_from` (see
-    /// [`litebox_broker_core::transfer`]). The broker core validated the peek
-    /// window.
+    /// The broker core validated the peek window.
     #[expect(clippy::too_many_arguments, reason = "mirrors PlatformSocket::receive")]
     pub(super) fn receive(
         &mut self,
@@ -640,8 +638,6 @@ impl Tcp {
         )))
     }
 
-    /// Sends what of `length` bytes there is room for, passing the room to
-    /// `copy_to` (see [`litebox_broker_core::transfer`]).
     pub(super) fn send(
         &mut self,
         sockets: &mut Sockets,

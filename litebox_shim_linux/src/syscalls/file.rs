@@ -89,9 +89,6 @@ impl<Platform: ShimPlatform> File<Platform> {
     }
 
     /// Reads into `buf` at `offset`, or at the file offset if `offset` is `None`.
-    ///
-    /// Reads a chunk at a time until the file runs short. Only the first chunk waits through
-    /// `cx`, and a failure after progress ends the read instead of being reported.
     pub(crate) fn read(
         &self,
         buf: &mut (impl ReadBuffer + ?Sized),
@@ -102,9 +99,6 @@ impl<Platform: ShimPlatform> File<Platform> {
     }
 
     /// Writes `buf` at `offset`, or at the file offset if `offset` is `None`.
-    ///
-    /// Writes a chunk at a time until the file takes a chunk short, and a failure after progress
-    /// ends the write instead of being reported.
     pub(crate) fn write(
         &self,
         buf: &(impl WriteBuffer + ?Sized),

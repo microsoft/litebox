@@ -87,8 +87,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
-    /// response that does not match the issued pipe request, or if `buffer` is
-    /// not a valid lease.
+    /// response that does not match the issued pipe request.
     pub fn write_pipe(
         &self,
         handle: ObjectHandle,

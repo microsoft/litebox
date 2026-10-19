@@ -164,8 +164,6 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn exit_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
 
-    /// Reads `length` random bytes, at most [`MAX_RANDOM_TRANSFER_SIZE`],
-    /// passing them to `copy_from`.
     fn fill_random(
         &self,
         length: usize,
@@ -228,8 +226,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         error: SocketError,
     ) -> core::result::Result<(), BrokerControlError>;
 
-    /// Sends up to `length` bytes, at most [`MAX_SOCKET_TRANSFER_SIZE`], on
-    /// a stream socket, which `copy_to` fills first.
     fn send_socket(
         &self,
         handle: ObjectHandle,
@@ -238,8 +234,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         flags: BrokerSendFlags,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
 
-    /// Receives up to `length` bytes, at most [`MAX_SOCKET_TRANSFER_SIZE`],
-    /// from a stream socket, passing the bytes received to `copy_from`.
     fn receive_socket(
         &self,
         handle: ObjectHandle,
@@ -250,8 +244,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         peek_length: u32,
     ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError>;
 
-    /// Sends `length` bytes, at most [`MAX_UDP_DATAGRAM_SIZE`], which `copy_to`
-    /// fills first, as one datagram.
     fn send_to_socket(
         &self,
         handle: ObjectHandle,
@@ -261,8 +253,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         destination: Option<SocketAddrV4>,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
 
-    /// Receives one datagram, up to `length` bytes of it, at most
-    /// [`MAX_UDP_DATAGRAM_SIZE`], passing the bytes received to `copy_from`.
     fn receive_from_socket(
         &self,
         handle: ObjectHandle,
@@ -382,8 +372,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         flags: FileOpenFlags,
     ) -> core::result::Result<CreatePipeResponse, BrokerControlError>;
 
-    /// Reads up to `length` bytes, at most [`MAX_PIPE_TRANSFER_SIZE`], from
-    /// a pipe, passing the bytes read to `copy_from`.
     fn read_pipe(
         &self,
         handle: ObjectHandle,
@@ -391,8 +379,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         copy_from: &mut CopyFromFn<'_>,
     ) -> core::result::Result<usize, BrokerControlError>;
 
-    /// Writes up to `length` bytes, at most [`MAX_PIPE_TRANSFER_SIZE`], to a
-    /// pipe, which `copy_to` fills first.
     fn write_pipe(
         &self,
         handle: ObjectHandle,
@@ -409,8 +395,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>;
 
-    /// Reads up to `length` bytes, at most [`MAX_FILE_TRANSFER_SIZE`], from
-    /// a file, passing the bytes read to `copy_from`.
     fn read_file(
         &self,
         handle: ObjectHandle,
@@ -419,8 +403,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError>;
 
-    /// Writes up to `length` bytes, at most [`MAX_FILE_TRANSFER_SIZE`], to a
-    /// file, which `copy_to` fills first.
     fn write_file(
         &self,
         handle: ObjectHandle,

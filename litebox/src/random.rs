@@ -24,8 +24,7 @@ pub enum FillRandomError {
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Fills `buf` completely with cryptographically secure random bytes.
     ///
-    /// Non-empty requests require a negotiated broker. On failure, any of the
-    /// bytes may have been filled.
+    /// Non-empty requests require a negotiated broker.
     pub fn fill_random(&self, buf: &mut (impl ReadBuffer + ?Sized)) -> Result<(), FillRandomError> {
         if buf.is_empty() {
             return Ok(());

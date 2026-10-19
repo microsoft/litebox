@@ -401,8 +401,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         Ok(end - start)
     }
 
-    /// Fills the file's bytes in place, past its end padded with zeroes first,
-    /// and restores its length if `copy_to` fails.
     fn write(
         &self,
         h: &super::backend::FileHandle,
