@@ -66,7 +66,9 @@ pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
 
     /// Creates the rendezvous state immediately before forking.
     ///
-    /// Returning [`ForkError::Unsupported`] requests copy-based startup instead.
+    /// Implementations should also quiesce host helper threads until the parent releases the
+    /// returned state, so that the clone never inherits their locks mid-update. Returning
+    /// [`ForkError::Unsupported`] requests copy-based startup instead.
     fn create_control_channel(&self) -> Result<Self::ControlChannel, ForkError<ProcessError>>;
 
     /// Encodes the child runner's host identity and control endpoint for broker adoption.
@@ -101,8 +103,6 @@ impl<Platform: ProcessProvider, Runner: ForkRunner<Platform>> StartRunner
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>> {
         let control_channel = self.runner.create_control_channel()?;
-        // TODO: Quiesce runner helper threads, such as the broker notification receiver, across
-        // the clone so the child never inherits a lock one of them held mid-update.
         // SAFETY: The caller keeps sibling guest threads paused. ForkLauncher::new guarantees
         // a clone-safe runner whose child bootstrap never returns or unwinds.
         match unsafe { Platform::fork_process() } {

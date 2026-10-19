@@ -10,6 +10,7 @@ use litebox_platform_linux_userland::SeccompScope;
 use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use litebox_broker_local_userland as broker;
 use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
@@ -46,10 +47,16 @@ struct NativeForkRunner {
     memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
 }
 
-/// A clone's pre-connected broker socket pair.
+/// How long a native fork waits for broker helper threads to finish their current work before
+/// falling back to copy-based fork.
+const NATIVE_FORK_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A clone's pre-connected broker socket pair and the helper-thread quiescence held across the
+/// clone.
 struct NativeForkChannel {
     broker_end: OwnedFd,
     runner_end: OwnedFd,
+    quiescence: broker::quiescence::HelperThreadQuiescence,
 }
 
 impl NativeForkRunner {
@@ -57,7 +64,7 @@ impl NativeForkRunner {
     fn install(
         builder: litebox_shim_linux::LinuxShimBuilder<Platform>,
     ) -> litebox_shim_linux::LinuxShimBuilder<Platform> {
-        // SAFETY: `run_child` abandons the copied task, resets platform state,
+        // SAFETY: `run_child` abandons the copied task, resets platform and helper-thread state,
         // and negotiates over its own socket before running the guest in a fresh shim.
         unsafe { builder.with_native_fork_runner(|memory| Self { memory }) }
     }
@@ -152,9 +159,18 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             litebox_util_log::warn!("native fork socket pair overlaps broker descriptors");
             return Err(ForkError::Unsupported);
         }
+        let quiescence =
+            broker::quiescence::HelperThreadQuiescence::acquire(NATIVE_FORK_QUIESCENCE_TIMEOUT)
+                .ok_or_else(|| {
+                    litebox_util_log::warn!(
+                        "broker helper threads stayed busy; copying fork instead"
+                    );
+                    ForkError::Unsupported
+                })?;
         Ok(NativeForkChannel {
             broker_end: broker_end.into(),
             runner_end: runner_end.into(),
+            quiescence,
         })
     }
 
@@ -166,7 +182,9 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         let NativeForkChannel {
             broker_end,
             runner_end,
+            quiescence,
         } = channel;
+        drop(quiescence);
         drop(runner_end);
         let process_id = process.process_id().map_err(|error| {
             litebox_util_log::error!("failed to identify native fork child: {error}");
@@ -185,7 +203,11 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         let NativeForkChannel {
             broker_end,
             runner_end,
+            quiescence,
         } = channel;
+        // SAFETY: This is the sole thread of the clone; no helper thread survived to use the
+        // copied gate.
+        unsafe { quiescence.reset_after_clone() };
         // SAFETY: The clone contains only this thread, and this function never returns through
         // the copied guest task or its thread-registration guard.
         let status = match unsafe { Platform::prepare_fork_child() }

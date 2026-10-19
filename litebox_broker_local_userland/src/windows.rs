@@ -17,6 +17,8 @@ use litebox_broker_transport_windows_userland::control_ring::{
 use litebox_broker_transport_windows_userland::named_pipe::WindowsNamedPipeLocalSetupChannel;
 use litebox_broker_transport_windows_userland::process_image::WindowsReceivedProcessImage;
 
+use crate::quiescence::HelperWork;
+
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// An active Windows-userland broker association.
@@ -95,11 +97,15 @@ pub fn start_notification_receiver(
         .spawn(move || {
             let error = loop {
                 match notifications.recv_notification() {
-                    Ok(Some(notification)) => dispatch_notification(notification),
+                    Ok(Some(notification)) => {
+                        let _work = HelperWork::begin();
+                        dispatch_notification(notification);
+                    }
                     Ok(None) => break None,
                     Err(error) => break Some(error),
                 }
             };
+            let _work = HelperWork::begin();
             dispatch_failure();
             if let Some(error) = error {
                 eprintln!("failed to receive broker notification: {error}");

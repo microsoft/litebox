@@ -16,12 +16,23 @@ use litebox_common_linux::program_startup::{LinuxProcessStartup, LinuxProgramSta
 use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
 use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
+use std::time::Duration;
 
 use litebox_broker_transport_windows_userland::existing_runner::{
     ControlChannelNames, ExistingRunnerDescriptor,
 };
 
 type Platform = WindowsUserland<{ litebox_common_linux::PAGE_SIZE }>;
+
+/// How long a native fork waits for broker helper threads to finish their current work before
+/// falling back to copy-based fork.
+const NATIVE_FORK_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A clone's control-pipe name and the helper-thread quiescence held across the clone.
+struct NativeForkChannel {
+    control_pipe: std::ffi::OsString,
+    quiescence: broker::quiescence::HelperThreadQuiescence,
+}
 
 struct NativeForkRunner {
     memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
@@ -38,7 +49,7 @@ impl NativeForkRunner {
         broker_process_id: u32,
         names: Arc<ControlChannelNames>,
     ) -> litebox_shim_linux::LinuxShimBuilder<Platform> {
-        // SAFETY: `run_child` abandons the copied task, resets platform state,
+        // SAFETY: `run_child` abandons the copied task, resets platform and helper-thread state,
         // and reconnects to the broker before running the guest in a fresh shim.
         unsafe {
             builder.with_native_fork_runner(|memory| Self {
@@ -95,16 +106,32 @@ impl NativeForkRunner {
 }
 
 impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkRunner {
-    type ControlChannel = std::ffi::OsString;
+    type ControlChannel = NativeForkChannel;
 
-    fn create_control_channel(&self) -> Result<std::ffi::OsString, ForkError<ProcessError>> {
-        Ok(self.names.next_name())
+    fn create_control_channel(&self) -> Result<NativeForkChannel, ForkError<ProcessError>> {
+        let quiescence =
+            broker::quiescence::HelperThreadQuiescence::acquire(NATIVE_FORK_QUIESCENCE_TIMEOUT)
+                .ok_or_else(|| {
+                    litebox_util_log::warn!(
+                        "broker helper threads stayed busy; copying fork instead"
+                    );
+                    ForkError::Unsupported
+                })?;
+        Ok(NativeForkChannel {
+            control_pipe: self.names.next_name(),
+            quiescence,
+        })
     }
     fn encode_runner_descriptor(
         &self,
         process: &<Platform as ProcessProvider>::ProcessHandle,
-        control_pipe: std::ffi::OsString,
+        channel: NativeForkChannel,
     ) -> Result<Vec<u8>, ProcessError> {
+        let NativeForkChannel {
+            control_pipe,
+            quiescence,
+        } = channel;
+        drop(quiescence);
         let process_id = process.process_id().map_err(|error| {
             litebox_util_log::error!("failed to identify native fork child: {error}");
             ProcessError::ServiceFailed
@@ -118,7 +145,14 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         .map_err(|_| ProcessError::OutOfMemory)
     }
 
-    unsafe fn run_child(&self, control_pipe: std::ffi::OsString) -> ! {
+    unsafe fn run_child(&self, channel: NativeForkChannel) -> ! {
+        let NativeForkChannel {
+            control_pipe,
+            quiescence,
+        } = channel;
+        // SAFETY: This is the sole thread of the clone; no helper thread survived to use the
+        // copied gate.
+        unsafe { quiescence.reset_after_clone() };
         // SAFETY: RtlCloneUserProcess cloned only this thread, and this path never returns through
         // the copied parent task or its registration guard.
         let status = match unsafe { Platform::prepare_fork_child() }

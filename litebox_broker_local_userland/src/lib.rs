@@ -5,6 +5,8 @@
 
 #![cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 
+pub mod quiescence;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

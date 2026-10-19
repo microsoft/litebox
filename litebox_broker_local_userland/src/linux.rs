@@ -23,6 +23,8 @@ use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
 };
 
+use crate::quiescence::HelperWork;
+
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
@@ -141,7 +143,10 @@ pub fn start_notification_receiver(
         .spawn(move || {
             let receive_error = loop {
                 match notifications.recv_notification() {
-                    Ok(Some(notification)) => dispatch_notification(notification),
+                    Ok(Some(notification)) => {
+                        let _work = HelperWork::begin();
+                        dispatch_notification(notification);
+                    }
                     Ok(None) => break None,
                     Err(error) => break Some(error),
                 }
@@ -217,6 +222,7 @@ impl BrokerAssociationFailureCoordinator {
         if self.failed.swap(true, Ordering::AcqRel) {
             return;
         }
+        let _work = HelperWork::begin();
         if let Some(shutdown_handle) = self
             .shutdown
             .lock()
