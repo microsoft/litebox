@@ -356,7 +356,7 @@ fn run_fake_runner(args: &[OsString]) {
                 let (head, tail) = unwritten.split_at(part.len());
                 part.copy_from_slice(head);
                 unwritten = tail;
-                Ok(())
+                Some(())
             })
             .unwrap(),
         data.len()
@@ -370,7 +370,7 @@ fn run_fake_runner(args: &[OsString]) {
                 let start = received.len();
                 received.resize(start + part.len(), 0);
                 part.copy_to_slice(&mut received[start..]);
-                Ok(())
+                Some(())
             },
         )
         .unwrap();

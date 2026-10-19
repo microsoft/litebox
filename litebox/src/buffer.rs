@@ -22,7 +22,6 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::Range;
-use litebox_broker_local::CopyFailed;
 
 use crate::mm::exception_table::Fault;
 use litebox_broker_transport::shared_memory::SharedBytes;
@@ -374,14 +373,12 @@ impl<B: WriteBuffer> WriteBuffer for SubBuffer<B> {
 pub(crate) fn copy_to_buffer(
     mut buffer: impl ReadBuffer,
     mut offset: usize,
-) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> {
+) -> impl FnMut(SharedBytes<'_>) -> Option<()> {
     move |part| {
         let length = part.len();
-        buffer
-            .copy_from_raw_at(offset, part.into())
-            .map_err(|Fault| CopyFailed)?;
+        buffer.copy_from_raw_at(offset, part.into()).ok()?;
         offset += length;
-        Ok(())
+        Some(())
     }
 }
 
@@ -390,14 +387,12 @@ pub(crate) fn copy_to_buffer(
 pub(crate) fn copy_from_buffer(
     buffer: impl WriteBuffer,
     mut offset: usize,
-) -> impl FnMut(SharedBytes<'_>) -> Result<(), CopyFailed> {
+) -> impl FnMut(SharedBytes<'_>) -> Option<()> {
     move |part| {
         let length = part.len();
-        buffer
-            .copy_to_raw_at(offset, part.into())
-            .map_err(|Fault| CopyFailed)?;
+        buffer.copy_to_raw_at(offset, part.into()).ok()?;
         offset += length;
-        Ok(())
+        Some(())
     }
 }
 

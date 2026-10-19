@@ -65,7 +65,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
             let outcome = self.broker.receive_socket(
                 self.handle,
                 length,
-                &mut |part| if discard { Ok(()) } else { copy_from(part) },
+                &mut |part| if discard { Some(()) } else { copy_from(part) },
                 broker_flags,
                 peek_offset,
                 peek_length,

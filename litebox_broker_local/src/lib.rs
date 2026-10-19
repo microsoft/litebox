@@ -62,23 +62,20 @@ pub use error::{BrokerLocalError, Result};
 /// Copies from each part of the bytes the broker read, in turn, to the
 /// caller's buffer.
 ///
-/// Its name gives the direction relative to the part, as on the broker. If it
-/// fails, the read fails with [`BrokerLocalError::CopyFailed`], having already
-/// consumed the bytes it read.
-pub type CopyFromFn<'a> = dyn FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed> + 'a;
+/// Its name gives the direction relative to the part, as on the broker. It
+/// returns `None` if it cannot copy a part, such as because the caller's buffer
+/// is inaccessible; the read then fails with [`BrokerLocalError::CopyFailed`],
+/// having already consumed the bytes it read.
+pub type CopyFromFn<'a> = dyn FnMut(SharedBytes<'_>) -> Option<()> + 'a;
 
 /// Copies to each part of the bytes to write, in turn, from the caller's
 /// buffer.
 ///
-/// Its name gives the direction relative to the part, as on the broker. If it
-/// fails, the write fails with [`BrokerLocalError::CopyFailed`] and sends
-/// nothing.
-pub type CopyToFn<'a> = dyn FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed> + 'a;
-
-/// Reports that a [`CopyFromFn`] or [`CopyToFn`] could not copy a part, such as
-/// because the caller's buffer is inaccessible.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CopyFailed;
+/// Its name gives the direction relative to the part, as on the broker. It
+/// returns `None` if it cannot copy a part, such as because the caller's buffer
+/// is inaccessible; the write then fails with [`BrokerLocalError::CopyFailed`]
+/// and sends nothing.
+pub type CopyToFn<'a> = dyn FnMut(SharedBytes<'_>) -> Option<()> + 'a;
 
 /// Typed broker-local control adapter for broker operations.
 ///
@@ -290,7 +287,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         offset: usize,
         length: usize,
-        copy: &mut dyn FnMut(SharedBytes<'_>) -> core::result::Result<(), CopyFailed>,
+        copy: &mut dyn FnMut(SharedBytes<'_>) -> Option<()>,
     ) -> Result<(), Channel::Error> {
         assert!(
             offset
@@ -303,7 +300,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .borrow_sequence(buffer, offset, length)
             .expect("validated shared buffer sequence must be accessible")
         {
-            copy(part).map_err(|CopyFailed| BrokerLocalError::CopyFailed)?;
+            copy(part).ok_or(BrokerLocalError::CopyFailed)?;
         }
         Ok(())
     }

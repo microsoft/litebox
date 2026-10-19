@@ -141,7 +141,6 @@ mod tests {
     use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::{HeapSharedMemory, SharedMemory};
 
-    use crate::CopyFailed;
     use crate::test_support::{copy_from_slice, copy_to_slice, test_broker_local};
 
     #[test]
@@ -260,12 +259,12 @@ mod tests {
         let local = test_broker_local(channel, memory);
 
         assert!(matches!(
-            local.write_pipe(ObjectHandle(2), sequence(0, 1), &mut |_| Err(CopyFailed)),
+            local.write_pipe(ObjectHandle(2), sequence(0, 1), &mut |_| None),
             Err(BrokerLocalError::CopyFailed)
         ));
         assert!(local.channel.sent_operations.borrow().is_empty());
         assert!(matches!(
-            local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut |_| Err(CopyFailed)),
+            local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut |_| None),
             Err(BrokerLocalError::CopyFailed)
         ));
     }
