@@ -11,7 +11,7 @@ use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::test_support::TestBrokerCoreBuilder;
-use litebox_broker_core::transfer::copy_from_slice;
+use litebox_broker_core::transfer::{copy_from_slice, copy_to_slice};
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -234,17 +234,6 @@ fn receive_datagram_into(
         flags,
         &mut copy_to_slice(data),
     )
-}
-
-/// Returns a `CopyFromFn` that copies the parts it is passed into `destination`,
-/// one after another.
-fn copy_to_slice(destination: &mut [u8]) -> impl FnMut(&[u8]) -> BrokerResult<()> + '_ {
-    let mut offset = 0;
-    move |part| {
-        destination[offset..][..part.len()].copy_from_slice(part);
-        offset += part.len();
-        Ok(())
-    }
 }
 
 #[test]
