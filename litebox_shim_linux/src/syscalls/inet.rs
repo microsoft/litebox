@@ -208,14 +208,9 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             } else {
                 None
             },
-            copies_data: !self.discards_data(flags),
+            // `MSG_TRUNC` discards stream data.
+            copies_data: !(is_stream && flags.contains(ReceiveFlags::TRUNC)),
         })
-    }
-
-    /// Whether a receive with `flags` discards the data instead of copying it, as `MSG_TRUNC`
-    /// does to stream data.
-    fn discards_data(&self, flags: ReceiveFlags) -> bool {
-        self.is_stream() && flags.contains(ReceiveFlags::TRUNC)
     }
 
     /// Whether the socket is nonblocking, which every descriptor sharing it sees.
