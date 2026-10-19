@@ -476,7 +476,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             Events::IN,
             || self.receive_timeout(),
             || loop {
-                let mut destination = buf.window(received, target_len - received);
+                let mut destination = buf.sub_buffer(received, target_len - received);
                 match self.socket.try_read(
                     &mut destination,
                     receive_flags,
@@ -552,10 +552,11 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             }
             Err(error @ TryOpError::WaitError(_)) if wait_all && peek => {
                 receive_flags.remove(inet_socket::ReceiveFlags::WAITALL);
-                match self
-                    .socket
-                    .try_read(buf.window(0, target_len), receive_flags, source_addr)
-                {
+                match self.socket.try_read(
+                    buf.sub_buffer(0, target_len),
+                    receive_flags,
+                    source_addr,
+                ) {
                     Ok(received) => Ok(received),
                     Err(SocketReadError::Fault) => Err(Errno::EFAULT),
                     Err(SocketReadError::ReadShutdown) => Ok(0),

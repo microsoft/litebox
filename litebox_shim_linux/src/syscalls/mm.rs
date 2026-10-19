@@ -119,7 +119,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let size = self
                     .do_read(
                         fd,
-                        buffer.window(copied, len - copied),
+                        buffer.sub_buffer(copied, len - copied),
                         Some(offset + copied),
                     )
                     .map_err(|e| match e {

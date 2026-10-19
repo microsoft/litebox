@@ -215,7 +215,7 @@ mod tests {
         let shared = memory.shared_bytes(0, 2).unwrap();
         shared.copy_from_slice(&[3, 4]);
         buffer
-            .window(2, 3)
+            .sub_buffer(2, 3)
             .copy_from_raw_at(1, shared.into())
             .unwrap();
         assert_eq!((a, c), ([0, 1], [2, 3, 4]));

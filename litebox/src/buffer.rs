@@ -7,7 +7,7 @@
 //! which copy directly between themselves and wherever the object keeps its
 //! bytes: a slice, or [`RawBytes`], such as memory shared with the broker that
 //! owns the object. A buffer need not be memory LiteBox can reference, such as
-//! a guest's memory, so its copies may [`Fault`]. A [`Window`] onto part of a
+//! a guest's memory, so its copies may [`Fault`]. A [`SubBuffer`] of a
 //! buffer is a buffer too.
 //!
 //! As with `std::io::Read` and `std::io::Write`, functions take buffers by
@@ -98,14 +98,14 @@ pub trait ReadBuffer {
     /// Panics if `source` does not fit in the buffer at `offset`.
     fn copy_from_raw_at(&mut self, offset: usize, source: RawBytes<'_>) -> Result<(), Fault>;
 
-    /// Returns the window of the `length` bytes at `offset` in the buffer.
+    /// Returns the sub-buffer of the `length` bytes at `offset` in the buffer.
     ///
     /// # Panics
     ///
     /// Panics if the bytes exceed the buffer.
-    fn window(&mut self, offset: usize, length: usize) -> Window<&mut Self> {
+    fn sub_buffer(&mut self, offset: usize, length: usize) -> SubBuffer<&mut Self> {
         let buffer_length = self.len();
-        Window::new(self, buffer_length, offset, length)
+        SubBuffer::new(self, buffer_length, offset, length)
     }
 }
 
@@ -139,13 +139,13 @@ pub trait WriteBuffer {
     /// `offset`.
     fn copy_to_raw_at(&self, offset: usize, destination: RawBytes<'_>) -> Result<(), Fault>;
 
-    /// Returns the window of the `length` bytes at `offset` in the buffer.
+    /// Returns the sub-buffer of the `length` bytes at `offset` in the buffer.
     ///
     /// # Panics
     ///
     /// Panics if the bytes exceed the buffer.
-    fn window(&self, offset: usize, length: usize) -> Window<&Self> {
-        Window::new(self, self.len(), offset, length)
+    fn sub_buffer(&self, offset: usize, length: usize) -> SubBuffer<&Self> {
+        SubBuffer::new(self, self.len(), offset, length)
     }
 }
 
@@ -297,14 +297,14 @@ impl WriteBuffer for Box<[u8]> {
 
 /// The bytes at an offset in a buffer, as a buffer of their own.
 ///
-/// [`ReadBuffer::window`] and [`WriteBuffer::window`] return windows.
-pub struct Window<B> {
+/// [`ReadBuffer::sub_buffer`] and [`WriteBuffer::sub_buffer`] return sub-buffers.
+pub struct SubBuffer<B> {
     buffer: B,
     offset: usize,
     length: usize,
 }
 
-impl<B> Window<B> {
+impl<B> SubBuffer<B> {
     fn new(buffer: B, buffer_length: usize, offset: usize, length: usize) -> Self {
         assert!(
             offset
@@ -320,24 +320,24 @@ impl<B> Window<B> {
     }
 
     /// Returns the offset in the buffer of the `length` bytes at `offset` in
-    /// the window.
+    /// the sub-buffer.
     ///
     /// # Panics
     ///
-    /// Panics if the bytes exceed the window.
+    /// Panics if the bytes exceed the sub-buffer.
     fn at(&self, offset: usize, length: usize) -> usize {
         assert!(
             offset
                 .checked_add(length)
                 .is_some_and(|end| end <= self.length),
-            "{length} bytes at {offset} exceed a window of {} bytes",
+            "{length} bytes at {offset} exceed a sub-buffer of {} bytes",
             self.length
         );
         self.offset + offset
     }
 }
 
-impl<B: ReadBuffer> ReadBuffer for Window<B> {
+impl<B: ReadBuffer> ReadBuffer for SubBuffer<B> {
     fn len(&self) -> usize {
         self.length
     }
@@ -353,7 +353,7 @@ impl<B: ReadBuffer> ReadBuffer for Window<B> {
     }
 }
 
-impl<B: WriteBuffer> WriteBuffer for Window<B> {
+impl<B: WriteBuffer> WriteBuffer for SubBuffer<B> {
     fn len(&self) -> usize {
         self.length
     }
@@ -438,17 +438,17 @@ mod tests {
     }
 
     #[test]
-    fn windows_copy_within_their_buffers() {
+    fn sub_buffers_copy_within_their_buffers() {
         let memory = HeapSharedMemory::new(2);
         let raw = RawBytes::from(memory.shared_bytes(0, 2).unwrap());
         let source: &[u8] = &[1, 2, 3, 4, 5];
-        let window = WriteBuffer::window(source, 1, 4);
-        let window = window.window(1, 3);
-        assert_eq!(window.len(), 3);
-        window.copy_to_raw_at(1, raw).unwrap();
+        let sub_buffer = WriteBuffer::sub_buffer(source, 1, 4);
+        let sub_buffer = sub_buffer.sub_buffer(1, 3);
+        assert_eq!(sub_buffer.len(), 3);
+        sub_buffer.copy_to_raw_at(1, raw).unwrap();
         let mut destination = [0; 6];
-        let mut outer = ReadBuffer::window(&mut destination, 2, 4);
-        let mut inner = outer.window(1, 3);
+        let mut outer = ReadBuffer::sub_buffer(&mut destination, 2, 4);
+        let mut inner = outer.sub_buffer(1, 3);
         inner.copy_from_raw_at(1, raw).unwrap();
         inner.copy_from_slice_at(0, &[9]).unwrap();
         assert_eq!(destination, [0, 0, 0, 9, 4, 5]);
@@ -456,16 +456,16 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "exceed a buffer")]
-    fn windows_past_their_buffer_panic() {
+    fn sub_buffers_past_their_buffer_panic() {
         let mut bytes = [0; 4];
-        let _ = ReadBuffer::window(&mut bytes, 3, 2);
+        let _ = ReadBuffer::sub_buffer(&mut bytes, 3, 2);
     }
 
     #[test]
-    #[should_panic(expected = "exceed a window")]
-    fn copies_past_a_window_panic() {
+    #[should_panic(expected = "exceed a sub-buffer")]
+    fn copies_past_a_sub_buffer_panic() {
         let bytes: &[u8] = &[0; 4];
-        let _ = WriteBuffer::window(bytes, 0, 2).copy_to_slice_at(1, &mut [0; 2]);
+        let _ = WriteBuffer::sub_buffer(bytes, 0, 2).copy_to_slice_at(1, &mut [0; 2]);
     }
 
     #[test]

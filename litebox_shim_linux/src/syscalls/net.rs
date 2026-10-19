@@ -943,7 +943,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             let size = match socket.receive(
                 &cx,
-                guest.window(received, chunk_len),
+                guest.sub_buffer(received, chunk_len),
                 flags,
                 received != 0,
                 if addr.is_some() {
@@ -1092,7 +1092,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             let size = match socket.receive(
                 &cx,
-                guest.window(total_received, chunk_len),
+                guest.sub_buffer(total_received, chunk_len),
                 flags,
                 total_received != 0,
                 if want_source {

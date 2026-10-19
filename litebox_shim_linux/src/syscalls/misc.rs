@@ -32,7 +32,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut offset = 0;
         while offset < count {
             let len = (count - offset).min(CHUNK_LEN);
-            match self.global.litebox.fill_random(buf.window(offset, len)) {
+            match self.global.litebox.fill_random(buf.sub_buffer(offset, len)) {
                 Ok(()) => offset += len,
                 // Like Linux, a failure after progress ends the call with that progress.
                 Err(_) if offset != 0 => break,
