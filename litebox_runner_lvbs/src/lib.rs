@@ -362,6 +362,10 @@ fn vtlcall_dispatch(platform: &'static Platform, params: &[u64; NUM_VTLCALL_PARA
             {
                 return vsm_error_to_errno(error).as_neg().into();
             }
+
+            use litebox_common_lvbs::Vtl1Gate as _;
+            LvbsVtl1Gate::mint(platform).signal_end_of_boot();
+            0
         }
         _ => vsm_dispatch(platform, func_id, &params[1..]),
     }
