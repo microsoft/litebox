@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_scatter_across_iovecs_and_windows() {
+    fn reads_scatter_across_iovecs_and_sub_buffers() {
         let (mut a, mut b, mut c) = ([0u8; 2], [0u8; 0], [0u8; 3]);
         let iovs = [read_iov(&mut a), read_iov(&mut b), read_iov(&mut c)];
         let mut buffer = GuestReadBuffer::<TestPlatform>::new(&iovs).unwrap();

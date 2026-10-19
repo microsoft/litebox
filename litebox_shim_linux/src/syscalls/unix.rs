@@ -680,7 +680,7 @@ mod tests {
                 SocketAddress::Unix(UnixSocketAddr::Unnamed)
             ));
             assert_eq!(
-                task.do_sendto(&server_conn, &[0u8; 0], SendFlags::empty(), None)
+                task.do_sendto(&server_conn, b"", SendFlags::empty(), None)
                     .expect("zero-length sendto failed"),
                 0
             );
