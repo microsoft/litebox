@@ -1721,10 +1721,23 @@ fn run_test_broker_connection(
         litebox_broker_host::ConnectionTermination::PeerClosed
     );
     readiness.close();
-    publisher
+    // The runner's clean close can fail a notification send already in flight, which the broker
+    // runtime likewise ignores; any other publication failure is a real error.
+    if let Err(error) = publisher
         .join()
         .expect("broker readiness publisher panicked")
-        .expect("broker readiness publication failed");
+    {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            ),
+            "broker readiness publication failed: {error:?}"
+        );
+    }
     association.finish();
     close_object_count_tx
         .send(close_object_count)
