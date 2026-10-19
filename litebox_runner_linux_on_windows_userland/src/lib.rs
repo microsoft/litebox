@@ -18,34 +18,47 @@ use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 
 use litebox_broker_transport_windows_userland::existing_runner::{
-    ExistingRunnerDescriptor, unique_control_channel,
+    ControlChannelNames, ExistingRunnerDescriptor,
 };
 
 type Platform = WindowsUserland<{ litebox_common_linux::PAGE_SIZE }>;
 
 struct NativeForkRunner {
     memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
+    /// Broker serving this runner, which must also serve its clones' control pipes.
+    broker_process_id: u32,
+    /// Names of clones' control pipes, keyed before any clone exists.
+    names: Arc<ControlChannelNames>,
 }
 
 impl NativeForkRunner {
     /// Configures `builder` to start native fork children.
     fn install(
         builder: litebox_shim_linux::LinuxShimBuilder<Platform>,
+        broker_process_id: u32,
+        names: Arc<ControlChannelNames>,
     ) -> litebox_shim_linux::LinuxShimBuilder<Platform> {
         // SAFETY: `run_child` abandons the copied task, resets platform state,
         // and reconnects to the broker before running the guest in a fresh shim.
-        unsafe { builder.with_native_fork_runner(|memory| Self { memory }) }
+        unsafe {
+            builder.with_native_fork_runner(|memory| Self {
+                memory,
+                broker_process_id,
+                names,
+            })
+        }
     }
 
     /// Rebuilds the runtime in a clone and returns the guest's exit status.
     fn bootstrap_child(&self, control_pipe: &std::ffi::OsStr) -> Result<i32> {
         let platform = Platform::new();
         Platform::set_guest_tls_mode(GuestTlsMode::Linux);
-        let (connection, startup) = broker::connect(control_pipe)?;
+        let (connection, startup) = broker::connect(control_pipe, Some(self.broker_process_id))?;
         let broker::BrokerConnection {
             local,
             notifications,
             process_image,
+            broker_process_id: _,
         } = connection;
         if process_image.is_some() {
             anyhow::bail!("native fork child unexpectedly received a process image");
@@ -70,7 +83,7 @@ impl NativeForkRunner {
                 Arc::clone(&self.memory),
             )
         };
-        let shim = Self::install(builder).build();
+        let shim = Self::install(builder, self.broker_process_id, Arc::clone(&self.names)).build();
         let startup = startup.context("native fork child has no startup data")?;
         // SAFETY: The startup describes this clone, whose inherited memory manager the fresh shim
         // now owns; this path never returns to the copied parent runtime.
@@ -85,7 +98,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     type ControlChannel = std::ffi::OsString;
 
     fn create_control_channel(&self) -> Result<std::ffi::OsString, ForkError<ProcessError>> {
-        Ok(unique_control_channel())
+        Ok(self.names.next_name())
     }
     fn encode_runner_descriptor(
         &self,
@@ -181,11 +194,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .broker_control_channel
         .as_deref()
         .context("file operations require --broker-control-channel")?;
-    let (connection, startup) = broker::connect(control_pipe)?;
+    let (connection, startup) = broker::connect(control_pipe, None)?;
     let broker::BrokerConnection {
         local,
         notifications,
         process_image,
+        broker_process_id,
     } = connection;
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, local);
@@ -198,7 +212,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let shim_builder =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
     let shim_builder = if std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none() {
-        NativeForkRunner::install(shim_builder)
+        let names = ControlChannelNames::new().context("failed to key native fork pipe names")?;
+        NativeForkRunner::install(shim_builder, broker_process_id, Arc::new(names))
     } else {
         shim_builder
     };

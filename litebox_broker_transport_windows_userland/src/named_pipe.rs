@@ -13,9 +13,12 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use windows_sys::Win32::Foundation::{
     ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 
 use crate::setup::OverlappedOperation;
@@ -33,6 +36,9 @@ pub struct WindowsNamedPipeStream(File);
 
 impl WindowsNamedPipeListener {
     /// Creates one duplex byte-mode named-pipe instance.
+    ///
+    /// Binding fails if any instance of `name` already exists, so a process that created the
+    /// name first cannot receive the broker's peer. Remote clients are rejected.
     pub fn bind(name: &OsStr) -> IoResult<Self> {
         let name = wide_string(name)?;
         // SAFETY: `name` is NUL-terminated. The pipe is overlapped and byte-mode, and uses the
@@ -40,8 +46,8 @@ impl WindowsNamedPipeListener {
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 64 * 1024,
                 64 * 1024,

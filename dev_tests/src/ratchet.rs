@@ -72,7 +72,6 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_bootloader/", 8),
             ("litebox_broker_core/", 1),
             ("litebox_broker_transport_linux_userland/", 1),
-            ("litebox_broker_transport_windows_userland/", 1),
             ("litebox_broker_userland/", 1),
             ("litebox_hal/", 1),
             ("litebox_platform/", 2),

@@ -60,7 +60,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .broker_control_channel
         .as_deref()
         .context("file operations require --broker-control-channel")?;
-    let (connection, startup) = broker::connect(control_pipe)?;
+    let (connection, startup) = broker::connect(control_pipe, None)?;
     if startup.is_some() {
         anyhow::bail!("unsupported child Windows process startup");
     }
@@ -71,6 +71,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         local,
         notifications,
         process_image: _,
+        broker_process_id: _,
     } = connection;
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, local);

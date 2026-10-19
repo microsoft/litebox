@@ -102,6 +102,22 @@ impl WindowsNamedPipeLocalSetupChannel {
         }
     }
 
+    /// Returns the process ID of the pipe server this channel connected to.
+    pub fn server_process_id(&self) -> IoResult<u32> {
+        let mut process_id = 0;
+        // SAFETY: `stream` owns a live client pipe handle and `process_id` is writable.
+        if unsafe {
+            windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(
+                self.stream.handle(),
+                &raw mut process_id,
+            )
+        } == 0
+        {
+            return Err(Error::last_os_error());
+        }
+        Ok(process_id)
+    }
+
     /// Receives and maps one shared-memory object duplicated into this process.
     pub fn receive_shared_memory(
         &mut self,

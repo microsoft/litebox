@@ -27,10 +27,18 @@ pub struct BrokerConnection {
     pub notifications: BrokerNotifications<WindowsControlRingLocalNotificationChannel>,
     /// Memory image this process starts from, if its parent wrote one.
     pub process_image: Option<WindowsReceivedProcessImage>,
+    /// Host process ID of the broker serving the control pipe.
+    pub broker_process_id: u32,
 }
 
 /// Connects to and negotiates an association with a Windows-userland broker.
-pub fn connect(control_pipe: &OsStr) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
+///
+/// If `expected_broker_process_id` is given, the pipe server must be that process, so a
+/// process that created the pipe name first cannot pose as the broker.
+pub fn connect(
+    control_pipe: &OsStr,
+    expected_broker_process_id: Option<u32>,
+) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let setup =
         WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(control_pipe, deadline)
@@ -40,6 +48,16 @@ pub fn connect(control_pipe: &OsStr) -> Result<(BrokerConnection, Option<Process
                     std::path::Path::new(control_pipe).display()
                 )
             })?;
+    let broker_process_id = setup
+        .server_process_id()
+        .context("failed to identify the broker")?;
+    if let Some(expected) = expected_broker_process_id
+        && broker_process_id != expected
+    {
+        anyhow::bail!(
+            "broker pipe is served by process {broker_process_id}, not the broker ({expected})"
+        );
+    }
     let (local, startup, (notifications, process_image)) =
         BrokerLocal::negotiate(setup, |mut setup| {
             let shared_memory = Arc::new(setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?);
@@ -60,6 +78,7 @@ pub fn connect(control_pipe: &OsStr) -> Result<(BrokerConnection, Option<Process
             local,
             notifications: BrokerNotifications::new(notifications),
             process_image,
+            broker_process_id,
         },
         startup,
     ))
