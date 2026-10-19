@@ -1,0 +1,11 @@
+[
+  {
+    "argv": ["/init"],
+    "expect_stdout": "parent 1\nleader 1\norphan's parent 1\nno children 1\n"
+  },
+  {
+    "argv": ["/init"],
+    "expect_stdout": "parent 1\nleader 1\norphan's parent 1\nno children 1\n"
+  },
+  { "concurrent": [{ "argv": ["/init"] }, { "argv": ["/init"] }] }
+]

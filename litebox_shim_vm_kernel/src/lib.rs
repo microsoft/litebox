@@ -114,6 +114,8 @@ pub enum SpawnError {
     Map(Status),
     #[error("pinning the broker control ring failed: {0:?}")]
     Pin(litebox_common_linux::errno::Errno),
+    #[error("creating the broker process failed: {0:?}")]
+    Broker(BrokerError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,7 +439,9 @@ impl Inner {
         lazy(layout::BROKER_SHARED_MEMORY)?;
         lazy(layout::HEAP)?;
         let control_ring = pin_control_ring(platform, address_space, &mappings)?;
-        let broker = broker.associate(layout::BROKER_SHARED_MEMORY, control_ring, launch);
+        let broker = broker
+            .associate(layout::BROKER_SHARED_MEMORY, control_ring, launch)
+            .map_err(SpawnError::Broker)?;
         let images = map_images(&mappings, config.images)?;
 
         let info = StartupInfo {
