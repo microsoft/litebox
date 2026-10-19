@@ -3,7 +3,7 @@
 
 //! Runner launch support backed by broker-owned process lifecycle state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Error as IoError, Result as IoResult};
 use std::process::ExitStatus;
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -24,7 +24,24 @@ pub(crate) struct UserlandProcessLauncher {
     broker: BrokerCore,
     started_runner_config: RunnerConfig,
     lifecycle: Arc<ProcessLifecycleNotifier>,
-    runners: Mutex<HashMap<ProcessId, std::sync::Weak<Mutex<RunnerProcess>>>>,
+    runners: Mutex<RunnerRegistry>,
+}
+
+/// Runners this broker supervises.
+///
+/// A host process ID is registered from the moment its runner is spawned or adopted until the
+/// runner has been reaped, so adoption can never claim a supervised runner.
+#[derive(Default)]
+struct RunnerRegistry {
+    by_process: HashMap<ProcessId, std::sync::Weak<Mutex<RunnerProcess>>>,
+    host_process_ids: HashSet<u32>,
+}
+
+impl RunnerRegistry {
+    fn remove(&mut self, process_id: ProcessId, host_process_id: u32) {
+        self.by_process.remove(&process_id);
+        self.host_process_ids.remove(&host_process_id);
+    }
 }
 
 /// Pending association for a broker-created runner process.
@@ -123,7 +140,7 @@ impl UserlandProcessLauncher {
             broker,
             started_runner_config,
             lifecycle,
-            runners: Mutex::new(HashMap::new()),
+            runners: Mutex::new(RunnerRegistry::default()),
         })
     }
 
@@ -165,7 +182,15 @@ impl UserlandProcessLauncher {
         completion_sender: Option<SyncSender<IoResult<ExitStatus>>>,
     ) -> Result<(), BrokerError> {
         let process = Arc::clone(&association.process);
-        let Ok(instance) = RunnerInstance::start(config) else {
+        let instance = {
+            // Registration under the lock that adoption and reaping hold keeps the new runner's
+            // host process ID from ever appearing unsupervised.
+            let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
+            RunnerInstance::start(config).inspect(|instance| {
+                runners.host_process_ids.insert(instance.host_process_id());
+            })
+        };
+        let Ok(instance) = instance else {
             let _ = process.fail_start(BrokerError::PeerClosed, false, false);
             process.retire(true);
             return Err(BrokerError::PeerClosed);
@@ -181,9 +206,11 @@ impl UserlandProcessLauncher {
     ) -> Result<(), BrokerError> {
         let process = Arc::clone(&association.process);
         let process_id = process.id();
+        let host_process_id = instance.host_process_id();
         self.runners
             .lock()
             .expect("runner registry mutex poisoned")
+            .by_process
             .insert(process_id, Arc::downgrade(&instance.runner_process()));
         let setup_deadline = instance.setup_deadline();
         let broker = self.broker.clone();
@@ -205,20 +232,22 @@ impl UserlandProcessLauncher {
                     completion.process_exit_status(),
                     abnormal,
                 );
+                // The instance reaped its runner before being consumed or dropped.
                 launcher
                     .runners
                     .lock()
                     .expect("runner registry mutex poisoned")
-                    .remove(&process_id);
+                    .remove(process_id, host_process_id);
                 if let Some(completion_sender) = completion_sender {
                     let _ = completion_sender.send(completion.into_result());
                 }
             });
         if thread.is_err() {
+            // Dropping the unstarted closure dropped, and so reaped, the instance.
             self.runners
                 .lock()
                 .expect("runner registry mutex poisoned")
-                .remove(&process_id);
+                .remove(process_id, host_process_id);
             let _ = process.fail_start(BrokerError::OutOfMemory, false, true);
             process.retire(true);
             return Err(BrokerError::OutOfMemory);
@@ -257,43 +286,41 @@ impl ProcessLauncher for UserlandProcessLauncher {
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,
     ) -> Result<(), BrokerError> {
-        #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-        {
-            let adoption = (|| {
-                let parent = self
-                    .runners
-                    .lock()
-                    .expect("runner registry mutex poisoned")
-                    .get(&parent_process_id)
-                    .and_then(std::sync::Weak::upgrade)
-                    .ok_or(BrokerError::PeerClosed)?;
-                RunnerInstance::adopt(&parent, &runner_descriptor)
-                    .map_err(|_| BrokerError::PolicyDenied)
-            })();
-            let instance = match adoption {
-                Ok(instance) => instance,
-                Err(error) => {
-                    let _ = process.fail_start(error, false, true);
-                    process.retire(true);
-                    return Err(error);
-                }
-            };
-            self.launch_runner_instance(
-                PendingRunnerAssociation::new(process, Some(startup), None),
-                instance,
-                None,
-            )
-        }
-        #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
-        {
-            let _ = startup;
-            let _ = runner_descriptor;
-            let _ = process.fail_start(BrokerError::UnsupportedOperation, false, true);
-            process.retire(true);
-            Err(BrokerError::UnsupportedOperation)
-        }
+        let adoption = {
+            let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
+            let adoption = runners
+                .by_process
+                .get(&parent_process_id)
+                .and_then(std::sync::Weak::upgrade)
+                .ok_or(BrokerError::PeerClosed)
+                .and_then(|parent| {
+                    RunnerInstance::adopt(&parent, &runner_descriptor, &runners.host_process_ids)
+                        .map_err(|error| {
+                            litebox_util_log::warn!("rejected native fork runner: {error}");
+                            BrokerError::PolicyDenied
+                        })
+                });
+            // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
+            // broker's children, so their parent runner's cleanup leaves zombies here.
+            if let Ok(instance) = &adoption {
+                runners.host_process_ids.insert(instance.host_process_id());
+            }
+            adoption
+        };
+        let instance = match adoption {
+            Ok(instance) => instance,
+            Err(error) => {
+                let _ = process.fail_start(error, false, true);
+                process.retire(true);
+                return Err(error);
+            }
+        };
+        self.launch_runner_instance(
+            PendingRunnerAssociation::new(process, Some(startup), None),
+            instance,
+            None,
+        )
     }
-
     fn create_image(
         &self,
         capacity: u64,

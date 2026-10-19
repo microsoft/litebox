@@ -62,6 +62,23 @@ impl<const ALIGN: usize> ProcessProvider for crate::WindowsUserland<ALIGN> {
     }
 }
 
+/// Terminates a process created by [`ProcessProvider::fork_process`] with `status`, without
+/// running the C runtime or DLL teardown of state copied from its multithreaded parent.
+///
+/// # Safety
+///
+/// The caller must be a cloned child whose copied runtime must not be torn down.
+pub unsafe fn exit_fork_child(status: i32) -> ! {
+    // SAFETY: Terminating the current process through its pseudo-handle does not return.
+    unsafe {
+        TerminateProcess(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            status.cast_unsigned(),
+        );
+    }
+    unreachable!("TerminateProcess on the current process returned")
+}
+
 impl ProcessHandle for ClonedProcess {
     type Error = Error;
 

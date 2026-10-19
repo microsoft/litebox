@@ -413,18 +413,35 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         }
     }
 
-    /// Uses `launcher` to start native fork children, replacing the copy-based default.
+    /// Starts native fork children with the runner `make_runner` creates, replacing the
+    /// copy-based default.
     ///
-    /// Construct its runner using the final manager returned by [`Self::memory_manager`].
+    /// `make_runner` receives this shim's memory manager, which a native child inherits and must
+    /// pass to [`Self::new_for_native_fork`].
+    ///
+    /// # Safety
+    ///
+    /// The runner must satisfy the clone-safety contract of [`ForkLauncher::new`].
     #[must_use]
-    pub fn with_fork_launcher(mut self, launcher: ForkLauncher) -> Self {
-        self.fork_launcher = Some(launcher);
-        self
+    pub unsafe fn with_native_fork_runner<Runner>(
+        self,
+        make_runner: impl FnOnce(Arc<MemoryManager<Platform>>) -> Runner,
+    ) -> Self
+    where
+        Platform: litebox::platform::ProcessProvider + 'static,
+        Runner: syscalls::process::ForkRunner<Platform>,
+    {
+        let runner = make_runner(Arc::clone(&self.memory_manager));
+        // SAFETY: The caller guarantees the runner's clone-safety contract.
+        let launcher = unsafe { ForkLauncher::new::<Platform>(runner) };
+        self.with_fork_launcher(launcher)
     }
 
-    /// Returns the final memory manager, which cannot be replaced after construction.
-    pub fn memory_manager(&self) -> &Arc<MemoryManager<Platform>> {
-        &self.memory_manager
+    /// Uses `launcher` to start native fork children, replacing the copy-based default.
+    #[must_use]
+    pub(crate) fn with_fork_launcher(mut self, launcher: ForkLauncher) -> Self {
+        self.fork_launcher = Some(launcher);
+        self
     }
 
     /// Returns the litebox object for the shim.
@@ -572,11 +589,13 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         })
     }
 
-    /// Continues a process whose address space was duplicated natively by the host.
+    /// Continues a process whose address space was duplicated natively by the host, from the
+    /// encoded fork startup payload its parent sent through the broker.
     ///
     /// The shim must reuse the inherited memory manager through
     /// [`LinuxShimBuilder::new_for_native_fork`]. Guest mappings and memory-management state are
-    /// retained without rebuilding their metadata.
+    /// retained without rebuilding their metadata, so a payload that carries memory regions or a
+    /// program break, as copy-based startup does, is rejected.
     ///
     /// # Safety
     ///
@@ -584,9 +603,10 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     /// parent runtime must never use or release that manager or its mappings again.
     pub unsafe fn restore_fork_from_native_clone(
         &self,
-        startup: litebox_common_linux::program_startup::LinuxForkStartup,
+        startup: &[u8],
         initial_thread: litebox::thread::Thread,
     ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
+        let startup = decode_native_fork_startup(startup)?;
         self.restore_fork_with_memory(startup, initial_thread, |_mm, _regions| Ok(()))
     }
 
@@ -710,9 +730,30 @@ pub struct LoadedProgram<Platform: ShimPlatform> {
     pub process: LinuxShimProcess<Platform>,
 }
 
+/// Decodes native fork startup state, which leaves memory state to the inherited manager.
+fn decode_native_fork_startup(
+    startup: &[u8],
+) -> Result<litebox_common_linux::program_startup::LinuxForkStartup, ForkRestoreError> {
+    use litebox_common_linux::program_startup::LinuxProcessStartup;
+
+    match LinuxProcessStartup::decode(startup) {
+        Ok(LinuxProcessStartup::Fork(startup))
+            if startup.regions.is_empty()
+                && startup.initial_program_break == 0
+                && startup.program_break == 0 =>
+        {
+            Ok(*startup)
+        }
+        _ => Err(ForkRestoreError::InvalidStartup),
+    }
+}
+
 /// A failure to continue a process duplicated by `fork`.
 #[derive(Debug, thiserror::Error)]
 pub enum ForkRestoreError {
+    /// The startup payload is not native fork startup state.
+    #[error("invalid native fork startup")]
+    InvalidStartup,
     /// The runner's code addresses differ from the parent's runner.
     #[error("the runner's address layout differs from the parent's")]
     IncompatibleRunner,

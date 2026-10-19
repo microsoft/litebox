@@ -251,12 +251,14 @@ impl LinuxUserland {
     )]
     /// Installs the runner seccomp filter on the threads selected by `scope`.
     ///
-    /// Broker transport exceptions are restricted to the supplied descriptors.
+    /// Broker transport exceptions are restricted to the supplied descriptors. If
+    /// `native_fork_stream_fd` is given, the runner may natively clone itself, and the clone
+    /// negotiates its broker association over a socket it places at that descriptor number.
     pub fn enable_seccomp_filter(
         positional_io_fds: &[std::os::fd::RawFd],
         shutdown_fds: &[std::os::fd::RawFd],
         scope: SeccompScope,
-        allow_native_fork_bootstrap: bool,
+        native_fork_stream_fd: Option<std::os::fd::RawFd>,
     ) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
@@ -357,92 +359,77 @@ impl LinuxUserland {
             ),
             (libc::SYS_close, vec![]),
         ];
-        if allow_native_fork_bootstrap {
-            let native_fork_flags = u64::from(
-                u32::try_from(libc::CLONE_PARENT | libc::CLONE_PIDFD | libc::SIGCHLD)
-                    .expect("native fork flags must be non-negative"),
-            );
-            let unix_stream_type = u64::from(
-                u32::try_from(libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
-                    .expect("Unix socket flags must be non-negative"),
-            );
+        if let Some(stream_fd) = native_fork_stream_fd {
+            let arg_eq = |index, value: u64| {
+                SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value)
+                    .unwrap()
+            };
+            let as_arg = |value: i32| {
+                u64::from(u32::try_from(value).expect("syscall argument must be non-negative"))
+            };
+            // The clone's descriptor-specific rules are confined to its control socket.
+            let stream = as_arg(stream_fd);
+            let socket_timeouts = [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO]
+                .into_iter()
+                .map(|option| {
+                    SeccompRule::new(vec![
+                        arg_eq(0, stream),
+                        arg_eq(1, as_arg(libc::SOL_SOCKET)),
+                        arg_eq(2, as_arg(option)),
+                    ])
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+
             rules.extend([
+                // Parent: the clone, its pre-connected broker socket pair, and cleanup of a clone
+                // the broker did not adopt.
                 (
                     libc::SYS_clone,
                     vec![
+                        SeccompRule::new(vec![arg_eq(
+                            0,
+                            as_arg(libc::CLONE_PARENT | libc::CLONE_PIDFD | libc::SIGCHLD),
+                        )])
+                        .unwrap(),
+                    ],
+                ),
+                (
+                    libc::SYS_socketpair,
+                    vec![
                         SeccompRule::new(vec![
-                            SeccompCondition::new(
-                                0,
-                                SeccompCmpArgLen::Dword,
-                                SeccompCmpOp::Eq,
-                                native_fork_flags,
-                            )
-                            .unwrap(),
+                            arg_eq(0, as_arg(libc::AF_UNIX)),
+                            arg_eq(1, as_arg(libc::SOCK_STREAM | libc::SOCK_CLOEXEC)),
                         ])
                         .unwrap(),
                     ],
                 ),
                 (
-                    libc::SYS_socket,
-                    vec![
-                        SeccompRule::new(vec![
-                            SeccompCondition::new(
-                                0,
-                                SeccompCmpArgLen::Dword,
-                                SeccompCmpOp::Eq,
-                                u64::from(libc::AF_UNIX as u32),
-                            )
-                            .unwrap(),
-                            SeccompCondition::new(
-                                1,
-                                SeccompCmpArgLen::Dword,
-                                SeccompCmpOp::Eq,
-                                unix_stream_type,
-                            )
-                            .unwrap(),
-                        ])
-                        .unwrap(),
-                    ],
+                    libc::SYS_pidfd_send_signal,
+                    vec![SeccompRule::new(vec![arg_eq(1, as_arg(libc::SIGKILL))]).unwrap()],
                 ),
-                (libc::SYS_connect, vec![]),
-                (libc::SYS_recvmsg, vec![]),
-                (libc::SYS_fcntl, vec![]),
-                (
-                    libc::SYS_ioctl,
-                    vec![
-                        SeccompRule::new(vec![
-                            SeccompCondition::new(
-                                1,
-                                SeccompCmpArgLen::Dword,
-                                SeccompCmpOp::Eq,
-                                libc::FIONBIO,
-                            )
-                            .unwrap(),
-                        ])
-                        .unwrap(),
-                    ],
-                ),
-                (libc::SYS_fstat, vec![]),
-                (libc::SYS_getsockopt, vec![]),
-                (libc::SYS_setsockopt, vec![]),
-                (
-                    libc::SYS_prctl,
-                    vec![
-                        SeccompRule::new(vec![
-                            SeccompCondition::new(
-                                0,
-                                SeccompCmpArgLen::Dword,
-                                SeccompCmpOp::Eq,
-                                u64::from(libc::PR_SET_NAME as u32),
-                            )
-                            .unwrap(),
-                        ])
-                        .unwrap(),
-                    ],
-                ),
-                (libc::SYS_clock_nanosleep, vec![]),
+                // Child: descriptor cleanup, placing the control socket, and negotiation over it.
                 (libc::SYS_close_range, vec![]),
-                (libc::SYS_pidfd_send_signal, vec![]),
+                (
+                    libc::SYS_recvmsg,
+                    vec![SeccompRule::new(vec![arg_eq(0, stream)]).unwrap()],
+                ),
+                (libc::SYS_getsockopt, socket_timeouts.clone()),
+                (libc::SYS_setsockopt, socket_timeouts),
+                // Duplicates the process's own descriptors to the lowest free number at or above
+                // `stream_fd`: the clone moves its socket there once the descriptors above the
+                // standard streams are closed, and the transport duplicates the socket into its
+                // shutdown handle.
+                (
+                    libc::SYS_fcntl,
+                    vec![
+                        SeccompRule::new(vec![
+                            arg_eq(1, as_arg(libc::F_DUPFD_CLOEXEC)),
+                            arg_eq(2, stream),
+                        ])
+                        .unwrap(),
+                    ],
+                ),
             ]);
         }
         if !positional_io_fds.is_empty() {
@@ -470,10 +457,10 @@ impl LinuxUserland {
             rules.push((libc::SYS_pread64, fd_rules()));
             rules.push((libc::SYS_pwrite64, fd_rules()));
         }
-        if !shutdown_fds.is_empty() || allow_native_fork_bootstrap {
+        if !shutdown_fds.is_empty() {
             // Association failure shuts down the control socket in both
             // directions to interrupt local and peer liveness waits.
-            let mut shutdown_rules: Vec<_> = shutdown_fds
+            let shutdown_rules = shutdown_fds
                 .iter()
                 .map(|fd| {
                     SeccompRule::new(vec![
@@ -500,23 +487,6 @@ impl LinuxUserland {
                     .unwrap()
                 })
                 .collect();
-            if allow_native_fork_bootstrap {
-                shutdown_rules.push(
-                    SeccompRule::new(vec![
-                        SeccompCondition::new(
-                            1,
-                            SeccompCmpArgLen::Dword,
-                            SeccompCmpOp::Eq,
-                            u64::from(
-                                u32::try_from(libc::SHUT_RDWR)
-                                    .expect("SHUT_RDWR must be non-negative"),
-                            ),
-                        )
-                        .unwrap(),
-                    ])
-                    .unwrap(),
-                );
-            }
             rules.push((libc::SYS_shutdown, shutdown_rules));
         }
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
@@ -855,12 +825,15 @@ impl ThreadHandle {
                     INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed),
                 )
             };
-            assert_eq!(
-                result,
-                0,
-                "failed to interrupt host thread {thread}: {}",
-                std::io::Error::last_os_error()
-            );
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                // A full real-time signal queue means interrupts are already pending, and a
+                // thread exiting outside its registration has nothing left to interrupt.
+                assert!(
+                    matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::ESRCH)),
+                    "failed to interrupt host thread {thread}: {error}"
+                );
+            }
         }
     }
 }
@@ -2271,7 +2244,7 @@ mod tests {
             &[allowed.as_raw_fd()],
             &[allowed_shutdown.as_raw_fd()],
             super::SeccompScope::AllThreads,
-            false,
+            None,
         );
         barrier.wait();
 
