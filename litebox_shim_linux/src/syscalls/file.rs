@@ -37,7 +37,6 @@ use litebox_common_linux::{
     signal::Signal,
 };
 use thiserror::Error;
-use zerocopy::FromBytes;
 
 use super::{
     epoll::EpollFd, eventfd::EventfdFd, inet::InetSocketFd, pipe::PipeFd, timerfd::TimerfdFd,
@@ -1743,8 +1742,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         self.with_typed_fd(fd, |fd| {
-            let iovs = read_iovs::<Platform, _>(iovec, iovcnt)?;
-            let buf = GuestReadBuffer::<Platform>::new(&iovs)?;
+            check_iovcnt(iovcnt)?;
+            let iovs: &[IoReadVec] = &iovec
+                .to_owned_slice::<Platform>(iovcnt)
+                .ok_or(Errno::EFAULT)?;
+            let buf = GuestReadBuffer::<Platform>::new(iovs)?;
             // Like Linux, an empty vector reads nothing without reaching the file.
             if buf.is_empty() {
                 return Ok(0);
@@ -1762,8 +1764,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         self.with_typed_fd(fd, |fd| {
-            let iovs = read_iovs::<Platform, _>(iovec, iovcnt)?;
-            let buf = GuestWriteBuffer::<Platform>::new(&iovs)?;
+            check_iovcnt(iovcnt)?;
+            let iovs: &[IoWriteVec] = &iovec
+                .to_owned_slice::<Platform>(iovcnt)
+                .ok_or(Errno::EFAULT)?;
+            let buf = GuestWriteBuffer::<Platform>::new(iovs)?;
             // Like Linux, an empty vector writes nothing without reaching the file.
             if buf.is_empty() {
                 return Ok(0);
@@ -1796,17 +1801,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 /// with `EINVAL` for `readv`/`writev`/`preadv`/`pwritev`.
 const IOV_MAX: usize = 1024;
 
-/// Reads the array of `iovcnt` iovecs at `iovec`.
-fn read_iovs<Platform: ShimPlatform, Iov: FromBytes>(
-    iovec: UserPtr<Iov>,
-    iovcnt: usize,
-) -> Result<alloc::boxed::Box<[Iov]>, Errno> {
+fn check_iovcnt(iovcnt: usize) -> Result<(), Errno> {
     if iovcnt > IOV_MAX {
-        return Err(Errno::EINVAL);
+        Err(Errno::EINVAL)
+    } else {
+        Ok(())
     }
-    iovec
-        .to_owned_slice::<Platform>(iovcnt)
-        .ok_or(Errno::EFAULT)
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
