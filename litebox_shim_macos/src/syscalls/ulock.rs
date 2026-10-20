@@ -79,7 +79,7 @@ impl<P: ShimPlatform> Default for UlockTable<P> {
 
 impl<P: ShimPlatform> UlockTable<P> {
     /// Threads in `ulock_wait` on the private lock word at `address`.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn waiters(&self, address: usize) -> u32 {
         self.locks
             .get(&UlockKey::Address(address))

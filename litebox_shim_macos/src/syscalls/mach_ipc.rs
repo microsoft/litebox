@@ -870,7 +870,7 @@ impl IpcSpace {
     }
 
     /// Live port records and names, for leak tests.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn live_counts(&self) -> (usize, usize) {
         (self.ports.len(), self.entries.len())
     }
