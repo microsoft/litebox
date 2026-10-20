@@ -946,3 +946,132 @@ fn dynamic_guest_leaves_host_runtime_untouched() {
         "host libsystem_kernel __TEXT changed"
     );
 }
+
+/// Run `binary` with `arguments` under the runner, failing if it has not
+/// exited within `timeout`; returns its exit code, stdout and stderr.
+#[cfg(feature = "test-broker")]
+fn run_guest_with_timeout(
+    binary: &Path,
+    arguments: &[&str],
+    timeout: std::time::Duration,
+) -> (Option<i32>, Vec<u8>, String) {
+    use std::io::Read as _;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg(binary)
+        .args(arguments)
+        .env_remove("LITEBOX_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("guest {arguments:?} did not exit within {timeout:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status.code(), stdout, stderr)
+}
+
+/// The guest-thread scenarios of `fixtures/threads.c`, compiled once per test.
+#[cfg(feature = "test-broker")]
+fn run_thread_scenario(scenario: &str) -> (Option<i32>, Vec<u8>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "threads.c",
+        include_str!("fixtures/threads.c"),
+        &["-O1"],
+    );
+    run_guest_with_timeout(&binary, &[scenario], std::time::Duration::from_secs(60))
+}
+
+/// Threads created and joined with return values, detached threads, TSD
+/// destructors, `_Thread_local`, per-thread errno, unique thread IDs and
+/// ports, and `mach_thread_self() == pthread_mach_thread_np(pthread_self())`.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_create_join_and_keep_per_thread_state() {
+    let (code, stdout, stderr) = run_thread_scenario("join");
+    assert_eq!(
+        (
+            code,
+            String::from_utf8_lossy(&stdout).as_ref(),
+            stderr.as_str()
+        ),
+        (
+            Some(0),
+            "results 0 distinct 1 consistent 16 destructors 20 tls -1 main 1\n",
+            ""
+        )
+    );
+}
+
+/// `os_unfair_lock` under contention: 8 threads x 100k increments.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_contend_on_an_unfair_lock() {
+    let (code, stdout, stderr) = run_thread_scenario("unfair");
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b"counter 800000\n"[..], "")
+    );
+}
+
+/// `pthread_exit` from main while workers run: the status is 0 once the
+/// last thread exits.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_outlive_a_main_thread_that_exits() {
+    let (code, stdout, stderr) = run_thread_scenario("main_exit");
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b"finished 4\n"[..], "")
+    );
+}
+
+/// `exit(42)` from a worker ends threads that run guest code, wait in
+/// `pthread_join` and wait on an unfair lock, promptly and with its status.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_end_with_the_status_of_an_exit_from_any_thread() {
+    let (code, stdout, stderr) = run_thread_scenario("exit_blocked");
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(42), &b""[..], "")
+    );
+}
+
+/// When every thread terminates without `exit`, the process exits with
+/// status 0 without running exit handlers.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_that_all_terminate_end_the_process() {
+    let (code, stdout, stderr) = run_thread_scenario("last_terminate");
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b""[..], "")
+    );
+}
