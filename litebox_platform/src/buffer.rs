@@ -23,9 +23,9 @@
 //! through a reference to it.
 //!
 //! A copy reports no progress when it faults, so objects count progress a
-//! chunk at a time: a fault reports only the bytes of earlier chunks, where
-//! Linux also counts the bytes copied before the fault. A write does not send
-//! the faulting chunk, and a read has already consumed it, so it is lost.
+//! chunk at a time: a fault reports only the bytes of earlier chunks, whereas
+//! Linux also counts those copied before the fault. A write does not send the
+//! faulting chunk, but a read may already have consumed it, losing it.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -192,9 +192,9 @@ pub trait ReadBuffer: Buffer {
     /// Panics if `source` does not fit in the buffer at `offset`.
     fn copy_from_raw_at(&mut self, offset: usize, source: RawBytes<'_>) -> Result<(), Fault>;
 
-    /// Copies `source` into the buffer at `offset`: directly if either's
-    /// bytes are [`RawBytes`], and otherwise through a small staging buffer.
-    /// A slice instead has `source` copy straight into it.
+    /// Copies `source` into the buffer at `offset`: through a direct transfer
+    /// if either's bytes are [`RawBytes`], and otherwise through a small
+    /// staging buffer. A slice overrides this to copy straight from `source`.
     ///
     /// On a fault, any of the bytes may have been copied.
     ///
@@ -256,10 +256,10 @@ pub trait ReadBuffer: Buffer {
     /// buffer, if they are [`RawBytes`].
     ///
     /// `read` is passed the bytes in order, in parts whose lengths sum to
-    /// `length`, and returns how many it read from their start, which is
-    /// returned. If the bytes are not [`RawBytes`], such as a guest's memory
-    /// that only copies that may fault can reach, returns `None` without
-    /// calling `read`.
+    /// `length`, and returns how many it read from their start; this returns
+    /// that count. Returns `None` without calling `read` if the bytes are not
+    /// [`RawBytes`], such as a guest's memory, which only faulting copies can
+    /// reach.
     ///
     /// # Panics
     ///
@@ -303,9 +303,9 @@ pub trait WriteBuffer: Buffer {
     ///
     /// `write` is passed the bytes in order, in parts whose lengths sum to
     /// `length`, which it must only read, and returns how many it wrote from
-    /// their start, which is returned. If the bytes are not [`RawBytes`],
-    /// such as a guest's memory that only copies that may fault can reach,
-    /// returns `None` without calling `write`.
+    /// their start; this returns that count. Returns `None` without calling
+    /// `write` if the bytes are not [`RawBytes`], such as a guest's memory,
+    /// which only faulting copies can reach.
     ///
     /// # Panics
     ///

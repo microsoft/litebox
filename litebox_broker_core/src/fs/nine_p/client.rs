@@ -445,10 +445,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
     /// Read from a file
     ///
-    /// Like Linux's v9fs, sends as many `Tread`s as it takes to fill `buf`, so a read larger
-    /// than a message is not cut short. Stops early when a `Tread` returns nothing, or fails
-    /// after earlier ones read something, in which case it returns what they read, unless the
-    /// broker itself failed, as when copying to `buf` faulted, which fails the read.
+    /// Like Linux's v9fs, sends `Tread`s until `buf` is full or one returns nothing, so a read
+    /// larger than a message is not cut short. If a later `Tread` fails, returns what earlier
+    /// ones read, unless the broker itself failed, such as when copying to `buf` faulted.
     pub(super) fn read(
         &self,
         fid: &Fid<Platform>,

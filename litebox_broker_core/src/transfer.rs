@@ -20,9 +20,10 @@ use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer}
 
 use crate::{BrokerError, Result};
 
-/// Returns `length` zeroed bytes for an object that cannot copy directly
-/// between its storage, such as a host file, and a caller's buffer, to stage
-/// the bytes it transfers in, or fails with [`BrokerError::OutOfMemory`].
+/// Returns `length` zeroed bytes in which to stage a transfer, for an object,
+/// such as a host file, that cannot copy directly between its storage and a
+/// caller's buffer. Fails with [`BrokerError::OutOfMemory`] if they cannot be
+/// allocated.
 pub fn bounce_buffer(length: usize) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     buffer
@@ -102,9 +103,9 @@ pub fn append_to_queue(
 /// Wraps a caller's buffer to check what a backend, such as a file system or
 /// a socket provider, reports about copying to or from it.
 ///
-/// Counts the bytes copied, which must run on from one another from the
-/// buffer's start, and keeps any fault, which fails the operation whatever
-/// the backend reports.
+/// Counts the bytes copied, which must be contiguous from the buffer's start.
+/// An out-of-order copy, an overcounted direct transfer, or any fault fails
+/// the operation, whatever the backend reports.
 pub(crate) struct CopyCount<B> {
     buffer: B,
     copied: Cell<usize>,

@@ -586,7 +586,7 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Receives bytes into the start of `output`, copied in order (see
     /// [`crate::transfer`]), without waiting for platform readiness: exactly
-    /// those it returns, so none when it fails.
+    /// those it returns, so none when it fails, except by a fault.
     ///
     /// A temporarily empty socket returns [`BrokerError::WouldBlock`]. End of
     /// stream returns [`PlatformStreamReceive::EndOfStream`]. The core handles
@@ -609,7 +609,8 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Receives a prefix of one datagram into the start of `output`, copied in
     /// order (see [`crate::transfer`]), without waiting for platform
-    /// readiness: exactly the bytes it returns, so none when it fails.
+    /// readiness: exactly the bytes it returns, so none when it fails, except
+    /// by a fault.
     ///
     /// The original datagram length is returned even when the caller's buffer
     /// is smaller, and zero-length datagrams are successful receives. When no
