@@ -7,7 +7,12 @@
 //! previously mapped range becomes executable through `mprotect`. Mappings
 //! retain cached rewrite metadata after their descriptors are closed.
 
-use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use core::ops::Range;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
@@ -67,6 +72,8 @@ struct MachoPatchInfo {
     slice_range: Range<usize>,
     trampoline_capacity: usize,
     rewrite_id: Arc<()>,
+    #[cfg(all(test, target_os = "macos"))]
+    hook: tests::hook::Slot,
 }
 
 impl MachoPatchInfo {
@@ -368,7 +375,7 @@ impl<P: ShimPlatform> Task<P> {
             )
         }?;
         if placement == (AnonymousPlacement::Fixed { replace: true }) {
-            self.replace_macho_mappings(range, None);
+            self.mappings_replaced(range, None);
         }
         Ok(pointer.as_usize())
     }
@@ -435,7 +442,7 @@ impl<P: ShimPlatform> Task<P> {
                     .as_ref()
                     .is_some_and(|before| *before != self.mapping_snapshot(fixed_range.clone()));
             if flags.contains(MmapFlags::FIXED) && replaced {
-                self.replace_macho_mappings(fixed_range.clone(), None);
+                self.mappings_replaced(fixed_range.clone(), None);
             }
             return result
                 .map(|pointer| pointer.as_usize())
@@ -457,10 +464,18 @@ impl<P: ShimPlatform> Task<P> {
             Vec::new()
         };
         let final_permissions = permissions(protection);
+        // Serializes this mapping's checkpoint, rewrite and publication or
+        // rollback with every other rewrite, so a rollback never reclaims or
+        // rewinds over gates another mapping published.
+        let mut macho_mappings = self.global.macho_mappings.lock();
         let trampoline_checkpoint = macho
             .as_ref()
             .filter(|_| executable)
             .map(|patch_info| self.macho_trampoline_checkpoint(patch_info));
+        #[cfg(all(test, target_os = "macos"))]
+        if let Some(patch_info) = macho.as_ref().filter(|_| executable) {
+            patch_info.hook.reach(tests::hook::Point::Checkpointed);
+        }
         let mut file_offset = offset;
         let mut buffer = [0; PAGE_SIZE];
         let mut initialization_error = None;
@@ -519,7 +534,7 @@ impl<P: ShimPlatform> Task<P> {
                     .as_ref()
                     .is_some_and(|before| *before != self.mapping_snapshot(fixed_range.clone()));
                 if flags.contains(MmapFlags::FIXED) && replaced {
-                    self.replace_macho_mappings(fixed_range.clone(), None);
+                    self.mappings_replaced_locked(&mut macho_mappings, fixed_range.clone(), None);
                 }
                 return Err(
                     initialization_error.map_or_else(|| mapping_error(error), mmap_read_error)
@@ -541,14 +556,17 @@ impl<P: ShimPlatform> Task<P> {
             }
         });
         if flags.contains(MmapFlags::FIXED) || mapping.is_some() {
-            self.replace_macho_mappings(address..address + length.as_usize(), mapping);
+            self.mappings_replaced_locked(
+                &mut macho_mappings,
+                address..address + length.as_usize(),
+                mapping,
+            );
         }
         Ok(address)
     }
 
-    // TODO: serialize this checkpoint through rollback with other mmap-based
-    // rewrites before supporting concurrent mmap of the same Mach-O. The
-    // current task model does not run mmap-based rewriting concurrently.
+    /// Callers hold `macho_mappings` from the checkpoint through rollback or
+    /// publication.
     fn macho_trampoline_checkpoint(
         &self,
         patch_info: &Arc<MachoPatchInfo>,
@@ -718,9 +736,22 @@ impl<P: ShimPlatform> Task<P> {
             state.cursor = 0;
         }
         let range = state.range.clone().expect("trampoline was just allocated");
+        // Pages holding published gates stay RX because other threads may be
+        // running them, so new gates start on a fresh page; pages past the
+        // cursor hold no gate that code branches to. Each rewrite of an image
+        // that already has gates (a second executable mapping, or mprotect
+        // RW->RX of rewritten text) thus costs up to a page of its fixed
+        // capacity; when it runs out, sites become traps, which end the
+        // guest rather than run an unrewritten syscall. Real guests rarely
+        // rewrite twice: macOS does not run modified code-signed text.
+        let cursor_align = if newly_allocated {
+            litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN
+        } else {
+            PAGE_SIZE
+        };
         let cursor = state
             .cursor
-            .checked_next_multiple_of(litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN)
+            .checked_next_multiple_of(cursor_align)
             .ok_or(MappingError::OutOfMemory)?;
         let trampoline_address = range
             .start
@@ -767,19 +798,24 @@ impl<P: ShimPlatform> Task<P> {
             }
             return trap_fallback(&"Mach-O trampoline capacity exhausted");
         }
-        // Existing gates are RX. Temporarily make the shared region writable,
-        // append the new gates, then publish all gates RX before code branches.
+        // A new allocation is still RW; in an existing one, the unpublished
+        // pages from `cursor` on are made RW, the gates written, and then
+        // every page is RX before code branches to them.
+        let unpublished = range.start + cursor..range.end;
         if !newly_allocated {
-            // SAFETY: `range` is the live trampoline allocation, and the
-            // trampoline lock serializes permission changes and gate appends.
+            // SAFETY: `unpublished` is in the live trampoline allocation, no
+            // code branches to it, and the trampoline lock serializes
+            // permission changes and gate appends.
             unsafe {
                 self.global.mm.change_page_permissions(
-                    P::RawMutPointer::from_usize(range.start),
-                    range.len(),
+                    P::RawMutPointer::from_usize(unpublished.start),
+                    unpublished.len(),
                     Permissions::READ | Permissions::WRITE,
                 )
             }
             .map_err(MappingError::ProtectError)?;
+            #[cfg(all(test, target_os = "macos"))]
+            patch_info.hook.reach(tests::hook::Point::GatePagesWritable);
         }
         if P::RawMutPointer::from_usize(range.start)
             .copy_from_slice(cursor, &gates)
@@ -789,12 +825,13 @@ impl<P: ShimPlatform> Task<P> {
                 state.range = None;
                 self.remove_trampoline(range);
             } else {
-                // SAFETY: `range` remains the live trampoline allocation and
-                // the trampoline lock still serializes this RX restoration.
+                // SAFETY: `unpublished` remains in the live trampoline
+                // allocation and the trampoline lock still serializes this RX
+                // restoration.
                 let _ = unsafe {
                     self.global.mm.change_page_permissions(
-                        P::RawMutPointer::from_usize(range.start),
-                        range.len(),
+                        P::RawMutPointer::from_usize(unpublished.start),
+                        unpublished.len(),
                         Permissions::READ | Permissions::EXEC,
                     )
                 };
@@ -805,8 +842,8 @@ impl<P: ShimPlatform> Task<P> {
         // code copy. The RW-to-RX transition synchronizes instruction caches.
         unsafe {
             self.global.mm.change_page_permissions(
-                P::RawMutPointer::from_usize(range.start),
-                range.len(),
+                P::RawMutPointer::from_usize(unpublished.start),
+                unpublished.len(),
                 Permissions::READ | Permissions::EXEC,
             )
         }
@@ -818,10 +855,32 @@ impl<P: ShimPlatform> Task<P> {
         Ok(())
     }
 
+    /// The mappings in `replaced` were replaced or removed, by `replacement`
+    /// if it is a tracked Mach-O mapping.
+    fn mappings_replaced(&self, replaced: Range<usize>, replacement: Option<MachoMapping>) {
+        let mut mappings = self.global.macho_mappings.lock();
+        self.mappings_replaced_locked(&mut mappings, replaced, replacement);
+    }
+
+    fn mappings_replaced_locked(
+        &self,
+        mappings: &mut BTreeMap<usize, MachoMapping>,
+        replaced: Range<usize>,
+        replacement: Option<MachoMapping>,
+    ) {
+        self.replace_macho_mappings(mappings, replaced.clone(), replacement);
+        self.retire_ulock_objects(replaced);
+    }
+
     /// Remove tracking for `replaced`, preserving any mapped prefix and suffix,
     /// and optionally install the mapping that replaced it. Published runtime
     /// trampolines follow the Linux baseline and live until address-space teardown.
-    fn replace_macho_mappings(&self, replaced: Range<usize>, replacement: Option<MachoMapping>) {
+    fn replace_macho_mappings(
+        &self,
+        mappings: &mut BTreeMap<usize, MachoMapping>,
+        replaced: Range<usize>,
+        replacement: Option<MachoMapping>,
+    ) {
         let invalidated: Vec<_> = {
             let mut trampolines = self.global.macho_trampolines.lock();
             trampolines
@@ -835,7 +894,6 @@ impl<P: ShimPlatform> Task<P> {
                 })
                 .collect()
         };
-        let mut mappings = self.global.macho_mappings.lock();
         for mapping in mappings.values_mut() {
             if invalidated.contains(&(Arc::as_ptr(&mapping.patch_info.rewrite_id) as usize)) {
                 mapping.trampoline_invalidated = true;
@@ -958,6 +1016,8 @@ impl<P: ShimPlatform> Task<P> {
             slice_range,
             trampoline_capacity,
             rewrite_id: Arc::new(()),
+            #[cfg(all(test, target_os = "macos"))]
+            hook: tests::hook::Slot::default(),
         });
         self.cache_macho_patch_info(file, Some(Arc::clone(&patch_info)));
         Ok(patch_info)
@@ -1135,7 +1195,7 @@ impl<P: ShimPlatform> Task<P> {
                 .remove_pages(P::RawMutPointer::from_usize(address), length)
         }
         .map_err(|_| Errno::EINVAL)?;
-        self.replace_macho_mappings(address..address + length, None);
+        self.mappings_replaced(address..address + length, None);
         Ok(())
     }
 
@@ -1286,6 +1346,56 @@ mod tests {
     const TEXT: usize = 0x400;
     const SVC: u32 = 0xd400_1001;
 
+    /// Pauses a rewrite of one image at a point of its transaction, on the
+    /// host thread that set the hook.
+    pub(super) mod hook {
+        extern crate std;
+
+        use alloc::boxed::Box;
+        use std::sync::Mutex;
+        use std::thread::{self, ThreadId};
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(in crate::syscalls::mm) enum Point {
+            /// An executable file mapping took its trampoline checkpoint.
+            Checkpointed,
+            /// An append made an existing trampoline's unpublished pages RW.
+            GatePagesWritable,
+        }
+
+        type Hook = Box<dyn FnMut(Point) + Send>;
+
+        #[derive(Default)]
+        pub(in crate::syscalls::mm) struct Slot(Mutex<Option<(ThreadId, Hook)>>);
+
+        impl Slot {
+            pub(in crate::syscalls::mm) fn set(&self, hook: impl FnMut(Point) + Send + 'static) {
+                *self.0.lock().unwrap() = Some((thread::current().id(), Box::new(hook)));
+            }
+
+            pub(in crate::syscalls::mm) fn clear(&self) {
+                *self.0.lock().unwrap() = None;
+            }
+
+            pub(in crate::syscalls::mm) fn reach(&self, point: Point) {
+                let mut slot = self.0.lock().unwrap();
+                let Some((owner, mut hook)) = slot.take() else {
+                    return;
+                };
+                if owner != thread::current().id() {
+                    *slot = Some((owner, hook));
+                    return;
+                }
+                drop(slot);
+                hook(point);
+                let mut slot = self.0.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some((owner, hook));
+                }
+            }
+        }
+    }
+
     fn put32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -1322,6 +1432,68 @@ mod tests {
         put32(&mut bytes, SECTION + 64, 0x8000_0000); // S_ATTR_PURE_INSTRUCTIONS
         put32(&mut bytes, TEXT, SVC);
         bytes
+    }
+
+    /// `macho_image` whose `__text` also fills a second page with syscalls,
+    /// so its trampoline spans several pages and mapping the first page
+    /// alone leaves room for later mappings' gates.
+    fn two_page_macho_image() -> Vec<u8> {
+        const SECTION: usize = 32 + 72;
+        let mut bytes = macho_image();
+        bytes.resize(2 * PAGE_SIZE, 0);
+        put64(&mut bytes, 64, 2 * PAGE_SIZE as u64);
+        put64(&mut bytes, 80, 2 * PAGE_SIZE as u64);
+        put64(&mut bytes, SECTION + 40, (2 * PAGE_SIZE - TEXT) as u64);
+        for offset in (PAGE_SIZE..2 * PAGE_SIZE).step_by(4) {
+            put32(&mut bytes, offset, SVC);
+        }
+        bytes
+    }
+
+    /// Map one page of the image on descriptor 0 at `offset`.
+    fn map_image_page(
+        task: &Task<Platform>,
+        offset: usize,
+        protection: VmProtection,
+    ) -> Result<usize, Errno> {
+        task.sys_mmap(
+            0,
+            PAGE_SIZE,
+            protection,
+            MmapFlags::PRIVATE,
+            0,
+            i64::try_from(offset).unwrap(),
+        )
+    }
+
+    /// The gate the rewritten syscall at `site` branches to; asserts that it
+    /// is an RX svc gate for `site`.
+    fn published_gate(task: &Task<Platform>, site: usize) -> usize {
+        let code = u32::from_le_bytes(
+            *UserPtr::<u8>::from_usize(site)
+                .to_owned_slice::<Platform>(4)
+                .unwrap()
+                .first_chunk()
+                .unwrap(),
+        );
+        let target = usize::try_from(decode_branch_target(code, site as u64).unwrap()).unwrap();
+        assert_eq!(
+            task.global.mm.get_memory_permissions(
+                NonZeroAddress::new(target & !(PAGE_SIZE - 1)).unwrap(),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+            ),
+            Some(Permissions::READ | Permissions::EXEC),
+        );
+        let gate = UserPtr::<u8>::from_usize(target)
+            .to_owned_slice::<Platform>(64)
+            .unwrap();
+        let classified = Rewriter::new(litebox_trampoline::TargetHost::MacOs)
+            .unwrap()
+            .classify_gate_slot(&gate, target as u64, target as u64)
+            .unwrap();
+        assert_eq!(classified.metadata(), GateMetadata::Svc);
+        assert_eq!(classified.original_site(), site as u64);
+        target
     }
 
     fn universal_macho_image() -> Vec<u8> {
@@ -1537,6 +1709,7 @@ mod tests {
                 slice_range: 0..image.len(),
                 trampoline_capacity: capacity,
                 rewrite_id: Arc::new(()),
+                hook: hook::Slot::default(),
             })),
         );
         let before = task.global.mm.mappings();
@@ -1704,14 +1877,10 @@ mod tests {
         task.sys_munmap(address, PAGE_SIZE).unwrap();
     }
 
-    #[test]
-    fn writable_transition_rewrites_modified_code_when_made_executable_again() {
+    /// Make the page at `address` writable, store a syscall at `site`, and
+    /// make it executable again, which rewrites it.
+    fn rewrite_stored_syscall(task: &Task<Platform>, address: usize, site: usize) {
         use litebox_common_macos::user_pointers::UserPtrMut;
-
-        let task = task_with_file(&macho_image());
-        let address =
-            mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
-        let site = address + TEXT;
 
         task.sys_mprotect(address, PAGE_SIZE, VmProtection::READ | VmProtection::WRITE)
             .unwrap();
@@ -1724,15 +1893,52 @@ mod tests {
             VmProtection::READ | VmProtection::EXECUTE,
         )
         .unwrap();
+    }
 
-        let instruction = u32::from_le_bytes(
-            *UserPtr::<u8>::from_usize(site)
-                .to_owned_slice::<Platform>(4)
-                .unwrap()
-                .first_chunk()
-                .unwrap(),
-        );
-        assert!(decode_branch_target(instruction, site as u64).is_some());
+    #[test]
+    fn writable_transition_rewrites_modified_code_when_made_executable_again() {
+        let task = task_with_file(&two_page_macho_image());
+        let address =
+            mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
+        let first_gate = published_gate(&task, address + TEXT);
+        let site = address + TEXT + 4;
+        rewrite_stored_syscall(&task, address, site);
+        // The new gate is on a fresh page; the first stays published.
+        assert!(published_gate(&task, site) > (first_gate | (PAGE_SIZE - 1)));
+        assert_eq!(published_gate(&task, address + TEXT), first_gate);
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    /// Once no fresh trampoline page is left, a rewrite fails closed: its
+    /// sites become traps and no syscall instruction stays in the code.
+    #[test]
+    fn exhausted_trampoline_capacity_traps_rewritten_sites() {
+        const BRK_TRAP: u32 = 0xd436_2160; // BRK #0xB10B
+        let task = task_with_file(&two_page_macho_image());
+        let address =
+            mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
+        let first_gate = published_gate(&task, address + TEXT);
+        {
+            let mut trampolines = task.global.macho_trampolines.lock();
+            let trampoline = trampolines.values_mut().next().unwrap();
+            let range = trampoline.range.clone().unwrap();
+            // Gates end just into the last page: no fresh page remains.
+            trampoline.cursor = range.len() - PAGE_SIZE + 4;
+        }
+        let site = address + TEXT + 4;
+        rewrite_stored_syscall(&task, address, site);
+        let code = UserPtr::<u8>::from_usize(address)
+            .to_owned_slice::<Platform>(PAGE_SIZE)
+            .unwrap();
+        let words: Vec<u32> = code
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect();
+        assert!(!words.contains(&SVC));
+        assert_eq!(words[(site - address) / 4], BRK_TRAP);
+        assert_eq!(published_gate(&task, address + TEXT), first_gate);
         task.sys_munmap(address, PAGE_SIZE).unwrap();
     }
 
@@ -1926,7 +2132,7 @@ mod tests {
 
     #[test]
     fn executable_mappings_share_one_trampoline_per_file() {
-        let task = task_with_file(&macho_image());
+        let task = task_with_file(&two_page_macho_image());
         let duplicate = i32::try_from(task.sys_dup(0).unwrap()).unwrap();
         let first =
             mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
@@ -1935,6 +2141,7 @@ mod tests {
             let trampoline = trampolines.values().next().unwrap();
             (trampoline.range.clone().unwrap(), trampoline.cursor)
         };
+        assert!(first_cursor < PAGE_SIZE);
         let second = task
             .sys_mmap(
                 0,
@@ -1945,25 +2152,15 @@ mod tests {
                 0,
             )
             .unwrap();
-        let targets: Vec<_> = [first, second]
-            .map(|address| {
-                let site = address + TEXT;
-                let instruction = u32::from_le_bytes(
-                    *UserPtr::<u8>::from_usize(site)
-                        .to_owned_slice::<Platform>(4)
-                        .unwrap()
-                        .first_chunk()
-                        .unwrap(),
-                );
-                usize::try_from(decode_branch_target(instruction, site as u64).unwrap()).unwrap()
-            })
-            .into();
+        let targets = [first, second].map(|address| published_gate(&task, address + TEXT));
+        // The second mapping's gates start on the page after the first's.
+        assert_eq!(targets[1] & !(PAGE_SIZE - 1), first_range.start + PAGE_SIZE);
         let trampolines = task.global.macho_trampolines.lock();
         assert_eq!(trampolines.len(), 1);
         let trampoline = trampolines.values().next().unwrap();
         let range = trampoline.range.as_ref().unwrap();
         assert_eq!(range, &first_range);
-        assert!(trampoline.cursor > first_cursor);
+        assert!(trampoline.cursor > PAGE_SIZE);
         assert!(targets.into_iter().all(|target| range.contains(&target)));
         for address in [first, second] {
             let allowed = trampoline_allocation_range(address..address + PAGE_SIZE).unwrap();
@@ -1974,12 +2171,14 @@ mod tests {
         let patch_info = task.macho_patch_info(&file).unwrap();
         assert_eq!(first_range.len(), patch_info.trampoline_capacity);
         let key = Arc::as_ptr(&patch_info.rewrite_id) as usize;
+        // A cursor on the last page leaves no fresh page: the mapping traps.
+        let last_page = first_range.len() - PAGE_SIZE + 4;
         task.global
             .macho_trampolines
             .lock()
             .get_mut(&key)
             .unwrap()
-            .cursor = first_range.len();
+            .cursor = last_page;
         let exhausted =
             mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
         let allowed = trampoline_allocation_range(exhausted..exhausted + PAGE_SIZE).unwrap();
@@ -1995,7 +2194,7 @@ mod tests {
             let trampolines = task.global.macho_trampolines.lock();
             assert_eq!(trampolines.len(), 1);
             assert_eq!(trampolines[&key].range.as_ref(), Some(&first_range));
-            assert_eq!(trampolines[&key].cursor, first_range.len());
+            assert_eq!(trampolines[&key].cursor, last_page);
         }
         task.sys_munmap(exhausted, PAGE_SIZE).unwrap();
         task.sys_munmap(first, PAGE_SIZE).unwrap();
@@ -2009,6 +2208,177 @@ mod tests {
             ),
             Some(Permissions::READ | Permissions::EXEC),
         );
+    }
+
+    /// A failed executable mapping that took its checkpoint before another
+    /// thread's mapping published gates of the same image must not reclaim
+    /// (no prior trampoline) or rewind over (existing trampoline) them.
+    fn assert_failed_mmap_keeps_gates_published_concurrently(existing: bool) {
+        let task = task_with_file(&two_page_macho_image());
+        let earlier = existing
+            .then(|| map_image_page(&task, 0, VmProtection::READ | VmProtection::EXECUTE).unwrap());
+        // Cache the image's rewrite metadata, so both mappings share it.
+        let patch_info = task
+            .macho_patch_info(&task.files.typed_fd(0).unwrap())
+            .unwrap();
+        let other = task.new_sibling(0);
+        let (start, started) = std::sync::mpsc::channel::<()>();
+        let (finish, finished) = std::sync::mpsc::channel::<usize>();
+        std::thread::scope(|scope| {
+            let mapper = scope.spawn(move || {
+                <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                    started
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    let address = map_image_page(
+                        &other,
+                        PAGE_SIZE,
+                        VmProtection::READ | VmProtection::EXECUTE,
+                    )
+                    .unwrap();
+                    // The receiver is gone once the transaction has ended.
+                    let _ = finish.send(address);
+                    address
+                })
+            });
+            // Between this mapping's checkpoint and its rollback, the other
+            // thread maps the same image; it must not publish before then.
+            patch_info.hook.set(move |point| {
+                if point == hook::Point::Checkpointed {
+                    start.send(()).unwrap();
+                    assert!(
+                        finished
+                            .recv_timeout(std::time::Duration::from_millis(500))
+                            .is_err(),
+                        "a mapping published gates inside another's transaction"
+                    );
+                }
+            });
+            // W^X: the mapping fails after its rewrite and rolls back.
+            assert!(
+                mmap_with_protection(
+                    &task,
+                    VmProtection::READ | VmProtection::WRITE | VmProtection::EXECUTE,
+                )
+                .is_err()
+            );
+            patch_info.hook.clear();
+            let address = mapper.join().unwrap();
+            published_gate(&task, address);
+            let trampolines = task.global.macho_trampolines.lock();
+            let trampoline = trampolines.values().next().unwrap();
+            let range = trampoline.range.clone().unwrap();
+            let last_gate = published_gate(&task, address + PAGE_SIZE - 4);
+            assert!(trampoline.cursor > last_gate - range.start);
+            drop(trampolines);
+            task.sys_munmap(address, PAGE_SIZE).unwrap();
+        });
+        if let Some(earlier) = earlier {
+            published_gate(&task, earlier + TEXT);
+            task.sys_munmap(earlier, PAGE_SIZE).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_mmap_keeps_a_new_trampoline_published_concurrently() {
+        assert_failed_mmap_keeps_gates_published_concurrently(false);
+    }
+
+    #[test]
+    fn failed_mmap_keeps_gates_appended_concurrently() {
+        assert_failed_mmap_keeps_gates_published_concurrently(true);
+    }
+
+    /// One thread keeps running code on a published trampoline page while
+    /// another maps more executable code of the same image, whose gates are
+    /// appended to that trampoline.
+    #[test]
+    fn appending_gates_keeps_published_gate_pages_executable() {
+        use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use litebox_common_macos::user_pointers::UserPtrMut;
+        const RET: u32 = 0xd65f_03c0;
+
+        /// Stops the runner however the scope ends, so a failure cannot
+        /// leave the scope waiting for it.
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let task = task_with_file(&two_page_macho_image());
+        let first = map_image_page(&task, 0, VmProtection::READ | VmProtection::EXECUTE).unwrap();
+        let gate = published_gate(&task, first + TEXT);
+        let (range, cursor) = {
+            let trampolines = task.global.macho_trampolines.lock();
+            let trampoline = trampolines.values().next().unwrap();
+            (trampoline.range.clone().unwrap(), trampoline.cursor)
+        };
+        let gate_page = range.start..range.start + PAGE_SIZE;
+        assert!(gate_page.contains(&gate));
+        // Stands in for running a gate: a `ret` in the published page's slack.
+        let code = gate_page.end - 4;
+        assert!(cursor <= code - range.start);
+        task.change_initialization_permissions(
+            gate_page.clone(),
+            Permissions::READ | Permissions::WRITE,
+        )
+        .unwrap();
+        UserPtrMut::<u8>::from_usize(code)
+            .copy_from_slice::<Platform>(0, &RET.to_le_bytes())
+            .unwrap();
+        task.change_initialization_permissions(
+            gate_page.clone(),
+            Permissions::READ | Permissions::EXEC,
+        )
+        .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let runner_calls = Arc::clone(&calls);
+            let stop_runner = Stop(&stop);
+            let stop = &stop;
+            scope.spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    // SAFETY: `code` is a `ret` in an RX page that stays
+                    // mapped until this thread stops.
+                    unsafe {
+                        core::arch::asm!("blr {code}", code = in(reg) code, clobber_abi("C"));
+                    }
+                    runner_calls.fetch_add(1, Ordering::Release);
+                }
+            });
+            let reached = Arc::new(AtomicBool::new(false));
+            let hook_reached = Arc::clone(&reached);
+            let hook_calls = Arc::clone(&calls);
+            let patch_info = task
+                .macho_patch_info(&task.files.typed_fd(0).unwrap())
+                .unwrap();
+            patch_info.hook.set(move |point| {
+                if point == hook::Point::GatePagesWritable {
+                    hook_reached.store(true, Ordering::Relaxed);
+                    // The runner completes calls while the append is open.
+                    let seen = hook_calls.load(Ordering::Acquire);
+                    let start = std::time::Instant::now();
+                    while hook_calls.load(Ordering::Acquire) < seen + 2 {
+                        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+                        std::thread::yield_now();
+                    }
+                }
+            });
+            let second =
+                map_image_page(&task, PAGE_SIZE, VmProtection::READ | VmProtection::EXECUTE)
+                    .unwrap();
+            patch_info.hook.clear();
+            drop(stop_runner);
+            assert!(reached.load(Ordering::Relaxed), "no gates were appended");
+            assert!(published_gate(&task, second) >= gate_page.end);
+            task.sys_munmap(second, PAGE_SIZE).unwrap();
+        });
+        assert_eq!(published_gate(&task, first + TEXT), gate);
+        task.sys_munmap(first, PAGE_SIZE).unwrap();
     }
 
     #[test]

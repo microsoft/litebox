@@ -842,11 +842,25 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     /// Whether a data abort at `address` in the shared-cache instance raced
-    /// with another thread supplying the page: the guest map now allows the
-    /// access (`esr`'s WnR bit tells a write), so it is retried.
+    /// with another thread supplying the page: it is a VM fault and the guest
+    /// map now allows the access (`esr`'s WnR bit tells a write), so it is
+    /// retried.
     pub(crate) fn shared_cache_fault_resolved(&self, address: usize, esr: u64) -> bool {
+        /// ESR_ELx.EC of a data abort from EL0.
+        const EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
+        const EC_SHIFT: u32 = 26;
+        const EC_MASK: u64 = 0x3f;
+        /// ESR_ELx.ISS.DFSC.
+        const DFSC_MASK: u64 = 0x3f;
         /// ESR_ELx.ISS.WnR of a data abort: the access was a write.
         const ESR_WNR: u64 = 1 << 6;
+        // sleh.c `is_vm_fault`: translation, access-flag and permission
+        // faults go to vm_fault; anything else (e.g. an alignment fault)
+        // cannot be resolved by supplying a page.
+        let vm_fault = matches!(esr & DFSC_MASK, 0x04..=0x07 | 0x09..=0x0b | 0x0d..=0x0f);
+        if (esr >> EC_SHIFT) & EC_MASK != EC_DATA_ABORT_LOWER_EL || !vm_fault {
+            return false;
+        }
         // Waits for a page-in in progress on another thread.
         let cache = self.global.shared_cache.lock();
         if !cache

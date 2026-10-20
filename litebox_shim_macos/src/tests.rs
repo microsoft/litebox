@@ -16,6 +16,7 @@ use litebox_platform_macos_userland::MacosUserland as Platform;
 
 mod mach;
 mod thread;
+mod ulock;
 
 fn task(shim: MacosShim<Platform>) -> Task<Platform> {
     Task::new_main(
@@ -592,17 +593,23 @@ fn shared_cache_page_in_uses_the_recorded_protection() {
 }
 
 /// A thread that faults on a page another thread has just supplied retries
-/// its access if the page now allows it.
+/// its access if it was a VM fault and the page now allows it.
 #[test]
 fn shared_cache_fault_after_a_concurrent_page_in_is_retried() {
-    /// A data abort's ESR with WnR set: a write.
-    const WRITE: u64 = 1 << 6;
+    /// ESR of a data abort from EL0 (EC 0x24, IL set) with this DFSC.
+    const fn data_abort(dfsc: u64) -> u64 {
+        (0x24 << 26) | (1 << 25) | dfsc
+    }
+    /// A level 3 translation fault on a read.
+    const READ_TRANSLATION: u64 = data_abort(0x07);
+    /// A level 3 permission fault on a write (WnR).
+    const WRITE_PERMISSION: u64 = data_abort(0x0f) | (1 << 6);
     let base = 0x76_0000_0000;
     let program = install_test_cache(base);
     let task = &program.entrypoints.task;
     let page = base + 4 * PAGE_SIZE;
     assert!(
-        !task.shared_cache_fault_resolved(page, 0),
+        !task.shared_cache_fault_resolved(page, READ_TRANSLATION),
         "not supplied yet"
     );
     assert_eq!(
@@ -612,10 +619,28 @@ fn shared_cache_fault_after_a_concurrent_page_in_is_retried() {
     // The first fault supplies the page; a fault racing it then retries.
     assert!(task.page_in_shared_cache(page + 8));
     assert!(!task.page_in_shared_cache(page + 16));
-    assert!(task.shared_cache_fault_resolved(page + 16, 0));
+    assert!(task.shared_cache_fault_resolved(page + 16, READ_TRANSLATION));
+    // Translation, access-flag and permission faults at every level qualify.
+    for dfsc in [0x04, 0x05, 0x06, 0x09, 0x0a, 0x0b, 0x0d, 0x0e, 0x0f] {
+        assert!(task.shared_cache_fault_resolved(page + 16, data_abort(dfsc)));
+    }
     // A write to the read-only page stays a fault.
-    assert!(!task.shared_cache_fault_resolved(page + 16, WRITE));
-    assert!(!task.shared_cache_fault_resolved(base - PAGE_SIZE, 0));
+    assert!(!task.shared_cache_fault_resolved(page + 16, WRITE_PERMISSION));
+    assert!(!task.shared_cache_fault_resolved(base - PAGE_SIZE, READ_TRANSLATION));
+    // Supplying a page cannot fix an alignment fault, an external abort or
+    // a fault that is not a data abort from EL0, so none is retried.
+    for esr in [
+        data_abort(0x21),
+        data_abort(0x10),
+        (0x25 << 26) | 0x07,
+        (0x20 << 26) | 0x07,
+        0,
+    ] {
+        assert!(
+            !task.shared_cache_fault_resolved(page + 16, esr),
+            "{esr:#x}"
+        );
+    }
 }
 
 #[test]

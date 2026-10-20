@@ -5,15 +5,16 @@
 //! `bsd/kern/sys_ulock.c`.
 //!
 //! Each waited-on lock word has a record (`ull_t`) keyed by its address, or
-//! for the shared operations by its memory object and offset, which within
-//! one guest is also its address but a separate key space. An unfair lock's
-//! record tracks its owner, the thread whose port name the lock word holds.
+//! for the shared operations by its memory object and offset (see
+//! [`UlockKey::Object`]). An unfair lock's record tracks its owner, the
+//! thread whose port name the lock word holds.
 
 use crate::{
     ShimPlatform, Task, ThreadId,
     wait::{WaitQueue, WaitResult},
 };
 use alloc::collections::BTreeMap;
+use core::ops::Range;
 use litebox::utils::TruncateExt as _;
 use litebox_common_macos::{errno::Errno, mach::MACH_PORT_DEAD, user_pointers::UserPtr};
 
@@ -48,9 +49,13 @@ mod flag {
 enum UlockKey {
     /// `ULK_UADDR`: an address in this task.
     Address(usize),
-    /// `ULK_XPROC`: a memory object and offset; this guest maps no object
-    /// twice, so its address names it.
-    Object(usize),
+    /// `ULK_XPROC`: a memory object and offset. The shim has no memory
+    /// object identities, so the address and the generation of the mapping
+    /// there stand in for them: a mapping that replaces or removes the one at
+    /// an address starts a new generation, so waiters on the old object never
+    /// meet the new one. Unlike XNU, two mappings of one file (read-only
+    /// `MAP_SHARED` mappings may alias) are different objects here.
+    Object { address: usize, generation: u64 },
 }
 
 /// `ull_t`.
@@ -67,12 +72,18 @@ struct Ull<P: ShimPlatform> {
 /// Every lock word with threads in `ulock_wait`.
 pub(crate) struct UlockTable<P: ShimPlatform> {
     locks: BTreeMap<UlockKey, Ull<P>>,
+    /// The current mapping generation at addresses whose mapping changed
+    /// while threads waited on an object there; absent means 0.
+    generations: BTreeMap<usize, u64>,
+    next_generation: u64,
 }
 
 impl<P: ShimPlatform> Default for UlockTable<P> {
     fn default() -> Self {
         Self {
             locks: BTreeMap::new(),
+            generations: BTreeMap::new(),
+            next_generation: 1,
         }
     }
 }
@@ -86,6 +97,56 @@ impl<P: ShimPlatform> UlockTable<P> {
             .map_or(0, |ull| ull.waiters)
     }
 
+    /// Threads in `ulock_wait` on shared lock words at `address`, whichever
+    /// mapping they waited on.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn object_waiters(&self, address: usize) -> u32 {
+        self.objects_at(address).map(|(_, ull)| ull.waiters).sum()
+    }
+
+    fn objects_at(&self, address: usize) -> impl Iterator<Item = (&UlockKey, &Ull<P>)> {
+        self.locks.range(
+            UlockKey::Object {
+                address,
+                generation: 0,
+            }..=UlockKey::Object {
+                address,
+                generation: u64::MAX,
+            },
+        )
+    }
+
+    /// The key of the object mapped at `address`.
+    fn object_key(&self, address: usize) -> UlockKey {
+        UlockKey::Object {
+            address,
+            generation: self.generations.get(&address).copied().unwrap_or(0),
+        }
+    }
+
+    /// The mapping at every address in `range` was replaced or removed: its
+    /// waiters keep their records, but no new wait or wake reaches them.
+    fn retire_objects(&mut self, range: Range<usize>) {
+        let start = UlockKey::Object {
+            address: range.start,
+            generation: 0,
+        };
+        let mut addresses: alloc::vec::Vec<usize> = self
+            .locks
+            .range(start..)
+            .map_while(|(key, _)| match *key {
+                UlockKey::Object { address, .. } if address < range.end => Some(address),
+                _ => None,
+            })
+            .collect();
+        addresses.dedup();
+        for address in addresses {
+            let generation = self.next_generation;
+            self.next_generation += 1;
+            self.generations.insert(address, generation);
+        }
+    }
+
     /// `ulock_wait_cleanup`: the waiter leaves; returns the waiters left.
     fn leave(&mut self, key: UlockKey) -> u32 {
         let ull = self.locks.get_mut(&key).expect("a waiter holds the record");
@@ -93,6 +154,13 @@ impl<P: ShimPlatform> UlockTable<P> {
         let left = ull.waiters;
         if left == 0 {
             self.locks.remove(&key);
+            if let UlockKey::Object { address, .. } = key
+                && self.objects_at(address).next().is_none()
+            {
+                // No waiter remains on any object here, so generation 0 can
+                // name the next one.
+                self.generations.remove(&address);
+            }
         }
         left
     }
@@ -131,14 +199,30 @@ impl<P: ShimPlatform> Task<P> {
             })
     }
 
+    /// The mappings in `range` were replaced or removed, so shared lock words
+    /// there belong to new objects.
+    pub(crate) fn retire_ulock_objects(&self, range: Range<usize>) {
+        self.global.ulocks.lock().retire_objects(range);
+    }
+
     /// `uaddr_findobj`: whether a mapping backs `address`.
-    fn ulock_object(&self, address: usize) -> Option<UlockKey> {
-        let mapped = !self
+    fn ulock_object_mapped(&self, address: usize) -> bool {
+        !self
             .global
             .mm
             .overlapping(address..address.saturating_add(1))
-            .is_empty();
-        mapped.then_some(UlockKey::Object(address))
+            .is_empty()
+    }
+
+    /// The key for `address`; a shared key names the object mapped there
+    /// now, so it is looked up under the table lock, which `retire_objects`
+    /// holds.
+    fn ulock_key(table: &UlockTable<P>, shared: bool, address: usize) -> UlockKey {
+        if shared {
+            table.object_key(address)
+        } else {
+            UlockKey::Address(address)
+        }
     }
 
     /// `sys_ulock_wait2`; `timeout` is in nanoseconds, or a
@@ -178,11 +262,9 @@ impl<P: ShimPlatform> Task<P> {
         if address == 0 || !address.is_multiple_of(size) {
             return Err(Errno::EINVAL);
         }
-        let key = if shared {
-            self.ulock_object(address).ok_or(Errno::EINVAL)?
-        } else {
-            UlockKey::Address(address)
-        };
+        if shared && !self.ulock_object_mapped(address) {
+            return Err(Errno::EINVAL);
+        }
         let mut owner = None;
         if flags & flag::WAIT_ADAPTIVE_SPIN != 0 && set_owner {
             // A changed lock returns at once. Spinning while the owner runs
@@ -196,6 +278,7 @@ impl<P: ShimPlatform> Task<P> {
             owner = self.ulock_resolve_owner(current).ok();
         }
         let mut table = self.global.ulocks.lock();
+        let key = Self::ulock_key(&table, shared, address);
         let ull = table.locks.entry(key).or_insert_with(|| Ull {
             opcode: 0,
             waiters: 0,
@@ -235,10 +318,8 @@ impl<P: ShimPlatform> Task<P> {
         })();
         match checked {
             Ok(true) => {}
-            Ok(false) => {
-                table.leave(key);
-                return Ok(0);
-            }
+            // `out_locked` -> `ulock_wait_cleanup`: the waiters left.
+            Ok(false) => return Ok(table.leave(key)),
             Err(error) => {
                 table.leave(key);
                 return Err(error);
@@ -307,11 +388,9 @@ impl<P: ShimPlatform> Task<P> {
         if address == 0 {
             return Err(Errno::EINVAL);
         }
-        let key = if shared {
-            self.ulock_object(address).ok_or(Errno::EINVAL)?
-        } else {
-            UlockKey::Address(address)
-        };
+        if shared && !self.ulock_object_mapped(address) {
+            return Err(Errno::EINVAL);
+        }
         let wake_thread = if flags & flag::WAKE_THREAD != 0 {
             Some(
                 self.port_name_to_other_thread(wake_value.trunc())
@@ -320,12 +399,13 @@ impl<P: ShimPlatform> Task<P> {
         } else {
             None
         };
-        self.ulock_wake_key(key, opcode, flags, wake_thread, allow_non_owner)
+        self.ulock_wake_key(shared, address, opcode, flags, wake_thread, allow_non_owner)
     }
 
     fn ulock_wake_key(
         &self,
-        key: UlockKey,
+        shared: bool,
+        address: usize,
         opcode: u32,
         flags: u32,
         wake_thread: Option<ThreadId>,
@@ -333,6 +413,7 @@ impl<P: ShimPlatform> Task<P> {
     ) -> Result<(), Errno> {
         let set_owner = opcode == op::UNFAIR_LOCK;
         let mut table = self.global.ulocks.lock();
+        let key = Self::ulock_key(&table, shared, address);
         let ull = table.locks.get_mut(&key).ok_or(Errno::ENOENT)?;
         if ull.opcode != opcode {
             return Err(Errno::EDOM);
@@ -365,7 +446,8 @@ impl<P: ShimPlatform> Task<P> {
             return;
         }
         let _ = self.ulock_wake_key(
-            UlockKey::Address(address),
+            false,
+            address,
             op::UNFAIR_LOCK,
             flag::WAKE_ALL | flag::WAKE_ALLOW_NON_OWNER,
             None,
