@@ -1053,6 +1053,42 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.insert_raw_file_fd(file, flags)
     }
 
+    /// Handle path-based `chown` and `fchownat`.
+    pub(crate) fn sys_fchownat(
+        &self,
+        dirfd: i32,
+        pathname: &str,
+        owner: u32,
+        group: u32,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let valid_flags = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        if flags.intersects(valid_flags.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        // The broker follows symlinks and cannot chown an open descriptor yet.
+        if !flags.is_empty() {
+            log_unsupported!("fchownat flags: {flags:?}");
+            return Err(Errno::ENOSYS);
+        }
+        let to_id = |id| {
+            if id == u32::MAX {
+                Ok(None)
+            } else {
+                u16::try_from(id).map(Some).map_err(|_| Errno::EINVAL)
+            }
+        };
+        let owner = to_id(owner)?;
+        let group = to_id(group)?;
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        self.global
+            .litebox
+            .chown_file(&context, &path, owner, group)
+            .map_err(Errno::from)
+    }
+
     /// Handle syscall `ftruncate`
     pub(crate) fn sys_ftruncate(&self, fd: i32, length: usize) -> Result<(), Errno> {
         let files = self.files.borrow();

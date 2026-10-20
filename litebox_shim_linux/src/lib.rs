@@ -971,6 +971,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     syscall!(sys_mkdirat(dirfd, path, mode))
                 }),
+            SyscallRequest::Fchownat {
+                dirfd,
+                pathname,
+                owner,
+                group,
+                flags,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
+                    syscall!(sys_fchownat(dirfd, path, owner, group, flags))
+                }),
             SyscallRequest::Chdir { pathname } => {
                 pathname
                     .to_cstring::<Platform>()
