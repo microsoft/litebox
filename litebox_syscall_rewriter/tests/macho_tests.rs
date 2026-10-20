@@ -119,27 +119,13 @@ fn arm64e_images_and_capability_bits_are_supported() {
 }
 
 #[test]
-fn whole_image_rewriting_preserves_native_tpidrro_mode() {
-    let input = image(&[SVC, MRS]);
-    let output = hook_syscalls_in_macho_with_options(
-        &input,
-        None,
-        RewriteOptions::macos_native_guest_tpidrro(),
-    )
-    .unwrap();
-
-    assert_ne!(u32_at(&output, TEXT), SVC);
-    assert_eq!(u32_at(&output, TEXT + 4), MRS);
-}
-
-#[test]
-fn whole_image_rewriting_emits_host_aware_tpidrro_gates() {
+fn whole_image_rewriting_emits_guest_tpidrro_gates() {
     let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
     let input = image(&[MRS]);
     let output = hook_syscalls_in_macho_with_options(
         &input,
         None,
-        RewriteOptions::macos_host_shared_cache(),
+        RewriteOptions::new(TargetHost::MacOs, false),
     )
     .unwrap();
     let (offset, base, size) = footer(&output);
@@ -148,12 +134,9 @@ fn whole_image_rewriting_emits_host_aware_tpidrro_gates() {
 
     assert_ne!(u32_at(&output, TEXT), MRS);
     let gate = rewriter
-        .classify_gate_slot(&gates[16..80], base + 16, base + 16)
+        .classify_gate_slot(&gates[16..], base + 16, base + 16)
         .unwrap();
-    assert_eq!(
-        gate.metadata(),
-        GateMetadata::HostAwareMrsTpidr { destination: 3 }
-    );
+    assert_eq!(gate.metadata(), GateMetadata::MrsTpidr { destination: 3 });
 }
 
 #[test]

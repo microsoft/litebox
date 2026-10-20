@@ -121,71 +121,7 @@ impl Rewriter {
         callback: u64,
         guest_tp_offset: u16,
     ) -> Result<(Vec<u8>, Vec<u64>)> {
-        self.patch_code_segment_with_options(
-            code,
-            code_vaddr,
-            ranges,
-            trampoline_vaddr,
-            callback,
-            guest_tp_offset,
-            RewriteOptions::new(self.host, false),
-        )
-    }
-
-    /// Rewrite SVC sites while leaving TPIDRRO reads on the physical pthread.
-    pub fn patch_native_guest_tpidrro_code(
-        self,
-        code: &mut [u8],
-        code_vaddr: u64,
-        ranges: &[Range<usize>],
-        trampoline_vaddr: u64,
-        callback: u64,
-        guest_tp_offset: u16,
-    ) -> Result<(Vec<u8>, Vec<u64>)> {
-        self.patch_code_segment_with_options(
-            code,
-            code_vaddr,
-            ranges,
-            trampoline_vaddr,
-            callback,
-            guest_tp_offset,
-            RewriteOptions::native_guest_thread_pointer(self.host),
-        )
-    }
-
-    /// Rewrite SVC and TPIDRRO sites in live host shared-cache code.
-    /// Host-aware TPIDRRO gates retain native host TLS outside guest execution.
-    pub fn patch_host_shared_cache_code(
-        self,
-        code: &mut [u8],
-        code_vaddr: u64,
-        ranges: &[Range<usize>],
-        trampoline_vaddr: u64,
-        callback: u64,
-        guest_tp_offset: u16,
-    ) -> Result<(Vec<u8>, Vec<u64>)> {
-        self.patch_code_segment_with_options(
-            code,
-            code_vaddr,
-            ranges,
-            trampoline_vaddr,
-            callback,
-            guest_tp_offset,
-            RewriteOptions::host_aware_thread_pointer(self.host),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn patch_code_segment_with_options(
-        self,
-        code: &mut [u8],
-        code_vaddr: u64,
-        ranges: &[Range<usize>],
-        trampoline_vaddr: u64,
-        callback: u64,
-        guest_tp_offset: u16,
-        options: RewriteOptions,
-    ) -> Result<(Vec<u8>, Vec<u64>)> {
+        let options = RewriteOptions::new(self.host, false);
         checked_add_u64(code_vaddr, code.len() as u64, "Mach-O mapping end")?;
         if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
             return Err(Error::ParseError(

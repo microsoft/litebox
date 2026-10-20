@@ -235,9 +235,6 @@ pub const GATES_START_OFFSET: usize = GATE_ALIGNMENT;
 /// Byte size of a direct-TLS `MRS TPIDR_EL0` gate slot.
 pub const MRS_SLOT_BYTES: usize = 16;
 
-/// Byte size of a host-aware Darwin shared-cache TPIDRRO gate.
-pub const HOST_AWARE_MRS_SLOT_BYTES: usize = 64;
-
 /// Byte size of a direct-TLS `MSR TPIDR_EL0` gate slot.
 pub const MSR_SLOT_BYTES: usize = 48;
 
@@ -487,7 +484,7 @@ enum GateKind {
     X18Adr = 5,
     X18Branch = 6,
     X18StackWriteback = 7,
-    HostAwareMrsTpidr = 8,
+    // 8 was a removed host-aware TPIDRRO gate kind; never reuse it.
 }
 
 impl GateKind {
@@ -505,7 +502,6 @@ impl GateKind {
             Self::X18Adr,
             Self::X18Branch,
             Self::X18StackWriteback,
-            Self::HostAwareMrsTpidr,
         ]
         .into_iter()
         .find(|kind| kind.bits() == bits)
@@ -522,9 +518,6 @@ pub enum GateMetadata {
         /// Register the guest thread pointer is read into.
         destination: u8,
     },
-    /// Read TPIDRRO from the physical host or private guest state according to
-    /// the current LiteBox execution mode.
-    HostAwareMrsTpidr { destination: u8 },
     /// An inline gate writes the logical guest thread pointer from `<Xs>`.
     MsrTpidr {
         /// Register holding the value to write.
@@ -574,19 +567,12 @@ pub struct EncodedGateMetadata(pub u32);
 
 impl EncodedGateMetadata {
     pub fn encode(metadata: GateMetadata) -> Option<Self> {
-        if matches!(
-            metadata,
-            GateMetadata::MrsTpidr { destination: XZR }
-                | GateMetadata::HostAwareMrsTpidr { destination: XZR }
-        ) {
+        if matches!(metadata, GateMetadata::MrsTpidr { destination: XZR }) {
             return None;
         }
         let (kind, register) = match metadata {
             GateMetadata::Svc => (GateKind::Svc, 0),
             GateMetadata::MrsTpidr { destination } => (GateKind::MrsTpidr, destination),
-            GateMetadata::HostAwareMrsTpidr { destination } => {
-                (GateKind::HostAwareMrsTpidr, destination)
-            }
             GateMetadata::MsrTpidr { source } => (GateKind::MsrTpidr, source),
             GateMetadata::X18 { scratch } => (GateKind::X18, scratch),
             GateMetadata::X18CompareBranch { scratch } => (GateKind::X18CompareBranch, scratch),
@@ -625,11 +611,6 @@ impl EncodedGateMetadata {
             GateKind::MrsTpidr if register != XZR => Some(GateMetadata::MrsTpidr {
                 destination: register,
             }),
-            GateKind::HostAwareMrsTpidr if register != XZR => {
-                Some(GateMetadata::HostAwareMrsTpidr {
-                    destination: register,
-                })
-            }
             GateKind::MsrTpidr => Some(GateMetadata::MsrTpidr { source: register }),
             GateKind::X18 if register != XZR => Some(GateMetadata::X18 { scratch: register }),
             GateKind::X18CompareBranch if register != XZR => {
@@ -1831,7 +1812,6 @@ impl GateMetadata {
         match self {
             GateMetadata::Svc => SVC_SLOT_BYTES,
             GateMetadata::MrsTpidr { .. } => MRS_SLOT_BYTES,
-            GateMetadata::HostAwareMrsTpidr { .. } => HOST_AWARE_MRS_SLOT_BYTES,
             GateMetadata::MsrTpidr { .. } => MSR_SLOT_BYTES,
             GateMetadata::X18 { .. } => X18_SLOT_BYTES,
             GateMetadata::X18StackWriteback { .. } => X18_STACK_WRITEBACK_SLOT_BYTES,
@@ -2764,10 +2744,6 @@ mod tests {
         let word = |m| EncodedGateMetadata::encode(m).unwrap().0;
         assert_eq!(word(GateMetadata::Svc), 0x0001b807);
         assert_eq!(word(GateMetadata::MrsTpidr { destination: 9 }), 0x0911b807);
-        assert_eq!(
-            word(GateMetadata::HostAwareMrsTpidr { destination: 9 }),
-            0x0981b807
-        );
         assert_eq!(word(GateMetadata::MsrTpidr { source: 9 }), 0x0921b807);
         assert_eq!(
             word(GateMetadata::X18Branch {

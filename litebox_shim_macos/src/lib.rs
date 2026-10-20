@@ -4,7 +4,8 @@
 //! Darwin BSD shim for AArch64 Mach-O guests.
 //!
 //! Guest mappings and file operations use LiteBox. A runtime provider may
-//! supply dyld and an external shared cache for dynamically linked programs.
+//! supply dyld and a guest-private dyld shared-cache instance for dynamically
+//! linked programs.
 //! Networking is unsupported.
 
 #![no_std]
@@ -131,8 +132,11 @@ pub enum SharedCacheInstallError {
     AlreadyInstalled,
     InvalidCacheRange,
     InvalidRegion,
+    InvalidGateIsland,
     UnreadableAlias,
     Rewrite,
+    /// No gate island with remaining capacity is within branch range of a site.
+    UnreachableGates,
 }
 
 impl core::fmt::Display for SharedCacheInstallError {
@@ -140,60 +144,54 @@ impl core::fmt::Display for SharedCacheInstallError {
         formatter.write_str(match self {
             Self::AlreadyInstalled => "shared cache already installed",
             Self::InvalidCacheRange => "invalid or uncovered shared-cache base",
-            Self::InvalidRegion => "invalid shared-cache region",
+            Self::InvalidRegion => "invalid shared-cache code region",
+            Self::InvalidGateIsland => "invalid shared-cache gate island",
             Self::UnreadableAlias => "shared-cache writable alias is unreadable",
             Self::Rewrite => "failed to rewrite shared-cache executable code",
+            Self::UnreachableGates => "no shared-cache gate island can serve a rewrite site",
         })
     }
 }
 
 impl core::error::Error for SharedCacheInstallError {}
 
-/// Writable staging and final addresses for the cache's shared gate area.
-pub struct SharedCacheTrampoline {
-    pub range: core::ops::Range<usize>,
-    pub writable_alias: usize,
-}
-
-/// One mapping in an externally prepared shared cache.
+/// One mapping of a guest shared-cache instance and its final protection.
 pub struct SharedCacheMapping {
     pub range: core::ops::Range<usize>,
     pub protection: VmProtection,
 }
 
-pub struct SharedCacheRegion<'a> {
+/// Guest-executed shared-cache code to rewrite in place, such as one image's `__TEXT`.
+pub struct SharedCacheCodeRegion<'a> {
+    /// Final guest address range; page-aligned.
     pub range: core::ops::Range<usize>,
+    /// Address at which the same bytes are writable during installation. It
+    /// may equal `range.start` while the target is temporarily writable.
     pub writable_alias: usize,
-    /// Code that executes only in the guest context.
-    pub guest_ranges: &'a [core::ops::Range<usize>],
-    /// Code shared between the host and guest contexts.
-    pub host_aware_ranges: &'a [core::ops::Range<usize>],
-    /// Code whose TPIDRRO reads must remain native.
-    pub native_thread_pointer_ranges: &'a [core::ops::Range<usize>],
+    /// Instruction byte ranges relative to `range.start`: sorted,
+    /// non-overlapping and 4-byte aligned.
+    pub instruction_ranges: &'a [core::ops::Range<usize>],
 }
 
-/// Layout of an externally prepared shared cache.
-pub struct SharedCacheLayout<'a> {
+/// Page-aligned, otherwise unused guest memory that receives rewrite gates.
+///
+/// Each rewritten site branches directly to its gate, so every site must lie
+/// within AArch64 `B` range (+-128 MiB) of an island with remaining capacity.
+pub struct SharedCacheGateIsland {
     pub range: core::ops::Range<usize>,
+    /// Address at which the island is writable during installation.
+    pub writable_alias: usize,
+}
+
+/// Layout of a guest-private shared-cache instance prepared by a runtime provider.
+pub struct SharedCacheLayout<'a> {
+    /// The whole reserved instance, `[base, base + sharedRegionSize)`.
+    pub range: core::ops::Range<usize>,
+    /// Final protections of the instance's pages, sorted and non-overlapping.
+    /// Code regions and gate islands must be covered by read-execute mappings.
     pub mappings: &'a [SharedCacheMapping],
-    pub executable_regions: &'a [SharedCacheRegion<'a>],
-    pub trampoline: SharedCacheTrampoline,
-}
-
-/// How TPIDRRO reads in dyld should behave for the selected runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DyldThreadPointerMode {
-    /// Read the physical thread register without rewriting it.
-    Native,
-    /// Read the guest thread pointer maintained by LiteBox.
-    Guest,
-}
-
-/// A dyld image prepared by the runtime provider.
-#[derive(Clone, Copy, Debug)]
-pub struct DyldImage<'a> {
-    pub data: &'a [u8],
-    pub thread_pointer: DyldThreadPointerMode,
+    pub code_regions: &'a [SharedCacheCodeRegion<'a>],
+    pub gate_islands: &'a [SharedCacheGateIsland],
 }
 
 impl<P: ShimPlatform> MacosShim<P> {
@@ -211,16 +209,17 @@ impl<P: ShimPlatform> MacosShim<P> {
         self.load(params, path, None, None, argv, envp)
     }
 
-    /// Load a dynamically linked executable with a runtime-provided dyld.
+    /// Load a dynamically linked executable with a runtime-provided, unrewritten
+    /// dyld image. dyld is rewritten like every other guest image.
     ///
-    /// The provider selects dyld's thread-pointer behavior and must install any
-    /// required shared cache before entering guest execution.
+    /// The provider must install any required shared cache before entering
+    /// guest execution.
     pub fn load_program_with_dyld(
         self,
         params: TaskParams,
         path: &str,
         image: &[u8],
-        dyld: DyldImage<'_>,
+        dyld: &[u8],
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
@@ -247,7 +246,7 @@ impl<P: ShimPlatform> MacosShim<P> {
         params: TaskParams,
         path: &str,
         image: Option<&[u8]>,
-        dyld: Option<DyldImage<'_>>,
+        dyld: Option<&[u8]>,
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
@@ -293,48 +292,58 @@ pub struct LoadedProgram<P: ShimPlatform> {
 }
 
 impl<P: ShimPlatform> LoadedProgram<P> {
-    /// Rewrite and register an externally prepared shared cache.
+    /// Rewrite and register a guest-private shared-cache instance.
     ///
-    /// The provider must keep target mappings alive for the guest lifetime and
-    /// supply writable aliases for the same bytes. No cache code may execute
-    /// during installation. After success, publish staged mappings and
+    /// The provider must keep the instance mapped for the guest lifetime and
+    /// supply writable aliases for code regions and gate islands. No cache code
+    /// may execute during installation. After success, apply the final
+    /// protections from `cache.mappings` (code and islands read-execute) and
     /// synchronize instruction caches before guest entry. Discard the process
     /// on error because installation is not transactional.
     pub fn install_shared_cache(
         &self,
         cache: &SharedCacheLayout<'_>,
     ) -> Result<(), SharedCacheInstallError> {
-        if self
-            .entrypoints
-            .task
-            .global
-            .shared_cache_base
-            .load(Ordering::Acquire)
-            != 0
-        {
+        let task = &self.entrypoints.task;
+        if task.global.shared_cache_base.load(Ordering::Acquire) != 0 {
             return Err(SharedCacheInstallError::AlreadyInstalled);
         }
-        if cache.range.start == 0
-            || cache.range.start >= cache.range.end
-            || !cache.range.start.is_multiple_of(PAGE_SIZE)
-            || !cache.range.end.is_multiple_of(PAGE_SIZE)
-            || cache.trampoline.range.start >= cache.trampoline.range.end
-            || !cache.trampoline.range.start.is_multiple_of(PAGE_SIZE)
-            || !cache.trampoline.range.end.is_multiple_of(PAGE_SIZE)
-            || (cache.trampoline.range.start < cache.range.end
-                && cache.range.start < cache.trampoline.range.end)
-            || cache.trampoline.writable_alias == 0
-        {
+        let page_aligned = |range: &core::ops::Range<usize>| {
+            range.start < range.end
+                && range.start.is_multiple_of(PAGE_SIZE)
+                && range.end.is_multiple_of(PAGE_SIZE)
+        };
+        let inside = |range: &core::ops::Range<usize>| {
+            range.start >= cache.range.start && range.end <= cache.range.end
+        };
+        let overlaps = |a: &core::ops::Range<usize>, b: &core::ops::Range<usize>| {
+            a.start < b.end && b.start < a.end
+        };
+        // Whether `range` is covered by consecutive mappings with exactly `protection`.
+        let covered_by = |range: &core::ops::Range<usize>, protection: VmProtection| {
+            let mut covered = range.start;
+            for mapping in cache.mappings {
+                if mapping.range.end <= covered {
+                    continue;
+                }
+                if mapping.range.start > covered || mapping.protection != protection {
+                    return false;
+                }
+                covered = mapping.range.end;
+                if covered >= range.end {
+                    return true;
+                }
+            }
+            false
+        };
+        if cache.range.start == 0 || !page_aligned(&cache.range) {
             return Err(SharedCacheInstallError::InvalidCacheRange);
         }
         if cache.mappings.is_empty()
-            || cache.mappings.iter().any(|mapping| {
-                mapping.range.start >= mapping.range.end
-                    || mapping.range.start < cache.range.start
-                    || mapping.range.end > cache.range.end
-                    || !mapping.range.start.is_multiple_of(PAGE_SIZE)
-                    || !mapping.range.end.is_multiple_of(PAGE_SIZE)
-            })
+            || cache
+                .mappings
+                .iter()
+                .any(|mapping| !page_aligned(&mapping.range) || !inside(&mapping.range))
             || cache
                 .mappings
                 .windows(2)
@@ -342,39 +351,44 @@ impl<P: ShimPlatform> LoadedProgram<P> {
         {
             return Err(SharedCacheInstallError::InvalidCacheRange);
         }
-        let mut trampoline_cursor = 0;
-        for region in cache.executable_regions {
-            if region.range.start >= region.range.end
+        let executable = VmProtection::READ | VmProtection::EXECUTE;
+        for (index, island) in cache.gate_islands.iter().enumerate() {
+            if !page_aligned(&island.range)
+                || island.writable_alias == 0
+                || !inside(&island.range)
+                || !covered_by(&island.range, executable)
+                || cache.gate_islands[index + 1..]
+                    .iter()
+                    .any(|other| overlaps(&island.range, &other.range))
+            {
+                return Err(SharedCacheInstallError::InvalidGateIsland);
+            }
+        }
+        for region in cache.code_regions {
+            if !page_aligned(&region.range)
                 || region.writable_alias == 0
-                || !region.range.start.is_multiple_of(PAGE_SIZE)
-                || !region.range.end.is_multiple_of(PAGE_SIZE)
-                || region.range.start < cache.range.start
-                || region.range.end > cache.range.end
+                || !inside(&region.range)
+                || !covered_by(&region.range, executable)
+                || cache
+                    .gate_islands
+                    .iter()
+                    .any(|island| overlaps(&island.range, &region.range))
             {
                 return Err(SharedCacheInstallError::InvalidRegion);
             }
-            trampoline_cursor = self.entrypoints.task.rewrite_shared_cache_region(
-                region,
-                &cache.trampoline,
-                trampoline_cursor,
-            )?;
         }
-        let mut mappings = self.entrypoints.task.global.shared_cache_mappings.lock();
-        mappings.extend(
+        let mut island_cursors = alloc::vec![0; cache.gate_islands.len()];
+        for region in cache.code_regions {
+            task.rewrite_shared_cache_region(region, cache.gate_islands, &mut island_cursors)?;
+        }
+        task.global.shared_cache_mappings.lock().extend(
             cache
                 .mappings
                 .iter()
                 .map(|mapping| (mapping.range.clone(), mapping.protection)),
         );
-        mappings.push((
-            cache.trampoline.range.clone(),
-            VmProtection::READ | VmProtection::EXECUTE,
-        ));
-        drop(mappings);
-        *self.entrypoints.task.global.shared_cache_range.lock() = Some(cache.range.clone());
-        self.entrypoints
-            .task
-            .global
+        *task.global.shared_cache_range.lock() = Some(cache.range.clone());
+        task.global
             .shared_cache_base
             .store(cache.range.start, Ordering::Release);
         Ok(())

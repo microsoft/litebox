@@ -39,45 +39,195 @@ fn syscall_return_registers_and_carry() {
     assert_eq!(ctx.regs[1], 0x1234);
 }
 
-#[test]
-fn shared_cache_installation_validates_state_and_trampoline() {
-    let task = task(MacosShimBuilder::new(Platform::new()).build());
+fn loaded_program(task: Task<Platform>) -> LoadedProgram<Platform> {
     let process = task.process.clone();
-    let program = LoadedProgram {
+    LoadedProgram {
         entrypoints: MacosShimEntrypoints {
             task,
             _not_send: core::marker::PhantomData,
         },
         process,
         initial_ctx: PtRegs::default(),
-    };
-    let mappings = [SharedCacheMapping {
-        range: PAGE_SIZE..3 * PAGE_SIZE,
-        protection: VmProtection::READ,
-    }];
-    let cache = SharedCacheLayout {
-        range: PAGE_SIZE..3 * PAGE_SIZE,
-        mappings: &mappings,
-        executable_regions: &[],
-        trampoline: SharedCacheTrampoline {
-            range: 2 * PAGE_SIZE..4 * PAGE_SIZE,
-            writable_alias: PAGE_SIZE,
+    }
+}
+
+#[test]
+fn shared_cache_installation_validates_layout() {
+    const RX: VmProtection = VmProtection::READ.union(VmProtection::EXECUTE);
+    let program = loaded_program(task(MacosShimBuilder::new(Platform::new()).build()));
+    let base = 0x10_0000_0000;
+    let mappings = [
+        SharedCacheMapping {
+            range: base..base + PAGE_SIZE,
+            protection: VmProtection::READ,
         },
+        SharedCacheMapping {
+            range: base + PAGE_SIZE..base + 3 * PAGE_SIZE,
+            protection: RX,
+        },
+    ];
+    let island = |start: usize| SharedCacheGateIsland {
+        range: start..start + PAGE_SIZE,
+        writable_alias: start,
+    };
+    let code = |start: usize| SharedCacheCodeRegion {
+        range: start..start + PAGE_SIZE,
+        writable_alias: start,
+        instruction_ranges: &[],
+    };
+    let layout = |code_regions, gate_islands| SharedCacheLayout {
+        range: base..base + 4 * PAGE_SIZE,
+        mappings: &mappings,
+        code_regions,
+        gate_islands,
+    };
+    let read_only_island = [island(base)];
+    let outside_island = [island(base + 4 * PAGE_SIZE)];
+    let overlapping_islands = [island(base + PAGE_SIZE), island(base + PAGE_SIZE)];
+    let unmapped_island = [island(base + 3 * PAGE_SIZE)];
+    for islands in [
+        &read_only_island[..],
+        &outside_island,
+        &overlapping_islands,
+        &unmapped_island,
+    ] {
+        assert_eq!(
+            program.install_shared_cache(&layout(&[], islands)),
+            Err(SharedCacheInstallError::InvalidGateIsland)
+        );
+    }
+    let valid_island = [island(base + 2 * PAGE_SIZE)];
+    let read_only_code = [code(base)];
+    let island_code = [code(base + 2 * PAGE_SIZE)];
+    for regions in [&read_only_code[..], &island_code] {
+        assert_eq!(
+            program.install_shared_cache(&layout(regions, &valid_island)),
+            Err(SharedCacheInstallError::InvalidRegion)
+        );
+    }
+    let unaligned = SharedCacheLayout {
+        range: base + 1..base + 4 * PAGE_SIZE,
+        ..layout(&[], &valid_island)
     };
     assert_eq!(
-        program.install_shared_cache(&cache),
+        program.install_shared_cache(&unaligned),
         Err(SharedCacheInstallError::InvalidCacheRange)
     );
-
-    program
-        .entrypoints
-        .task
-        .global
-        .shared_cache_base
-        .store(PAGE_SIZE, Ordering::Release);
+    // Without code to rewrite, a valid layout only registers the instance.
     assert_eq!(
-        program.install_shared_cache(&cache),
+        program.install_shared_cache(&layout(&[], &valid_island)),
+        Ok(())
+    );
+    assert_eq!(
+        program
+            .entrypoints
+            .task
+            .global
+            .shared_cache_base
+            .load(Ordering::Acquire),
+        base
+    );
+    assert_eq!(
+        program.install_shared_cache(&layout(&[], &valid_island)),
         Err(SharedCacheInstallError::AlreadyInstalled)
+    );
+}
+
+/// Rewrite one SVC and one TPIDRRO read with the given islands. Returns the
+/// region result, the code page, and the island cursors.
+fn rewrite_with_islands(
+    task: &Task<Platform>,
+    islands: impl FnOnce(usize) -> Vec<SharedCacheGateIsland>,
+) -> (
+    Result<(), SharedCacheInstallError>,
+    Vec<u8>,
+    Vec<SharedCacheGateIsland>,
+    Vec<usize>,
+) {
+    const CODE: [u32; 4] = [0xd503_201f, 0xd400_1001, 0xd53b_d063, 0xd65f_03c0];
+    // SAFETY: allocate fresh pages owned exclusively by this idle test task.
+    let base = unsafe {
+        task.global.mm.create_writable_pages(
+            NonZeroAddress::new(Platform::TASK_ADDR_MIN),
+            NonZeroPageSize::new(3 * PAGE_SIZE).unwrap(),
+            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+            |_| Ok(0),
+        )
+    }
+    .unwrap()
+    .as_usize();
+    let code: Vec<u8> = CODE.iter().flat_map(|word| word.to_le_bytes()).collect();
+    litebox_common_macos::user_pointers::UserPtrMut::<u8>::from_usize(base)
+        .copy_from_slice::<Platform>(0, &code)
+        .unwrap();
+    let instructions = 0..code.len();
+    let instruction_ranges = core::slice::from_ref(&instructions);
+    let region = SharedCacheCodeRegion {
+        range: base..base + PAGE_SIZE,
+        writable_alias: base,
+        instruction_ranges,
+    };
+    let islands = islands(base);
+    let mut cursors = vec![0; islands.len()];
+    let result = task.rewrite_shared_cache_region(&region, &islands, &mut cursors);
+    let code = litebox_common_macos::user_pointers::UserPtr::<u8>::from_usize(base)
+        .to_owned_slice::<Platform>(code.len())
+        .unwrap()
+        .into_vec();
+    (result, code, islands, cursors)
+}
+
+#[test]
+fn shared_cache_rewrite_uses_nearest_reachable_island() {
+    use litebox_trampoline::aarch64::decode_branch_target;
+
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    // The first island is out of `B` range. Its writable alias is a real page,
+    // so a wrong choice would be observable rather than fault.
+    let (result, code, islands, cursors) = rewrite_with_islands(&task, |base| {
+        vec![
+            SharedCacheGateIsland {
+                range: base + (256 << 20)..base + (256 << 20) + PAGE_SIZE,
+                writable_alias: base + PAGE_SIZE,
+            },
+            SharedCacheGateIsland {
+                range: base + 2 * PAGE_SIZE..base + 3 * PAGE_SIZE,
+                writable_alias: base + 2 * PAGE_SIZE,
+            },
+        ]
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(cursors[0], 0);
+    assert_ne!(cursors[1], 0);
+    let word =
+        |index: usize| u32::from_le_bytes(code[4 * index..4 * index + 4].try_into().unwrap());
+    assert_eq!(word(0), 0xd503_201f);
+    assert_eq!(word(3), 0xd65f_03c0);
+    let base = islands[1].range.start - 2 * PAGE_SIZE;
+    for index in [1, 2] {
+        let target = decode_branch_target(word(index), (base + 4 * index) as u64)
+            .expect("site must branch to its gate");
+        assert!(islands[1].range.contains(&usize::try_from(target).unwrap()));
+    }
+}
+
+#[test]
+fn shared_cache_rewrite_fails_closed_without_reachable_island() {
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    let (result, code, _, cursors) = rewrite_with_islands(&task, |base| {
+        vec![SharedCacheGateIsland {
+            range: base + (256 << 20)..base + (256 << 20) + PAGE_SIZE,
+            writable_alias: base + PAGE_SIZE,
+        }]
+    });
+    assert_eq!(result, Err(SharedCacheInstallError::UnreachableGates));
+    assert_eq!(cursors, [0]);
+    assert_eq!(
+        code,
+        [0xd503_201fu32, 0xd400_1001, 0xd53b_d063, 0xd65f_03c0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>()
     );
 }
 

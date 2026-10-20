@@ -7,7 +7,6 @@
 
 extern crate alloc;
 
-pub mod dyld;
 pub mod errno;
 pub mod loader;
 pub mod shared_cache;

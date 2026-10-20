@@ -211,8 +211,7 @@ pub fn canonicalize(
             staged_source = boundary.check_capture.then_some(source);
             (MSR_FRAME_BYTES.into(), [Some(16), Some(17)], None)
         }
-        GateMetadata::MrsTpidr { destination }
-        | GateMetadata::HostAwareMrsTpidr { destination } => (0, [None, None], Some(destination)),
+        GateMetadata::MrsTpidr { destination } => (0, [None, None], Some(destination)),
         GateMetadata::X18StackWriteback { scratch } => {
             let Some((delta, frame_bytes)) = gate.stack_writeback() else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
@@ -396,61 +395,6 @@ mod tests {
             .encode()
             .unwrap();
         (branch.to_le_bytes(), gates)
-    }
-
-    #[test]
-    fn host_aware_mrs_recovery_canonicalizes_middle_stages() {
-        const GUEST_TP_SLOT: usize = 0x2000_0000;
-        const GUEST_TP: usize = 0xfeed_1234;
-        const DESTINATION: usize = 9;
-        let (code, gates) = darwin_gate(GateMetadata::HostAwareMrsTpidr {
-            destination: u8::try_from(DESTINATION).unwrap(),
-        });
-        let guest_tp = GUEST_TP.to_ne_bytes();
-        let read = |address: usize, output: &mut [u8]| {
-            for (base, bytes) in [
-                (SITE, code.as_slice()),
-                (TRAMPOLINE, gates.as_slice()),
-                (GUEST_TP_SLOT, guest_tp.as_slice()),
-            ] {
-                if let Some(offset) = address.checked_sub(base)
-                    && let Some(end) = offset.checked_add(output.len())
-                    && let Some(source) = bytes.get(offset..end)
-                {
-                    output.copy_from_slice(source);
-                    return true;
-                }
-            }
-            false
-        };
-        let runtime = GateRuntimeState {
-            guest_thread_pointer_addr: GUEST_TP_SLOT,
-            expected_outbound_stub: 0,
-            expected_outbound_pc: 0,
-        };
-        for offset in [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48] {
-            let mut regs = [0; 31];
-            let mut sp = 0;
-            let mut pc = TRAMPOLINE + 16 + offset;
-            regs[DESTINATION] = if offset >= 40 { GUEST_TP } else { 0xdead };
-            assert!(
-                matches!(
-                    canonicalize(
-                        &mut regs,
-                        &mut sp,
-                        &mut pc,
-                        runtime,
-                        GateInterruption::Asynchronous,
-                        GateAbi::Darwin,
-                        read,
-                    ),
-                    Aarch64GateSignalResult::Canonicalized(())
-                ),
-                "Darwin MRS recovery failed at offset {offset}"
-            );
-            assert_eq!(pc, SITE + 4);
-            assert_eq!(regs[DESTINATION], GUEST_TP);
-        }
     }
 
     #[test]

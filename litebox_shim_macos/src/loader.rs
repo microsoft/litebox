@@ -7,7 +7,7 @@
 //! from later file changes. The runtime provider supplies dyld and any shared
 //! cache required by dynamically linked executables.
 
-use crate::{DyldImage, DyldThreadPointerMode, ShimPlatform, Task};
+use crate::{ShimPlatform, Task};
 use alloc::{borrow::Cow, ffi::CString, format, vec, vec::Vec};
 use core::ops::Range;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
@@ -18,9 +18,8 @@ use litebox_common_macos::{
     OpenFlags, PAGE_SIZE, VmProtection,
     loader::{MAX_IMAGE_SIZE, MachoParsedFile, TrampolineInfo, arm64_slice},
 };
-use litebox_syscall_rewriter::{
-    RewriteOptions,
-    macho::{CodeMetadata, Rewriter, hook_syscalls_in_macho_with_options},
+use litebox_syscall_rewriter::macho::{
+    CodeMetadata, Rewriter, hook_syscalls_in_macho_with_options,
 };
 
 use crate::MachoLoaderError;
@@ -101,10 +100,7 @@ struct Image<'a> {
 }
 
 impl<'a> Image<'a> {
-    fn prepare(
-        data: &'a [u8],
-        dyld_thread_pointer: Option<DyldThreadPointerMode>,
-    ) -> Result<Self, MachoLoaderError> {
+    fn prepare(data: &'a [u8]) -> Result<Self, MachoLoaderError> {
         let data = arm64_slice(data)?;
         let mut plan = MachoParsedFile::parse(data)?;
         let (data, trampoline) = match plan.parse_trampoline(data) {
@@ -114,22 +110,11 @@ impl<'a> Image<'a> {
             Ok(trampoline) => (Cow::Borrowed(data), trampoline),
             Err(MachoLoaderError::Unrewritten) => {
                 // Only absent rewrite metadata permits rewriting; invalid metadata is an error.
-                let rewritten = match dyld_thread_pointer {
-                    Some(DyldThreadPointerMode::Native) => hook_syscalls_in_macho_with_options(
-                        data,
-                        None,
-                        RewriteOptions::native_guest_thread_pointer(
-                            crate::aarch64_rewrite_options().target_host(),
-                        ),
-                    ),
-                    Some(DyldThreadPointerMode::Guest) | None => {
-                        hook_syscalls_in_macho_with_options(
-                            data,
-                            None,
-                            crate::aarch64_rewrite_options(),
-                        )
-                    }
-                }
+                let rewritten = hook_syscalls_in_macho_with_options(
+                    data,
+                    None,
+                    crate::aarch64_rewrite_options(),
+                )
                 .map_err(|_| MachoLoaderError::Rewrite)?;
                 plan = MachoParsedFile::parse(&rewritten)?;
                 let trampoline = plan.parse_trampoline(&rewritten)?;
@@ -232,7 +217,7 @@ pub(super) fn load<P: ShimPlatform>(
     task: &Task<P>,
     path: &str,
     image: Option<&[u8]>,
-    dyld: Option<DyldImage<'_>>,
+    dyld: Option<&[u8]>,
     argv: &[CString],
     envp: &[CString],
 ) -> Result<PtRegs, MachoLoaderError> {
@@ -243,7 +228,7 @@ pub(super) fn load<P: ShimPlatform>(
         owned_image = read_image(task, path)?;
         &owned_image
     };
-    let image = Image::prepare(data, None)?;
+    let image = Image::prepare(data)?;
     let uses_dyld = image.plan.uses_dyld;
     if image.plan.is_dyld {
         return Err(MachoLoaderError::Unsupported(
@@ -264,7 +249,7 @@ pub(super) fn load<P: ShimPlatform>(
             ));
         }
         (true, Some(dyld)) => {
-            let image = Image::prepare(dyld.data, Some(dyld.thread_pointer))?;
+            let image = Image::prepare(dyld)?;
             if !image.plan.is_dyld {
                 return Err(MachoLoaderError::Invalid(
                     "supplied dyld is not MH_DYLINKER",
