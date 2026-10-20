@@ -26,7 +26,7 @@ use super::errors::{
 use super::resolver::{Resolver, ResolverEntry};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
-use crate::transfer::CopyCount;
+use crate::transfer::CountedBuffer;
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a broker file operation.
@@ -255,7 +255,7 @@ where
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
-        let mut output = CopyCount::new(output);
+        let mut output = CountedBuffer::new(output);
         let read = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
@@ -299,7 +299,7 @@ where
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let nonblocking = entry.is_nonblocking();
-        let counted = CopyCount::new(input);
+        let counted = CountedBuffer::new(input);
         let written = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));

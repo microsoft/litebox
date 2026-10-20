@@ -28,7 +28,7 @@ use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
-use crate::transfer::CopyCount;
+use crate::transfer::CountedBuffer;
 use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessId, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
@@ -1377,7 +1377,7 @@ fn transport_send(
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let data = CopyCount::new(data);
+    let data = CountedBuffer::new(data);
     let outcome = state.resource.platform_socket.send(&data, flags);
     let copied = data.finish()?;
     let outcome = outcome.map_err(|error| would_block_error(error, state.nonblocking))?;
@@ -1554,7 +1554,7 @@ fn transport_send_to(
     }) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let data = CopyCount::new(data);
+    let data = CountedBuffer::new(data);
     let outcome = resource.platform_socket.send_to(&data, flags, destination);
     let copied = data.finish()?;
     let outcome = outcome.map_err(|error| would_block_error(error, nonblocking))?;
@@ -1689,7 +1689,7 @@ fn transport_receive(
     if output.is_empty() {
         return Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(0)));
     }
-    let mut output = CopyCount::new(output);
+    let mut output = CountedBuffer::new(output);
     let outcome = state.resource.platform_socket.receive(
         reader,
         &mut output,
@@ -1770,7 +1770,7 @@ fn transport_receive_from(
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let mut output = CopyCount::new(output);
+    let mut output = CountedBuffer::new(output);
     let outcome = state
         .resource
         .platform_socket

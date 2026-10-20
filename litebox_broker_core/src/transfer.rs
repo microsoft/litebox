@@ -106,13 +106,13 @@ pub fn append_to_queue(
 /// Counts the bytes copied, which must be contiguous from the buffer's start.
 /// An out-of-order copy, an overcounted direct transfer, or any fault fails
 /// the operation, whatever the backend reports.
-pub(crate) struct CopyCount<B> {
+pub(crate) struct CountedBuffer<B> {
     buffer: B,
     copied: Cell<usize>,
     failed: Cell<bool>,
 }
 
-impl<B> CopyCount<B> {
+impl<B> CountedBuffer<B> {
     pub(crate) const fn new(buffer: B) -> Self {
         Self {
             buffer,
@@ -165,13 +165,13 @@ impl<B> CopyCount<B> {
     }
 }
 
-impl<B: Buffer> Buffer for CopyCount<B> {
+impl<B: Buffer> Buffer for CountedBuffer<B> {
     fn len(&self) -> usize {
         self.buffer.len()
     }
 }
 
-impl<B: ReadBuffer> ReadBuffer for CopyCount<B> {
+impl<B: ReadBuffer> ReadBuffer for CountedBuffer<B> {
     fn copy_from_slice_at(
         &mut self,
         offset: usize,
@@ -216,7 +216,7 @@ impl<B: ReadBuffer> ReadBuffer for CopyCount<B> {
     }
 }
 
-impl<B: WriteBuffer> WriteBuffer for CopyCount<B> {
+impl<B: WriteBuffer> WriteBuffer for CountedBuffer<B> {
     fn copy_to_slice_at(
         &self,
         offset: usize,
@@ -337,9 +337,9 @@ mod tests {
     }
 
     #[test]
-    fn copy_counts_count_copies_that_run_on() {
+    fn counted_buffers_count_copies_that_run_on() {
         let mut destination = [0; 4];
-        let mut counted = CopyCount::new(&mut destination[..]);
+        let mut counted = CountedBuffer::new(&mut destination[..]);
         assert_eq!(counted.copy_from_slice_at(0, &[1]), Ok(()));
         assert_eq!(counted.copy_from_slice_at(1, &[2, 3]), Ok(()));
         assert_eq!(counted.copy_from_buffer_at(3, &vec![4u8]), Ok(()));
@@ -347,26 +347,26 @@ mod tests {
         assert_eq!(destination, [1, 2, 3, 4]);
 
         let source = [1, 2, 3, 4];
-        let counted = CopyCount::new(&source[..]);
+        let counted = CountedBuffer::new(&source[..]);
         assert_eq!(counted.copy_to_slice_at(0, &mut [0; 4]), Ok(()));
         assert_eq!(counted.finish(), Ok(4));
     }
 
     #[test]
-    fn copy_counts_fail_copies_that_skip_or_fault() {
+    fn counted_buffers_fail_copies_that_skip_or_fault() {
         let mut destination = [0; 4];
-        let mut counted = CopyCount::new(&mut destination[..]);
+        let mut counted = CountedBuffer::new(&mut destination[..]);
         assert_eq!(counted.copy_from_slice_at(1, &[2]), Err(Fault));
         assert_eq!(counted.copy_from_slice_at(0, &[1]), Err(Fault));
         assert_eq!(counted.finish(), Err(Fault.into()));
 
-        let mut counted = CopyCount::new(FaultingBuffer::new(4, 2));
+        let mut counted = CountedBuffer::new(FaultingBuffer::new(4, 2));
         assert_eq!(counted.copy_from_slice_at(0, &[1, 2]), Ok(()));
         assert_eq!(counted.copy_from_slice_at(2, &[3]), Err(Fault));
         assert_eq!(counted.finish(), Err(Fault.into()));
 
         // Copying straight into the destination's bytes faults on the source.
-        let mut counted = CopyCount::new(&mut destination[..]);
+        let mut counted = CountedBuffer::new(&mut destination[..]);
         assert_eq!(
             counted.copy_from_buffer_at(0, &FaultingBuffer::new(4, 2)),
             Err(Fault)
@@ -375,14 +375,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_counts_count_direct_transfers_up_to_their_length() {
+    fn counted_buffers_count_direct_transfers_up_to_their_length() {
         let mut destination = [0; 4];
-        let mut counted = CopyCount::new(&mut destination[..]);
+        let mut counted = CountedBuffer::new(&mut destination[..]);
         assert_eq!(counted.read_direct_at(0, 2, &mut |_| 2), Some(2));
         assert_eq!(counted.copy_from_slice_at(2, &[3]), Ok(()));
         assert_eq!(counted.finish(), Ok(3));
 
-        let mut counted = CopyCount::new(&mut destination[..]);
+        let mut counted = CountedBuffer::new(&mut destination[..]);
         assert_eq!(counted.read_direct_at(0, 1, &mut |_| 2), Some(2));
         assert_eq!(counted.finish(), Err(Fault.into()));
     }
