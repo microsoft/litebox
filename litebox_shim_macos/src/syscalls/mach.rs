@@ -98,10 +98,10 @@ impl<P: ShimPlatform> Task<P> {
                 Err(KernReturn::INVALID_ARGUMENT)
             };
         }
-        let Some(length) = size
-            .checked_add(if anywhere { 0 } else { address % PAGE_SIZE })
-            .and_then(|size| size.checked_next_multiple_of(PAGE_SIZE))
-        else {
+        // VM_SANITIZE_FLAGS_REALIGN_START: a FIXED start is truncated to its
+        // page and the size is rounded on its own, so the discarded offset
+        // does not extend the range.
+        let Some(length) = size.checked_next_multiple_of(PAGE_SIZE) else {
             return Err(KernReturn::INVALID_ARGUMENT);
         };
         let mask = mask | (PAGE_SIZE - 1);
@@ -146,10 +146,13 @@ impl<P: ShimPlatform> Task<P> {
                 .map_anonymous(hint, length, AnonymousPlacement::Hint, protection)
                 .map_err(map_error);
         }
-        // Over-reserve so an aligned start exists, then keep only that range.
-        let alignment = mask.checked_add(1).ok_or(KernReturn::NO_SPACE)?;
+        // Over-reserve so a start with no `mask` bits exists, then keep only
+        // that range. The mask need not be contiguous: like
+        // vm_map_locate_space, the start is `(reserved + mask) & !mask`,
+        // which lies at most `mask + 1 - PAGE_SIZE` above a page-aligned
+        // `reserved`.
         let padded = length
-            .checked_add(alignment - PAGE_SIZE)
+            .checked_add(mask - (PAGE_SIZE - 1))
             .ok_or(KernReturn::NO_SPACE)?;
         let reserved = self
             .map_anonymous(
@@ -159,7 +162,19 @@ impl<P: ShimPlatform> Task<P> {
                 VmProtection::empty(),
             )
             .map_err(map_error)?;
-        let start = reserved.next_multiple_of(alignment);
+        let start = reserved
+            .checked_add(mask)
+            .map(|start| start & !mask)
+            .filter(|start| {
+                start & mask == 0
+                    && start
+                        .checked_add(length)
+                        .is_some_and(|end| end <= reserved + padded)
+            });
+        let Some(start) = start else {
+            let _ = self.sys_munmap(reserved, padded);
+            return Err(KernReturn::NO_SPACE);
+        };
         for (from, to) in [(reserved, start), (start + length, reserved + padded)] {
             if from < to && self.sys_munmap(from, to - from).is_err() {
                 // The slack stays reserved; it is ours either way.

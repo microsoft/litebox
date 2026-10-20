@@ -20,6 +20,7 @@ pub mod msg_return {
     pub const SEND_MSG_TOO_SMALL: u32 = 0x1000_0008;
     pub const SEND_INVALID_REPLY: u32 = 0x1000_0009;
     pub const SEND_INVALID_RIGHT: u32 = 0x1000_000a;
+    pub const SEND_NO_BUFFER: u32 = 0x1000_000d;
     pub const SEND_TOO_LARGE: u32 = 0x1000_000e;
     pub const SEND_INVALID_TYPE: u32 = 0x1000_000f;
     pub const SEND_INVALID_HEADER: u32 = 0x1000_0010;
@@ -172,6 +173,9 @@ pub const MACH_PORT_UREFS_MAX: u32 = 0xffff;
 pub const MACH_PORT_QLIMIT_MAX: u32 = 1024;
 /// `MACH_PORT_QLIMIT_DEFAULT`.
 pub const MACH_PORT_QLIMIT_DEFAULT: u32 = 5;
+/// `MACH_PORT_QLIMIT_KERNEL`: the hard limit for messages that may exceed a
+/// port's queue limit (send-once and kernel-originated messages).
+pub const MACH_PORT_QLIMIT_KERNEL: u32 = 65534;
 /// `IPC_KMSG_MAX_BODY_SPACE`: the largest message a user may send.
 pub const MAX_MESSAGE_SIZE: u32 = (64 * 1024 * 1024 * 3) / 4 - MAX_TRAILER_SIZE;
 

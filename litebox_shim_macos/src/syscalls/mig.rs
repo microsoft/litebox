@@ -95,6 +95,9 @@ fn validate_restartable_ranges(ranges: &mut [RestartableRange]) -> KernReturn {
     KernReturn::SUCCESS
 }
 
+/// `SYNC_POLICY_FIFO | SYNC_POLICY_LIFO | SYNC_POLICY_PREPOST`.
+const SYNC_POLICY_USER_MASK: i32 = 0x2 | 0x4;
+
 /// `VM_RECLAIM_NOT_SUPPORTED`: `err_vm_reclaim(2)`.
 const VM_RECLAIM_NOT_SUPPORTED: i32 = (0x8 << 26) | (1 << 14) | 2;
 
@@ -431,12 +434,15 @@ impl<P: ShimPlatform> Task<P> {
             1 => ClockId::Calendar,
             _ => return error_reply(KernReturn::INVALID_ARGUMENT.raw()),
         };
-        let right = self
+        match self
             .global
             .ipc
             .lock()
-            .kernel_send_right(KernelObject::Clock(clock));
-        port_reply(right)
+            .kernel_send_right(KernelObject::Clock(clock))
+        {
+            Ok(right) => port_reply(right),
+            Err(code) => error_reply(code.raw()),
+        }
     }
 
     fn mig_task_info(&self, request: &Message) -> Message {
@@ -469,12 +475,12 @@ impl<P: ShimPlatform> Task<P> {
             special_port::KERNEL
             | special_port::NAME
             | special_port::INSPECT
-            | special_port::READ => Some(ipc.kernel_send_right(KernelObject::Task)),
+            | special_port::READ => ipc.kernel_send_right(KernelObject::Task).ok(),
             // The host port unless the task replaced it.
-            special_port::HOST => Some(
-                ipc.special_port(which)
-                    .unwrap_or_else(|| ipc.kernel_send_right(KernelObject::Host)),
-            ),
+            special_port::HOST => match ipc.special_port(which) {
+                Some(right) => Some(right),
+                None => ipc.kernel_send_right(KernelObject::Host).ok(),
+            },
             // No launchd, task_for_pid server, debugger, or resource-notify
             // service exists for this guest: until the task sets one, the
             // port is MACH_PORT_NULL.
@@ -524,20 +530,22 @@ impl<P: ShimPlatform> Task<P> {
         let Some(SemaphoreCreateRequest { policy, value }) = simple_request(request) else {
             return error_reply(mig::BAD_ARGUMENTS);
         };
-        // SYNC_POLICY_FIFO (0) and SYNC_POLICY_FIXED_PRIORITY (3); a
-        // negative value is invalid.
-        if value < 0 || !matches!(policy, 0 | 3) {
+        // semaphore_create: only SYNC_POLICY_USER_MASK (FIFO, LIFO, PREPOST)
+        // bits; a negative value is invalid.
+        if value < 0 || policy & !SYNC_POLICY_USER_MASK != 0 {
             return error_reply(KernReturn::INVALID_ARGUMENT.raw());
         }
-        let right = self
+        match self
             .global
             .ipc
             .lock()
             .kernel_send_right(KernelObject::Semaphore {
                 policy,
                 count: value,
-            });
-        port_reply(right)
+            }) {
+            Ok(right) => port_reply(right),
+            Err(code) => error_reply(code.raw()),
+        }
     }
 
     fn mig_semaphore_destroy(&self, request: &Message) -> Message {

@@ -20,10 +20,10 @@ use alloc::{
 use litebox_common_macos::{
     KernReturn,
     mach::{
-        MACH_PORT_DEAD, MACH_PORT_QLIMIT_DEFAULT, MACH_PORT_QLIMIT_MAX, MACH_PORT_UREFS_MAX,
-        MAX_MESSAGE_SIZE, MachMsgHeader, MachMsgMaxTrailer, MachMsgOptions, MachMsgPortDescriptor,
-        MachPortOptions, PORT_DESCRIPTOR, TRAILER_FORMAT_0, mpo, msg_return, msg_type, msgh_bits,
-        port_name_is_valid, port_right,
+        MACH_PORT_DEAD, MACH_PORT_QLIMIT_DEFAULT, MACH_PORT_QLIMIT_KERNEL, MACH_PORT_QLIMIT_MAX,
+        MACH_PORT_UREFS_MAX, MAX_MESSAGE_SIZE, MachMsgHeader, MachMsgMaxTrailer, MachMsgOptions,
+        MachMsgPortDescriptor, MachPortOptions, PORT_DESCRIPTOR, TRAILER_FORMAT_0, mpo, msg_return,
+        msg_type, msgh_bits, port_name_is_valid, port_right,
     },
     syscall::MachPortName,
     user_pointers::{UserPtr, UserPtrMut},
@@ -60,12 +60,15 @@ struct GuestQueue {
     context: u64,
     guarded: bool,
     strict_guard: bool,
+    /// `MPO_IMMOVABLE_RECEIVE`: the receive right cannot be moved.
+    immovable: bool,
 }
 
+/// A live port. A port's record is removed when it dies, so a `PortId`
+/// without a record names a dead port.
 #[derive(Debug)]
 struct Port {
     kind: PortKind,
-    active: bool,
 }
 
 type PortId = u64;
@@ -81,7 +84,7 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Entry {
     port: Option<PortId>,
     kind: EntryType,
@@ -100,6 +103,13 @@ pub(crate) enum Right {
 }
 
 impl Right {
+    fn port(self) -> Option<PortId> {
+        match self {
+            Self::Send(port) | Self::SendOnce(port) | Self::Receive(port) => Some(port),
+            Self::Dead => None,
+        }
+    }
+
     /// The disposition a receiver sees (`MACH_MSG_TYPE_PORT_*`).
     fn received_type(self) -> u32 {
         match self {
@@ -156,6 +166,15 @@ impl Message {
             sender: Sender::KERNEL,
         }
     }
+
+    /// Host memory charged to [`QUEUED_BYTES_LIMIT`] while queued.
+    fn charge(&self) -> usize {
+        message_charge(self.body.len(), self.ports.len())
+    }
+}
+
+fn message_charge(body_length: usize, port_count: usize) -> usize {
+    size_of::<Message>() + body_length + port_count * size_of::<(usize, Option<Right>)>()
 }
 
 /// `mig_reply_error_t`: NDR and a `RetCode`.
@@ -176,12 +195,37 @@ fn copyin_type(disposition: u32) -> u32 {
 /// Outcome of a failed `mach_msg2` operation.
 type MsgResult<T> = Result<T, u32>;
 
+/// Why a message could not be queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnqueueError {
+    /// The port is dead or is not a guest port.
+    Dead,
+    /// `MACH_PORT_QLIMIT_KERNEL` or the queued-bytes budget is reached.
+    Full,
+}
+
+/// Whether a send may queue on a guest port (`ipc_mqueue_send_locked`).
+enum QueueSpace {
+    Available,
+    /// The port's queue limit is reached; the sender would block.
+    Full {
+        /// `imq_full_kernel`: blocking cannot help.
+        kernel_limit: bool,
+    },
+    /// No message buffer can be allocated (the per-guest byte budget).
+    NoBuffer,
+}
+
 /// The guest task's IPC space.
 #[derive(Default)]
 pub(crate) struct IpcSpace {
     ports: BTreeMap<PortId, Port>,
     entries: BTreeMap<u32, Entry>,
+    /// Released names whose index is vacant, most recent last
+    /// (`ipc_entry_dealloc` pushes on the table's free list).
+    free_names: Vec<u32>,
     next_port: PortId,
+    /// The highest index ever handed out by [`IpcSpace::alloc_name`].
     next_index: u32,
     task: Option<PortId>,
     thread: Option<PortId>,
@@ -190,50 +234,118 @@ pub(crate) struct IpcSpace {
     /// Settable task special ports (`itk_bootstrap`, ...): a send right held
     /// by the task, keyed by `TASK_*_PORT` selector.
     special_ports: BTreeMap<i32, Right>,
+    /// Sum of [`Message::charge`] over every queued message.
+    queued_bytes: usize,
+    /// Messages whose rights are still to be released (XNU's
+    /// `ipc_kmsg_delayed_destroy` queue); drained by [`IpcSpace::reap`].
+    doomed: VecDeque<Message>,
 }
 
-/// Generation bits XNU uses for the first use of an entry index.
-const NAME_GENERATION: u32 = 3;
-const NAME_INDEX_LIMIT: u32 = 0x00ff_ffff;
+/// The low byte of a name on the first use of its index: XNU's generation
+/// with both rollover bits set, as in a native task's first name 0x103.
+const NAME_GENERATION: u32 = 0x03;
+/// `ipc_entry_next_gen` with rollover bits 3: the generation advances by
+/// `IE_BITS_GEN_ONE + (3 << IE_BITS_ROLL_BITS)` and wraps to the first one.
+const NAME_GENERATION_STEP: u8 = 0x10;
+/// `ipc_entry_table_count_max()`: `CONFIG_IPC_TABLE_ENTRIES_SIZE_MAX` (7 MiB
+/// on macOS) of 24-byte entries. Index 0 is reserved.
+const NAME_INDEX_LIMIT: u32 = (7 * 1024 * 1024 / 24) as u32;
+/// Live guest ports and semaphores. Every such port is created with a name,
+/// so this matches the name table limit.
+const LIVE_PORT_LIMIT: usize = NAME_INDEX_LIMIT as usize;
+/// Host memory all queued messages of this guest may use; past it a send
+/// fails like an `ipc_kmsg_alloc` failure (`MACH_SEND_NO_BUFFER`).
+const QUEUED_BYTES_LIMIT: usize = 256 * 1024 * 1024;
+
+fn name_index(name: u32) -> u32 {
+    name >> 8
+}
 
 impl IpcSpace {
-    fn new_port(&mut self, kind: PortKind) -> PortId {
+    fn insert_port(&mut self, kind: PortKind) -> PortId {
         self.next_port += 1;
-        self.ports
-            .insert(self.next_port, Port { kind, active: true });
+        self.ports.insert(self.next_port, Port { kind });
         self.next_port
     }
 
-    fn alloc_name(&mut self, entry: Entry) -> Result<u32, KernReturn> {
-        // Names are never reused: `(index << 8) | generation`, like a fresh
-        // XNU table entry. The first name is 0x103.
-        let index = self.next_index + 1;
-        if index >= NAME_INDEX_LIMIT {
-            return Err(KernReturn::NO_SPACE);
+    /// A guest-created port (receive right or semaphore).
+    fn new_port(&mut self, kind: PortKind) -> Result<PortId, KernReturn> {
+        if self.ports.len() >= LIVE_PORT_LIMIT {
+            return Err(KernReturn::RESOURCE_SHORTAGE);
         }
-        self.next_index = index;
-        let name = (index << 8) | NAME_GENERATION;
-        self.entries.insert(name, entry);
-        Ok(name)
+        Ok(self.insert_port(kind))
     }
 
-    fn kernel_port(&mut self, object: KernelObject) -> PortId {
+    /// Whether any name uses `index`, under any generation.
+    fn index_in_use(&self, index: u32) -> bool {
+        self.entries
+            .range(index << 8..=(index << 8) | 0xff)
+            .next()
+            .is_some()
+    }
+
+    /// `ipc_entry_claim`: reuse the most recently released index with the
+    /// next generation, else take a fresh index. Indices that hold an
+    /// explicitly inserted name are skipped.
+    fn alloc_name(&mut self, entry: Entry) -> Result<u32, KernReturn> {
+        while let Some(released) = self.free_names.pop() {
+            if self.index_in_use(name_index(released)) {
+                continue;
+            }
+            let generation = released.to_le_bytes()[0].wrapping_add(NAME_GENERATION_STEP);
+            let name = (released & !0xff) | u32::from(generation);
+            self.entries.insert(name, entry);
+            return Ok(name);
+        }
+        loop {
+            let index = self.next_index + 1;
+            if index >= NAME_INDEX_LIMIT {
+                return Err(KernReturn::NO_SPACE);
+            }
+            self.next_index = index;
+            if !self.index_in_use(index) {
+                let name = (index << 8) | NAME_GENERATION;
+                self.entries.insert(name, entry);
+                return Ok(name);
+            }
+        }
+    }
+
+    /// Name an entry with a caller-chosen name whose index is vacant
+    /// (`ipc_entry_alloc_name` takes the index off the free list).
+    fn insert_name(&mut self, name: u32, entry: Entry) {
+        let index = name_index(name);
+        self.free_names
+            .retain(|released| name_index(*released) != index);
+        self.entries.insert(name, entry);
+    }
+
+    /// `ipc_entry_dealloc`: remove a name; its index becomes reusable.
+    fn free_name(&mut self, name: u32) {
+        if self.entries.remove(&name).is_some() && name_index(name) <= self.next_index {
+            // Indices above `next_index` are reached by fresh allocation.
+            self.free_names.push(name);
+        }
+    }
+
+    /// The port of a singleton kernel object, or a new semaphore port.
+    fn kernel_port(&mut self, object: KernelObject) -> Result<PortId, KernReturn> {
         let slot = match object {
             KernelObject::Task => &mut self.task,
             KernelObject::Thread => &mut self.thread,
             KernelObject::Host => &mut self.host,
             KernelObject::Clock(id) => {
                 if let Some((_, port)) = self.clocks.iter().find(|(clock, _)| *clock == id) {
-                    return *port;
+                    return Ok(*port);
                 }
-                let port = self.new_port(PortKind::Kernel(object));
+                let port = self.insert_port(PortKind::Kernel(object));
                 self.clocks.push((id, port));
-                return port;
+                return Ok(port);
             }
             KernelObject::Semaphore { .. } => return self.new_port(PortKind::Kernel(object)),
         };
         if let Some(port) = *slot {
-            return port;
+            return Ok(port);
         }
         self.next_port += 1;
         let port = self.next_port;
@@ -242,10 +354,9 @@ impl IpcSpace {
             port,
             Port {
                 kind: PortKind::Kernel(object),
-                active: true,
             },
         );
-        port
+        Ok(port)
     }
 
     /// Replace a task special port, releasing the old right.
@@ -273,7 +384,6 @@ impl IpcSpace {
         match self.ports.get(&port) {
             Some(Port {
                 kind: PortKind::Kernel(object),
-                active: true,
             }) => Some(*object),
             _ => None,
         }
@@ -291,14 +401,12 @@ impl IpcSpace {
 
     /// Destroy a kernel object (`semaphore_destroy`): its rights become dead names.
     pub(crate) fn destroy_kernel_object(&mut self, port: PortId) {
-        if let Some(entry) = self.ports.get_mut(&port) {
-            entry.active = false;
-        }
-        self.kill_names(port);
+        self.kill_port(port);
+        self.reap();
     }
 
     fn port_is_active(&self, port: PortId) -> bool {
-        self.ports.get(&port).is_some_and(|port| port.active)
+        self.ports.contains_key(&port)
     }
 
     /// `ipc_right_check`: a send or send-once right to a dead port becomes a
@@ -370,41 +478,66 @@ impl IpcSpace {
         .unwrap_or(0)
     }
 
+    /// `ipc_object_copyout` of a right carried by a received message. A right
+    /// that cannot be named because the name table is full is destroyed and
+    /// the receiver sees `MACH_PORT_NULL`.
     fn copyout_right(&mut self, right: Option<Right>) -> u32 {
-        match right {
-            None => 0,
-            Some(Right::Dead) => MACH_PORT_DEAD,
-            Some(Right::Send(port)) => self.copyout_send(port),
-            Some(Right::SendOnce(port)) => {
+        let Some(right) = right else {
+            return 0;
+        };
+        let (port, kind, urefs) = match right {
+            Right::Dead => return MACH_PORT_DEAD,
+            Right::Send(port) => return self.copyout_send(port),
+            Right::SendOnce(port) => {
                 if !self.port_is_active(port) {
                     return MACH_PORT_DEAD;
                 }
-                self.alloc_name(Entry {
-                    port: Some(port),
-                    kind: EntryType::SEND_ONCE,
-                    urefs: 1,
-                })
-                .unwrap_or(0)
+                (port, EntryType::SEND_ONCE, 1)
             }
-            Some(Right::Receive(port)) => {
+            Right::Receive(port) => {
                 if let Some(name) = self.send_name(port) {
                     let entry = self.entries.get_mut(&name).expect("name was just found");
                     entry.kind |= EntryType::RECEIVE;
                     return name;
                 }
-                self.alloc_name(Entry {
-                    port: Some(port),
-                    kind: EntryType::RECEIVE,
-                    urefs: 0,
-                })
-                .unwrap_or(0)
+                (port, EntryType::RECEIVE, 0)
             }
+        };
+        let entry = Entry {
+            port: Some(port),
+            kind,
+            urefs,
+        };
+        self.alloc_name(entry).unwrap_or_else(|_| {
+            self.release(right);
+            0
+        })
+    }
+
+    /// `ipc_object_copyout_dest`: consume a received message's destination
+    /// right without adding a right to this space. The receiver sees its own
+    /// name for the port's receive right, or `MACH_PORT_NULL` if it no
+    /// longer holds it; a dead port reads as `MACH_PORT_DEAD`.
+    fn copyout_dest(&mut self, destination: Right) -> u32 {
+        let Some(port) = destination.port().filter(|port| self.port_is_active(*port)) else {
+            return MACH_PORT_DEAD;
+        };
+        let receiver = self.entries.iter().find_map(|(name, entry)| {
+            (entry.port == Some(port) && entry.kind.contains(EntryType::RECEIVE)).then_some(*name)
+        });
+        if let Some(name) = receiver {
+            return name;
         }
+        // The receive right moved away before copyout: a send-once right
+        // cannot be consumed quietly and fires its notification.
+        self.release(destination);
+        0
     }
 
     /// A send right to a kernel object, like `task_self_trap` and friends.
-    pub(crate) fn kernel_send_right(&mut self, object: KernelObject) -> Right {
-        Right::Send(self.kernel_port(object))
+    /// Only a new semaphore can fail, when the port budget is exhausted.
+    pub(crate) fn kernel_send_right(&mut self, object: KernelObject) -> Result<Right, KernReturn> {
+        self.kernel_port(object).map(Right::Send)
     }
 
     fn allocate_receive(&mut self, qlimit: u32, context: u64) -> Result<u32, KernReturn> {
@@ -415,7 +548,8 @@ impl IpcSpace {
             context,
             guarded: false,
             strict_guard: false,
-        }));
+            immovable: false,
+        }))?;
         self.alloc_name(Entry {
             port: Some(port),
             kind: EntryType::RECEIVE,
@@ -429,81 +563,155 @@ impl IpcSpace {
     /// Destroy a receive right: the port dies, queued messages are destroyed,
     /// and other names for it become dead names.
     fn destroy_receive(&mut self, port: PortId) {
-        let messages = match self.ports.get_mut(&port) {
-            Some(Port {
-                kind: PortKind::Guest(queue),
-                active,
-            }) => {
-                *active = false;
-                core::mem::take(&mut queue.messages)
+        self.kill_port(port);
+        self.reap();
+    }
+
+    /// The port dies: its record is reclaimed, its queued messages are
+    /// scheduled for destruction, and names for it become dead names.
+    fn kill_port(&mut self, port: PortId) {
+        if let Some(Port {
+            kind: PortKind::Guest(queue),
+        }) = self.ports.remove(&port)
+        {
+            for message in queue.messages {
+                self.queued_bytes -= message.charge();
+                self.doomed.push_back(message);
             }
-            _ => VecDeque::new(),
-        };
+        }
         self.kill_names(port);
-        for message in messages {
-            self.destroy_message(message);
+    }
+
+    /// Release the rights of every scheduled message. Destroying a message
+    /// can destroy receive rights and so schedule more messages; draining a
+    /// queue instead of recursing keeps host stack use constant however long
+    /// a guest's chain of queued receive rights is (`ipc_kmsg_reap_delayed`).
+    fn reap(&mut self) {
+        while let Some(message) = self.doomed.pop_front() {
+            self.release_right(message.destination);
+            if let Some(reply) = message.reply {
+                self.release_right(reply);
+            }
+            for right in message.ports.into_iter().filter_map(|(_, right)| right) {
+                self.release_right(right);
+            }
         }
     }
 
     /// `ipc_kmsg_destroy`: release every right a message carries.
     pub(crate) fn destroy_message(&mut self, message: Message) {
-        self.release(message.destination);
-        if let Some(reply) = message.reply {
-            self.release(reply);
-        }
-        for (_, right) in message.ports {
-            if let Some(right) = right {
-                self.release(right);
-            }
-        }
+        self.doomed.push_back(message);
+        self.reap();
     }
 
     /// Drop a right that is not in any name: a send-once right fires a
     /// send-once notification, a receive right destroys its port.
     pub(crate) fn release(&mut self, right: Right) {
+        self.release_right(right);
+        self.reap();
+    }
+
+    /// [`IpcSpace::release`] that leaves scheduled messages to the caller's
+    /// [`IpcSpace::reap`].
+    fn release_right(&mut self, right: Right) {
         match right {
             Right::Send(_) | Right::Dead => {}
-            Right::Receive(port) => self.destroy_receive(port),
+            Right::Receive(port) => self.kill_port(port),
             Right::SendOnce(port) => {
-                // MACH_NOTIFY_SEND_ONCE: delivered only to guest ports.
-                if matches!(
-                    self.ports.get(&port),
-                    Some(Port {
-                        kind: PortKind::Guest(_),
-                        active: true
-                    })
-                ) {
-                    self.enqueue(
-                        port,
-                        Message {
-                            id: mig::MACH_NOTIFY_SEND_ONCE,
-                            complex: false,
-                            destination: Right::SendOnce(port),
-                            reply: None,
-                            body: mig::ndr_body(&[]),
-                            ports: Vec::new(),
-                            sender: Sender::KERNEL,
-                        },
-                    );
-                }
+                // MACH_NOTIFY_SEND_ONCE: delivered only to guest ports. One
+                // that cannot be queued carries no other right and is dropped.
+                let _ = self.enqueue(
+                    port,
+                    Message {
+                        id: mig::MACH_NOTIFY_SEND_ONCE,
+                        complex: false,
+                        destination: Right::SendOnce(port),
+                        reply: None,
+                        body: mig::ndr_body(&[]),
+                        ports: Vec::new(),
+                        sender: Sender::KERNEL,
+                    },
+                );
             }
         }
     }
 
-    /// Queue a message on an active guest port, ignoring the queue limit (as
-    /// for kernel-originated messages); otherwise destroy it.
-    pub(crate) fn enqueue(&mut self, port: PortId, message: Message) {
-        match self.ports.get_mut(&port) {
+    /// `ipc_mqueue_send` with `MACH_SEND_ALWAYS`: queue `message` on a guest
+    /// port even past its queue limit, up to `MACH_PORT_QLIMIT_KERNEL` and
+    /// the queued-bytes budget. A message that cannot be queued is scheduled
+    /// for destruction without its destination right
+    /// (`IPC_KMSG_DESTROY_SKIP_REMOTE`), so a lost send-once notification
+    /// does not notify again; the caller reaps.
+    fn enqueue(&mut self, port: PortId, mut message: Message) -> Result<(), EnqueueError> {
+        let charge = message.charge();
+        let error = match self.ports.get_mut(&port) {
             Some(Port {
                 kind: PortKind::Guest(queue),
-                active: true,
-            }) => queue.messages.push_back(message),
-            _ => self.destroy_message(message),
+            }) => {
+                if queue.messages.len() < MACH_PORT_QLIMIT_KERNEL as usize
+                    && self.queued_bytes + charge <= QUEUED_BYTES_LIMIT
+                {
+                    queue.messages.push_back(message);
+                    self.queued_bytes += charge;
+                    return Ok(());
+                }
+                EnqueueError::Full
+            }
+            _ => EnqueueError::Dead,
+        };
+        message.destination = Right::Dead;
+        self.doomed.push_back(message);
+        Err(error)
+    }
+
+    /// Queue a kernel-originated message (a MIG reply); one that cannot be
+    /// queued is destroyed, like a failed kernel reply in `ipc_kmsg_send`.
+    pub(crate) fn enqueue_kernel(&mut self, port: PortId, message: Message) {
+        let _ = self.enqueue(port, message);
+        self.reap();
+    }
+
+    /// Whether a user message of `charge` bytes may queue on `port` now.
+    fn queue_space(&self, port: PortId, charge: usize, send_once: bool) -> QueueSpace {
+        let Some(Port {
+            kind: PortKind::Guest(queue),
+        }) = self.ports.get(&port)
+        else {
+            // Kernel objects do not queue; a dead port swallows the message.
+            return QueueSpace::Available;
+        };
+        if self.queued_bytes + charge > QUEUED_BYTES_LIMIT {
+            return QueueSpace::NoBuffer;
+        }
+        let length = queue.messages.len();
+        let kernel_limit = length >= MACH_PORT_QLIMIT_KERNEL as usize;
+        if length < queue.qlimit as usize || (send_once && !kernel_limit) {
+            QueueSpace::Available
+        } else {
+            QueueSpace::Full { kernel_limit }
         }
     }
 
+    /// Take a guest port's first message, with its sequence number and the
+    /// port's context.
+    fn dequeue(&mut self, port: PortId) -> Option<(Message, u32, u64)> {
+        let Some(Port {
+            kind: PortKind::Guest(queue),
+        }) = self.ports.get_mut(&port)
+        else {
+            return None;
+        };
+        let message = queue.messages.pop_front()?;
+        let seqno = queue.seqno;
+        queue.seqno = queue.seqno.wrapping_add(1);
+        let context = queue.context;
+        self.queued_bytes -= message.charge();
+        Some((message, seqno, context))
+    }
+
     /// `ipc_right_copyin` of `name` with `disposition` for a message header
-    /// or port descriptor.
+    /// or port descriptor. A failed copyin changes nothing except turning
+    /// rights to dead ports into dead names.
     fn copyin(&mut self, name: u32, disposition: u32) -> Result<Right, ()> {
         if name == MACH_PORT_DEAD {
             return Ok(Right::Dead);
@@ -546,7 +754,7 @@ impl IpcSpace {
                     return Err(());
                 }
                 let port = entry.port.expect("send-once rights name a port");
-                self.entries.remove(&name);
+                self.free_name(name);
                 Ok(Right::SendOnce(port))
             }
             msg_type::MOVE_RECEIVE => {
@@ -554,9 +762,25 @@ impl IpcSpace {
                     return Err(());
                 }
                 let port = entry.port.expect("receive rights name a port");
+                if let Some(Port {
+                    kind: PortKind::Guest(queue),
+                }) = self.ports.get_mut(&port)
+                {
+                    // ipc_move_receive_allowed
+                    if queue.immovable {
+                        return Err(());
+                    }
+                    // ipc_port_prepare_move: a moved receive right loses its
+                    // guard, context and sequence number.
+                    queue.guarded = false;
+                    queue.strict_guard = false;
+                    queue.context = 0;
+                    queue.seqno = 0;
+                }
+                let entry = self.entries.get_mut(&name).expect("entry was checked");
                 entry.kind.remove(EntryType::RECEIVE);
                 if entry.kind.is_empty() {
-                    self.entries.remove(&name);
+                    self.free_name(name);
                 }
                 Ok(Right::Receive(port))
             }
@@ -564,7 +788,84 @@ impl IpcSpace {
         }
     }
 
-    /// Whether `copyin(name, disposition)` would succeed, without side effects.
+    /// The joint copyin of a header whose destination and reply name the
+    /// same send right (`ipc_kmsg_copyin_dest_disposition`): each MOVE_SEND
+    /// takes one user reference, and both header fields carry a send right.
+    fn copyin_send_joint(
+        &mut self,
+        name: u32,
+        dest_type: u32,
+        reply_type: u32,
+    ) -> Result<PortId, ()> {
+        let moves = u32::from(dest_type == msg_type::MOVE_SEND)
+            + u32::from(reply_type == msg_type::MOVE_SEND);
+        let entry = self.check(name).ok_or(())?;
+        if !entry.kind.contains(EntryType::SEND) || entry.urefs < moves {
+            return Err(());
+        }
+        let port = entry.port.expect("send rights name a port");
+        if moves != 0 {
+            self.drop_urefs(name, moves);
+        }
+        Ok(port)
+    }
+
+    /// Live port records and names, for leak tests.
+    #[cfg(test)]
+    pub(crate) fn live_counts(&self) -> (usize, usize) {
+        (self.ports.len(), self.entries.len())
+    }
+
+    /// `ipc_kmsg_copyin_header_rights`: copy in the destination and reply
+    /// rights after their checks passed. Either both are copied in or the
+    /// space is left unchanged.
+    fn copyin_header(
+        &mut self,
+        dest_name: u32,
+        dest_type: u32,
+        reply_name: u32,
+        reply_type: u32,
+    ) -> MsgResult<(Right, Option<Right>)> {
+        let make =
+            |disposition| matches!(disposition, msg_type::MAKE_SEND | msg_type::MAKE_SEND_ONCE);
+        if dest_name == reply_name && !make(dest_type) && !make(reply_type) {
+            // Validation excluded MOVE_SEND_ONCE here, so both are send rights.
+            let port = self
+                .copyin_send_joint(dest_name, dest_type, reply_type)
+                .map_err(|()| msg_return::SEND_INVALID_DEST)?;
+            return Ok((Right::Send(port), Some(Right::Send(port))));
+        }
+        let saved_dest = self.entries.get(&dest_name).cloned();
+        let destination = self
+            .copyin(dest_name, dest_type)
+            .map_err(|()| msg_return::SEND_INVALID_DEST)?;
+        let reply = if port_name_is_valid(reply_name) {
+            let Ok(reply) = self.copyin(reply_name, reply_type) else {
+                // The reply was checked, so only a copyin of the destination
+                // could have invalidated it: undo that copyin.
+                self.restore_entry(dest_name, saved_dest);
+                return Err(msg_return::SEND_INVALID_REPLY);
+            };
+            Some(reply)
+        } else if reply_name == MACH_PORT_DEAD {
+            Some(Right::Dead)
+        } else {
+            None
+        };
+        Ok((destination, reply))
+    }
+
+    /// Undo a copyin from `name` by restoring its entry as saved before it.
+    /// The rights the copyin produced are dropped without being released.
+    fn restore_entry(&mut self, name: u32, saved: Option<Entry>) {
+        let Some(saved) = saved else {
+            return;
+        };
+        self.insert_name(name, saved);
+    }
+
+    /// `ipc_right_copyin_check_reply`: whether `copyin(name, disposition)`
+    /// would succeed, without side effects.
     fn can_copyin(&mut self, name: u32, disposition: u32) -> bool {
         if name == MACH_PORT_DEAD {
             return true;
@@ -573,7 +874,7 @@ impl IpcSpace {
             return false;
         };
         match disposition {
-            msg_type::MAKE_SEND | msg_type::MAKE_SEND_ONCE | msg_type::MOVE_RECEIVE => {
+            msg_type::MAKE_SEND | msg_type::MAKE_SEND_ONCE => {
                 entry.kind.contains(EntryType::RECEIVE)
             }
             msg_type::COPY_SEND | msg_type::MOVE_SEND => entry
@@ -599,7 +900,7 @@ impl IpcSpace {
         if entry.urefs == 0 {
             entry.kind.remove(EntryType::SEND | EntryType::DEAD_NAME);
             if entry.kind.is_empty() {
-                self.entries.remove(&name);
+                self.free_name(name);
             }
         }
     }
@@ -635,7 +936,7 @@ impl IpcSpace {
         };
         if entry.kind.contains(EntryType::SEND_ONCE) {
             let port = entry.port.expect("send-once rights name a port");
-            self.entries.remove(&name);
+            self.free_name(name);
             self.release(Right::SendOnce(port));
         } else if entry
             .kind
@@ -689,7 +990,7 @@ impl IpcSpace {
                 let entry = self.entries.get_mut(&name).expect("entry was checked");
                 entry.kind.remove(EntryType::RECEIVE);
                 if entry.kind.is_empty() {
-                    self.entries.remove(&name);
+                    self.free_name(name);
                 }
                 self.destroy_receive(port);
                 KernReturn::SUCCESS
@@ -703,7 +1004,7 @@ impl IpcSpace {
                 }
                 if delta == -1 {
                     let port = entry.port.expect("send-once rights name a port");
-                    self.entries.remove(&name);
+                    self.free_name(name);
                     self.release(Right::SendOnce(port));
                 }
                 KernReturn::SUCCESS
@@ -750,10 +1051,22 @@ impl IpcSpace {
         if !port_name_is_valid(poly) {
             return KernReturn::INVALID_CAPABILITY;
         }
-        if !self.can_copyin(poly, disposition) {
+        let Ok(right) = self.copyin(poly, disposition) else {
             return KernReturn::INVALID_CAPABILITY;
+        };
+        // ipc_entry_alloc_name: the index must fit the table and must not
+        // hold a different name.
+        let refusal = if name_index(name) >= NAME_INDEX_LIMIT {
+            Some(KernReturn::NO_SPACE)
+        } else if !self.entries.contains_key(&name) && self.index_in_use(name_index(name)) {
+            Some(KernReturn::FAILURE)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            self.release(right);
+            return refusal;
         }
-        let right = self.copyin(poly, disposition).expect("copyin was checked");
         let port = match right {
             Right::Send(port) | Right::SendOnce(port) => port,
             Right::Dead | Right::Receive(_) => {
@@ -788,7 +1101,7 @@ impl IpcSpace {
                 } else {
                     EntryType::SEND_ONCE
                 };
-                self.entries.insert(
+                self.insert_name(
                     name,
                     Entry {
                         port: Some(port),
@@ -848,7 +1161,7 @@ impl IpcSpace {
         let entry = self.entries.get_mut(&name).expect("entry was checked");
         entry.kind.remove(EntryType::RECEIVE);
         if entry.kind.is_empty() {
-            self.entries.remove(&name);
+            self.free_name(name);
         }
         self.destroy_receive(port);
         KernReturn::SUCCESS
@@ -895,6 +1208,7 @@ impl IpcSpace {
         {
             queue.guarded = flags & mpo::CONTEXT_AS_GUARD != 0;
             queue.strict_guard = queue.guarded && flags & mpo::STRICT != 0;
+            queue.immovable = flags & mpo::IMMOVABLE_RECEIVE != 0;
         }
         if flags & mpo::INSERT_SEND_RIGHT != 0 {
             let entry = self.entries.get_mut(&name).expect("new entry");
@@ -931,8 +1245,10 @@ impl<P: ShimPlatform> Task<P> {
 
     fn self_trap(&self, object: KernelObject) -> usize {
         let mut ipc = self.global.ipc.lock();
-        let port = ipc.kernel_port(object);
-        ipc.copyout_send(port) as usize
+        match ipc.kernel_port(object) {
+            Ok(port) => ipc.copyout_send(port) as usize,
+            Err(_) => 0,
+        }
     }
 
     pub(crate) fn sys_task_self(&self) -> usize {
@@ -1138,7 +1454,10 @@ impl<P: ShimPlatform> Task<P> {
         let body = if body_length == 0 {
             Vec::new()
         } else {
-            UserPtr::<u8>::from_usize(data + HEADER as usize)
+            let body_address = data
+                .checked_add(HEADER as usize)
+                .ok_or(msg_return::SEND_INVALID_DATA)?;
+            UserPtr::<u8>::from_usize(body_address)
                 .to_owned_slice::<P>(body_length)
                 .ok_or(msg_return::SEND_INVALID_DATA)?
                 .into_vec()
@@ -1189,56 +1508,59 @@ impl<P: ShimPlatform> Task<P> {
         let dest_live = ipc
             .check(dest_name)
             .is_some_and(|entry| !entry.kind.contains(EntryType::DEAD_NAME));
-        if !dest_live || !ipc.can_copyin(dest_name, dest_type) {
+        if !dest_live {
             return Err(msg_return::SEND_INVALID_DEST);
         }
-        if port_name_is_valid(reply_name) {
-            let reply_live = ipc.check(reply_name).is_some();
-            if !reply_live || !ipc.can_copyin(reply_name, reply_type) {
-                return Err(msg_return::SEND_INVALID_REPLY);
+        if port_name_is_valid(reply_name) && !ipc.can_copyin(reply_name, reply_type) {
+            return Err(msg_return::SEND_INVALID_REPLY);
+        }
+        let saved_dest = ipc.entries.get(&dest_name).cloned();
+        let saved_reply = ipc.entries.get(&reply_name).cloned();
+        let (destination, reply) =
+            ipc.copyin_header(dest_name, dest_type, reply_name, reply_type)?;
+        let Some(port) = destination.port() else {
+            // Unreachable: a dead destination was rejected above.
+            ipc.restore_entry(reply_name, saved_reply);
+            ipc.restore_entry(dest_name, saved_dest);
+            return Err(msg_return::SEND_INVALID_DEST);
+        };
+        // ipc_mqueue_send: if the message cannot queue, the sender gets its
+        // header rights back (mach_msg_receive_pseudo) and the error.
+        let send_once = matches!(
+            dest_type,
+            msg_type::MOVE_SEND_ONCE | msg_type::MAKE_SEND_ONCE
+        );
+        let charge = message_charge(body.len(), descriptor_count as usize);
+        let space = ipc.queue_space(port, charge, send_once);
+        if !matches!(space, QueueSpace::Available) {
+            ipc.restore_entry(reply_name, saved_reply);
+            ipc.restore_entry(dest_name, saved_dest);
+        }
+        match space {
+            QueueSpace::Available => {}
+            QueueSpace::NoBuffer => return Err(msg_return::SEND_NO_BUFFER),
+            QueueSpace::Full { kernel_limit } => {
+                if options.contains(MachMsgOptions::SEND_TIMEOUT) && timeout == 0 {
+                    return Err(msg_return::SEND_TIMED_OUT);
+                }
+                if kernel_limit {
+                    return Err(msg_return::SEND_NO_BUFFER);
+                }
+                // A full queue only drains on another thread, so the sender
+                // waits for its timeout or an interrupt.
+                drop(ipc);
+                let cx = self.wait_cx();
+                let cx = if options.contains(MachMsgOptions::SEND_TIMEOUT) {
+                    cx.with_timeout(core::time::Duration::from_millis(u64::from(timeout)))
+                } else {
+                    cx
+                };
+                return Err(match cx.sleep() {
+                    litebox::event::wait::WaitError::TimedOut => msg_return::SEND_TIMED_OUT,
+                    litebox::event::wait::WaitError::Interrupted => msg_return::SEND_INTERRUPTED,
+                });
             }
         }
-        // ipc_mqueue_send: a full queue only drains on another thread, so the
-        // sender waits for its timeout or an interrupt before any right moves.
-        let full = ipc
-            .entries
-            .get(&dest_name)
-            .and_then(|entry| entry.port)
-            .is_some_and(|port| {
-                dest_type != msg_type::MOVE_SEND_ONCE
-                    && dest_type != msg_type::MAKE_SEND_ONCE
-                    && matches!(
-                        ipc.ports.get(&port),
-                        Some(Port { kind: PortKind::Guest(queue), active: true })
-                            if queue.messages.len() >= queue.qlimit as usize
-                    )
-            });
-        if full {
-            drop(ipc);
-            let cx = self.wait_cx();
-            let cx = if options.contains(MachMsgOptions::SEND_TIMEOUT) {
-                cx.with_timeout(core::time::Duration::from_millis(u64::from(timeout)))
-            } else {
-                cx
-            };
-            return Err(match cx.sleep() {
-                litebox::event::wait::WaitError::TimedOut => msg_return::SEND_TIMED_OUT,
-                litebox::event::wait::WaitError::Interrupted => msg_return::SEND_INTERRUPTED,
-            });
-        }
-        let destination = ipc
-            .copyin(dest_name, dest_type)
-            .expect("copyin was checked");
-        let reply = if port_name_is_valid(reply_name) {
-            Some(
-                ipc.copyin(reply_name, reply_type)
-                    .expect("copyin was checked"),
-            )
-        } else if reply_name == MACH_PORT_DEAD {
-            Some(Right::Dead)
-        } else {
-            None
-        };
         let mut message = Message {
             id: header.id,
             complex,
@@ -1268,17 +1590,18 @@ impl<P: ShimPlatform> Task<P> {
                 }
                 let disposition = u32::from(descriptor.disposition);
                 let right = if port_name_is_valid(descriptor.name) {
-                    if !(msg_type::is_any_send(disposition)
-                        || disposition == msg_type::MOVE_RECEIVE)
-                        || !ipc.can_copyin(descriptor.name, disposition)
+                    let copied = if msg_type::is_any_send(disposition)
+                        || disposition == msg_type::MOVE_RECEIVE
                     {
+                        ipc.copyin(descriptor.name, disposition)
+                    } else {
+                        Err(())
+                    };
+                    let Ok(right) = copied else {
                         ipc.destroy_message(message);
                         return Err(msg_return::SEND_INVALID_RIGHT);
-                    }
-                    Some(
-                        ipc.copyin(descriptor.name, disposition)
-                            .expect("copyin was checked"),
-                    )
+                    };
+                    Some(right)
                 } else if descriptor.name == MACH_PORT_DEAD {
                     Some(Right::Dead)
                 } else {
@@ -1292,18 +1615,19 @@ impl<P: ShimPlatform> Task<P> {
         }
 
         // ipc_kmsg_send
-        let port = match destination {
-            Right::Send(port) | Right::SendOnce(port) | Right::Receive(port) => port,
-            Right::Dead => unreachable!("dead destinations were rejected"),
-        };
         if let Some(object) = ipc.kernel_object(port) {
             drop(ipc);
             self.kernel_call(object, message);
             return Ok(());
         }
-        // A message to a port whose receive right died is destroyed.
-        ipc.enqueue(port, message);
-        Ok(())
+        let queued = ipc.enqueue(port, message);
+        ipc.reap();
+        match queued {
+            // A message to a port whose receive right died is destroyed.
+            Ok(()) | Err(EnqueueError::Dead) => Ok(()),
+            // Space was checked above under the same lock.
+            Err(EnqueueError::Full) => Err(msg_return::SEND_NO_BUFFER),
+        }
     }
 
     /// Deliver a kernel-object request and queue its reply on the request's
@@ -1313,12 +1637,13 @@ impl<P: ShimPlatform> Task<P> {
         let reply_right = message.reply.take();
         let id = message.id;
         let mut reply = self.serve_mig(object, message);
-        reply.id = id + litebox_common_macos::mach::mig::REPLY_ID_OFFSET;
+        // MIG's reply id is a 32-bit addition.
+        reply.id = id.wrapping_add(litebox_common_macos::mach::mig::REPLY_ID_OFFSET);
         let mut ipc = self.global.ipc.lock();
         match reply_right {
             Some(right @ (Right::Send(port) | Right::SendOnce(port))) => {
                 reply.destination = right;
-                ipc.enqueue(port, reply);
+                ipc.enqueue_kernel(port, reply);
             }
             Some(right @ (Right::Dead | Right::Receive(_))) => {
                 ipc.release(right);
@@ -1348,12 +1673,15 @@ impl<P: ShimPlatform> Task<P> {
                 _ => return Err(msg_return::RCV_INVALID_NAME),
             }
         };
+        // A dead port also ends the wait.
         let has_message = || {
             let ipc = self.global.ipc.lock();
-            matches!(
-                ipc.ports.get(&port),
-                Some(Port { kind: PortKind::Guest(queue), active }) if !queue.messages.is_empty() || !*active
-            )
+            match ipc.ports.get(&port) {
+                Some(Port {
+                    kind: PortKind::Guest(queue),
+                }) => !queue.messages.is_empty(),
+                _ => true,
+            }
         };
         if !has_message() {
             if options.contains(MachMsgOptions::RCV_TIMEOUT) && timeout == 0 {
@@ -1379,12 +1707,13 @@ impl<P: ShimPlatform> Task<P> {
         let mut ipc = self.global.ipc.lock();
         let Some(Port {
             kind: PortKind::Guest(queue),
-            active: true,
-        }) = ipc.ports.get_mut(&port)
+        }) = ipc.ports.get(&port)
         else {
             return Err(msg_return::RCV_INVALID_NAME);
         };
-        let first = queue.messages.front().expect("a message is queued");
+        let Some(first) = queue.messages.front() else {
+            return Err(msg_return::RCV_INVALID_NAME);
+        };
         // Bodies are bounded by MAX_MESSAGE_SIZE at send time.
         let message_size = u32::try_from(HEADER + first.body.len()).expect("bounded message");
         if receive_size < message_size + trailer_size {
@@ -1392,7 +1721,8 @@ impl<P: ShimPlatform> Task<P> {
             if options.contains(MachMsgOptions::RCV_LARGE) {
                 // The message stays queued; report its size.
                 if receive_size >= 8 {
-                    let size_field = UserPtrMut::<u32>::from_usize(data + 4);
+                    let size_address = data.checked_add(4).ok_or(msg_return::RCV_INVALID_DATA)?;
+                    let size_field = UserPtrMut::<u32>::from_usize(size_address);
                     if size_field.write_at_offset::<P>(0, needed).is_none() {
                         return Err(msg_return::RCV_INVALID_DATA);
                     }
@@ -1401,18 +1731,18 @@ impl<P: ShimPlatform> Task<P> {
             }
             // mach_msg_receive_error: destroy the message, copy out the bare
             // header with the destination right.
-            let message = queue.messages.pop_front().expect("a message is queued");
-            queue.seqno = queue.seqno.wrapping_add(1);
-            let local = ipc.copyout_right(Some(message.destination));
+            let (message, _, _) = ipc.dequeue(port).expect("a message is queued");
+            let local = ipc.copyout_dest(message.destination);
             let bits = msgh_bits::ports(0, message.destination.received_type());
             let id = message.id;
             let Message { reply, ports, .. } = message;
             if let Some(reply) = reply {
-                ipc.release(reply);
+                ipc.release_right(reply);
             }
             for right in ports.into_iter().filter_map(|(_, right)| right) {
-                ipc.release(right);
+                ipc.release_right(right);
             }
+            ipc.reap();
             drop(ipc);
             let header = MachMsgHeader {
                 bits,
@@ -1435,10 +1765,7 @@ impl<P: ShimPlatform> Task<P> {
                 msg_return::RCV_INVALID_DATA
             });
         }
-        let message = queue.messages.pop_front().expect("a message is queued");
-        let seqno = queue.seqno;
-        queue.seqno = queue.seqno.wrapping_add(1);
-        let context = queue.context;
+        let (message, seqno, context) = ipc.dequeue(port).expect("a message is queued");
 
         // ipc_kmsg_copyout
         let Message {
@@ -1450,7 +1777,7 @@ impl<P: ShimPlatform> Task<P> {
             ports,
             sender,
         } = message;
-        let local = ipc.copyout_right(Some(destination));
+        let local = ipc.copyout_dest(destination);
         let remote = ipc.copyout_right(reply);
         let mut bits = msgh_bits::ports(
             reply.map_or(msg_type::NONE, Right::received_type),
@@ -1491,5 +1818,106 @@ impl<P: ShimPlatform> Task<P> {
         UserPtrMut::<u8>::from_usize(data)
             .copy_from_slice::<P>(0, &bytes)
             .ok_or(msg_return::RCV_INVALID_DATA)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn send_once_message(port: PortId, body: usize) -> Message {
+        Message {
+            destination: Right::SendOnce(port),
+            ..Message::reply(vec![0; body])
+        }
+    }
+
+    fn dead_name() -> Entry {
+        Entry {
+            port: None,
+            kind: EntryType::DEAD_NAME,
+            urefs: 1,
+        }
+    }
+
+    #[test]
+    fn queued_bytes_budget_refuses_messages_without_releasing_their_destination() {
+        let mut space = IpcSpace::default();
+        let name = space.allocate_receive(MACH_PORT_QLIMIT_DEFAULT, 0).unwrap();
+        let port = space.entries[&name].port.unwrap();
+        let room = send_once_message(port, 0).charge();
+        space.queued_bytes = QUEUED_BYTES_LIMIT - room;
+        assert!(matches!(
+            space.queue_space(port, room + 1, true),
+            QueueSpace::NoBuffer
+        ));
+        assert_eq!(
+            space.enqueue(port, send_once_message(port, 1)),
+            Err(EnqueueError::Full)
+        );
+        space.reap();
+        // The refused message's send-once destination sent no notification.
+        assert_eq!(space.enqueue(port, send_once_message(port, 0)), Ok(()));
+        assert_eq!(space.queued_bytes, QUEUED_BYTES_LIMIT);
+        let Some(Port {
+            kind: PortKind::Guest(queue),
+        }) = space.ports.get(&port)
+        else {
+            panic!("the port is alive");
+        };
+        assert_eq!(queue.messages.len(), 1);
+        space.dequeue(port).unwrap();
+        assert_eq!(space.queued_bytes, QUEUED_BYTES_LIMIT - room);
+    }
+
+    #[test]
+    fn name_table_and_port_budget_are_bounded() {
+        let mut space = IpcSpace {
+            next_index: NAME_INDEX_LIMIT - 2,
+            ..IpcSpace::default()
+        };
+        let last = space.alloc_name(dead_name()).unwrap();
+        assert_eq!(name_index(last), NAME_INDEX_LIMIT - 1);
+        assert_eq!(space.alloc_name(dead_name()), Err(KernReturn::NO_SPACE));
+        // A released index comes back with the next generation, wrapping
+        // after 0xf3.
+        space.free_name(last);
+        assert_eq!(space.alloc_name(dead_name()), Ok(last + 0x10));
+        let wrapped = (last & !0xff) | 0xf3;
+        space.free_name(last + 0x10);
+        space.entries.insert(wrapped, dead_name());
+        space.free_name(wrapped);
+        assert_eq!(space.alloc_name(dead_name()), Ok(last));
+
+        let mut space = IpcSpace::default();
+        while space.ports.len() < LIVE_PORT_LIMIT {
+            space.insert_port(PortKind::Kernel(KernelObject::Host));
+        }
+        assert_eq!(
+            space.allocate_receive(MACH_PORT_QLIMIT_DEFAULT, 0),
+            Err(KernReturn::RESOURCE_SHORTAGE)
+        );
+        assert!(
+            space
+                .kernel_send_right(KernelObject::Semaphore {
+                    policy: 0,
+                    count: 0
+                })
+                .is_err()
+        );
+        // Singleton kernel objects do not count against the budget.
+        assert!(space.kernel_send_right(KernelObject::Task).is_ok());
+    }
+
+    #[test]
+    fn reinserting_a_released_name_keeps_the_free_list_bounded() {
+        let mut space = IpcSpace::default();
+        let name = space.alloc_name(dead_name()).unwrap();
+        for _ in 0..1000 {
+            space.free_name(name);
+            space.insert_name(name, dead_name());
+        }
+        space.free_name(name);
+        assert_eq!(space.free_names, [name]);
     }
 }
