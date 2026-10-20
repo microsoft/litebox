@@ -26,8 +26,15 @@
 //! [`PendingRunnerAssociation`] ([`Association::take_pending_associations`]),
 //! for which the kernel creates a runner process and associates it
 //! ([`Broker::associate`]); the child's handshake returns its startup data.
-//! Memory images (`WriteChildMemory`) and adoption of existing runners
-//! (`StartChildWithExistingRunner`) are not supported.
+//! It can also start one with an existing runner
+//! (`StartChildWithExistingRunner`): a process clone it made (see
+//! `litebox_common_vm_abi`, `CloneKind::Process`), which the kernel associated
+//! as it made it ([`Broker::associate_clone`]). The child's queued association
+//! names the clone ([`PendingRunnerAssociation::clone_to_adopt`]), which the
+//! kernel adopts as the child's runner ([`Association::adopt`]), making the
+//! clone's handshake before it runs, so that the worker, suspended in the
+//! start, never waits for the clone. Memory images (`WriteChildMemory`) are not
+//! supported.
 //!
 //! When a process ends ([`Association::exited`]), its association ends and
 //! its broker process exits, releasing what it holds (e.g., pipe ends).
@@ -231,14 +238,45 @@ impl Broker {
                 Some(PendingRunnerAssociation {
                     process,
                     startup: None,
+                    clone: None,
                 })
             }
             (launch, _) => launch,
         };
+        Ok(self.association(shared_memory, control_ring_pages, launched, launch))
+    }
+
+    /// A process clone's association (see `litebox_common_vm_abi`,
+    /// `CloneKind::Process`), before its handshake: as a launched process's
+    /// (see [`Self::associate`]), but with no process until
+    /// [`Association::adopt`] gives it one. `control_ring_pages` must be
+    /// zeroed, as a new process's are.
+    ///
+    /// # Panics
+    ///
+    /// If `control_ring_pages` cannot hold [`CONTROL_RING_SIZE`].
+    pub fn associate_clone(
+        &self,
+        shared_memory: UserRange,
+        control_ring_pages: PinnedUserPages,
+    ) -> Association {
+        self.association(shared_memory, control_ring_pages, true, None)
+    }
+
+    /// # Panics
+    ///
+    /// If `control_ring_pages` cannot hold [`CONTROL_RING_SIZE`].
+    fn association(
+        &self,
+        shared_memory: UserRange,
+        control_ring_pages: PinnedUserPages,
+        launched: bool,
+        launch: Option<PendingRunnerAssociation>,
+    ) -> Association {
         let memory =
             PinnedControlRing::new(control_ring_pages).expect("the pages hold the control ring");
         let ring = ControlRing::new(memory).expect("a pinned control ring has the exact size");
-        Ok(Association {
+        Association {
             broker: self.clone(),
             shared_memory,
             readiness: Arc::new(KernelReadiness::new(self.woken.clone())),
@@ -250,8 +288,9 @@ impl Broker {
             exit_status: Cell::new(None),
             launcher: Arc::new(KernelProcessLauncher::default()),
             state: RefCell::new(State::New(ring, launch)),
+            adoption_response: Cell::new(None),
             submitted: Cell::new(false),
-        })
+        }
     }
 
     /// Looks at what changes outside requests: standard input, timers, and
@@ -273,6 +312,12 @@ struct KernelHostSetup {
     request: Option<BrokerHandshakeRequest>,
     response: Option<BrokerHandshakeResponse>,
 }
+
+/// The handshake request a runner makes, which the kernel makes for a
+/// process clone (see [`Association::adopt`]).
+const RUNNER_HANDSHAKE: BrokerHandshakeRequest = BrokerHandshakeRequest {
+    protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+};
 
 impl HostSetupChannel for KernelHostSetup {
     type Error = Infallible;
@@ -343,6 +388,9 @@ pub struct Association {
     /// Queues the child processes the process starts, for the kernel.
     launcher: Arc<KernelProcessLauncher>,
     state: RefCell<State>,
+    /// The response of a process clone's handshake, which [`Self::adopt`]
+    /// made, until the clone's own [`Self::handshake`] takes it.
+    adoption_response: Cell<Option<WireFrame>>,
     /// See [`Association::has_submitted`].
     submitted: Cell<bool>,
 }
@@ -443,15 +491,48 @@ impl Association {
     /// [`BrokerHandshake`](litebox_common_vm_abi::CallId::BrokerHandshake):
     /// one attempt, successful or not; success activates the control ring.
     /// Needs the process's address space, as a launched process's handshake
-    /// writes its startup data into its shared buffers.
+    /// writes its startup data into its shared buffers. For an adopted process
+    /// clone, it returns the response of the handshake that [`Self::adopt`]
+    /// made, if `request` is the one runners make.
     ///
     /// # Errors
     ///
     /// The status for the runner.
     pub fn handshake(&self, request: &WireFrame) -> Result<WireFrame, Status> {
+        let request = request
+            .as_slice()
+            .and_then(|request| wire::decode_handshake_request(request).ok())
+            .ok_or(Status::InvalidArgument);
+        if let Some(response) = self.adoption_response.take() {
+            return match request {
+                Ok(request) if request == RUNNER_HANDSHAKE => Ok(response),
+                _ => Err(Status::InvalidArgument),
+            };
+        }
+        self.connect(request)
+    }
+
+    /// Whether the association holds the response of the handshake that
+    /// [`Self::adopt`] made, which the process clone's [`Self::handshake`]
+    /// takes.
+    pub fn holds_adoption_response(&self) -> bool {
+        self.adoption_response.get().is_some()
+    }
+
+    /// Makes the association's one handshake, with `request` (or fails with
+    /// its error), as [`Self::handshake`] does.
+    fn connect(
+        &self,
+        request: Result<BrokerHandshakeRequest, Status>,
+    ) -> Result<WireFrame, Status> {
         let mut state = self.state.borrow_mut();
-        let State::New(ring, mut launch) = core::mem::replace(&mut *state, State::Ended) else {
-            return Err(Status::Denied);
+        let (ring, mut launch) = match core::mem::replace(&mut *state, State::Ended) {
+            State::New(ring, launch) => (ring, launch),
+            // Left as it was (e.g., active, on a repeated handshake).
+            other => {
+                *state = other;
+                return Err(Status::Denied);
+            }
         };
         let (process, startup) = match &mut launch {
             Some(launch) => (Some(launch.process.clone()), launch.startup.take()),
@@ -459,9 +540,7 @@ impl Association {
         };
         // `launch` lives until the end, so a failed handshake fails the start
         // (see `PendingRunnerAssociation`'s `Drop`).
-        let request =
-            wire::decode_handshake_request(request.as_slice().ok_or(Status::InvalidArgument)?)
-                .map_err(|_| Status::InvalidArgument)?;
+        let request = request?;
         let shared_buffers = SharedBufferPool::new(
             UserSharedMemory::new(self.shared_memory),
             SHARED_BUFFER_LAYOUT,
@@ -587,10 +666,11 @@ impl Association {
 
     /// The child processes the process started since the last call, in order,
     /// for the caller to create a runner process for each (see
-    /// [`Broker::associate`]) or fail ([`PendingRunnerAssociation::fail`]). The
-    /// request that started one keeps the worker suspended until the child
-    /// starts or fails (see [`Self::serve`]); dropping a pending association
-    /// fails it too.
+    /// [`Broker::associate`]), or adopt the process clone it names as its
+    /// runner ([`PendingRunnerAssociation::clone_to_adopt`]), or fail it
+    /// ([`PendingRunnerAssociation::fail`]). The request that started one
+    /// keeps the worker suspended until the child starts or fails (see
+    /// [`Self::serve`]); dropping a pending association fails it too.
     pub fn take_pending_associations(&self) -> Vec<PendingRunnerAssociation> {
         core::mem::take(&mut *self.launcher.pending.lock())
     }
@@ -603,6 +683,43 @@ impl Association {
     /// Whether the process is a launched one (see [`Broker::associate`]).
     pub fn is_launched(&self) -> bool {
         self.launched
+    }
+
+    /// Adopts the process clone this association is for (see
+    /// [`Broker::associate_clone`]) as the runner of `launch`'s process
+    /// (`StartChildWithExistingRunner`): makes the clone's handshake as its
+    /// runner would, which completes the start before the clone runs; the
+    /// clone's own [`Self::handshake`] then returns the response. Needs the
+    /// clone's address space current, with the kernel's faults on its user
+    /// memory handled (see `litebox_platform_vm_kernel::with_user_faults`), as
+    /// the handshake writes the startup data into its shared buffers.
+    ///
+    /// # Errors
+    ///
+    /// [`BrokerError::PolicyDenied`] unless the association is a clone's that
+    /// no start adopted and that has not ended, or [`BrokerError::PeerClosed`]
+    /// if the handshake fails; either fails `launch`.
+    pub fn adopt(&self, launch: PendingRunnerAssociation) -> Result<(), BrokerError> {
+        let adoptable =
+            self.launched && self.process.get().is_none() && self.exit_status.get().is_none();
+        if adoptable
+            && let Ok(mut state) = self.state.try_borrow_mut()
+            && let State::New(_, pending @ None) = &mut *state
+        {
+            let _ = self.process.set(launch.process.clone());
+            *pending = Some(launch);
+        } else {
+            launch.fail(BrokerError::PolicyDenied);
+            return Err(BrokerError::PolicyDenied);
+        }
+        match self.connect(Ok(RUNNER_HANDSHAKE)) {
+            Ok(response) if matches!(*self.state.borrow(), State::Active(_)) => {
+                self.adoption_response.set(Some(response));
+                Ok(())
+            }
+            // Dropping `launch` failed the start.
+            _ => Err(BrokerError::PeerClosed),
+        }
     }
 
     /// The process ended (e.g., it exited, or the kernel killed it) with
@@ -848,16 +965,27 @@ impl Drop for Association {
 }
 
 /// A child process to start (`StartChild`), for which the kernel creates a
-/// runner process (see [`Association::take_pending_associations`]), or a root
+/// runner process (see [`Association::take_pending_associations`]), or adopts a
+/// process clone as its runner (`StartChildWithExistingRunner`), or a root
 /// under the virtual init (see [`Broker::associate`]). Dropping it before the
 /// process's handshake fails the start.
 pub struct PendingRunnerAssociation {
     process: Arc<BrokerProcess>,
     /// Until the handshake takes it; a root has none.
     startup: Option<ProcessStartupData>,
+    /// See [`Self::clone_to_adopt`].
+    clone: Option<u64>,
 }
 
 impl PendingRunnerAssociation {
+    /// For a start with an existing runner (`StartChildWithExistingRunner`),
+    /// the process clone it names, which the kernel adopts as its runner
+    /// ([`Association::adopt`]) only if the starting process made the clone.
+    /// `None` for a runner process to create.
+    pub fn clone_to_adopt(&self) -> Option<u64> {
+        self.clone
+    }
+
     /// Fails to start the process, e.g., if its runner process cannot be
     /// created.
     pub fn fail(self, error: BrokerError) {
@@ -885,6 +1013,25 @@ struct KernelProcessLauncher {
     pending: spin::Mutex<Vec<PendingRunnerAssociation>>,
 }
 
+impl KernelProcessLauncher {
+    /// Queues `launch`, and suspends the worker until its process started or
+    /// failed: meanwhile, the kernel creates its runner process, or adopts the
+    /// process clone it names as its runner.
+    fn start(&self, launch: PendingRunnerAssociation) -> Result<(), BrokerError> {
+        let process = launch.process.clone();
+        self.pending.lock().push(launch);
+        loop {
+            if let Some(result) = process.startup_result() {
+                return result;
+            }
+            assert!(
+                litebox_platform_vm_kernel::worker::suspend(None),
+                "requests are served on the worker"
+            );
+        }
+    }
+}
+
 impl ProcessLauncher for KernelProcessLauncher {
     fn launch(
         self: Arc<Self>,
@@ -897,40 +1044,40 @@ impl ProcessLauncher for KernelProcessLauncher {
             PendingRunnerAssociation {
                 process,
                 startup: Some(startup),
+                clone: None,
             }
             .fail(BrokerError::UnsupportedOperation);
             return Err(BrokerError::UnsupportedOperation);
         }
-        self.pending.lock().push(PendingRunnerAssociation {
-            process: process.clone(),
+        self.start(PendingRunnerAssociation {
+            process,
             startup: Some(startup),
-        });
-        // The kernel creates its runner process while the worker is
-        // suspended; the request completes once it started or failed.
-        loop {
-            if let Some(result) = process.startup_result() {
-                return result;
-            }
-            assert!(
-                litebox_platform_vm_kernel::worker::suspend(None),
-                "requests are served on the worker"
-            );
-        }
+            clone: None,
+        })
     }
 
+    /// The runner must be a process clone that the parent made, which
+    /// `runner_descriptor` names (see
+    /// [`PendingRunnerAssociation::clone_to_adopt`]).
     fn launch_existing(
         self: Arc<Self>,
         _parent_process_id: ProcessId,
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
-        _runner_descriptor: Vec<u8>,
+        runner_descriptor: Vec<u8>,
     ) -> Result<(), BrokerError> {
-        PendingRunnerAssociation {
+        let clone = litebox_common_vm_abi::decode_clone_descriptor(&runner_descriptor);
+        let launch = PendingRunnerAssociation {
             process,
             startup: Some(startup),
+            clone,
+        };
+        if clone.is_none() {
+            log::warn!("rejected a runner descriptor that names no process clone");
+            launch.fail(BrokerError::PolicyDenied);
+            return Err(BrokerError::PolicyDenied);
         }
-        .fail(BrokerError::UnsupportedOperation);
-        Err(BrokerError::UnsupportedOperation)
+        self.start(launch)
     }
 
     fn create_image(&self, _capacity: u64) -> Result<Box<dyn ProcessImage>, BrokerError> {

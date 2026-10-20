@@ -25,6 +25,7 @@
 extern crate alloc;
 
 pub mod kcall;
+pub mod process;
 /// Only for runners, which are bare-metal programs; host builds (e.g., tests)
 /// keep `std`'s entry, allocator, and panic handler.
 #[cfg(target_os = "none")]
@@ -34,7 +35,7 @@ mod timer;
 
 pub use timer::Timer;
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use litebox::mm::vmap::{
     NoopPhysPageMapInfo, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
@@ -298,25 +299,38 @@ pub trait NotificationReceiver: Sync {
 }
 
 impl VmUserland {
-    /// Dispatches the broker notifications that interrupt the process. At
-    /// most once.
+    /// Dispatches the broker notifications that interrupt the process. Once,
+    /// and again in a process clone, which forgets its parent's (see
+    /// [`process`]).
     ///
     /// # Panics
     ///
-    /// On a second call.
+    /// If one is set.
     pub fn set_notification_receiver(&self, receiver: &'static dyn NotificationReceiver) {
-        let mut set = false;
-        TIMED_WAIT.receiver.call_once(|| {
-            set = true;
-            receiver
-        });
+        // A thin pointer, for the atomic.
+        let receiver = alloc::boxed::Box::leak(alloc::boxed::Box::new(receiver));
+        let set = TIMED_WAIT
+            .receiver
+            .compare_exchange(
+                core::ptr::null_mut(),
+                receiver,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
         assert!(set, "the notification receiver is already set");
     }
 }
 
+/// See [`VmUserland::set_notification_receiver`].
+fn notification_receiver() -> Option<&'static dyn NotificationReceiver> {
+    // Safety: null, or leaked by `set_notification_receiver`.
+    unsafe { TIMED_WAIT.receiver.load(Ordering::Acquire).as_ref() }.copied()
+}
+
 /// Dispatches the notifications an interrupt may be for.
 pub(crate) fn drain_notifications() {
-    if let Some(receiver) = TIMED_WAIT.receiver.get() {
+    if let Some(receiver) = notification_receiver() {
         receiver.drain();
     }
 }
@@ -326,7 +340,7 @@ pub(crate) fn drain_notifications() {
 /// this runner does not take interrupts for (e.g., notifications it receives
 /// only by waiting).
 pub(crate) fn interrupts_for_shim() -> bool {
-    TIMED_WAIT.receiver.get().is_some() || timer::any()
+    notification_receiver().is_some() || timer::any()
 }
 
 /// What [`RawMutex`] needs for waits, which get no platform reference; set
@@ -334,12 +348,14 @@ pub(crate) fn interrupts_for_shim() -> bool {
 struct TimedWait {
     /// [`StartupInfo::clock_khz`], for [`now`].
     clock_khz: AtomicU64,
-    receiver: spin::Once<&'static dyn NotificationReceiver>,
+    /// A leaked receiver, or null. No lock, which a thread could hold as the
+    /// process is cloned (see [`process`]).
+    receiver: AtomicPtr<&'static dyn NotificationReceiver>,
 }
 
 static TIMED_WAIT: TimedWait = TimedWait {
     clock_khz: AtomicU64::new(0),
-    receiver: spin::Once::new(),
+    receiver: AtomicPtr::new(core::ptr::null_mut()),
 };
 
 /// An instant on the kernel clock (see `litebox_common_vm_abi`); `from_nanos`

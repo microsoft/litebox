@@ -1,0 +1,22 @@
+[
+  { "argv": ["/fork", "thread"], "expect_stdout": "thread: 5\n" },
+  { "argv": ["/fork-pie", "thread"], "expect_stdout": "thread: 5\n" },
+  { "argv": ["/fork-dyn", "thread"], "expect_stdout": "thread: 5\n" },
+  {
+    "argv": ["/fork-dyn", "exec"],
+    "expect_stdout": "argv[0] = /args\nargv[1] = exit\nargv[2] = 5\nchild exited: 5\n",
+    "expect_stderr": "to stderr\n"
+  },
+  { "argv": ["/fork", "signal"], "expect_stdout": "child killed: 15\n" },
+  { "argv": ["/fork", "alarm"], "expect_stdout": "alarm: parent 1 child 0\n" },
+  { "argv": ["/fork", "cow"], "expect_stdout": "cow: child 0 parent 1\n" },
+  {
+    "argv": ["/fork", "shared"],
+    "expect_stdout": "shared: EAGAIN\nafter unmap: 0\n"
+  },
+  { "argv": ["/fork", "spawned"], "expect_stdout": "chain: 3\nspawned: 0\n" },
+  {
+    "argv": ["/fork", "orphan"],
+    "expect_stdout": "parent exits\norphan's parent: 1\n"
+  }
+]

@@ -93,6 +93,15 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
         unsafe { self.buddy_allocator.lock().add_to_heap(addr, addr + size) };
     }
 
+    /// Runs `f` with the allocator locked, its locks taken in the order allocations take them,
+    /// e.g., so that a copy of the process made in `f` has a copy of the allocator that no other
+    /// thread was changing. `f` must not allocate or free, which would deadlock.
+    pub fn with_locked<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _slab = self.slab_allocator.lock();
+        let _buddy = self.buddy_allocator.lock();
+        f()
+    }
+
     /// Allocates a new [`ObjectPage`] from the System.
     fn alloc_page(&self) -> Option<&'static mut ObjectPage<'static>> {
         self.allocate_pages(Self::BASE_PAGE_SIZE_ORDER).map(|r| {

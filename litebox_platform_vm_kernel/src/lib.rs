@@ -696,6 +696,18 @@ impl VmKernel {
     pub fn clone_address_space(&self, source: AddressSpaceId) -> Result<AddressSpaceId, Errno> {
         self.page_table_manager.clone_task_page_table(source)
     }
+
+    /// How many address spaces are registered (see
+    /// [`Self::create_address_space`]).
+    pub fn address_space_count(&self) -> usize {
+        self.page_table_manager.task_page_tables.read().len()
+    }
+
+    /// How many frames address spaces share copy-on-write (see
+    /// [`Self::clone_address_space`]).
+    pub fn shared_frame_count(&self) -> usize {
+        crate::arch::mm::paging::shared_frames().len()
+    }
 }
 
 /// See [`VmKernel::pin_user_pages`]. The process may write these pages at any
@@ -1130,6 +1142,24 @@ impl UserThreadState {
             gs_base: VirtAddr::new(gs_base),
             ..Self::default()
         })
+    }
+
+    /// A copy, with the same extended state and GS base, for
+    /// [`resume_thread_ref`] to continue it with. XSAVEOPT may save to a
+    /// buffer only after an XRSTOR from it, so the copy's area, a new buffer,
+    /// is saved with XSAVE until restored.
+    #[must_use]
+    pub fn duplicate(&self) -> Self {
+        Self {
+            area: self.area.clone(),
+            xsaved: match self.xsaved {
+                per_cpu::XsaveState::NeverSaved => per_cpu::XsaveState::NeverSaved,
+                per_cpu::XsaveState::Saved | per_cpu::XsaveState::Restored => {
+                    per_cpu::XsaveState::Saved
+                }
+            },
+            gs_base: self.gs_base,
+        }
     }
 }
 

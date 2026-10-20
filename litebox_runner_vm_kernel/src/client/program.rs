@@ -23,6 +23,9 @@
 //! `stdin`, `expect_stdout`, or `expect_stderr`, and at most one takes
 //! `console_stdin`.
 //!
+//! Debug builds also check that each entry's processes, once they all ended,
+//! left nothing behind in the kernel (see [`Programs::check_released`]).
+//!
 //! Output also goes to the console, as it would without this client.
 
 use crate::service::program::{Programs, Reply};
@@ -220,6 +223,9 @@ fn run_group(first: usize, runs: Vec<Run>, service: &mut Programs, stdio: &Stdio
     let output = stdio.take();
     for ((index, run), reply) in (first..).zip(runs).zip(replies) {
         check(index, run, reply, &output);
+    }
+    if cfg!(debug_assertions) {
+        service.check_released();
     }
 }
 

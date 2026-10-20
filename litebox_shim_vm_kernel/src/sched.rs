@@ -14,6 +14,9 @@
 //! A thread runs until it stops (exits, or, for the main thread, waits for a
 //! request; or its process dies), blocks in a broker or futex wait, or its
 //! slice of [`QUANTUM`] ends; preemption and blocking are transparent to it.
+//! A thread that clones its process stops in the call, for the clone to be
+//! made once its run ended (see `crate::fork`); it keeps the rest of its
+//! slice, to release what it held across the call.
 //! A slice ends early once another may run (a blocked thread's deadline or
 //! notification, or the worker's deadline or a device interrupt), and a
 //! thread alone has none. Only user mode is preempted.
@@ -27,7 +30,7 @@
 //! only when nothing can run.
 
 use crate::thread::{FutexState, Thread};
-use crate::{Inner, Running, Suspended};
+use crate::{Inner, Running, State, Suspended};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -85,8 +88,9 @@ impl Scheduler {
         self.0.borrow_mut().processes.push(process);
     }
 
-    /// See [`RunQueue::reap`].
-    pub(crate) fn reap(&self) {
+    /// Drops the dead processes, but one the broker's worker serves, which
+    /// releases their address spaces unless a [`crate::Process`] holds them.
+    pub fn reap(&self) {
         self.0.borrow_mut().reap();
     }
 }
@@ -221,19 +225,34 @@ impl RunQueue {
             .chain(slice)
             .chain(worker_wake)
             .min();
+        // Run from the next step on.
+        let mut clones = Vec::new();
         loop {
-            process.run_slice(thread, slice_end);
+            clones.extend(process.run_slice(thread, slice_end));
+            // Those that ended (e.g., replaced by a later one): freed here,
+            // between runs, as freeing one switches address spaces.
+            clones.retain(|clone| !clone.is_dead());
+            debug_assert!(
+                clones.len() <= 1,
+                "a process has at most one clone to adopt"
+            );
             // The slice may have been cut short (see `Inner::share_cpu`).
             slice_end = process.slice_end.get();
-            if thread.suspended.get() != Suspended::Yielded || serving.is_some() {
-                break;
+            match thread.suspended.get() {
+                // Served at once, it keeps the rest of its slice, unless the
+                // request waits for a device.
+                Suspended::Yielded if serving.is_none() => {
+                    if process.work(false) == Ran::Suspended {
+                        *serving = Some(process.clone());
+                        break;
+                    }
+                }
+                // It keeps the rest of its slice too, for the runner to let go
+                // of what it held across the call.
+                Suspended::Cloned { .. } => {}
+                _ => break,
             }
-            // Served at once, it keeps the rest of its slice, unless the
-            // request waits for a device, or another may run now.
-            if process.work(false) == Ran::Suspended {
-                *serving = Some(process.clone());
-                break;
-            }
+            // Unless another may run now.
             let now = process.platform.now();
             if process.is_stopped()
                 || slice_end.is_some_and(|slice_end| now >= slice_end)
@@ -242,6 +261,7 @@ impl RunQueue {
                 break;
             }
         }
+        processes.extend(clones);
         *next = index + 1;
         // Including that slice, but not threads that were waiting.
         let least = runnable()
@@ -349,8 +369,13 @@ impl Inner {
     /// `thread`'s [`Turn`]; ends its wait first, if it can.
     fn turn(&self, thread: &Thread) -> Turn {
         // Before polling a wait, which a stopped process's threads have none
-        // of to end.
-        if thread.exited.get() || self.is_stopped() {
+        // of to end. A clone that was not adopted runs nothing, and a thread
+        // is made a process clone of once its run ends, never later.
+        if thread.exited.get()
+            || self.is_stopped()
+            || matches!(*self.state.borrow(), State::Cloned { .. })
+            || matches!(thread.suspended.get(), Suspended::Forking { .. })
+        {
             return Turn::Stopped;
         }
         let suspended = thread.suspended.get();
@@ -395,8 +420,9 @@ impl Inner {
 
 impl Inner {
     /// Runs `thread` until it stops, blocks, or `slice_end` passes (none:
-    /// until it stops or blocks).
-    fn run_slice(&self, thread: &Thread, slice_end: Option<Instant>) {
+    /// until it stops or blocks). Returns the process clone it made, if any
+    /// (see `crate::fork`), for the scheduler to run.
+    fn run_slice(&self, thread: &Thread, slice_end: Option<Instant>) -> Option<Rc<Self>> {
         let start = self.platform.now();
         self.slice_end.set(slice_end);
         let new = self.is_new();
@@ -423,12 +449,18 @@ impl Inner {
             }
         }
         self.deactivate_thread(thread);
+        // Once the run saved the thread's state.
+        let clone = match thread.suspended.get() {
+            Suspended::Forking { slot } => self.fork(thread, slot),
+            _ => None,
+        };
         thread.charge(self.platform, start);
         if thread.exited.get() {
             self.reap(thread);
         } else if thread.suspended.get() == Suspended::No && !self.is_stopped() {
             self.kill("returned to the kernel without waiting");
         }
+        clone
     }
 
     /// Has the worker serve what the process submitted, or `resume` serving

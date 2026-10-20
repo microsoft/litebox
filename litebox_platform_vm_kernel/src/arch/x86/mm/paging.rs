@@ -252,6 +252,11 @@ impl SharedFrames {
         true
     }
 
+    /// How many frames are shared.
+    pub(crate) fn len(&self) -> usize {
+        self.blocks.values().map(|block| block.shared).sum()
+    }
+
     /// Whether no block is left, as none is once no frame is shared.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
