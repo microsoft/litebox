@@ -8,7 +8,7 @@
 //! cache required by dynamically linked executables.
 
 use crate::{ShimPlatform, Task};
-use alloc::{borrow::Cow, ffi::CString, format, vec, vec::Vec};
+use alloc::{borrow::Cow, ffi::CString, vec, vec::Vec};
 use core::ops::Range;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::ReinterpretSignedExt as _;
@@ -261,27 +261,37 @@ pub(super) fn load<P: ShimPlatform>(
     if let Some(dyld) = &dyld {
         *task.global.privately_mapped_dyld_range.lock() = Some(dyld.header..dyld.end);
     }
-    let mut apple = vec![
-        CString::new(format!("executable_path={path}"))
-            .map_err(|_| MachoLoaderError::Invalid("executable path"))?,
-    ];
-    if uses_dyld {
-        apple.push(
-            CString::new(format!("executable_mh=0x{:x}", main.header))
-                .map_err(|_| MachoLoaderError::Invalid("executable header"))?,
-        );
-    }
-    let stack_base = reserve(
+    let guard = reserve(
         task,
         STACK_SIZE + PAGE_SIZE,
         litebox::platform::page_mgmt::AllocationDirection::TopDown,
-    )? + PAGE_SIZE;
+    )?;
+    let stack_base = guard + PAGE_SIZE;
     // Keep the guard page inaccessible; this fixed-size stack must not use IS_STACK grow-down.
     protect(
         task,
         stack_base..stack_base + STACK_SIZE,
         VmProtection::READ | VmProtection::WRITE,
     )?;
+    let main_stack = stack::MainStack {
+        top: stack_base + STACK_SIZE,
+        size: STACK_SIZE,
+        allocation: guard,
+        allocation_size: STACK_SIZE + PAGE_SIZE,
+    };
+    // libSystem's initializers require the entropy keys; self-contained static
+    // executables cannot consume them, so they start without a broker request.
+    let entropy = if uses_dyld {
+        let mut entropy = [0u8; stack::APPLE_ENTROPY_BYTES];
+        task.global
+            .litebox
+            .fill_random(&mut entropy)
+            .map_err(|_| MachoLoaderError::Entropy)?;
+        Some(stack::AppleEntropy::from_bytes(&entropy))
+    } else {
+        None
+    };
+    let apple = stack::apple_strings(path, &main_stack, entropy.as_ref())?;
     let sp = stack::initialize::<P>(
         stack_base,
         argv,

@@ -9,7 +9,8 @@
 .global _start
 .p2align 2
 _start:
-    // argc, argv terminator, envp, and executable_path apple entry.
+    // argc, argv terminator, envp, and apple[]: executable_path, main_stack
+    // and security_config (no entropy keys for static executables).
     ldr x9, [sp]
     cmp x9, #3
     b.ne fail
@@ -27,6 +28,14 @@ _start:
     cmp w10, #'e'
     b.ne fail
     ldr x9, [sp, #64]
+    ldrb w10, [x9]
+    cmp w10, #'m'
+    b.ne fail
+    ldr x9, [sp, #72]
+    ldrb w10, [x9]
+    cmp w10, #'s'
+    b.ne fail
+    ldr x9, [sp, #80]
     cbnz x9, fail
 
     mov x19, sp

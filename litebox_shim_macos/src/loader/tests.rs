@@ -190,16 +190,27 @@ fn filesystem_loader_runs_linked_static_macho() {
         Platform::TASK_ADDR_MIN + (Platform::TASK_ADDR_MAX - Platform::TASK_ADDR_MIN) / 2;
     assert!(sp >= midpoint, "stack was not placed top-down: {sp:#x}");
     assert_eq!(word(sp), argument_count);
-    for terminator in [argv_end, envp_end, apple_start + 1] {
-        assert_eq!(word(sp + terminator * size_of::<usize>()), 0);
-    }
-    let apple = b"executable_path=/bin/main\0";
-    assert_eq!(
-        read_bytes(word(sp + apple_start * size_of::<usize>()), apple.len()),
-        apple
-    );
     let stack_end = (sp + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let guard = stack_end - STACK_SIZE - PAGE_SIZE;
+    // A static executable starts without the entropy keys.
+    let apple = [
+        std::string::String::from("executable_path=/bin/main"),
+        std::format!(
+            "main_stack={stack_end:#x},{STACK_SIZE:#x},{guard:#x},{:#x}",
+            STACK_SIZE + PAGE_SIZE
+        ),
+        std::string::String::from("security_config=0x0"),
+    ];
+    for terminator in [argv_end, envp_end, apple_start + apple.len()] {
+        assert_eq!(word(sp + terminator * size_of::<usize>()), 0);
+    }
+    for (index, expected) in apple.iter().enumerate() {
+        let address = word(sp + (apple_start + index) * size_of::<usize>());
+        assert_eq!(
+            read_bytes(address, expected.len() + 1),
+            [expected.as_bytes(), b"\0"].concat()
+        );
+    }
     assert!(
         !task
             .global

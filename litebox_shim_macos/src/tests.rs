@@ -39,6 +39,68 @@ fn syscall_return_registers_and_carry() {
     assert_eq!(ctx.regs[1], 0x1234);
 }
 
+#[test]
+fn platform_syscall_sets_and_gets_tsd_base_like_xnu() {
+    use litebox::platform::{ArchSpecificProvider as _, ArchSpecificRegister};
+    use litebox_common_macos::syscall::PLATFORM_SYSCALL_SELECTOR;
+
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    let platform = task.global.platform;
+    let original = platform
+        .get_arch_specific_register(&ArchSpecificRegister::TpidrroEl0)
+        .unwrap();
+    let _restore = litebox::utils::defer(|| {
+        platform
+            .set_arch_specific_register(&ArchSpecificRegister::TpidrroEl0, original)
+            .unwrap();
+    });
+    let tsd_base = Platform::TASK_ADDR_MIN + 0x1230;
+    let mut ctx = PtRegs::default();
+    // Upper x16 and x3 bits are ignored, as XNU reads them as 32-bit values.
+    ctx.regs[16] = 0xdead_0000_0000_0000 | PLATFORM_SYSCALL_SELECTOR as usize;
+    ctx.regs[0] = tsd_base;
+    ctx.regs[3] = 0xffff_ffff_0000_0002;
+    ctx.pstate = 0x2000_0000; // carry set
+    task.handle_syscall_request(&mut ctx);
+    assert_eq!(ctx.regs[0], tsd_base, "set leaves x0 unchanged");
+    assert_eq!(ctx.pstate, 0x2000_0000, "no BSD carry semantics");
+    assert_eq!(
+        platform
+            .get_arch_specific_register(&ArchSpecificRegister::TpidrroEl0)
+            .unwrap(),
+        tsd_base
+    );
+
+    ctx.regs[0] = 0;
+    ctx.regs[3] = 3;
+    ctx.pstate = 0;
+    task.handle_syscall_request(&mut ctx);
+    assert_eq!(ctx.regs[0], tsd_base);
+    assert_eq!(ctx.pstate, 0);
+
+    // Unknown and removed cache-flush codes have no effect.
+    for code in [0, 1, 4] {
+        ctx.regs[0] = 0x55;
+        ctx.regs[3] = code;
+        task.handle_syscall_request(&mut ctx);
+        assert_eq!(ctx.regs[0], 0x55);
+        assert_eq!(ctx.pstate, 0);
+    }
+
+    // machine_thread_set_tsd_base clears addresses beyond the task's map.
+    ctx.regs[0] = Platform::TASK_ADDR_MAX + 1;
+    ctx.regs[3] = 2;
+    task.handle_syscall_request(&mut ctx);
+    assert_eq!(ctx.regs[0], Platform::TASK_ADDR_MAX + 1);
+    assert_eq!(
+        platform
+            .get_arch_specific_register(&ArchSpecificRegister::TpidrroEl0)
+            .unwrap(),
+        0
+    );
+    assert_eq!(task.process.exit_status(), None);
+}
+
 fn loaded_program(task: Task<Platform>) -> LoadedProgram<Platform> {
     let process = task.process.clone();
     LoadedProgram {

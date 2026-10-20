@@ -5,7 +5,9 @@
 .global _start
 .p2align 2
 _start:
-    // argc and the argv/envp/apple terminators.
+    // argc and the argv/envp terminators, then apple[]: executable_path,
+    // main_stack and security_config (no entropy keys for static executables)
+    // and its terminator.
     ldr x9, [sp]
     cmp x9, #1
     b.ne fail
@@ -13,7 +15,7 @@ _start:
     cbnz x9, fail
     ldr x9, [sp, #32]
     cbnz x9, fail
-    ldr x9, [sp, #48]
+    ldr x9, [sp, #64]
     cbnz x9, fail
 
     // Initialized data must survive loading and be writable.
