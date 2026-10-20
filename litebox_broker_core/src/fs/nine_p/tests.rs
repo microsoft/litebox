@@ -540,6 +540,30 @@ fn test_nine_p_broken_read() {
     assert!(matches!(result, Err(ReadError::Io)));
 }
 
+/// A read whose connection breaks after its first `Tread` returns what that `Tread` read.
+#[test]
+fn test_nine_p_broken_read_after_progress() {
+    let server = DiodServer::start();
+
+    let data: alloc::vec::Vec<u8> = (0..100_000)
+        .map(|i: usize| u8::try_from(i % 251).unwrap())
+        .collect();
+    std::fs::write(server.export_path().join("read_me.bin"), &data).unwrap();
+
+    // 5 writes: version + attach + walk + lopen + the first Tread. The second Tread fails.
+    let fs = connect_9p_broken(&server, 5);
+    let mut fd = fs
+        .open(USER, "/read_me.bin", OFlags::RDONLY, Mode::empty())
+        .expect("open should succeed before break");
+
+    let mut buf = alloc::vec![0u8; data.len()];
+    let n = fs
+        .read(&mut fd, &mut buf, None)
+        .expect("read should return the first Tread's bytes");
+    assert!(n > 0 && n < data.len());
+    assert_eq!(buf[..n], data[..n]);
+}
+
 /// Writing to an fd obtained before the break should fail.
 #[test]
 fn test_nine_p_broken_write() {
