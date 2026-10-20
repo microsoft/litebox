@@ -268,7 +268,8 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     }
 }
 
-// TODO: Preserve guest XSAVE state once SNP floating-point support is implemented.
+// TODO: Preserve guest XSAVE state; signal frames currently expose only this
+// initial-state placeholder until SNP floating-point support is implemented.
 impl litebox::platform::GuestVectorStateProvider for SnpLinuxKernel {
     type GuestVectorState = litebox_common_linux::GuestVectorState;
 

@@ -19,7 +19,10 @@ use std::os::raw::c_void;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use litebox::arch::x86_64::xstate::{XsaveArea, XsaveChunk, XsaveLayout, XsaveLegacyArea};
+use litebox::arch::x86_64::xstate::{
+    XFeatureMask, XSAVE_HEADER_OFFSET, XsaveArea, XsaveChunk, XsaveHeader, XsaveLayout,
+    XsaveLegacyArea,
+};
 use litebox::platform::page_mgmt::{
     AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
@@ -496,7 +499,8 @@ static HOST_MXCSR: u32 = core::arch::x86_64::_MM_MASK_MASK;
 fn debug_assert_host_fx_control_state() {
     #[cfg(debug_assertions)]
     {
-        const HOST_MXCSR_CONTROL_MASK: u32 = 0xffc0;
+        use litebox::arch::x86_64::xstate::Mxcsr;
+        const HOST_MXCSR_CONTROL_MASK: u32 = Mxcsr::all().difference(Mxcsr::EXCEPTION_FLAGS).bits();
         let mut x87_control_word = 0_u16;
         let mut mxcsr = 0_u32;
         unsafe {
@@ -526,7 +530,7 @@ fn restore_xsave_to_context(
         CONTEXT_XSTATE_AMD64, LocateXStateFeature, SetXStateFeaturesMask, XSAVE_FORMAT,
     };
 
-    let legacy_state = xsave.materialized_legacy_area();
+    let legacy_state = xsave.sanitized_legacy_area();
     context.MxCsr = legacy_state.mxcsr;
     // SAFETY: XSAVE_FORMAT is Windows' representation of the architectural
     // legacy area, and its size is checked above.
@@ -560,6 +564,55 @@ fn restore_xsave_to_context(
     // SAFETY: The context owns initialized XSTATE storage for the enabled features.
     let ok = unsafe { SetXStateFeaturesMask(context, xstate_bv & layout.mask) };
     assert_ne!(ok, 0, "SetXStateFeaturesMask failed");
+}
+
+/// Converts the FP state in a Windows context to a standard-layout XSAVE area,
+/// the inverse of [`restore_xsave_to_context`].
+fn xsave_from_context(
+    context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) -> XsaveArea {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT_XSTATE_AMD64, GetXStateFeaturesMask, LocateXStateFeature,
+    };
+
+    let layout = XsaveLayout::get();
+    let mut bytes = vec![0_u8; layout.size];
+    // SAFETY: FltSave is Windows' representation of the architectural legacy
+    // area, whose size is checked above, and `bytes` holds at least that much.
+    unsafe {
+        core::ptr::from_ref(&context.Anonymous.FltSave)
+            .cast::<u8>()
+            .copy_to_nonoverlapping(bytes.as_mut_ptr(), size_of::<XsaveLegacyArea>());
+    }
+    // Windows contexts always hold materialized x87 and SSE state.
+    let mut xstate_bv = XFeatureMask::LEGACY.bits();
+    if context.ContextFlags & CONTEXT_XSTATE_AMD64 == CONTEXT_XSTATE_AMD64 {
+        let mut features = 0;
+        // SAFETY: The context has initialized XSTATE storage, checked above.
+        let ok = unsafe { GetXStateFeaturesMask(context, &raw mut features) };
+        assert_ne!(ok, 0, "GetXStateFeaturesMask failed");
+        for component in &layout.components {
+            if features & (1 << component.id) == 0 {
+                continue;
+            }
+            let mut length = 0;
+            // SAFETY: The context has initialized XSTATE storage, checked above.
+            let source =
+                unsafe { LocateXStateFeature(context, component.id, &raw mut length).cast::<u8>() };
+            assert!(!source.is_null());
+            assert_eq!(length as usize, component.size);
+            bytes[component.offset..component.offset + component.size]
+                // SAFETY: Windows reports `length` valid bytes at `source`.
+                .copy_from_slice(unsafe { core::slice::from_raw_parts(source, component.size) });
+            xstate_bv |= 1 << component.id;
+        }
+    }
+    let header = XsaveHeader {
+        xstate_bv,
+        ..Default::default()
+    };
+    bytes[XSAVE_HEADER_OFFSET..][..size_of::<XsaveHeader>()].copy_from_slice(header.as_bytes());
+    XsaveArea::from_bytes(&bytes, layout).expect("Windows captured restorable XSAVE state")
 }
 
 /// Represents an extended CPU context, including the XSAVE area.
@@ -1125,7 +1178,16 @@ impl<const ALIGN: usize> litebox::platform::GuestVectorStateProvider for Windows
         let tls = get_tls_ptr().expect("current thread is not managed by LiteBox");
         // SAFETY: managed threads own their TLS until `run_thread_arch` returns,
         // and guest state is accessed only while execution is on the host.
-        unsafe { (&*(*tls).guest_xsave_area.get()).clone() }
+        let tls = unsafe { &*tls };
+        match tls.guest_xstate_format.get() {
+            // SAFETY: the guest XSAVE area has no overlapping access while on the host.
+            GuestXstateFormat::Native => unsafe { (&*tls.guest_xsave_area.get()).clone() },
+            // Exceptions and interrupts capture the live state in `continue_context`.
+            // SAFETY: no other code accesses `continue_context` while on the host.
+            GuestXstateFormat::Windows => {
+                xsave_from_context(unsafe { &*(*tls.continue_context.get()).as_ptr() })
+            }
+        }
     }
 
     fn set_guest_vector_state(&self, state: &Self::GuestVectorState) {
@@ -2390,7 +2452,7 @@ mod tests {
                 self.calls.set(call);
                 // SAFETY: This is the active guest's host callback; capture has finished.
                 let area = unsafe { &*(*crate::get_tls_ptr().unwrap()).guest_xsave_area.get() };
-                let legacy = area.materialized_legacy_area();
+                let legacy = area.sanitized_legacy_area();
                 assert_eq!(legacy.control_word, TEST_CW);
                 assert_eq!(legacy.status_word & pending_status, pending_status);
                 assert_eq!(legacy.mxcsr, TEST_MXCSR);

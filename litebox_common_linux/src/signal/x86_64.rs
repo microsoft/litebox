@@ -3,10 +3,26 @@
 
 //! Definitions for x86_64 signal context structures.
 
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+/// `FpxSwBytes::magic1` value marking an XSAVE-format FP state.
+pub const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+/// Trailer stored immediately after the XSAVE area of a signal frame.
+pub const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+/// Size of the `FP_XSTATE_MAGIC2` trailer.
+pub const FP_XSTATE_MAGIC2_SIZE: usize = size_of::<u32>();
+
+/// `Ucontext::flags` bit: the FP state is in XSAVE format.
+pub const UC_FP_XSTATE: usize = 0x1;
+/// `Ucontext::flags` bit: `Sigcontext::ss` holds the interrupted SS.
+pub const UC_SIGCONTEXT_SS: usize = 0x2;
+/// `Ucontext::flags` bit: `rt_sigreturn` restores SS as saved.
+pub const UC_STRICT_RESTORE_SS: usize = 0x4;
+
+/// Software-reserved bytes describing the XSAVE layout of a signal frame,
+/// stored in the otherwise unused tail of the legacy FP area.
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, Immutable, IntoBytes)]
 pub struct FpxSwBytes {
     pub magic1: u32,
     pub extended_size: u32,
@@ -48,6 +64,8 @@ pub struct Sigcontext {
     pub reserved1: [u64; 8],
 }
 
+/// Linux's signal-frame view of the architectural FXSAVE area: same layout as
+/// `XsaveLegacyArea`, with Linux metadata in the otherwise unused tail.
 #[repr(C)]
 #[derive(Clone)]
 pub struct FpState {

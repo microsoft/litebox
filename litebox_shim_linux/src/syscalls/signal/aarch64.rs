@@ -117,6 +117,9 @@ pub(super) fn restart_syscall(ctx: &mut PtRegs, syscall_instruction_len: usize) 
     ctx.pc = ctx.pc.wrapping_sub(syscall_instruction_len);
 }
 
+/// AArch64 has no red zone below the stack pointer.
+pub(super) const RED_ZONE_SIZE: usize = 0;
+
 pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> Option<usize> {
     let frame_addr = sp.checked_sub(core::mem::size_of::<SignalFrame>())?;
     // Linux AArch64 signal entry requires a 16-byte-aligned stack pointer.

@@ -1601,6 +1601,10 @@ unsafe extern "C" fn exception_signal_handler(
 ) {
     #[cfg(target_arch = "aarch64")]
     let faulting_pc: usize = context.uc_mcontext.pc.trunc();
+    #[cfg(target_arch = "x86_64")]
+    let faulting_pc: usize = context.uc_mcontext.gregs[libc::REG_RIP as usize]
+        .reinterpret_as_unsigned()
+        .trunc();
 
     // Staging can raise SIGSEGV/SIGBUS with `in_guest` set; fix up before checking it.
     #[cfg(target_arch = "aarch64")]
@@ -1611,7 +1615,6 @@ unsafe extern "C" fn exception_signal_handler(
     }
 
     // Transition faults are host faults: `in_guest` and SP may be inconsistent.
-    #[cfg(target_arch = "aarch64")]
     if in_switch_to_guest(faulting_pc) {
         return unsafe { next_signal_handler(signum, info, context) };
     }

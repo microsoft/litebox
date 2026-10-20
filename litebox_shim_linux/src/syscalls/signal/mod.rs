@@ -12,6 +12,8 @@ mod x86_64;
 use aarch64 as arch;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86_64::max_signal_frame_size;
 
 use litebox_common_linux::signal::SignalDisposition;
 use zerocopy::FromZeros;
@@ -528,15 +530,19 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         sigreturn_trampoline: usize,
     ) -> Result<(), DeliverFault> {
         let sp = arch::sp(ctx);
-        let on_alt_stack = is_on_stack(&self.altstack.get(), sp);
         let altstack = self.altstack.get();
+        // Like Linux, overflow checks use the interrupted SP, while switching
+        // is judged below the red zone: a red zone reaching into the
+        // alternate stack counts as already being on it.
+        let nested_alt_stack = is_on_stack(&altstack, sp);
         let switch_stacks = action.flags.contains(SaFlags::ONSTACK)
-            && !on_alt_stack
+            && !is_on_stack(&altstack, sp.wrapping_sub(arch::RED_ZONE_SIZE))
             && !altstack.flags.contains(SsFlags::DISABLE);
+        // Only the interrupted stack's red zone is skipped.
         let sp = if switch_stacks {
             altstack.sp.wrapping_add(altstack.size)
         } else {
-            sp
+            sp.checked_sub(arch::RED_ZONE_SIZE).ok_or(DeliverFault)?
         };
 
         let frame_addr = arch::get_signal_frame(sp, action).ok_or(DeliverFault)?;
@@ -550,7 +556,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         let frame_prefix = 0;
         let frame_start = frame_addr.checked_sub(frame_prefix).ok_or(DeliverFault)?;
 
-        if (switch_stacks || on_alt_stack) && !is_on_stack(&altstack, frame_start) {
+        if (switch_stacks || nested_alt_stack) && !is_on_stack(&altstack, frame_start) {
             return Err(DeliverFault);
         }
 
@@ -705,32 +711,32 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(0)
     }
 
-    pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
+    /// Returns the restored return register, or 0 after forcing `SIGSEGV` for a bad frame.
+    pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> usize {
         let uctx_addr = arch::uctx_addr(ctx);
         let uctx_ptr = UserPtr::<Ucontext>::from_usize(uctx_addr);
         let Some(uctx) = uctx_ptr.read_at_offset::<Platform>(0) else {
-            self.force_signal(Signal::SIGSEGV, false);
-            return Err(Errno::EFAULT);
+            return self.sigreturn_bad_frame();
         };
 
         // Linux installs the signal mask before validating and restoring the
         // machine context. A malformed context therefore still changes it.
         self.signals.set_signal_mask(uctx.sigmask);
 
-        #[cfg(target_arch = "aarch64")]
-        let result = {
-            let Some(result) = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext)
-            else {
-                self.force_signal(Signal::SIGSEGV, false);
-                return Err(Errno::EFAULT);
-            };
-            result
+        let Some(result) = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext)
+        else {
+            return self.sigreturn_bad_frame();
         };
-        #[cfg(target_arch = "x86_64")]
-        let result = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext);
         // Restore the alternate signal stack, ignoring errors.
         self.signals.set_sigaltstack(uctx.stack).ok();
-        Ok(result)
+        result
+    }
+
+    /// Fails `rt_sigreturn` like Linux: `SIGSEGV` is forced and the syscall
+    /// returns 0 into whatever context was restored.
+    fn sigreturn_bad_frame(&self) -> usize {
+        self.force_signal(Signal::SIGSEGV, false);
+        0
     }
 
     pub(crate) fn sys_rt_sigaction(

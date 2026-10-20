@@ -4,29 +4,100 @@
 //! Host-independent x86-64 XSAVE layout discovery and aligned state storage.
 
 use alloc::{boxed::Box, vec, vec::Vec};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 /// Size of the architectural legacy x87/SSE save area.
-const XSAVE_LEGACY_SIZE: usize = core::mem::size_of::<XsaveLegacyArea>();
+pub const XSAVE_LEGACY_SIZE: usize = core::mem::size_of::<XsaveLegacyArea>();
 /// Offset of the XSAVE header in a standard-layout save area.
-const XSAVE_HEADER_OFFSET: usize = XSAVE_LEGACY_SIZE;
+pub const XSAVE_HEADER_OFFSET: usize = XSAVE_LEGACY_SIZE;
 /// Size of the architectural XSAVE header.
-const XSAVE_HEADER_SIZE: usize = core::mem::size_of::<XsaveHeader>();
+pub const XSAVE_HEADER_SIZE: usize = core::mem::size_of::<XsaveHeader>();
 
-/// Architectural x86-64 FXSAVE area at the start of a standard XSAVE area.
+bitflags::bitflags! {
+    /// x86-64 XCR0 and XSTATE_BV feature bits used by signal-state handling.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct XFeatureMask: u64 {
+        /// x87 state.
+        const X87 = 1 << 0;
+        /// SSE state (XMM registers and MXCSR).
+        const SSE = 1 << 1;
+        /// Upper halves of the YMM registers.
+        const AVX = 1 << 2;
+        /// State components held in the legacy area.
+        const LEGACY = Self::X87.bits() | Self::SSE.bits();
+    }
+}
+
+bitflags::bitflags! {
+    /// x86-64 MXCSR control and status bits.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Mxcsr: u32 {
+        /// Invalid operation flag.
+        const IE = 1 << 0;
+        /// Denormal flag.
+        const DE = 1 << 1;
+        /// Divide-by-zero flag.
+        const ZE = 1 << 2;
+        /// Overflow flag.
+        const OE = 1 << 3;
+        /// Underflow flag.
+        const UE = 1 << 4;
+        /// Precision flag.
+        const PE = 1 << 5;
+        /// Denormals are zeros.
+        const DAZ = 1 << 6;
+        /// Invalid operation mask.
+        const IM = 1 << 7;
+        /// Denormal operation mask.
+        const DM = 1 << 8;
+        /// Divide-by-zero mask.
+        const ZM = 1 << 9;
+        /// Overflow mask.
+        const OM = 1 << 10;
+        /// Underflow mask.
+        const UM = 1 << 11;
+        /// Precision mask.
+        const PM = 1 << 12;
+        /// Rounding control field.
+        const RC = 0b11 << 13;
+        /// Flush to zero.
+        const FZ = 1 << 15;
+    }
+}
+
+impl Mxcsr {
+    /// All sticky SIMD floating-point exception flags.
+    pub const EXCEPTION_FLAGS: Self = Self::IE
+        .union(Self::DE)
+        .union(Self::ZE)
+        .union(Self::OE)
+        .union(Self::UE)
+        .union(Self::PE);
+    /// All SIMD floating-point exception masks.
+    pub const EXCEPTION_MASKS: Self = Self::IM
+        .union(Self::DM)
+        .union(Self::ZM)
+        .union(Self::OM)
+        .union(Self::UM)
+        .union(Self::PM);
+    /// Supported bits implied by a zero MXCSR_MASK, on processors without DAZ.
+    pub const DEFAULT_MASK: Self = Self::all().difference(Self::DAZ);
+}
+
+/// Architectural x86-64 FXSAVE area at the start of a standard XSAVE area, in
+/// the 64-bit format written by `FXSAVE64` and `XSAVE64`.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
 pub struct XsaveLegacyArea {
     pub control_word: u16,
     pub status_word: u16,
     pub tag_word: u8,
     pub reserved1: u8,
     pub error_opcode: u16,
-    pub error_offset: u32,
-    pub error_selector: u16,
-    pub reserved2: u16,
-    pub data_offset: u32,
-    pub data_selector: u16,
-    pub reserved3: u16,
+    /// Last x87 instruction pointer (FIP).
+    pub instruction_pointer: u64,
+    /// Last x87 data operand pointer (FDP).
+    pub data_pointer: u64,
     pub mxcsr: u32,
     pub mxcsr_mask: u32,
     pub float_registers: [[u8; 16]; 8],
@@ -36,30 +107,13 @@ pub struct XsaveLegacyArea {
 
 impl Default for XsaveLegacyArea {
     fn default() -> Self {
-        Self {
-            control_word: 0,
-            status_word: 0,
-            tag_word: 0,
-            reserved1: 0,
-            error_opcode: 0,
-            error_offset: 0,
-            error_selector: 0,
-            reserved2: 0,
-            data_offset: 0,
-            data_selector: 0,
-            reserved3: 0,
-            mxcsr: 0,
-            mxcsr_mask: 0,
-            float_registers: [[0; 16]; 8],
-            xmm_registers: [[0; 16]; 16],
-            reserved4: [0; 96],
-        }
+        Self::new_zeroed()
     }
 }
 
 /// Architectural header following the legacy area in an XSAVE area.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
 pub struct XsaveHeader {
     /// Bitmap of state components that are not in their initial state.
     pub xstate_bv: u64,
@@ -70,17 +124,13 @@ pub struct XsaveHeader {
 
 impl Default for XsaveHeader {
     fn default() -> Self {
-        Self {
-            xstate_bv: 0,
-            xcomp_bv: 0,
-            reserved: [0; 48],
-        }
+        Self::new_zeroed()
     }
 }
 
 /// An initialized, 64-byte-aligned storage chunk for CPU or host context buffers.
 #[repr(C, align(64))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, FromBytes, Immutable, IntoBytes, KnownLayout)]
 pub struct XsaveChunk(
     /// The chunk's raw storage bytes.
     pub [u8; 64],
@@ -96,6 +146,8 @@ pub struct XsaveLayout {
     pub components: Vec<XsaveComponent>,
     /// Whether the CPU supports XSAVEOPT.
     pub xsaveopt: bool,
+    /// MXCSR bits the host accepts.
+    pub mxcsr_mask: u32,
 }
 
 /// An extended state component in the standard XSAVE layout.
@@ -174,7 +226,27 @@ impl XsaveLayout {
             mask,
             components,
             xsaveopt,
+            mxcsr_mask: detect_mxcsr_mask(),
         }
+    }
+}
+
+/// Reads the host's supported MXCSR bits from the FXSAVE area.
+fn detect_mxcsr_mask() -> u32 {
+    let mut area: [XsaveChunk; XSAVE_LEGACY_SIZE / size_of::<XsaveChunk>()] =
+        FromZeros::new_zeroed();
+    // SAFETY: FXSAVE64 only writes the 512-byte legacy area to this
+    // sufficiently aligned buffer.
+    unsafe {
+        core::arch::asm!(
+            "fxsave64 [{}]",
+            in(reg) area.as_mut_ptr(),
+            options(nostack, preserves_flags),
+        );
+    }
+    match XsaveLegacyArea::read_from_bytes(area.as_bytes()) {
+        Ok(legacy) if legacy.mxcsr_mask != 0 => legacy.mxcsr_mask,
+        _ => Mxcsr::DEFAULT_MASK.bits(),
     }
 }
 
@@ -189,7 +261,7 @@ impl XsaveArea {
     /// Architectural initial x87 control word, used when x87 is in init state.
     pub const GUEST_INITIAL_X87_CONTROL_WORD: u16 = 0x037f;
     /// Architectural initial MXCSR, with all SIMD exceptions masked.
-    pub const GUEST_INITIAL_MXCSR: u32 = 0x1f80;
+    pub const GUEST_INITIAL_MXCSR: u32 = Mxcsr::EXCEPTION_MASKS.bits();
 
     /// Allocates initial CPU state for the given layout.
     ///
@@ -205,21 +277,27 @@ impl XsaveArea {
             layout.size >= XSAVE_HEADER_OFFSET + XSAVE_HEADER_SIZE,
             "XSAVE layout must include the legacy area and header",
         );
-        let chunks = layout.size.div_ceil(size_of::<XsaveChunk>());
-        let mut area = Self {
-            storage: vec![XsaveChunk([0; 64]); chunks].into_boxed_slice(),
-            size: layout.size,
-        };
-        area.legacy_area_mut().mxcsr = Self::GUEST_INITIAL_MXCSR;
+        let mut area = Self::zeroed(layout);
+        area.set_initial_controls();
         area
     }
 
     /// Discards saved state and restores architectural initial state without
     /// replacing the aligned allocation.
     pub fn reset_to_initial(&mut self) {
-        for chunk in &mut self.storage {
-            chunk.0.fill(0);
+        self.storage.as_mut_bytes().fill(0);
+        self.set_initial_controls();
+    }
+
+    fn zeroed(layout: &XsaveLayout) -> Self {
+        let chunks = layout.size.div_ceil(size_of::<XsaveChunk>());
+        Self {
+            storage: vec![XsaveChunk([0; 64]); chunks].into_boxed_slice(),
+            size: layout.size,
         }
+    }
+
+    fn set_initial_controls(&mut self) {
         self.legacy_area_mut().mxcsr = Self::GUEST_INITIAL_MXCSR;
     }
 
@@ -230,8 +308,7 @@ impl XsaveArea {
         unsafe { &*self.as_ptr().cast() }
     }
 
-    /// Returns mutable access to the architectural x87/SSE state.
-    pub fn legacy_area_mut(&mut self) -> &mut XsaveLegacyArea {
+    fn legacy_area_mut(&mut self) -> &mut XsaveLegacyArea {
         // SAFETY: storage is 64-byte aligned and always contains the 512-byte legacy area.
         unsafe { &mut *self.as_mut_ptr().cast() }
     }
@@ -243,8 +320,7 @@ impl XsaveArea {
         unsafe { &*self.as_ptr().add(XSAVE_HEADER_OFFSET).cast() }
     }
 
-    /// Returns mutable access to the architectural XSAVE header.
-    pub fn header_mut(&mut self) -> &mut XsaveHeader {
+    fn header_mut(&mut self) -> &mut XsaveHeader {
         // SAFETY: storage contains the header at its architectural offset.
         unsafe { &mut *self.as_mut_ptr().add(XSAVE_HEADER_OFFSET).cast() }
     }
@@ -252,7 +328,7 @@ impl XsaveArea {
     /// Returns a complete legacy area with architectural initial state
     /// substituted for components that are not present in `XSTATE_BV`.
     #[must_use]
-    pub fn materialized_legacy_area(&self) -> XsaveLegacyArea {
+    pub fn sanitized_legacy_area(&self) -> XsaveLegacyArea {
         let saved = self.legacy_area();
         let mut state = XsaveLegacyArea {
             control_word: Self::GUEST_INITIAL_X87_CONTROL_WORD,
@@ -261,21 +337,57 @@ impl XsaveArea {
             ..Default::default()
         };
         let xstate_bv = self.xstate_bv();
-        if xstate_bv & 1 != 0 {
+        if xstate_bv & XFeatureMask::X87.bits() != 0 {
             state.control_word = saved.control_word;
             state.status_word = saved.status_word;
             state.tag_word = saved.tag_word;
             state.error_opcode = saved.error_opcode;
-            state.error_offset = saved.error_offset;
-            state.error_selector = saved.error_selector;
-            state.data_offset = saved.data_offset;
-            state.data_selector = saved.data_selector;
+            state.instruction_pointer = saved.instruction_pointer;
+            state.data_pointer = saved.data_pointer;
             state.float_registers = saved.float_registers;
         }
-        if xstate_bv & 2 != 0 {
+        if xstate_bv & XFeatureMask::SSE.bits() != 0 {
             state.xmm_registers = saved.xmm_registers;
         }
         state
+    }
+
+    /// Sanitizes this area into the form a non-optimized XSAVE would have saved,
+    /// which Linux exposes in signal frames (cf. Linux's former
+    /// `fpstate_sanitize_xstate`).
+    ///
+    /// XSAVEOPT skips components in their initial state, leaving stale bytes.
+    /// Here every initial component holds its initial value, x87 and SSE are
+    /// marked present so edits to them take effect, and MXCSR_MASK reports the
+    /// host value. The area remains valid for restoring.
+    pub fn sanitize(&mut self, layout: &XsaveLayout) {
+        let xstate_bv = self.xstate_bv();
+        let legacy = self.legacy_area_mut();
+        if xstate_bv & XFeatureMask::X87.bits() == 0 {
+            legacy.control_word = Self::GUEST_INITIAL_X87_CONTROL_WORD;
+            legacy.status_word = 0;
+            legacy.tag_word = 0;
+            legacy.error_opcode = 0;
+            legacy.instruction_pointer = 0;
+            legacy.data_pointer = 0;
+            legacy.float_registers = Default::default();
+        }
+        if xstate_bv & XFeatureMask::SSE.bits() == 0 {
+            legacy.xmm_registers = Default::default();
+        }
+        legacy.reserved1 = 0;
+        legacy.reserved4 = [0; 96];
+        // The stored mask is only trustworthy when XSAVE wrote it: initial and
+        // reset areas hold 0, areas accepted by `from_bytes` hold whatever the
+        // guest wrote (XRSTOR ignores the field), and software-built (SNP) or
+        // Windows-context areas may differ. Signal frames must report the host's.
+        legacy.mxcsr_mask = layout.mxcsr_mask;
+        for component in &layout.components {
+            if xstate_bv & (1 << component.id) == 0 {
+                self.as_bytes_mut()[component.offset..component.offset + component.size].fill(0);
+            }
+        }
+        self.header_mut().xstate_bv = xstate_bv | XFeatureMask::LEGACY.bits();
     }
 
     /// Returns the aligned buffer address, valid for this area's lifetime.
@@ -295,29 +407,37 @@ impl XsaveArea {
     /// Returns the logical XSAVE bytes, excluding trailing allocation padding.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `size` is the requested layout size used to allocate enough
-        // whole chunks, and the allocation remains live for the returned borrow.
-        unsafe { core::slice::from_raw_parts(self.as_ptr(), self.size) }
+        &self.storage.as_bytes()[..self.size]
+    }
+
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.storage.as_mut_bytes()[..self.size]
     }
 
     /// Reconstructs a standard-layout XSAVE area from untrusted bytes.
     ///
-    /// Returns `None` if the size, component mask, format, or reserved fields
-    /// could make restoring the state invalid for `layout`.
+    /// Returns `None` if the size, component mask, format, reserved fields, or
+    /// MXCSR would make restoring the state fault for `layout`, as standard-form
+    /// XRSTOR does. Header bytes that XRSTOR ignores are cleared.
     #[must_use]
     pub fn from_bytes(bytes: &[u8], layout: &XsaveLayout) -> Option<Self> {
+        /// Reserved header bytes that standard-form XRSTOR requires to be zero,
+        /// following XSTATE_BV and XCOMP_BV.
+        const CHECKED_RESERVED: usize = 8;
+
         if bytes.len() != layout.size {
             return None;
         }
-        let mut area = Self::initial(layout);
-        // SAFETY: source and destination are distinct valid buffers of exactly
-        // `layout.size` bytes.
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), area.as_mut_ptr(), bytes.len()) };
+        let mut area = Self::zeroed(layout);
+        area.as_bytes_mut().copy_from_slice(bytes);
+        // Older processors also checked these bytes; clearing them keeps the
+        // restore valid everywhere.
+        area.header_mut().reserved[CHECKED_RESERVED..].fill(0);
         let header = area.header();
         if header.xcomp_bv != 0
             || header.xstate_bv & !layout.mask != 0
-            || header.reserved != [0; 48]
-            || area.legacy_area().mxcsr & !0xffff != 0
+            || header.reserved[..CHECKED_RESERVED] != [0; CHECKED_RESERVED]
+            || area.legacy_area().mxcsr & !layout.mxcsr_mask != 0
         {
             return None;
         }
@@ -328,5 +448,99 @@ impl XsaveArea {
     #[must_use]
     pub fn xstate_bv(&self) -> u64 {
         self.header().xstate_bv
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::offset_of;
+
+    const MXCSR_OFFSET: usize = offset_of!(XsaveLegacyArea, mxcsr);
+    const FIP_OFFSET: usize = offset_of!(XsaveLegacyArea, instruction_pointer);
+    const FDP_OFFSET: usize = offset_of!(XsaveLegacyArea, data_pointer);
+    const XMM_OFFSET: usize = offset_of!(XsaveLegacyArea, xmm_registers);
+    const FLOAT_OFFSET: usize = offset_of!(XsaveLegacyArea, float_registers);
+
+    fn initial_bytes() -> Vec<u8> {
+        XsaveArea::initial(XsaveLayout::get()).as_bytes().to_vec()
+    }
+
+    fn with(mut bytes: Vec<u8>, offset: usize, value: &[u8]) -> Vec<u8> {
+        bytes[offset..offset + value.len()].copy_from_slice(value);
+        bytes
+    }
+
+    #[test]
+    fn from_bytes_rejects_state_that_xrstor_faults_on() {
+        let layout = XsaveLayout::get();
+        assert!(XsaveArea::from_bytes(&initial_bytes(), layout).is_some());
+        assert!(XsaveArea::from_bytes(&initial_bytes()[1..], layout).is_none());
+        let rejects = |offset, value: &[u8]| {
+            XsaveArea::from_bytes(&with(initial_bytes(), offset, value), layout).is_none()
+        };
+        assert!(rejects(XSAVE_HEADER_OFFSET, &(!layout.mask).to_ne_bytes()));
+        assert!(rejects(XSAVE_HEADER_OFFSET + 8, &1_u64.to_ne_bytes()));
+        assert!(rejects(XSAVE_HEADER_OFFSET + 16, &[1]));
+        assert!(rejects(MXCSR_OFFSET, &(!layout.mxcsr_mask).to_ne_bytes()));
+    }
+
+    #[test]
+    fn from_bytes_clears_header_bytes_xrstor_ignores() {
+        let layout = XsaveLayout::get();
+        let bytes = with(initial_bytes(), XSAVE_HEADER_OFFSET + 24, &[0xff; 40]);
+        let area = XsaveArea::from_bytes(&bytes, layout).unwrap();
+        assert_eq!(area.header().reserved, [0; 48]);
+    }
+
+    #[test]
+    fn sanitize_replaces_stale_initial_components() {
+        let layout = XsaveLayout::get();
+        let mut bytes = with(initial_bytes(), FLOAT_OFFSET, &[0xaa; 384]);
+        bytes = with(bytes, FIP_OFFSET, &u64::MAX.to_ne_bytes());
+        for component in &layout.components {
+            bytes = with(bytes, component.offset, &vec![0xbb; component.size]);
+        }
+        let mut area = XsaveArea::from_bytes(&bytes, layout).unwrap();
+        area.sanitize(layout);
+
+        assert_eq!(area.xstate_bv(), XFeatureMask::LEGACY.bits());
+        let legacy = area.legacy_area();
+        assert_eq!(
+            legacy.control_word,
+            XsaveArea::GUEST_INITIAL_X87_CONTROL_WORD
+        );
+        assert_eq!(legacy.instruction_pointer, 0);
+        assert_eq!(legacy.float_registers, [[0; 16]; 8]);
+        assert_eq!(legacy.xmm_registers, [[0; 16]; 16]);
+        assert_eq!(legacy.mxcsr, XsaveArea::GUEST_INITIAL_MXCSR);
+        assert_eq!(legacy.mxcsr_mask, layout.mxcsr_mask);
+        for component in &layout.components {
+            let saved = &area.as_bytes()[component.offset..component.offset + component.size];
+            assert!(saved.iter().all(|&byte| byte == 0));
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_present_state_including_64_bit_pointers() {
+        let layout = XsaveLayout::get();
+        let fip = 0x1234_5678_9abc_def0_u64;
+        let fdp = 0x0fed_cba9_8765_4321_u64;
+        let mut bytes = with(initial_bytes(), FIP_OFFSET, &fip.to_ne_bytes());
+        bytes = with(bytes, FDP_OFFSET, &fdp.to_ne_bytes());
+        bytes = with(bytes, XMM_OFFSET, &[0x5a; 16]);
+        bytes = with(
+            bytes,
+            XSAVE_HEADER_OFFSET,
+            &XFeatureMask::LEGACY.bits().to_ne_bytes(),
+        );
+        let mut area = XsaveArea::from_bytes(&bytes, layout).unwrap();
+        area.sanitize(layout);
+
+        let legacy = area.legacy_area();
+        assert_eq!(legacy.instruction_pointer, fip);
+        assert_eq!(legacy.data_pointer, fdp);
+        assert_eq!(legacy.xmm_registers[0], [0x5a; 16]);
+        assert_eq!(area.sanitized_legacy_area().instruction_pointer, fip);
     }
 }

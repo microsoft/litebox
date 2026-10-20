@@ -1073,7 +1073,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 oldact,
                 sigsetsize,
             } => self.sys_rt_sigaction(signum, act, oldact, sigsetsize),
-            SyscallRequest::RtSigreturn => self.sys_rt_sigreturn(ctx),
+            SyscallRequest::RtSigreturn => Ok(self.sys_rt_sigreturn(ctx)),
             SyscallRequest::Ioctl { fd, arg } => syscall!(sys_ioctl(fd, arg)),
             SyscallRequest::Pread64 {
                 fd,
