@@ -26,7 +26,8 @@
 //! [`PendingRunnerAssociation`] ([`Association::take_pending_associations`]),
 //! for which the kernel creates a runner process and associates it
 //! ([`Broker::associate`]); the child's handshake returns its startup data.
-//! Memory images (`WriteChildMemory`) are not supported.
+//! Memory images (`WriteChildMemory`) and adoption of existing runners
+//! (`StartChildWithExistingRunner`) are not supported.
 //!
 //! When a process ends ([`Association::exited`]), its association ends and
 //! its broker process exits, releasing what it holds (e.g., pipe ends).
@@ -915,6 +916,21 @@ impl ProcessLauncher for KernelProcessLauncher {
                 "requests are served on the worker"
             );
         }
+    }
+
+    fn launch_existing(
+        self: Arc<Self>,
+        _parent_process_id: ProcessId,
+        process: Arc<BrokerProcess>,
+        startup: ProcessStartupData,
+        _runner_descriptor: Vec<u8>,
+    ) -> Result<(), BrokerError> {
+        PendingRunnerAssociation {
+            process,
+            startup: Some(startup),
+        }
+        .fail(BrokerError::UnsupportedOperation);
+        Err(BrokerError::UnsupportedOperation)
     }
 
     fn create_image(&self, _capacity: u64) -> Result<Box<dyn ProcessImage>, BrokerError> {
