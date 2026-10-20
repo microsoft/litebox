@@ -194,6 +194,136 @@ fn brokered_windows_runner_command(initial_files: &std::path::Path) -> std::proc
     command
 }
 
+/// Runs a locally installed x64 Python through the runner. Uses
+/// `LITEBOX_PYTHON_PATH` when set, otherwise locates `python.exe` on `PATH`.
+/// Supports embeddable distributions and regular installations; the latter's
+/// standard library is mounted through the broker. Bytecode writes and site
+/// initialization are disabled to avoid modifying the host or loading its packages.
+///
+/// Python is run with deterministic hash seeding because the Windows entropy
+/// path it normally uses is not implemented by the shim yet.
+#[test]
+fn run_python_pe() {
+    let source = python_source();
+    println!("Using local Python at `{}`", source.display());
+    let source_dir = source
+        .parent()
+        .expect("LITEBOX_PYTHON_PATH must have a parent directory");
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let mut host_images = Vec::new();
+    for entry in std::fs::read_dir(source_dir)
+        .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", source_dir.display()))
+    {
+        let entry = entry.expect("failed to read Python distribution entry");
+        let file_type = entry
+            .file_type()
+            .expect("failed to read Python distribution entry type");
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let source_path = entry.path();
+        let destination = test_dir.join(entry.file_name());
+        let bytes = std::fs::read(&source_path)
+            .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", source_path.display()));
+        let file_name = entry.file_name();
+        let file_name = file_name.to_str();
+        if file_name.is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            name == "python.exe"
+                || (name.starts_with("python")
+                    && source_path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
+        }) {
+            let rewritten =
+                litebox_syscall_rewriter::rewrite_binary(&bytes, None).unwrap_or_else(|error| {
+                    panic!("failed to rewrite `{}`: {error}", source_path.display())
+                });
+            std::fs::write(&destination, rewritten).unwrap();
+            host_images.push(source_path);
+        } else {
+            std::fs::write(&destination, bytes).unwrap();
+        }
+    }
+
+    assert!(
+        test_dir.join("python.exe").is_file(),
+        "Python distribution did not contain python.exe"
+    );
+    build_rewritten_system_dll(&test_dir, "kernel.appcore.dll");
+    host_images.push(host_system32_file_path("kernel.appcore.dll"));
+    stage_startup_import_closures(
+        &test_dir,
+        host_images.iter().map(std::path::PathBuf::as_path),
+    );
+
+    let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let mut command = brokered_windows_runner_command(&tar_path);
+    let stdlib = source_dir.join("Lib");
+    if stdlib.is_dir() {
+        let mut mount = stdlib.into_os_string();
+        mount.push("::/Lib");
+        command.arg("--mount").arg(mount);
+    }
+    // command.env("LITEBOX_LOG", "debug");
+    command.args([
+        "--env",
+        "PYTHONHASHSEED=0",
+        "/python.exe",
+        "-B",
+        "-S",
+        "-c",
+        "import colorsys, sys; assert sys.dont_write_bytecode and sys.flags.no_site; \
+         assert colorsys.rgb_to_hsv(1, 0, 0) == (0, 1, 1); print('hello world')",
+    ]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!(
+        "Python exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    assert!(
+        output.status.success(),
+        "Python failed; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.lines().any(|line| line == "hello world"),
+        "Python output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+fn python_source() -> std::path::PathBuf {
+    if let Some(source) = std::env::var_os("LITEBOX_PYTHON_PATH") {
+        let source = std::path::PathBuf::from(source);
+        assert!(
+            source.is_file(),
+            "LITEBOX_PYTHON_PATH does not point to a file: `{}`",
+            source.display()
+        );
+        return source;
+    }
+
+    std::env::var_os("PATH")
+        .and_then(|paths| find_executable_on_path("python.exe", &paths))
+        .expect("python.exe not found on PATH; install x64 Python or set LITEBOX_PYTHON_PATH")
+}
+
 /// Runs a locally installed x64 Node.js through the runner. Uses
 /// `LITEBOX_NODE_PATH` when set, otherwise locates `node.exe` on `PATH`.
 #[test]
