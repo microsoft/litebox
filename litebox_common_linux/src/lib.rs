@@ -1629,6 +1629,25 @@ pub struct Utsname {
     pub domainname: [u8; 65],
 }
 
+/// Linux's 64-bit `struct statfs`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct Statfs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    pub f_spare: [i64; 4],
+}
+
 bitflags::bitflags! {
     #[derive(Debug)]
     /// Flags for the `getrandom` syscall.
@@ -2606,6 +2625,14 @@ pub enum SyscallRequest {
     Uname {
         buf: UserPtrMut<Utsname>,
     },
+    Statfs {
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<Statfs>,
+    },
+    Fstatfs {
+        fd: i32,
+        buf: UserPtrMut<Statfs>,
+    },
     Fcntl {
         fd: i32,
         arg: FcntlArg,
@@ -3134,6 +3161,8 @@ impl SyscallRequest {
             Sysno::vfork => SyscallRequest::Vfork,
             Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
             Sysno::uname => sys_req!(Uname { buf:* }),
+            Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
+            Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
             Sysno::fcntl => {
                 let cmd: i32 = ctx.sys_req_arg(1);
                 let arg = ctx.sys_req_arg(2);
@@ -3417,7 +3446,7 @@ impl SyscallRequest {
                 statxbuf:*,
             }),
             // Noisy unsupported syscalls.
-            Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {

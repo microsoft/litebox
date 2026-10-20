@@ -792,6 +792,23 @@ impl FsPath {
 /// install an inherited descriptor, since it installs them in ascending order into an empty table.
 const MAX_INHERITED_FD_GAP: usize = 255;
 
+/// Fixed `statfs`/`fstatfs` result, since LiteBox currently does not track per-filesystem usage.
+// TODO: Return actual per-filesystem values rather than this constant.
+const FAKE_STATFS: litebox_common_linux::Statfs = litebox_common_linux::Statfs {
+    f_type: 0x0102_1994, // TMPFS_MAGIC
+    f_bsize: 4096,
+    f_blocks: 1 << 20,
+    f_bfree: 1 << 19,
+    f_bavail: 1 << 19,
+    f_files: 1 << 20,
+    f_ffree: 1 << 19,
+    f_fsid: [0; 2],
+    f_namelen: 255,
+    f_frsize: 4096,
+    f_flags: 0x20, // ST_VALID
+    f_spare: [0; 4],
+};
+
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the descriptors a fresh runner inherits across `execve`, which are those not marked
     /// close-on-exec, in ascending order.
@@ -2105,6 +2122,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `fstat`
     pub fn sys_fstat(&self, fd: i32) -> Result<FileStat, Errno> {
         self.with_typed_fd(fd, |fd| self.do_stat(fd))
+    }
+
+    /// Handle syscall `statfs`.
+    pub(crate) fn sys_statfs(&self, pathname: &str) -> Result<litebox_common_linux::Statfs, Errno> {
+        self.sys_stat(pathname)?;
+        Ok(FAKE_STATFS)
+    }
+
+    /// Handle syscall `fstatfs`.
+    pub(crate) fn sys_fstatfs(&self, fd: i32) -> Result<litebox_common_linux::Statfs, Errno> {
+        self.sys_fstat(fd)?;
+        Ok(FAKE_STATFS)
     }
 
     fn do_fstatat<T>(&self, dirfd: i32, pathname: &str, flags: AtFlags) -> Result<T, Errno>

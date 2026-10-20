@@ -1253,6 +1253,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 addrlen,
             } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
             SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
+            SyscallRequest::Statfs { pathname, buf } => {
+                pathname
+                    .to_cstring::<Platform>()
+                    .map_or(Err(Errno::EFAULT), |path| {
+                        let path = path.to_str().map_err(|_| Errno::EINVAL)?;
+                        self.sys_statfs(path).and_then(|statfs| {
+                            buf.write_at_offset::<Platform>(0, statfs)
+                                .ok_or(Errno::EFAULT)
+                                .map(|()| 0)
+                        })
+                    })
+            }
+            SyscallRequest::Fstatfs { fd, buf } => self.sys_fstatfs(fd).and_then(|statfs| {
+                buf.write_at_offset::<Platform>(0, statfs)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }),
             SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
