@@ -39,11 +39,16 @@ fn syscall_return_registers_and_carry() {
     assert_eq!(ctx.pstate, 0xb000_0000);
     assert_eq!(ctx.regs[1], 0x1234);
 
+    // By default a guest is an ordinary process (PID 2) whose parent is
+    // launchd (PID 1), never launchd itself.
     ctx.regs[16] = litebox_common_macos::syscall::nr::GETPID;
     task.handle_syscall_request(&mut ctx);
-    assert_eq!(ctx.regs[0], 1);
+    assert_eq!(ctx.regs[0], 2);
     assert_eq!(ctx.pstate, 0x9000_0000);
     assert_eq!(ctx.regs[1], 0x1234);
+    ctx.regs[16] = litebox_common_macos::syscall::nr::GETPPID;
+    task.handle_syscall_request(&mut ctx);
+    assert_eq!(ctx.regs[0], 1);
 }
 
 #[test]
@@ -225,8 +230,8 @@ fn shared_cache_installation_rewrites_maps_and_registers_pieces() {
         SharedCachePiece {
             range: page(4),
             backing: SharedCacheBacking::Paged,
-            protection: VmProtection::empty(),
-            max_protection: VmProtection::empty(),
+            protection: VmProtection::READ,
+            max_protection: VmProtection::READ | VmProtection::WRITE,
         },
         SharedCachePiece {
             range: page(5),
@@ -247,7 +252,6 @@ fn shared_cache_installation_rewrites_maps_and_registers_pieces() {
     let pager: SharedCachePager = Arc::new(move |address| {
         (address == paged_address).then(|| SharedCachePage {
             bytes: vec![0x77; PAGE_SIZE],
-            protection: VmProtection::READ,
             max_protection: VmProtection::READ | VmProtection::WRITE,
         })
     });
@@ -334,20 +338,37 @@ fn shared_cache_installation_rewrites_maps_and_registers_pieces() {
     }
     assert_eq!(task.sys_mprotect(page(3).start, PAGE_SIZE, rw), Ok(()));
     assert!(guest_flags(task, page(3).start).contains(VmFlags::VM_WRITE));
+    // A page awaiting the pager has its map entry's protections: changes
+    // are recorded without mapping it (dyld makes whole DATA_CONST mappings
+    // writable this way), and never allow execution.
     assert_eq!(
-        task.sys_mprotect(page(4).start, PAGE_SIZE, VmProtection::READ),
-        Err(litebox_common_macos::errno::Errno::EACCES),
-        "pages await the pager"
+        task.sys_mprotect(page(4).start, PAGE_SIZE, RX),
+        Err(litebox_common_macos::errno::Errno::EACCES)
+    );
+    assert_eq!(task.sys_mprotect(page(4).start, PAGE_SIZE, rw), Ok(()));
+    assert_eq!(read_guest(page(4).start, 1), None, "not supplied yet");
+    assert!(
+        task.global
+            .shared_cache
+            .lock()
+            .as_ref()
+            .unwrap()
+            .is_paged(page(4).start)
     );
 
-    // Demand paging: only paged pieces are supplied, then follow their maximum.
+    // Demand paging: only paged pieces are supplied, with their recorded
+    // protection.
     assert!(!task.page_in_shared_cache(page(5).start));
     assert!(!task.page_in_shared_cache(page(1).start));
     assert!(task.page_in_shared_cache(page(4).start + 8));
     assert_eq!(read_guest(page(4).start, 2).unwrap(), [0x77, 0x77]);
-    assert!(!guest_flags(task, page(4).start).contains(VmFlags::VM_WRITE));
+    assert!(guest_flags(task, page(4).start).contains(VmFlags::VM_WRITE));
     assert!(!task.page_in_shared_cache(page(4).start), "supplied once");
-    assert_eq!(task.sys_mprotect(page(4).start, PAGE_SIZE, rw), Ok(()));
+    assert_eq!(
+        task.sys_mprotect(page(4).start, PAGE_SIZE, VmProtection::READ),
+        Ok(())
+    );
+    assert!(!guest_flags(task, page(4).start).contains(VmFlags::VM_WRITE));
     assert_eq!(
         program.install_shared_cache(&layout(&pieces, &code_regions, &islands)),
         Err(SharedCacheInstallError::AlreadyInstalled)
@@ -416,8 +437,8 @@ pub(crate) fn install_test_cache_for(task: Task<Platform>, base: usize) -> Loade
         SharedCachePiece {
             range: page(4),
             backing: SharedCacheBacking::Paged,
-            protection: VmProtection::empty(),
-            max_protection: VmProtection::empty(),
+            protection: VmProtection::READ,
+            max_protection: RW,
         },
         SharedCachePiece {
             range: page(5),
@@ -443,7 +464,6 @@ pub(crate) fn install_test_cache_for(task: Task<Platform>, base: usize) -> Loade
             pager: Some(Arc::new(move |address| {
                 (address == paged_address).then(|| SharedCachePage {
                     bytes: vec![0x77; PAGE_SIZE],
-                    protection: VmProtection::READ,
                     max_protection: RW,
                 })
             })),
@@ -542,6 +562,44 @@ fn bsd_unmap_and_fixed_map_cannot_replace_shared_cache_pieces() {
     assert!(task.page_in_shared_cache(page(4).start));
     assert_eq!(read_guest(page(4).start, 2).unwrap(), [0x77, 0x77]);
     assert!(!task.page_in_shared_cache(page(4).start));
+}
+
+#[test]
+fn shared_cache_page_in_uses_the_recorded_protection() {
+    let base = 0x74_0000_0000;
+    let program = install_test_cache(base);
+    let task = &program.entrypoints.task;
+    let page = base + 4 * PAGE_SIZE..base + 5 * PAGE_SIZE;
+    // A whole-range vm_protect over mixed pieces: the copied page changes
+    // now, the unsupplied page when it is supplied.
+    assert_eq!(
+        task.sys_mach_vm_protect(
+            litebox_common_macos::syscall::MachPortName(
+                u32::try_from(task.sys_task_self()).unwrap()
+            ),
+            base + 3 * PAGE_SIZE,
+            2 * PAGE_SIZE,
+            false,
+            litebox_common_macos::syscall::MachVmProtection::new(RW, true),
+        ),
+        KernReturn::SUCCESS
+    );
+    assert!(guest_flags(task, base + 3 * PAGE_SIZE).contains(VmFlags::VM_WRITE));
+    assert_eq!(read_guest(page.start, 1), None);
+    // PROT_NONE on an unsupplied page is kept: touching it is a real fault.
+    assert_eq!(
+        task.sys_mprotect(page.start, PAGE_SIZE, VmProtection::empty()),
+        Ok(())
+    );
+    assert!(!task.page_in_shared_cache(page.start));
+    assert_eq!(read_guest(page.start, 1), None);
+    assert_eq!(
+        task.sys_mprotect(page.start, PAGE_SIZE, VmProtection::READ),
+        Ok(())
+    );
+    assert!(task.page_in_shared_cache(page.start));
+    assert_eq!(read_guest(page.start, 1).unwrap(), [0x77]);
+    assert!(!guest_flags(task, page.start).contains(VmFlags::VM_WRITE));
 }
 
 #[test]
@@ -942,6 +1000,38 @@ fn shared_region_check_handles_sentinel_and_copyout_fault() {
     assert_eq!(
         task.sys_shared_region_check_np(UserPtrMut::from_usize(0x1234)),
         Err(Errno::EFAULT)
+    );
+}
+
+#[test]
+fn shared_region_map_and_slide_never_maps_another_cache() {
+    use litebox_common_macos::{errno::Errno, syscall::nr};
+
+    let call = |task: &Task<Platform>, args: &[usize]| {
+        let mut ctx = PtRegs::default();
+        ctx.regs[16] = nr::SHARED_REGION_MAP_AND_SLIDE_2_NP;
+        ctx.regs[..args.len()].copy_from_slice(args);
+        task.handle_syscall_request(&mut ctx);
+        (ctx.regs[0], ctx.pstate & (1 << 29) != 0)
+    };
+    // shared_file_np { sf_fd, sf_mappings_count, sf_slide }
+    let files = [3u32, 1, 0];
+    let files = files.as_ptr() as usize;
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    // Empty requests succeed; oversized counts and unreadable file arrays
+    // fail before the region is examined.
+    assert_eq!(call(&task, &[0, 0, 1, 0]), (0, false));
+    assert_eq!(call(&task, &[1, files, 0, 0]), (0, false));
+    assert_eq!(call(&task, &[257, files, 1, 0]), (Errno::EIO.raw(), true));
+    assert_eq!(call(&task, &[1, files, 2049, 0]), (Errno::EIO.raw(), true));
+    assert_eq!(call(&task, &[1, 0x10, 1, 0]), (Errno::EFAULT.raw(), true));
+    // Without an instance nothing can be mapped.
+    assert_eq!(call(&task, &[1, files, 1, 0]), (Errno::EINVAL.raw(), true));
+    // With an instance, the region is already mapped: KERN_FAILURE.
+    let program = install_test_cache(0x75_0000_0000);
+    assert_eq!(
+        call(&program.entrypoints.task, &[1, files, 1, 0]),
+        (Errno::EIO.raw(), true)
     );
 }
 

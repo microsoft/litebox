@@ -8,6 +8,8 @@
 
 use super::mm::AnonymousPlacement;
 use crate::{ShimPlatform, Task};
+use alloc::vec::Vec;
+use core::ops::Range;
 use litebox::platform::page_mgmt::AllocationError;
 use litebox_common_linux::vmem::MappingError;
 use litebox_common_macos::{
@@ -49,6 +51,81 @@ fn mach_page_range(address: usize, size: usize) -> Result<MachPageRange, ()> {
         address: start,
         size: end - start,
     })
+}
+
+/// Host collisions tolerated by one aligned ANYWHERE placement before it
+/// reports `KERN_NO_SPACE`. The guest map does not show host memory (such as
+/// the host's own multi-GiB shared region), so consecutive collisions move
+/// the search up by a doubling stride: any host region is crossed within
+/// this bound, at the cost of possibly skipping free space.
+const ALIGNED_PLACEMENT_ATTEMPTS: usize = 64;
+
+/// Result of trying to map one candidate range of an aligned placement.
+#[derive(Debug, PartialEq, Eq)]
+enum PlacementAttempt {
+    Mapped(usize),
+    /// Part of the range is in use, for example by the host.
+    Conflict,
+}
+
+/// ANYWHERE placement of `length` bytes at a start with no `mask` bits, in
+/// `search`, avoiding `mapped` (sorted, disjoint), like XNU's
+/// `vm_map_locate_space_anywhere`: each gap's only candidate is
+/// `(gap start + mask) & !mask`, which is at or above the gap start even for
+/// a non-contiguous mask. `try_map` gets exactly `length` bytes, never
+/// alignment slack, so a huge mask costs nothing.
+fn place_aligned(
+    mapped: &[Range<usize>],
+    search: Range<usize>,
+    length: usize,
+    mask: usize,
+    mut try_map: impl FnMut(Range<usize>) -> Result<PlacementAttempt, KernReturn>,
+) -> Result<usize, KernReturn> {
+    debug_assert_eq!(mask & (PAGE_SIZE - 1), PAGE_SIZE - 1);
+    let mut cursor = search.start;
+    let mut next = mapped.partition_point(|range| range.end <= cursor);
+    let mut conflicts = 0;
+    let mut stride = PAGE_SIZE;
+    loop {
+        while let Some(range) = mapped.get(next).filter(|range| range.start <= cursor) {
+            cursor = cursor.max(range.end);
+            next += 1;
+        }
+        let gap_end = mapped
+            .get(next)
+            .map_or(search.end, |range| range.start.min(search.end));
+        let candidate = cursor
+            .checked_add(mask)
+            .map(|start| start & !mask)
+            .and_then(|start| Some(start..start.checked_add(length)?))
+            .filter(|range| range.end <= gap_end);
+        let Some(candidate) = candidate else {
+            // Try the gap after the next mapping, if it starts in `search`.
+            let range = mapped
+                .get(next)
+                .filter(|range| range.start < search.end)
+                .ok_or(KernReturn::NO_SPACE)?;
+            cursor = range.end;
+            next += 1;
+            continue;
+        };
+        match try_map(candidate.clone())? {
+            PlacementAttempt::Mapped(address) => return Ok(address),
+            PlacementAttempt::Conflict => {
+                conflicts += 1;
+                if conflicts == ALIGNED_PLACEMENT_ATTEMPTS {
+                    return Err(KernReturn::NO_SPACE);
+                }
+                // The next candidate, `(cursor + mask) & !mask`, is above
+                // the refused start.
+                cursor = candidate
+                    .start
+                    .checked_add(stride)
+                    .ok_or(KernReturn::NO_SPACE)?;
+                stride = stride.saturating_mul(2);
+            }
+        }
+    }
 }
 
 /// An anonymous `vm_map_enter` request.
@@ -146,48 +223,34 @@ impl<P: ShimPlatform> Task<P> {
                 .map_anonymous(hint, length, AnonymousPlacement::Hint, protection)
                 .map_err(map_error);
         }
-        // Over-reserve so a start with no `mask` bits exists, then keep only
-        // that range. The mask need not be contiguous: like
-        // vm_map_locate_space, the start is `(reserved + mask) & !mask`,
-        // which lies at most `mask + 1 - PAGE_SIZE` above a page-aligned
-        // `reserved`.
-        let padded = length
-            .checked_add(mask - (PAGE_SIZE - 1))
-            .ok_or(KernReturn::NO_SPACE)?;
-        let reserved = self
-            .map_anonymous(
-                hint,
-                padded,
-                AnonymousPlacement::Hint,
-                VmProtection::empty(),
-            )
-            .map_err(map_error)?;
-        let start = reserved
-            .checked_add(mask)
-            .map(|start| start & !mask)
-            .filter(|start| {
-                start & mask == 0
-                    && start
-                        .checked_add(length)
-                        .is_some_and(|end| end <= reserved + padded)
-            });
-        let Some(start) = start else {
-            let _ = self.sys_munmap(reserved, padded);
-            return Err(KernReturn::NO_SPACE);
-        };
-        for (from, to) in [(reserved, start), (start + length, reserved + padded)] {
-            if from < to && self.sys_munmap(from, to - from).is_err() {
-                // The slack stays reserved; it is ours either way.
-                litebox_util_log::warn!(range:? = from..to; "failed to trim Mach VM alignment slack");
-            }
-        }
-        self.map_anonymous(
-            start,
+        // Like XNU, the search runs upward from the hint without wrapping.
+        let mapped: Vec<Range<usize>> = self
+            .global
+            .mm
+            .mappings()
+            .into_iter()
+            .map(|(range, _)| range)
+            .collect();
+        place_aligned(
+            &mapped,
+            hint.max(P::TASK_ADDR_MIN)..P::PLACEMENT_ADDR_MAX,
             length,
-            AnonymousPlacement::Fixed { replace: true },
-            protection,
+            mask,
+            |range| match self.map_anonymous(
+                range.start,
+                range.len(),
+                AnonymousPlacement::Fixed { replace: false },
+                protection,
+            ) {
+                Ok(address) => Ok(PlacementAttempt::Mapped(address)),
+                Err(MappingError::MapError(
+                    AllocationError::AddressInUse
+                    | AllocationError::AddressInUseByPlatform
+                    | AllocationError::AddressPartiallyInUse,
+                )) => Ok(PlacementAttempt::Conflict),
+                Err(error) => Err(map_error(error)),
+            },
         )
-        .map_err(map_error)
     }
 
     pub(crate) fn sys_mach_vm_allocate(
@@ -320,5 +383,125 @@ impl<P: ShimPlatform> Task<P> {
             Ok(()) => KernReturn::SUCCESS,
             Err(error) => errno_to_kern_return(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn aligned_placement_requests_only_the_mapping_length() {
+        // A one-page request with a 1 TiB alignment: every request is one
+        // page, never the alignment slack.
+        let mask = (1usize << 40) - 1;
+        let search = 0x1_0000_0000..0x7fff_fe00_0000;
+        let mapped = [
+            0x1_0000_0000..0x1_0000_4000,
+            0x100_0000_0000..0x100_0001_0000,
+        ];
+        let mut requests = Vec::new();
+        let address = place_aligned(&mapped, search.clone(), PAGE_SIZE, mask, |range| {
+            requests.push(range.clone());
+            // The host holds the first aligned start outside the guest map.
+            Ok(if requests.len() == 1 {
+                PlacementAttempt::Conflict
+            } else {
+                PlacementAttempt::Mapped(range.start)
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            requests,
+            vec![
+                0x200_0000_0000..0x200_0000_4000,
+                0x300_0000_0000..0x300_0000_4000
+            ],
+            "the guest-mapped 1 TiB boundary is skipped without a request"
+        );
+        assert_eq!(address, 0x300_0000_0000);
+
+        // Host conflicts everywhere end with KERN_NO_SPACE after a bounded
+        // number of one-page requests: at the end of the search range, or
+        // after ALIGNED_PLACEMENT_ATTEMPTS collisions.
+        for (mask, search) in [(mask, search), (PAGE_SIZE - 1, 0x4000..usize::MAX)] {
+            let mut count = 0;
+            let result = place_aligned(&[], search, PAGE_SIZE, mask, |range| {
+                assert_eq!(range.len(), PAGE_SIZE);
+                count += 1;
+                Ok(PlacementAttempt::Conflict)
+            });
+            assert_eq!(result, Err(KernReturn::NO_SPACE));
+            assert!(count <= ALIGNED_PLACEMENT_ATTEMPTS);
+        }
+    }
+
+    #[test]
+    fn aligned_placement_crosses_a_large_host_region_in_bounded_steps() {
+        // 8 GiB of host memory the guest map does not show.
+        let host = 0x1_0000_0000..0x3_0000_0000;
+        let mut count = 0;
+        let address = place_aligned(
+            &[],
+            0x1_0000_0000..0x7fff_fe00_0000,
+            PAGE_SIZE,
+            0xffff,
+            |range| {
+                count += 1;
+                Ok(if range.start < host.end {
+                    PlacementAttempt::Conflict
+                } else {
+                    PlacementAttempt::Mapped(range.start)
+                })
+            },
+        )
+        .unwrap();
+        assert!(address >= host.end && address.trailing_zeros() >= 16);
+        assert!(count < 40, "{count} requests");
+    }
+
+    #[test]
+    fn aligned_placement_follows_xnu_gap_rules() {
+        let mapped = |range: Range<usize>| Ok(PlacementAttempt::Mapped(range.start));
+        // A gap too small for the aligned start moves on to the next gap.
+        let gaps = [0x1_0000..0x1_8000, 0x2_4000..0x10_0000];
+        assert_eq!(
+            place_aligned(&gaps, 0x4000..0x20_0000, 0x8000, 0xffff, mapped),
+            Ok(0x10_0000)
+        );
+        // The hint bounds the search from below; nothing wraps around.
+        assert_eq!(
+            place_aligned(&[], 0x1_4000..0x4_0000, PAGE_SIZE, 0xffff, mapped),
+            Ok(0x2_0000)
+        );
+        assert_eq!(
+            place_aligned(&[], 0x3_4000..0x4_0000, PAGE_SIZE, 0xffff, mapped),
+            Err(KernReturn::NO_SPACE)
+        );
+        // A non-contiguous mask: the start has none of its bits.
+        let mask = 0x8000 | (PAGE_SIZE - 1);
+        let address =
+            place_aligned(&[], 0x2_0001_c000..0x3_0000_0000, PAGE_SIZE, mask, mapped).unwrap();
+        assert_eq!(address & mask, 0);
+        assert!(address >= 0x2_0001_c000);
+        // Overflowing candidates fail instead of wrapping.
+        assert_eq!(
+            place_aligned(
+                &[],
+                usize::MAX - 0x8000..usize::MAX,
+                PAGE_SIZE,
+                usize::MAX >> 1,
+                mapped
+            ),
+            Err(KernReturn::NO_SPACE)
+        );
+        // Errors other than conflicts are returned as they are.
+        assert_eq!(
+            place_aligned(&[], 0x4000..0x10_0000, PAGE_SIZE, 0xffff, |_| Err(
+                KernReturn::RESOURCE_SHORTAGE
+            )),
+            Err(KernReturn::RESOURCE_SHORTAGE)
+        );
     }
 }

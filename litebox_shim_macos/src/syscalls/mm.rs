@@ -1191,7 +1191,13 @@ impl<P: ShimPlatform> Task<P> {
         }
         let mut cache = self.global.shared_cache.lock();
         let cache = cache.as_mut().ok_or(Errno::EACCES)?;
-        self.change_permissions(cache_range.clone(), protection)?;
+        // Pages the pager has not supplied yet stay unmapped; like a VM map
+        // entry, their record carries the new protection to page-in.
+        for (part, paged) in cache.paged_parts(&cache_range) {
+            if !paged {
+                self.change_permissions(part, protection)?;
+            }
+        }
         cache.set_protection(&cache_range, protection);
         Ok(())
     }

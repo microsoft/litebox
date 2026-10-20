@@ -19,17 +19,19 @@
 //! - the host's live DynamicRegion page is copied read-only.
 //!
 //! The closure is the launch-time initializer closure of
-//! `/usr/lib/libSystem.B.dylib` and dyld-in-cache. Gate islands are whole
-//! pages strictly inside `__TEXT,__text` of cache images outside the launch
-//! set (every image dyld creates a loader for), whose bytes are never read.
+//! `/usr/lib/libSystem.B.dylib`, dyld-in-cache and the executable's own
+//! cache dependencies. Gate islands are whole pages of the shared region
+//! outside every cache mapping, or strictly inside `__TEXT,__text` of cache
+//! images outside the launch set (every image dyld creates a loader for);
+//! the guest never reads their bytes.
 
 use anyhow::{Context as _, Result, bail, ensure};
 use litebox_common_macos::{
     VmProtection,
     shared_cache::{
-        CacheFile, CacheHeader, CacheImage, CacheMapping, ClosureImage, DYNAMIC_REGION_SIZE,
-        MappingFlags, PointerAuthKey, PointerSigner, SharedCache, SlideInfoV5,
-        dynamic_region_cache_path,
+        CacheDependency, CacheFile, CacheHeader, CacheImage, CacheMapping, ClosureImage,
+        DYNAMIC_REGION_SIZE, DylibAttributes, MappingFlags, PointerAuthKey, PointerSigner,
+        SharedCache, SlideInfoV5, dynamic_region_cache_path,
     },
 };
 use litebox_shim_macos::{
@@ -176,7 +178,12 @@ impl GuestCache {
     /// Locate the host's live cache through its DynamicRegion, then open and
     /// verify the on-disk cache files (main and subcache UUIDs, mappings,
     /// slide info v5). Fails closed on any mismatch.
-    pub(crate) fn open() -> Result<Arc<Self>> {
+    ///
+    /// `dependencies` are the executable's dylib load commands: those in the
+    /// cache are roots of the closure (unless their initialization is
+    /// delayed) and of the launch set. dyld itself reports dependencies
+    /// outside the cache.
+    pub(crate) fn open(dependencies: &[CacheDependency]) -> Result<Arc<Self>> {
         let mut files = MappedFiles(Vec::new());
         let mut length = 0;
         // SAFETY: `length` is writable; the call only reports the live cache range.
@@ -226,15 +233,28 @@ impl GuestCache {
                 );
             }
         }
-        let roots = [
+        let mut roots = vec![
             cache
                 .image_index_by_path(ROOT)
                 .with_context(|| format!("{ROOT} is not in the cache"))?,
             cache.dyld_image_index().context("the cache has no dyld")?,
         ];
+        let mut launch_roots = roots.clone();
+        for dependency in dependencies {
+            let Some(index) = cache.image_index_by_path(&dependency.path) else {
+                continue;
+            };
+            if !dependency
+                .attributes
+                .contains(DylibAttributes::DELAYED_INIT)
+            {
+                roots.push(index);
+            }
+            launch_roots.push(index);
+        }
         let closure = cache.closure(&roots)?;
         let launch_set: BTreeSet<u64> = cache
-            .launch_set(&roots)?
+            .launch_set(&launch_roots)?
             .iter()
             .map(|image| image.image.address)
             .collect();
@@ -323,12 +343,14 @@ impl GuestCache {
         Ok(ranges)
     }
 
-    /// Whole native pages strictly inside `__TEXT,__text` of images outside
-    /// the launch set, within [`ISLAND_SEARCH`] of `cluster`, in address
-    /// order, excluding `excluded` (executable runs).
+    /// Whole native pages within [`ISLAND_SEARCH`] of `cluster` that are in
+    /// `holes` (parts of the shared region outside every mapping) or strictly
+    /// inside `__TEXT,__text` of images outside the launch set, in address
+    /// order, excluding `excluded` (executable runs and copied pages).
     fn island_candidates(
         &self,
         cluster: &Range<u64>,
+        holes: &[Range<u64>],
         excluded: &[Range<u64>],
     ) -> Result<Vec<Range<u64>>> {
         let search = cluster.start.saturating_sub(ISLAND_SEARCH)..cluster.end + ISLAND_SEARCH;
@@ -362,6 +384,7 @@ impl GuestCache {
                 page += PAGE;
             }
         }
+        pages.extend(hole_pages(holes, &search, excluded));
         pages.sort_by_key(|page| page.start);
         Ok(pages)
     }
@@ -400,7 +423,6 @@ impl GuestCache {
             .ok()?;
         Some(SharedCachePage {
             bytes,
-            protection: mapping.initial_protection,
             max_protection: mapping.max_protection,
         })
     }
@@ -615,6 +637,30 @@ fn reserve_free_range(
     bail!("reserving the guest cache: {RESERVATION_ATTEMPTS} placement conflicts")
 }
 
+/// Whole native pages of `holes` inside `search`, minus `excluded`.
+fn hole_pages(
+    holes: &[Range<u64>],
+    search: &Range<u64>,
+    excluded: &[Range<u64>],
+) -> Vec<Range<u64>> {
+    let mut pages = Vec::new();
+    for hole in holes {
+        let mut page = hole.start.max(search.start).next_multiple_of(PAGE);
+        let end = hole.end.min(search.end);
+        while page + PAGE <= end {
+            let candidate = page..page + PAGE;
+            if !excluded
+                .iter()
+                .any(|run| run.start < candidate.end && candidate.start < run.end)
+            {
+                pages.push(candidate);
+            }
+            page += PAGE;
+        }
+    }
+    pages
+}
+
 /// The farthest distance between any byte of `page` and of `code`.
 fn worst_distance(page: &Range<u64>, code: &Range<u64>) -> u64 {
     page.end.max(code.end) - page.start.min(code.start)
@@ -708,8 +754,9 @@ struct Copied {
 enum Region<'a> {
     /// Outside every mapping.
     Hole,
-    /// A writable or slid mapping: paged in and rebased on demand.
-    Data,
+    /// A writable or slid mapping, paged in and rebased on demand, with the
+    /// mapping's protections.
+    Data(&'a CacheMapping),
     /// A read-only view of a file mapping.
     View(&'a [u8]),
 }
@@ -873,7 +920,7 @@ pub(crate) fn install<P: ShimPlatform>(
         let data = mapping.initial_protection.contains(VmProtection::WRITE)
             || !mapping.slide_info.is_empty();
         let region = if data {
-            Region::Data
+            Region::Data(mapping)
         } else {
             let file = usize::try_from(mapping.file_range().start).expect("64-bit offsets");
             Region::View(&bytes[file..file + usize::try_from(mapping.size).expect("64-bit sizes")])
@@ -905,12 +952,14 @@ pub(crate) fn install<P: ShimPlatform>(
                     max_protection: VmProtection::READ,
                 }
             }
-            // DATA pages are slid on first touch, like XNU's slide pager.
-            Region::Data => Piece {
+            // DATA pages are slid on first touch, like XNU's slide pager,
+            // but keep their map entry's protections: dyld makes whole
+            // DATA_CONST mappings writable to patch them.
+            Region::Data(mapping) => Piece {
                 range,
                 backing: Backing::Paged,
-                protection: VmProtection::empty(),
-                max_protection: VmProtection::empty(),
+                protection: mapping.initial_protection,
+                max_protection: mapping.max_protection,
             },
             Region::Hole => Piece {
                 range,
@@ -948,8 +997,16 @@ pub(crate) fn install<P: ShimPlatform>(
     pieces.extend(copied_pieces);
     pieces.sort_by_key(|piece| piece.range.start);
 
+    let holes: Vec<Range<u64>> = regions
+        .iter()
+        .filter(|(_, kind)| matches!(kind, Region::Hole))
+        .map(|(range, _)| range.clone())
+        .collect();
+    // The DynamicRegion page is copied into a hole.
+    let mut excluded = text_runs.clone();
+    excluded.extend(dynamic_page);
     let islands = select_islands(&text_runs, |cluster| {
-        cache.island_candidates(cluster, &text_runs)
+        cache.island_candidates(cluster, &holes, &excluded)
     })?;
     let gate_islands: Vec<Range<usize>> = islands
         .iter()
@@ -1034,6 +1091,42 @@ mod tests {
                 0x1_8000_1234
             );
         }
+    }
+
+    #[test]
+    fn island_selection_uses_a_reachable_hole() {
+        const MIB: u64 = 1 << 20;
+        let base = 0x2_8000_0000;
+        let code = base..base + 4 * PAGE;
+        let runs = core::slice::from_ref(&code);
+        let search = base - ISLAND_SEARCH..base + 4 * PAGE + ISLAND_SEARCH;
+        // A hole far below is out of branch range; one above has a copied
+        // page (excluded), a partial page and two whole pages.
+        let holes = [
+            base - 512 * MIB..base - 256 * MIB,
+            base + 8 * MIB + PAGE / 2..base + 8 * MIB + 4 * PAGE,
+        ];
+        let copied_page = base + 8 * MIB + PAGE..base + 8 * MIB + 2 * PAGE;
+        let copied = core::slice::from_ref(&copied_page);
+        let pages = hole_pages(&holes, &search, copied);
+        assert_eq!(
+            pages,
+            [
+                base + 8 * MIB + 2 * PAGE..base + 8 * MIB + 3 * PAGE,
+                base + 8 * MIB + 3 * PAGE..base + 8 * MIB + 4 * PAGE,
+            ]
+        );
+        let islands = select_islands(runs, |cluster| {
+            assert_eq!(cluster, &code);
+            Ok(hole_pages(&holes, &search, copied))
+        })
+        .unwrap();
+        assert_eq!(
+            islands.into_iter().collect::<Vec<_>>(),
+            [base + 8 * MIB + 2 * PAGE, base + 8 * MIB + 3 * PAGE]
+        );
+        // Without the reachable hole, selection fails closed.
+        assert!(select_islands(runs, |_| Ok(hole_pages(&holes[..1], &search, copied))).is_err());
     }
 
     #[test]

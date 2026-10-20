@@ -384,7 +384,7 @@ fn mach_msg_queues_messages_and_send_once_notifications() {
     let trailer = &buffer[28..80];
     assert_eq!(trailer[4..8], 52u32.to_ne_bytes());
     assert_eq!(trailer[12..16], 1000u32.to_ne_bytes());
-    assert_eq!(trailer[40..44], 1u32.to_ne_bytes());
+    assert_eq!(trailer[40..44], 2u32.to_ne_bytes());
     // Dropping the received send-once right notifies the reply port.
     let own = trap(&task, mach_trap::TASK_SELF, &[]);
     assert_eq!(
@@ -510,7 +510,7 @@ fn mig_server_answers_host_and_task_routines() {
     // task_info(TASK_AUDIT_TOKEN): pid in val[5].
     let reply = mig_call(&task, own, 3405, &ndr(&[15, 8]), false);
     assert_eq!((word(&reply, 32), word(&reply, 36)), (0, 8));
-    assert_eq!(word(&reply, 40 + 5 * 4), 1);
+    assert_eq!(word(&reply, 40 + 5 * 4), 2);
     // task_get_special_port(TASK_BOOTSTRAP_PORT) is unset: a null MOVE_SEND.
     let reply = mig_call(&task, own, 3409, &ndr(&[4]), false);
     assert_ne!(header_of(&reply).bits & msgh_bits::COMPLEX, 0);
@@ -1126,6 +1126,27 @@ fn mach_vm_map_follows_xnu_placement_rules() {
     );
     let aligned = slot.get();
     assert_eq!(aligned & 0x3f_ffff, 0);
+    // A 1 TiB alignment maps one page, never the alignment slack.
+    let huge = (1usize << 40) - 1;
+    assert_eq!(
+        map(0, PAGE_SIZE, huge, MachVmFlags::ANYWHERE, rw),
+        KernReturn::SUCCESS
+    );
+    let huge_aligned = slot.get();
+    assert_eq!(huge_aligned & huge, 0);
+    let around: Vec<_> = task
+        .global
+        .mm
+        .mappings()
+        .into_iter()
+        .filter(|(range, _)| range.start < huge_aligned + huge && huge_aligned < range.end)
+        .map(|(range, _)| range)
+        .collect();
+    assert_eq!(around, vec![huge_aligned..huge_aligned + PAGE_SIZE]);
+    assert_eq!(
+        task.sys_mach_vm_deallocate(own, huge_aligned, PAGE_SIZE),
+        KernReturn::SUCCESS
+    );
     // A PROT_NONE reservation succeeds where free and fails where occupied.
     assert_eq!(
         map(

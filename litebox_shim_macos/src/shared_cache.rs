@@ -73,7 +73,9 @@ pub enum SharedCacheBacking<'a> {
     Reserved,
     /// Inaccessible until the guest touches it; each touched page is then
     /// supplied by [`SharedCacheLayout::pager`], like XNU's shared-region
-    /// slide pager.
+    /// slide pager. The piece's protections are those of its VM map entry:
+    /// guest `mprotect`/`vm_protect` change the recorded protection before
+    /// the page is supplied, and a supplied page gets the recorded one.
     Paged,
     /// A private copy-on-write mapping of immutable, native-page-aligned host
     /// bytes, such as a read-only mapping of a cache file. Never executable.
@@ -90,8 +92,8 @@ pub struct SharedCachePiece<'a> {
     pub protection: VmProtection,
     /// Upper bound for later guest `mprotect`/`vm_protect` requests, like a
     /// VM map entry's maximum protection. Never writable and executable;
-    /// never executable for [`SharedCacheBacking::Source`] pieces, and
-    /// exactly read-execute for rewritten code.
+    /// executable only for rewritten code ([`SharedCacheBacking::Copy`]
+    /// with a code region), and then exactly read-execute.
     pub max_protection: VmProtection,
 }
 
@@ -108,12 +110,12 @@ pub struct SharedCacheCodeRegion<'a> {
 /// `mapping / image / segment`, for fault diagnostics.
 pub type SharedCacheAttribution = Arc<dyn Fn(usize) -> Option<String> + Send + Sync>;
 
-/// Contents and protections of one demand-paged page.
+/// Contents of one demand-paged page.
 pub struct SharedCachePage {
     /// Exactly one page of bytes.
     pub bytes: Vec<u8>,
-    pub protection: VmProtection,
-    /// Never executable.
+    /// The maximum protection of the page's cache mapping; must allow the
+    /// page's recorded maximum. Never executable.
     pub max_protection: VmProtection,
 }
 
@@ -173,17 +175,47 @@ impl SharedCacheState {
 
     /// Whether `page` awaits the pager.
     pub(crate) fn is_paged(&self, page: usize) -> bool {
-        self.mappings
-            .iter()
-            .any(|mapping| mapping.paged && mapping.range.contains(&page))
+        self.mapping_at(page).is_some_and(|mapping| mapping.paged)
     }
 
-    /// Record a supplied page with its protections.
-    pub(crate) fn page_in(&mut self, page: &Range<usize>, supplied: &SharedCachePage) {
-        self.set_protection(page, supplied.protection);
+    /// The record containing `address`.
+    pub(crate) fn mapping_at(&self, address: usize) -> Option<&SharedCacheMapping> {
+        self.mappings
+            .iter()
+            .find(|mapping| mapping.range.contains(&address))
+    }
+
+    /// Parts of `range` that still await the pager (`true`) or are mapped
+    /// (`false`), in address order.
+    pub(crate) fn paged_parts(&self, range: &Range<usize>) -> Vec<(Range<usize>, bool)> {
+        let mut parts: Vec<(Range<usize>, bool)> = Vec::new();
+        for mapping in self
+            .mappings
+            .iter()
+            .filter(|mapping| overlaps(&mapping.range, range))
+        {
+            let part = mapping.range.start.max(range.start)..mapping.range.end.min(range.end);
+            match parts.last_mut() {
+                Some((last, paged)) if last.end == part.start && *paged == mapping.paged => {
+                    last.end = part.end;
+                }
+                _ => parts.push((part, mapping.paged)),
+            }
+        }
+        parts
+    }
+
+    /// Record that `page` has been supplied by the pager.
+    pub(crate) fn page_in(&mut self, page: &Range<usize>) {
+        // Split `page` out of its record, keeping its protection.
+        if let Some(protection) = self
+            .mapping_at(page.start)
+            .map(|mapping| mapping.protection)
+        {
+            self.set_protection(page, protection);
+        }
         for mapping in &mut self.mappings {
             if mapping.range == *page {
-                mapping.max_protection = supplied.max_protection;
                 mapping.paged = false;
             }
         }
@@ -489,11 +521,7 @@ fn validate_pieces(cache: &SharedCacheLayout<'_>) -> Result<(), SharedCacheInsta
             SharedCacheBacking::Reserved => {
                 piece.protection.is_empty() && piece.max_protection.is_empty()
             }
-            SharedCacheBacking::Paged => {
-                cache.pager.is_some()
-                    && piece.protection.is_empty()
-                    && piece.max_protection.is_empty()
-            }
+            SharedCacheBacking::Paged => cache.pager.is_some(),
             SharedCacheBacking::Source(bytes) => {
                 bytes.len() == piece.range.len()
                     && !piece.max_protection.contains(VmProtection::EXECUTE)
@@ -501,12 +529,13 @@ fn validate_pieces(cache: &SharedCacheLayout<'_>) -> Result<(), SharedCacheInsta
             SharedCacheBacking::Copy(bytes) => bytes.len() <= piece.range.len(),
         };
         let executable_piece = piece.max_protection.contains(VmProtection::EXECUTE);
+        let copied_code = matches!(piece.backing, SharedCacheBacking::Copy(_));
         if !valid
             || !piece.max_protection.contains(piece.protection)
             || piece
                 .max_protection
                 .contains(VmProtection::WRITE | VmProtection::EXECUTE)
-            || (executable_piece && piece.max_protection != executable)
+            || (executable_piece && (!copied_code || piece.max_protection != executable))
         {
             return Err(Error::InvalidCacheRange);
         }
@@ -795,19 +824,28 @@ impl<P: ShimPlatform> Task<P> {
         if !cache.is_paged(page.start) {
             return false;
         }
+        let Some(recorded) = cache.mapping_at(page.start).cloned() else {
+            return false;
+        };
+        if recorded.protection.is_empty() {
+            // The guest made the page inaccessible: a real fault.
+            return false;
+        }
         let Some(supplied) = cache.pager.as_ref().and_then(|pager| pager(page.start)) else {
             litebox_util_log::warn!(page:? = page; "shared-cache pager cannot supply a page");
             return false;
         };
         if supplied.bytes.len() != PAGE_SIZE
-            || !supplied.max_protection.contains(supplied.protection)
+            || !supplied.max_protection.contains(recorded.max_protection)
             || supplied.max_protection.contains(VmProtection::EXECUTE)
         {
             litebox_util_log::warn!(page:? = page; "shared-cache pager supplied an invalid page");
             return false;
         }
+        // The page gets its map entry's current protection, which guest
+        // mprotect/vm_protect may have changed before it was supplied.
         if self
-            .map_shared_cache_copy(&page, &supplied.bytes, supplied.protection)
+            .map_shared_cache_copy(&page, &supplied.bytes, recorded.protection)
             .is_err()
         {
             return false;
@@ -817,7 +855,7 @@ impl<P: ShimPlatform> Task<P> {
             description:? = cache.attribution.as_ref().and_then(|attribute| attribute(page.start));
             "shared-cache page supplied on demand"
         );
-        cache.page_in(&page, &supplied);
+        cache.page_in(&page);
         true
     }
 

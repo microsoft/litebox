@@ -43,6 +43,7 @@ pub mod nr {
     pub const TERMINATE_WITH_PAYLOAD: usize = 520;
     pub const ABORT_WITH_PAYLOAD: usize = 521;
     pub const MAP_WITH_LINKING_NP: usize = 550;
+    pub const SHARED_REGION_MAP_AND_SLIDE_2_NP: usize = 536;
     pub const DUP: usize = 41;
     pub const DUP2: usize = 90;
     pub const FCNTL: usize = 92;
@@ -461,6 +462,12 @@ pub enum SyscallRequest {
     SharedRegionCheckNp {
         start_address: UserPtrMut<usize>,
     },
+    SharedRegionMapAndSlide2Np {
+        files_count: u32,
+        /// `struct shared_file_np[files_count]`.
+        files: UserPtr<u8>,
+        mappings_count: u32,
+    },
     MachAbsoluteTime,
     MachTimebaseInfo {
         info: UserPtrMut<MachTimebaseInfo>,
@@ -722,6 +729,11 @@ impl SyscallRequest {
             nr::THREAD_SELFID => Self::ThreadSelfid,
             nr::SHARED_REGION_CHECK_NP => Self::SharedRegionCheckNp {
                 start_address: UserPtrMut::from_usize(args[0]),
+            },
+            nr::SHARED_REGION_MAP_AND_SLIDE_2_NP => Self::SharedRegionMapAndSlide2Np {
+                files_count: TruncateExt::<u32>::trunc(args[0]),
+                files: UserPtr::from_usize(args[1]),
+                mappings_count: TruncateExt::<u32>::trunc(args[2]),
             },
             _ => return Err(Errno::ENOSYS),
         })

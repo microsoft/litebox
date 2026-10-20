@@ -535,11 +535,34 @@ impl DylibAttributes {
     }
 }
 
-/// A dylib load command of a cache image.
+/// A dylib load command of a cache image or executable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheDependency {
     pub path: String,
     pub attributes: DylibAttributes,
+}
+
+impl CacheDependency {
+    /// Decode `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB` or
+    /// `LC_LOAD_UPWARD_DYLIB` (`body` is the whole command); `None` for
+    /// other commands.
+    pub fn from_load_command(command: u32, body: &[u8]) -> Result<Option<Self>> {
+        use object::macho;
+
+        if !matches!(
+            command,
+            macho::LC_LOAD_DYLIB
+                | macho::LC_LOAD_WEAK_DYLIB
+                | macho::LC_REEXPORT_DYLIB
+                | macho::LC_LOAD_UPWARD_DYLIB
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            path: String::from(dylib_name(body)?),
+            attributes: DylibAttributes::decode(command, body)?,
+        }))
+    }
 }
 
 /// A `section_64` of a cache image segment.
@@ -641,17 +664,11 @@ impl CacheImage {
                     }
                     image.install_name = Some(String::from(dylib_name(body)?));
                 }
-                macho::LC_LOAD_DYLIB
-                | macho::LC_LOAD_WEAK_DYLIB
-                | macho::LC_REEXPORT_DYLIB
-                | macho::LC_LOAD_UPWARD_DYLIB
-                    // Like dyld's forEachLinkedDylib, dyld itself links nothing.
-                    if file_type == macho::MH_DYLIB =>
-                {
-                    image.dependencies.push(CacheDependency {
-                        path: String::from(dylib_name(body)?),
-                        attributes: DylibAttributes::decode(command, body)?,
-                    });
+                // Like dyld's forEachLinkedDylib, dyld itself links nothing.
+                _ if file_type == macho::MH_DYLIB => {
+                    image
+                        .dependencies
+                        .extend(CacheDependency::from_load_command(command, body)?);
                 }
                 _ => {}
             }

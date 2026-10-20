@@ -3824,6 +3824,41 @@ mod tests {
         }
     }
 
+    /// Platforms are never dropped, so releasing a large reservation (such as
+    /// a guest shared-cache instance) must also release the ownership
+    /// table's storage, not only its entries.
+    #[test]
+    fn released_reservations_release_ownership_table_storage() {
+        const LEN: usize = 256 << 20;
+        let p = MacosUserland::new();
+        let reserve = |len: usize, permissions| {
+            // SAFETY: a fresh hint reservation replaces nothing.
+            unsafe {
+                p.reserve_and_commit_pages(
+                    core::iter::empty,
+                    TASK_ADDR_MIN..TASK_ADDR_MIN + len,
+                    permissions,
+                    false,
+                    false,
+                    FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+                )
+            }
+            .unwrap()
+            .range()
+        };
+        let capacity = || p.pages.lock().unwrap().capacity();
+        let kept = reserve(HOST_PAGE_SIZE, RW);
+        let large = reserve(LEN, MemoryRegionPermissions::empty());
+        let grown = capacity();
+        assert!(grown >= LEN / HOST_PAGE_SIZE);
+        // SAFETY: the test-owned reservation is idle.
+        unsafe { p.release_pages(large).unwrap() };
+        assert!(capacity() < grown / 4, "{} of {grown}", capacity());
+        // SAFETY: the test-owned reservation is idle.
+        unsafe { p.release_pages(kept).unwrap() };
+        assert_eq!(capacity(), 0);
+    }
+
     #[test]
     fn copy_on_write_pages_are_private_and_coalesce_large_reservations() {
         const PAGES: usize = 4096;

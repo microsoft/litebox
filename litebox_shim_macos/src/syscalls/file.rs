@@ -592,6 +592,12 @@ impl<P: ShimPlatform> Task<P> {
             F_GETPATH | F_GETPATH_NOFIRMLINK => {
                 // Only vnodes have a path.
                 let path = self.files.path(&typed)?.ok_or(Errno::EBADF)?;
+                // The caller's buffer holds MAXPATHLEN bytes; vn_getpath_ext
+                // fails with ENOSPC rather than copy out more
+                // (bsd/vfs/vfs_cache.c build_path_with_parent).
+                if path.len() >= PATH_MAX {
+                    return Err(Errno::ENOSPC);
+                }
                 let mut bytes = Vec::with_capacity(path.len() + 1);
                 bytes.extend_from_slice(path.as_bytes());
                 bytes.push(0);
@@ -1251,6 +1257,65 @@ mod tests {
             Err(Errno::ENOENT),
         );
         assert_eq!(task.sys_dup(1), Ok(12));
+    }
+
+    /// F_GETPATH never copies out more than MAXPATHLEN bytes, even for a file
+    /// opened relative to a directory whose canonical path is longer.
+    #[test]
+    fn getpath_fails_with_enospc_beyond_maxpathlen() {
+        const AT_FDCWD: usize = (-2isize).cast_unsigned();
+        let mode = FileMode::from_u32_bits_truncate(0o755);
+        let component = "c".repeat(200);
+        let mut nodes = vec![(
+            "/",
+            InitialNode::Directory {
+                mode,
+                owner: FileUser::ROOT,
+            },
+        )];
+        let mut path = String::new();
+        for _ in 0..6 {
+            path.push('/');
+            path.push_str(&component);
+            nodes.push((
+                String::leak(path.clone()),
+                InitialNode::Directory {
+                    mode,
+                    owner: FileUser::ROOT,
+                },
+            ));
+        }
+        let task = task_with(builder_with_files(nodes), TaskParams::default());
+        let call = |number: usize, args: &[usize]| {
+            let mut ctx = PtRegs::default();
+            ctx.regs[16] = number;
+            ctx.regs[..args.len()].copy_from_slice(args);
+            task.do_syscall(&ctx)
+        };
+        let openat = |dirfd: usize, path: &str| {
+            let path = alloc::ffi::CString::new(path).unwrap();
+            call(nr::OPENAT, &[dirfd, path.as_ptr() as usize, 0, 0]).unwrap()
+        };
+        let half = alloc::format!("/{component}").repeat(3);
+        assert_eq!(half.len(), 603);
+        let outer = openat(AT_FDCWD, &half);
+        let inner = openat(outer, &half[1..]);
+        assert_eq!(path.len(), 1206);
+        for command in [50, 102] {
+            // A MAXPATHLEN buffer followed by sentinel bytes.
+            let mut buffer = [0xa5u8; PATH_MAX + 256];
+            let pointer = buffer.as_mut_ptr() as usize;
+            assert_eq!(
+                call(nr::FCNTL, &[inner, command, pointer]),
+                Err(Errno::ENOSPC)
+            );
+            assert!(buffer.iter().all(|byte| *byte == 0xa5), "{command}");
+            // A path that fits, with its NUL, is copied out.
+            assert_eq!(call(nr::FCNTL, &[outer, command, pointer]), Ok(0));
+            assert_eq!(&buffer[..half.len()], half.as_bytes());
+            assert_eq!(buffer[half.len()], 0);
+            assert!(buffer[half.len() + 1..].iter().all(|byte| *byte == 0xa5));
+        }
     }
 
     /// stat64/fstat64, openat, fcntl, ioctl, fsctl and access against a small

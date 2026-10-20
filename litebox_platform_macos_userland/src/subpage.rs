@@ -178,6 +178,12 @@ fn flush(base: usize, permissions: Perm) {
 }
 
 impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
+    /// Entries the ownership table has room for.
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     pub(super) fn contains_range(&self, range: Range<usize>) -> bool {
         range.step_by(PAGE_SIZE).all(|address| {
             self.0
@@ -439,7 +445,22 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
                 len: run.len(),
             });
         }
+        self.release_unused_capacity();
         Ok(())
+    }
+
+    /// Free table storage left behind by large deallocations. A platform
+    /// outlives its guests, so a cache-sized table would otherwise stay
+    /// allocated after every page is released. Shrinking only below a quarter
+    /// of the capacity keeps repeated growth amortized.
+    fn release_unused_capacity(&mut self) {
+        const MIN_RETAINED_CAPACITY: usize = 1024;
+        if self.0.is_empty() {
+            self.0 = HashMap::new();
+        } else if self.0.capacity() > MIN_RETAINED_CAPACITY && self.0.len() < self.0.capacity() / 4
+        {
+            self.0.shrink_to_fit();
+        }
     }
 
     /// Map a private copy-on-write copy of the host pages at `source` over

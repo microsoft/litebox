@@ -790,6 +790,13 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::SharedRegionCheckNp { start_address } => self
                 .sys_shared_region_check_np(start_address)
                 .to_syscall_result(),
+            SyscallRequest::SharedRegionMapAndSlide2Np {
+                files_count,
+                files,
+                mappings_count,
+            } => self
+                .sys_shared_region_map_and_slide_2_np(files_count, files, mappings_count)
+                .to_syscall_result(),
             SyscallRequest::MachAbsoluteTime => Ok(self.sys_mach_absolute_time()),
             SyscallRequest::MachTimebaseInfo { info } => {
                 Ok(self.sys_mach_timebase_info(info).into())

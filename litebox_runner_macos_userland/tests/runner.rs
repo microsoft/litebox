@@ -348,7 +348,7 @@ fn runner_executes_mmap_mprotect_rewritten_macho_code() {
              ldr x9, 1f\n\
              add x9, x19, x9\n\
              blr x9\n\
-             cmp x0, #1\n\
+             cmp x0, #2\n\
              mov x0, #43\n\
              mov x10, #42\n\
              csel x0, x10, x0, eq\n\
@@ -550,12 +550,20 @@ fn loader_teardown_and_argument_limit() {
 /// Compile a C program with the host toolchain.
 #[cfg(feature = "test-broker")]
 fn compile_c(dir: &Path, source: &str) -> PathBuf {
-    let c = dir.join("main.c");
+    compile(dir, "clang", "main.c", source, &[])
+}
+
+/// Compile `source` (saved as `file`) with the host toolchain's `compiler`
+/// and extra `arguments`.
+#[cfg(feature = "test-broker")]
+fn compile(dir: &Path, compiler: &str, file: &str, source: &str, arguments: &[&str]) -> PathBuf {
+    let c = dir.join(file);
     let binary = dir.join("main");
     std::fs::write(&c, source).unwrap();
     let output = Command::new("xcrun")
-        .args(["clang", "-arch", "arm64"])
+        .args([compiler, "-arch", "arm64"])
         .arg(&c)
+        .args(arguments)
         .arg("-o")
         .arg(&binary)
         .output()
@@ -647,6 +655,69 @@ fn dynamic_exit_status() {
     assert_eq!(
         (code, stdout.as_slice(), stderr.as_str()),
         (Some(42), &b""[..], "")
+    );
+}
+
+/// A strong `operator new` overrides libc++'s weak definition, so dyld
+/// patches the cache's uses of it: it makes the cache's DATA_CONST
+/// mappings writable as a whole and writes to them.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_cpp_strong_operator_new_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang++",
+        "main.cpp",
+        "#include <cstdio>\n#include <cstdlib>\n#include <new>\n\
+         int new_calls;\n\
+         void *operator new(std::size_t size) {\n\
+           ++new_calls;\n\
+           void *p = std::malloc(size ? size : 1);\n\
+           if (!p) std::abort();\n\
+           return p;\n\
+         }\n\
+         void operator delete(void *p) noexcept { std::free(p); }\n\
+         int main() {\n\
+           int *x = new int(41);\n\
+           ++*x;\n\
+           std::printf(\"operator new: %d %d\\n\", *x, new_calls);\n\
+           delete x;\n\
+           return 0;\n\
+         }\n",
+        &[],
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b"operator new: 42 1\n"[..], "")
+    );
+}
+
+/// A cache library the executable links beyond libSystem runs: its code is
+/// rewritten and executable, and no gate island is placed inside it.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_calls_a_linked_cache_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "main.c",
+        "#include <stdio.h>\n#include <zlib.h>\n\
+         int main(void) { printf(\"zlib %s\\n\", zlibVersion()); return 0; }\n",
+        &["-lz"],
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    let stdout = String::from_utf8(stdout).unwrap();
+    assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
+    let version = stdout
+        .strip_prefix("zlib ")
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .unwrap_or_else(|| panic!("{stdout:?}"));
+    assert!(
+        !version.is_empty() && version.split('.').all(|part| part.parse::<u32>().is_ok()),
+        "{stdout:?}"
     );
 }
 

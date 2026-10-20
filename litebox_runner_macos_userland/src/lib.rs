@@ -45,18 +45,6 @@ mod test_broker;
 /// Host dyld, mapped privately into each dynamically linked guest.
 const DYLD_PATH: &str = "/usr/lib/dyld";
 
-/// Task identity of dynamically linked guests. macOS reserves PID 1 for
-/// launchd, and the guest's own system libraries take launchd-only paths for
-/// it (libignition's boot-time cryptex activation in dyld), so a dynamically
-/// linked guest is an ordinary process whose parent is PID 1.
-fn dynamic_task_params() -> TaskParams {
-    TaskParams {
-        pid: 2,
-        ppid: 1,
-        ..TaskParams::default()
-    }
-}
-
 /// Mirror the allowlisted system-identity sysctls from the host, including
 /// their MIBs and read errors; nodes absent on the host stay absent.
 fn host_sysctls() -> Vec<litebox_shim_macos::syscalls::misc::HostSysctl> {
@@ -147,9 +135,10 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .map(|s| CString::new(s.as_bytes()))
         .collect::<Result<Vec<_>, _>>()
         .context("NUL in environment entry")?;
-    let uses_dyld = litebox_common_macos::loader::arm64_slice(&data)
+    let plan = litebox_common_macos::loader::arm64_slice(&data)
         .and_then(litebox_common_macos::loader::MachoParsedFile::parse)
-        .is_ok_and(|plan| plan.uses_dyld);
+        .ok();
+    let uses_dyld = plan.as_ref().is_some_and(|plan| plan.uses_dyld);
     if uses_dyld && cfg!(not(feature = "test-broker")) {
         // libSystem's initializers need XNU's entropy apple[] strings, and
         // only the test broker provides guest randomness.
@@ -159,7 +148,9 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     }
     let dyld = if uses_dyld {
         // Verify the host cache before loading anything.
-        let cache = shared_cache::GuestCache::open().context("preparing the guest shared cache")?;
+        let dependencies = plan.map(|plan| plan.dependencies).unwrap_or_default();
+        let cache = shared_cache::GuestCache::open(&dependencies)
+            .context("preparing the guest shared cache")?;
         let dyld = std::fs::read(DYLD_PATH).with_context(|| format!("reading {DYLD_PATH}"))?;
         Some((dyld, cache))
     } else {
@@ -189,7 +180,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let (path, image) = (path.as_str(), Some(&data[..]));
     let program = match (&dyld, image) {
         (Some((dyld, _)), image) => {
-            shim.load_program_with_dyld(dynamic_task_params(), path, image, dyld, argv, envp)
+            shim.load_program_with_dyld(TaskParams::default(), path, image, dyld, argv, envp)
         }
         (None, Some(image)) => {
             shim.load_program_from_bytes(TaskParams::default(), path, image, argv, envp)
