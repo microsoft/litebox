@@ -131,7 +131,7 @@ pub struct InputResult {
     /// Bytes consumed; the transport must retain the unconsumed suffix.
     pub consumed: usize,
     /// Echo to append to the transport's output queue in order.
-    pub echo: Vec<u8>,
+    pub echo: VecDeque<u8>,
     /// Actions to publish to the attached process group.
     pub events: TerminalEvents,
     /// A signal-generating character discarded previously queued output.
@@ -415,7 +415,7 @@ impl TerminalEngine {
             .extend(self.line.drain(..).map(|entry| entry.byte));
     }
 
-    fn erase(&mut self, echo: &mut Vec<u8>, force_visual: bool) {
+    fn erase(&mut self, echo: &mut VecDeque<u8>, force_visual: bool) {
         let Some(start) = self.last_character_start() else {
             return;
         };
@@ -450,7 +450,7 @@ impl TerminalEngine {
         Some(start)
     }
 
-    fn echo_line_byte(&mut self, byte: u8, quoted: bool, output: &mut Vec<u8>) -> LineByte {
+    fn echo_line_byte(&mut self, byte: u8, quoted: bool, output: &mut VecDeque<u8>) -> LineByte {
         let column = self.column;
         self.echo(byte, quoted, output);
         LineByte {
@@ -465,7 +465,7 @@ impl TerminalEngine {
         }
     }
 
-    fn echo(&mut self, byte: u8, newline_is_control: bool, output: &mut Vec<u8>) {
+    fn echo(&mut self, byte: u8, newline_is_control: bool, output: &mut VecDeque<u8>) {
         let l = self.settings.local;
         if !l.contains(L::ECHO) {
             if byte == b'\n' && !newline_is_control && l.contains(L::CANONICAL | L::ECHO_NEWLINE) {
@@ -485,7 +485,7 @@ impl TerminalEngine {
         }
     }
 
-    fn output_byte(&mut self, mut byte: u8, output: &mut impl Extend<u8>) {
+    fn output_byte(&mut self, mut byte: u8, output: &mut VecDeque<u8>) {
         let flags = self.settings.output;
         if flags.contains(O::PROCESS) {
             if byte == b'\r' {
@@ -496,16 +496,16 @@ impl TerminalEngine {
                     byte = b'\n';
                 }
             } else if byte == b'\n' && flags.contains(O::NEWLINE_TO_CRLF) {
-                output.extend(*b"\r");
+                output.push_back(b'\r');
                 self.column = 0;
             } else if byte == b'\t' && flags.contains(O::EXPAND_TABS) {
                 let spaces = 8 - (self.column & 7);
-                output.extend(core::iter::repeat_n(b' ', spaces));
+                output.resize(output.len() + spaces, b' ');
                 self.column = self.column.saturating_add(spaces);
                 return;
             }
         }
-        output.extend([byte]);
+        output.push_back(byte);
         match byte {
             b'\r' => self.column = 0,
             b'\n' if flags.contains(O::PROCESS | O::NEWLINE_RETURNS_CARRIAGE) => self.column = 0,
@@ -532,7 +532,7 @@ impl TerminalEngine {
 
     /// Processes a guest write, appending at most [`Self::output_expansion`]
     /// transport bytes per input byte to `output`.
-    pub fn output(&mut self, input: &[u8], output: &mut impl Extend<u8>) {
+    pub fn output(&mut self, input: &[u8], output: &mut VecDeque<u8>) {
         for &byte in input {
             self.output_byte(byte, output);
         }
@@ -552,9 +552,9 @@ mod tests {
         }
 
         fn processed(&mut self, input: &[u8]) -> Vec<u8> {
-            let mut output = Vec::new();
+            let mut output = VecDeque::new();
             self.output(input, &mut output);
-            output
+            output.into()
         }
     }
 
