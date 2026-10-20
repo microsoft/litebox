@@ -10,7 +10,7 @@
 //! MIG server in [`super::mig`]. Nothing is forwarded to the host: every
 //! right names an object owned by this guest.
 
-use super::mig;
+use super::{mach::INVALID_TASK_DEST, mig};
 use crate::{ShimPlatform, Task};
 use alloc::{
     collections::{BTreeMap, VecDeque},
@@ -442,12 +442,6 @@ impl IpcSpace {
         }
     }
 
-    /// Destroy a kernel object (`semaphore_destroy`): its rights become dead names.
-    pub(crate) fn destroy_kernel_object(&mut self, port: PortId) {
-        self.kill_port(port);
-        self.reap();
-    }
-
     fn port_is_active(&self, port: PortId) -> bool {
         self.ports.contains_key(&port)
     }
@@ -603,9 +597,10 @@ impl IpcSpace {
         })
     }
 
-    /// Destroy a receive right: the port dies, queued messages are destroyed,
-    /// and other names for it become dead names.
-    fn destroy_receive(&mut self, port: PortId) {
+    /// Destroy a receive right or a kernel object (`semaphore_destroy`): the
+    /// port dies, queued messages are destroyed, and other names for it
+    /// become dead names.
+    pub(crate) fn destroy_port(&mut self, port: PortId) {
         self.kill_port(port);
         self.reap();
     }
@@ -710,13 +705,6 @@ impl IpcSpace {
         message.destination = Right::Dead;
         self.doomed.push_back(message);
         Err(error)
-    }
-
-    /// Queue a kernel-originated message (a MIG reply); one that cannot be
-    /// queued is destroyed, like a failed kernel reply in `ipc_kmsg_send`.
-    pub(crate) fn enqueue_kernel(&mut self, port: PortId, message: Message) {
-        let _ = self.enqueue(port, message);
-        self.reap();
     }
 
     /// Whether a user message with `payload` bytes ([`payload_charge`]) may
@@ -1043,7 +1031,7 @@ impl IpcSpace {
                 if entry.kind.is_empty() {
                     self.free_name(name);
                 }
-                self.destroy_receive(port);
+                self.destroy_port(port);
                 KernReturn::SUCCESS
             }
             port_right::SEND_ONCE => {
@@ -1219,7 +1207,7 @@ impl IpcSpace {
         if entry.kind.is_empty() {
             self.free_name(name);
         }
-        self.destroy_receive(port);
+        self.destroy_port(port);
         KernReturn::SUCCESS
     }
 
@@ -1340,7 +1328,7 @@ impl<P: ShimPlatform> Task<P> {
     ) -> KernReturn {
         let mut ipc = self.global.ipc.lock();
         if !ipc.is_task_name(target) {
-            return KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed());
+            return INVALID_TASK_DEST;
         }
         let allocated = match right {
             port_right::RECEIVE => ipc.allocate_receive(MACH_PORT_QLIMIT_DEFAULT, 0),
@@ -1369,7 +1357,7 @@ impl<P: ShimPlatform> Task<P> {
     ) -> KernReturn {
         let mut ipc = self.global.ipc.lock();
         if !ipc.is_task_name(target) {
-            return KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed());
+            return INVALID_TASK_DEST;
         }
         ipc.deallocate(name.0)
     }
@@ -1383,7 +1371,7 @@ impl<P: ShimPlatform> Task<P> {
     ) -> KernReturn {
         let mut ipc = self.global.ipc.lock();
         if !ipc.is_task_name(target) {
-            return KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed());
+            return INVALID_TASK_DEST;
         }
         ipc.mod_refs(name.0, right, delta)
     }
@@ -1397,7 +1385,7 @@ impl<P: ShimPlatform> Task<P> {
     ) -> KernReturn {
         let mut ipc = self.global.ipc.lock();
         if !ipc.is_task_name(target) {
-            return KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed());
+            return INVALID_TASK_DEST;
         }
         ipc.insert_right(name.0, poly.0, disposition)
     }
@@ -1411,7 +1399,7 @@ impl<P: ShimPlatform> Task<P> {
     ) -> KernReturn {
         let mut ipc = self.global.ipc.lock();
         if !ipc.is_task_name(target) {
-            return KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed());
+            return INVALID_TASK_DEST;
         }
         let Some(options) = options.read_at_offset::<P>(0) else {
             return KernReturn::MEMORY_ERROR;
@@ -1431,18 +1419,9 @@ impl<P: ShimPlatform> Task<P> {
     ) -> KernReturn {
         let mut ipc = self.global.ipc.lock();
         if !ipc.is_task_name(target) {
-            return KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed());
+            return INVALID_TASK_DEST;
         }
         ipc.destruct(name.0, send_right_delta, guard)
-    }
-
-    fn sender(&self) -> Sender {
-        let params = &self.params;
-        Sender {
-            uid: params.euid,
-            gid: params.egid,
-            audit: mig::audit_token(params),
-        }
     }
 
     /// `mach_msg2_trap` for scalar (non-vector) messages.
@@ -1625,7 +1604,11 @@ impl<P: ShimPlatform> Task<P> {
             body,
             // At most one descriptor per 12 body bytes, checked above.
             ports: Vec::with_capacity(descriptor_count as usize),
-            sender: self.sender(),
+            sender: Sender {
+                uid: self.params.euid,
+                gid: self.params.egid,
+                audit: mig::audit_token(&self.params),
+            },
         };
         // ipc_kmsg_copyin_body: only port descriptors are supported.
         if complex {
@@ -1700,7 +1683,10 @@ impl<P: ShimPlatform> Task<P> {
         match reply_right {
             Some(right @ (Right::Send(port) | Right::SendOnce(port))) => {
                 reply.destination = right;
-                ipc.enqueue_kernel(port, reply);
+                // A reply that cannot be queued is destroyed, like a failed
+                // kernel reply in `ipc_kmsg_send`.
+                let _ = ipc.enqueue(port, reply);
+                ipc.reap();
             }
             Some(right @ (Right::Dead | Right::Receive(_))) => {
                 ipc.release(right);
@@ -1774,13 +1760,12 @@ impl<P: ShimPlatform> Task<P> {
         // Bodies are bounded by MAX_MESSAGE_SIZE at send time.
         let message_size = u32::try_from(HEADER + first.body.len()).expect("bounded message");
         if receive_size < message_size + trailer_size {
-            let needed = message_size;
             if options.contains(MachMsgOptions::RCV_LARGE) {
                 // The message stays queued; report its size.
                 if receive_size >= 8 {
                     let size_address = data.checked_add(4).ok_or(msg_return::RCV_INVALID_DATA)?;
                     let size_field = UserPtrMut::<u32>::from_usize(size_address);
-                    if size_field.write_at_offset::<P>(0, needed).is_none() {
+                    if size_field.write_at_offset::<P>(0, message_size).is_none() {
                         return Err(msg_return::RCV_INVALID_DATA);
                     }
                 }
@@ -2009,7 +1994,7 @@ mod tests {
         // Only the slots of the messages still queued remain charged.
         assert!(space.queued_bytes <= (QUEUE_MIN_SLOTS + 4 * 2) * QUEUE_SLOT_BYTES);
         let doomed = ports[2];
-        space.destroy_receive(doomed);
+        space.destroy_port(doomed);
         assert_eq!(space.queued_bytes, recount(&space));
         assert_eq!(space.doomed.capacity(), 0);
     }

@@ -141,32 +141,17 @@ fn kern_reply(code: KernReturn, fields: &[u8]) -> Message {
     Message::reply(ndr_body(&body))
 }
 
-/// A successful reply carrying one port: `mach_msg_body_t` plus a port
-/// descriptor. Failures are `mig_reply_error_t`.
-fn port_reply(right: Right) -> Message {
-    let descriptor = MachMsgPortDescriptor {
-        name: 0,
-        pad1: 0,
-        pad2: 0,
-        disposition: u8::try_from(msg_type::MOVE_SEND).expect("fits"),
-        descriptor_type: PORT_DESCRIPTOR,
-    };
-    let mut body = Vec::with_capacity(16);
-    body.extend_from_slice(&1u32.to_ne_bytes());
-    body.extend_from_slice(descriptor.as_bytes());
-    let mut reply = Message::reply(body);
-    reply.complex = true;
-    reply.ports.push((4, Some(right)));
-    reply
-}
-
-/// A successful reply carrying several ports, each `None` for
-/// `MACH_PORT_NULL`.
+/// A successful reply carrying ports: `mach_msg_body_t` plus one `MOVE_SEND`
+/// port descriptor per right, `None` for `MACH_PORT_NULL`. Failures are
+/// `mig_reply_error_t`.
 fn ports_reply(rights: &[Option<Right>]) -> Message {
-    let mut reply = port_reply(Right::Dead);
-    reply.ports.clear();
-    reply.body.truncate(4);
-    reply.body[..4].copy_from_slice(&u32::try_from(rights.len()).expect("small").to_ne_bytes());
+    let mut reply = Message::reply(
+        u32::try_from(rights.len())
+            .expect("small")
+            .to_ne_bytes()
+            .to_vec(),
+    );
+    reply.complex = true;
     let descriptor = MachMsgPortDescriptor {
         name: 0,
         pad1: 0,
@@ -440,7 +425,7 @@ impl<P: ShimPlatform> Task<P> {
             .lock()
             .kernel_send_right(KernelObject::Clock(clock))
         {
-            Ok(right) => port_reply(right),
+            Ok(right) => ports_reply(&[Some(right)]),
             Err(code) => error_reply(code.raw()),
         }
     }
@@ -543,7 +528,7 @@ impl<P: ShimPlatform> Task<P> {
                 policy,
                 count: value,
             }) {
-            Ok(right) => port_reply(right),
+            Ok(right) => ports_reply(&[Some(right)]),
             Err(code) => error_reply(code.raw()),
         }
     }
@@ -562,7 +547,7 @@ impl<P: ShimPlatform> Task<P> {
                     Some(KernelObject::Semaphore { .. })
                 ) =>
             {
-                ipc.destroy_kernel_object(port);
+                ipc.destroy_port(port);
                 KernReturn::SUCCESS
             }
             _ => KernReturn::INVALID_ARGUMENT,
