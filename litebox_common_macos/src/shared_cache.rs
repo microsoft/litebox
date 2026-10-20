@@ -72,6 +72,13 @@ const DYLIB_USE_COMMAND_BYTES: usize = 28;
 /// linkage kind.
 const DYLIB_USE_MARKER: u32 = 0x1a74_1800;
 const UUID_COMMAND_BYTES: usize = 24;
+/// The load commands that link a dependency.
+const DYLIB_LOAD_COMMANDS: [u32; 4] = [
+    object::macho::LC_LOAD_DYLIB,
+    object::macho::LC_LOAD_WEAK_DYLIB,
+    object::macho::LC_REEXPORT_DYLIB,
+    object::macho::LC_LOAD_UPWARD_DYLIB,
+];
 
 /// Why a shared cache was rejected.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -548,15 +555,7 @@ impl CacheDependency {
     /// `None` for other commands. Cache images are built by Apple's cache
     /// builder, so any malformed or non-UTF-8 name is an error.
     pub fn from_load_command(command: u32, body: &[u8]) -> Result<Option<Self>> {
-        use object::macho;
-
-        if !matches!(
-            command,
-            macho::LC_LOAD_DYLIB
-                | macho::LC_LOAD_WEAK_DYLIB
-                | macho::LC_REEXPORT_DYLIB
-                | macho::LC_LOAD_UPWARD_DYLIB
-        ) {
+        if !DYLIB_LOAD_COMMANDS.contains(&command) {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -570,15 +569,7 @@ impl CacheDependency {
     /// [`load_command_bytes`]). Names that are not UTF-8 are not cache image
     /// paths and give `None`.
     pub fn from_executable_load_command(command: u32, body: &[u8]) -> Result<Option<Self>> {
-        use object::macho;
-
-        if !matches!(
-            command,
-            macho::LC_LOAD_DYLIB
-                | macho::LC_LOAD_WEAK_DYLIB
-                | macho::LC_REEXPORT_DYLIB
-                | macho::LC_LOAD_UPWARD_DYLIB
-        ) {
+        if !DYLIB_LOAD_COMMANDS.contains(&command) {
             return Ok(None);
         }
         let Ok(path) = core::str::from_utf8(load_command_bytes(body)?) else {

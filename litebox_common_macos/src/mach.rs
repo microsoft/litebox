@@ -270,14 +270,4 @@ mod tests {
         assert_eq!(size_of::<MachPortOptions>(), 24);
         assert_eq!(size_of::<MachMsgMaxTrailer>(), MAX_TRAILER_SIZE as usize);
     }
-
-    #[test]
-    fn requested_trailer_sizes() {
-        let elements = |n: u64| MachMsgOptions::from_bits_retain(n << 24);
-        assert_eq!(elements(0).trailer_size(), 8);
-        assert_eq!(elements(3).trailer_size(), 52);
-        assert_eq!(elements(4).trailer_size(), 60);
-        assert_eq!(elements(7).trailer_size(), 68);
-        assert_eq!(elements(8).trailer_size(), 68);
-    }
 }

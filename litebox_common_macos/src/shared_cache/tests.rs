@@ -5,7 +5,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use super::*;
-use alloc::{format, vec};
+use alloc::vec;
 use object::macho;
 
 const REGION_START: u64 = 0x1_8000_0000;
@@ -74,10 +74,10 @@ type ImageSpec<'a> = (&'a str, u64, u32, &'a [(&'a str, u32)]);
 /// Marks a test dependency as a `dylib_use_command` with these flags.
 const USE: u32 = 0x100;
 
-/// Images follow the TEXT subcache's own header.
 /// `__TEXT,__text` relative to each synthetic image's Mach header.
 const TEXT_SECTION: core::ops::Range<u64> = 0x100..0x800;
 
+/// Images follow the TEXT subcache's own header.
 fn image_address(index: u64) -> u64 {
     TEXT_ADDRESS + 0x1000 * (index + 1)
 }
@@ -623,7 +623,7 @@ fn malformed_images_are_rejected() {
     assert!(cache.parse_image(image_address(0)).is_err());
 }
 
-/// An 8-page-byte-granular v5 chain entry.
+/// A plain v5 chain entry; `next` counts 8-byte strides.
 fn regular(target: u64, high8: u8, next: u64) -> u64 {
     target | (u64::from(high8) << 34) | (next << 52)
 }
@@ -801,11 +801,7 @@ fn dynamic_region_cache_path_is_bounded() {
     ] {
         let mut copy = region.clone();
         copy[offset..offset + bytes.len()].copy_from_slice(bytes);
-        assert!(
-            dynamic_region_cache_path(&copy).is_err(),
-            "{}",
-            format!("{offset}")
-        );
+        assert!(dynamic_region_cache_path(&copy).is_err(), "{offset}");
     }
     region[0x80 + path.len()..].fill(b'a');
     assert!(dynamic_region_cache_path(&region).is_err());

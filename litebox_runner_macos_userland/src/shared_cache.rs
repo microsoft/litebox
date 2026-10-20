@@ -63,7 +63,7 @@ use std::{
 /// Native (and cache) page size.
 const PAGE: u64 = 0x4000;
 const PAGE_BYTES: usize = 0x4000;
-/// Images of the launch-time closure.
+/// Root of the launch-time initializer closure, with dyld-in-cache.
 const ROOT: &str = "/usr/lib/libSystem.B.dylib";
 /// Closure code within this distance belongs to one island cluster; well
 /// below the +-128 MiB branch range.
@@ -456,10 +456,6 @@ impl GuestCache {
         }))
     }
 
-    fn header(&self) -> &CacheHeader {
-        self.cache.header()
-    }
-
     /// Every mapping with its file's bytes, in address order.
     fn mappings(&self) -> Vec<(&CacheMapping, &[u8])> {
         let mut mappings: Vec<_> = self
@@ -550,17 +546,7 @@ impl GuestCache {
             else {
                 continue;
             };
-            let mut page = text.address_range.start.next_multiple_of(PAGE);
-            while page + PAGE <= text.address_range.end {
-                let candidate = page..page + PAGE;
-                if !excluded
-                    .iter()
-                    .any(|run| run.start < candidate.end && candidate.start < run.end)
-                {
-                    pages.push(candidate);
-                }
-                page += PAGE;
-            }
+            pages.extend(whole_pages(text.address_range.clone(), excluded));
         }
         pages.extend(hole_pages(holes, &search, excluded));
         pages.sort_by_key(|page| page.start);
@@ -815,28 +801,38 @@ fn reserve_free_range(
     bail!("reserving the guest cache: {RESERVATION_ATTEMPTS} placement conflicts")
 }
 
+/// Whole native pages of `range`, minus those overlapping `excluded`.
+fn whole_pages(range: Range<u64>, excluded: &[Range<u64>]) -> Vec<Range<u64>> {
+    let mut pages = Vec::new();
+    let mut page = range.start.next_multiple_of(PAGE);
+    while page + PAGE <= range.end {
+        let candidate = page..page + PAGE;
+        if !excluded
+            .iter()
+            .any(|run| run.start < candidate.end && candidate.start < run.end)
+        {
+            pages.push(candidate);
+        }
+        page += PAGE;
+    }
+    pages
+}
+
 /// Whole native pages of `holes` inside `search`, minus `excluded`.
 fn hole_pages(
     holes: &[Range<u64>],
     search: &Range<u64>,
     excluded: &[Range<u64>],
 ) -> Vec<Range<u64>> {
-    let mut pages = Vec::new();
-    for hole in holes {
-        let mut page = hole.start.max(search.start).next_multiple_of(PAGE);
-        let end = hole.end.min(search.end);
-        while page + PAGE <= end {
-            let candidate = page..page + PAGE;
-            if !excluded
-                .iter()
-                .any(|run| run.start < candidate.end && candidate.start < run.end)
-            {
-                pages.push(candidate);
-            }
-            page += PAGE;
-        }
-    }
-    pages
+    holes
+        .iter()
+        .flat_map(|hole| {
+            whole_pages(
+                hole.start.max(search.start)..hole.end.min(search.end),
+                excluded,
+            )
+        })
+        .collect()
 }
 
 /// The farthest distance between any byte of `page` and of `code`.
@@ -953,7 +949,7 @@ pub(crate) fn install<P: ShimPlatform>(
     program: &LoadedProgram<P>,
     cache: &Arc<GuestCache>,
 ) -> Result<Range<usize>> {
-    let header = cache.header();
+    let header = cache.cache.header();
     let start = header.shared_region_start;
     let size = header.shared_region_size.next_multiple_of(PAGE);
     let limit = litebox_platform_macos_userland::TASK_ADDR_MAX as u64;
@@ -1016,11 +1012,6 @@ pub(crate) fn install<P: ShimPlatform>(
         .map(|(offset, _)| start + offset..start + offset + DYNAMIC_REGION_SIZE as u64);
 
     let mut copies: BTreeMap<u64, Copied> = BTreeMap::new();
-    let read = |range: &Range<u64>| -> Result<Vec<u8>> {
-        Ok(cache
-            .cache
-            .read_at_address(range.start, usize::try_from(range.end - range.start)?)?)
-    };
     for run in &text_runs {
         let ranges = cache.instruction_ranges(run)?;
         let executable = VmProtection::READ | VmProtection::EXECUTE;
@@ -1028,7 +1019,9 @@ pub(crate) fn install<P: ShimPlatform>(
             run.start,
             Copied {
                 range: run.clone(),
-                bytes: read(run)?,
+                bytes: cache
+                    .cache
+                    .read_at_address(run.start, usize::try_from(run.end - run.start)?)?,
                 protection: executable,
                 max_protection: executable,
                 instruction_ranges: Some(ranges),
@@ -1500,7 +1493,8 @@ mod tests {
         let base = 0x1_8000_0000;
         // One cluster wider than the branch range (runs closer than
         // CLUSTER_GAP), with many candidates near its top and one near its
-        // bottom. One-sided ranking took only top candidates.
+        // bottom: ranking by distance to one end alone would take only top
+        // candidates.
         let runs = [
             base..base + PAGE,
             base + 30 * MIB..base + 30 * MIB + PAGE,

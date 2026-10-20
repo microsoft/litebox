@@ -596,8 +596,7 @@ fn run_guest(binary: &Path) -> (Option<i32>, Vec<u8>, String) {
     )
 }
 
-/// PLAN section 5 item 1: `_start` -> `write(1, ...)` -> `exit(0)`, raw and
-/// AOT-rewritten.
+/// `_start` -> `write(1, ...)` -> `exit(0)`, raw and AOT-rewritten.
 #[cfg(feature = "test-broker")]
 #[test]
 fn static_hello_world() {
@@ -628,8 +627,7 @@ fn static_hello_world() {
     }
 }
 
-/// PLAN section 5 item 2: a dynamic `printf` hello world runs on its own
-/// libSystem.
+/// A dynamic `printf` hello world runs on its own libSystem.
 #[cfg(feature = "test-broker")]
 #[test]
 fn dynamic_hello_world() {
@@ -885,8 +883,8 @@ mod host_state {
     }
 }
 
-/// PLAN section 5 item 3: the guest's own dyld reports its private cache
-/// instance, above the host's shared region and at another base.
+/// The guest's own dyld reports its private cache instance, above the host's
+/// shared region and at another base.
 #[cfg(feature = "test-broker")]
 #[test]
 fn dynamic_guest_cache_base_is_private() {
@@ -917,8 +915,8 @@ fn dynamic_guest_cache_base_is_private() {
     assert_ne!(guest_length, 0);
 }
 
-/// PLAN section 5 item 3: an in-process dynamic guest runs on its own private
-/// cache instance and leaves the host's libSystem, cache and TSD untouched.
+/// An in-process dynamic guest runs on its own private cache instance and
+/// leaves the host's libSystem, cache and TSD untouched.
 #[cfg(feature = "test-broker")]
 #[test]
 fn dynamic_guest_leaves_host_runtime_untouched() {
