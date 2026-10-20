@@ -32,9 +32,9 @@ use litebox_trampoline::aarch64::recovery::{
     Aarch64GateSignalResult, GateAbi, GateInterruption, GateRuntimeState, canonicalize,
 };
 use litebox_trampoline::{
-    aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP, aarch64::IN_GUEST_OFFSET_FROM_GUEST_TP,
-    aarch64::SVC_FRAME_BYTES, aarch64::SVC_FRAME_OFF_RETADDR, aarch64::SVC_FRAME_OFF_STUB,
-    aarch64::SVC_FRAME_OFF_X16, aarch64::is_patchable_guest_tpidr_offset,
+    aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP, aarch64::SVC_FRAME_BYTES,
+    aarch64::SVC_FRAME_OFF_RETADDR, aarch64::SVC_FRAME_OFF_STUB, aarch64::SVC_FRAME_OFF_X16,
+    aarch64::is_patchable_guest_tpidr_offset,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -901,7 +901,6 @@ mod tls_offset {
 // TlsBlock pointer from the pthread key slot.
 const _: () = assert!(tls_offset::GUEST_THREAD_POINTER == 0);
 const _: () = assert!(tls_offset::GUEST_X18 == GUEST_X18_OFFSET_FROM_GUEST_TP);
-const _: () = assert!(tls_offset::IN_GUEST == IN_GUEST_OFFSET_FROM_GUEST_TP as usize);
 
 #[derive(Debug)]
 struct TlsKey(libc::pthread_key_t);
@@ -3916,6 +3915,82 @@ mod tests {
                 .unwrap()
                 .contains_range(base..base + HOST_PAGE_SIZE)
         );
+    }
+
+    #[test]
+    fn failed_copy_on_write_replacement_keeps_the_target_mapping() {
+        let p = MacosUserland::new();
+        let reservation = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let target = reservation.range().start;
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                target,
+            );
+        assert_eq!(ptr.write_at_offset(0, 0x5a), Some(()));
+        // A source whose maximum protection forbids the requested WRITE: the
+        // legacy remap keeps that maximum, so protecting the copy fails.
+        // SAFETY: a fresh anonymous mapping, leaked for the program lifetime.
+        let source = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                HOST_PAGE_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(source, libc::MAP_FAILED);
+        // SAFETY: the test exclusively owns this mapping.
+        let source: &'static [u8] = unsafe {
+            core::ptr::write_bytes(source.cast::<u8>(), 0x11, HOST_PAGE_SIZE);
+            assert_eq!(
+                mach_vm_protect(
+                    mach_task_self(),
+                    source as u64,
+                    HOST_PAGE_SIZE as u64,
+                    MachBoolean::TRUE,
+                    MachVmProtection::READ
+                ),
+                KernReturn::SUCCESS
+            );
+            core::slice::from_raw_parts(source.cast(), HOST_PAGE_SIZE)
+        };
+        assert!(matches!(
+            unsafe {
+                p.try_allocate_cow_pages(
+                    || -> core::iter::Empty<_> { unreachable!("the replacement failed") },
+                    target,
+                    source,
+                    RW,
+                    FixedAddressBehavior::Replace,
+                )
+            },
+            Err(CowAllocationError::InternalFailure)
+        ));
+        // The caller still owns the previous mapping and its contents.
+        assert!(
+            p.pages
+                .lock()
+                .unwrap()
+                .contains_range(target..target + HOST_PAGE_SIZE)
+        );
+        assert_eq!(ptr.read_at_offset(0), Some(0x5a));
+        assert_eq!(ptr.write_at_offset(1, 0x6b), Some(()));
+        // SAFETY: the test owns the reservation and no longer accesses it.
+        unsafe {
+            p.release_pages(reservation.range()).unwrap();
+        }
     }
 
     #[test]

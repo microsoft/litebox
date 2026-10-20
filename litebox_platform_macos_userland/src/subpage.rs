@@ -494,53 +494,62 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
             // FIXED without OVERWRITE fails on any existing host mapping.
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => MachVmFlags::FIXED,
         };
-        let mut target = range.start as u64;
-        let mut current = MachVmProtection::empty();
-        let mut maximum = MachVmProtection::empty();
-        // SAFETY: FIXED without OVERWRITE fails on any existing host mapping;
-        // OVERWRITE replaces only pages this registry owns (checked above).
-        // The caller guarantees `source` is readable for the whole length.
-        // copy=true gives the target its own copy-on-write object.
-        let result = unsafe {
-            mach_vm_remap(
-                mach_task_self(),
-                &raw mut target,
-                range.len() as u64,
-                0,
-                flags,
-                mach_task_self(),
-                source as u64,
-                MachBoolean::TRUE,
-                &raw mut current,
-                &raw mut maximum,
-                MachVmInheritance::None,
-            )
-        };
-        if result != KernReturn::SUCCESS {
-            return Err(result.into());
-        }
-        let changes: Vec<_> = range
-            .clone()
-            .step_by(HOST_PAGE_SIZE)
-            .map(|base| (base, [Some(permissions); MAX_SUBPAGES]))
-            .collect();
-        let mut update = match self.protect_changes(&changes) {
-            Ok(update) => update,
-            Err(error) => {
-                // The copy replaced any previous contents; release it entirely.
-                for (base, _) in &changes {
-                    self.0.remove(base);
-                }
-                drop(Mapping {
-                    base: range.start,
-                    len: range.len(),
-                });
-                return Err(allocation_error(error));
+        let remap = |target: &mut u64, flags, source: usize, copy| {
+            let mut current = MachVmProtection::empty();
+            let mut maximum = MachVmProtection::empty();
+            // SAFETY: callers pass ANYWHERE, FIXED without OVERWRITE (which
+            // fails on any existing host mapping), or OVERWRITE over pages
+            // this registry owns (checked above); `source` is readable for
+            // the whole length.
+            let result = unsafe {
+                mach_vm_remap(
+                    mach_task_self(),
+                    target,
+                    range.len() as u64,
+                    0,
+                    flags,
+                    mach_task_self(),
+                    source as u64,
+                    copy,
+                    &raw mut current,
+                    &raw mut maximum,
+                    MachVmInheritance::None,
+                )
+            };
+            if result == KernReturn::SUCCESS {
+                Ok(())
+            } else {
+                Err(AllocationError::from(result))
             }
         };
-        for (base, slots) in changes {
-            update.set::<PAGE_SIZE>(base, Some(fused(slots)));
-            self.0.insert(base, slots);
+        // Prepare the copy at a temporary address first, so a failure (such
+        // as a source whose maximum protection forbids `permissions`) leaves
+        // the target and this registry untouched. copy=true gives the copy
+        // its own copy-on-write object.
+        let mut staged = 0;
+        remap(
+            &mut staged,
+            MachVmFlags::ANYWHERE,
+            source,
+            MachBoolean::TRUE,
+        )?;
+        let staged = Mapping {
+            base: staged.trunc(),
+            len: range.len(),
+        };
+        let native = fused([Some(permissions); MAX_SUBPAGES]);
+        protect(staged.base..staged.base + staged.len, native).map_err(allocation_error)?;
+        let mut update = recovery::begin_update();
+        // Move the prepared entries onto the target. XNU builds the copy
+        // before it clears the target range, so a failed remap leaves the
+        // target as it was; legacy remap keeps the staged protections.
+        let mut target = range.start as u64;
+        remap(&mut target, flags, staged.base, MachBoolean::FALSE)?;
+        // The target holds its own reference to the copy.
+        drop(staged);
+        for base in range.step_by(HOST_PAGE_SIZE) {
+            update.set::<PAGE_SIZE>(base, Some(native));
+            self.0.insert(base, [Some(permissions); MAX_SUBPAGES]);
         }
         Ok(())
     }

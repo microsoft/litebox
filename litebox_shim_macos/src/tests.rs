@@ -346,6 +346,408 @@ fn shared_cache_rewrite_fails_closed_without_reachable_island() {
     assert!(gates[0].is_empty());
 }
 
+const RX: VmProtection = VmProtection::READ.union(VmProtection::EXECUTE);
+const RW: VmProtection = VmProtection::READ.union(VmProtection::WRITE);
+
+/// Install a six-page instance at `base`: rewritten code (page 0), a Source
+/// piece (pages 1-2) whose page 2 becomes the used gate island, copied data
+/// (page 3, maximum RW), a Paged piece (page 4, supplied as 0x77 bytes) and a
+/// Reserved piece (page 5).
+fn install_test_cache(base: usize) -> LoadedProgram<Platform> {
+    let program = loaded_program(task(MacosShimBuilder::new(Platform::new()).build()));
+    let range = base..base + 6 * PAGE_SIZE;
+    program.reserve_shared_cache(range.clone()).unwrap();
+    let page = |index: usize| base + index * PAGE_SIZE..base + (index + 1) * PAGE_SIZE;
+    let code = words(&[NOP, SVC, MRS_TPIDRRO_X3, RET]);
+    let data = [0x11u8; 8];
+    let pieces = [
+        SharedCachePiece {
+            range: page(0),
+            backing: SharedCacheBacking::Copy(&code),
+            protection: RX,
+            max_protection: RX,
+        },
+        SharedCachePiece {
+            range: base + PAGE_SIZE..base + 3 * PAGE_SIZE,
+            backing: SharedCacheBacking::Source(leaked_source(2, 0x5a)),
+            protection: VmProtection::READ,
+            max_protection: VmProtection::READ,
+        },
+        SharedCachePiece {
+            range: page(3),
+            backing: SharedCacheBacking::Copy(&data),
+            protection: VmProtection::READ,
+            max_protection: RW,
+        },
+        SharedCachePiece {
+            range: page(4),
+            backing: SharedCacheBacking::Paged,
+            protection: VmProtection::empty(),
+            max_protection: VmProtection::empty(),
+        },
+        SharedCachePiece {
+            range: page(5),
+            backing: SharedCacheBacking::Reserved,
+            protection: VmProtection::empty(),
+            max_protection: VmProtection::empty(),
+        },
+    ];
+    let instructions = 0..code.len();
+    let code_regions = [SharedCacheCodeRegion {
+        piece: 0,
+        instruction_ranges: core::slice::from_ref(&instructions),
+    }];
+    let islands = [page(2)];
+    let paged_address = page(4).start;
+    program
+        .install_shared_cache(&SharedCacheLayout {
+            range,
+            pieces: &pieces,
+            code_regions: &code_regions,
+            gate_islands: &islands,
+            attribution: None,
+            pager: Some(Arc::new(move |address| {
+                (address == paged_address).then(|| SharedCachePage {
+                    bytes: vec![0x77; PAGE_SIZE],
+                    protection: VmProtection::READ,
+                    max_protection: RW,
+                })
+            })),
+        })
+        .unwrap();
+    program
+}
+
+/// Cache state, page contents and guest mappings of an instance.
+type SharedCacheSnapshot = (
+    Vec<crate::shared_cache::SharedCacheMapping>,
+    Vec<Option<Vec<u8>>>,
+    Vec<(core::ops::Range<usize>, VmFlags)>,
+);
+
+/// Mappings, contents and guest permissions of `range`.
+fn shared_cache_snapshot(
+    task: &Task<Platform>,
+    range: &core::ops::Range<usize>,
+) -> SharedCacheSnapshot {
+    (
+        task.global
+            .shared_cache
+            .lock()
+            .as_ref()
+            .unwrap()
+            .mappings
+            .clone(),
+        range
+            .clone()
+            .step_by(PAGE_SIZE)
+            .map(|page| read_guest(page, PAGE_SIZE))
+            .collect(),
+        task.global.mm.overlapping(range.clone()),
+    )
+}
+
+#[test]
+fn bsd_unmap_and_fixed_map_cannot_replace_shared_cache_pieces() {
+    use litebox_common_macos::{MmapFlags, errno::Errno};
+
+    let base = 0x71_0000_0000;
+    let program = install_test_cache(base);
+    let task = &program.entrypoints.task;
+    let range = base..base + 6 * PAGE_SIZE;
+    let page = |index: usize| base + index * PAGE_SIZE..base + (index + 1) * PAGE_SIZE;
+    let before = shared_cache_snapshot(task, &range);
+    // Rewritten code, the gate island, Source and Paged pieces, and requests
+    // that only partly overlap the instance.
+    let targets = [
+        page(0),
+        page(2),
+        page(1),
+        page(4),
+        base - PAGE_SIZE..base + PAGE_SIZE,
+        range.end - PAGE_SIZE..range.end + PAGE_SIZE,
+        base - PAGE_SIZE..range.end + PAGE_SIZE,
+    ];
+    let fixed = MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED;
+    for target in targets {
+        assert_eq!(
+            task.sys_munmap(target.start, target.len()),
+            Err(Errno::EINVAL),
+            "munmap {target:#x?}"
+        );
+        assert_eq!(
+            task.sys_mmap(target.start, target.len(), RW, fixed, -1, 0),
+            Err(Errno::EINVAL),
+            "anonymous MAP_FIXED {target:#x?}"
+        );
+        // File-backed MAP_FIXED is rejected before the descriptor is used.
+        assert_eq!(
+            task.sys_mmap(
+                target.start,
+                target.len(),
+                VmProtection::READ,
+                fixed & !MmapFlags::ANONYMOUS,
+                99,
+                0
+            ),
+            Err(Errno::EINVAL),
+            "file MAP_FIXED {target:#x?}"
+        );
+    }
+    assert_eq!(shared_cache_snapshot(task, &range), before);
+    // Rewritten code stays unwritable and Source text unexecutable.
+    assert_eq!(
+        task.sys_mprotect(page(0).start, PAGE_SIZE, RW),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        task.sys_mprotect(page(1).start, PAGE_SIZE, RX),
+        Err(Errno::EACCES)
+    );
+    // The pager still supplies the untouched page exactly once.
+    assert!(task.page_in_shared_cache(page(4).start));
+    assert_eq!(read_guest(page(4).start, 2).unwrap(), [0x77, 0x77]);
+    assert!(!task.page_in_shared_cache(page(4).start));
+}
+
+#[test]
+fn shared_cache_page_in_ignores_faults_at_the_top_of_the_address_space() {
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    for address in [usize::MAX, usize::MAX - PAGE_SIZE + 1, 0] {
+        assert!(!task.page_in_shared_cache(address));
+    }
+    let program = install_test_cache(0x72_0000_0000);
+    let task = &program.entrypoints.task;
+    for address in [usize::MAX, usize::MAX - PAGE_SIZE + 1, 0] {
+        assert!(!task.page_in_shared_cache(address));
+    }
+}
+
+#[test]
+fn mprotect_across_the_shared_cache_boundary_splits_at_the_instance() {
+    use litebox_common_macos::errno::Errno;
+
+    let base = 0x73_0000_0000;
+    let program = loaded_program(task(MacosShimBuilder::new(Platform::new()).build()));
+    let task = &program.entrypoints.task;
+    let range = base..base + 2 * PAGE_SIZE;
+    program.reserve_shared_cache(range.clone()).unwrap();
+    let data = [0x22u8; 4];
+    let pieces = [
+        SharedCachePiece {
+            range: base..base + PAGE_SIZE,
+            backing: SharedCacheBacking::Copy(&data),
+            protection: VmProtection::READ,
+            max_protection: RW,
+        },
+        SharedCachePiece {
+            range: base + PAGE_SIZE..range.end,
+            backing: SharedCacheBacking::Copy(&data),
+            protection: VmProtection::READ,
+            max_protection: VmProtection::READ,
+        },
+    ];
+    program
+        .install_shared_cache(&SharedCacheLayout {
+            range: range.clone(),
+            pieces: &pieces,
+            code_regions: &[],
+            gate_islands: &[],
+            attribution: None,
+            pager: None,
+        })
+        .unwrap();
+    let below = base - PAGE_SIZE;
+    assert_eq!(
+        task.map_anonymous(
+            below,
+            PAGE_SIZE,
+            crate::syscalls::mm::AnonymousPlacement::Fixed { replace: false },
+            VmProtection::READ,
+        )
+        .unwrap(),
+        below
+    );
+    // Task memory and a cache page whose maximum allows the request.
+    assert_eq!(task.sys_mprotect(below, 2 * PAGE_SIZE, RW), Ok(()));
+    assert!(guest_flags(task, below).contains(VmFlags::VM_WRITE));
+    assert!(guest_flags(task, base).contains(VmFlags::VM_WRITE));
+    let cache_protection = |address: usize| {
+        task.global
+            .shared_cache
+            .lock()
+            .as_ref()
+            .unwrap()
+            .mappings
+            .iter()
+            .find(|mapping| mapping.range.contains(&address))
+            .unwrap()
+            .protection
+    };
+    assert_eq!(cache_protection(base), RW);
+    // A cache page beyond its maximum fails before anything changes.
+    assert_eq!(
+        task.sys_mprotect(
+            below,
+            3 * PAGE_SIZE,
+            VmProtection::READ.union(VmProtection::WRITE)
+        ),
+        Err(Errno::EACCES)
+    );
+    assert_eq!(
+        task.sys_mprotect(below, 3 * PAGE_SIZE, VmProtection::READ),
+        Ok(())
+    );
+    assert!(!guest_flags(task, below).contains(VmFlags::VM_WRITE));
+    assert_eq!(cache_protection(base), VmProtection::READ);
+    // An unmapped hole outside the instance fails like XNU's unmapped ranges.
+    assert_eq!(
+        task.sys_mprotect(base + PAGE_SIZE, 2 * PAGE_SIZE, VmProtection::READ),
+        Err(Errno::ENOMEM)
+    );
+    // Executable task memory next to the instance still goes through the
+    // normal (rewriting) path; non-executable cache pages still refuse it.
+    assert_eq!(
+        task.sys_mprotect(below, 2 * PAGE_SIZE, RX),
+        Err(Errno::EACCES)
+    );
+    assert!(!guest_flags(task, below).contains(VmFlags::VM_EXEC));
+    task.sys_munmap(below, PAGE_SIZE).unwrap();
+}
+
+/// Gate bytes one site needs, measured with an empty island.
+fn gate_bytes_per_site(
+    task: &Task<Platform>,
+    address: usize,
+    island: &core::ops::Range<usize>,
+) -> usize {
+    let mut code = words(&[SVC]);
+    let mut gates = vec![Vec::new()];
+    task.rewrite_shared_cache_code(
+        &mut code,
+        address,
+        core::slice::from_ref(&(0..4)),
+        core::slice::from_ref(island),
+        &mut gates,
+    )
+    .unwrap();
+    gates[0].len()
+}
+
+/// Whether every word of `code` at `address` that was a site now branches
+/// into one of `islands`.
+fn sites_branch_into(
+    code: &[u8],
+    address: usize,
+    islands: &[core::ops::Range<usize>],
+) -> Vec<usize> {
+    use litebox_trampoline::aarch64::decode_branch_target;
+    code.as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(index, word)| {
+            let target =
+                decode_branch_target(u32::from_le_bytes(*word), (address + 4 * index) as u64)
+                    .expect("every site branches to its gate");
+            islands
+                .iter()
+                .position(|island| island.contains(&usize::try_from(target).unwrap()))
+                .expect("gates lie in an island")
+        })
+        .collect()
+}
+
+#[test]
+fn shared_cache_rewrite_splits_batches_across_island_pages() {
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    let address = SHARED_CACHE_MIN_ADDRESS + (8 << 20);
+    let islands: Vec<_> = (1..=4)
+        .map(|index| address - index * PAGE_SIZE..address - (index - 1) * PAGE_SIZE)
+        .collect();
+    let per_site = gate_bytes_per_site(&task, address, &islands[0]);
+    // More sites than one island page holds, all in one 64 KiB batch span.
+    let sites = (PAGE_SIZE / per_site * 3 / 2).min(PAGE_SIZE / 4);
+    assert!(
+        sites * per_site > PAGE_SIZE,
+        "the test needs a batch to split"
+    );
+    let mut code = words(&vec![SVC; sites]);
+    let whole = 0..code.len();
+    let mut gates = vec![Vec::new(); islands.len()];
+    task.rewrite_shared_cache_code(
+        &mut code,
+        address,
+        core::slice::from_ref(&whole),
+        &islands,
+        &mut gates,
+    )
+    .unwrap();
+    let used = sites_branch_into(&code, address, &islands);
+    let mut distinct = used.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert!(distinct.len() >= 2, "a split batch uses several islands");
+    for (island, gates) in islands.iter().zip(&gates) {
+        assert!(gates.len() <= island.len());
+    }
+}
+
+#[test]
+fn shared_cache_rewrite_skips_full_islands() {
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    let address = SHARED_CACHE_MIN_ADDRESS + (8 << 20);
+    let near = address - PAGE_SIZE..address;
+    let far = address - 3 * PAGE_SIZE..address - 2 * PAGE_SIZE;
+    let islands = [near.clone(), far];
+    let per_site = gate_bytes_per_site(&task, address, &near);
+
+    // The nearest island is already full: its gates move to the next one.
+    let mut code = words(&[SVC, NOP, SVC]);
+    let whole = 0..code.len();
+    let mut gates = vec![vec![0; PAGE_SIZE], Vec::new()];
+    task.rewrite_shared_cache_code(
+        &mut code,
+        address,
+        core::slice::from_ref(&whole),
+        &islands,
+        &mut gates,
+    )
+    .unwrap();
+    assert_eq!(gates[0].len(), PAGE_SIZE, "the full island is untouched");
+    assert!(!gates[1].is_empty());
+    assert_eq!(code[4..8], NOP.to_le_bytes());
+    for site in [0, 8] {
+        assert_eq!(
+            sites_branch_into(&code[site..site + 4], address + site, &islands),
+            [1]
+        );
+    }
+
+    // The nearest island has room for one gate but not the whole batch: the
+    // batch falls back to the farther island instead of being split.
+    let mut code = words(&[SVC, SVC]);
+    let whole = 0..code.len();
+    let align = litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN;
+    let used = (PAGE_SIZE - per_site) / align * align;
+    assert!(used + 2 * per_site > PAGE_SIZE);
+    let mut gates = vec![vec![0; used], Vec::new()];
+    task.rewrite_shared_cache_code(
+        &mut code,
+        address,
+        core::slice::from_ref(&whole),
+        &islands,
+        &mut gates,
+    )
+    .unwrap();
+    assert!(!gates[1].is_empty());
+    assert!(
+        sites_branch_into(&code, address, &islands)
+            .iter()
+            .all(|island| *island == 1)
+    );
+}
+
 #[test]
 fn sysctl_mirrors_only_allowlisted_host_nodes_read_only() {
     use litebox_common_macos::{errno::Errno, user_pointers::UserPtr};

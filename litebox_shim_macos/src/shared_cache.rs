@@ -30,7 +30,9 @@ pub const SHARED_CACHE_MIN_ADDRESS: usize = 64 << 30;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SharedCacheInstallError {
     AlreadyInstalled,
-    /// The address range cannot be reserved.
+    /// Part of the address range is already mapped, by the guest or the host.
+    ReservationConflict,
+    /// The address range cannot be reserved for another reason.
     Reservation,
     /// The layout's range is not the reserved range, or its pieces do not
     /// tile it with page-aligned, non-executable-source ranges.
@@ -48,6 +50,7 @@ impl core::fmt::Display for SharedCacheInstallError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(match self {
             Self::AlreadyInstalled => "shared cache already installed",
+            Self::ReservationConflict => "the shared-cache range is already in use",
             Self::Reservation => "cannot reserve the shared-cache range",
             Self::InvalidCacheRange => "invalid shared-cache range or pieces",
             Self::InvalidRegion => "invalid shared-cache code region",
@@ -134,7 +137,7 @@ pub struct SharedCacheLayout<'a> {
 }
 
 /// Current and maximum protection of one range of an installed instance.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SharedCacheMapping {
     pub(crate) range: Range<usize>,
     pub(crate) protection: VmProtection,
@@ -291,8 +294,17 @@ impl<P: ShimPlatform> LoadedProgram<P> {
             )
         }
         .map_err(|error| {
+            use litebox::platform::page_mgmt::AllocationError;
+            use litebox_common_linux::vmem::MappingError;
             litebox_util_log::warn!(error:?, range:?; "cannot reserve the shared-cache range");
-            SharedCacheInstallError::Reservation
+            match error {
+                MappingError::MapError(
+                    AllocationError::AddressInUse
+                    | AllocationError::AddressInUseByPlatform
+                    | AllocationError::AddressPartiallyInUse,
+                ) => SharedCacheInstallError::ReservationConflict,
+                _ => SharedCacheInstallError::Reservation,
+            }
         })?;
         *reservation = Some(range);
         Ok(())
@@ -763,12 +775,20 @@ impl<P: ShimPlatform> Task<P> {
     /// Supply a demand-paged shared-cache page for a guest data abort at
     /// `address`. Returns whether the faulting access can be retried.
     pub(crate) fn page_in_shared_cache(&self, address: usize) -> bool {
-        let page = address & !(PAGE_SIZE - 1);
-        let page = page..page + PAGE_SIZE;
         let mut cache = self.global.shared_cache.lock();
         let Some(cache) = cache.as_mut() else {
             return false;
         };
+        // Any guest fault address reaches here; check membership before
+        // building the page range.
+        if !cache.range.contains(&address) {
+            return false;
+        }
+        let start = address & !(PAGE_SIZE - 1);
+        let Some(end) = start.checked_add(PAGE_SIZE) else {
+            return false;
+        };
+        let page = start..end;
         if !cache.is_paged(page.start) {
             return false;
         }

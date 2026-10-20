@@ -307,9 +307,6 @@ const GUEST_X18_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET - 8;
 pub const GUEST_X18_OFFSET_FROM_GUEST_TP: usize = core::mem::size_of::<usize>();
 const _: () = assert!(GUEST_X18_OFFSET_FROM_GUEST_TP == GUEST_TPIDR_OFFSET_ALIGN as usize);
 
-/// Offset of the runtime's guest-mode word from its guest-TP field.
-pub const IN_GUEST_OFFSET_FROM_GUEST_TP: u16 = 32;
-
 /// Bits occupied by Darwin's CPU-number tag in `TPIDRRO_EL0`.
 const DARWIN_TPIDRRO_CPU_TAG_MASK: u64 = 0b111;
 

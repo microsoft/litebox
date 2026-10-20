@@ -28,14 +28,15 @@ use litebox_common_macos::{
     VmProtection,
     shared_cache::{
         CacheFile, CacheHeader, CacheImage, CacheMapping, ClosureImage, DYNAMIC_REGION_SIZE,
-        MappingFlags, PointerAuthKey, PointerSigner, SharedCache, dynamic_region_cache_path,
+        MappingFlags, PointerAuthKey, PointerSigner, SharedCache, SlideInfoV5,
+        dynamic_region_cache_path,
     },
 };
 use litebox_shim_macos::{
     LoadedProgram, ShimPlatform,
     shared_cache::{
-        SHARED_CACHE_MIN_ADDRESS, SharedCacheBacking, SharedCacheCodeRegion, SharedCacheLayout,
-        SharedCachePage, SharedCachePiece,
+        SHARED_CACHE_MIN_ADDRESS, SharedCacheBacking, SharedCacheCodeRegion,
+        SharedCacheInstallError, SharedCacheLayout, SharedCachePage, SharedCachePiece,
     },
 };
 use std::{
@@ -56,6 +57,15 @@ const ROOT: &str = "/usr/lib/libSystem.B.dylib";
 const CLUSTER_GAP: u64 = 32 << 20;
 /// Island candidates are searched within this distance of a cluster.
 const ISLAND_SEARCH: u64 = 64 << 20;
+/// AArch64 `B` reaches +-128 MiB; a gate island must be within this distance
+/// of every site it serves and of the instruction after it.
+const BRANCH_REACH: u64 = 128 << 20;
+/// Executable code is split into windows of at most this span, and each
+/// window gets its own nearest island candidates.
+const ISLAND_WINDOW: u64 = 16 << 20;
+/// Placement conflicts with concurrent host allocations tolerated while
+/// reserving the instance.
+const RESERVATION_ATTEMPTS: usize = 64;
 
 unsafe extern "C" {
     fn _dyld_get_shared_cache_range(length: *mut usize) -> *const u8;
@@ -115,10 +125,11 @@ impl Drop for MappedFiles {
 impl MappedFiles {
     /// Map a whole cache file read-only and privately.
     ///
-    /// The returned bytes are valid until `self` drops; `'static` only lets
-    /// them flow into APIs that copy them (copy-on-write mappings) or into
-    /// values stored next to `self` in [`GuestCache`].
-    fn map(&mut self, path: &str) -> Result<&'static [u8]> {
+    /// # Safety
+    ///
+    /// The returned bytes are valid only until `self` drops; the caller must
+    /// not use them after that.
+    unsafe fn map(&mut self, path: &str) -> Result<&'static [u8]> {
         let file = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
         let length = usize::try_from(file.metadata()?.len())?;
         ensure!(length != 0, "empty cache file {path}");
@@ -143,8 +154,12 @@ impl MappedFiles {
 
 /// The on-disk cache matching the host's live cache, verified and parsed.
 pub(crate) struct GuestCache {
-    /// Borrows `files`; declared first so it drops first.
+    /// Borrows `files`; declared first so it drops first. Its `'static`
+    /// bytes never leave `self` with that lifetime: accessors tie them to
+    /// `&self`.
     cache: SharedCache<&'static [u8]>,
+    /// Parsed slide info of each mapping that has one, by unslid mapping address.
+    slide_info: BTreeMap<u64, SlideInfoV5>,
     /// The live DynamicRegion page.
     dynamic_region: Vec<u8>,
     /// Images initialized at launch (libSystem + dyld initializer closure).
@@ -179,7 +194,10 @@ impl GuestCache {
             .context("reading the cache path from the live DynamicRegion")?
             .to_owned();
         litebox_util_log::debug!(path:%; "guest shared cache");
-        let main = CacheFile::parse(files.map(&path)?).context("parsing the main cache file")?;
+        // SAFETY: the bytes are only stored in `cache`, which `Self` drops
+        // before `files`.
+        let main = CacheFile::parse(unsafe { files.map(&path) }?)
+            .context("parsing the main cache file")?;
         ensure!(
             main.header().uuid == live.uuid,
             "on-disk cache {path} is not the live cache"
@@ -189,13 +207,19 @@ impl GuestCache {
             .iter()
             .map(|entry| {
                 let path = format!("{path}{}", entry.file_suffix);
-                CacheFile::parse(files.map(&path)?).with_context(|| format!("parsing {path}"))
+                // SAFETY: as for the main file.
+                CacheFile::parse(unsafe { files.map(&path) }?)
+                    .with_context(|| format!("parsing {path}"))
             })
             .collect::<Result<_>>()?;
         let cache = SharedCache::new(main, subcaches).context("verifying the subcaches")?;
+        let mut slide_info = BTreeMap::new();
         for file in cache.files() {
             for mapping in file.mappings() {
-                file.slide_info(mapping)?;
+                if let Some(info) = file.slide_info(mapping)? {
+                    // Mappings do not overlap, so addresses are unique keys.
+                    slide_info.insert(mapping.address, info);
+                }
                 ensure!(
                     !mapping.flags.contains(MappingFlags::TEXT_STUBS),
                     "TEXT_STUBS mappings are unsupported"
@@ -209,7 +233,7 @@ impl GuestCache {
             cache.dyld_image_index().context("the cache has no dyld")?,
         ];
         let closure = cache.closure(&roots)?;
-        let launch_set = cache
+        let launch_set: BTreeSet<u64> = cache
             .launch_set(&roots)?
             .iter()
             .map(|image| image.image.address)
@@ -220,11 +244,12 @@ impl GuestCache {
         image_addresses.dedup();
         litebox_util_log::debug!(
             closure = closure.len(),
-            launch_set = Vec::len(&cache.launch_set(&roots)?);
+            launch_set = launch_set.len();
             "guest shared-cache closure"
         );
         Ok(Arc::new(Self {
             cache,
+            slide_info,
             dynamic_region,
             closure,
             launch_set,
@@ -238,7 +263,7 @@ impl GuestCache {
     }
 
     /// Every mapping with its file's bytes, in address order.
-    fn mappings(&self) -> Vec<(&CacheMapping, &'static [u8])> {
+    fn mappings(&self) -> Vec<(&CacheMapping, &[u8])> {
         let mut mappings: Vec<_> = self
             .cache
             .files()
@@ -246,7 +271,7 @@ impl GuestCache {
             .flat_map(|file| {
                 file.mappings()
                     .iter()
-                    .map(move |mapping| (mapping, *file.reader()))
+                    .map(move |mapping| (mapping, &**file.reader()))
             })
             .collect();
         mappings.sort_by_key(|(mapping, _)| mapping.address);
@@ -299,8 +324,8 @@ impl GuestCache {
     }
 
     /// Whole native pages strictly inside `__TEXT,__text` of images outside
-    /// the launch set, within [`ISLAND_SEARCH`] of `cluster`, nearest first,
-    /// excluding `excluded` (executable runs).
+    /// the launch set, within [`ISLAND_SEARCH`] of `cluster`, in address
+    /// order, excluding `excluded` (executable runs).
     fn island_candidates(
         &self,
         cluster: &Range<u64>,
@@ -337,30 +362,17 @@ impl GuestCache {
                 page += PAGE;
             }
         }
-        let distance = |page: &Range<u64>| {
-            if page.start >= cluster.end {
-                page.end - cluster.start
-            } else {
-                cluster.end - page.start
-            }
-        };
-        pages.sort_by_key(distance);
+        pages.sort_by_key(|page| page.start);
         Ok(pages)
     }
 
-    /// The bytes of unslid `range` in `mapping` of file `file`, rebased for
+    /// The bytes of unslid `range` in `mapping`, rebased for
     /// `slide` like XNU's `vm_shared_region_slide_page_v5`.
-    fn slid_data(
-        &self,
-        file: usize,
-        mapping: &CacheMapping,
-        range: &Range<u64>,
-        slide: u64,
-    ) -> Result<Vec<u8>> {
+    fn slid_data(&self, mapping: &CacheMapping, range: &Range<u64>, slide: u64) -> Result<Vec<u8>> {
         let mut bytes = self
             .cache
             .read_at_address(range.start, usize::try_from(range.end - range.start)?)?;
-        if let Some(info) = self.cache.files()[file].slide_info(mapping)? {
+        if let Some(info) = self.slide_info.get(&mapping.address) {
             let page_size = info.page_size() as u64;
             ensure!(
                 range.start.is_multiple_of(page_size)
@@ -379,9 +391,9 @@ impl GuestCache {
 
     /// The slide pager: the rebased page at unslid `page` of a DATA mapping.
     fn page(&self, page: u64, slide: u64) -> Option<SharedCachePage> {
-        let (file, mapping) = self.cache.mapping_containing(page, PAGE)?;
+        let (_, mapping) = self.cache.mapping_containing(page, PAGE)?;
         let bytes = self
-            .slid_data(file, mapping, &(page..page + PAGE), slide)
+            .slid_data(mapping, &(page..page + PAGE), slide)
             .inspect_err(|error| {
                 litebox_util_log::warn!(error:% = format_args!("{error:#}"), page:?; "cannot page in");
             })
@@ -506,12 +518,22 @@ fn split_at_mappings(
     split
 }
 
-/// Choose a free, page-aligned host range of `length` bytes at or above
-/// [`SHARED_CACHE_MIN_ADDRESS`], starting the search at `from`.
-fn free_host_range(from: u64, length: u64) -> Option<u64> {
+/// The lowest page-aligned address at or above `from` (and
+/// [`SHARED_CACHE_MIN_ADDRESS`]) where `length` bytes are free in the host
+/// and end at or below `limit`; `Ok(None)` if there is none.
+fn free_host_range(from: u64, length: u64, limit: u64) -> Result<Option<u64>> {
+    const KERN_INVALID_ADDRESS: i32 = 1;
     const VM_REGION_BASIC_INFO_64: i32 = 9;
-    let mut candidate = from.max(SHARED_CACHE_MIN_ADDRESS as u64);
+    let Some(mut candidate) = from
+        .max(SHARED_CACHE_MIN_ADDRESS as u64)
+        .checked_next_multiple_of(PAGE)
+    else {
+        return Ok(None);
+    };
     loop {
+        let Some(end) = candidate.checked_add(length).filter(|end| *end <= limit) else {
+            return Ok(None);
+        };
         let mut address = candidate;
         let mut size = 0;
         let mut info = [0i32; 16];
@@ -529,18 +551,122 @@ fn free_host_range(from: u64, length: u64) -> Option<u64> {
                 &raw mut object,
             )
         };
-        // No region at or above `candidate`, or a large enough gap before the next one.
-        if result != 0 || address >= candidate.checked_add(length)? {
-            return Some(candidate);
+        match result {
+            // No region at or above `candidate`.
+            KERN_INVALID_ADDRESS => return Ok(Some(candidate)),
+            0 if address >= end => return Ok(Some(candidate)),
+            0 => {}
+            error => bail!("mach_vm_region({candidate:#x}) failed: {error}"),
         }
-        candidate = address.checked_add(size)?.next_multiple_of(PAGE);
+        // The region contains or follows `candidate`, so this advances.
+        let Some(next) = address
+            .checked_add(size)
+            .and_then(|next| next.checked_next_multiple_of(PAGE))
+        else {
+            return Ok(None);
+        };
+        candidate = next;
     }
 }
 
+/// Reserve the first free range of `length` bytes found by `free_range`
+/// (given a search start) with `reserve`. Only placement conflicts, such as
+/// a concurrent host allocation, are retried, past the conflicting address
+/// and at most [`RESERVATION_ATTEMPTS`] times.
+fn reserve_free_range(
+    length: u64,
+    mut free_range: impl FnMut(u64) -> Result<Option<u64>>,
+    mut reserve: impl FnMut(Range<usize>) -> Result<(), SharedCacheInstallError>,
+) -> Result<u64> {
+    let mut from = SHARED_CACHE_MIN_ADDRESS as u64;
+    for _ in 0..RESERVATION_ATTEMPTS {
+        let base = free_range(from)?
+            .with_context(|| format!("no free {length:#x}-byte range for the guest cache"))?;
+        let range = usize::try_from(base)?..usize::try_from(base + length)?;
+        match reserve(range) {
+            Ok(()) => return Ok(base),
+            Err(SharedCacheInstallError::ReservationConflict) => from = base + PAGE,
+            Err(error) => bail!("reserving the guest cache at {base:#x}: {error}"),
+        }
+    }
+    bail!("reserving the guest cache: {RESERVATION_ATTEMPTS} placement conflicts")
+}
+
+/// The farthest distance between any byte of `page` and of `code`.
+fn worst_distance(page: &Range<u64>, code: &Range<u64>) -> u64 {
+    page.end.max(code.end) - page.start.min(code.start)
+}
+
+/// Split `runs` (sorted executable runs) into windows spanning at most
+/// [`ISLAND_WINDOW`], each with its bytes of code.
+fn code_windows(runs: &[Range<u64>]) -> Vec<(Range<u64>, u64)> {
+    let mut windows: Vec<(Range<u64>, u64)> = Vec::new();
+    for run in runs {
+        let mut start = run.start;
+        while start < run.end {
+            match windows.last_mut() {
+                Some((window, code)) if start - window.start < ISLAND_WINDOW => {
+                    let end = run.end.min(window.start + ISLAND_WINDOW);
+                    *code += end - start;
+                    window.end = end;
+                    start = end;
+                }
+                _ => {
+                    let end = run.end.min(start + ISLAND_WINDOW);
+                    windows.push((start..end, end - start));
+                    start = end;
+                }
+            }
+        }
+    }
+    windows
+}
+
+/// Choose gate-island pages for `runs` (sorted executable runs) from
+/// `candidates` (each cluster's candidate pages, given the cluster). Every
+/// window of code gets its nearest candidates, ranked by worst-case distance
+/// and within branch reach of the whole window; fails if a window has none.
+fn select_islands(
+    runs: &[Range<u64>],
+    mut candidates: impl FnMut(&Range<u64>) -> Result<Vec<Range<u64>>>,
+) -> Result<BTreeSet<u64>> {
+    let mut clusters: Vec<Range<u64>> = Vec::new();
+    for run in runs {
+        match clusters.last_mut() {
+            Some(cluster) if run.start - cluster.end <= CLUSTER_GAP => cluster.end = run.end,
+            _ => clusters.push(run.clone()),
+        }
+    }
+    let mut islands = BTreeSet::new();
+    for cluster in &clusters {
+        let pages = candidates(cluster)?;
+        let cluster_runs: Vec<Range<u64>> = runs
+            .iter()
+            .filter(|run| run.start >= cluster.start && run.end <= cluster.end)
+            .cloned()
+            .collect();
+        for (window, code) in code_windows(&cluster_runs) {
+            let mut reachable: Vec<&Range<u64>> = pages
+                .iter()
+                .filter(|page| worst_distance(page, &window) < BRANCH_REACH)
+                .collect();
+            ensure!(
+                !reachable.is_empty(),
+                "no gate island candidate within branch range of {window:#x?}"
+            );
+            reachable.sort_by_key(|page| worst_distance(page, &window));
+            // Generous: unused candidates cost nothing.
+            let wanted = usize::try_from((code / 8).div_ceil(PAGE))? + 16;
+            islands.extend(reachable.iter().take(wanted).map(|page| page.start));
+        }
+    }
+    Ok(islands)
+}
+
 /// One piece of the instance, at unslid addresses.
-struct Piece {
+struct Piece<'a> {
     range: Range<u64>,
-    backing: Backing,
+    backing: Backing<'a>,
     protection: VmProtection,
     max_protection: VmProtection,
 }
@@ -556,19 +682,19 @@ struct Copied {
 
 /// What backs an uncopied part of the shared region.
 #[derive(Clone, Copy)]
-enum Region {
+enum Region<'a> {
     /// Outside every mapping.
     Hole,
     /// A writable or slid mapping: paged in and rebased on demand.
     Data,
     /// A read-only view of a file mapping.
-    View(&'static [u8]),
+    View(&'a [u8]),
 }
 
-enum Backing {
+enum Backing<'a> {
     Reserved,
     Paged,
-    Source(&'static [u8]),
+    Source(&'a [u8]),
     /// Key of the copied bytes.
     Copy(u64),
 }
@@ -582,17 +708,12 @@ pub(crate) fn install<P: ShimPlatform>(
     let header = cache.header();
     let start = header.shared_region_start;
     let size = header.shared_region_size.next_multiple_of(PAGE);
-    let mut from = SHARED_CACHE_MIN_ADDRESS as u64;
-    let base = loop {
-        let base = free_host_range(from, size).context("no free range for the guest cache")?;
-        let range = usize::try_from(base)?..usize::try_from(base + size)?;
-        match program.reserve_shared_cache(range) {
-            Ok(()) => break base,
-            // Raced with a host allocation; search past it.
-            Err(_) if base < u64::MAX - PAGE => from = base + PAGE,
-            Err(error) => bail!("reserving the guest cache: {error}"),
-        }
-    };
+    let limit = litebox_platform_macos_userland::TASK_ADDR_MAX as u64;
+    let base = reserve_free_range(
+        size,
+        |from| free_host_range(from, size, limit),
+        |range| program.reserve_shared_cache(range),
+    )?;
     let slide = base - start;
     litebox_util_log::debug!(base:? = base, slide:? = slide; "guest shared-cache instance");
     let slid = |address: u64| usize::try_from(address + slide).expect("64-bit addresses");
@@ -666,7 +787,7 @@ pub(crate) fn install<P: ShimPlatform>(
         );
     }
     for run in &data_runs {
-        let (file, mapping) = cache
+        let (_, mapping) = cache
             .cache
             .mapping_containing(run.start, run.end - run.start)
             .context("data run outside one mapping")?;
@@ -674,7 +795,7 @@ pub(crate) fn install<P: ShimPlatform>(
             !mapping.initial_protection.contains(VmProtection::EXECUTE),
             "closure data {run:#x?} is in an executable mapping"
         );
-        let bytes = cache.slid_data(file, mapping, run, slide)?;
+        let bytes = cache.slid_data(mapping, run, slide)?;
         copies.insert(
             run.start,
             Copied {
@@ -710,7 +831,7 @@ pub(crate) fn install<P: ShimPlatform>(
     // Tile [start, start + size): every mapping is a read-only file view
     // (header, text, read-only, LINKEDIT) or demand-paged (DATA), holes are
     // inaccessible, and copied pages replace either.
-    let mut regions: Vec<(Range<u64>, Region)> = Vec::new();
+    let mut regions: Vec<(Range<u64>, Region<'_>)> = Vec::new();
     let mut cursor = start;
     for (mapping, bytes) in &mappings {
         let range = mapping.address_range();
@@ -744,7 +865,7 @@ pub(crate) fn install<P: ShimPlatform>(
         regions.push((cursor..start + size, Region::Hole));
     }
     let mut pieces: Vec<Piece> = Vec::new();
-    let mut uncopied = |range: Range<u64>, region: &Range<u64>, kind: Region| {
+    let mut uncopied = |range: Range<u64>, region: &Range<u64>, kind| {
         if range.start == range.end {
             return;
         }
@@ -803,30 +924,9 @@ pub(crate) fn install<P: ShimPlatform>(
     pieces.extend(copied_pieces);
     pieces.sort_by_key(|piece| piece.range.start);
 
-    // Island candidates per cluster of executable runs.
-    let mut clusters: Vec<Range<u64>> = Vec::new();
-    for run in &text_runs {
-        match clusters.last_mut() {
-            Some(cluster) if run.start - cluster.end <= CLUSTER_GAP => cluster.end = run.end,
-            _ => clusters.push(run.clone()),
-        }
-    }
-    let mut islands: BTreeSet<u64> = BTreeSet::new();
-    for cluster in &clusters {
-        let code: u64 = text_runs
-            .iter()
-            .filter(|run| run.start >= cluster.start && run.end <= cluster.end)
-            .map(|run| run.end - run.start)
-            .sum();
-        // Generous: unused candidates cost nothing.
-        let wanted = usize::try_from((code / 8).div_ceil(PAGE))? + 16;
-        let candidates = cache.island_candidates(cluster, &text_runs)?;
-        ensure!(
-            !candidates.is_empty(),
-            "no gate island candidates near {cluster:#x?}"
-        );
-        islands.extend(candidates.iter().take(wanted).map(|page| page.start));
-    }
+    let islands = select_islands(&text_runs, |cluster| {
+        cache.island_candidates(cluster, &text_runs)
+    })?;
     let gate_islands: Vec<Range<usize>> = islands
         .iter()
         .map(|page| slid(*page)..slid(*page + PAGE))
@@ -839,7 +939,13 @@ pub(crate) fn install<P: ShimPlatform>(
             backing: match piece.backing {
                 Backing::Reserved => SharedCacheBacking::Reserved,
                 Backing::Paged => SharedCacheBacking::Paged,
-                Backing::Source(bytes) => SharedCacheBacking::Source(bytes),
+                // SAFETY: `cache` outlives this call, and the shim only maps
+                // Source bytes as private copy-on-write copies during
+                // `install_shared_cache` (`mach_vm_remap` with copy=TRUE),
+                // so guest pages never refer to them afterwards.
+                Backing::Source(bytes) => SharedCacheBacking::Source(unsafe {
+                    core::slice::from_raw_parts(bytes.as_ptr(), bytes.len())
+                }),
                 Backing::Copy(key) => SharedCacheBacking::Copy(&copies[&key].bytes),
             },
             protection: piece.protection,
@@ -866,7 +972,6 @@ pub(crate) fn install<P: ShimPlatform>(
         pieces = shim_pieces.len(),
         text_runs = text_runs.len(),
         data_runs = data_runs.len(),
-        clusters = clusters.len(),
         island_candidates = gate_islands.len();
         "guest shared-cache layout"
     );
@@ -905,6 +1010,149 @@ mod tests {
                 0x1_8000_1234
             );
         }
+    }
+
+    #[test]
+    fn island_selection_reaches_every_window_of_a_wide_cluster() {
+        const MIB: u64 = 1 << 20;
+        let base = 0x1_8000_0000;
+        // One cluster wider than the branch range (runs closer than
+        // CLUSTER_GAP), with many candidates near its top and one near its
+        // bottom. One-sided ranking took only top candidates.
+        let runs = [
+            base..base + PAGE,
+            base + 30 * MIB..base + 30 * MIB + PAGE,
+            base + 60 * MIB..base + 60 * MIB + PAGE,
+            base + 90 * MIB..base + 90 * MIB + PAGE,
+            base + 120 * MIB..base + 120 * MIB + PAGE,
+            base + 150 * MIB..base + 150 * MIB + PAGE,
+            base + 180 * MIB..base + 180 * MIB + PAGE,
+        ];
+        let low = base - 2 * PAGE..base - PAGE;
+        let mut pages: Vec<Range<u64>> = (0..64)
+            .map(|index| {
+                let start = base + 179 * MIB - index * PAGE;
+                start..start + PAGE
+            })
+            .collect();
+        pages.push(low.clone());
+        pages.sort_by_key(|page| page.start);
+        let islands = select_islands(&runs, |_| Ok(pages.clone())).unwrap();
+        assert!(islands.contains(&low.start));
+        for run in &runs {
+            assert!(
+                islands
+                    .iter()
+                    .any(|island| worst_distance(&(*island..*island + PAGE), run) < BRANCH_REACH),
+                "{run:#x?} has no reachable island"
+            );
+        }
+        // An interior page is ranked by its distance to both ends.
+        let cluster = base..base + 190 * MIB;
+        let top = base + 189 * MIB..base + 189 * MIB + PAGE;
+        assert_eq!(worst_distance(&top, &cluster), 190 * MIB);
+        // A window without any reachable candidate fails closed.
+        let far = base + 400 * MIB..base + 400 * MIB + PAGE;
+        assert!(select_islands(core::slice::from_ref(&far), |_| Ok(pages.clone())).is_err());
+    }
+
+    #[test]
+    fn code_windows_bound_their_span() {
+        const MIB: u64 = 1 << 20;
+        let windows = code_windows(&[0..PAGE, 4 * MIB..5 * MIB, 20 * MIB..60 * MIB]);
+        assert_eq!(
+            windows,
+            [
+                (0..5 * MIB, PAGE + MIB),
+                (20 * MIB..36 * MIB, 16 * MIB),
+                (36 * MIB..52 * MIB, 16 * MIB),
+                (52 * MIB..60 * MIB, 8 * MIB),
+            ]
+        );
+    }
+
+    #[test]
+    fn reservation_retries_only_placement_conflicts() {
+        let length = 4 * PAGE;
+        let start = SHARED_CACHE_MIN_ADDRESS as u64;
+        // A conflict restarts the search past the conflicting address.
+        let mut searches = Vec::new();
+        let mut attempts = 0;
+        let base = reserve_free_range(
+            length,
+            |from| {
+                searches.push(from);
+                Ok(Some(from))
+            },
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(SharedCacheInstallError::ReservationConflict)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(base, start + PAGE);
+        assert_eq!(searches, [start, start + PAGE]);
+        // Other reservation errors fail at once.
+        let mut attempts = 0;
+        assert!(
+            reserve_free_range(
+                length,
+                |from| Ok(Some(from)),
+                |_| {
+                    attempts += 1;
+                    Err(SharedCacheInstallError::Reservation)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(attempts, 1);
+        // Conflicts are bounded.
+        let mut attempts = 0;
+        assert!(
+            reserve_free_range(
+                length,
+                |from| Ok(Some(from)),
+                |_| {
+                    attempts += 1;
+                    Err(SharedCacheInstallError::ReservationConflict)
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(attempts, RESERVATION_ATTEMPTS);
+        // Exhaustion and search errors fail without reserving.
+        for result in [Ok(None), Err(anyhow::anyhow!("mach_vm_region failed"))] {
+            let mut result = Some(result);
+            assert!(
+                reserve_free_range(
+                    length,
+                    |_| result.take().unwrap(),
+                    |_| panic!("nothing to reserve")
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn free_host_range_is_bounded_by_the_limit() {
+        let limit = litebox_platform_macos_userland::TASK_ADDR_MAX as u64;
+        let found = free_host_range(0, PAGE, limit).unwrap().unwrap();
+        assert!(found >= SHARED_CACHE_MIN_ADDRESS as u64 && found.is_multiple_of(PAGE));
+        // No range fits above the limit.
+        assert_eq!(
+            free_host_range(limit - PAGE, 2 * PAGE, limit).unwrap(),
+            None
+        );
+        assert_eq!(
+            free_host_range(u64::MAX - PAGE, PAGE, u64::MAX).unwrap(),
+            None
+        );
+        assert_eq!(free_host_range(0, limit, limit).unwrap(), None);
     }
 
     #[test]

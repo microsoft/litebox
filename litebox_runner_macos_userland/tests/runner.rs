@@ -420,6 +420,26 @@ fn invalid_images_are_rejected_and_dynamic_images_require_dyld() {
     ));
 }
 
+/// Without the test broker there is no guest random source, so dynamic
+/// executables fail up front instead of after preparing the cache.
+#[cfg(not(feature = "test-broker"))]
+#[test]
+fn dynamic_executables_require_the_test_broker() {
+    // The runner itself is a dynamically linked AArch64 Mach-O.
+    let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .env_remove("LITEBOX_LOG")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("dynamic executables require a guest random source"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("guest shared cache"), "{stderr}");
+}
+
 #[test]
 fn incompatible_aot_gate_is_rejected_before_execution() {
     const INCOMPATIBLE_GATE_PROLOGUE: u32 = 0xd100_83ff; // sub sp, sp, #32 (Linux frame)
@@ -557,6 +577,7 @@ const HELLO_WORLD: &str =
 fn run_guest(binary: &Path) -> (Option<i32>, Vec<u8>, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
         .arg(binary)
+        .env_remove("LITEBOX_LOG")
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -691,6 +712,46 @@ mod host_state {
         unsafe { core::arch::asm!("mrs {}, tpidrro_el0", out(reg) value) };
         value
     }
+
+    /// This thread's TSD slot 0 (`_PTHREAD_TSD_SLOT_PTHREAD_SELF`).
+    pub fn pthread_self_slot() -> usize {
+        // TPIDRRO_EL0 holds the TSD base; its low bits may carry a CPU number.
+        let tsd = (thread_pointer() & !7) as *const usize;
+        // SAFETY: the TSD of the running thread is live and readable.
+        unsafe { tsd.read() }
+    }
+}
+
+/// PLAN section 5 item 3: the guest's own dyld reports its private cache
+/// instance, above the host's shared region and at another base.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_cache_base_is_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile_c(
+        dir.path(),
+        "#include <stdio.h>\n#include <stddef.h>\n\
+         extern const void *_dyld_get_shared_cache_range(size_t *length);\n\
+         int main(void) {\n\
+           size_t length = 0;\n\
+           const void *base = _dyld_get_shared_cache_range(&length);\n\
+           printf(\"%p %zx\\n\", base, length);\n\
+           return 0;\n\
+         }\n",
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+    let stdout = String::from_utf8(stdout).unwrap();
+    let mut fields = stdout.split_whitespace();
+    let guest_base =
+        usize::from_str_radix(fields.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+    let guest_length = usize::from_str_radix(fields.next().unwrap(), 16).unwrap();
+    assert!(
+        guest_base >= litebox_shim_macos::shared_cache::SHARED_CACHE_MIN_ADDRESS,
+        "{stdout}"
+    );
+    assert_ne!(guest_base, host_state::shared_cache_base());
+    assert_ne!(guest_length, 0);
 }
 
 /// PLAN section 5 item 3: an in-process dynamic guest runs on its own private
@@ -703,10 +764,13 @@ fn dynamic_guest_leaves_host_runtime_untouched() {
     let host_cache = host_state::shared_cache_base();
     assert!(
         host_cache != 0 && host_cache < litebox_shim_macos::shared_cache::SHARED_CACHE_MIN_ADDRESS,
-        "the guest instance is placed above the host's shared region"
+        "the host's shared region lies below every guest instance"
     );
     let text = host_state::libsystem_kernel_text();
     let thread_pointer = host_state::thread_pointer();
+    let pthread_self = host_state::pthread_self_slot();
+    // SAFETY: pthread_self has no preconditions.
+    assert_eq!(pthread_self, unsafe { libc::pthread_self() } as usize);
     // The guest runs on this thread, in this process.
     let status = litebox_runner_macos_userland::run(litebox_runner_macos_userland::CliArgs {
         program_and_arguments: vec![binary.to_str().unwrap().to_owned()],
@@ -718,6 +782,7 @@ fn dynamic_guest_leaves_host_runtime_untouched() {
     assert_eq!(status, 0);
     assert_eq!(host_state::shared_cache_base(), host_cache);
     assert_eq!(host_state::thread_pointer(), thread_pointer);
+    assert_eq!(host_state::pthread_self_slot(), pthread_self);
     assert!(
         host_state::libsystem_kernel_text() == text,
         "host libsystem_kernel __TEXT changed"

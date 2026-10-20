@@ -23,9 +23,10 @@ use std::{ffi::CString, io::Read as _};
 #[command(about = "Run AArch64 Mach-O programs")]
 pub struct CliArgs {
     /// Host path of a thin or universal Mach-O, followed by guest arguments.
-    /// Accepts raw or AOT-rewritten static images and dynamically linked
-    /// executables (which run with the host's dyld and a guest-private copy
-    /// of its shared cache). No host filesystem passthrough.
+    /// Accepts raw or AOT-rewritten static images. Builds with the
+    /// `test-broker` feature also accept dynamically linked executables
+    /// (which run with the host's dyld and a guest-private copy of its shared
+    /// cache). No host filesystem passthrough.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Guest environment entry (KEY=VALUE). Host environment is not forwarded.
@@ -149,6 +150,13 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let uses_dyld = litebox_common_macos::loader::arm64_slice(&data)
         .and_then(litebox_common_macos::loader::MachoParsedFile::parse)
         .is_ok_and(|plan| plan.uses_dyld);
+    if uses_dyld && cfg!(not(feature = "test-broker")) {
+        // libSystem's initializers need XNU's entropy apple[] strings, and
+        // only the test broker provides guest randomness.
+        bail!(
+            "dynamic executables require a guest random source; build with the `test-broker` feature: {path}"
+        );
+    }
     let dyld = if uses_dyld {
         // Verify the host cache before loading anything.
         let cache = shared_cache::GuestCache::open().context("preparing the guest shared cache")?;

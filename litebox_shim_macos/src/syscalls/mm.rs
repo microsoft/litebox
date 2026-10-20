@@ -408,6 +408,12 @@ impl<P: ShimPlatform> Task<P> {
         let suggested = NonZeroAddress::new(address);
         let length = NonZeroPageSize::new(length).ok_or(Errno::EINVAL)?;
         let fixed_range = address..address + length.as_usize();
+        if flags.contains(MmapFlags::FIXED) && self.overlaps_shared_cache(fixed_range.clone()) {
+            // The shared-cache instance's pieces and their maximum
+            // protections must stay authoritative, so replacing any part of
+            // it fails closed, like the Mach VM paths.
+            return Err(Errno::EINVAL);
+        }
         let fixed_snapshot = flags
             .contains(MmapFlags::FIXED)
             .then(|| self.mapping_snapshot(fixed_range.clone()));
@@ -1116,7 +1122,12 @@ impl<P: ShimPlatform> Task<P> {
             .checked_next_multiple_of(PAGE_SIZE)
             .filter(|length| *length != 0)
             .ok_or(Errno::EINVAL)?;
-        address.checked_add(length).ok_or(Errno::EINVAL)?;
+        let end = address.checked_add(length).ok_or(Errno::EINVAL)?;
+        if self.overlaps_shared_cache(address..end) {
+            // Fail closed rather than leave the instance's state stale; see
+            // the MAP_FIXED check in `mmap`.
+            return Err(Errno::EINVAL);
+        }
         // SAFETY: Darwin munmap relinquishes the caller-selected guest range.
         unsafe {
             self.global
@@ -1144,26 +1155,51 @@ impl<P: ShimPlatform> Task<P> {
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::EINVAL)?;
         let end = address.checked_add(length).ok_or(Errno::EINVAL)?;
-        if let Some(cache) = self.global.shared_cache.lock().as_mut()
-            && cache.range.start < end
-            && address < cache.range.end
-        {
-            // Like XNU, requests beyond a page's maximum protection fail with
-            // EACCES. Rewritten code and gate islands are never writable, and
-            // other cache text is never executable, so no unrewritten code can
-            // run. Pages without contents (maximum PROT_NONE) stay inaccessible.
-            let range = address..end;
-            if !cache.allows(&range, protection) {
-                return Err(Errno::EACCES);
-            }
-            self.change_permissions(range.clone(), protection)?;
-            cache.set_protection(&range, protection);
-            return Ok(());
-        }
-        if protection.contains(VmProtection::EXECUTE) {
-            self.rewrite_mprotect_range(address, length)?;
-        }
         let range = address..end;
+        let cache_range = self.global.shared_cache.lock().as_ref().and_then(|cache| {
+            let inner = cache.range.start.max(address)..cache.range.end.min(end);
+            (inner.start < inner.end).then_some(inner)
+        });
+        let Some(cache_range) = cache_range else {
+            return self.mprotect_task_memory(range, protection);
+        };
+        // Like XNU, requests beyond a page's maximum protection fail with
+        // EACCES before anything changes. Rewritten code and gate islands are
+        // never writable, and other cache text is never executable, so no
+        // unrewritten code can run. Pages without contents (maximum
+        // PROT_NONE) stay inaccessible.
+        let allowed = self
+            .global
+            .shared_cache
+            .lock()
+            .as_ref()
+            .is_some_and(|cache| cache.allows(&cache_range, protection));
+        if !allowed {
+            return Err(Errno::EACCES);
+        }
+        // Task memory on either side of the instance takes the normal path,
+        // including rewriting before it becomes executable.
+        for part in [address..cache_range.start, cache_range.end..end] {
+            if part.start < part.end {
+                self.mprotect_task_memory(part, protection)?;
+            }
+        }
+        let mut cache = self.global.shared_cache.lock();
+        let cache = cache.as_mut().ok_or(Errno::EACCES)?;
+        self.change_permissions(cache_range.clone(), protection)?;
+        cache.set_protection(&cache_range, protection);
+        Ok(())
+    }
+
+    /// `mprotect` of task memory outside the shared-cache instance.
+    fn mprotect_task_memory(
+        &self,
+        range: Range<usize>,
+        protection: VmProtection,
+    ) -> Result<(), Errno> {
+        if protection.contains(VmProtection::EXECUTE) {
+            self.rewrite_mprotect_range(range.start, range.len())?;
+        }
         if protection.contains(VmProtection::WRITE) {
             // Publish writable permissions and invalidate rewrite state while
             // holding the same lock used by executable transitions. Code may
