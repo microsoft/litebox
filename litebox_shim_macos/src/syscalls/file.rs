@@ -13,7 +13,9 @@ use litebox::{
 };
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
 use litebox_common_macos::{
-    FileDescriptorFlags, OpenFlags, PAGE_SIZE, PATH_MAX, errno::Errno, user_pointers::UserPtr,
+    FileDescriptorFlags, OpenFlags, PAGE_SIZE, PATH_MAX, Stat64,
+    errno::Errno,
+    user_pointers::{UserPtr, UserPtrMut},
 };
 
 const MAX_FDS: usize = 1024;
@@ -30,14 +32,36 @@ pub(crate) type FileFd<P> = TypedFd<FileSubsystem<P>>;
 /// A file descriptor's open file description.
 pub(crate) struct File<P: ShimPlatform> {
     file: Arc<litebox::fs::File<P>>,
+    /// The absolute path it was opened by, for `F_GETPATH`. Inherited
+    /// descriptors (such as stdio) have none.
+    path: Option<Arc<str>>,
 }
 
 impl<P: ShimPlatform> From<litebox::fs::File<P>> for File<P> {
     fn from(file: litebox::fs::File<P>) -> Self {
         Self {
             file: Arc::new(file),
+            path: None,
         }
     }
+}
+
+/// `path` relative to the root, which is every guest's working directory,
+/// with `.` and `..` components resolved lexically.
+fn absolute_path(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => components.push(component),
+        }
+    }
+    let mut absolute = String::from("/");
+    absolute.push_str(&components.join("/"));
+    absolute
 }
 
 pub(crate) struct FilesState<P: ShimPlatform> {
@@ -76,6 +100,14 @@ impl<P: ShimPlatform> FilesState<P> {
             .read()
             .fd_from_raw_integer::<FileSubsystem<P>>(usize::try_from(fd).map_err(|_| Errno::EBADF)?)
             .map_err(|_| Errno::EBADF)
+    }
+
+    /// The path `fd` was opened by, if any.
+    pub(crate) fn path(&self, fd: &FileFd<P>) -> Result<Option<Arc<str>>, Errno> {
+        self.litebox
+            .descriptor_table()
+            .with_entry(fd, |file| file.path.clone())
+            .ok_or(Errno::EBADF)
     }
 
     /// Returns the file at `fd`, without holding the descriptor table.
@@ -231,7 +263,10 @@ impl<P: ShimPlatform> Task<P> {
             .open_file(&context, path, access, open_flags, mode)
             .map_err(open_error)?;
         let mut descriptors = self.global.litebox.descriptor_table_mut();
-        let fd = descriptors.insert::<FileSubsystem<P>>(file);
+        let fd = descriptors.insert::<FileSubsystem<P>>(File {
+            file: Arc::new(file),
+            path: Some(Arc::from(absolute_path(path))),
+        });
         if flags.contains(OpenFlags::CLOEXEC) {
             // TODO: honor FD_CLOEXEC when macOS exec is implemented.
             let old = descriptors.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
@@ -300,6 +335,166 @@ impl<P: ShimPlatform> Task<P> {
     }
     pub(crate) fn sys_dup2(&self, old: i32, new: i32) -> Result<u32, Errno> {
         self.files.dup2(old, new)
+    }
+
+    /// The filesystem context of guest path lookups, acting as `user`/`group`.
+    pub(crate) fn fs_context(user: u32, group: u32) -> Result<litebox::fs::Context, Errno> {
+        let mut context = litebox::fs::Context::new();
+        context.set_acting_user(FileUser {
+            user: u16::try_from(user).map_err(|_| Errno::EINVAL)?,
+            group: u16::try_from(group).map_err(|_| Errno::EINVAL)?,
+        });
+        Ok(context)
+    }
+
+    /// `stat64` and `lstat64`. LiteBox filesystems have no symbolic links,
+    /// so both describe the named file.
+    pub(crate) fn sys_stat64(&self, path: &str, buffer: UserPtrMut<Stat64>) -> Result<(), Errno> {
+        if path.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        let context = Self::fs_context(self.params.euid, self.params.egid)?;
+        let status = self
+            .global
+            .litebox
+            .path_file_status(&context, path)
+            .map_err(file_status_error)?;
+        buffer
+            .write_at_offset::<P>(0, Stat64::try_from(&status)?)
+            .ok_or(Errno::EFAULT)
+    }
+
+    pub(crate) fn sys_fstat64(&self, fd: i32, buffer: UserPtrMut<Stat64>) -> Result<(), Errno> {
+        let fd = self.files.typed_fd(fd)?;
+        let status = self.files.file(&fd)?.status().map_err(file_status_error)?;
+        buffer
+            .write_at_offset::<P>(0, Stat64::try_from(&status)?)
+            .ok_or(Errno::EFAULT)
+    }
+
+    /// `fcntl` for descriptor flags and `F_GETPATH`. Other commands on a
+    /// LiteBox file are not vnode operations it supports, which XNU reports
+    /// as EINVAL (the filesystem's `VNOP_IOCTL` default) — notably code
+    /// signature registration (`F_ADDFILESIGS*`, `F_CHECK_LV`): guest files
+    /// carry no kernel-validated signature.
+    pub(crate) fn sys_fcntl(&self, fd: i32, command: i32, argument: usize) -> Result<usize, Errno> {
+        const F_GETFD: i32 = 1;
+        const F_SETFD: i32 = 2;
+        const F_GETPATH: i32 = 50;
+        const F_GETPATH_NOFIRMLINK: i32 = 102;
+        let typed = self.files.typed_fd(fd)?;
+        match command {
+            F_GETFD => {
+                let flags = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(&typed, |flags: &FileDescriptorFlags| *flags)
+                    .unwrap_or_default();
+                Ok(flags.bits() as usize)
+            }
+            F_SETFD => {
+                let flags = FileDescriptorFlags::from_bits_truncate(
+                    u32::try_from(argument & 0xffff_ffff).expect("masked"),
+                );
+                self.global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(&typed, flags);
+                Ok(0)
+            }
+            F_GETPATH | F_GETPATH_NOFIRMLINK => {
+                // Only vnodes have a path.
+                let path = self.files.path(&typed)?.ok_or(Errno::EBADF)?;
+                let mut bytes = Vec::with_capacity(path.len() + 1);
+                bytes.extend_from_slice(path.as_bytes());
+                bytes.push(0);
+                UserPtrMut::<u8>::from_usize(argument)
+                    .copy_from_slice::<P>(0, &bytes)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            _ => {
+                litebox_util_log::debug!(fd:?, command:?; "unsupported fcntl command");
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+
+    /// `openat`. Every guest's working directory is `/`, so `AT_FDCWD` and
+    /// absolute paths open like `open`; other relative paths resolve against
+    /// the directory's open path (LiteBox filesystems have no symbolic links
+    /// or renames that could make it stale).
+    pub(crate) fn sys_openat(
+        &self,
+        dirfd: i32,
+        path: &str,
+        flags: OpenFlags,
+        mode: FileMode,
+    ) -> Result<u32, Errno> {
+        /// `AT_FDCWD`.
+        const AT_FDCWD: i32 = -2;
+        if dirfd == AT_FDCWD || path.starts_with('/') {
+            return self.sys_open(path, flags, mode);
+        }
+        // nameiat: the descriptor must be an open directory.
+        let fd = self.files.typed_fd(dirfd)?;
+        let status = self.files.file(&fd)?.status().map_err(file_status_error)?;
+        if status.file_type != litebox_broker_protocol::fs::FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let Some(directory) = self.files.path(&fd)? else {
+            // An inherited directory descriptor with no known path.
+            self.log_unsupported_once(
+                "openat relative to an inherited directory",
+                format_args!(""),
+            );
+            return Err(Errno::ENOTSUP);
+        };
+        if path.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        let mut joined = String::from(&*directory);
+        joined.push('/');
+        joined.push_str(path);
+        self.sys_open(&absolute_path(&joined), flags, mode)
+    }
+
+    /// `ioctl`. LiteBox files are regular files, directories, or non-tty
+    /// character devices (the stdio streams): none is a terminal, so every
+    /// device request fails with ENOTTY, as `vn_ioctl` and a non-tty
+    /// driver's `d_ioctl` do. Descriptor-level requests are handled.
+    pub(crate) fn sys_ioctl(&self, fd: i32, command: u32, data: usize) -> Result<(), Errno> {
+        // sys/ioccom.h and sys/filio.h.
+        const IOCPARM_MAX: u32 = 8192;
+        const IOC_IN: u32 = 0x8000_0000;
+        const FIOCLEX: u32 = 0x2000_6601;
+        const FIONCLEX: u32 = 0x2000_6602;
+        let size = (command >> 16) & 0x1fff;
+        if size > IOCPARM_MAX {
+            return Err(Errno::ENOTTY);
+        }
+        if command & IOC_IN != 0 && size != 0 {
+            UserPtr::<u8>::from_usize(data)
+                .to_owned_slice::<P>(size as usize)
+                .ok_or(Errno::EFAULT)?;
+        }
+        let typed = self.files.typed_fd(fd)?;
+        match command {
+            FIOCLEX | FIONCLEX => {
+                let flags = if command == FIOCLEX {
+                    FileDescriptorFlags::FD_CLOEXEC
+                } else {
+                    FileDescriptorFlags::empty()
+                };
+                self.global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(&typed, flags);
+                Ok(())
+            }
+            _ => Err(Errno::ENOTTY),
+        }
     }
 
     /// XNU's `fsctl` on a LiteBox file. Generic and filesystem-specific

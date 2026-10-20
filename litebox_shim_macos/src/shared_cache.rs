@@ -417,6 +417,33 @@ impl<P: ShimPlatform> LoadedProgram<P> {
             paged: false,
         }));
         mappings.sort_by_key(|mapping| mapping.range.start);
+        // Fail closed if any page of the instance is executable without
+        // being rewritten code or a used gate island.
+        let mut rewritten_ranges: Vec<Range<usize>> = cache
+            .pieces
+            .iter()
+            .zip(&rewritten)
+            .filter(|(_, rewritten)| **rewritten)
+            .map(|(piece, _)| piece.range.clone())
+            .chain(
+                cache
+                    .gate_islands
+                    .iter()
+                    .zip(&gates)
+                    .filter(|(_, gates)| !gates.is_empty())
+                    .map(|(island, _)| island.clone()),
+            )
+            .collect();
+        rewritten_ranges.sort_by_key(|range| range.start);
+        if let Some(unexpected) = task
+            .executable_ranges(&cache.range)
+            .iter()
+            .flat_map(|range| subtract(range, &rewritten_ranges))
+            .next()
+        {
+            litebox_util_log::error!(range:? = unexpected; "unrewritten executable shared-cache memory");
+            return Err(Error::InvalidRegion);
+        }
         *task.global.shared_cache.lock() = Some(SharedCacheState {
             range: cache.range.clone(),
             mappings,
@@ -711,6 +738,26 @@ impl<P: ShimPlatform> Task<P> {
             }
         }
         Ok(())
+    }
+
+    /// Executable guest mappings overlapping `range`, clipped to it.
+    pub(crate) fn executable_ranges(&self, range: &Range<usize>) -> Vec<Range<usize>> {
+        self.global
+            .mm
+            .overlapping(range.clone())
+            .into_iter()
+            .filter(|(_, flags)| flags.contains(litebox_common_linux::vmem::VmFlags::VM_EXEC))
+            .map(|(mapping, _)| mapping.start.max(range.start)..mapping.end.min(range.end))
+            .collect()
+    }
+
+    /// Whether `range` overlaps the reserved shared-cache instance.
+    pub(crate) fn overlaps_shared_cache(&self, range: Range<usize>) -> bool {
+        self.global
+            .shared_cache_reservation
+            .lock()
+            .as_ref()
+            .is_some_and(|cache| overlaps(cache, &range))
     }
 
     /// Supply a demand-paged shared-cache page for a guest data abort at

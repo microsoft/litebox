@@ -1,21 +1,26 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Minimal Mach trap compatibility used by dyld startup.
+//! Mach VM traps on the guest's own address space.
 //!
-//! LiteBox does not expose host Mach rights. Port-returning traps use stable
-//! synthetic names, and VM traps operate only on the shim's PageManager.
-//!
-//! TODO: Replace these bootstrap-only approximations when guests require
-//! observable Mach port, IPC, memory-object, or task semantics.
+//! The target must be the guest's task port; requests operate only on the
+//! shim's page manager, following `xnu/osfmk/vm/vm_user.c` and `vm_map.c`.
 
+use super::mm::AnonymousPlacement;
 use crate::{ShimPlatform, Task};
+use litebox::platform::page_mgmt::AllocationError;
+use litebox_common_linux::vmem::MappingError;
 use litebox_common_macos::{
-    KernReturn, MmapFlags, PAGE_SIZE, VmProtection,
+    KernReturn, PAGE_SIZE, VmProtection,
     errno::Errno,
-    syscall::{MachPortName, MachVmAddressMask, MachVmFlags, MachVmProtection, synthetic_port},
+    mach::msg_return,
+    syscall::{MachPortName, MachVmAddressMask, MachVmFlags, MachVmProtection},
     user_pointers::UserPtrMut,
 };
+
+/// `port_name_to_current_task` failure.
+pub(crate) const INVALID_TASK_DEST: KernReturn =
+    KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed());
 
 fn errno_to_kern_return(error: Errno) -> KernReturn {
     match error {
@@ -46,38 +51,158 @@ fn mach_page_range(address: usize, size: usize) -> Result<MachPageRange, ()> {
     })
 }
 
+/// An anonymous `vm_map_enter` request.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AnonymousMapRequest {
+    pub address: usize,
+    pub size: usize,
+    pub mask: usize,
+    pub flags: MachVmFlags,
+    pub protection: VmProtection,
+    /// `mach_vm_allocate` lets a zero size succeed with address 0;
+    /// `mach_vm_map` rejects it.
+    pub zero_size_succeeds: bool,
+}
+
 impl<P: ShimPlatform> Task<P> {
-    pub(crate) fn sys_mach_vm_allocate_compat(
+    /// `vm_map_enter` of zero-filled memory: FIXED (optionally OVERWRITE) or
+    /// ANYWHERE at or above the address hint, aligned to `mask | page mask`.
+    pub(crate) fn mach_vm_map_anonymous(
+        &self,
+        request: AnonymousMapRequest,
+    ) -> Result<usize, KernReturn> {
+        let AnonymousMapRequest {
+            address,
+            size,
+            mask,
+            flags,
+            protection,
+            zero_size_succeeds,
+        } = request;
+        let anywhere = flags.contains(MachVmFlags::ANYWHERE);
+        if flags.intersects(MachVmFlags::SUPERPAGE_MASK) {
+            // No superpage size exists on arm64 (`vm_superpage_size`).
+            return Err(KernReturn::INVALID_ARGUMENT);
+        }
+        if flags.intersects(MachVmFlags::TPRO | MachVmFlags::MTE) {
+            // Neither hardware feature exists on this machine.
+            return Err(KernReturn::INVALID_ARGUMENT);
+        }
+        if anywhere && flags.contains(MachVmFlags::OVERWRITE) {
+            return Err(KernReturn::INVALID_ARGUMENT);
+        }
+        if size == 0 {
+            return if zero_size_succeeds {
+                Ok(0)
+            } else {
+                Err(KernReturn::INVALID_ARGUMENT)
+            };
+        }
+        let Some(length) = size
+            .checked_add(if anywhere { 0 } else { address % PAGE_SIZE })
+            .and_then(|size| size.checked_next_multiple_of(PAGE_SIZE))
+        else {
+            return Err(KernReturn::INVALID_ARGUMENT);
+        };
+        let mask = mask | (PAGE_SIZE - 1);
+        let map_error = |error: MappingError| match error {
+            MappingError::MapError(
+                AllocationError::BelowMinAddress | AllocationError::AboveMaxAddress,
+            ) => KernReturn::INVALID_ADDRESS,
+            MappingError::MapError(AllocationError::OutOfMemory) | MappingError::OutOfMemory => {
+                KernReturn::RESOURCE_SHORTAGE
+            }
+            _ => KernReturn::NO_SPACE,
+        };
+        if !anywhere {
+            let start = address & !(PAGE_SIZE - 1);
+            if start & mask != 0 {
+                return Err(KernReturn::NO_SPACE);
+            }
+            if start < P::TASK_ADDR_MIN
+                || start
+                    .checked_add(length)
+                    .is_none_or(|end| end > P::TASK_ADDR_MAX)
+            {
+                return Err(KernReturn::INVALID_ADDRESS);
+            }
+            if self.overlaps_shared_cache(start..start + length) {
+                // The shared region is not part of the task's own map.
+                return Err(KernReturn::NO_SPACE);
+            }
+            let replace = flags.contains(MachVmFlags::OVERWRITE);
+            return self
+                .map_anonymous(
+                    start,
+                    length,
+                    AnonymousPlacement::Fixed { replace },
+                    protection,
+                )
+                .map_err(map_error);
+        }
+        let hint = address & !(PAGE_SIZE - 1);
+        if mask == PAGE_SIZE - 1 {
+            return self
+                .map_anonymous(hint, length, AnonymousPlacement::Hint, protection)
+                .map_err(map_error);
+        }
+        // Over-reserve so an aligned start exists, then keep only that range.
+        let alignment = mask.checked_add(1).ok_or(KernReturn::NO_SPACE)?;
+        let padded = length
+            .checked_add(alignment - PAGE_SIZE)
+            .ok_or(KernReturn::NO_SPACE)?;
+        let reserved = self
+            .map_anonymous(
+                hint,
+                padded,
+                AnonymousPlacement::Hint,
+                VmProtection::empty(),
+            )
+            .map_err(map_error)?;
+        let start = reserved.next_multiple_of(alignment);
+        for (from, to) in [(reserved, start), (start + length, reserved + padded)] {
+            if from < to && self.sys_munmap(from, to - from).is_err() {
+                // The slack stays reserved; it is ours either way.
+                litebox_util_log::warn!(range:? = from..to; "failed to trim Mach VM alignment slack");
+            }
+        }
+        self.map_anonymous(
+            start,
+            length,
+            AnonymousPlacement::Fixed { replace: true },
+            protection,
+        )
+        .map_err(map_error)
+    }
+
+    pub(crate) fn sys_mach_vm_allocate(
         &self,
         target: MachPortName,
         address: UserPtrMut<usize>,
         size: usize,
         flags: MachVmFlags,
-    ) -> usize {
-        // Approximation: VM tags are ignored. Fixed-address allocation is not
-        // needed by the supported dyld path and fails closed.
-        if size == 0 {
-            if target != synthetic_port::TASK_SELF || !flags.contains(MachVmFlags::ANYWHERE) {
-                return KernReturn::INVALID_ARGUMENT.into();
-            }
-            return if address.write_at_offset::<P>(0, 0).is_some() {
-                KernReturn::SUCCESS
-            } else {
-                KernReturn::INVALID_ADDRESS
-            }
-            .into();
+    ) -> KernReturn {
+        if !self.is_own_task(target) {
+            return INVALID_TASK_DEST;
         }
-        self.sys_mach_vm_map_compat(
-            target,
-            address,
+        let Some(desired) = address.read_at_offset::<P>(0) else {
+            return KernReturn::MEMORY_ERROR;
+        };
+        if !MachVmFlags::USER_ALLOCATE.contains(flags) {
+            return KernReturn::INVALID_ARGUMENT;
+        }
+        let result = self.mach_vm_map_anonymous(AnonymousMapRequest {
+            address: desired,
             size,
-            MachVmAddressMask(0),
+            mask: 0,
             flags,
-            MachVmProtection::new(VmProtection::READ | VmProtection::WRITE, false),
-        )
+            protection: VmProtection::READ | VmProtection::WRITE,
+            zero_size_succeeds: true,
+        });
+        Self::copyout_mapped_address(address, result)
     }
 
-    pub(crate) fn sys_mach_vm_map_compat(
+    pub(crate) fn sys_mach_vm_map(
         &self,
         target: MachPortName,
         address: UserPtrMut<usize>,
@@ -85,96 +210,100 @@ impl<P: ShimPlatform> Task<P> {
         mask: MachVmAddressMask,
         flags: MachVmFlags,
         current_protection: MachVmProtection,
-    ) -> usize {
-        // Approximation: memory objects, copy semantics, inheritance, and max
-        // protection are not modeled. Current protection is enforced for the
-        // anonymous mapping used by the supported bootstrap path.
-        if target != synthetic_port::TASK_SELF
-            || !mask.is_zero()
-            || !flags.contains(MachVmFlags::ANYWHERE)
-        {
-            return KernReturn::INVALID_ARGUMENT.into();
-        }
-        if size == 0 {
-            return KernReturn::INVALID_ARGUMENT.into();
+    ) -> KernReturn {
+        if !self.is_own_task(target) {
+            return INVALID_TASK_DEST;
         }
         let Some(desired) = address.read_at_offset::<P>(0) else {
-            return KernReturn::INVALID_ADDRESS.into();
+            return KernReturn::MEMORY_ERROR;
         };
-        let Some(length) = size.checked_next_multiple_of(PAGE_SIZE) else {
-            return KernReturn::INVALID_ARGUMENT.into();
-        };
-        let hint = desired & !(PAGE_SIZE - 1);
-        let mapped = match self.sys_mmap(
-            hint,
-            length,
-            current_protection.permissions(),
-            MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
-            -1,
-            0,
-        ) {
-            Ok(mapped) => mapped,
-            Err(error) => return errno_to_kern_return(error).into(),
-        };
-        if address.write_at_offset::<P>(0, mapped).is_none() {
-            if let Err(error) = self.sys_munmap(mapped, length) {
-                litebox_util_log::warn!(error:? = error; "failed to roll back Mach VM mapping after copyout fault");
-            }
-            return KernReturn::INVALID_ADDRESS.into();
+        if !MachVmFlags::USER_MAP.contains(flags) {
+            return KernReturn::INVALID_ARGUMENT;
         }
-        KernReturn::SUCCESS.into()
+        // The trap maps anonymous memory with maximum protection VM_PROT_ALL;
+        // VM_PROT_COPY has no effect without a memory object.
+        let result = self.mach_vm_map_anonymous(AnonymousMapRequest {
+            address: desired,
+            size,
+            mask: mask.0,
+            flags,
+            protection: current_protection.permissions(),
+            zero_size_succeeds: false,
+        });
+        Self::copyout_mapped_address(address, result)
     }
 
-    pub(crate) fn sys_mach_vm_deallocate_compat(
+    fn copyout_mapped_address(
+        address: UserPtrMut<usize>,
+        result: Result<usize, KernReturn>,
+    ) -> KernReturn {
+        let mapped = match result {
+            Ok(mapped) => mapped,
+            Err(error) => return error,
+        };
+        if address.write_at_offset::<P>(0, mapped).is_some() {
+            return KernReturn::SUCCESS;
+        }
+        // XNU keeps the mapping and reports the copyout failure.
+        KernReturn::MEMORY_ERROR
+    }
+
+    pub(crate) fn sys_mach_vm_deallocate(
         &self,
         target: MachPortName,
         address: usize,
         size: usize,
-    ) -> usize {
-        if target != synthetic_port::TASK_SELF {
-            return KernReturn::INVALID_ARGUMENT.into();
+    ) -> KernReturn {
+        if !self.is_own_task(target) {
+            return INVALID_TASK_DEST;
         }
+        self.mach_vm_deallocate(address, size)
+    }
+
+    /// `mach_vm_deallocate` on the guest's own map.
+    pub(crate) fn mach_vm_deallocate(&self, address: usize, size: usize) -> KernReturn {
         let Ok(range) = mach_page_range(address, size) else {
-            return KernReturn::INVALID_ADDRESS.into();
+            return KernReturn::INVALID_ARGUMENT;
         };
         let MachPageRange::NonEmpty { address, size } = range else {
-            return KernReturn::SUCCESS.into();
+            return KernReturn::SUCCESS;
         };
+        if self.overlaps_shared_cache(address..address + size) {
+            // The shared region is not part of the task's own map.
+            return KernReturn::INVALID_ADDRESS;
+        }
         match self.sys_munmap(address, size) {
             Ok(()) => KernReturn::SUCCESS,
             Err(error) => errno_to_kern_return(error),
         }
-        .into()
     }
 
-    pub(crate) fn sys_mach_vm_protect_compat(
+    pub(crate) fn sys_mach_vm_protect(
         &self,
         target: MachPortName,
         address: usize,
         size: usize,
         set_maximum: bool,
         protection: MachVmProtection,
-    ) -> usize {
-        if target != synthetic_port::TASK_SELF || set_maximum {
-            // Maximum-protection changes are not modeled; accepting one would
-            // overstate rights that PageManager cannot subsequently enforce.
-            return KernReturn::INVALID_ARGUMENT.into();
+    ) -> KernReturn {
+        if !self.is_own_task(target) {
+            return INVALID_TASK_DEST;
+        }
+        if set_maximum {
+            // Maximum protections are not tracked outside the shared cache;
+            // accepting one would promise a restriction that is not enforced.
+            self.log_unsupported_once("mach_vm_protect(set_maximum)", format_args!(""));
+            return KernReturn::NOT_SUPPORTED;
         }
         let Ok(range) = mach_page_range(address, size) else {
-            return KernReturn::INVALID_ADDRESS.into();
+            return KernReturn::INVALID_ADDRESS;
         };
         let MachPageRange::NonEmpty { address, size } = range else {
-            return KernReturn::SUCCESS.into();
+            return KernReturn::SUCCESS;
         };
-        let permissions = protection.permissions();
-        match self.sys_mprotect(address, size, permissions) {
+        match self.sys_mprotect(address, size, protection.permissions()) {
             Ok(()) => KernReturn::SUCCESS,
             Err(error) => errno_to_kern_return(error),
         }
-        .into()
-    }
-
-    pub(crate) const fn synthetic_task_port() -> MachPortName {
-        synthetic_port::TASK_SELF
     }
 }

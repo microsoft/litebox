@@ -552,24 +552,80 @@ fn compile_c(dir: &Path, source: &str) -> PathBuf {
 const HELLO_WORLD: &str =
     "#include <stdio.h>\nint main(void) { printf(\"Hello, world!\\n\"); return 0; }\n";
 
+/// Run `binary` under the runner and return its exit code, stdout and stderr.
 #[cfg(feature = "test-broker")]
-#[test]
-#[ignore = "libSystem's initializer (libsystem_kernel mach_init) traps: Mach port traps \
-            (mach_reply_port, mach_port_construct, task_get_special_port via mach_msg) are not \
-            emulated yet"]
-fn dynamic_hello_world() {
-    let dir = tempfile::tempdir().unwrap();
-    let binary = compile_c(dir.path(), HELLO_WORLD);
+fn run_guest(binary: &Path) -> (Option<i32>, Vec<u8>, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
-        .arg(&binary)
+        .arg(binary)
         .stdin(Stdio::null())
         .output()
         .unwrap();
+    (
+        output.status.code(),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// PLAN section 5 item 1: `_start` -> `write(1, ...)` -> `exit(0)`, raw and
+/// AOT-rewritten.
+#[cfg(feature = "test-broker")]
+#[test]
+fn static_hello_world() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = assemble(
+        dir.path(),
+        ".global _start\n\
+         _start:\n\
+         mov x0, #1\n\
+         adr x1, 1f\n\
+         mov x2, #14\n\
+         mov x16, #4\n\
+         svc #0x80\n\
+         mov x0, #0\n\
+         mov x16, #1\n\
+         svc #0x80\n\
+         1: .ascii \"Hello, world!\\n\"\n\
+         .p2align 2\n",
+    );
+    for executable in [rewrite(&binary), binary] {
+        let (code, stdout, stderr) = run_guest(&executable);
+        assert_eq!(
+            (code, stdout.as_slice(), stderr.as_str()),
+            (Some(0), &b"Hello, world!\n"[..], ""),
+            "{}",
+            executable.display()
+        );
+    }
+}
+
+/// PLAN section 5 item 2: a dynamic `printf` hello world runs on its own
+/// libSystem.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_hello_world() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile_c(dir.path(), HELLO_WORLD);
+    let (code, stdout, stderr) = run_guest(&binary);
     assert_eq!(
-        (output.status.code(), output.stdout.as_slice()),
-        (Some(0), &b"Hello, world!\n"[..]),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b"Hello, world!\n"[..], "")
+    );
+}
+
+/// The guest's own `exit` reaches the runner's exit status.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_exit_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile_c(
+        dir.path(),
+        "#include <stdlib.h>\nint main(void) { exit(42); }\n",
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(42), &b""[..], "")
     );
 }
 
@@ -658,8 +714,8 @@ fn dynamic_guest_leaves_host_runtime_untouched() {
         test_mmap_image: None,
     })
     .unwrap();
-    // The guest ran guest-cache code (dyld, libSystem); it need not finish yet.
-    assert!(status == 0 || status >= 128, "status {status}");
+    // The guest ran dyld and its own libSystem to completion.
+    assert_eq!(status, 0);
     assert_eq!(host_state::shared_cache_base(), host_cache);
     assert_eq!(host_state::thread_pointer(), thread_pointer);
     assert!(

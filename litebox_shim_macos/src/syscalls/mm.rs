@@ -239,6 +239,15 @@ struct MmapRequest {
     direction: AllocationDirection,
 }
 
+/// Where [`Task::map_anonymous`] places pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnonymousPlacement {
+    /// Search upward from the address hint.
+    Hint,
+    /// Exactly at the address, replacing existing mappings or failing.
+    Fixed { replace: bool },
+}
+
 fn record_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usize>) {
     let mut merged = range;
     let mut remove = Vec::new();
@@ -327,6 +336,41 @@ impl<P: ShimPlatform> Task<P> {
             offset: 0,
             direction,
         })
+    }
+
+    /// Map zero-filled pages for Mach VM. `Fixed { replace: false }` fails
+    /// with `MappingError::MapError(AddressInUse)` (or `...ByPlatform`) if
+    /// any page is already mapped.
+    pub(crate) fn map_anonymous(
+        &self,
+        address: usize,
+        length: usize,
+        placement: AnonymousPlacement,
+        protection: VmProtection,
+    ) -> Result<usize, MappingError> {
+        let length = NonZeroPageSize::new(length).ok_or(MappingError::UnAligned)?;
+        let mut flags = CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY;
+        if let AnonymousPlacement::Fixed { replace } = placement {
+            flags |= CreatePagesFlags::FIXED_ADDR;
+            flags.set(CreatePagesFlags::NOREPLACE, !replace);
+        }
+        let range = address..address.saturating_add(length.as_usize());
+        // SAFETY: a replacing fixed mapping has Mach's VM_FLAGS_OVERWRITE
+        // semantics; otherwise nothing existing is replaced.
+        let pointer = unsafe {
+            self.global.mm.create_pages_with_permissions(
+                NonZeroAddress::new(address),
+                length,
+                flags,
+                permissions(protection),
+                None,
+                |_| Ok(0),
+            )
+        }?;
+        if placement == (AnonymousPlacement::Fixed { replace: true }) {
+            self.replace_macho_mappings(range, None);
+        }
+        Ok(pointer.as_usize())
     }
 
     fn mmap(&self, request: MmapRequest) -> Result<usize, Errno> {
