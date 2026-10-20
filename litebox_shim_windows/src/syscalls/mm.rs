@@ -14,8 +14,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::{ProcessHandle, section::pagefile_view_protection_is_compatible};
 use crate::{
-    ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task, WindowsPageManager, WindowsVirtualAllocation,
-    WindowsVirtualAllocations,
+    ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task, WindowsPageManager, WindowsPlaceholderState,
+    WindowsVirtualAllocation, WindowsVirtualAllocations,
 };
 
 pub(crate) const ALLOCATION_GRANULARITY: usize = 0x1_0000;
@@ -76,6 +76,8 @@ bitflags::bitflags! {
     struct AllocationType: u32 {
         const MEM_COMMIT = 0x1000;
         const MEM_RESERVE = 0x2000;
+        const MEM_REPLACE_PLACEHOLDER = 0x4000;
+        const MEM_RESERVE_PLACEHOLDER = 0x40000;
         const MEM_RESET = 0x80000;
         const MEM_TOP_DOWN = 0x100000;
         const MEM_WRITE_WATCH = 0x200000;
@@ -287,6 +289,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         allocation_type: u32,
         protect: u32,
     ) -> NtStatus {
+        if allocation_type
+            & (AllocationType::MEM_RESERVE_PLACEHOLDER | AllocationType::MEM_REPLACE_PLACEHOLDER)
+                .bits()
+            != 0
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
         self.sys_nt_allocate_virtual_memory_inner(
             process_handle,
             base_address,
@@ -325,6 +334,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let supported_allocation_types = AllocationType::MEM_COMMIT
             | AllocationType::MEM_RESERVE
+            | AllocationType::MEM_RESERVE_PLACEHOLDER
+            | AllocationType::MEM_REPLACE_PLACEHOLDER
             | AllocationType::MEM_RESET
             | AllocationType::MEM_TOP_DOWN;
         if size == 0
@@ -352,8 +363,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return NtStatus::INVALID_PARAMETER;
         }
 
+        let is_placeholder = allocation_type.contains(AllocationType::MEM_RESERVE_PLACEHOLDER);
+        let replace_placeholder = allocation_type.contains(AllocationType::MEM_REPLACE_PLACEHOLDER);
+        if is_placeholder
+            && (allocation_type - AllocationType::MEM_TOP_DOWN
+                != AllocationType::MEM_RESERVE | AllocationType::MEM_RESERVE_PLACEHOLDER
+                || protect != PageProtection::PAGE_NOACCESS.bits())
+            || replace_placeholder
+                && (base == 0
+                    || !base.is_multiple_of(PAGE_SIZE)
+                    || !size.is_multiple_of(PAGE_SIZE)
+                    || !allocation_type.contains(AllocationType::MEM_RESERVE)
+                    || allocation_type.intersects(
+                        AllocationType::MEM_TOP_DOWN | AllocationType::MEM_RESERVE_PLACEHOLDER,
+                    ))
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
         let new_allocation = base == 0 || allocation_type.contains(AllocationType::MEM_RESERVE);
-        let Some((aligned_base, aligned_len)) = (if new_allocation {
+        let Some((aligned_base, aligned_len)) = (if new_allocation && !replace_placeholder {
             reserve_allocation_region(base, size)
         } else {
             page_aligned_region(base, size)
@@ -363,6 +391,41 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some((protect, permissions)) = parse_page_protection(protect) else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
+
+        if replace_placeholder {
+            let mut allocations = self.process.virtual_allocations.write();
+            let Some(allocation) = allocations.get_mut(&aligned_base).filter(|allocation| {
+                allocation.placeholder_state == WindowsPlaceholderState::Reserved
+                    && allocation.size == aligned_len
+            }) else {
+                return NtStatus::CONFLICTING_ADDRESSES;
+            };
+            if allocation_type.contains(AllocationType::MEM_COMMIT) {
+                // SAFETY: The exact placeholder range remains exclusively reserved while
+                // the allocation lock serializes its replacement.
+                if unsafe {
+                    self.global.page_manager.commit_pages(
+                        MutPtr::<Platform, u8>::from_usize(aligned_base),
+                        aligned_len,
+                        permissions,
+                    )
+                }
+                .is_err()
+                {
+                    return NtStatus::NO_MEMORY;
+                }
+                allocation.page_protections =
+                    initial_page_protections(aligned_base, aligned_len, protect);
+            }
+            allocation.placeholder_state = WindowsPlaceholderState::Replaced;
+            allocation.allocation_protect = protect;
+            if base_address.write_at_offset(0, aligned_base).is_none()
+                || region_size.write_at_offset(0, aligned_len).is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            return NtStatus::SUCCESS;
+        }
 
         if !new_allocation {
             let status = self.commit_existing_virtual_memory(
@@ -452,6 +515,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 size: aligned_len,
                 allocation_protect: protect,
                 type_: MemoryType::MEM_PRIVATE,
+                placeholder_state: if is_placeholder {
+                    WindowsPlaceholderState::Reserved
+                } else {
+                    WindowsPlaceholderState::None
+                },
                 page_protections: if allocation_type.contains(AllocationType::MEM_COMMIT) {
                     initial_page_protections(ptr.as_usize(), aligned_len, protect)
                 } else {
@@ -526,6 +594,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ) {
             return NtStatus::INVALID_PARAMETER;
         }
+        if allocation.placeholder_state == WindowsPlaceholderState::Reserved {
+            return NtStatus::CONFLICTING_ADDRESSES;
+        }
         if allocation.type_ == MemoryType::MEM_MAPPED
             && !pagefile_view_protection_is_compatible(allocation.allocation_protect, protect)
         {
@@ -584,6 +655,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(free_type) = FreeType::from_bits(free_type) else {
             return NtStatus::INVALID_PARAMETER;
         };
+        if free_type
+            .intersects(FreeType::MEM_PRESERVE_PLACEHOLDER | FreeType::MEM_COALESCE_PLACEHOLDERS)
+        {
+            return match self.free_placeholder_memory(base, size, free_type) {
+                Ok((base, size)) => {
+                    if base_address.write_at_offset(0, base).is_none()
+                        || region_size.write_at_offset(0, size).is_none()
+                    {
+                        NtStatus::ACCESS_VIOLATION
+                    } else {
+                        NtStatus::SUCCESS
+                    }
+                }
+                Err(status) => status,
+            };
+        }
         if base == 0 || !matches!(free_type, FreeType::MEM_DECOMMIT | FreeType::MEM_RELEASE) {
             return NtStatus::INVALID_PARAMETER;
         }
@@ -595,6 +682,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let ptr = MutPtr::<Platform, u8>::from_usize(aligned_base);
         if free_type == FreeType::MEM_DECOMMIT {
+            if find_private_virtual_allocation(
+                &self.process.virtual_allocations,
+                aligned_base,
+                aligned_len,
+            )
+            .is_some_and(|allocation| {
+                allocation.placeholder_state == WindowsPlaceholderState::Reserved
+            }) {
+                return NtStatus::MEMORY_NOT_ALLOCATED;
+            }
             // SAFETY: The range is page-aligned and belongs to a private allocation tracked for
             // this process. Decommit discards page contents while leaving the address range
             // reserved for later recommit.
@@ -614,7 +711,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
             split_virtual_allocation_around_released_region(
-                &self.process.virtual_allocations,
+                &mut self.process.virtual_allocations.write(),
                 aligned_base,
                 aligned_len,
             );
@@ -626,6 +723,84 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         NtStatus::SUCCESS
+    }
+
+    /// Splits/coalesces logical placeholders without releasing their backing reservations.
+    fn free_placeholder_memory(
+        &self,
+        base: usize,
+        size: usize,
+        free_type: FreeType,
+    ) -> Result<(usize, usize), NtStatus> {
+        let preserve = FreeType::MEM_RELEASE | FreeType::MEM_PRESERVE_PLACEHOLDER;
+        let coalesce = FreeType::MEM_RELEASE | FreeType::MEM_COALESCE_PLACEHOLDERS;
+        if !matches!(free_type, flags if flags == preserve || flags == coalesce)
+            || base == 0
+            || !base.is_multiple_of(PAGE_SIZE)
+            || !size.is_multiple_of(PAGE_SIZE)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if size == 0 {
+            return Err(NtStatus::INVALID_PARAMETER_3);
+        }
+        let mut allocations = self.process.virtual_allocations.write();
+        if free_type == coalesce {
+            let end = base.checked_add(size).ok_or(NtStatus::INVALID_PARAMETER)?;
+            let mut covered_until = base;
+            let mut count = 0;
+            for (&start, allocation) in allocations.range(base..end) {
+                if start != covered_until
+                    || allocation.placeholder_state != WindowsPlaceholderState::Reserved
+                {
+                    return Err(NtStatus::CONFLICTING_ADDRESSES);
+                }
+                covered_until = start + allocation.size;
+                count += 1;
+            }
+            if covered_until != end || count < 2 {
+                return Err(NtStatus::CONFLICTING_ADDRESSES);
+            }
+            allocations.retain(|&start, _| start <= base || start >= end);
+            allocations.get_mut(&base).unwrap().size = size;
+            return Ok((base, size));
+        }
+
+        let mut allocation = allocations
+            .range(..=base)
+            .next_back()
+            .map(|(_, allocation)| allocation.clone())
+            .filter(|allocation| {
+                allocation.type_ == MemoryType::MEM_PRIVATE
+                    && allocation.placeholder_state != WindowsPlaceholderState::None
+            })
+            .ok_or(NtStatus::CONFLICTING_ADDRESSES)?;
+        let end = base.checked_add(size).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if size == 0
+            || end > allocation.base + allocation.size
+            || allocation.placeholder_state == WindowsPlaceholderState::Replaced
+                && (base != allocation.base || size != allocation.size)
+        {
+            return Err(NtStatus::CONFLICTING_ADDRESSES);
+        }
+        if allocation.placeholder_state == WindowsPlaceholderState::Replaced {
+            // SAFETY: The exact private allocation is retained while its committed contents
+            // are discarded. The allocation lock prevents competing placeholder transitions.
+            unsafe {
+                self.global
+                    .page_manager
+                    .decommit_pages(MutPtr::<Platform, u8>::from_usize(base), size)
+            }
+            .map_err(|_| NtStatus::UNABLE_TO_FREE_VM)?;
+        }
+        split_virtual_allocation_around_released_region(&mut allocations, base, size);
+        allocation.base = base;
+        allocation.size = size;
+        allocation.placeholder_state = WindowsPlaceholderState::Reserved;
+        allocation.allocation_protect = PageProtection::PAGE_NOACCESS;
+        allocation.page_protections = RangeMap::new();
+        allocations.insert(base, allocation);
+        Ok((base, size))
     }
 
     pub(crate) fn sys_nt_protect_virtual_memory(
@@ -1160,15 +1335,14 @@ fn free_region<Platform: ShimPlatform>(
     Some((aligned_base, aligned_len))
 }
 
-fn split_virtual_allocation_around_released_region<Platform: ShimPlatform>(
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+fn split_virtual_allocation_around_released_region(
+    allocations: &mut alloc::collections::BTreeMap<usize, WindowsVirtualAllocation>,
     released_base: usize,
     released_size: usize,
 ) {
     let Some(released_end) = released_base.checked_add(released_size) else {
         return;
     };
-    let mut allocations = virtual_allocations.write();
     let Some((&allocation_key, allocation)) = allocations.range(..=released_base).next_back()
     else {
         return;
@@ -1197,6 +1371,7 @@ fn split_virtual_allocation_around_released_region<Platform: ShimPlatform>(
                 size: end - base,
                 allocation_protect: allocation.allocation_protect,
                 type_: allocation.type_,
+                placeholder_state: allocation.placeholder_state.clone(),
                 page_protections: pages,
             },
         );
@@ -1636,6 +1811,127 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_split_replace_restore_and_coalesce() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let allocate =
+                |mut base, mut size, flags: AllocationType, protection: PageProtection| {
+                    let status = task.sys_nt_allocate_virtual_memory_ex(
+                        ProcessHandle::CURRENT,
+                        mut_ptr(&mut base),
+                        mut_ptr(&mut size),
+                        flags.bits(),
+                        protection.bits(),
+                        MemoryExtendedParameters {
+                            parameters: None,
+                            count: 0,
+                        },
+                    );
+                    (status, base, size)
+                };
+            let free = |mut base, mut size, flags: FreeType| {
+                task.sys_nt_free_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    mut_ptr(&mut size),
+                    flags.bits(),
+                )
+            };
+            let reserve = AllocationType::MEM_RESERVE | AllocationType::MEM_RESERVE_PLACEHOLDER;
+            let replace = AllocationType::MEM_RESERVE | AllocationType::MEM_REPLACE_PLACEHOLDER;
+            let preserve = FreeType::MEM_RELEASE | FreeType::MEM_PRESERVE_PLACEHOLDER;
+            let coalesce = FreeType::MEM_RELEASE | FreeType::MEM_COALESCE_PLACEHOLDERS;
+            let noaccess = PageProtection::PAGE_NOACCESS;
+            let rw = PageProtection::PAGE_READWRITE;
+            let unit = ALLOCATION_GRANULARITY;
+            let (status, base, size) = allocate(0, unit * 4, reserve, noaccess);
+            assert_eq!(status, NtStatus::SUCCESS);
+            assert_eq!(size, unit * 4);
+            let initial = query_basic_information(&task, base);
+            assert_eq!(initial.allocation_protect, noaccess.bits());
+            assert_eq!(initial.state, MemoryState::MEM_RESERVE.bits());
+            assert_eq!(initial.protect, 0);
+            let mut legacy_base = 0;
+            let mut legacy_size = unit;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut legacy_base),
+                    0,
+                    mut_ptr(&mut legacy_size),
+                    reserve.bits(),
+                    noaccess.bits(),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+
+            assert_eq!(
+                allocate(base, PAGE_SIZE, AllocationType::MEM_COMMIT, rw).0,
+                NtStatus::CONFLICTING_ADDRESSES
+            );
+            assert_eq!(
+                allocate(base, unit, replace, rw).0,
+                NtStatus::CONFLICTING_ADDRESSES
+            );
+            assert_eq!(
+                free(base, PAGE_SIZE, FreeType::MEM_DECOMMIT),
+                NtStatus::MEMORY_NOT_ALLOCATED
+            );
+            assert_eq!(free(base, 0, preserve), NtStatus::INVALID_PARAMETER_3);
+            assert_eq!(free(base, size, coalesce), NtStatus::CONFLICTING_ADDRESSES);
+
+            let middle = base + unit;
+            assert_eq!(free(middle, unit, preserve), NtStatus::SUCCESS);
+            for (start, length) in [(base, unit), (middle, unit), (base + unit * 2, unit * 2)] {
+                let info = query_basic_information(&task, start);
+                assert_eq!(info.allocation_base, start);
+                assert_eq!(info.region_size, length);
+                assert_eq!(info.state, MemoryState::MEM_RESERVE.bits());
+            }
+            assert_eq!(
+                allocate(middle, unit, replace | AllocationType::MEM_COMMIT, rw).0,
+                NtStatus::SUCCESS
+            );
+            assert_eq!(query_basic_information(&task, middle).protect, rw.bits());
+            // SAFETY: The replacement committed this page for reading and writing.
+            unsafe { core::ptr::write_bytes(middle as *mut u8, 0xa5, PAGE_SIZE) };
+            assert_eq!(free(base, size, coalesce), NtStatus::CONFLICTING_ADDRESSES);
+            assert_eq!(free(middle, unit, preserve), NtStatus::SUCCESS);
+            assert_eq!(query_basic_information(&task, middle).protect, 0);
+            assert_eq!(
+                allocate(middle, unit, replace | AllocationType::MEM_COMMIT, rw).0,
+                NtStatus::SUCCESS
+            );
+            // SAFETY: Replacing the placeholder recommitted this page for reading.
+            assert_eq!(unsafe { *(middle as *const u8) }, 0);
+            assert_eq!(free(middle, unit, preserve), NtStatus::SUCCESS);
+
+            // Re-reserving a released slice creates a separate backing reservation.
+            assert_eq!(free(middle, 0, FreeType::MEM_RELEASE), NtStatus::SUCCESS);
+            assert_eq!(
+                allocate(middle, unit, reserve, noaccess).0,
+                NtStatus::SUCCESS
+            );
+            assert_eq!(free(base, size, coalesce), NtStatus::SUCCESS);
+            assert_eq!(query_basic_information(&task, base).region_size, size);
+            assert_eq!(
+                allocate(base, size, replace | AllocationType::MEM_COMMIT, rw).0,
+                NtStatus::SUCCESS
+            );
+            assert_eq!(query_basic_information(&task, base).region_size, size);
+            assert_eq!(free(base, size, preserve), NtStatus::SUCCESS);
+            release_allocation(&task, base);
+
+            let (ordinary, ordinary_size) = allocate_committed_rw(&task, unit);
+            assert_eq!(
+                free(ordinary, ordinary_size, preserve),
+                NtStatus::CONFLICTING_ADDRESSES
+            );
+            release_allocation(&task, ordinary);
+        });
+    }
+
+    #[test]
     fn page_manager_distinguishes_platform_collisions_from_guest_overlaps() {
         run_with_test_platform_pointers(|| {
             let platform = crate::tests::test_platform();
@@ -1864,6 +2160,7 @@ mod tests {
             size: PAGE_SIZE * 6,
             allocation_protect: PageProtection::PAGE_READWRITE,
             type_: MemoryType::MEM_PRIVATE,
+            placeholder_state: WindowsPlaceholderState::None,
             page_protections: pages,
         };
         let mut mappings = RangeMap::new();

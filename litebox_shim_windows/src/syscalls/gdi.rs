@@ -68,6 +68,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 size: GDI_SHARED_TABLE_SIZE,
                 allocation_protect: PageProtection::PAGE_READWRITE,
                 type_: MemoryType::MEM_MAPPED,
+                placeholder_state: crate::WindowsPlaceholderState::None,
                 page_protections: pages,
             },
         );

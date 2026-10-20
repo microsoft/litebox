@@ -604,6 +604,7 @@ fn register_image_virtual_allocation<Platform: crate::ShimPlatform>(
             size: mapping.mapping_size,
             allocation_protect: PageProtection::PAGE_EXECUTE_WRITECOPY,
             type_: MemoryType::MEM_IMAGE,
+            placeholder_state: crate::WindowsPlaceholderState::None,
             page_protections: pages,
         },
     );

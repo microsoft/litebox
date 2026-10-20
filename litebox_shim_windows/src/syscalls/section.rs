@@ -811,6 +811,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 size: mapped_size,
                 allocation_protect: section.protection,
                 type_: MemoryType::MEM_MAPPED,
+                placeholder_state: crate::WindowsPlaceholderState::None,
                 page_protections: if is_reserved {
                     RangeMap::new()
                 } else {
@@ -906,6 +907,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 size: mapped_size,
                 allocation_protect: section.protection,
                 type_: MemoryType::MEM_MAPPED,
+                placeholder_state: crate::WindowsPlaceholderState::None,
                 // TODO(section-subsystem): honor per-view CSR protections only after
                 // the backing is no longer aliased by PEB direct-deref pointers.
                 page_protections: mm::initial_page_protections(

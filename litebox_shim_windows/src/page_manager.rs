@@ -223,15 +223,14 @@ where
         let start = ptr.as_usize();
         let range = page_range(start, len)
             .ok_or_else(|| VmemProtectError::UnAligned(start..start.saturating_add(len)))?;
-        let Some(reservation) = containing_reservation::<Platform>(&self.reservations, &range)
-        else {
+        if !reservations_cover_range::<Platform>(&self.reservations, &range) {
             return Err(VmemProtectError::InvalidRange(range));
-        };
-        // SAFETY: One retained reservation covers the range, and the caller excludes accesses
+        }
+        // SAFETY: Retained reservations cover the range, and the caller excludes accesses
         // that conflict with commitment or permission changes.
         unsafe {
             self.platform.commit_pages(
-                || core::iter::once(reservation),
+                || self.reservations.overlapping(range.clone()),
                 range.clone(),
                 permissions,
                 false,
@@ -253,14 +252,15 @@ where
         let start = ptr.as_usize();
         let range = page_range(start, len)
             .ok_or_else(|| VmemProtectError::UnAligned(start..start.saturating_add(len)))?;
-        let Some(reservation) = containing_reservation::<Platform>(&self.reservations, &range)
-        else {
+        if !reservations_cover_range::<Platform>(&self.reservations, &range) {
             return Err(VmemProtectError::InvalidRange(range));
-        };
-        // SAFETY: The retained reservation covers the range and the caller relinquishes contents.
+        }
+        // SAFETY: Retained reservations cover the range and the caller relinquishes contents.
         unsafe {
-            self.platform
-                .decommit_pages(|| core::iter::once(reservation), range.clone())
+            self.platform.decommit_pages(
+                || self.reservations.overlapping(range.clone()),
+                range.clone(),
+            )
         }
         .map_err(|_| VmemProtectError::InvalidRange(range.clone()))?;
         self.mappings.remove(range);
@@ -307,18 +307,17 @@ where
         let start = ptr.as_usize();
         let range = page_range(start, len)
             .ok_or_else(|| VmemProtectError::UnAligned(start..start.saturating_add(len)))?;
-        let Some(reservation) = containing_reservation::<Platform>(&self.reservations, &range)
-        else {
+        if !reservations_cover_range::<Platform>(&self.reservations, &range) {
             return Err(VmemProtectError::InvalidRange(range));
-        };
+        }
         if !self.is_range_mapped(&range) {
             return Err(VmemProtectError::InvalidRange(range));
         }
-        // SAFETY: The range is committed and covered by the retained reservation; the caller
+        // SAFETY: The range is committed and covered by retained reservations; the caller
         // excludes accesses that conflict with the permission change.
         unsafe {
             self.platform.protect_pages(
-                || core::iter::once(reservation),
+                || self.reservations.overlapping(range.clone()),
                 range.clone(),
                 permissions,
             )
@@ -337,7 +336,7 @@ where
     ) -> Result<(), VmemUnmapError> {
         let start = ptr.as_usize();
         let range = page_range(start, len).ok_or(VmemUnmapError::UnAligned)?;
-        if containing_reservation::<Platform>(&self.reservations, &range).is_none() {
+        if !reservations_cover_range::<Platform>(&self.reservations, &range) {
             return Err(litebox::platform::page_mgmt::DeallocationError::AlreadyUnallocated.into());
         }
         self.mappings.remove(range.clone());
@@ -677,20 +676,25 @@ fn page_range(start: usize, len: usize) -> Option<Range<usize>> {
         .then_some(start..end)
 }
 
-fn containing_reservation<'a, Platform>(
-    reservations: &'a Reservations<Platform>,
+fn reservations_cover_range<Platform>(
+    reservations: &Reservations<Platform>,
     range: &Range<usize>,
-) -> Option<&'a Platform::Reservation>
+) -> bool
 where
     Platform: crate::ShimPlatform,
 {
-    reservations
-        .iter()
-        .map(|(_, reservation)| reservation)
-        .find(|reservation| {
-            let extent = reservation.range();
-            extent.start <= range.start && range.end <= extent.end
-        })
+    let mut covered_until = range.start;
+    for reservation in reservations.overlapping(range.clone()) {
+        let extent = reservation.range();
+        if extent.start > covered_until {
+            return false;
+        }
+        covered_until = extent.end;
+        if covered_until >= range.end {
+            return true;
+        }
+    }
+    false
 }
 
 fn into_release_target<Platform>(

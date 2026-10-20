@@ -206,11 +206,20 @@ pub(crate) type WindowsSectionViews<Platform> =
 pub(crate) type WindowsObjectManager<Platform> = ObjectManager<Platform>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WindowsPlaceholderState {
+    None,
+    Reserved,
+    Replaced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {
     pub(crate) base: usize,
     pub(crate) size: usize,
     pub(crate) allocation_protect: syscalls::mm::PageProtection,
     pub(crate) type_: syscalls::mm::MemoryType,
+    /// Tracks both placeholders and private allocations that may be restored to placeholders.
+    pub(crate) placeholder_state: WindowsPlaceholderState,
     /// Exact Windows protections; commitment is determined by the page manager.
     pub(crate) page_protections: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
 }

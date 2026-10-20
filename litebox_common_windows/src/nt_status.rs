@@ -182,6 +182,7 @@ impl NtStatus {
             0xC000007E => "STATUS_RANGE_NOT_LOCKED: Range not locked",
             0xC000007F => "STATUS_DISK_FULL: Disk full",
             0xC0000080 => "STATUS_SERVER_DISABLED: Server disabled",
+            0xC00000A0 => "STATUS_MEMORY_NOT_ALLOCATED: Memory not allocated",
             0xC00000A2 => "STATUS_MEDIA_WRITE_PROTECTED: Media write protected",
             0xC00000A6 => "STATUS_CANT_OPEN_ANONYMOUS: Cannot open anonymous",
             0xC00000AC => "STATUS_PIPE_NOT_AVAILABLE: Pipe not available",
@@ -520,6 +521,9 @@ impl NtStatus {
 
     /// STATUS_SERVER_DISABLED
     pub const SERVER_DISABLED: Self = Self::from_raw(0xC0000080);
+
+    /// STATUS_MEMORY_NOT_ALLOCATED
+    pub const MEMORY_NOT_ALLOCATED: Self = Self::from_raw(0xC00000A0);
 
     /// STATUS_MEDIA_WRITE_PROTECTED
     pub const MEDIA_WRITE_PROTECTED: Self = Self::from_raw(0xC00000A2);
