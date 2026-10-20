@@ -69,11 +69,12 @@ impl<P: ShimPlatform> Task<P> {
     /// mapped, so this never reaches the host. Like XNU
     /// (`bsd/vm/vm_unix.c`), empty requests succeed, oversized counts fail
     /// with a raw `KERN_FAILURE` (the guest sees errno 5, `EIO`) and
-    /// unreadable file arrays with `EFAULT`. Every later failure goes through
-    /// `_shared_region_map_and_slide`, which converts `KERN_FAILURE` (a region
-    /// that is already mapped) and `KERN_INVALID_ARGUMENT` alike to `EINVAL`,
-    /// so the request is refused with `EINVAL` whether or not an instance is
-    /// installed.
+    /// unreadable file arrays with `EFAULT`. Failures inside
+    /// `_shared_region_map_and_slide` (including a region that is already
+    /// mapped) become `EINVAL`, so the request is refused with `EINVAL`
+    /// whether or not an instance is installed. The mappings array is not
+    /// read, so its raw `kern_return_t` failures (`vm_unix.c`, the mappings
+    /// copy-in, count and slide checks) are not reproduced.
     #[expect(
         clippy::unused_self,
         reason = "dispatched like every other syscall; the result never depends on the task"

@@ -81,9 +81,9 @@ const ISLAND_WINDOW: u64 = 16 << 20;
 const RESERVATION_ATTEMPTS: usize = 64;
 /// Darwin `PATH_MAX`: dyld builds candidate paths in buffers of this size.
 const PATH_MAX: usize = litebox_common_macos::PATH_MAX;
-/// Candidate paths examined while rooting the executable's dependencies,
-/// bounding host work for executables with huge numbers of `LC_RPATH` and
-/// `@rpath` load commands.
+/// Units of work (`LC_RPATH` entries, dependencies and candidate paths
+/// examined) while rooting the executable's dependencies, bounding host work
+/// for executables with huge numbers of `LC_RPATH` and dylib load commands.
 const MAX_DEPENDENCY_CANDIDATES: usize = 1 << 16;
 
 /// dyld's `Utils::concatenatePaths`: append `suffix`, avoiding a double slash.
@@ -131,31 +131,74 @@ fn expand_path_variables(executable_path: &str, path: &str) -> Option<String> {
     Some(format!("{}{tail}", &executable_path[..directory_end]))
 }
 
+/// Consume one unit of the dependency-resolution work budget.
+fn charge(budget: &mut usize) -> Result<()> {
+    *budget = budget
+        .checked_sub(1)
+        .context("the executable has too many dylib and LC_RPATH load commands")?;
+    Ok(())
+}
+
+/// The usable bases of the main executable's `LC_RPATH` entries `rpaths`, in
+/// order, for the executable at `executable_path`: absolute entries as is and
+/// `@loader_path` / `@executable_path` entries expanded, as dyld's
+/// `Loader::forEachResolvedAtPathVar` does for each run path. Relative and
+/// other `@` entries never name cache images and are dropped, as are entries
+/// of `PATH_MAX` bytes or more (dyld truncates them) and expansions of that
+/// length (every candidate built from them is at least as long). Each entry
+/// examined consumes one unit of `budget`.
+fn rpath_bases(
+    executable_path: &str,
+    rpaths: &[String],
+    budget: &mut usize,
+) -> Result<Vec<String>> {
+    let mut bases = Vec::new();
+    for rpath in rpaths {
+        charge(budget)?;
+        if rpath.len() >= PATH_MAX {
+            continue;
+        }
+        let base = if rpath.starts_with('@') {
+            match expand_path_variables(executable_path, rpath) {
+                Some(expanded) => expanded,
+                None => continue,
+            }
+        } else if rpath.starts_with('/') {
+            rpath.clone()
+        } else {
+            continue;
+        };
+        if base.len() < PATH_MAX {
+            bases.push(base);
+        }
+    }
+    Ok(bases)
+}
+
 /// Resolve a dependency of the main executable at `executable_path` with
-/// `LC_RPATH` entries `rpaths` to the first candidate path that `lookup`
-/// finds, in the order of dyld's `Loader::forEachResolvedAtPathVar`:
-/// `@loader_path/` and `@executable_path/` expansions, then `@rpath/`
-/// expanded with each run path in order, then `load_path` itself unless it
-/// starts with `@`.
+/// `LC_RPATH` bases `rpath_bases` (see [`rpath_bases`]) to the first
+/// candidate path that `lookup` finds, in the order of dyld's
+/// `Loader::forEachResolvedAtPathVar`: `@loader_path/` and
+/// `@executable_path/` expansions, then `@rpath/` expanded with each run path
+/// in order, then `load_path` itself unless it starts with `@`.
 ///
 /// Approximations: like the guest filesystem, no file exists on disk at any
 /// candidate, so the first candidate in the cache is the one dyld loads;
-/// the process is unrestricted (dyld's `allowAtPaths`); relative run paths,
-/// cryptex-prefixed candidates and bare leaf names (dyld's implicit `@rpath`)
-/// never name cache images and are not tried; and paths of `PATH_MAX` bytes
-/// or more, which dyld truncates, name no cache image. Each candidate
-/// examined consumes one unit of `budget`.
+/// the process is unrestricted (dyld's `allowAtPaths`); cryptex-prefixed
+/// candidates and bare leaf names (dyld's implicit `@rpath`) never name
+/// cache images and are not tried; and paths of `PATH_MAX` bytes or more,
+/// which dyld truncates, name no cache image. The dependency and each
+/// candidate examined consume one unit of `budget` each.
 fn resolve_dependency(
     executable_path: &str,
-    rpaths: &[String],
+    rpath_bases: &[String],
     load_path: &str,
     budget: &mut usize,
     lookup: impl Fn(&str) -> Option<usize>,
 ) -> Result<Option<usize>> {
+    charge(budget)?;
     let mut try_candidate = |candidate: &str| -> Result<Option<usize>> {
-        *budget = budget
-            .checked_sub(1)
-            .context("the executable has too many dylib and LC_RPATH load commands")?;
+        charge(budget)?;
         Ok(if candidate.len() < PATH_MAX {
             lookup(candidate)
         } else {
@@ -172,17 +215,8 @@ fn resolve_dependency(
         .strip_prefix("@rpath")
         .filter(|tail| tail.starts_with('/'))
     {
-        for rpath in rpaths.iter().filter(|rpath| rpath.len() < PATH_MAX) {
-            let mut candidate = if rpath.starts_with('@') {
-                match expand_path_variables(executable_path, rpath) {
-                    Some(expanded) => expanded,
-                    None => continue,
-                }
-            } else if rpath.starts_with('/') {
-                rpath.clone()
-            } else {
-                continue;
-            };
+        for base in rpath_bases {
+            let mut candidate = base.clone();
             concatenate_paths(&mut candidate, tail);
             if let Some(index) = try_candidate(&candidate)? {
                 return Ok(Some(index));
@@ -376,10 +410,11 @@ impl GuestCache {
             indices_by_path.entry(image.path.as_str()).or_insert(index);
         }
         let mut budget = MAX_DEPENDENCY_CANDIDATES;
+        let rpath_bases = rpath_bases(executable_path, rpaths, &mut budget)?;
         for dependency in dependencies {
             let Some(index) = resolve_dependency(
                 executable_path,
-                rpaths,
+                &rpath_bases,
                 &dependency.path,
                 &mut budget,
                 |path| indices_by_path.get(path).copied(),
@@ -1300,12 +1335,13 @@ mod tests {
         ]
         .map(String::from)
         .into();
+        let mut budget = MAX_DEPENDENCY_CANDIDATES;
+        let bases = rpath_bases("/opt/bin/main", &rpaths, &mut budget).unwrap();
         let resolve = |load_path: &str| {
             tried.borrow_mut().clear();
             let mut budget = MAX_DEPENDENCY_CANDIDATES;
-            let index =
-                resolve_dependency("/opt/bin/main", &rpaths, load_path, &mut budget, lookup)
-                    .unwrap();
+            let index = resolve_dependency("/opt/bin/main", &bases, load_path, &mut budget, lookup)
+                .unwrap();
             (index, tried.borrow().clone())
         };
         // Run paths are tried in order, expanded against the executable's
@@ -1356,12 +1392,14 @@ mod tests {
     fn dependency_resolution_is_bounded() {
         let rpaths = vec![String::from("/usr/lib/none"), String::from("/usr/lib")];
         let lookup = |path: &str| (path == "/usr/lib/libz.1.dylib").then_some(0);
-        // Each examined candidate consumes one unit of the budget.
-        let mut budget = 3;
+        // Each run path, dependency and examined candidate consumes one unit.
+        let mut budget = 6;
+        let bases = rpath_bases("/executable", &rpaths, &mut budget).unwrap();
+        assert_eq!(budget, 4);
         assert_eq!(
             resolve_dependency(
                 "/executable",
-                &rpaths,
+                &bases,
                 "@rpath/libz.1.dylib",
                 &mut budget,
                 lookup
@@ -1373,13 +1411,51 @@ mod tests {
         assert!(
             resolve_dependency(
                 "/executable",
-                &rpaths,
+                &bases,
                 "@rpath/libz.1.dylib",
                 &mut budget,
                 lookup
             )
             .is_err()
         );
+    }
+
+    /// Run paths that never yield a candidate (relative, unknown `@`
+    /// variables, `PATH_MAX` bytes or more before or after expansion) and
+    /// `@rpath` dependencies that find nothing still consume the budget.
+    #[test]
+    fn skipped_rpaths_and_unresolved_dependencies_consume_the_budget() {
+        let executable = format!("/{}/main", "d".repeat(200));
+        let unusable = [
+            String::from("relative/lib"),
+            String::new(),
+            String::from("@unknown/lib"),
+            format!("/{}", "x".repeat(PATH_MAX)),
+            format!("@executable_path/{}", "x".repeat(PATH_MAX - 100)),
+        ];
+        let rpaths: Vec<String> = unusable.iter().cycle().take(40).cloned().collect();
+        let lookup = |_: &str| -> Option<usize> { panic!("no candidate should be examined") };
+
+        let mut budget = rpaths.len() - 1;
+        assert!(rpath_bases(&executable, &rpaths, &mut budget).is_err());
+
+        let mut budget = rpaths.len() + 3;
+        let bases = rpath_bases(&executable, &rpaths, &mut budget).unwrap();
+        assert!(bases.is_empty());
+        assert_eq!(budget, 3);
+        let mut resolved = 0;
+        let result = loop {
+            match resolve_dependency(&executable, &bases, "@rpath/x", &mut budget, lookup) {
+                Ok(index) => {
+                    assert_eq!(index, None);
+                    resolved += 1;
+                    assert!(resolved <= 3, "unbounded dependency resolution");
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(resolved, 3);
+        assert!(result.to_string().contains("too many dylib"));
     }
 
     #[test]
