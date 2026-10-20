@@ -194,6 +194,125 @@ fn brokered_windows_runner_command(initial_files: &std::path::Path) -> std::proc
     command
 }
 
+/// Runs a locally installed x64 Node.js through the runner. Uses
+/// `LITEBOX_NODE_PATH` when set, otherwise locates `node.exe` on `PATH`.
+#[test]
+fn run_node_pe() {
+    let source = node_source();
+    println!("Using local Node.js at `{}`", source.display());
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("node");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let host_exe = std::fs::read(&source)
+        .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", source.display()));
+    let rewritten = litebox_syscall_rewriter::rewrite_binary(&host_exe, None)
+        .expect("failed to rewrite node.exe");
+    std::fs::write(test_dir.join("node.exe"), rewritten).unwrap();
+
+    let mut host_images = vec![source];
+    // Startup-only scans omit dbghelp's dbgcore export forwarders and the
+    // delay-load dependencies and provider DLLs used by BCrypt and legacy CryptoAPI.
+    for dll_name in [
+        "dbgcore.dll",
+        "bcryptprimitives.dll",
+        "cryptbase.dll",
+        "cryptsp.dll",
+        "rsaenh.dll",
+    ] {
+        build_rewritten_system_dll(&test_dir, dll_name);
+        host_images.push(host_system32_file_path(dll_name));
+    }
+    stage_startup_import_closures(
+        &test_dir,
+        host_images.iter().map(std::path::PathBuf::as_path),
+    );
+    stage_node_cryptoapi_registry(&test_dir);
+
+    let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("node.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let mut command = brokered_windows_runner_command(&tar_path);
+    // command.env("LITEBOX_LOG", "debug");
+    command.args(["/node.exe", "-e", "console.log('hello world')"]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!(
+        "Node.js exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    assert!(
+        output.status.success(),
+        "Node.js failed; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.lines().any(|line| line == "hello world"),
+        "Node.js output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Provisions the legacy CryptoAPI RSA provider used by some local Node builds.
+fn stage_node_cryptoapi_registry(test_dir: &std::path::Path) {
+    let defaults = test_dir.join(r"registry\machine\software\microsoft\cryptography\defaults");
+    for (key, name, value) in [
+        (
+            r"provider types\type 001",
+            "name",
+            "Microsoft Strong Cryptographic Provider",
+        ),
+        (
+            r"provider\microsoft strong cryptographic provider",
+            "image path",
+            r"C:\Windows\System32\rsaenh.dll",
+        ),
+    ] {
+        let values_dir = defaults.join(key).join(".values");
+        std::fs::create_dir_all(&values_dir).unwrap();
+        // Registry value files begin with a little-endian REG_SZ type tag.
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        bytes.extend(
+            value
+                .encode_utf16()
+                .chain(core::iter::once(0))
+                .flat_map(u16::to_le_bytes),
+        );
+        std::fs::write(values_dir.join(name), bytes).unwrap();
+    }
+    let mut bytes = 4u32.to_le_bytes().to_vec(); // REG_DWORD
+    bytes.extend(1u32.to_le_bytes()); // PROV_RSA_FULL
+    std::fs::write(
+        defaults.join(r"provider\microsoft strong cryptographic provider\.values\type"),
+        bytes,
+    )
+    .unwrap();
+}
+
+fn node_source() -> std::path::PathBuf {
+    if let Some(source) = std::env::var_os("LITEBOX_NODE_PATH") {
+        let source = std::path::PathBuf::from(source);
+        assert!(
+            source.is_file(),
+            "LITEBOX_NODE_PATH does not point to a file: `{}`",
+            source.display()
+        );
+        return source;
+    }
+
+    std::env::var_os("PATH")
+        .and_then(|paths| find_executable_on_path("node.exe", &paths))
+        .expect("node.exe not found on PATH; install x64 Node.js or set LITEBOX_NODE_PATH")
+}
+
 /// Stages the minimal guest system DLLs and locale tables the lightweight PE
 /// fixtures need. These fixtures import only a tiny surface, so a fixed minimal
 /// set is deliberately used rather than the full transitive closure: walking
