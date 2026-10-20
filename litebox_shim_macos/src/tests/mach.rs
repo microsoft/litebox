@@ -938,6 +938,69 @@ fn generated_names_skip_inserted_names() {
 }
 
 #[test]
+fn inserted_names_need_roll_bits_and_a_nonzero_index() {
+    let task = new_task();
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let port = construct(&task, 0);
+    let insert = |name: usize| {
+        kr(
+            &task,
+            mach_trap::MACH_PORT_INSERT_RIGHT,
+            &[own, name, port as usize, msg_type::MAKE_SEND_ONCE as usize],
+        )
+    };
+    // ipc_entry_alloc_name: the low two bits must be set, index 0 is
+    // reserved.
+    for name in [0xf0, 0x500, 0x501, 0x502] {
+        assert_eq!(insert(name), KernReturn::INVALID_VALUE, "{name:#x}");
+    }
+    assert_eq!(insert(0x03), KernReturn::FAILURE);
+    assert_eq!(insert(0xf3), KernReturn::FAILURE);
+    // The refused rights were destroyed: each sent a send-once notification.
+    let mut buffer = [0u8; 128];
+    for _ in 0..6 {
+        assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+    }
+    let generated = trap(&task, mach_trap::MACH_REPLY_PORT, &[]);
+    assert_ne!(generated >> 8, 0);
+    assert_eq!(generated & 0x3, 0x3);
+}
+
+#[test]
+fn released_inserted_names_come_back_with_a_new_generation() {
+    let task = new_task();
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let port = construct(&task, 0);
+    // An index above every generated one.
+    let inserted = 0x5003;
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_INSERT_RIGHT,
+            &[
+                own,
+                inserted,
+                port as usize,
+                msg_type::MAKE_SEND_ONCE as usize
+            ]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, inserted]),
+        KernReturn::SUCCESS
+    );
+    // Generate names until index 0x50 is reached again: the stale name is
+    // never handed out.
+    let generated: Vec<usize> = (0..0x60)
+        .map(|_| trap(&task, mach_trap::MACH_REPLY_PORT, &[]))
+        .collect();
+    assert_eq!(generated[0], 0x5013);
+    assert!(generated.iter().all(|&name| name != inserted));
+    assert!(generated.iter().any(|&name| name >> 8 > 0x50));
+}
+
+#[test]
 fn destroyed_ports_and_released_names_are_reclaimed() {
     let task = new_task();
     let own = u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap();

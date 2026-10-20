@@ -64,6 +64,37 @@ struct GuestQueue {
     immovable: bool,
 }
 
+impl GuestQueue {
+    /// Host memory of the queue's allocated slots, charged to
+    /// [`QUEUED_BYTES_LIMIT`] whether or not they hold a message.
+    fn storage(&self) -> usize {
+        self.messages.capacity() * QUEUE_SLOT_BYTES
+    }
+
+    /// The slots one more message would allocate (amortized doubling).
+    fn growth(&self) -> usize {
+        let capacity = self.messages.capacity();
+        if self.messages.len() < capacity {
+            0
+        } else {
+            capacity.max(QUEUE_MIN_SLOTS)
+        }
+    }
+
+    /// Release slots once at most a quarter are used, keeping twice the
+    /// remaining messages; with [`GuestQueue::growth`] a queue's slots stay
+    /// within four times its messages (or [`QUEUE_MIN_SLOTS`]), and an
+    /// emptied queue holds none.
+    fn trim(&mut self) {
+        let length = self.messages.len();
+        if length == 0 {
+            self.messages = VecDeque::new();
+        } else if length <= self.messages.capacity() / 4 {
+            self.messages.shrink_to((2 * length).max(QUEUE_MIN_SLOTS));
+        }
+    }
+}
+
 /// A live port. A port's record is removed when it dies, so a `PortId`
 /// without a record names a dead port.
 #[derive(Debug)]
@@ -167,15 +198,22 @@ impl Message {
         }
     }
 
-    /// Host memory charged to [`QUEUED_BYTES_LIMIT`] while queued.
+    /// Host memory outside its queue slot charged to [`QUEUED_BYTES_LIMIT`]
+    /// while queued.
     fn charge(&self) -> usize {
-        message_charge(self.body.len(), self.ports.len())
+        payload_charge(self.body.len(), self.ports.len())
     }
 }
 
-fn message_charge(body_length: usize, port_count: usize) -> usize {
-    size_of::<Message>() + body_length + port_count * size_of::<(usize, Option<Right>)>()
+/// A queued message's heap allocations: its body and port descriptors.
+fn payload_charge(body_length: usize, port_count: usize) -> usize {
+    body_length + port_count * size_of::<(usize, Option<Right>)>()
 }
+
+/// Host memory of one slot of a port's message queue.
+const QUEUE_SLOT_BYTES: usize = size_of::<Message>();
+/// Slots a queue allocates first and keeps when a shrink leaves messages.
+const QUEUE_MIN_SLOTS: usize = 4;
 
 /// `mig_reply_error_t`: NDR and a `RetCode`.
 pub(crate) fn error_reply(code: i32) -> Message {
@@ -234,7 +272,8 @@ pub(crate) struct IpcSpace {
     /// Settable task special ports (`itk_bootstrap`, ...): a send right held
     /// by the task, keyed by `TASK_*_PORT` selector.
     special_ports: BTreeMap<i32, Right>,
-    /// Sum of [`Message::charge`] over every queued message.
+    /// Sum of [`Message::charge`] over every queued message plus the slots
+    /// every guest port's queue has allocated ([`GuestQueue::storage`]).
     queued_bytes: usize,
     /// Messages whose rights are still to be released (XNU's
     /// `ipc_kmsg_delayed_destroy` queue); drained by [`IpcSpace::reap`].
@@ -244,6 +283,8 @@ pub(crate) struct IpcSpace {
 /// The low byte of a name on the first use of its index: XNU's generation
 /// with both rollover bits set, as in a native task's first name 0x103.
 const NAME_GENERATION: u32 = 0x03;
+/// `IE_BITS_ROLL_MASK` in a name: every valid name has both bits set.
+const NAME_ROLL_BITS: u8 = 0x03;
 /// `ipc_entry_next_gen` with rollover bits 3: the generation advances by
 /// `IE_BITS_GEN_ONE + (3 << IE_BITS_ROLL_BITS)` and wraps to the first one.
 const NAME_GENERATION_STEP: u8 = 0x10;
@@ -320,10 +361,12 @@ impl IpcSpace {
         self.entries.insert(name, entry);
     }
 
-    /// `ipc_entry_dealloc`: remove a name; its index becomes reusable.
+    /// `ipc_entry_dealloc`: remove a name; its index becomes reusable with
+    /// the next generation. Every released name is remembered, also above
+    /// `next_index`, so a fresh index is never reused under the same name.
     fn free_name(&mut self, name: u32) {
-        if self.entries.remove(&name).is_some() && name_index(name) <= self.next_index {
-            // Indices above `next_index` are reached by fresh allocation.
+        if self.entries.remove(&name).is_some() {
+            debug_assert_ne!(name_index(name), 0, "index 0 is never named");
             self.free_names.push(name);
         }
     }
@@ -574,6 +617,7 @@ impl IpcSpace {
             kind: PortKind::Guest(queue),
         }) = self.ports.remove(&port)
         {
+            self.queued_bytes -= queue.storage();
             for message in queue.messages {
                 self.queued_bytes -= message.charge();
                 self.doomed.push_back(message);
@@ -596,6 +640,7 @@ impl IpcSpace {
                 self.release_right(right);
             }
         }
+        self.doomed = VecDeque::new();
     }
 
     /// `ipc_kmsg_destroy`: release every right a message carries.
@@ -643,16 +688,19 @@ impl IpcSpace {
     /// (`IPC_KMSG_DESTROY_SKIP_REMOTE`), so a lost send-once notification
     /// does not notify again; the caller reaps.
     fn enqueue(&mut self, port: PortId, mut message: Message) -> Result<(), EnqueueError> {
-        let charge = message.charge();
         let error = match self.ports.get_mut(&port) {
             Some(Port {
                 kind: PortKind::Guest(queue),
             }) => {
+                let growth = queue.growth();
                 if queue.messages.len() < MACH_PORT_QLIMIT_KERNEL as usize
-                    && self.queued_bytes + charge <= QUEUED_BYTES_LIMIT
+                    && self.queued_bytes + message.charge() + growth * QUEUE_SLOT_BYTES
+                        <= QUEUED_BYTES_LIMIT
                 {
+                    let storage = queue.storage();
+                    queue.messages.reserve_exact(growth);
+                    self.queued_bytes += message.charge() + (queue.storage() - storage);
                     queue.messages.push_back(message);
-                    self.queued_bytes += charge;
                     return Ok(());
                 }
                 EnqueueError::Full
@@ -671,8 +719,9 @@ impl IpcSpace {
         self.reap();
     }
 
-    /// Whether a user message of `charge` bytes may queue on `port` now.
-    fn queue_space(&self, port: PortId, charge: usize, send_once: bool) -> QueueSpace {
+    /// Whether a user message with `payload` bytes ([`payload_charge`]) may
+    /// queue on `port` now.
+    fn queue_space(&self, port: PortId, payload: usize, send_once: bool) -> QueueSpace {
         let Some(Port {
             kind: PortKind::Guest(queue),
         }) = self.ports.get(&port)
@@ -680,7 +729,7 @@ impl IpcSpace {
             // Kernel objects do not queue; a dead port swallows the message.
             return QueueSpace::Available;
         };
-        if self.queued_bytes + charge > QUEUED_BYTES_LIMIT {
+        if self.queued_bytes + payload + queue.growth() * QUEUE_SLOT_BYTES > QUEUED_BYTES_LIMIT {
             return QueueSpace::NoBuffer;
         }
         let length = queue.messages.len();
@@ -705,7 +754,9 @@ impl IpcSpace {
         let seqno = queue.seqno;
         queue.seqno = queue.seqno.wrapping_add(1);
         let context = queue.context;
-        self.queued_bytes -= message.charge();
+        let storage = queue.storage();
+        queue.trim();
+        self.queued_bytes -= message.charge() + (storage - queue.storage());
         Some((message, seqno, context))
     }
 
@@ -1054,11 +1105,16 @@ impl IpcSpace {
         let Ok(right) = self.copyin(poly, disposition) else {
             return KernReturn::INVALID_CAPABILITY;
         };
-        // ipc_entry_alloc_name: the index must fit the table and must not
-        // hold a different name.
+        // ipc_entry_alloc_name: the index must fit the table, the roll bits
+        // must be set (ipc_entry_name_mask), index 0 is reserved, and the
+        // index must not hold a different name.
         let refusal = if name_index(name) >= NAME_INDEX_LIMIT {
             Some(KernReturn::NO_SPACE)
-        } else if !self.entries.contains_key(&name) && self.index_in_use(name_index(name)) {
+        } else if name & u32::from(NAME_ROLL_BITS) != u32::from(NAME_ROLL_BITS) {
+            Some(KernReturn::INVALID_VALUE)
+        } else if name_index(name) == 0
+            || (!self.entries.contains_key(&name) && self.index_in_use(name_index(name)))
+        {
             Some(KernReturn::FAILURE)
         } else {
             None
@@ -1530,8 +1586,8 @@ impl<P: ShimPlatform> Task<P> {
             dest_type,
             msg_type::MOVE_SEND_ONCE | msg_type::MAKE_SEND_ONCE
         );
-        let charge = message_charge(body.len(), descriptor_count as usize);
-        let space = ipc.queue_space(port, charge, send_once);
+        let payload = payload_charge(body.len(), descriptor_count as usize);
+        let space = ipc.queue_space(port, payload, send_once);
         if !matches!(space, QueueSpace::Available) {
             ipc.restore_entry(reply_name, saved_reply);
             ipc.restore_entry(dest_name, saved_dest);
@@ -1567,7 +1623,8 @@ impl<P: ShimPlatform> Task<P> {
             destination,
             reply,
             body,
-            ports: Vec::new(),
+            // At most one descriptor per 12 body bytes, checked above.
+            ports: Vec::with_capacity(descriptor_count as usize),
             sender: self.sender(),
         };
         // ipc_kmsg_copyin_body: only port descriptors are supported.
@@ -1840,15 +1897,40 @@ mod tests {
         }
     }
 
+    fn guest_queue(space: &IpcSpace, port: PortId) -> &GuestQueue {
+        let Some(Port {
+            kind: PortKind::Guest(queue),
+        }) = space.ports.get(&port)
+        else {
+            panic!("the port is alive");
+        };
+        queue
+    }
+
+    /// `queued_bytes` recomputed from every live queue.
+    fn recount(space: &IpcSpace) -> usize {
+        space
+            .ports
+            .values()
+            .filter_map(|port| match &port.kind {
+                PortKind::Guest(queue) => Some(
+                    queue.storage() + queue.messages.iter().map(Message::charge).sum::<usize>(),
+                ),
+                PortKind::Kernel(_) => None,
+            })
+            .sum()
+    }
+
     #[test]
     fn queued_bytes_budget_refuses_messages_without_releasing_their_destination() {
         let mut space = IpcSpace::default();
         let name = space.allocate_receive(MACH_PORT_QLIMIT_DEFAULT, 0).unwrap();
         let port = space.entries[&name].port.unwrap();
-        let room = send_once_message(port, 0).charge();
+        // The first message allocates the queue's first slots.
+        let room = QUEUE_MIN_SLOTS * QUEUE_SLOT_BYTES;
         space.queued_bytes = QUEUED_BYTES_LIMIT - room;
         assert!(matches!(
-            space.queue_space(port, room + 1, true),
+            space.queue_space(port, 1, true),
             QueueSpace::NoBuffer
         ));
         assert_eq!(
@@ -1859,15 +1941,77 @@ mod tests {
         // The refused message's send-once destination sent no notification.
         assert_eq!(space.enqueue(port, send_once_message(port, 0)), Ok(()));
         assert_eq!(space.queued_bytes, QUEUED_BYTES_LIMIT);
-        let Some(Port {
-            kind: PortKind::Guest(queue),
-        }) = space.ports.get(&port)
-        else {
-            panic!("the port is alive");
-        };
-        assert_eq!(queue.messages.len(), 1);
+        assert_eq!(guest_queue(&space, port).messages.len(), 1);
         space.dequeue(port).unwrap();
         assert_eq!(space.queued_bytes, QUEUED_BYTES_LIMIT - room);
+    }
+
+    #[test]
+    fn queue_growth_is_charged_to_the_queued_bytes_budget() {
+        let mut space = IpcSpace::default();
+        let name = space.allocate_receive(MACH_PORT_QLIMIT_DEFAULT, 0).unwrap();
+        let port = space.entries[&name].port.unwrap();
+        for _ in 0..QUEUE_MIN_SLOTS {
+            space.enqueue(port, send_once_message(port, 0)).unwrap();
+        }
+        assert_eq!(space.queued_bytes, QUEUE_MIN_SLOTS * QUEUE_SLOT_BYTES);
+        // The queue is full: one more message doubles its slots, which the
+        // budget no longer covers although the message itself is empty.
+        space.queued_bytes = QUEUED_BYTES_LIMIT - (QUEUE_MIN_SLOTS - 1) * QUEUE_SLOT_BYTES;
+        assert!(matches!(
+            space.queue_space(port, 0, true),
+            QueueSpace::NoBuffer
+        ));
+        assert_eq!(
+            space.enqueue(port, send_once_message(port, 0)),
+            Err(EnqueueError::Full)
+        );
+        space.reap();
+        assert_eq!(
+            guest_queue(&space, port).messages.capacity(),
+            QUEUE_MIN_SLOTS
+        );
+    }
+
+    #[test]
+    fn drained_queues_release_their_slots() {
+        let mut space = IpcSpace::default();
+        let mut ports = Vec::new();
+        for _ in 0..3 {
+            let name = space.allocate_receive(MACH_PORT_QLIMIT_DEFAULT, 0).unwrap();
+            ports.push(space.entries[&name].port.unwrap());
+        }
+        for round in 0..2 {
+            for (kept, &port) in ports.iter().enumerate() {
+                while guest_queue(&space, port).messages.len() < MACH_PORT_QLIMIT_KERNEL as usize {
+                    space.enqueue(port, send_once_message(port, 0)).unwrap();
+                }
+                assert!(space.queued_bytes >= MACH_PORT_QLIMIT_KERNEL as usize * QUEUE_SLOT_BYTES);
+                assert_eq!(space.queued_bytes, recount(&space));
+                // Leave 0, 1 and 2 messages behind; the ports stay alive.
+                while guest_queue(&space, port).messages.len() > kept {
+                    space.dequeue(port).unwrap();
+                }
+                assert_eq!(space.queued_bytes, recount(&space), "round {round}");
+                let queue = guest_queue(&space, port);
+                let bound = if kept == 0 {
+                    0
+                } else {
+                    (4 * kept).max(QUEUE_MIN_SLOTS)
+                };
+                assert!(
+                    queue.messages.capacity() <= bound,
+                    "{} slots retained for {kept} messages",
+                    queue.messages.capacity()
+                );
+            }
+        }
+        // Only the slots of the messages still queued remain charged.
+        assert!(space.queued_bytes <= (QUEUE_MIN_SLOTS + 4 * 2) * QUEUE_SLOT_BYTES);
+        let doomed = ports[2];
+        space.destroy_receive(doomed);
+        assert_eq!(space.queued_bytes, recount(&space));
+        assert_eq!(space.doomed.capacity(), 0);
     }
 
     #[test]
