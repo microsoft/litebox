@@ -1615,7 +1615,6 @@ unsafe extern "C" fn exception_signal_handler(
     }
 
     // Transition faults are host faults: `in_guest` and SP may be inconsistent.
-    // On x86-64 this includes the XRSTOR of guest vector state.
     if in_switch_to_guest(faulting_pc) {
         return unsafe { next_signal_handler(signum, info, context) };
     }

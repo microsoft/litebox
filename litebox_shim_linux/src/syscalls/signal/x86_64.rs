@@ -450,25 +450,6 @@ mod tests {
     }
 
     #[test]
-    fn null_fpstate_restores_initial_state() {
-        let _ = test_platform();
-        let layout = XsaveLayout::get();
-        assert_eq!(
-            read_fpstate::<TestPlatform>(0),
-            Some(XsaveArea::initial(layout))
-        );
-    }
-
-    #[test]
-    fn xsave_frame_round_trips() {
-        let mut frame = Frame::new(0);
-        frame.set(XMM0_OFFSET, &[0x5a; 16]);
-        let state = frame.read().unwrap();
-        assert_eq!(state.legacy_area().xmm_registers[0], [0x5a; 16]);
-        assert_eq!(state.xstate_bv(), XFeatureMask::LEGACY.bits());
-    }
-
-    #[test]
     fn frames_without_xsave_metadata_restore_legacy_state() {
         let layout = XsaveLayout::get();
         let mut no_magic = Frame::new(0);

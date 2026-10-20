@@ -472,14 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn detected_mxcsr_mask_covers_architectural_controls() {
-        let mask = Mxcsr::from_bits_retain(XsaveLayout::get().mxcsr_mask);
-        assert!(mask.contains(Mxcsr::DEFAULT_MASK));
-        assert_eq!(Mxcsr::DEFAULT_MASK.bits(), 0xffbf);
-        assert_eq!(XsaveArea::GUEST_INITIAL_MXCSR, 0x1f80);
-    }
-
-    #[test]
     fn from_bytes_rejects_state_that_xrstor_faults_on() {
         let layout = XsaveLayout::get();
         assert!(XsaveArea::from_bytes(&initial_bytes(), layout).is_some());

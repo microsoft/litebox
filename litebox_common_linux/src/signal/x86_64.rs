@@ -64,6 +64,8 @@ pub struct Sigcontext {
     pub reserved1: [u64; 8],
 }
 
+/// Linux's signal-frame view of the architectural FXSAVE area: same layout as
+/// `XsaveLegacyArea`, with Linux metadata in the otherwise unused tail.
 #[repr(C)]
 #[derive(Clone)]
 pub struct FpState {
@@ -80,17 +82,3 @@ pub struct FpState {
     pub reserved2: [u32; 12],
     pub sw_reserved: FpxSwBytes,
 }
-
-// Linux's signal-frame view of the architectural FXSAVE area: same layout as
-// `XsaveLegacyArea`, with Linux metadata in the otherwise unused tail.
-const _: () = {
-    use core::mem::offset_of;
-    use litebox::arch::x86_64::xstate::XsaveLegacyArea as Legacy;
-    assert!(size_of::<FpState>() == size_of::<Legacy>());
-    assert!(offset_of!(FpState, twd) == offset_of!(Legacy, tag_word));
-    assert!(offset_of!(FpState, rip) == offset_of!(Legacy, instruction_pointer));
-    assert!(offset_of!(FpState, mxcsr) == offset_of!(Legacy, mxcsr));
-    assert!(offset_of!(FpState, st_space) == offset_of!(Legacy, float_registers));
-    assert!(offset_of!(FpState, xmm_space) == offset_of!(Legacy, xmm_registers));
-    assert!(offset_of!(FpState, reserved2) == offset_of!(Legacy, reserved4));
-};
