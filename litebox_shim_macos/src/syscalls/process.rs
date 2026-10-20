@@ -8,9 +8,9 @@
 //! process.
 
 use crate::{ShimPlatform, Task};
-use litebox_broker_protocol::fs::FileMode;
+use litebox_broker_protocol::fs::{FileMode, FileType};
 use litebox_common_macos::{
-    SIGABRT,
+    SIGABRT, SIGKILL,
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
 };
@@ -28,6 +28,8 @@ const CS_OPS_STATUS: u32 = 0;
 const R_OK: i32 = 4;
 const W_OK: i32 = 2;
 const X_OK: i32 = 1;
+/// `_ACCESS_EXTENDED_MASK`: the `_READ_OK` .. `_CHOWN_OK` rights.
+const ACCESS_EXTENDED_MASK: i32 = 0x3f_fe00;
 
 impl<P: ShimPlatform> Task<P> {
     /// `issetugid`: the guest did not change identity at exec.
@@ -162,7 +164,8 @@ impl<P: ShimPlatform> Task<P> {
         self.process.exit(128 + SIGABRT);
     }
 
-    /// `terminate_with_payload`: only the guest itself can be targeted.
+    /// `terminate_with_payload`: only the guest itself is visible, and
+    /// terminating it delivers SIGKILL (`terminate_with_payload_internal`).
     pub(crate) fn sys_terminate_with_payload(
         &self,
         pid: i32,
@@ -170,18 +173,28 @@ impl<P: ShimPlatform> Task<P> {
         reason_code: u64,
         reason_string: UserPtr<core::ffi::c_char>,
     ) -> Result<(), Errno> {
+        if pid <= 0 {
+            return Err(Errno::EINVAL);
+        }
         if pid != self.params.pid {
             return Err(Errno::ESRCH);
         }
-        self.sys_abort_with_payload(reason_namespace, reason_code, reason_string);
+        let reason = Self::read_path(reason_string).ok();
+        litebox_util_log::error!(
+            namespace:? = reason_namespace,
+            code:? = format_args!("{reason_code:#x}"),
+            reason:? = reason;
+            "guest terminated itself"
+        );
+        self.process.exit(128 + SIGKILL);
         Ok(())
     }
 
-    /// `access` against the guest filesystem with the real credentials.
+    /// `access` against the guest filesystem with the real credentials, as
+    /// `faccessat_internal` and `access1` check it: mode bits other than
+    /// R_OK/W_OK/X_OK are ignored, and the extended `_*_OK` rights are not
+    /// supported.
     pub(crate) fn sys_access(&self, path: &str, mode: i32) -> Result<(), Errno> {
-        if mode & !(R_OK | W_OK | X_OK) != 0 {
-            return Err(Errno::EINVAL);
-        }
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
@@ -191,17 +204,30 @@ impl<P: ShimPlatform> Task<P> {
             .litebox
             .path_file_status(&context, path)
             .map_err(super::file::file_status_error)?;
-        if mode == 0 {
+        if mode & ACCESS_EXTENDED_MASK != 0 {
+            self.log_unsupported_once(
+                "access with extended _*_OK rights",
+                format_args!("{mode:#x}"),
+            );
+            return Err(Errno::ENOTSUP);
+        }
+        if mode & (R_OK | W_OK | X_OK) == 0 {
             return Ok(());
         }
-        let (read, write, execute) = if self.params.uid == 0 {
-            // Root may read and write anything, and execute anything with
-            // some execute bit.
-            let any_execute = status
-                .mode
-                .intersects(FileMode::XUSR | FileMode::XGRP | FileMode::XOTH);
-            (true, true, any_execute)
-        } else if u32::from(status.owner.user) == self.params.uid {
+        if self.params.uid == 0 {
+            // vnode_authorize_callback: root is granted everything, except
+            // that executing a regular file needs some execute bit.
+            if mode & X_OK != 0
+                && status.file_type == FileType::RegularFile
+                && !status
+                    .mode
+                    .intersects(FileMode::XUSR | FileMode::XGRP | FileMode::XOTH)
+            {
+                return Err(Errno::EPERM);
+            }
+            return Ok(());
+        }
+        let (read, write, execute) = if u32::from(status.owner.user) == self.params.uid {
             (
                 status.mode.contains(FileMode::RUSR),
                 status.mode.contains(FileMode::WUSR),

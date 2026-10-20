@@ -47,6 +47,36 @@ fn syscall_return_registers_and_carry() {
 }
 
 #[test]
+fn unsupported_syscall_reports_use_bounded_state() {
+    let mut reported = ReportedSyscalls::default();
+    // Each BSD number and Mach trap is reported once.
+    assert!(reported.first_report(999));
+    assert!(!reported.first_report(999));
+    assert!(!reported.first_report(0xffff_ffff_0000_03e7));
+    assert!(reported.first_report(0u32.wrapping_sub(48) as usize));
+    assert!(!reported.first_report((-48isize).cast_unsigned()));
+    assert!(reported.first_report(48), "BSD 48 is not Mach trap 48");
+    // Every other selector shares one report, however many the guest tries.
+    assert!(reported.first_report(1024));
+    for selector in 1025..100_000u32 {
+        assert!(!reported.first_report(selector as usize));
+        assert!(!reported.first_report(0u32.wrapping_sub(selector) as usize));
+    }
+    assert_eq!(size_of::<ReportedSyscalls>(), (1024 + 128) / 8 + 8);
+
+    // Through the dispatcher: distinct unsupported selectors keep failing
+    // with ENOSYS without retaining per-selector state.
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    for selector in [5000usize, 5001, 0x7fff_ffff] {
+        let mut ctx = PtRegs::default();
+        ctx.regs[16] = selector;
+        task.handle_syscall_request(&mut ctx);
+        assert_eq!(ctx.regs[0], 78);
+    }
+    assert!(task.global.reported_syscalls.lock().other);
+}
+
+#[test]
 fn platform_syscall_sets_and_gets_tsd_base_like_xnu() {
     use litebox::platform::{ArchSpecificProvider as _, ArchSpecificRegister};
     use litebox_common_macos::syscall::PLATFORM_SYSCALL_SELECTOR;
@@ -807,25 +837,64 @@ fn sysctl_mirrors_only_allowlisted_host_nodes_read_only() {
     ] {
         assert_eq!(sysctl(&name_to_oid, &mut [], None, name), Err(expected));
     }
-    // Reads: size query, exact copy, truncation, mirrored errors, no writes.
+    // Reads: size query, exact copy, short buffers, mirrored errors, no writes.
     let mut length = 0;
     assert_eq!(sysctl(&[6, 26], &mut [], Some(&mut length), b""), Ok(0));
     assert_eq!(length, 7);
     let mut value = [0u8; 7];
     assert_eq!(sysctl(&[6, 26], &mut value, Some(&mut length), b""), Ok(0));
     assert_eq!(&value, b"J274AP\0");
-    let mut short = [0u8; 3];
+    // sysctl_old_user fails a short transfer before copying and without
+    // advancing the output cursor, so nothing is written and 0 is reported.
+    let mut short = [0xa5u8; 3];
     let mut length = short.len();
     assert_eq!(
         sysctl(&[6, 26], &mut short, Some(&mut length), b""),
         Err(Errno::ENOMEM)
     );
-    assert_eq!((&short, length), (b"J27", 3));
+    assert_eq!((short, length), ([0xa5; 3], 0));
+    let mut oid = [0xa5u8; 4];
+    let mut length = oid.len();
+    assert_eq!(
+        sysctl(&name_to_oid, &mut oid, Some(&mut length), b"hw.target"),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!((oid, length), ([0xa5; 4], 0));
+    // A short buffer is never touched, so even an unmapped one is ENOMEM.
+    let target_mib = [6, 26];
+    let mut length = 3usize;
+    assert_eq!(
+        task.sys_sysctl(
+            UserPtr::from_ptr(target_mib.as_ptr()),
+            2,
+            UserPtrMut::from_usize(0x10),
+            UserPtrMut::from_usize(core::ptr::from_mut(&mut length) as usize),
+            UserPtr::from_usize(0),
+            0,
+        ),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!(length, 0);
     assert_eq!(
         sysctl(&[103, 101, 118, 100], &mut [], None, b""),
         Err(Errno::EPERM)
     );
     assert_eq!(sysctl(&[6, 26], &mut [], None, b"x"), Err(Errno::EPERM));
+    // A new value is only a write when its length is nonzero.
+    let mut value = [0u8; 7];
+    let mut length = value.len();
+    assert_eq!(
+        task.sys_sysctl(
+            UserPtr::from_ptr(target_mib.as_ptr()),
+            2,
+            UserPtrMut::from_usize(value.as_mut_ptr() as usize),
+            UserPtrMut::from_usize(core::ptr::from_mut(&mut length) as usize),
+            UserPtr::from_usize(0x10),
+            0,
+        ),
+        Ok(0)
+    );
+    assert_eq!((&value, length), (b"J274AP\0", 7));
     assert_eq!(sysctl(&[1, 65], &mut [], None, b""), Err(Errno::ENOENT));
     assert_eq!(sysctl(&[1], &mut [], None, b""), Err(Errno::EINVAL));
     // Only allowlisted names can be mirrored.

@@ -147,3 +147,41 @@ fn test_fd_raw_integer() {
         .unwrap();
     assert_eq!(data, "test");
 }
+
+#[test]
+fn test_reserved_slots_accept_sparse_specific_raw_integers() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+    let mut rds = super::RawDescriptorStorage::new();
+    let first: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "first".to_string(),
+    });
+    assert_eq!(rds.fd_into_raw_integer(first), 0);
+
+    // Far beyond the implicit growth bound of `fd_into_specific_raw_integer`.
+    rds.try_reserve_slots(1024).unwrap();
+    let sparse: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "sparse".to_string(),
+    });
+    assert!(rds.fd_into_specific_raw_integer(sparse, 1023));
+    let fetched = rds.fd_from_raw_integer::<MockSubsystem>(1023).unwrap();
+    assert_eq!(
+        descriptors
+            .with_entry(&fetched, |e| e.data.clone())
+            .unwrap(),
+        "sparse"
+    );
+    assert_eq!(rds.iter_alive().collect::<Vec<_>>(), vec![0, 1023]);
+
+    // Reserving never shrinks, and lowest-free allocation still fills holes first.
+    rds.try_reserve_slots(4).unwrap();
+    assert!(rds.is_alive(1023));
+    let next: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "next".to_string(),
+    });
+    assert_eq!(rds.fd_into_raw_integer(next), 1);
+
+    // An unsatisfiable reservation fails without changing the store.
+    assert!(rds.try_reserve_slots(usize::MAX).is_err());
+    assert_eq!(rds.iter_alive().collect::<Vec<_>>(), vec![0, 1, 1023]);
+}

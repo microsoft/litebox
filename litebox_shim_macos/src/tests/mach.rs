@@ -1308,6 +1308,15 @@ fn process_and_security_syscalls_match_an_unsigned_process() {
         bsd(&task, nr::MAP_WITH_LINKING_NP, &[0; 4]),
         Err(Errno::EINVAL.raw())
     );
+    // csops_audittoken requires a token.
+    assert_eq!(
+        bsd(
+            &task,
+            nr::CSOPS_AUDITTOKEN,
+            &[0, 0, core::ptr::from_mut(&mut out) as usize, 4, 0]
+        ),
+        Err(Errno::EINVAL.raw())
+    );
     // abort_with_payload ends the guest with SIGABRT.
     let reason = c"test abort";
     assert!(
@@ -1319,4 +1328,26 @@ fn process_and_security_syscalls_match_an_unsigned_process() {
         .is_ok()
     );
     assert_eq!(task.process.exit_status(), Some(128 + 6));
+}
+
+#[test]
+fn terminate_with_payload_kills_only_the_guest_itself() {
+    let task = new_task();
+    let reason = c"test terminate";
+    let terminate = |pid: usize| {
+        bsd(
+            &task,
+            nr::TERMINATE_WITH_PAYLOAD,
+            &[pid, 1, 2, 0, 0, reason.as_ptr() as usize],
+        )
+    };
+    // terminate_with_payload_internal: EINVAL before any process lookup.
+    for pid in [0, (-1isize).cast_unsigned(), 0xffff_ffff] {
+        assert_eq!(terminate(pid), Err(Errno::EINVAL.raw()));
+    }
+    assert_eq!(terminate(77), Err(Errno::ESRCH.raw()));
+    assert_eq!(task.process.exit_status(), None);
+    // The guest itself is killed with SIGKILL, unlike abort_with_payload's SIGABRT.
+    assert!(terminate(task.params.pid.cast_unsigned() as usize).is_ok());
+    assert_eq!(task.process.exit_status(), Some(128 + 9));
 }

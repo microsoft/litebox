@@ -38,30 +38,30 @@ pub struct HostSysctl {
     pub value: Result<Vec<u8>, Errno>,
 }
 
-/// Copy `bytes` out like XNU's `sysctl_old_user`: report the full length
-/// without a buffer, and truncate with ENOMEM if the buffer is too small.
+/// Copy `bytes` out as one `SYSCTL_OUT` transfer, like XNU's `sysctl` and
+/// `sysctl_old_user`: without a buffer, report the full length; with one too
+/// small, fail with ENOMEM before copying and report 0 (the output cursor is
+/// not advanced); otherwise copy and report the length.
 fn sysctl_copyout<P: ShimPlatform>(
     old_value: UserPtrMut<u8>,
     old_length: UserPtrMut<usize>,
     bytes: &[u8],
 ) -> Result<usize, Errno> {
+    // `fuulong`: an unreadable length reads as -1, clamped to SIZE_T_MAX.
     let available = if old_length.as_usize() == 0 {
         0
     } else {
-        old_length.read_at_offset::<P>(0).ok_or(Errno::EFAULT)?
+        old_length.read_at_offset::<P>(0).unwrap_or(usize::MAX)
     };
     let (reported, result) = if old_value.as_usize() == 0 {
         (bytes.len(), Ok(0))
+    } else if available < bytes.len() {
+        (0, Err(Errno::ENOMEM))
     } else {
-        let copied = bytes.len().min(available);
         old_value
-            .copy_from_slice::<P>(0, &bytes[..copied])
+            .copy_from_slice::<P>(0, bytes)
             .ok_or(Errno::EFAULT)?;
-        if copied < bytes.len() {
-            (copied, Err(Errno::ENOMEM))
-        } else {
-            (copied, Ok(0))
-        }
+        (bytes.len(), Ok(0))
     };
     if old_length.as_usize() != 0 {
         old_length
@@ -124,7 +124,8 @@ impl<P: ShimPlatform> Task<P> {
             litebox_util_log::debug!(mib:?; "sysctl MIB does not exist");
             return Err(Errno::ENOENT);
         };
-        if new_value.as_usize() != 0 {
+        // sysctl_create_user_req ignores `newp` unless `newlen` is nonzero.
+        if new_value.as_usize() != 0 && new_length != 0 {
             // Read-only node (no CTLFLAG_WR).
             return Err(Errno::EPERM);
         }

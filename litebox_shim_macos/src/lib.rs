@@ -146,7 +146,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 ipc: Mutex::new(syscalls::mach_ipc::IpcSpace::default()),
                 restartable_ranges: Mutex::new(None),
                 reported_unsupported: Mutex::new(alloc::collections::BTreeSet::new()),
-                reported_syscalls: Mutex::new(alloc::collections::BTreeSet::new()),
+                reported_syscalls: Mutex::new(ReportedSyscalls::default()),
                 next_thread_id: core::sync::atomic::AtomicU64::new(1u64 << 32),
             }),
             files: self.files,
@@ -283,9 +283,53 @@ struct GlobalState<P: ShimPlatform> {
     restartable_ranges: Mutex<P, Option<Vec<syscalls::mig::RestartableRange>>>,
     /// Unsupported features already logged.
     reported_unsupported: Mutex<P, alloc::collections::BTreeSet<&'static str>>,
-    /// Unsupported syscall numbers already logged.
-    reported_syscalls: Mutex<P, alloc::collections::BTreeSet<usize>>,
+    /// Unsupported syscall selectors already logged.
+    reported_syscalls: Mutex<P, ReportedSyscalls>,
     next_thread_id: core::sync::atomic::AtomicU64,
+}
+
+/// Fixed-size record of the unsupported syscall selectors already logged, so a
+/// guest cycling through selectors cannot grow host memory: one bit per BSD
+/// number and Mach trap in XNU's tables, and one flag shared by all others.
+struct ReportedSyscalls {
+    bsd: [u64; Self::BSD_SELECTORS / 64],
+    mach: [u64; Self::MACH_TRAPS / 64],
+    other: bool,
+}
+
+impl Default for ReportedSyscalls {
+    fn default() -> Self {
+        Self {
+            bsd: [0; Self::BSD_SELECTORS / 64],
+            mach: [0; Self::MACH_TRAPS / 64],
+            other: false,
+        }
+    }
+}
+
+impl ReportedSyscalls {
+    /// Covers XNU's `nsysent` (about 560) with room to grow.
+    const BSD_SELECTORS: usize = 1024;
+    /// `MACH_TRAP_TABLE_COUNT`.
+    const MACH_TRAPS: usize = 128;
+
+    /// Records `selector` (x16) and returns whether it was not yet reported.
+    /// Selectors outside both tables share one report.
+    fn first_report(&mut self, selector: usize) -> bool {
+        let low = selector & 0xffff_ffff;
+        let (bits, index) = if litebox_common_macos::syscall::is_mach_trap_selector(selector) {
+            (&mut self.mach[..], low.wrapping_neg() & 0xffff_ffff)
+        } else {
+            (&mut self.bsd[..], low)
+        };
+        let Some(word) = bits.get_mut(index / 64) else {
+            return !core::mem::replace(&mut self.other, true);
+        };
+        let bit = 1u64 << (index % 64);
+        let first = *word & bit == 0;
+        *word |= bit;
+        first
+    }
 }
 
 impl<P: ShimPlatform> Drop for GlobalState<P> {
@@ -465,7 +509,7 @@ impl<P: ShimPlatform> Task<P> {
                 .global
                 .reported_syscalls
                 .lock()
-                .insert(ctx.regs[16] & 0xffff_ffff)
+                .first_report(ctx.regs[16])
             {
                 litebox_util_log::warn!(feature:% = args; "unsupported");
             }

@@ -140,6 +140,20 @@ pub struct Stat64 {
     pub qspare: [i64; 2],
 }
 
+// The ABI dyld and libSystem read: `struct stat64` from <sys/stat.h>.
+const _: () = {
+    assert!(size_of::<Stat64>() == 144);
+    assert!(core::mem::offset_of!(Stat64, ino) == 8);
+    assert!(core::mem::offset_of!(Stat64, uid) == 16);
+    assert!(core::mem::offset_of!(Stat64, rdev) == 24);
+    assert!(core::mem::offset_of!(Stat64, times) == 32);
+    assert!(core::mem::offset_of!(Stat64, size) == 96);
+    assert!(core::mem::offset_of!(Stat64, blocks) == 104);
+    assert!(core::mem::offset_of!(Stat64, blksize) == 112);
+    assert!(core::mem::offset_of!(Stat64, flags) == 116);
+    assert!(core::mem::offset_of!(Stat64, qspare) == 128);
+};
+
 /// Darwin `S_IF*` file types.
 mod file_type {
     pub const CHARACTER_DEVICE: u16 = 0o020_000;
@@ -209,6 +223,8 @@ pub const STACK_ALIGNMENT: usize = 16;
 pub const SIGINT: i32 = 2;
 /// Darwin abort signal.
 pub const SIGABRT: i32 = 6;
+/// Darwin kill signal.
+pub const SIGKILL: i32 = 9;
 /// Darwin invalid-memory-reference signal.
 pub const SIGSEGV: i32 = 11;
 
