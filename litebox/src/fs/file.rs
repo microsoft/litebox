@@ -13,6 +13,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
+    MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
@@ -25,6 +26,7 @@ use crate::event::polling::{Pollee, TryOpError};
 use crate::event::wait::WaitContext;
 use crate::event::{Events, IOPollable};
 use crate::{LiteBox, sync};
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, IsTerminalError, MkdirError, OpenError, PathError,
@@ -275,12 +277,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// Reads from the file at `offset`, or at its offset if `offset` is
     /// `None`, into `buf`.
     ///
-    /// While the file has nothing to read, waits through `wait`, or fails with
+    /// Reads a chunk at a time until the file runs short or `buf` is full. While the file has
+    /// nothing to read, the first chunk waits through `wait`, or fails with
     /// [`ReadError::WouldBlock`] if `wait` is `None` or the file's status flags include
-    /// [`FileOpenFlags::NONBLOCKING`].
+    /// [`FileOpenFlags::NONBLOCKING`]. A failure after partial progress returns the bytes read.
     pub fn read(
         &self,
-        buf: &mut [u8],
+        mut buf: impl ReadBuffer,
         offset: Option<usize>,
         wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, ReadError> {
@@ -288,25 +291,44 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map(u64::try_from)
             .transpose()
             .map_err(|_| ReadError::Io)?;
-        self.wait(wait, Events::IN, || {
-            self.broker
-                .read_file(self.handle, buf, offset)?
-                .map_err(|error| TryOpError::Other(error.into()))
-        })
-        .map_err(ReadError::from)
+        let mut read = 0;
+        loop {
+            let length = (buf.len() - read).min(MAX_FILE_TRANSFER_SIZE as usize);
+            let offset = offset.map(|offset| offset.saturating_add(read as u64));
+            let wait = if read == 0 { wait } else { None };
+            match self.wait(wait, Events::IN, || {
+                self.broker
+                    .read_file(
+                        self.handle,
+                        &mut (&mut buf).sub_buffer(read, length),
+                        offset,
+                    )?
+                    .map_err(|error| TryOpError::Other(error.into()))
+            }) {
+                Ok(count) => {
+                    read += count;
+                    if count < length || read == buf.len() {
+                        return Ok(read);
+                    }
+                }
+                Err(_) if read != 0 => return Ok(read),
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// Writes `buf` to the file at `offset`, or at its offset if `offset` is
     /// `None`.
     ///
-    /// While the file cannot accept bytes, waits through `wait`, or fails with
+    /// Writes a chunk at a time until the file takes a chunk short or the whole buffer is
+    /// written. While the file cannot accept bytes, waits through `wait`, or fails with
     /// [`WriteError::WouldBlock`] if `wait` is `None` or the file's status flags include
-    /// [`FileOpenFlags::NONBLOCKING`]. Given `wait`, keeps writing until the whole buffer is
-    /// written or a failure or interruption follows partial progress, which then returns the bytes
+    /// [`FileOpenFlags::NONBLOCKING`]. Given `wait`, a short chunk only ends the write once the
+    /// file takes nothing. A failure or interruption after partial progress returns the bytes
     /// written.
     pub fn write(
         &self,
-        buf: &[u8],
+        buf: impl WriteBuffer,
         offset: Option<usize>,
         wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, WriteError> {
@@ -316,16 +338,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(|_| WriteError::Io)?;
         let mut written = 0;
         loop {
-            let rest = &buf[written..];
+            let length = (buf.len() - written).min(MAX_FILE_TRANSFER_SIZE as usize);
             let offset = offset.map(|offset| offset.saturating_add(written as u64));
             match self.wait(wait, Events::OUT, || {
                 self.broker
-                    .write_file(self.handle, rest, offset)?
+                    .write_file(self.handle, &(&buf).sub_buffer(written, length), offset)?
                     .map_err(|error| TryOpError::Other(error.into()))
             }) {
                 Ok(count) => {
                     written += count;
-                    if wait.is_none() || count == 0 || written == buf.len() {
+                    if count == 0 || written == buf.len() || (wait.is_none() && count < length) {
                         return Ok(written);
                     }
                 }
@@ -535,19 +557,27 @@ fn broker_fd_error<T>(error: BrokerControlError, closed: T, invalid_rights: T, i
     match error {
         BrokerControlError::Broker(ErrorCode::UnknownObject) => closed,
         BrokerControlError::Broker(ErrorCode::InvalidRights) => invalid_rights,
-        BrokerControlError::AssociationFailed | BrokerControlError::Broker(_) => io,
+        BrokerControlError::AssociationFailed
+        | BrokerControlError::Broker(_)
+        | BrokerControlError::Fault => io,
     }
 }
 
 impl From<BrokerControlError> for ReadError {
     fn from(error: BrokerControlError) -> Self {
-        broker_fd_error(error, Self::ClosedFd, Self::NotForReading, Self::Io)
+        match error {
+            BrokerControlError::Fault => Self::Fault,
+            error => broker_fd_error(error, Self::ClosedFd, Self::NotForReading, Self::Io),
+        }
     }
 }
 
 impl From<BrokerControlError> for WriteError {
     fn from(error: BrokerControlError) -> Self {
-        broker_fd_error(error, Self::ClosedFd, Self::NotForWriting, Self::Io)
+        match error {
+            BrokerControlError::Fault => Self::Fault,
+            error => broker_fd_error(error, Self::ClosedFd, Self::NotForWriting, Self::Io),
+        }
     }
 }
 

@@ -38,7 +38,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 
     fn read(
         &self,
-        _output: &mut [u8],
+        _output: &mut dyn litebox_platform::buffer::ReadBuffer,
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
         Err(litebox_broker_core::stdio::StdioProviderError::Unsupported)
     }
@@ -46,11 +46,13 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
     fn write(
         &self,
         stream: litebox_broker_core::stdio::StdioOutputStream,
-        input: &[u8],
+        input: &dyn litebox_platform::buffer::WriteBuffer,
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
         if stream == litebox_broker_core::stdio::StdioOutputStream::Stdout {
+            let mut output = vec![0; input.len()];
+            input.copy_to_slice_at(0, &mut output)?;
             self.stdout_tx
-                .send(input.to_vec())
+                .send(output)
                 .map_err(|_| litebox_broker_core::stdio::StdioProviderError::Failed)?;
         }
         Ok(input.len())

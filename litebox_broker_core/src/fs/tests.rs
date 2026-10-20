@@ -210,7 +210,7 @@ mod in_mem {
         let data = b"Hello, world!";
         fs.write(&mut fd, data, None)
             .expect("Failed to write to file");
-        fs.write(&mut fd, &data[2..], Some(2))
+        fs.write(&mut fd, &&data[2..], Some(2))
             .expect("Failed to write to file with offset");
         drop(fd);
 
@@ -222,8 +222,9 @@ mod in_mem {
         let bytes_read = fs
             .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
+        let mut rest = &mut buffer[2..];
         let bytes_read2 = fs
-            .read(&mut fd, &mut buffer[2..], Some(2))
+            .read(&mut fd, &mut rest, Some(2))
             .expect("Failed to read from file with offset");
         assert_eq!(bytes_read, data.len());
         assert_eq!(bytes_read2, data.len() - 2);
@@ -774,7 +775,7 @@ mod in_mem {
         let mut fd = fs
             .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
-        fs.write(&mut fd, data, None)
+        fs.write(&mut fd, &data, None)
             .expect("Failed to write initial content");
     }
 

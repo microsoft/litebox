@@ -9,12 +9,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{Mutex, RawSyncPrimitivesProvider};
 
 use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::id_pool::IdPool;
 use super::transport::{self, Read, Write};
+use crate::transfer::bounce_buffer;
 
 /// Pool of 9P Fid values
 struct FidPool<Platform: RawSyncPrimitivesProvider> {
@@ -442,35 +444,51 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Read from a file
+    ///
+    /// Like Linux's v9fs, sends `Tread`s until `buf` is full or one returns nothing, so a read
+    /// larger than a message is not cut short. If a later `Tread` fails, returns what earlier
+    /// ones read, unless the broker itself failed, such as when copying to `buf` faulted.
     pub(super) fn read(
         &self,
         fid: &Fid<Platform>,
         offset: u64,
-        buf: &mut [u8],
+        buf: &mut dyn ReadBuffer,
     ) -> Result<usize, Error> {
         let max_count = self
             .msize
             .checked_sub(fcall::IOHDRSZ)
             .ok_or(Error::InvalidResponse)? as usize;
-        let count = buf.len().min(max_count);
-        self.fcall(
-            Fcall::Tread(fcall::Tread {
-                fid: fid.id(),
-                offset,
-                count: u32::try_from(count).map_err(|_| Error::InvalidResponse)?,
-            }),
-            |response| match response {
-                Fcall::Rread(fcall::Rread { data }) => {
-                    if data.len() > count {
-                        return Err(Error::InvalidResponse);
+        let mut read = 0;
+        while read < buf.len() {
+            let count = (buf.len() - read).min(max_count);
+            match self.fcall(
+                Fcall::Tread(fcall::Tread {
+                    fid: fid.id(),
+                    offset: offset
+                        .checked_add(read as u64)
+                        .ok_or(Error::InvalidResponse)?,
+                    count: u32::try_from(count).map_err(|_| Error::InvalidResponse)?,
+                }),
+                |response| match response {
+                    Fcall::Rread(fcall::Rread { data }) => {
+                        if data.len() > count {
+                            return Err(Error::InvalidResponse);
+                        }
+                        buf.copy_from_slice_at(read, &data)?;
+                        Ok(data.len())
                     }
-                    buf[..data.len()].copy_from_slice(&data);
-                    Ok(data.len())
-                }
-                Fcall::Rlerror(e) => Err(Error::from(e)),
-                _ => Err(Error::InvalidResponse),
-            },
-        )
+                    Fcall::Rlerror(e) => Err(Error::from(e)),
+                    _ => Err(Error::InvalidResponse),
+                },
+            ) {
+                Ok(0) => break,
+                Ok(received) => read += received,
+                Err(error @ Error::Broker(_)) => return Err(error),
+                Err(_) if read != 0 => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(read)
     }
 
     /// Write to a file
@@ -478,18 +496,20 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         &self,
         fid: &Fid<Platform>,
         offset: u64,
-        data: &[u8],
+        data: &dyn WriteBuffer,
     ) -> Result<usize, Error> {
         let max_count = self
             .msize
             .checked_sub(fcall::IOHDRSZ)
             .ok_or(Error::InvalidResponse)? as usize;
         let count = data.len().min(max_count);
+        let mut bytes = bounce_buffer(count)?;
+        data.copy_to_slice_at(0, &mut bytes)?;
         self.fcall(
             Fcall::Twrite(fcall::Twrite {
                 fid: fid.id(),
                 offset,
-                data: alloc::borrow::Cow::Borrowed(&data[..count]),
+                data: alloc::borrow::Cow::Owned(bytes),
             }),
             |response| match response {
                 Fcall::Rwrite(fcall::Rwrite { count: written }) => {

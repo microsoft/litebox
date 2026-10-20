@@ -85,6 +85,16 @@ impl<T: FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
         }
     }
 
+    unsafe fn copy_to_raw(self, offset: usize, dst: *mut T, len: usize) -> Option<()> {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
+            return None;
+        }
+        // SAFETY: As in `to_owned_slice`, the pointer is trusted to be valid for the range, and
+        // the caller guarantees `dst`; the copy references neither.
+        unsafe { raw_copy(dst, ptr.wrapping_add(offset), len) }
+    }
+
     fn as_usize(&self) -> usize {
         self.inner
     }
@@ -161,6 +171,16 @@ impl<T: FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
         }
     }
 
+    unsafe fn copy_to_raw(self, offset: usize, dst: *mut T, len: usize) -> Option<()> {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
+            return None;
+        }
+        // SAFETY: As in `to_owned_slice`, the pointer is trusted to be valid for the range, and
+        // the caller guarantees `dst`; the copy references neither.
+        unsafe { raw_copy(dst, ptr.wrapping_add(offset), len) }
+    }
+
     fn as_usize(&self) -> usize {
         self.inner
     }
@@ -172,6 +192,16 @@ impl<T: FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
     }
 }
 impl<T: FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T> {
+    unsafe fn copy_from_raw(self, offset: usize, src: *const T, len: usize) -> Option<()> {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
+            return None;
+        }
+        // SAFETY: As in `mutate_subslice_with`, the pointer is trusted to be valid for the
+        // range, and the caller guarantees `src`; the copy references neither.
+        unsafe { raw_copy(ptr.wrapping_add(offset), src, len) }
+    }
+
     fn write_at_offset(self, count: isize, value: T) -> Option<()> {
         let ptr = self.as_ptr();
         if ptr.is_null() || !ptr.is_aligned() {
@@ -217,4 +247,16 @@ impl<T: FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T> {
         let slice = unsafe { core::slice::from_raw_parts_mut(data, len) };
         Some(f(slice))
     }
+}
+
+/// Copies `len` values from `src` to `dst` without referencing either, which another party may
+/// access concurrently.
+///
+/// # Safety
+///
+/// `src` must be valid for reads and `dst` for writes of `len` values.
+unsafe fn raw_copy<T>(dst: *mut T, src: *const T, len: usize) -> Option<()> {
+    let byte_len = len.checked_mul(size_of::<T>())?;
+    // SAFETY: The caller guarantees both ranges.
+    unsafe { crate::mm::exception_table::memcpy_fallible(dst.cast(), src.cast(), byte_len) }.ok()
 }

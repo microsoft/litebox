@@ -17,13 +17,14 @@ use super::{
     is_nonblocking_would_block,
 };
 use crate::{broker::error::BrokerObjectError, sync::RawSyncPrimitivesProvider};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// Receives one datagram, returning its whole length, and stores its
     /// sender's address in `source_address` if requested.
     pub(super) fn read_datagram(
         &self,
-        buffer: &mut [u8],
+        buffer: impl ReadBuffer,
         flags: ReceiveFlags,
         source_address: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, SocketReadError> {
@@ -36,10 +37,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         } else {
             buffer.len().min(MAX_UDP_DATAGRAM_SIZE as usize)
         };
-        match self
-            .broker
-            .receive_from_socket(self.handle, &mut buffer[..length], broker_flags)
-        {
+        match self.broker.receive_from_socket(
+            self.handle,
+            &mut buffer.sub_buffer(0, length),
+            broker_flags,
+        ) {
             Ok(SocketOutcome::Completed(received)) => {
                 if let Some(source_address) = source_address {
                     *source_address = Some(SocketAddr::V4(received.source_address));
@@ -60,7 +62,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// otherwise to the connected peer.
     pub(super) fn write_datagram(
         &self,
-        buffer: &[u8],
+        buffer: impl WriteBuffer,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
         if buffer.len() > MAX_UDP_DATAGRAM_SIZE as usize {
@@ -73,7 +75,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         };
         match self
             .broker
-            .send_to_socket(self.handle, buffer, BrokerSendFlags::NONE, destination)
+            .send_to_socket(self.handle, &buffer, BrokerSendFlags::NONE, destination)
         {
             Ok(SocketOutcome::Completed(sent)) => Ok(sent),
             Ok(SocketOutcome::Failed(BrokerSocketError::Shutdown)) => {

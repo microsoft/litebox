@@ -20,6 +20,7 @@ use litebox_broker_protocol::unix_socket::{
     ShutdownUnixSocketRequest, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
@@ -171,7 +172,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         address: &[u8],
-        data: &[u8],
+        data: &dyn WriteBuffer,
         user: FileUser,
     ) -> Result<UnixSocketResult<usize>, Channel::Error> {
         self.validate_unix_socket_buffer(
@@ -180,7 +181,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             MAX_UNIX_SOCKET_TRANSFER_SIZE,
         )?;
         self.write_shared_buffer_at(buffer, 0, address);
-        self.write_shared_buffer_at(buffer, address.len(), data);
+        self.copy_to_shared_buffer(buffer, address.len(), data)?;
         match self.request_unix_socket(UnixSocketRequest::Send(SendUnixSocketRequest {
             handle,
             buffer,
@@ -216,7 +217,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        destination: &mut [u8],
+        destination: &mut dyn ReadBuffer,
         peek: bool,
         source: bool,
         nonblocking: bool,
@@ -250,7 +251,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         && source_length <= name_size,
                     "broker returned inconsistent Unix socket receive lengths"
                 );
-                self.read_shared_buffer(buffer, &mut destination[..received]);
+                self.copy_from_shared_buffer(buffer, received, destination)?;
                 let name = source.then(|| {
                     let mut name = [0; MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize];
                     self.read_shared_buffer_at(buffer, received, &mut name[..source_length]);

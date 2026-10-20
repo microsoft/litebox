@@ -243,6 +243,7 @@ impl From<litebox::fs::errors::ReadError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::fs::errors::ReadError::Io => Errno::EIO,
+            litebox::fs::errors::ReadError::Fault => Errno::EFAULT,
             _ => unimplemented!(),
         }
     }
@@ -259,6 +260,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::fs::errors::WriteError::Io => Errno::EIO,
+            litebox::fs::errors::WriteError::Fault => Errno::EFAULT,
             _ => unimplemented!(),
         }
     }
@@ -618,6 +620,7 @@ impl From<litebox::inet_socket::errors::SocketWriteError> for Errno {
             litebox::inet_socket::errors::SocketWriteError::DestinationAddressRequired => {
                 Errno::EDESTADDRREQ
             }
+            litebox::inet_socket::errors::SocketWriteError::Fault => Errno::EFAULT,
             litebox::inet_socket::errors::SocketWriteError::Socket(error) => error.into(),
         }
     }
@@ -722,6 +725,7 @@ impl From<litebox::pipes::errors::ReadError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::pipes::errors::ReadError::Io => Errno::EIO,
+            litebox::pipes::errors::ReadError::Fault => Errno::EFAULT,
             _ => todo!(),
         }
     }
@@ -738,6 +742,7 @@ impl From<litebox::pipes::errors::WriteError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::pipes::errors::WriteError::Io => Errno::EIO,
+            litebox::pipes::errors::WriteError::Fault => Errno::EFAULT,
             _ => todo!(),
         }
     }
@@ -796,6 +801,7 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
             UnixSocketError::OutOfMemory => Errno::ENOMEM,
             UnixSocketError::PermissionDenied => Errno::EACCES,
             UnixSocketError::Unsupported => Errno::EINVAL,
+            UnixSocketError::Fault => Errno::EFAULT,
             _ => Errno::EIO,
         }
     }

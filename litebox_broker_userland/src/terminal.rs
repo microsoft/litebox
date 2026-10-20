@@ -20,11 +20,13 @@ use litebox_broker_core::stdio::StdioProviderError;
 use litebox_broker_core::terminal::{
     TerminalEndpoint, TerminalEngine, TerminalEventSink, TerminalTransport, TerminalTransportError,
 };
+use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalEvents, TerminalOperation, TerminalResponse, WindowSize,
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 /// How often the worker rechecks the window size. Hosts need not report
 /// resizes; Linux, for one, signals them only to the terminal's foreground
@@ -328,7 +330,7 @@ impl HostTerminal {
         })
     }
 
-    pub(crate) fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
+    pub(crate) fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize, StdioProviderError> {
         let mut state = self.shared.lock();
         if state.status == Status::Failed {
             return Err(StdioProviderError::Failed);
@@ -336,7 +338,7 @@ impl HostTerminal {
         if state.status == Status::HungUp {
             state.process_input();
         }
-        if let Some(count) = state.engine.read(output) {
+        if let Some(count) = state.engine.read(output)? {
             state.publish_if_changed();
             self.shared.wake();
             return Ok(count);
@@ -347,7 +349,7 @@ impl HostTerminal {
         Err(StdioProviderError::WouldBlock)
     }
 
-    pub(crate) fn write(&self, input: &[u8]) -> Result<usize, StdioProviderError> {
+    pub(crate) fn write(&self, input: &dyn WriteBuffer) -> Result<usize, StdioProviderError> {
         let mut state = self.shared.lock();
         if state.status != Status::Active {
             return Err(StdioProviderError::Failed);
@@ -358,12 +360,15 @@ impl HostTerminal {
         {
             return Err(StdioProviderError::WouldBlock);
         }
-        let (consumed, bytes) = state.engine.output(input, available);
-        state.output.extend(bytes);
+        // Output processing rewrites bytes, so stage them first.
+        let mut staged = bounce_buffer(input.len().min(available))?;
+        input.copy_to_slice_at(0, &mut staged)?;
+        let state = &mut *state;
+        state.engine.output(&staged, &mut state.output);
         state.drained = false;
         state.publish_if_changed();
         self.shared.wake();
-        Ok(consumed)
+        Ok(staged.len())
     }
 
     pub(crate) fn flush(&self) -> io::Result<()> {
@@ -581,7 +586,7 @@ mod tests {
         let tabs = vec![b'\t'; OUTPUT_CAPACITY];
         assert!(!terminal.readiness().contains(ReadinessFlags::WRITE));
         assert_eq!(
-            terminal.write(&tabs[..ATOMIC_WRITE_SIZE]),
+            terminal.write(&&tabs[..ATOMIC_WRITE_SIZE]),
             Err(StdioProviderError::WouldBlock)
         );
         assert!(terminal.write(&tabs).unwrap() > 0);

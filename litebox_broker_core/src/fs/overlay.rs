@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 
 use hashbrown::HashMap;
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
@@ -324,7 +325,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             while written < count {
                 let progress = self
                     .upper
-                    .write(upper, &buf[written..count], offset + written)
+                    .write(upper, &&buf[written..count], offset + written)
                     .map_err(|_| OpenError::Io)?;
                 if progress == 0 {
                     return Err(OpenError::Io);
@@ -939,7 +940,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         self.entries(&resolved).map_err(|_| ReadDirError::Io)
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
             backend.read(handle, buf, offset)
         })
@@ -951,7 +957,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        h: &FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+    ) -> Result<usize, WriteError> {
         let file = h.get_typed::<Self>();
         if let Some(upper) = self.migrated(file) {
             return self.upper.write(&upper, buf, offset);

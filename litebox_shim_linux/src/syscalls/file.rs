@@ -34,12 +34,14 @@ use litebox_common_linux::{
     program_startup::{ForkedFd, InheritedFd, InheritedFdKind},
     signal::Signal,
 };
+use litebox_platform::buffer::{Buffer as _, Fault, ReadBuffer, WriteBuffer};
 use thiserror::Error;
 
 use super::{
     epoll::EpollFd, eventfd::EventfdFd, inet::InetSocketFd, pipe::PipeFd, timerfd::TimerfdFd,
     unix::UnixSocketFd,
 };
+use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -87,7 +89,7 @@ impl<Platform: ShimPlatform> File<Platform> {
     /// Reads into `buf` at `offset`, or at the file offset if `offset` is `None`.
     pub(crate) fn read(
         &self,
-        buf: &mut [u8],
+        buf: impl ReadBuffer,
         offset: Option<usize>,
         cx: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, Errno> {
@@ -97,7 +99,7 @@ impl<Platform: ShimPlatform> File<Platform> {
     /// Writes `buf` at `offset`, or at the file offset if `offset` is `None`.
     pub(crate) fn write(
         &self,
-        buf: &[u8],
+        buf: impl WriteBuffer,
         offset: Option<usize>,
         cx: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, Errno> {
@@ -1184,7 +1186,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
     /// If `Some`, it will read from the specified offset without changing the current file position.
-    pub fn sys_read(&self, fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize, Errno> {
+    pub fn sys_read(
+        &self,
+        fd: i32,
+        buf: impl ReadBuffer,
+        offset: Option<usize>,
+    ) -> Result<usize, Errno> {
         let fd = self.typed_fd(fd)?;
         self.do_read(&fd, buf, offset)
     }
@@ -1192,16 +1199,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn do_read(
         &self,
         fd: &AnyTypedFd<Platform>,
-        buf: &mut [u8],
+        buf: impl ReadBuffer,
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
-        let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+        let buf = core::cell::RefCell::new(buf);
         let result = fd.dispatch(
             |fd| {
                 self.global.with_file(fd, |file| {
-                    file.read(&mut buf.borrow_mut(), offset, Some(&self.wait_cx()))
+                    file.read(&mut *buf.borrow_mut(), offset, Some(&self.wait_cx()))
                 })
             },
             |fd| {
@@ -1213,7 +1220,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }
                     let received = socket.receive(
                         &self.wait_cx(),
-                        &mut buf,
+                        &mut *buf,
                         litebox_common_linux::ReceiveFlags::empty(),
                         false,
                         None,
@@ -1223,18 +1230,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
-                self.global
-                    .with_pipe_end(fd, |pipe| pipe.read(&self.wait_cx(), &mut buf.borrow_mut()))
+                self.global.with_pipe_end(fd, |pipe| {
+                    pipe.read(&self.wait_cx(), &mut *buf.borrow_mut())
+                })
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global.with_eventfd(fd, |file| {
-                    let buf = &mut buf.borrow_mut();
+                    let mut buf = buf.borrow_mut();
                     if buf.len() < size_of::<u64>() {
                         return Err(Errno::EINVAL);
                     }
                     let value = file.read(&self.wait_cx())?;
-                    buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+                    buf.copy_from_slice_at(0, &value.to_le_bytes())
+                        .map_err(|Fault| Errno::EFAULT)?;
                     Ok(size_of::<u64>())
                 })
             },
@@ -1244,7 +1253,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.global.with_unix_socket(fd, |socket| {
                     socket.recvfrom(
                         &self.wait_cx(),
-                        &mut buf.borrow_mut(),
+                        &mut *buf.borrow_mut(),
                         litebox_common_linux::ReceiveFlags::empty(),
                         None,
                     )
@@ -1253,12 +1262,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global.with_timerfd(fd, |file| {
-                    let buf = &mut buf.borrow_mut();
+                    let mut buf = buf.borrow_mut();
                     if buf.len() < size_of::<u64>() {
                         return Err(Errno::EINVAL);
                     }
                     let expirations = file.read(&self.wait_cx())?;
-                    buf[..size_of::<u64>()].copy_from_slice(&expirations.to_ne_bytes());
+                    buf.copy_from_slice_at(0, &expirations.to_ne_bytes())
+                        .map_err(|Fault| Errno::EFAULT)?;
                     Ok(size_of::<u64>())
                 })
             },
@@ -1272,22 +1282,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// `offset` is an optional offset to write to. If `None`, it will write to the current file position.
     /// If `Some`, it will write to the specified offset without changing the current file position.
-    pub fn sys_write(&self, fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
+    pub fn sys_write(
+        &self,
+        fd: i32,
+        buf: impl WriteBuffer,
+        offset: Option<usize>,
+    ) -> Result<usize, Errno> {
         let fd = self.typed_fd(fd)?;
         self.do_write(&fd, buf, offset)
     }
 
-    fn do_write(
+    pub(crate) fn do_write(
         &self,
         fd: &AnyTypedFd<Platform>,
-        buf: &[u8],
+        buf: impl WriteBuffer,
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         let is_datagram = core::cell::Cell::new(false);
         let result = fd.dispatch(
             |fd| {
                 self.global
-                    .with_file(fd, |file| file.write(buf, offset, Some(&self.wait_cx())))
+                    .with_file(fd, |file| file.write(&buf, offset, Some(&self.wait_cx())))
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -1295,7 +1310,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     is_datagram.set(!socket.is_stream());
                     socket.sendto(
                         &self.wait_cx(),
-                        buf,
+                        &buf,
                         litebox_common_linux::SendFlags::empty(),
                         None,
                     )
@@ -1304,7 +1319,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global
-                    .with_pipe_end(fd, |pipe| pipe.write(&self.wait_cx(), buf))
+                    .with_pipe_end(fd, |pipe| pipe.write(&self.wait_cx(), &buf))
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -1312,12 +1327,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     if buf.len() < size_of::<u64>() {
                         return Err(Errno::EINVAL);
                     }
-                    let value = u64::from_le_bytes(
-                        buf[..size_of::<u64>()]
-                            .try_into()
-                            .map_err(|_| Errno::EINVAL)?,
-                    );
-                    file.write(&self.wait_cx(), value)
+                    let mut value = [0; size_of::<u64>()];
+                    buf.copy_to_slice_at(0, &mut value)
+                        .map_err(|Fault| Errno::EFAULT)?;
+                    file.write(&self.wait_cx(), u64::from_le_bytes(value))
                 })
             },
             |_fd| Err(Errno::EINVAL),
@@ -1325,7 +1338,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global.with_unix_socket(fd, |socket| {
                     is_datagram.set(!socket.is_stream());
-                    socket.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+                    socket.sendto(self, &buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
             |_fd| Err(Errno::EINVAL),
@@ -1339,8 +1352,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         result
     }
 
+    /// Handle syscall `pread64`
+    pub fn sys_pread64(&self, fd: i32, buf: impl ReadBuffer, offset: i64) -> Result<usize, Errno> {
+        let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        self.sys_read(fd, buf, Some(pos))
+    }
+
     /// Handle syscall `pwrite64`
-    pub fn sys_pwrite64(&self, fd: i32, buf: &[u8], offset: i64) -> Result<usize, Errno> {
+    pub fn sys_pwrite64(
+        &self,
+        fd: i32,
+        buf: impl WriteBuffer,
+        offset: i64,
+    ) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         self.sys_write(fd, buf, Some(pos))
     }
@@ -1671,18 +1695,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         iovcnt: usize,
         offset: i64,
     ) -> Result<usize, Errno> {
-        let base_offset = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
-        self.with_typed_fd(fd, |fd| {
-            check_iovcnt(iovcnt)?;
-            let iovs: &[IoReadVec] = &iovec
-                .to_owned_slice::<Platform>(iovcnt)
-                .ok_or(Errno::EFAULT)?;
-            let mut kernel_buffer = vec![0u8; PAGE_SIZE];
-            read_from_iovec::<_, Platform>(iovs, &mut kernel_buffer, |buf, total| {
-                let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
-                self.do_read(fd, buf, Some(cur_offset))
-            })
-        })
+        let offset = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        self.readv_at(fd, iovec, iovcnt, Some(offset))
     }
 
     /// Handle syscall `pwritev`
@@ -1693,18 +1707,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         iovcnt: usize,
         offset: i64,
     ) -> Result<usize, Errno> {
-        let base_offset = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
-        self.with_typed_fd(fd, |fd| {
-            check_iovcnt(iovcnt)?;
-            let iovs: &[IoWriteVec] = &iovec
-                .to_owned_slice::<Platform>(iovcnt)
-                .ok_or(Errno::EFAULT)?;
-            // TODO: Linux ignores pwritev's offset for O_APPEND files; see the O_APPEND bug documented in pwrite(2).
-            write_to_iovec::<_, Platform>(iovs, |buf, total| {
-                let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
-                self.do_write(fd, buf, Some(cur_offset))
-            })
-        })
+        let offset = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        // TODO: Linux ignores pwritev's offset for O_APPEND files; see the O_APPEND bug documented in pwrite(2).
+        self.writev_at(fd, iovec, iovcnt, Some(offset))
     }
 
     /// Handle syscall `readv`
@@ -1714,120 +1719,86 @@ impl<Platform: ShimPlatform> Task<Platform> {
         iovec: UserPtr<IoReadVec>,
         iovcnt: usize,
     ) -> Result<usize, Errno> {
+        self.readv_at(fd, iovec, iovcnt, None)
+    }
+
+    /// Handle syscall `writev`
+    pub(crate) fn sys_writev(
+        &self,
+        fd: i32,
+        iovec: UserPtr<IoWriteVec>,
+        iovcnt: usize,
+    ) -> Result<usize, Errno> {
+        self.writev_at(fd, iovec, iovcnt, None)
+    }
+
+    /// Reads into the `iovcnt` iovecs at `iovec`, at `offset` if given.
+    fn readv_at(
+        &self,
+        fd: i32,
+        iovec: UserPtr<IoReadVec>,
+        iovcnt: usize,
+        offset: Option<usize>,
+    ) -> Result<usize, Errno> {
         self.with_typed_fd(fd, |fd| {
             check_iovcnt(iovcnt)?;
             let iovs: &[IoReadVec] = &iovec
                 .to_owned_slice::<Platform>(iovcnt)
                 .ok_or(Errno::EFAULT)?;
-            if self.datagram_size_limit(fd).is_some() {
-                return read_datagram_from_iovec::<Platform>(iovs, |buf| {
-                    self.do_read(fd, buf, None)
-                });
+            let buf = GuestReadBuffer::<Platform>::new(iovs)?;
+            // Like Linux, an empty vector reads nothing without reaching the file.
+            if buf.is_empty() {
+                return Ok(0);
             }
-            let mut kernel_buffer = vec![0u8; PAGE_SIZE];
-            // TODO: The data transfers performed by readv() and writev() are atomic: the data
-            // written by writev() is written as a single block that is not intermingled with
-            // output from writes in other processes
-            read_from_iovec::<_, Platform>(iovs, &mut kernel_buffer, |buf, _total| {
-                self.do_read(fd, buf, None)
-            })
+            self.do_read(fd, buf, offset)
         })
     }
 
-    /// Returns the size limit of one datagram if `fd` is a datagram socket,
-    /// whose `readv` and `writev` must move one whole datagram rather than one
-    /// datagram per iovec.
-    fn datagram_size_limit(&self, fd: &AnyTypedFd<Platform>) -> Option<usize> {
-        match fd {
-            AnyTypedFd::Inet(fd) => {
-                let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
-                handle
-                    .with_entry(|socket| !socket.is_stream())
-                    .then_some(litebox::inet_socket::MAX_UDP_DATAGRAM_SIZE)
+    /// Writes from the `iovcnt` iovecs at `iovec`, at `offset` if given.
+    fn writev_at(
+        &self,
+        fd: i32,
+        iovec: UserPtr<IoWriteVec>,
+        iovcnt: usize,
+        offset: Option<usize>,
+    ) -> Result<usize, Errno> {
+        self.with_typed_fd(fd, |fd| {
+            check_iovcnt(iovcnt)?;
+            let iovs: &[IoWriteVec] = &iovec
+                .to_owned_slice::<Platform>(iovcnt)
+                .ok_or(Errno::EFAULT)?;
+            let buf = GuestWriteBuffer::<Platform>::new(iovs)?;
+            // Like Linux, an empty vector writes nothing without reaching the file.
+            if buf.is_empty() {
+                return Ok(0);
             }
-            AnyTypedFd::Unix(fd) => {
-                let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
-                // Like `sendmsg`, Unix datagrams have no size limit of their own.
-                handle
-                    .with_entry(|socket| !socket.is_stream())
-                    .then_some(usize::MAX)
+            if !matches!(fd, AnyTypedFd::Eventfd(_)) {
+                return self.do_write(fd, buf, offset);
             }
-            _ => None,
-        }
+            // Like Linux, an eventfd, which has no vectored write, writes each iovec separately,
+            // stopping at a short write and failing only if nothing was written.
+            let mut written = 0;
+            for iov in iovs.iter().filter(|iov| iov.iov_len != 0) {
+                let iov_offset = offset.map(|offset| offset + written);
+                match self.do_write(fd, GuestWriteBuffer::<Platform>::single(iov), iov_offset) {
+                    Ok(size) => {
+                        written += size;
+                        if size < iov.iov_len {
+                            break;
+                        }
+                    }
+                    Err(_) if written != 0 => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(written)
+        })
     }
-}
-
-/// Receives one datagram with `receive` and scatters it into `iovs`.
-fn read_datagram_from_iovec<Platform: ShimPlatform>(
-    iovs: &[IoReadVec],
-    receive: impl FnOnce(&mut [u8]) -> Result<usize, Errno>,
-) -> Result<usize, Errno> {
-    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
-    let capacity = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
-    if capacity == 0 {
-        return Ok(0);
-    }
-    let mut buffer = alloc::vec::Vec::new();
-    let capacity = capacity.min(litebox::inet_socket::SOCKET_RECEIVE_OPERATION_SIZE);
-    buffer
-        .try_reserve_exact(capacity)
-        .map_err(|_| Errno::ENOMEM)?;
-    buffer.resize(capacity, 0);
-    let received = receive(&mut buffer)?.min(buffer.len());
-    let mut copied = 0;
-    for iov in iovs {
-        if copied == received {
-            break;
-        }
-        let length = (received - copied).min(iov.iov_len);
-        if iov
-            .iov_base
-            .copy_from_slice::<Platform>(0, &buffer[copied..copied + length])
-            .is_none()
-        {
-            return Err(Errno::EFAULT);
-        }
-        copied += length;
-    }
-    Ok(received)
-}
-
-/// Gathers `iovs` into one datagram of at most `max_length` bytes and sends it
-/// with `send`.
-fn write_datagram_to_iovec<Platform: ShimPlatform>(
-    iovs: &[IoWriteVec],
-    max_length: usize,
-    send: impl FnOnce(&[u8]) -> Result<usize, Errno>,
-) -> Result<usize, Errno> {
-    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
-    let length = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
-    if length == 0 {
-        return Ok(0);
-    }
-    if length > max_length {
-        return Err(Errno::EMSGSIZE);
-    }
-    let mut buffer = alloc::vec::Vec::new();
-    buffer
-        .try_reserve_exact(length)
-        .map_err(|_| Errno::ENOMEM)?;
-    for iov in iovs {
-        for offset in 0..iov.iov_len {
-            let offset = isize::try_from(offset).map_err(|_| Errno::EFAULT)?;
-            buffer.push(
-                iov.iov_base
-                    .read_at_offset::<Platform>(offset)
-                    .ok_or(Errno::EFAULT)?,
-            );
-        }
-    }
-    send(&buffer)
 }
 
 /// Linux's `IOV_MAX` / `UIO_MAXIOV`: the kernel rejects iovec counts above this
 /// with `EINVAL` for `readv`/`writev`/`preadv`/`pwritev`.
 const IOV_MAX: usize = 1024;
-const SSIZE_MAX: usize = isize::MAX as usize;
 
 fn check_iovcnt(iovcnt: usize) -> Result<(), Errno> {
     if iovcnt > IOV_MAX {
@@ -1837,139 +1808,7 @@ fn check_iovcnt(iovcnt: usize) -> Result<(), Errno> {
     }
 }
 
-fn check_iov_lens(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno> {
-    let mut total = 0usize;
-    for iov_len in iov_lens {
-        total = total.checked_add(iov_len).ok_or(Errno::EINVAL)?;
-        if total > SSIZE_MAX {
-            return Err(Errno::EINVAL);
-        }
-    }
-    Ok(())
-}
-
-/// Drain reads into a sequence of user iovecs.
-fn read_from_iovec<F, Platform: ShimPlatform>(
-    iovs: &[IoReadVec],
-    kernel_buffer: &mut [u8],
-    mut read_fn: F,
-) -> Result<usize, Errno>
-where
-    F: FnMut(&mut [u8], usize) -> Result<usize, Errno>,
-{
-    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
-
-    let bail = |total: usize, e: Errno| if total > 0 { Ok(total) } else { Err(e) };
-    let mut total_read = 0;
-    'outer: for iov in iovs {
-        let iov_base = iov.iov_base;
-        let iov_len = iov.iov_len;
-        if iov_len == 0 {
-            continue;
-        }
-        let mut iov_filled = 0;
-        while iov_filled < iov_len {
-            let to_read = (iov_len - iov_filled).min(kernel_buffer.len());
-            let size = match read_fn(&mut kernel_buffer[..to_read], total_read) {
-                Ok(0) => break 'outer,
-                Ok(s) => s,
-                Err(e) => return bail(total_read, e),
-            };
-            if iov_base
-                .copy_from_slice::<Platform>(iov_filled, &kernel_buffer[..size])
-                .is_none()
-            {
-                return bail(total_read, Errno::EFAULT);
-            }
-            iov_filled += size;
-            total_read += size;
-            if size < to_read {
-                // Short read from the source — treat as EOF for the remaining iovecs.
-                break 'outer;
-            }
-        }
-    }
-    Ok(total_read)
-}
-
-/// Drain writes from a sequence of user iovecs.
-///
-/// `write_fn` receives the contents of each iovec along with the total number of
-/// bytes already written from earlier iovecs.
-pub(super) fn write_to_iovec<F, Platform: ShimPlatform>(
-    iovs: &[IoWriteVec],
-    mut write_fn: F,
-) -> Result<usize, Errno>
-where
-    F: FnMut(&[u8], usize) -> Result<usize, Errno>,
-{
-    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
-
-    // If any bytes have already been delivered from earlier iovecs, an error
-    // collapses to `Ok(total)` so partial progress is reported to user space.
-    let bail = |total: usize, e: Errno| if total > 0 { Ok(total) } else { Err(e) };
-    let mut kernel_buffer = alloc::vec::Vec::new();
-    let mut total_written = 0;
-    'outer: for iov in iovs {
-        let iov_base = iov.iov_base;
-        let iov_len = iov.iov_len;
-        if iov_len == 0 {
-            continue;
-        }
-        if kernel_buffer.is_empty() {
-            kernel_buffer.resize(PAGE_SIZE, 0);
-        }
-        let mut iov_written = 0;
-        while iov_written < iov_len {
-            let to_write = (iov_len - iov_written).min(kernel_buffer.len());
-            let base_offset = isize::try_from(iov_written).unwrap();
-            for (byte_offset, byte) in (0_isize..).zip(kernel_buffer[..to_write].iter_mut()) {
-                let Some(value) = iov_base.read_at_offset::<Platform>(base_offset + byte_offset)
-                else {
-                    return bail(total_written, Errno::EFAULT);
-                };
-                *byte = value;
-            }
-            let size = match write_fn(&kernel_buffer[..to_write], total_written) {
-                Ok(size) => size,
-                Err(err) => return bail(total_written, err),
-            };
-            iov_written += size;
-            total_written += size;
-            if size < to_write {
-                // Okay to transfer fewer bytes than requested.
-                break 'outer;
-            }
-        }
-    }
-    Ok(total_written)
-}
-
 impl<Platform: ShimPlatform> Task<Platform> {
-    /// Handle syscall `writev`
-    pub(crate) fn sys_writev(
-        &self,
-        fd: i32,
-        iovec: UserPtr<IoWriteVec>,
-        iovcnt: usize,
-    ) -> Result<usize, Errno> {
-        self.with_typed_fd(fd, |fd| {
-            check_iovcnt(iovcnt)?;
-            let iovs: &[IoWriteVec] = &iovec
-                .to_owned_slice::<Platform>(iovcnt)
-                .ok_or(Errno::EFAULT)?;
-            if let Some(max_length) = self.datagram_size_limit(fd) {
-                return write_datagram_to_iovec::<Platform>(iovs, max_length, |buf| {
-                    self.do_write(fd, buf, None)
-                });
-            }
-            // TODO: The data transfers performed by readv() and writev() are atomic: the data
-            // written by writev() is written as a single block that is not intermingled with
-            // output from writes in other processes
-            write_to_iovec::<_, Platform>(iovs, |buf, _total| self.do_write(fd, buf, None))
-        })
-    }
-
     fn validate_access_mode(mode: &AccessFlags) -> Result<(), Errno> {
         let valid_mode = AccessFlags::R_OK | AccessFlags::W_OK | AccessFlags::X_OK;
         if mode.intersects(valid_mode.complement()) {
@@ -3354,151 +3193,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 mod tests {
     use super::*;
     use alloc::string::String;
-    use core::cell::Cell;
 
     extern crate std;
-
-    #[test]
-    fn write_to_iovec_returns_partial_after_later_error() {
-        let first = b"first";
-        let second = b"second";
-        let iovs = [
-            IoWriteVec {
-                iov_base: UserPtr::from_usize(first.as_ptr().expose_provenance()),
-                iov_len: first.len(),
-            },
-            IoWriteVec {
-                iov_base: UserPtr::from_usize(second.as_ptr().expose_provenance()),
-                iov_len: second.len(),
-            },
-        ];
-        let calls = Cell::new(0);
-
-        let result =
-            write_to_iovec::<_, crate::syscalls::tests::TestPlatform>(&iovs, |buf, total| {
-                let call = calls.get();
-                calls.set(call + 1);
-                if call == 0 {
-                    assert_eq!(buf, first);
-                    assert_eq!(total, 0);
-                    Ok(buf.len())
-                } else {
-                    assert_eq!(buf, second);
-                    assert_eq!(total, first.len());
-                    Err(Errno::EPIPE)
-                }
-            });
-
-        assert_eq!(result, Ok(first.len()));
-        assert_eq!(calls.get(), 2);
-    }
-
-    #[test]
-    fn read_from_iovec_breaks_on_eof() {
-        let mut first = [0u8; 4];
-        let mut second = [0u8; 4];
-        let iovs = [
-            IoReadVec {
-                iov_base: UserPtrMut::from_usize(first.as_mut_ptr().expose_provenance()),
-                iov_len: first.len(),
-            },
-            IoReadVec {
-                iov_base: UserPtrMut::from_usize(second.as_mut_ptr().expose_provenance()),
-                iov_len: second.len(),
-            },
-        ];
-        let mut kernel_buffer = [0u8; 8];
-        let calls = Cell::new(0);
-
-        let result = read_from_iovec::<_, crate::syscalls::tests::TestPlatform>(
-            &iovs,
-            &mut kernel_buffer,
-            |buf, total| {
-                let call = calls.get();
-                calls.set(call + 1);
-                if call == 0 {
-                    assert_eq!(total, 0);
-                    buf.fill(b'a');
-                    Ok(buf.len())
-                } else {
-                    assert_eq!(total, 4);
-                    Ok(0)
-                }
-            },
-        );
-
-        assert_eq!(result, Ok(4));
-        assert_eq!(calls.get(), 2);
-        assert_eq!(&first, b"aaaa");
-        assert_eq!(&second, &[0u8; 4]);
-    }
-
-    #[test]
-    fn read_from_iovec_chunks_iov_larger_than_kernel_buffer() {
-        let mut dest = [0u8; 12];
-        let iovs = [IoReadVec {
-            iov_base: UserPtrMut::from_usize(dest.as_mut_ptr().expose_provenance()),
-            iov_len: dest.len(),
-        }];
-        let mut kernel_buffer = [0u8; 4];
-        let calls = Cell::new(0);
-
-        let result = read_from_iovec::<_, crate::syscalls::tests::TestPlatform>(
-            &iovs,
-            &mut kernel_buffer,
-            |buf, total| {
-                assert_eq!(buf.len(), 4);
-                assert_eq!(total, calls.get() * 4);
-                let marker = b'a' + u8::try_from(calls.get()).unwrap();
-                buf.fill(marker);
-                calls.set(calls.get() + 1);
-                Ok(buf.len())
-            },
-        );
-
-        assert_eq!(result, Ok(12));
-        assert_eq!(calls.get(), 3);
-        assert_eq!(&dest, b"aaaabbbbcccc");
-    }
-
-    #[test]
-    fn read_from_iovec_returns_partial_after_later_error() {
-        let mut first = [0u8; 4];
-        let mut second = [0u8; 4];
-        let iovs = [
-            IoReadVec {
-                iov_base: UserPtrMut::from_usize(first.as_mut_ptr().expose_provenance()),
-                iov_len: first.len(),
-            },
-            IoReadVec {
-                iov_base: UserPtrMut::from_usize(second.as_mut_ptr().expose_provenance()),
-                iov_len: second.len(),
-            },
-        ];
-        let mut kernel_buffer = [0u8; 4];
-        let calls = Cell::new(0);
-
-        let result = read_from_iovec::<_, crate::syscalls::tests::TestPlatform>(
-            &iovs,
-            &mut kernel_buffer,
-            |buf, total| {
-                let call = calls.get();
-                calls.set(call + 1);
-                if call == 0 {
-                    assert_eq!(total, 0);
-                    buf.fill(b'x');
-                    Ok(buf.len())
-                } else {
-                    assert_eq!(total, 4);
-                    Err(Errno::EIO)
-                }
-            },
-        );
-
-        assert_eq!(result, Ok(4));
-        assert_eq!(calls.get(), 2);
-        assert_eq!(&first, b"xxxx");
-    }
 
     #[test]
     fn fspath_new() {

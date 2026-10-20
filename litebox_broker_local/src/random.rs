@@ -5,6 +5,7 @@ use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_transport::channel::LocalCallChannel;
+use litebox_platform::buffer::ReadBuffer;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
@@ -18,7 +19,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn fill_random(
         &self,
         buffer: SharedBufferSequence,
-        output: &mut [u8],
+        output: &mut dyn ReadBuffer,
     ) -> Result<(), Channel::Error> {
         assert!(
             buffer.length() <= MAX_RANDOM_TRANSFER_SIZE,
@@ -34,8 +35,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .expect("shared buffer sequence must identify valid slot ranges");
         match self.request(BrokerOperation::FillRandom(buffer))? {
             BrokerResult::RandomFilled => {
-                self.read_shared_buffer(buffer, output);
-                Ok(())
+                self.copy_from_shared_buffer(buffer, output.len(), output)
             }
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected random response: {response:?}"),

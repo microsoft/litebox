@@ -26,6 +26,7 @@ use litebox_broker_protocol::socket::{
     SocketOptionValue, SocketOutcome,
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::storage::RingBuffer;
@@ -518,11 +519,12 @@ impl Tcp {
         &mut self,
         sockets: &mut Sockets,
         reader: ObjectHandle,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
+        let length = output.len();
         self.continue_peek(reader, flags, peek_offset)?;
         if !matches!(self.phase, Phase::Internal(..) | Phase::External(_)) {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
@@ -576,42 +578,69 @@ impl Tcp {
                 Ok(self.end_of_stream())
             };
         }
-        let data = match (&mut self.saved, &self.phase) {
-            (Some(saved), _) if peek => saved[start..end].to_vec(),
+        let received = match (&mut self.saved, &self.phase) {
+            (Some(saved), _) if peek => {
+                output.copy_from_slice_at(0, &saved[start..end])?;
+                end - start
+            }
             (Some(saved), _) => {
-                let data = saved.drain(..end).collect();
+                output.copy_from_slice_at(0, &saved[..end])?;
+                saved.drain(..end);
                 self.release_saved(sockets);
-                data
+                end
             }
             (None, &Phase::Internal(id, pair_end)) => {
-                sockets.read_pair(id, pair_end, start, end, peek)?
+                sockets.read_pair(id, pair_end, start, end, peek, output)?;
+                end - start
+            }
+            (None, &Phase::External(handle)) if peek => {
+                // smoltcp peeks past the first contiguous part of its receive
+                // buffer only into a slice, so a peek stages the bytes.
+                let mut data = zeroed(end)?;
+                let copied = sockets
+                    .tcp(handle)
+                    .peek_slice(&mut data)
+                    .map_err(|_| BrokerError::Internal)?;
+                let peeked = data.get(start..copied).ok_or(BrokerError::Internal)?;
+                output.copy_from_slice_at(0, peeked)?;
+                peeked.len()
             }
             (None, &Phase::External(handle)) => {
                 let socket = sockets.tcp(handle);
-                let mut data = zeroed(end)?;
-                let copied = if peek {
-                    socket.peek_slice(&mut data)
-                } else {
-                    socket.recv_slice(&mut data)
+                let mut received = 0;
+                // smoltcp passes its receive buffer's bytes one contiguous part
+                // at a time, and there are two parts at most. Once the peer has
+                // closed, a drained socket fails to pass any more.
+                for _ in 0..2 {
+                    if received == end {
+                        break;
+                    }
+                    received += socket
+                        .recv(|part| {
+                            let len = part.len().min(end - received);
+                            match output.copy_from_slice_at(received, &part[..len]) {
+                                Ok(()) => (len, Ok(len)),
+                                Err(fault) => (0, Err(fault)),
+                            }
+                        })
+                        .map_err(|_| BrokerError::Internal)??;
                 }
-                .map_err(|_| BrokerError::Internal)?;
-                data.truncate(copied);
-                data.split_off(start)
+                received
             }
             (None, _) => return Err(BrokerError::Internal),
         };
-        if data.is_empty() {
+        if received == 0 {
             return Err(BrokerError::Internal);
         }
         Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
-            data,
+            received,
         )))
     }
 
     pub(super) fn send(
         &mut self,
         sockets: &mut Sockets,
-        data: &[u8],
+        data: &dyn WriteBuffer,
     ) -> BrokerResult<SocketOutcome<usize>> {
         if self.write_shutdown {
             return Ok(SocketOutcome::Failed(SocketError::Shutdown));
@@ -650,7 +679,13 @@ impl Tcp {
                 if !socket.may_send() {
                     return Ok(SocketOutcome::Failed(SocketError::NotConnected));
                 }
-                match socket.send_slice(data) {
+                // smoltcp queues its send buffer's room a contiguous part at a
+                // time and cannot take a part back, so the bytes that fit are
+                // staged first: none are sent if their copy faults.
+                let room = socket.send_capacity() - socket.send_queue();
+                let mut staged = zeroed(data.len().min(room))?;
+                data.copy_to_slice_at(0, &mut staged)?;
+                match socket.send_slice(&staged) {
                     Ok(sent) => sent,
                     Err(_) => return Ok(SocketOutcome::Failed(SocketError::NotConnected)),
                 }
@@ -986,7 +1021,10 @@ impl Stack {
                 let data = match tcp.phase {
                     Phase::Internal(pair, end) => {
                         let available = self.sockets.pair(pair)?.available(end);
-                        self.sockets.read_pair(pair, end, 0, available, false)?
+                        let mut data = zeroed(available)?;
+                        self.sockets
+                            .read_pair(pair, end, 0, available, false, &mut data)?;
+                        data
                     }
                     Phase::External(handle) => take_received(self.sockets.tcp(handle))?,
                     _ => return Err(BrokerError::Internal),

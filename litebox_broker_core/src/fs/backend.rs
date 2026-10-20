@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -104,12 +106,18 @@ pub trait Backend: Send + Sync + Any {
             .find(|entry| entry.name == name))
     }
 
-    /// Read at `offset` into `buf`, returning the number of bytes read.
+    /// Read at `offset` into the start of `buf` (see [`crate::transfer`]), returning the number of
+    /// bytes read.
     ///
     /// Backends do not have an internal notion of offsets; instead the resolver maintains offsets
     /// as needed. For files with non-position-based [`SeekBehavior`], such as `stdin`, the resolver
     /// passes zero and the backend should ignore the offset.
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError>;
+    fn read(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+    ) -> Result<usize, ReadError>;
 
     /// Optional performance hook: get static backing data for a file, if available and supported.
     ///
@@ -122,7 +130,8 @@ pub trait Backend: Send + Sync + Any {
         None
     }
 
-    /// Write `buf` into the file, based on `offset`, returning the number of bytes written.
+    /// Write `buf` into the file, based on `offset` (see [`crate::transfer`]), returning the number
+    /// of bytes written from its start.
     ///
     /// See [`Self::read`] on internal offset storage for backends.
     // XXX(jayb): I need to think more about how we set up some sort of "intend to write" flag that
@@ -130,7 +139,12 @@ pub trait Backend: Send + Sync + Any {
     // it ugly on the interface side here. It would be very ugly for us to pass in extra flags, or
     // indeed even need to maintain/handle seeking on every backend; mostly we need some sort of
     // nicer locking discipline, but I don't want to block the MVP for this just yet.
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError>;
+    fn write(
+        &self,
+        h: &FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+    ) -> Result<usize, WriteError>;
 
     /// Truncate the file to the specified length.
     ///

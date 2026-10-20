@@ -7,9 +7,9 @@
 //! the accepted socket's (queued at its listener until accepted).
 
 use alloc::collections::VecDeque;
-use alloc::vec::Vec;
-use litebox_broker_core::transfer::copy_from_queue;
+use litebox_broker_core::transfer::{append_to_queue, copy_from_queue};
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::Sockets;
 
@@ -103,7 +103,12 @@ impl Sockets {
 
     /// Writes as much of `data` as `end`'s side of the connection, and the
     /// stack's memory budget, have room for; returns how much.
-    pub(super) fn write_pair(&mut self, id: u64, end: usize, data: &[u8]) -> BrokerResult<usize> {
+    pub(super) fn write_pair(
+        &mut self,
+        id: u64,
+        end: usize,
+        data: &dyn WriteBuffer,
+    ) -> BrokerResult<usize> {
         let room = self.room();
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[end];
@@ -113,13 +118,14 @@ impl Sockets {
         queue
             .try_reserve_exact(len)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        queue.extend(&data[..len]);
+        let written = append_to_queue(queue, len, data);
         account(&mut self.queued, queue, before);
-        Ok(len)
+        written.map(|()| len)
     }
 
-    /// What `end` reads from `start` to `stop` (of what it can read); taken,
-    /// unless `peek`, in which case `start` may be past the beginning.
+    /// Copies what `end` reads from `start` to `stop` (of what it can read)
+    /// into `output`, and takes it unless `peek`, in which case `start` may be
+    /// past the beginning.
     pub(super) fn read_pair(
         &mut self,
         id: u64,
@@ -127,16 +133,17 @@ impl Sockets {
         start: usize,
         stop: usize,
         peek: bool,
-    ) -> BrokerResult<Vec<u8>> {
+        output: &mut dyn ReadBuffer,
+    ) -> BrokerResult<()> {
         let pair = self.pairs.get_mut(&id).ok_or(BrokerError::Internal)?;
         let queue = &mut pair.data[1 - end];
-        let data = copy_from_queue(queue, start..stop)?;
+        copy_from_queue(queue, start..stop, output)?;
         if !peek {
             let before = queue.capacity();
             queue.drain(..stop);
             account(&mut self.queued, queue, before);
         }
-        Ok(data)
+        Ok(())
     }
 
     /// Discards what `end` can read; returns how much it was.

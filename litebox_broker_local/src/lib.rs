@@ -55,7 +55,8 @@ use litebox_broker_protocol::{
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
-use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
+use litebox_broker_transport::shared_memory::{SharedBuffer, SharedBufferPool, SharedMemory};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 pub use error::{BrokerLocalError, Result};
 
@@ -260,6 +261,42 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         self.shared_buffers
             .write_sequence(buffer, offset, data)
             .expect("validated shared buffer sequence must be accessible");
+    }
+
+    /// Returns the first `length` bytes of `buffer` as a buffer.
+    fn shared_buffer(&self, buffer: SharedBufferSequence, length: usize) -> SharedBuffer<'_> {
+        self.shared_buffers
+            .buffer(buffer, length)
+            .expect("shared buffer sequence must cover the bytes")
+    }
+
+    /// Copies `source` into `buffer` at `offset`, filling the rest of it.
+    fn copy_to_shared_buffer(
+        &self,
+        buffer: SharedBufferSequence,
+        offset: usize,
+        source: &dyn WriteBuffer,
+    ) -> Result<(), Channel::Error> {
+        assert_eq!(
+            offset.checked_add(source.len()),
+            Some(buffer.length() as usize),
+            "shared data must fill its buffer sequence"
+        );
+        self.shared_buffer(buffer, buffer.length() as usize)
+            .copy_from_buffer_at(offset, source)?;
+        Ok(())
+    }
+
+    /// Copies the first `length` bytes of `buffer` into the start of
+    /// `destination`.
+    fn copy_from_shared_buffer(
+        &self,
+        buffer: SharedBufferSequence,
+        length: usize,
+        destination: &mut dyn ReadBuffer,
+    ) -> Result<(), Channel::Error> {
+        destination.copy_from_buffer_at(0, &self.shared_buffer(buffer, length))?;
+        Ok(())
     }
 
     fn read_shared_buffer(&self, buffer: SharedBufferSequence, destination: &mut [u8]) {

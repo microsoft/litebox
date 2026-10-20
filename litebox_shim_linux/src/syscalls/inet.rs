@@ -36,6 +36,7 @@ use litebox_common_linux::{
     AddressFamily, IPProtocol, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
     SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
 };
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{
@@ -372,10 +373,14 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     pub(crate) fn sendto(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &[u8],
+        buf: impl WriteBuffer,
         flags: SendFlags,
         destination: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
+        // Like Linux, an oversized datagram is rejected before its bytes are read.
+        if !self.is_stream() && buf.len() > inet_socket::MAX_UDP_DATAGRAM_SIZE {
+            return Err(Errno::EMSGSIZE);
+        }
         let send_flags = convert_flags!(
             flags,
             SendFlags,
@@ -392,7 +397,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             flags.contains(SendFlags::DONTWAIT),
             Events::OUT,
             || self.timeout(socket::SocketOptionName::SendTimeout),
-            || match self.socket.try_write(buf, send_flags, destination) {
+            || match self.socket.try_write(&buf, send_flags, destination) {
                 Ok(0) if buf.is_empty() => Ok(0),
                 Ok(0) => Err(TryOpError::TryAgain),
                 Ok(n) => Ok(n),
@@ -423,16 +428,19 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     /// then ends instead of being reported.
     ///
     /// A datagram socket stores its sender's address in `source_addr` if requested.
+    ///
+    /// Receives at most [`inet_socket::SOCKET_RECEIVE_OPERATION_SIZE`] bytes.
     pub(crate) fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut [u8],
+        mut buf: impl ReadBuffer,
         flags: ReceiveFlags,
         has_prior_progress: bool,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
         let is_stream = self.is_stream();
-        if buf.is_empty() && is_stream {
+        let target_len = buf.len().min(inet_socket::SOCKET_RECEIVE_OPERATION_SIZE);
+        if target_len == 0 && is_stream {
             return Ok(0);
         }
         let dontwait = flags.contains(ReceiveFlags::DONTWAIT);
@@ -461,7 +469,6 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             });
         }
 
-        let target_len = buf.len();
         let mut received = 0;
         let (result, timeout) = self.wait(
             cx,
@@ -469,28 +476,14 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             Events::IN,
             || self.receive_timeout(),
             || loop {
-                let destination = if wait_all && !peek {
-                    &mut buf[received..target_len]
-                } else {
-                    &mut buf[..target_len]
-                };
-                match self
-                    .socket
-                    .try_read(destination, receive_flags, source_addr.as_deref_mut())
-                {
-                    Ok(n) if !wait_all => return Ok(n),
-                    Ok(n) if peek => {
-                        received = n;
-                        if received == target_len
-                            || self
-                                .socket
-                                .check_io_events()
-                                .intersects(Events::ERR | Events::HUP | Events::RDHUP)
-                        {
-                            return Ok(received);
-                        }
-                        return Err(TryOpError::TryAgain);
-                    }
+                let mut destination = (&mut buf).sub_buffer(received, target_len - received);
+                match self.socket.try_read(
+                    &mut destination,
+                    receive_flags,
+                    source_addr.as_deref_mut(),
+                ) {
+                    // A `WAITALL` peek already waited for all its bytes.
+                    Ok(n) if !wait_all || peek => return Ok(n),
                     Ok(n) => {
                         received += n;
                         if received == target_len {
@@ -524,13 +517,16 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                             None => Ok(0),
                         };
                     }
-                    Err(SocketReadError::NotConnected) if received != 0 || has_prior_progress => {
+                    Err(SocketReadError::NotConnected | SocketReadError::Fault)
+                        if received != 0 || has_prior_progress =>
+                    {
                         return Ok(received);
                     }
                     Err(SocketReadError::Socket(error)) if received != 0 || has_prior_progress => {
                         self.socket.set_async_error(error);
                         return Ok(received);
                     }
+                    Err(SocketReadError::Fault) => return Err(TryOpError::Other(Errno::EFAULT)),
                     // A pending error, such as the reset of an aborted connection attempt, is
                     // reported first.
                     Err(SocketReadError::NotConnected) => {
@@ -556,11 +552,13 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             }
             Err(error @ TryOpError::WaitError(_)) if wait_all && peek => {
                 receive_flags.remove(inet_socket::ReceiveFlags::WAITALL);
-                match self
-                    .socket
-                    .try_read(&mut buf[..target_len], receive_flags, source_addr)
-                {
+                match self.socket.try_read(
+                    buf.sub_buffer(0, target_len),
+                    receive_flags,
+                    source_addr,
+                ) {
                     Ok(received) => Ok(received),
+                    Err(SocketReadError::Fault) => Err(Errno::EFAULT),
                     Err(SocketReadError::ReadShutdown) => Ok(0),
                     Err(SocketReadError::ConnectionClosed) => {
                         match self.socket.take_async_error() {

@@ -96,6 +96,7 @@ impl From<BrokerControlError> for CreateError {
             BrokerControlError::Broker(error) => {
                 panic!("thread service returned unexpected create-thread error: {error}")
             }
+            BrokerControlError::Fault => unreachable!("thread requests copy no bytes"),
         }
     }
 }
@@ -110,6 +111,7 @@ impl From<BrokerControlError> for ExitError {
             BrokerControlError::Broker(error) => {
                 panic!("thread service returned unexpected exit-thread error: {error}")
             }
+            BrokerControlError::Fault => unreachable!("thread requests copy no bytes"),
         }
     }
 }

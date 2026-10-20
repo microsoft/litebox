@@ -20,6 +20,7 @@ use litebox_broker_protocol::socket::{
     TakeSocketErrorRequest,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
@@ -512,14 +513,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         flags: SendFlags,
     ) -> Result<core::result::Result<usize, SocketError>, Channel::Error> {
         assert!(
             buffer.length() <= MAX_SOCKET_TRANSFER_SIZE,
             "shared socket sequence exceeds the transfer limit"
         );
-        self.write_shared_buffer(buffer, data);
+        self.copy_to_shared_buffer(buffer, 0, data)?;
         match self.request_socket(SocketRequest::Send(SendSocketRequest {
             handle,
             buffer,
@@ -547,7 +548,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> Result<core::result::Result<usize, SocketError>, Channel::Error> {
@@ -555,7 +556,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() <= MAX_UDP_DATAGRAM_SIZE,
             "shared UDP sequence exceeds the datagram limit"
         );
-        self.write_shared_buffer(buffer, data);
+        self.copy_to_shared_buffer(buffer, 0, data)?;
         match self.request_socket(SocketRequest::SendTo(SendToSocketRequest {
             handle,
             buffer,
@@ -584,7 +585,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn receive_socket(
         &self,
         request: ReceiveSocketRequest,
-        destination: &mut [u8],
+        destination: &mut dyn ReadBuffer,
         copy_received: bool,
     ) -> Result<core::result::Result<ReceiveSocketResponse, SocketError>, Channel::Error> {
         self.validate_socket_buffer(request.buffer, destination.len());
@@ -597,7 +598,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     );
                     if copy_received {
                         let received = received as usize;
-                        self.read_shared_buffer(request.buffer, &mut destination[..received]);
+                        self.copy_from_shared_buffer(request.buffer, received, destination)?;
                     }
                 }
                 Ok(Ok(response))
@@ -617,7 +618,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        destination: &mut [u8],
+        destination: &mut dyn ReadBuffer,
         flags: ReceiveFromFlags,
     ) -> Result<core::result::Result<ReceiveFromSocketResponse, SocketError>, Channel::Error> {
         self.validate_udp_buffer(buffer, destination.len());
@@ -640,7 +641,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     "broker returned oversized UDP datagram length"
                 );
                 let received = response.received as usize;
-                self.read_shared_buffer(buffer, &mut destination[..received]);
+                self.copy_from_shared_buffer(buffer, received, destination)?;
                 Ok(Ok(response))
             }
             SocketResponse::Failed(error) => Ok(Err(error)),

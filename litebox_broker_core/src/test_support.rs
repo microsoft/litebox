@@ -7,26 +7,31 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::net::SocketAddrV4;
 use core::time::Duration;
 
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::socket::{ReceiveFlags, ReceiveFromFlags, SocketOutcome};
 use litebox_broker_protocol::terminal::{
     TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
 };
+use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer};
 use spin::Mutex;
 
 use crate::{
-    BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
+    BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, Result,
     fs::{FileResult, FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
     readiness::{
         ReadinessRegistration, ReadinessSource, ReadinessWatchers, SharedReadinessWatchers,
     },
-    socket::{SocketProvider, UnsupportedSocketProvider},
+    socket::{self, PlatformStreamReceive, SocketProvider, UnsupportedSocketProvider},
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     terminal::{TerminalEndpoint, TerminalEventSink},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
+    transfer::take_from_queue,
 };
 
 /// Builder for a test broker core with strict providers that reject unexpected operations.
@@ -226,25 +231,25 @@ impl StdioProvider for TestStdioProvider {
         connected.then(|| Arc::clone(&self.terminal) as Arc<dyn TerminalEndpoint>)
     }
 
-    fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
+    fn read(&self, output: &mut dyn ReadBuffer) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
         if input.bytes.is_empty() && input.open {
             input.blocked_reads += 1;
             return Err(StdioProviderError::WouldBlock);
         }
         let read = input.bytes.len().min(output.len());
-        for (destination, source) in output.iter_mut().zip(input.bytes.drain(..read)) {
-            *destination = source;
-        }
+        take_from_queue(&mut input.bytes, read, output)?;
         Ok(read)
     }
 
     fn write(
         &self,
         stream: StdioOutputStream,
-        input: &[u8],
+        input: &dyn WriteBuffer,
     ) -> core::result::Result<usize, StdioProviderError> {
-        self.writes.lock().push((stream, input.to_vec()));
+        let mut data = alloc::vec![0; input.len()];
+        input.copy_to_slice_at(0, &mut data)?;
+        self.writes.lock().push((stream, data));
         Ok(input.len())
     }
 
@@ -397,4 +402,142 @@ impl Drop for ManualAlarm {
     fn drop(&mut self) {
         self.state.lock().alarms.remove(&self.id);
     }
+}
+
+/// A buffer of `length` bytes whose copies fault from `fault_at` on, and
+/// otherwise copy nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct FaultingBuffer {
+    length: usize,
+    fault_at: usize,
+}
+
+impl FaultingBuffer {
+    /// Creates a buffer of `length` bytes whose copies fault from `fault_at`
+    /// on.
+    pub const fn new(length: usize, fault_at: usize) -> Self {
+        Self { length, fault_at }
+    }
+
+    /// Checks a copy of `length` bytes at `offset`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the copy is out of bounds, as for any buffer.
+    fn check(&self, offset: usize, length: usize) -> core::result::Result<(), Fault> {
+        let end = offset.checked_add(length).unwrap();
+        assert!(end <= self.length, "copy out of bounds");
+        if end > self.fault_at {
+            return Err(Fault);
+        }
+        Ok(())
+    }
+}
+
+impl Buffer for FaultingBuffer {
+    fn len(&self) -> usize {
+        self.length
+    }
+}
+
+impl ReadBuffer for FaultingBuffer {
+    fn copy_from_slice_at(
+        &mut self,
+        offset: usize,
+        source: &[u8],
+    ) -> core::result::Result<(), Fault> {
+        self.check(offset, source.len())
+    }
+
+    fn copy_from_raw_at(
+        &mut self,
+        offset: usize,
+        source: RawBytes<'_>,
+    ) -> core::result::Result<(), Fault> {
+        self.check(offset, source.len())
+    }
+}
+
+impl WriteBuffer for FaultingBuffer {
+    fn copy_to_slice_at(
+        &self,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> core::result::Result<(), Fault> {
+        self.check(offset, destination.len())
+    }
+
+    fn copy_to_raw_at(
+        &self,
+        offset: usize,
+        destination: RawBytes<'_>,
+    ) -> core::result::Result<(), Fault> {
+        self.check(offset, destination.len())
+    }
+}
+
+/// A stream receive's result, with the bytes received.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StreamData {
+    /// The bytes received.
+    Received(Vec<u8>),
+    /// The peer finished sending.
+    EndOfStream,
+}
+
+/// Receives up to `length` bytes with [`socket::receive`] into a new vector.
+pub fn receive_data(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    length: usize,
+    flags: ReceiveFlags,
+    peek_offset: u32,
+    peek_length: u32,
+) -> Result<SocketOutcome<StreamData>> {
+    let mut data = alloc::vec![0; length];
+    let outcome = socket::receive(process, handle, &mut data, flags, peek_offset, peek_length)?;
+    Ok(match outcome {
+        SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
+            data.truncate(received);
+            SocketOutcome::Completed(StreamData::Received(data))
+        }
+        SocketOutcome::Completed(PlatformStreamReceive::EndOfStream) => {
+            SocketOutcome::Completed(StreamData::EndOfStream)
+        }
+        SocketOutcome::Failed(error) => SocketOutcome::Failed(error),
+    })
+}
+
+/// A datagram receive's result, with the bytes received.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DatagramData {
+    /// The bytes received, at most the length requested.
+    pub data: Vec<u8>,
+    /// The datagram's full length.
+    pub datagram_length: usize,
+    /// Where the datagram came from.
+    pub source_address: SocketAddrV4,
+}
+
+/// Receives up to `length` bytes with [`socket::receive_from`] into a new
+/// vector.
+pub fn receive_data_from(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    length: usize,
+    flags: ReceiveFromFlags,
+) -> Result<SocketOutcome<DatagramData>> {
+    let mut data = alloc::vec![0; length];
+    let outcome = socket::receive_from(process, handle, &mut data, flags)?;
+    Ok(match outcome {
+        SocketOutcome::Completed(received) => {
+            data.truncate(received.received);
+            SocketOutcome::Completed(DatagramData {
+                data,
+                datagram_length: received.datagram_length,
+                source_address: received.source_address,
+            })
+        }
+        SocketOutcome::Failed(error) => SocketOutcome::Failed(error),
+    })
 }

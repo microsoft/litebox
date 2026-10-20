@@ -6,12 +6,13 @@
 
 use alloc::sync::Arc;
 use core::ops::Range;
-use litebox::mm::exception_table::{Fault, memcpy_fallible};
+use litebox::mm::exception_table::memcpy_fallible;
 use litebox::platform::common_providers::userspace_pointers::ValidateAccess as _;
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, MemoryAccessPolicy};
-use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use litebox_common_vm_abi::UserRange;
+use litebox_platform::buffer::Fault;
+use litebox_platform::peer_memory;
 use litebox_platform_vm_kernel::{PinnedUserPages, VmValidateAccess};
 
 /// The shared buffers, through the process's mapping: valid only while its

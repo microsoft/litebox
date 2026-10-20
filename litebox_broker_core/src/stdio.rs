@@ -4,10 +4,11 @@
 //! Host standard streams behind the `/dev` stdio devices.
 
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use thiserror::Error;
 
-use crate::Result;
 use crate::readiness::ReadinessRegistration;
+use crate::{BrokerError, Result};
 
 /// Standard stream selected by a terminal query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +45,16 @@ pub enum StdioProviderError {
     /// This broker deployment does not provide standard I/O.
     #[error("standard I/O is unsupported")]
     Unsupported,
+    /// The broker failed the operation itself, such as when copying to or
+    /// from the caller's buffer faulted or it ran out of memory.
+    #[error(transparent)]
+    Broker(#[from] BrokerError),
+}
+
+impl From<Fault> for StdioProviderError {
+    fn from(fault: Fault) -> Self {
+        Self::Broker(fault.into())
+    }
 }
 
 /// Trusted provider of standard-I/O operations.
@@ -61,15 +72,16 @@ pub trait StdioProvider: Send + Sync {
         None
     }
 
-    /// Reads available bytes from standard input, returning zero at
-    /// end-of-file.
-    fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError>;
+    /// Reads available bytes from standard input into the start of `output`
+    /// (see [`crate::transfer`]), returning zero at end-of-file.
+    fn read(&self, output: &mut dyn ReadBuffer) -> core::result::Result<usize, StdioProviderError>;
 
-    /// Writes bytes to the selected standard output stream.
+    /// Writes bytes from the start of `input` to the selected standard output
+    /// stream (see [`crate::transfer`]).
     fn write(
         &self,
         stream: StdioOutputStream,
-        input: &[u8],
+        input: &dyn WriteBuffer,
     ) -> core::result::Result<usize, StdioProviderError>;
 
     /// Determines whether the selected standard stream is connected to a
@@ -98,14 +110,17 @@ pub trait StdioProvider: Send + Sync {
 pub struct UnsupportedStdioProvider;
 
 impl StdioProvider for UnsupportedStdioProvider {
-    fn read(&self, _output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
+    fn read(
+        &self,
+        _output: &mut dyn ReadBuffer,
+    ) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }
 
     fn write(
         &self,
         _stream: StdioOutputStream,
-        _input: &[u8],
+        _input: &dyn WriteBuffer,
     ) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }

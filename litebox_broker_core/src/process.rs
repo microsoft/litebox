@@ -2068,6 +2068,14 @@ mod tests {
         process.complete_exit(exit_status).unwrap();
     }
 
+    /// Reads up to `length` bytes from the pipe `handle` into a new vector.
+    fn read_pipe(process: &BrokerProcess, handle: ObjectHandle, length: usize) -> Result<Vec<u8>> {
+        let mut data = vec![0; length];
+        let read = crate::pipe::read(process, handle, &mut data)?;
+        data.truncate(read);
+        Ok(data)
+    }
+
     /// Opens `process`'s signals, through which it learns of child exits.
     fn open_signals(
         process: &BrokerProcess,
@@ -2197,10 +2205,7 @@ mod tests {
             crate::pipe::write(&parent, writer, &[4, 5]),
             Err(BrokerError::WouldBlock)
         );
-        assert_eq!(
-            crate::pipe::read(&parent, reader, 1),
-            Ok(std::vec::Vec::from([1]))
-        );
+        assert_eq!(read_pipe(&parent, reader, 1), Ok(std::vec::Vec::from([1])));
         assert_eq!(
             take_republished(&parent_sink),
             [(writer, ReadinessFlags::WRITE)]
@@ -3686,10 +3691,7 @@ mod tests {
             .unwrap();
         assert_eq!(source.close_object_reference(writer), Ok(()));
         assert_eq!(crate::pipe::write(&target, duplicated_writer, &[1]), Ok(1));
-        assert_eq!(
-            crate::pipe::read(&source, reader, 1),
-            Ok(std::vec::Vec::from([1]))
-        );
+        assert_eq!(read_pipe(&source, reader, 1), Ok(std::vec::Vec::from([1])));
 
         let event = crate::event::create(&target, 0, FileOpenFlags::NONE).unwrap();
         assert_eq!(
@@ -4129,10 +4131,7 @@ mod tests {
             process.check_readiness(reader),
             Ok(ReadinessFlags::default())
         );
-        assert_eq!(
-            crate::pipe::read(&process, reader, 1),
-            Err(BrokerError::WouldBlock)
-        );
+        assert_eq!(read_pipe(&process, reader, 1), Err(BrokerError::WouldBlock));
         assert_eq!(crate::pipe::write(&process, writer, &[1, 2]), Ok(2));
         assert_eq!(crate::pipe::write(&process, writer, &[3, 4, 5]), Ok(2));
         assert_eq!(
@@ -4140,7 +4139,7 @@ mod tests {
             Err(BrokerError::WouldBlock)
         );
         assert_eq!(
-            crate::pipe::read(&process, reader, 3),
+            read_pipe(&process, reader, 3),
             Ok(std::vec::Vec::from([1, 2, 3]))
         );
         assert_eq!(crate::pipe::write(&process, writer, &[5, 6]), Ok(2));
@@ -4151,13 +4150,10 @@ mod tests {
             Ok(ReadinessFlags::READ | ReadinessFlags::CLOSED)
         );
         assert_eq!(
-            crate::pipe::read(&process, reader, 4),
+            read_pipe(&process, reader, 4),
             Ok(std::vec::Vec::from([4, 5, 6]))
         );
-        assert_eq!(
-            crate::pipe::read(&process, reader, 1),
-            Ok(std::vec::Vec::new())
-        );
+        assert_eq!(read_pipe(&process, reader, 1), Ok(std::vec::Vec::new()));
         assert_eq!(process.close_object_reference(reader), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }

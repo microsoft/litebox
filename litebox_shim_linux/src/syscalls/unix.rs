@@ -29,6 +29,7 @@ use litebox_common_linux::{
     AddressFamily, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType,
     SocketOption, SocketOptionName, UnixProtocol, errno::Errno,
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::{
     GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
@@ -258,7 +259,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn sendto(
         &self,
         task: &Task<Platform>,
-        buf: &[u8],
+        buf: impl WriteBuffer,
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
@@ -284,7 +285,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn recvfrom(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut [u8],
+        buf: impl ReadBuffer,
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
@@ -679,7 +680,7 @@ mod tests {
                 SocketAddress::Unix(UnixSocketAddr::Unnamed)
             ));
             assert_eq!(
-                task.do_sendto(&server_conn, &[], SendFlags::empty(), None)
+                task.do_sendto(&server_conn, b"", SendFlags::empty(), None)
                     .expect("zero-length sendto failed"),
                 0
             );

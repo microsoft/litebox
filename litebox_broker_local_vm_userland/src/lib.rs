@@ -28,6 +28,7 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_local::BrokerLocal;
@@ -44,11 +45,12 @@ use litebox_broker_transport::control_ring::{
     ControlRingReadError, ControlRingReadStatus, ControlRingWriteStatus, LocalControlRingEndpoints,
     MemoryAccessPolicy, WaitableSharedMemory,
 };
-use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use litebox_common_vm_abi::{
     BrokerHandshakeFrame, FutexRequest, StartupInfo, Status, UserRange, WireFrame,
 };
+use litebox_platform::buffer::RawBytes;
+use litebox_platform::peer_memory;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_userland::{Instant, NotificationReceiver, VmUserland, kcall};
 
@@ -219,6 +221,14 @@ impl SharedMemory for KernelSharedMemory {
         // Safety: as in `read`.
         unsafe { peer_memory::copy_to_peer(source, destination as *mut u8) };
         Ok(())
+    }
+
+    fn raw_bytes(&self) -> Option<RawBytes<'_>> {
+        let start: usize = self.region.start.trunc();
+        let start = NonNull::new(start as *mut u8).expect("the region is never at address zero");
+        // Safety: the region is mapped for the process's lifetime, disjoint
+        // from private memory, and never referenced.
+        Some(unsafe { RawBytes::from_raw_parts(start, self.len()) })
     }
 }
 

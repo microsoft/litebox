@@ -5,10 +5,12 @@
 //!
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
-use crate::{ShimPlatform, Task};
+use crate::{ShimPlatform, Task, guest_buffer::GuestReadBuffer};
+use litebox::random::FillRandomError;
 use litebox::user_pointers::UserPtrMut;
 use litebox::utils::TruncateExt as _;
-use litebox_common_linux::errno::Errno;
+use litebox_common_linux::{IoReadVec, errno::Errno};
+use litebox_platform::buffer::Buffer as _;
 use litebox_platform::time::Instant as _;
 
 impl<Platform: ShimPlatform> Task<Platform> {
@@ -21,19 +23,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         // Linux guarantees at least 256 bytes of randomness per call before
         // checking for interrupts.
-        const KBUF_LEN: usize = 256;
-        let mut kbuf = [0; KBUF_LEN];
+        const CHUNK_LEN: usize = 256;
+        let iov = IoReadVec {
+            iov_base: buf,
+            iov_len: count,
+        };
+        let mut buf = GuestReadBuffer::<Platform>::single(&iov);
         let mut offset = 0;
         while offset < count {
-            let len = (count - offset).min(kbuf.len());
-            let kbuf = &mut kbuf[..len];
-            self.global
+            let len = (count - offset).min(CHUNK_LEN);
+            match self
+                .global
                 .litebox
-                .fill_random(kbuf)
-                .map_err(|_| Errno::EIO)?;
-            buf.copy_from_slice::<Platform>(offset, kbuf)
-                .ok_or(Errno::EFAULT)?;
-            offset += len;
+                .fill_random((&mut buf).sub_buffer(offset, len))
+            {
+                Ok(()) => offset += len,
+                // Like Linux, a failure after progress ends the call with that progress.
+                Err(_) if offset != 0 => break,
+                Err(FillRandomError::Fault) => return Err(Errno::EFAULT),
+                Err(FillRandomError::Unavailable) => return Err(Errno::EIO),
+            }
             // TODO: check for interrupt here and break out.
         }
         Ok(offset)

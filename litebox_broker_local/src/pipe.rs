@@ -10,6 +10,7 @@ use litebox_broker_protocol::pipe::{
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_transport::channel::LocalCallChannel;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
@@ -53,7 +54,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        destination: &mut [u8],
+        destination: &mut dyn ReadBuffer,
     ) -> Result<usize, Channel::Error> {
         if buffer.length() > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
@@ -77,7 +78,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             "broker returned oversized pipe read"
         );
         let read = response.read as usize;
-        self.read_shared_buffer(buffer, &mut destination[..read]);
+        self.copy_from_shared_buffer(buffer, read, destination)?;
         Ok(read)
     }
 
@@ -95,14 +96,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        data: &[u8],
+        data: &dyn WriteBuffer,
     ) -> Result<usize, Channel::Error> {
         if buffer.length() > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        self.write_shared_buffer(buffer, data);
+        self.copy_to_shared_buffer(buffer, 0, data)?;
         let response =
             self.request_pipe(PipeRequest::Write(WritePipeRequest { handle, buffer }))?;
         let PipeResponse::Write(response) = response else {
@@ -145,6 +146,7 @@ mod tests {
     };
     use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
+    use litebox_platform::buffer::{Buffer, Fault, RawBytes};
 
     use crate::test_support::test_broker_local;
 
@@ -254,6 +256,59 @@ mod tests {
         let local = test_broker_local(channel, memory);
 
         let _ = local.write_pipe(ObjectHandle(1), sequence(0, 1), &[0]);
+    }
+
+    #[test]
+    fn pipe_reports_copy_failures() {
+        let channel =
+            ScriptedChannel::new([BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
+                read: 1,
+            }))]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let local = test_broker_local(channel, memory);
+
+        assert!(matches!(
+            local.write_pipe(ObjectHandle(2), sequence(0, 1), &FaultingBuffer),
+            Err(BrokerLocalError::Fault)
+        ));
+        assert!(local.channel.sent_operations.borrow().is_empty());
+        assert!(matches!(
+            local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut FaultingBuffer),
+            Err(BrokerLocalError::Fault)
+        ));
+    }
+
+    /// A one-byte buffer whose copies always fault.
+    struct FaultingBuffer;
+
+    impl Buffer for FaultingBuffer {
+        fn len(&self) -> usize {
+            1
+        }
+    }
+
+    impl ReadBuffer for FaultingBuffer {
+        fn copy_from_slice_at(&mut self, _: usize, _: &[u8]) -> core::result::Result<(), Fault> {
+            Err(Fault)
+        }
+
+        fn copy_from_raw_at(
+            &mut self,
+            _: usize,
+            _: RawBytes<'_>,
+        ) -> core::result::Result<(), Fault> {
+            Err(Fault)
+        }
+    }
+
+    impl WriteBuffer for FaultingBuffer {
+        fn copy_to_slice_at(&self, _: usize, _: &mut [u8]) -> core::result::Result<(), Fault> {
+            Err(Fault)
+        }
+
+        fn copy_to_raw_at(&self, _: usize, _: RawBytes<'_>) -> core::result::Result<(), Fault> {
+            Err(Fault)
+        }
     }
 
     fn sequence(slot: u32, length: u32) -> SharedBufferSequence {

@@ -12,7 +12,9 @@ use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
 use litebox_broker_core::terminal::TerminalTransport;
+use litebox_broker_core::transfer::{bounce_buffer, take_from_queue};
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::terminal::HostTerminal;
 
@@ -194,7 +196,7 @@ impl StdioProvider for UserlandStdioProvider {
         }
     }
 
-    fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
+    fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize, StdioProviderError> {
         if let Some(terminal) = &self.terminals[0] {
             return terminal.read(output);
         }
@@ -214,13 +216,15 @@ impl StdioProvider for UserlandStdioProvider {
             return end.map(|()| 0);
         }
         let count = output.len().min(state.data.len());
-        for (output, input) in output.iter_mut().zip(state.data.drain(..count)) {
-            *output = input;
-        }
+        take_from_queue(&mut state.data, count, output)?;
         Ok(count)
     }
 
-    fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
+    fn write(
+        &self,
+        stream: StdioOutputStream,
+        input: &dyn WriteBuffer,
+    ) -> Result<usize, StdioProviderError> {
         if let Some(terminal) = &self.terminals[match stream {
             StdioOutputStream::Stdout => 1,
             StdioOutputStream::Stderr => 2,
@@ -250,7 +254,9 @@ impl StdioProvider for UserlandStdioProvider {
                 return Err(StdioProviderError::Failed);
             }
         }
-        state.queue.push_back((index, input[..count].to_vec()));
+        let mut chunk = bounce_buffer(count)?;
+        input.copy_to_slice_at(0, &mut chunk)?;
+        state.queue.push_back((index, chunk));
         state.queued += count;
         self.output.changed.notify_all();
         Ok(count)
@@ -595,7 +601,7 @@ mod tests {
         assert_eq!(provider.write(StdioOutputStream::Stdout, b"a"), Ok(1));
         assert_eq!(provider.write(StdioOutputStream::Stderr, b"b"), Ok(1));
         assert_eq!(
-            provider.write(StdioOutputStream::Stdout, &fill[..OUTPUT_CAPACITY - 4]),
+            provider.write(StdioOutputStream::Stdout, &&fill[..OUTPUT_CAPACITY - 4]),
             Ok(OUTPUT_CAPACITY - 4)
         );
         // Small writes are never split.
@@ -609,7 +615,7 @@ mod tests {
             ReadinessFlags::default()
         );
         assert_eq!(
-            provider.write(StdioOutputStream::Stdout, &fill[..=ATOMIC_WRITE_SIZE]),
+            provider.write(StdioOutputStream::Stdout, &&fill[..=ATOMIC_WRITE_SIZE]),
             Ok(2)
         );
         assert_eq!(

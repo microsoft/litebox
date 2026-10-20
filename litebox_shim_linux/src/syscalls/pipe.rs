@@ -20,6 +20,7 @@ use litebox_broker_protocol::{
     fs::{FileMode as Mode, FileOpenFlags},
 };
 use litebox_common_linux::{InodeType, OFlags, errno::Errno};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::file::{linux_status_flags, status_flags_change};
 use crate::{GlobalState, ShimPlatform};
@@ -64,12 +65,16 @@ impl<Platform: ShimPlatform> PipeEnd<Platform> {
     pub(crate) fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut [u8],
+        buf: impl ReadBuffer,
     ) -> Result<usize, Errno> {
         Ok(self.end.read(cx, buf)?)
     }
 
-    pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
+    pub(crate) fn write(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: impl WriteBuffer,
+    ) -> Result<usize, Errno> {
         Ok(self.end.write(cx, buf)?)
     }
 

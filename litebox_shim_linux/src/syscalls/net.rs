@@ -25,12 +25,15 @@ use litebox_broker_protocol::{
     socket::{self, ShutdownMode},
 };
 use litebox_common_linux::{
-    AddressFamily, FileDescriptorFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType,
-    SocketOption, SocketOptionName, UserMmsgHdr, UserMsgHdr, errno::Errno, signal::Signal,
+    AddressFamily, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
+    ShutdownHow, SockFlags, SockType, SocketOption, SocketOptionName, UserMmsgHdr, UserMsgHdr,
+    errno::Errno, signal::Signal,
 };
 use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use litebox_platform::time::Instant as _;
 
+use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use crate::syscalls::{
     file::{AnyTypedFd, FilesState},
     inet::{self, InetSocket, InetSocketSubsystem},
@@ -80,7 +83,7 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
     fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
-        buf: &mut [u8],
+        buf: impl ReadBuffer,
         flags: ReceiveFlags,
         has_prior_progress: bool,
         source_addr: Option<&mut Option<SocketAddress>>,
@@ -527,33 +530,6 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
         .ok_or(Errno::EFAULT)
 }
 
-fn copy_iovs_to_vec<Platform: ShimPlatform>(
-    iovs: &[litebox_common_linux::IoVec],
-) -> Result<alloc::vec::Vec<u8>, Errno> {
-    let total_len = iovs.iter().try_fold(0usize, |total_len, iov| {
-        total_len.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
-    })?;
-    let mut data = alloc::vec::Vec::new();
-    data.try_reserve_exact(total_len)
-        .map_err(|_| Errno::ENOMEM)?;
-    data.resize(total_len, 0);
-    let mut offset = 0;
-    for iov in iovs {
-        if iov.iov_len == 0 {
-            continue;
-        }
-        let end = offset + iov.iov_len;
-        for (byte_offset, byte) in (0_isize..).zip(data[offset..end].iter_mut()) {
-            *byte = iov
-                .iov_base
-                .read_at_offset::<Platform>(byte_offset)
-                .ok_or(Errno::EFAULT)?;
-        }
-        offset = end;
-    }
-    Ok(data)
-}
-
 fn user_write_prefix<Platform: ShimPlatform>(
     page_manager: &VmemManager<Platform, PAGE_SIZE>,
     ptr: UserPtrMut<u8>,
@@ -742,13 +718,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let sockaddr = addr
             .map(|addr| read_sockaddr_from_user::<Platform>(addr, addrlen as usize))
             .transpose()?;
-        let buf = buf.to_owned_slice::<Platform>(len).ok_or(Errno::EFAULT)?;
-        self.do_sendto(&socket, &buf, flags, sockaddr)
+        let iov = IoWriteVec {
+            iov_base: buf,
+            iov_len: len,
+        };
+        self.do_sendto(
+            &socket,
+            GuestWriteBuffer::<Platform>::single(&iov),
+            flags,
+            sockaddr,
+        )
     }
     pub(super) fn do_sendto(
         &self,
         socket: &AnyTypedFd<Platform>,
-        buf: &[u8],
+        buf: impl WriteBuffer,
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
@@ -762,7 +746,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                socket.sendto(&self.wait_cx(), buf, flags, sockaddr)
+                socket.sendto(&self.wait_cx(), &buf, flags, sockaddr)
             },
             |file| {
                 let addr = sockaddr
@@ -770,7 +754,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 is_datagram.set(!file.is_stream());
-                file.sendto(self, buf, flags, addr)
+                file.sendto(self, &buf, flags, addr)
             },
         );
         // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
@@ -822,10 +806,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             Some(
                 msg.msg_iov
+                    .cast::<IoWriteVec>()
                     .to_owned_slice::<Platform>(msg.msg_iovlen)
                     .ok_or(Errno::EFAULT)?,
             )
         };
+        let data = GuestWriteBuffer::<Platform>::new(iovs.as_deref().unwrap_or_default())?;
         let is_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
@@ -836,7 +822,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
                 socket.sendto(&self.wait_cx(), &data, flags, sock_addr)
             },
             |file| {
@@ -844,7 +829,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
                 is_datagram.set(!file.is_stream());
                 file.sendto(self, &data, flags, unix_addr)
             },
@@ -922,15 +906,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let plan = socket.plan(flags)?;
         let cx = self.wait_cx().with_timeout(plan.timeout);
         let mut source_addr = None;
-        let scratch_len = len.min(SOCKET_RECEIVE_OPERATION_SIZE);
-        let mut buffer = alloc::vec::Vec::new();
-        buffer
-            .try_reserve_exact(scratch_len)
-            .map_err(|_| Errno::ENOMEM)?;
-        buffer.resize(scratch_len, 0);
+        let iov = IoReadVec {
+            iov_base: buf,
+            iov_len: len,
+        };
+        let mut guest = GuestReadBuffer::<Platform>::single(&iov);
         let mut received = 0;
         let reported = loop {
-            let requested_chunk_len = (len - received).min(buffer.len());
+            let requested_chunk_len = (len - received).min(SOCKET_RECEIVE_OPERATION_SIZE);
             let write_prefix = (plan.is_stream && plan.copies_data && requested_chunk_len != 0)
                 .then(|| user_write_prefix(&self.global.mm, buf, received, requested_chunk_len));
             let needs_probe = write_prefix.as_ref().is_some_and(
@@ -958,9 +941,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     prefix
                 }
             };
-            let size = socket.receive(
+            let size = match socket.receive(
                 &cx,
-                &mut buffer[..chunk_len],
+                (&mut guest).sub_buffer(received, chunk_len),
                 flags,
                 received != 0,
                 if addr.is_some() {
@@ -968,19 +951,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 },
-            )?;
+            ) {
+                Ok(size) => size,
+                // A fault after progress ends the call with that progress.
+                Err(Errno::EFAULT) if received != 0 => return Ok(received),
+                Err(error) => return Err(error),
+            };
             let copied = size.min(chunk_len);
-            if plan.copies_data
-                && buf
-                    .copy_from_slice::<Platform>(received, &buffer[..copied])
-                    .is_none()
-            {
-                return if received == 0 {
-                    Err(Errno::EFAULT)
-                } else {
-                    Ok(received)
-                };
-            }
             received += copied;
             let reported = if plan.wait_all { received } else { size };
             if !plan.wait_all || copied < chunk_len || received == len {
@@ -1012,7 +989,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(super) fn do_recvfrom(
         &self,
         socket: &AnyTypedFd<Platform>,
-        buf: &mut [u8],
+        buf: impl ReadBuffer,
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
@@ -1072,9 +1049,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .to_owned_slice::<Platform>(msg_iovlen)
             .ok_or(Errno::EFAULT)?;
 
-        let total_iov_capacity = iovs.iter().try_fold(0usize, |capacity, iov| {
-            capacity.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
-        })?;
+        let mut guest = GuestReadBuffer::<Platform>::new(&iovs)?;
+        let total_iov_capacity = guest.len();
 
         let want_source = msg_name.as_usize() != 0;
         let mut source_addr = None;
@@ -1082,16 +1058,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let plan = socket.plan(flags)?;
         let cx = self.wait_cx().with_timeout(plan.timeout);
 
-        // Keep the scratch allocation bounded and scatter each completed chunk.
-        let mut buffer = alloc::vec::Vec::new();
-        let receive_capacity = total_iov_capacity.min(SOCKET_RECEIVE_OPERATION_SIZE);
-        buffer
-            .try_reserve_exact(receive_capacity)
-            .map_err(|_| Errno::ENOMEM)?;
-        buffer.resize(receive_capacity, 0);
         let mut total_received = 0;
         let reported = 'receive: loop {
-            let requested_chunk_len = (total_iov_capacity - total_received).min(buffer.len());
+            let requested_chunk_len =
+                (total_iov_capacity - total_received).min(SOCKET_RECEIVE_OPERATION_SIZE);
             let write_prefix = (plan.is_stream && plan.copies_data && requested_chunk_len != 0)
                 .then(|| {
                     iov_write_prefix(&self.global.mm, &iovs, total_received, requested_chunk_len)
@@ -1120,9 +1090,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     prefix
                 }
             };
-            let size = socket.receive(
+            let size = match socket.receive(
                 &cx,
-                &mut buffer[..chunk_len],
+                (&mut guest).sub_buffer(total_received, chunk_len),
                 flags,
                 total_received != 0,
                 if want_source {
@@ -1130,42 +1100,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 },
-            )?;
+            ) {
+                Ok(size) => size,
+                // A fault after progress ends the call with that progress.
+                Err(Errno::EFAULT) if total_received != 0 => break 'receive total_received,
+                Err(error) => return Err(error),
+            };
             if size > chunk_len {
                 ret_flags.insert(ReceiveFlags::TRUNC);
             }
             let copied = size.min(chunk_len);
-            if plan.copies_data {
-                let mut skip = total_received;
-                let mut source_offset = 0;
-                for iov in &iovs {
-                    if skip >= iov.iov_len {
-                        skip -= iov.iov_len;
-                        continue;
-                    }
-                    let chunk = (copied - source_offset).min(iov.iov_len - skip);
-                    if iov
-                        .iov_base
-                        .copy_from_slice::<Platform>(
-                            skip,
-                            &buffer[source_offset..source_offset + chunk],
-                        )
-                        .is_none()
-                    {
-                        let copied_before_fault = total_received + source_offset;
-                        if copied_before_fault == 0 {
-                            return Err(Errno::EFAULT);
-                        }
-                        total_received = copied_before_fault;
-                        break 'receive copied_before_fault;
-                    }
-                    source_offset += chunk;
-                    skip = 0;
-                    if source_offset == copied {
-                        break;
-                    }
-                }
-            }
             total_received += copied;
             let reported = if plan.wait_all { total_received } else { size };
             if !plan.wait_all || copied < chunk_len || total_received == total_iov_capacity {

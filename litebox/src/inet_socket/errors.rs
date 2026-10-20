@@ -126,6 +126,9 @@ pub enum SocketReadError {
     NotConnected,
     /// The stream is closed.
     ConnectionClosed,
+    /// Copying into the buffer faulted; the bytes received are lost unless
+    /// peeked.
+    Fault,
     /// The host network operation failed.
     Socket(SocketAsyncError),
 }
@@ -149,6 +152,8 @@ pub enum SocketWriteError {
     MessageTooLong,
     /// A destination address is required but was not provided.
     DestinationAddressRequired,
+    /// Copying from the buffer faulted before anything was sent.
+    Fault,
     /// The host network operation failed.
     Socket(SocketAsyncError),
 }

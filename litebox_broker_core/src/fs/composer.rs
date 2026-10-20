@@ -11,6 +11,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
@@ -661,7 +663,12 @@ impl Backend for Composer {
         }
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
@@ -675,7 +682,12 @@ impl Backend for Composer {
             .get_static_backing_data(&h.handle)
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        h: &FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+    ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend

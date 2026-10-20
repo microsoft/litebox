@@ -63,8 +63,7 @@ macro_rules! ex_table_entry {
     };
 }
 
-/// Represents a fault during a fallible memory operation.
-pub struct Fault;
+use litebox_platform::buffer::Fault;
 
 /// Copies `size` bytes from `src` to `dst` in a fallible manner.
 ///

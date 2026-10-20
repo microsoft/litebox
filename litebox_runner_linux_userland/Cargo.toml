@@ -29,6 +29,7 @@ litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core", feat
 litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host" }
 litebox_broker_platform_linux_userland = { version = "0.1.0", path = "../litebox_broker_platform_linux_userland" }
 litebox_broker_userland = { version = "0.1.0", path = "../litebox_broker_userland" }
+litebox_platform = { version = "0.1.0", path = "../litebox_platform" }
 
 [features]
 lock_tracing = ["litebox/lock_tracing"]

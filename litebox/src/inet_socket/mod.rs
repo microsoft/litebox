@@ -35,6 +35,7 @@ use crate::{
     process::ProcessError,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 pub mod errors;
 mod tcp;
@@ -335,7 +336,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// sender's address in `source_addr` if requested.
     pub fn try_read(
         &self,
-        buf: &mut [u8],
+        buf: impl ReadBuffer,
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, SocketReadError> {
@@ -355,7 +356,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
     /// A TCP socket ignores `destination`.
     pub fn try_write(
         &self,
-        buf: &[u8],
+        buf: impl WriteBuffer,
         flags: SendFlags,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
@@ -498,7 +499,8 @@ impl From<BrokerObjectError> for SocketError {
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::WouldBlock
             | BrokerObjectError::PeerClosed
-            | BrokerObjectError::UnsupportedOperation => Self::BackendFailure,
+            | BrokerObjectError::UnsupportedOperation
+            | BrokerObjectError::Fault => Self::BackendFailure,
         }
     }
 }
@@ -508,6 +510,7 @@ impl From<BrokerObjectError> for SocketReadError {
         match error {
             BrokerObjectError::WouldBlock => Self::WouldBlock,
             BrokerObjectError::PeerClosed => Self::ConnectionClosed,
+            BrokerObjectError::Fault => Self::Fault,
             error => Self::Socket(error.into()),
         }
     }
@@ -518,6 +521,7 @@ impl From<BrokerObjectError> for SocketWriteError {
         match error {
             BrokerObjectError::WouldBlock => Self::BufferFull,
             BrokerObjectError::PeerClosed => Self::ConnectionClosed,
+            BrokerObjectError::Fault => Self::Fault,
             error => Self::Socket(error.into()),
         }
     }
@@ -529,7 +533,8 @@ impl From<BrokerObjectError> for SocketAsyncError {
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::PeerClosed
-            | BrokerObjectError::WouldBlock => Self::BackendFailure,
+            | BrokerObjectError::WouldBlock
+            | BrokerObjectError::Fault => Self::BackendFailure,
             BrokerObjectError::ResourceExhausted | BrokerObjectError::OutOfMemory => {
                 Self::ResourceExhausted
             }

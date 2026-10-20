@@ -11,8 +11,9 @@ use litebox_broker_transport::control_ring::{
     CONTROL_RING_MEMORY_SIZE, CONTROL_RING_PARALLEL_SPIN_LIMIT, ControlRingDirection,
     MemoryAccessPolicy, WaitableSharedMemory,
 };
-use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
+use litebox_platform::buffer::RawBytes;
+use litebox_platform::peer_memory;
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -420,6 +421,15 @@ impl SharedMemory for WindowsSharedMemory {
             return Err(SharedMemoryError::AccessFailed);
         }
         Ok(())
+    }
+
+    fn raw_bytes(&self) -> Option<RawBytes<'_>> {
+        if self.policy != MemoryAccessPolicy::Bytes {
+            return None;
+        }
+        // SAFETY: The committed read-write view stays mapped as long as
+        // `self` and is never referenced.
+        Some(unsafe { RawBytes::from_raw_parts(self.view, self.length) })
     }
 }
 

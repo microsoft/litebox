@@ -71,13 +71,6 @@ fn gateway_address(host_address: SocketAddrV4) -> SocketAddrV4 {
     SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, host_address.port())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReceivedPlatformDatagram {
-    received: usize,
-    datagram_length: usize,
-    source_address: SocketAddrV4,
-}
-
 #[test]
 fn pending_socket_retirement_prevents_reactor_activation() {
     let lifecycle = SocketLifecycle::pending();
@@ -172,7 +165,7 @@ fn send_bytes(
     data: &[u8],
     flags: SendFlags,
 ) -> BrokerResult<SocketOutcome<usize>> {
-    litebox_broker_core::socket::send(process, handle, data.to_vec(), flags)
+    litebox_broker_core::socket::send(process, handle, &data, flags)
 }
 
 fn send_datagram(
@@ -182,13 +175,13 @@ fn send_datagram(
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
 ) -> BrokerResult<SocketOutcome<usize>> {
-    litebox_broker_core::socket::send_to(process, handle, data.to_vec(), flags, destination)
+    litebox_broker_core::socket::send_to(process, handle, &data, flags, destination)
 }
 
 fn receive_into(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    data: &mut [u8],
+    mut data: &mut [u8],
     flags: ReceiveFlags,
     peek_offset: u32,
     peek_length: u32,
@@ -196,18 +189,14 @@ fn receive_into(
     match litebox_broker_core::socket::receive(
         process,
         handle,
-        data.len(),
+        &mut data,
         flags,
         peek_offset,
         peek_length,
     )? {
         SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
-            data[..received.len()].copy_from_slice(&received);
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
-                received
-                    .len()
-                    .try_into()
-                    .map_err(|_| BrokerError::Internal)?,
+                received.try_into().map_err(|_| BrokerError::Internal)?,
             )))
         }
         SocketOutcome::Completed(PlatformStreamReceive::EndOfStream) => {
@@ -220,20 +209,10 @@ fn receive_into(
 fn receive_datagram_into(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    data: &mut [u8],
+    mut data: &mut [u8],
     flags: ReceiveFromFlags,
-) -> BrokerResult<SocketOutcome<ReceivedPlatformDatagram>> {
-    match litebox_broker_core::socket::receive_from(process, handle, data.len(), flags)? {
-        SocketOutcome::Completed(received) => {
-            data[..received.data.len()].copy_from_slice(&received.data);
-            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-                received: received.data.len(),
-                datagram_length: received.datagram_length,
-                source_address: received.source_address,
-            }))
-        }
-        SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
-    }
+) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
+    litebox_broker_core::socket::receive_from(process, handle, &mut data, flags)
 }
 
 #[test]

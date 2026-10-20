@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
 use super::errors::{
@@ -388,7 +389,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     fn read(
         &self,
         h: &super::backend::FileHandle,
-        buf: &mut [u8],
+        buf: &mut dyn ReadBuffer,
         offset: usize,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
@@ -396,32 +397,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
         debug_assert!(start <= end);
         let len = end - start;
-        buf[..len].copy_from_slice(&file.data[start..end]);
+        buf.copy_from_slice_at(0, &file.data[start..end])?;
         Ok(len)
     }
 
     fn write(
         &self,
         h: &super::backend::FileHandle,
-        buf: &[u8],
+        buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, WriteError> {
         let mut file = h.get_typed::<Self>().file.write();
-        let overwritten_len = match offset.cmp(&file.data.len()) {
-            core::cmp::Ordering::Less => {
-                let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
-                let overwritten_len = end - offset;
-                file.data.to_mut()[offset..end].copy_from_slice(&buf[..overwritten_len]);
-                overwritten_len
-            }
-            core::cmp::Ordering::Equal => 0,
-            core::cmp::Ordering::Greater => {
-                // Need to pad with 0s because the offset was past the end of the file
-                file.data.to_mut().resize(offset, 0);
-                0
-            }
-        };
-        file.data.to_mut().extend(&buf[overwritten_len..]);
+        let data = file.data.to_mut();
+        let previous_len = data.len();
+        let end = offset.checked_add(buf.len()).unwrap();
+        if end > previous_len {
+            // Pads with 0s if the offset is past the end of the file.
+            data.resize(end, 0);
+        }
+        if let Err(fault) = buf.copy_to_slice_at(0, &mut data[offset..end]) {
+            data.truncate(previous_len);
+            return Err(fault.into());
+        }
         Ok(buf.len())
     }
 

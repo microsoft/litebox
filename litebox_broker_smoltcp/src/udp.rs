@@ -28,6 +28,7 @@ use litebox_broker_protocol::socket::{
     MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, ShutdownMode, SocketConnectionStatus, SocketError,
     SocketOutcome,
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata, UdpMetadata};
 use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
@@ -175,7 +176,7 @@ impl Udp {
     fn deliver(
         &mut self,
         sockets: &mut Sockets,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         source: SocketAddrV4,
         process: Option<ProcessId>,
     ) -> BrokerResult<()> {
@@ -186,10 +187,8 @@ impl Udp {
         if !wanted {
             return Ok(());
         }
-        let mut copy = Vec::new();
-        copy.try_reserve_exact(data.len())
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        copy.extend_from_slice(data);
+        let mut copy = zeroed(data.len())?;
+        data.copy_to_slice_at(0, &mut copy)?;
         self.received
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
@@ -282,7 +281,7 @@ impl Udp {
     fn send_external(
         &mut self,
         sockets: &mut Sockets,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         source: SocketAddrV4,
         destination: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<usize>> {
@@ -290,9 +289,13 @@ impl Udp {
         if data.len() > MAX_EXTERNAL_DATAGRAM {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
+        // smoltcp cannot take back a datagram it has queued, so the payload is
+        // staged first: one whose copy faults is not sent.
+        let mut payload = zeroed(data.len())?;
+        data.copy_to_slice_at(0, &mut payload)?;
         let mut meta = UdpMetadata::from(IpEndpoint::from(destination));
         meta.local_address = Some((*source.ip()).into());
-        match sockets.udp(handle).send_slice(data, meta) {
+        match sockets.udp(handle).send_slice(&payload, meta) {
             Ok(()) => {
                 self.blocked = None;
                 Ok(SocketOutcome::Completed(data.len()))
@@ -316,15 +319,17 @@ impl Udp {
     pub(super) fn receive_from(
         &mut self,
         sockets: &mut Sockets,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         if let Some(error) = self.pending_error.take() {
             return Ok(SocketOutcome::Failed(error));
         }
         let datagram = self.received.front().ok_or(BrokerError::WouldBlock)?;
+        let received = datagram.data.len().min(output.len());
+        output.copy_from_slice_at(0, &datagram.data[..received])?;
         let received = PlatformDatagramReceive {
-            data: datagram.data[..datagram.data.len().min(length)].to_vec(),
+            received,
             datagram_length: datagram.data.len(),
             source_address: datagram.source,
         };
@@ -501,7 +506,7 @@ impl Stack {
     pub(super) fn send_udp(
         &mut self,
         id: u64,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let process = self.entries.get(&id).ok_or(BrokerError::Internal)?.process;

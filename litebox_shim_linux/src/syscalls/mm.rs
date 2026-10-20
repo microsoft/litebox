@@ -9,15 +9,17 @@
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
-    MRemapFlags, MapFlags, ProtFlags,
+    IoReadVec, MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     mm::MmapPlacement,
     vmem::{MappingError, VmemProtectError},
 };
+use litebox_platform::buffer::Buffer as _;
 
 use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
+use crate::guest_buffer::GuestReadBuffer;
 use crate::syscalls::file::AnyTypedFd;
 
 pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
@@ -105,35 +107,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: usize,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
-            // Note a malicious user may unmap ptr while we are reading.
-            // `sys_read` does not handle page faults, so we need to use a
-            // temporary buffer to read the data from fs (without worrying page
-            // faults) and write it to the user buffer with page fault handling.
-            let mut file_offset = offset;
-            // Read in the largest chunks the broker transfers, as each read is a round trip.
-            let max_read = usize::try_from(litebox_broker_protocol::fs::MAX_FILE_TRANSFER_SIZE)
-                .expect("the broker transfer size fits usize");
-            let mut buffer = alloc::vec![0; len.min(max_read)];
+            // A malicious user may unmap ptr while we are reading, which the
+            // guest buffer's copies survive as faults.
+            let iov = IoReadVec {
+                iov_base: ptr,
+                iov_len: len,
+            };
+            let mut buffer = GuestReadBuffer::<Platform>::single(&iov);
             let mut copied = 0;
             while copied < len {
-                let want = (len - copied).min(buffer.len());
                 let size = self
-                    .do_read(fd, &mut buffer[..want], Some(file_offset))
+                    .do_read(
+                        fd,
+                        (&mut buffer).sub_buffer(copied, len - copied),
+                        Some(offset + copied),
+                    )
                     .map_err(|e| match e {
                         // The raw fd was resolved once at syscall entry and is intentionally
                         // not retained; this payload is discarded when converted to EBADF.
                         Errno::EBADF => MappingError::BadFD(-1),
                         Errno::EISDIR => MappingError::NotAFile,
                         Errno::EACCES => MappingError::NotForReading,
+                        Errno::EFAULT => MappingError::MemoryAccess,
                         _ => unimplemented!(),
                     })?;
                 if size == 0 {
                     break;
                 }
-                ptr.copy_from_slice::<Platform>(copied, &buffer[..size])
-                    .ok_or(MappingError::MemoryAccess)?;
                 copied += size;
-                file_offset += size;
             }
             Ok(copied)
         };

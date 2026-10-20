@@ -41,6 +41,8 @@ use litebox_broker_core::fs::errors::{
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use litebox_broker_core::transfer::bounce_buffer;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 /// A live host filesystem rooted at a canonical directory path.
 pub struct LocalFs {
@@ -626,7 +628,12 @@ impl Backend for LocalFs {
         Ok(result)
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         if !self.valid_file(h) {
             return Err(ReadError::Io);
@@ -637,20 +644,28 @@ impl Backend for LocalFs {
             .filter(|_| h.readable)
             .ok_or(ReadError::NotForReading)?;
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
+        let mut staged = bounce_buffer(buf.len())?;
         let result = {
             #[cfg(unix)]
             {
-                std::os::unix::fs::FileExt::read_at(&**file, buf, offset)
+                std::os::unix::fs::FileExt::read_at(&**file, &mut staged, offset)
             }
             #[cfg(windows)]
             {
-                std::os::windows::fs::FileExt::seek_read(&**file, buf, offset)
+                std::os::windows::fs::FileExt::seek_read(&**file, &mut staged, offset)
             }
         };
-        result.map_err(|_| ReadError::Io)
+        let read = result.map_err(|_| ReadError::Io)?;
+        buf.copy_from_slice_at(0, &staged[..read])?;
+        Ok(read)
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        h: &FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+    ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         if !self.valid_file(h) {
             return Err(WriteError::Io);
@@ -661,14 +676,16 @@ impl Backend for LocalFs {
             .filter(|_| h.writable)
             .ok_or(WriteError::NotForWriting)?;
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
+        let mut staged = bounce_buffer(buf.len())?;
+        buf.copy_to_slice_at(0, &mut staged)?;
         let result = {
             #[cfg(unix)]
             {
-                std::os::unix::fs::FileExt::write_at(&**file, buf, offset)
+                std::os::unix::fs::FileExt::write_at(&**file, &staged, offset)
             }
             #[cfg(windows)]
             {
-                std::os::windows::fs::FileExt::seek_write(&**file, buf, offset)
+                std::os::windows::fs::FileExt::seek_write(&**file, &staged, offset)
             }
         };
         result.map_err(|_| WriteError::Io)

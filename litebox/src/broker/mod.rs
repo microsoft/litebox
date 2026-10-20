@@ -49,6 +49,7 @@ use litebox_platform::time::TimeProvider;
 
 use crate::event::{Events, polling::Pollee};
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
+use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 pub(crate) mod error;
 mod shared_buffer;
@@ -163,7 +164,10 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn exit_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
 
-    fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
+    fn fill_random(
+        &self,
+        output: &mut dyn ReadBuffer,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn create_tcp_socket(
         &self,
@@ -224,14 +228,14 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn send_socket(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         flags: BrokerSendFlags,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
 
     fn receive_socket(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        data: &mut dyn ReadBuffer,
         flags: BrokerReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
@@ -241,7 +245,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn send_to_socket(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         flags: BrokerSendFlags,
         destination: Option<SocketAddrV4>,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
@@ -249,7 +253,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn receive_from_socket(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        data: &mut dyn ReadBuffer,
         flags: BrokerReceiveFromFlags,
     ) -> core::result::Result<SocketOutcome<ReceiveFromSocketResponse>, BrokerControlError>;
 
@@ -367,13 +371,13 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn read_pipe(
         &self,
         handle: ObjectHandle,
-        length: u32,
-    ) -> core::result::Result<Vec<u8>, BrokerControlError>;
+        data: &mut dyn ReadBuffer,
+    ) -> core::result::Result<usize, BrokerControlError>;
 
     fn write_pipe(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        data: &dyn WriteBuffer,
     ) -> core::result::Result<usize, BrokerControlError>;
 
     fn open_file(
@@ -388,14 +392,14 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn read_file(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        data: &mut dyn ReadBuffer,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError>;
 
     fn write_file(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError>;
 
@@ -526,7 +530,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>;
 
@@ -536,7 +540,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        data: &mut dyn ReadBuffer,
         peek: bool,
         source: bool,
         nonblocking: bool,
@@ -904,7 +908,10 @@ where
         self.request(|local| local.exit_thread(thread_id))
     }
 
-    fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError> {
+    fn fill_random(
+        &self,
+        output: &mut dyn ReadBuffer,
+    ) -> core::result::Result<(), BrokerControlError> {
         if output.len() > MAX_RANDOM_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -1011,7 +1018,7 @@ where
     fn send_socket(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         flags: BrokerSendFlags,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
@@ -1028,7 +1035,7 @@ where
     fn receive_socket(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        data: &mut dyn ReadBuffer,
         flags: BrokerReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
@@ -1060,7 +1067,7 @@ where
     fn send_to_socket(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         flags: BrokerSendFlags,
         destination: Option<SocketAddrV4>,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
@@ -1080,7 +1087,7 @@ where
     fn receive_from_socket(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        data: &mut dyn ReadBuffer,
         flags: BrokerReceiveFromFlags,
     ) -> core::result::Result<SocketOutcome<ReceiveFromSocketResponse>, BrokerControlError> {
         if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
@@ -1256,25 +1263,19 @@ where
     fn read_pipe(
         &self,
         handle: ObjectHandle,
-        length: u32,
-    ) -> core::result::Result<Vec<u8>, BrokerControlError> {
-        if length > MAX_PIPE_TRANSFER_SIZE {
+        data: &mut dyn ReadBuffer,
+    ) -> core::result::Result<usize, BrokerControlError> {
+        if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let mut data = Vec::new();
-        data.try_reserve_exact(length as usize)
-            .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
-        data.resize(length as usize, 0);
-        let lease = self.acquire_shared_buffer(length as usize)?;
-        let read = self.request(|local| local.read_pipe(handle, lease.sequence(), &mut data))?;
-        data.truncate(read);
-        Ok(data)
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| local.read_pipe(handle, lease.sequence(), data))
     }
 
     fn write_pipe(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        data: &dyn WriteBuffer,
     ) -> core::result::Result<usize, BrokerControlError> {
         if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
@@ -1299,11 +1300,11 @@ where
     fn read_file(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        data: &mut dyn ReadBuffer,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
-        let data = &mut data[..length];
+        let data = &mut data.sub_buffer(0, length);
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.read_file(handle, lease.sequence(), data, offset))
     }
@@ -1311,11 +1312,11 @@ where
     fn write_file(
         &self,
         handle: ObjectHandle,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
-        let data = &data[..length];
+        let data = &data.sub_buffer(0, length);
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.write_file(handle, lease.sequence(), data, offset))
     }
@@ -1515,7 +1516,7 @@ where
         &self,
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>
     {
@@ -1536,7 +1537,7 @@ where
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
-        data: &mut [u8],
+        data: &mut dyn ReadBuffer,
         peek: bool,
         source: bool,
         nonblocking: bool,
@@ -1545,7 +1546,7 @@ where
         BrokerControlError,
     > {
         let capacity = data.len().min(UNIX_SOCKET_BUFFER_SIZE as usize);
-        let data = &mut data[..capacity];
+        let data = &mut data.sub_buffer(0, capacity);
         let name_size = if source {
             MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize
         } else {
@@ -1697,10 +1698,15 @@ mod tests {
             local,
             Arc::new(BrokerPollableRegistry::new()),
         ));
+        let read = |control: Arc<BrokerLocalControl<MockPlatform, _>>, handle| {
+            let mut data = [0; 3];
+            let read = control.read_pipe(handle, &mut data)?;
+            Ok::<_, BrokerControlError>(data[..read].to_vec())
+        };
         let first_control = Arc::clone(&control);
-        let first = std::thread::spawn(move || first_control.read_pipe(ObjectHandle(1), 3));
+        let first = std::thread::spawn(move || read(first_control, ObjectHandle(1)));
         let second_control = Arc::clone(&control);
-        let second = std::thread::spawn(move || second_control.read_pipe(ObjectHandle(2), 3));
+        let second = std::thread::spawn(move || read(second_control, ObjectHandle(2)));
 
         let first_buffer = observed_receiver
             .recv_timeout(Duration::from_secs(1))

@@ -9,6 +9,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -544,7 +546,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub(crate) fn read_without_position_update(
         &self,
         entry: &ResolverEntry<Backend>,
-        buf: &mut [u8],
+        buf: &mut dyn ReadBuffer,
         offset: Option<usize>,
     ) -> Result<(usize, usize), ReadError> {
         if entry.path_only {
@@ -579,7 +581,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn read(
         &self,
         entry: &mut ResolverEntry<Backend>,
-        buf: &mut [u8],
+        buf: &mut dyn ReadBuffer,
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         let (read, read_offset) = self.read_without_position_update(entry, buf, offset)?;
@@ -592,7 +594,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub(crate) fn write_without_position_update(
         &self,
         entry: &ResolverEntry<Backend>,
-        buf: &[u8],
+        buf: &dyn WriteBuffer,
         offset: Option<usize>,
     ) -> Result<(usize, usize), WriteError> {
         if entry.path_only {
@@ -636,7 +638,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn write(
         &self,
         entry: &mut ResolverEntry<Backend>,
-        buf: &[u8],
+        buf: &dyn WriteBuffer,
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
         let (written, write_offset) = self.write_without_position_update(entry, buf, offset)?;

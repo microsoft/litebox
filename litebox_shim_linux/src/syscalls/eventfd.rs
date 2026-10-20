@@ -157,4 +157,39 @@ mod tests {
             .unwrap();
         drop(event);
     }
+
+    #[test]
+    fn test_eventfd_writev_writes_each_iovec() {
+        use crate::UserPtr;
+        use litebox_common_linux::{IoWriteVec, errno::Errno};
+
+        let task = crate::syscalls::tests::init_platform();
+        let fd = i32::try_from(task.sys_eventfd2(0, EfdFlags::NONBLOCK).unwrap()).unwrap();
+        let iov = |value: &u64, len| IoWriteVec {
+            iov_base: UserPtr::from_usize(core::ptr::from_ref(value).expose_provenance()),
+            iov_len: len,
+        };
+        let read = || {
+            let mut value = [0u8; 8];
+            task.sys_read(fd, &mut value, None)
+                .map(|_| u64::from_le_bytes(value))
+        };
+
+        // Each iovec is a separate write, skipping empty ones.
+        let (first, second) = (2u64, 3u64);
+        let iovs = [iov(&first, 8), iov(&first, 0), iov(&second, 8)];
+        let iovs_ptr = UserPtr::from_usize(iovs.as_ptr().expose_provenance());
+        assert_eq!(task.sys_writev(fd, iovs_ptr, 3), Ok(16));
+        assert_eq!(read(), Ok(5));
+
+        // A short iovec fails the write unless an earlier iovec was written.
+        let iovs = [iov(&first, 8), iov(&second, 4)];
+        let iovs_ptr = UserPtr::from_usize(iovs.as_ptr().expose_provenance());
+        assert_eq!(task.sys_writev(fd, iovs_ptr, 2), Ok(8));
+        assert_eq!(read(), Ok(2));
+        let iovs = [iov(&first, 4), iov(&second, 4)];
+        let iovs_ptr = UserPtr::from_usize(iovs.as_ptr().expose_provenance());
+        assert_eq!(task.sys_writev(fd, iovs_ptr, 2), Err(Errno::EINVAL));
+        assert_eq!(read(), Err(Errno::EAGAIN));
+    }
 }

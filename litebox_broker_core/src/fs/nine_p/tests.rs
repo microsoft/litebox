@@ -20,6 +20,7 @@ use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
 use crate::fs::{FileType, Mode, OFlags, SeekWhence};
 use crate::test_platform::TestPlatform;
+use crate::test_support::FaultingBuffer;
 
 use super::{NineP, transport};
 
@@ -540,6 +541,59 @@ fn test_nine_p_broken_read() {
     assert!(matches!(result, Err(ReadError::Io)));
 }
 
+/// A read whose connection breaks after its first `Tread` returns what that `Tread` read.
+#[test]
+fn test_nine_p_broken_read_after_progress() {
+    let server = DiodServer::start();
+
+    let data: alloc::vec::Vec<u8> = (0..100_000)
+        .map(|i: usize| u8::try_from(i % 251).unwrap())
+        .collect();
+    std::fs::write(server.export_path().join("read_me.bin"), &data).unwrap();
+
+    // 5 writes: version + attach + walk + lopen + the first Tread. The second Tread fails.
+    let fs = connect_9p_broken(&server, 5);
+    let mut fd = fs
+        .open(USER, "/read_me.bin", OFlags::RDONLY, Mode::empty())
+        .expect("open should succeed before break");
+
+    let mut buf = alloc::vec![0u8; data.len()];
+    let n = fs
+        .read(&mut fd, &mut buf, None)
+        .expect("read should return the first Tread's bytes");
+    assert!(n > 0 && n < data.len());
+    assert_eq!(buf[..n], data[..n]);
+}
+
+/// A read whose copy faults after its first `Tread` fails, and leaves the file position where it
+/// was.
+#[test]
+fn test_nine_p_faulting_read_after_progress() {
+    let server = DiodServer::start();
+
+    let data: alloc::vec::Vec<u8> = (0..100_000)
+        .map(|i: usize| u8::try_from(i % 251).unwrap())
+        .collect();
+    std::fs::write(server.export_path().join("read_me.bin"), &data).unwrap();
+
+    let fs = connect_9p(&server);
+    let mut fd = fs
+        .open(USER, "/read_me.bin", OFlags::RDONLY, Mode::empty())
+        .expect("open should succeed");
+
+    // A `Tread` carries at most 65512 bytes, so the first copy succeeds and a later one faults.
+    let mut faulting = FaultingBuffer::new(data.len(), 70_000);
+    let result = fs.read(&mut fd, &mut faulting, None);
+    assert!(matches!(result, Err(ReadError::Broker(_))));
+
+    let mut buf = alloc::vec![0u8; data.len()];
+    let n = fs
+        .read(&mut fd, &mut buf, None)
+        .expect("read should succeed");
+    assert_eq!(n, data.len());
+    assert_eq!(buf, data);
+}
+
 /// Writing to an fd obtained before the break should fail.
 #[test]
 fn test_nine_p_broken_write() {
@@ -838,7 +892,7 @@ fn test_nine_p_large_read_write() {
     let mut written = 0;
     while written < data.len() {
         let n = fs
-            .write(&mut fd, &data[written..], None)
+            .write(&mut fd, &&data[written..], None)
             .expect("write failed");
         assert!(n > 0, "write should make progress");
         written += n;
@@ -847,24 +901,16 @@ fn test_nine_p_large_read_write() {
 
     drop(fd);
 
-    // Read it all back
+    // Read it all back in one call, with room to spare: the client sends as many `Tread`s as it
+    // takes and stops at the end of the file.
     let mut fd = fs
         .open(USER, "/large_test.bin", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
-    let mut read_buf = alloc::vec![0u8; data_size];
-    let mut total_read = 0;
-    while total_read < data.len() {
-        let n = fs
-            .read(&mut fd, &mut read_buf[total_read..], None)
-            .expect("read failed");
-        if n == 0 {
-            break;
-        }
-        total_read += n;
-    }
-    assert_eq!(total_read, data.len());
-    assert_eq!(read_buf, data);
+    let mut read_buf = alloc::vec![0u8; data_size + 1];
+    let n = fs.read(&mut fd, &mut read_buf, None).expect("read failed");
+    assert_eq!(n, data.len());
+    assert_eq!(read_buf[..n], data);
 
     drop(fd);
 }

@@ -28,6 +28,7 @@ use litebox_broker_protocol::socket::{
     SocketOptionName, SocketOptionValue, SocketOutcome, SocketType,
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, epoll, eventfd};
 use rustix::io::{Errno, read, write};
@@ -284,23 +285,31 @@ impl PlatformSocket for LinuxSocket {
         self.reactor.connect(self.id, address, guest_source_lease)
     }
 
-    fn send(&self, data: Vec<u8>, _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
+    fn send(
+        &self,
+        data: &dyn WriteBuffer,
+        _flags: SendFlags,
+    ) -> BrokerResult<SocketOutcome<usize>> {
+        let mut staged = zeroed_vec(data.len())?;
+        data.copy_to_slice_at(0, &mut staged)?;
         self.reactor.request(|response| ReactorCommand::Send {
             id: self.id,
-            data,
+            data: staged,
             response,
         })
     }
 
     fn send_to(
         &self,
-        data: Vec<u8>,
+        data: &dyn WriteBuffer,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
+        let mut staged = zeroed_vec(data.len())?;
+        data.copy_to_slice_at(0, &mut staged)?;
         self.reactor.request(|response| ReactorCommand::SendTo {
             id: self.id,
-            data,
+            data: staged,
             destination,
             response,
         })
@@ -309,11 +318,12 @@ impl PlatformSocket for LinuxSocket {
     fn receive(
         &self,
         reader: ObjectHandle,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
     ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
+        let length = output.len();
         let peek_offset =
             usize::try_from(peek_offset).map_err(|_| BrokerError::UnsupportedOperation)?;
         let peek_length =
@@ -327,9 +337,12 @@ impl PlatformSocket for LinuxSocket {
             peek_length,
             response,
         })? {
-            ReactorReceiveOutcome::Received(received) => Ok(SocketOutcome::Completed(
-                PlatformStreamReceive::Received(received),
-            )),
+            ReactorReceiveOutcome::Received(received) => {
+                output.copy_from_slice_at(0, &received)?;
+                Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+                    received.len(),
+                )))
+            }
             ReactorReceiveOutcome::EndOfStream => {
                 Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
             }
@@ -339,26 +352,29 @@ impl PlatformSocket for LinuxSocket {
 
     fn receive_from(
         &self,
-        length: usize,
+        output: &mut dyn ReadBuffer,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         match self
             .reactor
             .request(|response| ReactorCommand::ReceiveFrom {
                 id: self.id,
-                length,
+                length: output.len(),
                 flags,
                 response,
             })? {
             ReactorReceiveFromOutcome::Received {
-                data: received,
+                data,
                 datagram_length,
                 source_address,
-            } => Ok(SocketOutcome::Completed(PlatformDatagramReceive {
-                data: received,
-                datagram_length,
-                source_address,
-            })),
+            } => {
+                output.copy_from_slice_at(0, &data)?;
+                Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                    received: data.len(),
+                    datagram_length,
+                    source_address,
+                }))
+            }
             ReactorReceiveFromOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
         }
     }

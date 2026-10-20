@@ -9,6 +9,7 @@ test-support = []
 [dependencies]
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 thiserror = { version = "2.0.6", default-features = false }
 
 [lints]

@@ -15,6 +15,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{
     TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
 };
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
@@ -99,7 +100,8 @@ impl ObjectEntry {
 mod private {
     use super::{
         BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
-        FileSeekWhence, FileStatus, FileStatusFlags, FileUser, Result, ServiceResult, Vec,
+        FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result, ServiceResult,
+        Vec, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -117,13 +119,18 @@ mod private {
         fn read(
             &self,
             _file: &File,
-            _output: &mut [u8],
+            _output: &mut dyn ReadBuffer,
             _offset: Option<u64>,
         ) -> ServiceResult<usize> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn write(&self, _file: &File, _input: &[u8], _offset: Option<u64>) -> ServiceResult<usize> {
+        fn write(
+            &self,
+            _file: &File,
+            _input: &dyn WriteBuffer,
+            _offset: Option<u64>,
+        ) -> ServiceResult<usize> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -233,7 +240,12 @@ where
         }))
     }
 
-    fn read(&self, file: &File, output: &mut [u8], offset: Option<u64>) -> ServiceResult<usize> {
+    fn read(
+        &self,
+        file: &File,
+        output: &mut dyn ReadBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize> {
         let Ok(offset) = checked_offset(offset, output.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
@@ -257,6 +269,7 @@ where
         let read = match read {
             Ok(read) => read,
             Err(ReadError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
+            Err(ReadError::Broker(error)) => return Err(error),
             Err(error) => return Ok(Err(file_read_error(error))),
         };
         if read > output.len() {
@@ -265,7 +278,12 @@ where
         Ok(Ok(read))
     }
 
-    fn write(&self, file: &File, input: &[u8], offset: Option<u64>) -> ServiceResult<usize> {
+    fn write(
+        &self,
+        file: &File,
+        input: &dyn WriteBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize> {
         let Ok(offset) = checked_offset(offset, input.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
@@ -289,6 +307,7 @@ where
         let written = match written {
             Ok(written) => written,
             Err(WriteError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
+            Err(WriteError::Broker(error)) => return Err(error),
             Err(error) => return Ok(Err(file_write_error(error))),
         };
         if written > input.len() {
@@ -526,7 +545,7 @@ pub(crate) fn open_without_reference(
 pub fn read(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    output: &mut [u8],
+    output: &mut dyn ReadBuffer,
     offset: Option<u64>,
 ) -> Result<FileResult<usize>> {
     if output.len() > MAX_FILE_TRANSFER_SIZE as usize {
@@ -543,7 +562,7 @@ pub fn read(
 pub fn write(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    input: &[u8],
+    input: &dyn WriteBuffer,
     offset: Option<u64>,
 ) -> Result<FileResult<usize>> {
     if input.len() > MAX_FILE_TRANSFER_SIZE as usize {
@@ -847,7 +866,9 @@ fn file_read_error(error: ReadError) -> FileError {
     match error {
         ReadError::NotAFile => FileError::NotFile,
         ReadError::NotForReading => FileError::NotForReading,
-        ReadError::ClosedFd | ReadError::Io | ReadError::WouldBlock => FileError::Io,
+        ReadError::ClosedFd | ReadError::Io | ReadError::WouldBlock | ReadError::Broker(_) => {
+            FileError::Io
+        }
     }
 }
 
@@ -855,7 +876,9 @@ fn file_write_error(error: WriteError) -> FileError {
     match error {
         WriteError::NotAFile => FileError::NotFile,
         WriteError::NotForWriting => FileError::NotForWriting,
-        WriteError::ClosedFd | WriteError::Io | WriteError::WouldBlock => FileError::Io,
+        WriteError::ClosedFd | WriteError::Io | WriteError::WouldBlock | WriteError::Broker(_) => {
+            FileError::Io
+        }
     }
 }
 

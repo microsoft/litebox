@@ -17,6 +17,7 @@ use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileReques
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_transport::channel::LocalCallChannel;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
@@ -63,7 +64,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        destination: &mut [u8],
+        destination: &mut dyn ReadBuffer,
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
         self.validate_file_buffer(buffer, destination.len(), MAX_FILE_TRANSFER_SIZE)?;
@@ -78,7 +79,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     "broker returned oversized file read"
                 );
                 let read = response.read as usize;
-                self.read_shared_buffer(buffer, &mut destination[..read]);
+                self.copy_from_shared_buffer(buffer, read, destination)?;
                 Ok(Ok(read))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -96,10 +97,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        data: &[u8],
+        data: &dyn WriteBuffer,
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
-        self.write_file_buffer(buffer, data, MAX_FILE_TRANSFER_SIZE)?;
+        self.validate_file_buffer(buffer, data.len(), MAX_FILE_TRANSFER_SIZE)?;
+        self.copy_to_shared_buffer(buffer, 0, data)?;
         match self.request_file(FileRequest::Write(WriteFileRequest {
             handle,
             buffer,

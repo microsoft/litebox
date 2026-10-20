@@ -2333,7 +2333,9 @@ fn read_exact_at<Platform: crate::ShimPlatform>(
 ) -> Result<(), NtStatus> {
     let mut offset = 0;
     while !data.is_empty() {
-        let read = fd.read(data, Some(offset), None).map_err(map_read_error)?;
+        let read = fd
+            .read(&mut *data, Some(offset), None)
+            .map_err(map_read_error)?;
         if read == 0 {
             return Err(NtStatus::UNSUCCESSFUL);
         }

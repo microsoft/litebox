@@ -5,8 +5,12 @@
 
 #![no_std]
 
-#[cfg(feature = "lock_tracing")]
 extern crate alloc;
 
+#[cfg(test)]
+extern crate std;
+
+pub mod buffer;
+pub mod peer_memory;
 pub mod sync;
 pub mod time;

@@ -28,6 +28,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::{DirEntry, FileType};
 
@@ -192,17 +193,27 @@ impl super::backend::Backend for TarRo {
             .map(|(name, child)| self.tar_index.dir_entry(name, *child)))
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
         let start = offset.min(file.len());
         let end = offset.checked_add(buf.len()).unwrap().min(file.len());
         debug_assert!(start <= end);
         let len = end - start;
-        buf[..len].copy_from_slice(&file[start..end]);
+        buf.copy_from_slice_at(0, &file[start..end])?;
         Ok(len)
     }
 
-    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        _h: &FileHandle,
+        _buf: &dyn WriteBuffer,
+        _offset: usize,
+    ) -> Result<usize, WriteError> {
         Err(WriteError::NotForWriting)
     }
 
