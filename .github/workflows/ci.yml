@@ -521,6 +521,9 @@ jobs:
           #
           # - `dev_bench` is meant to only be used for benchmarking, and thus
           #   can safely use std.
+          #
+          # - `dev_tools/compat_scanner` is a host-side development tool, and
+          #   thus can safely use std.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_local_userland/Cargo.toml' \
@@ -550,5 +553,6 @@ jobs:
             -not -path './litebox_service_heki/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
+            -not -path './dev_tools/compat_scanner/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
