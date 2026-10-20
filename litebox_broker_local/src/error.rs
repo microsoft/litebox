@@ -24,13 +24,13 @@ pub enum BrokerLocalError<E> {
     },
     #[error("broker rejected request: {0}")]
     Broker(#[source] ErrorCode),
-    #[error("copying the transferred bytes failed")]
-    CopyFailed,
+    #[error("copying the transferred bytes faulted")]
+    Fault,
 }
 
 impl<E> From<Fault> for BrokerLocalError<E> {
     fn from(Fault: Fault) -> Self {
-        Self::CopyFailed
+        Self::Fault
     }
 }
 

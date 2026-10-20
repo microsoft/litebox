@@ -269,12 +269,12 @@ mod tests {
 
         assert!(matches!(
             local.write_pipe(ObjectHandle(2), sequence(0, 1), &FaultingBuffer),
-            Err(BrokerLocalError::CopyFailed)
+            Err(BrokerLocalError::Fault)
         ));
         assert!(local.channel.sent_operations.borrow().is_empty());
         assert!(matches!(
             local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut FaultingBuffer),
-            Err(BrokerLocalError::CopyFailed)
+            Err(BrokerLocalError::Fault)
         ));
     }
 

@@ -84,7 +84,7 @@ impl<E> From<BrokerLocalError<E>> for BrokerControlError {
             | BrokerLocalError::RequestIdExhausted
             | BrokerLocalError::UnexpectedResponseId { .. } => Self::AssociationFailed,
             BrokerLocalError::Broker(error) => Self::Broker(error),
-            BrokerLocalError::CopyFailed => Self::Fault,
+            BrokerLocalError::Fault => Self::Fault,
         }
     }
 }
