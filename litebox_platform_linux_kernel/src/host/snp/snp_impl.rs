@@ -279,6 +279,10 @@ impl litebox::platform::GuestVectorStateProvider for SnpLinuxKernel {
     }
 
     fn set_guest_vector_state(&self, _state: &Self::GuestVectorState) {}
+
+    fn preserves_guest_vector_state(&self) -> bool {
+        false
+    }
 }
 
 impl litebox::platform::TimerProvider for SnpLinuxKernel {

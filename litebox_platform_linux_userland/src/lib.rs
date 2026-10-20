@@ -1615,6 +1615,14 @@ unsafe extern "C" fn exception_signal_handler(
     if in_switch_to_guest(faulting_pc) {
         return unsafe { next_signal_handler(signum, info, context) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if arch::is_guest_xstate_restore(
+        context.uc_mcontext.gregs[libc::REG_RIP as usize]
+            .reinterpret_as_unsigned()
+            .trunc(),
+    ) {
+        return unsafe { next_signal_handler(signum, info, context) };
+    }
 
     // Nested faults in the handler must be classified as host faults.
     #[cfg(target_arch = "aarch64")]

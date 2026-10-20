@@ -5,6 +5,22 @@
 
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+/// `FpxSwBytes::magic1` value marking an XSAVE-format FP state.
+pub const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+/// Trailer stored immediately after the XSAVE area of a signal frame.
+pub const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+/// Size of the `FP_XSTATE_MAGIC2` trailer.
+pub const FP_XSTATE_MAGIC2_SIZE: usize = size_of::<u32>();
+
+/// `Ucontext::flags` bit: the FP state is in XSAVE format.
+pub const UC_FP_XSTATE: usize = 0x1;
+/// `Ucontext::flags` bit: `Sigcontext::ss` holds the interrupted SS.
+pub const UC_SIGCONTEXT_SS: usize = 0x2;
+/// `Ucontext::flags` bit: `rt_sigreturn` restores SS as saved.
+pub const UC_STRICT_RESTORE_SS: usize = 0x4;
+
+/// Software-reserved bytes describing the XSAVE layout of a signal frame,
+/// stored in the otherwise unused tail of the legacy FP area.
 #[repr(C)]
 #[derive(Clone, FromBytes, Immutable, IntoBytes)]
 pub struct FpxSwBytes {
@@ -64,3 +80,6 @@ pub struct FpState {
     pub reserved2: [u32; 12],
     pub sw_reserved: FpxSwBytes,
 }
+
+const _: () = assert!(size_of::<FpState>() == 512);
+const _: () = assert!(core::mem::offset_of!(FpState, sw_reserved) == 464);

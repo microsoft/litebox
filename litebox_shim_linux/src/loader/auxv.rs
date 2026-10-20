@@ -62,6 +62,10 @@ pub enum AuxKey {
     AT_SYSINFO = 32,
     /// the start address of the page containing the VDSO
     AT_SYSINFO_EHDR = 33,
+
+    /* 34...50 not used */
+    /// minimal stack size for signal delivery
+    AT_MINSIGSTKSZ = 51,
 }
 
 pub type AuxVec = alloc::collections::btree_map::BTreeMap<AuxKey, usize>;
@@ -80,6 +84,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(vdso_base) = self.global.platform.get_vdso_address() {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
         }
+
+        // The XSAVE state in x86-64 signal frames makes their size host-dependent.
+        #[cfg(target_arch = "x86_64")]
+        aux.insert(
+            AuxKey::AT_MINSIGSTKSZ,
+            crate::syscalls::signal::max_signal_frame_size(),
+        );
 
         aux
     }
