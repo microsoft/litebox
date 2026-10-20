@@ -223,25 +223,56 @@ where
         let start = ptr.as_usize();
         let range = page_range(start, len)
             .ok_or_else(|| VmemProtectError::UnAligned(start..start.saturating_add(len)))?;
-        if !reservations_cover_range::<Platform>(&self.reservations, &range) {
+        let Some(reservations) = covering_reservations::<Platform>(&self.reservations, &range)
+        else {
             return Err(VmemProtectError::InvalidRange(range));
-        }
+        };
         // SAFETY: Retained reservations cover the range, and the caller excludes accesses
         // that conflict with commitment or permission changes.
-        unsafe {
-            self.platform.commit_pages(
-                || self.reservations.overlapping(range.clone()),
-                range.clone(),
-                permissions,
-                false,
-            )
+        let committed = unsafe {
+            self.platform
+                .commit_pages(|| reservations, range.clone(), permissions, false)
+        };
+        if committed.is_err() {
+            // A range spanning several reservations is committed piecewise, so a failure may
+            // leave earlier pieces committed. Restore the state recorded in `mappings`.
+            self.rollback_failed_commit(&range);
+            return Err(VmemProtectError::UnsupportedProtection);
         }
-        .map_err(|_| VmemProtectError::UnsupportedProtection)?;
         self.mappings.insert(
             range,
             VmFlags::VM_MAY_ACCESS_FLAGS | VmFlags::from(permissions),
         );
         Ok(())
+    }
+
+    /// Best-effort restoration of `range` to the commitment and permissions recorded in
+    /// `mappings` after a partially applied commit.
+    fn rollback_failed_commit(&self, range: &Range<usize>) {
+        for gap in self.mappings.gaps(range) {
+            if let Some(reservations) = covering_reservations::<Platform>(&self.reservations, &gap)
+            {
+                // SAFETY: The gap was uncommitted before the failed commit, so it holds no
+                // guest contents, and the caller's exclusion of conflicting accesses still holds.
+                let _ = unsafe { self.platform.decommit_pages(|| reservations, gap.clone()) };
+            }
+        }
+        for (mapped, flags) in self.mappings.overlapping(range.clone()) {
+            let restored = mapped.start.max(range.start)..mapped.end.min(range.end);
+            if let Some(reservations) =
+                covering_reservations::<Platform>(&self.reservations, &restored)
+            {
+                // SAFETY: The range was committed before the failed commit, which preserved its
+                // contents; this only reapplies its previously recorded permissions.
+                let _ = unsafe {
+                    self.platform.protect_pages(
+                        || reservations,
+                        restored.clone(),
+                        MemoryRegionPermissions::from(*flags),
+                    )
+                };
+            }
+        }
     }
 
     unsafe fn decommit_pages(
@@ -252,17 +283,13 @@ where
         let start = ptr.as_usize();
         let range = page_range(start, len)
             .ok_or_else(|| VmemProtectError::UnAligned(start..start.saturating_add(len)))?;
-        if !reservations_cover_range::<Platform>(&self.reservations, &range) {
+        let Some(reservations) = covering_reservations::<Platform>(&self.reservations, &range)
+        else {
             return Err(VmemProtectError::InvalidRange(range));
-        }
+        };
         // SAFETY: Retained reservations cover the range and the caller relinquishes contents.
-        unsafe {
-            self.platform.decommit_pages(
-                || self.reservations.overlapping(range.clone()),
-                range.clone(),
-            )
-        }
-        .map_err(|_| VmemProtectError::InvalidRange(range.clone()))?;
+        unsafe { self.platform.decommit_pages(|| reservations, range.clone()) }
+            .map_err(|_| VmemProtectError::InvalidRange(range.clone()))?;
         self.mappings.remove(range);
         Ok(())
     }
@@ -307,20 +334,18 @@ where
         let start = ptr.as_usize();
         let range = page_range(start, len)
             .ok_or_else(|| VmemProtectError::UnAligned(start..start.saturating_add(len)))?;
-        if !reservations_cover_range::<Platform>(&self.reservations, &range) {
-            return Err(VmemProtectError::InvalidRange(range));
-        }
         if !self.is_range_mapped(&range) {
             return Err(VmemProtectError::InvalidRange(range));
         }
+        let Some(reservations) = covering_reservations::<Platform>(&self.reservations, &range)
+        else {
+            return Err(VmemProtectError::InvalidRange(range));
+        };
         // SAFETY: The range is committed and covered by retained reservations; the caller
         // excludes accesses that conflict with the permission change.
         unsafe {
-            self.platform.protect_pages(
-                || self.reservations.overlapping(range.clone()),
-                range.clone(),
-                permissions,
-            )
+            self.platform
+                .protect_pages(|| reservations, range.clone(), permissions)
         }?;
         self.mappings.insert(
             range,
@@ -336,7 +361,7 @@ where
     ) -> Result<(), VmemUnmapError> {
         let start = ptr.as_usize();
         let range = page_range(start, len).ok_or(VmemUnmapError::UnAligned)?;
-        if !reservations_cover_range::<Platform>(&self.reservations, &range) {
+        if covering_reservations::<Platform>(&self.reservations, &range).is_none() {
             return Err(litebox::platform::page_mgmt::DeallocationError::AlreadyUnallocated.into());
         }
         self.mappings.remove(range.clone());
@@ -676,20 +701,37 @@ fn page_range(start: usize, len: usize) -> Option<Range<usize>> {
         .then_some(start..end)
 }
 
-fn reservations_cover_range<Platform>(
-    reservations: &Reservations<Platform>,
+/// Returns the reservations overlapping `range` if they contiguously cover it.
+///
+/// Coverage is validated up front so platform operations never act on a partially covered
+/// range; the returned iterator is passed lazily to the platform.
+fn covering_reservations<'a, Platform>(
+    reservations: &'a Reservations<Platform>,
     range: &Range<usize>,
-) -> bool
+) -> Option<impl Iterator<Item = &'a Platform::Reservation> + use<'a, Platform>>
 where
     Platform: crate::ShimPlatform,
 {
+    ranges_cover(
+        reservations
+            .overlapping(range.clone())
+            .map(litebox::platform::page_mgmt::PageReservation::range),
+        range,
+    )
+    .then(|| reservations.overlapping(range.clone()))
+}
+
+/// Returns whether ascending, non-overlapping `extents` contiguously cover a non-empty `range`.
+fn ranges_cover(extents: impl Iterator<Item = Range<usize>>, range: &Range<usize>) -> bool {
+    if range.is_empty() {
+        return false;
+    }
     let mut covered_until = range.start;
-    for reservation in reservations.overlapping(range.clone()) {
-        let extent = reservation.range();
+    for extent in extents {
         if extent.start > covered_until {
             return false;
         }
-        covered_until = extent.end;
+        covered_until = covered_until.max(extent.end);
         if covered_until >= range.end {
             return true;
         }
@@ -706,4 +748,33 @@ where
     <Platform::PlatformReservations as litebox::platform::page_mgmt::ReservationStore>::ReleaseTarget::from(
         reservation,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ranges_cover;
+
+    #[test]
+    fn ranges_cover_requires_contiguous_coverage() {
+        let range = 0x2000..0x6000;
+        assert!(ranges_cover(
+            [0x1000..0x3000, 0x3000..0x7000].into_iter(),
+            &range
+        ));
+        assert!(ranges_cover(core::iter::once(0x2000..0x6000), &range));
+        assert!(!ranges_cover(
+            [0x1000..0x3000, 0x4000..0x7000].into_iter(),
+            &range
+        ));
+        assert!(!ranges_cover(core::iter::once(0x3000..0x7000), &range));
+        assert!(!ranges_cover(
+            [0x2000..0x3000, 0x3000..0x5000].into_iter(),
+            &range
+        ));
+        assert!(!ranges_cover(core::iter::empty(), &range));
+        assert!(!ranges_cover(
+            core::iter::once(0x1000..0x7000),
+            &(0x2000..0x2000)
+        ));
+    }
 }

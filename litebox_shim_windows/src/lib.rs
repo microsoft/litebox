@@ -205,10 +205,16 @@ pub(crate) type WindowsSectionViews<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsSectionView<Platform>>>;
 pub(crate) type WindowsObjectManager<Platform> = ObjectManager<Platform>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Windows placeholder lifecycle of a logical virtual allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WindowsPlaceholderState {
+    /// An ordinary allocation that never participates in placeholder operations.
     None,
+    /// A `MEM_RESERVE_PLACEHOLDER` range that can be split, coalesced, or replaced, but not
+    /// committed directly.
     Reserved,
+    /// A private allocation created with `MEM_REPLACE_PLACEHOLDER`; releasing it with
+    /// `MEM_PRESERVE_PLACEHOLDER` turns it back into a `Reserved` placeholder.
     Replaced,
 }
 
