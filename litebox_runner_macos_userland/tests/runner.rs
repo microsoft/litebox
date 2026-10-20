@@ -660,7 +660,9 @@ fn dynamic_exit_status() {
 
 /// A strong `operator new` overrides libc++'s weak definition, so dyld
 /// patches the cache's uses of it: it makes the cache's DATA_CONST
-/// mappings writable as a whole and writes to them.
+/// mappings writable as a whole and writes to them. Allocations made inside
+/// libc++.dylib (stream buffer growth) then reach the override, which records
+/// its callers.
 #[cfg(feature = "test-broker")]
 #[test]
 fn dynamic_cpp_strong_operator_new_override() {
@@ -669,9 +671,12 @@ fn dynamic_cpp_strong_operator_new_override() {
         dir.path(),
         "clang++",
         "main.cpp",
-        "#include <cstdio>\n#include <cstdlib>\n#include <new>\n\
+        "#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <dlfcn.h>\n\
+         #include <new>\n#include <sstream>\n#include <string>\n\
          int new_calls;\n\
+         void *callers[64];\n\
          void *operator new(std::size_t size) {\n\
+           if (new_calls < 64) callers[new_calls] = __builtin_return_address(0);\n\
            ++new_calls;\n\
            void *p = std::malloc(size ? size : 1);\n\
            if (!p) std::abort();\n\
@@ -681,7 +686,20 @@ fn dynamic_cpp_strong_operator_new_override() {
          int main() {\n\
            int *x = new int(41);\n\
            ++*x;\n\
-           std::printf(\"operator new: %d %d\\n\", *x, new_calls);\n\
+           int direct_calls = new_calls;\n\
+           {\n\
+             std::ostringstream stream;\n\
+             stream << std::string(1000, 'x');\n\
+             if (stream.str().size() != 1000) return 1;\n\
+           }\n\
+           int libcxx_calls = 0;\n\
+           for (int i = 0; i < new_calls && i < 64; ++i) {\n\
+             Dl_info info;\n\
+             if (dladdr(callers[i], &info) && info.dli_fname &&\n\
+                 std::strcmp(info.dli_fname, \"/usr/lib/libc++.1.dylib\") == 0)\n\
+               ++libcxx_calls;\n\
+           }\n\
+           std::printf(\"operator new: %d %d %d\\n\", *x, direct_calls, libcxx_calls > 0);\n\
            delete x;\n\
            return 0;\n\
          }\n",
@@ -690,25 +708,47 @@ fn dynamic_cpp_strong_operator_new_override() {
     let (code, stdout, stderr) = run_guest(&binary);
     assert_eq!(
         (code, stdout.as_slice(), stderr.as_str()),
-        (Some(0), &b"operator new: 42 1\n"[..], "")
+        (Some(0), &b"operator new: 42 1 1\n"[..], "")
     );
 }
 
-/// A cache library the executable links beyond libSystem runs: its code is
-/// rewritten and executable, and no gate island is placed inside it.
+/// The source of a guest printing zlib's version.
 #[cfg(feature = "test-broker")]
-#[test]
-fn dynamic_guest_calls_a_linked_cache_library() {
-    let dir = tempfile::tempdir().unwrap();
-    let binary = compile(
-        dir.path(),
-        "clang",
-        "main.c",
-        "#include <stdio.h>\n#include <zlib.h>\n\
-         int main(void) { printf(\"zlib %s\\n\", zlibVersion()); return 0; }\n",
-        &["-lz"],
+const ZLIB_VERSION: &str = "#include <stdio.h>\n#include <zlib.h>\n\
+     int main(void) { printf(\"zlib %s\\n\", zlibVersion()); return 0; }\n";
+
+/// Change the path of `binary`'s dependency `from` to `to` and re-sign it.
+#[cfg(feature = "test-broker")]
+fn change_dependency(binary: &Path, from: &str, to: &[u8]) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let output = Command::new("xcrun")
+        .args(["install_name_tool", "-change", from])
+        .arg(std::ffi::OsStr::from_bytes(to))
+        .arg(binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let (code, stdout, stderr) = run_guest(&binary);
+    let output = Command::new("codesign")
+        .args(["-s", "-", "-f"])
+        .arg(binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Run the zlib-version guest `binary` and check its output.
+#[cfg(feature = "test-broker")]
+fn assert_prints_zlib_version(binary: &Path) {
+    let (code, stdout, stderr) = run_guest(binary);
     let stdout = String::from_utf8(stdout).unwrap();
     assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
     let version = stdout
@@ -718,6 +758,58 @@ fn dynamic_guest_calls_a_linked_cache_library() {
     assert!(
         !version.is_empty() && version.split('.').all(|part| part.parse::<u32>().is_ok()),
         "{stdout:?}"
+    );
+}
+
+/// A cache library the executable links beyond libSystem runs: its code is
+/// rewritten and executable, and no gate island is placed inside it.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_calls_a_linked_cache_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(dir.path(), "clang", "main.c", ZLIB_VERSION, &["-lz"]);
+    assert_prints_zlib_version(&binary);
+}
+
+/// A cache library linked through `@rpath` and the executable's `LC_RPATH`
+/// is resolved like dyld does and runs.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_calls_a_cache_library_linked_through_rpath() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "main.c",
+        ZLIB_VERSION,
+        &["-lz", "-Wl,-rpath,/usr/lib"],
+    );
+    change_dependency(&binary, "/usr/lib/libz.1.dylib", b"@rpath/libz.1.dylib");
+    assert_prints_zlib_version(&binary);
+}
+
+/// dyld accepts a weakly linked dylib whose name is not UTF-8 (and does not
+/// exist); such an executable still runs under its dyld.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_with_a_non_utf8_weak_dependency_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "main.c",
+        HELLO_WORLD,
+        &["-Wl,-weak-lz"],
+    );
+    change_dependency(
+        &binary,
+        "/usr/lib/libz.1.dylib",
+        b"/usr/lib/lib\xff.1.dylib",
+    );
+    let (code, stdout, stderr) = run_guest(&binary);
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b"Hello, world!\n"[..], "")
     );
 }
 

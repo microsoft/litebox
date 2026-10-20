@@ -544,8 +544,9 @@ pub struct CacheDependency {
 
 impl CacheDependency {
     /// Decode `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB` or
-    /// `LC_LOAD_UPWARD_DYLIB` (`body` is the whole command); `None` for
-    /// other commands.
+    /// `LC_LOAD_UPWARD_DYLIB` of a cache image (`body` is the whole command);
+    /// `None` for other commands. Cache images are built by Apple's cache
+    /// builder, so any malformed or non-UTF-8 name is an error.
     pub fn from_load_command(command: u32, body: &[u8]) -> Result<Option<Self>> {
         use object::macho;
 
@@ -563,6 +564,49 @@ impl CacheDependency {
             attributes: DylibAttributes::decode(command, body)?,
         }))
     }
+
+    /// Decode an executable's dylib load command like
+    /// [`Self::from_load_command`], but reject only what dyld rejects (see
+    /// [`load_command_bytes`]). Names that are not UTF-8 are not cache image
+    /// paths and give `None`.
+    pub fn from_executable_load_command(command: u32, body: &[u8]) -> Result<Option<Self>> {
+        use object::macho;
+
+        if !matches!(
+            command,
+            macho::LC_LOAD_DYLIB
+                | macho::LC_LOAD_WEAK_DYLIB
+                | macho::LC_REEXPORT_DYLIB
+                | macho::LC_LOAD_UPWARD_DYLIB
+        ) {
+            return Ok(None);
+        }
+        let Ok(path) = core::str::from_utf8(load_command_bytes(body)?) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            path: String::from(path),
+            attributes: DylibAttributes::decode(command, body)?,
+        }))
+    }
+}
+
+/// The bytes of the `lc_str` of a load command (`body` is the whole command)
+/// up to its NUL, checked like dyld's `stringOverflow`
+/// (`mach_o/UnsafeHeader.cpp`): the offset (at byte 8, as in every command
+/// with a string) must lie inside the command and a NUL must follow it
+/// inside the command.
+pub fn load_command_bytes(body: &[u8]) -> Result<&[u8]> {
+    let offset = u32_at(body, 8)? as usize;
+    let bytes = body
+        .get(offset..)
+        .filter(|bytes| !bytes.is_empty())
+        .ok_or(SharedCacheError::Malformed("load command string offset"))?;
+    let length = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or(SharedCacheError::Malformed("unterminated string"))?;
+    Ok(&bytes[..length])
 }
 
 /// A `section_64` of a cache image segment.

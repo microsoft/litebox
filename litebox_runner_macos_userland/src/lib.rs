@@ -146,10 +146,17 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             "dynamic executables require a guest random source; build with the `test-broker` feature: {path}"
         );
     }
+    // The executable's path in the guest, as its dyld sees it.
+    #[cfg(feature = "test-broker")]
+    let guest_path = test_broker::EXECUTABLE_PATH;
+    #[cfg(not(feature = "test-broker"))]
+    let guest_path = path.as_str();
     let dyld = if uses_dyld {
         // Verify the host cache before loading anything.
-        let dependencies = plan.map(|plan| plan.dependencies).unwrap_or_default();
-        let cache = shared_cache::GuestCache::open(&dependencies)
+        let (dependencies, rpaths) = plan
+            .map(|plan| (plan.dependencies, plan.rpaths))
+            .unwrap_or_default();
+        let cache = shared_cache::GuestCache::open(guest_path, &dependencies, &rpaths)
             .context("preparing the guest shared cache")?;
         let dyld = std::fs::read(DYLD_PATH).with_context(|| format!("reading {DYLD_PATH}"))?;
         Some((dyld, cache))
@@ -175,9 +182,9 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .build();
     // With test-broker, the executable is read from the guest filesystem.
     #[cfg(feature = "test-broker")]
-    let (path, image) = (test_broker::EXECUTABLE_PATH, None);
+    let (path, image) = (guest_path, None);
     #[cfg(not(feature = "test-broker"))]
-    let (path, image) = (path.as_str(), Some(&data[..]));
+    let (path, image) = (guest_path, Some(&data[..]));
     let program = match (&dyld, image) {
         (Some((dyld, _)), image) => {
             shim.load_program_with_dyld(TaskParams::default(), path, image, dyld, argv, envp)

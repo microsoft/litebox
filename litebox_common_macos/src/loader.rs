@@ -7,8 +7,11 @@
 //! relocations are unsupported. Images slide as a unit, so guest code must
 //! be position independent.
 
-use crate::{PAGE_SIZE, VmProtection, shared_cache::CacheDependency};
-use alloc::{vec, vec::Vec};
+use crate::{
+    PAGE_SIZE, VmProtection,
+    shared_cache::{CacheDependency, load_command_bytes},
+};
+use alloc::{string::String, vec, vec::Vec};
 use core::ops::Range;
 use litebox::utils::ReinterpretSignedExt as _;
 use object::{
@@ -87,8 +90,12 @@ pub struct MachoParsedFile {
     pub uses_dyld: bool,
     /// The image itself is dyld (`MH_DYLINKER`).
     pub is_dyld: bool,
-    /// The dylibs the image links, in load-command order.
+    /// The dylibs the image links, in load-command order. Names that are not
+    /// UTF-8 (never cache image paths) are omitted.
     pub dependencies: Vec<CacheDependency>,
+    /// The image's `LC_RPATH` entries, in load-command order. Entries that
+    /// are not UTF-8 are omitted.
+    pub rpaths: Vec<String>,
 }
 
 /// AOT trampoline payload described by the rewriter's 64-bit footer.
@@ -236,6 +243,7 @@ impl MachoParsedFile {
             .map_err(|_| Invalid("load commands"))?;
         let mut segments = Vec::new();
         let mut dependencies = Vec::new();
+        let mut rpaths = Vec::new();
         let mut entry = None;
         let mut main_entry_file_offset = None;
         let mut command_bytes = 0usize;
@@ -249,12 +257,19 @@ impl MachoParsedFile {
             command_bytes = command_bytes
                 .checked_add(raw.len())
                 .ok_or(Invalid("load commands"))?;
-            if let Some(dependency) = CacheDependency::from_load_command(command.cmd(), raw)
-                .map_err(|_| Invalid("dylib load command"))?
+            if let Some(dependency) =
+                CacheDependency::from_executable_load_command(command.cmd(), raw)
+                    .map_err(|_| Invalid("dylib load command"))?
             {
                 dependencies.push(dependency);
             }
             match command.cmd() {
+                macho::LC_RPATH => {
+                    let path = load_command_bytes(raw).map_err(|_| Invalid("LC_RPATH"))?;
+                    if let Ok(path) = core::str::from_utf8(path) {
+                        rpaths.push(String::from(path));
+                    }
+                }
                 macho::LC_LOAD_DYLINKER => uses_dyld = true,
                 macho::LC_MAIN => {
                     let command = command
@@ -409,6 +424,7 @@ impl MachoParsedFile {
             uses_dyld,
             is_dyld,
             dependencies,
+            rpaths,
         })
     }
 }
@@ -754,30 +770,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dylib_load_commands_are_reported_with_their_attributes() {
-        use crate::shared_cache::DylibAttributes;
-
-        // (cmd, name offset, dylib_use_command flags, name)
-        let commands: [(u32, u32, Option<u32>, &str); 3] = [
-            (macho::LC_LOAD_DYLIB, 24, None, "/usr/lib/libz.1.dylib"),
-            (
-                macho::LC_LOAD_WEAK_DYLIB,
-                24,
-                None,
-                "/usr/lib/libweak.dylib",
-            ),
-            (
-                macho::LC_LOAD_DYLIB,
-                28,
-                Some(0x08),
-                "/usr/lib/libdelayed.dylib",
-            ),
-        ];
+    /// [`image`] followed by `commands`: (cmd, string offset,
+    /// `dylib_use_command` flags, string). Returns the image and each
+    /// command's file offset.
+    fn image_with_string_commands(
+        commands: &[(u32, u32, Option<u32>, &[u8])],
+    ) -> (Vec<u8>, Vec<usize>) {
         let mut data = image();
         let mut offset = METADATA_END;
-        for (command, name_offset, flags, name) in commands {
+        let mut offsets = Vec::new();
+        for &(command, name_offset, flags, name) in commands {
             let size = (name_offset as usize + name.len() + 1).next_multiple_of(8);
+            offsets.push(offset);
             put32(&mut data, offset, command);
             put32(&mut data, offset + 4, u32::try_from(size).unwrap());
             put32(&mut data, offset + 8, name_offset);
@@ -786,15 +790,43 @@ mod tests {
                 put32(&mut data, offset + 24, flags);
             }
             let name_start = offset + name_offset as usize;
-            data[name_start..name_start + name.len()].copy_from_slice(name.as_bytes());
+            data[name_start..name_start + name.len()].copy_from_slice(name);
             offset += size;
         }
-        put32(&mut data, COMMAND_COUNT, 5);
+        put32(
+            &mut data,
+            COMMAND_COUNT,
+            2 + u32::try_from(commands.len()).unwrap(),
+        );
         put32(
             &mut data,
             COMMAND_BYTES,
             u32::try_from(offset - SEGMENT_START).unwrap(),
         );
+        (data, offsets)
+    }
+
+    #[test]
+    fn dylib_load_commands_are_reported_with_their_attributes() {
+        use crate::shared_cache::DylibAttributes;
+
+        let (mut data, offsets) = image_with_string_commands(&[
+            (macho::LC_LOAD_DYLIB, 24, None, b"/usr/lib/libz.1.dylib"),
+            (macho::LC_RPATH, 12, None, b"/usr/lib/swift"),
+            (
+                macho::LC_LOAD_WEAK_DYLIB,
+                24,
+                None,
+                b"/usr/lib/libweak.dylib",
+            ),
+            (
+                macho::LC_LOAD_DYLIB,
+                28,
+                Some(0x08),
+                b"/usr/lib/libdelayed.dylib",
+            ),
+            (macho::LC_RPATH, 12, None, b"@executable_path/../lib"),
+        ]);
         let plan = MachoParsedFile::parse(&data).unwrap();
         let dependencies: Vec<_> = plan
             .dependencies
@@ -809,8 +841,44 @@ mod tests {
                 ("/usr/lib/libdelayed.dylib", DylibAttributes::DELAYED_INIT),
             ]
         );
-        // A name outside its command is rejected.
-        put32(&mut data, METADATA_END + 8, 0x1000);
+        assert_eq!(plan.rpaths, ["/usr/lib/swift", "@executable_path/../lib"]);
+        // Like dyld's stringOverflow, a string outside its command is rejected.
+        put32(&mut data, offsets[0] + 8, 0x1000);
+        assert!(matches!(
+            MachoParsedFile::parse(&data),
+            Err(MachoLoaderError::Invalid("dylib load command"))
+        ));
+        put32(&mut data, offsets[0] + 8, 24);
+        put32(&mut data, offsets[1] + 8, 0x1000);
+        assert!(matches!(
+            MachoParsedFile::parse(&data),
+            Err(MachoLoaderError::Invalid("LC_RPATH"))
+        ));
+    }
+
+    /// dyld only requires a dylib name to start and end with a NUL inside its
+    /// command; such executables still parse, and names that cannot be cache
+    /// image paths are left out.
+    #[test]
+    fn dylib_names_dyld_accepts_are_not_rejected() {
+        let (mut data, offsets) = image_with_string_commands(&[
+            // The name overlaps the dylib struct's version fields.
+            (macho::LC_LOAD_DYLIB, 16, None, b"/usr/lib/libz.1.dylib"),
+            (macho::LC_LOAD_DYLIB, 24, None, b"/usr/lib/lib\xff.dylib"),
+            (macho::LC_RPATH, 12, None, b"/usr/\xfe"),
+            (macho::LC_RPATH, 12, None, b"/usr/lib"),
+        ]);
+        let plan = MachoParsedFile::parse(&data).unwrap();
+        let dependencies: Vec<_> = plan
+            .dependencies
+            .iter()
+            .map(|dependency| dependency.path.as_str())
+            .collect();
+        assert_eq!(dependencies, ["/usr/lib/libz.1.dylib"]);
+        assert_eq!(plan.rpaths, ["/usr/lib"]);
+        // No NUL inside the command: dyld rejects it, and so does the parser.
+        let size = u32::from_le_bytes(data[offsets[1] + 4..offsets[1] + 8].try_into().unwrap());
+        data[offsets[1] + 24..offsets[1] + size as usize].fill(b'x');
         assert!(matches!(
             MachoParsedFile::parse(&data),
             Err(MachoLoaderError::Invalid("dylib load command"))

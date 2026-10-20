@@ -1027,11 +1027,12 @@ fn shared_region_map_and_slide_never_maps_another_cache() {
     assert_eq!(call(&task, &[1, 0x10, 1, 0]), (Errno::EFAULT.raw(), true));
     // Without an instance nothing can be mapped.
     assert_eq!(call(&task, &[1, files, 1, 0]), (Errno::EINVAL.raw(), true));
-    // With an instance, the region is already mapped: KERN_FAILURE.
+    // With an instance, the region is already mapped: KERN_FAILURE, which
+    // _shared_region_map_and_slide converts to EINVAL.
     let program = install_test_cache(0x75_0000_0000);
     assert_eq!(
         call(&program.entrypoints.task, &[1, files, 1, 0]),
-        (Errno::EIO.raw(), true)
+        (Errno::EINVAL.raw(), true)
     );
 }
 

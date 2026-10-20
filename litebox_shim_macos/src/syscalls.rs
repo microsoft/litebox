@@ -67,12 +67,17 @@ impl<P: ShimPlatform> Task<P> {
     /// task's shared region only when it cannot reuse one. The guest's region
     /// already holds its private instance, and no other region can be
     /// mapped, so this never reaches the host. Like XNU
-    /// (`bsd/vm/vm_unix.c`), empty requests succeed and oversized counts or
-    /// unreadable file arrays fail first; then `vm_shared_region_map_file`
-    /// fails a region that is already mapped with `KERN_FAILURE`, which the
-    /// syscall returns as is: the guest sees errno 5 (`EIO`). Without an instance, the request is refused
-    /// with `EINVAL` (`_shared_region_map_and_slide`'s conversion of
-    /// `KERN_INVALID_ARGUMENT`).
+    /// (`bsd/vm/vm_unix.c`), empty requests succeed, oversized counts fail
+    /// with a raw `KERN_FAILURE` (the guest sees errno 5, `EIO`) and
+    /// unreadable file arrays with `EFAULT`. Every later failure goes through
+    /// `_shared_region_map_and_slide`, which converts `KERN_FAILURE` (a region
+    /// that is already mapped) and `KERN_INVALID_ARGUMENT` alike to `EINVAL`,
+    /// so the request is refused with `EINVAL` whether or not an instance is
+    /// installed.
+    #[expect(
+        clippy::unused_self,
+        reason = "dispatched like every other syscall; the result never depends on the task"
+    )]
     pub(crate) fn sys_shared_region_map_and_slide_2_np(
         &self,
         files_count: u32,
@@ -86,7 +91,7 @@ impl<P: ShimPlatform> Task<P> {
         const MAX_MAPPINGS: u32 = MAX_FILES * 8;
         /// `sizeof(struct shared_file_np)`.
         const FILE_BYTES: usize = 12;
-        // XNU returns these kern_return_t values as errno values.
+        // XNU returns the count-limit kern_return_t as an errno value.
         const KERN_FAILURE: Errno = Errno::EIO;
 
         if files_count == 0 || mappings_count == 0 {
@@ -98,9 +103,6 @@ impl<P: ShimPlatform> Task<P> {
         files
             .to_owned_slice::<P>(files_count as usize * FILE_BYTES)
             .ok_or(Errno::EFAULT)?;
-        if self.global.shared_cache_base.load(Ordering::Acquire) != 0 {
-            return Err(KERN_FAILURE);
-        }
         Err(Errno::EINVAL)
     }
 

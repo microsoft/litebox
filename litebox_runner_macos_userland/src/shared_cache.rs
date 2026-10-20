@@ -20,10 +20,21 @@
 //!
 //! The closure is the launch-time initializer closure of
 //! `/usr/lib/libSystem.B.dylib`, dyld-in-cache and the executable's own
-//! cache dependencies. Gate islands are whole pages of the shared region
+//! cache dependencies, including `@rpath/`, `@executable_path/` and
+//! `@loader_path/` ones resolved like dyld against the executable's guest path
+//! and `LC_RPATH` entries. Gate islands are whole pages of the shared region
 //! outside every cache mapping, or strictly inside `__TEXT,__text` of cache
 //! images outside the launch set (every image dyld creates a loader for);
 //! the guest never reads their bytes.
+//!
+//! Known limitation: only the main executable's load commands are read. A
+//! cache image reached only through a dylib outside the cache (one the
+//! executable links that in turn links a cache image the executable does
+//! not) is not a root: its code is never made executable, so the program
+//! faults when it calls it, and one of its `__text` pages may hold a gate
+//! island. A guest call landing there runs gate code instead of the image's,
+//! which only enters the shim like any other gate: the misbehavior stays
+//! inside the guest and grants no host rights.
 
 use anyhow::{Context as _, Result, bail, ensure};
 use litebox_common_macos::{
@@ -42,7 +53,7 @@ use litebox_shim_macos::{
     },
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
     ops::Range,
     os::fd::AsRawFd as _,
@@ -68,6 +79,121 @@ const ISLAND_WINDOW: u64 = 16 << 20;
 /// Placement conflicts with concurrent host allocations tolerated while
 /// reserving the instance.
 const RESERVATION_ATTEMPTS: usize = 64;
+/// Darwin `PATH_MAX`: dyld builds candidate paths in buffers of this size.
+const PATH_MAX: usize = litebox_common_macos::PATH_MAX;
+/// Candidate paths examined while rooting the executable's dependencies,
+/// bounding host work for executables with huge numbers of `LC_RPATH` and
+/// `@rpath` load commands.
+const MAX_DEPENDENCY_CANDIDATES: usize = 1 << 16;
+
+/// dyld's `Utils::concatenatePaths`: append `suffix`, avoiding a double slash.
+fn concatenate_paths(path: &mut String, suffix: &str) {
+    match suffix.strip_prefix('/') {
+        Some(rest) if path.ends_with('/') => path.push_str(rest),
+        _ => path.push_str(suffix),
+    }
+}
+
+/// The remainder of `path` after `variable` when `path` is `variable` alone or
+/// followed by `/` (dyld's `@loader_path` / `@executable_path` checks).
+fn path_variable_tail<'a>(path: &'a str, variable: &str) -> Option<&'a str> {
+    let tail = path.strip_prefix(variable)?;
+    (tail.is_empty() || tail.starts_with('/')).then_some(tail)
+}
+
+/// Expand `@loader_path` and `@executable_path` for an image loaded by the
+/// main executable at `executable_path`, where both name its directory.
+///
+/// `@loader_path` follows dyld's `Loader::expandAtLoaderPath`;
+/// `@executable_path` follows `Loader::expandAndNormalizeAtExecutablePath`,
+/// including its folding of leading `/..` components. dyld's folding steps
+/// before the start of its buffer for an executable directly in `/`; here
+/// folding stops at `/` instead.
+fn expand_path_variables(executable_path: &str, path: &str) -> Option<String> {
+    let directory_end = executable_path.rfind('/')?;
+    if let Some(tail) = path_variable_tail(path, "@loader_path") {
+        return Some(format!("{}{tail}", &executable_path[..directory_end]));
+    }
+    let mut tail = path_variable_tail(path, "@executable_path")?;
+    if tail.is_empty() {
+        return Some(String::from(&executable_path[..=directory_end]));
+    }
+    let mut directory_end = directory_end;
+    while tail.starts_with("/..") {
+        match executable_path[..directory_end].rfind('/') {
+            Some(parent) if parent != 0 => {
+                tail = &tail[3..];
+                directory_end = parent;
+            }
+            _ => break,
+        }
+    }
+    Some(format!("{}{tail}", &executable_path[..directory_end]))
+}
+
+/// Resolve a dependency of the main executable at `executable_path` with
+/// `LC_RPATH` entries `rpaths` to the first candidate path that `lookup`
+/// finds, in the order of dyld's `Loader::forEachResolvedAtPathVar`:
+/// `@loader_path/` and `@executable_path/` expansions, then `@rpath/`
+/// expanded with each run path in order, then `load_path` itself unless it
+/// starts with `@`.
+///
+/// Approximations: like the guest filesystem, no file exists on disk at any
+/// candidate, so the first candidate in the cache is the one dyld loads;
+/// the process is unrestricted (dyld's `allowAtPaths`); relative run paths,
+/// cryptex-prefixed candidates and bare leaf names (dyld's implicit `@rpath`)
+/// never name cache images and are not tried; and paths of `PATH_MAX` bytes
+/// or more, which dyld truncates, name no cache image. Each candidate
+/// examined consumes one unit of `budget`.
+fn resolve_dependency(
+    executable_path: &str,
+    rpaths: &[String],
+    load_path: &str,
+    budget: &mut usize,
+    lookup: impl Fn(&str) -> Option<usize>,
+) -> Result<Option<usize>> {
+    let mut try_candidate = |candidate: &str| -> Result<Option<usize>> {
+        *budget = budget
+            .checked_sub(1)
+            .context("the executable has too many dylib and LC_RPATH load commands")?;
+        Ok(if candidate.len() < PATH_MAX {
+            lookup(candidate)
+        } else {
+            None
+        })
+    };
+    if load_path.len() >= PATH_MAX {
+        return Ok(None);
+    }
+    if let Some(candidate) = expand_path_variables(executable_path, load_path) {
+        return try_candidate(&candidate);
+    }
+    if let Some(tail) = load_path
+        .strip_prefix("@rpath")
+        .filter(|tail| tail.starts_with('/'))
+    {
+        for rpath in rpaths.iter().filter(|rpath| rpath.len() < PATH_MAX) {
+            let mut candidate = if rpath.starts_with('@') {
+                match expand_path_variables(executable_path, rpath) {
+                    Some(expanded) => expanded,
+                    None => continue,
+                }
+            } else if rpath.starts_with('/') {
+                rpath.clone()
+            } else {
+                continue;
+            };
+            concatenate_paths(&mut candidate, tail);
+            if let Some(index) = try_candidate(&candidate)? {
+                return Ok(Some(index));
+            }
+        }
+    }
+    if load_path.starts_with('@') {
+        return Ok(None);
+    }
+    try_candidate(load_path)
+}
 
 unsafe extern "C" {
     fn _dyld_get_shared_cache_range(length: *mut usize) -> *const u8;
@@ -179,11 +305,16 @@ impl GuestCache {
     /// verify the on-disk cache files (main and subcache UUIDs, mappings,
     /// slide info v5). Fails closed on any mismatch.
     ///
-    /// `dependencies` are the executable's dylib load commands: those in the
-    /// cache are roots of the closure (unless their initialization is
-    /// delayed) and of the launch set. dyld itself reports dependencies
-    /// outside the cache.
-    pub(crate) fn open(dependencies: &[CacheDependency]) -> Result<Arc<Self>> {
+    /// `dependencies` are the dylib load commands of the executable at guest
+    /// path `executable_path` with `LC_RPATH` entries `rpaths`. Those that
+    /// resolve into the cache (see [`resolve_dependency`]) are roots of the
+    /// closure (unless their initialization is delayed) and of the launch
+    /// set. dyld itself reports dependencies it cannot load.
+    pub(crate) fn open(
+        executable_path: &str,
+        dependencies: &[CacheDependency],
+        rpaths: &[String],
+    ) -> Result<Arc<Self>> {
         let mut files = MappedFiles(Vec::new());
         let mut length = 0;
         // SAFETY: `length` is writable; the call only reports the live cache range.
@@ -240,8 +371,20 @@ impl GuestCache {
             cache.dyld_image_index().context("the cache has no dyld")?,
         ];
         let mut launch_roots = roots.clone();
+        let mut indices_by_path = HashMap::new();
+        for (index, image) in cache.images().iter().enumerate() {
+            indices_by_path.entry(image.path.as_str()).or_insert(index);
+        }
+        let mut budget = MAX_DEPENDENCY_CANDIDATES;
         for dependency in dependencies {
-            let Some(index) = cache.image_index_by_path(&dependency.path) else {
+            let Some(index) = resolve_dependency(
+                executable_path,
+                rpaths,
+                &dependency.path,
+                &mut budget,
+                |path| indices_by_path.get(path).copied(),
+            )?
+            else {
                 continue;
             };
             if !dependency
@@ -1091,6 +1234,152 @@ mod tests {
                 0x1_8000_1234
             );
         }
+    }
+
+    #[test]
+    fn path_variables_expand_like_dyld() {
+        let main = "/Applications/App.app/Contents/MacOS/App";
+        for (path, expanded) in [
+            (
+                "@loader_path/libx.dylib",
+                Some("/Applications/App.app/Contents/MacOS/libx.dylib"),
+            ),
+            ("@loader_path", Some("/Applications/App.app/Contents/MacOS")),
+            (
+                "@loader_path/../Frameworks",
+                Some("/Applications/App.app/Contents/MacOS/../Frameworks"),
+            ),
+            (
+                "@executable_path",
+                Some("/Applications/App.app/Contents/MacOS/"),
+            ),
+            (
+                "@executable_path/../Frameworks",
+                Some("/Applications/App.app/Contents/Frameworks"),
+            ),
+            (
+                "@executable_path/../../../../../x",
+                Some("/Applications/../../x"),
+            ),
+            ("@executable_pathx", None),
+            ("@loader_pathx/y", None),
+            ("/usr/lib", None),
+        ] {
+            assert_eq!(
+                expand_path_variables(main, path).as_deref(),
+                expanded,
+                "{path}"
+            );
+        }
+        // An executable directly in `/` folds nothing.
+        assert_eq!(
+            expand_path_variables("/executable", "@executable_path/../usr/lib").as_deref(),
+            Some("/../usr/lib")
+        );
+        assert_eq!(
+            expand_path_variables("/executable", "@loader_path/usr/lib").as_deref(),
+            Some("/usr/lib")
+        );
+    }
+
+    #[test]
+    fn dependencies_resolve_to_the_first_cache_candidate_in_dyld_order() {
+        let cache = ["/usr/lib/libz.1.dylib", "/usr/lib/swift/libswiftCore.dylib"];
+        let tried = core::cell::RefCell::new(Vec::new());
+        let lookup = |path: &str| {
+            tried.borrow_mut().push(String::from(path));
+            cache.iter().position(|image| *image == path)
+        };
+        let rpaths: Vec<String> = [
+            "relative/lib",
+            "@executable_path/../lib",
+            "/usr/lib/swift/",
+            "@loader_path/../usr/lib",
+            "/usr/lib",
+            "@unknown/lib",
+        ]
+        .map(String::from)
+        .into();
+        let resolve = |load_path: &str| {
+            tried.borrow_mut().clear();
+            let mut budget = MAX_DEPENDENCY_CANDIDATES;
+            let index =
+                resolve_dependency("/opt/bin/main", &rpaths, load_path, &mut budget, lookup)
+                    .unwrap();
+            (index, tried.borrow().clone())
+        };
+        // Run paths are tried in order, expanded against the executable's
+        // directory; relative and unknown ones are skipped.
+        assert_eq!(
+            resolve("@rpath/libswiftCore.dylib"),
+            (
+                Some(1),
+                vec![
+                    String::from("/opt/lib/libswiftCore.dylib"),
+                    String::from("/usr/lib/swift/libswiftCore.dylib"),
+                ]
+            )
+        );
+        assert_eq!(
+            resolve("@rpath/libz.1.dylib"),
+            (
+                Some(0),
+                vec![
+                    String::from("/opt/lib/libz.1.dylib"),
+                    String::from("/usr/lib/swift/libz.1.dylib"),
+                    String::from("/opt/bin/../usr/lib/libz.1.dylib"),
+                    String::from("/usr/lib/libz.1.dylib"),
+                ]
+            )
+        );
+        // Executable- and loader-relative paths have one candidate. Like
+        // dyld, folding `..` never reaches `/`.
+        assert_eq!(
+            resolve("@executable_path/../../usr/lib/libz.1.dylib"),
+            (None, vec![String::from("/opt/../usr/lib/libz.1.dylib")])
+        );
+        assert_eq!(
+            resolve("@loader_path/libz.1.dylib"),
+            (None, vec![String::from("/opt/bin/libz.1.dylib")])
+        );
+        // Absolute paths are looked up as is; other `@` forms not at all.
+        assert_eq!(
+            resolve("/usr/lib/libz.1.dylib"),
+            (Some(0), vec![String::from("/usr/lib/libz.1.dylib")])
+        );
+        assert_eq!(resolve("@rpathx/libz.1.dylib"), (None, vec![]));
+        let long = format!("/{}", "x".repeat(PATH_MAX));
+        assert_eq!(resolve(&long), (None, vec![]));
+    }
+
+    #[test]
+    fn dependency_resolution_is_bounded() {
+        let rpaths = vec![String::from("/usr/lib/none"), String::from("/usr/lib")];
+        let lookup = |path: &str| (path == "/usr/lib/libz.1.dylib").then_some(0);
+        // Each examined candidate consumes one unit of the budget.
+        let mut budget = 3;
+        assert_eq!(
+            resolve_dependency(
+                "/executable",
+                &rpaths,
+                "@rpath/libz.1.dylib",
+                &mut budget,
+                lookup
+            )
+            .unwrap(),
+            Some(0)
+        );
+        assert_eq!(budget, 1);
+        assert!(
+            resolve_dependency(
+                "/executable",
+                &rpaths,
+                "@rpath/libz.1.dylib",
+                &mut budget,
+                lookup
+            )
+            .is_err()
+        );
     }
 
     #[test]
