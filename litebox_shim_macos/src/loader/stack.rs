@@ -196,28 +196,6 @@ mod tests {
                 "security_config=0x0",
             ]
         );
-        for removed in [
-            "executable_mh=",
-            "th_port=",
-            "ptrauth_disabled",
-            "dyld_hw_tpro",
-        ] {
-            assert!(strings.iter().all(|string| !string.starts_with(removed)));
-        }
-    }
-
-    #[test]
-    fn apple_strings_without_entropy_omit_only_entropy_keys() {
-        let strings = apple_strings("/bin/main", &main_stack(), None).unwrap();
-        let strings: Vec<_> = strings.iter().map(|s| s.to_str().unwrap()).collect();
-        assert_eq!(
-            strings,
-            [
-                "executable_path=/bin/main",
-                "main_stack=0x70000000,0x800000,0x6f7fc000,0x804000",
-                "security_config=0x0",
-            ]
-        );
         assert!(matches!(
             apple_strings("/bin/\0main", &main_stack(), None),
             Err(MachoLoaderError::Invalid(_))

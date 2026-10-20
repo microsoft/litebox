@@ -291,20 +291,11 @@ struct GlobalState<P: ShimPlatform> {
 /// Fixed-size record of the unsupported syscall selectors already logged, so a
 /// guest cycling through selectors cannot grow host memory: one bit per BSD
 /// number and Mach trap in XNU's tables, and one flag shared by all others.
+#[derive(Default)]
 struct ReportedSyscalls {
     bsd: [u64; Self::BSD_SELECTORS / 64],
     mach: [u64; Self::MACH_TRAPS / 64],
     other: bool,
-}
-
-impl Default for ReportedSyscalls {
-    fn default() -> Self {
-        Self {
-            bsd: [0; Self::BSD_SELECTORS / 64],
-            mach: [0; Self::MACH_TRAPS / 64],
-            other: false,
-        }
-    }
 }
 
 impl ReportedSyscalls {

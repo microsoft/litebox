@@ -27,6 +27,7 @@ use litebox_syscall_rewriter::macho::Rewriter;
 /// fixed pointer ranges.
 pub const SHARED_CACHE_MIN_ADDRESS: usize = 64 << 30;
 
+/// Why reserving or installing a shared-cache instance failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SharedCacheInstallError {
     AlreadyInstalled,
@@ -457,8 +458,8 @@ impl<P: ShimPlatform> LoadedProgram<P> {
                 }
             }
         }
-        mappings.extend(islands.into_iter().map(|range| SharedCacheMapping {
-            range,
+        mappings.extend(islands.iter().map(|range| SharedCacheMapping {
+            range: range.clone(),
             protection: executable,
             max_protection: executable,
             paged: false,
@@ -472,14 +473,7 @@ impl<P: ShimPlatform> LoadedProgram<P> {
             .zip(&rewritten)
             .filter(|(_, rewritten)| **rewritten)
             .map(|(piece, _)| piece.range.clone())
-            .chain(
-                cache
-                    .gate_islands
-                    .iter()
-                    .zip(&gates)
-                    .filter(|(_, gates)| !gates.is_empty())
-                    .map(|(island, _)| island.clone()),
-            )
+            .chain(islands)
             .collect();
         rewritten_ranges.sort_by_key(|range| range.start);
         if let Some(unexpected) = task

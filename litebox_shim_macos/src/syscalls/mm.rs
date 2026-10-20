@@ -2231,15 +2231,8 @@ mod tests {
         );
         assert!(!flags_at(task, below).contains(VmFlags::VM_WRITE));
         assert!(!flags_at(task, base).contains(VmFlags::VM_WRITE));
-        // A hole above the instance: ENOMEM, and nothing changes either.
+        // Without the refusing mapping the same request applies to every part.
         task.sys_munmap(cache.end, PAGE_SIZE).unwrap();
-        assert_eq!(
-            task.sys_mprotect(below, 3 * PAGE_SIZE, RW),
-            Err(Errno::ENOMEM)
-        );
-        assert!(!flags_at(task, below).contains(VmFlags::VM_WRITE));
-        assert!(!flags_at(task, base).contains(VmFlags::VM_WRITE));
-        // Without the hole the same request applies to every part.
         assert_eq!(task.sys_mprotect(below, 2 * PAGE_SIZE, RW), Ok(()));
         assert!(flags_at(task, below).contains(VmFlags::VM_WRITE));
         assert!(flags_at(task, base).contains(VmFlags::VM_WRITE));

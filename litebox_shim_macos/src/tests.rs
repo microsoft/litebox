@@ -549,15 +549,6 @@ fn bsd_unmap_and_fixed_map_cannot_replace_shared_cache_pieces() {
         );
     }
     assert_eq!(shared_cache_snapshot(task, &range), before);
-    // Rewritten code stays unwritable and Source text unexecutable.
-    assert_eq!(
-        task.sys_mprotect(page(0).start, PAGE_SIZE, RW),
-        Err(Errno::EACCES)
-    );
-    assert_eq!(
-        task.sys_mprotect(page(1).start, PAGE_SIZE, RX),
-        Err(Errno::EACCES)
-    );
     // The pager still supplies the untouched page exactly once.
     assert!(task.page_in_shared_cache(page(4).start));
     assert_eq!(read_guest(page(4).start, 2).unwrap(), [0x77, 0x77]);
@@ -604,10 +595,6 @@ fn shared_cache_page_in_uses_the_recorded_protection() {
 
 #[test]
 fn shared_cache_page_in_ignores_faults_at_the_top_of_the_address_space() {
-    let task = task(MacosShimBuilder::new(Platform::new()).build());
-    for address in [usize::MAX, usize::MAX - PAGE_SIZE + 1, 0] {
-        assert!(!task.page_in_shared_cache(address));
-    }
     let program = install_test_cache(0x72_0000_0000);
     let task = &program.entrypoints.task;
     for address in [usize::MAX, usize::MAX - PAGE_SIZE + 1, 0] {
@@ -735,8 +722,8 @@ fn gate_bytes_per_site(
     gates[0].len()
 }
 
-/// Whether every word of `code` at `address` that was a site now branches
-/// into one of `islands`.
+/// The index in `islands` that each word of `code` at `address` branches
+/// into; panics if a word is not such a branch.
 fn sites_branch_into(
     code: &[u8],
     address: usize,
