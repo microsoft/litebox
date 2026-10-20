@@ -600,10 +600,6 @@ struct TestSocketState {
     closed_processes: StdMutex<std::vec::Vec<ProcessId>>,
     sent: StdMutex<std::vec::Vec<u8>>,
     next_send_count: StdMutex<Option<usize>>,
-    /// How many bytes the next send copies, if not all.
-    next_copy_length: StdMutex<Option<usize>>,
-    /// Ignores a faulting copy, as a faulty platform might.
-    ignore_faults: core::sync::atomic::AtomicBool,
     connect_calls: AtomicUsize,
     connect_destinations: StdMutex<std::vec::Vec<SocketAddrV4>>,
     connect_source_addresses: StdMutex<std::vec::Vec<Option<SocketAddrV4>>>,
@@ -746,10 +742,6 @@ impl TestSocketProvider {
         *self.state.next_send_count.lock().unwrap() = Some(count);
     }
 
-    fn copy_next_send(&self, length: usize) {
-        *self.state.next_copy_length.lock().unwrap() = Some(length);
-    }
-
     fn return_next_stream_receive(
         &self,
         copied: &[u8],
@@ -861,25 +853,10 @@ impl TestPlatformSocket {
         }
     }
 
-    /// Passes on a copy's fault, unless told to ignore it.
-    fn copied(&self, result: core::result::Result<(), Fault>) -> Result<()> {
-        if self.state.ignore_faults.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        Ok(result?)
-    }
-
-    /// Copies in `data`, or as much of it as told to.
+    /// Copies in `data`.
     fn copy_in(&self, data: &dyn WriteBuffer) -> Result<()> {
-        let length = self
-            .state
-            .next_copy_length
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap_or(data.len());
-        let mut bytes = vec![0; length];
-        self.copied(data.copy_to_slice_at(0, &mut bytes))?;
+        let mut bytes = vec![0; data.len()];
+        data.copy_to_slice_at(0, &mut bytes)?;
         self.state.sent.lock().unwrap().extend_from_slice(&bytes);
         Ok(())
     }
@@ -1094,11 +1071,11 @@ impl PlatformSocket for TestPlatformSocket {
     ) -> Result<SocketOutcome<PlatformStreamReceive>> {
         self.state.receive_calls.fetch_add(1, Ordering::Relaxed);
         if let Some((copied, received)) = self.state.next_stream_receive.lock().unwrap().take() {
-            self.copied(output.copy_from_slice_at(0, &copied))?;
+            output.copy_from_slice_at(0, &copied)?;
             return received;
         }
         let received = output.len().min(2);
-        self.copied(output.copy_from_slice_at(0, &[7, 9][..received]))?;
+        output.copy_from_slice_at(0, &[7, 9][..received])?;
         Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
             received,
         )))
@@ -1113,11 +1090,11 @@ impl PlatformSocket for TestPlatformSocket {
             .receive_from_calls
             .fetch_add(1, Ordering::Relaxed);
         if let Some((copied, received)) = self.state.next_datagram_receive.lock().unwrap().take() {
-            self.copied(output.copy_from_slice_at(0, &copied))?;
+            output.copy_from_slice_at(0, &copied)?;
             return received;
         }
         let received = output.len().min(2);
-        self.copied(output.copy_from_slice_at(0, &[7, 9][..received]))?;
+        output.copy_from_slice_at(0, &[7, 9][..received])?;
         Ok(SocketOutcome::Completed(PlatformDatagramReceive {
             received,
             datagram_length: 4,
@@ -2580,43 +2557,31 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         send(&process, handle, &[1, 2, 3], SendFlags::NONE),
         Ok(SocketOutcome::Completed(2))
     );
-    provider.copy_next_send(2);
-    assert_eq!(
-        send(&process, handle, &[1, 2, 3], SendFlags::NONE),
-        Err(BrokerError::Internal)
-    );
     assert_eq!(
         send(&process, handle, &[], SendFlags::NONE),
         Ok(SocketOutcome::Completed(0))
     );
-    // A faulting buffer fails the transfer, even when the platform ignores the fault.
-    for ignored in [false, true] {
-        provider
-            .state
-            .ignore_faults
-            .store(ignored, Ordering::Relaxed);
-        assert_eq!(
-            send(
-                &process,
-                handle,
-                &FaultingBuffer::new(1, 0),
-                SendFlags::NONE
-            ),
-            Err(Fault.into())
-        );
-        assert_eq!(
-            receive(
-                &process,
-                handle,
-                &mut FaultingBuffer::new(1, 0),
-                ReceiveFlags::NONE,
-                0,
-                0,
-            ),
-            Err(Fault.into())
-        );
-    }
-    provider.state.ignore_faults.store(false, Ordering::Relaxed);
+    // A faulting buffer fails the transfer.
+    assert_eq!(
+        send(
+            &process,
+            handle,
+            &FaultingBuffer::new(1, 0),
+            SendFlags::NONE
+        ),
+        Err(Fault.into())
+    );
+    assert_eq!(
+        receive(
+            &process,
+            handle,
+            &mut FaultingBuffer::new(1, 0),
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Err(Fault.into())
+    );
     let sent_before = provider.state.sent.lock().unwrap().len();
     assert_eq!(
         send(
@@ -2641,38 +2606,19 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         receive_data(&process, handle, 4, ReceiveFlags::PEEK, 0, 4),
         Ok(SocketOutcome::Completed(StreamData::Received(vec![7, 9],)))
     );
-    // The platform must report what it copies.
-    for (copied, received) in [
-        (
-            &[][..],
-            SocketOutcome::Completed(PlatformStreamReceive::Received(0)),
-        ),
-        (
-            &[7],
-            SocketOutcome::Completed(PlatformStreamReceive::Received(0)),
-        ),
-        (
-            &[],
-            SocketOutcome::Completed(PlatformStreamReceive::Received(1)),
-        ),
-        (
-            &[7],
-            SocketOutcome::Completed(PlatformStreamReceive::EndOfStream),
-        ),
-        (&[7], SocketOutcome::Failed(SocketError::ConnectionReset)),
-    ] {
-        provider.return_next_stream_receive(copied, Ok(received));
+    // The platform must receive some bytes, but no more than requested.
+    for (copied, received) in [(&[][..], 0), (&[7], 2)] {
+        provider.return_next_stream_receive(
+            copied,
+            Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+                received,
+            ))),
+        );
         assert_eq!(
             receive_data(&process, handle, 1, ReceiveFlags::NONE, 0, 0),
             Err(BrokerError::Internal)
         );
     }
-    // Nor may it copy bytes and then fail.
-    provider.return_next_stream_receive(&[7], Err(BrokerError::WouldBlock));
-    assert_eq!(
-        receive_data(&process, handle, 1, ReceiveFlags::NONE, 0, 0),
-        Err(BrokerError::Internal)
-    );
     assert_eq!(
         receive_data(&process, handle, 1, ReceiveFlags::PEEK, 1, 2),
         Err(BrokerError::UnsupportedOperation)
@@ -2728,11 +2674,9 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
     assert_eq!(process_reserved_sockets(&process), 0);
-    // Including the part of a send copied, and ending with the byte sent while
-    // ignoring its fault.
     assert_eq!(
         provider.state.sent.lock().unwrap().as_slice(),
-        [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 0]
+        [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3]
     );
     assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 1);
     assert_eq!(provider.state.status_calls.load(Ordering::Relaxed), 1);
@@ -3022,50 +2966,26 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
         ),
         Err(BrokerError::Internal)
     );
-    // A datagram is copied whole, unless the platform drops it.
-    for (copied, expected) in [
-        (1, Err(BrokerError::Internal)),
-        (0, Ok(SocketOutcome::Completed(3))),
-    ] {
-        provider.copy_next_send(copied);
-        assert_eq!(
-            send_to(
-                &process,
-                handle,
-                b"udp",
-                SendFlags::NONE,
-                Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
-            ),
-            expected
-        );
-    }
-    // A faulting buffer fails the transfer, even when the platform ignores the fault.
-    for ignored in [false, true] {
-        provider
-            .state
-            .ignore_faults
-            .store(ignored, Ordering::Relaxed);
-        assert_eq!(
-            send_to(
-                &process,
-                handle,
-                &FaultingBuffer::new(1, 0),
-                SendFlags::NONE,
-                Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
-            ),
-            Err(Fault.into())
-        );
-        assert_eq!(
-            receive_from(
-                &process,
-                handle,
-                &mut FaultingBuffer::new(2, 0),
-                ReceiveFromFlags::NONE,
-            ),
-            Err(Fault.into())
-        );
-    }
-    provider.state.ignore_faults.store(false, Ordering::Relaxed);
+    // A faulting buffer fails the transfer.
+    assert_eq!(
+        send_to(
+            &process,
+            handle,
+            &FaultingBuffer::new(1, 0),
+            SendFlags::NONE,
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
+        ),
+        Err(Fault.into())
+    );
+    assert_eq!(
+        receive_from(
+            &process,
+            handle,
+            &mut FaultingBuffer::new(2, 0),
+            ReceiveFromFlags::NONE,
+        ),
+        Err(Fault.into())
+    );
     let send_calls = provider.state.send_calls.load(Ordering::Relaxed);
     assert_eq!(
         send_to(
@@ -3128,9 +3048,9 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
     for (length, copied, received, datagram_length) in [
         (4, &[7][..], 1, 4),
         (2, &[7], 1, 4),
+        (2, &[7, 9], 3, 3),
         (2, &[7, 9], 2, 1),
         (2, &[7, 9], 2, MAX_UDP_DATAGRAM_SIZE as usize + 1),
-        (2, &[7], 2, 4),
     ] {
         provider.return_next_datagram_receive(
             copied,
@@ -3159,16 +3079,6 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
                 source_address: SocketAddrV4::new(source_ip, 49153),
             })),
         );
-        assert_eq!(
-            receive_data_from(&process, handle, 2, ReceiveFromFlags::NONE),
-            Err(BrokerError::Internal)
-        );
-    }
-    for failure in [
-        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused)),
-        Err(BrokerError::WouldBlock),
-    ] {
-        provider.return_next_datagram_receive(&[7], failure);
         assert_eq!(
             receive_data_from(&process, handle, 2, ReceiveFromFlags::NONE),
             Err(BrokerError::Internal)

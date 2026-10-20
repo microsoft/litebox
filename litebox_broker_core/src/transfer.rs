@@ -6,17 +6,17 @@
 //!
 //! An object reads into a caller's [`ReadBuffer`] and writes from a caller's
 //! [`WriteBuffer`]. Either may be memory the broker cannot reference, such as
-//! memory shared with a runner, so copying it may [`Fault`]. An operation
-//! whose copy faults fails with the fault's [`BrokerError`]. The object stays
-//! consistent, but may have consumed any of the bytes it read, or kept any of
-//! the bytes it wrote.
+//! memory shared with a runner, so copying it may
+//! [`Fault`](litebox_platform::buffer::Fault). An operation whose copy faults
+//! fails with the fault's [`BrokerError`]. The object stays consistent, but
+//! may have consumed any of the bytes it read, or kept any of the bytes it
+//! wrote.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::cell::Cell;
 use core::ops::Range;
 
-use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer};
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::{BrokerError, Result};
 
@@ -100,162 +100,12 @@ pub fn append_to_queue(
     Ok(result?)
 }
 
-/// Wraps a caller's buffer to check what a backend, such as a file system or
-/// a socket provider, reports about copying to or from it.
-///
-/// Counts the bytes copied, which must be contiguous from the buffer's start.
-/// An out-of-order copy, an overcounted direct transfer, or any fault fails
-/// the operation, whatever the backend reports.
-pub(crate) struct CountedBuffer<B> {
-    buffer: B,
-    copied: Cell<usize>,
-    failed: Cell<bool>,
-}
-
-impl<B> CountedBuffer<B> {
-    pub(crate) const fn new(buffer: B) -> Self {
-        Self {
-            buffer,
-            copied: Cell::new(0),
-            failed: Cell::new(false),
-        }
-    }
-
-    /// Returns how many bytes were copied, or fails if a copy faulted, did not
-    /// run on from the one before, or reported more bytes than it was passed.
-    pub(crate) fn finish(self) -> Result<usize> {
-        if self.failed.get() {
-            return Err(Fault.into());
-        }
-        Ok(self.copied.get())
-    }
-
-    /// Checks that a copy at `offset` runs on from the one before, which did
-    /// not fault.
-    fn start(&self, offset: usize) -> core::result::Result<(), Fault> {
-        if self.failed.get() || offset != self.copied.get() {
-            self.failed.set(true);
-            return Err(Fault);
-        }
-        Ok(())
-    }
-
-    /// Counts the `copied` bytes at `offset`, unless copying them faulted.
-    fn end(
-        &self,
-        offset: usize,
-        copied: usize,
-        result: core::result::Result<(), Fault>,
-    ) -> core::result::Result<(), Fault> {
-        match result {
-            Ok(()) => self.copied.set(offset + copied),
-            Err(Fault) => self.failed.set(true),
-        }
-        result
-    }
-
-    /// Counts the `transferred` bytes that a direct transfer of `length`
-    /// bytes at `offset` reports, which cannot be more than `length`.
-    fn end_direct(&self, offset: usize, length: usize, transferred: usize) {
-        if transferred > length {
-            self.failed.set(true);
-        } else {
-            self.copied.set(offset + transferred);
-        }
-    }
-}
-
-impl<B: Buffer> Buffer for CountedBuffer<B> {
-    fn len(&self) -> usize {
-        self.buffer.len()
-    }
-}
-
-impl<B: ReadBuffer> ReadBuffer for CountedBuffer<B> {
-    fn copy_from_slice_at(
-        &mut self,
-        offset: usize,
-        source: &[u8],
-    ) -> core::result::Result<(), Fault> {
-        self.start(offset)?;
-        let result = self.buffer.copy_from_slice_at(offset, source);
-        self.end(offset, source.len(), result)
-    }
-
-    fn copy_from_raw_at(
-        &mut self,
-        offset: usize,
-        source: RawBytes<'_>,
-    ) -> core::result::Result<(), Fault> {
-        self.start(offset)?;
-        let result = self.buffer.copy_from_raw_at(offset, source);
-        self.end(offset, source.len(), result)
-    }
-
-    fn copy_from_buffer_at(
-        &mut self,
-        offset: usize,
-        source: &dyn WriteBuffer,
-    ) -> core::result::Result<(), Fault> {
-        self.start(offset)?;
-        let result = self.buffer.copy_from_buffer_at(offset, source);
-        self.end(offset, source.len(), result)
-    }
-
-    fn read_direct_at(
-        &mut self,
-        offset: usize,
-        length: usize,
-        read: &mut dyn FnMut(&[RawBytes<'_>]) -> usize,
-    ) -> Option<usize> {
-        // Copying without the direct path then fails too.
-        self.start(offset).ok()?;
-        let read = self.buffer.read_direct_at(offset, length, read)?;
-        self.end_direct(offset, length, read);
-        Some(read)
-    }
-}
-
-impl<B: WriteBuffer> WriteBuffer for CountedBuffer<B> {
-    fn copy_to_slice_at(
-        &self,
-        offset: usize,
-        destination: &mut [u8],
-    ) -> core::result::Result<(), Fault> {
-        self.start(offset)?;
-        let result = self.buffer.copy_to_slice_at(offset, destination);
-        self.end(offset, destination.len(), result)
-    }
-
-    fn copy_to_raw_at(
-        &self,
-        offset: usize,
-        destination: RawBytes<'_>,
-    ) -> core::result::Result<(), Fault> {
-        self.start(offset)?;
-        let result = self.buffer.copy_to_raw_at(offset, destination);
-        self.end(offset, destination.len(), result)
-    }
-
-    fn write_direct_at(
-        &self,
-        offset: usize,
-        length: usize,
-        write: &mut dyn FnMut(&[RawBytes<'_>]) -> usize,
-    ) -> Option<usize> {
-        // Copying without the direct path then fails too.
-        self.start(offset).ok()?;
-        let written = self.buffer.write_direct_at(offset, length, write)?;
-        self.end_direct(offset, length, written);
-        Some(written)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::FaultingBuffer;
     use alloc::vec;
+    use litebox_platform::buffer::Fault;
 
     /// Returns the bytes `0..8` in a queue whose storage wraps them.
     fn wrapped_queue() -> VecDeque<u8> {
@@ -334,56 +184,5 @@ mod tests {
         let source = FaultingBuffer::new(6, 4);
         assert_eq!(append_to_queue(&mut queue, 6, &source), Err(Fault.into()));
         assert!(queue.iter().copied().eq(4..6));
-    }
-
-    #[test]
-    fn counted_buffers_count_copies_that_run_on() {
-        let mut destination = [0; 4];
-        let mut counted = CountedBuffer::new(&mut destination[..]);
-        assert_eq!(counted.copy_from_slice_at(0, &[1]), Ok(()));
-        assert_eq!(counted.copy_from_slice_at(1, &[2, 3]), Ok(()));
-        assert_eq!(counted.copy_from_buffer_at(3, &vec![4u8]), Ok(()));
-        assert_eq!(counted.finish(), Ok(4));
-        assert_eq!(destination, [1, 2, 3, 4]);
-
-        let source = [1, 2, 3, 4];
-        let counted = CountedBuffer::new(&source[..]);
-        assert_eq!(counted.copy_to_slice_at(0, &mut [0; 4]), Ok(()));
-        assert_eq!(counted.finish(), Ok(4));
-    }
-
-    #[test]
-    fn counted_buffers_fail_copies_that_skip_or_fault() {
-        let mut destination = [0; 4];
-        let mut counted = CountedBuffer::new(&mut destination[..]);
-        assert_eq!(counted.copy_from_slice_at(1, &[2]), Err(Fault));
-        assert_eq!(counted.copy_from_slice_at(0, &[1]), Err(Fault));
-        assert_eq!(counted.finish(), Err(Fault.into()));
-
-        let mut counted = CountedBuffer::new(FaultingBuffer::new(4, 2));
-        assert_eq!(counted.copy_from_slice_at(0, &[1, 2]), Ok(()));
-        assert_eq!(counted.copy_from_slice_at(2, &[3]), Err(Fault));
-        assert_eq!(counted.finish(), Err(Fault.into()));
-
-        // Copying straight into the destination's bytes faults on the source.
-        let mut counted = CountedBuffer::new(&mut destination[..]);
-        assert_eq!(
-            counted.copy_from_buffer_at(0, &FaultingBuffer::new(4, 2)),
-            Err(Fault)
-        );
-        assert_eq!(counted.finish(), Err(Fault.into()));
-    }
-
-    #[test]
-    fn counted_buffers_count_direct_transfers_up_to_their_length() {
-        let mut destination = [0; 4];
-        let mut counted = CountedBuffer::new(&mut destination[..]);
-        assert_eq!(counted.read_direct_at(0, 2, &mut |_| 2), Some(2));
-        assert_eq!(counted.copy_from_slice_at(2, &[3]), Ok(()));
-        assert_eq!(counted.finish(), Ok(3));
-
-        let mut counted = CountedBuffer::new(&mut destination[..]);
-        assert_eq!(counted.read_direct_at(0, 1, &mut |_| 2), Some(2));
-        assert_eq!(counted.finish(), Err(Fault.into()));
     }
 }

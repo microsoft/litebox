@@ -28,7 +28,6 @@ use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
-use crate::transfer::CountedBuffer;
 use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessId, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
@@ -556,17 +555,16 @@ pub trait PlatformSocket: Send + Sync {
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError>;
 
-    /// Sends bytes from the start of `data`, copied in order (see
-    /// [`crate::transfer`]), without waiting for platform readiness, and
-    /// returns how many it sent, which may be fewer than it copied.
+    /// Sends bytes from the start of `data` (see [`crate::transfer`]) without
+    /// waiting for platform readiness.
     ///
     /// A temporarily full socket returns [`BrokerError::WouldBlock`]. A socket
     /// shut down for writing fails with `Shutdown`. Ordinary network failures
     /// return [`SocketOutcome::Failed`].
     fn send(&self, data: &dyn WriteBuffer, flags: SendFlags) -> Result<SocketOutcome<usize>>;
 
-    /// Sends `data` as one complete datagram, copied in order (see
-    /// [`crate::transfer`]), without waiting for platform readiness.
+    /// Sends `data` as one complete datagram (see [`crate::transfer`]) without
+    /// waiting for platform readiness.
     ///
     /// A destination is required for an unconnected socket and omitted to use
     /// the socket's connected peer. An explicit destination is normalized but
@@ -574,9 +572,8 @@ pub trait PlatformSocket: Send + Sync {
     /// [`normalize_socket_destination`] before choosing a host-socket target.
     /// A temporarily full socket returns [`BrokerError::WouldBlock`], and a
     /// socket shut down for writing fails with `Shutdown`. Partial successful
-    /// sends are invalid, and a datagram is copied whole, but one the platform
-    /// drops, as UDP may, need not be copied. Resource failures are broker
-    /// errors rather than ordinary socket failures.
+    /// sends are invalid. Resource failures are broker errors rather than
+    /// ordinary socket failures.
     fn send_to(
         &self,
         data: &dyn WriteBuffer,
@@ -584,9 +581,8 @@ pub trait PlatformSocket: Send + Sync {
         destination: Option<SocketAddrV4>,
     ) -> Result<SocketOutcome<usize>>;
 
-    /// Receives bytes into the start of `output`, copied in order (see
-    /// [`crate::transfer`]), without waiting for platform readiness: exactly
-    /// those it returns, so none when it fails, except by a fault.
+    /// Receives bytes into the start of `output` (see [`crate::transfer`])
+    /// without waiting for platform readiness.
     ///
     /// A temporarily empty socket returns [`BrokerError::WouldBlock`]. End of
     /// stream returns [`PlatformStreamReceive::EndOfStream`]. The core handles
@@ -607,10 +603,8 @@ pub trait PlatformSocket: Send + Sync {
         peek_length: u32,
     ) -> Result<SocketOutcome<PlatformStreamReceive>>;
 
-    /// Receives a prefix of one datagram into the start of `output`, copied in
-    /// order (see [`crate::transfer`]), without waiting for platform
-    /// readiness: exactly the bytes it returns, so none when it fails, except
-    /// by a fault.
+    /// Receives a prefix of one datagram into the start of `output` (see
+    /// [`crate::transfer`]) without waiting for platform readiness.
     ///
     /// The original datagram length is returned even when the caller's buffer
     /// is smaller, and zero-length datagrams are successful receives. When no
@@ -1377,14 +1371,13 @@ fn transport_send(
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let data = CountedBuffer::new(data);
-    let outcome = state.resource.platform_socket.send(&data, flags);
-    let copied = data.finish()?;
-    let outcome = outcome.map_err(|error| would_block_error(error, state.nonblocking))?;
-    // A platform may copy more than it sends, such as one that copies all of
-    // it before learning how much the host takes.
+    let outcome = state
+        .resource
+        .platform_socket
+        .send(data, flags)
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(sent) = outcome
-        && (sent > copied || (length != 0 && sent == 0))
+        && (sent > length || (length != 0 && sent == 0))
     {
         return Err(BrokerError::Internal);
     }
@@ -1554,14 +1547,12 @@ fn transport_send_to(
     }) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let data = CountedBuffer::new(data);
-    let outcome = resource.platform_socket.send_to(&data, flags, destination);
-    let copied = data.finish()?;
-    let outcome = outcome.map_err(|error| would_block_error(error, nonblocking))?;
-    // A platform may accept a datagram it then drops without copying it, as
-    // UDP may drop any datagram.
+    let outcome = resource
+        .platform_socket
+        .send_to(data, flags, destination)
+        .map_err(|error| would_block_error(error, nonblocking))?;
     if let SocketOutcome::Completed(sent) = outcome
-        && (sent != length || (copied != 0 && copied != length))
+        && sent != length
     {
         return Err(BrokerError::Internal);
     }
@@ -1689,28 +1680,18 @@ fn transport_receive(
     if output.is_empty() {
         return Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(0)));
     }
-    let mut output = CountedBuffer::new(output);
-    let outcome = state.resource.platform_socket.receive(
-        reader,
-        &mut output,
-        flags,
-        peek_offset,
-        peek_length,
-    );
-    let copied = output.finish()?;
-    let received = match outcome {
-        Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(received))) => received,
-        _ => 0,
-    };
-    if received != copied
-        || matches!(
-            outcome,
-            Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(0)))
-        )
+    let length = output.len();
+    let outcome = state
+        .resource
+        .platform_socket
+        .receive(reader, output, flags, peek_offset, peek_length)
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
+    if let SocketOutcome::Completed(PlatformStreamReceive::Received(received)) = outcome
+        && (received > length || received == 0)
     {
         return Err(BrokerError::Internal);
     }
-    outcome.map_err(|error| would_block_error(error, state.nonblocking))
+    Ok(outcome)
 }
 
 /// Receives a prefix of one datagram into the start of `output` without
@@ -1770,26 +1751,19 @@ fn transport_receive_from(
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let mut output = CountedBuffer::new(output);
     let outcome = state
         .resource
         .platform_socket
-        .receive_from(&mut output, flags);
-    let copied = output.finish()?;
-    let invalid = match &outcome {
-        Ok(SocketOutcome::Completed(received)) => {
-            received.received != copied
-                || received.received != received.datagram_length.min(length)
-                || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize
-                || normalize_socket_destination(received.source_address)
-                    != Ok(received.source_address)
-        }
-        Ok(SocketOutcome::Failed(_)) | Err(_) => copied != 0,
-    };
-    if invalid {
+        .receive_from(output, flags)
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
+    if let SocketOutcome::Completed(received) = &outcome
+        && (received.received != received.datagram_length.min(length)
+            || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize
+            || normalize_socket_destination(received.source_address) != Ok(received.source_address))
+    {
         return Err(BrokerError::Internal);
     }
-    outcome.map_err(|error| would_block_error(error, state.nonblocking))
+    Ok(outcome)
 }
 
 /// Sets one option of a broker-owned socket.

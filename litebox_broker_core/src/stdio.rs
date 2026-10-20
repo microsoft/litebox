@@ -72,13 +72,12 @@ pub trait StdioProvider: Send + Sync {
         None
     }
 
-    /// Reads available bytes from standard input into `output`, copied in
-    /// order from its start (see [`crate::transfer`]), returning zero at
-    /// end-of-file.
+    /// Reads available bytes from standard input into the start of `output`
+    /// (see [`crate::transfer`]), returning zero at end-of-file.
     fn read(&self, output: &mut dyn ReadBuffer) -> core::result::Result<usize, StdioProviderError>;
 
-    /// Writes bytes to the selected standard output stream, which it copies
-    /// out of `input` in order from its start (see [`crate::transfer`]).
+    /// Writes bytes from the start of `input` to the selected standard output
+    /// stream (see [`crate::transfer`]).
     fn write(
         &self,
         stream: StdioOutputStream,
