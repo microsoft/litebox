@@ -119,7 +119,11 @@ impl Mapping {
             base: target.trunc(),
             len: HOST_PAGE_SIZE,
         };
-        protect(alias.base, Perm::READ | Perm::WRITE).map_err(allocation_error)?;
+        protect(
+            alias.base..alias.base + HOST_PAGE_SIZE,
+            Perm::READ | Perm::WRITE,
+        )
+        .map_err(allocation_error)?;
         Ok(alias)
     }
 }
@@ -129,15 +133,38 @@ pub(super) fn recover_fault(pc: usize, fault_address: usize, esr: u64) -> bool {
     recovery::recover(pc, fault_address, esr) != recovery::Recovery::Unhandled
 }
 
-fn protect(base: usize, permissions: Perm) -> Result<(), PermissionUpdateError> {
+/// Coalesce `(native page base, value)` pairs into maximal runs of
+/// consecutive pages with equal values, in input order.
+fn runs<T: PartialEq>(pages: impl IntoIterator<Item = (usize, T)>) -> Vec<(Range<usize>, T)> {
+    let mut runs: Vec<(Range<usize>, T)> = Vec::new();
+    for (base, value) in pages {
+        match runs.last_mut() {
+            Some((range, last)) if range.end == base && *last == value => {
+                range.end += HOST_PAGE_SIZE;
+            }
+            _ => runs.push((base..base + HOST_PAGE_SIZE, value)),
+        }
+    }
+    runs
+}
+
+/// Contiguous runs of native page bases, in input order.
+fn base_runs(bases: impl IntoIterator<Item = usize>) -> Vec<Range<usize>> {
+    runs(bases.into_iter().map(|base| (base, ())))
+        .into_iter()
+        .map(|(range, ())| range)
+        .collect()
+}
+
+fn protect(range: Range<usize>, permissions: Perm) -> Result<(), PermissionUpdateError> {
     // Start mixed pages RW; recovery selects RX on instruction faults.
     let native = if permissions.contains(Perm::WRITE | Perm::EXEC) {
         (permissions | Perm::READ) & !Perm::EXEC
     } else {
         permissions
     };
-    // SAFETY: callers hold the registry lock and own this entire native page.
-    if unsafe { libc::mprotect(base as *mut _, HOST_PAGE_SIZE, prot_flags(native)) } != 0 {
+    // SAFETY: callers hold the registry lock and own these entire native pages.
+    if unsafe { libc::mprotect(range.start as *mut _, range.len(), prot_flags(native)) } != 0 {
         return Err(permission_error());
     }
     Ok(())
@@ -160,20 +187,33 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
     }
 
     /// Apply protections with rollback on failure; hold the returned gate through commit.
+    ///
+    /// Consecutive native pages with equal permissions share one `mprotect`,
+    /// so multi-GiB reservations cost a few system calls, not one per page.
     fn protect_changes(
         &self,
         changes: &[(usize, Slots)],
     ) -> Result<recovery::Update, PermissionUpdateError> {
         let update = recovery::begin_update();
-        for (index, (base, slots)) in changes.iter().enumerate() {
-            if let Err(error) = protect(*base, fused(*slots)) {
-                for (base, _) in &changes[..index] {
-                    let previous = self
-                        .0
-                        .get(base)
+        let runs = runs(changes.iter().map(|(base, slots)| (*base, fused(*slots))));
+        for (index, (range, permissions)) in runs.iter().enumerate() {
+            if let Err(error) = protect(range.clone(), *permissions) {
+                let previous = |base| {
+                    self.0
+                        .get(&base)
                         .copied()
-                        .map_or(Perm::READ | Perm::WRITE, fused);
-                    protect(*base, previous).expect("failed to roll back native page protection");
+                        .map_or(Perm::READ | Perm::WRITE, fused)
+                };
+                for (range, _) in &runs[..index] {
+                    for (range, permissions) in self::runs(
+                        range
+                            .clone()
+                            .step_by(HOST_PAGE_SIZE)
+                            .map(|base| (base, previous(base))),
+                    ) {
+                        protect(range, permissions)
+                            .expect("failed to roll back native page protection");
+                    }
                 }
                 return Err(error);
             }
@@ -262,25 +302,30 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
         for (base, _) in &changes {
             if self.0.contains_key(base) {
                 aliases.push((*base, Mapping::write_alias(*base)?));
-            } else {
-                let mut address = *base as u64;
-                // SAFETY: the native-aligned FIXED reservation cannot overwrite host memory.
-                let result = unsafe {
-                    mach_vm_allocate(
-                        mach_task_self(),
-                        &raw mut address,
-                        HOST_PAGE_SIZE as u64,
-                        MachVmFlags::FIXED,
-                    )
-                };
-                if result != KernReturn::SUCCESS {
-                    return Err(result.into());
-                }
-                reservations.push(Mapping {
-                    base: *base,
-                    len: HOST_PAGE_SIZE,
-                });
             }
+        }
+        let fresh = changes
+            .iter()
+            .map(|(base, _)| *base)
+            .filter(|base| !self.0.contains_key(base));
+        for run in base_runs(fresh) {
+            let mut address = run.start as u64;
+            // SAFETY: the native-aligned FIXED reservation cannot overwrite host memory.
+            let result = unsafe {
+                mach_vm_allocate(
+                    mach_task_self(),
+                    &raw mut address,
+                    run.len() as u64,
+                    MachVmFlags::FIXED,
+                )
+            };
+            if result != KernReturn::SUCCESS {
+                return Err(result.into());
+            }
+            reservations.push(Mapping {
+                base: run.start,
+                len: run.len(),
+            });
         }
         let mut update = self.protect_changes(&changes).map_err(allocation_error)?;
         for (base, alias) in &aliases {
@@ -377,18 +422,125 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
         let mut update = self
             .protect_changes(&changes)
             .map_err(|_| DeallocationError::AlreadyUnallocated)?;
+        let mut released = Vec::new();
         for (base, slots) in changes {
             if slots.iter().all(Option::is_none) {
-                drop(Mapping {
-                    base,
-                    len: HOST_PAGE_SIZE,
-                });
+                released.push(base);
                 self.0.remove(&base);
                 update.set::<PAGE_SIZE>(base, None);
             } else {
                 self.0.insert(base, slots);
                 update.set::<PAGE_SIZE>(base, Some(fused(slots)));
             }
+        }
+        for run in base_runs(released) {
+            drop(Mapping {
+                base: run.start,
+                len: run.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Map a private copy-on-write copy of the host pages at `source` over
+    /// `range`, with `permissions`.
+    ///
+    /// `Replace` atomically overwrites pages owned by this registry; with
+    /// `NoReplace`, the range must be unowned and unmapped. Both must be
+    /// native-page aligned. Later writes never reach `source`, and changes to
+    /// `source` must not be relied upon to be visible either.
+    ///
+    /// # Safety
+    ///
+    /// `source` must be readable host memory of `range.len()` bytes that
+    /// stays mapped and unmodified for the duration of this call.
+    pub(super) unsafe fn allocate_copy_on_write(
+        &mut self,
+        range: Range<usize>,
+        source: usize,
+        permissions: Perm,
+        behavior: FixedAddressBehavior,
+    ) -> Result<(), AllocationError> {
+        const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+        if !range.start.is_multiple_of(HOST_PAGE_SIZE)
+            || !range.end.is_multiple_of(HOST_PAGE_SIZE)
+            || !source.is_multiple_of(HOST_PAGE_SIZE)
+            || range.is_empty()
+        {
+            return Err(AllocationError::Unaligned);
+        }
+        if permissions.contains(Perm::WRITE | Perm::EXEC) {
+            return Err(AllocationError::PermissionDenied);
+        }
+        let _ = prot_flags(permissions);
+        let owned = range
+            .clone()
+            .step_by(HOST_PAGE_SIZE)
+            .filter(|base| self.0.contains_key(base))
+            .count();
+        let pages = range.len() / HOST_PAGE_SIZE;
+        let flags = match behavior {
+            FixedAddressBehavior::Hint(_) => return Err(AllocationError::UnsupportedByPlatform),
+            // Only pages this registry owns may be overwritten.
+            FixedAddressBehavior::Replace if owned == pages => {
+                MachVmFlags::from_bits_retain(VM_FLAGS_OVERWRITE)
+            }
+            FixedAddressBehavior::Replace if owned != 0 => {
+                return Err(AllocationError::AddressPartiallyInUse);
+            }
+            FixedAddressBehavior::NoReplace if owned != 0 => {
+                return Err(AllocationError::AddressInUse);
+            }
+            // FIXED without OVERWRITE fails on any existing host mapping.
+            FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => MachVmFlags::FIXED,
+        };
+        let mut target = range.start as u64;
+        let mut current = MachVmProtection::empty();
+        let mut maximum = MachVmProtection::empty();
+        // SAFETY: FIXED without OVERWRITE fails on any existing host mapping;
+        // OVERWRITE replaces only pages this registry owns (checked above).
+        // The caller guarantees `source` is readable for the whole length.
+        // copy=true gives the target its own copy-on-write object.
+        let result = unsafe {
+            mach_vm_remap(
+                mach_task_self(),
+                &raw mut target,
+                range.len() as u64,
+                0,
+                flags,
+                mach_task_self(),
+                source as u64,
+                MachBoolean::TRUE,
+                &raw mut current,
+                &raw mut maximum,
+                MachVmInheritance::None,
+            )
+        };
+        if result != KernReturn::SUCCESS {
+            return Err(result.into());
+        }
+        let changes: Vec<_> = range
+            .clone()
+            .step_by(HOST_PAGE_SIZE)
+            .map(|base| (base, [Some(permissions); MAX_SUBPAGES]))
+            .collect();
+        let mut update = match self.protect_changes(&changes) {
+            Ok(update) => update,
+            Err(error) => {
+                // The copy replaced any previous contents; release it entirely.
+                for (base, _) in &changes {
+                    self.0.remove(base);
+                }
+                drop(Mapping {
+                    base: range.start,
+                    len: range.len(),
+                });
+                return Err(allocation_error(error));
+            }
+        };
+        for (base, slots) in changes {
+            update.set::<PAGE_SIZE>(base, Some(fused(slots)));
+            self.0.insert(base, slots);
         }
         Ok(())
     }

@@ -13,8 +13,8 @@ use std::sync::{
 use std::time::Duration;
 
 use litebox::platform::page_mgmt::{
-    AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    PermissionUpdateError,
+    AllocationError, CowAllocationError, DeallocationError, FixedAddressBehavior,
+    MemoryRegionPermissions, PermissionUpdateError,
 };
 use litebox::platform::{ArchSpecificError, ArchSpecificRegister, RawConstPointer as _};
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
@@ -633,7 +633,6 @@ struct MachBoolean(i32);
 
 impl MachBoolean {
     const FALSE: Self = Self(0);
-    #[cfg(test)]
     const TRUE: Self = Self(1);
 }
 
@@ -796,6 +795,51 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
             return Err(DeallocationError::Unaligned);
         }
         self.pages.lock().unwrap().deallocate(range)
+    }
+
+    /// Map a private copy-on-write copy of `source_data` with `mach_vm_remap`.
+    ///
+    /// `source_data` must be native-page aligned host memory, such as a
+    /// read-only file mapping. Only exact placement is supported.
+    unsafe fn try_allocate_cow_pages<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_start: usize,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<MacosUserlandReservation<PAGE_SIZE>, CowAllocationError>
+    where
+        Reservations: Iterator<Item = MacosUserlandReservation<PAGE_SIZE>>,
+    {
+        if matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)) {
+            return Err(CowAllocationError::UnsupportedSourceRegion);
+        }
+        let range = suggested_start
+            ..suggested_start
+                .checked_add(source_data.len())
+                .ok_or(CowAllocationError::InternalFailure)?;
+        if suggested_start < TASK_ADDR_MIN || range.end > TASK_ADDR_MAX {
+            return Err(CowAllocationError::InternalFailure);
+        }
+        // SAFETY: `source_data` is immutable host memory for the program lifetime.
+        unsafe {
+            self.pages.lock().unwrap().allocate_copy_on_write(
+                range.clone(),
+                source_data.as_ptr() as usize,
+                permissions,
+                fixed_address_behavior,
+            )
+        }
+        .map_err(|error| match error {
+            AllocationError::Unaligned => CowAllocationError::Unaligned,
+            _ => CowAllocationError::InternalFailure,
+        })?;
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            replaced_reservations().for_each(drop);
+        }
+        // SAFETY: Pages acquired exclusive ownership of this exact guest extent.
+        Ok(unsafe { MacosUserlandReservation::new(range) })
     }
 
     unsafe fn protect_pages<'reservation, Reservations>(
@@ -3779,6 +3823,99 @@ mod tests {
             p.release_pages(base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn copy_on_write_pages_are_private_and_coalesce_large_reservations() {
+        const PAGES: usize = 4096;
+        let p = MacosUserland::new();
+        // A 64 MiB reservation costs a few native calls, not one per page.
+        let reservation = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + PAGES * HOST_PAGE_SIZE,
+                MemoryRegionPermissions::empty(),
+                false,
+                false,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let base = reservation.range().start;
+        let source: &'static mut [u8] =
+            Box::leak(vec![0u8; 3 * HOST_PAGE_SIZE + HOST_PAGE_SIZE].into_boxed_slice());
+        let offset = source.as_ptr().align_offset(HOST_PAGE_SIZE);
+        let source = &mut source[offset..offset + 2 * HOST_PAGE_SIZE];
+        source.fill(0x11);
+        let source: &'static [u8] = source;
+        let ptr = |address: usize| {
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                address,
+            )
+        };
+        let target = base + HOST_PAGE_SIZE;
+        let (_, replaced, _) = reservation.split(target..target + source.len());
+        let copy = unsafe {
+            p.try_allocate_cow_pages(
+                || core::iter::once(replaced),
+                target,
+                source,
+                MemoryRegionPermissions::READ,
+                FixedAddressBehavior::Replace,
+            )
+        }
+        .unwrap();
+        assert_eq!(ptr(target).read_at_offset(0), Some(0x11));
+        assert_eq!(ptr(target).write_at_offset(0, 0x22), None);
+        // Neighbors remain inaccessible reservations.
+        assert_eq!(ptr(base).read_at_offset(0), None);
+        unsafe {
+            p.protect_pages(
+                || core::iter::once(&copy),
+                target..target + HOST_PAGE_SIZE,
+                RW,
+            )
+            .unwrap();
+        }
+        assert_eq!(ptr(target).write_at_offset(0, 0x22), Some(()));
+        assert_eq!(source[0], 0x11, "writes never reach the source");
+        // Only exact placement over owned pages or free space is supported.
+        assert!(matches!(
+            unsafe {
+                p.try_allocate_cow_pages(
+                    core::iter::empty,
+                    target,
+                    source,
+                    MemoryRegionPermissions::READ,
+                    FixedAddressBehavior::NoReplace,
+                )
+            },
+            Err(CowAllocationError::InternalFailure)
+        ));
+        assert!(matches!(
+            unsafe {
+                p.try_allocate_cow_pages(
+                    core::iter::empty,
+                    target,
+                    &source[1..],
+                    MemoryRegionPermissions::READ,
+                    FixedAddressBehavior::Replace,
+                )
+            },
+            Err(CowAllocationError::Unaligned)
+        ));
+        // SAFETY: the test owns the whole reservation and no longer accesses it.
+        unsafe {
+            p.release_pages(base..base + PAGES * HOST_PAGE_SIZE)
+                .unwrap();
+        }
+        // Concurrent host allocations may reuse released addresses at once.
+        assert!(
+            !p.pages
+                .lock()
+                .unwrap()
+                .contains_range(base..base + HOST_PAGE_SIZE)
+        );
     }
 
     #[test]
