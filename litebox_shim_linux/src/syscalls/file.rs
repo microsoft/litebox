@@ -1053,6 +1053,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.insert_raw_file_fd(file, flags)
     }
 
+    /// Handle path-based `chmod` and `fchmodat`.
+    pub(crate) fn sys_fchmodat(&self, dirfd: i32, pathname: &str, mode: u32) -> Result<(), Errno> {
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        self.global
+            .litebox
+            .chmod_file(&context, &path, Mode::from_u32_bits_truncate(mode))
+            .map_err(Errno::from)
+    }
+
     /// Handle path-based `chown` and `fchownat`.
     pub(crate) fn sys_fchownat(
         &self,
