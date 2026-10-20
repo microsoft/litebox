@@ -7,9 +7,10 @@ use super::{
     VirtualProtect, Win32_Memory, WindowsUserland, c_void,
 };
 use litebox::platform::common_providers::reservations::TrackedReservations;
-use litebox::platform::page_mgmt::{
-    AllocationDirection, HintPlacementBehavior, PageReservation as _,
-};
+use litebox::platform::page_mgmt::{AllocationDirection, HintPlacementBehavior, PageReservation};
+
+/// `MEM_COALESCE_PLACEHOLDERS`, which `windows-sys` does not define.
+const MEM_COALESCE_PLACEHOLDERS: Win32_Memory::VIRTUAL_FREE_TYPE = 0x1;
 
 #[allow(
     clippy::match_same_arms,
@@ -65,17 +66,25 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         range: core::ops::Range<usize>,
         behavior: FixedAddressBehavior,
         permissions: Option<MemoryRegionPermissions>,
+        mergeable: bool,
     ) -> Result<WindowsUserlandReservation<ALIGN>, AllocationError> {
         debug_assert!(range.start.is_multiple_of(
             <Self as litebox::platform::PageManagementProvider<ALIGN>>::RESERVATION_ALIGNMENT,
         ));
         debug_assert!(range.end.is_multiple_of(ALIGN));
+        debug_assert!(!mergeable || permissions.is_none());
+        // A mergeable reservation starts as a native placeholder so it can be coalesced later.
         let reserve = |address| unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
                 address,
                 range.len(),
                 Win32_Memory::MEM_RESERVE
+                    | if mergeable {
+                        Win32_Memory::MEM_RESERVE_PLACEHOLDER
+                    } else {
+                        0
+                    }
                     | if permissions.is_some() {
                         Win32_Memory::MEM_COMMIT
                     } else {
@@ -108,8 +117,58 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
 
         let base = ptr as usize;
         let extent = base..base + range.len();
+        if mergeable && !Self::replace_placeholder(&extent) {
+            // SAFETY: The placeholder was just created by this call and has no other users.
+            unsafe { VirtualFree(ptr, 0, Win32_Memory::MEM_RELEASE) };
+            return Err(AllocationError::OutOfMemory);
+        }
         // SAFETY: VirtualAlloc2 successfully returned exclusive ownership of this aligned extent.
         Ok(unsafe { WindowsUserlandReservation::new(extent) })
+    }
+
+    /// Replaces the native placeholder at `extent` with an ordinary inaccessible reservation,
+    /// which keeps it convertible back to a placeholder.
+    fn replace_placeholder(extent: &core::ops::Range<usize>) -> bool {
+        // SAFETY: The caller exclusively owns the placeholder at exactly `extent`.
+        let ptr = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                extent.start as *mut c_void,
+                extent.len(),
+                Win32_Memory::MEM_RESERVE | Win32_Memory::MEM_REPLACE_PLACEHOLDER,
+                Win32_Memory::PAGE_NOACCESS,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        ptr as usize == extent.start
+    }
+
+    fn reserve_native_pages(
+        &self,
+        suggested_range: core::ops::Range<usize>,
+        can_grow_down: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+        mergeable: bool,
+    ) -> Result<WindowsUserlandReservation<ALIGN>, AllocationError> {
+        debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
+        debug_assert_alignment!(suggested_range, ALIGN);
+        debug_assert!(
+            (suggested_range.start == 0
+                && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
+                || suggested_range.start
+                    >= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
+        );
+        debug_assert!(
+            suggested_range.end
+                <= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
+        );
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            return Err(AllocationError::UnsupportedByPlatform);
+        }
+        // TODO: For Windows, there is no MAP_GROWDOWN features so far.
+        let _ = can_grow_down;
+        Self::allocate_native_reservation(suggested_range, fixed_address_behavior, None, mergeable)
     }
 
     fn release_reservation(reservation: WindowsUserlandReservation<ALIGN>) {
@@ -247,6 +306,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
             suggested_range,
             fixed_address_behavior,
             Some(permissions),
+            false,
         )?;
         if populate_pages_immediately {
             let extent = reservation.range();
@@ -265,26 +325,79 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     where
         Reservations: Iterator<Item = WindowsUserlandReservation<ALIGN>>,
     {
-        debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
-        debug_assert_alignment!(suggested_range, ALIGN);
-        debug_assert!(
-            (suggested_range.start == 0
-                && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
-                || suggested_range.start
-                    >= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
-        );
-        debug_assert!(
-            suggested_range.end
-                <= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
-        );
-        if fixed_address_behavior == FixedAddressBehavior::Replace {
-            return Err(AllocationError::UnsupportedByPlatform);
+        self.reserve_native_pages(
+            suggested_range,
+            can_grow_down,
+            fixed_address_behavior,
+            false,
+        )
+    }
+
+    unsafe fn reserve_mergeable_pages<Reservations>(
+        &self,
+        _replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_range: core::ops::Range<usize>,
+        can_grow_down: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<WindowsUserlandReservation<ALIGN>, AllocationError>
+    where
+        Reservations: Iterator<Item = WindowsUserlandReservation<ALIGN>>,
+    {
+        self.reserve_native_pages(suggested_range, can_grow_down, fixed_address_behavior, true)
+    }
+
+    unsafe fn merge_reservations(
+        &self,
+        reservations: Vec<WindowsUserlandReservation<ALIGN>>,
+    ) -> WindowsUserlandReservation<ALIGN> {
+        assert!(!reservations.is_empty());
+        if reservations.len() == 1 {
+            return reservations.into_iter().next().unwrap();
         }
-        // TODO: For Windows, there is no MAP_GROWDOWN features so far.
-        let _ = can_grow_down;
-        let reservation =
-            Self::allocate_native_reservation(suggested_range, fixed_address_behavior, None)?;
-        Ok(reservation)
+        // Native allocations cannot be joined directly: convert each uncommitted piece back to a
+        // placeholder, coalesce the placeholders, and replace the result with one reservation.
+        // The address range stays owned by placeholders throughout, so nothing can claim it.
+        for reservation in &reservations {
+            let extent = reservation.range();
+            assert_ne!(
+                // SAFETY: The caller guarantees this mergeable piece has no committed pages or
+                // users, so discarding its (empty) contents is sound.
+                unsafe {
+                    VirtualFree(
+                        extent.start as *mut c_void,
+                        extent.len(),
+                        Win32_Memory::MEM_RELEASE | Win32_Memory::MEM_PRESERVE_PLACEHOLDER,
+                    )
+                },
+                0,
+                "VirtualFree(PRESERVE_PLACEHOLDER) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let merged = reservations
+            .into_iter()
+            .reduce(PageReservation::merge)
+            .unwrap();
+        let extent = merged.range();
+        assert_ne!(
+            // SAFETY: The extent now consists solely of placeholders owned by `merged`.
+            unsafe {
+                VirtualFree(
+                    extent.start as *mut c_void,
+                    extent.len(),
+                    Win32_Memory::MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+                )
+            },
+            0,
+            "VirtualFree(COALESCE_PLACEHOLDERS) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            Self::replace_placeholder(&extent),
+            "VirtualAlloc2(REPLACE_PLACEHOLDER) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        merged
     }
 
     unsafe fn commit_pages<'reservation, Reservations>(
@@ -499,6 +612,77 @@ mod tests {
         assert_eq!(
             collect_regions(base..base + 0x2_0000),
             vec![(base..base + 0x2_0000, Win32_Memory::MEM_FREE)]
+        );
+    }
+
+    #[test]
+    fn test_merge_separately_reserved_mergeable_reservations() {
+        type Provider = WindowsUserland;
+        const UNIT: usize = 0x1_0000;
+        let platform = WindowsUserland::new();
+        // SAFETY: The fixture retains exclusive ownership of the returned reservation.
+        let reservation = unsafe {
+            <Provider as PageManagementProvider<PAGE_SIZE>>::reserve_mergeable_pages(
+                platform,
+                core::iter::empty,
+                0..3 * UNIT,
+                false,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let base = reservation.range().start;
+        let (head, middle, tail) = reservation.split(base + UNIT..base + 2 * UNIT);
+        // SAFETY: The split handle exclusively owns the unused middle extent.
+        unsafe { <Provider as PageManagementProvider<PAGE_SIZE>>::release_pages(platform, middle) }
+            .unwrap();
+        // SAFETY: The middle extent was just released and is re-reserved without replacement.
+        let middle = unsafe {
+            <Provider as PageManagementProvider<PAGE_SIZE>>::reserve_mergeable_pages(
+                platform,
+                core::iter::empty,
+                base + UNIT..base + 2 * UNIT,
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+
+        // SAFETY: The pieces are adjacent, ascending, mergeable, uncommitted, and unused.
+        let merged = unsafe {
+            <Provider as PageManagementProvider<PAGE_SIZE>>::merge_reservations(
+                platform,
+                vec![head.unwrap(), middle, tail.unwrap()],
+            )
+        };
+        assert_eq!(merged.range(), base..base + 3 * UNIT);
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        do_query_on_region(&mut mbi, base as *mut c_void);
+        assert_eq!(mbi.AllocationBase as usize, base);
+        assert_eq!(mbi.RegionSize, 3 * UNIT);
+        assert_eq!(mbi.State, Win32_Memory::MEM_RESERVE);
+
+        // SAFETY: The merged reservation covers the range, which has no other users.
+        unsafe {
+            <Provider as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+                platform,
+                || core::iter::once(&merged),
+                base..base + 3 * UNIT,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                false,
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            collect_regions(base..base + 3 * UNIT),
+            vec![(base..base + 3 * UNIT, Win32_Memory::MEM_COMMIT)]
+        );
+        // SAFETY: The merged reservation is unused after the checks above.
+        unsafe { <Provider as PageManagementProvider<PAGE_SIZE>>::release_pages(platform, merged) }
+            .unwrap();
+        assert_eq!(
+            collect_regions(base..base + 3 * UNIT),
+            vec![(base..base + 3 * UNIT, Win32_Memory::MEM_FREE)]
         );
     }
 

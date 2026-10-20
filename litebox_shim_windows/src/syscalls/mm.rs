@@ -464,16 +464,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // SAFETY: The manager acquires fresh aligned address space without replacement, and the
         // allocation remains unpublished until output writeback succeeds.
         let allocation = unsafe {
-            self.global.page_manager.create_private_pages(
-                NonZeroAddress::new(aligned_base),
-                address_bounds,
-                length,
-                ALLOCATION_GRANULARITY,
-                flags,
-                allocation_type
-                    .contains(AllocationType::MEM_COMMIT)
-                    .then_some(permissions),
-            )
+            if is_placeholder {
+                self.global.page_manager.create_mergeable_reserved_pages(
+                    NonZeroAddress::new(aligned_base),
+                    address_bounds,
+                    length,
+                    ALLOCATION_GRANULARITY,
+                    flags,
+                )
+            } else {
+                self.global.page_manager.create_private_pages(
+                    NonZeroAddress::new(aligned_base),
+                    address_bounds,
+                    length,
+                    ALLOCATION_GRANULARITY,
+                    flags,
+                    allocation_type
+                        .contains(AllocationType::MEM_COMMIT)
+                        .then_some(permissions),
+                )
+            }
         }
         .map_err(mapping_error_to_nt_status);
         let ptr = match allocation {
@@ -754,12 +764,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if covered_until != end || count < 2 {
                 return Err(NtStatus::CONFLICTING_ADDRESSES);
             }
+            // SAFETY: Every piece is an uncommitted guest placeholder reserved as mergeable, and
+            // the allocation lock excludes competing placeholder transitions.
+            unsafe {
+                self.global
+                    .page_manager
+                    .merge_reservations(MutPtr::<Platform, u8>::from_usize(base), size)
+            }
+            .map_err(|_| NtStatus::CONFLICTING_ADDRESSES)?;
             allocations.retain(|&start, _| start <= base || start >= end);
             allocations.get_mut(&base).unwrap().size = size;
             return Ok((base, size));
         }
 
-        let (allocation_base, allocation_end, placeholder_state) = allocations
+        let (allocation_end, placeholder_state) = allocations
             .range(..=base)
             .next_back()
             .map(|(_, allocation)| allocation)
@@ -769,21 +787,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
             })
             .and_then(|allocation| {
                 Some((
-                    allocation.base,
                     allocation.base.checked_add(allocation.size)?,
                     allocation.placeholder_state,
                 ))
             })
             .ok_or(NtStatus::CONFLICTING_ADDRESSES)?;
-        if end > allocation_end
-            || placeholder_state == WindowsPlaceholderState::Replaced
-                && (base != allocation_base || end != allocation_end)
-        {
+        // Like Windows, a replaced allocation may restore any page-aligned sub-range; the
+        // remaining pieces stay replaced and keep their contents.
+        if end > allocation_end {
             return Err(NtStatus::CONFLICTING_ADDRESSES);
         }
         if placeholder_state == WindowsPlaceholderState::Replaced {
-            // SAFETY: The exact private allocation is retained while its committed contents
-            // are discarded. The allocation lock prevents competing placeholder transitions.
+            // SAFETY: The restored sub-range of the private allocation is retained while its
+            // committed contents are discarded. The allocation lock prevents competing
+            // placeholder transitions.
             unsafe {
                 self.global
                     .page_manager
@@ -1944,6 +1961,14 @@ mod tests {
                 NtStatus::SUCCESS
             );
             assert_eq!(free(base, size, coalesce), NtStatus::SUCCESS);
+            // Coalescing joins the separately reserved slice into one backing reservation.
+            assert!(
+                task.global
+                    .page_manager
+                    .read_vmem()
+                    .reservation_ranges()
+                    .any(|range| range == (base..base + size))
+            );
             assert_eq!(query_basic_information(&task, base).region_size, size);
             assert_eq!(
                 allocate(base, size, replace | AllocationType::MEM_COMMIT, rw).0,
@@ -2075,13 +2100,37 @@ mod tests {
             );
             // SAFETY: The page was just committed for reading and writing.
             unsafe { core::ptr::write_bytes(middle as *mut u8, 0x5a, PAGE_SIZE) };
+
+            // Like Windows, restoring part of a replaced allocation splits it and keeps the
+            // remaining replaced pieces intact.
             assert_eq!(
-                free(middle, PAGE_SIZE, preserve),
-                NtStatus::CONFLICTING_ADDRESSES
+                free(middle + PAGE_SIZE, PAGE_SIZE, preserve),
+                NtStatus::SUCCESS
             );
+            // SAFETY: The first page of the replaced allocation is still committed.
+            assert_eq!(unsafe { *(middle as *const u8) }, 0x5a);
+            let head = query_basic_information(&task, middle);
+            assert_eq!(head.allocation_base, middle);
+            assert_eq!(head.region_size, PAGE_SIZE);
+            assert_eq!(head.state, MemoryState::MEM_COMMIT.bits());
+            assert_eq!(head.protect, rw.bits());
+            let restored = query_basic_information(&task, middle + PAGE_SIZE);
+            assert_eq!(restored.allocation_base, middle + PAGE_SIZE);
+            assert_eq!(restored.region_size, PAGE_SIZE);
+            assert_eq!(restored.state, MemoryState::MEM_RESERVE.bits());
+            assert_eq!(restored.allocation_protect, noaccess.bits());
+            let rest = query_basic_information(&task, middle + PAGE_SIZE * 2);
+            assert_eq!(rest.allocation_base, middle + PAGE_SIZE * 2);
+            assert_eq!(rest.allocation_protect, rw.bits());
+            assert_eq!(free(middle, PAGE_SIZE, preserve), NtStatus::SUCCESS);
+            assert_eq!(
+                free(middle + PAGE_SIZE * 2, unit - PAGE_SIZE * 2, preserve),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(free(middle, unit, coalesce), NtStatus::SUCCESS);
+            assert_eq!(query_basic_information(&task, middle).region_size, unit);
 
             // A released slice leaves a gap that cannot be coalesced across.
-            assert_eq!(free(middle, unit, preserve), NtStatus::SUCCESS);
             assert_eq!(free(middle, 0, FreeType::MEM_RELEASE), NtStatus::SUCCESS);
             assert_eq!(free(base, size, coalesce), NtStatus::CONFLICTING_ADDRESSES);
 

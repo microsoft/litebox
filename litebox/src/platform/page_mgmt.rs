@@ -21,6 +21,14 @@ pub trait PageReservation: Into<Range<usize>> {
     fn split(self, range: Range<usize>) -> (Option<Self>, Self, Option<Self>)
     where
         Self: Sized;
+
+    /// Join ownership with the immediately following extent without changing memory.
+    ///
+    /// `next` must start exactly where this extent ends. The returned handle owns both extents.
+    #[must_use]
+    fn merge(self, next: Self) -> Self
+    where
+        Self: Sized;
 }
 
 /// Direction used to search for available virtual address space.
@@ -228,6 +236,60 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
                 fixed_address_behavior,
             )
         }
+    }
+
+    /// Reserve virtual address space that can later be joined with adjacent mergeable
+    /// reservations by [`Self::merge_reservations`].
+    ///
+    /// Parameters, errors, and safety requirements match [`Self::reserve_pages`]. Reservations
+    /// split from the returned handle remain mergeable. The default forwards to
+    /// [`Self::reserve_pages`], which suits platforms whose native operations can already span
+    /// adjacent reservations.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::reserve_pages`].
+    unsafe fn reserve_mergeable_pages<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_range: Range<usize>,
+        can_grow_down: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
+    where
+        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
+    {
+        // SAFETY: Forwarded caller contract.
+        unsafe {
+            self.reserve_pages(
+                replaced_reservations,
+                suggested_range,
+                can_grow_down,
+                fixed_address_behavior,
+            )
+        }
+    }
+
+    /// Join adjacent mergeable reservations into one native reservation.
+    ///
+    /// Afterwards, a single range operation such as [`Self::commit_pages`] or
+    /// [`Self::release_pages`] may span the whole merged extent. The default only joins the
+    /// handles, which suits platforms whose native operations can already span adjacent
+    /// reservations.
+    ///
+    /// # Safety
+    ///
+    /// `reservations` must be nonempty, in ascending address order, and contiguous. Each must
+    /// come from [`Self::reserve_mergeable_pages`] or be split from such a reservation. No page in
+    /// them may be committed, and the caller must exclude all users of their extents.
+    unsafe fn merge_reservations(
+        &self,
+        reservations: Vec<ReservationOf<Self, ALIGN>>,
+    ) -> ReservationOf<Self, ALIGN> {
+        reservations
+            .into_iter()
+            .reduce(PageReservation::merge)
+            .expect("merge_reservations requires at least one reservation")
     }
 
     /// Commit backing within live reservations.
