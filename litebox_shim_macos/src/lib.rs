@@ -276,10 +276,8 @@ impl<P: ShimPlatform> Process<P> {
         (status >= 0).then_some(status)
     }
 
-    /// Block until every guest thread has ended and return the exit status.
-    ///
-    /// # Panics
-    /// Never: the last thread to end records a status if none was.
+    /// Block until every guest thread has ended and return the exit status,
+    /// which the last thread records if no thread exited.
     pub fn wait_for_exit(&self) -> i32 {
         let live = &self.0.live_threads;
         loop {
@@ -289,8 +287,7 @@ impl<P: ShimPlatform> Process<P> {
             }
             let _ = live.block(count);
         }
-        self.exit_status()
-            .expect("the last guest thread records an exit status")
+        self.0.exit_status.load(Ordering::Acquire)
     }
 
     /// Record `status` unless the process already exited (`exit1`: the first
