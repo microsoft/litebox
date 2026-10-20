@@ -526,3 +526,144 @@ fn loader_teardown_and_argument_limit() {
     }
     assert_eq!(process.exit_status(), Some(0));
 }
+
+/// Compile a C program with the host toolchain.
+#[cfg(feature = "test-broker")]
+fn compile_c(dir: &Path, source: &str) -> PathBuf {
+    let c = dir.join("main.c");
+    let binary = dir.join("main");
+    std::fs::write(&c, source).unwrap();
+    let output = Command::new("xcrun")
+        .args(["clang", "-arch", "arm64"])
+        .arg(&c)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("Xcode command line tools are required");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(feature = "test-broker")]
+const HELLO_WORLD: &str =
+    "#include <stdio.h>\nint main(void) { printf(\"Hello, world!\\n\"); return 0; }\n";
+
+#[cfg(feature = "test-broker")]
+#[test]
+#[ignore = "libSystem's initializer (libsystem_kernel mach_init) traps: Mach port traps \
+            (mach_reply_port, mach_port_construct, task_get_special_port via mach_msg) are not \
+            emulated yet"]
+fn dynamic_hello_world() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile_c(dir.path(), HELLO_WORLD);
+    let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg(&binary)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        (output.status.code(), output.stdout.as_slice()),
+        (Some(0), &b"Hello, world!\n"[..]),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Host state the guest must never touch.
+#[cfg(feature = "test-broker")]
+mod host_state {
+    unsafe extern "C" {
+        fn _dyld_get_shared_cache_range(length: *mut usize) -> *const u8;
+        fn dladdr(address: *const core::ffi::c_void, info: *mut DlInfo) -> i32;
+        fn getpid() -> i32;
+    }
+
+    #[repr(C)]
+    struct DlInfo {
+        fname: *const core::ffi::c_char,
+        fbase: *const u8,
+        sname: *const core::ffi::c_char,
+        saddr: *const core::ffi::c_void,
+    }
+
+    pub fn shared_cache_base() -> usize {
+        let mut length = 0;
+        // SAFETY: `length` is writable; the call only reports the live range.
+        unsafe { _dyld_get_shared_cache_range(&raw mut length) as usize }
+    }
+
+    /// The host's `libsystem_kernel` `__TEXT` bytes (it implements `getpid`).
+    pub fn libsystem_kernel_text() -> Vec<u8> {
+        let mut info = DlInfo {
+            fname: core::ptr::null(),
+            fbase: core::ptr::null(),
+            sname: core::ptr::null(),
+            saddr: core::ptr::null(),
+        };
+        // SAFETY: `info` is writable; getpid is a live host symbol.
+        assert_ne!(unsafe { dladdr(getpid as *const _, &raw mut info) }, 0);
+        // SAFETY: dladdr reported a loaded image's Mach header.
+        let header = unsafe { core::slice::from_raw_parts(info.fbase, 32) };
+        let commands = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let mut offset = 32;
+        for _ in 0..commands {
+            // SAFETY: load commands follow the mapped header.
+            let command = unsafe { core::slice::from_raw_parts(info.fbase.add(offset), 72) };
+            let size = u32::from_le_bytes(command[4..8].try_into().unwrap()) as usize;
+            if u32::from_le_bytes(command[..4].try_into().unwrap()) == 0x19
+                && command[8..14] == *b"__TEXT"
+            {
+                let length = u64::from_le_bytes(command[32..40].try_into().unwrap());
+                // SAFETY: the image's __TEXT is mapped from its header onward.
+                return unsafe {
+                    core::slice::from_raw_parts(info.fbase, usize::try_from(length).unwrap())
+                }
+                .to_vec();
+            }
+            offset += size;
+        }
+        panic!("libsystem_kernel has no __TEXT");
+    }
+
+    pub fn thread_pointer() -> usize {
+        let value: usize;
+        // SAFETY: reading this thread's TPIDRRO_EL0 has no side effects.
+        unsafe { core::arch::asm!("mrs {}, tpidrro_el0", out(reg) value) };
+        value
+    }
+}
+
+/// PLAN section 5 item 3: an in-process dynamic guest runs on its own private
+/// cache instance and leaves the host's libSystem, cache and TSD untouched.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_guest_leaves_host_runtime_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile_c(dir.path(), HELLO_WORLD);
+    let host_cache = host_state::shared_cache_base();
+    assert!(
+        host_cache != 0 && host_cache < litebox_shim_macos::shared_cache::SHARED_CACHE_MIN_ADDRESS,
+        "the guest instance is placed above the host's shared region"
+    );
+    let text = host_state::libsystem_kernel_text();
+    let thread_pointer = host_state::thread_pointer();
+    // The guest runs on this thread, in this process.
+    let status = litebox_runner_macos_userland::run(litebox_runner_macos_userland::CliArgs {
+        program_and_arguments: vec![binary.to_str().unwrap().to_owned()],
+        environment_variables: Vec::new(),
+        test_mmap_image: None,
+    })
+    .unwrap();
+    // The guest ran guest-cache code (dyld, libSystem); it need not finish yet.
+    assert!(status == 0 || status >= 128, "status {status}");
+    assert_eq!(host_state::shared_cache_base(), host_cache);
+    assert_eq!(host_state::thread_pointer(), thread_pointer);
+    assert!(
+        host_state::libsystem_kernel_text() == text,
+        "host libsystem_kernel __TEXT changed"
+    );
+}

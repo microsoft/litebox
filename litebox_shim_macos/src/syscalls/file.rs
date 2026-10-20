@@ -106,6 +106,35 @@ impl<P: ShimPlatform> FilesState<P> {
         Ok(())
     }
 
+    /// XNU's `dup2`: `old` must be open, `new` must be below the descriptor
+    /// limit, `old == new` is a no-op, and an open `new` is closed first.
+    pub(crate) fn dup2(&self, old: i32, new: i32) -> Result<u32, Errno> {
+        let old_fd = self.typed_fd(old)?;
+        let new_raw = usize::try_from(new)
+            .ok()
+            .filter(|new| *new < MAX_FDS)
+            .ok_or(Errno::EBADF)?;
+        if old == new {
+            return Ok(new.cast_unsigned());
+        }
+        let duplicate = self
+            .litebox
+            .descriptor_table_mut()
+            .duplicate(&old_fd)
+            .ok_or(Errno::EBADF)?;
+        let replaced = {
+            let mut raw = self.raw.write();
+            let replaced = raw.fd_consume_raw_integer::<FileSubsystem<P>>(new_raw).ok();
+            let stored = raw.fd_into_specific_raw_integer(duplicate, new_raw);
+            assert!(stored, "dup2 target was just vacated");
+            replaced
+        };
+        if let Some(replaced) = replaced {
+            self.remove(&replaced);
+        }
+        Ok(new.cast_unsigned())
+    }
+
     pub(crate) fn dup(&self, fd: i32) -> Result<u32, Errno> {
         let fd = self.typed_fd(fd)?;
         let duplicate = self
@@ -268,6 +297,36 @@ impl<P: ShimPlatform> Task<P> {
     }
     pub(crate) fn sys_dup(&self, fd: i32) -> Result<u32, Errno> {
         self.files.dup(fd)
+    }
+    pub(crate) fn sys_dup2(&self, old: i32, new: i32) -> Result<u32, Errno> {
+        self.files.dup2(old, new)
+    }
+
+    /// XNU's `fsctl` on a LiteBox file. Generic and filesystem-specific
+    /// commands are unsupported: guest files are not host volumes, and their
+    /// `VNOP_IOCTL` is `err_ioctl` (ENOTSUP). Never forwarded to the host.
+    pub(crate) fn sys_fsctl(&self, path: &str, command: u32, data: usize) -> Result<(), Errno> {
+        // IOCPARM_LEN / IOCPARM_MAX / IOC_IN from sys/ioccom.h.
+        const IOCPARM_MAX: usize = 8192;
+        const IOC_IN: u32 = 0x8000_0000;
+        const FSIOC_FD_ONLY_OPEN_ONCE: u32 = 0x4004_4a16;
+        if command == FSIOC_FD_ONLY_OPEN_ONCE {
+            return Err(Errno::EINVAL);
+        }
+        // namei: the path must name an existing file.
+        let fd = self.sys_open(path, OpenFlags::RDONLY, FileMode::empty())?;
+        self.sys_close(fd.cast_signed())?;
+        let size = ((command >> 16) & 0x1fff) as usize;
+        if size > IOCPARM_MAX {
+            return Err(Errno::EINVAL);
+        }
+        if command & IOC_IN != 0 && size != 0 {
+            litebox_common_macos::user_pointers::UserPtr::<u8>::from_usize(data)
+                .to_owned_slice::<P>(size)
+                .ok_or(Errno::EFAULT)?;
+        }
+        litebox_util_log::debug!(path:%, command:? = format_args!("{command:#x}"); "unsupported fsctl");
+        Err(Errno::ENOTSUP)
     }
 }
 
@@ -479,6 +538,29 @@ mod tests {
         assert_eq!(&*buf.to_owned_slice(6).unwrap(), b"abcdXY");
         // INT_MAX itself is permitted; at EOF it returns zero bytes.
         assert_eq!(invoke(nr::READ, 1, max_count), Ok(0));
+        // dup2 replaces an open target, shares the open file description,
+        // and validates both descriptors like XNU.
+        assert_eq!(task.sys_dup2(1, 1), Ok(1));
+        assert_eq!(task.sys_dup2(1, 2), Ok(2));
+        assert_eq!(invoke(nr::READ, 2, 1), Ok(0), "shares fd 1's offset");
+        assert_eq!(
+            invoke(nr::WRITE, 2, 1),
+            Err(Errno::EBADF),
+            "fd 2 is now read-only"
+        );
+        assert_eq!(task.sys_dup2(9, 3), Err(Errno::EBADF));
+        assert_eq!(task.sys_dup2(1, -1), Err(Errno::EBADF));
+        assert_eq!(task.sys_dup2(1, i32::MAX), Err(Errno::EBADF));
+        assert_eq!(task.sys_dup2(1, 7), Ok(7));
+        assert_eq!(invoke(nr::CLOSE, 7, 0), Ok(0));
+        // fsctl resolves the path and never reaches a host volume.
+        assert_eq!(task.sys_fsctl("/data", 0x4008_4a6a, 0), Err(Errno::ENOTSUP));
+        assert_eq!(
+            task.sys_fsctl("/missing", 0x4008_4a6a, 0),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(task.sys_fsctl("/data", 0x8008_4a6a, 0), Err(Errno::EFAULT));
+        assert_eq!(task.sys_fsctl("/data", 0x4004_4a16, 0), Err(Errno::EINVAL));
         assert_eq!(invoke(nr::CLOSE, 2, 0), Ok(0));
         assert_eq!(invoke(nr::CLOSE, 2, 0), Err(Errno::EBADF));
 

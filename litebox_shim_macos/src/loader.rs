@@ -174,17 +174,7 @@ impl<'a> Image<'a> {
                 .ok_or(MachoLoaderError::Memory)?;
             // Anonymous pages supply zero-filled BSS/padding; holes remain
             // inaccessible. macOS synchronizes instruction caches on RW -> RX.
-            // Dyld mutates its DATA_CONST/authenticated bookkeeping
-            // during bootstrap and normally asks the kernel mapping machinery
-            // to toggle those pages. Keep non-executable dyld data writable in
-            // this minimal loader; executable segments still remain W^X.
-            let final_protection =
-                if self.plan.is_dyld && !segment.protection.contains(VmProtection::EXECUTE) {
-                    segment.protection | VmProtection::WRITE
-                } else {
-                    segment.protection
-                };
-            protect(task, range, final_protection)?;
+            protect(task, range, segment.protection)?;
         }
         if let Some(trampoline) = &self.trampoline {
             let start = relocate(trampoline.virtual_range.start);
@@ -202,7 +192,6 @@ impl<'a> Image<'a> {
         Ok(MappedImage {
             entry: relocate(self.plan.entry),
             header: relocate(self.plan.virtual_range.start),
-            end: base + self.plan.virtual_range.len(),
         })
     }
 }
@@ -210,7 +199,6 @@ impl<'a> Image<'a> {
 struct MappedImage {
     entry: usize,
     header: usize,
-    end: usize,
 }
 
 pub(super) fn load<P: ShimPlatform>(
@@ -258,9 +246,6 @@ pub(super) fn load<P: ShimPlatform>(
             Some(image.map(task)?)
         }
     };
-    if let Some(dyld) = &dyld {
-        *task.global.privately_mapped_dyld_range.lock() = Some(dyld.header..dyld.end);
-    }
     let guard = reserve(
         task,
         STACK_SIZE + PAGE_SIZE,
@@ -279,17 +264,14 @@ pub(super) fn load<P: ShimPlatform>(
         allocation: guard,
         allocation_size: STACK_SIZE + PAGE_SIZE,
     };
-    // libSystem's initializers require the entropy keys; self-contained static
-    // executables cannot consume them, so they start without a broker request.
-    let entropy = if uses_dyld {
-        let mut entropy = [0u8; stack::APPLE_ENTROPY_BYTES];
-        task.global
-            .litebox
-            .fill_random(&mut entropy)
-            .map_err(|_| MachoLoaderError::Entropy)?;
-        Some(stack::AppleEntropy::from_bytes(&entropy))
-    } else {
-        None
+    // XNU always supplies the entropy keys. libSystem's initializers require
+    // them, so dynamic executables fail without a random source; static
+    // executables start without them when no broker provides randomness.
+    let mut entropy = [0u8; stack::APPLE_ENTROPY_BYTES];
+    let entropy = match task.global.litebox.fill_random(&mut entropy) {
+        Ok(()) => Some(stack::AppleEntropy::from_bytes(&entropy)),
+        Err(_) if !uses_dyld => None,
+        Err(_) => return Err(MachoLoaderError::Entropy),
     };
     let apple = stack::apple_strings(path, &main_stack, entropy.as_ref())?;
     let sp = stack::initialize::<P>(

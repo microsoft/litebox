@@ -4,9 +4,14 @@
 extern crate std;
 
 use super::*;
+use crate::shared_cache::{
+    SHARED_CACHE_MIN_ADDRESS, SharedCacheBacking, SharedCacheCodeRegion, SharedCacheInstallError,
+    SharedCacheLayout, SharedCachePage, SharedCachePager, SharedCachePiece,
+};
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::{RawConstPointer as _, page_mgmt::MemoryRegionPermissions as Permissions};
 use litebox_common_linux::vmem::{CreatePagesFlags, VmFlags};
+use litebox_common_macos::VmProtection;
 use litebox_platform_macos_userland::MacosUserland as Platform;
 
 fn task(shim: MacosShim<Platform>) -> Task<Platform> {
@@ -113,213 +118,225 @@ fn loaded_program(task: Task<Platform>) -> LoadedProgram<Platform> {
     }
 }
 
+const SVC: u32 = 0xd400_1001;
+const MRS_TPIDRRO_X3: u32 = 0xd53b_d063;
+const NOP: u32 = 0xd503_201f;
+const RET: u32 = 0xd65f_03c0;
+
+fn words(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+/// Native-page-aligned immutable host bytes, as a cache file mapping provides.
+fn leaked_source(pages: usize, fill: u8) -> &'static [u8] {
+    let bytes: &'static mut [u8] = Vec::leak(vec![fill; (pages + 1) * PAGE_SIZE]);
+    let offset = bytes.as_ptr().align_offset(PAGE_SIZE);
+    &bytes[offset..offset + pages * PAGE_SIZE]
+}
+
+fn read_guest(address: usize, length: usize) -> Option<Vec<u8>> {
+    litebox_common_macos::user_pointers::UserPtr::<u8>::from_usize(address)
+        .to_owned_slice::<Platform>(length)
+        .map(<[u8]>::into_vec)
+}
+
+fn guest_flags(task: &Task<Platform>, address: usize) -> VmFlags {
+    task.global
+        .mm
+        .mappings()
+        .into_iter()
+        .find_map(|(range, flags)| range.contains(&address).then_some(flags))
+        .unwrap()
+}
+
 #[test]
-fn shared_cache_installation_validates_layout() {
+fn shared_cache_installation_rewrites_maps_and_registers_pieces() {
+    use litebox_trampoline::aarch64::decode_branch_target;
     const RX: VmProtection = VmProtection::READ.union(VmProtection::EXECUTE);
+
     let program = loaded_program(task(MacosShimBuilder::new(Platform::new()).build()));
-    let base = 0x10_0000_0000;
-    let mappings = [
-        SharedCacheMapping {
-            range: base..base + PAGE_SIZE,
-            protection: VmProtection::READ,
-        },
-        SharedCacheMapping {
-            range: base + PAGE_SIZE..base + 3 * PAGE_SIZE,
-            protection: RX,
-        },
-    ];
-    let island = |start: usize| SharedCacheGateIsland {
-        range: start..start + PAGE_SIZE,
-        writable_alias: start,
-    };
-    let code = |start: usize| SharedCacheCodeRegion {
-        range: start..start + PAGE_SIZE,
-        writable_alias: start,
-        instruction_ranges: &[],
-    };
-    let layout = |code_regions, gate_islands| SharedCacheLayout {
-        range: base..base + 4 * PAGE_SIZE,
-        mappings: &mappings,
-        code_regions,
-        gate_islands,
-    };
-    let read_only_island = [island(base)];
-    let outside_island = [island(base + 4 * PAGE_SIZE)];
-    let overlapping_islands = [island(base + PAGE_SIZE), island(base + PAGE_SIZE)];
-    let unmapped_island = [island(base + 3 * PAGE_SIZE)];
-    for islands in [
-        &read_only_island[..],
-        &outside_island,
-        &overlapping_islands,
-        &unmapped_island,
-    ] {
-        assert_eq!(
-            program.install_shared_cache(&layout(&[], islands)),
-            Err(SharedCacheInstallError::InvalidGateIsland)
-        );
-    }
-    let valid_island = [island(base + 2 * PAGE_SIZE)];
-    let read_only_code = [code(base)];
-    let island_code = [code(base + 2 * PAGE_SIZE)];
-    for regions in [&read_only_code[..], &island_code] {
-        assert_eq!(
-            program.install_shared_cache(&layout(regions, &valid_island)),
-            Err(SharedCacheInstallError::InvalidRegion)
-        );
-    }
-    let unaligned = SharedCacheLayout {
-        range: base + 1..base + 4 * PAGE_SIZE,
-        ..layout(&[], &valid_island)
-    };
+    // Above the host's malloc reservation that covers [64, 448) GiB.
+    let range = 0x70_0000_0000..0x70_0000_0000 + 6 * PAGE_SIZE;
     assert_eq!(
-        program.install_shared_cache(&unaligned),
+        program.reserve_shared_cache(PAGE_SIZE..2 * PAGE_SIZE),
         Err(SharedCacheInstallError::InvalidCacheRange)
     );
-    // Without code to rewrite, a valid layout only registers the instance.
+    program.reserve_shared_cache(range.clone()).unwrap();
     assert_eq!(
-        program.install_shared_cache(&layout(&[], &valid_island)),
-        Ok(())
-    );
-    assert_eq!(
-        program
-            .entrypoints
-            .task
-            .global
-            .shared_cache_base
-            .load(Ordering::Acquire),
-        base
-    );
-    assert_eq!(
-        program.install_shared_cache(&layout(&[], &valid_island)),
+        program.reserve_shared_cache(range.clone()),
         Err(SharedCacheInstallError::AlreadyInstalled)
     );
-}
-
-/// Rewrite one SVC and one TPIDRRO read with the given islands. Returns the
-/// region result, the code page, and the island cursors.
-fn rewrite_with_islands(
-    task: &Task<Platform>,
-    islands: impl FnOnce(usize) -> Vec<SharedCacheGateIsland>,
-) -> (
-    Result<(), SharedCacheInstallError>,
-    Vec<u8>,
-    Vec<SharedCacheGateIsland>,
-    Vec<usize>,
-) {
-    const CODE: [u32; 4] = [0xd503_201f, 0xd400_1001, 0xd53b_d063, 0xd65f_03c0];
-    // SAFETY: allocate fresh pages owned exclusively by this idle test task.
-    let base = unsafe {
-        task.global.mm.create_writable_pages(
-            NonZeroAddress::new(Platform::TASK_ADDR_MIN),
-            NonZeroPageSize::new(3 * PAGE_SIZE).unwrap(),
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            |_| Ok(0),
-        )
-    }
-    .unwrap()
-    .as_usize();
-    let code: Vec<u8> = CODE.iter().flat_map(|word| word.to_le_bytes()).collect();
-    litebox_common_macos::user_pointers::UserPtrMut::<u8>::from_usize(base)
-        .copy_from_slice::<Platform>(0, &code)
-        .unwrap();
+    let base = range.start;
+    let page = |index: usize| base + index * PAGE_SIZE..base + (index + 1) * PAGE_SIZE;
+    let source = leaked_source(2, 0x5a);
+    let code = words(&[NOP, SVC, MRS_TPIDRRO_X3, RET]);
+    let data = [0x11u8; 8];
+    let pieces = [
+        SharedCachePiece {
+            range: page(0),
+            backing: SharedCacheBacking::Copy(&code),
+            protection: RX,
+            max_protection: RX,
+        },
+        SharedCachePiece {
+            range: base + PAGE_SIZE..base + 3 * PAGE_SIZE,
+            backing: SharedCacheBacking::Source(source),
+            protection: VmProtection::READ,
+            max_protection: VmProtection::READ,
+        },
+        SharedCachePiece {
+            range: page(3),
+            backing: SharedCacheBacking::Copy(&data),
+            protection: VmProtection::READ,
+            max_protection: VmProtection::READ | VmProtection::WRITE,
+        },
+        SharedCachePiece {
+            range: page(4),
+            backing: SharedCacheBacking::Paged,
+            protection: VmProtection::empty(),
+            max_protection: VmProtection::empty(),
+        },
+        SharedCachePiece {
+            range: page(5),
+            backing: SharedCacheBacking::Reserved,
+            protection: VmProtection::empty(),
+            max_protection: VmProtection::empty(),
+        },
+    ];
     let instructions = 0..code.len();
-    let instruction_ranges = core::slice::from_ref(&instructions);
-    let region = SharedCacheCodeRegion {
-        range: base..base + PAGE_SIZE,
-        writable_alias: base,
-        instruction_ranges,
-    };
-    let islands = islands(base);
-    let mut cursors = vec![0; islands.len()];
-    let result = task.rewrite_shared_cache_region(&region, &islands, &mut cursors);
-    let code = litebox_common_macos::user_pointers::UserPtr::<u8>::from_usize(base)
-        .to_owned_slice::<Platform>(code.len())
-        .unwrap()
-        .into_vec();
-    (result, code, islands, cursors)
-}
-
-#[test]
-fn shared_cache_rewrite_uses_nearest_reachable_island() {
-    use litebox_trampoline::aarch64::decode_branch_target;
-
-    let task = task(MacosShimBuilder::new(Platform::new()).build());
-    // The first island is out of `B` range. Its writable alias is a real page,
-    // so a wrong choice would be observable rather than fault.
-    let (result, code, islands, cursors) = rewrite_with_islands(&task, |base| {
-        vec![
-            SharedCacheGateIsland {
-                range: base + (256 << 20)..base + (256 << 20) + PAGE_SIZE,
-                writable_alias: base + PAGE_SIZE,
-            },
-            SharedCacheGateIsland {
-                range: base + 2 * PAGE_SIZE..base + 3 * PAGE_SIZE,
-                writable_alias: base + 2 * PAGE_SIZE,
-            },
-        ]
+    let code_regions = [SharedCacheCodeRegion {
+        piece: 0,
+        instruction_ranges: core::slice::from_ref(&instructions),
+    }];
+    // The nearest island candidate (inside the Source piece) is used; the
+    // other (inside the Reserved piece) is not.
+    let islands = [page(2), page(5)];
+    let paged_address = page(4).start;
+    let pager: SharedCachePager = Arc::new(move |address| {
+        (address == paged_address).then(|| SharedCachePage {
+            bytes: vec![0x77; PAGE_SIZE],
+            protection: VmProtection::READ,
+            max_protection: VmProtection::READ | VmProtection::WRITE,
+        })
     });
-    assert_eq!(result, Ok(()));
-    assert_eq!(cursors[0], 0);
-    assert_ne!(cursors[1], 0);
+    let layout = |pieces, code_regions, gate_islands| SharedCacheLayout {
+        range: range.clone(),
+        pieces,
+        code_regions,
+        gate_islands,
+        attribution: None,
+        pager: Some(pager.clone()),
+    };
+    let copied_island = [page(3)];
+    let rejected = [
+        // Executable code without a code region would run unrewritten.
+        layout(&pieces, &[], &islands),
+        // Islands may not replace copied bytes.
+        layout(&pieces, &code_regions, &copied_island),
+        // Pieces must tile the reservation.
+        layout(&pieces[..3], &code_regions, &islands),
+    ];
+    for (layout, expected) in rejected.iter().zip([
+        SharedCacheInstallError::InvalidRegion,
+        SharedCacheInstallError::InvalidGateIsland,
+        SharedCacheInstallError::InvalidCacheRange,
+    ]) {
+        assert_eq!(program.install_shared_cache(layout), Err(expected));
+    }
+    let executable_source = [SharedCachePiece {
+        range: range.clone(),
+        backing: SharedCacheBacking::Source(leaked_source(6, 0)),
+        protection: VmProtection::READ,
+        max_protection: RX,
+    }];
+    assert_eq!(
+        program.install_shared_cache(&layout(&executable_source, &[], &[])),
+        Err(SharedCacheInstallError::InvalidCacheRange)
+    );
+
+    program
+        .install_shared_cache(&layout(&pieces, &code_regions, &islands))
+        .unwrap();
+    let task = &program.entrypoints.task;
+    assert_eq!(task.global.shared_cache_base.load(Ordering::Acquire), base);
+    let code = read_guest(base, code.len()).unwrap();
     let word =
         |index: usize| u32::from_le_bytes(code[4 * index..4 * index + 4].try_into().unwrap());
-    assert_eq!(word(0), 0xd503_201f);
-    assert_eq!(word(3), 0xd65f_03c0);
-    let base = islands[1].range.start - 2 * PAGE_SIZE;
+    assert_eq!((word(0), word(3)), (NOP, RET));
     for index in [1, 2] {
         let target = decode_branch_target(word(index), (base + 4 * index) as u64)
             .expect("site must branch to its gate");
-        assert!(islands[1].range.contains(&usize::try_from(target).unwrap()));
+        assert!(page(2).contains(&usize::try_from(target).unwrap()));
     }
+    assert!(guest_flags(task, base).contains(VmFlags::VM_EXEC));
+    assert!(guest_flags(task, page(2).start).contains(VmFlags::VM_EXEC));
+    assert_eq!(read_guest(page(1).start, 2).unwrap(), [0x5a, 0x5a]);
+    assert!(!guest_flags(task, page(1).start).contains(VmFlags::VM_EXEC));
+    assert_eq!(
+        read_guest(page(3).start, 9).unwrap(),
+        [0x11; 8].iter().copied().chain([0]).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        read_guest(page(5).start, 1),
+        None,
+        "unused islands stay reserved"
+    );
+
+    // Protections follow each piece's maximum, like XNU map entries.
+    let rw = VmProtection::READ | VmProtection::WRITE;
+    assert_eq!(
+        task.sys_mprotect(page(1).start, PAGE_SIZE, VmProtection::READ),
+        Ok(())
+    );
+    for (page, protection) in [(page(1), RX), (page(1), rw), (page(0), rw), (page(2), rw)] {
+        assert_eq!(
+            task.sys_mprotect(page.start, PAGE_SIZE, protection),
+            Err(litebox_common_macos::errno::Errno::EACCES),
+            "{page:#x?} {protection:?}"
+        );
+    }
+    assert_eq!(task.sys_mprotect(page(3).start, PAGE_SIZE, rw), Ok(()));
+    assert!(guest_flags(task, page(3).start).contains(VmFlags::VM_WRITE));
+    assert_eq!(
+        task.sys_mprotect(page(4).start, PAGE_SIZE, VmProtection::READ),
+        Err(litebox_common_macos::errno::Errno::EACCES),
+        "pages await the pager"
+    );
+
+    // Demand paging: only paged pieces are supplied, then follow their maximum.
+    assert!(!task.page_in_shared_cache(page(5).start));
+    assert!(!task.page_in_shared_cache(page(1).start));
+    assert!(task.page_in_shared_cache(page(4).start + 8));
+    assert_eq!(read_guest(page(4).start, 2).unwrap(), [0x77, 0x77]);
+    assert!(!guest_flags(task, page(4).start).contains(VmFlags::VM_WRITE));
+    assert!(!task.page_in_shared_cache(page(4).start), "supplied once");
+    assert_eq!(task.sys_mprotect(page(4).start, PAGE_SIZE, rw), Ok(()));
+    assert_eq!(
+        program.install_shared_cache(&layout(&pieces, &code_regions, &islands)),
+        Err(SharedCacheInstallError::AlreadyInstalled)
+    );
 }
 
 #[test]
 fn shared_cache_rewrite_fails_closed_without_reachable_island() {
     let task = task(MacosShimBuilder::new(Platform::new()).build());
-    let (result, code, _, cursors) = rewrite_with_islands(&task, |base| {
-        vec![SharedCacheGateIsland {
-            range: base + (256 << 20)..base + (256 << 20) + PAGE_SIZE,
-            writable_alias: base + PAGE_SIZE,
-        }]
-    });
-    assert_eq!(result, Err(SharedCacheInstallError::UnreachableGates));
-    assert_eq!(cursors, [0]);
+    let original = words(&[NOP, SVC, MRS_TPIDRRO_X3, RET]);
+    let mut code = original.clone();
+    let address = SHARED_CACHE_MIN_ADDRESS;
+    let far = address + (256 << 20)..address + (256 << 20) + PAGE_SIZE;
+    let mut gates = vec![Vec::new()];
     assert_eq!(
-        code,
-        [0xd503_201fu32, 0xd400_1001, 0xd53b_d063, 0xd65f_03c0]
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect::<Vec<_>>()
+        task.rewrite_shared_cache_code(
+            &mut code,
+            address,
+            core::slice::from_ref(&(0..16)),
+            &[far],
+            &mut gates
+        ),
+        Err(SharedCacheInstallError::UnreachableGates)
     );
-}
-
-#[test]
-fn dyld_data_remains_writable_during_bootstrap() {
-    use litebox_common_macos::VmProtection;
-
-    let task = task(MacosShimBuilder::new(Platform::new()).build());
-    // SAFETY: allocate one fresh page owned exclusively by this test task.
-    let page = unsafe {
-        task.global.mm.create_writable_pages(
-            NonZeroAddress::new(Platform::TASK_ADDR_MIN),
-            NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            |_| Ok(0),
-        )
-    }
-    .unwrap();
-    let base = page.as_usize();
-    *task.global.privately_mapped_dyld_range.lock() = Some(base..base + PAGE_SIZE);
-    task.sys_mprotect(base, PAGE_SIZE, VmProtection::READ)
-        .unwrap();
-    let flags = task
-        .global
-        .mm
-        .mappings()
-        .into_iter()
-        .find_map(|(range, flags)| range.contains(&base).then_some(flags))
-        .unwrap();
-    assert!(flags.contains(VmFlags::VM_WRITE));
+    assert_eq!(code, original);
+    assert!(gates[0].is_empty());
 }
 
 #[test]
@@ -445,28 +462,94 @@ fn mach_vm_map_honors_current_protection() {
 }
 
 #[test]
-fn sysctl_fallback_requires_name_to_oid_mib_and_bounds_name() {
+fn sysctl_mirrors_only_allowlisted_host_nodes_read_only() {
     use litebox_common_macos::{errno::Errno, user_pointers::UserPtr};
 
-    let wrong_mib = [0, 2];
-    assert_eq!(
-        Task::<Platform>::sys_sysctl_compat(
-            UserPtr::from_ptr(wrong_mib.as_ptr()),
-            2,
-            UserPtr::from_usize(1),
-            b"kern.bootargs".len(),
-        ),
-        Err(Errno::ENOSYS)
-    );
+    use litebox_common_macos::user_pointers::UserPtrMut;
+
+    let shim = MacosShimBuilder::new(Platform::new())
+        .host_sysctls(vec![
+            HostSysctl {
+                name: "hw.target",
+                mib: vec![6, 26],
+                value: Ok(b"J274AP\0".to_vec()),
+            },
+            HostSysctl {
+                name: "security.mac.img4.ignition_blob",
+                mib: vec![103, 101, 118, 100],
+                value: Err(Errno::EPERM),
+            },
+        ])
+        .unwrap()
+        .build();
+    let task = task(shim);
+    let sysctl = |mib: &[i32], old: &mut [u8], old_length: Option<&mut usize>, new: &[u8]| {
+        task.sys_sysctl(
+            UserPtr::from_ptr(mib.as_ptr()),
+            u32::try_from(mib.len()).unwrap(),
+            UserPtrMut::from_usize(if old.is_empty() {
+                0
+            } else {
+                old.as_mut_ptr() as usize
+            }),
+            UserPtrMut::from_usize(
+                old_length.map_or(0, |length| core::ptr::from_mut(length) as usize),
+            ),
+            UserPtr::from_usize(if new.is_empty() {
+                0
+            } else {
+                new.as_ptr() as usize
+            }),
+            new.len(),
+        )
+    };
     let name_to_oid = [0, 3];
+    // Lookups: allowlisted names resolve to the host's MIB; others do not exist.
+    let mut oid = [0u8; 48];
+    let mut length = oid.len();
     assert_eq!(
-        Task::<Platform>::sys_sysctl_compat(
-            UserPtr::from_ptr(name_to_oid.as_ptr()),
-            2,
-            UserPtr::from_usize(1),
-            usize::MAX,
-        ),
-        Err(Errno::ENOSYS)
+        sysctl(&name_to_oid, &mut oid, Some(&mut length), b"hw.target"),
+        Ok(0)
+    );
+    assert_eq!(length, 8);
+    assert_eq!(oid[..8], [6, 0, 0, 0, 26, 0, 0, 0]);
+    for (name, expected) in [
+        (&b"kern.bootargs"[..], Errno::ENOENT),
+        (b"", Errno::ENOENT),
+        (&[b'a'; 1024], Errno::ENAMETOOLONG),
+    ] {
+        assert_eq!(sysctl(&name_to_oid, &mut [], None, name), Err(expected));
+    }
+    // Reads: size query, exact copy, truncation, mirrored errors, no writes.
+    let mut length = 0;
+    assert_eq!(sysctl(&[6, 26], &mut [], Some(&mut length), b""), Ok(0));
+    assert_eq!(length, 7);
+    let mut value = [0u8; 7];
+    assert_eq!(sysctl(&[6, 26], &mut value, Some(&mut length), b""), Ok(0));
+    assert_eq!(&value, b"J274AP\0");
+    let mut short = [0u8; 3];
+    let mut length = short.len();
+    assert_eq!(
+        sysctl(&[6, 26], &mut short, Some(&mut length), b""),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!((&short, length), (b"J27", 3));
+    assert_eq!(
+        sysctl(&[103, 101, 118, 100], &mut [], None, b""),
+        Err(Errno::EPERM)
+    );
+    assert_eq!(sysctl(&[6, 26], &mut [], None, b"x"), Err(Errno::EPERM));
+    assert_eq!(sysctl(&[1, 65], &mut [], None, b""), Err(Errno::ENOENT));
+    assert_eq!(sysctl(&[1], &mut [], None, b""), Err(Errno::EINVAL));
+    // Only allowlisted names can be mirrored.
+    assert!(
+        MacosShimBuilder::new(Platform::new())
+            .host_sysctls(vec![HostSysctl {
+                name: "kern.bootargs",
+                mib: vec![1, 65],
+                value: Ok(Vec::new()),
+            }])
+            .is_err()
     );
 }
 
@@ -475,6 +558,11 @@ fn shared_region_check_handles_sentinel_and_copyout_fault() {
     use litebox_common_macos::{errno::Errno, user_pointers::UserPtrMut};
 
     let task = task(MacosShimBuilder::new(Platform::new()).build());
+    assert_eq!(
+        task.sys_shared_region_check_np(UserPtrMut::from_usize(usize::MAX)),
+        Err(Errno::EINVAL),
+        "no shared region before installation"
+    );
     task.global
         .shared_cache_base
         .store(0x1800_0000, Ordering::Release);

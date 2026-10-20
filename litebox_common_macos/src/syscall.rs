@@ -27,12 +27,14 @@ pub mod nr {
     pub const GETEUID: usize = 25;
     pub const GETPPID: usize = 39;
     pub const DUP: usize = 41;
+    pub const DUP2: usize = 90;
     pub const GETEGID: usize = 43;
     pub const GETGID: usize = 47;
     pub const MUNMAP: usize = 73;
     pub const MPROTECT: usize = 74;
     pub const MMAP: usize = 197;
     pub const SYSCTL: usize = 202;
+    pub const FSCTL: usize = 242;
     pub const SHARED_REGION_CHECK_NP: usize = 294;
     pub const THREAD_SELFID: usize = 372;
     pub const READ_NOCANCEL: usize = 396;
@@ -203,6 +205,10 @@ pub enum SyscallRequest {
     Dup {
         fd: i32,
     },
+    Dup2 {
+        old: i32,
+        new: i32,
+    },
     Sysctl {
         name: UserPtr<i32>,
         name_length: u32,
@@ -210,6 +216,12 @@ pub enum SyscallRequest {
         old_length: UserPtrMut<usize>,
         new_value: UserPtr<u8>,
         new_length: usize,
+    },
+    Fsctl {
+        path: UserPtr<core::ffi::c_char>,
+        command: u32,
+        data: usize,
+        options: u32,
     },
     Mmap {
         address: usize,
@@ -349,6 +361,10 @@ impl SyscallRequest {
             },
             nr::CLOSE | nr::CLOSE_NOCANCEL => Self::Close { fd: int_arg(0) },
             nr::DUP => Self::Dup { fd: int_arg(0) },
+            nr::DUP2 => Self::Dup2 {
+                old: int_arg(0),
+                new: int_arg(1),
+            },
             nr::SYSCTL => Self::Sysctl {
                 name: UserPtr::from_usize(args[0]),
                 name_length: TruncateExt::<u32>::trunc(args[1]),
@@ -356,6 +372,12 @@ impl SyscallRequest {
                 old_length: UserPtrMut::from_usize(args[3]),
                 new_value: UserPtr::from_usize(args[4]),
                 new_length: args[5],
+            },
+            nr::FSCTL => Self::Fsctl {
+                path: UserPtr::from_usize(args[0]),
+                command: TruncateExt::<u32>::trunc(args[1]),
+                data: args[2],
+                options: TruncateExt::<u32>::trunc(args[3]),
             },
             nr::MMAP => Self::Mmap {
                 address: args[0],

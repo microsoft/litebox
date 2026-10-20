@@ -24,9 +24,11 @@ use litebox::{
 use litebox_common_linux::{PtRegs, mm::VmemManager, vmem::VmFlags};
 use litebox_common_macos::{
     KernReturn, PAGE_SIZE, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
-    VmProtection, errno::Errno, loader::MachoLoaderError,
+    errno::Errno, loader::MachoLoaderError,
 };
 use litebox_platform::time::TimeProvider;
+
+use syscalls::misc::{HOST_SYSCTL_NAMES, HostSysctl};
 
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
     #[cfg(target_os = "macos")]
@@ -37,6 +39,7 @@ const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
 }
 
 mod loader;
+pub mod shared_cache;
 pub mod syscalls;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
@@ -75,6 +78,7 @@ pub struct MacosShimBuilder<P: ShimPlatform> {
     platform: &'static P,
     litebox: Arc<LiteBox<P>>,
     files: Arc<syscalls::file::FilesState<P>>,
+    host_sysctls: Vec<HostSysctl>,
 }
 
 impl<P: ShimPlatform> MacosShimBuilder<P> {
@@ -90,7 +94,25 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
             platform,
             files: Arc::new(syscalls::file::FilesState::new(Arc::clone(&litebox))),
             litebox,
+            host_sysctls: Vec::new(),
         }
+    }
+
+    /// Mirror host sysctl nodes read-only into the guest. Each name must be
+    /// in [`HOST_SYSCTL_NAMES`] and appear once.
+    pub fn host_sysctls(mut self, sysctls: Vec<HostSysctl>) -> Result<Self, Errno> {
+        for (index, sysctl) in sysctls.iter().enumerate() {
+            if !HOST_SYSCTL_NAMES.contains(&sysctl.name)
+                || !(2..=12).contains(&sysctl.mib.len())
+                || sysctls[..index]
+                    .iter()
+                    .any(|other| other.name == sysctl.name)
+            {
+                return Err(Errno::EINVAL);
+            }
+        }
+        self.host_sysctls = sysctls;
+        Ok(self)
     }
 
     pub fn litebox(&self) -> &LiteBox<P> {
@@ -112,9 +134,9 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 macho_mappings: Mutex::new(BTreeMap::new()),
                 macho_trampolines: Mutex::new(BTreeMap::new()),
                 shared_cache_base: AtomicUsize::new(0),
-                shared_cache_range: Mutex::new(None),
-                shared_cache_mappings: Mutex::new(Vec::new()),
-                privately_mapped_dyld_range: Mutex::new(None),
+                shared_cache_reservation: Mutex::new(None),
+                shared_cache: Mutex::new(None),
+                host_sysctls: self.host_sysctls,
                 next_thread_id: core::sync::atomic::AtomicU64::new(1u64 << 32),
             }),
             files: self.files,
@@ -129,75 +151,9 @@ pub struct MacosShim<P: ShimPlatform> {
     files: Arc<syscalls::file::FilesState<P>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SharedCacheInstallError {
-    AlreadyInstalled,
-    InvalidCacheRange,
-    InvalidRegion,
-    InvalidGateIsland,
-    UnreadableAlias,
-    Rewrite,
-    /// No gate island with remaining capacity is within branch range of a site.
-    UnreachableGates,
-}
-
-impl core::fmt::Display for SharedCacheInstallError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str(match self {
-            Self::AlreadyInstalled => "shared cache already installed",
-            Self::InvalidCacheRange => "invalid or uncovered shared-cache base",
-            Self::InvalidRegion => "invalid shared-cache code region",
-            Self::InvalidGateIsland => "invalid shared-cache gate island",
-            Self::UnreadableAlias => "shared-cache writable alias is unreadable",
-            Self::Rewrite => "failed to rewrite shared-cache executable code",
-            Self::UnreachableGates => "no shared-cache gate island can serve a rewrite site",
-        })
-    }
-}
-
-impl core::error::Error for SharedCacheInstallError {}
-
-/// One mapping of a guest shared-cache instance and its final protection.
-pub struct SharedCacheMapping {
-    pub range: core::ops::Range<usize>,
-    pub protection: VmProtection,
-}
-
-/// Guest-executed shared-cache code to rewrite in place, such as one image's `__TEXT`.
-pub struct SharedCacheCodeRegion<'a> {
-    /// Final guest address range; page-aligned.
-    pub range: core::ops::Range<usize>,
-    /// Address at which the same bytes are writable during installation. It
-    /// may equal `range.start` while the target is temporarily writable.
-    pub writable_alias: usize,
-    /// Instruction byte ranges relative to `range.start`: sorted,
-    /// non-overlapping and 4-byte aligned.
-    pub instruction_ranges: &'a [core::ops::Range<usize>],
-}
-
-/// Page-aligned, otherwise unused guest memory that receives rewrite gates.
-///
-/// Each rewritten site branches directly to its gate, so every site must lie
-/// within AArch64 `B` range (+-128 MiB) of an island with remaining capacity.
-pub struct SharedCacheGateIsland {
-    pub range: core::ops::Range<usize>,
-    /// Address at which the island is writable during installation.
-    pub writable_alias: usize,
-}
-
-/// Layout of a guest-private shared-cache instance prepared by a runtime provider.
-pub struct SharedCacheLayout<'a> {
-    /// The whole reserved instance, `[base, base + sharedRegionSize)`.
-    pub range: core::ops::Range<usize>,
-    /// Final protections of the instance's pages, sorted and non-overlapping.
-    /// Code regions and gate islands must be covered by read-execute mappings.
-    pub mappings: &'a [SharedCacheMapping],
-    pub code_regions: &'a [SharedCacheCodeRegion<'a>],
-    pub gate_islands: &'a [SharedCacheGateIsland],
-}
-
 impl<P: ShimPlatform> MacosShim<P> {
     /// Load a self-contained static executable from the guest filesystem.
+    /// Dynamic executables require [`Self::load_program_with_dyld`].
     ///
     /// `path` also supplies the startup apple vector's `executable_path` entry,
     /// independently of `argv[0]`. Requires read access; execute permissions are not checked.
@@ -214,18 +170,19 @@ impl<P: ShimPlatform> MacosShim<P> {
     /// Load a dynamically linked executable with a runtime-provided, unrewritten
     /// dyld image. dyld is rewritten like every other guest image.
     ///
-    /// The provider must install any required shared cache before entering
-    /// guest execution.
+    /// Without `image`, the executable is read from `path` in the guest
+    /// filesystem. The provider must install the shared cache dyld uses before
+    /// entering guest execution.
     pub fn load_program_with_dyld(
         self,
         params: TaskParams,
         path: &str,
-        image: &[u8],
+        image: Option<&[u8]>,
         dyld: &[u8],
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
-        self.load(params, path, Some(image), Some(dyld), argv, envp)
+        self.load(params, path, image, Some(dyld), argv, envp)
     }
 
     /// Load a self-contained static executable snapshot without file I/O.
@@ -293,110 +250,6 @@ pub struct LoadedProgram<P: ShimPlatform> {
     pub initial_ctx: PtRegs,
 }
 
-impl<P: ShimPlatform> LoadedProgram<P> {
-    /// Rewrite and register a guest-private shared-cache instance.
-    ///
-    /// The provider must keep the instance mapped for the guest lifetime and
-    /// supply writable aliases for code regions and gate islands. No cache code
-    /// may execute during installation. After success, apply the final
-    /// protections from `cache.mappings` (code and islands read-execute) and
-    /// synchronize instruction caches before guest entry. Discard the process
-    /// on error because installation is not transactional.
-    pub fn install_shared_cache(
-        &self,
-        cache: &SharedCacheLayout<'_>,
-    ) -> Result<(), SharedCacheInstallError> {
-        let task = &self.entrypoints.task;
-        if task.global.shared_cache_base.load(Ordering::Acquire) != 0 {
-            return Err(SharedCacheInstallError::AlreadyInstalled);
-        }
-        let page_aligned = |range: &core::ops::Range<usize>| {
-            range.start < range.end
-                && range.start.is_multiple_of(PAGE_SIZE)
-                && range.end.is_multiple_of(PAGE_SIZE)
-        };
-        let inside = |range: &core::ops::Range<usize>| {
-            range.start >= cache.range.start && range.end <= cache.range.end
-        };
-        let overlaps = |a: &core::ops::Range<usize>, b: &core::ops::Range<usize>| {
-            a.start < b.end && b.start < a.end
-        };
-        // Whether `range` is covered by consecutive mappings with exactly `protection`.
-        let covered_by = |range: &core::ops::Range<usize>, protection: VmProtection| {
-            let mut covered = range.start;
-            for mapping in cache.mappings {
-                if mapping.range.end <= covered {
-                    continue;
-                }
-                if mapping.range.start > covered || mapping.protection != protection {
-                    return false;
-                }
-                covered = mapping.range.end;
-                if covered >= range.end {
-                    return true;
-                }
-            }
-            false
-        };
-        if cache.range.start == 0 || !page_aligned(&cache.range) {
-            return Err(SharedCacheInstallError::InvalidCacheRange);
-        }
-        if cache.mappings.is_empty()
-            || cache
-                .mappings
-                .iter()
-                .any(|mapping| !page_aligned(&mapping.range) || !inside(&mapping.range))
-            || cache
-                .mappings
-                .windows(2)
-                .any(|pair| pair[0].range.end > pair[1].range.start)
-        {
-            return Err(SharedCacheInstallError::InvalidCacheRange);
-        }
-        let executable = VmProtection::READ | VmProtection::EXECUTE;
-        for (index, island) in cache.gate_islands.iter().enumerate() {
-            if !page_aligned(&island.range)
-                || island.writable_alias == 0
-                || !inside(&island.range)
-                || !covered_by(&island.range, executable)
-                || cache.gate_islands[index + 1..]
-                    .iter()
-                    .any(|other| overlaps(&island.range, &other.range))
-            {
-                return Err(SharedCacheInstallError::InvalidGateIsland);
-            }
-        }
-        for region in cache.code_regions {
-            if !page_aligned(&region.range)
-                || region.writable_alias == 0
-                || !inside(&region.range)
-                || !covered_by(&region.range, executable)
-                || cache
-                    .gate_islands
-                    .iter()
-                    .any(|island| overlaps(&island.range, &region.range))
-            {
-                return Err(SharedCacheInstallError::InvalidRegion);
-            }
-        }
-        let mut island_cursors = alloc::vec![0; cache.gate_islands.len()];
-        for region in cache.code_regions {
-            task.rewrite_shared_cache_region(region, cache.gate_islands, &mut island_cursors)?;
-        }
-        task.global.shared_cache_mappings.lock().extend(
-            cache
-                .mappings
-                .iter()
-                .map(|mapping| (mapping.range.clone(), mapping.protection)),
-        );
-        *task.global.shared_cache_range.lock() = Some(cache.range.clone());
-        task.global
-            .shared_cache_base
-            .store(cache.range.start, Ordering::Release);
-        Ok(())
-    }
-}
-
 pub struct MacosShimEntrypoints<P: ShimPlatform> {
     task: Task<P>,
     // A bound task cannot be moved to another host thread.
@@ -409,10 +262,11 @@ struct GlobalState<P: ShimPlatform> {
     mm: VmemManager<P, PAGE_SIZE>,
     macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
     macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
+    /// Base of the installed shared cache for `shared_region_check_np`; 0 before installation.
     shared_cache_base: AtomicUsize,
-    shared_cache_range: Mutex<P, Option<core::ops::Range<usize>>>,
-    shared_cache_mappings: Mutex<P, Vec<(core::ops::Range<usize>, VmProtection)>>,
-    privately_mapped_dyld_range: Mutex<P, Option<core::ops::Range<usize>>>,
+    shared_cache_reservation: Mutex<P, Option<core::ops::Range<usize>>>,
+    shared_cache: Mutex<P, Option<shared_cache::SharedCacheState>>,
+    host_sysctls: Vec<HostSysctl>,
     next_thread_id: core::sync::atomic::AtomicU64,
 }
 
@@ -513,7 +367,15 @@ impl<P: ShimPlatform> Task<P> {
             return;
         }
         let is_mach = litebox_common_macos::syscall::is_mach_trap_selector(ctx.regs[16]);
-        match self.do_syscall(ctx) {
+        let result = self.do_syscall(ctx);
+        litebox_util_log::trace!(
+            number:? = ctx.regs[16].cast_signed(),
+            args:? = format_args!("{:x?}", &ctx.regs[..6]),
+            pc:? = format_args!("{:#x}", ctx.pc),
+            result:? = result;
+            "Darwin syscall"
+        );
+        match result {
             Ok(value) => {
                 ctx.regs[0] = value;
                 if !is_mach {
@@ -603,13 +465,31 @@ impl<P: ShimPlatform> Task<P> {
             }
             SyscallRequest::Close { fd } => self.sys_close(fd).to_syscall_result(),
             SyscallRequest::Dup { fd } => self.sys_dup(fd).to_syscall_result(),
+            SyscallRequest::Dup2 { old, new } => self.sys_dup2(old, new).to_syscall_result(),
             SyscallRequest::Sysctl {
                 name,
                 name_length,
+                old_value,
+                old_length,
                 new_value,
                 new_length,
-                ..
-            } => Self::sys_sysctl_compat(name, name_length, new_value, new_length),
+            } => self.sys_sysctl(
+                name,
+                name_length,
+                old_value,
+                old_length,
+                new_value,
+                new_length,
+            ),
+            SyscallRequest::Fsctl {
+                path,
+                command,
+                data,
+                options: _,
+            } => {
+                let path = Self::read_path(path)?;
+                self.sys_fsctl(&path, command, data).to_syscall_result()
+            }
             SyscallRequest::Mmap {
                 address,
                 length,
@@ -724,8 +604,22 @@ impl<P: ShimPlatform> EnterShim for MacosShimEntrypoints<P> {
     }
 
     fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
+        if info.exception == litebox::shim::Exception::DATA_ABORT_LOWER_EL
+            && self.task.page_in_shared_cache(info.fault_address)
+        {
+            // Retry the access, like a page fault resolved by the kernel.
+            return self.task.continuation(ctx);
+        }
         // Syscalls enter through the rewriter's direct callback.
-        litebox_util_log::error!(exception:? = info, pc:? = ctx.pc; "unhandled macOS guest exception");
+        litebox_util_log::error!(
+            exception:? = info,
+            pc:? = ctx.pc,
+            lr:? = ctx.regs[30],
+            fault_in:? = self.task.describe_shared_cache_address(info.fault_address),
+            pc_in:? = self.task.describe_shared_cache_address(ctx.pc),
+            lr_in:? = self.task.describe_shared_cache_address(ctx.regs[30]);
+            "unhandled macOS guest exception"
+        );
         self.task.process.exit(128 + SIGSEGV);
         ContinueOperation::Terminate
     }

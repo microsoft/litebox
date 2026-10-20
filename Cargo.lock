@@ -2072,6 +2072,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "getrandom 0.3.4",
+ "libc",
  "litebox",
  "litebox_broker_core",
  "litebox_broker_host",
@@ -2082,7 +2084,9 @@ dependencies = [
  "litebox_shim_macos",
  "litebox_syscall_rewriter",
  "litebox_trampoline",
+ "litebox_util_log",
  "tempfile",
+ "tracing-subscriber",
 ]
 
 [[package]]

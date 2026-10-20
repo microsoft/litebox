@@ -26,7 +26,7 @@ use litebox_syscall_rewriter::{macho::CodeMetadata, macho::Rewriter};
 use litebox_trampoline::trampoline_allocation_range;
 
 use crate::syscalls::file::{FileFd, FileSubsystem};
-use crate::{SharedCacheCodeRegion, SharedCacheGateIsland, ShimPlatform, Task};
+use crate::{ShimPlatform, Task};
 
 /// File provenance and rewrite state retained for a live guest mapping.
 pub(crate) struct MachoMapping {
@@ -278,33 +278,6 @@ fn forget_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usi
     }
 }
 
-fn reserve_shared_cache_gates(
-    cursor: usize,
-    gate_length: usize,
-    capacity: usize,
-) -> Option<Range<usize>> {
-    let start = cursor.checked_next_multiple_of(litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN)?;
-    let end = start.checked_add(gate_length)?;
-    (end <= capacity).then_some(start..end)
-}
-
-/// Distance from a batch of code to the next gate an island would emit.
-fn gate_island_distance(
-    code: &Range<usize>,
-    island: &SharedCacheGateIsland,
-    cursor: usize,
-) -> usize {
-    let gate = island.range.start.saturating_add(cursor);
-    if gate >= code.end {
-        gate - code.start
-    } else if gate < code.start {
-        code.end - gate
-    } else {
-        // An island never overlaps a code region; keep the order total anyway.
-        0
-    }
-}
-
 impl<P: ShimPlatform> Task<P> {
     fn mapping_snapshot(&self, target: Range<usize>) -> Vec<(Range<usize>, VmFlags)> {
         self.global
@@ -317,149 +290,6 @@ impl<P: ShimPlatform> Task<P> {
                 (start < end).then_some((start..end, flags))
             })
             .collect()
-    }
-
-    /// Rewrite one guest shared-cache code region, placing each batch of gates
-    /// in the nearest island that can reach it and has remaining capacity.
-    ///
-    /// `island_cursors[i]` is the next free byte offset in `islands[i]`.
-    /// Code is modified only after all of its gates have been written.
-    pub(crate) fn rewrite_shared_cache_region(
-        &self,
-        region: &SharedCacheCodeRegion<'_>,
-        islands: &[SharedCacheGateIsland],
-        island_cursors: &mut [usize],
-    ) -> Result<(), crate::SharedCacheInstallError> {
-        use crate::SharedCacheInstallError as Error;
-        const DARWIN_SVC: u32 = 0xd400_1001;
-        const MRS_TPIDRRO_MASK: u32 = 0xffff_ffe0;
-        const MRS_TPIDRRO_BITS: u32 = 0xd53b_d060;
-        const MAX_BATCH_SPAN: usize = 64 * 1024;
-
-        debug_assert_eq!(islands.len(), island_cursors.len());
-        let ranges = region.instruction_ranges;
-        let length = region.range.len();
-        if ranges.iter().any(|range| {
-            range.start >= range.end
-                || range.end > length
-                || !range.start.is_multiple_of(size_of::<u32>())
-                || !range.end.is_multiple_of(size_of::<u32>())
-        }) || ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
-        {
-            return Err(Error::InvalidRegion);
-        }
-        let rewriter = Rewriter::new(crate::aarch64_rewrite_options().target_host())
-            .map_err(|_| Error::Rewrite)?;
-        let callback = self.global.platform.get_syscall_entry_point();
-        let tls_offset = self
-            .global
-            .platform
-            .guest_thread_pointer_offset()
-            .and_then(|offset| u16::try_from(offset).ok())
-            .ok_or(Error::Rewrite)?;
-        let mut patches = Vec::new();
-        let mut first = 0;
-        while first < ranges.len() {
-            let batch_start = ranges[first].start;
-            let mut batch_end = ranges[first].end;
-            let mut last = first + 1;
-            while let Some(next) = ranges.get(last)
-                && next.end - batch_start <= MAX_BATCH_SPAN
-                && next.start - batch_end <= PAGE_SIZE
-            {
-                batch_end = next.end;
-                last += 1;
-            }
-            let code = P::RawMutPointer::<u8>::from_usize(region.writable_alias + batch_start)
-                .to_owned_slice(batch_end - batch_start)
-                .ok_or(Error::UnreadableAlias)?
-                .into_vec();
-            let mut local_ranges: Vec<_> = ranges[first..last]
-                .iter()
-                .map(|range| range.start - batch_start..range.end - batch_start)
-                .collect();
-            local_ranges.retain(|range| {
-                code[range.clone()].as_chunks::<4>().0.iter().any(|word| {
-                    let word = u32::from_le_bytes(*word);
-                    word == DARWIN_SVC || word & MRS_TPIDRRO_MASK == MRS_TPIDRRO_BITS
-                })
-            });
-            first = last;
-            if local_ranges.is_empty() {
-                continue;
-            }
-            let code_address = region
-                .range
-                .start
-                .checked_add(batch_start)
-                .ok_or(Error::Rewrite)?;
-            let code_range = code_address..code_address + code.len();
-            let mut candidates: Vec<_> = (0..islands.len()).collect();
-            candidates.sort_by_key(|&index| {
-                gate_island_distance(&code_range, &islands[index], island_cursors[index])
-            });
-            let mut placed = None;
-            for index in candidates {
-                let island = &islands[index];
-                let Some(cursor) = island_cursors[index]
-                    .checked_next_multiple_of(litebox_trampoline::TRAMPOLINE_CURSOR_ALIGN)
-                    .filter(|cursor| *cursor < island.range.len())
-                else {
-                    continue;
-                };
-                let gate_address = island
-                    .range
-                    .start
-                    .checked_add(cursor)
-                    .ok_or(Error::Rewrite)?;
-                let mut rewritten = code.clone();
-                let (gates, trapped) = rewriter
-                    .patch_code_segment(
-                        &mut rewritten,
-                        code_address as u64,
-                        &local_ranges,
-                        gate_address as u64,
-                        callback as u64,
-                        tls_offset,
-                    )
-                    .map_err(|error| {
-                        litebox_util_log::warn!(error:?; "failed to build shared-cache gates");
-                        Error::Rewrite
-                    })?;
-                let Some(gate_range) =
-                    reserve_shared_cache_gates(cursor, gates.len(), island.range.len())
-                else {
-                    continue;
-                };
-                if !trapped.is_empty() {
-                    continue;
-                }
-                P::RawMutPointer::<u8>::from_usize(island.writable_alias + gate_range.start)
-                    .copy_from_slice(0, &gates)
-                    .ok_or(Error::Rewrite)?;
-                island_cursors[index] = gate_range.end;
-                placed = Some(rewritten);
-                break;
-            }
-            let Some(rewritten) = placed else {
-                litebox_util_log::warn!(
-                    code:? = code_range,
-                    islands:? = islands.len();
-                    "no shared-cache gate island can serve these sites"
-                );
-                return Err(Error::UnreachableGates);
-            };
-            patches.push((batch_start, rewritten, local_ranges));
-        }
-        let pointer = P::RawMutPointer::<u8>::from_usize(region.writable_alias);
-        for (batch_start, code, local_ranges) in patches {
-            for local_range in local_ranges {
-                pointer
-                    .copy_from_slice(batch_start + local_range.start, &code[local_range])
-                    .ok_or(Error::Rewrite)?;
-            }
-        }
-        Ok(())
     }
 
     pub(crate) fn sys_mmap(
@@ -1270,21 +1100,22 @@ impl<P: ShimPlatform> Task<P> {
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::EINVAL)?;
         let end = address.checked_add(length).ok_or(Errno::EINVAL)?;
-        let dyld_range = self.global.privately_mapped_dyld_range.lock().clone();
-        // This process-lifetime override lets dyld update DATA_CONST: its
-        // helper restarts at the authenticated call site after a fault, so a
-        // read-only transition would repeatedly fault before the write. Remove
-        // it when those protection transitions can complete without that loop.
-        let protection = if dyld_range
-            .as_ref()
-            .is_some_and(|dyld| address >= dyld.start && end <= dyld.end)
-            && protection.contains(VmProtection::READ)
-            && !protection.intersects(VmProtection::WRITE | VmProtection::EXECUTE)
+        if let Some(cache) = self.global.shared_cache.lock().as_mut()
+            && cache.range.start < end
+            && address < cache.range.end
         {
-            protection | VmProtection::WRITE
-        } else {
-            protection
-        };
+            // Like XNU, requests beyond a page's maximum protection fail with
+            // EACCES. Rewritten code and gate islands are never writable, and
+            // other cache text is never executable, so no unrewritten code can
+            // run. Pages without contents (maximum PROT_NONE) stay inaccessible.
+            let range = address..end;
+            if !cache.allows(&range, protection) {
+                return Err(Errno::EACCES);
+            }
+            self.change_permissions(range.clone(), protection)?;
+            cache.set_protection(&range, protection);
+            return Ok(());
+        }
         if protection.contains(VmProtection::EXECUTE) {
             self.rewrite_mprotect_range(address, length)?;
         }

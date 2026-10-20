@@ -10,7 +10,7 @@ use litebox_common_macos::{KernReturn, syscall::MachTimebaseInfo, user_pointers:
 
 pub(crate) mod file;
 pub(crate) mod mach;
-pub(crate) mod misc;
+pub mod misc;
 pub(crate) mod mm;
 
 impl<P: ShimPlatform> Task<P> {
