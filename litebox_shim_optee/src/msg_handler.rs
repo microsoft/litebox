@@ -288,7 +288,8 @@ pub fn read_rpc_shm<Platform: litebox::mm::vmap::VmapManager<PAGE_SIZE>>(
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// It returns an `OpteeSmcResult` representing the result of the SMC call or `OpteeMsgArgs` it contains
 /// if the SMC call involves with an OP-TEE message which should be handled by
-/// `handle_optee_msg_args` or `handle_ta_request`.
+/// `handle_optee_msg_args` or, for OpenSession/InvokeCommand/CloseSession, dispatched by
+/// the caller itself.
 pub fn handle_optee_smc_args<'a, Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
     smc: &'a mut OpteeSmcArgs,
@@ -385,13 +386,42 @@ pub fn handle_optee_smc_args<'a, Platform: crate::OpteeShimPlatform>(
 
 /// This function handles an OP-TEE message contained in `OpteeMsgArgs`.
 /// Currently, it only handles shared memory registration and unregistration.
-/// If an OP-TEE message involves with a TA request, it simply returns
-/// `Err(OpteeSmcReturnCode::Ok)` while expecting that the caller will handle
-/// the message with `handle_ta_request`.
+///
+/// - The reply is written via `write_back`. If it fails, its error is returned unchanged in
+///   place of the command's result, so it must not be a code the SMC dispatcher acts on.
+/// - `RegisterShm` is rolled back (best-effort) if `write_back` fails.
+/// - `UnregisterShm` takes effect regardless, because Linux frees the buffer even when
+///   unregistration fails.
+/// - TA requests (OpenSession/InvokeCommand/CloseSession) must be dispatched by the caller;
+///   here they get a `BadParameters` reply and `Err(EBadCmd)`.
 pub fn handle_optee_msg_args<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
-    msg_args: &OpteeMsgArgs,
+    msg_args: &mut OpteeMsgArgs,
+    write_back: impl FnOnce(&OpteeMsgArgs) -> Result<(), OpteeSmcReturnCode>,
 ) -> Result<(), OpteeSmcReturnCode> {
+    let result = apply_optee_msg_cmd(platform, msg_args);
+    msg_args.ret = if result.is_ok() {
+        TeeResult::Success
+    } else {
+        TeeResult::BadParameters
+    };
+    msg_args.ret_origin = TeeOrigin::Tee;
+    if let Err(error) = write_back(msg_args) {
+        if let Ok(Some(shm_ref)) = result {
+            // Best-effort: only a normal world racing itself on the same `shm_ref` can make
+            // this remove another registration, which affects only its own state.
+            shm_ref_map().remove(shm_ref);
+        }
+        return Err(error);
+    }
+    result.map(|_| ())
+}
+
+/// On success, `Some(shm_ref)` is the registration to roll back if the reply fails.
+fn apply_optee_msg_cmd<Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
+    msg_args: &OpteeMsgArgs,
+) -> Result<Option<u64>, OpteeSmcReturnCode> {
     msg_args.validate()?;
     match msg_args.cmd {
         OpteeMessageCommand::RegisterShm => {
@@ -419,6 +449,7 @@ pub fn handle_optee_msg_args<Platform: crate::OpteeShimPlatform>(
                 aligned_size,
                 tmem.shm_ref,
             )?;
+            Ok(Some(tmem.shm_ref))
         }
         OpteeMessageCommand::UnregisterShm => {
             let rmem = msg_args.get_param_rmem(0)?;
@@ -428,21 +459,21 @@ pub fn handle_optee_msg_args<Platform: crate::OpteeShimPlatform>(
             shm_ref_map()
                 .remove(rmem.shm_ref)
                 .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            Ok(None)
         }
         OpteeMessageCommand::OpenSession
         | OpteeMessageCommand::InvokeCommand
-        | OpteeMessageCommand::CloseSession => return Err(OpteeSmcReturnCode::Ok),
+        | OpteeMessageCommand::CloseSession => Err(OpteeSmcReturnCode::EBadCmd),
         _ => {
             #[cfg(debug_assertions)]
             todo!("Unimplemented OpteeMessageCommand: {:?}", msg_args.cmd);
             #[cfg(not(debug_assertions))]
             {
                 litebox_util_log::debug!(cmd:? = msg_args.cmd; "Unimplemented OpteeMessageCommand");
-                return Err(OpteeSmcReturnCode::EBadCmd);
+                Err(OpteeSmcReturnCode::EBadCmd)
             }
         }
     }
-    Ok(())
 }
 
 /// TA request information extracted from an OP-TEE message.
@@ -1052,6 +1083,8 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
 }
 
 /// Serialize RPC arguments immediately after the main message in registered shared memory.
+///
+/// Any failure is reported as `EBadAddr`.
 pub fn write_rpc_args_to_regd_shm<Platform: litebox::mm::vmap::VmapManager<PAGE_SIZE>>(
     platform: &Platform,
     shm_ref: u64,
@@ -1067,8 +1100,12 @@ pub fn write_rpc_args_to_regd_shm<Platform: litebox::mm::vmap::VmapManager<PAGE_
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
     let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
     let mut blob = alloc::vec![0u8; rpc_args_size];
-    rpc_args.serialize(&mut blob)?;
-    shm_info.write_at(platform, rpc_args_offset, &blob)
+    rpc_args
+        .serialize(&mut blob)
+        .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+    shm_info
+        .write_at(platform, rpc_args_offset, &blob)
+        .map_err(|_| OpteeSmcReturnCode::EBadAddr)
 }
 
 fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {

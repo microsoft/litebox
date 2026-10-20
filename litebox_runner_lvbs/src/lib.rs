@@ -684,21 +684,9 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
                 ),
                 InvokeCommand => handle_invoke_command(platform, &mut msg_args, msg_args_phys_addr),
                 CloseSession => handle_close_session(platform, &mut msg_args, msg_args_phys_addr),
-                _ => {
-                    let r = handle_optee_msg_args(platform, &msg_args);
-                    if r.is_ok() {
-                        msg_args.ret = TeeResult::Success;
-                    } else {
-                        msg_args.ret = TeeResult::BadParameters;
-                    }
-                    msg_args.ret_origin = TeeOrigin::Tee;
-                    let _ = write_non_ta_msg_args_to_normal_world(
-                        platform,
-                        &msg_args,
-                        msg_args_phys_addr,
-                    );
-                    r
-                }
+                _ => handle_optee_msg_args(platform, &mut msg_args, |m| {
+                    write_non_ta_msg_args_to_normal_world(platform, m, msg_args_phys_addr)
+                }),
             };
 
             // Always switch back to base page table before returning to VTL0
@@ -1749,7 +1737,8 @@ fn handle_close_session(
 /// Update msg_args with return values and write back to normal world memory.
 ///
 /// Serializes `OpteeMsgArgs` into a contiguous byte blob and writes it to
-/// the VTL0 physical address.
+/// the VTL0 physical address. Every failure, including TA-output copy-out, is reported as
+/// `EBadAddr` (see [`write_non_ta_msg_args_to_normal_world`]).
 ///
 /// Per OP-TEE OS semantics:
 /// - `TeeOrigin::Tee` is used when the error comes from TEE itself (panic/TARGET_DEAD)
@@ -1798,28 +1787,19 @@ fn write_msg_args_to_normal_world(
         ta_req_info,
         memref_addresses,
         msg_args,
-    )?;
+    )
+    .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
 
-    let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
-    let mut blob = vec![0u8; msg_args_size];
-    msg_args.serialize(&mut blob)?;
-
-    let ptr = NormalWorldMutPtr::<Platform, u8, PAGE_SIZE>::with_contiguous_pages(
-        platform,
-        msg_args_phys_addr.trunc(),
-        msg_args_size,
-    )?;
-    ptr.write_slice_at_offset(0, &blob)?;
-    Ok(())
+    write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)
 }
 
-/// Write back `OpteeMsgArgs` for non-TA commands (e.g., RegisterShm, UnregisterShm) that
-/// don't require TA userspace memory access.
+/// Serialize an already-populated `OpteeMsgArgs` (`ret` / `ret_origin` set by the caller)
+/// and write it to the normal-world physical address `msg_args_phys_addr`.
 ///
-/// Unlike [`write_msg_args_to_normal_world`], this function does not access TA userspace
-/// memory and can be called from the base page table context. It simply serializes the
-/// msg_args (which should already have `ret` / `ret_origin` set by the caller) back to
-/// the normal world physical address.
+/// Does not access TA userspace memory, so it is safe to call on the base page table.
+///
+/// Any failure is reported as `EBadAddr`: a failed reply must never surface as a code the SMC
+/// dispatcher acts on (e.g., `EThreadLimit` requeues the RPC context and re-runs OpenSession).
 #[inline]
 fn write_non_ta_msg_args_to_normal_world(
     platform: &'static Platform,
@@ -1828,15 +1808,18 @@ fn write_non_ta_msg_args_to_normal_world(
 ) -> Result<(), OpteeSmcReturnCode> {
     let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
     let mut blob = vec![0u8; msg_args_size];
-    msg_args.serialize(&mut blob)?;
+    msg_args
+        .serialize(&mut blob)
+        .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
 
     let ptr = NormalWorldMutPtr::<Platform, u8, PAGE_SIZE>::with_contiguous_pages(
         platform,
         msg_args_phys_addr.trunc(),
         msg_args_size,
-    )?;
-    ptr.write_slice_at_offset(0, &blob)?;
-    Ok(())
+    )
+    .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+    ptr.write_slice_at_offset(0, &blob)
+        .map_err(|_| OpteeSmcReturnCode::EBadAddr)
 }
 
 const LDELF_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ldelf.elf"));

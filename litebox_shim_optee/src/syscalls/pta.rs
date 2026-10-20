@@ -124,7 +124,7 @@ impl ClientPta {
     ///
     /// # Errors
     ///
-    /// `EBadAddr` if shared memory cannot be written.
+    /// Every failure is reported as `EBadAddr`.
     pub fn invoke_command<Platform: crate::OpteeShimPlatform>(
         self,
         platform: &Platform,
@@ -138,8 +138,9 @@ impl ClientPta {
                 ta_req_info.cmd_id,
                 &mut params,
                 &ta_req_info.shm_info,
-            )?,
-        };
+            ),
+        }
+        .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
         // Outputs are meaningful only on these results; a rejected NULL memref
         // would otherwise fail the size check.
         let outputs =
@@ -155,6 +156,7 @@ impl ClientPta {
             None,
             msg_args,
         )
+        .map_err(|_| OpteeSmcReturnCode::EBadAddr)
     }
 
     /// Fill `msg_args` with the reply to a `CloseSession`; sessions are not
