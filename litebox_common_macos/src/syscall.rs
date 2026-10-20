@@ -29,6 +29,16 @@ pub mod nr {
     pub const CROSSARCH_TRAP: usize = 38;
     pub const GETPPID: usize = 39;
     pub const SIGPROCMASK: usize = 48;
+    pub const PTHREAD_KILL: usize = 328;
+    pub const PTHREAD_SIGMASK: usize = 329;
+    pub const DISABLE_THREADSIGNAL: usize = 331;
+    pub const BSDTHREAD_CREATE: usize = 360;
+    pub const BSDTHREAD_TERMINATE: usize = 361;
+    pub const BSDTHREAD_REGISTER: usize = 366;
+    pub const BSDTHREAD_CTL: usize = 478;
+    pub const ULOCK_WAIT: usize = 515;
+    pub const ULOCK_WAKE: usize = 516;
+    pub const ULOCK_WAIT2: usize = 544;
     pub const IOCTL: usize = 54;
     pub const CSOPS: usize = 169;
     pub const CSOPS_AUDITTOKEN: usize = 170;
@@ -126,6 +136,9 @@ pub mod mach_trap {
     pub const SEMAPHORE_SIGNAL: u32 = 33;
     pub const SEMAPHORE_WAIT: u32 = 36;
     pub const MACH_MSG2: u32 = 47;
+    pub const SWTCH_PRI: u32 = 59;
+    pub const SWTCH: u32 = 60;
+    pub const THREAD_SWITCH: u32 = 61;
     /// `mach_timebase_info(mach_timebase_info_t)`.
     pub const MACH_TIMEBASE_INFO: u32 = 89;
     /// `mach_wait_until(deadline)`.
@@ -328,6 +341,61 @@ pub enum SyscallRequest {
         mask: UserPtr<u32>,
         old_mask: UserPtrMut<u32>,
     },
+    /// `__pthread_sigmask`: like `sigprocmask`, on the calling thread only.
+    PthreadSigmask {
+        how: i32,
+        mask: UserPtr<u32>,
+        old_mask: UserPtrMut<u32>,
+    },
+    /// `__pthread_kill(thread_port, sig)`.
+    PthreadKill {
+        thread: MachPortName,
+        signal: i32,
+    },
+    DisableThreadsignal,
+    /// `bsdthread_register(threadstart, wqthread, pthsize, data, data_size,
+    /// dispatchqueue_offset)`; libpthread passes its registration data where
+    /// `syscalls.master` names `stack_addr_hint` and `targetconc_ptr`.
+    BsdthreadRegister {
+        threadstart: usize,
+        wqthread: usize,
+        pthread_size: i32,
+        data: usize,
+        data_size: usize,
+        dispatch_queue_offset: u32,
+    },
+    BsdthreadCreate {
+        function: usize,
+        argument: usize,
+        stack: usize,
+        pthread: usize,
+        flags: u32,
+    },
+    BsdthreadTerminate {
+        stack: usize,
+        size: usize,
+        port: MachPortName,
+        /// A semaphore name, or the address of a ulock to wake.
+        semaphore_or_ulock: usize,
+    },
+    BsdthreadCtl {
+        command: usize,
+        arguments: [usize; 3],
+    },
+    /// `ulock_wait` (timeout in microseconds) and `ulock_wait2` (timeout in
+    /// nanoseconds, or a deadline with `ULF_DEADLINE`), normalized to
+    /// nanoseconds.
+    UlockWait {
+        operation: u32,
+        address: usize,
+        value: u64,
+        timeout: u64,
+    },
+    UlockWake {
+        operation: u32,
+        address: usize,
+        wake_value: u64,
+    },
     Csops {
         pid: i32,
         operation: u32,
@@ -459,6 +527,13 @@ pub enum SyscallRequest {
     SemaphoreWait {
         semaphore: MachPortName,
     },
+    SwtchPri,
+    Swtch,
+    ThreadSwitch {
+        thread: MachPortName,
+        option: i32,
+        option_time: u32,
+    },
     SharedRegionCheckNp {
         start_address: UserPtrMut<usize>,
     },
@@ -584,6 +659,13 @@ impl SyscallRequest {
                 mach_trap::SEMAPHORE_WAIT => Ok(Self::SemaphoreWait {
                     semaphore: port_arg(0),
                 }),
+                mach_trap::SWTCH_PRI => Ok(Self::SwtchPri),
+                mach_trap::SWTCH => Ok(Self::Swtch),
+                mach_trap::THREAD_SWITCH => Ok(Self::ThreadSwitch {
+                    thread: port_arg(0),
+                    option: int_arg(1),
+                    option_time: TruncateExt::<u32>::trunc(args[2]),
+                }),
                 mach_trap::MACH_TIMEBASE_INFO => Ok(Self::MachTimebaseInfo {
                     info: UserPtrMut::from_usize(args[0]),
                 }),
@@ -676,6 +758,59 @@ impl SyscallRequest {
                 how: int_arg(0),
                 mask: UserPtr::from_usize(args[1]),
                 old_mask: UserPtrMut::from_usize(args[2]),
+            },
+            nr::PTHREAD_SIGMASK => Self::PthreadSigmask {
+                how: int_arg(0),
+                mask: UserPtr::from_usize(args[1]),
+                old_mask: UserPtrMut::from_usize(args[2]),
+            },
+            nr::PTHREAD_KILL => Self::PthreadKill {
+                thread: port_arg(0),
+                signal: int_arg(1),
+            },
+            nr::DISABLE_THREADSIGNAL => Self::DisableThreadsignal,
+            nr::BSDTHREAD_REGISTER => Self::BsdthreadRegister {
+                threadstart: args[0],
+                wqthread: args[1],
+                pthread_size: int_arg(2),
+                data: args[3],
+                data_size: args[4],
+                dispatch_queue_offset: TruncateExt::<u32>::trunc(args[5]),
+            },
+            nr::BSDTHREAD_CREATE => Self::BsdthreadCreate {
+                function: args[0],
+                argument: args[1],
+                stack: args[2],
+                pthread: args[3],
+                flags: TruncateExt::<u32>::trunc(args[4]),
+            },
+            nr::BSDTHREAD_TERMINATE => Self::BsdthreadTerminate {
+                stack: args[0],
+                size: args[1],
+                port: port_arg(2),
+                semaphore_or_ulock: args[3],
+            },
+            nr::BSDTHREAD_CTL => Self::BsdthreadCtl {
+                command: args[0],
+                arguments: [args[1], args[2], args[3]],
+            },
+            nr::ULOCK_WAIT => Self::UlockWait {
+                operation: TruncateExt::<u32>::trunc(args[0]),
+                address: args[1],
+                value: u64_arg(2),
+                // sys_ulock_wait: a 32-bit count of microseconds.
+                timeout: u64::from(TruncateExt::<u32>::trunc(args[3])) * 1000,
+            },
+            nr::ULOCK_WAIT2 => Self::UlockWait {
+                operation: TruncateExt::<u32>::trunc(args[0]),
+                address: args[1],
+                value: u64_arg(2),
+                timeout: u64_arg(3),
+            },
+            nr::ULOCK_WAKE => Self::UlockWake {
+                operation: TruncateExt::<u32>::trunc(args[0]),
+                address: args[1],
+                wake_value: u64_arg(2),
             },
             nr::CSOPS_AUDITTOKEN if args[4] == 0 => return Err(Errno::EINVAL),
             nr::CSOPS | nr::CSOPS_AUDITTOKEN => Self::Csops {
@@ -905,6 +1040,90 @@ mod tests {
         assert_eq!((send_size, descriptor_count), (0x28, 0));
         assert_eq!((receive_name, receive_size), (MachPortName(0x603), 0xc8));
         assert_eq!((priority, timeout), (0, 7));
+    }
+
+    #[test]
+    fn thread_and_ulock_arguments() {
+        // libpthread's registration: data and its size where syscalls.master
+        // names stack_addr_hint and targetconc_ptr; 32-bit pthsize and offset.
+        assert!(matches!(
+            SyscallRequest::from_args(
+                nr::BSDTHREAD_REGISTER,
+                [
+                    0x1c14,
+                    0x1c08,
+                    0xdead_0000_4000,
+                    0x7000,
+                    0x38,
+                    0x1_0000_00a0,
+                    0,
+                    0
+                ],
+            ),
+            Ok(SyscallRequest::BsdthreadRegister {
+                threadstart: 0x1c14,
+                wqthread: 0x1c08,
+                pthread_size: 0x4000,
+                data: 0x7000,
+                data_size: 0x38,
+                dispatch_queue_offset: 0xa0,
+            })
+        ));
+        assert!(matches!(
+            SyscallRequest::from_args(
+                nr::BSDTHREAD_CREATE,
+                [1, 2, 3, 4, 0xffff_ffff_0100_0000, 0, 0, 0]
+            ),
+            Ok(SyscallRequest::BsdthreadCreate {
+                function: 1,
+                argument: 2,
+                stack: 3,
+                pthread: 4,
+                flags: 0x0100_0000,
+            })
+        ));
+        // ulock_wait's timeout is 32-bit microseconds; ulock_wait2's is 64-bit
+        // nanoseconds. Both become nanoseconds.
+        assert!(matches!(
+            SyscallRequest::from_args(
+                nr::ULOCK_WAIT,
+                [
+                    0x0100_0002,
+                    0x1000,
+                    0x1_0000_0003,
+                    0xffff_ffff_0000_0007,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            Ok(SyscallRequest::UlockWait {
+                operation: 0x0100_0002,
+                address: 0x1000,
+                value: 0x1_0000_0003,
+                timeout: 7000,
+            })
+        ));
+        assert!(matches!(
+            SyscallRequest::from_args(nr::ULOCK_WAIT2, [5, 0x1000, 3, 0x1_0000_0000, 9, 0, 0, 0]),
+            Ok(SyscallRequest::UlockWait {
+                operation: 5,
+                timeout: 0x1_0000_0000,
+                ..
+            })
+        ));
+        assert!(matches!(
+            SyscallRequest::from_args(
+                0u32.wrapping_sub(mach_trap::THREAD_SWITCH) as usize,
+                [0x103, 0xffff_ffff_ffff_ffff, 10, 0, 0, 0, 0, 0],
+            ),
+            Ok(SyscallRequest::ThreadSwitch {
+                thread: MachPortName(0x103),
+                option: -1,
+                option_time: 10,
+            })
+        ));
     }
 
     #[test]

@@ -67,9 +67,11 @@ pub enum Errno {
     ENOTEMPTY = 66,
     ENOSYS = 78,
     EOVERFLOW = 84,
+    EBADMSG = 94,
     EOPNOTSUPP = 102,
     /// No such MAC policy registered.
     ENOPOLICY = 103,
+    EOWNERDEAD = 105,
 }
 
 impl core::error::Error for Errno {}
