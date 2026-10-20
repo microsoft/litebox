@@ -10,8 +10,8 @@ use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::{vec, vec::Vec};
 use core::mem::offset_of;
 use litebox::arch::x86_64::xstate::{
-    XFEATURE_MASK_AVX, XFEATURE_MASK_LEGACY, XFEATURE_MASK_SSE, XSAVE_HEADER_OFFSET,
-    XSAVE_HEADER_SIZE, XSAVE_LEGACY_SIZE, XsaveArea, XsaveHeader, XsaveLayout, XsaveLegacyArea,
+    XFeatureMask, XSAVE_HEADER_OFFSET, XSAVE_HEADER_SIZE, XSAVE_LEGACY_SIZE, XsaveArea,
+    XsaveHeader, XsaveLayout, XsaveLegacyArea,
 };
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
@@ -61,7 +61,7 @@ pub(crate) fn max_signal_frame_size() -> usize {
 fn write_fpstate<Platform: ShimPlatform>(platform: &Platform, addr: usize) -> Option<()> {
     let layout = XsaveLayout::get();
     let mut state = platform.get_guest_vector_state();
-    state.materialize(layout);
+    state.sanitize(layout);
     let sw = FpxSwBytes {
         magic1: FP_XSTATE_MAGIC1,
         extended_size: u32::try_from(fpstate_size(layout)).ok()?,
@@ -70,8 +70,11 @@ fn write_fpstate<Platform: ShimPlatform>(platform: &Platform, addr: usize) -> Op
         padding: [0; 7],
     };
     let ptr = UserPtrMut::<u8>::from_usize(addr);
-    ptr.copy_from_slice::<Platform>(0, state.as_bytes())?;
+    let bytes = state.as_bytes();
+    // `sw` occupies the legacy area's tail, so copy the state around it.
+    ptr.copy_from_slice::<Platform>(0, &bytes[..SW_RESERVED_OFFSET])?;
     ptr.copy_from_slice::<Platform>(SW_RESERVED_OFFSET, sw.as_bytes())?;
+    ptr.copy_from_slice::<Platform>(XSAVE_LEGACY_SIZE, &bytes[XSAVE_LEGACY_SIZE..])?;
     ptr.copy_from_slice::<Platform>(layout.size, FP_XSTATE_MAGIC2.as_bytes())
 }
 
@@ -110,7 +113,7 @@ fn read_fpstate<Platform: ShimPlatform>(addr: usize) -> Option<XsaveArea> {
 fn legacy_xstate_bytes(legacy: &[u8; XSAVE_LEGACY_SIZE], layout: &XsaveLayout) -> Vec<u8> {
     let mut bytes = vec![0; layout.size];
     bytes[..XSAVE_LEGACY_SIZE].copy_from_slice(legacy);
-    bytes[XSTATE_BV_OFFSET..][..8].copy_from_slice(&XFEATURE_MASK_LEGACY.to_ne_bytes());
+    bytes[XSTATE_BV_OFFSET..][..8].copy_from_slice(&XFeatureMask::LEGACY.bits().to_ne_bytes());
     bytes
 }
 
@@ -143,11 +146,11 @@ fn read_xstate_bytes<Platform: ShimPlatform>(
         return None;
     }
     bytes[XSTATE_BV_OFFSET..][..8].copy_from_slice(&xstate_bv.to_ne_bytes());
-    if xfeatures & XFEATURE_MASK_SSE == 0 {
+    if xfeatures & XFeatureMask::SSE.bits() == 0 {
         // XRSTOR loads MXCSR, faulting on unsupported bits, only for SSE or
         // AVX. Linux then reinitializes the SSE state omitted from `xfeatures`.
         let mxcsr = u32::read_from_bytes(&bytes[MXCSR_OFFSET..][..4]).ok()?;
-        if xfeatures & XFEATURE_MASK_AVX != 0 && mxcsr & !layout.mxcsr_mask != 0 {
+        if xfeatures & XFeatureMask::AVX.bits() != 0 && mxcsr & !layout.mxcsr_mask != 0 {
             return None;
         }
         bytes[MXCSR_OFFSET..][..4].copy_from_slice(&XsaveArea::GUEST_INITIAL_MXCSR.to_ne_bytes());
@@ -215,19 +218,12 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         sigreturn_trampoline: usize,
     ) -> Result<(), DeliverFault> {
         let last_exception = self.last_exception.get();
-        let preserves_vector_state = platform.preserves_guest_vector_state();
-        let (fpstate, flags) = if preserves_vector_state {
-            let addr = fpstate_addr(frame_addr).ok_or(DeliverFault)?;
-            write_fpstate(platform, addr).ok_or(DeliverFault)?;
-            (addr, UC_FP_XSTATE | UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS)
-        } else {
-            // A null FP-state pointer tells the handler that nothing was saved.
-            (0, UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS)
-        };
+        let fpstate = fpstate_addr(frame_addr).ok_or(DeliverFault)?;
+        write_fpstate(platform, fpstate).ok_or(DeliverFault)?;
         let frame = SignalFrame {
             return_address: sigreturn_trampoline,
             ucontext: Ucontext {
-                flags,
+                flags: UC_FP_XSTATE | UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS,
                 link: 0, // core::ptr::null_mut(),
                 stack: self.altstack.get(),
                 mcontext: Sigcontext {
@@ -278,9 +274,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         ctx.rax = 0;
         let direction_flag: usize = litebox::arch::x86_64::RFlags::DF.bits().trunc();
         ctx.eflags &= !direction_flag;
-        if preserves_vector_state {
-            platform.set_guest_vector_state(&XsaveArea::initial(XsaveLayout::get()));
-        }
+        platform.set_guest_vector_state(&XsaveArea::initial(XsaveLayout::get()));
         Ok(())
     }
 }
@@ -376,7 +370,7 @@ mod tests {
                 offset,
             };
             let mut state = XsaveArea::initial(layout);
-            state.materialize(layout);
+            state.sanitize(layout);
             frame.bytes()[..layout.size].copy_from_slice(state.as_bytes());
             frame.set_sw(|sw| {
                 *sw = FpxSwBytes {
@@ -457,7 +451,7 @@ mod tests {
         frame.set(XMM0_OFFSET, &[0x5a; 16]);
         let state = frame.read().unwrap();
         assert_eq!(state.legacy_area().xmm_registers[0], [0x5a; 16]);
-        assert_eq!(state.xstate_bv(), XFEATURE_MASK_LEGACY);
+        assert_eq!(state.xstate_bv(), XFeatureMask::LEGACY.bits());
     }
 
     #[test]
@@ -474,7 +468,7 @@ mod tests {
             frame.set(XMM0_OFFSET, &[0x3c; 16]);
             frame.set_xstate_bv(layout.mask);
             let state = frame.read().unwrap();
-            assert_eq!(state.xstate_bv(), XFEATURE_MASK_LEGACY);
+            assert_eq!(state.xstate_bv(), XFeatureMask::LEGACY.bits());
             assert_eq!(state.legacy_area().xmm_registers[0], [0x3c; 16]);
         }
         assert!(Frame::new(16).read().is_none());
@@ -484,10 +478,10 @@ mod tests {
     fn omitted_sse_reinitializes_mxcsr() {
         let mut frame = Frame::new(0);
         frame.set_mxcsr(0x5f80);
-        frame.set_sw(|sw| sw.xfeatures &= !XFEATURE_MASK_SSE);
+        frame.set_sw(|sw| sw.xfeatures &= !XFeatureMask::SSE.bits());
         let state = frame.read().unwrap();
         assert_eq!(state.legacy_area().mxcsr, XsaveArea::GUEST_INITIAL_MXCSR);
-        assert_eq!(state.xstate_bv() & XFEATURE_MASK_SSE, 0);
+        assert_eq!(state.xstate_bv() & XFeatureMask::SSE.bits(), 0);
     }
 
     #[test]
@@ -495,14 +489,15 @@ mod tests {
         let invalid = !XsaveLayout::get().mxcsr_mask;
         let mut unloaded = Frame::new(0);
         unloaded.set_mxcsr(invalid);
-        unloaded.set_sw(|sw| sw.xfeatures &= !(XFEATURE_MASK_SSE | XFEATURE_MASK_AVX));
+        unloaded.set_sw(|sw| sw.xfeatures &= !(XFeatureMask::SSE | XFeatureMask::AVX).bits());
         let state = unloaded.read().unwrap();
         assert_eq!(state.legacy_area().mxcsr, XsaveArea::GUEST_INITIAL_MXCSR);
 
         let mut avx_only = Frame::new(0);
         avx_only.set_mxcsr(invalid);
-        avx_only
-            .set_sw(|sw| sw.xfeatures = (sw.xfeatures & !XFEATURE_MASK_SSE) | XFEATURE_MASK_AVX);
+        avx_only.set_sw(|sw| {
+            sw.xfeatures = (sw.xfeatures & !XFeatureMask::SSE.bits()) | XFeatureMask::AVX.bits();
+        });
         assert!(avx_only.read().is_none());
 
         let mut full = Frame::new(0);
@@ -513,7 +508,7 @@ mod tests {
     #[test]
     fn unsupported_xstate_bv_bits_fail_even_when_masked() {
         let mut frame = Frame::new(0);
-        frame.set_xstate_bv(XFEATURE_MASK_LEGACY | 1 << 63);
+        frame.set_xstate_bv(XFeatureMask::LEGACY.bits() | 1 << 63);
         frame.set_sw(|sw| sw.xfeatures &= !(1 << 63));
         assert!(frame.read().is_none());
     }
@@ -527,7 +522,7 @@ mod tests {
         let short_size = XSAVE_HEADER_OFFSET + XSAVE_HEADER_SIZE;
         let short = |xfeatures: u64| {
             let mut frame = Frame::new(0);
-            frame.set_xstate_bv(XFEATURE_MASK_LEGACY | 1 << component.id);
+            frame.set_xstate_bv(XFeatureMask::LEGACY.bits() | 1 << component.id);
             frame.set(short_size, &FP_XSTATE_MAGIC2.to_ne_bytes());
             frame.set_sw(|sw| {
                 sw.xstate_size = u32::try_from(short_size).unwrap();
@@ -537,6 +532,6 @@ mod tests {
         };
         assert!(short(layout.mask).is_none());
         let state = short(layout.mask & !(1 << component.id)).unwrap();
-        assert_eq!(state.xstate_bv(), XFEATURE_MASK_LEGACY);
+        assert_eq!(state.xstate_bv(), XFeatureMask::LEGACY.bits());
     }
 }

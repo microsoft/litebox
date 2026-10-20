@@ -14,15 +14,6 @@ pub trait GuestVectorStateProvider {
 
     /// Atomically replaces the complete vector state of the current guest thread.
     fn set_guest_vector_state(&self, state: &Self::GuestVectorState);
-
-    /// Returns whether the getter and setter above operate on the guest's live
-    /// vector state.
-    ///
-    /// Platforms that cannot yet preserve it return `false`, so callers do not
-    /// report placeholder state to the guest as saved.
-    fn preserves_guest_vector_state(&self) -> bool {
-        true
-    }
 }
 
 // TODO: replace this blanket with architecture-specific providers before

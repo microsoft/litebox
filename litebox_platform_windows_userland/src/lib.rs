@@ -20,7 +20,7 @@ use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use litebox::arch::x86_64::xstate::{
-    XFEATURE_MASK_LEGACY, XSAVE_HEADER_OFFSET, XsaveArea, XsaveChunk, XsaveHeader, XsaveLayout,
+    XFeatureMask, XSAVE_HEADER_OFFSET, XsaveArea, XsaveChunk, XsaveHeader, XsaveLayout,
     XsaveLegacyArea,
 };
 use litebox::platform::page_mgmt::{
@@ -499,7 +499,8 @@ static HOST_MXCSR: u32 = core::arch::x86_64::_MM_MASK_MASK;
 fn debug_assert_host_fx_control_state() {
     #[cfg(debug_assertions)]
     {
-        const HOST_MXCSR_CONTROL_MASK: u32 = 0xffc0;
+        use litebox::arch::x86_64::xstate::Mxcsr;
+        const HOST_MXCSR_CONTROL_MASK: u32 = Mxcsr::all().difference(Mxcsr::EXCEPTION_FLAGS).bits();
         let mut x87_control_word = 0_u16;
         let mut mxcsr = 0_u32;
         unsafe {
@@ -529,7 +530,7 @@ fn restore_xsave_to_context(
         CONTEXT_XSTATE_AMD64, LocateXStateFeature, SetXStateFeaturesMask, XSAVE_FORMAT,
     };
 
-    let legacy_state = xsave.materialized_legacy_area();
+    let legacy_state = xsave.sanitized_legacy_area();
     context.MxCsr = legacy_state.mxcsr;
     // SAFETY: XSAVE_FORMAT is Windows' representation of the architectural
     // legacy area, and its size is checked above.
@@ -584,7 +585,7 @@ fn xsave_from_context(
             .copy_to_nonoverlapping(bytes.as_mut_ptr(), size_of::<XsaveLegacyArea>());
     }
     // Windows contexts always hold materialized x87 and SSE state.
-    let mut xstate_bv = XFEATURE_MASK_LEGACY;
+    let mut xstate_bv = XFeatureMask::LEGACY.bits();
     if context.ContextFlags & CONTEXT_XSTATE_AMD64 == CONTEXT_XSTATE_AMD64 {
         let mut features = 0;
         // SAFETY: The context has initialized XSTATE storage, checked above.
@@ -2451,7 +2452,7 @@ mod tests {
                 self.calls.set(call);
                 // SAFETY: This is the active guest's host callback; capture has finished.
                 let area = unsafe { &*(*crate::get_tls_ptr().unwrap()).guest_xsave_area.get() };
-                let legacy = area.materialized_legacy_area();
+                let legacy = area.sanitized_legacy_area();
                 assert_eq!(legacy.control_word, TEST_CW);
                 assert_eq!(legacy.status_word & pending_status, pending_status);
                 assert_eq!(legacy.mxcsr, TEST_MXCSR);

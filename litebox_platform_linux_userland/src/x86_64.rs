@@ -584,8 +584,6 @@ pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRe
         "mov r10, fs:guest_xsave@tpoff",
         "mov eax, DWORD PTR fs:xsave_mask@tpoff",
         "mov edx, DWORD PTR fs:xsave_mask@tpoff+4",
-        ".globl switch_to_guest_xrstor",
-        "switch_to_guest_xrstor:",
         "xrstor64 [r10]",
         // Restore guest context from ctx.
         "mov rsp, rdi",
@@ -613,7 +611,6 @@ unsafe extern "C" {
     pub(super) fn interrupt_callback();
     pub(super) fn interrupt_callback_no_xsave();
     pub(super) fn switch_to_guest_start();
-    pub(super) fn switch_to_guest_xrstor();
     pub(super) fn switch_to_guest_end();
 }
 
@@ -627,13 +624,6 @@ pub(super) fn syscall_entry_point() -> usize {
 pub(super) fn in_switch_to_guest(pc: usize) -> bool {
     (switch_to_guest_start as *const () as usize..switch_to_guest_end as *const () as usize)
         .contains(&pc)
-}
-
-/// Whether `pc` is the XRSTOR that loads guest vector state on guest entry.
-///
-/// A fault there is a host fault even though `in_guest` is already set.
-pub(super) fn is_guest_xstate_restore(pc: usize) -> bool {
-    pc == switch_to_guest_xrstor as *const () as usize
 }
 
 pub(super) fn in_syscall_callback_prologue(ip: usize) -> bool {
