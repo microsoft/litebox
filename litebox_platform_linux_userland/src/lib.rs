@@ -38,6 +38,7 @@ extern crate alloc;
 #[cfg_attr(target_arch = "x86_64", path = "x86_64.rs")]
 mod arch;
 mod page_mgmt;
+pub mod process;
 
 #[cfg(target_arch = "aarch64")]
 use arch::{
@@ -127,6 +128,22 @@ impl LinuxUserland {
             boot_id: std::sync::OnceLock::new(),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Creates a fresh platform around signal handlers inherited by a native process clone.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the sole thread in a process cloned from an initialized
+    /// [`LinuxUserland`] runner. The child must not use or destroy the copied platform instance.
+    pub unsafe fn new_after_process_clone() -> &'static Self {
+        #[cfg(target_arch = "aarch64")]
+        assert_tls_block_placement();
+
+        Box::leak(Box::new(Self {
+            cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            boot_id: std::sync::OnceLock::new(),
+        }))
     }
 
     /// Configures the process-wide guest TLS mode.
@@ -234,11 +251,14 @@ impl LinuxUserland {
     )]
     /// Installs the runner seccomp filter on the threads selected by `scope`.
     ///
-    /// Broker transport exceptions are restricted to the supplied descriptors.
+    /// Broker transport exceptions are restricted to the supplied descriptors. If
+    /// `native_fork_stream_fd` is given, the runner may natively clone itself, and the clone
+    /// negotiates its broker association over a socket it places at that descriptor number.
     pub fn enable_seccomp_filter(
         positional_io_fds: &[std::os::fd::RawFd],
         shutdown_fds: &[std::os::fd::RawFd],
         scope: SeccompScope,
+        native_fork_stream_fd: Option<std::os::fd::RawFd>,
     ) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
@@ -339,6 +359,79 @@ impl LinuxUserland {
             ),
             (libc::SYS_close, vec![]),
         ];
+        if let Some(stream_fd) = native_fork_stream_fd {
+            let arg_eq = |index, value: u64| {
+                SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value)
+                    .unwrap()
+            };
+            let as_arg = |value: i32| {
+                u64::from(u32::try_from(value).expect("syscall argument must be non-negative"))
+            };
+            // The clone's descriptor-specific rules are confined to its control socket.
+            let stream = as_arg(stream_fd);
+            let socket_timeouts = [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO]
+                .into_iter()
+                .map(|option| {
+                    SeccompRule::new(vec![
+                        arg_eq(0, stream),
+                        arg_eq(1, as_arg(libc::SOL_SOCKET)),
+                        arg_eq(2, as_arg(option)),
+                    ])
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+
+            rules.extend([
+                // Parent: the clone, its pre-connected broker socket pair, and cleanup of a clone
+                // the broker did not adopt.
+                (
+                    libc::SYS_clone,
+                    vec![
+                        SeccompRule::new(vec![arg_eq(
+                            0,
+                            as_arg(libc::CLONE_PARENT | libc::CLONE_PIDFD | libc::SIGCHLD),
+                        )])
+                        .unwrap(),
+                    ],
+                ),
+                (
+                    libc::SYS_socketpair,
+                    vec![
+                        SeccompRule::new(vec![
+                            arg_eq(0, as_arg(libc::AF_UNIX)),
+                            arg_eq(1, as_arg(libc::SOCK_STREAM | libc::SOCK_CLOEXEC)),
+                        ])
+                        .unwrap(),
+                    ],
+                ),
+                (
+                    libc::SYS_pidfd_send_signal,
+                    vec![SeccompRule::new(vec![arg_eq(1, as_arg(libc::SIGKILL))]).unwrap()],
+                ),
+                // Child: descriptor cleanup, placing the control socket, and negotiation over it.
+                (libc::SYS_close_range, vec![]),
+                (
+                    libc::SYS_recvmsg,
+                    vec![SeccompRule::new(vec![arg_eq(0, stream)]).unwrap()],
+                ),
+                (libc::SYS_getsockopt, socket_timeouts.clone()),
+                (libc::SYS_setsockopt, socket_timeouts),
+                // Duplicates the process's own descriptors to the lowest free number at or above
+                // `stream_fd`: the clone moves its socket there once the descriptors above the
+                // standard streams are closed, and the transport duplicates the socket into its
+                // shutdown handle.
+                (
+                    libc::SYS_fcntl,
+                    vec![
+                        SeccompRule::new(vec![
+                            arg_eq(1, as_arg(libc::F_DUPFD_CLOEXEC)),
+                            arg_eq(2, stream),
+                        ])
+                        .unwrap(),
+                    ],
+                ),
+            ]);
+        }
         if !positional_io_fds.is_empty() {
             // Broker shared memory uses positional descriptor I/O.
             let fd_rules = || {
@@ -663,18 +756,38 @@ fn thread_start(
 
 // A handle to a platform thread.
 #[derive(Clone)]
-pub struct ThreadHandle(std::sync::Arc<std::sync::Mutex<Option<libc::pthread_t>>>);
+pub struct ThreadHandle(std::sync::Arc<std::sync::Mutex<Option<libc::pid_t>>>);
 
 thread_local! {
     static CURRENT_THREAD: std::cell::RefCell<Option<ThreadHandle>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Clears inherited guest-thread registration in the fork child.
+///
+/// # Panics
+///
+/// Panics if copied platform thread state is borrowed or poisoned.
+///
+/// # Safety
+///
+/// The caller must be the sole thread in a newly cloned process and must never return through the
+/// copied guest-thread stack after calling this function.
+pub unsafe fn reset_current_thread_after_process_clone() {
+    let current = CURRENT_THREAD.take();
+    if let Some(current) = current {
+        *current.0.lock().expect("thread handle mutex poisoned") = None;
+    }
+    replace_guest_thread_marker(false);
+}
+
 impl ThreadHandle {
     /// Runs `f`, ensuring that [`ThreadHandle::current`] can be called within `f`.
     fn run_with_handle<R>(f: impl FnOnce() -> R) -> R {
-        let handle = ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(unsafe {
-            libc::pthread_self()
-        }))));
+        // A raw clone does not update libc's cached pthread TID, so query the kernel directly.
+        // SAFETY: gettid takes no arguments and always returns the calling thread's ID.
+        let thread_id = unsafe { libc::syscall(libc::SYS_gettid) };
+        let thread_id = libc::pid_t::try_from(thread_id).expect("kernel thread ID fits pid_t");
+        let handle = ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(thread_id))));
         CURRENT_THREAD.with_borrow_mut(|current| {
             assert!(
                 current.is_none(),
@@ -702,8 +815,24 @@ impl ThreadHandle {
     fn interrupt(&self) {
         let thread = self.0.lock().unwrap();
         if let Some(&thread) = thread.as_ref() {
-            unsafe {
-                libc::pthread_kill(thread, INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed));
+            // SAFETY: Holding the registration lock prevents the target from unregistering and
+            // exiting, so its kernel TID cannot be reused before this directed signal is sent.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    thread,
+                    INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed),
+                )
+            };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                // A full real-time signal queue means interrupts are already pending, and a
+                // thread exiting outside its registration has nothing left to interrupt.
+                assert!(
+                    matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::ESRCH)),
+                    "failed to interrupt host thread {thread}: {error}"
+                );
             }
         }
     }
@@ -1930,6 +2059,88 @@ mod tests {
 
     extern crate std;
 
+    #[test]
+    fn native_clone_thread_can_be_interrupted() {
+        // SAFETY: A null stack creates a fork-like clone. Only the child uses the copied
+        // runtime below, and it exits without returning through the test harness.
+        let child = unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                libc::SIGCHLD,
+                0usize,
+                core::ptr::null_mut::<libc::pid_t>(),
+                core::ptr::null_mut::<libc::pid_t>(),
+                0usize,
+            )
+        };
+        assert!(
+            child >= 0,
+            "clone failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            // SAFETY: The child is the only surviving thread and never returns to copied state.
+            unsafe { super::reset_current_thread_after_process_clone() };
+            super::INTERRUPT_SIGNAL_NUMBER
+                .store(libc::SIGUSR1, core::sync::atomic::Ordering::Relaxed);
+            // SAFETY: A zero-initialized sigset_t is valid storage for sigemptyset.
+            let mut signals = unsafe { core::mem::zeroed::<libc::sigset_t>() };
+            // SAFETY: `signals` is writable, and pthread_sigmask copies it before returning.
+            let blocked = unsafe {
+                libc::sigemptyset(&raw mut signals) == 0
+                    && libc::sigaddset(&raw mut signals, libc::SIGUSR1) == 0
+                    && libc::pthread_sigmask(
+                        libc::SIG_BLOCK,
+                        &raw const signals,
+                        core::ptr::null_mut(),
+                    ) == 0
+            };
+            let interrupted = blocked
+                && super::ThreadHandle::run_with_handle(|| {
+                    let thread = super::ThreadHandle::current();
+                    let Ok(sender) = std::thread::Builder::new().spawn(move || thread.interrupt())
+                    else {
+                        return false;
+                    };
+                    let timeout = libc::timespec {
+                        tv_sec: 2,
+                        tv_nsec: 0,
+                    };
+                    // SAFETY: The signal is blocked in both threads, and the set and timeout
+                    // are valid for the bounded wait. No signal handler runs in the child.
+                    let signal = unsafe {
+                        libc::sigtimedwait(
+                            &raw const signals,
+                            core::ptr::null_mut(),
+                            &raw const timeout,
+                        )
+                    };
+                    sender.join().is_ok() && signal == libc::SIGUSR1
+                });
+            // SAFETY: Do not unwind through or destroy the copied test runtime.
+            unsafe { libc::_exit(i32::from(!interrupted)) };
+        }
+        let child = libc::pid_t::try_from(child).expect("clone returned a valid process ID");
+        let mut status = 0;
+        loop {
+            // SAFETY: This test owns the clone, and `status` is writable.
+            let waited = unsafe { libc::waitpid(child, &raw mut status, 0) };
+            if waited == child {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR),
+                "waitpid failed"
+            );
+        }
+        assert!(
+            libc::WIFEXITED(status),
+            "clone did not exit normally: {status}"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0, "clone was not interrupted");
+    }
+
     /// An interrupt pending at guest entry diverts to the interrupt handler
     /// without entering the guest, so a further interrupt taken while that
     /// handler runs host code must not be treated as a guest interrupt, which
@@ -2033,6 +2244,7 @@ mod tests {
             &[allowed.as_raw_fd()],
             &[allowed_shutdown.as_raw_fd()],
             super::SeccompScope::AllThreads,
+            None,
         );
         barrier.wait();
 

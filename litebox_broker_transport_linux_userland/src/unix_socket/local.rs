@@ -100,6 +100,16 @@ impl UnixStreamLocalSetupChannel {
         }
     }
 
+    /// Creates a local setup channel from an already-connected Unix stream, with an absolute
+    /// deadline for setup I/O.
+    pub const fn from_connected_with_setup_deadline(stream: UnixStream, deadline: Instant) -> Self {
+        Self {
+            stream,
+            setup_deadline: Some(deadline),
+            negotiated: false,
+        }
+    }
+
     /// Connects to a userland broker Unix socket.
     pub fn connect(path: impl AsRef<Path>) -> IoResult<Self> {
         UnixStream::connect(path).map(Self::from_connected)
@@ -148,7 +158,7 @@ impl UnixStreamLocalSetupChannel {
     /// call, notification, and shutdown handles, starting the liveness
     /// monitor.
     ///
-    /// The ring must be the validated control-ring memfd received during this
+    /// The ring must be the control-ring memfd received during this
     /// setup exchange.
     pub fn into_active(
         self,

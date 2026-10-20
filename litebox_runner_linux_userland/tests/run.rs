@@ -62,6 +62,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 const DEDICATED_C_TESTS: &[&str] = &[
     "async_x16.c",
     "fork_parent.c",
+    "fork_interrupt_parent.c",
     "fork_threads_parent.c",
     "fork_aarch64_state.c",
     "fork_epoll_parent.c",
@@ -1004,6 +1005,25 @@ fn fork_child_resumes_from_parent_snapshot() {
     assert_eq!(numeric_field(raw_line, "waited="), raw_child);
     assert_eq!(numeric_field(raw_line, "exited="), 1);
     assert_eq!(numeric_field(raw_line, "code="), 9);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fork_child_can_be_interrupted_in_guest_code() {
+    let parent = common::compile(
+        "./tests/fork_interrupt_parent.c",
+        "fork_interrupt_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "fork_interrupt_parent");
+    runner.allow_process_duplication();
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "forked child interrupted")
+    );
 }
 
 #[cfg(target_os = "linux")]

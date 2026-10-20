@@ -52,6 +52,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
+pub mod process;
 mod teb;
 
 use teb::{
@@ -424,6 +425,37 @@ pub unsafe fn run_thread(
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
     run_thread_inner(&shim, ctx);
+}
+
+/// Clears inherited managed-thread registration in the fork child.
+///
+/// # Panics
+///
+/// Panics if copied platform thread-state locks are poisoned.
+///
+/// # Safety
+///
+/// The caller must be the sole thread in a newly cloned process and must never return through the
+/// copied guest-thread stack after calling this function.
+pub unsafe fn reset_current_thread_after_process_clone() {
+    // The clone inherits no handles, so copied `OwnedHandle`s name handles this process does not
+    // own. Leak them rather than close whatever their values may refer to here.
+    let current = CURRENT_THREAD_HANDLE.take();
+    core::mem::forget(core::mem::take(
+        &mut *ACTIVE_THREADS
+            .lock()
+            .expect("active thread registry mutex poisoned"),
+    ));
+    if let Some(current) = current
+        && let Some(inner) = current
+            .0
+            .lock()
+            .expect("thread handle mutex poisoned")
+            .take()
+    {
+        core::mem::forget(inner.handle);
+    }
+    uninstall_tls();
 }
 
 fn run_thread_inner(

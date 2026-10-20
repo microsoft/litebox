@@ -9,12 +9,120 @@ extern crate alloc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use litebox::platform::{ForkError, ProcessHandle as _, ProcessProvider};
+use litebox::process::ProcessError;
 use litebox_broker_local_userland as broker;
 use litebox_common_linux::program_startup::{LinuxProcessStartup, LinuxProgramStartup};
 use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
+use std::os::windows::io::AsRawHandle;
+use std::sync::Arc;
+
+use litebox_broker_transport_windows_userland::existing_runner::{
+    ExistingRunnerDescriptor, unique_control_channel,
+};
 
 type Platform = WindowsUserland<{ litebox_common_linux::PAGE_SIZE }>;
 
+struct NativeForkRunner {
+    memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
+}
+
+impl NativeForkRunner {
+    /// Configures `builder` to start native fork children.
+    fn install(
+        builder: litebox_shim_linux::LinuxShimBuilder<Platform>,
+    ) -> litebox_shim_linux::LinuxShimBuilder<Platform> {
+        // SAFETY: `run_child` abandons the copied task, resets platform state,
+        // and reconnects to the broker before running the guest in a fresh shim.
+        unsafe { builder.with_native_fork_runner(|memory| Self { memory }) }
+    }
+
+    /// Rebuilds the runtime in a clone and returns the guest's exit status.
+    fn bootstrap_child(&self, control_pipe: &std::ffi::OsStr) -> Result<i32> {
+        let platform = Platform::new();
+        Platform::set_guest_tls_mode(GuestTlsMode::Linux);
+        let (connection, startup) = broker::connect(control_pipe)?;
+        let broker::BrokerConnection {
+            local,
+            notifications,
+            process_image,
+        } = connection;
+        if process_image.is_some() {
+            anyhow::bail!("native fork child unexpectedly received a process image");
+        }
+        let (litebox, process_id, initial_thread) =
+            litebox::LiteBox::new_process_with_broker_local(platform, local);
+        let process_id =
+            i32::try_from(process_id.0).context("process ID does not fit Linux pid_t")?;
+        broker::start_notification_receiver(
+            notifications,
+            litebox.broker_notification_dispatcher(),
+            litebox.broker_failure_dispatcher(),
+        )?;
+        // SAFETY: Sibling guests were paused with memory-manager locks released before the
+        // clone. The fresh platform supports the inherited mappings, and the old runtime is
+        // abandoned.
+        let builder = unsafe {
+            litebox_shim_linux::LinuxShimBuilder::new_for_native_fork(
+                platform,
+                litebox,
+                process_id,
+                Arc::clone(&self.memory),
+            )
+        };
+        let shim = Self::install(builder).build();
+        let startup = startup.context("native fork child has no startup data")?;
+        // SAFETY: The startup describes this clone, whose inherited memory manager the fresh shim
+        // now owns; this path never returns to the copied parent runtime.
+        let program =
+            unsafe { shim.restore_fork_from_native_clone(&startup.payload, initial_thread) }
+                .context("failed to restore native fork state")?;
+        Ok(run_guest(&shim, program))
+    }
+}
+
+impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkRunner {
+    type ControlChannel = std::ffi::OsString;
+
+    fn create_control_channel(&self) -> Result<std::ffi::OsString, ForkError<ProcessError>> {
+        Ok(unique_control_channel())
+    }
+    fn encode_runner_descriptor(
+        &self,
+        process: &<Platform as ProcessProvider>::ProcessHandle,
+        control_pipe: std::ffi::OsString,
+    ) -> Result<Vec<u8>, ProcessError> {
+        let process_id = process.process_id().map_err(|error| {
+            litebox_util_log::error!("failed to identify native fork child: {error}");
+            ProcessError::ServiceFailed
+        })?;
+        ExistingRunnerDescriptor {
+            process_handle: process.as_raw_handle() as usize as u64,
+            process_id,
+            control_channel: control_pipe,
+        }
+        .encode()
+        .map_err(|_| ProcessError::OutOfMemory)
+    }
+
+    unsafe fn run_child(&self, control_pipe: std::ffi::OsString) -> ! {
+        // SAFETY: RtlCloneUserProcess cloned only this thread, and this path never returns through
+        // the copied parent task or its registration guard.
+        let status = match unsafe { Platform::prepare_fork_child() }
+            .context("failed to prepare native fork child")
+            .and_then(|()| self.bootstrap_child(&control_pipe))
+        {
+            Ok(status) => status,
+            Err(error) => {
+                litebox_util_log::error!("native fork child bootstrap failed: {error:#}");
+                127
+            }
+        };
+        // Skip CRT and DLL teardown of state copied from the multithreaded parent runtime.
+        // SAFETY: This is a clone whose copied runtime must not be torn down.
+        unsafe { litebox_platform_windows_userland::process::exit_fork_child(status) }
+    }
+}
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///
 /// The program binary and all its dependencies must be available in the
@@ -89,6 +197,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     )?;
     let shim_builder =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
+    let shim_builder = if std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none() {
+        NativeForkRunner::install(shim_builder)
+    } else {
+        shim_builder
+    };
 
     let shim = shim_builder.build();
     let startup = startup
@@ -205,6 +318,15 @@ fn run_program(
     shim: &litebox_shim_linux::LinuxShim<Platform>,
     program: litebox_shim_linux::LoadedProgram<Platform>,
 ) -> ! {
+    std::process::exit(run_guest(shim, program))
+}
+
+/// Runs the loaded `program` until it exits and returns the runner's exit status.
+fn run_guest(
+    shim: &litebox_shim_linux::LinuxShim<Platform>,
+    program: litebox_shim_linux::LoadedProgram<Platform>,
+) -> i32 {
+    // SAFETY: The entry points belong to `shim`, which outlives the guest thread.
     unsafe {
         litebox_platform_windows_userland::run_thread(
             program.entrypoints,
@@ -216,5 +338,5 @@ fn run_program(
     let _ = shim
         .litebox()
         .report_exit_status(program.process.wait_for_exit_status());
-    std::process::exit(program.process.wait())
+    program.process.wait()
 }

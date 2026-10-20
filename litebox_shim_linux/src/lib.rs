@@ -63,6 +63,8 @@ pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
 
+use syscalls::process::ForkLauncher;
+
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
 /// This exists so that the (many) `impl` blocks throughout the shim can be written
@@ -361,6 +363,8 @@ pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
     process_id: i32,
+    fork_launcher: Option<ForkLauncher>,
+    memory_manager: Arc<MemoryManager<Platform>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -379,7 +383,65 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform,
             litebox,
             process_id,
+            fork_launcher: None,
+            memory_manager: Arc::new(MemoryManager::new(platform)),
         }
+    }
+
+    /// Returns a new shim builder using a native fork child's inherited memory manager.
+    ///
+    /// # Safety
+    ///
+    /// The manager must have no held locks, and `platform` must be able to manage
+    /// all inherited mappings and reservations. Only this shim may use the manager; the copied
+    /// parent runtime must never use or release it again.
+    pub unsafe fn new_for_native_fork(
+        platform: &'static Platform,
+        litebox: LiteBox<Platform>,
+        process_id: i32,
+        memory: Arc<MemoryManager<Platform>>,
+    ) -> Self {
+        // SAFETY: The caller guarantees exclusive use, unlocked state, and compatibility with
+        // the fresh platform. No operations use the copied platform after rebinding.
+        unsafe { memory.rebind_platform_after_clone(platform) };
+        Self {
+            platform,
+            litebox,
+            process_id,
+            fork_launcher: None,
+            memory_manager: memory,
+        }
+    }
+
+    /// Starts native fork children with the runner `make_runner` creates, replacing the
+    /// copy-based default.
+    ///
+    /// `make_runner` receives this shim's memory manager, which a native child inherits and must
+    /// pass to [`Self::new_for_native_fork`].
+    ///
+    /// # Safety
+    ///
+    /// The runner must satisfy the clone-safety contract of [`ForkLauncher::new`].
+    #[must_use]
+    pub unsafe fn with_native_fork_runner<Runner>(
+        self,
+        make_runner: impl FnOnce(Arc<MemoryManager<Platform>>) -> Runner,
+    ) -> Self
+    where
+        Platform: litebox::platform::ProcessProvider + 'static,
+        Runner: syscalls::process::ForkRunner<Platform>,
+    {
+        let runner = make_runner(Arc::clone(&self.memory_manager));
+        // SAFETY: The caller guarantees the runner's clone-safety contract.
+        let launcher = unsafe { ForkLauncher::new::<Platform>(runner) };
+        self.with_fork_launcher(launcher)
+    }
+
+    /// Uses `launcher` to start native fork children, replacing the copy-based default.
+    #[must_use]
+    pub(crate) fn with_fork_launcher(mut self, launcher: ForkLauncher) -> Self {
+        self.fork_launcher = Some(launcher);
+        self
     }
 
     /// Returns the litebox object for the shim.
@@ -392,11 +454,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let litebox = Arc::new(self.litebox);
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            mm: MemoryManager::new(self.platform),
+            mm: self.memory_manager,
             futex_manager: FutexManager::new(),
             boot_time: self.platform.now(),
             process_id: self.process_id,
             litebox,
+            fork_launcher: self.fork_launcher,
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim(global)
@@ -521,6 +584,41 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         initial_thread: litebox::thread::Thread,
         load_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
     ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
+        self.restore_fork_with_memory(startup, initial_thread, |mm, regions| {
+            Task::restore_fork_image(mm, regions, load_image)
+        })
+    }
+
+    /// Continues a process whose address space was duplicated natively by the host, from the
+    /// encoded fork startup payload its parent sent through the broker.
+    ///
+    /// The shim must reuse the inherited memory manager through
+    /// [`LinuxShimBuilder::new_for_native_fork`]. Guest mappings and memory-management state are
+    /// retained without rebuilding their metadata, so a payload that carries memory regions or a
+    /// program break, as copy-based startup does, is rejected.
+    ///
+    /// # Safety
+    ///
+    /// The memory manager must be the one inherited with `startup` by a native clone. The copied
+    /// parent runtime must never use or release that manager or its mappings again.
+    pub unsafe fn restore_fork_from_native_clone(
+        &self,
+        startup: &[u8],
+        initial_thread: litebox::thread::Thread,
+    ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
+        let startup = decode_native_fork_startup(startup)?;
+        self.restore_fork_with_memory(startup, initial_thread, |_mm, _regions| Ok(()))
+    }
+
+    fn restore_fork_with_memory(
+        &self,
+        startup: litebox_common_linux::program_startup::LinuxForkStartup,
+        initial_thread: litebox::thread::Thread,
+        restore_memory: impl FnOnce(
+            &MemoryManager<Platform>,
+            &[litebox_common_linux::program_startup::ForkMemoryRegion],
+        ) -> Result<(), ForkRestoreError>,
+    ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
         let litebox_common_linux::program_startup::LinuxForkStartup {
             uid,
             euid,
@@ -548,10 +646,12 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             return Err(ForkRestoreError::IncompatibleRunner);
         }
 
-        Task::restore_fork_image(&self.0.mm, &regions, load_image)?;
-        self.0
-            .mm
-            .restore_program_break(initial_program_break, program_break);
+        restore_memory(&self.0.mm, &regions)?;
+        if initial_program_break != 0 {
+            self.0
+                .mm
+                .restore_program_break(initial_program_break, program_break);
+        }
 
         let files = syscalls::file::FilesState::new();
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
@@ -630,9 +730,30 @@ pub struct LoadedProgram<Platform: ShimPlatform> {
     pub process: LinuxShimProcess<Platform>,
 }
 
+/// Decodes native fork startup state, which leaves memory state to the inherited manager.
+fn decode_native_fork_startup(
+    startup: &[u8],
+) -> Result<litebox_common_linux::program_startup::LinuxForkStartup, ForkRestoreError> {
+    use litebox_common_linux::program_startup::LinuxProcessStartup;
+
+    match LinuxProcessStartup::decode(startup) {
+        Ok(LinuxProcessStartup::Fork(startup))
+            if startup.regions.is_empty()
+                && startup.initial_program_break == 0
+                && startup.program_break == 0 =>
+        {
+            Ok(*startup)
+        }
+        _ => Err(ForkRestoreError::InvalidStartup),
+    }
+}
+
 /// A failure to continue a process duplicated by `fork`.
 #[derive(Debug, thiserror::Error)]
 pub enum ForkRestoreError {
+    /// The startup payload is not native fork startup state.
+    #[error("invalid native fork startup")]
+    InvalidStartup,
     /// The runner's code addresses differ from the parent's runner.
     #[error("the runner's address layout differs from the parent's")]
     IncompatibleRunner,
@@ -1522,13 +1643,15 @@ struct GlobalState<Platform: ShimPlatform> {
     /// The LiteBox instance used throughout the shim.
     litebox: Arc<litebox::LiteBox<Platform>>,
     /// The memory manager for managing virtual memory.
-    mm: MemoryManager<Platform>,
+    mm: Arc<MemoryManager<Platform>>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.
     process_id: i32,
+    /// Native fork launcher, or `None` to use copy-based fork directly.
+    fork_launcher: Option<ForkLauncher>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, loader::patch::ElfPatchCache<Platform>>,
 }

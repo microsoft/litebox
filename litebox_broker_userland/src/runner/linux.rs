@@ -6,23 +6,26 @@ use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
+use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
+use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_broker_transport_linux_userland::memfd::{MemfdProcessImage, MemfdSharedMemory};
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 
 use super::{
-    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, UserlandProcessLauncher, accept_runner_channel,
-    runner_has_exited,
+    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, RunnerProcess, SupervisedRunners,
+    UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -86,6 +89,8 @@ pub(super) struct PlatformRunnerEndpoint {
     socket_path: PathBuf,
     listener: Option<UnixListener>,
     directory: Option<tempfile::TempDir>,
+    /// Control stream the broker already holds for an adopted runner, which never listens.
+    connected: Option<UnixStream>,
 }
 
 impl PlatformRunnerEndpoint {
@@ -100,6 +105,7 @@ impl PlatformRunnerEndpoint {
             socket_path,
             listener: Some(listener),
             directory: Some(directory),
+            connected: None,
         })
     }
 
@@ -109,16 +115,28 @@ impl PlatformRunnerEndpoint {
 
     pub(super) fn serve(
         &mut self,
-        runner: &Arc<Mutex<Child>>,
+        runner: &Arc<Mutex<RunnerProcess>>,
         startup: PendingRunnerAssociation,
         setup_deadline: Instant,
         broker: BrokerCore,
         launcher: Arc<UserlandProcessLauncher>,
     ) -> AssociationOutcome {
+        let control_channel = match self.connected.take() {
+            // Adoption bound this stream to the runner, so it needs no peer authentication.
+            Some(stream) => Ok(UnixStreamHostSetupChannel::from_host_guaranteed(
+                stream,
+                setup_deadline,
+            )),
+            None => accept_control_channel(
+                self.listener
+                    .as_ref()
+                    .expect("a live spawned runner instance must own its control listener"),
+                runner,
+                setup_deadline,
+            ),
+        };
         serve_association(
-            self.listener
-                .as_ref()
-                .expect("a live runner instance must own its control listener"),
+            control_channel,
             runner,
             startup,
             setup_deadline,
@@ -130,12 +148,138 @@ impl PlatformRunnerEndpoint {
     pub(super) fn close(&mut self) {
         self.listener.take();
         self.directory.take();
+        self.connected.take();
+    }
+}
+
+pub(crate) struct AdoptedProcess {
+    process_id: u32,
+    status: Option<ExitStatus>,
+}
+
+impl AdoptedProcess {
+    pub(super) const fn id(&self) -> u32 {
+        self.process_id
+    }
+
+    pub(super) fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let process_id =
+            libc::pid_t::try_from(self.process_id).map_err(|_| ErrorKind::InvalidInput)?;
+        let mut status = 0;
+        // SAFETY: `process_id` names a direct child of this broker and `status` is writable.
+        let result = unsafe { libc::waitpid(process_id, &raw mut status, libc::WNOHANG) };
+        if result < 0 {
+            return Err(IoError::last_os_error());
+        }
+        if result == 0 {
+            return Ok(None);
+        }
+        let status = ExitStatus::from_raw(status);
+        self.status = Some(status);
+        Ok(Some(status))
+    }
+
+    pub(super) fn kill(&mut self) -> IoResult<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        let process_id =
+            libc::pid_t::try_from(self.process_id).map_err(|_| ErrorKind::InvalidInput)?;
+        // SAFETY: Only this owner reaps the adopted child, so its PID cannot be reused yet.
+        if unsafe { libc::kill(process_id, libc::SIGKILL) } < 0 {
+            return Err(IoError::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Adopts a natively cloned runner, taking the broker's end of the control socket pair its
+/// parent created for it.
+///
+/// The clone must be a running child of this broker that no runner instance supervises
+/// (`supervised` holds their host process IDs). A compromised runner could name another of this
+/// broker's unsupervised clones, but every candidate belongs to the same sandbox.
+pub(super) fn adopt(
+    _parent: &Arc<Mutex<RunnerProcess>>,
+    runner_descriptor: &[u8],
+    supervised: &SupervisedRunners,
+) -> IoResult<(RunnerProcess, PlatformRunnerEndpoint)> {
+    let descriptor = ExistingRunnerDescriptor::decode(runner_descriptor)?;
+    if supervised.contains_key(&descriptor.process_id) {
+        return Err(IoError::new(
+            ErrorKind::PermissionDenied,
+            "runner process is already supervised",
+        ));
+    }
+    let process_id = libc::pid_t::try_from(descriptor.process_id)
+        .map_err(|_| IoError::from(ErrorKind::InvalidInput))?;
+    // SAFETY: A zeroed siginfo_t is valid output storage for waitid.
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    // WNOWAIT observes without reaping, so another child's exit status is never consumed here.
+    // SAFETY: `info` is writable, and the call takes no other pointers.
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            descriptor.process_id,
+            &raw mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } < 0
+    {
+        return Err(IoError::last_os_error());
+    }
+    // SAFETY: waitid initialized `info`, whose PID is zero if no child has exited.
+    if unsafe { info.si_pid() } != 0 {
+        return Err(IoError::new(
+            ErrorKind::BrokenPipe,
+            "runner clone exited before adoption",
+        ));
+    }
+    // An unreaped child's PID cannot be reused, so the pidfd names the checked clone.
+    let pidfd = owned_fd_from_syscall(
+        // SAFETY: `pidfd_open` takes no pointers.
+        unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0u32) },
+    )?;
+    let broker_end = owned_fd_from_syscall(
+        // SAFETY: `pidfd_getfd` takes no pointers and duplicates a descriptor into this process.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_getfd,
+                pidfd.as_raw_fd(),
+                descriptor.broker_fd,
+                0u32,
+            )
+        },
+    )?;
+    let stream = UnixStream::from(broker_end);
+    Ok((
+        RunnerProcess::Adopted(AdoptedProcess {
+            process_id: descriptor.process_id,
+            status: None,
+        }),
+        PlatformRunnerEndpoint {
+            socket_path: PathBuf::new(),
+            listener: None,
+            directory: None,
+            connected: Some(stream),
+        },
+    ))
+}
+
+fn owned_fd_from_syscall(result: libc::c_long) -> IoResult<OwnedFd> {
+    match RawFd::try_from(result) {
+        // SAFETY: The system call returned a new descriptor that nothing else owns.
+        Ok(fd) if fd >= 0 => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+        _ => Err(IoError::last_os_error()),
     }
 }
 
 fn serve_association(
-    control_listener: &UnixListener,
-    runner: &Arc<Mutex<Child>>,
+    control_channel: IoResult<UnixStreamHostSetupChannel>,
+    runner: &Arc<Mutex<RunnerProcess>>,
     mut startup: PendingRunnerAssociation,
     setup_deadline: Instant,
     broker: BrokerCore,
@@ -143,7 +287,7 @@ fn serve_association(
 ) -> AssociationOutcome {
     let image = startup.take_image();
     let shutdown_was_expected = startup.process.shutdown_was_expected();
-    let control_channel = match accept_control_channel(control_listener, runner, setup_deadline) {
+    let control_channel = match control_channel {
         Ok(connection) => connection,
         Err(error) => {
             let abnormal = !(runner_has_exited(runner).unwrap_or(false)
@@ -182,7 +326,7 @@ fn serve_association(
 
 fn accept_control_channel(
     control_listener: &UnixListener,
-    runner: &Arc<Mutex<Child>>,
+    runner: &Arc<Mutex<RunnerProcess>>,
     setup_deadline: Instant,
 ) -> IoResult<UnixStreamHostSetupChannel> {
     let control_stream = accept_runner_channel(
@@ -211,7 +355,7 @@ fn accept_control_channel(
 /// Waits until the runner exits, `listener` becomes readable, or `timeout`
 /// elapses. Callers recheck their own condition, so early returns are harmless.
 pub(super) fn wait_for_runner_event(
-    runner: &Arc<Mutex<Child>>,
+    runner: &Arc<Mutex<RunnerProcess>>,
     listener: Option<&UnixListener>,
     timeout: Option<Duration>,
 ) -> IoResult<()> {
@@ -260,4 +404,48 @@ pub(super) fn wait_for_runner_event(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Child, Stdio};
+
+    fn sleeper() -> Child {
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn descriptor(process_id: u32, broker_fd: RawFd) -> Vec<u8> {
+        ExistingRunnerDescriptor {
+            process_id,
+            broker_fd,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[test]
+    fn adoption_rejects_supervised_and_foreign_processes() {
+        let parent = Arc::new(Mutex::new(RunnerProcess::Spawned(sleeper())));
+        let parent_id = parent.lock().unwrap().id();
+        let error = adopt(
+            &parent,
+            &descriptor(parent_id, 3),
+            &SupervisedRunners::from([(parent_id, 1)]),
+        )
+        .err()
+        .expect("a supervised runner must not be adopted again");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        // PID 1 is never this broker's child.
+        assert!(adopt(&parent, &descriptor(1, 3), &SupervisedRunners::new()).is_err());
+        let RunnerProcess::Spawned(parent) = &mut *parent.lock().unwrap() else {
+            unreachable!();
+        };
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+    }
 }

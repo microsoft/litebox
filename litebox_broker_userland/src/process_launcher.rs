@@ -3,6 +3,8 @@
 
 //! Runner launch support backed by broker-owned process lifecycle state.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::{Error as IoError, Result as IoResult};
 use std::process::ExitStatus;
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -13,15 +15,47 @@ use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
 
-use crate::runner::{RunnerCompletion, RunnerConfig, RunnerInstance};
+use crate::runner::{
+    RunnerCompletion, RunnerConfig, RunnerInstance, RunnerProcess, SupervisedRunners,
+};
 
 /// Userland implementation that starts one out-of-process runner per process.
 pub(crate) struct UserlandProcessLauncher {
     broker: BrokerCore,
     started_runner_config: RunnerConfig,
     lifecycle: Arc<ProcessLifecycleNotifier>,
+    runners: Mutex<RunnerRegistry>,
+}
+
+/// Runners this broker supervises.
+///
+/// A host process ID is registered from the moment its runner is spawned or adopted until the
+/// runner has been reaped, so adoption can never claim a supervised runner. Registrations are
+/// counted per host process ID, because the OS may reuse a reaped runner's ID for a new runner
+/// before the old registration is removed.
+#[derive(Default)]
+struct RunnerRegistry {
+    by_process: HashMap<ProcessId, std::sync::Weak<Mutex<RunnerProcess>>>,
+    host_process_ids: SupervisedRunners,
+}
+
+impl RunnerRegistry {
+    fn register(&mut self, host_process_id: u32) {
+        *self.host_process_ids.entry(host_process_id).or_default() += 1;
+    }
+
+    fn remove(&mut self, process_id: ProcessId, host_process_id: u32) {
+        self.by_process.remove(&process_id);
+        if let Entry::Occupied(mut registrations) = self.host_process_ids.entry(host_process_id) {
+            *registrations.get_mut() -= 1;
+            if *registrations.get() == 0 {
+                registrations.remove();
+            }
+        }
+    }
 }
 
 /// Pending association for a broker-created runner process.
@@ -120,6 +154,7 @@ impl UserlandProcessLauncher {
             broker,
             started_runner_config,
             lifecycle,
+            runners: Mutex::new(RunnerRegistry::default()),
         })
     }
 
@@ -161,12 +196,36 @@ impl UserlandProcessLauncher {
         completion_sender: Option<SyncSender<IoResult<ExitStatus>>>,
     ) -> Result<(), BrokerError> {
         let process = Arc::clone(&association.process);
-        let process_id = process.id();
-        let Ok(instance) = RunnerInstance::start(config) else {
+        let instance = {
+            // Registration under the lock that adoption holds keeps the new runner's host
+            // process ID from appearing unsupervised to a concurrent adoption.
+            let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
+            RunnerInstance::start(config).inspect(|instance| {
+                runners.register(instance.host_process_id());
+            })
+        };
+        let Ok(instance) = instance else {
             let _ = process.fail_start(BrokerError::PeerClosed, false, false);
             process.retire(true);
             return Err(BrokerError::PeerClosed);
         };
+        self.launch_runner_instance(association, instance, completion_sender)
+    }
+
+    fn launch_runner_instance(
+        self: Arc<Self>,
+        association: PendingRunnerAssociation,
+        instance: RunnerInstance,
+        completion_sender: Option<SyncSender<IoResult<ExitStatus>>>,
+    ) -> Result<(), BrokerError> {
+        let process = Arc::clone(&association.process);
+        let process_id = process.id();
+        let host_process_id = instance.host_process_id();
+        self.runners
+            .lock()
+            .expect("runner registry mutex poisoned")
+            .by_process
+            .insert(process_id, Arc::downgrade(&instance.runner_process()));
         let setup_deadline = instance.setup_deadline();
         let broker = self.broker.clone();
         let launcher = Arc::clone(&self);
@@ -175,7 +234,7 @@ impl UserlandProcessLauncher {
             .name(format!("litebox-runner-{}", process_id.0))
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    instance.run_process_to_completion(association, broker, launcher)
+                    instance.run_process_to_completion(association, broker, Arc::clone(&launcher))
                 }));
                 let (completion, thread_panicked) = match outcome {
                     Ok(completion) => (completion, false),
@@ -187,11 +246,29 @@ impl UserlandProcessLauncher {
                     completion.process_exit_status(),
                     abnormal,
                 );
+                // The instance reaped its runner before being consumed or dropped.
+                // TODO: Release the host process ID only after deregistering it. The runner is
+                // reaped before this removal, outside the registry lock, so the OS can reuse its
+                // PID in between. Counted registrations keep a runner spawned with that PID
+                // registered, but a native fork clone given it is refused adoption and its fork
+                // fails. This is tolerable for now: Linux allocates PIDs sequentially, so reuse
+                // within the window requires cycling through `pid_max`, and the window spans
+                // only in-memory bookkeeping.
+                launcher
+                    .runners
+                    .lock()
+                    .expect("runner registry mutex poisoned")
+                    .remove(process_id, host_process_id);
                 if let Some(completion_sender) = completion_sender {
                     let _ = completion_sender.send(completion.into_result());
                 }
             });
         if thread.is_err() {
+            // Dropping the unstarted closure dropped, and so reaped, the instance.
+            self.runners
+                .lock()
+                .expect("runner registry mutex poisoned")
+                .remove(process_id, host_process_id);
             let _ = process.fail_start(BrokerError::OutOfMemory, false, true);
             process.retire(true);
             return Err(BrokerError::OutOfMemory);
@@ -223,6 +300,48 @@ impl ProcessLauncher for UserlandProcessLauncher {
         )
     }
 
+    fn launch_existing(
+        self: Arc<Self>,
+        parent_process_id: litebox_broker_protocol::ProcessId,
+        process: Arc<BrokerProcess>,
+        startup: ProcessStartupData,
+        runner_descriptor: Vec<u8>,
+    ) -> Result<(), BrokerError> {
+        let adoption = {
+            let mut runners = self.runners.lock().expect("runner registry mutex poisoned");
+            let adoption = runners
+                .by_process
+                .get(&parent_process_id)
+                .and_then(std::sync::Weak::upgrade)
+                .ok_or(BrokerError::PeerClosed)
+                .and_then(|parent| {
+                    RunnerInstance::adopt(&parent, &runner_descriptor, &runners.host_process_ids)
+                        .map_err(|error| {
+                            litebox_util_log::warn!("rejected native fork runner: {error}");
+                            BrokerError::PolicyDenied
+                        })
+                });
+            // TODO: Reap Linux clones that are never adopted. CLONE_PARENT makes them this
+            // broker's children, so their parent runner's cleanup leaves zombies here.
+            if let Ok(instance) = &adoption {
+                runners.register(instance.host_process_id());
+            }
+            adoption
+        };
+        let instance = match adoption {
+            Ok(instance) => instance,
+            Err(error) => {
+                let _ = process.fail_start(error, false, true);
+                process.retire(true);
+                return Err(error);
+            }
+        };
+        self.launch_runner_instance(
+            PendingRunnerAssociation::new(process, Some(startup), None),
+            instance,
+            None,
+        )
+    }
     fn create_image(
         &self,
         capacity: u64,

@@ -78,6 +78,17 @@ pub(crate) trait BrokerControl: Send + Sync {
         payload: &[u8],
     ) -> core::result::Result<(), BrokerControlError>;
 
+    /// Starts the logical guest child using an already-created host runner.
+    ///
+    /// `runner_descriptor` encodes the platform-specific host identity and control endpoint;
+    /// `payload` contains the guest startup state.
+    fn start_child_with_existing_runner(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        runner_descriptor: &[u8],
+        payload: &[u8],
+    ) -> core::result::Result<(), BrokerControlError>;
+
     fn write_child_memory(
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
@@ -738,6 +749,37 @@ where
         let shared_buffer_lease = self.acquire_shared_buffer(payload.len())?;
         self.request(|local| {
             local.start_child_process(child_process_id, shared_buffer_lease.sequence(), payload)
+        })
+    }
+
+    fn start_child_with_existing_runner(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        runner_descriptor: &[u8],
+        payload: &[u8],
+    ) -> core::result::Result<(), BrokerControlError> {
+        use litebox_broker_protocol::process::{
+            MAX_EXISTING_RUNNER_START_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
+        };
+
+        if runner_descriptor.len() > MAX_RUNNER_DESCRIPTOR_SIZE as usize
+            || payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize
+        {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length = runner_descriptor
+            .len()
+            .checked_add(payload.len())
+            .filter(|length| *length <= MAX_EXISTING_RUNNER_START_SIZE as usize)
+            .ok_or(BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
+        let shared_buffer_lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| {
+            local.start_child_with_existing_runner(
+                child_process_id,
+                shared_buffer_lease.sequence(),
+                runner_descriptor,
+                payload,
+            )
         })
     }
 

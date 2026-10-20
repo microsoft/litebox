@@ -2,8 +2,9 @@
 // Licensed under the MIT license.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{ErrorKind, Result, Write as _};
-use std::os::unix::ffi::OsStrExt as _;
+#[cfg(target_os = "linux")]
+use std::io::Result;
+use std::io::{ErrorKind, Write as _};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -16,19 +17,29 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
 };
+#[cfg(target_os = "linux")]
 use litebox_broker_protocol::socket::{ReceiveFromFlags, SendFlags, SocketConnectionStatus};
+use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_broker_transport::control_ring::ControlRing;
-use litebox_broker_transport_linux_userland::unix_socket::{
-    UnixControlRingLocalCallChannel, UnixStreamLocalSetupChannel,
-};
+#[cfg(target_os = "linux")]
+use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
+#[cfg(windows)]
+use litebox_broker_transport_windows_userland::named_pipe::WindowsNamedPipeLocalSetupChannel;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
+#[cfg(target_os = "linux")]
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
 const CHILD_START_RUNNER_ARGUMENT: &str = "broker-userland-child-start-runner";
 const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--list") {
+        if !args.iter().any(|arg| arg == "--ignored") {
+            println!("userland_broker: test");
+        }
+        return;
+    }
     if args
         .first()
         .is_some_and(|arg| arg == OsStr::new("--unstable"))
@@ -44,10 +55,7 @@ fn run_parent_test() {
     // runner. Cargo starts this executable without broker args, so it runs the
     // parent path here. The broker then starts the same executable with the real
     // runner argv (`--unstable --broker-control-channel <path>`), which runs
-    // `run_fake_runner`. After
-    // the fake runner finishes its broker requests, it terminates the broker
-    // parent process; this lets the test exercise the long-running broker
-    // without a test-only shutdown path.
+    // `run_fake_runner`.
     let test_executable = std::env::current_exe().unwrap();
     let mut event_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
     event_command
@@ -71,6 +79,12 @@ fn run_parent_test() {
     assert!(child_result.ends_with("\nstarted\nfinished\n"));
     std::fs::remove_file(child_marker).unwrap();
 
+    #[cfg(target_os = "linux")]
+    run_network_test(&test_executable);
+}
+
+#[cfg(target_os = "linux")]
+fn run_network_test(test_executable: &Path) {
     let gateway = std::net::Ipv4Addr::new(10, 0, 2, 1);
     let tcp_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let tcp_port = tcp_listener.local_addr().unwrap().port();
@@ -129,27 +143,46 @@ fn run_fake_runner(args: &[OsString]) {
         Some(OsStr::new("--broker-control-channel"))
     );
 
-    let control_socket_path = args.get(2).unwrap();
-    let setup_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
+    let control_channel = args.get(2).unwrap();
+    #[cfg(target_os = "linux")]
+    let setup_channel = connect_control_with_retry(Path::new(control_channel)).unwrap();
+    #[cfg(windows)]
+    let setup_channel = WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(
+        control_channel,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
     let (local, startup, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
-        let shared_memory = setup.receive_memfd(
-            SHARED_BUFFER_POOL_SIZE,
-            Some(Instant::now() + Duration::from_secs(5)),
-        )?;
-        let control_memory =
-            setup.receive_control_ring(Some(Instant::now() + Duration::from_secs(5)))?;
-        assert!(
-            setup
-                .receive_process_image(Some(Instant::now() + Duration::from_secs(5)))?
-                .is_none()
-        );
+        #[cfg(target_os = "linux")]
+        let (shared_memory, control_memory, process_image) = {
+            let shared_memory = setup.receive_memfd(
+                SHARED_BUFFER_POOL_SIZE,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )?;
+            let control_memory =
+                setup.receive_control_ring(Some(Instant::now() + Duration::from_secs(5)))?;
+            let process_image =
+                setup.receive_process_image(Some(Instant::now() + Duration::from_secs(5)))?;
+            (shared_memory, control_memory, process_image)
+        };
+        #[cfg(windows)]
+        let (shared_memory, control_memory, process_image) = {
+            let shared_memory = setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?;
+            let control_memory = setup.receive_control_ring()?;
+            let process_image = setup.receive_process_image()?;
+            (shared_memory, control_memory, process_image)
+        };
+        assert!(process_image.is_none());
         let control_ring = ControlRing::new(control_memory).map_err(|error| {
             std::io::Error::new(
                 ErrorKind::InvalidData,
                 format!("invalid test control ring: {error:?}"),
             )
         })?;
+        #[cfg(target_os = "linux")]
         let (call_channel, _notifications, _shutdown) = setup.into_active(control_ring, || {})?;
+        #[cfg(windows)]
+        let (call_channel, _notifications) = setup.into_active(control_ring)?;
         Ok((call_channel, Arc::new(shared_memory), ()))
     })
     .unwrap();
@@ -159,6 +192,7 @@ fn run_fake_runner(args: &[OsString]) {
     }
     let local = Arc::new(local);
 
+    #[cfg(target_os = "linux")]
     if args.get(3).and_then(|argument| argument.to_str()) == Some(NETWORK_RUNNER_ARGUMENT) {
         assert_eq!(args.len(), 6, "unexpected runner arguments: {args:?}");
         let tcp_port = args[4].to_str().unwrap().parse::<u16>().unwrap();
@@ -236,7 +270,7 @@ fn run_fake_runner(args: &[OsString]) {
     if args.get(3).and_then(|argument| argument.to_str()) == Some(CHILD_START_RUNNER_ARGUMENT) {
         assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
         let marker = Path::new(&args[4]);
-        let bootstrap = marker.as_os_str().as_encoded_bytes();
+        let bootstrap = marker.to_str().unwrap().as_bytes();
         let failed = local.allocate_child_process().unwrap();
         local
             .start_child_process(
@@ -336,14 +370,11 @@ fn run_fake_runner(args: &[OsString]) {
     drop(local);
 }
 
-fn run_fake_child(
-    local: BrokerLocal<UnixControlRingLocalCallChannel>,
-    bootstrap: ProcessStartupData,
-) {
+fn run_fake_child(local: BrokerLocal<impl LocalCallChannel>, bootstrap: ProcessStartupData) {
     if bootstrap.payload.is_empty() {
         return;
     }
-    let marker = Path::new(OsStr::from_bytes(&bootstrap.payload));
+    let marker = Path::new(std::str::from_utf8(&bootstrap.payload).unwrap());
     std::fs::write(marker, format!("ready:{}\n", local.process_id().0)).unwrap();
     std::fs::OpenOptions::new()
         .append(true)
@@ -400,6 +431,7 @@ impl Drop for ChildGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn connect_control_with_retry(socket_path: &Path) -> Result<UnixStreamLocalSetupChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

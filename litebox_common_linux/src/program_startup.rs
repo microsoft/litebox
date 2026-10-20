@@ -159,8 +159,9 @@ pub enum TimerfdClock {
 
 /// Linux process state needed to continue a child duplicated by `fork` in a fresh runner.
 ///
-/// The child's memory contents travel separately, in a process image holding the contents of
-/// each region that [has contents](ForkMemoryRegion::has_contents) back to back, in region order.
+/// For copy-based fork, the child's memory contents travel separately, in a process image holding
+/// the contents of each region that [has contents](ForkMemoryRegion::has_contents) back to back,
+/// in region order. Native fork reuses the inherited memory manager instead.
 #[derive(Clone)]
 pub struct LinuxForkStartup {
     /// Real user ID.
@@ -196,11 +197,13 @@ pub struct LinuxForkStartup {
     pub set_child_tid: usize,
     /// Address the child clears and wakes when it exits, or zero.
     pub clear_child_tid: usize,
-    /// Initial program break.
+    /// Initial program break for copy-based fork, or zero to retain the inherited state.
     pub initial_program_break: usize,
-    /// Current program break.
+    /// Current program break for copy-based fork, or zero for native fork.
     pub program_break: usize,
-    /// Memory regions, in strictly ascending address order.
+    /// Memory regions for copy-based fork, in strictly ascending address order.
+    ///
+    /// Native fork leaves this empty because the inherited manager already owns the mappings.
     pub regions: Vec<ForkMemoryRegion>,
     /// Descriptors the child inherits, in strictly ascending descriptor order.
     pub fds: Vec<ForkedFd>,

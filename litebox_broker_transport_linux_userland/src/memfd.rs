@@ -14,10 +14,12 @@
 //! addresses to the kernel.
 //!
 //! Direct access raises `SIGBUS` instead of returning an error if a mapped page
-//! loses its backing, so every mapping must have its size sealed: the broker
-//! maps only memfds it created and sealed, and received memfds are rejected
-//! unless sealed. The broker must never map a memfd its peer created, since the
-//! peer chooses that file's backing.
+//! loses its backing, so every mapping must have its size sealed. The broker
+//! maps only memfds it created and sealed, and must never map a memfd its peer
+//! created, since the peer chooses that file's backing. Runners receive memfds
+//! only from the trusted broker and map them at the protocol's expected sizes
+//! without re-inspecting them, which also keeps the syscalls a natively cloned
+//! runner needs, under its inherited syscall filter, to a minimum.
 
 use std::io::{Error, Result as IoResult};
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
@@ -29,7 +31,7 @@ use std::ptr::NonNull;
 use std::time::Instant;
 
 use rustix::fs::{
-    MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, fstat, ftruncate, memfd_create,
+    MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, ftruncate, memfd_create,
 };
 use rustix::io::{Errno, pwrite};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
@@ -227,15 +229,15 @@ impl MemfdSharedMemory {
         Self::map(fd, length, policy)
     }
 
-    /// Validates and maps a received byte-copy memfd with `expected_length` bytes.
+    /// Maps a byte-copy memfd received from the broker with `expected_length` bytes.
     ///
-    /// The descriptor must have the expected nonzero size sealed against
-    /// changes.
+    /// The trusted broker creates the descriptor with that nonzero size sealed
+    /// against changes, so it is not re-inspected.
     pub fn from_received_fd(fd: OwnedFd, expected_length: usize) -> IoResult<Self> {
         Self::from_received_fd_with_policy(fd, expected_length, MemoryAccessPolicy::Bytes)
     }
 
-    /// Validates and maps a received control-ring memfd.
+    /// Maps a control-ring memfd received from the broker.
     pub fn control_ring_from_received_fd(fd: OwnedFd) -> IoResult<Self> {
         Self::from_received_fd_with_policy(
             fd,
@@ -252,20 +254,7 @@ impl MemfdSharedMemory {
         if expected_length == 0 {
             return Err(invalid_data("shared memory cannot be empty"));
         }
-        // Verify the size seals before reading the size so it cannot change
-        // between validation and mapping.
-        let seals = fcntl_get_seals(&fd)?;
-        if !seals.contains(REQUIRED_MEMFD_SEALS) {
-            return Err(invalid_data("shared-memory size is not sealed"));
-        }
-        let length = usize::try_from(fstat(&fd)?.st_size)
-            .map_err(|_| invalid_data("invalid shared-memory length"))?;
-        if length != expected_length {
-            return Err(invalid_data(
-                "shared-memory length does not match expected size",
-            ));
-        }
-        Self::map(fd, length, policy)
+        Self::map(fd, expected_length, policy)
     }
 
     fn map(fd: OwnedFd, length: usize, policy: MemoryAccessPolicy) -> IoResult<Self> {
@@ -289,6 +278,8 @@ impl MemfdSharedMemory {
         }?;
         let address =
             NonNull::new(address.cast()).ok_or_else(|| invalid_data("mmap returned null"))?;
+        // TODO: Keep natively cloned runners from inheriting this mapping (`MADV_DONTFORK`), so a
+        // clone, which negotiates its own association, cannot observe its parent's.
         let spin_limit = match policy {
             MemoryAccessPolicy::Bytes => 0,
             MemoryAccessPolicy::ControlRing => parallel_spin_limit(),
@@ -451,7 +442,7 @@ pub fn send_memfd(
     })
 }
 
-/// Receives, validates, and maps one memfd-backed shared-memory resource.
+/// Receives and maps one memfd-backed shared-memory resource from the broker.
 ///
 /// `expected_length` supplies the trusted expected size. `deadline` bounds
 /// setup I/O without leaving a changed socket timeout behind.
@@ -464,7 +455,7 @@ pub fn receive_memfd(
     MemfdSharedMemory::from_received_fd(fd, expected_length)
 }
 
-/// Receives, validates, and maps one control-ring memfd.
+/// Receives and maps one control-ring memfd from the broker.
 pub fn receive_control_ring_memfd(
     stream: &mut UnixStream,
     deadline: Option<Instant>,
@@ -928,26 +919,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsealed_mismatched_and_oversized_mappings() {
-        let fd = memfd_create("litebox-broker-shm-test", MemfdFlags::CLOEXEC).unwrap();
-        ftruncate(&fd, 1).unwrap();
-        assert_eq!(
-            MemfdSharedMemory::from_received_fd(fd, 1)
-                .err()
-                .expect("unsealed memfd should fail")
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
-
+    fn rejects_empty_and_oversized_mappings() {
         let memory = MemfdSharedMemory::create(64).unwrap();
         assert_eq!(
-            MemfdSharedMemory::from_received_fd(
-                memory.fd.as_fd().try_clone_to_owned().unwrap(),
-                32,
-            )
-            .err()
-            .expect("mismatched memfd size should fail")
-            .kind(),
+            MemfdSharedMemory::from_received_fd(memory.fd.as_fd().try_clone_to_owned().unwrap(), 0)
+                .err()
+                .expect("empty mapping should fail")
+                .kind(),
             std::io::ErrorKind::InvalidData
         );
 
@@ -1138,34 +1116,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_size_and_unsealed_memory() {
-        let length = SHARED_BUFFER_POOL_SIZE;
-
-        let wrong_size = MemfdSharedMemory::create(length - 1).unwrap();
-        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_memfd(&mut sender, &wrong_size, None).unwrap();
-        assert_eq!(
-            receive_memfd(&mut receiver, length, None)
-                .err()
-                .expect("wrong shared-memory size must be rejected")
-                .kind(),
-            ErrorKind::InvalidData
-        );
-
-        let unsealed = memfd_create("unsealed-transfer-test", MemfdFlags::CLOEXEC).unwrap();
-        ftruncate(&unsealed, length.try_into().unwrap()).unwrap();
-        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_test_fds(&mut sender, &[unsealed.as_fd()]);
-        assert_eq!(
-            receive_memfd(&mut receiver, length, None)
-                .err()
-                .expect("unsealed shared memory must be rejected")
-                .kind(),
-            ErrorKind::InvalidData
-        );
-    }
-
-    #[test]
     fn reports_eof_and_expired_deadline() {
         let length = 8;
         let (mut receiver, sender) = UnixStream::pair().unwrap();
@@ -1226,7 +1176,7 @@ mod tests {
             ErrorKind::InvalidInput
         );
 
-        assert_eq!(fstat(&image.fd).unwrap().st_size, 0x1006);
+        assert_eq!(rustix::fs::fstat(&image.fd).unwrap().st_size, 0x1006);
         let mut bytes = [0; 6];
         assert_eq!(rustix::io::pread(&image.fd, &mut bytes, 0x1000).unwrap(), 6);
         assert_eq!(&bytes, b"shared");

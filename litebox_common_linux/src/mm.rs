@@ -59,6 +59,17 @@ where
         Self { vmem }
     }
 
+    /// Rebinds an inherited memory manager to the native child's platform.
+    ///
+    /// # Safety
+    ///
+    /// The caller must exclusively control the manager after a native clone, with no held locks.
+    /// `platform` must be able to manage every inherited mapping and reservation. The copied
+    /// parent runtime must never use this manager again.
+    pub unsafe fn rebind_platform_after_clone(&self, platform: &'static Platform) {
+        self.vmem.write().platform = platform;
+    }
+
     /// Attempt a native copy-on-write mapping backed by static data.
     ///
     /// `suggested_start` is the hint address for where to create the pages if it is not `None`.
@@ -608,6 +619,14 @@ where
                     | MemoryRegionPermissions::EXEC,
             )
         }
+    }
+
+    /// Returns whether any mapping has shared-memory semantics.
+    pub fn has_shared_mappings(&self) -> bool {
+        self.vmem
+            .read()
+            .iter()
+            .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED))
     }
 
     /// Returns all mappings in a vector.

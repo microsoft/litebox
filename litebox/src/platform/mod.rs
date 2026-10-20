@@ -98,6 +98,72 @@ pub trait ThreadProvider: RawPointerProvider {
     }
 }
 
+/// Result returned by [`ProcessProvider::fork_process`].
+pub enum ForkResult<Handle> {
+    /// The parent owns a handle to the new process.
+    Parent(Handle),
+    /// The child resumes on the calling thread.
+    Child,
+}
+
+/// Error returned by [`ProcessProvider::fork_process`].
+#[derive(Debug, Error)]
+pub enum ForkError<E> {
+    #[error("native process cloning is unsupported")]
+    Unsupported,
+    /// Native cloning or startup failed.
+    #[error(transparent)]
+    Failed(E),
+}
+
+/// Process management provider.
+pub trait ProcessProvider {
+    /// The process handle type.
+    type ProcessHandle: ProcessHandle<Error = Self::ProcessError>;
+    /// Error type for process operations.
+    type ProcessError: core::error::Error;
+
+    /// Duplicates the caller's address space with only the calling thread.
+    ///
+    /// Depending on the host, the child starts either suspended or already running. A suspended
+    /// child runs nothing until the parent calls [`ProcessHandle::resume`], so the parent must
+    /// resume it before anything that waits on the child.
+    ///
+    /// # Safety
+    ///
+    /// All other relevant threads must be quiescent. The child must immediately enter a
+    /// clone-safe bootstrap path, prepare its platform state, and never return through or
+    /// destroy the copied runtime. Inherited locks may belong to threads that no longer exist.
+    unsafe fn fork_process()
+    -> Result<ForkResult<Self::ProcessHandle>, ForkError<Self::ProcessError>> {
+        Err(ForkError::Unsupported)
+    }
+
+    /// Prepares platform state in the child created by [`Self::fork_process`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the sole thread in a newly cloned process and must never return
+    /// through the copied guest-thread stack, including on failure.
+    unsafe fn prepare_fork_child() -> Result<(), Self::ProcessError>;
+}
+
+/// A handle to a process created by [`ProcessProvider::fork_process`].
+pub trait ProcessHandle {
+    /// Error type for process operations.
+    type Error: core::error::Error;
+
+    /// Returns the host process ID of the clone.
+    fn process_id(&self) -> Result<u32, Self::Error>;
+
+    /// Releases the clone's initial suspension, or succeeds if it was created running.
+    /// See [`ProcessProvider::fork_process`].
+    fn resume(&self) -> Result<(), Self::Error>;
+
+    /// Terminates the clone after startup fails.
+    fn terminate(&self) -> Result<(), Self::Error>;
+}
+
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum TimerCreationError {

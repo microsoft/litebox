@@ -3,6 +3,7 @@
 
 //! Reusable ownership for one out-of-process LiteBox runner.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::path::PathBuf;
@@ -23,17 +24,17 @@ mod windows;
 
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 #[cfg(target_os = "linux")]
-use linux::PlatformRunnerEndpoint;
-#[cfg(target_os = "linux")]
 pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
-#[cfg(all(windows, target_arch = "x86_64"))]
-use windows::PlatformRunnerEndpoint;
+#[cfg(target_os = "linux")]
+use linux::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use windows::create_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use windows::{AdoptedProcess, PlatformRunnerEndpoint, adopt};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -111,19 +112,22 @@ impl RunnerConfig {
     }
 }
 
+/// Registration counts of supervised runners, keyed by host process ID.
+pub(crate) type SupervisedRunners = HashMap<u32, usize>;
+
 /// One out-of-process runner and its dedicated broker control endpoint.
 ///
 /// Dropping an instance before [`Self::run_process_to_completion`] completes
 /// terminates and reaps the runner.
 pub(crate) struct RunnerInstance {
-    runner: Arc<Mutex<Child>>,
+    runner: Arc<Mutex<RunnerProcess>>,
     shutdown: Arc<RunnerShutdown>,
     endpoint: PlatformRunnerEndpoint,
     setup_deadline: Instant,
 }
 
 struct RunnerShutdown {
-    runner: Arc<Mutex<Child>>,
+    runner: Arc<Mutex<RunnerProcess>>,
     state: Mutex<RunnerShutdownState>,
     changed: Condvar,
     termination_dispatched: AtomicBool,
@@ -134,6 +138,35 @@ enum RunnerShutdownState {
     Active,
     Terminating,
     Retired,
+}
+
+/// A runner process spawned by this broker or natively cloned by another runner.
+pub(super) enum RunnerProcess {
+    Spawned(Child),
+    Adopted(AdoptedProcess),
+}
+
+impl RunnerProcess {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Spawned(process) => process.id(),
+            Self::Adopted(process) => process.id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+        match self {
+            Self::Spawned(process) => process.try_wait(),
+            Self::Adopted(process) => process.try_wait(),
+        }
+    }
+
+    fn kill(&mut self) -> IoResult<()> {
+        match self {
+            Self::Spawned(process) => process.kill(),
+            Self::Adopted(process) => process.kill(),
+        }
+    }
 }
 
 pub(crate) struct RunnerCompletion {
@@ -269,7 +302,7 @@ impl RunnerInstance {
         if config.disable_aslr {
             linux::disable_aslr(&mut command);
         }
-        let runner = Arc::new(Mutex::new(command.spawn()?));
+        let runner = Arc::new(Mutex::new(RunnerProcess::Spawned(command.spawn()?)));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),
@@ -282,6 +315,43 @@ impl RunnerInstance {
             endpoint,
             setup_deadline,
         })
+    }
+
+    /// Adopts a runner natively cloned by `parent` from the runner's encoded descriptor.
+    ///
+    /// `supervised` holds the host process IDs of every runner the broker supervises, none of
+    /// which may be adopted again.
+    pub(crate) fn adopt(
+        parent: &Arc<Mutex<RunnerProcess>>,
+        runner_descriptor: &[u8],
+        supervised: &SupervisedRunners,
+    ) -> IoResult<Self> {
+        let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+        let (runner, endpoint) = adopt(parent, runner_descriptor, supervised)?;
+        let runner = Arc::new(Mutex::new(runner));
+        let shutdown = Arc::new(RunnerShutdown {
+            runner: Arc::clone(&runner),
+            state: Mutex::new(RunnerShutdownState::Active),
+            changed: Condvar::new(),
+            termination_dispatched: AtomicBool::new(false),
+        });
+        Ok(Self {
+            runner,
+            shutdown,
+            endpoint,
+            setup_deadline,
+        })
+    }
+
+    /// Returns the runner's host process ID.
+    pub(crate) fn host_process_id(&self) -> u32 {
+        self.runner
+            .lock()
+            .expect("runner process mutex poisoned")
+            .id()
+    }
+    pub(crate) fn runner_process(&self) -> Arc<Mutex<RunnerProcess>> {
+        Arc::clone(&self.runner)
     }
 
     pub(crate) const fn setup_deadline(&self) -> Instant {
@@ -447,7 +517,7 @@ fn accept_runner_channel<Channel>(
     }
 }
 
-fn runner_has_exited(runner: &Arc<Mutex<Child>>) -> IoResult<bool> {
+fn runner_has_exited(runner: &Arc<Mutex<RunnerProcess>>) -> IoResult<bool> {
     // A pre-authentication caller stops accepting before acting on `true`;
     // post-authentication callers no longer rely on PID-based authentication.
     runner
@@ -457,7 +527,7 @@ fn runner_has_exited(runner: &Arc<Mutex<Child>>) -> IoResult<bool> {
         .map(|status| status.is_some())
 }
 
-fn wait_for_runner_exit(runner: &Arc<Mutex<Child>>) -> IoResult<ExitStatus> {
+fn wait_for_runner_exit(runner: &Arc<Mutex<RunnerProcess>>) -> IoResult<ExitStatus> {
     loop {
         if let Some(status) = runner
             .lock()
@@ -472,7 +542,9 @@ fn wait_for_runner_exit(runner: &Arc<Mutex<Child>>) -> IoResult<ExitStatus> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::sync::{Arc, Condvar, Mutex, atomic::AtomicBool, mpsc};
+    #[cfg(target_os = "linux")]
     use std::time::Duration;
 
     #[cfg(target_os = "linux")]
@@ -504,15 +576,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_can_terminate_while_runner_waits_for_exit() {
-        use super::{RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
+        use super::{RunnerProcess, RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
         use std::process::Command;
 
-        let runner = Arc::new(Mutex::new(
+        let runner = Arc::new(Mutex::new(RunnerProcess::Spawned(
             Command::new("sh")
                 .args(["-c", "exec sleep 30"])
                 .spawn()
                 .unwrap(),
-        ));
+        )));
         let shutdown = RunnerShutdown {
             runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),
@@ -540,12 +612,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_after_observed_exit_records_no_termination() {
-        use super::{RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
+        use super::{RunnerProcess, RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
         use std::process::Command;
 
-        let runner = Arc::new(Mutex::new(
+        let runner = Arc::new(Mutex::new(RunnerProcess::Spawned(
             Command::new("sh").args(["-c", "exit 1"]).spawn().unwrap(),
-        ));
+        )));
         let shutdown = RunnerShutdown {
             runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),
