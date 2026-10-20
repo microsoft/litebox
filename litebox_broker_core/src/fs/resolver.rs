@@ -666,6 +666,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         match entry.seek_behavior {
             SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
             SeekBehavior::ZeroPosition => Ok(0),
+            // A position query reports the position even when another
+            // description truncated the file below it.
+            SeekBehavior::PositionBased
+                if offset == 0 && matches!(whence, SeekWhence::RelativeToCurrentOffset) =>
+            {
+                Ok(entry.position)
+            }
             SeekBehavior::PositionBased => {
                 let file_len = self
                     .backend

@@ -769,6 +769,41 @@ mod in_mem {
         assert_eq!(&buf2[..n2], b"Xbcdef12");
     }
 
+    #[test]
+    fn position_query_beyond_eof_after_truncation_by_another_open() {
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
+        create_with_content(&fs, "/shrinks", b"0123456789");
+        let mut reader = fs
+            .open(USER, "/shrinks", OFlags::RDONLY, Mode::empty())
+            .expect("open failed");
+        let mut buffer = [0u8; 4];
+        assert_eq!(fs.read(&mut reader, &mut buffer, None).unwrap(), 4);
+        fs.open(
+            USER,
+            "/shrinks",
+            OFlags::WRONLY | OFlags::TRUNC,
+            Mode::empty(),
+        )
+        .expect("truncating open failed");
+        // The retained position is beyond EOF: querying it neither fails nor
+        // moves it, while other seeks beyond EOF are still refused.
+        assert_eq!(
+            fs.seek(&mut reader, 0, SeekWhence::RelativeToCurrentOffset)
+                .unwrap(),
+            4
+        );
+        assert!(
+            fs.seek(&mut reader, 1, SeekWhence::RelativeToCurrentOffset)
+                .is_err()
+        );
+        assert_eq!(
+            fs.seek(&mut reader, 0, SeekWhence::RelativeToCurrentOffset)
+                .unwrap(),
+            4
+        );
+    }
+
     /// Create `path` holding `data`, as the unprivileged user.
     fn create_with_content(fs: &InMemFs, path: &str, data: &[u8]) {
         let mut fd = fs

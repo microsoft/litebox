@@ -270,6 +270,13 @@ impl<P: ShimPlatform> Task<P> {
         if path.len() >= PATH_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
+        self.open_path(path, flags, mode)
+    }
+
+    /// `open` of a nonempty `path` whose guest-supplied part was checked
+    /// against PATH_MAX: `openat` prefixes its directory's path, which namei
+    /// does not count.
+    fn open_path(&self, path: &str, flags: OpenFlags, mode: FileMode) -> Result<u32, Errno> {
         if path.as_bytes().contains(&0) {
             return Err(Errno::EINVAL);
         }
@@ -639,12 +646,15 @@ impl<P: ShimPlatform> Task<P> {
         if path.len() >= PATH_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
-        // Not normalized: `sys_open` needs the trailing slash and the `..`
-        // components to resolve them like namei.
+        // Not normalized: `open_path` needs the trailing slash and the `..`
+        // components to resolve them like namei. Only the guest's `path`
+        // counts against PATH_MAX: nameiat starts from the directory's vnode
+        // (vfs_lookup.c). The directory's path names an existing directory,
+        // and the broker bounds the joined path it accepts.
         let mut joined = String::from(&*directory);
         joined.push('/');
         joined.push_str(path);
-        self.sys_open(&joined, flags, mode)
+        self.open_path(&joined, flags, mode)
     }
 
     /// `ioctl`. Descriptor-level requests (`FIOCLEX`, `FIONCLEX`) and the
@@ -1422,6 +1432,24 @@ mod tests {
             Ok("/dir/new")
         );
         close(created);
+        // PATH_MAX bounds the guest's pathname, not the directory prefix.
+        let mut long = "./".repeat(508);
+        long.push_str("data");
+        assert_eq!(long.len(), PATH_MAX - 4);
+        let long = alloc::ffi::CString::new(long).unwrap();
+        let long_data = openat(dir, &long, OpenFlags::RDONLY).unwrap();
+        assert_eq!(
+            get_path(long_data, &mut path_buffer).as_deref(),
+            Ok("/dir/data")
+        );
+        close(long_data);
+        let mut too_long = "./".repeat(510);
+        too_long.push_str("data");
+        let too_long = alloc::ffi::CString::new(too_long).unwrap();
+        assert_eq!(
+            openat(dir, &too_long, OpenFlags::RDONLY),
+            Err(Errno::ENAMETOOLONG)
+        );
         assert_eq!(openat(data, c"x", OpenFlags::RDONLY), Err(Errno::ENOTDIR));
         assert_eq!(openat(999, c"x", OpenFlags::RDONLY), Err(Errno::EBADF));
         assert_eq!(openat(dir, c"", OpenFlags::RDONLY), Err(Errno::ENOENT));
@@ -1495,6 +1523,23 @@ mod tests {
         );
         assert_eq!(call(nr::IOCTL, &[data, FIONREAD, count_ptr]), Ok(0));
         assert_eq!(count, 6);
+        // Another open truncates the file below the shared offset: vn_ioctl
+        // reports 0 bytes and the offset stays put.
+        let truncating = openat(dir, c"data", OpenFlags::WRONLY | OpenFlags::TRUNC).unwrap();
+        assert_eq!(call(nr::IOCTL, &[data, FIONREAD, count_ptr]), Ok(0));
+        assert_eq!(count, 0);
+        assert_eq!(
+            call(nr::WRITE, &[truncating, b"abcdefgh".as_ptr() as usize, 8]),
+            Ok(8)
+        );
+        close(truncating);
+        assert_eq!(call(nr::IOCTL, &[data, FIONREAD, count_ptr]), Ok(0));
+        assert_eq!(count, 4);
+        assert_eq!(
+            call(nr::READ, &[data, path_buffer.as_mut_ptr() as usize, 8]),
+            Ok(4)
+        );
+        assert_eq!(&path_buffer[..4], b"efgh");
         assert_eq!(call(nr::IOCTL, &[dir, FIONREAD, count_ptr]), Ok(0));
         assert_eq!(call(nr::IOCTL, &[data, FIONREAD, 0x10]), Err(Errno::EFAULT));
         let on = 1i32;
