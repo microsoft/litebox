@@ -75,6 +75,9 @@ type ImageSpec<'a> = (&'a str, u64, u32, &'a [(&'a str, u32)]);
 const USE: u32 = 0x100;
 
 /// Images follow the TEXT subcache's own header.
+/// `__TEXT,__text` relative to each synthetic image's Mach header.
+const TEXT_SECTION: core::ops::Range<u64> = 0x100..0x800;
+
 fn image_address(index: u64) -> u64 {
     TEXT_ADDRESS + 0x1000 * (index + 1)
 }
@@ -144,14 +147,29 @@ const IMAGES_SPEC: &[ImageSpec<'static>] = &[
 fn write_image(file: &mut [u8], offset: usize, image: &ImageSpec<'_>, uuid: u8) {
     let (path, address, file_type, dependencies) = *image;
     let mut commands = Vec::new();
-    let mut segment = vec![0; SEGMENT_COMMAND_64_BYTES];
+    let mut segment = vec![0; SEGMENT_COMMAND_64_BYTES + SECTION_64_BYTES];
     put32(&mut segment, 0, macho::LC_SEGMENT_64);
-    put32(&mut segment, 4, SEGMENT_COMMAND_64_BYTES as u32);
+    put32(
+        &mut segment,
+        4,
+        (SEGMENT_COMMAND_64_BYTES + SECTION_64_BYTES) as u32,
+    );
     segment[8..14].copy_from_slice(b"__TEXT");
     put64(&mut segment, 24, address);
     put64(&mut segment, 32, 0x1000);
     put32(&mut segment, 56, RX);
     put32(&mut segment, 60, RX);
+    put32(&mut segment, 64, 1);
+    let section = &mut segment[SEGMENT_COMMAND_64_BYTES..];
+    section[..6].copy_from_slice(b"__text");
+    section[16..22].copy_from_slice(b"__TEXT");
+    put64(section, 32, address + TEXT_SECTION.start);
+    put64(section, 40, TEXT_SECTION.end - TEXT_SECTION.start);
+    put32(
+        section,
+        64,
+        macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS,
+    );
     commands.push(segment);
     let mut uuid_command = vec![0; UUID_COMMAND_BYTES];
     put32(&mut uuid_command, 0, macho::LC_UUID);
@@ -373,6 +391,15 @@ fn header_mappings_and_subcache_entries_parse() {
         text.address_range,
         image_address(0)..image_address(0) + 0x1000
     );
+    let [section] = text.sections.as_slice() else {
+        panic!("__TEXT has one section")
+    };
+    assert_eq!(section.name, "__text");
+    assert_eq!(
+        section.address_range,
+        image_address(0) + TEXT_SECTION.start..image_address(0) + TEXT_SECTION.end
+    );
+    assert!(section.has_instructions());
     assert_eq!(
         image
             .dependencies
@@ -436,6 +463,17 @@ fn closure_follows_all_dylib_commands_across_cycles_and_aliases() {
         })
     );
     assert!(cache.closure(&[IMAGES_SPEC.len()]).is_err());
+    // The launch set also follows the delayed-init link to libunused, whose
+    // own non-weak dependency is missing.
+    assert_eq!(
+        cache.launch_set(&roots),
+        Err(SharedCacheError::MissingDependency {
+            image: "/usr/lib/libunused.dylib".into(),
+            dependency: "/usr/lib/not-in-cache.dylib".into(),
+        })
+    );
+    let libe = cache.image_index_by_path("/usr/lib/libe.dylib").unwrap();
+    assert_eq!(cache.launch_set(&[libe]), cache.closure(&[libe]));
 }
 
 #[test]
@@ -562,9 +600,11 @@ fn malformed_images_are_rejected() {
         // sizeofcmds beyond the mapping.
         (header + 20, 0x10_0000),
         // Section count beyond the segment command.
-        (first_command + 64, 1),
+        (first_command + 64, 2),
+        // Section extending beyond its segment.
+        (first_command + 72 + 40, 0x1000),
         // Dylib name offset inside the fixed command fields.
-        (first_command + 72 + 24 + 8, 8),
+        (first_command + 152 + 24 + 8, 8),
     ] {
         let original = files.text.clone();
         put32(&mut files.text, offset, value);
@@ -576,7 +616,7 @@ fn malformed_images_are_rejected() {
         files.text = original;
     }
     // Missing NUL in an install name.
-    let id = first_command + 72 + 24;
+    let id = first_command + 152 + 24;
     let size = u32::from_le_bytes(files.text[id + 4..id + 8].try_into().unwrap()) as usize;
     files.text[id + DYLIB_COMMAND_BYTES..id + size].fill(b'a');
     let cache = parse(&files).unwrap();

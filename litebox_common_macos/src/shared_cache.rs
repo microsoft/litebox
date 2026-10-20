@@ -542,6 +542,26 @@ pub struct CacheDependency {
     pub attributes: DylibAttributes,
 }
 
+/// A `section_64` of a cache image segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheSection {
+    pub name: String,
+    /// Unslid address range.
+    pub address_range: Range<u64>,
+    /// `section_64.flags`: section type and attributes.
+    pub flags: u32,
+}
+
+impl CacheSection {
+    /// `S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS`.
+    const INSTRUCTION_ATTRIBUTES: u32 = 0x8000_0400;
+
+    /// Whether the section contains machine instructions.
+    pub fn has_instructions(&self) -> bool {
+        self.flags & Self::INSTRUCTION_ATTRIBUTES != 0
+    }
+}
+
 /// An `LC_SEGMENT_64` of a cache image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheSegment {
@@ -550,6 +570,7 @@ pub struct CacheSegment {
     pub address_range: Range<u64>,
     pub max_protection: VmProtection,
     pub initial_protection: VmProtection,
+    pub sections: Vec<CacheSection>,
 }
 
 /// The load commands of one cache image.
@@ -648,36 +669,63 @@ impl CacheImage {
     }
 }
 
+/// A fixed 16-byte, NUL-padded Mach-O name.
+fn fixed_name(bytes: &[u8], offset: usize) -> Result<String> {
+    let name: [u8; 16] = field(bytes, offset)?;
+    let length = name
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(name.len());
+    core::str::from_utf8(&name[..length])
+        .map(String::from)
+        .map_err(|_| SharedCacheError::Malformed("segment or section name"))
+}
+
+fn address_range(address: u64, size: u64) -> Result<Range<u64>> {
+    Ok(address
+        ..address
+            .checked_add(size)
+            .ok_or(SharedCacheError::Malformed("segment address range"))?)
+}
+
 fn segment(body: &[u8]) -> Result<CacheSegment> {
     if body.len() < SEGMENT_COMMAND_64_BYTES {
         return Err(SharedCacheError::Malformed("LC_SEGMENT_64 size"));
     }
-    let name: [u8; 16] = field(body, 8)?;
-    let name_length = name
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(name.len());
-    let name = core::str::from_utf8(&name[..name_length])
-        .map_err(|_| SharedCacheError::Malformed("segment name"))?;
-    let address = u64_at(body, 24)?;
-    let size = u64_at(body, 32)?;
-    let sections = u32_at(body, 64)? as usize;
-    if sections
+    let address_range = address_range(u64_at(body, 24)?, u64_at(body, 32)?)?;
+    let section_count = u32_at(body, 64)? as usize;
+    if section_count
         .checked_mul(SECTION_64_BYTES)
         .and_then(|bytes| bytes.checked_add(SEGMENT_COMMAND_64_BYTES))
         .is_none_or(|needed| needed > body.len())
     {
         return Err(SharedCacheError::Malformed("LC_SEGMENT_64 sections"));
     }
+    let mut sections = Vec::with_capacity(section_count);
+    for index in 0..section_count {
+        let section = SEGMENT_COMMAND_64_BYTES + index * SECTION_64_BYTES;
+        let range = address_range_of_section(body, section)?;
+        if range.start < address_range.start || range.end > address_range.end {
+            return Err(SharedCacheError::Malformed("section outside its segment"));
+        }
+        sections.push(CacheSection {
+            name: fixed_name(body, section)?,
+            address_range: range,
+            flags: u32_at(body, section + 64)?,
+        });
+    }
     Ok(CacheSegment {
-        name: String::from(name),
-        address_range: address
-            ..address
-                .checked_add(size)
-                .ok_or(SharedCacheError::Malformed("segment address range"))?,
+        name: fixed_name(body, 8)?,
+        address_range,
         max_protection: protection(u32_at(body, 56)?)?,
         initial_protection: protection(u32_at(body, 60)?)?,
+        sections,
     })
+}
+
+/// The unslid address range of the `section_64` at `offset` in a segment command.
+fn address_range_of_section(body: &[u8], offset: usize) -> Result<Range<u64>> {
+    address_range(u64_at(body, offset + 32)?, u64_at(body, offset + 40)?)
 }
 
 /// The `lc_str` name of a `dylib_command`.
@@ -857,6 +905,22 @@ impl<R: CacheFileReader> SharedCache<R> {
     /// image, cycles are visited once, and only missing weak dependencies are
     /// tolerated. Results are sorted by address.
     pub fn closure(&self, roots: &[usize]) -> Result<Vec<ClosureImage>> {
+        self.closure_with(roots, false)
+    }
+
+    /// Like [`Self::closure`], but also following
+    /// [`DylibAttributes::DELAYED_INIT`] links: every image dyld creates a
+    /// loader for (maps, binds and exposes to debuggers) at launch, including
+    /// those whose initializers it delays.
+    pub fn launch_set(&self, roots: &[usize]) -> Result<Vec<ClosureImage>> {
+        self.closure_with(roots, true)
+    }
+
+    fn closure_with(
+        &self,
+        roots: &[usize],
+        follow_delayed_init: bool,
+    ) -> Result<Vec<ClosureImage>> {
         let mut pending = Vec::new();
         for &root in roots {
             pending.push(
@@ -874,9 +938,10 @@ impl<R: CacheFileReader> SharedCache<R> {
                 .ok_or(SharedCacheError::Malformed("closure image address"))?;
             let image = self.parse_image(address)?;
             for dependency in &image.dependencies {
-                if dependency
-                    .attributes
-                    .contains(DylibAttributes::DELAYED_INIT)
+                if !follow_delayed_init
+                    && dependency
+                        .attributes
+                        .contains(DylibAttributes::DELAYED_INIT)
                 {
                     continue;
                 }
