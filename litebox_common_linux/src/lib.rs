@@ -2374,6 +2374,13 @@ pub enum SyscallRequest {
     Chdir {
         pathname: UserPtr<c_char>,
     },
+    Fchownat {
+        dirfd: i32,
+        pathname: UserPtr<c_char>,
+        owner: u32,
+        group: u32,
+        flags: AtFlags,
+    },
     Mmap {
         addr: usize,
         length: usize,
@@ -2945,6 +2952,15 @@ impl SyscallRequest {
             },
             Sysno::mkdirat => sys_req!(Mkdirat { dirfd, pathname:*, mode }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chown => SyscallRequest::Fchownat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                owner: ctx.sys_req_arg(1),
+                group: ctx.sys_req_arg(2),
+                flags: AtFlags::empty(),
+            },
+            Sysno::fchownat => sys_req!(Fchownat { dirfd, pathname:*, owner, group, flags }),
             Sysno::mmap => sys_req!(Mmap {
                 addr,
                 length,
