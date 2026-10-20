@@ -50,12 +50,6 @@ jobs:
         run: |
           sudo apt install -y binutils-aarch64-linux-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Cache custom out directories
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            target/*/build/litebox_runner_linux_userland-*/out
-          key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs', '**/litebox_trampoline/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_qemu --exclude litebox_runner_optee_on_vm_userland --exclude litebox_runner_linux_on_vm_userland --exclude litebox_runner_vm_kernel --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_linux_on_macos_userland
@@ -78,6 +72,17 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo build
           ./.github/tools/github_actions_run_cargo build -p litebox_runner_optee_on_linux_userland
+      - name: Identify Linux test fixtures
+        id: fixture-key
+        run: python3 -B .github/tools/test_fixture_cache_key.py
+      - name: Clear test fixtures before restore
+        run: rm -rf -- target/tmp
+      - name: Restore Linux test fixtures
+        id: fixture-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tmp
+          key: ${{ steps.fixture-key.outputs.cache-key }}
       - run: |
           ./.github/tools/github_actions_run_cargo nextest
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
@@ -88,6 +93,21 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_qemu --exclude litebox_runner_optee_on_vm_userland --exclude litebox_runner_linux_on_vm_userland --exclude litebox_runner_vm_kernel --exclude litebox_runner_snp --exclude litebox_runner_linux_on_macos_userland
+      # Base-branch saves avoid large PR-scoped caches evicting dependency caches.
+      # Save before cleanup: rust-cache's post step does not preserve these fixtures.
+      - name: Save Linux test fixtures
+        if: >-
+          success() && steps.fixture-cache.outputs.cache-hit != 'true' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ulitebox')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tmp
+          key: ${{ steps.fixture-key.outputs.cache-key }}
+      - name: Remove Linux test fixtures
+        if: always()
+        # Fixtures are cached separately above; keep them out of rust-cache.
+        run: rm -rf -- target/tmp
 
   test_qemu:
     name: Build and Test on QEMU (KVM)

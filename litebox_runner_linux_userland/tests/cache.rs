@@ -21,7 +21,7 @@ impl CacheEntry {
         let mut input_summaries = Vec::new();
 
         for input_path in input_paths {
-            let summary = compute_file_summary(input_path)?;
+            let summary = compute_input_summary(input_path)?;
             input_summaries.push(summary);
         }
 
@@ -50,7 +50,7 @@ impl CacheEntry {
         }
 
         for (i, input_path) in input_paths.iter().enumerate() {
-            let current_summary = compute_file_summary(input_path)?;
+            let current_summary = compute_input_summary(input_path)?;
             if current_summary != self.input_summaries[i] {
                 return Ok(false);
             }
@@ -110,6 +110,26 @@ impl CacheEntry {
             Ok(None)
         }
     }
+}
+
+fn compute_input_summary(path: &Path) -> std::io::Result<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let source_roots = [
+        root.join("litebox_runner_linux_userland/tests"),
+        root.join("litebox_syscall_rewriter/src"),
+        root.join("litebox_trampoline/src"),
+    ];
+    if source_roots
+        .iter()
+        .any(|source| std::path::absolute(path).is_ok_and(|p| p.starts_with(source)))
+    {
+        // Hash source contents so fixtures restored into a fresh checkout (new
+        // mtimes) stay valid. Other inputs use the metadata check below.
+        let mut hasher = Sha256::new();
+        hasher.update(std::fs::read(path)?);
+        return Ok(format!("{}:sha256:{:x}", path.display(), hasher.finalize()));
+    }
+    compute_file_summary(path)
 }
 
 fn compute_file_summary(path: &Path) -> std::io::Result<String> {
