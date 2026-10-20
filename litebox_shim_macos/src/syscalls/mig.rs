@@ -266,6 +266,8 @@ const BASEPRI_DEFAULT: u32 = 31;
 const DEPRESSPRI: u32 = 0;
 const IDLEPRI: u32 = 0;
 const MINPRI_USER: u32 = 0;
+
+/// XNU `osfmk/mach/machine.h`.
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
 /// The scheduler quantum (`sched_info.min_quantum`), in milliseconds.
