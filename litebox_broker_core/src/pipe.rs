@@ -97,19 +97,6 @@ pub fn write(
     object.as_pipe()?.write(data)
 }
 
-/// Reads up to `length` bytes from a broker-owned pipe into a new vector.
-#[cfg(test)]
-pub(crate) fn read_to_vec(
-    process: &BrokerProcess,
-    handle: ObjectHandle,
-    length: usize,
-) -> Result<alloc::vec::Vec<u8>> {
-    let mut data = alloc::vec![0; length];
-    let read = read(process, handle, &mut data)?;
-    data.truncate(read);
-    Ok(data)
-}
-
 impl ObjectEntry {
     fn as_pipe(&self) -> Result<&PipeObject> {
         match self {
