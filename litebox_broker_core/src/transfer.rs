@@ -120,8 +120,8 @@ impl<B> CopyCount<B> {
         }
     }
 
-    /// Returns how many bytes were copied, or fails if a copy faulted or did
-    /// not run on from the one before.
+    /// Returns how many bytes were copied, or fails if a copy faulted, did not
+    /// run on from the one before, or reported more bytes than it was passed.
     pub(crate) fn finish(self) -> Result<usize> {
         if self.failed.get() {
             return Err(Fault.into());
@@ -151,6 +151,16 @@ impl<B> CopyCount<B> {
             Err(Fault) => self.failed.set(true),
         }
         result
+    }
+
+    /// Counts the `transferred` bytes that a direct transfer of `length`
+    /// bytes at `offset` reports, which cannot be more than `length`.
+    fn end_direct(&self, offset: usize, length: usize, transferred: usize) {
+        if transferred > length {
+            self.failed.set(true);
+        } else {
+            self.copied.set(offset + transferred);
+        }
     }
 }
 
@@ -190,7 +200,7 @@ impl<B: ReadBuffer> ReadBuffer for CopyCount<B> {
         // Copying without the direct path then fails too.
         self.start(offset).ok()?;
         let read = self.buffer.read_direct_at(offset, length, read)?;
-        self.copied.set(offset + read);
+        self.end_direct(offset, length, read);
         Some(read)
     }
 }
@@ -225,7 +235,7 @@ impl<B: WriteBuffer> WriteBuffer for CopyCount<B> {
         // Copying without the direct path then fails too.
         self.start(offset).ok()?;
         let written = self.buffer.write_direct_at(offset, length, write)?;
-        self.copied.set(offset + written);
+        self.end_direct(offset, length, written);
         Some(written)
     }
 }
@@ -341,6 +351,19 @@ mod tests {
         let mut counted = CopyCount::new(FaultingBuffer::new(4, 2));
         assert_eq!(counted.copy_from_slice_at(0, &[1, 2]), Ok(()));
         assert_eq!(counted.copy_from_slice_at(2, &[3]), Err(Fault));
+        assert_eq!(counted.finish(), Err(Fault.into()));
+    }
+
+    #[test]
+    fn copy_counts_count_direct_transfers_up_to_their_length() {
+        let mut destination = [0; 4];
+        let mut counted = CopyCount::new(&mut destination[..]);
+        assert_eq!(counted.read_direct_at(0, 2, &mut |_| 2), Some(2));
+        assert_eq!(counted.copy_from_slice_at(2, &[3]), Ok(()));
+        assert_eq!(counted.finish(), Ok(3));
+
+        let mut counted = CopyCount::new(&mut destination[..]);
+        assert_eq!(counted.read_direct_at(0, 1, &mut |_| 2), Some(2));
         assert_eq!(counted.finish(), Err(Fault.into()));
     }
 }
