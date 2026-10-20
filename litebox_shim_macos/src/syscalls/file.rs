@@ -565,8 +565,8 @@ impl<P: ShimPlatform> Task<P> {
                     .map_err(status_flags_error)?;
                 let xnu_only = XNU_ONLY_STATUS_FLAGS & FCNTL_FLAGS;
                 let xnu_status = self.files.xnu_status(&typed)?;
-                let _ = xnu_status.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                    Some((old & !xnu_only) | (requested & xnu_only))
+                xnu_status.update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    (old & !xnu_only) | (requested & xnu_only)
                 });
                 Ok(0)
             }

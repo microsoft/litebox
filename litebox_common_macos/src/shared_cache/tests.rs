@@ -420,7 +420,7 @@ fn header_mappings_and_subcache_entries_parse() {
         (dyld.file_type, dyld.install_name),
         (macho::MH_DYLINKER, None)
     );
-    assert!(dyld.dependencies.is_empty());
+    assert_eq!(dyld.dependencies, Vec::new());
 }
 
 #[test]

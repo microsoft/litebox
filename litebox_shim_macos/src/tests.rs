@@ -394,7 +394,7 @@ fn shared_cache_rewrite_fails_closed_without_reachable_island() {
         Err(SharedCacheInstallError::UnreachableGates)
     );
     assert_eq!(code, original);
-    assert!(gates[0].is_empty());
+    assert_eq!(gates[0], Vec::<u8>::new());
 }
 
 const RX: VmProtection = VmProtection::READ.union(VmProtection::EXECUTE);
@@ -816,7 +816,7 @@ fn shared_cache_rewrite_skips_full_islands() {
     )
     .unwrap();
     assert_eq!(gates[0].len(), PAGE_SIZE, "the full island is untouched");
-    assert!(!gates[1].is_empty());
+    assert_ne!(gates[1], Vec::<u8>::new());
     assert_eq!(code[4..8], NOP.to_le_bytes());
     for site in [0, 8] {
         assert_eq!(
@@ -841,7 +841,7 @@ fn shared_cache_rewrite_skips_full_islands() {
         &mut gates,
     )
     .unwrap();
-    assert!(!gates[1].is_empty());
+    assert_ne!(gates[1], Vec::<u8>::new());
     assert!(
         sites_branch_into(&code, address, &islands)
             .iter()

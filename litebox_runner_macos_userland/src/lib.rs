@@ -5,8 +5,8 @@
 //!
 //! Static, position-independent executables run directly. Dynamically linked
 //! executables run under the host's on-disk dyld with a guest-private
-//! instance of the host's dyld shared cache (see [`shared_cache`]); the guest
-//! never uses the runner's own libSystem.
+//! instance of the host's dyld shared cache (see the `shared_cache` module);
+//! the guest never uses the runner's own libSystem.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use anyhow::{Context as _, Result, bail};

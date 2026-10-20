@@ -1441,7 +1441,7 @@ mod tests {
 
         let mut budget = rpaths.len() + 3;
         let bases = rpath_bases(&executable, &rpaths, &mut budget).unwrap();
-        assert!(bases.is_empty());
+        assert_eq!(bases, Vec::<String>::new());
         assert_eq!(budget, 3);
         let mut resolved = 0;
         let result = loop {
