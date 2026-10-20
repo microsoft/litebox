@@ -194,6 +194,7 @@ pub trait ReadBuffer: Buffer {
 
     /// Copies `source` into the buffer at `offset`: directly if either's
     /// bytes are [`RawBytes`], and otherwise through a small staging buffer.
+    /// A slice instead has `source` copy straight into it.
     ///
     /// On a fault, any of the bytes may have been copied.
     ///
@@ -347,6 +348,16 @@ impl ReadBuffer for [u8] {
         Ok(())
     }
 
+    /// Copies `source` straight into the slice.
+    fn copy_from_buffer_at(
+        &mut self,
+        offset: usize,
+        source: &dyn WriteBuffer,
+    ) -> Result<(), Fault> {
+        assert_within(offset, source.len(), self.len(), "buffer");
+        source.copy_to_slice_at(0, &mut self[offset..][..source.len()])
+    }
+
     fn read_direct_at(
         &mut self,
         offset: usize,
@@ -388,6 +399,14 @@ impl<B: ReadBuffer + ?Sized> ReadBuffer for &mut B {
 
     fn copy_from_raw_at(&mut self, offset: usize, source: RawBytes<'_>) -> Result<(), Fault> {
         (**self).copy_from_raw_at(offset, source)
+    }
+
+    fn copy_from_buffer_at(
+        &mut self,
+        offset: usize,
+        source: &dyn WriteBuffer,
+    ) -> Result<(), Fault> {
+        (**self).copy_from_buffer_at(offset, source)
     }
 
     fn read_direct_at(
@@ -440,6 +459,14 @@ macro_rules! forward_to_slice {
                 source: RawBytes<'_>,
             ) -> Result<(), Fault> {
                 ReadBuffer::copy_from_raw_at(&mut self[..], offset, source)
+            }
+
+            fn copy_from_buffer_at(
+                &mut self,
+                offset: usize,
+                source: &dyn WriteBuffer,
+            ) -> Result<(), Fault> {
+                ReadBuffer::copy_from_buffer_at(&mut self[..], offset, source)
             }
 
             fn read_direct_at(
@@ -516,6 +543,15 @@ impl<B: ReadBuffer> ReadBuffer for SubBuffer<B> {
         self.buffer.copy_from_raw_at(at, source)
     }
 
+    fn copy_from_buffer_at(
+        &mut self,
+        offset: usize,
+        source: &dyn WriteBuffer,
+    ) -> Result<(), Fault> {
+        let at = self.at(offset, source.len());
+        self.buffer.copy_from_buffer_at(at, source)
+    }
+
     fn read_direct_at(
         &mut self,
         offset: usize,
@@ -582,6 +618,48 @@ mod tests {
         fn copy_to_raw_at(&self, offset: usize, destination: RawBytes<'_>) -> Result<(), Fault> {
             WriteBuffer::copy_to_raw_at(&self.0, offset, destination)
         }
+    }
+
+    /// A buffer that can copy only into slices, so a copy that would stage
+    /// through raw bytes panics.
+    struct SliceCopied(Vec<u8>);
+
+    impl Buffer for SliceCopied {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    impl WriteBuffer for SliceCopied {
+        fn copy_to_slice_at(&self, offset: usize, destination: &mut [u8]) -> Result<(), Fault> {
+            WriteBuffer::copy_to_slice_at(&self.0, offset, destination)
+        }
+
+        fn copy_to_raw_at(&self, _: usize, _: RawBytes<'_>) -> Result<(), Fault> {
+            unreachable!("slices copy from buffers straight into themselves")
+        }
+
+        fn write_direct_at(
+            &self,
+            _: usize,
+            _: usize,
+            _: &mut dyn FnMut(&[RawBytes<'_>]) -> usize,
+        ) -> Option<usize> {
+            unreachable!("slices copy from buffers straight into themselves")
+        }
+    }
+
+    #[test]
+    fn slices_copy_from_buffers_straight_into_themselves() {
+        let source = SliceCopied(vec![1, 2, 3]);
+        let mut destination = vec![0; 7];
+        destination.copy_from_buffer_at(0, &source).unwrap();
+        let mut outer = (&mut destination).sub_buffer(1, 6);
+        (&mut outer)
+            .sub_buffer(2, 4)
+            .copy_from_buffer_at(1, &source)
+            .unwrap();
+        assert_eq!(destination, [1, 2, 3, 0, 1, 2, 3]);
     }
 
     #[test]
