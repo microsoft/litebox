@@ -388,6 +388,27 @@ impl<Memory: SharedMemory> SharedBufferPool<Memory> {
         Ok(())
     }
 
+    /// Returns the first `length` bytes of `sequence` as a buffer.
+    pub fn buffer(
+        &self,
+        sequence: SharedBufferSequence,
+        length: usize,
+    ) -> Result<SharedBuffer<'_>, SharedBufferError> {
+        let mut ranges: [Range<usize>; MAX_SHARED_BUFFER_SEQUENCE_SLOTS] =
+            core::array::from_fn(|_| 0..0);
+        let mut parts = 0;
+        for range in self.sequence_ranges(sequence, length)? {
+            ranges[parts] = range;
+            parts += 1;
+        }
+        Ok(SharedBuffer {
+            memory: &self.memory,
+            ranges,
+            parts,
+            length,
+        })
+    }
+
     /// Returns the shared-memory ranges holding the `length` bytes at
     /// `offset` in `sequence`, in transfer order.
     fn ranges_at(
@@ -428,29 +449,6 @@ pub struct SharedBuffer<'a> {
     ranges: [Range<usize>; MAX_SHARED_BUFFER_SEQUENCE_SLOTS],
     parts: usize,
     length: usize,
-}
-
-impl<Memory: SharedMemory> SharedBufferPool<Memory> {
-    /// Returns the first `length` bytes of `sequence` as a buffer.
-    pub fn buffer(
-        &self,
-        sequence: SharedBufferSequence,
-        length: usize,
-    ) -> Result<SharedBuffer<'_>, SharedBufferError> {
-        let mut ranges: [Range<usize>; MAX_SHARED_BUFFER_SEQUENCE_SLOTS] =
-            core::array::from_fn(|_| 0..0);
-        let mut parts = 0;
-        for range in self.sequence_ranges(sequence, length)? {
-            ranges[parts] = range;
-            parts += 1;
-        }
-        Ok(SharedBuffer {
-            memory: &self.memory,
-            ranges,
-            parts,
-            length,
-        })
-    }
 }
 
 impl SharedBuffer<'_> {
