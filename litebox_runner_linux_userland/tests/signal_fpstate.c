@@ -23,7 +23,7 @@
 #endif
 
 enum { PRESERVE, EDIT, LEGACY, RESET, NESTED, NO_TRAILER, INITIAL_RESET, INITIAL,
-       MASK_SSE, INIT_SSE, MASK_AVX, SHORT_XSTATE,
+       MASK_SSE, INIT_SSE, MASK_AVX, SHORT_XSTATE, ACTIVE_SHORT_XSTATE,
        FAULT, ASYNC, RED_ZONE, MIN_ALTSTACK,
        BAD_MXCSR, BAD_POINTER, BAD_XCOMP, BAD_FEATURE, BAD_ALIGN, BAD_LEGACY_ALIGN,
        BAD_INACCESSIBLE, BAD_UNMAPPED, BAD_LEGACY_READ, BAD_TRAILER_READ,
@@ -207,7 +207,14 @@ static void handler(int signo, siginfo_t *info, void *context) {
         sw[4] = 576;
         /* The trailer follows the shortened XSAVE area. */
         *(uint32_t *)((unsigned char *)fp + 576) = 0x46505845;
+    } else if (mode == ACTIVE_SHORT_XSTATE) {
+        header[0] |= 7;
+        sw[1] = 580;
+        sw[4] = 576;
+        /* XRSTOR still reads active AVX data at this standard-layout offset. */
+        *(uint32_t *)((unsigned char *)fp + 576) = 0x46505845;
     } else if (mode == BAD_SHORT_XSTATE) {
+        /* Keep the frame aligned and its trailer readable, but not all AVX data. */
         unsigned char *copy = guard_page - 640;
         memcpy(copy, fp, 576);
         uint32_t *copy_sw = (uint32_t *)(copy + 464);
@@ -271,8 +278,10 @@ static void handler(int signo, siginfo_t *info, void *context) {
 
 static void run_case(int test_mode) {
     unsigned char observed[32] = {0};
+    unsigned char short_xstate_high[16];
     unsigned short cw;
     uint32_t mxcsr;
+    const uint32_t trailer = 0x46505845;
     long double st0;
     long result;
     mode = test_mode;
@@ -305,6 +314,8 @@ static void run_case(int test_mode) {
                      : "rcx", "r11", "xmm0", "memory");
     }
     check(result == 0 && handled, "signal delivery");
+    memcpy(short_xstate_high, expected + 16, sizeof(short_xstate_high));
+    memcpy(short_xstate_high, &trailer, sizeof(trailer));
     check(cw == (mode == EDIT ? 0x0b7f : mode == RESET ? 0x037f : initial_cw),
           "restored x87 control word");
     /* Linux sigreturn initializes SSE controls when software xfeatures omits SSE. */
@@ -321,7 +332,8 @@ static void run_case(int test_mode) {
     check(memcmp(observed, want, 16) == 0, "restored XMM0");
     if (use_avx) {
         /* Linux initializes components omitted by legacy frames or feature masks. */
-        const unsigned char *want_high = mode == EDIT ? edited :
+        const unsigned char *want_high = mode == ACTIVE_SHORT_XSTATE ? short_xstate_high :
+            mode == EDIT ? edited :
             mode == RESET || mode == LEGACY || mode == NO_TRAILER ||
             mode == MASK_AVX || mode == SHORT_XSTATE ? zero : expected + 16;
         check(memcmp(observed + 16, want_high, 16) == 0, "restored YMM0 high half");
@@ -512,6 +524,7 @@ int main(void) {
             test_initial_state();
             test_fault();
             test_async();
+            run_case(ACTIVE_SHORT_XSTATE);
         }
     }
     for (int i = BAD_MXCSR; i <= BAD_SHORT_XSTATE; i++) {

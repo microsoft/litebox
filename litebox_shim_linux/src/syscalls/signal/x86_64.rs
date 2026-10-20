@@ -137,13 +137,27 @@ fn read_xstate_bytes<Platform: ShimPlatform>(
     if xstate_bv & !layout.mask != 0 {
         return None;
     }
-    // Components outside `xfeatures` return to their initial state, so only
-    // the rest must lie within the frame.
+    // Components outside `xfeatures` return to their initial state without
+    // reading their saved bytes.
     let xstate_bv = xstate_bv & xfeatures;
-    if layout.components.iter().any(|component| {
-        xstate_bv & (1 << component.id) != 0 && component.offset + component.size > xstate_size
-    }) {
-        return None;
+    for component in &layout.components {
+        if xstate_bv & (1 << component.id) == 0 {
+            continue;
+        }
+        let component_end = component.offset.checked_add(component.size)?;
+        if component_end > layout.size {
+            return None;
+        }
+        if component_end > xstate_size {
+            // Linux's xstate_size locates the trailer; XRSTOR still reads active
+            // components at their standard offsets beyond that declared size.
+            let component_addr = addr.checked_add(component.offset)?;
+            let component_bytes = UserPtr::<u8>::from_usize(component_addr)
+                .to_owned_slice::<Platform>(component.size)?;
+            bytes
+                .get_mut(component.offset..component_end)?
+                .copy_from_slice(&component_bytes);
+        }
     }
     bytes[XSTATE_BV_OFFSET..][..8].copy_from_slice(&xstate_bv.to_ne_bytes());
     if xfeatures & XFeatureMask::SSE.bits() == 0 {
@@ -514,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn short_frames_may_omit_only_unrestored_components() {
+    fn short_frames_read_active_components_past_the_trailer_offset() {
         let layout = XsaveLayout::get();
         let Some(component) = layout.components.first() else {
             return;
@@ -530,7 +544,8 @@ mod tests {
             });
             frame.read()
         };
-        assert!(short(layout.mask).is_none());
+        let state = short(layout.mask).unwrap();
+        assert_ne!(state.xstate_bv() & (1 << component.id), 0);
         let state = short(layout.mask & !(1 << component.id)).unwrap();
         assert_eq!(state.xstate_bv(), XFeatureMask::LEGACY.bits());
     }

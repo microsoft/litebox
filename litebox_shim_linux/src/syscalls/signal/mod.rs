@@ -530,12 +530,15 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         sigreturn_trampoline: usize,
     ) -> Result<(), DeliverFault> {
         let sp = arch::sp(ctx);
-        let on_alt_stack = is_on_stack(&self.altstack.get(), sp);
         let altstack = self.altstack.get();
+        // Like Linux, overflow checks use the interrupted SP, while switching
+        // is judged below the red zone: a red zone reaching into the
+        // alternate stack counts as already being on it.
+        let nested_alt_stack = is_on_stack(&altstack, sp);
         let switch_stacks = action.flags.contains(SaFlags::ONSTACK)
-            && !on_alt_stack
+            && !is_on_stack(&altstack, sp.wrapping_sub(arch::RED_ZONE_SIZE))
             && !altstack.flags.contains(SsFlags::DISABLE);
-        // Like Linux, only the interrupted stack's red zone is skipped.
+        // Only the interrupted stack's red zone is skipped.
         let sp = if switch_stacks {
             altstack.sp.wrapping_add(altstack.size)
         } else {
@@ -553,7 +556,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         let frame_prefix = 0;
         let frame_start = frame_addr.checked_sub(frame_prefix).ok_or(DeliverFault)?;
 
-        if (switch_stacks || on_alt_stack) && !is_on_stack(&altstack, frame_start) {
+        if (switch_stacks || nested_alt_stack) && !is_on_stack(&altstack, frame_start) {
             return Err(DeliverFault);
         }
 
