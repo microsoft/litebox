@@ -398,6 +398,8 @@ fn thread_ports_name_live_threads_and_die_with_them() {
         bsd(&task, nr::PTHREAD_KILL, &[other, 0]),
         errno(Errno::ESRCH)
     );
+    // UT_CANCELDISABLE too.
+    assert!(sibling.thread.guest.cancel_disabled.load(Ordering::Relaxed));
     drop(sibling);
     // The name became a dead name.
     assert_eq!(task.global.ipc.lock().thread_for_name(other.trunc()), None);
@@ -483,7 +485,7 @@ fn bsdthread_ctl_follows_xnu_for_a_non_workqueue_thread() {
     );
     register(&task, &mut host_registration()).unwrap();
     assert_eq!(ctl(SET_SELF, [USER_INITIATED, 0, QOS_FLAG]), Ok(0));
-    assert_eq!(task.thread.qos.get().tier, 5);
+    assert_eq!(task.thread.guest.policy.lock().qos.tier, 5);
     // Invalid QoS and voucher together; then each alone.
     assert_eq!(
         ctl(SET_SELF, [0, 0x103, QOS_FLAG | VOUCHER_FLAG]),
@@ -496,7 +498,7 @@ fn bsdthread_ctl_follows_xnu_for_a_non_workqueue_thread() {
     assert_eq!(ctl(SET_SELF, [0, 0, VOUCHER_FLAG]), Ok(0));
     assert_eq!(ctl(SET_SELF, [0, 0, UNBIND]), errno(Errno::EINVAL));
     assert_eq!(ctl(SET_SELF, [0, 0, FIXEDPRIORITY_FLAG]), Ok(0));
-    assert!(!task.thread.timeshare.get());
+    assert!(!task.thread.guest.policy.lock().timeshare);
     let own = trap(&task, mach_trap::THREAD_SELF, &[]);
     // Explicit overrides: a valid QoS and a live thread.
     assert_eq!(ctl(0x40, [own, USER_INITIATED, 0]), Ok(0));
@@ -513,12 +515,17 @@ fn bsdthread_ctl_follows_xnu_for_a_non_workqueue_thread() {
     assert_eq!(ctl(0x4000, [1 << 1, 0, 0]), Ok(0));
     assert_eq!(ctl(0x800, [0, 0, 0]), errno(Errno::EINVAL));
     assert_eq!(ctl(0x800, [4, 0x4, 0]), errno(Errno::ENOTSUP));
+    // The QoS is a thread_qos_t (uint8_t): 0x104 is QoS 4, past the checks.
+    assert_eq!(ctl(0x800, [0x104, 0, 0]), errno(Errno::ENOTSUP));
+    assert_eq!(ctl(0x800, [0x107, 0, 0]), errno(Errno::EINVAL));
     for removed in [0x10, 0x401, 0x402] {
         assert_eq!(ctl(removed, [0, 0, 0]), errno(Errno::ENOTSUP));
     }
     assert_eq!(ctl(0x20, [0, 0, 0]), errno(Errno::EINVAL));
 }
 
+/// The yield traps yield the host thread (see the platform's
+/// `yield_thread_gives_up_the_processor`) and return XNU's values.
 #[test]
 fn yield_traps_return_like_xnu() {
     let task = new_task();
@@ -826,6 +833,266 @@ fn bsdthread_terminate_wakes_a_user_join_ulock() {
         assert_eq!(handle.join().unwrap(), Ok(0));
     });
     assert_eq!(gate.read_at_offset::<Platform>(0), Some(worker_port & !0x3));
+}
+
+/// XNU's user-join order (thread.c thread_deallocate_complete,
+/// pthread_shims.c bsdthread_terminate): the join word is published and the
+/// joiners woken while the port still names the thread, then the saved name
+/// is released and the port dies. In between, the thread has left the task.
+#[test]
+fn a_user_join_is_published_while_the_port_names_the_thread() {
+    let task = new_task();
+    let page = guest_page(&task);
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let worker = task.new_sibling(0);
+    let id = worker.thread.guest.id;
+    let worker_port: u32 = port_of(&worker, &worker).trunc();
+    let gate = UserPtrMut::<u32>::from_usize(page);
+    gate.write_at_offset::<Platform>(0, worker_port).unwrap();
+    bsd(
+        &worker,
+        nr::BSDTHREAD_TERMINATE,
+        &[0, 0, worker_port as usize, page],
+    )
+    .unwrap();
+    std::thread::scope(|scope| {
+        // Hold the wake: the worker's teardown stops in it.
+        let ulocks = task.global.ulocks.lock();
+        let teardown = scope.spawn(move || drop(worker));
+        let start = Instant::now();
+        while gate.read_at_offset::<Platform>(0) == Some(worker_port) {
+            assert!(start.elapsed() < Duration::from_secs(10), "never published");
+            std::thread::yield_now();
+        }
+        assert_eq!(gate.read_at_offset::<Platform>(0), Some(worker_port & !0x3));
+        assert_eq!(
+            task.global.ipc.lock().thread_for_name(worker_port),
+            Some(id),
+            "the port still names the thread"
+        );
+        // The thread is no longer active.
+        let reply = mig_call(&task, worker_port, 3612, &ndr(&[4, 6]), false);
+        assert_eq!(word(&reply, 32), 37, "KERN_TERMINATED");
+        let reply = mig_call(&task, worker_port, 3616, &ndr(&[1, 1, 31, 1]), false);
+        assert_eq!(word(&reply, 32), 37, "KERN_TERMINATED");
+        let (ports, names) = task.global.ipc.lock().live_counts();
+        drop(ulocks);
+        teardown.join().unwrap();
+        // The thread's port and its one name are gone.
+        assert_eq!(task.global.ipc.lock().live_counts(), (ports - 1, names - 1));
+    });
+    assert_eq!(task.global.ipc.lock().thread_for_name(worker_port), None);
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_DEALLOCATE,
+            &[own, worker_port as usize]
+        ),
+        KernReturn::INVALID_NAME,
+        "the saved port name was released"
+    );
+}
+
+/// A joiner that read the join word before it was published resolves the
+/// terminating thread as the owner and waits, or sees the published word;
+/// it never finds a dead owner (EOWNERDEAD).
+#[test]
+fn a_user_joiner_racing_termination_never_sees_a_dead_owner() {
+    let task = new_task();
+    let page = guest_page(&task);
+    let gate = UserPtrMut::<u32>::from_usize(page);
+    for _ in 0..200 {
+        let worker = task.new_sibling(0);
+        let worker_port: u32 = port_of(&worker, &worker).trunc();
+        gate.write_at_offset::<Platform>(0, worker_port).unwrap();
+        bsd(
+            &worker,
+            nr::BSDTHREAD_TERMINATE,
+            &[0, 0, worker_port as usize, page],
+        )
+        .unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let joiner = task.new_sibling(0);
+            let barrier = &barrier;
+            let handle = scope.spawn(move || {
+                let gate = UserPtrMut::<u32>::from_usize(page);
+                barrier.wait();
+                // _pthread_joiner_wait.
+                loop {
+                    let current = gate.read_at_offset::<Platform>(0).unwrap();
+                    if current != worker_port {
+                        return Ok(current);
+                    }
+                    // Bounded: a lost wakeup fails the test (ETIMEDOUT).
+                    let result = ulock_wait(
+                        &joiner,
+                        UL_UNFAIR_LOCK | ULF_NO_ERRNO,
+                        page,
+                        worker_port as usize,
+                        10_000_000,
+                    );
+                    for error in [Errno::EOWNERDEAD, Errno::ETIMEDOUT] {
+                        if result == Ok(negative(error)) {
+                            return Err(error);
+                        }
+                    }
+                }
+            });
+            barrier.wait();
+            drop(worker);
+            let result = handle.join().unwrap();
+            assert_eq!(result, Ok(worker_port & !0x3));
+        });
+    }
+}
+
+/// Repeated user-join terminations release every port and name.
+#[test]
+fn user_join_terminations_release_their_ports_and_names() {
+    let task = new_task();
+    let page = guest_page(&task);
+    let gate = UserPtrMut::<u32>::from_usize(page);
+    let before = task.global.ipc.lock().live_counts();
+    for _ in 0..8 {
+        let worker = task.new_sibling(0);
+        let worker_port: u32 = port_of(&worker, &worker).trunc();
+        gate.write_at_offset::<Platform>(0, worker_port).unwrap();
+        bsd(
+            &worker,
+            nr::BSDTHREAD_TERMINATE,
+            &[0, 0, worker_port as usize, page],
+        )
+        .unwrap();
+        drop(worker);
+        assert_eq!(task.global.ipc.lock().live_counts(), before);
+    }
+}
+
+fn live_threads(task: &Task<Platform>) -> u32 {
+    task.process
+        .0
+        .live_threads
+        .underlying_atomic()
+        .load(Ordering::Relaxed)
+}
+
+/// XNU refuses threads past `task_threadmax` (`_bsdthread_create`: ENOMEM),
+/// releasing everything, and admits again once a thread ends.
+#[test]
+fn thread_creation_stops_at_task_threadmax_and_recovers() {
+    const CUSTOM: usize = 0x0100_0000;
+    let limit = crate::thread::TASK_THREADMAX;
+    let task = new_task();
+    register(&task, &mut host_registration()).unwrap();
+    let pthread = guest_page(&task);
+    let mut threads: Vec<_> = (1..limit).map(|_| task.new_sibling(0)).collect();
+    assert_eq!(live_threads(&task), limit);
+    assert!(task.try_new_sibling(0).is_none());
+    let before = task.global.ipc.lock().live_counts();
+    assert_eq!(
+        bsd(
+            &task,
+            nr::BSDTHREAD_CREATE,
+            &[0x1000, 0, pthread, pthread, CUSTOM]
+        ),
+        errno(Errno::ENOMEM)
+    );
+    assert_eq!(task.global.ipc.lock().live_counts(), before);
+    assert_eq!(live_threads(&task), limit);
+    assert_eq!(task.process.0.threads.lock().len(), limit as usize);
+    // A thread's end frees its slot.
+    threads.pop();
+    let again = task.try_new_sibling(0).expect("a slot was freed");
+    assert!(task.try_new_sibling(0).is_none());
+    drop(again);
+
+    // Concurrent creators: exactly the free slots are admitted.
+    let creators: Vec<_> = threads.drain(..4).collect();
+    threads.pop();
+    assert_eq!(live_threads(&task), limit - 2);
+    let barrier = std::sync::Barrier::new(creators.len());
+    let created: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = creators
+            .into_iter()
+            .map(|creator| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    (creator.try_new_sibling(0), creator)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(
+        created.iter().filter(|(child, _)| child.is_some()).count(),
+        2
+    );
+    assert_eq!(live_threads(&task), limit);
+    assert_eq!(task.process.0.threads.lock().len(), limit as usize);
+    drop(created);
+    drop(threads);
+    assert_eq!(live_threads(&task), 1);
+    assert_eq!(task.process.0.threads.lock().len(), 1);
+}
+
+/// `thread_policy` (`pthread_setschedparam`): XNU's policy, count and
+/// priority checks, then the thread's QoS is dropped and its mode and
+/// importance recorded; nothing reaches the host.
+#[test]
+fn thread_policy_validates_and_records_another_threads_policy() {
+    const THREAD_POLICY: i32 = 3616;
+    const INVALID_POLICY: u32 = 28;
+    const POLICY_LIMIT: u32 = 27;
+    let task = new_task();
+    let worker = task.new_sibling(0);
+    let port: u32 = port_of(&task, &worker).trunc();
+    worker.thread.guest.policy.lock().qos = syscalls::thread::ThreadQos {
+        tier: 4,
+        importance: 0,
+    };
+    let call = |fields: &[u32]| {
+        word(
+            &mig_call(&task, port, THREAD_POLICY, &ndr(fields), false),
+            32,
+        )
+    };
+    // policy, count, base[count], set_limit.
+    assert_eq!(call(&[4, 1, 47, 1]), 0, "SCHED_FIFO at its maximum");
+    let policy = *worker.thread.guest.policy.lock();
+    assert_eq!(
+        (policy.qos.tier, policy.timeshare, policy.importance),
+        (0, false, 16)
+    );
+    assert_eq!(call(&[2, 2, 15, 0, 1]), 0, "SCHED_RR with its quantum");
+    assert_eq!(worker.thread.guest.policy.lock().importance, -16);
+    assert_eq!(call(&[1, 1, 31, 0]), 0, "SCHED_OTHER below the limit");
+    let policy = *worker.thread.guest.policy.lock();
+    assert_eq!((policy.timeshare, policy.importance), (true, 0));
+    // Priorities beyond MAXPRI_USER are clamped.
+    assert_eq!(call(&[1, 1, 100, 1]), 0);
+    assert_eq!(worker.thread.guest.policy.lock().importance, 32);
+    // Invalid policies, counts and priorities.
+    assert_eq!(call(&[3, 1, 31, 1]), INVALID_POLICY);
+    assert_eq!(call(&[0, 1, 31, 1]), INVALID_POLICY);
+    assert_eq!(call(&[1, 2, 31, 0, 1]), 4, "KERN_INVALID_ARGUMENT");
+    assert_eq!(call(&[2, 1, 31, 1]), 4, "KERN_INVALID_ARGUMENT");
+    assert_eq!(call(&[1, 1, 128, 1]), 4, "KERN_INVALID_ARGUMENT");
+    assert_eq!(call(&[1, 1, (-1i32).cast_unsigned(), 1]), 4);
+    assert_eq!(call(&[1, 1, 64, 0]), POLICY_LIMIT);
+    // A malformed request: the array bound, or a size that does not match
+    // the count.
+    assert_eq!(
+        call(&[1, 6, 0, 0, 0, 0, 0, 0, 1]),
+        litebox_common_macos::mach::mig::BAD_ARGUMENTS.cast_unsigned()
+    );
+    assert_eq!(
+        call(&[1, 1, 31]),
+        litebox_common_macos::mach::mig::BAD_ARGUMENTS.cast_unsigned()
+    );
+    let policy = *worker.thread.guest.policy.lock();
+    assert_eq!((policy.timeshare, policy.importance), (true, 32));
 }
 
 #[test]

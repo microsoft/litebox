@@ -295,8 +295,17 @@ impl<P: ShimPlatform> Process<P> {
     fn record_exit(&self, status: i32) -> bool {
         self.0
             .exit_status
-            .compare_exchange(-1, status, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(-1, status, Ordering::SeqCst, Ordering::Acquire)
             .is_ok()
+    }
+
+    /// Whether an exit is recorded, read after the caller's SeqCst store of
+    /// its running state. With the SeqCst fence in `Task::exit_process`
+    /// between recording and reading other threads' states, either this read
+    /// sees the exit or the exiting thread sees the caller running guest code
+    /// and interrupts it.
+    fn exit_recorded_seqcst(&self) -> bool {
+        self.0.exit_status.load(Ordering::SeqCst) >= 0
     }
 }
 
@@ -418,6 +427,12 @@ struct GuestThread<P: ShimPlatform> {
     signal_mask: AtomicU32,
     /// `UT_NO_SIGMASK`, set by `__disable_threadsignal`.
     no_signals: AtomicBool,
+    /// `UT_CANCELDISABLE`, set by `__disable_threadsignal`: the thread takes
+    /// no further cancellation.
+    cancel_disabled: AtomicBool,
+    /// Scheduling policy set by the thread itself or, through `thread_policy`,
+    /// by another thread (XNU's thread mutex).
+    policy: Mutex<P, syscalls::thread::ThreadPolicy>,
     /// `machine.cthread_self`: the TSD base.
     tsd_base: AtomicUsize,
     /// Interrupts the thread's waits or guest execution; set when the thread
@@ -437,12 +452,6 @@ struct ThreadState<P: ShimPlatform> {
     /// `bsdthread_terminate`'s user-join ulock address and the thread's port
     /// name, written and woken once the thread has terminated.
     user_join: core::cell::Cell<Option<(usize, u32)>>,
-    /// Requested `THREAD_QOS_POLICY`: tier and relative priority.
-    qos: core::cell::Cell<syscalls::thread::ThreadQos>,
-    /// `THREAD_EXTENDED_POLICY`: timeshare (the default) or fixed priority.
-    timeshare: core::cell::Cell<bool>,
-    /// `ith_voucher_name`.
-    voucher: core::cell::Cell<u32>,
 }
 
 struct Task<P: ShimPlatform> {
@@ -936,7 +945,7 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::SemaphoreWait { semaphore } => {
                 Ok(self.sys_semaphore_wait(semaphore).into())
             }
-            SyscallRequest::SwtchPri | SyscallRequest::Swtch => Ok(Self::sys_swtch()),
+            SyscallRequest::SwtchPri | SyscallRequest::Swtch => Ok(self.sys_swtch()),
             SyscallRequest::ThreadSwitch {
                 thread: _,
                 option,
@@ -982,7 +991,7 @@ impl<P: ShimPlatform> Task<P> {
             return ContinueOperation::Terminate;
         }
         let resume = self.thread.wait_state.prepare_to_run_guest(|| {
-            !self.take_host_signal() && self.process.exit_status().is_none()
+            !self.take_host_signal() && !self.process.exit_recorded_seqcst()
         });
         if resume {
             ContinueOperation::Resume

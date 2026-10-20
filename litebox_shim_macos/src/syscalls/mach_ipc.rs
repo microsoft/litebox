@@ -367,14 +367,24 @@ impl IpcSpace {
         }
     }
 
-    /// The port of a singleton kernel object, or a new semaphore or thread
-    /// port.
+    /// The port of a singleton kernel object or of a live thread, or a new
+    /// semaphore port.
     fn kernel_port(&mut self, object: KernelObject) -> Result<PortId, KernReturn> {
         let slot = match object {
             KernelObject::Task => &mut self.task,
             KernelObject::Host => &mut self.host,
-            // Bounded by the guest's threads, like the task's thread list.
-            KernelObject::Thread(_) => return Ok(self.insert_port(PortKind::Kernel(object))),
+            // A thread has one control port, made by `new_thread_port`; a
+            // terminated thread has none.
+            KernelObject::Thread(_) => {
+                return self
+                    .ports
+                    .iter()
+                    .find_map(|(port, record)| {
+                        matches!(&record.kind, PortKind::Kernel(kernel) if *kernel == object)
+                            .then_some(*port)
+                    })
+                    .ok_or(KernReturn::INVALID_ARGUMENT);
+            }
             KernelObject::Clock(id) => {
                 if let Some((_, port)) = self.clocks.iter().find(|(clock, _)| *clock == id) {
                     return Ok(*port);
@@ -2060,6 +2070,21 @@ mod tests {
         );
         // Singleton kernel objects do not count against the budget.
         assert!(space.kernel_send_right(KernelObject::Task).is_ok());
+    }
+
+    #[test]
+    fn a_thread_send_right_names_its_one_control_port() {
+        let mut space = IpcSpace::default();
+        let port = space.new_thread_port(7);
+        assert_eq!(
+            space.kernel_send_right(KernelObject::Thread(7)),
+            Ok(Right::Send(port))
+        );
+        space.thread_port_died(port);
+        assert_eq!(
+            space.kernel_send_right(KernelObject::Thread(7)),
+            Err(KernReturn::INVALID_ARGUMENT)
+        );
     }
 
     #[test]

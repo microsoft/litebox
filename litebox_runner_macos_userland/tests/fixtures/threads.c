@@ -25,6 +25,7 @@ extern int __bsdthread_terminate(void *stackaddr, size_t freesize, mach_port_t t
 extern int __ulock_wait(uint32_t operation, void *address, uint64_t value, uint32_t timeout);
 extern int __ulock_wake(uint32_t operation, void *address, uint64_t wake_value);
 #define UL_COMPARE_AND_WAIT 1
+#define UL_UNFAIR_LOCK 2
 #define ULF_WAKE_ALL 0x100
 #define ULF_NO_ERRNO 0x1000000
 
@@ -184,11 +185,11 @@ static int main_exit(void) {
 
 static pthread_t chain[4];
 static atomic_int blocking;
+static os_unfair_lock held[3] = {OS_UNFAIR_LOCK_INIT, OS_UNFAIR_LOCK_INIT, OS_UNFAIR_LOCK_INIT};
 
 static void *lock_forever(void *argument) {
-  (void)argument;
   atomic_fetch_add(&blocking, 1);
-  os_unfair_lock_lock(&lock);
+  os_unfair_lock_lock(&held[(long)argument]);
   return NULL;
 }
 
@@ -213,24 +214,54 @@ static void *sleep_forever(void *argument) {
   return NULL;
 }
 
+// Whether a thread is blocked in __ulock_wait(UL_UNFAIR_LOCK) on `address`:
+// the kernel keeps a wait record only while a thread is in that call, and a
+// wake by a thread that is not the lock's owner is then a no-op returning 0
+// instead of ENOENT (sys_ulock.c ulock_wake).
+static int blocked_on(void *address) {
+  for (int tries = 0; tries < 5000; tries++) {
+    if (__ulock_wake(UL_UNFAIR_LOCK | ULF_NO_ERRNO, address, 0) == 0) return 1;
+    sleep_ms(1);
+  }
+  return 0;
+}
+
+// The word pthread_join waits on: libpthread's pthread_t::tl_exit_gate
+// (types_internal.h), which holds the target's port while a joiner waits.
+static uint32_t *exit_gate(pthread_t thread) {
+  uint32_t *gate = (uint32_t *)((char *)thread + 0x34);
+  for (int tries = 0; tries < 5000 && *gate != pthread_mach_thread_np(thread); tries++) {
+    sleep_ms(1);
+  }
+  return *gate == pthread_mach_thread_np(thread) ? gate : NULL;
+}
+
 static void *exit_soon(void *argument) {
   (void)argument;
-  while (atomic_load(&blocking) < 8) sched_yield();
-  // Let the others reach their waits.
-  sleep_ms(100);
-  exit(42);
+  // Eight workers and main have started; chain[] is complete.
+  while (atomic_load(&blocking) < 9) sched_yield();
+  // Every joiner (the chain's next thread, and main for its last) and every
+  // unfair-lock waiter is blocked in the kernel when exit runs.
+  int blocked = 0;
+  for (int i = 0; i < 4; i++) {
+    uint32_t *gate = exit_gate(chain[i]);
+    blocked += gate != NULL && blocked_on(gate);
+  }
+  for (int i = 0; i < 3; i++) blocked += blocked_on(&held[i]);
+  exit(blocked == 7 ? 42 : 43);
 }
 
 // exit from a worker while the other threads run, sleep, block in joins, and
-// block on an unfair lock.
+// block on unfair locks.
 static int exit_blocked(void) {
-  os_unfair_lock_lock(&lock);
+  for (int i = 0; i < 3; i++) os_unfair_lock_lock(&held[i]);
   pthread_t thread;
   pthread_create(&chain[0], NULL, spin, NULL);
   pthread_create(&thread, NULL, sleep_forever, NULL);
-  for (int i = 0; i < 3; i++) pthread_create(&thread, NULL, lock_forever, NULL);
+  for (long i = 0; i < 3; i++) pthread_create(&thread, NULL, lock_forever, (void *)i);
   for (int i = 1; i < 4; i++) pthread_create(&chain[i], NULL, join_previous, &chain[i - 1]);
   pthread_create(&thread, NULL, exit_soon, NULL);
+  atomic_fetch_add(&blocking, 1);
   pthread_join(chain[3], NULL);
   return 1;
 }
@@ -254,6 +285,51 @@ static int last_terminate(void) {
   return 1;
 }
 
+static _Atomic uint32_t sched_gate;
+
+static void *wait_for_gate(void *argument) {
+  (void)argument;
+  while (!atomic_load(&sched_gate)) {
+    __ulock_wait(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, &sched_gate, 0, 0);
+  }
+  return NULL;
+}
+
+// pthread_setschedparam (thread_policy) on a running worker and on main,
+// valid and invalid.
+static int schedparam(void) {
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, wait_for_gate, NULL) != 0) return 10;
+  struct sched_param param = {.sched_priority = sched_get_priority_max(SCHED_FIFO)};
+  int fifo = pthread_setschedparam(thread, SCHED_FIFO, &param);
+  int policy = 0;
+  struct sched_param got = {0};
+  pthread_getschedparam(thread, &policy, &got);
+  int kept = policy == SCHED_FIFO && got.sched_priority == param.sched_priority;
+  param.sched_priority = sched_get_priority_min(SCHED_RR);
+  int rr = pthread_setschedparam(thread, SCHED_RR, &param);
+  param.sched_priority = 200;
+  int bad_priority = pthread_setschedparam(thread, SCHED_OTHER, &param);
+  param.sched_priority = 31;
+  int bad_policy = pthread_setschedparam(thread, 3, &param);
+  int self = pthread_setschedparam(pthread_self(), SCHED_OTHER, &param);
+  atomic_store(&sched_gate, 1);
+  __ulock_wake(UL_COMPARE_AND_WAIT | ULF_WAKE_ALL | ULF_NO_ERRNO, &sched_gate, 0);
+  pthread_join(thread, NULL);
+  printf("fifo %d kept %d rr %d bad_priority %d bad_policy %d self %d\n", fifo, kept, rr,
+         bad_priority == EINVAL, bad_policy == EINVAL, self);
+  return 0;
+}
+
+// pthread_exit from main while workers sleep; the runner gets Ctrl-C.
+static int interrupt_after_main_exit(void) {
+  for (int i = 0; i < 2; i++) {
+    pthread_t thread;
+    pthread_create(&thread, NULL, sleep_forever, NULL);
+  }
+  pthread_exit(NULL);
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) return 2;
   if (strcmp(argv[1], "join") == 0) return join();
@@ -261,5 +337,7 @@ int main(int argc, char **argv) {
   if (strcmp(argv[1], "main_exit") == 0) return main_exit();
   if (strcmp(argv[1], "exit_blocked") == 0) return exit_blocked();
   if (strcmp(argv[1], "last_terminate") == 0) return last_terminate();
+  if (strcmp(argv[1], "schedparam") == 0) return schedparam();
+  if (strcmp(argv[1], "interrupt_after_main_exit") == 0) return interrupt_after_main_exit();
   return 3;
 }

@@ -157,6 +157,9 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
 impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
     /// Wakes up the thread if it is waiting (but not if it is running in the guest).
     fn wake(&self) {
+        // Orders the caller's publication of the wait condition before the
+        // state read below; pairs with the fence in `WaitContext::start_wait`.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.condvar;
         let v =
             condvar
@@ -220,6 +223,11 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
     /// condition and interrupt condition. If it is running guest code, the
     /// platform will interrupt the thread and re-enter the shim.
     pub fn interrupt(&self) {
+        // Orders the caller's publication of the interrupt condition before
+        // the state read below; pairs with the SeqCst fence in
+        // `WaitContext::start_wait` and the SeqCst state store in
+        // `WaitState::prepare_to_run_guest`.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.waker.0.condvar;
         let v =
             condvar
@@ -393,6 +401,12 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
+        // The wait and interrupt conditions are read after this and may be
+        // published by another thread before it wakes this one: with the
+        // fence in `WaitStateInner::wake` and `ThreadHandle::interrupt`,
+        // either the condition read sees the publication or the waker sees
+        // WAITING (store-buffer pattern).
+        core::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// Returns the thread to the running state after a wait.

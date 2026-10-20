@@ -22,6 +22,11 @@ use litebox_common_linux::PtRegs;
 use litebox_common_macos::TaskParams;
 use litebox_platform::sync::RawMutex as _;
 
+/// `task_threadmax`: XNU refuses a task more threads (`thread_create`'s
+/// `KERN_FAILURE`, `ENOMEM` from `bsdthread_create`). The value is the host's
+/// `kern.num_taskthreads`, which XNU scales from memory at boot.
+pub(crate) const TASK_THREADMAX: u32 = 4096;
+
 impl<P: ShimPlatform> Task<P> {
     /// The process's first thread.
     pub(crate) fn new_main(
@@ -31,11 +36,13 @@ impl<P: ShimPlatform> Task<P> {
         process: Process<P>,
     ) -> Self {
         Self::new_thread(global, files, params, process, true, 0)
+            .expect("the first thread is below task_threadmax")
     }
 
     /// A new thread of `self`'s process, inheriting the creator's signal
     /// mask (`uthread_alloc`). It starts with the TSD base `tsd_base`.
-    pub(crate) fn new_sibling(&self, tsd_base: usize) -> Self {
+    /// `None` when the process has `TASK_THREADMAX` threads.
+    pub(crate) fn try_new_sibling(&self, tsd_base: usize) -> Option<Self> {
         let task = Self::new_thread(
             Arc::clone(&self.global),
             Arc::clone(&self.files),
@@ -43,13 +50,20 @@ impl<P: ShimPlatform> Task<P> {
             self.process.clone(),
             false,
             self.thread.guest.signal_mask.load(Ordering::Relaxed),
-        );
+        )?;
         task.thread.start.set(Some(tsd_base));
         task.thread
             .guest
             .tsd_base
             .store(tsd_base, Ordering::Relaxed);
-        task
+        Some(task)
+    }
+
+    /// [`Self::try_new_sibling`] below the thread limit.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn new_sibling(&self, tsd_base: usize) -> Self {
+        self.try_new_sibling(tsd_base)
+            .expect("below task_threadmax")
     }
 
     fn new_thread(
@@ -59,7 +73,18 @@ impl<P: ShimPlatform> Task<P> {
         process: Process<P>,
         is_main: bool,
         signal_mask: u32,
-    ) -> Self {
+    ) -> Option<Self> {
+        // Admission: the live count is checked and taken under the registry
+        // lock before anything is allocated; the Task's Drop returns it.
+        {
+            let _threads = process.0.threads.lock();
+            let live = process.0.live_threads.underlying_atomic();
+            let count = live.load(Ordering::Relaxed);
+            if count >= TASK_THREADMAX {
+                return None;
+            }
+            live.store(count + 1, Ordering::Release);
+        }
         let id = global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let port = global.ipc.lock().new_thread_port(id);
         let guest = Arc::new(GuestThread {
@@ -68,32 +93,26 @@ impl<P: ShimPlatform> Task<P> {
             is_main,
             signal_mask: AtomicU32::new(signal_mask),
             no_signals: AtomicBool::new(false),
+            cancel_disabled: AtomicBool::new(false),
+            policy: Mutex::new(crate::syscalls::thread::ThreadPolicy::DEFAULT),
             tsd_base: AtomicUsize::new(0),
             interrupt: Mutex::new(None),
         });
-        {
-            let mut threads = process.0.threads.lock();
-            threads.insert(id, Arc::clone(&guest));
-            let live = process.0.live_threads.underlying_atomic();
-            live.store(live.load(Ordering::Relaxed) + 1, Ordering::Release);
-        }
+        process.0.threads.lock().insert(id, Arc::clone(&guest));
         let thread = ThreadState {
             guest,
             wait_state: litebox::event::wait::WaitState::new(global.platform),
             start: core::cell::Cell::new(None),
             terminated: core::cell::Cell::new(false),
             user_join: core::cell::Cell::new(None),
-            qos: core::cell::Cell::new(crate::syscalls::thread::ThreadQos::UNSPECIFIED),
-            timeshare: core::cell::Cell::new(true),
-            voucher: core::cell::Cell::new(0),
         };
-        Self {
+        Some(Self {
             global,
             files,
             params,
             process,
             thread,
-        }
+        })
     }
 
     /// The guest thread `id` of this process, if it has not terminated.
@@ -114,6 +133,10 @@ impl<P: ShimPlatform> Task<P> {
         if !self.process.record_exit(status) {
             return;
         }
+        // Pairs with `Process::exit_recorded_seqcst` (store-buffer pattern):
+        // a thread about to resume the guest either sees the exit or is seen
+        // running guest code by the interrupts below.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let others: alloc::vec::Vec<_> = self
             .process
             .0
@@ -156,12 +179,17 @@ impl<P: ShimPlatform> Task<P> {
 impl<P: ShimPlatform> Drop for Task<P> {
     fn drop(&mut self) {
         let guest = &self.thread.guest;
-        // The thread leaves the task, then its port dies (thread_terminate_self).
+        // thread_terminate_self, then thread_deallocate_complete: the thread
+        // leaves the task; a user join is published and its joiners woken
+        // while the port still names the thread (pthread_shims.c
+        // bsdthread_terminate), then the saved port name is released
+        // (uthread_joiner_wake) and the port dies.
         self.process.0.threads.lock().remove(&guest.id);
-        self.global.ipc.lock().thread_port_died(guest.port);
         if let Some((address, port)) = self.thread.user_join.take() {
             self.wake_user_joiner(address, port);
+            let _ = self.global.ipc.lock().deallocate(port);
         }
+        self.global.ipc.lock().thread_port_died(guest.port);
         let last = {
             let _threads = self.process.0.threads.lock();
             let live = self.process.0.live_threads.underlying_atomic();

@@ -1052,8 +1052,10 @@ fn threads_outlive_a_main_thread_that_exits() {
     );
 }
 
-/// `exit(42)` from a worker ends threads that run guest code, wait in
-/// `pthread_join` and wait on an unfair lock, promptly and with its status.
+/// `exit(42)` from a worker ends threads that run guest code, sleep, and
+/// wait in `pthread_join` and on unfair locks, promptly and with its status.
+/// The exiting thread first checks that every join and unfair-lock waiter is
+/// blocked in the kernel (status 43 otherwise).
 #[cfg(feature = "test-broker")]
 #[test]
 fn threads_end_with_the_status_of_an_exit_from_any_thread() {
@@ -1062,6 +1064,120 @@ fn threads_end_with_the_status_of_an_exit_from_any_thread() {
         (code, stdout.as_slice(), stderr.as_str()),
         (Some(42), &b""[..], "")
     );
+}
+
+/// `pthread_setschedparam` (`thread_policy`) on a worker and on main, and
+/// its rejection of an invalid priority or policy.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_set_scheduling_parameters() {
+    let (code, stdout, stderr) = run_thread_scenario("schedparam");
+    assert_eq!(
+        (
+            code,
+            String::from_utf8_lossy(&stdout).as_ref(),
+            stderr.as_str()
+        ),
+        (
+            Some(0),
+            "fifo 0 kept 1 rr 0 bad_priority 1 bad_policy 1 self 0\n",
+            ""
+        )
+    );
+}
+
+/// The number of threads of process `pid` (`proc_pidinfo`'s
+/// `PROC_PIDTASKINFO`), 0 if it cannot be read.
+#[cfg(feature = "test-broker")]
+fn host_thread_count(pid: i32) -> i32 {
+    // SAFETY: proc_taskinfo is plain integers, zero-valid.
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_taskinfo>() };
+    let size = i32::try_from(size_of::<libc::proc_taskinfo>()).unwrap();
+    // SAFETY: info is writable storage of `size` bytes.
+    let read =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+    if read == size { info.pti_threadnum } else { 0 }
+}
+
+/// The runner's thread keeps the forwarded signals (SIGINT, SIGALRM) blocked
+/// outside guest execution, so while it waits for the guest's other threads
+/// after the main thread's `pthread_exit`, XNU delivers Ctrl-C to one of them.
+#[cfg(feature = "test-broker")]
+#[test]
+fn the_runner_thread_leaves_forwarded_signals_to_guest_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile_c(dir.path(), HELLO_WORLD);
+    let status = litebox_runner_macos_userland::run(litebox_runner_macos_userland::CliArgs {
+        program_and_arguments: vec![binary.to_str().unwrap().to_owned()],
+        environment_variables: Vec::new(),
+        test_mmap_image: None,
+    })
+    .unwrap();
+    assert_eq!(status, 0);
+    // SAFETY: zero is valid for this integer bitmask.
+    let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: a null new mask only reads this thread's mask into live storage.
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, core::ptr::null(), &raw mut mask) },
+        0
+    );
+    for signal in [libc::SIGINT, libc::SIGALRM] {
+        // SAFETY: mask is an initialized sigset_t.
+        assert_eq!(unsafe { libc::sigismember(&raw const mask, signal) }, 1);
+    }
+}
+
+/// Ctrl-C after the main thread's `pthread_exit` ends the guest through its
+/// remaining threads with status 130; the runner thread waiting for them
+/// does not take the signal. (XNU picks the receiving thread, so this alone
+/// does not always catch a runner thread that takes it; the test above does.)
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_take_ctrl_c_after_the_main_thread_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "threads.c",
+        include_str!("fixtures/threads.c"),
+        &["-O1"],
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg(&binary)
+        .arg("interrupt_after_main_exit")
+        .env_remove("LITEBOX_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Signal once the guest runs: the runner thread and the two sleepers
+    // the guest's main thread creates right before its pthread_exit.
+    let pid = i32::try_from(child.id()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while host_thread_count(pid) < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the guest never started its threads"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // SAFETY: kill has no memory preconditions; the child has not been reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("the guest did not end after Ctrl-C");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(130), "{status:?}");
 }
 
 /// When every thread terminates without `exit`, the process exits with

@@ -30,6 +30,7 @@ mod start {
     pub const QOSCLASS_MASK: u32 = 0x00ff_ffff;
     pub const POLICY_BITSHIFT: u32 = 16;
     pub const POLICY_MASK: u32 = 0xff;
+    pub const IMPORTANCE_MASK: u32 = 0xffff;
 }
 
 /// `PTHREAD_FEATURE_SUPPORTED` (kern_internal.h): DISPATCHFUNC, FINEPRIO,
@@ -43,8 +44,19 @@ const MAX_PTHREAD_SIZE: i32 = 64 * 1024;
 const PTH_DEFAULT_STACKSIZE: usize = 512 * 1024;
 /// `SHARED_REGION_BASE_ARM64`.
 const SHARED_REGION_BASE_ARM64: usize = 0x1_8000_0000;
-/// `POLICY_TIMESHARE` (`SCHED_OTHER`).
-const POLICY_TIMESHARE: u32 = 1;
+/// `policy_t` values (`mach/policy.h`): `SCHED_OTHER`, `SCHED_RR` and
+/// `SCHED_FIFO`.
+mod policy {
+    pub const TIMESHARE: i32 = 1;
+    pub const RR: i32 = 2;
+    pub const FIFO: i32 = 4;
+}
+/// `BASEPRI_DEFAULT`: also every guest thread's task priority.
+const BASEPRI_DEFAULT: i32 = 31;
+/// `MAXPRI_USER`: a user thread's `max_priority`.
+const MAXPRI_USER: i32 = 63;
+/// `MAXPRI`: `invalid_pri`'s bound.
+const MAXPRI: i32 = 127;
 /// `NSIG`.
 const NSIG: i32 = 32;
 
@@ -91,12 +103,33 @@ pub(crate) struct ThreadQos {
 }
 
 impl ThreadQos {
-    pub(crate) const UNSPECIFIED: Self = Self {
+    const UNSPECIFIED: Self = Self {
         tier: 0,
         importance: 0,
     };
     const LEGACY: Self = Self {
         tier: 4,
+        importance: 0,
+    };
+}
+
+/// A thread's requested scheduling policy. The host schedules guest threads,
+/// so this is bookkeeping: only the QoS tier changes guest-visible results
+/// (`bsdthread_register`'s main QoS, `BSDTHREAD_CTL_SET_SELF`'s `EPERM`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadPolicy {
+    /// `THREAD_QOS_POLICY`: tier and relative priority.
+    pub qos: ThreadQos,
+    /// `THREAD_EXTENDED_POLICY`: timeshare (`TH_MODE_TIMESHARE`) or fixed.
+    pub timeshare: bool,
+    /// `THREAD_PRECEDENCE_POLICY`: priority relative to the task's.
+    pub importance: i32,
+}
+
+impl ThreadPolicy {
+    pub(crate) const DEFAULT: Self = Self {
+        qos: ThreadQos::UNSPECIFIED,
+        timeshare: true,
         importance: 0,
     };
 }
@@ -296,13 +329,17 @@ impl<P: ShimPlatform> Task<P> {
         if data != 0 {
             write_u64(&mut bytes, field::VERSION, registration::SIZE as u64);
             // An unspecified main thread gets the legacy QoS imposed.
-            if self.thread.qos.get().tier == 0 {
-                self.thread.qos.set(ThreadQos::LEGACY);
-            }
+            let main_qos = {
+                let mut policy = self.thread.guest.policy.lock();
+                if policy.qos.tier == 0 {
+                    policy.qos = ThreadQos::LEGACY;
+                }
+                policy.qos.tier
+            };
             write_u64(
                 &mut bytes,
                 field::MAIN_QOS,
-                priority::from_thread_qos(self.thread.qos.get().tier),
+                priority::from_thread_qos(main_qos),
             );
             write_u32(&mut bytes, field::TSD_OFFSET, record.tsd_offset);
             write_u64(
@@ -373,7 +410,8 @@ impl<P: ShimPlatform> Task<P> {
             let base = pthread.wrapping_add(registration.tsd_offset as usize);
             if base > P::TASK_ADDR_MAX { 0 } else { base }
         };
-        let child = self.new_sibling(tsd_base);
+        // thread_create refuses a task at task_threadmax.
+        let child = self.try_new_sibling(tsd_base).ok_or(Errno::ENOMEM)?;
         let port = self.global.ipc.lock().copyout_send(child.thread.guest.port);
         let result = self.prepare_thread(&child, port, pthread, flags, registration);
         let flags = match result {
@@ -443,14 +481,18 @@ impl<P: ShimPlatform> Task<P> {
         }
         if flags & start::SETSCHED != 0 {
             // thread_policy_set of the extended and precedence policies: the
-            // thread leaves QoS and gets the requested timesharing mode.
+            // thread leaves QoS and gets the requested mode and importance.
             let policy = (flags >> start::POLICY_BITSHIFT) & start::POLICY_MASK;
-            child.thread.qos.set(ThreadQos::UNSPECIFIED);
-            child.thread.timeshare.set(policy == POLICY_TIMESHARE);
+            let importance = (flags & start::IMPORTANCE_MASK).cast_signed();
+            *child.thread.guest.policy.lock() = ThreadPolicy {
+                qos: ThreadQos::UNSPECIFIED,
+                timeshare: policy == policy::TIMESHARE.cast_unsigned(),
+                importance: importance - BASEPRI_DEFAULT,
+            };
         } else if flags & start::QOSCLASS != 0 {
             let qos = priority::to_policy(u64::from(flags & start::QOSCLASS_MASK))
                 .ok_or(Errno::EINVAL)?;
-            child.thread.qos.set(qos);
+            child.thread.guest.policy.lock().qos = qos;
         }
         if registration.mach_thread_self_offset != 0 && registration.tsd_offset != 0 {
             let slot = pthread
@@ -527,9 +569,12 @@ impl<P: ShimPlatform> Task<P> {
         self.ulock_wake_all_unfair(address);
     }
 
-    /// `__disable_threadsignal`: no signal is delivered to this thread again.
+    /// `__disable_threadsignal`: no signal is delivered to this thread again,
+    /// and it takes no further cancellation.
     pub(crate) fn sys_disable_threadsignal(&self) {
-        self.thread.guest.no_signals.store(true, Ordering::Relaxed);
+        let guest = &self.thread.guest;
+        guest.no_signals.store(true, Ordering::Relaxed);
+        guest.cancel_disabled.store(true, Ordering::Relaxed);
     }
 
     /// `__pthread_kill`. Only signal 0 (a liveness check) is supported.
@@ -597,11 +642,12 @@ impl<P: ShimPlatform> Task<P> {
                 _ => None,
             };
             change(old).ok_or(Errno::EINVAL)?;
+            // One read-modify-write per thread, so a concurrent change of the
+            // same thread's mask is not lost (XNU holds the proc lock).
             let apply = |thread: &crate::GuestThread<P>| {
-                let current = thread.signal_mask.load(Ordering::Relaxed);
-                thread
+                let _ = thread
                     .signal_mask
-                    .store(change(current).expect("how was checked"), Ordering::Relaxed);
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, change);
             };
             if every_thread {
                 self.for_each_thread(apply);
@@ -662,6 +708,7 @@ impl<P: ShimPlatform> Task<P> {
             ctl::SET_SELF => self.bsdthread_set_self(arg1 as u64, arg2.trunc(), arg3),
             ctl::QOS_MAX_PARALLELISM => {
                 unused(arg3)?;
+                // thread_qos_t is a uint8_t.
                 bsdthread_get_max_parallelism(arg1.trunc(), arg2)?;
                 // The answer is the host's CPU topology, which the guest does
                 // not see (libdispatch's width hint).
@@ -716,63 +763,97 @@ impl<P: ShimPlatform> Task<P> {
             } else {
                 !priority::has_override_qos(priority)
             };
+            let mut policy = self.thread.guest.policy.lock();
             match qos {
                 None => Err(Errno::EINVAL),
                 Some(_) if !override_valid => Err(Errno::EINVAL),
                 // Threads opted out of QoS can't change QoS.
-                Some(_) if self.thread.qos.get().tier == 0 => Err(Errno::EPERM),
+                Some(_) if policy.qos.tier == 0 => Err(Errno::EPERM),
                 Some(qos) => {
-                    self.thread.qos.set(qos);
+                    policy.qos = qos;
                     Ok(())
                 }
             }
         } else {
             Ok(())
         };
-        let voucher_result = if flags & set_self::VOUCHER != 0 {
-            // No name in this space denotes a voucher.
-            if voucher == 0 {
-                self.thread.voucher.set(0);
-                Ok(())
-            } else {
-                Err(Errno::ENOENT)
-            }
+        // No name in this space denotes a voucher, so only adopting none
+        // (MACH_PORT_NULL) succeeds; a thread never holds a voucher.
+        let voucher_result = if flags & set_self::VOUCHER != 0 && voucher != 0 {
+            Err(Errno::ENOENT)
         } else {
             Ok(())
         };
-        let fixed_priority = if qos.is_err() {
-            Ok(())
-        } else if flags & set_self::FIXEDPRIORITY != 0 {
-            self.thread.timeshare.set(false);
-            Ok(())
-        } else if flags & set_self::TIMESHARE != 0 {
-            self.thread.timeshare.set(true);
-            Ok(())
-        } else {
-            Ok(())
-        };
+        if qos.is_ok() && flags & (set_self::FIXEDPRIORITY | set_self::TIMESHARE) != 0 {
+            self.thread.guest.policy.lock().timeshare = flags & set_self::FIXEDPRIORITY == 0;
+        }
         if qos.is_err() && voucher_result.is_err() {
             return Err(Errno::EBADMSG);
         }
-        unbind
-            .and(qos)
-            .and(voucher_result)
-            .and(fixed_priority)
-            .map(|()| 0)
+        unbind.and(qos).and(voucher_result).map(|()| 0)
     }
 
-    /// `swtch` and `swtch_pri`: whether yielding helped. The host schedules
-    /// guest threads, so there is never a better thread to run here.
-    pub(crate) fn sys_swtch() -> usize {
+    /// `thread_policy` (`mk_sp.c`) of `thread`: the policy's base and,
+    /// with `set_limit`, its limit are validated like `thread_policy` and
+    /// `thread_set_policy`; then `thread_set_mode_and_absolute_pri` drops
+    /// the thread's QoS and records its mode and importance.
+    pub(crate) fn thread_policy(
+        &self,
+        thread: crate::ThreadId,
+        policy: i32,
+        base: &[i32],
+        set_limit: bool,
+    ) -> KernReturn {
+        let base_count = match policy {
+            policy::TIMESHARE | policy::FIFO => 1,
+            policy::RR => 2,
+            _ => return KernReturn::INVALID_POLICY,
+        };
+        if base.len() != base_count {
+            return KernReturn::INVALID_ARGUMENT;
+        }
+        let base_priority = base[0];
+        // Without set_limit the limit stays the thread's max_priority, which
+        // the base may not exceed; with it, the limit is the base.
+        let max_priority = if set_limit {
+            base_priority
+        } else if base_priority > MAXPRI_USER {
+            return KernReturn::POLICY_LIMIT;
+        } else {
+            MAXPRI_USER
+        };
+        let valid = 0..=MAXPRI;
+        if !valid.contains(&base_priority) || !valid.contains(&max_priority) {
+            return KernReturn::INVALID_ARGUMENT;
+        }
+        let Some(target) = self.guest_thread(thread) else {
+            return KernReturn::TERMINATED;
+        };
+        let mut recorded = target.policy.lock();
+        recorded.qos = ThreadQos::UNSPECIFIED;
+        recorded.timeshare = policy == policy::TIMESHARE;
+        // The absolute priority becomes an importance relative to the task's
+        // priority, clamped to [MINPRI, max_priority]; max_priority is
+        // MAXPRI_USER and the task priority BASEPRI_DEFAULT here.
+        recorded.importance = base_priority.min(MAXPRI_USER) - BASEPRI_DEFAULT;
+        KernReturn::SUCCESS
+    }
+
+    /// `swtch` and `swtch_pri`: yield the host thread. They return whether
+    /// the thread should still yield afterwards (`thread_should_yield`),
+    /// which only the host scheduler knows; FALSE is one of XNU's answers.
+    pub(crate) fn sys_swtch(&self) -> usize {
+        litebox::platform::ThreadProvider::yield_thread(self.global.platform);
         0
     }
 
-    /// `thread_switch`: the WAIT options block for the option time; a
-    /// directed handoff or priority depression is a hint the host scheduler
-    /// does not take.
+    /// `thread_switch`: the WAIT options block for the option time, the
+    /// others yield the host thread. A directed handoff and priority
+    /// depression are hints the host scheduler does not take.
     pub(crate) fn sys_thread_switch(&self, option: i32, option_time: u32) -> KernReturn {
         let scale = match option {
             switch_option::NONE | switch_option::DEPRESS | switch_option::OSLOCK_DEPRESS => {
+                litebox::platform::ThreadProvider::yield_thread(self.global.platform);
                 return KernReturn::SUCCESS;
             }
             switch_option::WAIT | switch_option::OSLOCK_WAIT => 1_000_000,
@@ -787,12 +868,12 @@ impl<P: ShimPlatform> Task<P> {
 }
 
 /// `bsdthread_get_max_parallelism`'s argument checks.
-fn bsdthread_get_max_parallelism(qos: u32, flags: usize) -> Result<(), Errno> {
+fn bsdthread_get_max_parallelism(qos: u8, flags: usize) -> Result<(), Errno> {
     const COUNT_LOGICAL: usize = 0x1;
     const REALTIME: usize = 0x2;
     const CLUSTER_SHARED_RESOURCE: usize = 0x4;
     /// `THREAD_QOS_LAST`.
-    const THREAD_QOS_LAST: u32 = 7;
+    const THREAD_QOS_LAST: u8 = 7;
     if flags & !(REALTIME | COUNT_LOGICAL | CLUSTER_SHARED_RESOURCE) != 0 {
         return Err(Errno::EINVAL);
     }

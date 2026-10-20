@@ -82,6 +82,10 @@ pub trait ThreadProvider: RawPointerProvider {
     /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
 
+    /// Offer the processor to another runnable thread, if the platform's
+    /// scheduler has one. The default does nothing.
+    fn yield_thread(&self) {}
+
     /// Runs `f` on the current thread after performing any platform-specific
     /// thread registration needed for [`current_thread`](Self::current_thread)
     /// and related functionality to work.

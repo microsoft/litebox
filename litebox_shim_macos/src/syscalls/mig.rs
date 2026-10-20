@@ -42,6 +42,7 @@ mod routine {
     pub const SEMAPHORE_CREATE: i32 = 3418;
     pub const SEMAPHORE_DESTROY: i32 = 3419;
     pub const THREAD_INFO: i32 = 3612;
+    pub const THREAD_POLICY: i32 = 3616;
     pub const MACH_VM_ALLOCATE: i32 = 4800;
     pub const MACH_VM_DEALLOCATE: i32 = 4801;
     pub const MACH_VM_MAP: i32 = 4811;
@@ -97,9 +98,6 @@ fn validate_restartable_ranges(ranges: &mut [RestartableRange]) -> KernReturn {
 
 /// `SYNC_POLICY_FIFO | SYNC_POLICY_LIFO | SYNC_POLICY_PREPOST`.
 const SYNC_POLICY_USER_MASK: i32 = 0x2 | 0x4;
-
-/// `KERN_TERMINATED`: the target thread has terminated.
-const KERN_TERMINATED: i32 = 37;
 
 /// `VM_RECLAIM_NOT_SUPPORTED`: `err_vm_reclaim(2)`.
 const VM_RECLAIM_NOT_SUPPORTED: i32 = (0x8 << 26) | (1 << 14) | 2;
@@ -323,6 +321,9 @@ impl<P: ShimPlatform> Task<P> {
             (KernelObject::Thread(thread), routine::THREAD_INFO) => {
                 self.mig_thread_info(thread, &request)
             }
+            (KernelObject::Thread(thread), routine::THREAD_POLICY) => {
+                self.mig_thread_policy(thread, &request)
+            }
             (KernelObject::Task, routine::TASK_RESTARTABLE_RANGES_REGISTER) => {
                 self.mig_restartable_ranges_register(&request)
             }
@@ -398,7 +399,7 @@ impl<P: ShimPlatform> Task<P> {
         // thread_info_out[THREAD_INFO_MAX]
         let count = count.min(32);
         let Some(target) = self.guest_thread(thread) else {
-            return error_reply(KERN_TERMINATED);
+            return error_reply(KernReturn::TERMINATED.raw());
         };
         if flavor != thread_flavor::IDENTIFIER_INFO {
             self.log_unsupported_once("thread_info flavor", format_args!("{flavor}"));
@@ -423,6 +424,32 @@ impl<P: ShimPlatform> Task<P> {
             info[2 * index + 1] = litebox::utils::TruncateExt::<u32>::trunc(value >> 32);
         }
         info_reply(KernReturn::SUCCESS, &info, count)
+    }
+
+    /// `thread_policy`: `policy`, a `policy_base_t` array of at most 5
+    /// integers, and `set_limit`, packed after the array's used elements.
+    fn mig_thread_policy(&self, thread: crate::ThreadId, request: &Message) -> Message {
+        const BASE_MAX: usize = 5;
+        let fields = (!request.complex)
+            .then(|| request.body.get(NDR_RECORD.len()..))
+            .flatten();
+        let Some((header, rest)) = fields.and_then(|fields| fields.split_first_chunk::<8>()) else {
+            return error_reply(mig::BAD_ARGUMENTS);
+        };
+        let policy = i32::from_ne_bytes(header[..4].try_into().expect("4 bytes"));
+        let count = u32::from_ne_bytes(header[4..].try_into().expect("4 bytes")) as usize;
+        if count > BASE_MAX || rest.len() != count * 4 + 4 {
+            return error_reply(mig::BAD_ARGUMENTS);
+        }
+        let (base, set_limit) = rest.split_at(count * 4);
+        let base: Vec<i32> = base
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| i32::from_ne_bytes(*word))
+            .collect();
+        let set_limit = u32::from_ne_bytes(set_limit.try_into().expect("4 bytes")) != 0;
+        kern_reply(self.thread_policy(thread, policy, &base, set_limit), &[])
     }
 
     /// `task_restartable_ranges_register`. Guest signals are never delivered,

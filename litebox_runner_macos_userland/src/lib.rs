@@ -107,6 +107,9 @@ fn init_logging() {
         .try_init();
 }
 
+/// Run the guest on the calling thread and return its exit status once every
+/// guest thread has ended. The calling thread is left with the forwarded
+/// signals (SIGINT, SIGALRM) blocked, so they reach the guest's threads.
 pub fn run(cli_args: CliArgs) -> Result<i32> {
     init_logging();
     set_guest_abi(GuestAbi::Darwin);
@@ -203,12 +206,15 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         process,
         mut initial_ctx,
     } = program;
+    // The main thread may end (pthread_exit) before the guest's other
+    // threads. Ctrl-C while this thread waits for them must reach one of them.
+    litebox_platform_macos_userland::block_forwarded_signals()
+        .context("blocking forwarded signals")?;
     // SAFETY: the loader owns valid mappings and has finalized Darwin gates;
     // entrypoints retain those mappings until guest execution stops.
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
-    // The main thread may end (pthread_exit) before the guest's other threads.
     let status = process.wait_for_exit();
     #[cfg(feature = "test-broker")]
     test_broker::flush_output(&stdio)?;

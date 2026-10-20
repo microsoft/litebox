@@ -1031,10 +1031,15 @@ fn write_tls(offset: usize, value: usize) {
 }
 
 fn initialize_thread_tls() {
+    try_initialize_thread_tls()
+        .unwrap_or_else(|error| panic!("failed to initialize macOS thread TLS: {error}"));
+}
+
+fn try_initialize_thread_tls() -> std::io::Result<()> {
     let key = tls_key();
     // SAFETY: the process-wide key remains allocated for the process lifetime.
     if !unsafe { libc::pthread_getspecific(key) }.is_null() {
-        return;
+        return Ok(());
     }
     let vector = Box::into_raw(Box::new(GuestVectorState::default())) as usize;
     let block = Box::new(TlsBlock {
@@ -1055,11 +1060,9 @@ fn initialize_thread_tls() {
     if error != 0 {
         // SAFETY: pthread did not take ownership after the failed call.
         unsafe { drop_tls_block(block.cast()) };
-        panic!(
-            "failed to initialize macOS thread TLS: {}",
-            std::io::Error::from_raw_os_error(error)
-        );
+        return Err(std::io::Error::from_raw_os_error(error));
     }
+    Ok(())
 }
 
 fn guest_thread_pointer_tp_offset() -> usize {
@@ -1145,6 +1148,30 @@ fn forwarded_guest_signal(signal: i32) -> Option<litebox_common_linux::signal::S
         .find_map(|&(host, guest)| (host == signal).then_some(guest))
 }
 
+/// Block the host signals forwarded to the guest (SIGINT, SIGALRM) on the
+/// calling thread. [`run_thread`] unblocks them while it runs guest code and
+/// restores the caller's mask afterwards, so a host thread that waits for a
+/// guest's other threads after calling this leaves those signals to them:
+/// the guest's exit model handles them instead of the host's default
+/// disposition.
+pub fn block_forwarded_signals() -> std::io::Result<()> {
+    // SAFETY: zero is valid for this integer bitmask.
+    let mut signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: signals is live stack storage; only this thread's mask changes.
+    let error = unsafe {
+        libc::sigemptyset(&raw mut signals);
+        for &(signal, _) in FORWARDED_SIGNALS {
+            libc::sigaddset(&raw mut signals, signal);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, core::ptr::null_mut())
+    };
+    if error == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(error))
+    }
+}
+
 fn host_signals() -> impl Iterator<Item = i32> {
     EXCEPTION_SIGNALS
         .into_iter()
@@ -1175,17 +1202,31 @@ struct ThreadContext<'a> {
     exit: GuestExit,
 }
 
+/// A spawned guest thread: its resource setup is reported to the spawner
+/// through `ready` before the shim's initializer runs. On failure the thread
+/// drops `init_thread` before reporting, so the shim's thread is gone when
+/// `spawn_thread` returns the error.
 fn thread_start(
     init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = PtRegs>>,
     mut ctx: PtRegs,
     vector_state: GuestVectorState,
     process: Arc<ProcessState>,
+    ready: std::sync::mpsc::SyncSender<std::io::Result<()>>,
 ) {
-    initialize_thread_tls();
+    let alt_stack = try_initialize_thread_tls().and_then(|()| SignalAltStack::new());
+    let alt_stack = match alt_stack {
+        Ok(alt_stack) => alt_stack,
+        Err(error) => {
+            drop(init_thread);
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(()));
     set_guest_vector_state(&vector_state);
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
-    run_thread_inner_with_process(shim.as_ref(), &mut ctx, process);
+    run_thread_inner_with_process(shim.as_ref(), &mut ctx, process, alt_stack);
 }
 
 #[derive(Default)]
@@ -1312,18 +1353,23 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         let ctx = ctx.clone();
         let vector_state =
             litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
-        // TODO: report child TLS setup failures synchronously. pthread_setspecific
-        // can still fail after spawn_thread has returned success, causing the child
-        // to exit before running its initialization callback.
+        let (ready, setup) = std::sync::mpsc::sync_channel(1);
         let _handle = std::thread::Builder::new()
-            .spawn(move || thread_start(init_thread, ctx, vector_state, process))?;
-        Ok(())
+            .spawn(move || thread_start(init_thread, ctx, vector_state, process, ready))?;
+        // The thread's per-thread resources exist, or it failed without
+        // running guest code.
+        setup
+            .recv()
+            .unwrap_or_else(|_| Err(std::io::Error::other("guest thread ended during its setup")))
     }
     fn current_thread(&self) -> Self::ThreadHandle {
         ThreadHandle::current()
     }
     fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
         thread.interrupt();
+    }
+    fn yield_thread(&self) {
+        std::thread::yield_now();
     }
 
     #[cfg(debug_assertions)]
@@ -1797,13 +1843,15 @@ where
 }
 
 fn run_thread_inner(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut PtRegs) {
-    run_thread_inner_with_process(shim, ctx, Arc::new(ProcessState::default()));
+    let alt_stack = SignalAltStack::new().expect("failed to allocate signal stack");
+    run_thread_inner_with_process(shim, ctx, Arc::new(ProcessState::default()), alt_stack);
 }
 
 fn run_thread_inner_with_process(
     shim: &dyn EnterShim<ExecutionContext = PtRegs>,
     ctx: &mut PtRegs,
     process: Arc<ProcessState>,
+    alt_stack: SignalAltStack,
 ) {
     let guest_abi = *GUEST_ABI.get().expect("guest ABI must be configured first");
     initialize_thread_tls();
@@ -1883,80 +1931,110 @@ fn run_thread_inner_with_process(
             0,
         );
     });
-    with_signal_alt_stack(|| {
+    alt_stack.install(|| {
         // SAFETY: thread state, handlers and stack are initialized; the caller supplies valid guest mappings.
         unsafe { run_thread_arch(&mut thread_ctx) };
     });
 }
 
-fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
-    let alt_stack_size = (libc::SIGSTKSZ * 2).next_multiple_of(HOST_PAGE_SIZE);
-    let mapping_size = HOST_PAGE_SIZE + alt_stack_size;
-    // SAFETY: allocate fresh anonymous memory without replacing any existing mapping.
-    let stack_base = unsafe {
-        libc::mmap(
-            core::ptr::null_mut(),
-            mapping_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    assert_ne!(
-        stack_base,
-        libc::MAP_FAILED,
-        "failed to allocate signal stack"
-    );
-    let unmap_guard = litebox::utils::defer(|| {
+/// A signal stack mapping with a guard page below it, unmapped on drop.
+struct SignalAltStack {
+    base: *mut libc::c_void,
+    size: usize,
+}
+
+impl SignalAltStack {
+    fn new() -> std::io::Result<Self> {
+        Self::with_size((libc::SIGSTKSZ * 2).next_multiple_of(HOST_PAGE_SIZE))
+    }
+
+    /// A stack of `size` bytes; failing to map it is an error, not a panic,
+    /// so thread creation under memory pressure fails cleanly.
+    fn with_size(size: usize) -> std::io::Result<Self> {
+        let mapping_size = size
+            .checked_add(HOST_PAGE_SIZE)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+        // SAFETY: allocate fresh anonymous memory without replacing any existing mapping.
+        let base = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                mapping_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stack = Self { base, size };
+        // SAFETY: the first page is exclusively owned and outside the usable signal stack.
+        if unsafe { libc::mprotect(base, HOST_PAGE_SIZE, libc::PROT_NONE) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(stack)
+    }
+
+    /// Run `f` with this stack installed as the thread's signal stack, then
+    /// restore the previous one and release the mapping.
+    fn install<R>(self, f: impl FnOnce() -> R) -> R {
+        let alternate = libc::stack_t {
+            ss_sp: self.base.wrapping_byte_add(HOST_PAGE_SIZE),
+            ss_size: self.size,
+            ss_flags: 0,
+        };
+        let unmap_guard = self;
+        // SAFETY: stack_t consists of a nullable pointer and integers, all zero-valid.
+        let mut previous = unsafe { std::mem::zeroed::<libc::stack_t>() };
+        // SAFETY: the writable mapping stays live until the previous altstack is restored.
+        let install_result = unsafe { libc::sigaltstack(&raw const alternate, &raw mut previous) };
         assert_eq!(
-            // SAFETY: this mapping was never installed, or cleanup restored the
-            // previous altstack before releasing this guard.
-            unsafe { libc::munmap(stack_base, mapping_size) },
+            install_result,
+            0,
+            "sigaltstack failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // Darwin libc checks the minimum size even for SS_DISABLE. The kernel
+        // ignores that field when disabling a stack, including a previously absent one.
+        if previous.ss_flags & libc::SS_DISABLE != 0 {
+            previous.ss_size = libc::MINSIGSTKSZ;
+        }
+        // Transfer mapping ownership to the cleanup that must restore the stack first.
+        let _cleanup = litebox::utils::defer(move || {
+            // SAFETY: previous was returned by sigaltstack for this thread and stays live.
+            let result = unsafe { libc::sigaltstack(&raw const previous, core::ptr::null_mut()) };
+            if result != 0 {
+                // The kernel may still reference this mapping. Prevent its guard
+                // from unmapping it during unwinding; process exit reclaims it.
+                core::mem::forget(unmap_guard);
+                panic!(
+                    "failed to restore the host signal stack: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            drop(unmap_guard);
+        });
+        f()
+    }
+}
+
+impl Drop for SignalAltStack {
+    fn drop(&mut self) {
+        assert_eq!(
+            // SAFETY: this mapping was never installed, or `install` restored the
+            // previous altstack before dropping it.
+            unsafe { libc::munmap(self.base, self.size + HOST_PAGE_SIZE) },
             0,
         );
-    });
-    assert_eq!(
-        // SAFETY: the first page is exclusively owned and outside the usable signal stack.
-        unsafe { libc::mprotect(stack_base, HOST_PAGE_SIZE, libc::PROT_NONE) },
-        0,
-    );
-    let alternate = libc::stack_t {
-        ss_sp: stack_base.wrapping_byte_add(HOST_PAGE_SIZE),
-        ss_size: alt_stack_size,
-        ss_flags: 0,
-    };
-    // SAFETY: stack_t consists of a nullable pointer and integers, all zero-valid.
-    let mut previous = unsafe { std::mem::zeroed::<libc::stack_t>() };
-    // SAFETY: the writable mapping stays live until the previous altstack is restored.
-    let install_result = unsafe { libc::sigaltstack(&raw const alternate, &raw mut previous) };
-    assert_eq!(
-        install_result,
-        0,
-        "sigaltstack failed: {}",
-        std::io::Error::last_os_error()
-    );
-    // Darwin libc checks the minimum size even for SS_DISABLE. The kernel
-    // ignores that field when disabling a stack, including a previously absent one.
-    if previous.ss_flags & libc::SS_DISABLE != 0 {
-        previous.ss_size = libc::MINSIGSTKSZ;
     }
-    // Transfer mapping ownership to the cleanup that must restore the stack first.
-    let _cleanup = litebox::utils::defer(move || {
-        // SAFETY: previous was returned by sigaltstack for this thread and stays live.
-        let result = unsafe { libc::sigaltstack(&raw const previous, core::ptr::null_mut()) };
-        if result != 0 {
-            // The kernel may still reference this mapping. Prevent its guard
-            // from unmapping it during unwinding; process exit reclaims it.
-            core::mem::forget(unmap_guard);
-            panic!(
-                "failed to restore the host signal stack: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        drop(unmap_guard);
-    });
-    f()
+}
+
+#[cfg(test)]
+fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
+    SignalAltStack::new()
+        .expect("failed to allocate signal stack")
+        .install(f)
 }
 
 impl ThreadContext<'_> {
@@ -2720,6 +2798,132 @@ mod tests {
     const RW: MemoryRegionPermissions =
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
 
+    /// A condition published with a plain store and then a wake is never
+    /// missed by a thread entering `wait_until` concurrently (no lost wakeup
+    /// between the waiter's state store and condition read and the waker's
+    /// condition store and state read). A lost wakeup fails the test by
+    /// timeout instead of hanging it.
+    #[test]
+    fn wait_until_never_misses_a_concurrent_wake() {
+        use litebox::event::wait::WaitState;
+        use std::sync::atomic::AtomicU32;
+        const ROUNDS: u32 = 20_000;
+        struct Shared {
+            /// The round the waiter is about to wait for.
+            entering: AtomicU32,
+            /// The last round whose condition holds.
+            published: AtomicU32,
+        }
+        let platform = MacosUserland::new();
+        let shared = std::sync::Arc::new(Shared {
+            entering: AtomicU32::new(0),
+            published: AtomicU32::new(0),
+        });
+        let (waker_sender, waker_receiver) = std::sync::mpsc::sync_channel(1);
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let waiter_shared = shared.clone();
+        let _waiter = std::thread::spawn(move || {
+            let state = WaitState::new(platform);
+            let cx = state.context();
+            waker_sender.send(cx.waker().clone()).unwrap();
+            for round in 1..=ROUNDS {
+                waiter_shared.entering.store(round, Ordering::Relaxed);
+                cx.wait_until(|| waiter_shared.published.load(Ordering::Relaxed) >= round)
+                    .unwrap();
+            }
+            done_sender.send(()).unwrap();
+        });
+        let waker = waker_receiver.recv().unwrap();
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(60);
+        for round in 1..=ROUNDS {
+            // Publish while the waiter enters its wait, to hit the window
+            // between its state store and its condition read.
+            while shared.entering.load(Ordering::Relaxed) < round {
+                assert!(std::time::Instant::now() < deadline, "a wakeup was lost");
+                core::hint::spin_loop();
+            }
+            shared.published.store(round, Ordering::Relaxed);
+            waker.wake();
+        }
+        done_receiver
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("a wakeup was lost");
+    }
+
+    /// A signal stack that cannot be mapped is an error for the caller (a
+    /// guest thread's creation), not a panic.
+    #[test]
+    fn unmappable_signal_stack_is_an_error() {
+        let error = SignalAltStack::with_size(usize::MAX / 2)
+            .err()
+            .expect("an impossible mapping fails");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOMEM));
+        assert!(SignalAltStack::new().is_ok());
+    }
+
+    /// `yield_thread` gives the processor to other runnable threads: with
+    /// every CPU busy, yielding switches this thread out where spinning for
+    /// the same time does not.
+    #[test]
+    fn yield_thread_gives_up_the_processor() {
+        fn context_switches() -> i32 {
+            const TASK_EVENTS_INFO: i32 = 2;
+            unsafe extern "C" {
+                fn task_info(task: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
+            }
+            // task_events_info: faults, pageins, cow_faults, messages_sent,
+            // messages_received, syscalls_mach, syscalls_unix, csw.
+            let mut info = [0i32; 8];
+            let mut count = 8u32;
+            // SAFETY: info holds `count` integers; mach_task_self names this task.
+            let result = unsafe {
+                task_info(
+                    mach_task_self(),
+                    TASK_EVENTS_INFO,
+                    info.as_mut_ptr(),
+                    &raw mut count,
+                )
+            };
+            assert_eq!(result, 0);
+            info[7]
+        }
+        fn busy_round(yielding: bool) -> i32 {
+            let platform = MacosUserland::new();
+            let before = context_switches();
+            for _ in 0..2000 {
+                for i in 0..1000 {
+                    core::hint::black_box(i);
+                }
+                if yielding {
+                    litebox::platform::ThreadProvider::yield_thread(platform);
+                }
+            }
+            context_switches() - before
+        }
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spinners: Vec<_> = (0..std::thread::available_parallelism().unwrap().get())
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        core::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(core::time::Duration::from_millis(50));
+        let spinning: i32 = (0..3).map(|_| busy_round(false)).sum();
+        let yielding: i32 = (0..3).map(|_| busy_round(true)).sum();
+        stop.store(true, Ordering::Relaxed);
+        for spinner in spinners {
+            spinner.join().unwrap();
+        }
+        assert!(
+            yielding > 2 * spinning + 20,
+            "yielding {yielding} vs spinning {spinning} context switches"
+        );
+    }
+
     #[test]
     fn signal_altstack_restores_disabled_and_enabled_stacks() {
         extern "C" fn check(_: *mut libc::c_void) -> *mut libc::c_void {
@@ -2949,6 +3153,7 @@ mod tests {
             &InitOnly(std::cell::RefCell::new(Some(f))),
             &mut PtRegs::default(),
             process,
+            SignalAltStack::new().unwrap(),
         );
     }
 
