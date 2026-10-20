@@ -1522,7 +1522,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0)
             .expect("failed to clear guest TLS on execve");
 
-        self.load_program(loader, argv_vec, envp_vec)
+        self.load_program(loader, argv_vec, envp_vec, None)
             .expect("TODO: terminate the process cleanly");
 
         self.init_thread_context(ctx);
@@ -1536,8 +1536,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mut loader: crate::loader::elf::ElfLoader<'_, Platform>,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
+        padding: Option<&[u8; 16]>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
-        let load_info = loader.load(argv, envp, self.init_auxv())?;
+        let load_info = loader.load(argv, envp, padding, self.init_auxv())?;
 
         self.set_task_comm(loader.comm());
 
