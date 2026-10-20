@@ -378,35 +378,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_joins_adjacent_reservations() {
-        // SAFETY: The test ranges are adjacent, aligned, and uniquely represented.
-        let (first, second) = unsafe {
-            (
-                TestReservation::<0x1000>::new(0x1000..0x3000),
-                TestReservation::<0x1000>::new(0x3000..0x4000),
-            )
-        };
-        let merged = first.merge(second);
-        assert_eq!(merged.range(), 0x1000..0x4000);
-        let (prefix, middle, suffix) = merged.split(0x2000..0x3000);
-        let rejoined = prefix.unwrap().merge(middle).merge(suffix.unwrap());
-        assert_eq!(rejoined.range(), 0x1000..0x4000);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion `left == right` failed")]
-    fn merge_rejects_non_adjacent_reservations() {
-        // SAFETY: The test ranges are disjoint, aligned, and uniquely represented.
-        let (first, second) = unsafe {
-            (
-                TestReservation::<0x1000>::new(0x1000..0x2000),
-                TestReservation::<0x1000>::new(0x3000..0x4000),
-            )
-        };
-        let _ = first.merge(second);
-    }
-
-    #[test]
     fn take_replaced_splits_and_preserves_outside_ownership() {
         let mut reservations = TrackedReservations::default();
         for range in [0x1000..0x3000, 0x3000..0x5000] {

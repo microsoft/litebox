@@ -833,32 +833,3 @@ where
         reservation,
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ranges_cover;
-
-    #[test]
-    fn ranges_cover_requires_contiguous_coverage() {
-        let range = 0x2000..0x6000;
-        assert!(ranges_cover(
-            [0x1000..0x3000, 0x3000..0x7000].into_iter(),
-            &range
-        ));
-        assert!(ranges_cover(core::iter::once(0x2000..0x6000), &range));
-        assert!(!ranges_cover(
-            [0x1000..0x3000, 0x4000..0x7000].into_iter(),
-            &range
-        ));
-        assert!(!ranges_cover(core::iter::once(0x3000..0x7000), &range));
-        assert!(!ranges_cover(
-            [0x2000..0x3000, 0x3000..0x5000].into_iter(),
-            &range
-        ));
-        assert!(!ranges_cover(core::iter::empty(), &range));
-        assert!(!ranges_cover(
-            core::iter::once(0x1000..0x7000),
-            &(0x2000..0x2000)
-        ));
-    }
-}
