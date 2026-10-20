@@ -1163,11 +1163,15 @@ impl<P: ShimPlatform> Task<P> {
         let Some(cache_range) = cache_range else {
             return self.mprotect_task_memory(range, protection);
         };
-        // Like XNU, requests beyond a page's maximum protection fail with
-        // EACCES before anything changes. Rewritten code and gate islands are
-        // never writable, and other cache text is never executable, so no
-        // unrewritten code can run. Pages without contents (maximum
-        // PROT_NONE) stay inaccessible.
+        let below = address..cache_range.start;
+        let above = cache_range.end..end;
+        // Like XNU's vm_map_protect, the whole range is checked in address
+        // order before anything changes: a hole fails with ENOMEM, a request
+        // beyond a page's maximum protection with EACCES.
+        self.check_task_memory_protection(below.clone(), protection)?;
+        // Rewritten code and gate islands are never writable, and other cache
+        // text is never executable, so no unrewritten code can run. Pages
+        // without contents (maximum PROT_NONE) stay inaccessible.
         let allowed = self
             .global
             .shared_cache
@@ -1177,9 +1181,10 @@ impl<P: ShimPlatform> Task<P> {
         if !allowed {
             return Err(Errno::EACCES);
         }
+        self.check_task_memory_protection(above.clone(), protection)?;
         // Task memory on either side of the instance takes the normal path,
         // including rewriting before it becomes executable.
-        for part in [address..cache_range.start, cache_range.end..end] {
+        for part in [below, above] {
             if part.start < part.end {
                 self.mprotect_task_memory(part, protection)?;
             }
@@ -1188,6 +1193,34 @@ impl<P: ShimPlatform> Task<P> {
         let cache = cache.as_mut().ok_or(Errno::EACCES)?;
         self.change_permissions(cache_range.clone(), protection)?;
         cache.set_protection(&cache_range, protection);
+        Ok(())
+    }
+
+    /// Whether `mprotect_task_memory(range, protection)` passes the checks
+    /// `protect_mapping` makes before changing anything: `range` has no hole
+    /// (ENOMEM) and its mappings' maximum permissions allow `protection`
+    /// (EACCES), in address order.
+    fn check_task_memory_protection(
+        &self,
+        range: Range<usize>,
+        protection: VmProtection,
+    ) -> Result<(), Errno> {
+        let requested = VmFlags::from_bits_truncate(u32::from(permissions(protection).bits()))
+            & VmFlags::VM_ACCESS_FLAGS;
+        let mut cursor = range.start;
+        for (mapping, flags) in self.global.mm.overlapping(range.clone()) {
+            if mapping.start > cursor {
+                return Err(Errno::ENOMEM);
+            }
+            let maximum = VmFlags::from_bits_truncate(flags.bits() >> 4);
+            if flags & VmFlags::VM_ACCESS_FLAGS != requested && !maximum.contains(requested) {
+                return Err(Errno::EACCES);
+            }
+            cursor = mapping.end;
+        }
+        if cursor < range.end {
+            return Err(Errno::ENOMEM);
+        }
         Ok(())
     }
 
@@ -2089,6 +2122,122 @@ mod tests {
             Err(Errno::EINVAL)
         );
         task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    fn instruction_at(site: usize) -> u32 {
+        u32::from_le_bytes(
+            *UserPtr::<u8>::from_usize(site)
+                .to_owned_slice::<Platform>(4)
+                .unwrap()
+                .first_chunk()
+                .unwrap(),
+        )
+    }
+
+    fn flags_at(task: &Task<Platform>, address: usize) -> VmFlags {
+        task.global
+            .mm
+            .overlapping(address..address + 1)
+            .first()
+            .unwrap()
+            .1
+    }
+
+    fn map_image_at(
+        task: &Task<Platform>,
+        address: usize,
+        flags: MmapFlags,
+    ) -> Result<usize, Errno> {
+        task.sys_mmap(
+            address,
+            PAGE_SIZE,
+            VmProtection::READ,
+            flags | MmapFlags::FIXED,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn executable_mprotect_across_the_shared_cache_rewrites_task_memory() {
+        let base = 0x74_0000_0000;
+        let program = crate::tests::install_test_cache_for(task_with_file(&macho_image()), base);
+        let task = &program.entrypoints.task;
+        // Mach-O code right below the instance's rewritten code page (maximum
+        // RX): an executable request over both rewrites the task memory part.
+        let below = base - PAGE_SIZE;
+        assert_eq!(map_image_at(task, below, MmapFlags::PRIVATE), Ok(below));
+        assert_eq!(instruction_at(below + TEXT), SVC);
+        assert_eq!(
+            task.sys_mprotect(
+                below,
+                2 * PAGE_SIZE,
+                VmProtection::READ | VmProtection::EXECUTE
+            ),
+            Ok(())
+        );
+        assert!(flags_at(task, below).contains(VmFlags::VM_EXEC));
+        assert!(
+            decode_branch_target(instruction_at(below + TEXT), (below + TEXT) as u64).is_some()
+        );
+        task.sys_munmap(below, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn mprotect_across_the_shared_cache_checks_every_part_first() {
+        use crate::shared_cache::{SharedCacheBacking, SharedCacheLayout, SharedCachePiece};
+        const RW: VmProtection = VmProtection::READ.union(VmProtection::WRITE);
+
+        let base = 0x75_0000_0000;
+        let program = crate::tests::loaded_program(task_with_file(&macho_image()));
+        let task = &program.entrypoints.task;
+        let cache = base..base + PAGE_SIZE;
+        program.reserve_shared_cache(cache.clone()).unwrap();
+        let data = [0x22u8; 4];
+        program
+            .install_shared_cache(&SharedCacheLayout {
+                range: cache.clone(),
+                pieces: &[SharedCachePiece {
+                    range: cache.clone(),
+                    backing: SharedCacheBacking::Copy(&data),
+                    protection: VmProtection::READ,
+                    max_protection: RW,
+                }],
+                code_regions: &[],
+                gate_islands: &[],
+                attribution: None,
+                pager: None,
+            })
+            .unwrap();
+        let below = base - PAGE_SIZE;
+        assert_eq!(map_image_at(task, below, MmapFlags::PRIVATE), Ok(below));
+        // A read-only shared file mapping above the instance: its maximum
+        // refuses writes, so neither the task memory below nor the cache
+        // page becomes writable.
+        assert_eq!(
+            map_image_at(task, cache.end, MmapFlags::SHARED),
+            Ok(cache.end)
+        );
+        assert!(!flags_at(task, cache.end).contains(VmFlags::VM_MAYWRITE));
+        assert_eq!(
+            task.sys_mprotect(below, 3 * PAGE_SIZE, RW),
+            Err(Errno::EACCES)
+        );
+        assert!(!flags_at(task, below).contains(VmFlags::VM_WRITE));
+        assert!(!flags_at(task, base).contains(VmFlags::VM_WRITE));
+        // A hole above the instance: ENOMEM, and nothing changes either.
+        task.sys_munmap(cache.end, PAGE_SIZE).unwrap();
+        assert_eq!(
+            task.sys_mprotect(below, 3 * PAGE_SIZE, RW),
+            Err(Errno::ENOMEM)
+        );
+        assert!(!flags_at(task, below).contains(VmFlags::VM_WRITE));
+        assert!(!flags_at(task, base).contains(VmFlags::VM_WRITE));
+        // Without the hole the same request applies to every part.
+        assert_eq!(task.sys_mprotect(below, 2 * PAGE_SIZE, RW), Ok(()));
+        assert!(flags_at(task, below).contains(VmFlags::VM_WRITE));
+        assert!(flags_at(task, base).contains(VmFlags::VM_WRITE));
+        task.sys_munmap(below, PAGE_SIZE).unwrap();
     }
 
     #[test]

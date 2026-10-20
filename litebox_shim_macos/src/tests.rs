@@ -138,7 +138,7 @@ fn platform_syscall_sets_and_gets_tsd_base_like_xnu() {
     assert_eq!(task.process.exit_status(), None);
 }
 
-fn loaded_program(task: Task<Platform>) -> LoadedProgram<Platform> {
+pub(crate) fn loaded_program(task: Task<Platform>) -> LoadedProgram<Platform> {
     let process = task.process.clone();
     LoadedProgram {
         entrypoints: MacosShimEntrypoints {
@@ -379,12 +379,16 @@ fn shared_cache_rewrite_fails_closed_without_reachable_island() {
 const RX: VmProtection = VmProtection::READ.union(VmProtection::EXECUTE);
 const RW: VmProtection = VmProtection::READ.union(VmProtection::WRITE);
 
-/// Install a six-page instance at `base`: rewritten code (page 0), a Source
-/// piece (pages 1-2) whose page 2 becomes the used gate island, copied data
-/// (page 3, maximum RW), a Paged piece (page 4, supplied as 0x77 bytes) and a
-/// Reserved piece (page 5).
 fn install_test_cache(base: usize) -> LoadedProgram<Platform> {
-    let program = loaded_program(task(MacosShimBuilder::new(Platform::new()).build()));
+    install_test_cache_for(task(MacosShimBuilder::new(Platform::new()).build()), base)
+}
+
+/// Install a six-page instance at `base` for `task`: rewritten code (page 0),
+/// a Source piece (pages 1-2) whose page 2 becomes the used gate island,
+/// copied data (page 3, maximum RW), a Paged piece (page 4, supplied as 0x77
+/// bytes) and a Reserved piece (page 5).
+pub(crate) fn install_test_cache_for(task: Task<Platform>, base: usize) -> LoadedProgram<Platform> {
+    let program = loaded_program(task);
     let range = base..base + 6 * PAGE_SIZE;
     program.reserve_shared_cache(range.clone()).unwrap();
     let page = |index: usize| base + index * PAGE_SIZE..base + (index + 1) * PAGE_SIZE;
@@ -635,8 +639,17 @@ fn mprotect_across_the_shared_cache_boundary_splits_at_the_instance() {
         task.sys_mprotect(base + PAGE_SIZE, 2 * PAGE_SIZE, VmProtection::READ),
         Err(Errno::ENOMEM)
     );
-    // Executable task memory next to the instance still goes through the
-    // normal (rewriting) path; non-executable cache pages still refuse it.
+    // The whole range is checked before anything changes: a hole above the
+    // instance leaves the task memory below it untouched.
+    assert_eq!(task.sys_mprotect(below, PAGE_SIZE, RW), Ok(()));
+    assert_eq!(
+        task.sys_mprotect(below, 4 * PAGE_SIZE, VmProtection::READ),
+        Err(Errno::ENOMEM)
+    );
+    assert!(guest_flags(task, below).contains(VmFlags::VM_WRITE));
+    assert_eq!(cache_protection(base), VmProtection::READ);
+    // Non-executable cache pages refuse executable requests before the task
+    // memory next to them changes.
     assert_eq!(
         task.sys_mprotect(below, 2 * PAGE_SIZE, RX),
         Err(Errno::EACCES)

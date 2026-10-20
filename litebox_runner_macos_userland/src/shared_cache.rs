@@ -518,12 +518,39 @@ fn split_at_mappings(
     split
 }
 
+/// The first host VM region that contains or follows `address`, or `None`
+/// if there is none.
+fn next_host_region(address: u64) -> Result<Option<Range<u64>>> {
+    const KERN_INVALID_ADDRESS: i32 = 1;
+    const VM_REGION_BASIC_INFO_64: i32 = 9;
+    let mut start = address;
+    let mut size = 0;
+    let mut info = [0i32; 16];
+    let mut count = 9u32;
+    let mut object = 0;
+    // SAFETY: all outputs are valid; VM_REGION_BASIC_INFO_64 writes 9 ints.
+    let result = unsafe {
+        mach_vm_region(
+            mach_task_self(),
+            &raw mut start,
+            &raw mut size,
+            VM_REGION_BASIC_INFO_64,
+            info.as_mut_ptr(),
+            &raw mut count,
+            &raw mut object,
+        )
+    };
+    match result {
+        0 => Ok(Some(start..start.saturating_add(size))),
+        KERN_INVALID_ADDRESS => Ok(None),
+        error => bail!("mach_vm_region({address:#x}) failed: {error}"),
+    }
+}
+
 /// The lowest page-aligned address at or above `from` (and
 /// [`SHARED_CACHE_MIN_ADDRESS`]) where `length` bytes are free in the host
 /// and end at or below `limit`; `Ok(None)` if there is none.
 fn free_host_range(from: u64, length: u64, limit: u64) -> Result<Option<u64>> {
-    const KERN_INVALID_ADDRESS: i32 = 1;
-    const VM_REGION_BASIC_INFO_64: i32 = 9;
     let Some(mut candidate) = from
         .max(SHARED_CACHE_MIN_ADDRESS as u64)
         .checked_next_multiple_of(PAGE)
@@ -534,48 +561,36 @@ fn free_host_range(from: u64, length: u64, limit: u64) -> Result<Option<u64>> {
         let Some(end) = candidate.checked_add(length).filter(|end| *end <= limit) else {
             return Ok(None);
         };
-        let mut address = candidate;
-        let mut size = 0;
-        let mut info = [0i32; 16];
-        let mut count = 9u32;
-        let mut object = 0;
-        // SAFETY: all outputs are valid; VM_REGION_BASIC_INFO_64 writes 9 ints.
-        let result = unsafe {
-            mach_vm_region(
-                mach_task_self(),
-                &raw mut address,
-                &raw mut size,
-                VM_REGION_BASIC_INFO_64,
-                info.as_mut_ptr(),
-                &raw mut count,
-                &raw mut object,
-            )
+        let region = match next_host_region(candidate)? {
+            Some(region) if region.start < end => region,
+            _ => return Ok(Some(candidate)),
         };
-        match result {
-            // No region at or above `candidate`.
-            KERN_INVALID_ADDRESS => return Ok(Some(candidate)),
-            0 if address >= end => return Ok(Some(candidate)),
-            0 => {}
-            error => bail!("mach_vm_region({candidate:#x}) failed: {error}"),
-        }
         // The region contains or follows `candidate`, so this advances.
-        let Some(next) = address
-            .checked_add(size)
-            .and_then(|next| next.checked_next_multiple_of(PAGE))
-        else {
+        let Some(next) = region.end.checked_next_multiple_of(PAGE) else {
             return Ok(None);
         };
         candidate = next;
     }
 }
 
+/// Whether any host VM region overlaps `range`.
+fn host_range_occupied(range: Range<u64>) -> Result<bool> {
+    Ok(next_host_region(range.start)?.is_some_and(|region| region.start < range.end))
+}
+
 /// Reserve the first free range of `length` bytes found by `free_range`
 /// (given a search start) with `reserve`. Only placement conflicts, such as
 /// a concurrent host allocation, are retried, past the conflicting address
 /// and at most [`RESERVATION_ATTEMPTS`] times.
+///
+/// The native allocator's refusal of a fixed range does not say why (an
+/// occupied range and, say, `RLIMIT_AS` both give `KERN_NO_SPACE`), so a
+/// refusal is a conflict only if `occupied` (the host's regions) confirms
+/// the range is in use; otherwise it fails at once.
 fn reserve_free_range(
     length: u64,
     mut free_range: impl FnMut(u64) -> Result<Option<u64>>,
+    mut occupied: impl FnMut(Range<u64>) -> Result<bool>,
     mut reserve: impl FnMut(Range<usize>) -> Result<(), SharedCacheInstallError>,
 ) -> Result<u64> {
     let mut from = SHARED_CACHE_MIN_ADDRESS as u64;
@@ -585,7 +600,15 @@ fn reserve_free_range(
         let range = usize::try_from(base)?..usize::try_from(base + length)?;
         match reserve(range) {
             Ok(()) => return Ok(base),
-            Err(SharedCacheInstallError::ReservationConflict) => from = base + PAGE,
+            Err(SharedCacheInstallError::ReservationConflict) => {
+                if !occupied(base..base + length)? {
+                    bail!(
+                        "reserving the guest cache at {base:#x}: the host refused \
+                         {length:#x} free bytes (address space or resource limit)"
+                    );
+                }
+                from = base + PAGE;
+            }
             Err(error) => bail!("reserving the guest cache at {base:#x}: {error}"),
         }
     }
@@ -712,6 +735,7 @@ pub(crate) fn install<P: ShimPlatform>(
     let base = reserve_free_range(
         size,
         |from| free_host_range(from, size, limit),
+        host_range_occupied,
         |range| program.reserve_shared_cache(range),
     )?;
     let slide = base - start;
@@ -1084,6 +1108,7 @@ mod tests {
                 searches.push(from);
                 Ok(Some(from))
             },
+            |_| Ok(true),
             |_| {
                 attempts += 1;
                 if attempts == 1 {
@@ -1102,6 +1127,7 @@ mod tests {
             reserve_free_range(
                 length,
                 |from| Ok(Some(from)),
+                |_| Ok(true),
                 |_| {
                     attempts += 1;
                     Err(SharedCacheInstallError::Reservation)
@@ -1116,6 +1142,7 @@ mod tests {
             reserve_free_range(
                 length,
                 |from| Ok(Some(from)),
+                |_| Ok(true),
                 |_| {
                     attempts += 1;
                     Err(SharedCacheInstallError::ReservationConflict)
@@ -1131,11 +1158,63 @@ mod tests {
                 reserve_free_range(
                     length,
                     |_| result.take().unwrap(),
+                    |_| panic!("nothing to check"),
                     |_| panic!("nothing to reserve")
                 )
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn refused_reservations_of_free_host_ranges_are_not_retried() {
+        let length = 4 * PAGE;
+        let limit = litebox_platform_macos_userland::TASK_ADDR_MAX as u64;
+        // A real free host range: the native allocator refused it for
+        // another reason (KERN_NO_SPACE from a resource limit is reported as
+        // a placement conflict), so it fails at once with that diagnostic.
+        let free = free_host_range(0, length, limit).unwrap().unwrap();
+        assert!(!host_range_occupied(free..free + length).unwrap());
+        let mut attempts = 0;
+        let error = reserve_free_range(
+            length,
+            |_| Ok(Some(free)),
+            host_range_occupied,
+            |_| {
+                attempts += 1;
+                Err(SharedCacheInstallError::ReservationConflict)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("refused"), "{error}");
+        // A range the host really uses is a conflict and is searched past.
+        let heap = vec![0u8; 1];
+        let used = heap.as_ptr() as u64 & !(PAGE - 1);
+        assert!(host_range_occupied(used..used + length).unwrap());
+        let mut attempts = 0;
+        let base = reserve_free_range(
+            length,
+            |from| {
+                Ok(Some(if from == SHARED_CACHE_MIN_ADDRESS as u64 {
+                    used
+                } else {
+                    from
+                }))
+            },
+            host_range_occupied,
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(SharedCacheInstallError::ReservationConflict)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!((attempts, base), (2, used + PAGE));
+        drop(heap);
     }
 
     #[test]

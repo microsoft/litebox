@@ -30,7 +30,10 @@ pub const SHARED_CACHE_MIN_ADDRESS: usize = 64 << 30;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SharedCacheInstallError {
     AlreadyInstalled,
-    /// Part of the address range is already mapped, by the guest or the host.
+    /// Part of the address range is already mapped by the guest, or the host
+    /// refused the fixed range. The host reports other refusals (such as
+    /// `RLIMIT_AS`) the same way, so callers confirm the range is occupied
+    /// before retrying elsewhere.
     ReservationConflict,
     /// The address range cannot be reserved for another reason.
     Reservation,
