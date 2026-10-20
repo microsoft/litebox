@@ -467,9 +467,9 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
     /// `range`, with `permissions`.
     ///
     /// `Replace` atomically overwrites pages owned by this registry; with
-    /// `NoReplace`, the range must be unowned and unmapped. Both must be
-    /// native-page aligned. Later writes never reach `source`, and changes to
-    /// `source` must not be relied upon to be visible either.
+    /// `NoReplace`, the range must be unowned and unmapped. `range` and
+    /// `source` must be native-page aligned. Later writes never reach `source`,
+    /// and changes to `source` must not be relied upon to be visible either.
     ///
     /// # Safety
     ///

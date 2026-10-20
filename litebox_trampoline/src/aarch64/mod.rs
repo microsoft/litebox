@@ -16,8 +16,7 @@
 //!
 //! Direct-TLS gates address anchor-relative fields; indirect-TLS gates access
 //! fixed fields through the block pointer. Read gates return logical `TPIDR_EL0`
-//! for Linux guests or `TPIDRRO_EL0` for Darwin guests. Host-aware TPIDRRO gates
-//! preserve native reads outside guest execution.
+//! for Linux guests or `TPIDRRO_EL0` for Darwin guests.
 //!
 //! Linux normally leaves guest x18 native; Linux guests on macOS virtualize it.
 //!
@@ -481,7 +480,7 @@ enum GateKind {
     X18Adr = 5,
     X18Branch = 6,
     X18StackWriteback = 7,
-    // 8 was a removed host-aware TPIDRRO gate kind; never reuse it.
+    // 8 is retired: older rewritten binaries may still encode it.
 }
 
 impl GateKind {

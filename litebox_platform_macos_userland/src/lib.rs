@@ -47,11 +47,7 @@ pub enum GuestAbi {
     Darwin = litebox_trampoline::aarch64::DARWIN_SVC_FRAME_BYTES as usize,
 }
 
-struct GuestConfiguration {
-    abi: GuestAbi,
-}
-
-static GUEST_CONFIGURATION: OnceLock<GuestConfiguration> = OnceLock::new();
+static GUEST_ABI: OnceLock<GuestAbi> = OnceLock::new();
 
 /// Set the process-wide guest ABI before running or spawning guest threads.
 ///
@@ -59,18 +55,10 @@ static GUEST_CONFIGURATION: OnceLock<GuestConfiguration> = OnceLock::new();
 /// Panics if a different ABI has already been configured.
 pub fn set_guest_abi(abi: GuestAbi) {
     assert_eq!(
-        GUEST_CONFIGURATION
-            .get_or_init(|| GuestConfiguration { abi })
-            .abi,
+        *GUEST_ABI.get_or_init(|| abi),
         abi,
         "guest ABI is already configured"
     );
-}
-
-fn guest_configuration() -> &'static GuestConfiguration {
-    GUEST_CONFIGURATION
-        .get()
-        .expect("guest ABI must be configured first")
 }
 
 /// Native page size on AArch64 macOS.
@@ -1310,7 +1298,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         ctx: &Self::ExecutionContext,
         init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>>,
     ) -> Result<(), Self::ThreadSpawnError> {
-        if GUEST_CONFIGURATION.get().is_none() {
+        if GUEST_ABI.get().is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "guest ABI must be configured before spawning guest threads",
@@ -1817,7 +1805,7 @@ fn run_thread_inner_with_process(
     ctx: &mut PtRegs,
     process: Arc<ProcessState>,
 ) {
-    let config = guest_configuration();
+    let guest_abi = *GUEST_ABI.get().expect("guest ABI must be configured first");
     initialize_thread_tls();
     register_exception_handlers().expect("re-registering macOS exception handlers");
     assert!(
@@ -1842,7 +1830,7 @@ fn run_thread_inner_with_process(
         waker: Mutex::new(None),
     }));
     let mut thread_ctx = ThreadContext {
-        guest_abi: config.abi,
+        guest_abi,
         shim,
         ctx,
         host_sp: 0,
