@@ -3,6 +3,9 @@
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
+// Import-closure tests require dumpbin.exe, either on PATH or installed with
+// Visual Studio's x64 C++ tools (located through vswhere.exe).
+
 /// Runs a hello-world guest PE end to end through the userland broker.
 #[test]
 fn run_hello_world_pe() {
@@ -191,7 +194,12 @@ fn brokered_windows_runner_command(initial_files: &std::path::Path) -> std::proc
     command
 }
 
-/// Stages the guest system DLLs and locale tables the PE fixture needs.
+/// Stages the minimal guest system DLLs and locale tables the lightweight PE
+/// fixtures need. These fixtures import only a tiny surface, so a fixed minimal
+/// set is deliberately used rather than the full transitive closure: walking
+/// `kernel32`'s real closure would stage hundreds of DLLs and exhaust the guest
+/// allocator. The transitive-closure helpers are used instead for real
+/// third-party applications.
 fn stage_system_fixtures(test_dir: &std::path::Path) {
     for dll_name in [
         "ntdll.dll",
@@ -305,6 +313,33 @@ pub unsafe extern "system" fn mainCRTStartup() -> ! {
         );
         ExitProcess(u32::from(ok == 0 || written as usize != MESSAGE.len()));
     }
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+"#;
+
+/// A minimal PE that imports a single `ntdll` symbol and nothing else. `ntdll`
+/// is a true leaf (it has no regular or delay imports of its own), so staging
+/// this fixture's closure resolves and stages exactly one DLL — `ntdll.dll` —
+/// keeping the hermetic closure-walk test fast and deterministic without any
+/// external binary.
+const NTDLL_ONLY_PE_SOURCE: &str = r#"
+#![no_std]
+#![no_main]
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn RtlExitUserProcess(exit_code: u32) -> !;
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn mainCRTStartup() -> ! {
+    unsafe { RtlExitUserProcess(0) }
 }
 
 #[panic_handler]
@@ -522,6 +557,641 @@ fn build_rewritten_system_dll(test_dir: &std::path::Path, dll_name: &str) -> std
     };
     std::fs::write(&dll_path, rewritten).unwrap();
     dll_path
+}
+
+// Resolves an api-set contract to the host module that implements it, by asking
+// the host loader directly (`api-ms-*`/`ext-ms-*` names are not physical files).
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryExW(
+        name: *const u16,
+        file: *mut core::ffi::c_void,
+        flags: u32,
+    ) -> *mut core::ffi::c_void;
+    fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+    fn GetModuleFileNameW(module: *mut core::ffi::c_void, filename: *mut u16, size: u32) -> u32;
+}
+
+/// `LOAD_LIBRARY_SEARCH_SYSTEM32` — restrict DLL resolution to System32.
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+
+fn find_executable_on_path(name: &str, paths: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    std::env::split_paths(paths)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.join(name))
+        .find(|path| path.is_file())
+}
+
+#[test]
+fn find_executable_on_path_respects_order_and_skips_directories() {
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("executable_lookup");
+    let directory = test_dir.join("directory");
+    let first = test_dir.join("first with spaces");
+    let second = test_dir.join("second");
+    std::fs::create_dir_all(directory.join("node.exe")).unwrap();
+    for dir in [&first, &second] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("node.exe"), b"fixture").unwrap();
+    }
+    let paths = std::env::join_paths([&directory, &first, &second]).unwrap();
+    assert_eq!(
+        find_executable_on_path("node.exe", &paths),
+        Some(first.join("node.exe"))
+    );
+    let paths = std::env::join_paths([&second, &first]).unwrap();
+    assert_eq!(
+        find_executable_on_path("node.exe", &paths),
+        Some(second.join("node.exe"))
+    );
+    assert_eq!(find_executable_on_path("missing.exe", &paths), None);
+    assert_eq!(
+        find_executable_on_path("node.exe", std::ffi::OsStr::new("")),
+        None
+    );
+}
+
+fn dumpbin_path() -> &'static std::path::Path {
+    static DUMPBIN: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
+        if let Some(path) = std::env::var_os("PATH")
+            .and_then(|paths| find_executable_on_path("dumpbin.exe", &paths))
+        {
+            return path;
+        }
+
+        let vswhere = std::path::PathBuf::from(
+            std::env::var_os("ProgramFiles(x86)")
+                .expect("ProgramFiles(x86) is not set; put dumpbin.exe on PATH"),
+        )
+        .join(r"Microsoft Visual Studio\Installer\vswhere.exe");
+        let output = std::process::Command::new(&vswhere)
+            .args([
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-find",
+                r"VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe",
+            ])
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to run `{}`: {error}; install Visual Studio's x64 C++ tools or put dumpbin.exe on PATH", vswhere.display())
+            });
+        assert!(
+            output.status.success(),
+            "vswhere failed: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("vswhere output is not UTF-8")
+            .lines()
+            .map(|line| std::path::PathBuf::from(line.trim()))
+            .find(|path| path.is_file())
+            .expect(
+                "dumpbin.exe not found; install Visual Studio's x64 C++ tools or put it on PATH",
+            )
+    });
+    &DUMPBIN
+}
+
+#[derive(Debug, Default)]
+struct ImportScan {
+    names: Vec<String>,
+    regular_names: Vec<String>,
+}
+
+/// Parses dumpbin's regular and delay-load dependency sections, ignoring the
+/// input filename and section summary. Diagnostics are errors even when
+/// dumpbin exits successfully (for example, warning LNK4048 for invalid input).
+fn parse_dumpbin_dependents(output: &str) -> Result<ImportScan, String> {
+    let mut scan = ImportScan::default();
+    let mut regular = None;
+    let mut is_pe = false;
+    let mut has_summary = false;
+    for line in output.lines().map(str::trim) {
+        if line.contains(": warning ")
+            || line.contains(": error ")
+            || line.contains(": fatal error ")
+        {
+            return Err(line.to_owned());
+        }
+        match line {
+            "File Type: DLL" | "File Type: EXECUTABLE IMAGE" => is_pe = true,
+            "Image has the following dependencies:" => regular = Some(true),
+            "Image has the following delay load dependencies:" => regular = Some(false),
+            "Summary" => {
+                regular = None;
+                has_summary = true;
+            }
+            "" => {}
+            name => {
+                if let Some(regular) = regular {
+                    let name = staged_file_name(name)
+                        .ok_or_else(|| format!("invalid dumpbin dependency name `{name}`"))?;
+                    if regular {
+                        scan.regular_names.push(name.clone());
+                    }
+                    scan.names.push(name);
+                }
+            }
+        }
+    }
+    if !is_pe || !has_summary {
+        return Err(format!(
+            "unrecognized or incomplete dumpbin output:\n{output}"
+        ));
+    }
+    Ok(scan)
+}
+
+fn scan_imports(image: &std::path::Path) -> Result<ImportScan, String> {
+    let output = std::process::Command::new(dumpbin_path())
+        .args(["/NOLOGO", "/DEPENDENTS"])
+        .arg(image)
+        .output()
+        .map_err(|error| format!("failed to start dumpbin: {error}"))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(format!(
+            "dumpbin failed for `{}`: {}\nstdout:\n{}\nstderr:\n{}",
+            image.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("dumpbin output is not UTF-8: {error}"))?;
+    parse_dumpbin_dependents(&stdout)
+        .map_err(|error| format!("dumpbin could not inspect `{}`: {error}", image.display()))
+}
+
+/// Validates that an imported name is a single normal filename component and
+/// returns it lowercased. Import names come from an untrusted guest PE, so an
+/// absolute path or one containing `..` (which would escape the fixture
+/// System32 directory when joined) is rejected, returning `None`.
+fn staged_file_name(name: &str) -> Option<String> {
+    let lowered = name.to_ascii_lowercase();
+    let mut components = std::path::Path::new(&lowered).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None) => {
+            Some(component.to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Resolves an imported name to the host System32 file that must be staged.
+///
+/// Real DLL imports map to themselves. Api-set contracts are resolved through
+/// the host loader to their implementing module. Contracts with no host
+/// implementation (empty-target api-sets such as `ext-ms-win-core-winrt-remote`)
+/// resolve to `None` and are skipped by the caller.
+fn resolve_to_host_dll(import_name: &str) -> Option<String> {
+    let lowercased = import_name.to_ascii_lowercase();
+    if !(lowercased.starts_with("api-ms-") || lowercased.starts_with("ext-ms-")) {
+        // A real DLL import maps to itself, but only if it is a bare filename;
+        // a path-bearing name from an untrusted PE is rejected.
+        return staged_file_name(import_name);
+    }
+
+    let wide: Vec<u16> = import_name
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect();
+    // Restrict the search to System32 so resolution cannot be redirected by the
+    // test process's working directory or PATH.
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 string; the module handle,
+    // if non-null, is released with `FreeLibrary` before returning.
+    let module = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            core::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if module.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 260];
+    let capacity = u32::try_from(buffer.len()).expect("buffer length fits in u32");
+    // SAFETY: `module` is a live handle from `LoadLibraryExW`; `buffer` is a
+    // writable array of `buffer.len()` `u16`s.
+    let length = unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), capacity) } as usize;
+    // SAFETY: `module` is a live handle previously returned by `LoadLibraryExW`.
+    unsafe {
+        FreeLibrary(module);
+    }
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buffer[..length]);
+    let file_name = std::path::Path::new(&path).file_name()?.to_string_lossy();
+    staged_file_name(&file_name)
+}
+
+/// Stages the transitive import closure of a guest PE: walks its imports,
+/// resolves api-set contracts to host modules, rewrites and stages each real
+/// DLL, and recurses into every staged DLL's own imports.
+///
+/// Returns a [`StagingReport`] recording which DLLs were staged, which were
+/// skipped (with a reason). Failed import scans abort staging instead of
+/// silently treating an unreadable import table as an empty closure.
+///
+/// This is a *floor* for harness DLL staging only — it does NOT touch the
+/// shim's `API_SET_MAPPINGS` table. A contract it resolves and stages here can
+/// still fail to load in the guest if that contract is absent from the shim
+/// table; surfacing those api-set-table gaps stays with runtime iteration, not
+/// this helper. Likewise, export forwarders (`kernel32.f -> kernelbase.f`) are
+/// not followed here — the import-table walk under-approximates the true
+/// closure, and any forwarder target it misses is expected to be staged by the
+/// runtime iteration pass rather than by this static floor. Missing or
+/// unrewritable host DLLs are skipped with a report rather than panicking,
+/// since an open closure walk legitimately encounters modules that cannot be
+/// staged.
+#[derive(Default)]
+struct StagingReport {
+    staged: Vec<String>,
+    skipped: Vec<String>,
+}
+
+fn stage_transitive_import_closure(
+    test_dir: &std::path::Path,
+    guest_image: &std::path::Path,
+) -> StagingReport {
+    stage_import_closure(test_dir, [guest_image], true)
+}
+
+fn stage_startup_import_closures<'a>(
+    test_dir: &std::path::Path,
+    guest_images: impl IntoIterator<Item = &'a std::path::Path>,
+) -> StagingReport {
+    stage_import_closure(test_dir, guest_images, false)
+}
+
+fn stage_import_closure<'a>(
+    test_dir: &std::path::Path,
+    guest_images: impl IntoIterator<Item = &'a std::path::Path>,
+    include_delay_imports: bool,
+) -> StagingReport {
+    let mut report = StagingReport::default();
+    let mut staged = std::collections::BTreeSet::new();
+    let mut worklist = Vec::new();
+
+    for guest_image in guest_images {
+        let scan = scan_imports(guest_image).unwrap_or_else(|error| panic!("closure: {error}"));
+        worklist.extend(if include_delay_imports {
+            scan.names
+        } else {
+            scan.regular_names
+        });
+    }
+
+    while let Some(import_name) = worklist.pop() {
+        let Some(host_dll) = resolve_to_host_dll(&import_name) else {
+            let reason = format!("unresolved import `{import_name}`");
+            println!("closure: skipping {reason}");
+            report.skipped.push(reason);
+            continue;
+        };
+        // Visited-set keyed by the resolved real DLL breaks ntdll/kernelbase/
+        // kernel32 import cycles.
+        if !staged.insert(host_dll.clone()) {
+            continue;
+        }
+
+        let host_path = host_system32_file_path(&host_dll);
+        let host_bytes = match std::fs::read(&host_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let reason = format!("`{host_dll}` (unreadable host DLL: {error})");
+                println!("closure: skipping {reason}");
+                report.skipped.push(reason);
+                continue;
+            }
+        };
+
+        // Recurse into the DLL's own imports regardless of whether the DLL
+        // itself is rewritable, so the closure stays complete.
+        let scan = scan_imports(&host_path).unwrap_or_else(|error| panic!("closure: {error}"));
+        worklist.extend(if include_delay_imports {
+            scan.names
+        } else {
+            scan.regular_names
+        });
+
+        match litebox_syscall_rewriter::rewrite_binary(&host_bytes, None) {
+            Ok(rewritten) => {
+                let dll_path = fixture_system32_path(test_dir, &host_dll);
+                std::fs::write(&dll_path, rewritten).unwrap();
+                println!("closure: staged `{host_dll}`");
+                report.staged.push(host_dll);
+            }
+            // Narrow skip: only DLLs whose dense syscall stubs cannot be patched
+            // are skipped-with-report. Any other rewrite error is a real defect
+            // and panics loudly rather than silently under-staging a DLL the
+            // guest genuinely needs.
+            Err(litebox_syscall_rewriter::Error::UnpatchableSyscalls(reason)) => {
+                let reason = format!("`{host_dll}` (unpatchable syscalls: {reason})");
+                println!("closure: skipping {reason}");
+                report.skipped.push(reason);
+            }
+            Err(error) => {
+                panic!("closure: failed to rewrite `{host_dll}`: {error}");
+            }
+        }
+    }
+
+    for nls_name in ["c_1252.nls", "c_437.nls", "c_10000.nls", "locale.nls"] {
+        copy_host_system32_file(test_dir, nls_name);
+    }
+
+    report
+}
+
+/// `staged_file_name` must reject path-bearing import names (traversal defense)
+/// and accept bare filenames.
+#[test]
+fn staged_file_name_rejects_path_traversal() {
+    assert_eq!(
+        staged_file_name("kernel32.dll").as_deref(),
+        Some("kernel32.dll")
+    );
+    assert_eq!(
+        staged_file_name("KERNEL32.DLL").as_deref(),
+        Some("kernel32.dll")
+    );
+    assert_eq!(staged_file_name(r"..\..\evil.dll"), None);
+    assert_eq!(staged_file_name(r"C:\Windows\evil.dll"), None);
+    assert_eq!(staged_file_name("sub/dir.dll"), None);
+    assert_eq!(staged_file_name(".."), None);
+}
+
+/// `resolve_to_host_dll` maps a real DLL to itself and an api-set contract to
+/// its host implementer via the host loader. Uses a contract known to be absent
+/// from the shim's `API_SET_MAPPINGS`, proving host-loader resolution (not the
+/// shim table) is the staging authority.
+#[test]
+fn resolve_to_host_dll_maps_real_dll_and_absent_contract() {
+    assert_eq!(
+        resolve_to_host_dll("ntdll.dll").as_deref(),
+        Some("ntdll.dll")
+    );
+    assert_eq!(
+        resolve_to_host_dll("api-ms-win-core-libraryloader-l1-1-0").as_deref(),
+        Some("kernelbase.dll"),
+    );
+    // An empty-target / nonexistent contract has no host implementation.
+    assert_eq!(
+        resolve_to_host_dll("api-ms-win-does-not-exist-l1-1-0"),
+        None
+    );
+}
+
+#[test]
+fn scan_imports_parses_host_dll() {
+    let names = scan_imports(&host_system32_file_path("ucrtbase.dll"))
+        .unwrap()
+        .names;
+    assert!(!names.is_empty(), "ucrtbase.dll should have imports");
+    assert!(
+        names
+            .iter()
+            .any(|name| name.to_ascii_lowercase().starts_with("api-ms-win-")),
+        "expected api-set imports, got {names:?}"
+    );
+}
+
+#[test]
+fn scan_imports_reports_unparsable_pe() {
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dumpbin_invalid");
+    std::fs::create_dir_all(&test_dir).unwrap();
+    let path = test_dir.join("invalid image.dll");
+    std::fs::write(&path, b"this is not a PE image").unwrap();
+    let error = scan_imports(&path).unwrap_err();
+    assert!(
+        error.contains("LNK"),
+        "expected a dumpbin diagnostic: {error}"
+    );
+}
+
+#[test]
+fn scan_imports_reports_missing_file() {
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("dumpbin_missing")
+        .join("missing.dll");
+    assert!(!path.exists());
+    let error = scan_imports(&path).unwrap_err();
+    assert!(
+        error.contains("LNK"),
+        "expected a dumpbin diagnostic: {error}"
+    );
+}
+
+#[test]
+fn parse_dumpbin_dependents_separates_startup_and_delay_imports() {
+    let scan = parse_dumpbin_dependents(
+        "Dump of file C:\\a directory\\input.dll\r\n\
+         File Type: DLL\r\n\
+           Image has the following dependencies:\r\n\
+         \r\n\
+             KERNEL32.dll\r\n\
+             api-ms-win-crt-runtime-l1-1-0.dll\r\n\
+           Image has the following delay load dependencies:\r\n\
+         \r\n\
+             VERSION.dll\r\n\
+             plugin.without_dll_extension\r\n\
+           Summary\r\n\
+                 1000 .data\r\n",
+    )
+    .unwrap();
+    assert_eq!(
+        scan.regular_names,
+        ["kernel32.dll", "api-ms-win-crt-runtime-l1-1-0.dll"]
+    );
+    assert_eq!(
+        scan.names,
+        [
+            "kernel32.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "version.dll",
+            "plugin.without_dll_extension",
+        ]
+    );
+}
+
+#[test]
+fn parse_dumpbin_dependents_accepts_import_free_and_delay_only_images() {
+    let scan = parse_dumpbin_dependents(
+        "Dump of file leaf.dll\nFile Type: DLL\n  Summary\n  1000 .text\n",
+    )
+    .unwrap();
+    assert_eq!(scan.names, Vec::<String>::new());
+    let scan = parse_dumpbin_dependents(
+        "File Type: EXECUTABLE IMAGE\n\
+         Image has the following delay load dependencies:\n\
+             VERSION.dll\n\
+         Summary\n",
+    )
+    .unwrap();
+    assert_eq!(scan.regular_names, Vec::<String>::new());
+    assert_eq!(scan.names, ["version.dll"]);
+}
+
+#[test]
+fn parse_dumpbin_dependents_rejects_diagnostics_and_unrecognized_output() {
+    for output in [
+        "",
+        "Dump of file invalid.dll\n  Summary\n",
+        "File Type: DLL\n",
+        "File Type: DLL\ninvalid.dll : warning LNK4048: Invalid format file; ignored\nSummary\n",
+        "invalid.dll : fatal error LNK1107: invalid or corrupt file\n",
+        "invalid.dll : error LNK1107: invalid or corrupt file\n",
+        "File Type: DLL\nImage has the following dependencies:\n..\\evil.dll\nSummary\n",
+    ] {
+        assert!(
+            parse_dumpbin_dependents(output).is_err(),
+            "accepted invalid output: {output}"
+        );
+    }
+}
+
+/// The closure walk must record a *skip with reason* — not silently drop — when
+/// an import resolves to a host DLL that cannot be read. Builds the ntdll-only
+/// fixture, rewrites its single import name in place to a bogus (nonexistent)
+/// DLL, and asserts the returned report skips it and stages nothing.
+#[test]
+fn stage_transitive_import_closure_reports_skipped_unresolvable() {
+    let test_dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("closure_skip_report");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let pe_path = build_kernel32_import_pe(&test_dir, "ntdll_skip", NTDLL_ONLY_PE_SOURCE, &[]);
+    let mut guest_image = std::fs::read(&pe_path).unwrap();
+
+    // Replace the import name string in place with a same-length bogus name so
+    // it resolves to a bare (nonexistent) filename that cannot be read from
+    // System32. Same length keeps every RVA/offset valid.
+    let original = b"ntdll.dll";
+    let bogus = b"zzdll.zzz";
+    assert_eq!(original.len(), bogus.len());
+    let mut replaced = false;
+    let mut cursor = 0;
+    while let Some(pos) = guest_image[cursor..]
+        .windows(original.len())
+        .position(|window| window.eq_ignore_ascii_case(original))
+    {
+        let start = cursor + pos;
+        guest_image[start..start + original.len()].copy_from_slice(bogus);
+        replaced = true;
+        cursor = start + original.len();
+    }
+    assert!(
+        replaced,
+        "did not find the ntdll.dll import name to corrupt"
+    );
+
+    std::fs::write(&pe_path, guest_image).unwrap();
+    let report = stage_transitive_import_closure(&test_dir, &pe_path);
+
+    assert!(
+        report.staged.is_empty(),
+        "nothing should have been staged for a bogus import, got {:?}",
+        report.staged
+    );
+    assert!(
+        report.skipped.iter().any(|reason| reason.contains("zzdll")),
+        "the unreadable bogus import was not reported as skipped: {:?}",
+        report.skipped
+    );
+    assert!(
+        !fixture_system32_path(&test_dir, "zzdll.zzz").exists(),
+        "a bogus import must not be staged"
+    );
+}
+
+/// Hermetic, always-on exercise of the closure-walk orchestration itself
+/// (`stage_transitive_import_closure`) — not just its sub-functions — on every
+/// default gate, with no external binary. It builds a fixture PE that imports a
+/// single `ntdll` symbol; because `ntdll` is a leaf (no imports of its own), the
+/// walk resolves the import, reads the host module, recurses (into an empty
+/// import set), rewrites it, and stages exactly `ntdll.dll`. This proves the
+/// worklist loop, real-DLL resolution, host read, recursion, cycle-insert, and
+/// the successful rewrite-and-stage branch run deterministically and cheaply.
+///
+/// The skip-with-report decision (`resolve_to_host_dll` returning `None`, and
+/// path-traversal rejection) is covered on every run by the unit tests above
+/// (`resolve_to_host_dll_maps_real_dll_and_absent_contract`,
+/// `staged_file_name_rejects_path_traversal`); the deep multi-level walk over a
+/// real third-party closure is covered by the two gated tests below.
+#[test]
+fn stage_transitive_import_closure_walks_and_stages_leaf() {
+    let test_dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("closure_walk_hermetic");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let pe_path = build_kernel32_import_pe(&test_dir, "ntdll_only", NTDLL_ONLY_PE_SOURCE, &[]);
+    // Confirm the fixture really imports the leaf we rely on, so the walk below
+    // is exercising the intended (single-DLL) closure.
+    let imports = scan_imports(&pe_path).unwrap().names;
+    assert!(
+        imports
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("ntdll.dll")),
+        "ntdll-only fixture did not import ntdll.dll, got {imports:?}"
+    );
+
+    let report = stage_transitive_import_closure(&test_dir, &pe_path);
+
+    assert!(
+        fixture_system32_path(&test_dir, "ntdll.dll").exists(),
+        "closure walk did not stage the ntdll.dll leaf"
+    );
+    assert!(
+        report.staged.iter().any(|dll| dll == "ntdll.dll"),
+        "staging report did not record ntdll.dll as staged: {report:?}",
+        report = report.staged
+    );
+
+    let ntdll = host_system32_file_path("ntdll.dll");
+    let startup_report =
+        stage_startup_import_closures(&test_dir, [pe_path.as_path(), ntdll.as_path()]);
+    assert_eq!(startup_report.staged, ["ntdll.dll"]);
+    assert_eq!(startup_report.skipped, Vec::<String>::new());
+}
+
+/// End-to-end hermetic exercise of the staging helper without an external
+/// binary: staging the closure of host `ucrtbase.dll` must resolve its api-set
+/// imports through the host loader and transitively stage `kernelbase.dll`.
+///
+/// Rewriting ucrtbase's full transitive closure is expensive (100+ DLLs, ~60s),
+/// so this deep end-to-end test is gated behind `LITEBOX_RUN_SLOW_TESTS` and
+/// skips cleanly by default. The fast unit tests above cover resolution,
+/// parsing, and traversal rejection on every run, and
+/// `stage_transitive_import_closure_walks_and_stages_leaf` exercises the walk
+/// orchestration on every run; this adds the deep multi-level proof on demand.
+#[test]
+fn stage_transitive_import_closure_stages_transitive_dependency() {
+    if std::env::var_os("LITEBOX_RUN_SLOW_TESTS").is_none() {
+        println!(
+            "skipping stage_transitive_import_closure_stages_transitive_dependency: \
+             LITEBOX_RUN_SLOW_TESTS is not set"
+        );
+        return;
+    }
+
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("closure_hermetic");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    stage_transitive_import_closure(&test_dir, &host_system32_file_path("ucrtbase.dll"));
+
+    assert!(
+        fixture_system32_path(&test_dir, "kernelbase.dll").exists(),
+        "closure did not transitively stage kernelbase.dll from ucrtbase's api-set imports"
+    );
 }
 
 fn copy_host_system32_file(test_dir: &std::path::Path, file_name: &str) -> std::path::PathBuf {
