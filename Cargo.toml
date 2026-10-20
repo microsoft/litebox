@@ -61,6 +61,7 @@ members = [
     # `litebox_`), but exist purely to better manage development on LiteBox.
     "dev_tests",
     "dev_bench",
+    "dev_tools/compat_scanner",
 ]
 default-members = [
     "litebox",

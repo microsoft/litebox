@@ -1,0 +1,19 @@
+[package]
+name = "compat_scanner"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
+description = "Reports how LiteBox fares on external compatibility test suites"
+publish = false
+
+[dependencies]
+anyhow = "1.0.99"
+clap = { version = "4.5.33", features = ["derive"] }
+serde = { version = "1.0.142", features = ["derive"] }
+serde_json = "1.0.142"
+sha2 = "0.10"
+xshell = "0.2.7"
+
+[lints]
+workspace = true
