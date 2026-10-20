@@ -687,14 +687,17 @@ impl ReceivingRole {
 /// Returns whether executing `operation` may wait, so its worker passes the
 /// receiving role on first.
 ///
-/// Starting a child process waits for its runner's setup, and file requests
-/// may wait for host storage. Other requests wait at most briefly for broker
-/// threads such as the socket reactor, and never for the guest, which learns
-/// of readiness through notifications instead.
+/// Starting a child process waits for its runner's setup, file requests may
+/// wait for host storage, and status-flag requests may wait for a file request
+/// on the same file. Other requests wait at most briefly for broker threads
+/// such as the socket reactor, and never for the guest, which learns of
+/// readiness through notifications instead.
 fn may_wait(operation: &BrokerOperation) -> bool {
     matches!(
         operation,
         BrokerOperation::File(_)
+            | BrokerOperation::GetStatusFlags(_)
+            | BrokerOperation::SetStatusFlags(_)
             | BrokerOperation::Process(
                 ProcessRequest::StartChild(_) | ProcessRequest::StartChildWithExistingRunner(_)
             )
@@ -878,6 +881,7 @@ mod tests {
         assert!(may_wait(&BrokerOperation::File(FileRequest::HandleStatus(
             HandleFileStatusRequest { handle: HANDLE }
         ))));
+        assert!(may_wait(&BrokerOperation::GetStatusFlags(HANDLE)));
         assert!(!may_wait(&BrokerOperation::CloseObject(HANDLE)));
     }
 
