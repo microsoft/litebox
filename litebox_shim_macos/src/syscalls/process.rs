@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Process identity, signal-mask, code-signing and security-policy syscalls.
+//! Process identity, code-signing and security-policy syscalls.
 //!
 //! The guest is an unsigned, non-platform process with no MAC policies, SIP
 //! configuration, or Rosetta: each call returns what XNU returns to such a
@@ -15,8 +15,6 @@ use litebox_common_macos::{
     user_pointers::{UserPtr, UserPtrMut},
 };
 
-/// `sigcantmask`: SIGKILL and SIGSTOP.
-const UNMASKABLE_SIGNALS: u32 = (1 << (9 - 1)) | (1 << (17 - 1));
 /// `CROSSARCH_MAX_VALID_NAMESPACE` (`CROSSARCH_ROSETTA`).
 const CROSSARCH_MAX_VALID_NAMESPACE: u32 = 1;
 /// `csrctl` operations.
@@ -35,35 +33,6 @@ impl<P: ShimPlatform> Task<P> {
     /// `issetugid`: the guest did not change identity at exec.
     pub(crate) fn sys_issetugid() -> usize {
         0
-    }
-
-    /// `sigprocmask` on the thread's mask. Guest signal delivery is not
-    /// supported, so the mask has no further effect.
-    pub(crate) fn sys_sigprocmask(
-        &self,
-        how: i32,
-        mask: UserPtr<u32>,
-        old_mask: UserPtrMut<u32>,
-    ) -> Result<(), Errno> {
-        const SIG_BLOCK: i32 = 1;
-        const SIG_UNBLOCK: i32 = 2;
-        const SIG_SETMASK: i32 = 3;
-        let old = self.thread.signal_mask.get();
-        if mask.as_usize() != 0 {
-            let new = mask.read_at_offset::<P>(0).ok_or(Errno::EFAULT)? & !UNMASKABLE_SIGNALS;
-            let updated = match how {
-                SIG_BLOCK => old | new,
-                SIG_UNBLOCK => old & !new,
-                SIG_SETMASK => new,
-                _ => return Err(Errno::EINVAL),
-            };
-            self.thread.signal_mask.set(updated);
-        }
-        if old_mask.as_usize() != 0 {
-            // XNU ignores this copyout's failure.
-            let _ = old_mask.write_at_offset::<P>(0, old);
-        }
-        Ok(())
     }
 
     /// `crossarch_trap`: Rosetta is not present.
@@ -161,7 +130,7 @@ impl<P: ShimPlatform> Task<P> {
             reason:? = reason;
             "guest aborted"
         );
-        self.process.exit(128 + SIGABRT);
+        self.exit_process(128 + SIGABRT);
     }
 
     /// `terminate_with_payload`: only the guest itself is visible, and
@@ -186,7 +155,7 @@ impl<P: ShimPlatform> Task<P> {
             reason:? = reason;
             "guest terminated itself"
         );
-        self.process.exit(128 + SIGKILL);
+        self.exit_process(128 + SIGKILL);
         Ok(())
     }
 

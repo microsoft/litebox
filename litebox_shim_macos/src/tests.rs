@@ -15,16 +15,15 @@ use litebox_common_macos::VmProtection;
 use litebox_platform_macos_userland::MacosUserland as Platform;
 
 mod mach;
+mod thread;
 
 fn task(shim: MacosShim<Platform>) -> Task<Platform> {
-    let thread = ThreadState::new(1u64 << 32, shim.global.platform);
-    Task {
-        global: shim.global,
-        files: shim.files,
-        params: TaskParams::default(),
-        process: Process(Arc::new(AtomicI32::new(-1))),
-        thread,
-    }
+    Task::new_main(
+        shim.global,
+        shim.files,
+        TaskParams::default(),
+        Process::new(),
+    )
 }
 
 #[test]
@@ -590,6 +589,33 @@ fn shared_cache_page_in_uses_the_recorded_protection() {
     assert!(task.page_in_shared_cache(page.start));
     assert_eq!(read_guest(page.start, 1).unwrap(), [0x77]);
     assert!(!guest_flags(task, page.start).contains(VmFlags::VM_WRITE));
+}
+
+/// A thread that faults on a page another thread has just supplied retries
+/// its access if the page now allows it.
+#[test]
+fn shared_cache_fault_after_a_concurrent_page_in_is_retried() {
+    /// A data abort's ESR with WnR set: a write.
+    const WRITE: u64 = 1 << 6;
+    let base = 0x76_0000_0000;
+    let program = install_test_cache(base);
+    let task = &program.entrypoints.task;
+    let page = base + 4 * PAGE_SIZE;
+    assert!(
+        !task.shared_cache_fault_resolved(page, 0),
+        "not supplied yet"
+    );
+    assert_eq!(
+        task.sys_mprotect(page, PAGE_SIZE, VmProtection::READ),
+        Ok(())
+    );
+    // The first fault supplies the page; a fault racing it then retries.
+    assert!(task.page_in_shared_cache(page + 8));
+    assert!(!task.page_in_shared_cache(page + 16));
+    assert!(task.shared_cache_fault_resolved(page + 16, 0));
+    // A write to the read-only page stays a fault.
+    assert!(!task.shared_cache_fault_resolved(page + 16, WRITE));
+    assert!(!task.shared_cache_fault_resolved(base - PAGE_SIZE, 0));
 }
 
 #[test]

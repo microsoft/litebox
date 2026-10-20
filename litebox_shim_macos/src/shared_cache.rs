@@ -19,7 +19,7 @@ use core::ops::Range;
 use core::sync::atomic::Ordering;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::{RawMutPointer as _, page_mgmt::MemoryRegionPermissions as Permissions};
-use litebox_common_linux::vmem::CreatePagesFlags;
+use litebox_common_linux::vmem::{CreatePagesFlags, VmFlags};
 use litebox_common_macos::{PAGE_SIZE, VmProtection};
 use litebox_syscall_rewriter::macho::Rewriter;
 
@@ -839,6 +839,32 @@ impl<P: ShimPlatform> Task<P> {
         );
         cache.page_in(&page);
         true
+    }
+
+    /// Whether a data abort at `address` in the shared-cache instance raced
+    /// with another thread supplying the page: the guest map now allows the
+    /// access (`esr`'s WnR bit tells a write), so it is retried.
+    pub(crate) fn shared_cache_fault_resolved(&self, address: usize, esr: u64) -> bool {
+        /// ESR_ELx.ISS.WnR of a data abort: the access was a write.
+        const ESR_WNR: u64 = 1 << 6;
+        // Waits for a page-in in progress on another thread.
+        let cache = self.global.shared_cache.lock();
+        if !cache
+            .as_ref()
+            .is_some_and(|cache| cache.range.contains(&address))
+        {
+            return false;
+        }
+        let needed = if esr & ESR_WNR != 0 {
+            VmFlags::VM_WRITE
+        } else {
+            VmFlags::VM_READ
+        };
+        self.global
+            .mm
+            .overlapping(address..address + 1)
+            .first()
+            .is_some_and(|(_, flags)| flags.contains(needed))
     }
 
     /// Describe a guest address in the installed shared cache, if any.

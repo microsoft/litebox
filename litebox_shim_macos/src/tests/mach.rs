@@ -16,7 +16,7 @@ use litebox_common_macos::{
 
 const CARRY: u64 = 1 << 29;
 
-fn trap(task: &Task<Platform>, number: u32, args: &[usize]) -> usize {
+pub(super) fn trap(task: &Task<Platform>, number: u32, args: &[usize]) -> usize {
     let mut ctx = PtRegs::default();
     ctx.regs[16] = 0u32.wrapping_sub(number) as usize;
     ctx.regs[..args.len()].copy_from_slice(args);
@@ -24,11 +24,11 @@ fn trap(task: &Task<Platform>, number: u32, args: &[usize]) -> usize {
     ctx.regs[0]
 }
 
-fn kr(task: &Task<Platform>, number: u32, args: &[usize]) -> KernReturn {
+pub(super) fn kr(task: &Task<Platform>, number: u32, args: &[usize]) -> KernReturn {
     KernReturn::from_raw(i32::try_from(trap(task, number, args)).unwrap())
 }
 
-fn bsd(task: &Task<Platform>, number: usize, args: &[usize]) -> Result<usize, usize> {
+pub(super) fn bsd(task: &Task<Platform>, number: usize, args: &[usize]) -> Result<usize, usize> {
     let mut ctx = PtRegs::default();
     ctx.regs[16] = number;
     ctx.regs[..args.len()].copy_from_slice(args);
@@ -40,7 +40,7 @@ fn bsd(task: &Task<Platform>, number: usize, args: &[usize]) -> Result<usize, us
     }
 }
 
-fn new_task() -> Task<Platform> {
+pub(super) fn new_task() -> Task<Platform> {
     task(MacosShimBuilder::new(Platform::new()).build())
 }
 
@@ -434,7 +434,13 @@ fn mach_msg_queues_messages_and_send_once_notifications() {
 }
 
 /// [`mig_call_on`] with a new reply port.
-fn mig_call(task: &Task<Platform>, remote: u32, id: i32, body: &[u8], complex: bool) -> Vec<u8> {
+pub(super) fn mig_call(
+    task: &Task<Platform>,
+    remote: u32,
+    id: i32,
+    body: &[u8],
+    complex: bool,
+) -> Vec<u8> {
     let reply = u32::try_from(trap(task, mach_trap::MACH_REPLY_PORT, &[])).unwrap();
     mig_call_on(task, reply, remote, id, body, complex)
 }
@@ -484,7 +490,7 @@ fn mig_call_on(
     buffer
 }
 
-fn ndr(fields: &[u32]) -> Vec<u8> {
+pub(super) fn ndr(fields: &[u32]) -> Vec<u8> {
     let mut body = litebox_common_macos::mach::NDR_RECORD.to_vec();
     for field in fields {
         body.extend_from_slice(&field.to_ne_bytes());
@@ -492,7 +498,7 @@ fn ndr(fields: &[u32]) -> Vec<u8> {
     body
 }
 
-fn word(bytes: &[u8], offset: usize) -> u32 {
+pub(super) fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 

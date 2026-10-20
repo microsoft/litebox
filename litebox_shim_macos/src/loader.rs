@@ -258,6 +258,10 @@ pub(super) fn load<P: ShimPlatform>(
         stack_base..stack_base + STACK_SIZE,
         VmProtection::READ | VmProtection::WRITE,
     )?;
+    task.global.main_stack_top.store(
+        stack_base + STACK_SIZE,
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let main_stack = stack::MainStack {
         top: stack_base + STACK_SIZE,
         size: STACK_SIZE,

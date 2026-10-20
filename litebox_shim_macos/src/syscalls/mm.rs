@@ -1264,7 +1264,6 @@ mod tests {
 
     use super::*;
     use alloc::{sync::Arc, vec::Vec};
-    use core::sync::atomic::AtomicI32;
     use litebox::LiteBox;
     use litebox_broker_core::{
         ObjectRights, PolicyEngine,
@@ -1388,14 +1387,12 @@ mod tests {
             .unwrap();
         assert_eq!(builder.inherit_file(file), Ok(0));
         let shim = builder.build();
-        let thread = crate::ThreadState::new(1u64 << 32, shim.global.platform);
-        Task {
-            global: shim.global,
-            files: shim.files,
-            params: TaskParams::default(),
-            process: Process(Arc::new(AtomicI32::new(-1))),
-            thread,
-        }
+        Task::new_main(
+            shim.global,
+            shim.files,
+            TaskParams::default(),
+            Process::new(),
+        )
     }
 
     fn mmap_with_protection(
@@ -1435,14 +1432,12 @@ mod tests {
     fn mprotect_validates_ranges() {
         let platform = Platform::new();
         let shim = MacosShimBuilder::new(platform).build();
-        let thread = crate::ThreadState::new(1u64 << 32, shim.global.platform);
-        let task = Task {
-            global: shim.global,
-            files: shim.files,
-            params: TaskParams::default(),
-            process: Process(Arc::new(AtomicI32::new(-1))),
-            thread,
-        };
+        let task = Task::new_main(
+            shim.global,
+            shim.files,
+            TaskParams::default(),
+            Process::new(),
+        );
 
         assert_eq!(
             task.sys_mprotect(PAGE_SIZE, PAGE_SIZE, VmProtection::READ),

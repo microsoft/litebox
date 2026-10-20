@@ -33,7 +33,8 @@ use zerocopy::{FromBytes as _, IntoBytes as _};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KernelObject {
     Task,
-    Thread,
+    /// A guest thread's control port; it dies when the thread terminates.
+    Thread(crate::ThreadId),
     Host,
     /// `SYSTEM_CLOCK` (`REALTIME_CLOCK`) or `CALENDAR_CLOCK`.
     Clock(mig::ClockId),
@@ -101,7 +102,7 @@ struct Port {
     kind: PortKind,
 }
 
-type PortId = u64;
+pub(crate) type PortId = u64;
 
 bitflags::bitflags! {
     /// `mach_port_type_t` right bits of a name.
@@ -262,7 +263,6 @@ pub(crate) struct IpcSpace {
     /// The highest index ever handed out by [`IpcSpace::alloc_name`].
     next_index: u32,
     task: Option<PortId>,
-    thread: Option<PortId>,
     host: Option<PortId>,
     clocks: Vec<(mig::ClockId, PortId)>,
     /// Settable task special ports (`itk_bootstrap`, ...): a send right held
@@ -367,12 +367,14 @@ impl IpcSpace {
         }
     }
 
-    /// The port of a singleton kernel object, or a new semaphore port.
+    /// The port of a singleton kernel object, or a new semaphore or thread
+    /// port.
     fn kernel_port(&mut self, object: KernelObject) -> Result<PortId, KernReturn> {
         let slot = match object {
             KernelObject::Task => &mut self.task,
-            KernelObject::Thread => &mut self.thread,
             KernelObject::Host => &mut self.host,
+            // Bounded by the guest's threads, like the task's thread list.
+            KernelObject::Thread(_) => return Ok(self.insert_port(PortKind::Kernel(object))),
             KernelObject::Clock(id) => {
                 if let Some((_, port)) = self.clocks.iter().find(|(clock, _)| *clock == id) {
                     return Ok(*port);
@@ -488,7 +490,7 @@ impl IpcSpace {
     /// `ipc_port_copyout_send`: add a send right to `port`, merging with an
     /// existing send or receive name. Returns `MACH_PORT_DEAD` for a dead
     /// port and `MACH_PORT_NULL` if the space is full.
-    fn copyout_send(&mut self, port: PortId) -> u32 {
+    pub(crate) fn copyout_send(&mut self, port: PortId) -> u32 {
         if !self.port_is_active(port) {
             return MACH_PORT_DEAD;
         }
@@ -571,6 +573,28 @@ impl IpcSpace {
     /// Only a new semaphore can fail, when the port budget is exhausted.
     pub(crate) fn kernel_send_right(&mut self, object: KernelObject) -> Result<Right, KernReturn> {
         self.kernel_port(object).map(Right::Send)
+    }
+
+    /// A new guest thread's control port (`convert_thread_to_port`).
+    pub(crate) fn new_thread_port(&mut self, thread: crate::ThreadId) -> PortId {
+        self.insert_port(PortKind::Kernel(KernelObject::Thread(thread)))
+    }
+
+    /// The thread a send right names in this space (`port_name_to_thread`).
+    pub(crate) fn thread_for_name(&mut self, name: u32) -> Option<crate::ThreadId> {
+        if !port_name_is_valid(name) {
+            return None;
+        }
+        match self.object_for_send_name(MachPortName(name))? {
+            (_, KernelObject::Thread(thread)) => Some(thread),
+            _ => None,
+        }
+    }
+
+    /// A thread's control port dies with the thread (`ipc_thread_disable`):
+    /// names for it become dead names.
+    pub(crate) fn thread_port_died(&mut self, port: PortId) {
+        self.destroy_port(port);
     }
 
     fn allocate_receive(&mut self, qlimit: u32, context: u64) -> Result<u32, KernReturn> {
@@ -963,7 +987,7 @@ impl IpcSpace {
     }
 
     /// `mach_port_deallocate`.
-    fn deallocate(&mut self, name: u32) -> KernReturn {
+    pub(crate) fn deallocate(&mut self, name: u32) -> KernReturn {
         if !port_name_is_valid(name) {
             return KernReturn::SUCCESS;
         }
@@ -1296,8 +1320,9 @@ impl<P: ShimPlatform> Task<P> {
         self.self_trap(KernelObject::Task)
     }
 
+    /// `thread_self_trap`: a send right to the calling thread's own port.
     pub(crate) fn sys_thread_self(&self) -> usize {
-        self.self_trap(KernelObject::Thread)
+        self.global.ipc.lock().copyout_send(self.thread.guest.port) as usize
     }
 
     pub(crate) fn sys_host_self(&self) -> usize {
@@ -1578,8 +1603,9 @@ impl<P: ShimPlatform> Task<P> {
                 if kernel_limit {
                     return Err(msg_return::SEND_NO_BUFFER);
                 }
-                // A full queue only drains on another thread, so the sender
-                // waits for its timeout or an interrupt.
+                // A full queue only drains on another thread, whose receive
+                // does not wake a blocked sender yet: the sender waits for
+                // its timeout or an interrupt.
                 drop(ipc);
                 let cx = self.wait_cx();
                 let cx = if options.contains(MachMsgOptions::SEND_TIMEOUT) {
@@ -1727,8 +1753,9 @@ impl<P: ShimPlatform> Task<P> {
             if options.contains(MachMsgOptions::RCV_TIMEOUT) && timeout == 0 {
                 return Err(msg_return::RCV_TIMED_OUT);
             }
-            // Only this thread could fill the queue: wait to be interrupted
-            // or for the timeout, like a native single-threaded receiver.
+            // Only a message this thread sends can arrive (another thread's
+            // send does not wake a blocked receiver yet): wait to be
+            // interrupted or for the timeout.
             let cx = self.wait_cx();
             let cx = if options.contains(MachMsgOptions::RCV_TIMEOUT) {
                 cx.with_timeout(core::time::Duration::from_millis(u64::from(timeout)))

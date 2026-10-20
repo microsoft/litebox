@@ -19,10 +19,12 @@ pub(crate) mod mig;
 pub mod misc;
 pub(crate) mod mm;
 pub(crate) mod process;
+pub(crate) mod thread;
+pub(crate) mod ulock;
 
 impl<P: ShimPlatform> Task<P> {
     pub(crate) fn sys_exit(&self, status: i32) {
-        self.process.exit(status & 0xff);
+        self.exit_process(status & 0xff);
     }
 
     pub(crate) fn sys_getpid(&self) -> i32 {
@@ -119,7 +121,16 @@ impl<P: ShimPlatform> Task<P> {
         KernReturn::SUCCESS
     }
 
+    /// `mach_wait_until`: an abortable sleep (`clock_sleep_internal`) that
+    /// process exit ends with `KERN_ABORTED`.
     pub(crate) fn sys_mach_wait_until(&self, deadline: u64) -> KernReturn {
-        self.global.platform.mach_wait_until(deadline)
+        match self
+            .wait_cx()
+            .with_timeout(self.mach_deadline_timeout(deadline))
+            .sleep()
+        {
+            litebox::event::wait::WaitError::TimedOut => KernReturn::SUCCESS,
+            litebox::event::wait::WaitError::Interrupted => KernReturn::ABORTED,
+        }
     }
 }

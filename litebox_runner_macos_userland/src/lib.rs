@@ -208,9 +208,9 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
+    // The main thread may end (pthread_exit) before the guest's other threads.
+    let status = process.wait_for_exit();
     #[cfg(feature = "test-broker")]
     test_broker::flush_output(&stdio)?;
-    process
-        .exit_status()
-        .context("guest stopped without an exit status")
+    Ok(status)
 }
