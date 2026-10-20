@@ -14,16 +14,20 @@
 # ldd lists them, and libgcc_s.so.1, at their host paths; as the root has no
 # symbolic links, they are copies of what the links name. The shim patches
 # their syscalls as the programs map them. The root is packed with the
-# userland runner and a test's runs into a tar passed as the initrd.
+# userland runner into a tar passed as the initrd.
 #
-# A test is litebox_runner_vm_kernel/tests/linux/<test>.json, the kernel's
-# programs.json (see litebox_runner_vm_kernel/src/client/program.rs), which
-# checks each run's exit status and output. The programs are unmodified: the
-# shim patches their syscalls as it loads them, and the kernel reflects any it
-# misses (reflect.c).
+# A test is litebox_runner_vm_kernel/tests/linux/<test>.json, the runs file of
+# the host client litebox_vm_host (see its src/main.rs). The VM gets a
+# vhost-vsock device (guest CID $VSOCK_CID), on which the kernel serves its
+# control channel; the host client runs each program over it, checks its exit
+# status and output, and shuts the VM down. The channel has no
+# authentication: any local user who can use vsock can control the VM while
+# it runs (see litebox_common_vm_control's trust model). The programs are
+# unmodified: the shim patches their syscalls as it loads them, and the
+# kernel reflects any it misses (reflect.c).
 #
 # Runner processes' standard output and error go to a virtio console, backed
-# by a file; each run's standard input is its `stdin` in programs.json, or,
+# by a file; each run's standard input is its `stdin` in its runs file, or,
 # with `console_stdin`, the console's. A test's <test>.input.txt, if any, is
 # the console's input: sent once the console shows a line `ready`, so it
 # arrives while the program runs.
@@ -35,10 +39,13 @@
 # A fresh host directory per test, with greeting.txt, is mounted read-only at
 # /mnt/host over virtio-9p (its mount tag).
 #
+# Needs read/write access to /dev/vhost-vsock.
+#
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
 #   -r   build and run the release kernel and runner
-#   -v   print the full guest log and console output for passing runs too
+#   -v   print the full guest log, host client output, and console output for
+#        passing runs too
 #
 # Environment:
 #   CC            C compiler with a static and a shared glibc (default: cc)
@@ -48,8 +55,9 @@
 #   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
 #   TIMEOUT       per-run timeout in seconds (default: 120)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
-#   CARGO_BUILD   command that builds the runners, run in their directories
-#                 (default: "cargo build"; CI uses
+#   VSOCK_CID     guest CID (default: unique per run of the script)
+#   CARGO_BUILD   command that builds the runners, run in their directories,
+#                 and the host client (default: "cargo build"; CI uses
 #                 ".github/tools/github_actions_run_cargo build")
 
 set -euo pipefail
@@ -81,18 +89,23 @@ fi
 # The userland runner has its own target directory.
 KERNEL="$(target_dir "$KERNEL_DIR")/x86_64-unknown-none/$profile/litebox_runner_vm_kernel"
 USERLAND="$(target_dir "$USERLAND_DIR")/x86_64-unknown-none/$profile/litebox_runner_linux_on_vm_userland"
+CLIENT="$(target_dir "$REPO_DIR")/$profile/litebox_vm_host"
+check_vsock
 
-echo "[*] building litebox_runner_vm_kernel and litebox_runner_linux_on_vm_userland ($profile)"
+echo "[*] building litebox_runner_vm_kernel, litebox_runner_linux_on_vm_userland, and litebox_vm_host ($profile)"
 # shellcheck disable=SC2086 # CARGO_BUILD is a command line
 (cd "$KERNEL_DIR" && $CARGO_BUILD "${cargo_flags[@]}")
 # RUSTFLAGS would replace the codegen flags in its .cargo/config.toml.
 # shellcheck disable=SC2086
 (cd "$USERLAND_DIR" && env -u RUSTFLAGS $CARGO_BUILD "${cargo_flags[@]}")
-for f in "$KERNEL" "$USERLAND"; do
+# shellcheck disable=SC2086
+(cd "$REPO_DIR" && $CARGO_BUILD -p litebox_vm_host "${cargo_flags[@]}")
+for f in "$KERNEL" "$USERLAND" "$CLIENT"; do
     [[ -x $f ]] || { echo "error: the build did not produce $f" >&2; exit 2; }
 done
 echo "[*] kernel: $KERNEL"
 echo "[*] userland runner: $USERLAND"
+echo "[*] host client: $CLIENT, over vsock (guest CID $VSOCK_CID)"
 echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU"
 
 # Tests that need a dynamic linker (e.g., dlopen), not built static.
@@ -158,7 +171,13 @@ share_args() {
         -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
 }
 
-# The kernel checks the output; this only shows it.
+# The host client for test $1.
+run_programs() {
+    "$CLIENT" --cid "$VSOCK_CID" --connect-timeout "$TIMEOUT" programs "$TESTS_DIR/$1.json"
+}
+client=run_programs
+
+# The host client checks the output; this only shows it.
 show_console() {
     if [[ ${verbose:-0} -ne 0 ]]; then
         echo "--- console ($1) ---" >&2
@@ -173,8 +192,7 @@ for t in "${tests[@]}"; do
     mkdir -p "$WORK/$t"
     cp "$USERLAND" "$WORK/$t/runner.elf"
     cp "$WORK/rootfs.tar" "$WORK/$t/rootfs.tar"
-    cp "$TESTS_DIR/$t.json" "$WORK/$t/programs.json"
-    tar --format=ustar -cf "$WORK/$t.tar" -C "$WORK/$t" runner.elf rootfs.tar programs.json
+    tar --format=ustar -cf "$WORK/$t.tar" -C "$WORK/$t" runner.elf rootfs.tar
     failed_before=$fail
     : >"$WORK/$t.stdout"
     feeder=
@@ -187,7 +205,8 @@ for t in "${tests[@]}"; do
         feeder=$!
     fi
     # shellcheck disable=SC2046 # these print separate arguments
-    run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args) $(share_args "$t")
+    run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args) $(share_args "$t") \
+        $(vsock_args)
     if [[ -n $feeder ]]; then
         kill "$feeder" 2>/dev/null || true
         wait "$feeder" 2>/dev/null || true

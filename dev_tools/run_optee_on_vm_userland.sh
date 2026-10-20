@@ -7,16 +7,22 @@
 # with stacked runners: litebox_runner_vm_kernel as the guest kernel and
 # litebox_runner_optee_on_vm_userland as a ring-3 process per TA instance.
 # ldelf and each TA are syscall-rewritten ahead of time (unless -u), then
-# packed with the userland runner and the test's cmds.json into a tar passed
-# as the initrd.
+# packed with the userland runner into a tar passed as the initrd.
 #
 # A test is a scenario litebox_runner_vm_kernel/tests/<test>-cmds.json, whose
 # open_session commands name the TAs it needs in their "ta" fields, or a TA
-# with a *-cmds.json of its own.
+# with a *-cmds.json of its own. The VM gets a vhost-vsock device (guest CID
+# $VSOCK_CID), on which the kernel serves its control channel; the host
+# client litebox_vm_host (see its src/main.rs for the cmds.json format) runs
+# the test's commands over it, checks each result, and shuts the VM down. The
+# channel has no authentication: any local user who can use vsock can control
+# the VM while it runs (see litebox_common_vm_control's trust model).
 #
 # Runner processes' standard streams are a virtio console, backed by files:
 # TA output must reach it, and in debug builds, whose runners echo standard
 # input, so must the line fed to it.
+#
+# Needs read/write access to /dev/vhost-vsock.
 #
 # Usage: dev_tools/run_optee_on_vm_userland.sh [-t <test>]... [-u] [-r] [-v]
 #   -t   test to run, e.g. ta-death or hello-ta; append @default to a TA to
@@ -24,7 +30,8 @@
 #        hello-ta@default for the default-commands path)
 #   -u   use unmodified ldelf and TAs; the kernel reflects their syscalls
 #   -r   build and run the release kernel
-#   -v   print the full guest log and console output for passing runs too
+#   -v   print the full guest log, host client output, and console output for
+#        passing runs too
 #
 # Environment:
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
@@ -33,8 +40,10 @@
 #   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
 #   TIMEOUT       per-run timeout in seconds (default: 120)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
+#   VSOCK_CID     guest CID (default: unique per run of the script)
 #   CARGO_BUILD   command that builds the runners (and the rewriter unless
-#                 -u), run in their directories (default: "cargo build"; CI uses
+#                 -u), run in their directories, and the host client
+#                 (default: "cargo build"; CI uses
 #                 ".github/tools/github_actions_run_cargo build")
 
 set -euo pipefail
@@ -68,14 +77,18 @@ done
 KERNEL="$(target_dir "$KERNEL_DIR")/x86_64-unknown-none/$profile/litebox_runner_vm_kernel"
 USERLAND="$(target_dir "$USERLAND_DIR")/x86_64-unknown-none/$profile/litebox_runner_optee_on_vm_userland"
 REWRITER="$(target_dir "$REPO_DIR")/debug/litebox_syscall_rewriter"
+CLIENT="$(target_dir "$REPO_DIR")/$profile/litebox_vm_host"
+check_vsock
 
-echo "[*] building litebox_runner_vm_kernel and litebox_runner_optee_on_vm_userland ($profile)"
+echo "[*] building litebox_runner_vm_kernel, litebox_runner_optee_on_vm_userland, and litebox_vm_host ($profile)"
 # shellcheck disable=SC2086 # CARGO_BUILD is a command line
 (cd "$KERNEL_DIR" && $CARGO_BUILD "${cargo_flags[@]}")
 # RUSTFLAGS would replace the codegen flags in its .cargo/config.toml.
 # shellcheck disable=SC2086
 (cd "$USERLAND_DIR" && env -u RUSTFLAGS $CARGO_BUILD "${cargo_flags[@]}")
-built=("$KERNEL" "$USERLAND")
+# shellcheck disable=SC2086
+(cd "$REPO_DIR" && $CARGO_BUILD -p litebox_vm_host "${cargo_flags[@]}")
+built=("$KERNEL" "$USERLAND" "$CLIENT")
 if [[ $rewrite -eq 1 ]]; then
     # shellcheck disable=SC2086
     (cd "$REPO_DIR" && $CARGO_BUILD -p litebox_syscall_rewriter)
@@ -86,6 +99,7 @@ for f in "${built[@]}"; do
 done
 echo "[*] kernel: $KERNEL"
 echo "[*] userland runner: $USERLAND"
+echo "[*] host client: $CLIENT, over vsock (guest CID $VSOCK_CID)"
 echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU"
 if [[ $rewrite -eq 1 ]]; then echo "[*] TAs: syscall-rewritten"; else echo "[*] TAs: unmodified"; fi
 
@@ -126,6 +140,14 @@ check_console() {
 }
 check=check_console
 
+# The host client for test $1, with the test's cmds.json, if any, in
+# $test_cmds.
+run_commands() {
+    "$CLIENT" --cid "$VSOCK_CID" --connect-timeout "$TIMEOUT" \
+        optee --tas "$WORK/$1/tas" ${test_cmds:+"$test_cmds"}
+}
+client=run_commands
+
 for ta in "${tas[@]}"; do
     name=${ta%@default}
     if [[ -f "$VM_TESTS_DIR/$name-cmds.json" ]]; then
@@ -146,12 +168,10 @@ for ta in "${tas[@]}"; do
         prepare "$TESTS_DIR/$t.elf" "$WORK/$ta/tas/$t.elf"
         files+=("tas/$t.elf")
     done
-    if [[ $ta != *@default && -f "$cmds" ]]; then
-        cp "$cmds" "$WORK/$ta/cmds.json"
-        files+=(cmds.json)
-    fi
+    test_cmds=
+    [[ $ta == *@default || ! -f "$cmds" ]] || test_cmds=$cmds
     tar --format=ustar -cf "$WORK/$ta.tar" -C "$WORK/$ta" "${files[@]}"
-    # shellcheck disable=SC2046 # console_args prints separate arguments
-    run_vm "$ta" "$KERNEL" "$WORK/$ta.tar" $(console_args "$ta")
+    # shellcheck disable=SC2046 # these print separate arguments
+    run_vm "$ta" "$KERNEL" "$WORK/$ta.tar" $(console_args "$ta") $(vsock_args)
 done
 summary

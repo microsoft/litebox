@@ -7,7 +7,6 @@
 //! `litebox_runner_linux_on_vm_userland`); the programs' files are the
 //! broker's (see `rootfs.tar` in [`crate::payload`]).
 
-use super::Service;
 use crate::payload::Payload;
 use alloc::vec::Vec;
 use litebox_common_vm_abi::WallClock;
@@ -16,7 +15,7 @@ use litebox_hal::clock::Clock;
 use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_vm_kernel::program::RunError;
 use litebox_shim_vm_kernel::sched::Scheduler;
-use litebox_shim_vm_kernel::{Process, ProcessConfig, ProcessTimer};
+use litebox_shim_vm_kernel::{Process, ProcessConfig, ProcessTimer, SpawnError};
 
 pub struct Programs {
     scheduler: Scheduler,
@@ -64,26 +63,34 @@ impl Programs {
 
 impl Programs {
     /// Runs `programs` at once, a process each, which ends with the call;
-    /// replies are in order.
-    pub fn run_concurrently(&mut self, programs: &[Program]) -> Vec<Reply> {
-        let mut processes: Vec<Process> = programs.iter().map(|_| self.start()).collect();
+    /// replies are in order. If a process cannot be spawned (e.g., memory ran
+    /// out), none runs.
+    ///
+    /// # Errors
+    ///
+    /// Why a process could not be spawned.
+    pub fn run_concurrently(&mut self, programs: &[Program]) -> Result<Vec<Reply>, SpawnError> {
+        let mut processes: Vec<Process> = programs
+            .iter()
+            .map(|_| self.start())
+            .collect::<Result<_, _>>()?;
         let statuses = {
             let mut runs: Vec<(&mut Process, &Program)> =
                 processes.iter_mut().zip(programs).collect();
             litebox_shim_vm_kernel::program::run_all(&self.scheduler, &mut runs)
         };
-        processes
+        Ok(processes
             .iter()
             .zip(statuses)
             .map(|(process, status)| Reply {
                 status,
                 reflected_syscalls: process.reflected_syscalls(),
             })
-            .collect()
+            .collect())
     }
 
     /// A runner process, started: dead if it did not get that far.
-    fn start(&self) -> Process {
+    fn start(&self) -> Result<Process, SpawnError> {
         let mut process = Process::spawn(
             &self.scheduler,
             self.platform,
@@ -98,22 +105,9 @@ impl Programs {
                 // Programs may start child processes.
                 started_runner: Some(self.runner),
             },
-        )
-        .unwrap_or_else(|error| panic!("failed to spawn a program runner: {error}"));
+        )?;
         // A dead process fails its run.
         let _ = process.start();
-        process
-    }
-}
-
-impl Service for Programs {
-    type Request = Program;
-    type Reply = Reply;
-
-    /// The process ends with the call.
-    fn call(&mut self, program: Program) -> Reply {
-        self.run_concurrently(core::slice::from_ref(&program))
-            .pop()
-            .expect("one reply per program")
+        Ok(process)
     }
 }

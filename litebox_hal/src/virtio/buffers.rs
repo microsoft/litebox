@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 //! Fixed-size buffers in one DMA region, each a one-descriptor chain while
-//! the device has it: what the console and network devices exchange data
-//! in.
+//! the device has it: what the console, network and socket (vsock) devices
+//! exchange data in.
 
 use super::Error;
 use super::queue::{Buffer, VirtQueue};

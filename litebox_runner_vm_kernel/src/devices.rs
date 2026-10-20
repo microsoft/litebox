@@ -13,6 +13,8 @@
 //!   `SetTimer` deadline and time slice.
 //! - [`Devices::shares`]: the VM's virtio-9p devices, each a host directory
 //!   mounted at its tag.
+//! - [`Devices::vsock`]: the VM's virtio-vsock device, for the
+//!   [control channel](crate::control) only.
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
@@ -32,7 +34,7 @@ use litebox_broker_vm_kernel::Events;
 use litebox_broker_vm_kernel::share::{Share, Transport, TransportError};
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
-use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice};
+use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice, VsockDevice};
 use litebox_hal::interrupt::LocalApic;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::{Instant, VmKernel};
@@ -48,6 +50,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const SHARE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a share that does not interrupt is polled.
 const SHARE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// How often a vsock device that does not interrupt is polled.
+const VSOCK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// The local APIC's timer.
 const TIMER_VECTOR: u8 = 0x30;
@@ -177,6 +182,23 @@ impl Devices {
         shares
     }
 
+    /// The VM's virtio-vsock device, brought up, listening on `port`; `None`
+    /// if there is none. Call once.
+    ///
+    /// # Errors
+    ///
+    /// The device cannot be driven.
+    pub fn vsock(&'static self, port: u32) -> Result<Option<Vsock>, litebox_hal::virtio::Error> {
+        let device = VsockDevice::probe(self.platform, self.apic.target(DEVICE_VECTOR), port)?;
+        Ok(device.map(|device| {
+            litebox_util_log::info!(device:% = device; "vsock");
+            Vsock {
+                devices: self,
+                device,
+            }
+        }))
+    }
+
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
     /// per-CPU data.
     fn on_interrupt(&self, vector: u8) -> bool {
@@ -249,6 +271,36 @@ impl ProcessTimer for Devices {
                 .arm_timer(self.clock.ticks_at(deadline.as_nanos())),
             None => self.apic.disarm_timer(),
         }
+    }
+}
+
+/// The VM's virtio-vsock device, for a user on the boot CPU outside the
+/// scheduler (which halts to wait for it).
+pub struct Vsock {
+    devices: &'static Devices,
+    /// Driven only through this handle; it interrupts on the shared
+    /// `DEVICE_VECTOR`.
+    pub device: VsockDevice,
+}
+
+impl Vsock {
+    pub fn now(&self) -> Instant {
+        self.devices.platform.now()
+    }
+
+    /// `timeout` from now.
+    pub fn deadline(&self, timeout: Duration) -> Instant {
+        self.now()
+            .checked_add(timeout)
+            .expect("the clock is far from overflowing")
+    }
+
+    /// Halts until the device may have changed (an interrupt; or soon, if it
+    /// does not interrupt), or `deadline`; then look again. Not on the
+    /// worker, which must suspend instead (see [`Devices::block`]).
+    pub fn wait(&self, deadline: Option<Instant>) {
+        let poll = (!self.device.interrupts()).then(|| self.deadline(VSOCK_POLL_INTERVAL));
+        self.devices.halt(poll.into_iter().chain(deadline).min());
     }
 }
 

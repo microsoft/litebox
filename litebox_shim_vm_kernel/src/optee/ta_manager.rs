@@ -129,6 +129,13 @@ where
         self.instances.len()
     }
 
+    /// Live instances, as their IDs, which are not reused, and their TAs.
+    pub fn instances(&self) -> impl Iterator<Item = (u64, &TeeUuid)> {
+        self.instances
+            .iter()
+            .map(|(id, instance)| (*id, &instance.uuid))
+    }
+
     /// `uuid` is used only for [`EntryFunc::OpenSession`], whose completion
     /// carries the new session; otherwise `invocation.session` names it.
     pub fn call(&mut self, uuid: &TeeUuid, invocation: Invocation) -> Completion {
@@ -544,6 +551,24 @@ mod tests {
         assert_eq!(invoke(&mut m, b.session).result, tee::ERROR_TARGET_DEAD);
         assert_eq!(close(&mut m, b.session).result, tee::SUCCESS);
         assert_eq!(open(&mut m, &SHARED).result, tee::SUCCESS);
+    }
+
+    #[test]
+    fn instances_are_listed_with_ids_never_reused() {
+        let (mut m, _log) = manager();
+        assert_eq!(m.instances().count(), 0);
+        let a = open(&mut m, &MULTI);
+        let b = open(&mut m, &SHARED);
+        open(&mut m, &SHARED);
+        let listed: Vec<(u64, TeeUuid)> = m.instances().map(|(id, uuid)| (id, *uuid)).collect();
+        assert_eq!(listed, [(1, MULTI), (2, SHARED)]);
+        close(&mut m, a.session);
+        let c = open(&mut m, &MULTI);
+        let listed: Vec<(u64, TeeUuid)> = m.instances().map(|(id, uuid)| (id, *uuid)).collect();
+        assert_eq!(listed, [(2, SHARED), (3, MULTI)]);
+        close(&mut m, b.session);
+        close(&mut m, c.session);
+        assert_eq!(m.instances().count(), 1);
     }
 
     #[test]

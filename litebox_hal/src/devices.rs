@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! Devices behind device-neutral types ([`ConsoleDevice`],
-//! [`NetworkDevice`], [`NinePDevice`]), each probing
+//! [`NetworkDevice`], [`NinePDevice`], [`VsockDevice`]), each probing
 //! the drivers the HAL has for its kind. Runners choose which devices to
 //! probe, where they interrupt, and what to do without one.
 
@@ -11,6 +11,7 @@ use crate::interrupt::InterruptTarget;
 use crate::virtio::console::VirtioConsole;
 use crate::virtio::net::VirtioNet;
 use crate::virtio::nine_p::Virtio9p;
+use crate::virtio::vsock::{self, VirtioVsock};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
@@ -226,6 +227,100 @@ impl fmt::Display for NinePDevice {
             "virtio (pci {}, interrupts {})",
             self.0.transport().function(),
             self.interrupts()
+        )
+    }
+}
+
+/// A [`VsockDevice`]'s state, as its user sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VsockState {
+    /// No connection: the next request from the host is accepted.
+    Listening,
+    /// A connection, which may still have data to read after the host shut
+    /// down its sending side, or after the connection is gone (see
+    /// [`Self::Closed`]), until its data is read.
+    Connected,
+    /// The connection is gone (reset, shut down both ways, or lost to a
+    /// transport reset), and its data read; [`VsockDevice::close`] it to
+    /// listen again. Requests are refused meanwhile.
+    Closed,
+}
+
+/// A stream listener on one port of the VM's socket device, which the host
+/// connects to: at most one connection at a time, only from the host. Not
+/// internally synchronized.
+pub struct VsockDevice(Box<VirtioVsock>);
+
+impl VsockDevice {
+    /// The VM's socket device, interrupting `interrupt` if it can (see
+    /// [`Self::interrupts`]), listening on `port`; `None` if there is none.
+    ///
+    /// # Errors
+    ///
+    /// The device cannot be driven.
+    pub fn probe(
+        hal: &'static dyn Hal,
+        interrupt: InterruptTarget,
+        port: u32,
+    ) -> Result<Option<Self>, crate::virtio::Error> {
+        // Virtio over PCI.
+        let device = VirtioVsock::probe(hal, interrupt.msi_message(), port).transpose()?;
+        Ok(device.map(|device| Self(Box::new(device))))
+    }
+
+    /// Whether the device raises its interrupt; else it must be polled.
+    pub fn interrupts(&self) -> bool {
+        self.0.transport().interrupts()
+    }
+
+    /// The host's port of the connection, if any.
+    pub fn peer_port(&self) -> Option<u32> {
+        self.0.peer_port()
+    }
+
+    /// The listener's state, once what the device returned is taken.
+    pub fn state(&mut self) -> VsockState {
+        match self.0.state() {
+            vsock::State::Listening => VsockState::Listening,
+            vsock::State::Connected => VsockState::Connected,
+            vsock::State::Closed => VsockState::Closed,
+        }
+    }
+
+    /// Copies received data into `output`: how much (zero if none is
+    /// waiting), or `None` at the end of the stream (no connection, or the
+    /// host sends no more).
+    pub fn read(&mut self, output: &mut [u8]) -> Option<usize> {
+        self.0.read(output)
+    }
+
+    /// Queues as much of `bytes` as the device and host take now: how much,
+    /// or `None` if the stream takes no more (no live connection, or the
+    /// host receives no more).
+    pub fn write(&mut self, bytes: &[u8]) -> Option<usize> {
+        self.0.write(bytes)
+    }
+
+    /// Ends the connection, if any, and listens again.
+    pub fn close(&mut self) {
+        self.0.close();
+    }
+
+    /// Whether everything written reached the host's socket.
+    pub fn flushed(&mut self) -> bool {
+        self.0.flushed()
+    }
+}
+
+impl fmt::Display for VsockDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "virtio (pci {}, interrupts {}, cid {}, port {})",
+            self.0.transport().function(),
+            self.interrupts(),
+            self.0.guest_cid(),
+            self.0.port()
         )
     }
 }
