@@ -679,26 +679,16 @@ impl Tcp {
                 if !socket.may_send() {
                     return Ok(SocketOutcome::Failed(SocketError::NotConnected));
                 }
-                let mut sent = 0;
-                // smoltcp passes the room in its send buffer a contiguous part
-                // at a time, and it has two at most.
-                for _ in 0..2 {
-                    if sent == data.len() {
-                        break;
-                    }
-                    let filled = socket.send(|part| {
-                        let len = part.len().min(data.len() - sent);
-                        match data.copy_to_slice_at(sent, &mut part[..len]) {
-                            Ok(()) => (len, Ok(len)),
-                            Err(fault) => (0, Err(fault)),
-                        }
-                    });
-                    match filled {
-                        Ok(filled) => sent += filled?,
-                        Err(_) => return Ok(SocketOutcome::Failed(SocketError::NotConnected)),
-                    }
+                // smoltcp queues its send buffer's room a contiguous part at a
+                // time and cannot take a part back, so the bytes that fit are
+                // staged first: none are sent if their copy faults.
+                let room = socket.send_capacity() - socket.send_queue();
+                let mut staged = zeroed(data.len().min(room))?;
+                data.copy_to_slice_at(0, &mut staged)?;
+                match socket.send_slice(&staged) {
+                    Ok(sent) => sent,
+                    Err(_) => return Ok(SocketOutcome::Failed(SocketError::NotConnected)),
                 }
-                sent
             }
             _ => return Err(BrokerError::Internal),
         };

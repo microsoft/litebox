@@ -18,7 +18,8 @@ use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket as core_socket;
 use litebox_broker_core::socket::SocketProvider as _;
 use litebox_broker_core::test_support::{
-    ManualTimerProvider, StreamData, TestBrokerCoreBuilder, receive_data, receive_data_from,
+    FaultingBuffer, ManualTimerProvider, StreamData, TestBrokerCoreBuilder, receive_data,
+    receive_data_from,
 };
 use litebox_broker_core::timer::TimerProvider as _;
 use litebox_broker_core::{
@@ -32,6 +33,7 @@ use litebox_broker_protocol::socket::{
     ReceiveFromFlags, SendFlags, ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome,
     SocketType,
 };
+use litebox_platform::buffer::Fault;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
@@ -628,6 +630,74 @@ fn external_tcp_reaches_the_host_through_the_link() {
 }
 
 #[test]
+fn a_send_whose_copy_faults_where_the_send_queue_wraps_sends_nothing() {
+    let wire: &'static Wire = Box::leak(Box::default());
+    let test = Test::new(Some(wire));
+    let mut host = Host::new(wire, &test.clock);
+    let (process, socket) = echo_connection(&test, &mut host);
+    host.paused = true;
+    let host_queue = |host: &Host| host.sockets.get::<tcp::Socket>(host.echo).recv_queue();
+    let send = |data: &[u8]| {
+        let chunk = litebox_broker_protocol::socket::MAX_SOCKET_TRANSFER_SIZE as usize;
+        for chunk in data.chunks(chunk) {
+            assert_eq!(
+                core_socket::send(&process, socket, &chunk, SendFlags::NONE),
+                Ok(SocketOutcome::Completed(chunk.len()))
+            );
+        }
+    };
+    // The host takes the first 48 KiB, which empties the send queue, and the
+    // first 16 KiB of the next 48 KiB, which leaves the queue's free room
+    // wrapping around its end.
+    let first = vec![1; 48 * 1024];
+    let second = vec![2; 48 * 1024];
+    send(&first);
+    pump(&test, &mut host, |host| host_queue(host) == first.len());
+    run_for(
+        &test,
+        &mut host,
+        Duration::from_millis(100),
+        Duration::from_millis(1),
+    );
+    send(&second);
+    pump(&test, &mut host, |host| host_queue(host) == 64 * 1024);
+    run_for(
+        &test,
+        &mut host,
+        Duration::from_millis(100),
+        Duration::from_millis(1),
+    );
+    assert_eq!(
+        core_socket::send(
+            &process,
+            socket,
+            &FaultingBuffer::new(32 * 1024, 20 * 1024),
+            SendFlags::NONE
+        ),
+        Err(Fault.into())
+    );
+    host.paused = false;
+    let mut echoed = Vec::new();
+    let expected = [first, second].concat();
+    pump(&test, &mut host, |_| {
+        if let Ok(SocketOutcome::Completed(StreamData::Received(data))) =
+            receive(&process, socket, 32 * 1024)
+        {
+            echoed.extend(data);
+        }
+        echoed.len() >= expected.len()
+    });
+    run_for(
+        &test,
+        &mut host,
+        Duration::from_millis(100),
+        Duration::from_millis(1),
+    );
+    assert_eq!(receive(&process, socket, 1), Err(BrokerError::WouldBlock));
+    assert!(echoed == expected, "{} bytes echoed", echoed.len());
+}
+
+#[test]
 fn external_udp_goes_through_the_gateway() {
     let wire: &'static Wire = Box::leak(Box::default());
     let test = Test::new(Some(wire));
@@ -648,6 +718,18 @@ fn external_udp_goes_through_the_gateway() {
     let process = test.process();
     let socket = test.socket(&process, SocketType::Datagram);
     let host_address = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 53);
+    // A datagram whose copy faults is not sent, so the host sees only the
+    // query.
+    assert_eq!(
+        core_socket::send_to(
+            &process,
+            socket,
+            &FaultingBuffer::new(5, 0),
+            SendFlags::NONE,
+            Some(host_address)
+        ),
+        Err(Fault.into())
+    );
     assert_eq!(
         core_socket::send_to(
             &process,

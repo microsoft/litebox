@@ -289,17 +289,15 @@ impl Udp {
         if data.len() > MAX_EXTERNAL_DATAGRAM {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
+        // smoltcp cannot take back a datagram it has queued, so the payload is
+        // staged first: one whose copy faults is not sent.
+        let mut payload = zeroed(data.len())?;
+        data.copy_to_slice_at(0, &mut payload)?;
         let mut meta = UdpMetadata::from(IpEndpoint::from(destination));
         meta.local_address = Some((*source.ip()).into());
-        // Unlike `send_with`, `send` queues a datagram only once it has room
-        // for its metadata too.
-        match sockets.udp(handle).send(data.len(), meta) {
-            Ok(datagram) => {
+        match sockets.udp(handle).send_slice(&payload, meta) {
+            Ok(()) => {
                 self.blocked = None;
-                // smoltcp sends the datagram whatever happens; one whose copy
-                // faulted goes out zeroed rather than with stale bytes.
-                data.copy_to_slice_at(0, datagram)
-                    .inspect_err(|_| datagram.fill(0))?;
                 Ok(SocketOutcome::Completed(data.len()))
             }
             Err(udp::SendError::BufferFull) => {
