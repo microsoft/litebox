@@ -847,23 +847,16 @@ fn test_nine_p_large_read_write() {
 
     drop(fd);
 
-    // Read it all back
+    // Read it all back in one call, with room to spare: the client sends as many `Tread`s as it
+    // takes and stops at the end of the file.
     let mut fd = fs
         .open(USER, "/large_test.bin", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
-    let mut read_buf = alloc::vec![0u8; data_size];
-    let mut total_read = 0;
-    while total_read < data.len() {
-        let mut rest = &mut read_buf[total_read..];
-        let n = fs.read(&mut fd, &mut rest, None).expect("read failed");
-        if n == 0 {
-            break;
-        }
-        total_read += n;
-    }
-    assert_eq!(total_read, data.len());
-    assert_eq!(read_buf, data);
+    let mut read_buf = alloc::vec![0u8; data_size + 1];
+    let n = fs.read(&mut fd, &mut read_buf, None).expect("read failed");
+    assert_eq!(n, data.len());
+    assert_eq!(read_buf[..n], data);
 
     drop(fd);
 }

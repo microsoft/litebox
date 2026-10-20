@@ -444,6 +444,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Read from a file
+    ///
+    /// Like Linux's v9fs, sends as many `Tread`s as it takes to fill `buf`, stopping early only
+    /// when one returns nothing, so a read larger than a message is not cut short.
     pub(super) fn read(
         &self,
         fid: &Fid<Platform>,
@@ -454,25 +457,35 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             .msize
             .checked_sub(fcall::IOHDRSZ)
             .ok_or(Error::InvalidResponse)? as usize;
-        let count = buf.len().min(max_count);
-        self.fcall(
-            Fcall::Tread(fcall::Tread {
-                fid: fid.id(),
-                offset,
-                count: u32::try_from(count).map_err(|_| Error::InvalidResponse)?,
-            }),
-            |response| match response {
-                Fcall::Rread(fcall::Rread { data }) => {
-                    if data.len() > count {
-                        return Err(Error::InvalidResponse);
+        let mut read = 0;
+        while read < buf.len() {
+            let count = (buf.len() - read).min(max_count);
+            let received = self.fcall(
+                Fcall::Tread(fcall::Tread {
+                    fid: fid.id(),
+                    offset: offset
+                        .checked_add(read as u64)
+                        .ok_or(Error::InvalidResponse)?,
+                    count: u32::try_from(count).map_err(|_| Error::InvalidResponse)?,
+                }),
+                |response| match response {
+                    Fcall::Rread(fcall::Rread { data }) => {
+                        if data.len() > count {
+                            return Err(Error::InvalidResponse);
+                        }
+                        buf.copy_from_slice_at(read, &data)?;
+                        Ok(data.len())
                     }
-                    buf.copy_from_slice_at(0, &data)?;
-                    Ok(data.len())
-                }
-                Fcall::Rlerror(e) => Err(Error::from(e)),
-                _ => Err(Error::InvalidResponse),
-            },
-        )
+                    Fcall::Rlerror(e) => Err(Error::from(e)),
+                    _ => Err(Error::InvalidResponse),
+                },
+            )?;
+            if received == 0 {
+                break;
+            }
+            read += received;
+        }
+        Ok(read)
     }
 
     /// Write to a file
