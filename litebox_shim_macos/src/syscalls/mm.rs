@@ -142,7 +142,7 @@ struct MachoTrampolineCheckpoint {
 #[derive(Clone)]
 struct MachoPatchMetadata(Option<Arc<MachoPatchInfo>>);
 
-fn permissions(protection: VmProtection) -> Permissions {
+pub(crate) fn permissions(protection: VmProtection) -> Permissions {
     let mut permissions = Permissions::empty();
     permissions.set(Permissions::READ, protection.contains(VmProtection::READ));
     permissions.set(Permissions::WRITE, protection.contains(VmProtection::WRITE));
@@ -2231,7 +2231,7 @@ mod tests {
         );
         assert!(!flags_at(task, below).contains(VmFlags::VM_WRITE));
         assert!(!flags_at(task, base).contains(VmFlags::VM_WRITE));
-        // Without the refusing mapping the same request applies to every part.
+        // Without the refusing mapping, a request spanning both parts succeeds.
         task.sys_munmap(cache.end, PAGE_SIZE).unwrap();
         assert_eq!(task.sys_mprotect(below, 2 * PAGE_SIZE, RW), Ok(()));
         assert!(flags_at(task, below).contains(VmFlags::VM_WRITE));

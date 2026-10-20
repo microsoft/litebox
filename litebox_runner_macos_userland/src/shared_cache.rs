@@ -106,9 +106,11 @@ fn path_variable_tail<'a>(path: &'a str, variable: &str) -> Option<&'a str> {
 ///
 /// `@loader_path` follows dyld's `Loader::expandAtLoaderPath`;
 /// `@executable_path` follows `Loader::expandAndNormalizeAtExecutablePath`,
-/// including its folding of leading `/..` components. dyld's folding steps
-/// before the start of its buffer for an executable directly in `/`; here
-/// folding stops at `/` instead.
+/// including its folding of leading `/..` components, which stops before
+/// removing the top-level directory (`/opt/bin/main` with
+/// `@executable_path/../../x` gives `/opt/../x`). dyld's folding steps before
+/// the start of its buffer for an executable directly in `/`; here nothing is
+/// folded then.
 fn expand_path_variables(executable_path: &str, path: &str) -> Option<String> {
     let directory_end = executable_path.rfind('/')?;
     if let Some(tail) = path_variable_tail(path, "@loader_path") {
@@ -324,7 +326,8 @@ pub(crate) struct GuestCache {
     slide_info: BTreeMap<u64, SlideInfoV5>,
     /// The live DynamicRegion page.
     dynamic_region: Vec<u8>,
-    /// Images initialized at launch (libSystem + dyld initializer closure).
+    /// Images initialized at launch: the initializer closure of libSystem,
+    /// dyld and the executable's non-delayed cache dependencies.
     closure: Vec<ClosureImage>,
     /// Header addresses of every image dyld creates a loader for at launch.
     launch_set: BTreeSet<u64>,
@@ -759,7 +762,6 @@ fn free_host_range(from: u64, length: u64, limit: u64) -> Result<Option<u64>> {
     }
 }
 
-/// Whether any host VM region overlaps `range`.
 fn host_range_occupied(range: Range<u64>) -> Result<bool> {
     Ok(next_host_region(range.start)?.is_some_and(|region| region.start < range.end))
 }

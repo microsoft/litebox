@@ -479,7 +479,6 @@ type SharedCacheSnapshot = (
     Vec<(core::ops::Range<usize>, VmFlags)>,
 );
 
-/// Mappings, contents and guest permissions of `range`.
 fn shared_cache_snapshot(
     task: &Task<Platform>,
     range: &core::ops::Range<usize>,

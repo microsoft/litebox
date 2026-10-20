@@ -75,7 +75,7 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     /// `csrctl`: System Integrity Protection is fully enabled (active
-    /// configuration 0), so every check fails with EPERM.
+    /// configuration 0), so checking any nonzero mask fails with EPERM.
     pub(crate) fn sys_csrctl(
         operation: u32,
         buffer: UserPtrMut<u32>,

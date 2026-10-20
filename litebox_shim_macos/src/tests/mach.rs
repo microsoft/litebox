@@ -433,13 +433,14 @@ fn mach_msg_queues_messages_and_send_once_notifications() {
     );
 }
 
-/// Send a MIG request to `remote` and receive its reply.
+/// [`mig_call_on`] with a new reply port.
 fn mig_call(task: &Task<Platform>, remote: u32, id: i32, body: &[u8], complex: bool) -> Vec<u8> {
     let reply = u32::try_from(trap(task, mach_trap::MACH_REPLY_PORT, &[])).unwrap();
     mig_call_on(task, reply, remote, id, body, complex)
 }
 
-/// [`mig_call`] with the caller's reply port.
+/// Send a MIG request to `remote` with reply port `reply` and return the
+/// reply, asserting its kernel-reply header.
 fn mig_call_on(
     task: &Task<Platform>,
     reply: u32,
@@ -617,7 +618,6 @@ fn send_port(task: &Task<Platform>, remote: u32, name: u32, disposition: u32) ->
     msg2(task, &mut buffer, SEND, header, 40, 1, 0, 0)
 }
 
-/// Receive one message from `port` without waiting.
 fn receive_now(task: &Task<Platform>, port: u32, buffer: &mut [u8]) -> u32 {
     let size = u32::try_from(buffer.len()).unwrap();
     msg2(

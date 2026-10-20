@@ -547,7 +547,6 @@ fn loader_teardown_and_argument_limit() {
     assert_eq!(process.exit_status(), Some(0));
 }
 
-/// Compile a C program with the host toolchain.
 #[cfg(feature = "test-broker")]
 fn compile_c(dir: &Path, source: &str) -> PathBuf {
     compile(dir, "clang", "main.c", source, &[])
@@ -743,7 +742,6 @@ fn change_dependency(binary: &Path, from: &str, to: &[u8]) {
     );
 }
 
-/// Run the zlib-version guest `binary` and check its output.
 #[cfg(feature = "test-broker")]
 fn assert_prints_zlib_version(binary: &Path) {
     let (code, stdout, stderr) = run_guest(binary);
@@ -939,7 +937,6 @@ fn dynamic_guest_leaves_host_runtime_untouched() {
         test_mmap_image: None,
     })
     .unwrap();
-    // The guest ran dyld and its own libSystem to completion.
     assert_eq!(status, 0);
     assert_eq!(host_state::shared_cache_base(), host_cache);
     assert_eq!(host_state::thread_pointer(), thread_pointer);

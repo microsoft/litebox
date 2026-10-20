@@ -60,7 +60,6 @@ fn mach_page_range(address: usize, size: usize) -> Result<MachPageRange, ()> {
 /// this bound, at the cost of possibly skipping free space.
 const ALIGNED_PLACEMENT_ATTEMPTS: usize = 64;
 
-/// Result of trying to map one candidate range of an aligned placement.
 #[derive(Debug, PartialEq, Eq)]
 enum PlacementAttempt {
     Mapped(usize),

@@ -33,8 +33,6 @@ pub const SLIDE_V5_PAGE_NO_REBASE: u16 = 0xffff;
 /// Size of a `DyldSharedCache::DynamicRegion` reservation.
 pub const DYNAMIC_REGION_SIZE: usize = 0x4000;
 
-/// Longest accepted path string (Darwin `PATH_MAX`, including NUL).
-const MAX_PATH_BYTES: usize = crate::PATH_MAX;
 /// Upper bounds that reject absurd counts before allocating.
 const MAX_MAPPINGS: u32 = 64;
 const MAX_SUBCACHES: u32 = 1024;
@@ -200,7 +198,7 @@ fn read_path<R: CacheFileReader + ?Sized>(reader: &R, offset: u64) -> Result<Str
         .ok_or(SharedCacheError::Malformed("path offset"))?;
     let length = usize::try_from(available)
         .unwrap_or(usize::MAX)
-        .min(MAX_PATH_BYTES);
+        .min(crate::PATH_MAX);
     let bytes = read_vec(reader, offset, length)?;
     c_string(&bytes, 0, bytes.len()).map(String::from)
 }

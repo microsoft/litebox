@@ -12,6 +12,7 @@
 //! provider-owned host bytes as private copy-on-write pages. The instance is
 //! tracked by the shim's `VmemManager` and released with the address space.
 
+use crate::syscalls::mm::permissions;
 use crate::{LoadedProgram, ShimPlatform, Task};
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::ops::Range;
@@ -174,12 +175,10 @@ impl SharedCacheState {
                 .all(|mapping| mapping.max_protection.contains(protection))
     }
 
-    /// Whether `page` awaits the pager.
     pub(crate) fn is_paged(&self, page: usize) -> bool {
         self.mapping_at(page).is_some_and(|mapping| mapping.paged)
     }
 
-    /// The record containing `address`.
     pub(crate) fn mapping_at(&self, address: usize) -> Option<&SharedCacheMapping> {
         self.mappings
             .iter()
@@ -248,17 +247,6 @@ impl SharedCacheState {
         }
         self.mappings = updated;
     }
-}
-
-fn permissions(protection: VmProtection) -> Permissions {
-    let mut permissions = Permissions::empty();
-    permissions.set(Permissions::READ, protection.contains(VmProtection::READ));
-    permissions.set(Permissions::WRITE, protection.contains(VmProtection::WRITE));
-    permissions.set(
-        Permissions::EXEC,
-        protection.contains(VmProtection::EXECUTE),
-    );
-    permissions
 }
 
 fn page_aligned(range: &Range<usize>) -> bool {

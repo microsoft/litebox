@@ -50,9 +50,9 @@ impl AppleEntropy {
 /// and `executable_cdhash=`/`executable_boothash=` (no guest file identity or
 /// code signature), `th_port=` (no guest Mach thread port name exists yet;
 /// libpthread then falls back to `mach_thread_self()`), `ptrauth_disabled=1`
-/// (only for arm64e mains run as arm64) and `dyld_hw_tpro*` (no TPRO). Static
-/// executables, which have no libSystem to consume them, start without the
-/// entropy keys (`entropy` is `None`).
+/// (only for arm64e mains run as arm64) and `dyld_hw_tpro*` (no TPRO). The
+/// entropy keys are omitted when `entropy` is `None`, which the loader allows
+/// only for static executables without a random source.
 pub(super) fn apple_strings(
     executable_path: &str,
     main_stack: &MainStack,

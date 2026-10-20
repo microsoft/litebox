@@ -30,7 +30,6 @@ use litebox_common_macos::{
 };
 use zerocopy::{FromBytes as _, IntoBytes as _};
 
-/// A kernel object reachable through a port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KernelObject {
     Task,
@@ -60,7 +59,7 @@ struct GuestQueue {
     context: u64,
     guarded: bool,
     strict_guard: bool,
-    /// `MPO_IMMOVABLE_RECEIVE`: the receive right cannot be moved.
+    /// `MPO_IMMOVABLE_RECEIVE`.
     immovable: bool,
 }
 
@@ -95,8 +94,8 @@ impl GuestQueue {
     }
 }
 
-/// A live port. A port's record is removed when it dies, so a `PortId`
-/// without a record names a dead port.
+/// A port's record is removed when it dies, so a `PortId` without a record
+/// names a dead port.
 #[derive(Debug)]
 struct Port {
     kind: PortKind,
@@ -210,7 +209,6 @@ fn payload_charge(body_length: usize, port_count: usize) -> usize {
     body_length + port_count * size_of::<(usize, Option<Right>)>()
 }
 
-/// Host memory of one slot of a port's message queue.
 const QUEUE_SLOT_BYTES: usize = size_of::<Message>();
 /// Slots a queue allocates first and keeps when a shrink leaves messages.
 const QUEUE_MIN_SLOTS: usize = 4;
@@ -230,10 +228,9 @@ fn copyin_type(disposition: u32) -> u32 {
     }
 }
 
-/// Outcome of a failed `mach_msg2` operation.
+/// The error is a `mach_msg_return_t`.
 type MsgResult<T> = Result<T, u32>;
 
-/// Why a message could not be queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnqueueError {
     /// The port is dead or is not a guest port.
@@ -254,7 +251,6 @@ enum QueueSpace {
     NoBuffer,
 }
 
-/// The guest task's IPC space.
 #[derive(Default)]
 pub(crate) struct IpcSpace {
     ports: BTreeMap<PortId, Port>,
@@ -904,7 +900,8 @@ impl IpcSpace {
     }
 
     /// `ipc_right_copyin_check_reply`: whether `copyin(name, disposition)`
-    /// would succeed, without side effects.
+    /// would succeed. Consumes no rights, but like [`IpcSpace::check`] turns
+    /// rights to dead ports into dead names.
     fn can_copyin(&mut self, name: u32, disposition: u32) -> bool {
         if name == MACH_PORT_DEAD {
             return true;

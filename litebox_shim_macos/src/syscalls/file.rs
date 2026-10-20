@@ -37,7 +37,6 @@ pub(crate) type FileFd<P> = TypedFd<FileSubsystem<P>>;
 
 /// A file descriptor's open file description.
 pub(crate) struct File<P: ShimPlatform> {
-    /// The LiteBox file this open file description refers to.
     description: Arc<litebox::fs::File<P>>,
     /// The absolute path it was opened by, for `F_GETPATH`. Inherited
     /// descriptors (such as stdio) have none.
@@ -127,7 +126,6 @@ impl<P: ShimPlatform> FilesState<P> {
             .map_err(|_| Errno::EBADF)
     }
 
-    /// The path `fd` was opened by, if any.
     pub(crate) fn path(&self, fd: &FileFd<P>) -> Result<Option<Arc<str>>, Errno> {
         self.litebox
             .descriptor_table()
@@ -135,7 +133,6 @@ impl<P: ShimPlatform> FilesState<P> {
             .ok_or(Errno::EBADF)
     }
 
-    /// The XNU-only status flags of `fd`'s open file description.
     fn xnu_status(&self, fd: &FileFd<P>) -> Result<Arc<AtomicU32>, Errno> {
         self.litebox
             .descriptor_table()
@@ -627,7 +624,6 @@ impl<P: ShimPlatform> Task<P> {
         flags: OpenFlags,
         mode: FileMode,
     ) -> Result<u32, Errno> {
-        /// `AT_FDCWD`.
         const AT_FDCWD: i32 = -2;
         if dirfd == AT_FDCWD || path.starts_with('/') {
             return self.sys_open(path, flags, mode);

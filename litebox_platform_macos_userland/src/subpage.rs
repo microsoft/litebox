@@ -148,7 +148,6 @@ fn runs<T: PartialEq>(pages: impl IntoIterator<Item = (usize, T)>) -> Vec<(Range
     runs
 }
 
-/// Contiguous runs of native page bases, in input order.
 fn base_runs(bases: impl IntoIterator<Item = usize>) -> Vec<Range<usize>> {
     runs(bases.into_iter().map(|base| (base, ())))
         .into_iter()
@@ -178,7 +177,6 @@ fn flush(base: usize, permissions: Perm) {
 }
 
 impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
-    /// Entries the ownership table has room for.
     #[cfg(test)]
     pub(super) fn capacity(&self) -> usize {
         self.0.capacity()

@@ -192,7 +192,8 @@ fn filesystem_loader_runs_linked_static_macho() {
     assert_eq!(word(sp), argument_count);
     let stack_end = (sp + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let guard = stack_end - STACK_SIZE - PAGE_SIZE;
-    // A static executable starts without the entropy keys.
+    // Without a broker's random source, a static executable starts without
+    // the entropy keys.
     let apple = [
         std::string::String::from("executable_path=/bin/main"),
         std::format!(

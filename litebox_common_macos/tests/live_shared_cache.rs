@@ -129,7 +129,6 @@ fn live_host_cache_closure_covers_libsystem() {
         .iter()
         .map(|image| cache.images()[image.index].path.as_str())
         .collect();
-    // 45 images, including dyld, on macOS 26.7.1 (25G241).
     println!("closure: {} images including dyld", closure.len());
     // Delayed-init links (such as libxpc -> CoreFoundation) are not followed.
     assert!(

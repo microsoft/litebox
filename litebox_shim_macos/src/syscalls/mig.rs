@@ -20,7 +20,6 @@ use litebox_common_macos::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// `MACH_NOTIFY_SEND_ONCE`.
 pub(crate) const MACH_NOTIFY_SEND_ONCE: i32 = 0o107;
 
 /// `clock_id_t` of a clock kernel object.
@@ -267,15 +266,13 @@ const BASEPRI_DEFAULT: u32 = 31;
 const DEPRESSPRI: u32 = 0;
 const IDLEPRI: u32 = 0;
 const MINPRI_USER: u32 = 0;
-/// `CPU_TYPE_ARM64` and `CPU_SUBTYPE_ARM64_ALL`.
 const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
 /// The scheduler quantum (`sched_info.min_quantum`), in milliseconds.
 const SCHED_QUANTUM_MS: u32 = 10;
 
 impl<P: ShimPlatform> Task<P> {
-    /// Serve one request to a kernel object and return its reply. Every
-    /// routine served here replies.
+    /// Every routine served here replies.
     pub(crate) fn serve_mig(&self, object: KernelObject, mut request: Message) -> Message {
         let reply = match (object, request.id) {
             (KernelObject::Host, routine::HOST_INFO) => self.mig_host_info(&request),
@@ -606,7 +603,6 @@ impl<P: ShimPlatform> Task<P> {
             return error_reply(mig::BAD_ARGUMENTS);
         };
         if object.is_some() {
-            // Named memory entries are not supported.
             self.log_unsupported_once("mach_vm_map with a memory object", format_args!(""));
             return error_reply(KernReturn::INVALID_ARGUMENT.raw());
         }

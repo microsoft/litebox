@@ -277,13 +277,10 @@ struct GlobalState<P: ShimPlatform> {
     shared_cache_reservation: Mutex<P, Option<core::ops::Range<usize>>>,
     shared_cache: Mutex<P, Option<shared_cache::SharedCacheState>>,
     host_sysctls: Vec<HostSysctl>,
-    /// The task's Mach IPC space.
     ipc: Mutex<P, syscalls::mach_ipc::IpcSpace>,
     /// `task_restartable_ranges_register` state.
     restartable_ranges: Mutex<P, Option<Vec<syscalls::mig::RestartableRange>>>,
-    /// Unsupported features already logged.
     reported_unsupported: Mutex<P, alloc::collections::BTreeSet<&'static str>>,
-    /// Unsupported syscall selectors already logged.
     reported_syscalls: Mutex<P, ReportedSyscalls>,
     next_thread_id: core::sync::atomic::AtomicU64,
 }

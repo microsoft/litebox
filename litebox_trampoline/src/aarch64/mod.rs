@@ -480,7 +480,7 @@ enum GateKind {
     X18Adr = 5,
     X18Branch = 6,
     X18StackWriteback = 7,
-    // 8 is retired: older rewritten binaries may still encode it.
+    // 8 is retired (older rewritten binaries may encode it); never reuse it.
 }
 
 impl GateKind {
