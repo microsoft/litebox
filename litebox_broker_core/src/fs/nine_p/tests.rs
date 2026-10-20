@@ -20,6 +20,7 @@ use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
 use crate::fs::{FileType, Mode, OFlags, SeekWhence};
 use crate::test_platform::TestPlatform;
+use crate::test_support::FaultingBuffer;
 
 use super::{NineP, transport};
 
@@ -562,6 +563,35 @@ fn test_nine_p_broken_read_after_progress() {
         .expect("read should return the first Tread's bytes");
     assert!(n > 0 && n < data.len());
     assert_eq!(buf[..n], data[..n]);
+}
+
+/// A read whose copy faults after its first `Tread` fails, and leaves the file position where it
+/// was.
+#[test]
+fn test_nine_p_faulting_read_after_progress() {
+    let server = DiodServer::start();
+
+    let data: alloc::vec::Vec<u8> = (0..100_000)
+        .map(|i: usize| u8::try_from(i % 251).unwrap())
+        .collect();
+    std::fs::write(server.export_path().join("read_me.bin"), &data).unwrap();
+
+    let fs = connect_9p(&server);
+    let mut fd = fs
+        .open(USER, "/read_me.bin", OFlags::RDONLY, Mode::empty())
+        .expect("open should succeed");
+
+    // A `Tread` carries at most 65512 bytes, so the first copy succeeds and a later one faults.
+    let mut faulting = FaultingBuffer::new(data.len(), 70_000);
+    let result = fs.read(&mut fd, &mut faulting, None);
+    assert!(matches!(result, Err(ReadError::Broker(_))));
+
+    let mut buf = alloc::vec![0u8; data.len()];
+    let n = fs
+        .read(&mut fd, &mut buf, None)
+        .expect("read should succeed");
+    assert_eq!(n, data.len());
+    assert_eq!(buf, data);
 }
 
 /// Writing to an fd obtained before the break should fail.

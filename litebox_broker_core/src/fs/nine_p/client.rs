@@ -447,7 +447,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     ///
     /// Like Linux's v9fs, sends as many `Tread`s as it takes to fill `buf`, so a read larger
     /// than a message is not cut short. Stops early when a `Tread` returns nothing, or fails
-    /// after earlier ones read something, in which case it returns what they read.
+    /// after earlier ones read something, in which case it returns what they read, unless the
+    /// broker itself failed, as when copying to `buf` faulted, which fails the read.
     pub(super) fn read(
         &self,
         fid: &Fid<Platform>,
@@ -483,6 +484,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             ) {
                 Ok(0) => break,
                 Ok(received) => read += received,
+                Err(error @ Error::Broker(_)) => return Err(error),
                 Err(_) if read != 0 => break,
                 Err(error) => return Err(error),
             }

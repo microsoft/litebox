@@ -191,6 +191,16 @@ impl<B: ReadBuffer> ReadBuffer for CopyCount<B> {
         self.end(offset, source.len(), result)
     }
 
+    fn copy_from_buffer_at(
+        &mut self,
+        offset: usize,
+        source: &dyn WriteBuffer,
+    ) -> core::result::Result<(), Fault> {
+        self.start(offset)?;
+        let result = self.buffer.copy_from_buffer_at(offset, source);
+        self.end(offset, source.len(), result)
+    }
+
     fn read_direct_at(
         &mut self,
         offset: usize,
@@ -331,8 +341,9 @@ mod tests {
         let mut counted = CopyCount::new(&mut destination[..]);
         assert_eq!(counted.copy_from_slice_at(0, &[1]), Ok(()));
         assert_eq!(counted.copy_from_slice_at(1, &[2, 3]), Ok(()));
-        assert_eq!(counted.finish(), Ok(3));
-        assert_eq!(destination, [1, 2, 3, 0]);
+        assert_eq!(counted.copy_from_buffer_at(3, &vec![4u8]), Ok(()));
+        assert_eq!(counted.finish(), Ok(4));
+        assert_eq!(destination, [1, 2, 3, 4]);
 
         let source = [1, 2, 3, 4];
         let counted = CopyCount::new(&source[..]);
@@ -351,6 +362,14 @@ mod tests {
         let mut counted = CopyCount::new(FaultingBuffer::new(4, 2));
         assert_eq!(counted.copy_from_slice_at(0, &[1, 2]), Ok(()));
         assert_eq!(counted.copy_from_slice_at(2, &[3]), Err(Fault));
+        assert_eq!(counted.finish(), Err(Fault.into()));
+
+        // Copying straight into the destination's bytes faults on the source.
+        let mut counted = CopyCount::new(&mut destination[..]);
+        assert_eq!(
+            counted.copy_from_buffer_at(0, &FaultingBuffer::new(4, 2)),
+            Err(Fault)
+        );
         assert_eq!(counted.finish(), Err(Fault.into()));
     }
 
