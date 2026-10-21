@@ -169,11 +169,6 @@ impl<const PAGE_SIZE: usize> MachClock for MacosUserlandWithPageSize<PAGE_SIZE> 
         info
     }
 
-    fn mach_wait_until(&self, deadline: u64) -> KernReturn {
-        // SAFETY: the deadline is a scalar in mach_absolute_time's clock domain.
-        unsafe { mach_wait_until(deadline) }
-    }
-
     fn mach_get_times(&self) -> (u64, Duration) {
         let mut absolute = 0u64;
         let mut t = libc::timespec {
@@ -629,7 +624,6 @@ enum MachVmInheritance {
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> KernReturn;
-    fn mach_wait_until(deadline: u64) -> KernReturn;
     fn mach_get_times(
         absolute_time: *mut u64,
         continuous_time: *mut u64,
