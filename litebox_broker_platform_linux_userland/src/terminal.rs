@@ -28,11 +28,9 @@ use rustix::termios::{OptionalActions, QueueSelector, Termios, Winsize};
 /// started by `setsid`, has none to open.
 pub fn open_controlling_terminal() -> io::Result<Option<(LinuxTerminal, [bool; 3])>> {
     let (stdin, stdout, stderr) = (io::stdin(), io::stdout(), io::stderr());
-    let mut views = [false; 3];
-    for (view, fd) in views
-        .iter_mut()
-        .zip([stdin.as_fd(), stdout.as_fd(), stderr.as_fd()])
-    {
+    let fds = [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()];
+    let mut is_terminal = [false; 3];
+    for (stream_is_terminal, fd) in is_terminal.iter_mut().zip(fds) {
         let status = match rustix::fs::fstat(fd) {
             Ok(status) => status,
             Err(Errno::BADF) => continue,
@@ -40,7 +38,9 @@ pub fn open_controlling_terminal() -> io::Result<Option<(LinuxTerminal, [bool; 3
         };
         match FileType::from_raw_mode(status.st_mode) {
             FileType::Fifo | FileType::Socket => return Ok(None),
-            FileType::CharacterDevice => *view = is_controlling_terminal(fd, status.st_rdev),
+            FileType::CharacterDevice => {
+                *stream_is_terminal = is_controlling_terminal(fd, status.st_rdev);
+            }
             _ => {}
         }
     }
@@ -65,7 +65,7 @@ pub fn open_controlling_terminal() -> io::Result<Option<(LinuxTerminal, [bool; 3
     if !foreground {
         return Ok(None);
     }
-    Ok(Some((LinuxTerminal::new(file)?, views)))
+    Ok(Some((LinuxTerminal::new(file)?, is_terminal)))
 }
 
 /// Whether `fd`, a character device numbered `device`, is this process's

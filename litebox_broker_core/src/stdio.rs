@@ -65,10 +65,10 @@ impl From<Fault> for StdioProviderError {
 /// progress can keep the default readiness methods.
 ///
 /// A provider gives the guest at most one terminal, its controlling terminal
-/// behind `/dev/tty`. Each standard stream that refers to it is a view of it,
-/// whose reads, writes, and readiness go through the terminal instead of this
-/// provider. Without a terminal, no stream is a terminal. Neither the terminal
-/// nor which streams refer to it changes over the provider's lifetime.
+/// behind `/dev/tty`. Reads, writes, and readiness of each standard stream that
+/// refers to it go through the terminal instead of this provider. Without a
+/// terminal, no stream is a terminal. Neither the terminal nor which streams
+/// refer to it changes over the provider's lifetime.
 pub trait StdioProvider: Send + Sync {
     /// The guest's terminal, if any.
     fn terminal(&self) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {

@@ -45,7 +45,7 @@ pub struct UserlandStdioProvider {
     terminal: Option<Arc<HostTerminal>>,
     /// Whether each standard stream, indexed by [`StdioStream`], refers to
     /// `terminal`.
-    views: [bool; 3],
+    is_terminal: [bool; 3],
 }
 
 impl Default for UserlandStdioProvider {
@@ -67,7 +67,9 @@ impl UserlandStdioProvider {
     #[cfg(target_os = "linux")]
     pub fn open_terminal() -> std::io::Result<Self> {
         match litebox_broker_platform_linux_userland::terminal::open_controlling_terminal() {
-            Ok(Some((transport, views))) => Self::with_terminal(Arc::new(transport), views),
+            Ok(Some((transport, is_terminal))) => {
+                Self::with_terminal(Arc::new(transport), is_terminal)
+            }
             Ok(None) => Ok(Self::default()),
             Err(error) => {
                 litebox_util_log::warn!(
@@ -79,15 +81,15 @@ impl UserlandStdioProvider {
         }
     }
 
-    /// Serves `transport` as the guest's terminal, with `views` marking the
-    /// standard streams, indexed by [`StdioStream`], that refer to it.
+    /// Serves `transport` as the guest's terminal, with `is_terminal` marking
+    /// the standard streams, indexed by [`StdioStream`], that refer to it.
     pub fn with_terminal(
         transport: Arc<dyn TerminalTransport>,
-        views: [bool; 3],
+        is_terminal: [bool; 3],
     ) -> std::io::Result<Self> {
         Ok(Self {
             terminal: Some(Arc::new(HostTerminal::new(transport)?)),
-            views,
+            is_terminal,
             ..Self::default()
         })
     }
@@ -108,7 +110,7 @@ impl UserlandStdioProvider {
     ) -> Self {
         Self {
             terminal: None,
-            views: [false; 3],
+            is_terminal: [false; 3],
             input: Arc::new(HostIo::new(InputState {
                 host: Some(Box::new(stdin)),
                 data: VecDeque::new(),
@@ -163,7 +165,7 @@ impl StdioProvider for UserlandStdioProvider {
     }
 
     fn is_terminal(&self, stream: StdioStream) -> bool {
-        self.views[stream as usize]
+        self.is_terminal[stream as usize]
     }
 
     fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize, StdioProviderError> {

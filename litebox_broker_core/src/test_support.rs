@@ -134,7 +134,7 @@ pub struct TestStdioProvider {
     input_watchers: Mutex<ReadinessWatchers>,
     writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
     /// Whether each stream, indexed by [`StdioStream`], refers to the terminal.
-    views: [bool; 3],
+    is_terminal: [bool; 3],
     terminal: Option<Arc<TestTerminal>>,
 }
 
@@ -148,7 +148,7 @@ impl Default for TestStdioProvider {
             }),
             input_watchers: Mutex::new(ReadinessWatchers::default()),
             writes: Mutex::new(Vec::new()),
-            views: [false; 3],
+            is_terminal: [false; 3],
             terminal: None,
         }
     }
@@ -158,7 +158,7 @@ impl TestStdioProvider {
     /// Makes `stream` refer to the guest terminal.
     #[must_use]
     pub fn with_terminal(mut self, stream: StdioStream) -> Self {
-        self.views[stream as usize] = true;
+        self.is_terminal[stream as usize] = true;
         self.with_controlling_terminal()
     }
 
@@ -254,7 +254,7 @@ impl StdioProvider for TestStdioProvider {
     }
 
     fn is_terminal(&self, stream: StdioStream) -> bool {
-        self.views[stream as usize]
+        self.is_terminal[stream as usize]
     }
 
     fn read(&self, output: &mut dyn ReadBuffer) -> core::result::Result<usize, StdioProviderError> {
