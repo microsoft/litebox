@@ -935,6 +935,7 @@ fn dynamic_guest_leaves_host_runtime_untouched() {
         program_and_arguments: vec![binary.to_str().unwrap().to_owned()],
         environment_variables: Vec::new(),
         test_mmap_image: None,
+        test_open_stdin: false,
     })
     .unwrap();
     assert_eq!(status, 0);
@@ -1111,6 +1112,7 @@ fn the_runner_thread_leaves_forwarded_signals_to_guest_threads() {
         program_and_arguments: vec![binary.to_str().unwrap().to_owned()],
         environment_variables: Vec::new(),
         test_mmap_image: None,
+        test_open_stdin: false,
     })
     .unwrap();
     assert_eq!(status, 0);
@@ -1420,6 +1422,12 @@ fn threads_use_cpp_std_mutex_and_condition_variable() {
 /// The scenarios of `fixtures/sync.c`.
 #[cfg(feature = "test-broker")]
 fn run_sync_scenario(scenario: &str) -> (Option<i32>, String, String) {
+    run_sync_scenario_with(&[], scenario)
+}
+
+/// [`run_sync_scenario`] with runner options before the guest.
+#[cfg(feature = "test-broker")]
+fn run_sync_scenario_with(options: &[&str], scenario: &str) -> (Option<i32>, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let binary = compile(
         dir.path(),
@@ -1428,7 +1436,9 @@ fn run_sync_scenario(scenario: &str) -> (Option<i32>, String, String) {
         include_str!("fixtures/sync.c"),
         &["-O1"],
     );
-    let (code, stdout, stderr) = run_runner_with_timeout(&[binary.to_str().unwrap(), scenario]);
+    let mut arguments = options.to_vec();
+    arguments.extend([binary.to_str().unwrap(), scenario]);
+    let (code, stdout, stderr) = run_runner_with_timeout(&arguments);
     (code, String::from_utf8(stdout).unwrap(), stderr)
 }
 
@@ -1472,6 +1482,17 @@ fn threads_cancel_threads_at_cancellation_points() {
             "cond 1 cleanup 1 relocked 1 sleep 1 write 1 fast 1\n".to_owned(),
             String::new()
         )
+    );
+}
+
+/// `pthread_cancel` of a thread blocked in `read` of open, empty standard
+/// input ends the read with `EINTR`, and the thread is canceled.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_cancel_a_thread_blocked_in_read() {
+    assert_eq!(
+        run_sync_scenario_with(&["--test-open-stdin"], "cancel_read"),
+        (Some(0), "read 1 fast 1\n".to_owned(), String::new())
     );
 }
 

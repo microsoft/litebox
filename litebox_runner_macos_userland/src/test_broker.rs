@@ -43,8 +43,14 @@ pub(crate) fn setup(
     platform: &'static MacosUserland,
     executable: Vec<u8>,
     mmap_image: Option<&[u8]>,
+    open_stdin: bool,
 ) -> Result<(MacosShimBuilder<MacosUserland>, Arc<TestStdioProvider>)> {
-    let stdio = Arc::new(TestStdioProvider::default());
+    let stdio = if open_stdin {
+        TestStdioProvider::default().with_open_input()
+    } else {
+        TestStdioProvider::default()
+    };
+    let stdio = Arc::new(stdio);
     let mut input = Vec::new();
     std::io::stdin()
         .read_to_end(&mut input)

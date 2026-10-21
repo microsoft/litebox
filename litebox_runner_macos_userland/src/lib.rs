@@ -36,6 +36,11 @@ pub struct CliArgs {
     #[cfg(feature = "test-broker")]
     #[arg(long, hide = true, value_hint = clap::ValueHint::FilePath)]
     pub test_mmap_image: Option<PathBuf>,
+    /// Keep standard input open after the host's input, so guest reads of
+    /// empty input block instead of reporting end-of-file.
+    #[cfg(feature = "test-broker")]
+    #[arg(long, hide = true)]
+    pub test_open_stdin: bool,
 }
 
 mod shared_cache;
@@ -177,7 +182,12 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             .map(std::fs::read)
             .transpose()
             .context("reading mmap test image")?;
-        test_broker::setup(platform, data.clone(), mmap_image.as_deref())?
+        test_broker::setup(
+            platform,
+            data.clone(),
+            mmap_image.as_deref(),
+            cli_args.test_open_stdin,
+        )?
     };
     let shim = builder
         .host_sysctls(host_sysctls())

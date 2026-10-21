@@ -475,8 +475,10 @@ struct Task<P: ShimPlatform> {
 }
 
 impl<P: ShimPlatform> Task<P> {
-    /// Returns a wait context that process exit and a host signal, such as
-    /// Ctrl-C, interrupt.
+    /// Returns a wait context that process exit, a host signal, such as
+    /// Ctrl-C, and a pending safe abort interrupt. Every wait the shim makes
+    /// for the guest is abort-safe in XNU, including blocked reads and writes
+    /// (`msleep` with `PCATCH`).
     fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, P> {
         self.thread
             .wait_state
@@ -500,7 +502,9 @@ impl<P: ShimPlatform> Task<P> {
 
 impl<P: ShimPlatform> litebox::event::wait::CheckForInterrupt for Task<P> {
     fn check_for_interrupt(&self) -> bool {
-        self.take_host_signal() || self.process.exit_status().is_some()
+        self.take_host_signal()
+            || self.process.exit_status().is_some()
+            || self.thread.guest.take_abort()
     }
 }
 

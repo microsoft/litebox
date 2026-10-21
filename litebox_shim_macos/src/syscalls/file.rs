@@ -874,6 +874,8 @@ mod tests {
             in_mem::{InMem, InitialNode},
             resolver::Resolver,
         },
+        readiness::{ReadinessRegistration, SharedReadinessWatchers},
+        stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
         test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
     };
     use litebox_broker_host::test_support::InProcessBrokerSetup;
@@ -881,6 +883,7 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileUser,
     };
+    use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_common_linux::{PtRegs, vmem::CreatePagesFlags};
     use litebox_common_macos::{MmapFlags, PAGE_SIZE, TaskParams, VmProtection, syscall::nr};
     use litebox_platform_macos_userland::MacosUserland as Platform;
@@ -890,16 +893,20 @@ mod tests {
 
     /// A shim whose LiteBox has `nodes` in memory and the stdio devices at `/dev`.
     fn builder_with_files(nodes: Vec<(&'static str, InitialNode)>) -> MacosShimBuilder<Platform> {
+        builder_with_files_and_stdio(nodes, Arc::new(TestStdioProvider::default()))
+    }
+
+    /// [`builder_with_files`] whose stdio devices are served by `stdio`.
+    fn builder_with_files_and_stdio(
+        nodes: Vec<(&'static str, InitialNode)>,
+        stdio: Arc<dyn StdioProvider>,
+    ) -> MacosShimBuilder<Platform> {
         let platform = Platform::new();
         let fs = InMem::<Platform>::new_initialized(nodes);
         let fs = Composer::builder()
             .mount("/", |_| fs)
             .mount("/dev", |allocator| {
-                Devices::new(
-                    allocator,
-                    Arc::new(TestStdioProvider::default()),
-                    Arc::new(FailingRandomProvider),
-                )
+                Devices::new(allocator, stdio, Arc::new(FailingRandomProvider))
             })
             .build()
             .unwrap();
@@ -1696,5 +1703,154 @@ mod tests {
         assert_eq!(root_access("/secret", 4 | 1), Err(Errno::EPERM));
         assert_eq!(root_access("/group-only", 1), Err(Errno::EPERM));
         assert_eq!(root_access("/script", 1), Ok(()));
+    }
+
+    /// [`TestStdioProvider`] whose standard output is full until
+    /// [`FullOutput::drain`]: writes would block.
+    struct FullOutput {
+        inner: TestStdioProvider,
+        full: core::sync::atomic::AtomicBool,
+        blocked_writes: core::sync::atomic::AtomicUsize,
+        watchers: SharedReadinessWatchers,
+    }
+
+    impl FullOutput {
+        fn drain(&self) {
+            self.full.store(false, core::sync::atomic::Ordering::SeqCst);
+            self.watchers.publish(ReadinessFlags::WRITE);
+        }
+    }
+
+    impl StdioProvider for FullOutput {
+        fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
+            self.inner.read(output)
+        }
+
+        fn write(
+            &self,
+            stream: StdioOutputStream,
+            input: &[u8],
+        ) -> Result<usize, StdioProviderError> {
+            if self.full.load(core::sync::atomic::Ordering::SeqCst) {
+                self.blocked_writes
+                    .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                return Err(StdioProviderError::WouldBlock);
+            }
+            self.inner.write(stream, input)
+        }
+
+        fn is_terminal(&self, stream: StdioStream) -> bool {
+            self.inner.is_terminal(stream)
+        }
+
+        fn readiness(&self, stream: StdioStream) -> ReadinessFlags {
+            match stream {
+                StdioStream::Stdin => self.inner.readiness(stream),
+                _ if self.full.load(core::sync::atomic::Ordering::SeqCst) => {
+                    ReadinessFlags::default()
+                }
+                _ => ReadinessFlags::WRITE,
+            }
+        }
+
+        fn watch(
+            &self,
+            stream: StdioStream,
+            registration: &ReadinessRegistration,
+        ) -> litebox_broker_core::Result<()> {
+            match stream {
+                StdioStream::Stdin => self.inner.watch(stream, registration),
+                _ => self.watchers.watch(registration),
+            }
+        }
+    }
+
+    /// `pthread_cancel` of a thread blocked reading empty standard input or
+    /// writing to full standard output ends the call with EINTR: XNU sleeps
+    /// there with `PCATCH`, so `thread_abort_safely` ends the sleep.
+    #[test]
+    fn markcancel_ends_blocked_reads_and_writes() {
+        use core::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        const BOUND: Duration = Duration::from_secs(10);
+        let stdio = Arc::new(FullOutput {
+            inner: TestStdioProvider::default().with_open_input(),
+            full: true.into(),
+            blocked_writes: 0.into(),
+            watchers: SharedReadinessWatchers::default(),
+        });
+        let mut builder = builder_with_files_and_stdio(
+            vec![(
+                "/",
+                InitialNode::Directory {
+                    mode: FileMode::RWXU,
+                    owner: FileUser::ROOT,
+                },
+            )],
+            stdio.clone(),
+        );
+        let context = litebox::fs::Context::new();
+        for (path, access) in [
+            ("/dev/stdin", FileAccessMode::ReadOnly),
+            ("/dev/stdout", FileAccessMode::WriteOnly),
+        ] {
+            let file = builder
+                .litebox()
+                .open_file(
+                    &context,
+                    path,
+                    access,
+                    FileOpenFlags::NONE,
+                    FileMode::empty(),
+                )
+                .unwrap();
+            builder.inherit_file(file).unwrap();
+        }
+        let task = task_with(builder, TaskParams::default());
+        let reads = || stdio.inner.blocked_input_reads();
+        let writes = || stdio.blocked_writes.load(Ordering::SeqCst);
+        for (number, fd, blocked) in [
+            (nr::READ, 0, &reads as &dyn Fn() -> usize),
+            (nr::WRITE, 1, &writes),
+        ] {
+            let before = blocked();
+            let sibling = task.new_sibling(0);
+            let guest = Arc::clone(&sibling.thread.guest);
+            let port = task.global.ipc.lock().copyout_send(guest.port);
+            let (sender, ended) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                        sibling.start_thread();
+                        let mut byte = *b"x";
+                        let mut ctx = PtRegs::default();
+                        ctx.regs[16] = number;
+                        ctx.regs[0] = fd;
+                        ctx.regs[1] = byte.as_mut_ptr() as usize;
+                        ctx.regs[2] = 1;
+                        sibling.handle_syscall_request(&mut ctx);
+                        sender.send(ctx.regs[0]).unwrap();
+                    });
+                });
+                // The call failed once, registered for readiness, failed
+                // again, and is waiting (or about to).
+                let start = Instant::now();
+                while blocked() < before + 2 || guest.interrupt.lock().is_none() {
+                    assert!(start.elapsed() < BOUND, "{number} never blocked");
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    task.sys_pthread_markcancel(litebox_common_macos::syscall::MachPortName(port)),
+                    Ok(())
+                );
+                let result = ended.recv_timeout(BOUND);
+                if result.is_err() {
+                    // Unblock the call the cancellation did not end.
+                    stdio.inner.close_input();
+                    stdio.drain();
+                }
+                assert_eq!(result, Ok(Errno::EINTR.raw()), "{number}");
+            });
+        }
     }
 }

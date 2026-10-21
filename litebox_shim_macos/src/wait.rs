@@ -12,7 +12,8 @@
 //!
 //! Every guest wait the shim emulates is `THREAD_ABORTSAFE` in XNU (ulock,
 //! psynch, semaphores, Mach message queues, `mach_wait_until`,
-//! `thread_switch`), so every wait here ends for a pending safe abort.
+//! `thread_switch`, and blocked reads and writes), so every wait ends for a
+//! pending safe abort, which the task's interrupt check also consumes.
 
 use crate::{GuestThread, ShimPlatform, Task, ThreadId};
 use alloc::{collections::VecDeque, sync::Arc};

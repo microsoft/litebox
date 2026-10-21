@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 // Mach semaphore, sleep, cancellation and Mach message scenarios for the
-// runner's end-to-end tests, selected by argv[1].
+// runner's end-to-end tests, selected by argv[1]. "cancel_read" needs the
+// runner's --test-open-stdin.
 
 #include <dispatch/dispatch.h>
 #include <errno.h>
@@ -162,6 +163,31 @@ static int cancel(void) {
   return 0;
 }
 
+// pthread_cancel of a thread blocked reading standard input that stays open
+// and empty: the read ends with EINTR and the thread acts on the cancel.
+static atomic_int reading;
+
+static void *reader(void *unused) {
+  (void)unused;
+  char byte;
+  atomic_store(&reading, 1);
+  for (;;) read(STDIN_FILENO, &byte, 1);
+  return NULL;
+}
+
+static int cancel_read(void) {
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  pthread_t thread;
+  pthread_create(&thread, NULL, reader, NULL);
+  while (!atomic_load(&reading)) usleep(1000);
+  // Long enough for the read to block.
+  usleep(20000);
+  int read_canceled = canceled(thread);
+  printf("read %d fast %d\n", read_canceled, seconds_since(&start) < 30);
+  return 0;
+}
+
 // nanosleep, usleep and sleep in threads sleep for their time.
 static void *timed_sleeper(void *argument) {
   struct timespec start;
@@ -255,6 +281,7 @@ int main(int argc, char **argv) {
   if (strcmp(argv[1], "custom_stack") == 0) return custom_stack();
   if (strcmp(argv[1], "dispatch") == 0) return dispatch_ping_pong();
   if (strcmp(argv[1], "cancel") == 0) return cancel();
+  if (strcmp(argv[1], "cancel_read") == 0) return cancel_read();
   if (strcmp(argv[1], "sleep") == 0) return sleeps();
   if (strcmp(argv[1], "mach") == 0) return mach_ping_pong();
   return 3;
