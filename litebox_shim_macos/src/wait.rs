@@ -280,6 +280,16 @@ impl<P: ShimPlatform> Task<P> {
         }
     }
 
+    /// Whether `deadline` has passed, as a wait until it would find.
+    pub(crate) fn deadline_passed(&self, deadline: Option<P::Instant>) -> bool {
+        use litebox_platform::time::Instant as _;
+        deadline.is_some_and(|deadline| {
+            deadline
+                .checked_duration_since(&self.global.platform.now())
+                .is_none()
+        })
+    }
+
     /// The deadline of a Mach message timeout of `milliseconds`.
     pub(crate) fn msg_deadline(&self, milliseconds: u32) -> P::Instant {
         use litebox_platform::time::Instant as _;

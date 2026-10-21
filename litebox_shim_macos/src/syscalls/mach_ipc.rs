@@ -78,6 +78,9 @@ struct GuestQueue {
     /// Threads blocked in a send to the full queue (`IPC_MQUEUE_FULL`),
     /// woken whenever a message leaves it and restarted when the port dies.
     senders: PortWaitQueue,
+    /// How often the receive right moved: a receiver that [`Self::receivers`]
+    /// no longer holds, because a message woke it, sees a move this way.
+    receive_moves: u64,
 }
 
 impl GuestQueue {
@@ -635,6 +638,7 @@ impl IpcSpace {
             immovable: false,
             receivers: PortWaitQueue::default(),
             senders: PortWaitQueue::default(),
+            receive_moves: 0,
         }))?;
         self.alloc_name(Entry {
             port: Some(port),
@@ -875,6 +879,7 @@ impl IpcSpace {
                     // guard, context and sequence number, and its blocked
                     // receivers are sent away.
                     queue.receivers.restart_all();
+                    queue.receive_moves = queue.receive_moves.wrapping_add(1);
                     queue.guarded = false;
                     queue.strict_guard = false;
                     queue.context = 0;
@@ -1641,6 +1646,11 @@ impl<P: ShimPlatform> Task<P> {
             if let Some(error) = last_chance {
                 return Err(error);
             }
+            // A woken sender that lost the slot to another does not wait
+            // again past its deadline.
+            if self.deadline_passed(deadline) {
+                return Err(msg_return::SEND_TIMED_OUT);
+            }
             let waiter = self.new_waiter();
             let queued: Arc<dyn AnyWaiter> = waiter.clone();
             ipc.guest_queue_mut(port)
@@ -1648,7 +1658,15 @@ impl<P: ShimPlatform> Task<P> {
                 .senders
                 .push(Arc::clone(&queued));
             drop(ipc);
+            #[cfg(all(test, target_os = "macos"))]
+            self.global
+                .mapping_hook
+                .reach(crate::syscalls::mm::hook::Point::MachMsgQueued);
             let ended = self.wait_for_wakeup_until(&waiter, deadline);
+            #[cfg(all(test, target_os = "macos"))]
+            self.global
+                .mapping_hook
+                .reach(crate::syscalls::mm::hook::Point::MachMsgWaited);
             if ended == WaitResult::Awakened {
                 // There is room now, or the port died.
                 continue;
@@ -1874,25 +1892,29 @@ impl<P: ShimPlatform> Task<P> {
     ) -> MsgResult<()> {
         const HEADER: usize = 24;
         let trailer_size = options.trailer_size();
-        // ipc_mqueue_copyin
-        let port = {
-            let mut ipc = self.global.ipc.lock();
-            match ipc.check(receive_name.0) {
-                Some(entry) if entry.kind.contains(EntryType::RECEIVE) => {
-                    entry.port.expect("receive rights name a port")
-                }
-                _ => return Err(msg_return::RCV_INVALID_NAME),
-            }
-        };
-        // ipc_mqueue_receive: block until a message arrives or the receive
-        // right moves or dies (MACH_RCV_PORT_CHANGED).
         let deadline = options
             .contains(MachMsgOptions::RCV_TIMEOUT)
             .then(|| self.msg_deadline(timeout));
-        let mut last_chance = None;
         let mut ipc = self.global.ipc.lock();
+        // ipc_mqueue_copyin
+        let port = match ipc.check(receive_name.0) {
+            Some(entry) if entry.kind.contains(EntryType::RECEIVE) => {
+                entry.port.expect("receive rights name a port")
+            }
+            _ => return Err(msg_return::RCV_INVALID_NAME),
+        };
+        let moves = ipc
+            .guest_queue_mut(port)
+            .expect("a receive right names a guest queue")
+            .receive_moves;
+        // ipc_mqueue_receive: block until a message arrives or the receive
+        // right moves or dies (MACH_RCV_PORT_CHANGED).
+        let mut last_chance = None;
         let first = loop {
-            let Some(queue) = ipc.guest_queue_mut(port) else {
+            let Some(queue) = ipc
+                .guest_queue_mut(port)
+                .filter(|queue| queue.receive_moves == moves)
+            else {
                 return Err(msg_return::RCV_PORT_CHANGED);
             };
             if !queue.messages.is_empty() {
@@ -1904,11 +1926,24 @@ impl<P: ShimPlatform> Task<P> {
             if options.contains(MachMsgOptions::RCV_TIMEOUT) && timeout == 0 {
                 return Err(msg_return::RCV_TIMED_OUT);
             }
+            // A woken receiver that lost the message to another does not
+            // wait again past its deadline.
+            if self.deadline_passed(deadline) {
+                return Err(msg_return::RCV_TIMED_OUT);
+            }
             let waiter = self.new_waiter();
             let queued: Arc<dyn AnyWaiter> = waiter.clone();
             queue.receivers.push(Arc::clone(&queued));
             drop(ipc);
+            #[cfg(all(test, target_os = "macos"))]
+            self.global
+                .mapping_hook
+                .reach(crate::syscalls::mm::hook::Point::MachMsgQueued);
             let ended = self.wait_for_wakeup_until(&waiter, deadline);
+            #[cfg(all(test, target_os = "macos"))]
+            self.global
+                .mapping_hook
+                .reach(crate::syscalls::mm::hook::Point::MachMsgWaited);
             ipc = self.global.ipc.lock();
             if ended == WaitResult::Awakened {
                 if waiter.was_restarted() {

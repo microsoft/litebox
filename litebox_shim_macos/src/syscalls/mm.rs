@@ -103,6 +103,12 @@ pub(crate) mod hook {
         /// A blocked psynch call's wait ended and it has not locked the
         /// table again yet.
         PsynchWaited,
+        /// A Mach message send or receive queued its waiter and has not
+        /// waited yet.
+        MachMsgQueued,
+        /// A Mach message send or receive's wait ended and it has not locked
+        /// the IPC space again yet.
+        MachMsgWaited,
     }
 
     type Hook = Box<dyn FnMut(Point) + Send>;
