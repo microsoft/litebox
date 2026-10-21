@@ -37,6 +37,13 @@
 # A fresh host directory per test, with greeting.txt, is mounted read-only at
 # /mnt/host over virtio-9p (its mount tag).
 #
+# With QEMU_SMP above 1, the CPUs but the boot CPU must have run programs too:
+# the kernel prints the slices each CPU ran, and the run fails if, over the
+# passing tests with concurrent runs, the other CPUs ran none (a smoke check,
+# for the other CPUs running nothing at all). With more than
+# 4, the preempt test is skipped: it checks preemption with 8 CPU-bound
+# programs. Both need QEMU_SMP to start with the CPU count, or to have cpus=.
+#
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
 #   -r   build and run the release kernel and runner
@@ -49,7 +56,7 @@
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
 #   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
 #   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1)
-#   TIMEOUT       per-run timeout in seconds (default: 120)
+#   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners, run in their directories
 #                 (default: "cargo build"; CI uses
@@ -171,10 +178,54 @@ show_console() {
         echo "---" >&2
     fi
 }
-check=show_console
+
+# The CPU count (see the header), if QEMU_SMP has it.
+case $QEMU_SMP in
+    [0-9]*) smp=${QEMU_SMP%%[!0-9]*} ;;
+    cpus=[0-9]* | *,cpus=[0-9]*)
+        smp=",$QEMU_SMP"
+        smp=${smp##*,cpus=}
+        smp=${smp%%[!0-9]*}
+        ;;
+    *) smp= ;;
+esac
+if [[ -z $smp ]]; then
+    echo "warning: no CPU count in QEMU_SMP=$QEMU_SMP: the other CPUs' slices are not checked," \
+        "and preempt runs" >&2
+fi
+
+# Per passing test with concurrent runs, a line with the slices the CPUs but
+# the boot CPU ran (see the header); `run_vm` runs checks in a subshell.
+: >"$WORK/other_slices"
+
+# Shows test $1's console, and records its other CPUs' slices.
+check_test() {
+    show_console "$1"
+    if [[ ${smp:-1} -gt 1 ]] && grep -q '"concurrent"' "$TESTS_DIR/$1.json"; then
+        local line slices count sum=0
+        # Each CPU's, the boot CPU's first, as the kernel prints them at the
+        # end, whatever LITEBOX_LOG.
+        line=$(sed -n 's/.*\[litebox\] slices run per CPU: \[\([0-9, ]*\)\].*/\1/p' "$WORK/$1.log")
+        if [[ -z $line ]]; then
+            echo "no slices run per CPU in the log"
+            return 1
+        fi
+        IFS=', ' read -r -a slices <<<"$line"
+        for count in "${slices[@]:1}"; do
+            sum=$((sum + count))
+        done
+        echo "$sum" >>"$WORK/other_slices"
+    fi
+}
+check=check_test
 
 for t in "${tests[@]}"; do
     [[ -f "$TESTS_DIR/$t.json" ]] || { echo "error: no test $TESTS_DIR/$t.json" >&2; exit 2; }
+    if [[ $t == preempt && ${smp:-1} -gt 4 ]]; then
+        echo "SKIP  $t  (more CPUs than its preemption checks allow: see the header)"
+        skipped=$((skipped + 1))
+        continue
+    fi
     mkdir -p "$WORK/$t"
     cp "$USERLAND" "$WORK/$t/runner.elf"
     cp "$WORK/rootfs.tar" "$WORK/$t/rootfs.tar"
@@ -203,4 +254,15 @@ for t in "${tests[@]}"; do
         sed 's/^/      > /' "$WORK/$t.stdout" | tail -20
     fi
 done
+concurrent=$(wc -l <"$WORK/other_slices")
+if [[ $concurrent -gt 0 ]]; then
+    other=$(awk '{ sum += $1 } END { print sum }' "$WORK/other_slices")
+    if [[ $other -gt 0 ]]; then
+        echo "[*] other CPUs ran $other slices in $concurrent tests with concurrent runs"
+    else
+        echo "FAIL  other CPUs ran no slice in $concurrent tests with concurrent runs"
+        fail=$((fail + 1))
+        failed+=("other CPUs")
+    fi
+fi
 summary

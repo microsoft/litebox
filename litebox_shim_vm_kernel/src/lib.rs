@@ -5,8 +5,10 @@
 //! [`VmKernel`].
 //!
 //! Assumptions:
-//! - Single CPU: processes run only inside a [`sched::Scheduler`]'s calls
-//!   (e.g., from [`Process::start`] or [`Process::call`]).
+//! - Processes run only inside a [`sched::Scheduler`]'s calls: on the boot
+//!   CPU, a service's (e.g., from [`Process::start`] or [`Process::call`]);
+//!   on the others, [`sched::Scheduler::run`]. A process runs on one CPU at
+//!   a time, the one holding its claim (see `claim`).
 //! - The kernel does not use FS; user state across switches is the address
 //!   space, and, per thread (see `thread`), the FS base and
 //!   [`UserThreadState`].
@@ -34,6 +36,7 @@ extern crate alloc;
 /// The longest request [`Process::call`] accepts, and the longest reply.
 pub const MAX_MESSAGE_LEN: u64 = layout::MESSAGE_WINDOW.len;
 
+mod claim;
 mod fork;
 mod layout;
 pub mod loader;
@@ -45,8 +48,8 @@ pub mod program;
 pub mod sched;
 mod thread;
 
-use alloc::rc::{Rc, Weak};
 use alloc::string::String;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::ops::Range;
@@ -69,9 +72,11 @@ use litebox_common_vm_abi::{
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 #[cfg(doc)]
 use litebox_platform_vm_kernel::UserThreadState;
+use litebox_platform_vm_kernel::cpu::CpuId;
 use litebox_platform_vm_kernel::{AddressSpaceId, Instant, PinnedUserPages, VmKernel};
 use zerocopy::IntoBytes;
 
+use claim::Owned;
 use memory::{Mappings, checked_range, copy_from_user, copy_to_user};
 use sched::Scheduler;
 use thread::{FutexFlow, FutexWait, Thread};
@@ -96,13 +101,13 @@ pub struct ProcessConfig<'a> {
     pub started_runner: Option<&'static [u8]>,
 }
 
-/// The kernel's one-shot hardware timer, which processes' [`CallId::SetTimer`]
+/// Each CPU's one-shot hardware timer, which processes' [`CallId::SetTimer`]
 /// deadlines and the [scheduler](sched)'s time slices share, one at a time:
 /// the runner owns it (e.g., a local APIC's).
 pub trait ProcessTimer: Sync {
-    /// Arms, or with `None` disarms, a one-shot interrupt at `deadline`,
-    /// which interrupts a process running then (see
-    /// [`EnterShim::interrupt`]). Arming replaces an earlier deadline.
+    /// Arms the calling CPU's timer, or with `None` disarms it, for a one-shot
+    /// interrupt at `deadline`, which interrupts a process running then there
+    /// (see [`EnterShim::interrupt`]). Arming replaces an earlier deadline.
     fn arm(&self, deadline: Option<Instant>);
 }
 
@@ -166,8 +171,10 @@ enum State {
 }
 
 /// A runner process, shared by its [`Scheduler`], its [`Process`] handle, if
-/// any, and, while it serves the process, the broker's worker. Its address
-/// space is released once the last of them drops it.
+/// any, and, while one serves the process, a CPU's broker worker, behind its
+/// claim (see `claim`); a process clone not adopted yet, weakly, by its parent
+/// (see `fork`). Its address space is released once the last of them drops
+/// it.
 struct Inner {
     platform: &'static VmKernel,
     address_space: AddressSpaceId,
@@ -197,18 +204,21 @@ struct Inner {
     /// For the running thread; `None` if nothing else needs the CPU.
     slice_end: Cell<Option<Instant>>,
     /// The main thread first; exited threads until `sched` reaps them.
-    threads: RefCell<Vec<Rc<Thread>>>,
+    threads: RefCell<Vec<Arc<Thread>>>,
     /// The next [`Thread::id`].
     next_thread: Cell<u64>,
     /// See [`Inner::broker_requester`].
     broker_requester: Cell<u64>,
-    /// The broker's worker is suspended serving the process: its
-    /// association is in use, so broker calls wait (see `sched`).
-    broker_busy: Cell<bool>,
+    /// The CPU whose broker worker is suspended serving the process, set and
+    /// cleared by that CPU: the association is in use, so broker calls wait
+    /// ([`Self::broker_busy`]), and only that CPU claims the process, to
+    /// resume the worker (see `sched`). The one record of it, mirrored in
+    /// [`Owned::worker`] at each release.
+    worker: Cell<Option<CpuId>>,
     /// The process clone the process made that is not adopted yet, if any, with
-    /// its ID (see `fork`). Weak: only the scheduler, between runs, may drop a
-    /// process's last reference, as dropping it switches address spaces.
-    pending_clone: RefCell<Option<(u64, Weak<Inner>)>>,
+    /// its ID (see `fork`), reached only through the clone's claim. Weak: the
+    /// scheduler owns it, and forgets it once dead (see `sched`).
+    pending_clone: RefCell<Option<(u64, Weak<Owned>)>>,
     /// The next process clone's ID: the process never reuses one.
     next_clone: Cell<u64>,
 }
@@ -248,14 +258,22 @@ enum Suspended {
 
 /// A service's runner process, which runs in its scheduler until it dies.
 /// Dropping it [finishes](Self::finish) it.
+///
+/// Its methods, but [`Self::is_stopped`] and [`Self::identity`], take the
+/// process's claim (see `claim`), waiting while another CPU holds it (e.g.,
+/// for a slice): call them between the scheduler's steps, holding nothing
+/// the processes' broker work may take (see `sched::Scheduler::claim`).
 pub struct Process {
-    inner: Rc<Inner>,
+    owned: Arc<Owned>,
     scheduler: Scheduler,
+    identity: [u8; IDENTITY_LEN],
+    /// [`Self::start`] was called (another CPU may have started it before).
+    started: bool,
 }
 
 impl Process {
-    /// Adds the process to `scheduler`, and leaves its new address space
-    /// current. Runs nothing.
+    /// Adds the process to `scheduler`. Runs nothing, but the other CPUs may
+    /// start it at once.
     ///
     /// # Errors
     ///
@@ -272,11 +290,13 @@ impl Process {
     ) -> Result<Self, SpawnError> {
         // Frees the memory of those that died (e.g., dropped ones) first.
         scheduler.reap();
-        let inner = Rc::new(Inner::spawn(platform, broker, config, None)?);
-        scheduler.add(inner.clone());
+        let inner = Inner::spawn(platform, broker, config, None)?;
+        let identity = inner.identity;
         Ok(Self {
-            inner,
+            owned: scheduler.add(inner),
             scheduler: scheduler.clone(),
+            identity,
+            started: false,
         })
     }
 
@@ -290,9 +310,10 @@ impl Process {
     ///
     /// If called twice.
     pub fn start(&mut self) -> Result<(), Dead> {
-        assert!(self.inner.is_new(), "process already started");
-        self.scheduler.run_until(|| self.inner.is_stopped());
-        self.settle()?;
+        assert!(!self.started, "process already started");
+        self.started = true;
+        self.scheduler.run_until(|| self.owned.is_stopped());
+        self.claim().settle()?;
         Ok(())
     }
 
@@ -309,7 +330,7 @@ impl Process {
     /// As for [`Self::submit`].
     pub fn call(&mut self, request: &[u8]) -> Result<Vec<u8>, Dead> {
         self.submit(request)?;
-        self.scheduler.run_until(|| self.inner.is_stopped());
+        self.scheduler.run_until(|| self.owned.is_stopped());
         self.reply()
     }
 
@@ -325,22 +346,25 @@ impl Process {
     /// If the process is not waiting for a request (e.g., not started), or
     /// `request` is longer than [`MAX_MESSAGE_LEN`].
     pub fn submit(&mut self, request: &[u8]) -> Result<(), Dead> {
-        if let Some(dead) = self.inner.dead() {
+        let process = self.claim();
+        if let Some(dead) = process.dead() {
             return Err(dead);
         }
-        let State::Waiting { waiter, .. } = *self.inner.state.borrow() else {
+        let State::Waiting { waiter, .. } = *process.state.borrow() else {
             panic!("process is not waiting for a request");
         };
         assert!(
             request.len() as u64 <= MAX_MESSAGE_LEN,
             "request exceeds the message window"
         );
-        *self.inner.state.borrow_mut() = State::Delivering {
+        *process.state.borrow_mut() = State::Delivering {
             waiter,
             request: request.into(),
         };
-        self.inner.entries.set(0);
-        self.inner.reflected.set(0);
+        process.entries.set(0);
+        process.reflected.set(0);
+        // For any CPU to run.
+        process.share();
         Ok(())
     }
 
@@ -355,29 +379,30 @@ impl Process {
     ///
     /// If there is no reply: no request was submitted, or it was not run.
     pub fn reply(&mut self) -> Result<Vec<u8>, Dead> {
-        let reply = self.settle()?;
+        let process = self.claim();
+        let reply = process.settle()?;
         log::debug!(
             "request served with {} kernel entries ({} reflected syscalls)",
-            self.inner.entries.get(),
-            self.inner.reflected.get()
+            process.entries.get(),
+            process.reflected.get()
         );
         Ok(reply.expect("a waiting process has completed its request"))
     }
 
     /// Whether the process waits for a request (e.g., with its reply), or is
-    /// dead.
+    /// dead. Lock-free, as of the last release of its claim.
     pub fn is_stopped(&self) -> bool {
-        self.inner.is_stopped()
+        self.owned.is_stopped()
     }
 
     /// Guest syscalls the kernel reflected to the runner (`syscall`s outside
     /// its gate) while serving the last request.
     pub fn reflected_syscalls(&self) -> u64 {
-        self.inner.reflected.get()
+        self.claim().reflected.get()
     }
 
     pub fn identity(&self) -> &[u8; IDENTITY_LEN] {
-        &self.inner.identity
+        &self.identity
     }
 
     /// For services: ends a process that has served all it will (e.g., its one
@@ -385,32 +410,29 @@ impl Process {
     /// releasing what it holds (e.g., pipe ends its children may wait on). A
     /// dead process keeps its cause of death.
     pub fn finish(&mut self) {
-        if self.inner.dead().is_none() {
-            self.inner.die(Dead::Finished);
+        let process = self.claim();
+        if process.dead().is_none() {
+            process.die(Dead::Finished);
         }
+        // E.g., for the worker suspended serving it.
+        process.share();
     }
 
     /// For services: ends a process that broke their protocol. A dead process
     /// keeps its cause of death.
     pub fn kill(&mut self, reason: &'static str) -> Dead {
-        if let Some(dead) = self.inner.dead() {
+        let process = self.claim();
+        if let Some(dead) = process.dead() {
             return dead;
         }
-        self.inner.kill(reason);
+        process.kill(reason);
+        process.share();
         Dead::Killed(reason)
     }
 
-    /// The waiting process's reply, if it has one.
-    ///
-    /// # Panics
-    ///
-    /// If the process still has to run.
-    fn settle(&self) -> Result<Option<Vec<u8>>, Dead> {
-        match &mut *self.inner.state.borrow_mut() {
-            State::Waiting { reply, .. } => Ok(reply.take()),
-            State::Dead(dead) => Err(*dead),
-            _ => panic!("the process has not run to a wait"),
-        }
+    /// See [`Scheduler::claim`].
+    fn claim(&self) -> claim::Claim<'_> {
+        self.scheduler.claim(&self.owned)
     }
 }
 
@@ -422,7 +444,8 @@ impl Drop for Process {
 
 impl Inner {
     /// With `launch`, the process is a launched one (see
-    /// [`Broker::associate`]).
+    /// [`Broker::associate`]). Leaves the kernel's address space current, so
+    /// the process can be published to other CPUs (see `claim`).
     fn spawn(
         platform: &'static VmKernel,
         broker: &Broker,
@@ -433,11 +456,16 @@ impl Inner {
         // Safety: the kernel holds no references into user memory.
         unsafe { platform.switch_address_space(address_space) }
             .expect("a freshly created address space is registered");
-        Self::populate(platform, address_space, broker, config, launch).inspect_err(|_| {
-            // Safety: nothing references the half-built process's memory, and
-            // it never ran, so its frames are exclusively owned.
-            unsafe { release_address_space(platform, address_space) };
-        })
+        let inner =
+            Self::populate(platform, address_space, broker, config, launch).inspect_err(|_| {
+                // Safety: nothing references the half-built process's memory,
+                // and it never ran, so its frames are exclusively owned.
+                unsafe { release_address_space(platform, address_space) };
+            })?;
+        // Safety: as above.
+        unsafe { platform.switch_address_space(AddressSpaceId::KERNEL) }
+            .expect("the kernel address space always exists");
+        Ok(inner)
     }
 
     fn populate(
@@ -514,16 +542,18 @@ impl Inner {
             armed_deadline: Cell::new(None),
             notified: Cell::new(false),
             slice_end: Cell::new(None),
-            threads: RefCell::new(alloc::vec![Rc::new(Thread::main(layout::UPCALL_STACK))]),
+            threads: RefCell::new(alloc::vec![new_thread(Thread::main(layout::UPCALL_STACK))]),
             next_thread: Cell::new(thread::MAIN + 1),
             broker_requester: Cell::new(thread::MAIN),
-            broker_busy: Cell::new(false),
+            worker: Cell::new(None),
             pending_clone: RefCell::new(None),
             next_clone: Cell::new(1),
         })
     }
 
-    /// Makes the process's address space current, e.g., for the worker.
+    /// Makes the process's address space current, e.g., for the worker;
+    /// only under its claim, whose release makes the kernel's current again
+    /// (see `claim`).
     fn activate(&self) {
         // Safety: the kernel holds no references into user memory.
         unsafe { self.platform.switch_address_space(self.address_space) }
@@ -574,8 +604,9 @@ impl Inner {
     /// `spawned`, or adopts the process clone it was started with as its runner
     /// (see `fork`), and fails the start of those it cannot. Returns whether
     /// there were any: either way, the requests that started them can complete.
-    /// Leaves another address space current.
-    pub(crate) fn spawn_launched(&self, spawned: &mut Vec<Rc<Self>>) -> bool {
+    /// Leaves the kernel's address space current if it creates or adopts a
+    /// process.
+    pub(crate) fn spawn_launched(&self, spawned: &mut Vec<Self>) -> bool {
         let broker = self.broker.broker();
         let launches = self.broker.take_pending_associations();
         let started = !launches.is_empty();
@@ -591,7 +622,7 @@ impl Inner {
             };
             // `spawn` fails it if it cannot create the process.
             match Self::spawn(self.platform, broker, config, Some(launch)) {
-                Ok(process) => spawned.push(Rc::new(process)),
+                Ok(process) => spawned.push(process),
                 Err(error) => log::warn!("failed to spawn a launched process: {error}"),
             }
         }
@@ -622,6 +653,17 @@ unsafe fn release_address_space(platform: &VmKernel, address_space: AddressSpace
             .expect("the kernel address space always exists");
         let _ = platform.unregister_address_space(address_space);
     }
+}
+
+/// Shared across CPUs only inside its process (see `claim`), whose claim
+/// serializes what it touches; `Arc` for references held past a claim (e.g.,
+/// by `sched`).
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "a thread is touched only under its process's claim"
+)]
+fn new_thread(thread: Thread) -> Arc<Thread> {
+    Arc::new(thread)
 }
 
 fn region_range(region: UserRange) -> Range<usize> {
@@ -749,7 +791,9 @@ impl Inner {
 
     /// Ends every thread, wherever it stopped (e.g., in a wait), so none is
     /// left for the scheduler, and the process clone it has not started a
-    /// child with, if any.
+    /// child with, if any, which may leave the kernel's address space current
+    /// (see [`fork::end_pending`]): the caller must not resume a thread
+    /// afterward.
     fn die(&self, dead: Dead) {
         *self.state.borrow_mut() = State::Dead(dead);
         self.broker.exited(match dead {
@@ -778,6 +822,24 @@ impl Inner {
         *self.state.borrow() == State::New
     }
 
+    /// See [`Self::worker`].
+    fn broker_busy(&self) -> bool {
+        self.worker.get().is_some()
+    }
+
+    /// The waiting process's reply, if it has one.
+    ///
+    /// # Panics
+    ///
+    /// If the process still has to run.
+    fn settle(&self) -> Result<Option<Vec<u8>>, Dead> {
+        match &mut *self.state.borrow_mut() {
+            State::Waiting { reply, .. } => Ok(reply.take()),
+            State::Dead(dead) => Err(*dead),
+            _ => panic!("the process has not run to a wait"),
+        }
+    }
+
     /// Waiting for a request, or dead.
     fn is_stopped(&self) -> bool {
         matches!(*self.state.borrow(), State::Waiting { .. } | State::Dead(_))
@@ -793,8 +855,10 @@ impl Inner {
         // Others may have published to it (e.g., fired its timers).
         self.broker.poll_events();
         // That, or an interrupt during a halt in the kernel, may have made
-        // another due to run: stop, for the scheduler to see.
-        if self.others_due() {
+        // another due to run: a blocked thread, which it runs soon after
+        // (see `sched`), or this CPU's worker, which it stops for at once.
+        self.take_notified();
+        if self.worker_due() {
             thread.suspended.set(Suspended::Preempted);
             return ContinueOperation::Terminate;
         }
@@ -845,7 +909,7 @@ impl Inner {
         let slot = ctx.rdx as u64;
         match request {
             // The worker is using the association (see `sched`).
-            Request::BrokerHandshake(_) if self.broker_busy.get() => Self::retry(thread, ctx),
+            Request::BrokerHandshake(_) if self.broker_busy() => Self::retry(thread, ctx),
             Request::Ready(_) | Request::ReplyAndWait(_)
                 if !thread.is_main() || self.live_threads() > 1 =>
             {
@@ -1007,8 +1071,14 @@ impl Inner {
     }
 
     /// Arms the platform's timer for `deadline` or the end of the time slice,
-    /// whichever is first.
+    /// whichever is first. Only as ring 3 resumes, in the process's address
+    /// space (e.g., not after [`Self::die`]).
     fn arm_timer(&self, deadline: Option<Instant>) {
+        debug_assert_eq!(
+            self.platform.current_address_space(),
+            self.address_space,
+            "ring 3 resumes in its process's address space"
+        );
         let first = match (deadline, self.slice_end.get()) {
             (Some(deadline), Some(slice_end)) => Some(deadline.min(slice_end)),
             (deadline, slice_end) => deadline.or(slice_end),
@@ -1392,9 +1462,10 @@ impl EnterShim for Running<'_> {
         if inner.broker.take_published() {
             inner.notified.set(true);
         }
-        let now = inner.platform.now();
         // Another may be due to run (see `sched`).
-        if inner.others_due()
+        inner.take_notified();
+        let now = inner.platform.now();
+        if inner.worker_due()
             || inner
                 .slice_end
                 .get()

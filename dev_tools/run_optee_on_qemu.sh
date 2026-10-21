@@ -21,7 +21,7 @@
 #   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
 #   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1); the kernel uses
 #                 only the first
-#   TIMEOUT       per-run timeout in seconds (default: 120)
+#   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runner, run in its directory
 #                 (default: "cargo build"; CI uses

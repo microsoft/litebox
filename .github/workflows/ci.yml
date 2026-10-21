@@ -163,6 +163,8 @@ jobs:
           QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
       - name: Run Linux programs in a QEMU VM with stacked runners on 2 CPUs (KVM)
+        # Processes run on every CPU; the suite also checks that the other CPU
+        # ran some.
         run: |
           QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh

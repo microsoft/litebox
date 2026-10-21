@@ -21,12 +21,12 @@
 //! Devices: [`VmKernel`] is the drivers' [`litebox_hal::dma::Hal`].
 //!
 //! Interrupts: the kernel runs with interrupts disabled, except while it
-//! halts ([`cpu::halt`]); user code runs with them enabled. External
-//! interrupts, on any CPU, go to the handler the runner installs
-//! ([`set_interrupt_handler`]); one that interrupted user code then also
-//! enters the shim's `interrupt` (e.g., for the runner's one-shot timer, or
-//! a device's input); ending the run there lets the runner preempt the
-//! thread ([`resume_thread_ref`]).
+//! halts ([`cpu::halt`]) or spins in [`cpu::relax`]; user code runs with them
+//! enabled. External interrupts, on any CPU, go to the handler the runner
+//! installs ([`set_interrupt_handler`]); one that interrupted user code then
+//! also enters the shim's `interrupt` (e.g., for the runner's one-shot timer,
+//! a device's input, or another CPU's wake IPI, see [`cpu`]); ending the run
+//! there lets the runner preempt the thread ([`resume_thread_ref`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -120,11 +120,12 @@ pub type InterruptHandler = dyn Fn(u8) -> bool + Sync;
 /// panics.
 ///
 /// The handler runs with interrupts disabled, on the interrupted context's GS
-/// (user mode, or [`cpu::halt`]), on any CPU: it must not touch per-CPU data,
-/// block, or take locks; it should only end the interrupt, maybe wake CPUs
-/// (e.g., [`cpu::wake`]), and leave the work to the kernel after the
-/// halt. It also handles the wake IPI ([`cpu::Ipi::Wake`]), on every CPU,
-/// the boot CPU too, from [`VmKernel::start_cpus`] on.
+/// (user mode, [`cpu::halt`], or a spin's [`cpu::relax`]), on any CPU: it
+/// must not touch per-CPU data, block, or take locks; it should only end the
+/// interrupt, maybe wake CPUs (e.g., [`cpu::wake_idle`]), and leave the work
+/// to the kernel after the halt. It also handles the wake IPI
+/// ([`cpu::Ipi::Wake`]), on every CPU, the boot CPU too, from
+/// [`VmKernel::start_cpus`] on.
 ///
 /// # Panics
 ///
@@ -218,28 +219,30 @@ impl PageTableManager {
         }
     }
 
+    /// The calling CPU's current address space: the one whose table CR3
+    /// holds.
+    fn current_address_space(&self) -> AddressSpaceId {
+        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+        if self.base_page_table_frame == cr3_frame {
+            AddressSpaceId::KERNEL
+        } else {
+            AddressSpaceId(cr3_frame.start_address().as_u64().trunc())
+        }
+    }
+
     /// # Panics
     ///
     /// Panics if CR3 does not match the current core's retained page table.
     #[inline]
     pub(crate) fn current_page_table(&self) -> PageTableHandle<'_> {
-        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
-
-        if self.base_page_table_frame == cr3_frame {
+        let id = self.current_address_space();
+        if id == AddressSpaceId::KERNEL {
             return PageTableHandle::base(&self.base_page_table);
         }
-
-        let cr3_id: usize = cr3_frame.start_address().as_u64().trunc();
-        if let Some(pt) =
-            with_per_cpu_variables(|pcv| pcv.active_page_table(AddressSpaceId(cr3_id)))
-        {
+        if let Some(pt) = with_per_cpu_variables(|pcv| pcv.active_page_table(id)) {
             return PageTableHandle::task(pt);
         }
-
-        unreachable!(
-            "CR3 does not match the per-CPU page table: {:?}",
-            cr3_frame.start_address()
-        );
+        unreachable!("CR3 does not match the per-CPU page table: {:#x}", id.0);
     }
 
     /// # Safety
@@ -622,6 +625,12 @@ impl VmKernel {
         }
     }
 
+    /// The calling CPU's current address space: [`AddressSpaceId::KERNEL`], or
+    /// a task's.
+    pub fn current_address_space(&self) -> AddressSpaceId {
+        self.page_table_manager.current_address_space()
+    }
+
     /// Switch to a registered address space, or [`AddressSpaceId::KERNEL`].
     ///
     /// # Safety
@@ -760,7 +769,15 @@ impl RawMutexProvider for VmKernel {
 
 impl WaitWakerProvider for VmKernel {}
 
-/// Without a scheduler, no thread can wake a blocked waiter; blocking panics.
+/// No kernel thread blocks, so nothing wakes a waiter: it spins until
+/// another CPU changes the value (every wake follows a change), with
+/// [`cpu::relax`], taking interrupts meanwhile, as a halt does. That CPU may
+/// be holding the lock in its worker, suspended, until it resumes it (see
+/// [`worker`]). A spin that sees no change for [`LOCK_WARNING`] warns, once,
+/// and spins on: it may be a deadlock (e.g., the holder's CPU waits for the
+/// spinning one; which CPU holds a lock is unknown), or a long hold. With no
+/// other CPU online, blocking would deadlock, and panics; timeouts are
+/// unsupported (no kernel code uses one), and panic.
 pub struct RawMutex {
     inner: AtomicU32,
 }
@@ -795,23 +812,49 @@ impl RawMutexTrait for RawMutex {
     }
 }
 
+/// How long a [`RawMutex`] spins seeing no change, or a claim stays held for
+/// a waiter (see the shim), before it warns of a possible deadlock (once per
+/// wait); it then waits on, as some locks are held longer: e.g., an open
+/// file's, across a whole read, which takes a 9P round trip per message, each
+/// up to 30 s, the total unbounded.
+pub const LOCK_WARNING: core::time::Duration = core::time::Duration::from_mins(1);
+
 impl RawMutex {
     fn block_or_maybe_timeout(
         &self,
         val: u32,
-        _timeout: Option<core::time::Duration>,
+        timeout: Option<core::time::Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        if self
-            .underlying_atomic()
-            .load(core::sync::atomic::Ordering::Relaxed)
-            != val
-        {
+        let value = || {
+            self.underlying_atomic()
+                .load(core::sync::atomic::Ordering::Relaxed)
+        };
+        if value() != val {
             return Err(ImmediatelyWokenUp);
         }
-        panic!(
-            "blocking on a single-CPU VM guest with no scheduler would deadlock \
-             (see `RawMutex`)"
-        )
+        assert!(
+            timeout.is_none() && cpu::online_count() > 1,
+            "blocking in the VM guest kernel, with no other CPU to release the lock, or with a \
+             timeout, would deadlock (see `RawMutex`)"
+        );
+        let platform = boot::started().expect("other CPUs are online once started");
+        let deadline = platform
+            .now()
+            .checked_add(LOCK_WARNING)
+            .expect("the clock is far from overflowing");
+        let mut warned = false;
+        while value() == val {
+            if !warned && platform.now() >= deadline {
+                litebox_util_log::warn!(
+                    lock:? = core::ptr::from_ref(self),
+                    waited:? = LOCK_WARNING;
+                    "still spinning for a lock: a deadlock? (see `RawMutex`)"
+                );
+                warned = true;
+            }
+            cpu::relax();
+        }
+        Ok(UnblockedOrTimedOut::Unblocked)
     }
 }
 
@@ -1053,7 +1096,8 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for VmKernel {
 /// # Safety
 ///
 /// The platform must be set up (see the crate docs), and no other
-/// `run_thread_ref`/`reenter_thread_ref` call may be in progress.
+/// `run_thread_ref`/`reenter_thread_ref` call may be in progress on the
+/// calling CPU.
 pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
 where
     T: EnterShim<ExecutionContext = PtRegs>,

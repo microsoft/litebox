@@ -147,10 +147,11 @@ isr_ignore:
  * or fatal. IDT entries require an 8-byte stride; CALL pushes stub + 5 for
  * vector lookup.
  *
- * They arrive from user mode, or from the kernel only while it halts with
- * IF=1. Entry does not depend on GS (which may still be the user's): the
- * handler must not touch per-CPU data, so no SWAPGS. The kernel runs with
- * SSE disabled, so only the caller-saved GPRs need saving.
+ * They arrive from user mode, or from the kernel only while it halts, or
+ * spins in `cpu::relax`, with IF=1. Entry does not depend on GS
+ * (which may still be the user's): the handler must not touch per-CPU data,
+ * so no SWAPGS. The kernel runs with SSE disabled, so only the caller-saved
+ * GPRs need saving.
  *
  * One that interrupted user mode then also reaches the shim: with an
  * `errcode`/`vector` pair pushed, as the CPU exception stubs do for

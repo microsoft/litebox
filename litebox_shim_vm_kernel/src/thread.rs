@@ -9,8 +9,8 @@
 //! stopped are its own. The main thread serves the process's requests.
 
 use crate::memory::{checked_range, copy_from_user, copy_to_user};
-use crate::{Inner, State, Suspended, layout};
-use alloc::rc::Rc;
+use crate::{Inner, State, Suspended, layout, new_thread};
+use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_vm_kernel::{EnterError, Entered, RingFutex};
@@ -167,7 +167,7 @@ fn pt_regs(regs: &Registers) -> PtRegs {
 
 impl Inner {
     /// The main thread, which every process has.
-    pub(crate) fn main_thread(&self) -> Rc<Thread> {
+    pub(crate) fn main_thread(&self) -> Arc<Thread> {
         self.threads
             .borrow()
             .first()
@@ -179,7 +179,7 @@ impl Inner {
     /// The thread the worker's serving is for (see `sched`): the last to
     /// make a broker call, which may have published requests, else the main
     /// thread.
-    pub(crate) fn broker_requester(&self) -> Rc<Thread> {
+    pub(crate) fn broker_requester(&self) -> Arc<Thread> {
         let id = self.broker_requester.get();
         self.threads
             .borrow()
@@ -202,7 +202,7 @@ impl Inner {
     pub(crate) fn reap(&self, thread: &Thread) {
         self.threads
             .borrow_mut()
-            .retain(|other| !core::ptr::eq(Rc::as_ptr(other), thread));
+            .retain(|other| !core::ptr::eq(Arc::as_ptr(other), thread));
     }
 
     /// [`CallId::Clone`](litebox_common_vm_abi::CallId::Clone) of a
@@ -242,7 +242,7 @@ impl Inner {
         };
         let thread = Thread::new(id, ctx, user_state, &new);
         thread.suspended.set(Suspended::Preempted);
-        self.threads.borrow_mut().push(Rc::new(thread));
+        self.threads.borrow_mut().push(new_thread(thread));
         self.share_cpu();
         log::debug!("thread {id} created");
         Ok(CloneReply { thread: id })
@@ -300,7 +300,7 @@ impl Inner {
         offset: usize,
         r: &FutexRequest,
     ) -> Result<FutexFlow, Status> {
-        if self.broker_busy.get() {
+        if self.broker_busy() {
             // The worker is using the association (see `sched`).
             return Ok(FutexFlow::Retry);
         }

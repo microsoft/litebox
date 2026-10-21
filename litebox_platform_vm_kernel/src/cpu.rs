@@ -5,25 +5,22 @@
 //! with a dense index ([`CpuId`]; the boot CPU's is 0) and a local APIC ID
 //! ([`apic_id`]), for IPIs.
 //!
-//! An idle CPU halts ([`halt`]); [`wake`] ends its halt with the runner's
-//! wake IPI ([`InterruptController`]). No wakeup is lost: a halt marks its
-//! CPU idle, then halts unless it was marked woken; a waker marks the CPU
-//! woken, then sends the IPI if it is idle (all sequentially consistent). So
-//! either the halt sees the mark, or the waker sees the CPU idle, and its
-//! IPI, pending while interrupts are disabled, ends the halt.
+//! An idle CPU halts ([`halt`]). [`wake`], [`wake_idle`] and [`notify_all`]
+//! mark CPUs, and end the halts of those idle with the runner's wake IPI
+//! ([`InterruptController`]); [`notify_all`] also tells busy CPUs
+//! ([`take_notified`]). No wakeup is lost: a halt marks its CPU idle, then
+//! halts unless it was marked; a waker marks, then sends the IPI to those idle
+//! (all sequentially consistent). Only the loop a CPU runs (e.g., its
+//! scheduler) clears its marks ([`acknowledge`], [`take_notified`]), before it
+//! looks again at what it was woken for; until then, its halts return at once,
+//! taking only the pending interrupts (e.g., a driver's, which then polls).
+//! Wakers publish what they wake for first; halts may also end spuriously:
+//! check for work before halting, and again after.
 //!
-//! Only the loop a CPU runs (e.g., its scheduler) clears its mark
-//! ([`acknowledge`]), before it looks again at what it was woken for (as
-//! does a CPU coming online, for its own wait); halts never do. So a halt
-//! within its look (e.g., a driver's, waiting for a device) cannot lose a
-//! wakeup meant for it: such a halt just returns at once until then, and its
-//! caller polls. Wakers publish what they wake for first; halts may also end
-//! spuriously: check for work before halting, and again after.
-//!
-//! Lock-free, and only [`current`] (so [`halt`] and [`acknowledge`]) touches
-//! per-CPU data: [`wake`] is usable in interrupt handlers. From one that
-//! interrupted a halt, it sends that CPU the IPI too, which it takes before
-//! the halt ends.
+//! Takes no locks, and only [`current`] (so [`halt`], [`marked`],
+//! [`acknowledge`], [`take_notified`] and `set_suspended`) touches per-CPU
+//! data: [`wake`], [`wake_idle`] and [`notify_all`] are usable in interrupt
+//! handlers.
 //!
 //! The kernel clock ([`crate::clock`]) is the TSC of whichever CPU reads it:
 //! the CPUs' TSCs are assumed synchronized, unchecked (VMMs such as QEMU and
@@ -59,7 +56,7 @@ impl CpuId {
         self.0 as usize
     }
 
-    const fn bit(self) -> u64 {
+    pub(crate) const fn bit(self) -> u64 {
         1 << self.0
     }
 }
@@ -128,8 +125,16 @@ struct Cpus {
     /// until then, its halts return at once. Set busy or not: a CPU about to
     /// halt may not be idle yet.
     woken: AtomicU64,
+    /// Bit `i`: CPU `i` was notified since it last
+    /// [acknowledged](acknowledge) or [took](take_notified) it; as `woken`
+    /// for halts.
+    notified: AtomicU64,
     /// Index to local APIC ID, set before the CPU is online.
     apic_ids: [AtomicU32; MAX_CPUS],
+    /// Bit `i`: CPU `i`'s work suspended: set once it first suspends, until
+    /// it finishes (also while resumed); see
+    /// [`crate::worker::interrupt_suspended`].
+    suspended: AtomicU64,
     /// Set by [`VmKernel::start_cpus`]; until then, no IPIs are sent.
     controller: spin::Once<&'static dyn InterruptController>,
 }
@@ -138,7 +143,9 @@ static CPUS: Cpus = Cpus {
     online: AtomicU64::new(CpuId::BOOT.bit()),
     idle: AtomicU64::new(0),
     woken: AtomicU64::new(0),
+    notified: AtomicU64::new(0),
     apic_ids: [const { AtomicU32::new(0) }; MAX_CPUS],
+    suspended: AtomicU64::new(0),
     controller: spin::Once::new(),
 };
 
@@ -147,9 +154,19 @@ pub fn current() -> CpuId {
     with_per_cpu_variables(|pcv| pcv.cpu)
 }
 
+/// Bit `i` for each online CPU `i`.
+pub fn online_mask() -> u64 {
+    CPUS.online.load(Ordering::SeqCst)
+}
+
+/// How many CPUs are online.
+pub fn online_count() -> usize {
+    online_mask().count_ones() as usize
+}
+
 /// The online CPUs, in order. Once online, a CPU stays online.
 pub fn online() -> impl Iterator<Item = CpuId> {
-    let mask = CPUS.online.load(Ordering::SeqCst);
+    let mask = online_mask();
     (0..MAX_CPUS)
         .filter(move |&i| mask & (1 << i) != 0)
         .filter_map(CpuId::new)
@@ -186,42 +203,130 @@ pub(crate) fn controller() -> Option<&'static dyn InterruptController> {
 }
 
 /// Halts the calling CPU until an interrupt, with interrupts enabled only for
-/// the halt, or until it is woken ([`wake`]): at once while it is marked
-/// woken (see [`acknowledge`]), or if an interrupt became pending while they
-/// were disabled. Clears no mark. May return spuriously: check for work
-/// first, and again after.
+/// the halt, or until it is woken ([`wake`], [`wake_idle`], [`notify_all`]):
+/// at once while it is marked (see [`acknowledge`]), taking the pending
+/// interrupts ([`relax`]), or if an interrupt became pending while they were
+/// disabled. Clears no mark. May return spuriously: check for work first,
+/// and again after.
 pub fn halt() {
     let bit = current().bit();
     CPUS.idle.fetch_or(bit, Ordering::SeqCst);
-    if CPUS.woken.load(Ordering::SeqCst) & bit == 0 {
+    if marks() & bit == 0 {
         x86_64::instructions::interrupts::enable_and_hlt();
         x86_64::instructions::interrupts::disable();
+    } else {
+        relax();
     }
     // A waker that then finds this CPU busy sends no IPI: its mark ends the
     // next halt at once.
     CPUS.idle.fetch_and(!bit, Ordering::SeqCst);
 }
 
-/// Clears the calling CPU's mark, before it looks for work (e.g., what it
-/// was woken for): a wakeup after marks it again, and its next halt returns
-/// at once.
+/// A step of a spin wait (e.g., for a lock, or for another CPU): takes the
+/// pending interrupts if they are disabled (handlers neither lock nor touch
+/// per-CPU data, see [`crate::set_interrupt_handler`]), so that a CPU spinning
+/// with them disabled delays none for long (e.g., a device's, which the boot
+/// CPU forwards to the others), then hints the spin. Sound only once the
+/// calling CPU's IDT is loaded (so not as it starts, before then).
+pub fn relax() {
+    if !x86_64::instructions::interrupts::are_enabled() {
+        // Safety: takes the pending interrupts (after the one instruction
+        // STI defers them for), through the loaded IDT, whose handlers
+        // neither lock nor touch per-CPU data; not `nomem`: they may write
+        // memory.
+        unsafe { core::arch::asm!("sti", "nop", "cli", options(nostack)) };
+    }
+    core::hint::spin_loop();
+}
+
+/// Whether the calling CPU is marked (see [`acknowledge`]), so that its
+/// halts return at once, e.g., for a driver to poll without arming a timer.
+pub fn marked() -> bool {
+    marks() & current().bit() != 0
+}
+
+/// Bit `i`: CPU `i` is marked, woken or notified.
+fn marks() -> u64 {
+    CPUS.woken.load(Ordering::SeqCst) | CPUS.notified.load(Ordering::SeqCst)
+}
+
+/// Clears the calling CPU's marks, for the scheduler, before it looks for
+/// work (e.g., what its services wait for, and the processes): a wakeup
+/// after marks it again, and its next halt returns at once.
 pub fn acknowledge() {
-    CPUS.woken.fetch_and(!current().bit(), Ordering::SeqCst);
+    let bit = current().bit();
+    CPUS.woken.fetch_and(!bit, Ordering::SeqCst);
+    CPUS.notified.fetch_and(!bit, Ordering::SeqCst);
+}
+
+/// Whether the calling CPU was notified ([`notify_all`]) since it last
+/// acknowledged it, which this does, e.g., for a busy CPU to look again at
+/// what it waits for.
+pub fn take_notified() -> bool {
+    let bit = current().bit();
+    CPUS.notified.load(Ordering::Relaxed) & bit != 0
+        && CPUS.notified.fetch_and(!bit, Ordering::SeqCst) & bit != 0
 }
 
 /// Wakes `cpu` if it is idle (in [`halt`]); if not, its halts return at once
 /// until it acknowledges it.
 pub fn wake(cpu: CpuId) {
-    CPUS.woken.fetch_or(cpu.bit(), Ordering::SeqCst);
-    if is_idle(cpu)
-        && let Some(controller) = controller()
-    {
+    signal(&CPUS.woken, cpu.bit());
+}
+
+/// Wakes the idle CPUs (in [`halt`]) but `except`, e.g., for work any CPU
+/// could take: `except` looks for work again itself (e.g., the calling CPU,
+/// or the one an interrupt handler runs on), and its halts do not return at
+/// once for this. Busy CPUs are not interrupted, but marked, as by [`wake`].
+pub fn wake_idle(except: CpuId) {
+    signal(&CPUS.woken, !except.bit());
+}
+
+/// Notifies every CPU ([`take_notified`]), waking the idle ones, e.g., for an
+/// event that may end what any CPU waits for.
+pub fn notify_all() {
+    signal(&CPUS.notified, u64::MAX);
+}
+
+/// Marks `cpus` in `set`, then sends the wake IPI to those idle.
+fn signal(set: &AtomicU64, cpus: u64) {
+    set.fetch_or(cpus, Ordering::SeqCst);
+    interrupt(CPUS.idle.load(Ordering::SeqCst) & cpus);
+}
+
+/// Sends the wake IPI to `cpus` (bit `i`: CPU `i`), busy or idle, marking
+/// none: e.g., for those in user mode to enter the kernel. Nothing before
+/// [`VmKernel::start_cpus`].
+pub(crate) fn interrupt(mut cpus: u64) {
+    let Some(controller) = controller() else {
+        return;
+    };
+    while cpus != 0 {
+        let index = cpus.trailing_zeros() as usize;
+        cpus &= cpus - 1;
+        let apic_id = CPUS.apic_ids[index].load(Ordering::Relaxed);
         // Safety: a wake IPI.
-        unsafe { controller.send_ipi(apic_id(cpu), Ipi::Wake) };
+        unsafe { controller.send_ipi(apic_id, Ipi::Wake) };
     }
 }
 
 /// Whether `cpu` is in [`halt`].
 pub(crate) fn is_idle(cpu: CpuId) -> bool {
     CPUS.idle.load(Ordering::SeqCst) & cpu.bit() != 0
+}
+
+/// Bit `i`: CPU `i`'s work suspended, and has not finished (see
+/// [`crate::worker::interrupt_suspended`]).
+pub(crate) fn suspended_mask() -> u64 {
+    CPUS.suspended.load(Ordering::SeqCst)
+}
+
+/// Sets the calling CPU's bit in [`suspended_mask`], or clears it.
+pub(crate) fn set_suspended(suspended: bool) {
+    let bit = current().bit();
+    if suspended {
+        CPUS.suspended.fetch_or(bit, Ordering::SeqCst);
+    } else {
+        CPUS.suspended.fetch_and(!bit, Ordering::SeqCst);
+    }
 }

@@ -10,10 +10,12 @@
 use super::Service;
 use crate::payload::Payload;
 use alloc::vec::Vec;
+use core::time::Duration;
 use litebox_common_vm_abi::WallClock;
 use litebox_common_vm_abi::program::{ExitStatus, Program};
 use litebox_hal::clock::Clock;
-use litebox_platform_vm_kernel::VmKernel;
+use litebox_platform::time::{Instant as _, TimeProvider as _};
+use litebox_platform_vm_kernel::{VmKernel, cpu};
 use litebox_shim_vm_kernel::program::RunError;
 use litebox_shim_vm_kernel::sched::Scheduler;
 use litebox_shim_vm_kernel::{Process, ProcessConfig, ProcessTimer};
@@ -84,22 +86,43 @@ impl Programs {
 
     /// Checks that the processes that ran, which all ended, left nothing
     /// behind in the kernel: no address space, and no frame shared
-    /// copy-on-write (e.g., of a process clone never freed).
+    /// copy-on-write (e.g., of a process clone never freed), once the other
+    /// CPUs released what they still held (see [`Scheduler::reap`]).
     ///
     /// # Panics
     ///
     /// If they did.
     pub fn check_released(&self) {
-        self.scheduler.reap();
+        /// Ample for the other CPUs to release them, even under emulation.
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        /// Between looks, which take locks that releasing them takes.
+        const BACKOFF: Duration = Duration::from_micros(100);
+        let released = || {
+            self.scheduler.reap();
+            self.platform.address_space_count() == 0 && self.platform.shared_frame_count() == 0
+        };
+        let after = |duration| {
+            self.platform
+                .now()
+                .checked_add(duration)
+                .expect("the clock is far from overflowing")
+        };
+        let deadline = after(TIMEOUT);
+        while !released() && self.platform.now() < deadline {
+            let next = after(BACKOFF);
+            while self.platform.now() < next {
+                cpu::relax();
+            }
+        }
         assert_eq!(
             self.platform.address_space_count(),
             0,
-            "ended processes left address spaces"
+            "ended processes left address spaces, after waiting {TIMEOUT:?} for the other CPUs"
         );
         assert_eq!(
             self.platform.shared_frame_count(),
             0,
-            "ended processes left shared frames"
+            "ended processes left shared frames, after waiting {TIMEOUT:?} for the other CPUs"
         );
     }
 
