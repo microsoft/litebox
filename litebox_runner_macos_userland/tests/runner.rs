@@ -1259,11 +1259,27 @@ fn run_runner_with_timeout(arguments: &[&str]) -> (Option<i32>, Vec<u8>, String)
             .spawn()
             .unwrap(),
     );
-    let mut stdout = Vec::new();
+    // Both pipes drain while the guest runs, so neither fills and blocks
+    // it, and a guest that does not exit still reports its stderr.
     let mut out = child.0.stdout.take().unwrap();
-    let reader = std::thread::spawn(move || {
+    let stdout = std::thread::spawn(move || {
+        let mut stdout = Vec::new();
         out.read_to_end(&mut stdout).unwrap();
         stdout
+    });
+    let mut err = child.0.stderr.take().unwrap();
+    let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_reader = std::thread::spawn({
+        let stderr = std::sync::Arc::clone(&stderr);
+        move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match err.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => stderr.lock().unwrap().extend_from_slice(&chunk[..count]),
+                }
+            }
+        }
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let status = loop {
@@ -1272,19 +1288,14 @@ fn run_runner_with_timeout(arguments: &[&str]) -> (Option<i32>, Vec<u8>, String)
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "guest {arguments:?} did not exit within a minute"
+            "guest {arguments:?} did not exit within a minute; stderr so far:\n{}",
+            String::from_utf8_lossy(&stderr.lock().unwrap())
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    let mut stderr = String::new();
-    child
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    (status.code(), reader.join().unwrap(), stderr)
+    stderr_reader.join().unwrap();
+    let stderr = String::from_utf8(std::mem::take(&mut *stderr.lock().unwrap())).unwrap();
+    (status.code(), stdout.join().unwrap(), stderr)
 }
 
 /// A contended `pthread_mutex` (psynch): 8 threads x 100k increments with

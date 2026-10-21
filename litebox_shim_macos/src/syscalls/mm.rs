@@ -429,7 +429,8 @@ impl<P: ShimPlatform> Task<P> {
     /// but not a placement that replaces nothing (a non-fixed mmap or a
     /// no-replace Mach allocation) into a hole of the range. One that refills
     /// a failed replacement's hole with the same flags hides it, so the old
-    /// shared ulock objects and Mach-O tracking stay over the new pages; one
+    /// shared wait objects (ulock and psynch) and Mach-O tracking stay over
+    /// the new pages; one
     /// that fills a hole a failed, non-replacing MAP_FIXED left alone retires
     /// the untouched pages' objects and tracking. Only two threads mapping
     /// into one range at once can hit either.
@@ -1371,10 +1372,13 @@ impl<P: ShimPlatform> Task<P> {
         let above = cache_range.end..end;
         // Like XNU's vm_map_protect, which holds the map lock throughout, the
         // checks and every part's change happen under one hold of
-        // `macho_mappings`, so no mapping change lands between them and the
-        // request applies entirely or not at all. The whole range is checked
-        // in address order before anything changes: a hole fails with
-        // ENOMEM, a request beyond a page's maximum protection with EACCES.
+        // `macho_mappings`, so no mapping change lands between them and every
+        // part changes against the state the checks saw. The whole range is
+        // checked in address order before anything changes: a hole fails
+        // with ENOMEM, a request beyond a page's maximum protection with
+        // EACCES. A part can still fail after an earlier part changed (for
+        // example a code rewrite that cannot proceed), and the call then
+        // returns that error with the earlier parts changed.
         let mut mappings = self.global.macho_mappings.lock();
         self.check_task_memory_protection(below.clone(), protection)?;
         // Rewritten code and gate islands are never writable, and other cache
