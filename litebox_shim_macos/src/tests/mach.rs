@@ -81,6 +81,32 @@ fn msg2_at(
     receive_name: u32,
     receive_size: u32,
 ) -> u32 {
+    msg2_timed(
+        task,
+        data,
+        options,
+        header,
+        send_size,
+        descriptors,
+        receive_name,
+        receive_size,
+        0,
+    )
+}
+
+/// [`msg2_at`] with a send or receive timeout in milliseconds.
+#[expect(clippy::too_many_arguments)]
+fn msg2_timed(
+    task: &Task<Platform>,
+    data: usize,
+    options: u64,
+    header: MachMsgHeader,
+    send_size: u32,
+    descriptors: u32,
+    receive_name: u32,
+    receive_size: u32,
+    timeout: u32,
+) -> u32 {
     let pack =
         |low: u32, high: u32| usize::try_from(u64::from(high) << 32 | u64::from(low)).unwrap();
     let result = trap(
@@ -94,7 +120,7 @@ fn msg2_at(
             pack(header.voucher_port, header.id.cast_unsigned()),
             pack(descriptors, receive_name),
             pack(receive_size, 0),
-            0,
+            timeout as usize,
         ],
     );
     u32::try_from(result).unwrap()
@@ -1440,4 +1466,215 @@ fn terminate_with_payload_kills_only_the_guest_itself() {
     // The guest itself is killed with SIGKILL, unlike abort_with_payload's SIGABRT.
     assert!(terminate(task.params.pid.cast_unsigned() as usize).is_ok());
     assert_eq!(task.process.exit_status(), Some(128 + 9));
+}
+
+/// Wait until `receivers` threads block receiving on `port` and `senders`
+/// sending to it.
+fn await_port_waiters(task: &Task<Platform>, port: u32, receivers: usize, senders: usize) {
+    let start = std::time::Instant::now();
+    while task.global.ipc.lock().port_waiters(port) != (receivers, senders) {
+        assert!(
+            start.elapsed() < core::time::Duration::from_secs(10),
+            "waiters never blocked"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// A receive bounded by ten seconds on a sibling of `task`; returns the
+/// result and the received message id.
+fn spawn_receiver<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    task: &Task<Platform>,
+    port: u32,
+) -> std::thread::ScopedJoinHandle<'scope, (u32, i32)> {
+    let sibling = task.new_sibling(0);
+    scope.spawn(move || {
+        <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            sibling.start_thread();
+            let mut buffer = [0u8; 256];
+            let result = msg2_timed(
+                &sibling,
+                buffer.as_mut_ptr() as usize,
+                RECEIVE | RCV_TIMEOUT,
+                MachMsgHeader::default(),
+                0,
+                0,
+                port,
+                256,
+                10_000,
+            );
+            (result, header_of(&buffer).id)
+        })
+    })
+}
+
+/// A blocked receive takes a message another thread sends, and ends with
+/// `MACH_RCV_PORT_CHANGED` when its receive right dies or moves away, and
+/// with `MACH_RCV_INTERRUPTED` when the thread is canceled.
+#[test]
+fn blocked_receives_end_for_messages_and_port_changes() {
+    let task = new_task();
+    let _watchdog = super::psynch::Watchdog::new(&task);
+    let port = construct(&task, mpo::INSERT_SEND_RIGHT);
+    std::thread::scope(|scope| {
+        let receiver = spawn_receiver(scope, &task, port);
+        await_port_waiters(&task, port, 1, 0);
+        assert_eq!(
+            simple_send(&task, msg_type::COPY_SEND, port, 0, 0),
+            msg_return::SUCCESS
+        );
+        assert_eq!(receiver.join().unwrap(), (msg_return::SUCCESS, 7));
+    });
+    await_port_waiters(&task, port, 0, 0);
+
+    std::thread::scope(|scope| {
+        let receiver = spawn_receiver(scope, &task, port);
+        await_port_waiters(&task, port, 1, 0);
+        let carrier = construct(&task, 0);
+        assert_eq!(
+            send_port(&task, carrier, port, msg_type::MOVE_RECEIVE),
+            msg_return::SUCCESS
+        );
+        assert_eq!(receiver.join().unwrap().0, msg_return::RCV_PORT_CHANGED);
+        let mut buffer = [0u8; 256];
+        assert_eq!(
+            receive_now(&task, carrier, &mut buffer),
+            msg_return::SUCCESS
+        );
+    });
+
+    let port = construct(&task, 0);
+    std::thread::scope(|scope| {
+        let receiver = spawn_receiver(scope, &task, port);
+        await_port_waiters(&task, port, 1, 0);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            mod_refs(&task, port, port_right::RECEIVE, -1),
+            KernReturn::SUCCESS
+        );
+        assert_eq!(receiver.join().unwrap().0, msg_return::RCV_PORT_CHANGED);
+        // Woken by the port's death, not by its own ten-second timeout.
+        assert!(start.elapsed() < core::time::Duration::from_secs(5));
+    });
+
+    let port = construct(&task, 0);
+    std::thread::scope(|scope| {
+        let receiver = spawn_receiver(scope, &task, port);
+        await_port_waiters(&task, port, 1, 0);
+        let thread = {
+            let threads = task.process.0.threads.lock();
+            threads
+                .values()
+                .find(|thread| thread.id != task.thread.guest.id)
+                .unwrap()
+                .port
+        };
+        let name = task.global.ipc.lock().copyout_send(thread);
+        while task
+            .process
+            .0
+            .threads
+            .lock()
+            .values()
+            .any(|thread| thread.id != task.thread.guest.id && thread.interrupt.lock().is_none())
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(bsd(&task, nr::PTHREAD_MARKCANCEL, &[name as usize]), Ok(0));
+        assert_eq!(receiver.join().unwrap().0, msg_return::RCV_INTERRUPTED);
+    });
+    await_port_waiters(&task, port, 0, 0);
+}
+
+/// A send of `header` with a four-byte body and a timeout on a sibling of
+/// `task`.
+fn spawn_sender<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    task: &Task<Platform>,
+    header: MachMsgHeader,
+    timeout: u32,
+) -> std::thread::ScopedJoinHandle<'scope, u32> {
+    let sibling = task.new_sibling(0);
+    scope.spawn(move || {
+        <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            sibling.start_thread();
+            let mut buffer = [0u8; 64];
+            buffer[..24].copy_from_slice(zerocopy::IntoBytes::as_bytes(&header));
+            msg2_timed(
+                &sibling,
+                buffer.as_mut_ptr() as usize,
+                SEND | SEND_TIMEOUT,
+                header,
+                28,
+                0,
+                0,
+                0,
+                timeout,
+            )
+        })
+    })
+}
+
+/// A send to a full queue blocks until a receive makes room, its timeout
+/// passes, or the destination dies; the sender keeps its rights.
+#[test]
+fn sends_to_a_full_queue_block_until_there_is_room() {
+    let task = new_task();
+    let _watchdog = super::psynch::Watchdog::new(&task);
+    let port = construct(&task, mpo::INSERT_SEND_RIGHT);
+    let header = MachMsgHeader {
+        bits: msgh_bits::ports(msg_type::COPY_SEND, 0),
+        size: 0,
+        remote_port: port,
+        local_port: 0,
+        voucher_port: 0,
+        id: 11,
+    };
+    for _ in 0..litebox_common_macos::mach::MACH_PORT_QLIMIT_DEFAULT {
+        assert_eq!(
+            simple_send(&task, msg_type::COPY_SEND, port, 0, 0),
+            msg_return::SUCCESS
+        );
+    }
+    std::thread::scope(|scope| {
+        let sender = spawn_sender(scope, &task, header, 10_000);
+        await_port_waiters(&task, port, 0, 1);
+        let mut buffer = [0u8; 256];
+        assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+        assert_eq!(sender.join().unwrap(), msg_return::SUCCESS);
+    });
+    let start = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        assert_eq!(
+            spawn_sender(scope, &task, header, 30).join().unwrap(),
+            msg_return::SEND_TIMED_OUT
+        );
+    });
+    assert!(start.elapsed() >= core::time::Duration::from_millis(30));
+    // The queue holds the five messages, the last from the blocked sender.
+    let mut ids = Vec::new();
+    let mut buffer = [0u8; 256];
+    while receive_now(&task, port, &mut buffer) == msg_return::SUCCESS {
+        ids.push(header_of(&buffer).id);
+    }
+    assert_eq!(ids, [7, 7, 7, 7, 11]);
+
+    for _ in 0..litebox_common_macos::mach::MACH_PORT_QLIMIT_DEFAULT {
+        assert_eq!(
+            simple_send(&task, msg_type::COPY_SEND, port, 0, 0),
+            msg_return::SUCCESS
+        );
+    }
+    std::thread::scope(|scope| {
+        let sender = spawn_sender(scope, &task, header, 10_000);
+        await_port_waiters(&task, port, 0, 1);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            mod_refs(&task, port, port_right::RECEIVE, -1),
+            KernReturn::SUCCESS
+        );
+        assert_eq!(sender.join().unwrap(), msg_return::SEND_INVALID_DEST);
+        assert!(start.elapsed() < core::time::Duration::from_secs(5));
+    });
 }

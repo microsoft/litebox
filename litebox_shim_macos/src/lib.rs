@@ -15,7 +15,7 @@
 //!
 //! Each guest thread runs on its own host thread with its own Mach thread
 //! port; the shim emulates XNU's thread lifecycle, ulock, psynch, Mach
-//! semaphore, cancellation and yield calls on guest-private
+//! semaphore, Mach message, cancellation and yield calls on guest-private
 //! wait queues. Networking, workqueue (GCD) threads and signal delivery are
 //! unsupported.
 

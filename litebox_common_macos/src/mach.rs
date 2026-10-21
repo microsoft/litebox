@@ -29,6 +29,7 @@ pub mod msg_return {
     pub const RCV_TIMED_OUT: u32 = 0x1000_4003;
     pub const RCV_TOO_LARGE: u32 = 0x1000_4004;
     pub const RCV_INTERRUPTED: u32 = 0x1000_4005;
+    pub const RCV_PORT_CHANGED: u32 = 0x1000_4006;
     pub const RCV_INVALID_DATA: u32 = 0x1000_4008;
     pub const RCV_INVALID_ARGUMENTS: u32 = 0x1000_4013;
 }

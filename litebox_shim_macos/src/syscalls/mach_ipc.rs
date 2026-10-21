@@ -9,11 +9,22 @@
 //! kernel objects (task, thread, host, clock, semaphore) served by the typed
 //! MIG server in [`super::mig`]. Nothing is forwarded to the host: every
 //! right names an object owned by this guest.
+//!
+//! A receive blocks until a message arrives or the receive right moves or
+//! dies; a send to a full queue blocks until a receive makes room or the
+//! port dies (`ipc_mqueue`). Unlike XNU, which hands a message to a blocked
+//! receiver and a queue slot to a blocked sender, a woken thread tries again,
+//! so another thread may take the message or slot first; the woken thread
+//! then waits again until its deadline.
 
 use super::{mach::INVALID_TASK_DEST, mig};
-use crate::{ShimPlatform, Task};
+use crate::{
+    ShimPlatform, Task,
+    wait::{AnyWaiter, PortWaitQueue, WaitResult},
+};
 use alloc::{
     collections::{BTreeMap, VecDeque},
+    sync::Arc,
     vec,
     vec::Vec,
 };
@@ -60,6 +71,13 @@ struct GuestQueue {
     strict_guard: bool,
     /// `MPO_IMMOVABLE_RECEIVE`.
     immovable: bool,
+    /// Threads blocked in a receive on this port (`IPC_MQUEUE_RECEIVE`),
+    /// woken by every message and restarted when the receive right moves
+    /// or dies (`ipc_mqueue_changed`).
+    receivers: PortWaitQueue,
+    /// Threads blocked in a send to the full queue (`IPC_MQUEUE_FULL`),
+    /// woken whenever a message leaves it and restarted when the port dies.
+    senders: PortWaitQueue,
 }
 
 impl GuestQueue {
@@ -229,6 +247,17 @@ fn copyin_type(disposition: u32) -> u32 {
 
 /// The error is a `mach_msg_return_t`.
 type MsgResult<T> = Result<T, u32>;
+
+/// A send's copied-in header rights, or the guest port whose full queue the
+/// sender may wait on.
+enum SendHeader {
+    Ready {
+        destination: Right,
+        reply: Option<Right>,
+        port: PortId,
+    },
+    Full(PortId),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnqueueError {
@@ -604,6 +633,8 @@ impl IpcSpace {
             guarded: false,
             strict_guard: false,
             immovable: false,
+            receivers: PortWaitQueue::default(),
+            senders: PortWaitQueue::default(),
         }))?;
         self.alloc_name(Entry {
             port: Some(port),
@@ -627,9 +658,11 @@ impl IpcSpace {
     /// scheduled for destruction, and names for it become dead names.
     fn kill_port(&mut self, port: PortId) {
         if let Some(Port {
-            kind: PortKind::Guest(queue),
+            kind: PortKind::Guest(mut queue),
         }) = self.ports.remove(&port)
         {
+            queue.receivers.restart_all();
+            queue.senders.restart_all();
             self.queued_bytes -= queue.storage();
             for message in queue.messages {
                 self.queued_bytes -= message.charge();
@@ -714,6 +747,7 @@ impl IpcSpace {
                     queue.messages.reserve_exact(growth);
                     self.queued_bytes += message.charge() + (queue.storage() - storage);
                     queue.messages.push_back(message);
+                    queue.receivers.wake_all();
                     return Ok(());
                 }
                 EnqueueError::Full
@@ -747,6 +781,15 @@ impl IpcSpace {
         }
     }
 
+    fn guest_queue_mut(&mut self, port: PortId) -> Option<&mut GuestQueue> {
+        match self.ports.get_mut(&port) {
+            Some(Port {
+                kind: PortKind::Guest(queue),
+            }) => Some(queue),
+            _ => None,
+        }
+    }
+
     /// Take a guest port's first message, with its sequence number and the
     /// port's context.
     fn dequeue(&mut self, port: PortId) -> Option<(Message, u32, u64)> {
@@ -757,6 +800,7 @@ impl IpcSpace {
             return None;
         };
         let message = queue.messages.pop_front()?;
+        queue.senders.wake_all();
         let seqno = queue.seqno;
         queue.seqno = queue.seqno.wrapping_add(1);
         let context = queue.context;
@@ -828,7 +872,9 @@ impl IpcSpace {
                         return Err(());
                     }
                     // ipc_port_prepare_move: a moved receive right loses its
-                    // guard, context and sequence number.
+                    // guard, context and sequence number, and its blocked
+                    // receivers are sent away.
+                    queue.receivers.restart_all();
                     queue.guarded = false;
                     queue.strict_guard = false;
                     queue.context = 0;
@@ -865,6 +911,37 @@ impl IpcSpace {
             self.drop_urefs(name, moves);
         }
         Ok(port)
+    }
+
+    /// Threads blocked in receives on and sends to the port `name` holds a
+    /// right to.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn port_waiters(&self, name: u32) -> (usize, usize) {
+        self.entries
+            .get(&name)
+            .and_then(|entry| entry.port)
+            .and_then(|port| match self.ports.get(&port) {
+                Some(Port {
+                    kind: PortKind::Guest(queue),
+                }) => Some((queue.receivers.len(), queue.senders.len())),
+                _ => None,
+            })
+            .unwrap_or((0, 0))
+    }
+
+    /// End every blocked receive and send as if its port died; returns how
+    /// many there were.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn release_all_waiters(&mut self) -> usize {
+        let mut released = 0;
+        for port in self.ports.values_mut() {
+            if let PortKind::Guest(queue) = &mut port.kind {
+                released += queue.receivers.len() + queue.senders.len();
+                queue.receivers.restart_all();
+                queue.senders.restart_all();
+            }
+        }
+        released
     }
 
     /// Live port records and names, for leak tests.
@@ -1543,100 +1620,56 @@ impl<P: ShimPlatform> Task<P> {
             return Err(msg_return::SEND_INVALID_DATA);
         }
 
-        let mut ipc = self.global.ipc.lock();
-        // ipc_kmsg_copyin_header_validate
-        if header.bits & !msgh_bits::USER != 0 {
-            return Err(msg_return::SEND_INVALID_HEADER);
-        }
-        let reply_type = msgh_bits::local(header.bits);
-        let reply_name = header.local_port;
-        if reply_type == msg_type::NONE {
-            if reply_name != 0 {
-                return Err(msg_return::SEND_INVALID_HEADER);
-            }
-        } else if !msg_type::is_any_send(reply_type) {
-            return Err(msg_return::SEND_INVALID_HEADER);
-        }
-        match msgh_bits::voucher(header.bits) {
-            msg_type::NONE => {}
-            msg_type::MOVE_SEND | msg_type::COPY_SEND => {
-                // This task never receives voucher rights, so no name can
-                // denote one.
-                return Err(msg_return::SEND_INVALID_VOUCHER);
-            }
-            _ => return Err(msg_return::SEND_INVALID_VOUCHER),
-        }
-        let dest_type = msgh_bits::remote(header.bits);
-        let dest_name = header.remote_port;
-        if !msg_type::is_any_send(dest_type) {
-            return Err(msg_return::SEND_INVALID_HEADER);
-        }
-        if !port_name_is_valid(dest_name) {
-            return Err(msg_return::SEND_INVALID_DEST);
-        }
-        if dest_name == reply_name
-            && (dest_type == msg_type::MOVE_SEND_ONCE || reply_type == msg_type::MOVE_SEND_ONCE)
-        {
-            return Err(msg_return::SEND_INVALID_DEST);
-        }
-        // ipc_kmsg_copyin_header_rights
-        let dest_live = ipc
-            .check(dest_name)
-            .is_some_and(|entry| !entry.kind.contains(EntryType::DEAD_NAME));
-        if !dest_live {
-            return Err(msg_return::SEND_INVALID_DEST);
-        }
-        if port_name_is_valid(reply_name) && !ipc.can_copyin(reply_name, reply_type) {
-            return Err(msg_return::SEND_INVALID_REPLY);
-        }
-        let saved_dest = ipc.entries.get(&dest_name).cloned();
-        let saved_reply = ipc.entries.get(&reply_name).cloned();
-        let (destination, reply) =
-            ipc.copyin_header(dest_name, dest_type, reply_name, reply_type)?;
-        let Some(port) = destination.port() else {
-            // Unreachable: a dead destination was rejected above.
-            ipc.restore_entry(reply_name, saved_reply);
-            ipc.restore_entry(dest_name, saved_dest);
-            return Err(msg_return::SEND_INVALID_DEST);
-        };
-        // ipc_mqueue_send: if the message cannot queue, the sender gets its
-        // header rights back (mach_msg_receive_pseudo) and the error.
-        let send_once = matches!(
-            dest_type,
-            msg_type::MOVE_SEND_ONCE | msg_type::MAKE_SEND_ONCE
-        );
         let payload = payload_charge(body.len(), descriptor_count as usize);
-        let space = ipc.queue_space(port, payload, send_once);
-        if !matches!(space, QueueSpace::Available) {
-            ipc.restore_entry(reply_name, saved_reply);
-            ipc.restore_entry(dest_name, saved_dest);
-        }
-        match space {
-            QueueSpace::Available => {}
-            QueueSpace::NoBuffer => return Err(msg_return::SEND_NO_BUFFER),
-            QueueSpace::Full { kernel_limit } => {
-                if options.contains(MachMsgOptions::SEND_TIMEOUT) && timeout == 0 {
-                    return Err(msg_return::SEND_TIMED_OUT);
-                }
-                if kernel_limit {
-                    return Err(msg_return::SEND_NO_BUFFER);
-                }
-                // A full queue only drains on another thread, whose receive
-                // does not wake a blocked sender yet: the sender waits for
-                // its timeout or an interrupt.
-                drop(ipc);
-                let cx = self.wait_cx();
-                let cx = if options.contains(MachMsgOptions::SEND_TIMEOUT) {
-                    cx.with_timeout(core::time::Duration::from_millis(u64::from(timeout)))
-                } else {
-                    cx
-                };
-                return Err(match cx.sleep() {
-                    litebox::event::wait::WaitError::TimedOut => msg_return::SEND_TIMED_OUT,
-                    litebox::event::wait::WaitError::Interrupted => msg_return::SEND_INTERRUPTED,
-                });
+        let deadline = options
+            .contains(MachMsgOptions::SEND_TIMEOUT)
+            .then(|| self.msg_deadline(timeout));
+        let mut last_chance = None;
+        // A send to a full queue blocks and then starts over; the header
+        // rights stay with the sender while it waits.
+        let (mut ipc, destination, reply, port) = loop {
+            let mut ipc = self.global.ipc.lock();
+            let port = match Self::copyin_send_header(&mut ipc, options, &header, payload, timeout)?
+            {
+                SendHeader::Ready {
+                    destination,
+                    reply,
+                    port,
+                } => break (ipc, destination, reply, port),
+                SendHeader::Full(port) => port,
+            };
+            if let Some(error) = last_chance {
+                return Err(error);
             }
-        }
+            let waiter = self.new_waiter();
+            let queued: Arc<dyn AnyWaiter> = waiter.clone();
+            ipc.guest_queue_mut(port)
+                .expect("only a guest queue is full")
+                .senders
+                .push(Arc::clone(&queued));
+            drop(ipc);
+            let ended = self.wait_for_wakeup_until(&waiter, deadline);
+            if ended == WaitResult::Awakened {
+                // There is room now, or the port died.
+                continue;
+            }
+            let error = if ended == WaitResult::TimedOut {
+                msg_return::SEND_TIMED_OUT
+            } else {
+                msg_return::SEND_INTERRUPTED
+            };
+            let withdrawn = self
+                .global
+                .ipc
+                .lock()
+                .guest_queue_mut(port)
+                .is_some_and(|queue| queue.senders.withdraw(&queued));
+            if withdrawn {
+                return Err(error);
+            }
+            // Woken as the wait ended: one more try without blocking.
+            last_chance = Some(error);
+        };
         let mut message = Message {
             id: header.id,
             complex,
@@ -1711,6 +1744,100 @@ impl<P: ShimPlatform> Task<P> {
         }
     }
 
+    /// `ipc_kmsg_copyin_header` of a send and `ipc_mqueue_send`'s space
+    /// check under `ipc`. A send that cannot queue keeps its header rights.
+    fn copyin_send_header(
+        ipc: &mut IpcSpace,
+        options: MachMsgOptions,
+        header: &MachMsgHeader,
+        payload: usize,
+        timeout: u32,
+    ) -> MsgResult<SendHeader> {
+        // ipc_kmsg_copyin_header_validate
+        if header.bits & !msgh_bits::USER != 0 {
+            return Err(msg_return::SEND_INVALID_HEADER);
+        }
+        let reply_type = msgh_bits::local(header.bits);
+        let reply_name = header.local_port;
+        if reply_type == msg_type::NONE {
+            if reply_name != 0 {
+                return Err(msg_return::SEND_INVALID_HEADER);
+            }
+        } else if !msg_type::is_any_send(reply_type) {
+            return Err(msg_return::SEND_INVALID_HEADER);
+        }
+        match msgh_bits::voucher(header.bits) {
+            msg_type::NONE => {}
+            msg_type::MOVE_SEND | msg_type::COPY_SEND => {
+                // This task never receives voucher rights, so no name can
+                // denote one.
+                return Err(msg_return::SEND_INVALID_VOUCHER);
+            }
+            _ => return Err(msg_return::SEND_INVALID_VOUCHER),
+        }
+        let dest_type = msgh_bits::remote(header.bits);
+        let dest_name = header.remote_port;
+        if !msg_type::is_any_send(dest_type) {
+            return Err(msg_return::SEND_INVALID_HEADER);
+        }
+        if !port_name_is_valid(dest_name) {
+            return Err(msg_return::SEND_INVALID_DEST);
+        }
+        if dest_name == reply_name
+            && (dest_type == msg_type::MOVE_SEND_ONCE || reply_type == msg_type::MOVE_SEND_ONCE)
+        {
+            return Err(msg_return::SEND_INVALID_DEST);
+        }
+        // ipc_kmsg_copyin_header_rights
+        let dest_live = ipc
+            .check(dest_name)
+            .is_some_and(|entry| !entry.kind.contains(EntryType::DEAD_NAME));
+        if !dest_live {
+            return Err(msg_return::SEND_INVALID_DEST);
+        }
+        if port_name_is_valid(reply_name) && !ipc.can_copyin(reply_name, reply_type) {
+            return Err(msg_return::SEND_INVALID_REPLY);
+        }
+        let saved_dest = ipc.entries.get(&dest_name).cloned();
+        let saved_reply = ipc.entries.get(&reply_name).cloned();
+        let (destination, reply) =
+            ipc.copyin_header(dest_name, dest_type, reply_name, reply_type)?;
+        let Some(port) = destination.port() else {
+            // Unreachable: a dead destination was rejected above.
+            ipc.restore_entry(reply_name, saved_reply);
+            ipc.restore_entry(dest_name, saved_dest);
+            return Err(msg_return::SEND_INVALID_DEST);
+        };
+        // ipc_mqueue_send: if the message cannot queue, the sender gets its
+        // header rights back (mach_msg_receive_pseudo) and the error.
+        let send_once = matches!(
+            dest_type,
+            msg_type::MOVE_SEND_ONCE | msg_type::MAKE_SEND_ONCE
+        );
+        let space = ipc.queue_space(port, payload, send_once);
+        if !matches!(space, QueueSpace::Available) {
+            ipc.restore_entry(reply_name, saved_reply);
+            ipc.restore_entry(dest_name, saved_dest);
+        }
+        match space {
+            QueueSpace::Available => Ok(SendHeader::Ready {
+                destination,
+                reply,
+                port,
+            }),
+            QueueSpace::NoBuffer => Err(msg_return::SEND_NO_BUFFER),
+            QueueSpace::Full { kernel_limit } => {
+                if options.contains(MachMsgOptions::SEND_TIMEOUT) && timeout == 0 {
+                    return Err(msg_return::SEND_TIMED_OUT);
+                }
+                if kernel_limit {
+                    return Err(msg_return::SEND_NO_BUFFER);
+                }
+                Ok(SendHeader::Full(port))
+            }
+        }
+    }
+
     /// Deliver a kernel-object request and queue its reply on the request's
     /// reply right. Without a usable reply right the reply is destroyed.
     fn kernel_call(&self, object: KernelObject, mut message: Message) {
@@ -1757,47 +1884,54 @@ impl<P: ShimPlatform> Task<P> {
                 _ => return Err(msg_return::RCV_INVALID_NAME),
             }
         };
-        // A dead port also ends the wait.
-        let has_message = || {
-            let ipc = self.global.ipc.lock();
-            match ipc.ports.get(&port) {
-                Some(Port {
-                    kind: PortKind::Guest(queue),
-                }) => !queue.messages.is_empty(),
-                _ => true,
+        // ipc_mqueue_receive: block until a message arrives or the receive
+        // right moves or dies (MACH_RCV_PORT_CHANGED).
+        let deadline = options
+            .contains(MachMsgOptions::RCV_TIMEOUT)
+            .then(|| self.msg_deadline(timeout));
+        let mut last_chance = None;
+        let mut ipc = self.global.ipc.lock();
+        let first = loop {
+            let Some(queue) = ipc.guest_queue_mut(port) else {
+                return Err(msg_return::RCV_PORT_CHANGED);
+            };
+            if !queue.messages.is_empty() {
+                break queue.messages.front().expect("not empty");
             }
-        };
-        if !has_message() {
+            if let Some(error) = last_chance {
+                return Err(error);
+            }
             if options.contains(MachMsgOptions::RCV_TIMEOUT) && timeout == 0 {
                 return Err(msg_return::RCV_TIMED_OUT);
             }
-            // Only a message this thread sends can arrive (another thread's
-            // send does not wake a blocked receiver yet): wait to be
-            // interrupted or for the timeout.
-            let cx = self.wait_cx();
-            let cx = if options.contains(MachMsgOptions::RCV_TIMEOUT) {
-                cx.with_timeout(core::time::Duration::from_millis(u64::from(timeout)))
-            } else {
-                cx
-            };
-            match cx.wait_until(has_message) {
-                Ok(()) => {}
-                Err(litebox::event::wait::WaitError::TimedOut) => {
-                    return Err(msg_return::RCV_TIMED_OUT);
+            let waiter = self.new_waiter();
+            let queued: Arc<dyn AnyWaiter> = waiter.clone();
+            queue.receivers.push(Arc::clone(&queued));
+            drop(ipc);
+            let ended = self.wait_for_wakeup_until(&waiter, deadline);
+            ipc = self.global.ipc.lock();
+            if ended == WaitResult::Awakened {
+                if waiter.was_restarted() {
+                    return Err(msg_return::RCV_PORT_CHANGED);
                 }
-                Err(_) => return Err(msg_return::RCV_INTERRUPTED),
+                continue;
             }
-        }
-
-        let mut ipc = self.global.ipc.lock();
-        let Some(Port {
-            kind: PortKind::Guest(queue),
-        }) = ipc.ports.get(&port)
-        else {
-            return Err(msg_return::RCV_INVALID_NAME);
-        };
-        let Some(first) = queue.messages.front() else {
-            return Err(msg_return::RCV_INVALID_NAME);
+            let error = if ended == WaitResult::TimedOut {
+                msg_return::RCV_TIMED_OUT
+            } else {
+                msg_return::RCV_INTERRUPTED
+            };
+            let withdrawn = ipc
+                .guest_queue_mut(port)
+                .is_some_and(|queue| queue.receivers.withdraw(&queued));
+            if withdrawn {
+                return Err(error);
+            }
+            if waiter.was_restarted() {
+                return Err(msg_return::RCV_PORT_CHANGED);
+            }
+            // Woken as the wait ended: take a message that is there.
+            last_chance = Some(error);
         };
         // Bodies are bounded by MAX_MESSAGE_SIZE at send time.
         let message_size = u32::try_from(HEADER + first.body.len()).expect("bounded message");

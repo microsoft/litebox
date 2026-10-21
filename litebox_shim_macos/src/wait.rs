@@ -11,7 +11,7 @@
 //! guest thread sleeps on its own shim wait state.
 //!
 //! Every guest wait the shim emulates is `THREAD_ABORTSAFE` in XNU (ulock,
-//! psynch, semaphores, `mach_wait_until`,
+//! psynch, semaphores, Mach message queues, `mach_wait_until`,
 //! `thread_switch`), so every wait here ends for a pending safe abort.
 
 use crate::{GuestThread, ShimPlatform, Task, ThreadId};
@@ -131,6 +131,74 @@ impl<P: ShimPlatform> WaitQueue<P> {
     }
 }
 
+/// A [`Waiter`] whose platform type is erased, for wait queues kept in state
+/// that is not generic over the platform (Mach port queues).
+pub(crate) trait AnyWaiter: Send + Sync {
+    fn wake(&self);
+    fn restart(&self);
+}
+
+impl<P: ShimPlatform> AnyWaiter for Waiter<P> {
+    fn wake(&self) {
+        Waiter::wake(self);
+    }
+
+    fn restart(&self) {
+        Waiter::restart(self);
+    }
+}
+
+/// Threads blocked on a Mach port's message queue, as [`AnyWaiter`]s.
+#[derive(Default)]
+pub(crate) struct PortWaitQueue {
+    waiters: VecDeque<Arc<dyn AnyWaiter>>,
+}
+
+impl core::fmt::Debug for PortWaitQueue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PortWaitQueue")
+            .field("waiters", &self.waiters.len())
+            .finish()
+    }
+}
+
+impl PortWaitQueue {
+    pub(crate) fn push(&mut self, waiter: Arc<dyn AnyWaiter>) {
+        self.waiters.push_back(waiter);
+    }
+
+    pub(crate) fn wake_all(&mut self) {
+        for waiter in self.waiters.drain(..) {
+            waiter.wake();
+        }
+    }
+
+    pub(crate) fn restart_all(&mut self) {
+        for waiter in self.waiters.drain(..) {
+            waiter.restart();
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn len(&self) -> usize {
+        self.waiters.len()
+    }
+
+    /// [`WaitQueue::withdraw`].
+    pub(crate) fn withdraw(&mut self, waiter: &Arc<dyn AnyWaiter>) -> bool {
+        let Some(index) = self
+            .waiters
+            .iter()
+            .position(|w| core::ptr::addr_eq(Arc::as_ptr(w), Arc::as_ptr(waiter)))
+        else {
+            return false;
+        };
+        self.waiters.remove(index);
+        true
+    }
+}
+
 /// How a wait ended, like XNU's `wait_result_t`. A [`Waiter::restart`] ends
 /// the wait as [`WaitResult::Awakened`]; [`Waiter::was_restarted`] tells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +232,23 @@ impl<P: ShimPlatform> Task<P> {
         waiter: &Waiter<P>,
         timeout: Option<core::time::Duration>,
     ) -> WaitResult {
-        let cx = self.wait_cx().with_timeout(timeout);
+        self.wait_for_wakeup_in(waiter, &self.wait_cx().with_timeout(timeout))
+    }
+
+    /// [`Task::wait_for_wakeup`] until `deadline`.
+    pub(crate) fn wait_for_wakeup_until(
+        &self,
+        waiter: &Waiter<P>,
+        deadline: Option<P::Instant>,
+    ) -> WaitResult {
+        self.wait_for_wakeup_in(waiter, &self.wait_cx().with_deadline(deadline))
+    }
+
+    fn wait_for_wakeup_in(
+        &self,
+        waiter: &Waiter<P>,
+        cx: &litebox::event::wait::WaitContext<'_, P>,
+    ) -> WaitResult {
         let mut aborted = false;
         let result = cx.wait_until(|| {
             if waiter.woken.load(Ordering::Acquire) {
@@ -193,6 +277,14 @@ impl<P: ShimPlatform> Task<P> {
             Ok(()) | Err(WaitError::Interrupted) => WaitResult::Interrupted,
             Err(WaitError::TimedOut) => WaitResult::TimedOut,
         }
+    }
+
+    /// The deadline of a Mach message timeout of `milliseconds`.
+    pub(crate) fn msg_deadline(&self, milliseconds: u32) -> P::Instant {
+        use litebox_platform::time::Instant as _;
+        let now = self.global.platform.now();
+        now.checked_add(core::time::Duration::from_millis(u64::from(milliseconds)))
+            .unwrap_or(now)
     }
 
     /// The time left until `deadline` in `mach_absolute_time` units; zero if

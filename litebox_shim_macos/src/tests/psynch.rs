@@ -179,7 +179,7 @@ fn rw(
 
 /// Bounds a test's waits, most of which have no timeout: after [`BOUND`]
 /// it releases every thread blocked in psynch (with a zero grant), on a
-/// semaphore (as if it was destroyed) or in ulock until the test ends,
+/// semaphore or Mach port (as if it died) or in ulock until the test ends,
 /// and then fails the test, so a broken implementation fails instead of
 /// hanging.
 pub(super) struct Watchdog {
@@ -202,6 +202,7 @@ impl Watchdog {
                     if start.elapsed() >= BOUND {
                         let released = global.psynch.lock().release_all_waiters()
                             + global.semaphores.lock().release_all_waiters()
+                            + global.ipc.lock().release_all_waiters()
                             + global.ulocks.lock().release_all_waiters();
                         if released > 0 {
                             fired.store(true, Ordering::Release);
