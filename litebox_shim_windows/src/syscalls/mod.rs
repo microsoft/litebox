@@ -429,6 +429,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         file_information: Platform::RawMutPointer<file::FileBasicInformation>,
     },
+    NtQueryFullAttributesFile {
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        file_information: Platform::RawMutPointer<file::FileNetworkOpenInformation>,
+    },
     NtQueryInformationByName {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
@@ -1277,6 +1281,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 open_options,
             })),
             NtSysno::NtQueryAttributesFile => Some(sys_req!(NtQueryAttributesFile {
+                object_attributes:*,
+                file_information:*,
+            })),
+            NtSysno::NtQueryFullAttributesFile => Some(sys_req!(NtQueryFullAttributesFile {
                 object_attributes:*,
                 file_information:*,
             })),
