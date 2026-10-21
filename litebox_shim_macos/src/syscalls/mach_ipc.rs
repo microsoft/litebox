@@ -16,6 +16,14 @@
 //! receiver and a queue slot to a blocked sender, a woken thread tries again,
 //! so another thread may take the message or slot first; the woken thread
 //! then waits again until its deadline.
+//!
+//! XNU copies a send's header and body rights into the message before it
+//! blocks on a full queue. Here a blocked send copies nothing in until the
+//! message can queue: the rights its header and port descriptors name stay
+//! in the sender's space while it waits, and a descriptor that is invalid
+//! (a bad right, or an unsupported out-of-line type) fails the send only
+//! once there is room, not at once. Only another thread changing those
+//! names during the wait, or such a malformed send, can tell.
 
 use super::{mach::INVALID_TASK_DEST, mig};
 use crate::{
@@ -1630,8 +1638,8 @@ impl<P: ShimPlatform> Task<P> {
             .contains(MachMsgOptions::SEND_TIMEOUT)
             .then(|| self.msg_deadline(timeout));
         let mut last_chance = None;
-        // A send to a full queue blocks and then starts over; the header
-        // rights stay with the sender while it waits.
+        // A send to a full queue blocks and then starts over; the header and
+        // descriptor rights stay with the sender while it waits.
         let (mut ipc, destination, reply, port) = loop {
             let mut ipc = self.global.ipc.lock();
             let port = match Self::copyin_send_header(&mut ipc, options, &header, payload, timeout)?

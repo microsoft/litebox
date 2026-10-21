@@ -181,7 +181,6 @@ impl PortWaitQueue {
     }
 
     #[cfg(all(test, target_os = "macos"))]
-    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn len(&self) -> usize {
         self.waiters.len()
     }

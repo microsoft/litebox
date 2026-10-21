@@ -205,10 +205,12 @@ impl Watchdog {
                 let start = Instant::now();
                 while !done.load(Ordering::Acquire) {
                     if start.elapsed() >= bound {
-                        let released = global.psynch.lock().release_all_waiters()
-                            + global.semaphores.lock().release_all_waiters()
-                            + global.ipc.lock().release_all_waiters()
-                            + global.ulocks.lock().release_all_waiters();
+                        // One table lock at a time: holding several would
+                        // invert the shim's lock order.
+                        let mut released = global.psynch.lock().release_all_waiters();
+                        released += global.semaphores.lock().release_all_waiters();
+                        released += global.ipc.lock().release_all_waiters();
+                        released += global.ulocks.lock().release_all_waiters();
                         if released > 0 {
                             fired.store(true, Ordering::Release);
                         }
