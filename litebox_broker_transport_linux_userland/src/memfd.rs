@@ -282,7 +282,9 @@ impl MemfdSharedMemory {
         let mapping = MappedRegion { address, length };
         // A natively cloned runner must not inherit, and so cannot observe or corrupt, its
         // parent's association memory; it negotiates its own.
-        // SAFETY: The range is exactly the mapping created above and owned by `mapping`.
+        // SAFETY: The range is exactly the mapping created above and owned by `mapping`, and
+        // `MADV_DONTFORK` only affects inheritance by child processes, not the range's contents
+        // or validity in this process.
         unsafe { madvise(address.as_ptr().cast(), length, Advice::LinuxDontFork) }?;
         let spin_limit = match policy {
             MemoryAccessPolicy::Bytes => 0,
@@ -929,6 +931,74 @@ mod tests {
         );
         memory.increment_u32_release(epoch_offset).unwrap();
         assert_eq!(memory.load_u32_acquire(epoch_offset), Ok(0));
+    }
+
+    /// Returns whether `[address, address + length)` is still mapped in a forked child.
+    fn mapped_in_forked_child(address: *mut std::ffi::c_void, length: usize) -> bool {
+        // SAFETY: The child only issues raw syscalls and reads `errno` before `_exit`, all of
+        // which are async-signal-safe, so it never touches state another thread may hold.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {}", Error::last_os_error());
+        if child == 0 {
+            // SAFETY: `MADV_NORMAL` only resets read-ahead advice; on a range that is not
+            // mapped in this child it fails with `ENOMEM`.
+            let mapped = unsafe { libc::madvise(address, length, libc::MADV_NORMAL) } == 0;
+            let code = if mapped {
+                0
+            } else if Error::last_os_error().raw_os_error() == Some(libc::ENOMEM) {
+                1
+            } else {
+                2
+            };
+            // SAFETY: `_exit` skips Rust and libc teardown, which is unsafe in a forked child.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: `child` is this process's unreaped child and `status` is writable.
+        assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        match libc::WEXITSTATUS(status) {
+            0 => true,
+            1 => false,
+            code => panic!("child probe failed with exit code {code}"),
+        }
+    }
+
+    #[test]
+    fn fork_children_do_not_inherit_association_mappings() {
+        // SAFETY: A fresh anonymous mapping at a kernel-chosen address replaces nothing.
+        let control = unsafe {
+            rustix::mm::mmap_anonymous(std::ptr::null_mut(), 1, ProtFlags::READ, MapFlags::PRIVATE)
+        }
+        .unwrap();
+        let control_inherited = mapped_in_forked_child(control, 1);
+        // SAFETY: `control` is the 1-byte mapping created above and is not used afterwards.
+        unsafe { munmap(control, 1) }.unwrap();
+        assert!(
+            control_inherited,
+            "probe must see ordinary inherited mappings"
+        );
+
+        let pool = MemfdSharedMemory::create(64).unwrap();
+        let received_pool =
+            MemfdSharedMemory::from_received_fd(pool.fd.as_fd().try_clone_to_owned().unwrap(), 64)
+                .unwrap();
+        let ring = MemfdSharedMemory::create_control_ring().unwrap();
+        let received_ring = MemfdSharedMemory::control_ring_from_received_fd(
+            ring.fd.as_fd().try_clone_to_owned().unwrap(),
+        )
+        .unwrap();
+        for memory in [&pool, &received_pool, &ring, &received_ring] {
+            assert!(!mapped_in_forked_child(
+                memory.mapping.address.as_ptr().cast(),
+                memory.mapping.length,
+            ));
+        }
+
+        pool.write(0, &[5]).unwrap();
+        let mut byte = [0];
+        received_pool.read(0, &mut byte).unwrap();
+        assert_eq!(byte, [5]);
     }
 
     #[test]
