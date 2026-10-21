@@ -116,9 +116,9 @@ pub(crate) const PSYNCH_MAX_QUEUES: usize = 8 * TASK_THREADMAX as usize;
 /// behind keeps its own highest `outstanding + 1` sequences. Without such
 /// delayed signals this is within the limit while live condition variables
 /// hold fewer than 7 uncounted wakeups per possible thread. An entry costs
-/// at most 96 bytes (24 and spare capacity), 6 MiB at the limit. Only past it does a signal fail with
-/// ENOMEM, before any effect; libpthread ignores the error, so the signal
-/// is lost.
+/// at most 96 bytes (24 and spare capacity), 6 MiB at the limit. Only past
+/// it does a signal fail with ENOMEM, before any effect; libpthread ignores
+/// the error, so the signal is lost.
 pub(crate) const PSYNCH_MAX_FAKES: usize = 2 * PSYNCH_MAX_QUEUES;
 /// Entries a queue may keep capacity for beyond twice what it holds.
 const SPARE_ENTRIES: usize = 8;

@@ -545,7 +545,7 @@ mod tests {
     extern crate std;
 
     use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     use super::{ThreadState, WaitState};
@@ -553,40 +553,57 @@ mod tests {
 
     /// `interrupt_guest` interrupts a thread running guest code once and
     /// reports it until the thread is back in the host; it leaves a thread
-    /// in the host or waiting alone.
+    /// in the host or waiting alone. Each state the test checks lasts until
+    /// the test moves the thread on, so a descheduled test thread still
+    /// observes it; one deadline bounds the whole test.
     #[test]
     fn interrupt_guest_only_interrupts_guest_execution() {
+        const TEST_LIMIT: Duration = Duration::from_secs(10);
+        /// Time a waiter woken by mistake gets to leave WAITING-with-one-check.
+        const SETTLE: Duration = Duration::from_millis(20);
+        let deadline = Instant::now() + TEST_LIMIT;
         let platform = MockPlatform::new();
+        let released = Arc::new(AtomicBool::new(false));
+        let checks = Arc::new(AtomicU32::new(0));
         let (handle_sender, handle_receiver) = std::sync::mpsc::sync_channel(1);
         let (step_sender, step_receiver) = std::sync::mpsc::sync_channel(0);
-        let thread = std::thread::spawn(move || {
-            let state = WaitState::new(platform);
-            handle_sender
-                .send((state.thread_handle(), state.waker.clone()))
-                .unwrap();
-            step_receiver.recv().unwrap();
-            assert!(state.prepare_to_run_guest(|| true));
-            step_receiver.recv().unwrap();
-            state.finish_running_guest();
-            step_receiver.recv().unwrap();
-            let cx = state.context().with_timeout(Duration::from_millis(200));
-            let mut checks = 0;
-            let timed_out = cx.wait_until(|| {
-                checks += 1;
-                false
-            });
-            (timed_out.is_err(), checks)
+        let thread = std::thread::spawn({
+            let released = released.clone();
+            let checks = checks.clone();
+            move || {
+                let state = WaitState::new(platform);
+                handle_sender
+                    .send((state.thread_handle(), state.waker.clone()))
+                    .unwrap();
+                step_receiver.recv().unwrap();
+                assert!(state.prepare_to_run_guest(|| true));
+                step_receiver.recv().unwrap();
+                state.finish_running_guest();
+                step_receiver.recv().unwrap();
+                state
+                    .context()
+                    .wait_until(|| {
+                        checks.fetch_add(1, Ordering::SeqCst);
+                        released.load(Ordering::SeqCst)
+                    })
+                    .unwrap();
+            }
         });
-        let (handle, waker) = handle_receiver
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap();
-        let step = |state: ThreadState| {
-            step_sender.send(()).unwrap();
-            let start = Instant::now();
-            while waker.0.state_for_assert() != state {
-                assert!(start.elapsed() < Duration::from_secs(10), "{state:?}");
+        let (handle, waker) = handle_receiver.recv_timeout(TEST_LIMIT).unwrap();
+        // Releases the waiter on every exit, including a failed assertion.
+        let release = crate::utils::defer(|| {
+            released.store(true, Ordering::SeqCst);
+            waker.wake();
+        });
+        let wait_for = |done: &dyn Fn() -> bool, what: &dyn core::fmt::Debug| {
+            while !done() {
+                assert!(Instant::now() < deadline, "{what:?}");
                 std::thread::yield_now();
             }
+        };
+        let step = |state: ThreadState| {
+            step_sender.send(()).unwrap();
+            wait_for(&|| waker.0.state_for_assert() == state, &state);
         };
         assert!(!handle.interrupt_guest());
         step(ThreadState::RUNNING_IN_GUEST);
@@ -595,9 +612,18 @@ mod tests {
         assert_eq!(handle.thread.load(Ordering::Relaxed), 1);
         step(ThreadState::RUNNING_IN_HOST);
         assert!(!handle.interrupt_guest());
+        // The waiter is WAITING from before its first check until it is woken.
         step(ThreadState::WAITING);
+        wait_for(&|| checks.load(Ordering::SeqCst) == 1, &"first check");
         assert!(!handle.interrupt_guest());
-        assert_eq!(thread.join().unwrap(), (true, 1));
+        // A waiter woken by `interrupt_guest` would be WOKEN or check again.
+        std::thread::sleep(SETTLE);
+        assert_eq!(waker.0.state_for_assert(), ThreadState::WAITING);
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        drop(release);
+        wait_for(&|| thread.is_finished(), &"released waiter");
+        thread.join().unwrap();
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
         assert_eq!(handle.thread.load(Ordering::Relaxed), 1);
     }
 
