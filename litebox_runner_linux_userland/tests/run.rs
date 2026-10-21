@@ -1641,6 +1641,22 @@ fn spawn_test_broker_with_mode(
     }
 }
 
+/// Shuts a test broker association down if one of its lane threads, or the thread starting them,
+/// panics, ending every wait on it so the test fails instead of hanging.
+#[cfg(target_os = "linux")]
+struct ShutdownOnPanic<'a>(
+    &'a litebox_broker_transport_linux_userland::unix_socket::UnixControlRingHostShutdown,
+);
+
+#[cfg(target_os = "linux")]
+impl Drop for ShutdownOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = self.0.shutdown();
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn run_test_broker_connection(
     broker: &litebox_broker_core::BrokerCore,
@@ -1702,12 +1718,14 @@ fn run_test_broker_connection(
     // Serves each call lane the runner starts using on its own thread, until the runner closes the
     // association.
     std::thread::scope(|scope| {
+        let _shutdown_on_panic = ShutdownOnPanic(&shutdown);
         while let Some(mut lane) = lanes
             .next_lane()
             .expect("failed to receive a broker test call lane")
         {
             let (association, counts, shutdown) = (&association, &counts, &shutdown);
             scope.spawn(move || {
+                let _shutdown_on_panic = ShutdownOnPanic(shutdown);
                 loop {
                     match lane
                         .recv_request()
@@ -1749,8 +1767,6 @@ fn run_test_broker_connection(
                         }
                         litebox_broker_transport::channel::HostReceive::PeerClosed => return,
                         litebox_broker_transport::channel::HostReceive::ProtocolViolation => {
-                            // Ends the wait for lanes, so the test fails instead of hanging.
-                            let _ = shutdown.shutdown();
                             panic!("broker test request violated the protocol");
                         }
                     }
