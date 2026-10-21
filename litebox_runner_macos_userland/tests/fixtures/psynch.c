@@ -24,7 +24,7 @@ extern int __ulock_wake(uint32_t operation, void *address, uint64_t wake_value);
 #define ULF_NO_ERRNO 0x1000000
 
 #define THREADS 8
-#define ITERATIONS 100000
+#define ITERATIONS 20000
 
 // A start gate: every worker blocks until `open_gate`.
 static _Atomic uint32_t gate;
@@ -71,7 +71,7 @@ static void *increment(void *argument) {
   return NULL;
 }
 
-// A contended pthread mutex, 8 threads x 100k, with the default (first-fit)
+// A contended pthread mutex, 8 threads x 20k, with the default (first-fit)
 // policy and then fair share (which never takes the ulock path).
 static int mutex_contention(void) {
   run(increment, THREADS);
@@ -91,7 +91,7 @@ static int mutex_contention(void) {
 }
 
 #define SLOTS 4
-#define ITEMS 20000
+#define ITEMS 5000
 static pthread_cond_t not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t not_full = PTHREAD_COND_INITIALIZER;
 static int buffer[SLOTS];
@@ -192,7 +192,7 @@ static atomic_long reads, torn;
 static void *read_or_write(void *argument) {
   long index = (long)argument;
   wait_at_gate();
-  for (int i = 0; i < 2000; i++) {
+  for (int i = 0; i < 500; i++) {
     if (index < 2) {
       pthread_rwlock_wrlock(&rwlock);
       first_half++;

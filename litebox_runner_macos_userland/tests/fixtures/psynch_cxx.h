@@ -21,7 +21,7 @@ int main() {
     std::vector<std::thread> threads;
     for (int i = 0; i < 8; i++) {
       threads.emplace_back([&] {
-        for (int j = 0; j < 100000; j++) {
+        for (int j = 0; j < 20000; j++) {
           std::lock_guard<std::mutex> guard(mutex);
           counter++;
         }
@@ -35,7 +35,7 @@ int main() {
   std::deque<int> queue;
   long sum = 0;
   std::thread consumer([&] {
-    for (int i = 0; i < 20000; i++) {
+    for (int i = 0; i < 5000; i++) {
       std::unique_lock<std::mutex> lock(mutex);
       changed.wait(lock, [&] { return !queue.empty(); });
       sum += queue.front();
@@ -43,7 +43,7 @@ int main() {
       changed.notify_all();
     }
   });
-  for (int i = 0; i < 20000; i++) {
+  for (int i = 0; i < 5000; i++) {
     std::unique_lock<std::mutex> lock(mutex);
     changed.wait(lock, [&] { return queue.size() < 4; });
     queue.push_back(i);

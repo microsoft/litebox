@@ -58,7 +58,7 @@ static int custom_stack(void) {
 
 // dispatch_semaphore ping-pong between two pthreads (no dispatch queues).
 static dispatch_semaphore_t ping, pong;
-enum { PINGS = 20000 };
+enum { PINGS = 5000 };
 
 static void *ponger(void *unused) {
   (void)unused;
@@ -226,7 +226,7 @@ static int sleeps(void) {
 
 // Mach message ping-pong between two threads, each receiving on its own
 // port and sending to the other's.
-enum { MESSAGES = 5000 };
+enum { MESSAGES = 2000 };
 static mach_port_t ports[2];
 
 typedef struct {

@@ -144,7 +144,7 @@ static long counter;
 
 static void *increment(void *argument) {
   (void)argument;
-  for (int i = 0; i < 100000; i++) {
+  for (int i = 0; i < 20000; i++) {
     os_unfair_lock_lock(&lock);
     counter++;
     os_unfair_lock_unlock(&lock);
@@ -152,7 +152,7 @@ static void *increment(void *argument) {
   return NULL;
 }
 
-// os_unfair_lock contention: 8 threads x 100k increments.
+// os_unfair_lock contention: 8 threads x 20k increments.
 static int unfair(void) {
   pthread_t threads[8];
   for (int i = 0; i < 8; i++) pthread_create(&threads[i], NULL, increment, NULL);

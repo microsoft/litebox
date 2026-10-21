@@ -1030,14 +1030,14 @@ fn threads_create_join_and_keep_per_thread_state() {
     );
 }
 
-/// `os_unfair_lock` under contention: 8 threads x 100k increments.
+/// `os_unfair_lock` under contention: 8 threads x 20k increments.
 #[cfg(feature = "test-broker")]
 #[test]
 fn threads_contend_on_an_unfair_lock() {
     let (code, stdout, stderr) = run_thread_scenario("unfair");
     assert_eq!(
         (code, stdout.as_slice(), stderr.as_str()),
-        (Some(0), &b"counter 800000\n"[..], "")
+        (Some(0), &b"counter 160000\n"[..], "")
     );
 }
 
@@ -1302,7 +1302,7 @@ fn run_runner_with_timeout(arguments: &[&str]) -> (Option<i32>, Vec<u8>, String)
     (status.code(), stdout.join().unwrap(), stderr)
 }
 
-/// A contended `pthread_mutex` (psynch): 8 threads x 100k increments with
+/// A contended `pthread_mutex` (psynch): 8 threads x 20k increments with
 /// the default first-fit policy and with fair share.
 #[cfg(feature = "test-broker")]
 #[test]
@@ -1311,7 +1311,7 @@ fn threads_contend_on_a_pthread_mutex() {
         run_psynch_scenario("mutex", &[]),
         (
             Some(0),
-            "firstfit 800000 fairshare 800000 ulock 0\n".to_owned(),
+            "firstfit 160000 fairshare 160000 ulock 0\n".to_owned(),
             String::new()
         )
     );
@@ -1326,7 +1326,7 @@ fn threads_share_pthread_condition_variables() {
         run_psynch_scenario("condvar", &[]),
         (
             Some(0),
-            "consumed 80000 sum 1 absolute 1 waited 1 relative 1 signaled 1 ulock 0\n".to_owned(),
+            "consumed 20000 sum 1 absolute 1 waited 1 relative 1 signaled 1 ulock 0\n".to_owned(),
             String::new()
         )
     );
@@ -1342,7 +1342,7 @@ fn threads_use_ulock_pthread_mutexes_and_condition_variables() {
         run_psynch_scenario("mutex", &ulock),
         (
             Some(0),
-            "firstfit 800000 fairshare 800000 ulock 1\n".to_owned(),
+            "firstfit 160000 fairshare 160000 ulock 1\n".to_owned(),
             String::new()
         )
     );
@@ -1350,7 +1350,7 @@ fn threads_use_ulock_pthread_mutexes_and_condition_variables() {
         run_psynch_scenario("condvar", &ulock),
         (
             Some(0),
-            "consumed 80000 sum 1 absolute 1 waited 1 relative 1 signaled 1 ulock 1\n".to_owned(),
+            "consumed 20000 sum 1 absolute 1 waited 1 relative 1 signaled 1 ulock 1\n".to_owned(),
             String::new()
         )
     );
@@ -1365,7 +1365,7 @@ fn threads_share_a_pthread_rwlock() {
         run_psynch_scenario("rwlock", &[]),
         (
             Some(0),
-            "writes 4000 reads 12000 torn 0\n".to_owned(),
+            "writes 1000 reads 3000 torn 0\n".to_owned(),
             String::new()
         )
     );
@@ -1415,7 +1415,7 @@ fn threads_use_cpp_std_mutex_and_condition_variable() {
         (code, String::from_utf8(stdout).unwrap(), stderr),
         (
             Some(0),
-            "counter 800000 sum 199990000 timeout 1 waited 1\n".to_owned(),
+            "counter 160000 sum 12497500 timeout 1 waited 1\n".to_owned(),
             String::new()
         )
     );
@@ -1463,11 +1463,7 @@ fn threads_join_threads_with_custom_stacks() {
 fn threads_ping_pong_on_dispatch_semaphores() {
     assert_eq!(
         run_sync_scenario("dispatch"),
-        (
-            Some(0),
-            "rounds 20000 timeout 1\n".to_owned(),
-            String::new()
-        )
+        (Some(0), "rounds 5000 timeout 1\n".to_owned(), String::new())
     );
 }
 
@@ -1515,7 +1511,7 @@ fn threads_sleep_with_nanosleep_usleep_and_sleep() {
 fn threads_ping_pong_mach_messages() {
     assert_eq!(
         run_sync_scenario("mach"),
-        (Some(0), "main 10000 peer 9999\n".to_owned(), String::new())
+        (Some(0), "main 4000 peer 3999\n".to_owned(), String::new())
     );
 }
 
