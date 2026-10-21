@@ -87,12 +87,21 @@ const KSYN_CLEANUP_DEADLINE: core::time::Duration = core::time::Duration::from_s
 
 /// Wait queues a process may have. XNU allocates them from a zone without a
 /// per-process limit; here a lookup that needs a new queue in a full table
-/// first frees idle rwlock queues early, then fails with ENOMEM. Live
-/// waiters hold at most `TASK_THREADMAX` queues; the rest is room for
-/// preposted unlocks.
+/// first frees idle rwlock queues early, then fails with ENOMEM before any
+/// effect. A queue that is not idle holds a thread blocked on it or a
+/// prepost for a thread on its way to it, so libpthread traffic needs at
+/// most `TASK_THREADMAX` of them. Past the limit libpthread's mutexwait
+/// retries forever, an unlock or rwlock call aborts the process
+/// (`PTHREAD_INTERNAL_CRASH`), a cvwait whose mutex unlock fails returns
+/// EINVAL and leaves that mutex's waiter blocked, and a condition variable
+/// signal is lost (libpthread ignores its error).
 pub(crate) const PSYNCH_MAX_QUEUES: usize = 4 * TASK_THREADMAX as usize;
 /// Prepost and broadcast entries (`kw_fakecount`) of all condition
-/// variables. A signal that needs one more fails with ENOMEM.
+/// variables. XNU's allocations of them never fail; here a signal that needs
+/// one more in a full budget first drops the entries no later call can tell
+/// apart from the ones kept ([`Kwq::compact_fakes`]), which leaves libpthread
+/// traffic at most two per thread. Only then does it fail with ENOMEM,
+/// before any effect; libpthread ignores the error, so the signal is lost.
 pub(crate) const PSYNCH_MAX_FAKES: usize = 4 * TASK_THREADMAX as usize;
 
 fn is_seqlower(x: u32, y: u32) -> bool {
@@ -252,6 +261,16 @@ struct Prepost {
     sseq: u32,
 }
 
+/// A condition variable's view of its sequence words.
+#[derive(Clone, Copy)]
+struct CvWords {
+    lword: u32,
+    uword: u32,
+    sword: u32,
+    lastunlockseq: u32,
+    zeroed_out: bool,
+}
+
 /// Which queue of a wait queue (`kwq_queue_type_t`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueueKind {
@@ -324,8 +343,12 @@ impl<P: ShimPlatform> Default for Kwq<P> {
 struct Fakes(usize);
 
 impl Fakes {
+    fn is_full(&self) -> bool {
+        self.0 >= PSYNCH_MAX_FAKES
+    }
+
     fn take(&mut self) -> Result<(), Errno> {
-        if self.0 >= PSYNCH_MAX_FAKES {
+        if self.is_full() {
             return Err(Errno::ENOMEM);
         }
         self.0 += 1;
@@ -486,6 +509,92 @@ impl<P: ShimPlatform> Kwq<P> {
         fakes.put();
     }
 
+    /// Drop the fake entries no later call can tell apart from the ones
+    /// kept. A fake entry acts only through being at or above a sequence: a
+    /// cvwait at `c` consumes or converts the first one at or above `c`, a
+    /// signal up to `u` merges into or is subsumed by the first one at or
+    /// above `u`, and a broadcast or clear removes every one up to its own.
+    /// Each is at or below L, and blocked threads queue above them all. A
+    /// later cvwait at or below one is a return S does not count yet that is
+    /// not queued (`outstanding`); each removes at most one sequence, and a
+    /// conversion leaves a broadcast entry that no cvwait removes. So with
+    /// the highest `outstanding + 1` sequences kept, an entry stays above
+    /// every dropped one after all those returns, and every later call meets
+    /// what it would have met; a broadcast entry does the same for the run
+    /// of fake entries below it. Blocked threads interleaved with fake
+    /// entries (a canceled one, or a guest's own sequences) end the run that
+    /// is dropped.
+    fn compact_fakes(&mut self, fakes: &mut Fakes) {
+        if self.kind != Some(Kind::Cvar) || self.fakecount == 0 {
+            return;
+        }
+        let pending = diff_genseq(self.lword, self.sword) >> PTHRW_COUNT_SHIFT;
+        let queued = self
+            .write
+            .entries
+            .iter()
+            .filter(|kwe| kwe.state == KweState::InWait)
+            .count();
+        let outstanding = usize::try_from(pending)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(queued);
+        let mut kept = 0usize;
+        let mut last = None;
+        let mut covered = false;
+        let mut seen_fake = false;
+        let mut end = 0;
+        for (index, kwe) in self.write.entries.iter().enumerate().rev() {
+            if kwe.state == KweState::InWait {
+                if seen_fake {
+                    break;
+                }
+                continue;
+            }
+            seen_fake = true;
+            if last == Some(kwe.lockseq) {
+                continue;
+            }
+            if covered {
+                end = index + 1;
+                break;
+            }
+            last = Some(kwe.lockseq);
+            kept += 1;
+            covered = kwe.state == KweState::Broadcast || kept > outstanding;
+        }
+        if end == 0 {
+            return;
+        }
+        // The dropped run starts at the first fake entry below the kept ones
+        // and goes down to the next blocked thread or the queue's front.
+        let start = self
+            .write
+            .entries
+            .range(..end)
+            .rposition(|kwe| kwe.state == KweState::InWait)
+            .map_or(0, |index| index + 1);
+        let dropped = self.write.entries.drain(start..end).count();
+        if let Some(first) = self.write.entries.front() {
+            self.write.firstnum = first.lockseq;
+        }
+        self.fakecount -= u32::try_from(dropped).expect("queued entries fit in u32");
+        fakes.0 -= dropped;
+    }
+
+    /// Whether a broadcast up to `upto` would add an entry the budget has no
+    /// room for: it adds one unless L == S, and it frees one first if a fake
+    /// entry is at or below `upto`.
+    fn broadcast_lacks_room(&self, upto: u32, fakes: &Fakes) -> bool {
+        fakes.is_full()
+            && diff_genseq(self.lword, self.sword) != 0
+            && !self
+                .write
+                .entries
+                .iter()
+                .take_while(|kwe| !is_seqhigher(kwe.lockseq, upto))
+                .any(|kwe| kwe.state != KweState::InWait)
+    }
+
     /// `ksyn_prepost`: queue a fake entry.
     fn prepost_fake(
         &mut self,
@@ -541,6 +650,25 @@ impl<P: ShimPlatform> Kwq<P> {
             self.init_cleared = true;
         }
         init
+    }
+
+    /// What [`Self::update_cv`] changes.
+    fn cv_words(&self) -> CvWords {
+        CvWords {
+            lword: self.lword,
+            uword: self.uword,
+            sword: self.sword,
+            lastunlockseq: self.lastunlockseq,
+            zeroed_out: self.zeroed_out,
+        }
+    }
+
+    fn set_cv_words(&mut self, words: CvWords) {
+        self.lword = words.lword;
+        self.uword = words.uword;
+        self.sword = words.sword;
+        self.lastunlockseq = words.lastunlockseq;
+        self.zeroed_out = words.zeroed_out;
     }
 
     /// `UPDATE_CVKWQ`.
@@ -805,6 +933,17 @@ impl<P: ShimPlatform> PsynchTable<P> {
         }
     }
 
+    /// With the fake-entry budget full, drop every condition variable's fake
+    /// entries no later call can tell from the kept ones.
+    fn make_room_for_fake(&mut self) {
+        if self.fakes.is_full() {
+            let Self { queues, fakes, .. } = self;
+            for kwq in queues.values_mut() {
+                kwq.compact_fakes(fakes);
+            }
+        }
+    }
+
     /// `ksyn_cvupdate_fixup`.
     fn cv_fixup(&mut self, key: PsynchKey, updatebits: &mut u32) {
         let Self { queues, fakes, .. } = self;
@@ -854,6 +993,9 @@ fn handle_cvbroad<P: ShimPlatform>(
     upto: u32,
     updatebits: &mut u32,
 ) -> Result<(), Errno> {
+    if kwq.broadcast_lacks_room(upto, fakes) {
+        return Err(Errno::ENOMEM);
+    }
     let mut woken = 0u32;
     // Every entry up to `upto` leaves the queue except canceled waiters.
     let mut index = 0;
@@ -1291,40 +1433,44 @@ impl<P: ShimPlatform> Task<P> {
         };
         let mut table = self.global.psynch.lock();
         let key = self.psynch_find(&mut table, cv, flags, Kind::Cvar, cgen, cugen, csgen)?;
+        table.make_room_for_fake();
         let PsynchTable { queues, fakes, .. } = &mut *table;
         let kwq = queues.get_mut(&key).expect("a call holds the queue");
+        let words = kwq.cv_words();
         kwq.update_cv(cgen, cugen, csgen);
         let mut updatebits = 0;
         let mut result = Ok(());
         if !broadcast && diff_genseq(kwq.lword, kwq.sword) != 0 {
-            match thread {
-                Some(thread) => {
-                    cvsignal_thread(
-                        kwq,
-                        thread,
-                        uptoseq,
-                        fromseq,
-                        &mut updatebits,
-                        &mut broadcast,
-                    );
-                }
-                None => {
-                    result = cvsignal_any(
-                        kwq,
-                        fakes,
-                        uptoseq,
-                        fromseq,
-                        &mut updatebits,
-                        &mut broadcast,
-                    );
-                }
-            }
+            result = match thread {
+                Some(thread) => cvsignal_thread(
+                    kwq,
+                    fakes,
+                    thread,
+                    uptoseq,
+                    fromseq,
+                    &mut updatebits,
+                    &mut broadcast,
+                ),
+                None => cvsignal_any(
+                    kwq,
+                    fakes,
+                    uptoseq,
+                    fromseq,
+                    &mut updatebits,
+                    &mut broadcast,
+                ),
+            };
         }
-        if broadcast {
+        if broadcast && result.is_ok() {
             result = handle_cvbroad(kwq, fakes, uptoseq, &mut updatebits);
         }
-        kwq.sword = kwq.sword.wrapping_add(updatebits & PTHRW_COUNT_MASK);
-        table.cv_fixup(key, &mut updatebits);
+        if result.is_err() {
+            // The call failed before it changed the queue.
+            kwq.set_cv_words(words);
+        } else {
+            kwq.sword = kwq.sword.wrapping_add(updatebits & PTHRW_COUNT_MASK);
+            table.cv_fixup(key, &mut updatebits);
+        }
         table.release(key, None);
         result.map(|()| updatebits)
     }
@@ -1677,12 +1823,13 @@ fn cvsignal_any<P: ShimPlatform>(
 /// variable; otherwise, or if it is outside the signal's range, broadcast.
 fn cvsignal_thread<P: ShimPlatform>(
     kwq: &mut Kwq<P>,
+    fakes: &Fakes,
     thread: ThreadId,
     uptoseq: u32,
     signalseq: u32,
     updatebits: &mut u32,
     broadcast: &mut bool,
-) {
+) -> Result<(), Errno> {
     let Some(index) = kwq
         .write
         .entries
@@ -1690,15 +1837,20 @@ fn cvsignal_thread<P: ShimPlatform>(
         .position(|kwe| kwe.thread() == Some(thread))
     else {
         *broadcast = true;
-        return;
+        return Ok(());
     };
     let lockseq = kwq.write.entries[index].lockseq;
+    let outside = is_seqhigher(lockseq, uptoseq) || is_seqlower(lockseq, signalseq);
+    if outside && kwq.broadcast_lacks_room(uptoseq, fakes) {
+        return Err(Errno::ENOMEM);
+    }
     kwq.signal(QueueKind::Write, index, PTH_RWL_MTX_WAIT);
-    if is_seqhigher(lockseq, uptoseq) || is_seqlower(lockseq, signalseq) {
+    if outside {
         *broadcast = true;
     } else {
         *updatebits = updatebits.wrapping_add(PTHRW_INC);
     }
+    Ok(())
 }
 
 /// `_kwq_handle_overlap`: a reader arriving while the lock is granted to
