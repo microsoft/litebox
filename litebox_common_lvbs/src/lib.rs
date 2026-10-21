@@ -53,8 +53,14 @@ pub const VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY: u32 = 0x1_ffed;
 // This VSM function ID for generating the identity signing key is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_GENERATE_IDENTITY_SIGNING_KEY: u32 = 0x1_ffee;
 
+// VSM function ID for setting crash dump key
+pub const VSM_VTL_CALL_FUNC_ID_SET_CRASH_DUMP_KEY: u32 = 0x1_ffef;
+
 // This VSM function ID for OP-TEE messages is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
+
+// Run LVBS tests
+pub const VSM_VTL_CALL_FUNC_ID_RUN_LVBS_TEST: u32 = 0xf_0000;
 
 /// VSM Functions
 #[derive(Debug, PartialEq, TryFromPrimitive)]
@@ -77,6 +83,8 @@ pub enum VsmFunction {
     AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
     SetPlatformRootKey = VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY,
     GenerateIdentitySigningKey = VSM_VTL_CALL_FUNC_ID_GENERATE_IDENTITY_SIGNING_KEY,
+    SetCrashDumpKey = VSM_VTL_CALL_FUNC_ID_SET_CRASH_DUMP_KEY,
+    RunLvbsTest = VSM_VTL_CALL_FUNC_ID_RUN_LVBS_TEST,
 }
 
 // `HV_STATUS_*` constants used as discriminants for `HypervCallError`.
@@ -289,6 +297,15 @@ pub enum VsmError {
 
     #[error("symbol name contains invalid UTF-8")]
     SymbolNameInvalidUtf8,
+
+    #[error("Invalid key: {0}")]
+    InvalidKey(&'static str),
+
+    #[error("Timeout on: {0}")]
+    OperationTimeout(&'static str),
+
+    #[error("Cipher operation failed: {0}")]
+    CipherOpFailed(&'static str),
 }
 
 impl From<VerificationError> for VsmError {
@@ -806,7 +823,7 @@ pub trait Vtl0Gate {
     ) -> Result<(), VsmError>;
 
     /// Install a VTL0 physical buffer as the platform's log ring buffer.
-    fn install_ringbuffer(&self, pa: u64, size: u64);
+    fn install_ringbuffer(&self, pa: u64, size: u64) -> Result<(), VsmError>;
 
     /// Whether VTL0 has signalled end of boot, i.e., whether VTL1's window of
     /// trusting VTL0 has closed. Operations that are only legitimate while VTL0
@@ -897,6 +914,9 @@ pub trait Vtl1Gate {
 
     /// Read the platform root key from VTL0 `key_pa` and store it in VTL1 state.
     fn set_platform_root_key(&self, key_pa: u64) -> Result<(), VsmError>;
+
+    /// Read the crash dump public key from VTL0 'key_pa'.
+    fn set_crash_dump_key(&self, key_pa: u64, key_len: u64) -> Result<(), VsmError>;
 
     /// Close VTL1's window of trusting VTL0, making
     /// [`Vtl0Gate::end_of_boot_reached`] report `true` from here on. One-way:
