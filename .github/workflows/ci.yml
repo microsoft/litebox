@@ -74,7 +74,14 @@ jobs:
           ./.github/tools/github_actions_run_cargo build -p litebox_runner_optee_on_linux_userland
       - name: Identify Linux test fixtures
         id: fixture-key
-        run: python3 -B .github/tools/test_fixture_cache_key.py
+        # Fixtures restored via the prefix are revalidated per input by the tests
+        # (tests/cache.rs), except for compiler and dependency changes, which
+        # the prefix covers. ImageVersion is avoided: rollouts mix versions.
+        run: |
+          gcc_hash=$(gcc --version | sha256sum | cut -c1-16)
+          prefix="linux-test-fixtures-v1-$ImageOS-$gcc_hash-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'litebox_common_windows/src/**') }}-"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "key=${prefix}${{ hashFiles('litebox_runner_linux_userland/tests/**', 'litebox_syscall_rewriter/src/**', 'litebox_trampoline/src/**') }}" >> "$GITHUB_OUTPUT"
       - name: Clear test fixtures before restore
         run: rm -rf -- target/tmp
       - name: Restore Linux test fixtures
@@ -82,7 +89,8 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/tmp
-          key: ${{ steps.fixture-key.outputs.cache-key }}
+          key: ${{ steps.fixture-key.outputs.key }}
+          restore-keys: ${{ steps.fixture-key.outputs.prefix }}
       - run: |
           ./.github/tools/github_actions_run_cargo nextest
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
@@ -103,7 +111,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/tmp
-          key: ${{ steps.fixture-key.outputs.cache-key }}
+          key: ${{ steps.fixture-key.outputs.key }}
       - name: Remove Linux test fixtures
         if: always()
         # Fixtures are cached separately above; keep them out of rust-cache.
