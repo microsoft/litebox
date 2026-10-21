@@ -1819,6 +1819,14 @@ mod tests {
             let port = task.global.ipc.lock().copyout_send(guest.port);
             let (sender, ended) = std::sync::mpsc::channel();
             std::thread::scope(|scope| {
+                // On any failure, unblock a call the cancellation did not
+                // end before the scope joins it.
+                let _unblock = litebox::utils::defer(|| {
+                    if std::thread::panicking() {
+                        stdio.inner.close_input();
+                        stdio.drain();
+                    }
+                });
                 scope.spawn(move || {
                     <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
                         sibling.start_thread();
@@ -1843,13 +1851,11 @@ mod tests {
                     task.sys_pthread_markcancel(litebox_common_macos::syscall::MachPortName(port)),
                     Ok(())
                 );
-                let result = ended.recv_timeout(BOUND);
-                if result.is_err() {
-                    // Unblock the call the cancellation did not end.
-                    stdio.inner.close_input();
-                    stdio.drain();
-                }
-                assert_eq!(result, Ok(Errno::EINTR.raw()), "{number}");
+                assert_eq!(
+                    ended.recv_timeout(BOUND),
+                    Ok(Errno::EINTR.raw()),
+                    "{number}"
+                );
             });
         }
     }
