@@ -1778,6 +1778,20 @@ fn run_paused(
     }
 }
 
+/// Run a deadline scenario until its call queued at least once: a 100 ms
+/// deadline can pass on a loaded runner before the call first looks, and
+/// such a call times out without queueing, which tests nothing. Returns the
+/// scenario's result and queue count.
+fn until_queued(mut scenario: impl FnMut() -> (u32, usize)) -> (u32, usize) {
+    for _ in 0..5 {
+        let (result, queued) = scenario();
+        if queued != 0 {
+            return (result, queued);
+        }
+    }
+    panic!("the call timed out before it queued five times");
+}
+
 /// A receiver a message woke, which is off the wait queue, still sees its
 /// receive right move before it retries: it returns `MACH_RCV_PORT_CHANGED`
 /// instead of waiting on the moved port.
@@ -1843,48 +1857,51 @@ fn a_receiver_that_keeps_losing_messages_times_out() {
     let task = new_task();
     let _watchdog = super::psynch::Watchdog::new(&task);
     let port = construct(&task, mpo::INSERT_SEND_RIGHT);
-    std::thread::scope(|scope| {
-        let (reports, acknowledge) = spawn_paused(scope, &task, move |receiver| {
+    let mut stolen = Vec::new();
+    let (result, queued) = until_queued(|| {
+        stolen.clear();
+        std::thread::scope(|scope| {
+            let (reports, acknowledge) = spawn_paused(scope, &task, move |receiver| {
+                let mut buffer = [0u8; 256];
+                msg2_timed(
+                    receiver,
+                    buffer.as_mut_ptr() as usize,
+                    RECEIVE | RCV_TIMEOUT,
+                    MachMsgHeader::default(),
+                    0,
+                    0,
+                    port,
+                    256,
+                    100,
+                )
+            });
             let mut buffer = [0u8; 256];
-            msg2_timed(
-                receiver,
-                buffer.as_mut_ptr() as usize,
-                RECEIVE | RCV_TIMEOUT,
-                MachMsgHeader::default(),
-                0,
-                0,
-                port,
-                256,
-                100,
-            )
-        });
-        let mut buffer = [0u8; 256];
-        let mut wakeups = 0;
-        // The test's own calls never block, so a receiver that keeps
-        // queueing fails the test instead of hanging it.
-        let mut stolen = Vec::new();
-        let (result, queued) = run_paused(&reports, &acknowledge, |point| match point {
-            // A message wakes the queued receiver before it looks; a
-            // receiver that keeps queueing again is let go after three.
-            Point::MachMsgQueued => {
-                wakeups += 1;
-                if wakeups <= 3 {
-                    assert_eq!(send_now(&task, port), msg_return::SUCCESS);
+            let mut wakeups = 0;
+            // The test's own calls never block, so a receiver that keeps
+            // queueing fails the test instead of hanging it.
+            run_paused(&reports, &acknowledge, |point| match point {
+                // A message wakes the queued receiver before it looks; a
+                // receiver that keeps queueing again is let go after three.
+                Point::MachMsgQueued => {
+                    wakeups += 1;
+                    if wakeups <= 3 {
+                        assert_eq!(send_now(&task, port), msg_return::SUCCESS);
+                    }
                 }
-            }
-            // Another thread takes the message, and the deadline passes.
-            Point::MachMsgWaited if wakeups <= 3 => {
-                stolen.push(receive_now(&task, port, &mut buffer));
-                std::thread::sleep(core::time::Duration::from_millis(150));
-            }
-            Point::MachMsgWaited => {}
-            _ => unreachable!(),
-        });
-        assert_eq!(
-            (result, queued, stolen.as_slice()),
-            (msg_return::RCV_TIMED_OUT, 1, &[msg_return::SUCCESS][..])
-        );
+                // Another thread takes the message, and the deadline passes.
+                Point::MachMsgWaited if wakeups <= 3 => {
+                    stolen.push(receive_now(&task, port, &mut buffer));
+                    std::thread::sleep(core::time::Duration::from_millis(150));
+                }
+                Point::MachMsgWaited => {}
+                _ => unreachable!(),
+            })
+        })
     });
+    assert_eq!(
+        (result, queued, stolen.as_slice()),
+        (msg_return::RCV_TIMED_OUT, 1, &[msg_return::SUCCESS][..])
+    );
 }
 
 /// A sender that is woken and loses the queue slot to another thread does
@@ -1910,49 +1927,52 @@ fn a_sender_that_keeps_losing_queue_slots_times_out() {
         voucher_port: 0,
         id: 11,
     };
-    std::thread::scope(|scope| {
-        let (reports, acknowledge) = spawn_paused(scope, &task, move |sender| {
-            let mut buffer = [0u8; 64];
-            buffer[..24].copy_from_slice(zerocopy::IntoBytes::as_bytes(&header));
-            msg2_timed(
-                sender,
-                buffer.as_mut_ptr() as usize,
-                SEND | SEND_TIMEOUT,
-                header,
-                28,
-                0,
-                0,
-                0,
-                100,
-            )
-        });
-        let mut buffer = [0u8; 256];
-        let mut wakeups = 0;
-        // The test's own calls never block, so a sender that keeps queueing
-        // fails the test instead of hanging it.
-        let mut filled = Vec::new();
-        let (result, queued) = run_paused(&reports, &acknowledge, |point| match point {
-            // A receive wakes the queued sender before it looks; a sender
-            // that keeps queueing again is let go after three.
-            Point::MachMsgQueued => {
-                wakeups += 1;
-                if wakeups <= 3 {
-                    assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+    let mut filled = Vec::new();
+    let (result, queued) = until_queued(|| {
+        filled.clear();
+        std::thread::scope(|scope| {
+            let (reports, acknowledge) = spawn_paused(scope, &task, move |sender| {
+                let mut buffer = [0u8; 64];
+                buffer[..24].copy_from_slice(zerocopy::IntoBytes::as_bytes(&header));
+                msg2_timed(
+                    sender,
+                    buffer.as_mut_ptr() as usize,
+                    SEND | SEND_TIMEOUT,
+                    header,
+                    28,
+                    0,
+                    0,
+                    0,
+                    100,
+                )
+            });
+            let mut buffer = [0u8; 256];
+            let mut wakeups = 0;
+            // The test's own calls never block, so a sender that keeps
+            // queueing fails the test instead of hanging it.
+            run_paused(&reports, &acknowledge, |point| match point {
+                // A receive wakes the queued sender before it looks; a sender
+                // that keeps queueing again is let go after three.
+                Point::MachMsgQueued => {
+                    wakeups += 1;
+                    if wakeups <= 3 {
+                        assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+                    }
                 }
-            }
-            // Another thread fills the slot, and the deadline passes.
-            Point::MachMsgWaited if wakeups <= 3 => {
-                filled.push(send_now(&task, port));
-                std::thread::sleep(core::time::Duration::from_millis(150));
-            }
-            Point::MachMsgWaited => {}
-            _ => unreachable!(),
-        });
-        assert_eq!(
-            (result, queued, filled.as_slice()),
-            (msg_return::SEND_TIMED_OUT, 1, &[msg_return::SUCCESS][..])
-        );
+                // Another thread fills the slot, and the deadline passes.
+                Point::MachMsgWaited if wakeups <= 3 => {
+                    filled.push(send_now(&task, port));
+                    std::thread::sleep(core::time::Duration::from_millis(150));
+                }
+                Point::MachMsgWaited => {}
+                _ => unreachable!(),
+            })
+        })
     });
+    assert_eq!(
+        (result, queued, filled.as_slice()),
+        (msg_return::SEND_TIMED_OUT, 1, &[msg_return::SUCCESS][..])
+    );
     // The sender's message never queued.
     let mut ids = Vec::new();
     let mut buffer = [0u8; 256];
