@@ -1051,8 +1051,11 @@ fn psynch_compaction_keeps_preposts_queued_out_of_order() {
     const BEFORE: u32 = 8;
     const AFTER: u32 = 8;
     const BLOCKED_ROUNDS: u32 = 4;
+    // The two scoped waiters stay blocked across filling the whole fake
+    // budget, which takes seconds on a loaded runner.
+    const FILL_BOUND_SECONDS: usize = 60;
     let task = new_task();
-    let _watchdog = Watchdog::new(&task);
+    let _watchdog = Watchdog::with_bound(&task, Duration::from_secs(60));
     let (cv, longer, blocked) = (0x9_0000, 0x9_1000, 0x9_2000);
     prepost_behind_canceled_waiters(&task, cv, 0, 0);
     prepost_behind_canceled_waiters(&task, longer, BEFORE, AFTER);
@@ -1066,7 +1069,16 @@ fn psynch_compaction_keeps_preposts_queued_out_of_order() {
         let canceled = scope.spawn(move || {
             <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
                 canceled.start_thread();
-                cvwait(&canceled, blocked, 5 * INC, 3 * INC, 0, 0, BOUND_SECONDS, 0)
+                cvwait(
+                    &canceled,
+                    blocked,
+                    5 * INC,
+                    3 * INC,
+                    0,
+                    0,
+                    FILL_BOUND_SECONDS,
+                    0,
+                )
             })
         });
         await_psynch_waiters(&task, blocked, 1);
@@ -1081,7 +1093,16 @@ fn psynch_compaction_keeps_preposts_queued_out_of_order() {
             assert_eq!(cvsignal(&task, blocked, l, s + INC, l - INC, 0, 0), Ok(0));
         }
         let waiter = spawn_sibling(scope, &task, move |waiter| {
-            cvwait(waiter, blocked, 4 * INC, 3 * INC, 0, 0, BOUND_SECONDS, 0)
+            cvwait(
+                waiter,
+                blocked,
+                4 * INC,
+                3 * INC,
+                0,
+                0,
+                FILL_BOUND_SECONDS,
+                0,
+            )
         });
         // The queue's entries: the two threads and the preposts.
         let queued = 2 + BLOCKED_ROUNDS as usize;
