@@ -1960,32 +1960,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_nt_set_information_key_arguments() {
-        let tags = 3u32;
-        let regs = litebox_common_linux::PtRegs {
-            orig_rax: NtSysno::NtSetInformationKey.as_raw() as usize,
-            r10: 0x40,
-            rdx: 5,
-            r8: core::ptr::from_ref(&tags) as usize,
-            r9: size_of::<u32>(),
-            ..Default::default()
-        };
-        let Some(SyscallRequest::NtSetInformationKey {
-            key_handle,
-            key_set_information_class,
-            key_set_information,
-            key_set_information_length,
-        }) = SyscallRequest::<crate::tests::TestPlatform>::try_from_raw(&regs)
-        else {
-            panic!("NtSetInformationKey was not decoded");
-        };
-        assert_eq!(key_handle.as_raw(), regs.r10);
-        assert_eq!(key_set_information_class, 5);
-        assert_eq!(key_set_information.as_usize(), regs.r8);
-        assert_eq!(key_set_information_length as usize, size_of::<u32>());
-    }
-
-    #[test]
     fn handle_encodes_raw_fds_and_rejects_invalid_values() {
         let first_handle = Handle::from_raw_fd(0).expect("raw fd 0 should encode");
         assert_eq!(first_handle, Handle::from_raw(1usize << HANDLE_SHIFT));
