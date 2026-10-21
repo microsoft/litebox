@@ -613,6 +613,123 @@ fn cv_timeouts_report_cleared_and_prepost_bits() {
     assert_eq!(task.global.psynch.lock().fake_count(), 0);
 }
 
+/// A cvwait that meets a prepost above its own sequence takes it as a
+/// broadcast up to that sequence, which stays queued for the waiter the
+/// signal was for; a broadcast entry stays until every waiter it covers
+/// has come.
+#[test]
+fn cv_wait_below_a_prepost_takes_it_as_a_broadcast() {
+    let task = new_task();
+    let _watchdog = Watchdog::new(&task);
+    let cv = 0x1_2000;
+    // Waiters took L=1 and L=2; the signal for the second came first.
+    assert_eq!(
+        cvsignal(&task, cv, 2 * INC, 0, 0, 0, 0),
+        Ok(CV_PBIT as usize)
+    );
+    assert_eq!(
+        cvwait(&task, cv, INC, 0, 0, 0, 0, 0),
+        Ok((INC | CV_PBIT) as usize)
+    );
+    assert_eq!(task.global.psynch.lock().fake_count(), 1);
+    assert_eq!(
+        cvwait(&task, cv, 2 * INC, INC, 0, 0, 0, 1_000_000),
+        Ok((INC | CV_CBIT) as usize)
+    );
+    assert_eq!(task.global.psynch.lock().fake_count(), 0);
+
+    // A broadcast before both its waiters.
+    assert_eq!(
+        cvbroad(&task, cv, 2 * INC, 0, 0, 2, 0),
+        Ok(CV_PBIT as usize)
+    );
+    assert_eq!(
+        cvwait(&task, cv, INC, 0, 0, 0, 0, 0),
+        Ok((INC | CV_PBIT) as usize)
+    );
+    assert_eq!(
+        cvwait(&task, cv, 2 * INC, INC, 0, 0, 0, 1_000_000),
+        Ok((INC | CV_CBIT) as usize)
+    );
+    assert_eq!(task.global.psynch.lock().queue_count(), 0);
+}
+
+/// A signal whose own waiter has not come yet but that finds a waiter below
+/// its sequence wakes every waiter up to it and leaves a broadcast for the
+/// one still to come, so neither misses it.
+#[test]
+fn cv_signal_past_a_lower_waiter_broadcasts() {
+    let task = new_task();
+    let _watchdog = Watchdog::new(&task);
+    let cv = 0x1_3000;
+    std::thread::scope(|scope| {
+        let waiter = task.new_sibling(0);
+        let lower = scope.spawn(move || cvwait(&waiter, cv, INC, 0, 0, 0, 0, 0));
+        await_waiters(&task, cv, 1);
+        // U=1: this signal is the second, for the waiter at L=2.
+        assert_eq!(
+            cvsignal(&task, cv, 2 * INC, 0, INC, 0, 0),
+            Ok((INC | CV_PBIT) as usize)
+        );
+        assert_eq!(lower.join().unwrap(), Ok(0));
+    });
+    assert_eq!(
+        cvwait(&task, cv, 2 * INC, INC, 0, 0, 0, 1_000_000),
+        Ok((INC | CV_CBIT) as usize)
+    );
+    assert_eq!(task.global.psynch.lock().queue_count(), 0);
+}
+
+/// Signals that reach the kernel at one sequence before any waiter merge
+/// into one prepost that counts them; each cvwait at that sequence takes
+/// one.
+#[test]
+fn cv_signals_at_one_sequence_merge_into_one_prepost() {
+    let task = new_task();
+    let _watchdog = Watchdog::new(&task);
+    let cv = 0x1_4000;
+    assert_eq!(
+        cvsignal(&task, cv, 2 * INC, 0, 0, 0, 0),
+        Ok(CV_PBIT as usize)
+    );
+    assert_eq!(
+        cvsignal(&task, cv, 2 * INC, 0, INC, 0, 0),
+        Ok(CV_PBIT as usize)
+    );
+    assert_eq!(task.global.psynch.lock().fake_count(), 1);
+    assert_eq!(
+        cvwait(&task, cv, 2 * INC, 0, 0, 0, 0, 0),
+        Ok((INC | CV_PBIT) as usize)
+    );
+    assert_eq!(
+        cvwait(&task, cv, 2 * INC, INC, 0, 0, 0, 1_000_000),
+        Ok((INC | CV_CBIT) as usize)
+    );
+    assert_eq!(task.global.psynch.lock().queue_count(), 0);
+}
+
+/// A timed-out wait whose return balances the condition variable (S reaches
+/// L) clears it: every thread still queued there returns spuriously.
+#[test]
+fn cv_timeout_that_balances_clears_the_other_waiters() {
+    let task = new_task();
+    let _watchdog = Watchdog::new(&task);
+    let cv = 0x1_5000;
+    std::thread::scope(|scope| {
+        let waiter = task.new_sibling(0);
+        let queued = scope.spawn(move || cvwait(&waiter, cv, INC, 0, 0, 0, 0, 0));
+        await_waiters(&task, cv, 1);
+        // Userspace already counts the queued waiter's return (S=1, with
+        // the C bit so the kernel takes it).
+        assert_eq!(
+            cvwait(&task, cv, 2 * INC, INC | CV_CBIT, 0, 0, 0, 1_000_000),
+            Err(Errno::ETIMEDOUT.raw() | ECVCLEARED as usize)
+        );
+        assert_eq!(queued.join().unwrap(), Ok((INC | CV_CBIT) as usize));
+    });
+    assert_eq!(task.global.psynch.lock().queue_count(), 0);
+}
+
 /// A waiter whose timeout passes as a signal takes it is granted: the
 /// signal is not lost and the wait succeeds, as if the signal came first.
 #[test]
