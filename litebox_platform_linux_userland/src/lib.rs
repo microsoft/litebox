@@ -1473,44 +1473,82 @@ fn register_exception_handlers() {
     });
 }
 
+/// An anonymous read-write stack mapping with an inaccessible guard below it, which overflows of
+/// the stack fault on. Dropping it unmaps the whole mapping.
+pub(crate) struct GuardedStack {
+    mapping: core::ptr::NonNull<libc::c_void>,
+    guard_size: usize,
+    size: usize,
+}
+
+impl GuardedStack {
+    /// Maps `size` usable bytes above a `guard_size`-byte guard, both multiples of the page size,
+    /// adding `flags` to `MAP_PRIVATE | MAP_ANONYMOUS`.
+    pub(crate) fn map(guard_size: usize, size: usize, flags: libc::c_int) -> std::io::Result<Self> {
+        // SAFETY: An anonymous private mapping at a kernel-chosen address affects no existing
+        // memory.
+        let mapping = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                guard_size + size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | flags,
+                -1,
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let Some(mapping) = core::ptr::NonNull::new(mapping) else {
+            return Err(std::io::Error::other("mmap returned a null stack"));
+        };
+        let stack = Self {
+            mapping,
+            guard_size,
+            size,
+        };
+        // SAFETY: The guard lies within the mapping this function just created.
+        if unsafe { libc::mprotect(mapping.as_ptr(), guard_size, libc::PROT_NONE) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(stack)
+    }
+
+    /// Lowest address of the mapping, where its guard starts.
+    pub(crate) fn mapping_base(&self) -> usize {
+        self.mapping.addr().get()
+    }
+
+    /// Lowest usable address, just above the guard.
+    pub(crate) fn bottom(&self) -> *mut libc::c_void {
+        self.mapping.as_ptr().wrapping_byte_add(self.guard_size)
+    }
+
+    /// End of the stack, where it starts growing down from.
+    pub(crate) fn top(&self) -> usize {
+        self.mapping_base() + self.guard_size + self.size
+    }
+}
+
+impl Drop for GuardedStack {
+    fn drop(&mut self) {
+        // SAFETY: This value exclusively owns the mapping, which nothing runs on once it drops.
+        let result = unsafe { libc::munmap(self.mapping.as_ptr(), self.guard_size + self.size) };
+        // Unmapping a whole mapping splits nothing, so it cannot fail.
+        debug_assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+}
+
 /// Runs `f` with an alternate signal stack set up.
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let alt_stack_size = libc::SIGSTKSZ * 2;
-    let guard_page_size = 0x1000;
-    let stack_base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            guard_page_size + alt_stack_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    assert!(
-        stack_base != libc::MAP_FAILED,
-        "failed to allocate memory for alternate signal stack: {}",
-        std::io::Error::last_os_error()
-    );
-    let _unmap_guard = litebox::utils::defer(|| {
-        let r = unsafe { libc::munmap(stack_base, guard_page_size + alt_stack_size) };
-        assert!(
-            r == 0,
-            "failed to free memory for alternate signal stack: {}",
-            std::io::Error::last_os_error()
-        );
+    let stack = GuardedStack::map(0x1000, alt_stack_size, 0).unwrap_or_else(|error| {
+        panic!("failed to allocate memory for alternate signal stack: {error}")
     });
 
-    // Set up a guard page to catch stack overflows.
-    let r = unsafe { libc::mprotect(stack_base, guard_page_size, libc::PROT_NONE) };
-    assert!(
-        r == 0,
-        "failed to set guard page for alternate signal stack: {}",
-        std::io::Error::last_os_error()
-    );
-
     let alt_stack = libc::stack_t {
-        ss_sp: stack_base.cast(),
+        ss_sp: stack.bottom(),
         ss_flags: 0,
         ss_size: alt_stack_size,
     };

@@ -106,6 +106,10 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     }
 
     unsafe fn run_child(&self, control_pipe: std::ffi::OsString) -> ! {
+        // TODO: Continue on a fresh stack, as the Linux runner's native fork child does. The clone
+        // runs on a copy of the stack it forked on, under every frame of its parent's runtime, and
+        // guest `execve` keeps the runner process, so a long fork chain deepens the stack with
+        // each generation until it overflows. A switch must also update the TEB's stack bounds.
         // SAFETY: RtlCloneUserProcess cloned only this thread, and this path never returns through
         // the copied parent task or its registration guard.
         let status = match unsafe { Platform::prepare_fork_child() }

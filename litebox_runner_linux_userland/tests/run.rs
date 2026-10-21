@@ -63,6 +63,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 // colliding with this sweep's dynamic `<stem>_rewriter` outputs.
 const DEDICATED_C_TESTS: &[&str] = &[
     "async_x16.c",
+    "fork_chain_parent.c",
     "fork_parent.c",
     "fork_interrupt_parent.c",
     "fork_threads_parent.c",
@@ -1287,6 +1288,37 @@ fn orphans_are_adopted_by_subreapers_and_the_initial_process() {
         output.lines().any(|line| line == "process-tree failures=0"),
         "{output}"
     );
+}
+
+/// Generations in a deep fork chain, beyond the about 260 at which the runner overflowed its
+/// host stack when each native fork clone continued on the stack it forked on.
+#[cfg(target_os = "linux")]
+const DEEP_FORK_CHAIN_DEPTH: u32 = 300;
+
+/// Runs a deep `fork_chain_parent.c` chain in `mode` and checks that every generation ran.
+#[cfg(target_os = "linux")]
+fn run_deep_fork_chain(mode: &str) {
+    let name = format!("fork_chain_{mode}");
+    let parent = common::compile("./tests/fork_chain_parent.c", &name, true, false);
+    let mut runner = Runner::new(&parent, &name);
+    runner
+        .allow_process_duplication()
+        .args([mode, DEEP_FORK_CHAIN_DEPTH.to_string().as_str()]);
+    let output = String::from_utf8(runner.output()).unwrap();
+    let expected = format!("{mode}-chain depth={DEEP_FORK_CHAIN_DEPTH} code=42");
+    assert!(output.lines().any(|line| line == expected), "{output}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deep_fork_chains_do_not_exhaust_the_runner_stack() {
+    run_deep_fork_chain("fork");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deep_fork_exec_chains_do_not_exhaust_the_runner_stack() {
+    run_deep_fork_chain("exec");
 }
 
 #[cfg(target_os = "linux")]

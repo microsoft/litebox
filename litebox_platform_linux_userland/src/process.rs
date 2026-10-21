@@ -6,7 +6,6 @@
 use std::convert::Infallible;
 use std::io::{Error, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox::platform::{
@@ -178,121 +177,85 @@ impl ProcessHandle for ClonedProcess {
 
 /// Usable size of a [`CloneStack`], matching Linux's default main-thread `RLIMIT_STACK`.
 const CLONE_STACK_SIZE: usize = 8 << 20;
-/// Size of the inaccessible guard below a [`CloneStack`], a multiple of every Linux page size.
+/// Size of the inaccessible guard below a [`CloneStack`], a multiple of every x86_64 and aarch64
+/// page size.
 const CLONE_STACK_GUARD_SIZE: usize = 64 << 10;
 const CLONE_STACK_MAPPING_SIZE: usize = CLONE_STACK_GUARD_SIZE + CLONE_STACK_SIZE;
 
-/// Base address of the [`CloneStack`] this process runs on, or zero if it is not a native fork
+/// Mapping base of the [`CloneStack`] this process started on, or zero if it is not a native fork
 /// clone.
 static CURRENT_CLONE_STACK: AtomicUsize = AtomicUsize::new(0);
 
 /// A fresh stack for a native fork clone to continue on.
 ///
 /// The clone's only thread starts on a copy of the stack it forked on, under every frame of its
-/// parent's runtime. Continuing there would deepen the stack with each generation of a fork chain
-/// until it overflows. Each clone instead switches to a new stack and unmaps the one its parent ran
-/// on, if that was a clone stack too, so the stack a generation leaves behind is never inherited.
+/// parent's runtime; continuing there would deepen the stack with each generation of a fork chain
+/// until it overflows. Map it before cloning, so a failure is reported before any clone exists.
 ///
-/// The parent maps the stack before cloning, so a failure is reported before any clone exists. The
-/// clone inherits the untouched mapping and [runs](Self::run) on it; the parent drops its copy.
-pub struct CloneStack {
-    base: NonNull<libc::c_void>,
-}
+/// A clone still inherits the stack mappings of its parent's other threads. If it forked on one of
+/// them rather than on the thread its parent started on, it also keeps that thread's stack, which
+/// holds the TLS the clone still uses.
+pub struct CloneStack(crate::GuardedStack);
 
 impl CloneStack {
-    /// Maps a new stack.
+    /// Maps an 8 MiB stack, reserving no memory until it is touched, above a 64 KiB inaccessible
+    /// guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error if the mapping or its guard cannot be set up.
     pub fn map() -> Result<Self> {
-        // SAFETY: An anonymous private mapping at a kernel-chosen address affects no existing
-        // memory.
-        let base = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                CLONE_STACK_MAPPING_SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_STACK,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err(Error::last_os_error());
-        }
-        let Some(base) = NonNull::new(base) else {
-            return Err(Error::other("mmap returned a null stack"));
-        };
-        let stack = Self { base };
-        // SAFETY: The guard lies within the mapping this function just created.
-        if unsafe { libc::mprotect(base.as_ptr(), CLONE_STACK_GUARD_SIZE, libc::PROT_NONE) } < 0 {
-            return Err(Error::last_os_error());
-        }
-        Ok(stack)
+        crate::GuardedStack::map(
+            CLONE_STACK_GUARD_SIZE,
+            CLONE_STACK_SIZE,
+            libc::MAP_NORESERVE | libc::MAP_STACK,
+        )
+        .map(Self)
     }
 
-    /// Continues the calling thread with `f` on this stack, abandoning the calling frames.
+    /// Continues the calling thread with `f` on this stack after unmapping the clone stack the
+    /// parent process continued on, if any, abandoning the calling frames.
     ///
-    /// Before running `f`, this unmaps the clone stack the parent ran on, if any.
+    /// `f` is `'static` because the calling frames may be on the unmapped stack.
     ///
     /// # Safety
     ///
     /// The caller must be the sole thread of a newly cloned process. Nothing may use the calling
     /// frames afterwards, or anything on the stack the parent process continued on as a clone.
-    pub unsafe fn run(self, f: Box<dyn FnOnce() -> Infallible>) -> ! {
-        let base = self.base.as_ptr() as usize;
-        core::mem::forget(self);
-        let top = base + CLONE_STACK_MAPPING_SIZE;
-        // A thin pointer, for the assembly.
-        let f = Box::into_raw(Box::new(f));
-        // SAFETY: `top` is the 16-byte-aligned end of a fresh stack that nothing uses, and
-        // `on_clone_stack` takes ownership of `f`.
-        unsafe { switch_stack(top, base, f) }
+    pub unsafe fn run_freeing_parent_stack<F: FnOnce() -> Infallible + 'static>(self, f: F) -> ! {
+        // This process runs on the mapping from now on; the next generation of a fork chain unmaps
+        // it.
+        let stack = core::mem::ManuallyDrop::new(self.0);
+        let f = Box::into_raw(Box::new(f)).cast::<()>();
+        // SAFETY: `stack.top()` is the 16-byte-aligned end of a fresh stack that nothing uses, and
+        // `clone_stack_entry::<F>` takes the mapping base and `f`, a `Box<F>`. The caller
+        // guarantees the rest of `clone_stack_entry`'s requirements.
+        unsafe {
+            crate::arch::switch_stack(stack.top(), stack.mapping_base(), f, clone_stack_entry::<F>)
+        }
     }
 }
 
-impl Drop for CloneStack {
-    fn drop(&mut self) {
-        // SAFETY: This value exclusively owns the mapping, which nothing runs on.
-        unsafe { libc::munmap(self.base.as_ptr(), CLONE_STACK_MAPPING_SIZE) };
-    }
-}
-
-/// Moves the stack pointer to `top`, then calls [`on_clone_stack`] with `base` and `f`.
-#[unsafe(naked)]
-unsafe extern "C" fn switch_stack(
-    top: usize,
-    base: usize,
-    f: *mut Box<dyn FnOnce() -> Infallible>,
-) -> ! {
-    #[cfg(target_arch = "x86_64")]
-    core::arch::naked_asm!(
-        "mov rsp, rdi",
-        "xor ebp, ebp",
-        "mov rdi, rsi",
-        "mov rsi, rdx",
-        "call {entry}",
-        "ud2",
-        entry = sym on_clone_stack,
-    );
-    #[cfg(target_arch = "aarch64")]
-    core::arch::naked_asm!(
-        "mov sp, x0",
-        "mov x29, xzr",
-        "mov x30, xzr",
-        "mov x0, x1",
-        "mov x1, x2",
-        "bl {entry}",
-        "brk #1",
-        entry = sym on_clone_stack,
-    );
-}
-
-extern "C" fn on_clone_stack(base: usize, f: *mut Box<dyn FnOnce() -> Infallible>) -> ! {
-    // SAFETY: From `Box::into_raw` in `CloneStack::run`.
-    let f = unsafe { Box::from_raw(f) };
-    let parent = CURRENT_CLONE_STACK.swap(base, Ordering::Relaxed);
-    if parent != 0 {
-        // SAFETY: `CloneStack::run`'s caller guarantees that nothing uses the stack the parent
-        // continued on: the clone's only thread just left the frames it holds.
-        unsafe { libc::munmap(parent as *mut libc::c_void, CLONE_STACK_MAPPING_SIZE) };
+/// Records that this process runs on the [`CloneStack`] mapped at `base`, unmaps the one its
+/// parent continued on, if any, and runs `f`.
+///
+/// # Safety
+///
+/// `f` must come from `Box::<F>::into_raw`, the calling thread must have left the stack its parent
+/// continued on, and the caller must meet [`CloneStack::run_freeing_parent_stack`]'s requirements.
+unsafe extern "C" fn clone_stack_entry<F: FnOnce() -> Infallible>(base: usize, f: *mut ()) -> ! {
+    // SAFETY: The caller passes `f` from `Box::<F>::into_raw`.
+    let f = unsafe { *Box::from_raw(f.cast::<F>()) };
+    let parent_stack_base = CURRENT_CLONE_STACK.swap(base, Ordering::Relaxed);
+    if parent_stack_base != 0 {
+        // SAFETY: The caller guarantees that nothing uses the stack the parent continued on. Its
+        // thread is either absent from this clone or this thread, which has left it.
+        unsafe {
+            libc::munmap(
+                parent_stack_base as *mut libc::c_void,
+                CLONE_STACK_MAPPING_SIZE,
+            )
+        };
     }
     match f() {}
 }
@@ -367,13 +330,14 @@ mod tests {
     }
 
     /// Runs `f` in a forked child, whose only thread may switch stacks, and returns its status.
-    fn in_forked_child(f: fn() -> bool) -> libc::c_int {
-        // SAFETY: The child only makes system calls and `_exit`s, never returning to the harness.
+    fn in_forked_child(f: fn() -> libc::c_int) -> libc::c_int {
+        // SAFETY: `libc::fork` runs glibc's fork handlers, so the single-threaded child may
+        // allocate, and it `_exit`s without returning to the harness.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "{}", Error::last_os_error());
         if pid == 0 {
             // SAFETY: `_exit` ends the child without running the harness's handlers.
-            unsafe { libc::_exit(i32::from(!f())) };
+            unsafe { libc::_exit(f()) };
         }
         let mut status = 0;
         // SAFETY: `pid` is this process's unreaped child, and `status` is writable.
@@ -383,31 +347,41 @@ mod tests {
 
     #[test]
     fn clones_continue_on_a_fresh_stack_and_free_their_parents() {
+        const MAP_FAILED: libc::c_int = 1;
+        const NOT_ON_NEW_STACK: libc::c_int = 2;
+        const PARENT_STACK_MAPPED: libc::c_int = 3;
         let status = in_forked_child(|| {
             let Ok(first) = CloneStack::map() else {
-                return false;
+                return MAP_FAILED;
             };
-            let first_base = first.base.as_ptr() as usize;
+            let first_base = first.0.mapping_base();
             // SAFETY: The forked child has only this thread, and nothing uses the calling frames.
             unsafe {
-                first.run(Box::new(move || {
+                first.run_freeing_parent_stack(move || {
                     let local = 0u8;
-                    let on_first = (first_base..first_base + CLONE_STACK_MAPPING_SIZE)
-                        .contains(&core::ptr::from_ref(&local).addr());
+                    if !(first_base..first_base + CLONE_STACK_MAPPING_SIZE)
+                        .contains(&core::ptr::from_ref(&local).addr())
+                    {
+                        libc::_exit(NOT_ON_NEW_STACK);
+                    }
                     // The next generation of a fork chain starts on this stack.
                     let Ok(second) = CloneStack::map() else {
-                        libc::_exit(2);
+                        libc::_exit(MAP_FAILED);
                     };
-                    second.run(Box::new(move || {
+                    second.run_freeing_parent_stack(move || {
                         let freed = !is_mapped(first_base + CLONE_STACK_GUARD_SIZE);
-                        libc::_exit(if on_first && freed { 0 } else { 3 });
-                    }))
-                }))
+                        libc::_exit(if freed { 0 } else { PARENT_STACK_MAPPED });
+                    })
+                })
             }
         });
-        assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "clone stack child failed with status {status:#x}"
-        );
+        let failure = match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
+            Some(0) => return,
+            Some(MAP_FAILED) => "a clone stack could not be mapped",
+            Some(NOT_ON_NEW_STACK) => "the first clone did not run on its new stack",
+            Some(PARENT_STACK_MAPPED) => "the second clone did not unmap its parent's stack",
+            _ => "the clone stack child did not exit normally",
+        };
+        panic!("{failure} (status {status:#x})");
     }
 }

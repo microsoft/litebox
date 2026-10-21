@@ -527,6 +527,29 @@ interrupt_callback_no_xsave:
     );
 }
 
+/// Moves the stack pointer to `top`, then calls `entry` with `base` and `arg`.
+///
+/// # Safety
+///
+/// `top` must be the 16-byte-aligned end of a stack that nothing uses, and `entry` must accept
+/// `base` and `arg`. Nothing may use the calling frames afterwards.
+#[unsafe(naked)]
+pub(super) unsafe extern "C" fn switch_stack(
+    top: usize,
+    base: usize,
+    arg: *mut (),
+    entry: unsafe extern "C" fn(usize, *mut ()) -> !,
+) -> ! {
+    core::arch::naked_asm!(
+        "mov rsp, rdi",
+        "xor ebp, ebp",
+        "mov rdi, rsi",
+        "mov rsi, rdx",
+        "call rcx",
+        "ud2",
+    );
+}
+
 /// Switches to the provided guest context.
 ///
 /// # Safety

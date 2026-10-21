@@ -1115,6 +1115,30 @@ pub(super) mod resume_frame {
     }
 }
 
+/// Moves the stack pointer to `top`, then calls `entry` with `base` and `arg`.
+///
+/// # Safety
+///
+/// `top` must be the 16-byte-aligned end of a stack that nothing uses, and `entry` must accept
+/// `base` and `arg`. Nothing may use the calling frames afterwards.
+#[unsafe(naked)]
+pub(super) unsafe extern "C" fn switch_stack(
+    top: usize,
+    base: usize,
+    arg: *mut (),
+    entry: unsafe extern "C" fn(usize, *mut ()) -> !,
+) -> ! {
+    core::arch::naked_asm!(
+        "mov sp, x0",
+        "mov x29, xzr",
+        "mov x30, xzr",
+        "mov x0, x1",
+        "mov x1, x2",
+        "blr x3",
+        "brk #1",
+    );
+}
+
 /// Switches to the provided guest context.
 ///
 /// # Safety
