@@ -1,0 +1,4 @@
+[
+  { "argv": ["/fork", "chain", "48"], "expect_stdout": "chain: 48\n" },
+  { "argv": ["/fork", "many", "100"], "expect_stdout": "forked 100 times\n" }
+]

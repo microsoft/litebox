@@ -82,7 +82,9 @@
 //! returns at once with an empty message, resetting neither extended state
 //! nor the GS base. From then on, the process is as if serving a request,
 //! until [`CallId::Exit`]; its [`CallId::ReplyAndWait`] is
-//! [`Status::Denied`].
+//! [`Status::Denied`]. A process clone ([`CloneKind::Process`]) is a launched
+//! process that is created as if after `Ready`, with its parent's upcall
+//! entry: its `Ready` is [`Status::Denied`] too.
 //!
 //! # Memory
 //!
@@ -105,8 +107,16 @@
 //! - [`CloneKind::Thread`]: in the same process, sharing everything but its
 //!   registers, FS and GS bases, extended state (initial), and upcall stack
 //!   (its own, given by the runner, unlike the main thread's
-//!   [`StartupInfo::upcall_stack`]). Further kinds (e.g., a process with a
-//!   copy of the address space, for `fork`) may come.
+//!   [`StartupInfo::upcall_stack`]).
+//! - [`CloneKind::Process`]: a *process clone*, as Linux's `fork`: a process
+//!   with a copy-on-write copy of the calling process's whole address space
+//!   (but see [Broker](crate#broker)), mappings, identity, upcall entry,
+//!   lockdown, and ability to start child processes, and one thread, a copy
+//!   of the calling one (registers, FS and GS bases, and extended state),
+//!   which, as its main thread, has the main thread's upcall stack and
+//!   returns from the call too. It runs nothing until the kernel adopts it
+//!   (see [Broker](crate#broker)), and has no deadline, pending interrupt, or
+//!   other thread.
 //! - A thread runs until [`CallId::ExitThread`]; [`CallId::Exit`] ends every
 //!   thread. The main thread cannot exit alone, and replies (or waits for its
 //!   first request) only once it is the only thread: like `exec`, a request
@@ -127,14 +137,16 @@
 //!
 //! [`CallId::Restrict`] irrevocably narrows the allowed calls and page
 //! permissions. A violation kills the process. [`CallId::Exit`] and
-//! [`CallId::ExitThread`] are always allowed.
+//! [`CallId::ExitThread`] are always allowed. A process clone inherits its
+//! parent's lockdown, but may make its one [`CallId::BrokerHandshake`]
+//! regardless (see [Broker](crate#broker)).
 //!
 //! # Trust
 //!
 //! The runner is untrusted: the guest shares its address space and can make
 //! any call. Every call is scoped to the calling process, and identity-bound
 //! results (derived keys) bind to [`StartupInfo::identity`], fixed at process
-//! creation.
+//! creation; a process clone has its parent's.
 //!
 //! # Broker
 //!
@@ -146,6 +158,16 @@
 //!   [`StartupInfo::broker_shared_memory`]. [`ABI_VERSION`] covers the ring
 //!   layout. A launched process's handshake also writes its startup data
 //!   into the shared buffers, which its reply locates.
+//! - A process clone ([`CloneKind::Process`]) starts with its control ring
+//!   zeroed and fresh shared buffers. The kernel adopts it as the runner of a
+//!   child that its parent starts with an existing runner
+//!   (`StartChildWithExistingRunner`), which [`encode_clone_descriptor`]
+//!   describes. The kernel then makes the clone's handshake, as a launched
+//!   process's, with the request runners make (for the current
+//!   `litebox_broker_protocol` version), before the clone runs. The clone's
+//!   [`CallId::BrokerHandshake`] returns its response, with the startup data
+//!   passed along, if its request is that one, else
+//!   [`Status::InvalidArgument`]; either way, it is the clone's one attempt.
 //! - The runner publishes requests and consumes responses, with
 //!   [`CallId::Futex`] on ring words, as the userland transport uses the
 //!   host's futex. The kernel's broker changes the ring words, and serves the
@@ -265,6 +287,30 @@ impl Status {
         let raw = u32::try_from(raw).ok()?;
         Self::try_read_from_bytes(raw.as_bytes()).ok().map(Err)
     }
+}
+
+/// The variant's name.
+impl core::fmt::Display for Status {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self, f)
+    }
+}
+
+impl core::error::Error for Status {}
+
+/// The runner descriptor of the process clone `clone` (see
+/// [`CloneKind::Process`]), with which its parent starts a child with an
+/// existing runner (`StartChildWithExistingRunner`): its ID, 8 bytes
+/// little-endian.
+pub const fn encode_clone_descriptor(clone: u64) -> [u8; 8] {
+    clone.to_le_bytes()
+}
+
+/// The clone ID of an [`encode_clone_descriptor`]; `None` for any other
+/// length, or zero, which no clone has.
+pub fn decode_clone_descriptor(descriptor: &[u8]) -> Option<u64> {
+    let clone = u64::from_le_bytes(descriptor.try_into().ok()?);
+    (clone != 0).then_some(clone)
 }
 
 /// A reserved field: zero on the wire, and decoding rejects anything else.
@@ -394,8 +440,8 @@ kernel_calls! {
     /// e.g. while running kernel code on the process's behalf, but not
     /// early.
     12 => SetTimer(SetTimerRequest) -> ();
-    /// Creates a thread. Allowed only while serving a request (in a launched
-    /// process, after `Ready`; see
+    /// Creates a thread, or a process clone (see [`CloneKind`]). Allowed only
+    /// while serving a request (in a launched process, after `Ready`; see
     /// [Threads](crate#threads)); [`Status::NoMemory`] at the kernel's thread
     /// limit.
     13 => Clone(CloneRequest) -> CloneReply;
@@ -830,14 +876,23 @@ pub struct SetTimerRequest {
 pub enum CloneKind {
     /// A thread of the calling process.
     Thread = 0,
+    /// A process clone (see [Threads](crate#threads)), whose thread continues
+    /// from the call, as the caller does: its [`CloneRequest`]'s thread is
+    /// [`NewThread::default`], and its reply is the clone's ID in the caller
+    /// (nonzero; a process never reuses one), and [`MAIN_THREAD`] in the
+    /// clone. A clone not adopted yet ends once the process makes another, or
+    /// exits. [`Status::Unsupported`] for a process that cannot start child
+    /// processes; [`Status::NoMemory`] if the kernel runs out of frames for
+    /// the clone.
+    Process = 1,
 }
 
-/// The new thread starts at `regs` (`rip` and `rsp` in user space; `cs`,
-/// `ss`, and privileged flags are the kernel's; `rax` is replaced with its
-/// [`CloneReply::thread`], for it to know itself), with the given FS and GS
-/// bases (valid user addresses, or zero), and initial extended state. Its
-/// upcalls go on `upcall_stack`: page-aligned, nonempty, in
-/// [`RUNNER_MANAGED_MIN`]..[`USER_END`].
+/// For [`CloneKind::Thread`], the new thread starts at `regs` (`rip` and
+/// `rsp` in user space; `cs`, `ss`, and privileged flags are the kernel's;
+/// `rax` is replaced with its [`CloneReply::thread`], for it to know itself),
+/// with the given FS and GS bases (valid user addresses, or zero), and
+/// initial extended state. Its upcalls go on `upcall_stack`: page-aligned,
+/// nonempty, in [`RUNNER_MANAGED_MIN`]..[`USER_END`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct CloneRequest {
@@ -878,7 +933,8 @@ impl CloneRequest {
 }
 
 /// For [`CallId::InterruptThread`]. The main thread is [`MAIN_THREAD`]; a
-/// process never reuses an ID.
+/// process never reuses an ID. For a process clone, see
+/// [`CloneKind::Process`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct CloneReply {
@@ -1155,6 +1211,11 @@ mod tests {
             .as_bytes(),
             4,
         );
+        check(
+            CallId::Clone,
+            CloneRequest::new(CloneKind::Process, NewThread::default()).as_bytes(),
+            4,
+        );
     }
 
     #[test]
@@ -1175,10 +1236,14 @@ mod tests {
 
     #[test]
     fn clone_kinds_are_validated() {
-        let request = CloneRequest::new(CloneKind::Thread, NewThread::default());
+        let request = CloneRequest::new(CloneKind::Process, NewThread::default());
+        assert!(matches!(
+            Request::decode(CallId::Clone, request.as_bytes()),
+            Ok(Request::Clone(r)) if r == request
+        ));
         let mut bytes = [0u8; size_of::<CloneRequest>()];
         bytes.copy_from_slice(request.as_bytes());
-        bytes[0] = 1;
+        bytes[0] = 2;
         assert_eq!(
             Request::decode(CallId::Clone, &bytes).unwrap_err(),
             Status::InvalidArgument

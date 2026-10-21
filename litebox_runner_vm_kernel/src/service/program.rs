@@ -82,6 +82,27 @@ impl Programs {
             .collect()
     }
 
+    /// Checks that the processes that ran, which all ended, left nothing
+    /// behind in the kernel: no address space, and no frame shared
+    /// copy-on-write (e.g., of a process clone never freed).
+    ///
+    /// # Panics
+    ///
+    /// If they did.
+    pub fn check_released(&self) {
+        self.scheduler.reap();
+        assert_eq!(
+            self.platform.address_space_count(),
+            0,
+            "ended processes left address spaces"
+        );
+        assert_eq!(
+            self.platform.shared_frame_count(),
+            0,
+            "ended processes left shared frames"
+        );
+    }
+
     /// A runner process, started: dead if it did not get that far.
     fn start(&self) -> Process {
         let mut process = Process::spawn(

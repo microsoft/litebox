@@ -9,8 +9,9 @@ use core::sync::atomic::AtomicU32;
 use litebox_common_vm_abi::{
     CallSet, CloneKind, CloneRequest, DeriveKeyReply, DeriveKeyRequest, ExitRequest,
     ExitThreadRequest, FutexRequest, InterruptThreadRequest, KernelCall, LogLevel, LogRequest,
-    MapRequest, Message, NewThread, Placement, Populate, Prot, ProtSet, ProtectRequest,
-    ReadyRequest, RestrictRequest, SetTimerRequest, Status, UnmapRequest, UserRange,
+    MAIN_THREAD, MapRequest, Message, NewThread, Placement, Populate, Prot, ProtSet,
+    ProtectRequest, ReadyRequest, RestrictRequest, SetTimerRequest, Status, UnmapRequest,
+    UserRange,
 };
 use zerocopy::{FromZeros as _, IntoBytes as _};
 
@@ -118,6 +119,18 @@ pub fn reply_and_wait(reply: &Message) -> Result<Message, Status> {
 /// See [`call`].
 pub fn clone_thread(thread: NewThread) -> Result<u64, Status> {
     call(&CloneRequest::new(CloneKind::Thread, thread)).map(|reply| reply.thread)
+}
+
+/// A process clone of this process (see [`CloneKind::Process`]), which
+/// returns twice: in this process, with the clone's ID, and in the clone,
+/// which has only the calling thread, with `None`.
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn clone_process() -> Result<Option<u64>, Status> {
+    call(&CloneRequest::new(CloneKind::Process, NewThread::default()))
+        .map(|reply| (reply.thread != MAIN_THREAD).then_some(reply.thread))
 }
 
 /// Ends the calling thread; then the kernel clears `clear`, waking its

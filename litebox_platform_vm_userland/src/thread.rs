@@ -13,15 +13,18 @@
 //! pointer, which the kernel keeps per thread, and which the guest is assumed
 //! to leave alone (see the crate docs).
 //! The main thread's is static, set by `VmUserland::new` and again after
-//! each wait for a request, which resets the GS base; other threads' come
+//! each wait for a request, which resets the GS base, and in a process clone
+//! (see [`crate::process`]); other threads' come
 //! from [`ThreadProvider::spawn_thread`](litebox::platform::ThreadProvider::spawn_thread),
 //! which the kernel starts with theirs.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::convert::Infallible;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo, InitThread};
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::{NewThread, Registers, Status, UpcallFrame, UpcallKind, UserRange};
 use zerocopy::TryFromBytes as _;
@@ -68,6 +71,29 @@ impl SwitchState {
             noticed_timer: AtomicU64::new(0),
         }
     }
+
+    /// As [`Self::new`] makes it.
+    fn reset(&self) {
+        let Self {
+            host_sp,
+            host_bp,
+            guest_context_top,
+            resume_rip,
+            in_guest,
+            pending_interrupt,
+            thread,
+            interruptible,
+            noticed_timer,
+        } = self;
+        for word in [host_sp, host_bp, guest_context_top, resume_rip] {
+            word.store(0, Ordering::Relaxed);
+        }
+        for flag in [in_guest, pending_interrupt, interruptible] {
+            flag.store(false, Ordering::Relaxed);
+        }
+        thread.store(litebox_common_vm_abi::MAIN_THREAD, Ordering::Relaxed);
+        noticed_timer.store(0, Ordering::Relaxed);
+    }
 }
 
 /// The main thread, which joins the others (see [`join_all`]).
@@ -77,11 +103,15 @@ struct MainThread {
     /// (unlike the timers' lock, which waits take): a thread may be preempted
     /// holding it.
     others: litebox_platform::sync::Mutex<crate::VmUserland, Vec<Arc<ThreadRecord>>>,
+    /// In a process clone made from a thread from `spawn`, that thread's
+    /// record, kept until [`run_on_main_stack`] leaves its stack.
+    forked: litebox_platform::sync::Mutex<crate::VmUserland, Option<Arc<ThreadRecord>>>,
 }
 
 static MAIN: MainThread = MainThread {
     state: SwitchState::new(),
     others: litebox_platform::sync::Mutex::new(Vec::new()),
+    forked: litebox_platform::sync::Mutex::new(None),
 };
 
 /// The calling thread's switch state. A GS base of zero is the main
@@ -683,6 +713,90 @@ fn reap() {
     MAIN.others
         .lock()
         .retain(|record| record.alive.load(Ordering::Acquire) != 0);
+}
+
+/// The records of the threads from [`spawn`], locked across a process clone
+/// (see [`crate::process`]), which has only the calling thread.
+pub(crate) struct Threads(
+    litebox_platform::sync::MutexGuard<'static, crate::VmUserland, Vec<Arc<ThreadRecord>>>,
+);
+
+pub(crate) fn lock_threads() -> Threads {
+    Threads(MAIN.others.lock())
+}
+
+impl Threads {
+    /// In a process clone, whose one thread is its main thread: forgets the
+    /// threads from [`spawn`], which it does not have, for the next [`reap`]
+    /// to free what they ran on, but for the stack the calling thread still
+    /// runs on, which [`run_on_main_stack`] frees once off it. The calling
+    /// thread gets a new main thread's switch state.
+    pub(crate) fn forget(mut self) {
+        // Safety: the kernel enables FSGSBASE; no memory access.
+        let current = unsafe { litebox::arch::x86_64::rdgsbase() };
+        let forking = self
+            .0
+            .iter()
+            .position(|record| core::ptr::from_ref(&record.state) as usize == current);
+        // Zero is the main thread's too (see `current`).
+        debug_assert!(
+            forking.is_some() || [0, &raw const MAIN.state as usize].contains(&current),
+            "a process clone of a thread neither main nor from `spawn`"
+        );
+        if let Some(index) = forking {
+            *MAIN.forked.lock() = Some(self.0.swap_remove(index));
+        }
+        for record in self.0.iter() {
+            record.alive.store(0, Ordering::Release);
+        }
+        MAIN.state.reset();
+        // Safety: the kernel enables FSGSBASE; the runner owns GS.
+        unsafe { litebox::arch::x86_64::wrgsbase(&raw const MAIN.state as usize) };
+    }
+}
+
+/// Continues the calling thread with `f` on `stack`, the process's main stack
+/// ([`StartupInfo::stack`](litebox_common_vm_abi::StartupInfo::stack)), once
+/// what exited threads ran on is freed (as [`join_all`] does), including, in a
+/// process clone (see [`crate::process`]), the stack it was made on, if another
+/// thread's.
+///
+/// # Safety
+///
+/// The calling thread must be the main thread, and the only one (e.g., in a
+/// process clone, before it spawns threads), and nothing on `stack` may be in
+/// use: the calling frames are abandoned.
+pub unsafe fn run_on_main_stack(stack: UserRange, f: Box<dyn FnOnce() -> Infallible>) -> ! {
+    let top: usize = stack.end().trunc();
+    // A thin pointer, for the assembly.
+    let f = Box::into_raw(Box::new(f));
+    // Safety: the stack's end is page-aligned, and nothing on it is in use.
+    unsafe { switch_to_main_stack(top, f) }
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn switch_to_main_stack(
+    top: usize,
+    f: *mut Box<dyn FnOnce() -> Infallible>,
+) -> ! {
+    core::arch::naked_asm!(
+        "mov rsp, rdi",
+        "xor ebp, ebp",
+        "mov rdi, rsi",
+        "call {main}",
+        "ud2",
+        main = sym on_main_stack,
+    );
+}
+
+extern "C" fn on_main_stack(f: *mut Box<dyn FnOnce() -> Infallible>) -> ! {
+    // Safety: from `Box::into_raw` in `run_on_main_stack`.
+    let f = unsafe { Box::from_raw(f) };
+    // Off the stack a process clone was made on (see `Threads::forget`).
+    let forked = MAIN.forked.lock().take();
+    drop(forked);
+    reap();
+    match f() {}
 }
 
 /// Waits until every thread the guest created has exited, as the main thread

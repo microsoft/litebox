@@ -6,15 +6,17 @@
 # Run Linux programs under QEMU with stacked runners:
 # litebox_runner_vm_kernel as the guest kernel and
 # litebox_runner_linux_on_vm_userland as a ring-3 process per program run.
-# Every litebox_runner_vm_kernel/tests/linux/<name>.c is compiled three times,
-# as /<name> (static), /<name>-pie (static PIE), and /<name>-dyn (dynamically
-# linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, into rootfs.tar, the
-# broker's read-only root. As in litebox_runner_linux_userland's tests, the
-# root also has the dynamic programs' shared libraries and interpreter, as
-# ldd lists them, and libgcc_s.so.1, at their host paths; as the root has no
-# symbolic links, they are copies of what the links name. The shim patches
-# their syscalls as the programs map them. The root is packed with the
-# userland runner and a test's runs into a tar passed as the initrd.
+# Every litebox_runner_vm_kernel/tests/linux/<name>.c, and each of SHARED,
+# the hosted runner's tests that run here as they are, is compiled three
+# times, as /<name> (static), /<name>-pie (static PIE), and /<name>-dyn
+# (dynamically linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, into
+# rootfs.tar, the broker's read-only root. As in
+# litebox_runner_linux_userland's tests, the root also has the dynamic
+# programs' shared libraries and interpreter, as ldd lists them, and
+# libgcc_s.so.1, at their host paths; as the root has no symbolic links, they
+# are copies of what the links name. The shim patches their syscalls as the
+# programs map them. The root is packed with the userland runner and a test's
+# runs into a tar passed as the initrd.
 #
 # A test is litebox_runner_vm_kernel/tests/linux/<test>.json, the kernel's
 # programs.json (see litebox_runner_vm_kernel/src/client/program.rs), which
@@ -59,6 +61,8 @@ REPO_DIR=$(dirname "$SCRIPT_DIR")
 KERNEL_DIR="$REPO_DIR/litebox_runner_vm_kernel"
 USERLAND_DIR="$REPO_DIR/litebox_runner_linux_on_vm_userland"
 TESTS_DIR="$KERNEL_DIR/tests/linux"
+HOSTED_TESTS_DIR="$REPO_DIR/litebox_runner_linux_userland/tests"
+SHARED=(fork_threads_parent.c fork_interrupt_parent.c fork_event_parent.c fork_epoll_parent.c)
 # shellcheck source=dev_tools/qemu_test_lib.sh
 source "$SCRIPT_DIR/qemu_test_lib.sh"
 
@@ -99,7 +103,7 @@ echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU"
 DYNAMIC_ONLY=(dynamic)
 
 mkdir -p "$WORK/rootfs"
-for src in "$TESTS_DIR"/*.c; do
+for src in "$TESTS_DIR"/*.c "${SHARED[@]/#/$HOSTED_TESTS_DIR/}"; do
     name=$(basename "$src" .c)
     if [[ ! " ${DYNAMIC_ONLY[*]} " =~ " $name " ]]; then
         ${CC:-cc} -static -O2 -o "$WORK/rootfs/$name" "$src"

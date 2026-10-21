@@ -163,6 +163,15 @@ impl<F: Frames + 'static> Mappings<F> {
         }
     }
 
+    /// A copy of the record, for a copy of the address space (see
+    /// `VmKernel::clone_address_space`). Touches no address space.
+    pub(crate) fn duplicate(&self) -> Self {
+        Self {
+            platform: self.platform,
+            regions: core::cell::RefCell::new(self.regions.borrow().clone()),
+        }
+    }
+
     /// A failed [`Placement::Replace`] leaves the range unmapped.
     pub(crate) fn map(
         &self,

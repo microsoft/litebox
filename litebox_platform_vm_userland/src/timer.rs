@@ -111,6 +111,22 @@ impl litebox::platform::SignalProvider for VmUserland {
     }
 }
 
+/// The timers, locked across a process clone (see [`crate::process`]).
+pub(crate) struct Timers(spin::MutexGuard<'static, Vec<Weak<TimerState>>>);
+
+pub(crate) fn lock_timers() -> Timers {
+    Timers(TIMERS.lock())
+}
+
+impl Timers {
+    /// In a process clone, which must not have its parent's timers (nor does
+    /// a Linux `fork` child): armed, they would set its kernel timer and raise
+    /// their signals in it.
+    pub(crate) fn forget(mut self) {
+        self.0.clear();
+    }
+}
+
 /// Whether any timer was created (and is not dropped).
 pub(crate) fn any() -> bool {
     TIMERS.lock().iter().any(|timer| timer.strong_count() != 0)

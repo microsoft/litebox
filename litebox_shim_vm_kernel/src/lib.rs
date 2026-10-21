@@ -21,7 +21,9 @@
 //! When a process starts a child process (`StartChild`), the scheduler
 //! creates a launched process for it (see `litebox_common_vm_abi`, Messages)
 //! with [`ProcessConfig::started_runner`], and runs it with the others (see
-//! [`sched::Scheduler`]).
+//! [`sched::Scheduler`]). A process that may start children can also clone
+//! itself, as Linux's `fork` (see `fork`); the clone runs only once the
+//! process starts a child with it (`StartChildWithExistingRunner`).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -32,6 +34,7 @@ extern crate alloc;
 /// The longest request [`Process::call`] accepts, and the longest reply.
 pub const MAX_MESSAGE_LEN: u64 = layout::MESSAGE_WINDOW.len;
 
+mod fork;
 mod layout;
 pub mod loader;
 mod lockdown;
@@ -42,7 +45,7 @@ pub mod program;
 pub mod sched;
 mod thread;
 
-use alloc::rc::Rc;
+use alloc::rc::{Rc, Weak};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
@@ -56,7 +59,7 @@ use litebox_broker_vm_kernel::{Association, Broker, PendingRunnerAssociation, Wa
 use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::envelope::Envelope;
 use litebox_common_vm_abi::{
-    ABI_VERSION, CallId, DERIVED_KEY_LEN, DeriveKeyReply, DeriveKeyRequest, FutexReply,
+    ABI_VERSION, CallId, CloneKind, DERIVED_KEY_LEN, DeriveKeyReply, DeriveKeyRequest, FutexReply,
     IDENTITY_LEN, Image, KernelCall, LogLevel, LogRequest, MAX_IMAGES, MAX_KDF_CONTEXT_LEN,
     MAX_LOG_LEN, MapReply, MapRequest, Message, PAGE_SIZE, Placement, Populate, Prot,
     ProtectRequest, RUNNER_MANAGED_MAX, RUNNER_MANAGED_MIN, Registers, Request, RestrictRequest,
@@ -73,6 +76,7 @@ use memory::{Mappings, checked_range, copy_from_user, copy_to_user};
 use sched::Scheduler;
 use thread::{FutexFlow, FutexWait, Thread};
 
+#[derive(Clone)]
 pub struct ProcessConfig<'a> {
     /// Static-PIE ELF (see `loader`).
     pub runner: &'a [u8],
@@ -138,6 +142,11 @@ struct Waiter {
 #[derive(Debug, PartialEq, Eq)]
 enum State {
     New,
+    /// A process clone not adopted yet (see `fork`), which runs nothing until
+    /// then: it then serves, with its parent's `upcall_entry`.
+    Cloned {
+        upcall_entry: Option<u64>,
+    },
     /// Before [`CallId::Ready`].
     Starting,
     /// In `Ready` or `ReplyAndWait`; `reply` is the last request's.
@@ -196,6 +205,12 @@ struct Inner {
     /// The broker's worker is suspended serving the process: its
     /// association is in use, so broker calls wait (see `sched`).
     broker_busy: Cell<bool>,
+    /// The process clone the process made that is not adopted yet, if any, with
+    /// its ID (see `fork`). Weak: only the scheduler, between runs, may drop a
+    /// process's last reference, as dropping it switches address spaces.
+    pending_clone: RefCell<Option<(u64, Weak<Inner>)>>,
+    /// The next process clone's ID: the process never reuses one.
+    next_clone: Cell<u64>,
 }
 
 /// Why a thread stopped mid-run, to resume where it was.
@@ -215,8 +230,20 @@ enum Suspended {
     /// Its broker call is to be made again, once the worker is done with
     /// the process: it resumes at the call.
     Retry,
-    /// `Futex` returns this once the thread resumes.
+    /// `Futex`, or a failed `Clone` of a process clone, returns this once
+    /// the thread resumes.
     Woken(Result<(), Status>),
+    /// In `Clone` of a process clone, which the scheduler makes once its run
+    /// ends (see `fork`); `slot` is the call's reply.
+    Forking {
+        slot: u64,
+    },
+    /// Back from `Clone` of a process clone, in the process and in the clone:
+    /// once it resumes, the call returns its reply, `thread`, at `slot`.
+    Cloned {
+        slot: u64,
+        thread: u64,
+    },
 }
 
 /// A service's runner process, which runs in its scheduler until it dies.
@@ -438,7 +465,8 @@ impl Inner {
         lazy(layout::MESSAGE_WINDOW)?;
         lazy(layout::BROKER_SHARED_MEMORY)?;
         lazy(layout::HEAP)?;
-        let control_ring = pin_control_ring(platform, address_space, &mappings)?;
+        let control_ring =
+            pin_control_ring(platform, address_space, &mappings, Placement::NoReplace)?;
         let broker = broker
             .associate(layout::BROKER_SHARED_MEMORY, control_ring, launch)
             .map_err(SpawnError::Broker)?;
@@ -490,6 +518,8 @@ impl Inner {
             next_thread: Cell::new(thread::MAIN + 1),
             broker_requester: Cell::new(thread::MAIN),
             broker_busy: Cell::new(false),
+            pending_clone: RefCell::new(None),
+            next_clone: Cell::new(1),
         })
     }
 
@@ -541,14 +571,19 @@ impl Inner {
 
     /// Creates a runner process for each child this process started since the
     /// last call (see [`Association::take_pending_associations`]), adding it to
-    /// `spawned`, and fails the start of those it cannot create. Returns
-    /// whether there were any: either way, the requests that started them can
-    /// complete. Leaves another address space current.
+    /// `spawned`, or adopts the process clone it was started with as its runner
+    /// (see `fork`), and fails the start of those it cannot. Returns whether
+    /// there were any: either way, the requests that started them can complete.
+    /// Leaves another address space current.
     pub(crate) fn spawn_launched(&self, spawned: &mut Vec<Rc<Self>>) -> bool {
         let broker = self.broker.broker();
         let launches = self.broker.take_pending_associations();
         let started = !launches.is_empty();
         for launch in launches {
+            if let Some(clone) = launch.clone_to_adopt() {
+                self.adopt(clone, launch);
+                continue;
+            }
             let Some(config) = &self.started_runner_config else {
                 log::warn!("a process without a child runner started a child process");
                 launch.fail(BrokerError::UnsupportedOperation);
@@ -567,15 +602,18 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         // Safety: the kernel holds no references into user memory, and the
-        // process never runs again, so its frames are exclusively owned.
+        // process never runs again.
         unsafe { release_address_space(self.platform, self.address_space) };
     }
 }
 
+/// Releases `address_space`; other processes keep the frames they share with
+/// it copy-on-write (see `fork`).
+///
 /// # Safety
 ///
-/// Nothing may reference the address space's user memory, and its frames must
-/// be exclusively owned.
+/// Nothing may reference the address space's user memory, and it must never
+/// run again.
 unsafe fn release_address_space(platform: &VmKernel, address_space: AddressSpaceId) {
     // Safety: forwarded to the caller.
     unsafe {
@@ -590,21 +628,18 @@ fn region_range(region: UserRange) -> Range<usize> {
     usize::try_from(region.start).unwrap()..usize::try_from(region.end()).unwrap()
 }
 
-/// Populated and pinned at creation. Nothing unmaps or remaps it: the
-/// runner's calls are confined to the runner-managed area.
+/// Populated and pinned at creation, a process clone's too, as the clone does
+/// not map its parent's. Nothing unmaps or remaps it: the runner's calls are
+/// confined to the runner-managed area.
 fn pin_control_ring(
     platform: &VmKernel,
     address_space: AddressSpaceId,
     mappings: &Mappings,
+    placement: Placement,
 ) -> Result<PinnedUserPages, SpawnError> {
     let range = region_range(layout::BROKER_CONTROL_RING);
     mappings
-        .map(
-            range.clone(),
-            Prot::ReadWrite,
-            Placement::NoReplace,
-            Populate::Now,
-        )
+        .map(range.clone(), Prot::ReadWrite, placement, Populate::Now)
         .map_err(SpawnError::Map)?;
     // Safety: see above; unregistering the address space frees nothing while
     // pinned.
@@ -713,7 +748,8 @@ impl Inner {
     }
 
     /// Ends every thread, wherever it stopped (e.g., in a wait), so none is
-    /// left for the scheduler.
+    /// left for the scheduler, and the process clone it has not started a
+    /// child with, if any.
     fn die(&self, dead: Dead) {
         *self.state.borrow_mut() = State::Dead(dead);
         self.broker.exited(match dead {
@@ -731,6 +767,7 @@ impl Inner {
             thread.suspended.set(Suspended::No);
         }
         self.broker.abandon_wait();
+        fork::end_pending(self.pending_clone.take());
     }
 
     fn is_dead(&self) -> bool {
@@ -789,7 +826,11 @@ impl Inner {
         let Some(id) = CallId::from_raw(ctx.orig_rax as u64) else {
             return Flow::Return(Err(Status::UnknownCall));
         };
-        if !self.lockdown.get().permits_call(id) {
+        // A process clone may make the handshake its inherited lockdown
+        // refuses while its association holds the response of the one the
+        // kernel made at adoption, which `Association::handshake` takes.
+        let exempt = id == CallId::BrokerHandshake && self.broker.holds_adoption_response();
+        if !self.lockdown.get().permits_call(id) && !exempt {
             return self.violation("call not allowed by the lockdown", id);
         }
         if ctx.rsi != id.request_size() || ctx.r10 != id.reply_size() {
@@ -876,7 +917,17 @@ impl Inner {
             }
             Request::Restrict(r) => respond(&r, slot, self.restrict(&r)),
             Request::SetTimer(r) => respond(&r, slot, self.set_timer(r)),
-            Request::Clone(r) => respond(&r, slot, self.clone_thread(&r)),
+            Request::Clone(r) => match r.kind {
+                CloneKind::Thread => respond(&r, slot, self.clone_thread(&r)),
+                // The scheduler makes it once the run ends.
+                CloneKind::Process => match self.check_fork(&r) {
+                    Ok(()) => {
+                        thread.suspended.set(Suspended::Forking { slot });
+                        Flow::Stop
+                    }
+                    Err(status) => Flow::Return(Err(status)),
+                },
+            },
             Request::ExitThread(_) if thread.is_main() => Flow::Return(Err(Status::Denied)),
             Request::ExitThread(r) => {
                 self.exit_thread(thread, r.clear);
@@ -1252,9 +1303,13 @@ impl EnterShim for Running<'_> {
             Suspended::Waiting(_) | Suspended::Futex(_) => {
                 return inner.kill_and_stop("resumed while waiting");
             }
+            Suspended::Forking { .. } => return inner.kill_and_stop("resumed while forking"),
             Suspended::Preempted | Suspended::Retry => return inner.resume(thread),
             Suspended::Yielded => return inner.resume_call(thread, ctx, Ok(())),
             Suspended::Woken(result) => return inner.resume_call(thread, ctx, result),
+            Suspended::Cloned { slot, thread: id } => {
+                return inner.resume_cloned(thread, ctx, slot, id);
+            }
         }
         let (waiter, request) = match &mut *inner.state.borrow_mut() {
             State::Delivering { waiter, request } => (*waiter, core::mem::take(request)),

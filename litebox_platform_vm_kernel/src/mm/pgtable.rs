@@ -11,6 +11,11 @@ use crate::arch::{
 // A non-present user leaf that still owns the frame stored in its address bits.
 pub(crate) const PROT_NONE: PageTableFlags = PageTableFlags::BIT_9;
 
+// A user leaf whose frame other leaves may map too (see `SHARED_FRAMES`):
+// never writable; a write fault copies the frame, or takes it over once no
+// other leaf maps it.
+pub(crate) const COW: PageTableFlags = PageTableFlags::BIT_10;
+
 pub(crate) struct PageTableAllocator<M: super::MemoryProvider> {
     _provider: core::marker::PhantomData<M>,
 }
@@ -56,7 +61,10 @@ pub(crate) trait PageTableImpl<const ALIGN: usize> {
     #[cfg(test)]
     fn translate(&self, addr: VirtAddr) -> x86_64::structures::paging::mapper::TranslateResult;
 
-    /// Map `page` with `flags` if it is not mapped yet.
+    /// Resolves a fault on `page`, after which it is mapped with `flags`,
+    /// the permissions its mapping allows: maps it with a fresh frame if it
+    /// is not mapped yet, or, for a write to a [`COW`] leaf, maps a copy of
+    /// its frame, or the frame itself once no other leaf maps it.
     ///
     /// # Safety
     ///

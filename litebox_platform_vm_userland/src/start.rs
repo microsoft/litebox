@@ -80,6 +80,12 @@ const HEAP_ORDER: usize = 28;
 static ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<'static, HEAP_ORDER, NoHost> =
     litebox::mm::allocator::SafeZoneAllocator::new();
 
+/// Runs `f`, which must not allocate or free, with the heap locked (see
+/// [`crate::process`]).
+pub(crate) fn with_heap_locked<R>(f: impl FnOnce() -> R) -> R {
+    ALLOCATOR.with_locked(f)
+}
+
 struct NoHost;
 
 impl litebox::mm::allocator::MemoryProvider for NoHost {

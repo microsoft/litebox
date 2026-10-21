@@ -86,6 +86,7 @@ impl PerCpuStacks {
 }
 
 /// XSAVE requires 64-byte alignment: 512 legacy bytes + a 64-byte header.
+#[derive(Clone)]
 #[repr(C, align(64))]
 pub(crate) struct XsaveArea([u8; PerCpuVariables::XSAVE_AREA_SIZE]);
 

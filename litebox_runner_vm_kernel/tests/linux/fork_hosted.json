@@ -1,0 +1,33 @@
+[
+  { "argv": ["/fork_parent"] },
+  { "argv": ["/fork_parent-pie"] },
+  { "argv": ["/fork_parent-dyn"] },
+  {
+    "argv": ["/fork_threads_parent"],
+    "expect_stdout": "threads-fork code=7 failures=0 read=1 slept=1\n"
+  },
+  {
+    "argv": ["/fork_threads_parent-dyn"],
+    "expect_stdout": "threads-fork code=7 failures=0 read=1 slept=1\n"
+  },
+  {
+    "argv": ["/fork_interrupt_parent"],
+    "expect_stdout": "forked child interrupted\n"
+  },
+  {
+    "argv": ["/fork_event_parent"],
+    "expect_stdout": "event-fork blocked=1 semaphore=1 nonblock=1 timer=1\n"
+  },
+  {
+    "argv": ["/fork_event_parent-pie"],
+    "expect_stdout": "event-fork blocked=1 semaphore=1 nonblock=1 timer=1\n"
+  },
+  {
+    "argv": ["/fork_epoll_parent"],
+    "expect_stdout": "epoll-fork shared=1 blocked=1 flags=1\n"
+  },
+  {
+    "argv": ["/fork_epoll_parent-pie"],
+    "expect_stdout": "epoll-fork shared=1 blocked=1 flags=1\n"
+  }
+]

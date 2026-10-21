@@ -16,7 +16,7 @@ use litebox::utils::TruncateExt as _;
 use litebox_broker_vm_kernel::{EnterError, Entered, RingFutex};
 use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::{
-    CloneKind, CloneReply, CloneRequest, FutexOp, FutexRequest, InterruptThreadRequest, NewThread,
+    CloneReply, CloneRequest, FutexOp, FutexRequest, InterruptThreadRequest, NewThread,
     RUNNER_MANAGED_MIN, Registers, Status, USER_END, UserRange,
 };
 use litebox_platform::time::TimeProvider as _;
@@ -59,6 +59,26 @@ impl Thread {
                 ..NewThread::default()
             },
         )
+    }
+
+    /// A process clone's main thread (see `crate::fork`): a copy of
+    /// `thread`, whose run ended in its `Clone`, on the main thread's upcall
+    /// stack, which returns from the call too, with its reply at `slot`.
+    pub(crate) fn cloned(thread: &Self, slot: u64) -> Self {
+        let clone = Self::new(
+            MAIN,
+            thread.ctx.borrow().clone(),
+            thread.user_state.borrow().duplicate(),
+            &NewThread {
+                fs_base: thread.fs_base.get() as u64,
+                upcall_stack: layout::UPCALL_STACK,
+                ..NewThread::default()
+            },
+        );
+        clone
+            .suspended
+            .set(Suspended::Cloned { slot, thread: MAIN });
+        clone
     }
 
     fn new(id: u64, ctx: PtRegs, user_state: UserThreadState, thread: &NewThread) -> Self {
@@ -185,14 +205,12 @@ impl Inner {
             .retain(|other| !core::ptr::eq(Rc::as_ptr(other), thread));
     }
 
-    /// [`CallId::Clone`](litebox_common_vm_abi::CallId::Clone). The new
-    /// thread starts as if preempted at `regs`, with `rax` its ID.
+    /// [`CallId::Clone`](litebox_common_vm_abi::CallId::Clone) of a
+    /// [`CloneKind::Thread`](litebox_common_vm_abi::CloneKind::Thread). The
+    /// new thread starts as if preempted at `regs`, with `rax` its ID.
     pub(crate) fn clone_thread(&self, r: &CloneRequest) -> Result<CloneReply, Status> {
         if !matches!(*self.state.borrow(), State::Serving { .. }) {
             return Err(Status::Denied);
-        }
-        match r.kind {
-            CloneKind::Thread => {}
         }
         let fs_base: usize = r.fs_base.trunc();
         if !(user_address(r.regs.rip) && user_address(r.regs.rsp))
