@@ -777,9 +777,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .map_err(|_| NtStatus::CONFLICTING_ADDRESSES)?;
             // The first piece starts at `base` and absorbs the others.
             let allocations = vmem.allocations_mut();
-            while let Some((&start, _)) = allocations.range(base + 1..end).next() {
-                allocations.remove(&start);
-            }
+            for _ in allocations.extract_if(base + 1..end, |_, _| true) {}
             allocations
                 .get_mut(&base)
                 .expect("coalesced placeholders start at the requested base")
@@ -1785,19 +1783,34 @@ fn query_allocation_basic_information(
     mappings: &RangeMap<usize, VmFlags>,
 ) -> Option<MemoryBasicInformation> {
     let allocation_end = allocation.base.checked_add(allocation.size)?;
+    let query_protection = allocation.page_protections.get_key_value(&query_base);
+    let protection_boundary = query_protection
+        .map(|(range, _)| range.end)
+        .or_else(|| {
+            allocation
+                .page_protections
+                .overlapping(query_base..allocation_end)
+                .next()
+                .map(|(range, _)| range.start)
+        })
+        .unwrap_or(allocation_end)
+        .min(allocation_end);
     let mut mappings = mappings.overlapping(query_base..allocation_end);
     let first = mappings.next();
     let (state, protect, region_end) = if let Some((first_range, first_flags)) =
         first.filter(|(range, _)| range.contains(&query_base))
     {
-        let mut region_end = first_range.end.min(allocation_end);
-        for (range, _) in mappings {
-            if region_end == allocation_end || range.start != region_end {
+        let mut region_end = first_range.end.min(protection_boundary);
+        while region_end < protection_boundary {
+            let Some((range, _)) = mappings.next() else {
+                break;
+            };
+            if range.start != region_end {
                 break;
             }
-            region_end = range.end.min(allocation_end);
+            region_end = range.end.min(protection_boundary);
         }
-        if let Some((range, protect)) = allocation.page_protections.get_key_value(&query_base) {
+        if let Some((range, protect)) = query_protection {
             region_end = region_end.min(range.end);
             (MemoryState::MEM_COMMIT.bits(), protect.bits(), region_end)
         } else {
