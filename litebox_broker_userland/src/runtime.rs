@@ -412,30 +412,32 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>> Drop
     }
 }
 
-/// Requests cancellation before an association scope joins its workers.
-struct AssociationCancellationGuard<'association, Memory: SharedMemory> {
+/// Ends an association once its end is observed, including on an unwind:
+/// cancels the requests still executing and applies owner-death handling, which
+/// fails the children still starting.
+struct AssociationEndingGuard<'association, Memory: SharedMemory> {
     association: &'association BrokerHostAssociation<Memory>,
 }
 
-impl<Memory: SharedMemory> Drop for AssociationCancellationGuard<'_, Memory> {
+impl<Memory: SharedMemory> Drop for AssociationEndingGuard<'_, Memory> {
     fn drop(&mut self) {
         self.association.request_cancellation();
+        self.association.association_ending();
     }
 }
 
 /// Serves one association until it ends, then reports its first failure.
 ///
-/// Each call lane has its own worker from the runner's first use of it, so the
+/// Each call lane gets its own worker once the runner first uses it, so the
 /// association has as many workers as the runner has had calls in flight at
-/// once. A worker serves only its own lane, so a call never waits for another
-/// call to finish, and back-to-back calls stay on the first lane's worker.
+/// once. Calls on different lanes never wait for each other, and back-to-back
+/// calls stay on the first lane's worker.
 ///
-/// This thread is the first lane's worker. Having set the association up with
-/// the runner, it tends to run where the runner's writes reach it fastest,
-/// whereas the scheduler places a new thread on the least busy CPUs, which can
-/// be across a cache boundary from the runner. An observer thread starts the
-/// workers of further lanes, observes the end of the association, and cancels
-/// the requests still executing; this thread then joins every worker.
+/// This thread serves the first lane: having run setup with the runner, it
+/// tends to stay near the runner, whereas a new thread can land across a cache
+/// boundary. An observer thread starts and joins the workers of further lanes
+/// and ends the association as soon as it observes its end, so requests still
+/// executing see that promptly.
 ///
 /// `readiness` is created by the caller rather than here so readiness sources
 /// can record into the same runtime this publishes from. The Linux network
@@ -503,36 +505,24 @@ where
             readiness: &readiness,
             failure_coordinator: &failure_coordinator,
         };
-        let workers = match context.next_lane(&mut lane_source) {
-            Some(first_lane) => {
-                let observer = std::thread::Builder::new()
-                    .name("litebox-broker-lanes".to_owned())
-                    .spawn_scoped(scope, move || {
-                        context.serve_further_lanes(scope, lane_source)
-                    });
-                match observer {
-                    Ok(observer) => {
-                        context.serve(first_lane);
-                        observer.join().unwrap_or_else(|_| {
-                            failure_coordinator
-                                .report_panic(IoError::other("broker call-lane observer panicked"));
-                            Vec::new()
-                        })
-                    }
-                    Err(error) => {
-                        failure_coordinator.report(error);
-                        Vec::new()
+        if let Some(first_lane) = context.next_lane(&mut lane_source) {
+            let observer = std::thread::Builder::new()
+                .name("litebox-broker-lanes".to_owned())
+                .spawn_scoped(scope, move || context.serve_further_lanes(lane_source));
+            match observer {
+                Ok(observer) => {
+                    context.serve(first_lane);
+                    if observer.join().is_err() {
+                        failure_coordinator
+                            .report_panic(IoError::other("broker call-lane observer panicked"));
                     }
                 }
-            }
-            None => Vec::new(),
-        };
-        association.association_ending();
-        for worker in workers {
-            if worker.join().is_err() {
-                failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
+                Err(error) => failure_coordinator.report(error),
             }
         }
+        // Ends the association if no observer did; ending it again is
+        // harmless.
+        association.association_ending();
         // Readiness publication lives exactly as long as the association, and
         // workers can still change readiness until they are joined. Ending it
         // here rather than leaving it to the scope orders it before the join
@@ -600,38 +590,31 @@ where
     }
 
     /// Starts a worker for each further lane the runner uses until the
-    /// association ends, then cancels the requests still executing and returns
-    /// the workers to join.
-    fn serve_further_lanes<'scope, LaneSource>(
-        self,
-        scope: &'scope std::thread::Scope<'scope, '_>,
-        mut lane_source: LaneSource,
-    ) -> Vec<std::thread::ScopedJoinHandle<'scope, ()>>
+    /// association ends, then ends the association and joins the workers.
+    fn serve_further_lanes<LaneSource>(self, mut lane_source: LaneSource)
     where
         LaneSource: HostCallLaneSource<Error = IoError>,
-        LaneSource::Lane: Send + 'scope,
-        Self: Send + 'scope,
+        LaneSource::Lane: Send,
+        Self: Send,
     {
-        // Cancelling on an unwind too keeps the scope from waiting forever on
-        // a worker blocked in a request.
-        let cancellation = AssociationCancellationGuard {
-            association: self.association,
-        };
-        let mut workers = Vec::new();
-        while let Some(lane) = self.next_lane(&mut lane_source) {
-            let started = std::thread::Builder::new()
-                .name(format!("litebox-broker-worker-{}", workers.len() + 1))
-                .spawn_scoped(scope, move || self.serve(lane));
-            match started {
-                Ok(started) => workers.push(started),
-                Err(error) => {
+        std::thread::scope(|scope| {
+            // Dropped before the scope joins the workers, including on an
+            // unwind, so the join never waits on a worker blocked in a request.
+            let _ending = AssociationEndingGuard {
+                association: self.association,
+            };
+            let mut workers = 0;
+            while let Some(lane) = self.next_lane(&mut lane_source) {
+                workers += 1;
+                let started = std::thread::Builder::new()
+                    .name(format!("litebox-broker-worker-{workers}"))
+                    .spawn_scoped(scope, move || self.serve(lane));
+                if let Err(error) = started {
                     self.failure_coordinator.report(error);
                     break;
                 }
             }
-        }
-        drop(cancellation);
-        workers
+        });
     }
 
     /// Serves one lane's requests until the association ends.

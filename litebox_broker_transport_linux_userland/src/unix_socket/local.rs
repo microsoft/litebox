@@ -486,7 +486,11 @@ impl LocalRingAssociation {
                 Err(ControlRingReadError::Decode(error)) => return Err(wire_error(error)),
             }
         };
-        consumer.publish_head().map_err(ring_error)?;
+        // Accepting the response excludes failure recording, so no call
+        // succeeds once the association has failed.
+        self.lanes
+            .run_if_live(|| consumer.publish_head().map_err(ring_error))
+            .map_err(call_lane_pool_error)?;
         consumer.wake_producer()?;
         if response.request_id != request_id {
             return Err(invalid_data("broker answered a different request"));
