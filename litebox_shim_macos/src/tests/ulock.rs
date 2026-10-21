@@ -307,13 +307,17 @@ fn shared_wait_on_an_address_reused_during_munmap_is_woken() {
         });
         let global = Arc::clone(&task.global);
         // After munmap removed the page and before it retires the old
-        // objects, the page is mapped again and a shared wait starts on it.
+        // objects, the page is mapped again and a shared wait is about to
+        // start on it. munmap holds the table lock here, so `try_lock` fails
+        // at once and the wait may start only after the retirement: the test
+        // checks that the retirement does not strand that wait. Were the
+        // table lock released before the retirement, `try_lock` would succeed
+        // and this loop would let the wait join a record the retirement then
+        // strands.
         task.global.mapping_hook.set(move |point| {
             assert_eq!(point, hook::Point::MappingsChanged);
             go.send(()).unwrap();
             about_to_wait.recv_timeout(BOUND).unwrap();
-            // The wait either queues behind the table lock munmap holds, or
-            // joins a record before the retirement.
             let start = Instant::now();
             while global
                 .ulocks
@@ -333,5 +337,77 @@ fn shared_wait_on_an_address_reused_during_munmap_is_woken() {
             Ok(0)
         );
         assert_eq!(handle.join().unwrap(), Ok(0));
+    });
+}
+
+/// A shared wait or wake finds the object mapped at the address under the
+/// table lock: if a munmap ends after it validated its arguments and before
+/// it locked the table, it fails with EINVAL rather than keying the removed
+/// object, which a later mapping there would share.
+#[test]
+fn shared_ulock_on_an_address_unmapped_before_the_lookup_fails() {
+    use crate::syscalls::mm::hook;
+
+    let task = new_task();
+    let page = vm_allocate(&task, 0, VM_FLAGS_ANYWHERE);
+    std::thread::scope(|scope| {
+        let unmapper = task.new_sibling(0);
+        let (go, unmap) = std::sync::mpsc::channel::<()>();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let handle = scope.spawn(move || {
+            <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                unmap.recv_timeout(BOUND).unwrap();
+                let result = bsd(&unmapper, nr::MUNMAP, &[page, PAGE_SIZE]);
+                done.send(()).unwrap();
+                result
+            })
+        });
+        task.global.mapping_hook.set(move |point| {
+            if point == hook::Point::UlockLookup {
+                go.send(()).unwrap();
+                finished.recv_timeout(BOUND).unwrap();
+            }
+        });
+        assert_eq!(
+            ulock_wait(&task, UL_COMPARE_AND_WAIT_SHARED, page, 0, 100_000),
+            errno(Errno::EINVAL)
+        );
+        task.global.mapping_hook.clear();
+        assert_eq!(handle.join().unwrap(), Ok(0), "munmap");
+    });
+    assert_eq!(task.global.ulocks.lock().object_waiters(page), 0);
+
+    let page = vm_allocate(&task, 0, VM_FLAGS_ANYWHERE);
+    std::thread::scope(|scope| {
+        let waiter = task.new_sibling(0);
+        let unmapper = task.new_sibling(0);
+        let old =
+            scope.spawn(move || ulock_wait(&waiter, UL_COMPARE_AND_WAIT_SHARED, page, 0, BOUND_US));
+        await_count(&task, 1, |table| table.object_waiters(page));
+        let (go, unmap) = std::sync::mpsc::channel::<()>();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let handle = scope.spawn(move || {
+            <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                unmap.recv_timeout(BOUND).unwrap();
+                let result = bsd(&unmapper, nr::MUNMAP, &[page, PAGE_SIZE]);
+                done.send(()).unwrap();
+                result
+            })
+        });
+        task.global.mapping_hook.set(move |point| {
+            if point == hook::Point::UlockLookup {
+                go.send(()).unwrap();
+                finished.recv_timeout(BOUND).unwrap();
+            }
+        });
+        assert_eq!(
+            ulock_wake(&task, UL_COMPARE_AND_WAIT_SHARED, page, 0),
+            errno(Errno::EINVAL)
+        );
+        task.global.mapping_hook.clear();
+        assert_eq!(handle.join().unwrap(), Ok(0), "munmap");
+        assert_eq!(task.global.ulocks.lock().object_waiters(page), 1);
+        task.global.ulocks.lock().wake_all_objects_at(page);
+        assert_eq!(old.join().unwrap(), Ok(0));
     });
 }

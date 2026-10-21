@@ -225,14 +225,22 @@ impl<P: ShimPlatform> Task<P> {
             .is_empty()
     }
 
-    /// The key for `address`; a shared key names the object mapped there
-    /// now, so it is looked up under the table lock, which mapping changes
-    /// hold until they have retired the old objects.
-    fn ulock_key(table: &UlockTable<P>, shared: bool, address: usize) -> UlockKey {
-        if shared {
-            table.object_key(address)
+    /// The key for `address`. A shared key names the object mapped there
+    /// now (`uaddr_findobj`, EINVAL if none), so it is looked up under the
+    /// table lock, which mapping changes hold until they have retired the
+    /// old objects.
+    fn ulock_key(
+        &self,
+        table: &UlockTable<P>,
+        shared: bool,
+        address: usize,
+    ) -> Result<UlockKey, Errno> {
+        if !shared {
+            Ok(UlockKey::Address(address))
+        } else if self.ulock_object_mapped(address) {
+            Ok(table.object_key(address))
         } else {
-            UlockKey::Address(address)
+            Err(Errno::EINVAL)
         }
     }
 
@@ -273,9 +281,6 @@ impl<P: ShimPlatform> Task<P> {
         if address == 0 || !address.is_multiple_of(size) {
             return Err(Errno::EINVAL);
         }
-        if shared && !self.ulock_object_mapped(address) {
-            return Err(Errno::EINVAL);
-        }
         let mut owner = None;
         if flags & flag::WAIT_ADAPTIVE_SPIN != 0 && set_owner {
             // A changed lock returns at once. Spinning while the owner runs
@@ -288,8 +293,12 @@ impl<P: ShimPlatform> Task<P> {
             }
             owner = self.ulock_resolve_owner(current).ok();
         }
+        #[cfg(all(test, target_os = "macos"))]
+        self.global
+            .mapping_hook
+            .reach(crate::syscalls::mm::hook::Point::UlockLookup);
         let mut table = self.global.ulocks.lock();
-        let key = Self::ulock_key(&table, shared, address);
+        let key = self.ulock_key(&table, shared, address)?;
         let ull = table.locks.entry(key).or_insert_with(|| Ull {
             opcode: 0,
             waiters: 0,
@@ -399,6 +408,8 @@ impl<P: ShimPlatform> Task<P> {
         if address == 0 {
             return Err(Errno::EINVAL);
         }
+        // Before the ULF_WAKE_THREAD lookup's ESRCH, as in XNU; checked again
+        // with the key under the table lock.
         if shared && !self.ulock_object_mapped(address) {
             return Err(Errno::EINVAL);
         }
@@ -423,8 +434,12 @@ impl<P: ShimPlatform> Task<P> {
         allow_non_owner: bool,
     ) -> Result<(), Errno> {
         let set_owner = opcode == op::UNFAIR_LOCK;
+        #[cfg(all(test, target_os = "macos"))]
+        self.global
+            .mapping_hook
+            .reach(crate::syscalls::mm::hook::Point::UlockLookup);
         let mut table = self.global.ulocks.lock();
-        let key = Self::ulock_key(&table, shared, address);
+        let key = self.ulock_key(&table, shared, address)?;
         let ull = table.locks.get_mut(&key).ok_or(Errno::ENOENT)?;
         if ull.opcode != opcode {
             return Err(Errno::EDOM);

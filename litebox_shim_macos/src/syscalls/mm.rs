@@ -69,8 +69,8 @@ impl MachoMapping {
     }
 }
 
-/// Pauses a rewrite of one image, or a mapping change, at a point, on the
-/// host thread that set the hook.
+/// Pauses a rewrite of one image, a mapping change, or a ulock key lookup at
+/// a point, on the host thread that set the hook.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod hook {
     extern crate std;
@@ -88,6 +88,9 @@ pub(crate) mod hook {
         /// A mapping change replaced or removed mappings and has not retired
         /// their shared ulock objects yet.
         MappingsChanged,
+        /// A ulock wait or wake validated its arguments and has not locked
+        /// the ulock table yet.
+        UlockLookup,
     }
 
     type Hook = Box<dyn FnMut(Point) + Send>;
@@ -302,6 +305,12 @@ struct MmapRequest {
     direction: AllocationDirection,
 }
 
+/// The `macho_mappings` and `ulocks` guards a mapping change holds.
+type MappingChangeLocks<'a, P> = (
+    MutexGuard<'a, P, BTreeMap<usize, MachoMapping>>,
+    MutexGuard<'a, P, UlockTable<P>>,
+);
+
 /// Where [`Task::map_anonymous`] places pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AnonymousPlacement {
@@ -351,12 +360,22 @@ fn forget_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usi
 }
 
 impl<P: ShimPlatform> Task<P> {
-    /// A mapping change that held `ulocks` since before it touched the
-    /// address space replaced or removed the mappings in `range` if
-    /// `changed`: retire their shared ulock objects before `ulocks` is
-    /// released, so a wait or wake that starts after the change keys the new
-    /// mapping and no later retirement can strand it. `ulocks` nests inside
-    /// `macho_mappings` and outside trampoline and page-manager state.
+    /// Lock what a mapping change that replaces or removes mappings holds
+    /// from before it touches the address space until its shared ulock
+    /// objects are retired and its Mach-O tracking is updated, so no
+    /// executable transition sees stale or missing tracking and no wait or
+    /// wake keys a replaced object. The lock order is `macho_mappings`,
+    /// `ulocks`, then trampoline, shared-cache, page-manager and IPC state.
+    fn lock_mapping_change(&self) -> MappingChangeLocks<'_, P> {
+        let macho_mappings = self.global.macho_mappings.lock();
+        (macho_mappings, self.global.ulocks.lock())
+    }
+
+    /// A mapping change that took [`Self::lock_mapping_change`] replaced or
+    /// removed the mappings in `range` if `changed`: retire their shared
+    /// ulock objects before `ulocks` is released, so a wait or wake that
+    /// starts after the change keys the new mapping and no later retirement
+    /// can strand it.
     #[cfg_attr(
         not(all(test, target_os = "macos")),
         expect(clippy::unused_self, reason = "only the test hook reads the task")
@@ -442,7 +461,7 @@ impl<P: ShimPlatform> Task<P> {
         }
         let range = address..address.saturating_add(length.as_usize());
         let replace = placement == (AnonymousPlacement::Fixed { replace: true });
-        let ulocks = replace.then(|| self.global.ulocks.lock());
+        let locked = replace.then(|| self.lock_mapping_change());
         // SAFETY: a replacing fixed mapping has Mach's VM_FLAGS_OVERWRITE
         // semantics; otherwise nothing existing is replaced.
         let result = unsafe {
@@ -455,14 +474,13 @@ impl<P: ShimPlatform> Task<P> {
                 |_| Ok(0),
             )
         };
-        if let Some(ulocks) = ulocks {
+        if let Some((mut macho_mappings, ulocks)) = locked {
             self.retire_ulock_objects(ulocks, range.clone(), result.is_ok());
+            if result.is_ok() {
+                self.replace_macho_mappings(&mut macho_mappings, range, None);
+            }
         }
-        let pointer = result?;
-        if replace {
-            self.mappings_replaced(range, None);
-        }
-        Ok(pointer.as_usize())
+        Ok(result?.as_usize())
     }
 
     fn mmap(&self, request: MmapRequest) -> Result<usize, Errno> {
@@ -506,13 +524,10 @@ impl<P: ShimPlatform> Task<P> {
             // it fails closed, like the Mach VM paths.
             return Err(Errno::EINVAL);
         }
-        let fixed_snapshot = flags
-            .contains(MmapFlags::FIXED)
-            .then(|| self.mapping_snapshot(fixed_range.clone()));
+        let fixed = flags.contains(MmapFlags::FIXED);
         if flags.contains(MmapFlags::ANONYMOUS) {
-            let ulocks = flags
-                .contains(MmapFlags::FIXED)
-                .then(|| self.global.ulocks.lock());
+            let locked = fixed.then(|| self.lock_mapping_change());
+            let before = fixed.then(|| self.mapping_snapshot(fixed_range.clone()));
             // SAFETY: MAP_FIXED has Darwin's replacement semantics; otherwise
             // PageManager treats `suggested` only as an allocation hint.
             let result = unsafe {
@@ -525,14 +540,13 @@ impl<P: ShimPlatform> Task<P> {
                     |_| Ok(0),
                 )
             };
-            let replaced = result.is_ok()
-                || fixed_snapshot
-                    .as_ref()
-                    .is_some_and(|before| *before != self.mapping_snapshot(fixed_range.clone()));
-            if let Some(ulocks) = ulocks {
+            if let Some((mut macho_mappings, ulocks)) = locked {
+                let replaced = result.is_ok()
+                    || before
+                        .is_some_and(|before| before != self.mapping_snapshot(fixed_range.clone()));
                 self.retire_ulock_objects(ulocks, fixed_range.clone(), replaced);
                 if replaced {
-                    self.mappings_replaced(fixed_range.clone(), None);
+                    self.replace_macho_mappings(&mut macho_mappings, fixed_range.clone(), None);
                 }
             }
             return result
@@ -556,20 +570,23 @@ impl<P: ShimPlatform> Task<P> {
         };
         let final_permissions = permissions(protection);
         let rewritten = macho.as_ref().filter(|_| executable);
-        // Serializes a rewritten mapping's checkpoint, rewrite and
-        // publication or rollback with every other rewrite, so a rollback
-        // never reclaims or rewinds over gates another mapping published.
-        // Other mappings take it only to update tracking afterwards.
-        let mut macho_mappings = rewritten.map(|_| self.global.macho_mappings.lock());
+        // Held from before the mapping exists until its tracking is updated,
+        // so an executable transition never finds a Mach-O mapping untracked
+        // or a replaced one still tracked, and a rewritten mapping's
+        // checkpoint, rewrite and publication or rollback are serialized with
+        // every other rewrite, so a rollback never reclaims or rewinds over
+        // gates another mapping published. Only a non-fixed mapping of a file
+        // that is not Mach-O, which is never tracked, reads without it.
+        let mut macho_mappings =
+            (fixed || macho.is_some()).then(|| self.global.macho_mappings.lock());
         let trampoline_checkpoint =
             rewritten.map(|patch_info| self.macho_trampoline_checkpoint(patch_info));
         #[cfg(all(test, target_os = "macos"))]
         if let Some(patch_info) = rewritten {
             patch_info.hook.reach(hook::Point::Checkpointed);
         }
-        let ulocks = flags
-            .contains(MmapFlags::FIXED)
-            .then(|| self.global.ulocks.lock());
+        let ulocks = fixed.then(|| self.global.ulocks.lock());
+        let before = fixed.then(|| self.mapping_snapshot(fixed_range.clone()));
         let mut file_offset = offset;
         let mut buffer = [0; PAGE_SIZE];
         let mut initialization_error = None;
@@ -617,9 +634,7 @@ impl<P: ShimPlatform> Task<P> {
             )
         };
         let replaced = result.is_ok()
-            || fixed_snapshot
-                .as_ref()
-                .is_some_and(|before| *before != self.mapping_snapshot(fixed_range.clone()));
+            || before.is_some_and(|before| before != self.mapping_snapshot(fixed_range.clone()));
         if let Some(ulocks) = ulocks {
             self.retire_ulock_objects(ulocks, fixed_range.clone(), replaced);
         }
@@ -629,9 +644,7 @@ impl<P: ShimPlatform> Task<P> {
                 if let (Some(patch_info), Some(checkpoint)) = (rewritten, trampoline_checkpoint) {
                     self.rollback_macho_trampoline(patch_info, checkpoint);
                 }
-                if flags.contains(MmapFlags::FIXED) && replaced {
-                    let mappings =
-                        macho_mappings.get_or_insert_with(|| self.global.macho_mappings.lock());
+                if replaced && let Some(mappings) = macho_mappings.as_mut() {
                     self.replace_macho_mappings(mappings, fixed_range.clone(), None);
                 }
                 return Err(
@@ -653,8 +666,7 @@ impl<P: ShimPlatform> Task<P> {
                 trampoline_invalidated: false,
             }
         });
-        if flags.contains(MmapFlags::FIXED) || mapping.is_some() {
-            let mappings = macho_mappings.get_or_insert_with(|| self.global.macho_mappings.lock());
+        if let Some(mappings) = macho_mappings.as_mut() {
             self.replace_macho_mappings(mappings, address..address + length.as_usize(), mapping);
         }
         Ok(address)
@@ -948,13 +960,6 @@ impl<P: ShimPlatform> Task<P> {
         }
         state.cursor = new_cursor;
         Ok(())
-    }
-
-    /// The mappings in `replaced` were replaced or removed, by `replacement`
-    /// if it is a tracked Mach-O mapping.
-    fn mappings_replaced(&self, replaced: Range<usize>, replacement: Option<MachoMapping>) {
-        let mut mappings = self.global.macho_mappings.lock();
-        self.replace_macho_mappings(&mut mappings, replaced, replacement);
     }
 
     /// Remove tracking for `replaced`, preserving any mapped prefix and suffix,
@@ -1273,7 +1278,7 @@ impl<P: ShimPlatform> Task<P> {
             // the MAP_FIXED check in `mmap`.
             return Err(Errno::EINVAL);
         }
-        let ulocks = self.global.ulocks.lock();
+        let (mut macho_mappings, ulocks) = self.lock_mapping_change();
         // SAFETY: Darwin munmap relinquishes the caller-selected guest range.
         let result = unsafe {
             self.global
@@ -1282,7 +1287,7 @@ impl<P: ShimPlatform> Task<P> {
         };
         self.retire_ulock_objects(ulocks, address..end, result.is_ok());
         result.map_err(|_| Errno::EINVAL)?;
-        self.mappings_replaced(address..end, None);
+        self.replace_macho_mappings(&mut macho_mappings, address..end, None);
         Ok(())
     }
 
@@ -1549,25 +1554,38 @@ mod tests {
     }
 
     fn task_with_file(data: &[u8]) -> Task<Platform> {
+        task_with_files(&[data])
+    }
+
+    /// A task with each of `files` open read-only on the descriptor of its
+    /// index, at `/image` for the first and `/image<index>` for the others.
+    fn task_with_files(files: &[&[u8]]) -> Task<Platform> {
         let platform = Platform::new();
         let mode = FileMode::RWXU | FileMode::RWXG | FileMode::RWXO;
-        let fs = InMem::<Platform>::new_initialized(vec![
-            (
-                "/",
-                InitialNode::Directory {
-                    mode,
-                    owner: FileUser::ROOT,
-                },
-            ),
-            (
-                "/image",
+        let paths: Vec<_> = (0..files.len())
+            .map(|index| match index {
+                0 => std::string::String::from("/image"),
+                _ => std::format!("/image{index}"),
+            })
+            .collect();
+        let mut nodes = vec![(
+            "/",
+            InitialNode::Directory {
+                mode,
+                owner: FileUser::ROOT,
+            },
+        )];
+        for (path, data) in paths.iter().zip(files) {
+            nodes.push((
+                path.as_str(),
                 InitialNode::File {
                     mode,
                     owner: FileUser::ROOT,
                     data: data.to_vec().into(),
                 },
-            ),
-        ]);
+            ));
+        }
+        let fs = InMem::<Platform>::new_initialized(nodes);
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1584,17 +1602,19 @@ mod tests {
         let litebox = LiteBox::new_with_broker_local(platform, local);
         readiness.attach(litebox.broker_notification_dispatcher());
         let mut builder = MacosShimBuilder::new_with_litebox(platform, litebox);
-        let file = builder
-            .litebox()
-            .open_file(
-                &litebox::fs::Context::new(),
-                "/image",
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::NONE,
-                FileMode::empty(),
-            )
-            .unwrap();
-        assert_eq!(builder.inherit_file(file), Ok(0));
+        for (fd, path) in (0..).zip(&paths) {
+            let file = builder
+                .litebox()
+                .open_file(
+                    &litebox::fs::Context::new(),
+                    path.as_str(),
+                    FileAccessMode::ReadOnly,
+                    FileOpenFlags::NONE,
+                    FileMode::empty(),
+                )
+                .unwrap();
+            assert_eq!(builder.inherit_file(file), Ok(fd));
+        }
         let shim = builder.build();
         Task::new_main(
             shim.global,
@@ -2566,6 +2586,213 @@ mod tests {
             0,
             0,
         )
+    }
+
+    /// Run `change` on this thread and `racer` on a sibling that starts
+    /// once `change` has changed the address space and before it has
+    /// updated Mach-O tracking. `change` resumes once the sibling has
+    /// checked whether `macho_mappings` is held, which this returns with
+    /// both results; `racer` needs `macho_mappings`, so if it is held,
+    /// `racer` completes only after `change` does.
+    fn race_mapping_change<C, R>(
+        task: &Task<Platform>,
+        change: impl FnOnce() -> C,
+        racer: impl FnOnce(&Task<Platform>) -> R + Send,
+    ) -> (bool, C, R)
+    where
+        R: Send,
+    {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+        let sibling = task.new_sibling(0);
+        let (go, start) = std::sync::mpsc::channel::<()>();
+        let (report, held) = std::sync::mpsc::channel::<bool>();
+        std::thread::scope(|scope| {
+            let racer = scope.spawn(move || {
+                <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                    start.recv_timeout(BOUND).unwrap();
+                    report
+                        .send(sibling.global.macho_mappings.try_lock().is_none())
+                        .unwrap();
+                    racer(&sibling)
+                })
+            });
+            let (pass, excluded) = std::sync::mpsc::channel::<bool>();
+            let mut go = Some(go);
+            task.global.mapping_hook.set(move |point| {
+                if point == hook::Point::MappingsChanged {
+                    go.take().unwrap().send(()).unwrap();
+                    pass.send(held.recv_timeout(BOUND).unwrap()).unwrap();
+                }
+            });
+            let changed = change();
+            task.global.mapping_hook.clear();
+            (excluded.try_recv().unwrap(), changed, racer.join().unwrap())
+        })
+    }
+
+    /// A Mach-O mapping is tracked before it is visible: an `mprotect`
+    /// making it executable while it is being mapped rewrites it.
+    #[test]
+    fn mprotect_exec_racing_a_readonly_macho_map_fixed_rewrites_it() {
+        let task = task_with_file(&macho_image());
+        let address = task
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                VmProtection::READ | VmProtection::WRITE,
+                MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+        let (excluded, mapped, protected) = race_mapping_change(
+            &task,
+            || map_image_at(&task, address, MmapFlags::PRIVATE),
+            |sibling| {
+                sibling.sys_mprotect(
+                    address,
+                    PAGE_SIZE,
+                    VmProtection::READ | VmProtection::EXECUTE,
+                )
+            },
+        );
+        assert!(excluded, "the mapping was visible before its tracking");
+        assert_eq!((mapped, protected), (Ok(address), Ok(())));
+        assert!(
+            decode_branch_target(instruction_at(address + TEXT), (address + TEXT) as u64).is_some()
+        );
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    /// An unmap or replacement racing a Mach-O mapping removes its tracking
+    /// with it: no stale tracking rewrites what is mapped there later.
+    fn assert_change_racing_a_macho_map_fixed_leaves_no_tracking(replace: bool) {
+        let task = task_with_file(&macho_image());
+        let address = map_image_at(&task, 0x7b_0000_0000, MmapFlags::PRIVATE).unwrap();
+        let (excluded, mapped, changed) = race_mapping_change(
+            &task,
+            || map_image_at(&task, address, MmapFlags::PRIVATE),
+            |sibling| {
+                if replace {
+                    sibling
+                        .sys_mmap(
+                            address,
+                            PAGE_SIZE,
+                            VmProtection::READ | VmProtection::WRITE,
+                            MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED,
+                            -1,
+                            0,
+                        )
+                        .map(|_| ())
+                } else {
+                    sibling.sys_munmap(address, PAGE_SIZE)
+                }
+            },
+        );
+        assert!(excluded, "the mapping was visible before its tracking");
+        assert_eq!((mapped, changed), (Ok(address), Ok(())));
+        assert!(
+            task.global
+                .macho_mappings
+                .lock()
+                .values()
+                .all(|mapping| mapping.range.end <= address
+                    || mapping.range.start >= address + PAGE_SIZE),
+            "replace: {replace}"
+        );
+        if replace {
+            litebox_common_macos::user_pointers::UserPtrMut::<u8>::from_usize(address + TEXT)
+                .copy_from_slice::<Platform>(0, &SVC.to_le_bytes())
+                .unwrap();
+            task.sys_mprotect(
+                address,
+                PAGE_SIZE,
+                VmProtection::READ | VmProtection::EXECUTE,
+            )
+            .unwrap();
+            assert_eq!(instruction_at(address + TEXT), SVC);
+            task.sys_munmap(address, PAGE_SIZE).unwrap();
+        }
+    }
+
+    #[test]
+    fn unmap_racing_a_macho_map_fixed_leaves_no_tracking() {
+        assert_change_racing_a_macho_map_fixed_leaves_no_tracking(false);
+    }
+
+    #[test]
+    fn replacement_racing_a_macho_map_fixed_leaves_no_tracking() {
+        assert_change_racing_a_macho_map_fixed_leaves_no_tracking(true);
+    }
+
+    /// An unmap updates tracking before another mapping can take its range:
+    /// a Mach-O mapping made there while the unmap runs stays tracked, so
+    /// making it executable rewrites it.
+    #[test]
+    fn macho_mapping_racing_an_unmap_of_its_range_stays_tracked() {
+        let task = task_with_file(&macho_image());
+        let address = task
+            .sys_mmap(
+                0x7c_0000_0000,
+                PAGE_SIZE,
+                VmProtection::READ | VmProtection::WRITE,
+                MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED,
+                -1,
+                0,
+            )
+            .unwrap();
+        let (excluded, unmapped, mapped) = race_mapping_change(
+            &task,
+            || task.sys_munmap(address, PAGE_SIZE),
+            |sibling| map_image_at(sibling, address, MmapFlags::PRIVATE),
+        );
+        assert!(excluded, "the unmap's tracking update could be overtaken");
+        assert_eq!((unmapped, mapped), (Ok(()), Ok(address)));
+        task.sys_mprotect(
+            address,
+            PAGE_SIZE,
+            VmProtection::READ | VmProtection::EXECUTE,
+        )
+        .unwrap();
+        assert!(
+            decode_branch_target(instruction_at(address + TEXT), (address + TEXT) as u64).is_some()
+        );
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    /// A mapping of a file that is not Mach-O replacing a tracked Mach-O
+    /// mapping drops the old tracking before an `mprotect` making it
+    /// executable can apply it to the new contents.
+    #[test]
+    fn mprotect_exec_racing_a_non_macho_map_fixed_never_applies_old_tracking() {
+        let mut other = vec![0; PAGE_SIZE];
+        put32(&mut other, TEXT, SVC);
+        let task = task_with_files(&[&macho_image(), &other]);
+        let address = map_image_at(&task, 0x7d_0000_0000, MmapFlags::PRIVATE).unwrap();
+        let (excluded, mapped, protected) = race_mapping_change(
+            &task,
+            || {
+                task.sys_mmap(
+                    address,
+                    PAGE_SIZE,
+                    VmProtection::READ,
+                    MmapFlags::PRIVATE | MmapFlags::FIXED,
+                    1,
+                    0,
+                )
+            },
+            |sibling| {
+                sibling.sys_mprotect(
+                    address,
+                    PAGE_SIZE,
+                    VmProtection::READ | VmProtection::EXECUTE,
+                )
+            },
+        );
+        assert!(excluded, "the old tracking outlived the replacement");
+        assert_eq!((mapped, protected), (Ok(address), Ok(())));
+        assert_eq!(instruction_at(address + TEXT), SVC);
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
     }
 
     #[test]

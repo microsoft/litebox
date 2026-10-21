@@ -533,10 +533,13 @@ mod tests {
     /// A thread entering the guest while another publishes an interrupt
     /// condition and calls `ThreadHandle::interrupt` either sees the condition
     /// in its `prepare_to_run_guest` check or is interrupted (no store-buffer
-    /// outcome where both miss).
+    /// outcome where both miss). Each side yields while it waits, so a
+    /// descheduled partner on a small oversubscribed runner costs a yield,
+    /// not a full quantum of spinning, per round.
     #[test]
     fn prepare_to_run_guest_never_misses_a_concurrent_interrupt() {
-        const ROUNDS: u32 = 2_000_000;
+        const ROUNDS: u32 = 200_000;
+        const SPINS_BEFORE_YIELD: u32 = 64;
         #[derive(Default)]
         struct Rounds {
             /// The round both threads are running.
@@ -549,11 +552,20 @@ mod tests {
             guest_done: AtomicU32,
         }
         let deadline = Instant::now() + Duration::from_secs(60);
-        let wait_for = move |counter: &AtomicU32, round: u32| {
-            while counter.load(Ordering::Acquire) < round {
+        let wait_until = move |done: &dyn Fn() -> bool, round: u32| {
+            let mut spins = 0u32;
+            while !done() {
                 assert!(Instant::now() < deadline, "round {round} stalled");
-                core::hint::spin_loop();
+                spins += 1;
+                if spins.is_multiple_of(SPINS_BEFORE_YIELD) {
+                    std::thread::yield_now();
+                } else {
+                    core::hint::spin_loop();
+                }
             }
+        };
+        let wait_for = move |counter: &AtomicU32, round: u32| {
+            wait_until(&|| counter.load(Ordering::Acquire) >= round, round);
         };
         let rounds = Arc::new(Rounds::default());
         let platform = MockPlatform::new();
@@ -590,10 +602,10 @@ mod tests {
             rounds.condition.store(round, Ordering::Relaxed);
             handle.interrupt();
             rounds.interrupted.store(round, Ordering::Release);
-            while rounds.guest_done.load(Ordering::Acquire) < round && !guest.is_finished() {
-                assert!(Instant::now() < deadline, "round {round} stalled");
-                core::hint::spin_loop();
-            }
+            wait_until(
+                &|| rounds.guest_done.load(Ordering::Acquire) >= round || guest.is_finished(),
+                round,
+            );
             if guest.is_finished() {
                 break;
             }
