@@ -429,16 +429,17 @@ impl<P: ShimPlatform> Task<P> {
 
     /// The mapped parts of `target` with the flags an mprotect cannot change,
     /// merging neighbors that differ only in flags it can. A failed MAP_FIXED
-    /// replaced or removed mappings if this changed, since the page manager
-    /// leaves a hole where a failed mapping replaced pages. The caller's
-    /// locks keep every replacement, unmap and mprotect out of the window,
-    /// but not a placement that replaces nothing (a non-fixed mmap or a
-    /// no-replace Mach allocation) into a hole of the range. One that refills
-    /// a failed replacement's hole with the same flags hides it, so the old
-    /// shared wait objects (ulock and psynch) and Mach-O tracking stay over
-    /// the new pages; one that fills a hole a failed, non-replacing MAP_FIXED
-    /// left alone retires the untouched pages' objects and tracking. Only two
-    /// threads mapping into one range at once can hit either.
+    /// or replacing Mach allocation replaced or removed mappings if this
+    /// changed, since the page manager leaves a hole where a failed mapping
+    /// replaced pages. The caller's locks keep every replacement, unmap and
+    /// mprotect out of the window, but not a placement that replaces nothing
+    /// (a non-fixed mmap or a no-replace Mach allocation) into a hole of the
+    /// range. One that refills a failed replacement's hole with the same
+    /// flags hides it, so the old shared wait objects (ulock and psynch) and
+    /// Mach-O tracking stay over the new pages; one that fills a hole a
+    /// failed, non-replacing MAP_FIXED left alone retires the untouched
+    /// pages' objects and tracking. Only two threads mapping into one range
+    /// at once can hit either.
     fn mapping_snapshot(&self, target: Range<usize>) -> Vec<(Range<usize>, VmFlags)> {
         let mut snapshot: Vec<(Range<usize>, VmFlags)> = Vec::new();
         for (range, flags) in self.global.mm.overlapping(target.clone()) {
@@ -510,6 +511,7 @@ impl<P: ShimPlatform> Task<P> {
         let range = address..address.saturating_add(length.as_usize());
         let replace = placement == (AnonymousPlacement::Fixed { replace: true });
         let locked = replace.then(|| self.lock_mapping_change());
+        let before = replace.then(|| self.mapping_snapshot(range.clone()));
         // SAFETY: a replacing fixed mapping has Mach's VM_FLAGS_OVERWRITE
         // semantics; otherwise nothing existing is replaced.
         let result = unsafe {
@@ -523,8 +525,10 @@ impl<P: ShimPlatform> Task<P> {
             )
         };
         if let Some((mut macho_mappings, wait_objects)) = locked {
-            self.retire_wait_objects(wait_objects, range.clone(), result.is_ok());
-            if result.is_ok() {
+            let replaced = result.is_ok()
+                || before.is_some_and(|before| before != self.mapping_snapshot(range.clone()));
+            self.retire_wait_objects(wait_objects, range.clone(), replaced);
+            if replaced {
                 self.replace_macho_mappings(&mut macho_mappings, range, None);
             }
         }

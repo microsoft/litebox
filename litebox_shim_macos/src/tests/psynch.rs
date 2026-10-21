@@ -1296,6 +1296,72 @@ fn shared_objects_go_with_their_mapping() {
     assert_eq!(task.global.psynch.lock().queue_count(), 0);
 }
 
+/// A replacing Mach allocation whose final protection the host refuses
+/// (W+X) fails after it destroyed the old mapping; the old mapping's shared
+/// objects go with it, so a later allocation into the hole starts fresh.
+#[test]
+fn a_failed_overwrite_retires_the_shared_objects_it_destroyed() {
+    const VM_FLAGS_OVERWRITE: usize = 0x4000;
+    const VM_PROT_ALL: usize = 7;
+    let task = new_task();
+    let _watchdog = Watchdog::new(&task);
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let mut address = 0x7b_1000_0000usize;
+    assert_eq!(
+        super::mach::kr(
+            &task,
+            mach_trap::MACH_VM_ALLOCATE,
+            &[own, (&raw mut address) as usize, PAGE_SIZE, 0]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        cvsignal(&task, address, INC, 0, 0, 0, PSHARED),
+        Ok(CV_PBIT as usize)
+    );
+    let mut overwrite = address;
+    assert_eq!(
+        super::mach::kr(
+            &task,
+            mach_trap::MACH_VM_MAP,
+            &[
+                own,
+                (&raw mut overwrite) as usize,
+                PAGE_SIZE,
+                0,
+                VM_FLAGS_OVERWRITE,
+                VM_PROT_ALL,
+            ]
+        ),
+        KernReturn::NO_SPACE
+    );
+    assert!(
+        task.global
+            .mm
+            .overlapping(address..address + PAGE_SIZE)
+            .is_empty(),
+        "the failed overwrite left the old mapping"
+    );
+    assert_eq!(task.global.psynch.lock().fake_count(), 0);
+    let mut refill = address;
+    assert_eq!(
+        super::mach::kr(
+            &task,
+            mach_trap::MACH_VM_ALLOCATE,
+            &[own, (&raw mut refill) as usize, PAGE_SIZE, 0]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(refill, address);
+    assert_eq!(
+        cvwait(&task, address, INC, 0, 0, PSHARED, 0, 1_000_000),
+        Err(Errno::ETIMEDOUT.raw() | ECVCLEARED as usize),
+        "the new mapping's condition variable met the old prepost"
+    );
+    assert_eq!(task.global.psynch.lock().queue_count(), 0);
+    assert_eq!(bsd(&task, nr::MUNMAP, &[address, PAGE_SIZE]), Ok(0));
+}
+
 /// Process exit ends threads blocked on a mutex, a condition variable and
 /// an rwlock with EINTR, and each ends at its next shim entry.
 #[test]
