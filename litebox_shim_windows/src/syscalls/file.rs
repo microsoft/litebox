@@ -414,7 +414,7 @@ pub(crate) struct FileBasicInformation {
     _reserved: u32,
 }
 
-/// Native `FILE_NETWORK_OPEN_INFORMATION` returned by `NtQueryFullAttributesFile`.
+/// Native `FILE_NETWORK_OPEN_INFORMATION` layout.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
 pub(crate) struct FileNetworkOpenInformation {
@@ -457,6 +457,55 @@ struct FileStandardInformation {
     delete_pending: u8,
     directory: u8,
     padding: [u8; 2],
+}
+
+// TODO(fs-timestamps): Populate timestamps when FileStatus exposes them; the conversions
+// below leave every timestamp field zeroed.
+impl From<&FileStatusMetadata> for FileBasicInformation {
+    fn from(metadata: &FileStatusMetadata) -> Self {
+        Self {
+            file_attributes: metadata.file_attributes.bits(),
+            ..Self::default()
+        }
+    }
+}
+
+impl From<&FileStatusMetadata> for FileNetworkOpenInformation {
+    fn from(metadata: &FileStatusMetadata) -> Self {
+        Self {
+            allocation_size: metadata.allocation_size,
+            end_of_file: metadata.end_of_file,
+            file_attributes: metadata.file_attributes.bits(),
+            ..Self::default()
+        }
+    }
+}
+
+impl From<&FileStatusMetadata> for FileStatBasicInformation {
+    fn from(metadata: &FileStatusMetadata) -> Self {
+        Self {
+            file_id: i64::from_ne_bytes(metadata.file_id.to_ne_bytes()),
+            allocation_size: metadata.allocation_size,
+            end_of_file: metadata.end_of_file,
+            file_attributes: metadata.file_attributes.bits(),
+            number_of_links: 1,
+            device_type: FileDeviceType::Disk as u32,
+            file_id_128: metadata.file_id_128,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<&FileStatusMetadata> for FileStandardInformation {
+    fn from(metadata: &FileStatusMetadata) -> Self {
+        Self {
+            allocation_size: metadata.allocation_size,
+            end_of_file: metadata.end_of_file,
+            number_of_links: 1,
+            directory: u8::from(metadata.file_attributes.contains(FileAttributes::DIRECTORY)),
+            ..Self::default()
+        }
+    }
 }
 
 impl<Platform: ShimPlatform> FdEnabledSubsystem for FileObject<Platform> {
@@ -963,103 +1012,96 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
         file_information: MutPtr<Platform, FileBasicInformation>,
     ) -> NtStatus {
+        self.query_path_attributes(object_attributes, file_information)
+    }
+
+    /// Handles `NtQueryFullAttributesFile`, reporting basic attributes plus allocation size
+    /// and end-of-file for the named file without opening it.
+    pub(crate) fn sys_nt_query_full_attributes_file(
+        &self,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        file_information: MutPtr<Platform, FileNetworkOpenInformation>,
+    ) -> NtStatus {
+        self.query_path_attributes(object_attributes, file_information)
+    }
+
+    /// Shared body of the path-based attribute queries: probes `file_information`, resolves the
+    /// named file, and writes `T` built from its metadata. The output is untouched on failure.
+    fn query_path_attributes<T>(
+        &self,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        file_information: MutPtr<Platform, T>,
+    ) -> NtStatus
+    where
+        T: FromBytes + IntoBytes + for<'a> From<&'a FileStatusMetadata>,
+    {
         let Some(object_attributes) = object_attributes else {
             return NtStatus::INVALID_PARAMETER;
         };
-        if let Err(status) =
-            probe_guest_output_preserving_value::<Platform, FileBasicInformation>(file_information)
-        {
+        if let Err(status) = probe_guest_output_preserving_value::<Platform, T>(file_information) {
             return status;
         }
-        let status = match self.query_file_attributes(object_attributes) {
-            Ok(status) => status,
+        let file_status = match self.query_file_status(object_attributes) {
+            Ok(file_status) => file_status,
             Err(status) => return status,
         };
         if !matches!(
-            status.file_type,
+            file_status.file_type,
             FileType::Directory | FileType::RegularFile
         ) {
             // TODO(chardev-attributes): Probe native attributes for character devices and
             // future filesystem node types; regular files are host-grounded as ARCHIVE.
             litebox_util_log::debug!(
-                file_type:? = status.file_type;
+                file_type:? = file_status.file_type;
                 "Using archive attributes for nonstandard filesystem node"
             );
         }
-        // TODO(fs-timestamps): Populate timestamps when FileStatus exposes them.
-        litebox_util_log::debug!("Using zero timestamps for file attributes");
-        let information = FileBasicInformation {
-            file_attributes: FileStatusMetadata::from_status(&status)
-                .file_attributes
-                .bits(),
-            ..FileBasicInformation::default()
-        };
+        let information = T::from(&FileStatusMetadata::from_status(&file_status));
         if file_information.write_at_offset(0, information).is_none() {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
     }
 
-    fn query_file_attributes(
+    /// Resolves `object_attributes` to a filesystem node and returns its status, mapping lookup
+    /// failures to the statuses that native path-based queries report: a missing leaf is
+    /// `OBJECT_NAME_NOT_FOUND`, while a missing or non-directory parent is
+    /// `OBJECT_PATH_NOT_FOUND`.
+    fn query_file_status(
         &self,
         object_attributes: ConstPtr<Platform, ObjectAttributes>,
     ) -> Result<FileStatus, NtStatus> {
         let object_attributes = read_object_attributes::<Platform>(object_attributes)?;
         let path = match self.object_attributes_to_file_target(object_attributes)? {
             FileTarget::Filesystem(path) => path,
-            FileTarget::Condrv(_) | FileTarget::KsecDevice => {
-                litebox_util_log::debug!("File attribute queries do not support device objects");
+            // TODO(condrv-attributes): Model native attributes for ConDrv objects.
+            target @ (FileTarget::Condrv(_) | FileTarget::KsecDevice) => {
+                litebox_util_log::debug!(
+                    target:? = target;
+                    "Path-based file queries do not support device objects"
+                );
                 return Err(NtStatus::OBJECT_NAME_NOT_FOUND);
             }
         };
         match self.fs.path_file_status(&self.fs_context, &path) {
-            Ok(status) => Ok(status),
+            Ok(file_status) => Ok(file_status),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
                 let parent = parent_directory_path(&path);
-                Err(
-                    if self.fs.path_file_status(&self.fs_context, parent).is_ok() {
-                        NtStatus::OBJECT_NAME_NOT_FOUND
-                    } else {
-                        NtStatus::OBJECT_PATH_NOT_FOUND
-                    },
-                )
+                let parent_is_directory = self
+                    .fs
+                    .path_file_status(&self.fs_context, parent)
+                    .is_ok_and(|parent_status| parent_status.file_type == FileType::Directory);
+                Err(if parent_is_directory {
+                    NtStatus::OBJECT_NAME_NOT_FOUND
+                } else {
+                    NtStatus::OBJECT_PATH_NOT_FOUND
+                })
+            }
+            Err(FileStatusError::PathError(PathError::ComponentNotADirectory)) => {
+                Err(NtStatus::OBJECT_PATH_NOT_FOUND)
             }
             Err(error) => Err(map_file_status_error(error)),
         }
-    }
-
-    pub(crate) fn sys_nt_query_full_attributes_file(
-        &self,
-        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
-        file_information: MutPtr<Platform, FileNetworkOpenInformation>,
-    ) -> NtStatus {
-        let Some(object_attributes) = object_attributes else {
-            return NtStatus::INVALID_PARAMETER;
-        };
-        if let Err(status) = probe_guest_output_preserving_value::<
-            Platform,
-            FileNetworkOpenInformation,
-        >(file_information)
-        {
-            return status;
-        }
-        let status = match self.query_file_attributes(object_attributes) {
-            Ok(status) => status,
-            Err(status) => return status,
-        };
-        let metadata = FileStatusMetadata::from_status(&status);
-        // TODO(fs-timestamps): Populate timestamps when FileStatus exposes them.
-        litebox_util_log::debug!("Using zero timestamps for full file attributes");
-        let information = FileNetworkOpenInformation {
-            allocation_size: metadata.allocation_size,
-            end_of_file: metadata.end_of_file,
-            file_attributes: metadata.file_attributes.bits(),
-            ..FileNetworkOpenInformation::default()
-        };
-        if file_information.write_at_offset(0, information).is_none() {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_query_information_by_name(
@@ -1108,41 +1150,12 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         {
             return NtStatus::ACCESS_VIOLATION;
         }
-        let object_attributes = match read_object_attributes::<Platform>(object_attributes) {
-            Ok(object_attributes) => object_attributes,
+        let file_status = match self.query_file_status(object_attributes) {
+            Ok(file_status) => file_status,
             Err(status) => return status,
         };
-        let path = match self.object_attributes_to_file_target(object_attributes) {
-            Ok(FileTarget::Filesystem(path)) => path,
-            Ok(FileTarget::Condrv(_) | FileTarget::KsecDevice) => {
-                return NtStatus::OBJECT_NAME_NOT_FOUND;
-            }
-            Err(status) => return status,
-        };
-        let status = match self.fs.path_file_status(&self.fs_context, &path) {
-            Ok(status) => status,
-            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
-                let parent = parent_directory_path(&path);
-                return if self.fs.path_file_status(&self.fs_context, parent).is_ok() {
-                    NtStatus::OBJECT_NAME_NOT_FOUND
-                } else {
-                    NtStatus::OBJECT_PATH_NOT_FOUND
-                };
-            }
-            Err(error) => return map_file_status_error(error),
-        };
-        let metadata = FileStatusMetadata::from_status(&status);
-        // TODO(fs-timestamps): Populate timestamps when FileStatus exposes them.
-        let information = FileStatBasicInformation {
-            file_id: i64::from_ne_bytes(metadata.file_id.to_ne_bytes()),
-            allocation_size: metadata.allocation_size,
-            end_of_file: metadata.end_of_file,
-            file_attributes: metadata.file_attributes.bits(),
-            number_of_links: 1,
-            device_type: FileDeviceType::Disk as u32,
-            file_id_128: metadata.file_id_128,
-            ..FileStatBasicInformation::default()
-        };
+        let information =
+            FileStatBasicInformation::from(&FileStatusMetadata::from_status(&file_status));
         let output =
             MutPtr::<Platform, FileStatBasicInformation>::from_usize(file_information.as_usize());
         if output.write_at_offset(0, information).is_none()
@@ -1224,14 +1237,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Ok(status) => status,
             Err(status) => return status,
         };
-        let metadata = FileStatusMetadata::from_status(&status);
-        let information = FileStandardInformation {
-            allocation_size: metadata.allocation_size,
-            end_of_file: metadata.end_of_file,
-            number_of_links: 1,
-            directory: u8::from(status.file_type == FileType::Directory),
-            ..FileStandardInformation::default()
-        };
+        let information = FileStandardInformation::from(&FileStatusMetadata::from_status(&status));
         let output =
             MutPtr::<Platform, FileStandardInformation>::from_usize(file_information.as_usize());
         if output.write_at_offset(0, information).is_none()
@@ -3310,8 +3316,7 @@ mod tests {
         assert_eq!(size_of::<FileNetworkOpenInformation>(), 56);
         assert_eq!(offset_of!(FileNetworkOpenInformation, file_attributes), 48);
         for path in ["/tmp/full-attributes.txt", "/tmp/full-attributes-dir"] {
-            let status = task.fs.path_file_status(&task.fs_context, path).unwrap();
-            let metadata = FileStatusMetadata::from_status(&status);
+            let file_status = task.fs.path_file_status(&task.fs_context, path).unwrap();
             let (_path, _name, attributes) = open_object_attributes(path);
             let mut information = FileNetworkOpenInformation::default();
             assert_eq!(
@@ -3323,14 +3328,9 @@ mod tests {
             );
             assert_eq!(
                 information,
-                FileNetworkOpenInformation {
-                    allocation_size: metadata.allocation_size,
-                    end_of_file: metadata.end_of_file,
-                    file_attributes: metadata.file_attributes.bits(),
-                    ..FileNetworkOpenInformation::default()
-                }
+                FileNetworkOpenInformation::from(&FileStatusMetadata::from_status(&file_status))
             );
-            if status.file_type == FileType::RegularFile {
+            if file_status.file_type == FileType::RegularFile {
                 assert_eq!(information.end_of_file, 4);
                 assert!(information.allocation_size >= 4);
                 assert_eq!(information.file_attributes, FileAttributes::ARCHIVE.bits());
@@ -3347,6 +3347,7 @@ mod tests {
     fn nt_query_full_attributes_file_rejects_missing_paths_and_invalid_inputs() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task_with_broker_files(&[]);
+            create_existing_file(&task, "/tmp/full-attributes-parent.txt", b"data");
             let sentinel = FileNetworkOpenInformation {
                 end_of_file: 123,
                 ..FileNetworkOpenInformation::default()
@@ -3359,6 +3360,12 @@ mod tests {
                 ),
                 (
                     "/missing-full-attributes/file",
+                    NtStatus::OBJECT_PATH_NOT_FOUND,
+                ),
+                // Windows host probe: a regular file used as a parent component reports
+                // STATUS_OBJECT_PATH_NOT_FOUND, not STATUS_NOT_A_DIRECTORY.
+                (
+                    "/tmp/full-attributes-parent.txt/child",
                     NtStatus::OBJECT_PATH_NOT_FOUND,
                 ),
                 ("/registry", NtStatus::OBJECT_PATH_NOT_FOUND),
