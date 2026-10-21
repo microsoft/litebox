@@ -86,6 +86,7 @@ pub mod nr {
     pub const OPEN_NOCANCEL: usize = 398;
     pub const CLOSE_NOCANCEL: usize = 399;
     pub const GETENTROPY: usize = 500;
+    pub const GETTIMEOFDAY: usize = 116;
 }
 
 /// Selector of XNU's AArch64 machine-dependent `platform_syscall` trap
@@ -515,6 +516,13 @@ pub enum SyscallRequest {
     Getgid,
     Getegid,
     ThreadSelfid,
+    /// `gettimeofday(tp, tzp, mach_absolute_time)`; libsyscall's
+    /// `__gettimeofday` passes a null third pointer.
+    Gettimeofday {
+        time: UserPtrMut<crate::Timeval>,
+        zone: UserPtrMut<crate::Timezone>,
+        mach_absolute_time: UserPtrMut<u64>,
+    },
     Getentropy {
         buffer: UserPtrMut<u8>,
         count: usize,
@@ -989,6 +997,11 @@ impl SyscallRequest {
                 reason_string: UserPtr::from_usize(args[5]),
             },
             nr::MAP_WITH_LINKING_NP => Self::MapWithLinkingNp,
+            nr::GETTIMEOFDAY => Self::Gettimeofday {
+                time: UserPtrMut::from_usize(args[0]),
+                zone: UserPtrMut::from_usize(args[1]),
+                mach_absolute_time: UserPtrMut::from_usize(args[2]),
+            },
             nr::GETENTROPY => Self::Getentropy {
                 buffer: UserPtrMut::from_usize(args[0]),
                 count: args[1],

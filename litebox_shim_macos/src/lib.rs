@@ -910,6 +910,13 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::ThreadSelfid => {
                 Ok(usize::try_from(self.thread.guest.id).expect("AArch64 thread IDs fit in usize"))
             }
+            SyscallRequest::Gettimeofday {
+                time,
+                zone,
+                mach_absolute_time,
+            } => self
+                .sys_gettimeofday(time, zone, mach_absolute_time)
+                .to_syscall_result(),
             SyscallRequest::Getentropy { buffer, count } => self.sys_getentropy(buffer, count),
             SyscallRequest::MachVmAllocate {
                 target,

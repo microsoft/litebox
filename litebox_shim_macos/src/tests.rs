@@ -1018,6 +1018,79 @@ fn sysctl_mirrors_only_allowlisted_host_nodes_read_only() {
     );
 }
 
+/// `gettimeofday` copies out the wall-clock time (seconds through
+/// `uint32_t`), a zero time zone and the matching `mach_absolute_time` for
+/// each non-null pointer, in that order, and fails with EFAULT at the first
+/// copyout that faults.
+#[test]
+fn gettimeofday_copies_out_like_xnu() {
+    use litebox_common_macos::{MachClock as _, Timeval, Timezone, errno::Errno};
+
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    let gettimeofday = |time: usize, zone: usize, ticks: usize| {
+        let mut ctx = PtRegs::default();
+        ctx.regs[16] = litebox_common_macos::syscall::nr::GETTIMEOFDAY;
+        ctx.regs[..3].copy_from_slice(&[time, zone, ticks]);
+        task.handle_syscall_request(&mut ctx);
+        (ctx.pstate & (1 << 29) != 0, ctx.regs[0])
+    };
+    let mut time = Timeval {
+        seconds: -1,
+        microseconds: -1,
+        pad: 7,
+    };
+    let mut zone = Timezone {
+        minutes_west: -1,
+        dst_time: -1,
+    };
+    let mut ticks = 0u64;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let first = task.global.platform.mach_absolute_time();
+    assert_eq!(
+        gettimeofday(
+            (&raw mut time) as usize,
+            (&raw mut zone) as usize,
+            (&raw mut ticks) as usize
+        ),
+        (false, 0)
+    );
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let got = core::time::Duration::new(
+        u64::try_from(time.seconds).unwrap(),
+        u32::try_from(time.microseconds).unwrap() * 1000,
+    );
+    assert!(before.saturating_sub(core::time::Duration::from_micros(1)) <= got && got <= after);
+    assert!((0..1_000_000).contains(&time.microseconds));
+    // XNU copies out a zero-initialized user64_timeval, padding included.
+    assert_eq!(time.pad, 0);
+    assert_eq!((zone.minutes_west, zone.dst_time), (0, 0));
+    assert!(first <= ticks && ticks <= task.global.platform.mach_absolute_time());
+
+    // libsyscall's __gettimeofday: only the time.
+    assert_eq!(gettimeofday((&raw mut time) as usize, 0, 0), (false, 0));
+    assert_eq!(gettimeofday(0, 0, 0), (false, 0));
+    // The first faulting copyout fails the call; later ones are not made.
+    ticks = 0;
+    assert_eq!(
+        gettimeofday(0x10, 0, (&raw mut ticks) as usize),
+        (true, Errno::EFAULT.raw())
+    );
+    assert_eq!(ticks, 0);
+    assert_eq!(
+        gettimeofday((&raw mut time) as usize, 0x10, (&raw mut ticks) as usize),
+        (true, Errno::EFAULT.raw())
+    );
+    assert_eq!(ticks, 0);
+    assert_eq!(
+        gettimeofday((&raw mut time) as usize, 0, 0x10),
+        (true, Errno::EFAULT.raw())
+    );
+}
+
 #[test]
 fn shared_region_check_handles_sentinel_and_copyout_fault() {
     use litebox_common_macos::{errno::Errno, user_pointers::UserPtrMut};

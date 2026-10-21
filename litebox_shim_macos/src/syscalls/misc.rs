@@ -135,6 +135,49 @@ impl<P: ShimPlatform> Task<P> {
         }
     }
 
+    /// `gettimeofday` (BSD 116), after XNU's `bsd/kern/kern_time.c`: the
+    /// wall-clock time with its seconds cast through `uint32_t` (as the
+    /// arm64 commpage does), the kernel's time zone (`tz`, which nothing on
+    /// macOS sets, so zero), and the `mach_absolute_time` read with the
+    /// time, each copied out if its pointer is not null; the first failing
+    /// copyout ends the call with EFAULT. arm64 libsyscall's stub returns 0
+    /// from x0 and reads nothing else.
+    pub(crate) fn sys_gettimeofday(
+        &self,
+        time: UserPtrMut<litebox_common_macos::Timeval>,
+        zone: UserPtrMut<litebox_common_macos::Timezone>,
+        mach_absolute_time: UserPtrMut<u64>,
+    ) -> Result<(), Errno> {
+        use litebox_platform::time::{SystemTime as _, TimeProvider};
+
+        let platform = self.global.platform;
+        let now = platform.current_time();
+        let ticks = platform.mach_absolute_time();
+        let since_epoch = now
+            .duration_since(&<P as TimeProvider>::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        if time.as_usize() != 0 {
+            let seconds: u32 = litebox::utils::TruncateExt::trunc(since_epoch.as_secs());
+            let timeval = litebox_common_macos::Timeval {
+                seconds: i64::from(seconds),
+                microseconds: i32::try_from(since_epoch.subsec_micros())
+                    .expect("microseconds fit in i32"),
+                pad: 0,
+            };
+            time.write_at_offset::<P>(0, timeval).ok_or(Errno::EFAULT)?;
+        }
+        if zone.as_usize() != 0 {
+            zone.write_at_offset::<P>(0, litebox_common_macos::Timezone::default())
+                .ok_or(Errno::EFAULT)?;
+        }
+        if mach_absolute_time.as_usize() != 0 {
+            mach_absolute_time
+                .write_at_offset::<P>(0, ticks)
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn sys_getentropy(
         &self,
         buffer: UserPtrMut<u8>,

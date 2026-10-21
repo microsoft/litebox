@@ -121,6 +121,24 @@ bitflags::bitflags! {
     }
 }
 
+/// Darwin's 64-bit `struct timeval` (`user64_timeval`): a 64-bit `tv_sec`
+/// and a 32-bit `tv_usec`, padded to 16 bytes.
+#[derive(Clone, Copy, Debug, Default, zerocopy::FromBytes, zerocopy::IntoBytes)]
+#[repr(C)]
+pub struct Timeval {
+    pub seconds: i64,
+    pub microseconds: i32,
+    pub pad: u32,
+}
+
+/// Darwin `struct timezone`.
+#[derive(Clone, Copy, Debug, Default, zerocopy::FromBytes, zerocopy::IntoBytes)]
+#[repr(C)]
+pub struct Timezone {
+    pub minutes_west: i32,
+    pub dst_time: i32,
+}
+
 /// Darwin `struct stat64` (`struct stat` with 64-bit inodes).
 #[derive(Clone, Copy, Debug, Default, zerocopy::FromBytes, zerocopy::IntoBytes)]
 #[repr(C)]
@@ -143,6 +161,14 @@ pub struct Stat64 {
     pub lspare: i32,
     pub qspare: [i64; 2],
 }
+
+// The ABI libSystem reads: `struct timeval` and `struct timezone` from
+// <sys/time.h> for a 64-bit process.
+const _: () = {
+    assert!(size_of::<Timeval>() == 16);
+    assert!(core::mem::offset_of!(Timeval, microseconds) == 8);
+    assert!(size_of::<Timezone>() == 8);
+};
 
 // The ABI dyld and libSystem read: `struct stat64` from <sys/stat.h>.
 const _: () = {
