@@ -2,7 +2,9 @@
 // Licensed under the MIT license.
 
 // std::thread, std::mutex and std::condition_variable for the runner's
-// end-to-end tests: libc++ on the guest's own libpthread.
+// end-to-end tests: libc++ on the guest's own libpthread. A C++ program,
+// kept as .h for the repository's header check; the test compiles it as
+// psynch.cpp.
 
 #include <chrono>
 #include <condition_variable>

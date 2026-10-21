@@ -1392,7 +1392,7 @@ fn threads_use_cpp_std_mutex_and_condition_variable() {
         dir.path(),
         "clang++",
         "psynch.cpp",
-        include_str!("fixtures/psynch.cpp"),
+        include_str!("fixtures/psynch_cxx.h"),
         &["-std=c++17", "-O1"],
     );
     let (code, stdout, stderr) = run_runner_with_timeout(&[binary.to_str().unwrap()]);
