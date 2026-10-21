@@ -989,20 +989,10 @@ fn process_exit_ends_psynch_waits() {
                 })
             })
             .collect();
+        // Each waiter registered its interrupt (`start_thread`) before it
+        // blocked.
         for address in addresses {
             await_waiters(&task, address, 1);
-        }
-        while task
-            .process
-            .0
-            .threads
-            .lock()
-            .values()
-            .filter(|thread| thread.interrupt.lock().is_some())
-            .count()
-            < 3
-        {
-            std::thread::yield_now();
         }
         assert_eq!(bsd(&task, nr::EXIT, &[7]), Ok(0));
         for handle in handles {

@@ -753,9 +753,19 @@ impl<P: ShimPlatform> PsynchTable<P> {
         let kwq = self.queues.remove(&key).expect("a queue to discard");
         self.fakes.0 -= kwq.fakecount as usize;
         if let PsynchKey::Shared { address, .. } = key
-            && !self.queues.keys().any(|other| {
-                matches!(other, PsynchKey::Shared { address: other, .. } if *other == address)
-            })
+            && self
+                .queues
+                .range(
+                    PsynchKey::Shared {
+                        address,
+                        generation: 0,
+                    }..=PsynchKey::Shared {
+                        address,
+                        generation: u64::MAX,
+                    },
+                )
+                .next()
+                .is_none()
         {
             // No queue remains at the address, so generation 0 can name the
             // next object there.
