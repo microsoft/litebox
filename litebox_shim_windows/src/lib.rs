@@ -1830,17 +1830,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => {
                 self.sys_nt_open_key_ex(key_handle, desired_access, object_attributes, open_options)
             }
-            SyscallRequest::NtSetInformationKey {
-                key_handle,
-                key_set_information_class,
-                key_set_information,
-                key_set_information_length,
-            } => self.sys_nt_set_information_key(
-                key_handle,
-                key_set_information_class,
-                key_set_information,
-                key_set_information_length,
-            ),
             SyscallRequest::NtQueryKey {
                 key_handle,
                 key_information_class,
@@ -1853,6 +1842,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 key_information,
                 length,
                 result_length,
+            ),
+            SyscallRequest::NtSetInformationKey {
+                key_handle,
+                key_set_information_class,
+                key_set_information,
+                key_set_information_length,
+            } => self.sys_nt_set_information_key(
+                key_handle,
+                key_set_information_class,
+                key_set_information,
+                key_set_information_length,
             ),
             SyscallRequest::NtEnumerateKey {
                 key_handle,
