@@ -1020,9 +1020,9 @@ fn sysctl_mirrors_only_allowlisted_host_nodes_read_only() {
 }
 
 /// `gettimeofday` copies out the wall-clock time (seconds through
-/// `uint32_t`), a zero time zone and the matching `mach_absolute_time` for
-/// each non-null pointer, in that order, and fails with EFAULT at the first
-/// copyout that faults.
+/// `uint32_t`), a zero time zone and the `mach_absolute_time` the time was
+/// derived from, for each non-null pointer in that order, and fails with
+/// EFAULT at the first copyout that faults.
 #[test]
 fn gettimeofday_copies_out_like_xnu() {
     use litebox_common_macos::{MachClock as _, Timeval, Timezone, errno::Errno};
@@ -1070,6 +1070,17 @@ fn gettimeofday_copies_out_like_xnu() {
     assert_eq!(time.pad, 0);
     assert_eq!((zone.minutes_west, zone.dst_time), (0, 0));
     assert!(first <= ticks && ticks <= task.global.platform.mach_absolute_time());
+    // The pair is one reading: the time less the ticks (as nanoseconds) is
+    // the host's calendar offset, up to the microsecond truncation.
+    let timebase = task.global.platform.mach_timebase_info();
+    let offset = |ticks: u64, time: core::time::Duration| {
+        let nanoseconds =
+            u128::from(ticks) * u128::from(timebase.numer) / u128::from(timebase.denom);
+        i128::try_from(time.as_nanos()).unwrap() - i128::try_from(nanoseconds).unwrap()
+    };
+    let (host_ticks, host_time) = task.global.platform.mach_get_times();
+    let skew = offset(ticks, got) - offset(host_ticks, host_time);
+    assert!(skew.abs() <= 2_000, "time and ticks are {skew} ns apart");
 
     // libsyscall's __gettimeofday: only the time.
     assert_eq!(gettimeofday((&raw mut time) as usize, 0, 0), (false, 0));

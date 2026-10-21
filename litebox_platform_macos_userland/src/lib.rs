@@ -173,6 +173,25 @@ impl<const PAGE_SIZE: usize> MachClock for MacosUserlandWithPageSize<PAGE_SIZE> 
         // SAFETY: the deadline is a scalar in mach_absolute_time's clock domain.
         unsafe { mach_wait_until(deadline) }
     }
+
+    fn mach_get_times(&self) -> (u64, Duration) {
+        let mut absolute = 0u64;
+        let mut t = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `absolute` and `t` are writable output storage; a null
+        // continuous-time pointer is allowed.
+        let result =
+            unsafe { mach_get_times(&raw mut absolute, core::ptr::null_mut(), &raw mut t) };
+        assert_eq!(result, KernReturn::SUCCESS, "mach_get_times failed");
+        #[expect(clippy::useless_conversion)]
+        let since_epoch = Duration::new(
+            t.tv_sec.reinterpret_as_unsigned().into(),
+            t.tv_nsec.reinterpret_as_unsigned().trunc(),
+        );
+        (absolute, since_epoch)
+    }
 }
 
 impl<const PAGE_SIZE: usize> TimeProvider for MacosUserlandWithPageSize<PAGE_SIZE> {
@@ -611,6 +630,11 @@ unsafe extern "C" {
     fn mach_absolute_time() -> u64;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> KernReturn;
     fn mach_wait_until(deadline: u64) -> KernReturn;
+    fn mach_get_times(
+        absolute_time: *mut u64,
+        continuous_time: *mut u64,
+        time: *mut libc::timespec,
+    ) -> KernReturn;
     fn mach_task_self() -> u32;
     fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: MachVmFlags) -> KernReturn;
     #[cfg(test)]

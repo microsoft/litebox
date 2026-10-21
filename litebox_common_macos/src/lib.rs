@@ -71,6 +71,10 @@ pub trait MachClock {
     fn mach_absolute_time(&self) -> u64;
     fn mach_timebase_info(&self) -> syscall::MachTimebaseInfo;
     fn mach_wait_until(&self, deadline: u64) -> KernReturn;
+    /// The `mach_absolute_time` and the calendar time since the Unix epoch
+    /// derived from that same reading (`mach_get_times`), as XNU's
+    /// `clock_gettimeofday_and_absolute_time` pairs them.
+    fn mach_get_times(&self) -> (u64, core::time::Duration);
 }
 
 impl From<KernReturn> for litebox::platform::page_mgmt::AllocationError {
