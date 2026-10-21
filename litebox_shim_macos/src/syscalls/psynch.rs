@@ -509,71 +509,97 @@ impl<P: ShimPlatform> Kwq<P> {
         fakes.put();
     }
 
-    /// Drop the fake entries no later call can tell apart from the ones
-    /// kept. A fake entry acts only through being at or above a sequence: a
-    /// cvwait at `c` consumes or converts the first one at or above `c`, a
-    /// signal up to `u` merges into or is subsumed by the first one at or
-    /// above `u`, and a broadcast or clear removes every one up to its own.
-    /// Each is at or below L, and blocked threads queue above them all. A
-    /// later cvwait at or below one is a return S does not count yet that is
-    /// not queued (`outstanding`); each removes at most one sequence, and a
-    /// conversion leaves a broadcast entry that no cvwait removes. So with
-    /// the highest `outstanding + 1` sequences kept, an entry stays above
-    /// every dropped one after all those returns, and every later call meets
-    /// what it would have met; a broadcast entry does the same for the run
-    /// of fake entries below it. Blocked threads interleaved with fake
-    /// entries (a canceled one, or a guest's own sequences) end the run that
-    /// is dropped.
+    /// Drop the fake entries no later call can tell apart from the ones kept.
+    ///
+    /// Every call walks the write queue from the front: a cvwait at `c`
+    /// consumes or converts the first fake entry at or above `c` (or blocks
+    /// at a blocked thread there), a signal up to `u` merges into or is
+    /// subsumed by the first one at or above `u`, and a broadcast or clear
+    /// removes entries up to its sequence until the first above it. The queue
+    /// is in sequence order except where `insert` appends a prepost beside a
+    /// canceled waiter at `firstnum`, which can put a lower fake entry after
+    /// higher ones. So only a segment of fake entries in sequence order, each
+    /// above every entry before the segment, is compacted: a call at or below
+    /// an entry before the segment stops by that entry, one above the segment
+    /// passes it, and one in between meets the segment as it would a sorted
+    /// queue. Each fake entry is at or below L. A cvwait at or below one is a
+    /// return S does not count yet that is not queued (`outstanding`, which
+    /// only over-counts). With the highest `outstanding + 1` sequences of a
+    /// segment kept, a cvwait that would meet a dropped entry meets the
+    /// lowest kept one instead and returns the same; it removes at most one
+    /// kept sequence (a conversion removes its segment's entries up to the
+    /// one it met), so a kept entry remains above the dropped ones after
+    /// every outstanding return. A signal up to a dropped sequence is
+    /// absorbed by a kept entry as it would have been by the dropped one,
+    /// waking no one; with a thread blocked before the fake entries (behind
+    /// a canceled one above it) it would wake that thread instead, so such
+    /// a queue keeps all of them. A broadcast entry covers the entries of
+    /// its segment below it the same way.
     fn compact_fakes(&mut self, fakes: &mut Fakes) {
         if self.kind != Some(Kind::Cvar) || self.fakecount == 0 {
             return;
         }
-        let pending = diff_genseq(self.lword, self.sword) >> PTHRW_COUNT_SHIFT;
-        let queued = self
-            .write
-            .entries
+        let entries = &self.write.entries;
+        let Some(last_fake) = entries
             .iter()
-            .filter(|kwe| kwe.state == KweState::InWait)
-            .count();
+            .rposition(|kwe| kwe.state != KweState::InWait)
+        else {
+            return;
+        };
+        if entries
+            .range(..last_fake)
+            .any(|kwe| kwe.state == KweState::InWait)
+        {
+            return;
+        }
+        let pending = diff_genseq(self.lword, self.sword) >> PTHRW_COUNT_SHIFT;
+        let queued = entries.len() - (last_fake + 1);
         let outstanding = usize::try_from(pending)
             .unwrap_or(usize::MAX)
             .saturating_sub(queued);
-        let mut kept = 0usize;
-        let mut last = None;
-        let mut covered = false;
-        let mut seen_fake = false;
-        let mut end = 0;
-        for (index, kwe) in self.write.entries.iter().enumerate().rev() {
-            if kwe.state == KweState::InWait {
-                if seen_fake {
+        let mut dropped_runs = Vec::new();
+        let mut highest_before: Option<u32> = None;
+        let mut index = 0;
+        while index <= last_fake {
+            if highest_before.is_some_and(|highest| !is_seqhigher(entries[index].lockseq, highest))
+            {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            index += 1;
+            while index <= last_fake
+                && is_seqhigher_eq(entries[index].lockseq, entries[index - 1].lockseq)
+            {
+                index += 1;
+            }
+            highest_before = Some(entries[index - 1].lockseq);
+            // Keep the segment's highest `outstanding + 1` sequences, or down
+            // to a broadcast entry; entries at a kept sequence stay together.
+            let mut kept = 0usize;
+            let mut last = None;
+            let mut covered = false;
+            for below in (start..index).rev() {
+                let kwe = &entries[below];
+                if last == Some(kwe.lockseq) {
+                    continue;
+                }
+                if covered {
+                    dropped_runs.push(start..below + 1);
                     break;
                 }
-                continue;
+                last = Some(kwe.lockseq);
+                kept += 1;
+                covered = kwe.state == KweState::Broadcast || kept > outstanding;
             }
-            seen_fake = true;
-            if last == Some(kwe.lockseq) {
-                continue;
-            }
-            if covered {
-                end = index + 1;
-                break;
-            }
-            last = Some(kwe.lockseq);
-            kept += 1;
-            covered = kwe.state == KweState::Broadcast || kept > outstanding;
         }
-        if end == 0 {
+        let mut dropped = 0;
+        for run in dropped_runs.into_iter().rev() {
+            dropped += self.write.entries.drain(run).count();
+        }
+        if dropped == 0 {
             return;
         }
-        // The dropped run starts at the first fake entry below the kept ones
-        // and goes down to the next blocked thread or the queue's front.
-        let start = self
-            .write
-            .entries
-            .range(..end)
-            .rposition(|kwe| kwe.state == KweState::InWait)
-            .map_or(0, |index| index + 1);
-        let dropped = self.write.entries.drain(start..end).count();
         if let Some(first) = self.write.entries.front() {
             self.write.firstnum = first.lockseq;
         }

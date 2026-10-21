@@ -32,8 +32,8 @@ pub(super) const KBIT: u32 = 0x01;
 pub(super) const EBIT: u32 = 0x02;
 const WBIT: u32 = 0x04;
 const MBIT: u32 = 0x40;
-const CV_CBIT: u32 = 0x01;
-const CV_PBIT: u32 = 0x02;
+pub(super) const CV_CBIT: u32 = 0x01;
+pub(super) const CV_PBIT: u32 = 0x02;
 /// Mutex options: first-fit and fair-share policies, process-shared, and
 /// the mutex bit cvclrprepost reads.
 pub(super) const FIRSTFIT: u32 = 0x080;
@@ -253,6 +253,43 @@ pub(super) fn await_waiters(task: &Task<Platform>, address: usize, count: usize)
 /// The calling thread's own port name.
 fn own_port(task: &Task<Platform>) -> usize {
     trap(task, mach_trap::THREAD_SELF, &[])
+}
+
+/// Preposts a filler condition variable holds; a signal walks them all.
+const FILLER_ENTRIES: u32 = 1024;
+
+/// Fill the fake-entry budget up to `limit` with preposts on condition
+/// variables at `base`, `base + 8`, ..., whose L - S equals their entries,
+/// so compaction keeps them all. Returns each one's L.
+pub(super) fn fill_fake_budget(task: &Task<Platform>, base: usize, limit: usize) -> Vec<u32> {
+    let mut lwords: Vec<u32> = Vec::new();
+    while task.global.psynch.lock().fake_count() < limit {
+        if lwords.last().is_none_or(|&l| l == FILLER_ENTRIES * INC) {
+            lwords.push(0);
+        }
+        let index = lwords.len() - 1;
+        lwords[index] += INC;
+        let l = lwords[index];
+        assert_eq!(
+            cvsignal(task, base + 8 * index, l, 0, l - INC, 0, 0),
+            Ok(CV_PBIT as usize)
+        );
+    }
+    lwords
+}
+
+/// Clear [`fill_fake_budget`]'s condition variables (`pthread_cond_destroy`).
+pub(super) fn clear_fillers(task: &Task<Platform>, base: usize, lwords: &[u32]) {
+    for (index, &l) in lwords.iter().enumerate() {
+        assert_eq!(
+            bsd(
+                task,
+                nr::PSYNCH_CVCLRPREPOST,
+                &[base + 8 * index, l as usize, 0, 0, 0, l as usize, 0]
+            ),
+            Ok(0)
+        );
+    }
 }
 
 #[test]

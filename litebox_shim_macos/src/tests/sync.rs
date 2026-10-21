@@ -8,11 +8,12 @@
 
 use super::mach::{bsd, kr, mig_call, ndr, new_task, trap, word};
 use super::psynch::{
-    EBIT, FIRSTFIT, INC, KBIT, Watchdog, await_waiters as await_psynch_waiters, cvbroad, cvsignal,
-    cvwait, mutexdrop, mutexwait,
+    CV_CBIT, CV_PBIT, EBIT, FIRSTFIT, INC, KBIT, Watchdog, await_waiters as await_psynch_waiters,
+    clear_fillers, cvbroad, cvsignal, cvwait, fill_fake_budget, mutexdrop, mutexwait,
 };
 use super::*;
 use crate::syscalls::cancel::ut;
+use crate::syscalls::psynch::PSYNCH_MAX_FAKES;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 use litebox::utils::TruncateExt as _;
@@ -976,6 +977,165 @@ fn psynch_signals_pass_canceled_waiters_by() {
             Errno::EINTR.raw()
         );
     });
+}
+
+/// On `cv`, waiters at L=1 and L=2 block and are canceled but have not
+/// withdrawn yet, and the signals libpthread reserved U for them are delayed
+/// before their kernel calls. Waiters at L=3 and L=4 took their tickets but
+/// are withheld. Signals at L=3 and L=4, and `before` timed waits at L=5..
+/// that time out, each followed by its signal, pass the canceled waiters by
+/// and prepost. The delayed signals then prepost beside the canceled waiter
+/// at `firstnum`, after the higher preposts, and each canceled waiter
+/// withdraws. `after` more timed waits and signals prepost behind those:
+/// the queue holds 3, 4, .., 4 + before, 1, 2, 5 + before, .., 4 + before +
+/// after in that order, with L - S = 2.
+fn prepost_behind_canceled_waiters(task: &Task<Platform>, cv: usize, before: u32, after: u32) {
+    let timed_round = |round: u32, s: u32, signaled: u32| {
+        let l = (4 + round) * INC;
+        assert_eq!(
+            cvwait(task, cv, l, s * INC, s * INC, 0, 0, 1).map_err(|error| error & 0xff),
+            Err(Errno::ETIMEDOUT.raw())
+        );
+        assert_eq!(
+            cvsignal(task, cv, l, (s + 1) * INC, l - INC, 0, 0),
+            Ok(signaled as usize)
+        );
+    };
+    std::thread::scope(|scope| {
+        let canceled: Vec<_> = (1..=2u32)
+            .map(|l| {
+                let waiter = task.new_sibling(0);
+                let guest = Arc::clone(&waiter.thread.guest);
+                let handle = scope.spawn(move || {
+                    <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                        waiter.start_thread();
+                        cvwait(&waiter, cv, l * INC, 0, 0, 0, BOUND_SECONDS, 0)
+                    })
+                });
+                (guest, handle)
+            })
+            .collect();
+        await_psynch_waiters(task, cv, 2);
+        for (guest, _) in &canceled {
+            await_interruptible(guest);
+            guest.flags.fetch_or(ut::CANCEL, Ordering::AcqRel);
+        }
+        assert_eq!(cvsignal(task, cv, 3 * INC, 0, 2 * INC, 0, 0), Ok(0));
+        assert_eq!(cvsignal(task, cv, 4 * INC, 0, 3 * INC, 0, 0), Ok(0));
+        for round in 1..=before {
+            timed_round(round, round - 1, 0);
+        }
+        for (l, (guest, handle)) in (1..).zip(canceled) {
+            assert_eq!(cvsignal(task, cv, l * INC, 0, (l - 1) * INC, 0, 0), Ok(0));
+            guest.abort_safely();
+            assert_eq!(
+                handle.join().unwrap().unwrap_err() & 0xff,
+                Errno::EINTR.raw()
+            );
+        }
+    });
+    for round in before + 1..=before + after {
+        timed_round(round, round + 1, CV_PBIT);
+    }
+}
+
+/// Preposts that passed canceled waiters by can queue after higher ones.
+/// With the budget full, compaction keeps every prepost a withheld waiter
+/// can still take there, and still drops the ones no call can reach from
+/// runs in sequence order before and after them; each withheld waiter then
+/// takes its signal. A thread blocked below preposts (behind a canceled
+/// waiter at a higher sequence) keeps all of them: a late signal up to the
+/// lowest still merges into it instead of waking that thread.
+#[test]
+fn psynch_compaction_keeps_preposts_queued_out_of_order() {
+    const BEFORE: u32 = 8;
+    const AFTER: u32 = 8;
+    const BLOCKED_ROUNDS: u32 = 4;
+    let task = new_task();
+    let _watchdog = Watchdog::new(&task);
+    let (cv, longer, blocked) = (0x9_0000, 0x9_1000, 0x9_2000);
+    prepost_behind_canceled_waiters(&task, cv, 0, 0);
+    prepost_behind_canceled_waiters(&task, longer, BEFORE, AFTER);
+    let fakes = || task.global.psynch.lock().fake_count();
+    std::thread::scope(|scope| {
+        // `blocked`: tickets up to 3 returned; a canceled waiter at 5 stays
+        // queued while timed waits at 6.. time out and their signals prepost
+        // past it; then a waiter at 4 blocks at the canceled one.
+        let canceled = task.new_sibling(0);
+        let canceled_guest = Arc::clone(&canceled.thread.guest);
+        let canceled = scope.spawn(move || {
+            <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                canceled.start_thread();
+                cvwait(&canceled, blocked, 5 * INC, 3 * INC, 0, 0, BOUND_SECONDS, 0)
+            })
+        });
+        await_psynch_waiters(&task, blocked, 1);
+        await_interruptible(&canceled_guest);
+        canceled_guest.flags.fetch_or(ut::CANCEL, Ordering::AcqRel);
+        for round in 1..=BLOCKED_ROUNDS {
+            let (l, s) = ((5 + round) * INC, (2 + round) * INC);
+            assert_eq!(
+                cvwait(&task, blocked, l, s, s, 0, 0, 1).map_err(|error| error & 0xff),
+                Err(Errno::ETIMEDOUT.raw())
+            );
+            assert_eq!(cvsignal(&task, blocked, l, s + INC, l - INC, 0, 0), Ok(0));
+        }
+        let waiter = spawn_sibling(scope, &task, move |waiter| {
+            cvwait(waiter, blocked, 4 * INC, 3 * INC, 0, 0, BOUND_SECONDS, 0)
+        });
+        // The queue's entries: the two threads and the preposts.
+        let queued = 2 + BLOCKED_ROUNDS as usize;
+        await_psynch_waiters(&task, blocked, queued);
+
+        let held = 4 + 4 + (BEFORE + AFTER + BLOCKED_ROUNDS) as usize;
+        assert_eq!(fakes(), held);
+        let fillers = 0x20_0000;
+        let mut lwords = fill_fake_budget(&task, fillers, PSYNCH_MAX_FAKES);
+        let last = fillers + 8 * (lwords.len() - 1);
+        let l = lwords.last_mut().unwrap();
+        *l += INC;
+        // Of `longer`'s runs 3..=4+BEFORE and 5+BEFORE..=4+BEFORE+AFTER the
+        // two withheld waiters can reach only into each one's highest three;
+        // the rest go. Nothing goes from `cv` or `blocked`.
+        assert_eq!(
+            cvsignal(&task, last, *l, 0, *l - INC, 0, 0),
+            Ok(CV_PBIT as usize)
+        );
+        let dropped = (BEFORE as usize - 1) + (AFTER as usize - 3);
+        assert_eq!(fakes(), PSYNCH_MAX_FAKES - dropped + 1);
+        clear_fillers(&task, fillers, &lwords);
+        assert_eq!(fakes(), held - dropped);
+
+        // A late signal up to 6 merges into the prepost there.
+        assert_eq!(
+            cvsignal(&task, blocked, 6 * INC, 3 * INC, 5 * INC, 0, 0),
+            Ok(0)
+        );
+        assert_eq!(task.global.psynch.lock().waiters(blocked), queued);
+        canceled_guest.abort_safely();
+        assert_eq!(
+            canceled.join().unwrap().unwrap_err() & 0xff,
+            Errno::EINTR.raw()
+        );
+        let l = (5 + BLOCKED_ROUNDS) * INC;
+        assert_eq!(
+            cvbroad(&task, blocked, l, l - INC, l - INC, 1, 0),
+            Ok((INC | CV_CBIT) as usize)
+        );
+        assert_eq!(waiter.join().unwrap(), Ok(0));
+    });
+    for cv in [cv, longer] {
+        assert_eq!(
+            cvwait(&task, cv, 4 * INC, 0, 0, 0, 0, 1_000_000),
+            Ok((INC | CV_PBIT) as usize)
+        );
+        assert_eq!(
+            cvwait(&task, cv, 3 * INC, 0, 0, 0, 0, 1_000_000),
+            Ok((INC | CV_CBIT) as usize)
+        );
+    }
+    assert_eq!(fakes(), 0);
+    assert_eq!(task.global.psynch.lock().queue_count(), 0);
 }
 
 /// `clock_get_time` on the system (uptime) and calendar clocks.
