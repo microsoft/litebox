@@ -166,6 +166,8 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 main_stack_top: AtomicUsize::new(0),
                 pthread_registration: Mutex::new(None),
                 ulocks: Mutex::new(syscalls::ulock::UlockTable::default()),
+                #[cfg(all(test, target_os = "macos"))]
+                mapping_hook: syscalls::mm::hook::Slot::default(),
             }),
             files: self.files,
         }
@@ -343,6 +345,9 @@ struct GlobalState<P: ShimPlatform> {
     /// `bsdthread_register` state; set once per process.
     pthread_registration: Mutex<P, Option<syscalls::thread::PthreadRegistration>>,
     ulocks: Mutex<P, syscalls::ulock::UlockTable<P>>,
+    /// Pauses mapping changes, which belong to no image, in tests.
+    #[cfg(all(test, target_os = "macos"))]
+    mapping_hook: syscalls::mm::hook::Slot,
 }
 
 /// `thread_tid`: a system-wide unique 64-bit thread ID.

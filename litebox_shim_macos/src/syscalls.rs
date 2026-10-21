@@ -121,8 +121,8 @@ impl<P: ShimPlatform> Task<P> {
         KernReturn::SUCCESS
     }
 
-    /// `mach_wait_until`: an abortable sleep (`clock_sleep_internal`) that
-    /// process exit ends with `KERN_ABORTED`.
+    /// `mach_wait_until_trap` (`osfmk/kern/clock.c`): an abortable sleep
+    /// that process exit ends with `KERN_ABORTED`.
     pub(crate) fn sys_mach_wait_until(&self, deadline: u64) -> KernReturn {
         match self
             .wait_cx()

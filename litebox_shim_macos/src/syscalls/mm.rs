@@ -21,6 +21,7 @@ use litebox::{
         RawConstPointer as _, RawMutPointer as _,
         page_mgmt::{AllocationDirection, MemoryRegionPermissions as Permissions},
     },
+    sync::MutexGuard,
     utils::TruncateExt as _,
 };
 use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, VmFlags, VmemProtectError};
@@ -31,6 +32,7 @@ use litebox_syscall_rewriter::{macho::CodeMetadata, macho::Rewriter};
 use litebox_trampoline::trampoline_allocation_range;
 
 use crate::syscalls::file::{FileFd, FileSubsystem};
+use crate::syscalls::ulock::UlockTable;
 use crate::{ShimPlatform, Task};
 
 /// File provenance and rewrite state retained for a live guest mapping.
@@ -67,13 +69,67 @@ impl MachoMapping {
     }
 }
 
+/// Pauses a rewrite of one image, or a mapping change, at a point, on the
+/// host thread that set the hook.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod hook {
+    extern crate std;
+
+    use alloc::boxed::Box;
+    use std::sync::Mutex;
+    use std::thread::{self, ThreadId};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// An executable file mapping took its trampoline checkpoint.
+        Checkpointed,
+        /// An append made an existing trampoline's unpublished pages RW.
+        GatePagesWritable,
+        /// A mapping change replaced or removed mappings and has not retired
+        /// their shared ulock objects yet.
+        MappingsChanged,
+    }
+
+    type Hook = Box<dyn FnMut(Point) + Send>;
+
+    #[derive(Default)]
+    pub(crate) struct Slot(Mutex<Option<(ThreadId, Hook)>>);
+
+    impl Slot {
+        pub(crate) fn set(&self, hook: impl FnMut(Point) + Send + 'static) {
+            *self.0.lock().unwrap() = Some((thread::current().id(), Box::new(hook)));
+        }
+
+        pub(crate) fn clear(&self) {
+            *self.0.lock().unwrap() = None;
+        }
+
+        pub(crate) fn reach(&self, point: Point) {
+            let mut slot = self.0.lock().unwrap();
+            let Some((owner, mut hook)) = slot.take() else {
+                return;
+            };
+            if owner != thread::current().id() {
+                *slot = Some((owner, hook));
+                return;
+            }
+            drop(slot);
+            hook(point);
+            let mut slot = self.0.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some((owner, hook));
+            }
+        }
+    }
+}
+
 struct MachoPatchInfo {
     metadata: CodeMetadata,
     slice_range: Range<usize>,
     trampoline_capacity: usize,
     rewrite_id: Arc<()>,
     #[cfg(all(test, target_os = "macos"))]
-    hook: tests::hook::Slot,
+    hook: hook::Slot,
 }
 
 impl MachoPatchInfo {
@@ -295,6 +351,29 @@ fn forget_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usi
 }
 
 impl<P: ShimPlatform> Task<P> {
+    /// A mapping change that held `ulocks` since before it touched the
+    /// address space replaced or removed the mappings in `range` if
+    /// `changed`: retire their shared ulock objects before `ulocks` is
+    /// released, so a wait or wake that starts after the change keys the new
+    /// mapping and no later retirement can strand it. `ulocks` nests inside
+    /// `macho_mappings` and outside trampoline and page-manager state.
+    #[cfg_attr(
+        not(all(test, target_os = "macos")),
+        expect(clippy::unused_self, reason = "only the test hook reads the task")
+    )]
+    fn retire_ulock_objects(
+        &self,
+        mut ulocks: MutexGuard<'_, P, UlockTable<P>>,
+        range: Range<usize>,
+        changed: bool,
+    ) {
+        if changed {
+            #[cfg(all(test, target_os = "macos"))]
+            self.global.mapping_hook.reach(hook::Point::MappingsChanged);
+            ulocks.retire_objects(range);
+        }
+    }
+
     fn mapping_snapshot(&self, target: Range<usize>) -> Vec<(Range<usize>, VmFlags)> {
         self.global
             .mm
@@ -362,9 +441,11 @@ impl<P: ShimPlatform> Task<P> {
             flags.set(CreatePagesFlags::NOREPLACE, !replace);
         }
         let range = address..address.saturating_add(length.as_usize());
+        let replace = placement == (AnonymousPlacement::Fixed { replace: true });
+        let ulocks = replace.then(|| self.global.ulocks.lock());
         // SAFETY: a replacing fixed mapping has Mach's VM_FLAGS_OVERWRITE
         // semantics; otherwise nothing existing is replaced.
-        let pointer = unsafe {
+        let result = unsafe {
             self.global.mm.create_pages_with_permissions(
                 NonZeroAddress::new(address),
                 length,
@@ -373,8 +454,12 @@ impl<P: ShimPlatform> Task<P> {
                 None,
                 |_| Ok(0),
             )
-        }?;
-        if placement == (AnonymousPlacement::Fixed { replace: true }) {
+        };
+        if let Some(ulocks) = ulocks {
+            self.retire_ulock_objects(ulocks, range.clone(), result.is_ok());
+        }
+        let pointer = result?;
+        if replace {
             self.mappings_replaced(range, None);
         }
         Ok(pointer.as_usize())
@@ -425,6 +510,9 @@ impl<P: ShimPlatform> Task<P> {
             .contains(MmapFlags::FIXED)
             .then(|| self.mapping_snapshot(fixed_range.clone()));
         if flags.contains(MmapFlags::ANONYMOUS) {
+            let ulocks = flags
+                .contains(MmapFlags::FIXED)
+                .then(|| self.global.ulocks.lock());
             // SAFETY: MAP_FIXED has Darwin's replacement semantics; otherwise
             // PageManager treats `suggested` only as an allocation hint.
             let result = unsafe {
@@ -441,8 +529,11 @@ impl<P: ShimPlatform> Task<P> {
                 || fixed_snapshot
                     .as_ref()
                     .is_some_and(|before| *before != self.mapping_snapshot(fixed_range.clone()));
-            if flags.contains(MmapFlags::FIXED) && replaced {
-                self.mappings_replaced(fixed_range.clone(), None);
+            if let Some(ulocks) = ulocks {
+                self.retire_ulock_objects(ulocks, fixed_range.clone(), replaced);
+                if replaced {
+                    self.mappings_replaced(fixed_range.clone(), None);
+                }
             }
             return result
                 .map(|pointer| pointer.as_usize())
@@ -464,18 +555,21 @@ impl<P: ShimPlatform> Task<P> {
             Vec::new()
         };
         let final_permissions = permissions(protection);
-        // Serializes this mapping's checkpoint, rewrite and publication or
-        // rollback with every other rewrite, so a rollback never reclaims or
-        // rewinds over gates another mapping published.
-        let mut macho_mappings = self.global.macho_mappings.lock();
-        let trampoline_checkpoint = macho
-            .as_ref()
-            .filter(|_| executable)
-            .map(|patch_info| self.macho_trampoline_checkpoint(patch_info));
+        let rewritten = macho.as_ref().filter(|_| executable);
+        // Serializes a rewritten mapping's checkpoint, rewrite and
+        // publication or rollback with every other rewrite, so a rollback
+        // never reclaims or rewinds over gates another mapping published.
+        // Other mappings take it only to update tracking afterwards.
+        let mut macho_mappings = rewritten.map(|_| self.global.macho_mappings.lock());
+        let trampoline_checkpoint =
+            rewritten.map(|patch_info| self.macho_trampoline_checkpoint(patch_info));
         #[cfg(all(test, target_os = "macos"))]
-        if let Some(patch_info) = macho.as_ref().filter(|_| executable) {
-            patch_info.hook.reach(tests::hook::Point::Checkpointed);
+        if let Some(patch_info) = rewritten {
+            patch_info.hook.reach(hook::Point::Checkpointed);
         }
+        let ulocks = flags
+            .contains(MmapFlags::FIXED)
+            .then(|| self.global.ulocks.lock());
         let mut file_offset = offset;
         let mut buffer = [0; PAGE_SIZE];
         let mut initialization_error = None;
@@ -509,7 +603,7 @@ impl<P: ShimPlatform> Task<P> {
                             .checked_add(read)
                             .expect("validated mapping offset and length cannot overflow");
                     }
-                    if let Some(info) = macho.as_ref().filter(|_| executable) {
+                    if let Some(info) = rewritten {
                         self.rewrite_macho_mapping(
                             pointer,
                             length.as_usize(),
@@ -522,19 +616,23 @@ impl<P: ShimPlatform> Task<P> {
                 },
             )
         };
+        let replaced = result.is_ok()
+            || fixed_snapshot
+                .as_ref()
+                .is_some_and(|before| *before != self.mapping_snapshot(fixed_range.clone()));
+        if let Some(ulocks) = ulocks {
+            self.retire_ulock_objects(ulocks, fixed_range.clone(), replaced);
+        }
         let pointer = match result {
             Ok(pointer) => pointer,
             Err(error) => {
-                if let (Some(patch_info), Some(checkpoint)) =
-                    (macho.as_ref(), trampoline_checkpoint)
-                {
+                if let (Some(patch_info), Some(checkpoint)) = (rewritten, trampoline_checkpoint) {
                     self.rollback_macho_trampoline(patch_info, checkpoint);
                 }
-                let replaced = fixed_snapshot
-                    .as_ref()
-                    .is_some_and(|before| *before != self.mapping_snapshot(fixed_range.clone()));
                 if flags.contains(MmapFlags::FIXED) && replaced {
-                    self.mappings_replaced_locked(&mut macho_mappings, fixed_range.clone(), None);
+                    let mappings =
+                        macho_mappings.get_or_insert_with(|| self.global.macho_mappings.lock());
+                    self.replace_macho_mappings(mappings, fixed_range.clone(), None);
                 }
                 return Err(
                     initialization_error.map_or_else(|| mapping_error(error), mmap_read_error)
@@ -556,11 +654,8 @@ impl<P: ShimPlatform> Task<P> {
             }
         });
         if flags.contains(MmapFlags::FIXED) || mapping.is_some() {
-            self.mappings_replaced_locked(
-                &mut macho_mappings,
-                address..address + length.as_usize(),
-                mapping,
-            );
+            let mappings = macho_mappings.get_or_insert_with(|| self.global.macho_mappings.lock());
+            self.replace_macho_mappings(mappings, address..address + length.as_usize(), mapping);
         }
         Ok(address)
     }
@@ -815,7 +910,7 @@ impl<P: ShimPlatform> Task<P> {
             }
             .map_err(MappingError::ProtectError)?;
             #[cfg(all(test, target_os = "macos"))]
-            patch_info.hook.reach(tests::hook::Point::GatePagesWritable);
+            patch_info.hook.reach(hook::Point::GatePagesWritable);
         }
         if P::RawMutPointer::from_usize(range.start)
             .copy_from_slice(cursor, &gates)
@@ -859,17 +954,7 @@ impl<P: ShimPlatform> Task<P> {
     /// if it is a tracked Mach-O mapping.
     fn mappings_replaced(&self, replaced: Range<usize>, replacement: Option<MachoMapping>) {
         let mut mappings = self.global.macho_mappings.lock();
-        self.mappings_replaced_locked(&mut mappings, replaced, replacement);
-    }
-
-    fn mappings_replaced_locked(
-        &self,
-        mappings: &mut BTreeMap<usize, MachoMapping>,
-        replaced: Range<usize>,
-        replacement: Option<MachoMapping>,
-    ) {
-        self.replace_macho_mappings(mappings, replaced.clone(), replacement);
-        self.retire_ulock_objects(replaced);
+        self.replace_macho_mappings(&mut mappings, replaced, replacement);
     }
 
     /// Remove tracking for `replaced`, preserving any mapped prefix and suffix,
@@ -1017,7 +1102,7 @@ impl<P: ShimPlatform> Task<P> {
             trampoline_capacity,
             rewrite_id: Arc::new(()),
             #[cfg(all(test, target_os = "macos"))]
-            hook: tests::hook::Slot::default(),
+            hook: hook::Slot::default(),
         });
         self.cache_macho_patch_info(file, Some(Arc::clone(&patch_info)));
         Ok(patch_info)
@@ -1188,14 +1273,16 @@ impl<P: ShimPlatform> Task<P> {
             // the MAP_FIXED check in `mmap`.
             return Err(Errno::EINVAL);
         }
+        let ulocks = self.global.ulocks.lock();
         // SAFETY: Darwin munmap relinquishes the caller-selected guest range.
-        unsafe {
+        let result = unsafe {
             self.global
                 .mm
                 .remove_pages(P::RawMutPointer::from_usize(address), length)
-        }
-        .map_err(|_| Errno::EINVAL)?;
-        self.mappings_replaced(address..address + length, None);
+        };
+        self.retire_ulock_objects(ulocks, address..end, result.is_ok());
+        result.map_err(|_| Errno::EINVAL)?;
+        self.mappings_replaced(address..end, None);
         Ok(())
     }
 
@@ -1345,56 +1432,6 @@ mod tests {
 
     const TEXT: usize = 0x400;
     const SVC: u32 = 0xd400_1001;
-
-    /// Pauses a rewrite of one image at a point of its transaction, on the
-    /// host thread that set the hook.
-    pub(super) mod hook {
-        extern crate std;
-
-        use alloc::boxed::Box;
-        use std::sync::Mutex;
-        use std::thread::{self, ThreadId};
-
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub(in crate::syscalls::mm) enum Point {
-            /// An executable file mapping took its trampoline checkpoint.
-            Checkpointed,
-            /// An append made an existing trampoline's unpublished pages RW.
-            GatePagesWritable,
-        }
-
-        type Hook = Box<dyn FnMut(Point) + Send>;
-
-        #[derive(Default)]
-        pub(in crate::syscalls::mm) struct Slot(Mutex<Option<(ThreadId, Hook)>>);
-
-        impl Slot {
-            pub(in crate::syscalls::mm) fn set(&self, hook: impl FnMut(Point) + Send + 'static) {
-                *self.0.lock().unwrap() = Some((thread::current().id(), Box::new(hook)));
-            }
-
-            pub(in crate::syscalls::mm) fn clear(&self) {
-                *self.0.lock().unwrap() = None;
-            }
-
-            pub(in crate::syscalls::mm) fn reach(&self, point: Point) {
-                let mut slot = self.0.lock().unwrap();
-                let Some((owner, mut hook)) = slot.take() else {
-                    return;
-                };
-                if owner != thread::current().id() {
-                    *slot = Some((owner, hook));
-                    return;
-                }
-                drop(slot);
-                hook(point);
-                let mut slot = self.0.lock().unwrap();
-                if slot.is_none() {
-                    *slot = Some((owner, hook));
-                }
-            }
-        }
-    }
 
     fn put32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -2223,22 +2260,24 @@ mod tests {
             .unwrap();
         let other = task.new_sibling(0);
         let (start, started) = std::sync::mpsc::channel::<()>();
-        let (finish, finished) = std::sync::mpsc::channel::<usize>();
+        let (report, excluded) = std::sync::mpsc::channel::<bool>();
         std::thread::scope(|scope| {
             let mapper = scope.spawn(move || {
                 <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
                     started
                         .recv_timeout(std::time::Duration::from_secs(10))
                         .unwrap();
-                    let address = map_image_page(
+                    // The transaction holds `macho_mappings`, which this
+                    // mapping needs before its own checkpoint.
+                    report
+                        .send(other.global.macho_mappings.try_lock().is_none())
+                        .unwrap();
+                    map_image_page(
                         &other,
                         PAGE_SIZE,
                         VmProtection::READ | VmProtection::EXECUTE,
                     )
-                    .unwrap();
-                    // The receiver is gone once the transaction has ended.
-                    let _ = finish.send(address);
-                    address
+                    .unwrap()
                 })
             });
             // Between this mapping's checkpoint and its rollback, the other
@@ -2247,10 +2286,10 @@ mod tests {
                 if point == hook::Point::Checkpointed {
                     start.send(()).unwrap();
                     assert!(
-                        finished
-                            .recv_timeout(std::time::Duration::from_millis(500))
-                            .is_err(),
-                        "a mapping published gates inside another's transaction"
+                        excluded
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap(),
+                        "another mapping could enter this mapping's transaction"
                     );
                 }
             });

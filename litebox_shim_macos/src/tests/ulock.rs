@@ -213,7 +213,9 @@ fn unfair_lock_wake_one_makes_the_woken_thread_the_owner() {
 
 /// Shared lock words are keyed by the object mapped at the address: a
 /// mapping that replaces or removes it leaves its waiters behind, out of
-/// reach of waits and wakes on the new object (`uaddr_findobj`).
+/// reach of waits and wakes on the new object (`uaddr_findobj`). The old
+/// waiters are released through the table at the end, since no syscall
+/// reaches them.
 #[test]
 fn shared_ulock_waiters_stay_with_a_replaced_mapping() {
     let task = new_task();
@@ -226,7 +228,7 @@ fn shared_ulock_waiters_stay_with_a_replaced_mapping() {
         let old = [replaced, removed].map(|page| {
             let waiter = task.new_sibling(0);
             let handle = scope
-                .spawn(move || ulock_wait(&waiter, UL_COMPARE_AND_WAIT_SHARED, page, 0, 3_000_000));
+                .spawn(move || ulock_wait(&waiter, UL_COMPARE_AND_WAIT_SHARED, page, 0, BOUND_US));
             object_waiters(page, 1);
             handle
         });
@@ -263,8 +265,11 @@ fn shared_ulock_waiters_stay_with_a_replaced_mapping() {
             assert_eq!(new.join().unwrap(), Ok(0));
             assert_eq!(task.global.ulocks.lock().object_waiters(page), 1);
         }
+        for page in [replaced, removed] {
+            task.global.ulocks.lock().wake_all_objects_at(page);
+        }
         for handle in old {
-            assert_eq!(handle.join().unwrap(), errno(Errno::ETIMEDOUT));
+            assert_eq!(handle.join().unwrap(), Ok(0));
         }
     });
     // With every waiter gone, the objects mapped now take new waiters.
@@ -275,4 +280,58 @@ fn shared_ulock_waiters_stay_with_a_replaced_mapping() {
             errno(Errno::ETIMEDOUT)
         );
     }
+}
+
+/// A shared wait on a mapping made at an address a concurrent munmap freed
+/// stays reachable: the munmap retires the old objects before any wait can
+/// key the new mapping, so its late retirement cannot strand the waiter.
+#[test]
+fn shared_wait_on_an_address_reused_during_munmap_is_woken() {
+    use crate::syscalls::mm::hook;
+
+    let task = new_task();
+    // Far above where host allocations land, so none takes the page while
+    // it is unmapped.
+    let page = vm_allocate(&task, 0x7a_0000_0000, VM_FLAGS_FIXED);
+    std::thread::scope(|scope| {
+        let waiter = task.new_sibling(0);
+        let (go, start) = std::sync::mpsc::channel::<()>();
+        let (waiting, about_to_wait) = std::sync::mpsc::channel::<()>();
+        let handle = scope.spawn(move || {
+            <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                start.recv_timeout(BOUND).unwrap();
+                assert_eq!(vm_allocate(&waiter, page, VM_FLAGS_FIXED), page);
+                waiting.send(()).unwrap();
+                ulock_wait(&waiter, UL_COMPARE_AND_WAIT_SHARED, page, 0, BOUND_US)
+            })
+        });
+        let global = Arc::clone(&task.global);
+        // After munmap removed the page and before it retires the old
+        // objects, the page is mapped again and a shared wait starts on it.
+        task.global.mapping_hook.set(move |point| {
+            assert_eq!(point, hook::Point::MappingsChanged);
+            go.send(()).unwrap();
+            about_to_wait.recv_timeout(BOUND).unwrap();
+            // The wait either queues behind the table lock munmap holds, or
+            // joins a record before the retirement.
+            let start = Instant::now();
+            while global
+                .ulocks
+                .try_lock()
+                .is_some_and(|table| table.object_waiters(page) == 0)
+            {
+                assert!(start.elapsed() < BOUND, "the waiter never blocked");
+                std::thread::yield_now();
+            }
+        });
+        let unmapped = bsd(&task, nr::MUNMAP, &[page, PAGE_SIZE]);
+        task.global.mapping_hook.clear();
+        assert_eq!(unmapped, Ok(0));
+        await_count(&task, 1, |table| table.object_waiters(page));
+        assert_eq!(
+            ulock_wake(&task, UL_COMPARE_AND_WAIT_SHARED, page, 0),
+            Ok(0)
+        );
+        assert_eq!(handle.join().unwrap(), Ok(0));
+    });
 }

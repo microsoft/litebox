@@ -104,6 +104,21 @@ impl<P: ShimPlatform> UlockTable<P> {
         self.objects_at(address).map(|(_, ull)| ull.waiters).sum()
     }
 
+    /// Wake every thread waiting on a shared lock word at `address`, whichever
+    /// mapping it waited on.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn wake_all_objects_at(&mut self, address: usize) {
+        let keys: alloc::vec::Vec<UlockKey> =
+            self.objects_at(address).map(|(key, _)| *key).collect();
+        for key in keys {
+            self.locks
+                .get_mut(&key)
+                .expect("the record was just found")
+                .queue
+                .wake_all();
+        }
+    }
+
     fn objects_at(&self, address: usize) -> impl Iterator<Item = (&UlockKey, &Ull<P>)> {
         self.locks.range(
             UlockKey::Object {
@@ -126,7 +141,9 @@ impl<P: ShimPlatform> UlockTable<P> {
 
     /// The mapping at every address in `range` was replaced or removed: its
     /// waiters keep their records, but no new wait or wake reaches them.
-    fn retire_objects(&mut self, range: Range<usize>) {
+    /// Callers hold the table lock from before the mapping change until this
+    /// returns, so no waiter on the new mapping joins an old record.
+    pub(crate) fn retire_objects(&mut self, range: Range<usize>) {
         let start = UlockKey::Object {
             address: range.start,
             generation: 0,
@@ -199,12 +216,6 @@ impl<P: ShimPlatform> Task<P> {
             })
     }
 
-    /// The mappings in `range` were replaced or removed, so shared lock words
-    /// there belong to new objects.
-    pub(crate) fn retire_ulock_objects(&self, range: Range<usize>) {
-        self.global.ulocks.lock().retire_objects(range);
-    }
-
     /// `uaddr_findobj`: whether a mapping backs `address`.
     fn ulock_object_mapped(&self, address: usize) -> bool {
         !self
@@ -215,8 +226,8 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     /// The key for `address`; a shared key names the object mapped there
-    /// now, so it is looked up under the table lock, which `retire_objects`
-    /// holds.
+    /// now, so it is looked up under the table lock, which mapping changes
+    /// hold until they have retired the old objects.
     fn ulock_key(table: &UlockTable<P>, shared: bool, address: usize) -> UlockKey {
         if shared {
             table.object_key(address)
