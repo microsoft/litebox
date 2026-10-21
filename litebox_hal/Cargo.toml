@@ -10,6 +10,7 @@ spin = { version = "0.10.0", default-features = false, features = ["once", "spin
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 [lints]
 workspace = true

@@ -19,7 +19,9 @@ const CALIBRATION_TIMEOUT_CYCLES: u64 = 1 << 36;
 const PLAUSIBLE_KHZ: core::ops::RangeInclusive<u64> = 100_000..=100_000_000;
 
 /// The counter: the TSC, as ring 3 reads it (see the module docs). Never
-/// decreases (one CPU, constant rate).
+/// decreases, given a constant rate and, with several CPUs, synchronized
+/// TSCs: an assumption, not checked (VMMs such as QEMU and KVM normally
+/// keep them so, but need not).
 pub fn now() -> u64 {
     // Safety: RDTSC has no side effects.
     unsafe { core::arch::x86_64::_rdtsc() }
