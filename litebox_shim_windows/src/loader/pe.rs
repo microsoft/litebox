@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::collections::btree_map::BTreeMap;
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use core::{
     marker::PhantomData,
@@ -29,7 +28,9 @@ use crate::nt_types::{
     ClientId, Luid, PebBitField, ProcessEnvironmentBlock, RtlUserProcFlags,
     RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString, X64Context,
 };
-use crate::syscalls::mm::{ALLOCATION_GRANULARITY, MemoryType, PageProtection};
+use crate::syscalls::mm::{
+    ALLOCATION_GRANULARITY, MemoryType, PageProtection, record_committed_allocation,
+};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATH: &str = "/Windows/System32/ntdll.dll";
@@ -66,11 +67,10 @@ pub(crate) struct WindowsProcessEnvironment {
     pub(crate) windows_shared_section: usize,
 }
 
-pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
+pub(crate) struct PeLoadInfo {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
     pub(crate) ntdll: Option<NtDllInfo>,
-    pub(crate) virtual_allocations: crate::WindowsVirtualAllocations<Platform>,
     pub(crate) environment: WindowsProcessEnvironment,
 }
 
@@ -126,7 +126,7 @@ impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
         envp: &[CString],
         process_id: usize,
         thread_id: usize,
-    ) -> Result<PeLoadInfo<Platform>, WindowsLoadError> {
+    ) -> Result<PeLoadInfo, WindowsLoadError> {
         let image = load_image(self.platform, self.fs.clone(), path, self.page_manager)?;
         let application_entry_point = image.mapping.entry_point;
         let ntdll = load_ntdll(self.platform, self.fs.clone(), self.page_manager)?;
@@ -163,24 +163,16 @@ impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
             write_guest_slice::<Platform, _>(environment.context, context.as_bytes())?;
         }
 
-        let virtual_allocations =
-            crate::WindowsVirtualAllocations::<Platform>::new(BTreeMap::new());
-        register_image_virtual_allocation(&virtual_allocations, image.mapping, image.pages);
-        let ntdll = ntdll.map(|ntdll| {
-            let mapping = ntdll.image.mapping;
-            register_image_virtual_allocation(&virtual_allocations, mapping, ntdll.image.pages);
-            NtDllInfo {
-                mapping,
-                ldr_initialize_thunk: ntdll.exports.ldr_initialize_thunk,
-                rtl_user_thread_start: ntdll.exports.rtl_user_thread_start,
-            }
+        let ntdll = ntdll.map(|ntdll| NtDllInfo {
+            mapping: ntdll.image.mapping,
+            ldr_initialize_thunk: ntdll.exports.ldr_initialize_thunk,
+            rtl_user_thread_start: ntdll.exports.rtl_user_thread_start,
         });
 
         Ok(PeLoadInfo {
             entry_point,
             stack_top: environment.stack_top,
             ntdll,
-            virtual_allocations,
             environment,
         })
     }
@@ -231,7 +223,7 @@ fn create_process_environment<Platform: crate::ShimPlatform>(
     page_manager: &crate::WindowsPageManager<Platform>,
     input: ProcessEnvironmentInput<'_>,
 ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
-    let create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
+    let create_unrecorded_pages = |size: usize| -> Result<usize, PeImageAccessError> {
         let aligned_length = size.next_multiple_of(PAGE_SIZE);
         let length =
             NonZeroPageSize::new(aligned_length).ok_or(PeImageAccessError::AddressOverflow)?;
@@ -244,6 +236,11 @@ fn create_process_environment<Platform: crate::ShimPlatform>(
             |_| Ok(0),
         )?;
         Ok(ptr.as_usize())
+    };
+    let create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
+        let base = create_unrecorded_pages(size)?;
+        record_read_write_allocation(page_manager, base, size.next_multiple_of(PAGE_SIZE));
+        Ok(base)
     };
     let peb_ptr = create_pages(size_of::<ProcessEnvironmentBlock>())?;
     let api_set_map = API_SET_NAMESPACE;
@@ -335,7 +332,9 @@ fn create_process_environment<Platform: crate::ShimPlatform>(
         .write_at_offset(0, process_parameters)
         .ok_or(PeImageAccessError::MemoryAccess)?;
 
-    let read_only_shared_memory_base = create_pages(WINDOWS_SHARED_SECTION_SIZE)?;
+    // The CSR shared section view records this range as a mapped allocation when the guest maps
+    // it, so it is not recorded as private memory here.
+    let read_only_shared_memory_base = create_unrecorded_pages(WINDOWS_SHARED_SECTION_SIZE)?;
     let mut shared_heap =
         GuestMemoryAllocator::new(read_only_shared_memory_base, WINDOWS_SHARED_SECTION_SIZE)?;
     let read_only_static_server_data =
@@ -425,6 +424,7 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
             |_| Ok(0),
         )
         .map_err(PeImageAccessError::Mapping)?;
+    record_read_write_allocation(page_manager, stack_base.as_usize(), stack_size);
     let stack_allocation_top = stack_base
         .as_usize()
         .checked_add(stack_size)
@@ -450,8 +450,11 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
         )
         .map_err(PeImageAccessError::Mapping)?
         .as_usize();
+    record_read_write_allocation(page_manager, teb_ptr, teb_length.as_usize());
     let context_length = NonZeroPageSize::new(size_of::<X64Context>().next_multiple_of(PAGE_SIZE))
         .ok_or(PeImageAccessError::AddressOverflow)?;
+    // The initial context page is LiteBox-internal rather than a Windows allocation, so it is not
+    // recorded.
     // SAFETY: address selection is left to the page manager, so this cannot replace a mapping.
     let context = page_manager
         .create_initialized_pages(
@@ -592,27 +595,22 @@ fn initialize_static_server_data<Platform: RawPointerProvider>(
     Ok(())
 }
 
-fn register_image_virtual_allocation<Platform: crate::ShimPlatform>(
-    virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
-    mapping: MappingInfo,
-    pages: RangeMap<usize, PageProtection>,
+fn record_read_write_allocation<Platform: crate::ShimPlatform>(
+    page_manager: &crate::WindowsPageManager<Platform>,
+    base: usize,
+    size: usize,
 ) {
-    virtual_allocations.write().insert(
-        mapping.base_addr,
-        crate::WindowsVirtualAllocation {
-            base: mapping.base_addr,
-            size: mapping.mapping_size,
-            allocation_protect: PageProtection::PAGE_EXECUTE_WRITECOPY,
-            type_: MemoryType::MEM_IMAGE,
-            placeholder_state: crate::WindowsPlaceholderState::None,
-            page_protections: pages,
-        },
+    record_committed_allocation(
+        page_manager,
+        base,
+        size,
+        MemoryType::MEM_PRIVATE,
+        PageProtection::PAGE_READWRITE,
     );
 }
 
 struct LoadedImage {
     mapping: MappingInfo,
-    pages: RangeMap<usize, PageProtection>,
     parsed: PeParsedFile,
 }
 
@@ -974,12 +972,8 @@ pub(crate) fn load_image_section<Platform: crate::ShimPlatform>(
     fs: Arc<crate::fs::Fs<Platform>>,
     path: &str,
     page_manager: &crate::WindowsPageManager<Platform>,
-    virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
 ) -> Result<MappingInfo, WindowsLoadError> {
-    let image = load_image(platform, fs, path, page_manager)?;
-    let mapping = image.mapping;
-    register_image_virtual_allocation(virtual_allocations, mapping, image.pages);
-    Ok(mapping)
+    Ok(load_image(platform, fs, path, page_manager)?.mapping)
 }
 
 pub(crate) struct ImageSectionMetadata {
@@ -1035,17 +1029,21 @@ fn load_image_with_writable_sections<Platform: crate::ShimPlatform>(
         file: &file,
         page_manager,
         chunk: alloc::vec![0u8; FILE_CHUNK_BYTES],
-        pages: RangeMap::new(),
+        reserved: None,
     };
     let mut memory = PeImageMemory::<Platform>(PhantomData);
-    let mapping = parsed
-        .load_with_writable_sections(&mut mapper, &mut memory, writable_section_names)
-        .map_err(WindowsLoadError::Load)?;
-    Ok(LoadedImage {
-        mapping,
-        pages: mapper.pages,
-        parsed,
-    })
+    let mapping = match parsed.load_with_writable_sections(
+        &mut mapper,
+        &mut memory,
+        writable_section_names,
+    ) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            mapper.release_reserved();
+            return Err(WindowsLoadError::Load(error));
+        }
+    };
+    Ok(LoadedImage { mapping, parsed })
 }
 
 fn ntdll_exports<Platform: RawPointerProvider>(
@@ -1187,7 +1185,8 @@ struct PeImageMapper<'a, Platform: crate::ShimPlatform> {
     page_manager: &'a crate::WindowsPageManager<Platform>,
     /// Reusable per-call I/O staging buffer for [`MapMemory::map_file`].
     chunk: Vec<u8>,
-    pages: RangeMap<usize, PageProtection>,
+    /// Base and length of the reserved image, which is recorded as a `MEM_IMAGE` allocation.
+    reserved: Option<(usize, usize)>,
 }
 
 impl<Platform: crate::ShimPlatform> PeImageMapper<'_, Platform> {
@@ -1204,8 +1203,26 @@ impl<Platform: crate::ShimPlatform> PeImageMapper<'_, Platform> {
         let end = start
             .checked_add(len)
             .ok_or(PeImageAccessError::AddressOverflow)?;
-        self.pages.insert(start..end, protect);
+        let (base, _) = self.reserved.ok_or(PeImageAccessError::MemoryAccess)?;
+        let mut vmem = self.page_manager.write_vmem();
+        let allocation = vmem
+            .allocations_mut()
+            .get_mut(&base)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+        allocation.page_protections.insert(start..end, protect);
         Ok(())
+    }
+
+    /// Releases a partially loaded image and its allocation record.
+    fn release_reserved(&mut self) {
+        let Some((base, len)) = self.reserved.take() else {
+            return;
+        };
+        let mut vmem = self.page_manager.write_vmem();
+        vmem.allocations_mut().remove(&base);
+        // SAFETY: The image failed to load before its base was returned, so nothing references
+        // the reserved pages.
+        let _ = unsafe { vmem.remove_pages(MutPtr::<Platform, u8>::from_usize(base), len) };
     }
 
     fn protect_and_record_pages(
@@ -1244,7 +1261,20 @@ impl<Platform: crate::ShimPlatform> MapMemory for PeImageMapper<'_, Platform> {
             |_| Ok(0),
         )?;
         let base = ptr.as_usize();
-        self.record_pages(base, len, PageProtection::PAGE_NOACCESS)?;
+        let mut pages = RangeMap::new();
+        pages.insert(base..base + len, PageProtection::PAGE_NOACCESS);
+        self.page_manager.write_vmem().allocations_mut().insert(
+            base,
+            crate::WindowsVirtualAllocation {
+                base,
+                size: len,
+                allocation_protect: PageProtection::PAGE_EXECUTE_WRITECOPY,
+                type_: MemoryType::MEM_IMAGE,
+                placeholder_state: crate::WindowsPlaceholderState::None,
+                page_protections: pages,
+            },
+        );
+        self.reserved = Some((base, len));
         Ok(base)
     }
 
@@ -2859,7 +2889,6 @@ mod tests {
                     .checked_add(parsed.entry_point_rva())
                     .expect("module entry point address fits usize"),
             },
-            pages: RangeMap::new(),
             parsed,
         }
     }

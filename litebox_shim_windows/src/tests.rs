@@ -212,12 +212,7 @@ fn test_task_from_litebox_with_process_id(
     let windows_shared_section =
         crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base);
 
-    let process = Arc::new(Process::new(
-        process_id,
-        parent_id,
-        None,
-        windows_shared_section,
-    ));
+    let process = Arc::new(Process::new(process_id, parent_id, windows_shared_section));
     let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
         initial_thread_id as usize,
         0,

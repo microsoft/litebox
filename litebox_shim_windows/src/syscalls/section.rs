@@ -626,7 +626,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
         }
-        self.process.virtual_allocations.write().remove(&view_base);
+        self.global
+            .page_manager
+            .write_vmem()
+            .allocations_mut()
+            .remove(&view_base);
         NtStatus::SUCCESS
     }
 
@@ -804,21 +808,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 section: Some(Arc::clone(section)),
             },
         );
-        self.process.virtual_allocations.write().insert(
-            base,
-            crate::WindowsVirtualAllocation {
+        self.global
+            .page_manager
+            .write_vmem()
+            .allocations_mut()
+            .insert(
                 base,
-                size: mapped_size,
-                allocation_protect: section.protection,
-                type_: MemoryType::MEM_MAPPED,
-                placeholder_state: crate::WindowsPlaceholderState::None,
-                page_protections: if is_reserved {
-                    RangeMap::new()
-                } else {
-                    mm::initial_page_protections(base, mapped_size, page_protection)
+                crate::WindowsVirtualAllocation {
+                    base,
+                    size: mapped_size,
+                    allocation_protect: section.protection,
+                    type_: MemoryType::MEM_MAPPED,
+                    placeholder_state: crate::WindowsPlaceholderState::None,
+                    page_protections: if is_reserved {
+                        RangeMap::new()
+                    } else {
+                        mm::initial_page_protections(base, mapped_size, page_protection)
+                    },
                 },
-            },
-        );
+            );
         Ok(MappedPagefileSectionView { base, view_size })
     }
 
@@ -832,7 +840,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             section.pagefile_view_active.store(false, Ordering::Release);
         }
         let _ = remove_view_pages::<Platform>(&self.global.page_manager, view_base, view.size);
-        self.process.virtual_allocations.write().remove(&view_base);
+        self.global
+            .page_manager
+            .write_vmem()
+            .allocations_mut()
+            .remove(&view_base);
     }
 
     fn map_csr_shared_section(
@@ -900,23 +912,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 section: Some(Arc::clone(section)),
             },
         );
-        self.process.virtual_allocations.write().insert(
-            base,
-            crate::WindowsVirtualAllocation {
+        self.global
+            .page_manager
+            .write_vmem()
+            .allocations_mut()
+            .insert(
                 base,
-                size: mapped_size,
-                allocation_protect: section.protection,
-                type_: MemoryType::MEM_MAPPED,
-                placeholder_state: crate::WindowsPlaceholderState::None,
-                // TODO(section-subsystem): honor per-view CSR protections only after
-                // the backing is no longer aliased by PEB direct-deref pointers.
-                page_protections: mm::initial_page_protections(
+                crate::WindowsVirtualAllocation {
                     base,
-                    mapped_size,
-                    section.protection,
-                ),
-            },
-        );
+                    size: mapped_size,
+                    allocation_protect: section.protection,
+                    type_: MemoryType::MEM_MAPPED,
+                    placeholder_state: crate::WindowsPlaceholderState::None,
+                    // TODO(section-subsystem): honor per-view CSR protections only after
+                    // the backing is no longer aliased by PEB direct-deref pointers.
+                    page_protections: mm::initial_page_protections(
+                        base,
+                        mapped_size,
+                        section.protection,
+                    ),
+                },
+            );
         NtStatus::SUCCESS
     }
 
@@ -952,7 +968,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Arc::clone(&self.fs),
             fs_path,
             &self.global.page_manager,
-            &self.process.virtual_allocations,
         ) {
             Ok(mapping) => mapping,
             Err(error) => {
@@ -982,9 +997,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 mapping.base_addr,
                 mapping.mapping_size,
             );
-            self.process
-                .virtual_allocations
-                .write()
+            self.global
+                .page_manager
+                .write_vmem()
+                .allocations_mut()
                 .remove(&mapping.base_addr);
             return NtStatus::ACCESS_VIOLATION;
         }

@@ -272,10 +272,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 
     /// Join adjacent mergeable reservations into one native reservation.
     ///
-    /// Afterwards, a single range operation such as [`Self::commit_pages`] or
-    /// [`Self::release_pages`] may span the whole merged extent. The default only joins the
-    /// handles, which suits platforms whose native operations can already span adjacent
-    /// reservations.
+    /// The default only joins the handles, which suits platforms whose native operations can
+    /// already span adjacent reservations.
     ///
     /// # Safety
     ///

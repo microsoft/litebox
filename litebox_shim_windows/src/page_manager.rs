@@ -3,6 +3,7 @@
 
 //! Windows-style explicit reservation, commitment, decommitment, and release.
 
+use alloc::collections::BTreeMap;
 use core::ops::Range;
 
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
@@ -12,7 +13,7 @@ use litebox::platform::page_mgmt::{
     AllocationDirection, AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
     PageReservation as _, ReleaseTargetOf, ReservationStore as _,
 };
-use litebox::sync::{RwLock, RwLockReadGuard};
+use litebox::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use litebox_common_linux::vmem::{
     CreatePagesFlags, MappingError, VmFlags, VmemProtectError, VmemUnmapError,
 };
@@ -47,6 +48,9 @@ where
     platform: &'static Platform,
     reservations: Reservations<Platform>,
     mappings: RangeMap<usize, VmFlags>,
+    /// Guest-visible Windows allocations, kept under the same lock as the page state they
+    /// describe so no lock ordering is needed between them.
+    allocations: BTreeMap<usize, crate::WindowsVirtualAllocation>,
 }
 
 impl<Platform> WindowsVmem<Platform>
@@ -58,7 +62,18 @@ where
             platform,
             reservations: TrackedReservations::<Platform::Reservation>::default(),
             mappings: RangeMap::new(),
+            allocations: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn allocations(&self) -> &BTreeMap<usize, crate::WindowsVirtualAllocation> {
+        &self.allocations
+    }
+
+    pub(crate) fn allocations_mut(
+        &mut self,
+    ) -> &mut BTreeMap<usize, crate::WindowsVirtualAllocation> {
+        &mut self.allocations
     }
 
     pub(crate) fn is_range_mapped(&self, range: &Range<usize>) -> bool {
@@ -245,7 +260,7 @@ where
         Ok(ptr)
     }
 
-    unsafe fn commit_pages(
+    pub(crate) unsafe fn commit_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
@@ -276,7 +291,7 @@ where
         Ok(())
     }
 
-    unsafe fn decommit_pages(
+    pub(crate) unsafe fn decommit_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
@@ -304,7 +319,7 @@ where
     /// # Safety
     /// Every reservation overlapping `range` must come from [`Self::allocate_private_pages`]
     /// with [`PrivatePages::Mergeable`], and the caller must exclude all users of `range`.
-    unsafe fn merge_reservations(
+    pub(crate) unsafe fn merge_reservations(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
@@ -339,7 +354,7 @@ where
             .map(|(_, reservation)| reservation.range())
     }
 
-    fn get_memory_permissions(
+    pub(crate) fn get_memory_permissions(
         &self,
         ptr: NonZeroAddress<PAGE_SIZE>,
         len: NonZeroPageSize<PAGE_SIZE>,
@@ -364,7 +379,7 @@ where
         None
     }
 
-    unsafe fn protect_pages(
+    pub(crate) unsafe fn protect_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
@@ -396,7 +411,7 @@ where
         Ok(())
     }
 
-    unsafe fn remove_pages(
+    pub(crate) unsafe fn remove_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
@@ -470,7 +485,7 @@ where
     }
 
     /// Reserves inaccessible private address space that can later be joined with adjacent
-    /// mergeable reservations by [`Self::merge_reservations`].
+    /// mergeable reservations by [`WindowsVmem::merge_reservations`].
     ///
     /// # Safety
     /// The caller must not access the reserved pages until they are committed.
@@ -494,21 +509,6 @@ where
                 PrivatePages::Mergeable,
             )
         }
-    }
-
-    /// Joins the mergeable reservations exactly covering `len` bytes at `ptr` into one.
-    ///
-    /// # Safety
-    /// Every reservation overlapping the range must come from
-    /// [`Self::create_mergeable_reserved_pages`], and the caller must exclude all users of it.
-    pub(crate) unsafe fn merge_reservations(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-    ) -> Result<(), VmemProtectError> {
-        let mut vmem = self.vmem.write();
-        // SAFETY: The write guard provides exclusive state access and forwards the caller contract.
-        unsafe { vmem.merge_reservations(ptr, len) }
     }
 
     pub(crate) unsafe fn create_reserved_pages(
@@ -590,37 +590,13 @@ where
         Ok(ptr)
     }
 
-    pub(crate) unsafe fn commit_pages(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-        permissions: MemoryRegionPermissions,
-    ) -> Result<(), VmemProtectError> {
-        let mut vmem = self.vmem.write();
-        // SAFETY: The write guard provides exclusive state access and forwards the caller contract.
-        unsafe { vmem.commit_pages(ptr, len, permissions) }
-    }
-
-    pub(crate) unsafe fn decommit_pages(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-    ) -> Result<(), VmemProtectError> {
-        let mut vmem = self.vmem.write();
-        // SAFETY: The write guard provides exclusive state access and forwards the caller contract.
-        unsafe { vmem.decommit_pages(ptr, len) }
-    }
-
     pub(crate) fn read_vmem(&self) -> RwLockReadGuard<'_, Platform, WindowsVmem<Platform>> {
         self.vmem.read()
     }
 
-    pub(crate) fn get_memory_permissions(
-        &self,
-        ptr: NonZeroAddress<PAGE_SIZE>,
-        len: NonZeroPageSize<PAGE_SIZE>,
-    ) -> Option<MemoryRegionPermissions> {
-        self.vmem.read().get_memory_permissions(ptr, len)
+    /// Locks the page state and guest allocations together for a combined update.
+    pub(crate) fn write_vmem(&self) -> RwLockWriteGuard<'_, Platform, WindowsVmem<Platform>> {
+        self.vmem.write()
     }
 
     unsafe fn protect_pages(

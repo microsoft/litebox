@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::collections::BTreeMap;
 use core::mem::size_of;
 
 use int_enum::IntEnum;
@@ -12,10 +13,11 @@ use litebox_common_windows::nt_status::NtStatus;
 use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+use crate::page_manager::WindowsVmem;
 use crate::syscalls::{ProcessHandle, section::pagefile_view_protection_is_compatible};
 use crate::{
     ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task, WindowsPageManager, WindowsPlaceholderState,
-    WindowsVirtualAllocation, WindowsVirtualAllocations,
+    WindowsVirtualAllocation,
 };
 
 pub(crate) const ALLOCATION_GRANULARITY: usize = 0x1_0000;
@@ -384,18 +386,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         if replace_placeholder {
-            let mut allocations = self.process.virtual_allocations.write();
-            let Some(allocation) = allocations.get_mut(&aligned_base).filter(|allocation| {
-                allocation.placeholder_state == WindowsPlaceholderState::Reserved
-                    && allocation.size == aligned_len
-            }) else {
+            let mut vmem = self.global.page_manager.write_vmem();
+            if !vmem
+                .allocations()
+                .get(&aligned_base)
+                .is_some_and(|allocation| {
+                    allocation.placeholder_state == WindowsPlaceholderState::Reserved
+                        && allocation.size == aligned_len
+                })
+            {
                 return NtStatus::CONFLICTING_ADDRESSES;
-            };
-            if allocation_type.contains(AllocationType::MEM_COMMIT) {
-                // SAFETY: The exact placeholder range remains exclusively reserved while
-                // the allocation lock serializes its replacement.
+            }
+            let commit = allocation_type.contains(AllocationType::MEM_COMMIT);
+            if commit {
+                // SAFETY: The exact placeholder range remains exclusively reserved while the
+                // page-manager lock serializes its replacement.
                 if unsafe {
-                    self.global.page_manager.commit_pages(
+                    vmem.commit_pages(
                         MutPtr::<Platform, u8>::from_usize(aligned_base),
                         aligned_len,
                         permissions,
@@ -405,11 +412,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     return NtStatus::NO_MEMORY;
                 }
+            }
+            let allocation = vmem.allocations_mut().get_mut(&aligned_base).unwrap();
+            if commit {
                 allocation.page_protections =
                     initial_page_protections(aligned_base, aligned_len, protect);
             }
             allocation.placeholder_state = WindowsPlaceholderState::Replaced;
             allocation.allocation_protect = protect;
+            drop(vmem);
             if base_address.write_at_offset(0, aligned_base).is_none()
                 || region_size.write_at_offset(0, aligned_len).is_none()
             {
@@ -509,25 +520,29 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let _ = unsafe { self.global.page_manager.remove_pages(ptr, aligned_len) };
             return NtStatus::ACCESS_VIOLATION;
         }
-        self.process.virtual_allocations.write().insert(
-            ptr.as_usize(),
-            WindowsVirtualAllocation {
-                base: ptr.as_usize(),
-                size: aligned_len,
-                allocation_protect: protect,
-                type_: MemoryType::MEM_PRIVATE,
-                placeholder_state: if is_placeholder {
-                    WindowsPlaceholderState::Reserved
-                } else {
-                    WindowsPlaceholderState::None
+        self.global
+            .page_manager
+            .write_vmem()
+            .allocations_mut()
+            .insert(
+                ptr.as_usize(),
+                WindowsVirtualAllocation {
+                    base: ptr.as_usize(),
+                    size: aligned_len,
+                    allocation_protect: protect,
+                    type_: MemoryType::MEM_PRIVATE,
+                    placeholder_state: if is_placeholder {
+                        WindowsPlaceholderState::Reserved
+                    } else {
+                        WindowsPlaceholderState::None
+                    },
+                    page_protections: if allocation_type.contains(AllocationType::MEM_COMMIT) {
+                        initial_page_protections(ptr.as_usize(), aligned_len, protect)
+                    } else {
+                        RangeMap::new()
+                    },
                 },
-                page_protections: if allocation_type.contains(AllocationType::MEM_COMMIT) {
-                    initial_page_protections(ptr.as_usize(), aligned_len, protect)
-                } else {
-                    RangeMap::new()
-                },
-            },
-        );
+            );
 
         litebox_util_log::debug!(
             base:% = format_args!("{:#x}", base),
@@ -554,18 +569,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some((aligned_base, aligned_len)) = page_aligned_region(base, size) else {
             return NtStatus::INVALID_PARAMETER;
         };
-        let Some(allocation) =
-            find_virtual_allocation(&self.process.virtual_allocations, aligned_base, aligned_len)
-        else {
-            return NtStatus::INVALID_PARAMETER;
-        };
-        if allocation.type_ != MemoryType::MEM_PRIVATE {
+        let vmem = self.global.page_manager.read_vmem();
+        if !find_virtual_allocation(vmem.allocations(), aligned_base, aligned_len)
+            .is_some_and(|allocation| allocation.type_ == MemoryType::MEM_PRIVATE)
+        {
             return NtStatus::INVALID_PARAMETER;
         }
-        let vmem = self.global.page_manager.read_vmem();
         if !vmem.is_range_mapped(&(aligned_base..aligned_base + aligned_len)) {
             return NtStatus::CONFLICTING_ADDRESSES;
         }
+        drop(vmem);
 
         if base_address.write_at_offset(0, aligned_base).is_none()
             || region_size.write_at_offset(0, aligned_len).is_none()
@@ -584,8 +597,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         base_address: MutPtr<Platform, usize>,
         region_size: MutPtr<Platform, usize>,
     ) -> NtStatus {
+        let mut vmem = self.global.page_manager.write_vmem();
         let Some(allocation) =
-            find_virtual_allocation(&self.process.virtual_allocations, aligned_base, aligned_len)
+            find_virtual_allocation(vmem.allocations(), aligned_base, aligned_len)
         else {
             return NtStatus::INVALID_PARAMETER;
         };
@@ -604,21 +618,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return NtStatus::SECTION_PROTECTION;
         }
         let ptr = MutPtr::<Platform, u8>::from_usize(aligned_base);
-        if unsafe {
-            self.global
-                .page_manager
-                .commit_pages(ptr, aligned_len, permissions)
-        }
-        .is_err()
-        {
+        // SAFETY: The range lies within a tracked private or mapped allocation, and the
+        // page-manager lock serializes the commit with the protection metadata update.
+        if unsafe { vmem.commit_pages(ptr, aligned_len, permissions) }.is_err() {
             return NtStatus::INVALID_PARAMETER;
         }
         update_page_protections(
-            &self.process.virtual_allocations,
+            vmem.allocations_mut(),
             aligned_base,
             aligned_len,
             Some(protect),
         );
+        drop(vmem);
         if base_address.write_at_offset(0, aligned_base).is_none()
             || region_size.write_at_offset(0, aligned_len).is_none()
         {
@@ -676,47 +687,39 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return NtStatus::INVALID_PARAMETER;
         }
 
-        let Some((aligned_base, aligned_len)) =
-            free_region(&self.process.virtual_allocations, base, size)
-        else {
+        let mut vmem = self.global.page_manager.write_vmem();
+        let Some((aligned_base, aligned_len)) = free_region(vmem.allocations(), base, size) else {
             return NtStatus::INVALID_PARAMETER;
         };
         let ptr = MutPtr::<Platform, u8>::from_usize(aligned_base);
         if free_type == FreeType::MEM_DECOMMIT {
-            if find_private_virtual_allocation(
-                &self.process.virtual_allocations,
-                aligned_base,
-                aligned_len,
-            )
-            .is_some_and(|allocation| {
-                allocation.placeholder_state == WindowsPlaceholderState::Reserved
-            }) {
+            if find_private_virtual_allocation(vmem.allocations(), aligned_base, aligned_len)
+                .is_some_and(|allocation| {
+                    allocation.placeholder_state == WindowsPlaceholderState::Reserved
+                })
+            {
                 return NtStatus::MEMORY_NOT_ALLOCATED;
             }
             // SAFETY: The range is page-aligned and belongs to a private allocation tracked for
             // this process. Decommit discards page contents while leaving the address range
             // reserved for later recommit.
-            if unsafe { self.global.page_manager.decommit_pages(ptr, aligned_len) }.is_err() {
+            if unsafe { vmem.decommit_pages(ptr, aligned_len) }.is_err() {
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
-            update_page_protections(
-                &self.process.virtual_allocations,
-                aligned_base,
-                aligned_len,
-                None,
-            );
+            update_page_protections(vmem.allocations_mut(), aligned_base, aligned_len, None);
         } else {
             // SAFETY: The range is page-aligned and belongs to an allocation tracked for this
             // process. The guest requested release, so the pages must not be used after success.
-            if unsafe { self.global.page_manager.remove_pages(ptr, aligned_len) }.is_err() {
+            if unsafe { vmem.remove_pages(ptr, aligned_len) }.is_err() {
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
             split_virtual_allocation_around_released_region(
-                &mut self.process.virtual_allocations.write(),
+                vmem.allocations_mut(),
                 aligned_base,
                 aligned_len,
             );
         }
+        drop(vmem);
         if base_address.write_at_offset(0, aligned_base).is_none()
             || region_size.write_at_offset(0, aligned_len).is_none()
         {
@@ -745,12 +748,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if size == 0 {
             return Err(NtStatus::INVALID_PARAMETER_3);
         }
-        let mut allocations = self.process.virtual_allocations.write();
+        let mut vmem = self.global.page_manager.write_vmem();
         let end = base.checked_add(size).ok_or(NtStatus::INVALID_PARAMETER)?;
         if free_type == coalesce {
             let mut covered_until = base;
             let mut count = 0;
-            for (&start, allocation) in allocations.range(base..end) {
+            for (&start, allocation) in vmem.allocations().range(base..end) {
                 if start != covered_until
                     || allocation.placeholder_state != WindowsPlaceholderState::Reserved
                 {
@@ -765,19 +768,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return Err(NtStatus::CONFLICTING_ADDRESSES);
             }
             // SAFETY: Every piece is an uncommitted guest placeholder reserved as mergeable, and
-            // the allocation lock excludes competing placeholder transitions.
-            unsafe {
-                self.global
-                    .page_manager
-                    .merge_reservations(MutPtr::<Platform, u8>::from_usize(base), size)
-            }
-            .map_err(|_| NtStatus::CONFLICTING_ADDRESSES)?;
+            // the page-manager lock excludes competing placeholder transitions.
+            unsafe { vmem.merge_reservations(MutPtr::<Platform, u8>::from_usize(base), size) }
+                .map_err(|_| NtStatus::CONFLICTING_ADDRESSES)?;
+            let allocations = vmem.allocations_mut();
             allocations.retain(|&start, _| start <= base || start >= end);
             allocations.get_mut(&base).unwrap().size = size;
             return Ok((base, size));
         }
 
-        let (allocation_end, placeholder_state) = allocations
+        let (allocation_end, placeholder_state) = vmem
+            .allocations()
             .range(..=base)
             .next_back()
             .map(|(_, allocation)| allocation)
@@ -799,16 +800,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         if placeholder_state == WindowsPlaceholderState::Replaced {
             // SAFETY: The restored sub-range of the private allocation is retained while its
-            // committed contents are discarded. The allocation lock prevents competing
+            // committed contents are discarded. The page-manager lock prevents competing
             // placeholder transitions.
-            unsafe {
-                self.global
-                    .page_manager
-                    .decommit_pages(MutPtr::<Platform, u8>::from_usize(base), size)
-            }
-            .map_err(|_| NtStatus::UNABLE_TO_FREE_VM)?;
+            unsafe { vmem.decommit_pages(MutPtr::<Platform, u8>::from_usize(base), size) }
+                .map_err(|_| NtStatus::UNABLE_TO_FREE_VM)?;
         }
-        split_virtual_allocation_around_released_region(&mut allocations, base, size);
+        let allocations = vmem.allocations_mut();
+        split_virtual_allocation_around_released_region(allocations, base, size);
         allocations.insert(
             base,
             WindowsVirtualAllocation {
@@ -863,14 +861,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some((new_protect, new_permissions)) = parse_page_protection(new_protect) else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
-        let old_protect_value = match scan_protect_range(
-            &self.global.page_manager,
-            &self.process.virtual_allocations,
-            aligned_base,
-            aligned_len,
-        ) {
+        let mut vmem = self.global.page_manager.write_vmem();
+        let old_protect_value = match scan_protect_range(&vmem, aligned_base, aligned_len) {
             Some(PageRangeScan::FullyCommitted(first_protect)) => first_protect,
             Some(PageRangeScan::ContainsUncommitted) => {
+                drop(vmem);
                 if old_protect
                     .write_at_offset(0, PageProtection::PAGE_NOACCESS.bits())
                     .is_none()
@@ -882,22 +877,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             None => return NtStatus::NOT_COMMITTED,
         };
 
-        if update_permissions(
-            &self.global.page_manager,
-            aligned_base,
-            aligned_len,
-            new_permissions,
-        )
-        .is_err()
-        {
+        if update_permissions(&mut vmem, aligned_base, aligned_len, new_permissions).is_err() {
             return NtStatus::ACCESS_VIOLATION;
         }
         update_page_protections(
-            &self.process.virtual_allocations,
+            vmem.allocations_mut(),
             aligned_base,
             aligned_len,
             Some(new_protect),
         );
+        drop(vmem);
 
         // ReactOS NtProtectVirtualMemory writes OldProtection, BaseAddress, then RegionSize after
         // MiProtectVirtualMemory succeeds; failed writeback does not roll back the protection.
@@ -1052,8 +1041,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let Some(info) = query_memory_basic_information::<Platform>(
-            &self.global.page_manager,
-            &self.process.virtual_allocations,
+            &self.global.page_manager.read_vmem(),
             base_address,
         ) else {
             return NtStatus::INVALID_PARAMETER;
@@ -1083,15 +1071,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return status;
         }
 
-        let Some(allocation) =
-            find_image_allocation_containing(&self.process.virtual_allocations, base_address)
-        else {
+        let Some((image_base, image_size)) = self.image_allocation_containing(base_address) else {
             return NtStatus::INVALID_PARAMETER;
         };
 
         let info = MemoryImageInformation {
-            image_base: allocation.base,
-            size_of_image: allocation.size,
+            image_base,
+            size_of_image: image_size,
             image_flags: 0,
             _padding: 0,
         };
@@ -1104,12 +1090,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         litebox_util_log::debug!(
             process_handle:? = process_handle,
             base:% = format_args!("{base_address:#x}"),
-            image_base:% = format_args!("{:#x}", allocation.base),
-            image_size = allocation.size;
+            image_base:% = format_args!("{image_base:#x}"),
+            image_size;
             "Handled NtQueryVirtualMemory MemoryImageInformation syscall"
         );
 
         NtStatus::SUCCESS
+    }
+
+    /// Returns the base and size of the image allocation containing `address`.
+    fn image_allocation_containing(&self, address: usize) -> Option<(usize, usize)> {
+        let vmem = self.global.page_manager.read_vmem();
+        find_image_allocation_containing(vmem.allocations(), address)
+            .map(|allocation| (allocation.base, allocation.size))
     }
 
     fn write_memory_image_extension_information(
@@ -1128,9 +1121,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return status;
         }
 
-        let Some(allocation) =
-            find_image_allocation_containing(&self.process.virtual_allocations, base_address)
-        else {
+        let Some((image_base, image_size)) = self.image_allocation_containing(base_address) else {
             return NtStatus::INVALID_PARAMETER;
         };
 
@@ -1158,8 +1149,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         litebox_util_log::debug!(
             process_handle:? = process_handle,
             base:% = format_args!("{base_address:#x}"),
-            image_base:% = format_args!("{:#x}", allocation.base),
-            image_size = allocation.size;
+            image_base:% = format_args!("{image_base:#x}"),
+            image_size;
             "Handled NtQueryVirtualMemory MemoryImageExtensionInformation syscall"
         );
 
@@ -1358,18 +1349,16 @@ fn is_valid_placeholder_replacement(
             .intersects(AllocationType::MEM_TOP_DOWN | AllocationType::MEM_RESERVE_PLACEHOLDER)
 }
 
-fn free_region<Platform: ShimPlatform>(
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+fn free_region(
+    virtual_allocations: &BTreeMap<usize, WindowsVirtualAllocation>,
     base: usize,
     size: usize,
 ) -> Option<(usize, usize)> {
     if size == 0 {
         let allocation_base = base & !(PAGE_SIZE - 1);
         let allocation = virtual_allocations
-            .read()
             .get(&allocation_base)
-            .filter(|allocation| allocation.type_ == MemoryType::MEM_PRIVATE)
-            .cloned()?;
+            .filter(|allocation| allocation.type_ == MemoryType::MEM_PRIVATE)?;
         return Some((allocation.base, allocation.size));
     }
 
@@ -1422,6 +1411,28 @@ fn split_virtual_allocation_around_released_region(
     }
 }
 
+/// Records committed pages created directly through the page manager, such as loader-created
+/// process structures or shim-owned views, as a guest-visible Windows allocation.
+pub(crate) fn record_committed_allocation<Platform: ShimPlatform>(
+    page_manager: &WindowsPageManager<Platform>,
+    base: usize,
+    size: usize,
+    type_: MemoryType,
+    protect: PageProtection,
+) {
+    page_manager.write_vmem().allocations_mut().insert(
+        base,
+        WindowsVirtualAllocation {
+            base,
+            size,
+            allocation_protect: protect,
+            type_,
+            placeholder_state: WindowsPlaceholderState::None,
+            page_protections: initial_page_protections(base, size, protect),
+        },
+    );
+}
+
 pub(super) fn initial_page_protections(
     base: usize,
     size: usize,
@@ -1435,17 +1446,16 @@ pub(super) fn initial_page_protections(
     pages
 }
 
-fn find_virtual_allocation<Platform: ShimPlatform>(
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+fn find_virtual_allocation(
+    virtual_allocations: &BTreeMap<usize, WindowsVirtualAllocation>,
     base: usize,
     size: usize,
-) -> Option<WindowsVirtualAllocation> {
+) -> Option<&WindowsVirtualAllocation> {
     let end = base.checked_add(size)?;
     virtual_allocations
-        .read()
         .range(..=base)
         .next_back()
-        .map(|(_, allocation)| allocation.clone())
+        .map(|(_, allocation)| allocation)
         .filter(|allocation| {
             allocation
                 .base
@@ -1454,27 +1464,27 @@ fn find_virtual_allocation<Platform: ShimPlatform>(
         })
 }
 
-fn find_private_virtual_allocation<Platform: ShimPlatform>(
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+fn find_private_virtual_allocation(
+    virtual_allocations: &BTreeMap<usize, WindowsVirtualAllocation>,
     base: usize,
     size: usize,
-) -> Option<WindowsVirtualAllocation> {
+) -> Option<&WindowsVirtualAllocation> {
     find_virtual_allocation(virtual_allocations, base, size)
         .filter(|allocation| allocation.type_ == MemoryType::MEM_PRIVATE)
 }
 
-fn find_image_allocation_containing<Platform: ShimPlatform>(
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+fn find_image_allocation_containing(
+    virtual_allocations: &BTreeMap<usize, WindowsVirtualAllocation>,
     base: usize,
-) -> Option<WindowsVirtualAllocation> {
+) -> Option<&WindowsVirtualAllocation> {
     find_virtual_allocation(virtual_allocations, base, 1)
         .filter(|allocation| allocation.type_ == MemoryType::MEM_IMAGE)
 }
 
-fn find_virtual_allocation_containing<Platform: ShimPlatform>(
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+fn find_virtual_allocation_containing(
+    virtual_allocations: &BTreeMap<usize, WindowsVirtualAllocation>,
     base: usize,
-) -> Option<WindowsVirtualAllocation> {
+) -> Option<&WindowsVirtualAllocation> {
     find_virtual_allocation(virtual_allocations, base, 1)
 }
 
@@ -1484,15 +1494,13 @@ enum PageRangeScan {
 }
 
 fn scan_protect_range<Platform: ShimPlatform>(
-    page_manager: &WindowsPageManager<Platform>,
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+    vmem: &WindowsVmem<Platform>,
     base: usize,
     size: usize,
 ) -> Option<PageRangeScan> {
-    let allocation = find_virtual_allocation_containing(virtual_allocations, base)?;
+    let allocation = find_virtual_allocation_containing(vmem.allocations(), base)?;
     let end = base.checked_add(size)?;
     let allocation_end = allocation.base.checked_add(allocation.size)?;
-    let vmem = page_manager.read_vmem();
     if end > allocation_end || !vmem.is_range_mapped(&(base..end)) {
         return Some(PageRangeScan::ContainsUncommitted);
     }
@@ -1500,7 +1508,7 @@ fn scan_protect_range<Platform: ShimPlatform>(
         if let Some(protect) = allocation.page_protections.get(&base) {
             *protect
         } else {
-            permissions_to_page_protect(page_manager.get_memory_permissions(
+            permissions_to_page_protect(vmem.get_memory_permissions(
                 NonZeroAddress::new(base)?,
                 NonZeroPageSize::new(PAGE_SIZE)?,
             )?)
@@ -1509,8 +1517,8 @@ fn scan_protect_range<Platform: ShimPlatform>(
 }
 
 /// Updates Windows protection metadata after a successful page manager operation.
-fn update_page_protections<Platform: ShimPlatform>(
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+fn update_page_protections(
+    allocations: &mut BTreeMap<usize, WindowsVirtualAllocation>,
     base: usize,
     size: usize,
     protect: Option<PageProtection>,
@@ -1518,7 +1526,6 @@ fn update_page_protections<Platform: ShimPlatform>(
     let Some(end) = base.checked_add(size) else {
         return;
     };
-    let mut allocations = virtual_allocations.write();
     let Some((_, allocation)) = allocations.range_mut(..=base).next_back() else {
         return;
     };
@@ -1624,47 +1631,19 @@ fn mapping_error_to_nt_status(error: MappingError) -> NtStatus {
 }
 
 fn update_permissions<Platform: ShimPlatform>(
-    page_manager: &WindowsPageManager<Platform>,
+    vmem: &mut WindowsVmem<Platform>,
     aligned_base: usize,
     aligned_len: usize,
     permissions: MemoryRegionPermissions,
 ) -> Result<(), VmemProtectError> {
     let ptr = MutPtr::<Platform, u8>::from_usize(aligned_base);
-    // SAFETY: This applies the guest's explicit VM protection/free request to a page-aligned range
-    // tracked by the LiteBox page manager. The page manager serializes the VMA update.
-    unsafe {
-        match permissions {
-            permissions if permissions.is_empty() => {
-                page_manager.make_pages_inaccessible(ptr, aligned_len)
-            }
-            MemoryRegionPermissions::READ => page_manager.make_pages_readable(ptr, aligned_len),
-            permissions
-                if permissions
-                    == MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE =>
-            {
-                page_manager.make_pages_writable(ptr, aligned_len)
-            }
-            permissions
-                if permissions == MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC =>
-            {
-                page_manager.make_pages_executable(ptr, aligned_len)
-            }
-            permissions
-                if permissions
-                    == MemoryRegionPermissions::READ
-                        | MemoryRegionPermissions::WRITE
-                        | MemoryRegionPermissions::EXEC =>
-            {
-                page_manager.make_pages_rwx(ptr, aligned_len)
-            }
-            _ => unreachable!("Windows page protection parser produced unsupported permissions"),
-        }
-    }
+    // SAFETY: This applies the guest's explicit VM protection request to a page-aligned range
+    // tracked by the LiteBox page manager, whose lock the caller holds.
+    unsafe { vmem.protect_pages(ptr, aligned_len, permissions) }
 }
 
 fn query_memory_basic_information<Platform: ShimPlatform>(
-    page_manager: &WindowsPageManager<Platform>,
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+    vmem: &WindowsVmem<Platform>,
     base_address: usize,
 ) -> Option<MemoryBasicInformation> {
     let query_base = base_address & !(PAGE_SIZE - 1);
@@ -1672,13 +1651,8 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
         return None;
     }
 
-    // Look up the allocation before taking the vmem lock: placeholder transitions hold the
-    // allocations lock while calling into the page manager, so nesting in the opposite order
-    // here would deadlock.
-    let allocation = find_virtual_allocation_containing(virtual_allocations, query_base);
-    let vmem = page_manager.read_vmem();
     let mappings = vmem.mappings();
-    if let Some(allocation) = allocation {
+    if let Some(allocation) = find_virtual_allocation_containing(vmem.allocations(), query_base) {
         return query_allocation_basic_information(allocation, query_base, mappings);
     }
 
@@ -1747,7 +1721,7 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
 }
 
 fn query_allocation_basic_information(
-    allocation: WindowsVirtualAllocation,
+    allocation: &WindowsVirtualAllocation,
     query_base: usize,
     mappings: &RangeMap<usize, VmFlags>,
 ) -> Option<MemoryBasicInformation> {
@@ -1856,6 +1830,51 @@ mod tests {
         );
         assert_eq!(return_length, size_of::<MemoryBasicInformation>());
         info
+    }
+
+    #[test]
+    fn thread_environment_is_recorded_as_private_allocations() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let environment = crate::loader::create_thread_environment(
+                &task.global.page_manager,
+                0,
+                0,
+                crate::nt_types::ClientId {
+                    unique_process: 0,
+                    unique_thread: 0,
+                },
+                false,
+            )
+            .unwrap();
+            let teb = query_basic_information(&task, environment.teb);
+            assert_eq!(teb.allocation_base, environment.teb);
+            assert_eq!(teb.type_, MemoryType::MEM_PRIVATE.bits());
+            assert_eq!(
+                teb.allocation_protect,
+                PageProtection::PAGE_READWRITE.bits()
+            );
+
+            // Like Windows, the stack is an ordinary allocation whose pages can be reprotected.
+            let stack_page = (environment.stack_top - 1) & !(PAGE_SIZE - 1);
+            let mut protect_base = stack_page;
+            let mut protect_size = PAGE_SIZE;
+            let mut old_protect = 0u32;
+            assert_eq!(
+                task.sys_nt_protect_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut protect_base),
+                    mut_ptr(&mut protect_size),
+                    PageProtection::PAGE_READONLY.bits(),
+                    mut_ptr(&mut old_protect),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(old_protect, PageProtection::PAGE_READWRITE.bits());
+            let stack = query_basic_information(&task, stack_page);
+            assert_eq!(stack.type_, MemoryType::MEM_PRIVATE.bits());
+            assert_eq!(stack.protect, PageProtection::PAGE_READONLY.bits());
+        });
     }
 
     #[test]
@@ -2283,7 +2302,7 @@ mod tests {
                     assert_eq!(guest.as_usize(), middle.as_usize());
                     assert_eq!(guest.as_usize() % alignment, 0);
                     assert_eq!(
-                        guest_manager.get_memory_permissions(
+                        guest_manager.read_vmem().get_memory_permissions(
                             NonZeroAddress::new(guest.as_usize()).unwrap(),
                             length,
                         ),
@@ -2328,7 +2347,7 @@ mod tests {
 
             // SAFETY: This test owns the reservation and does not access its contents.
             unsafe {
-                task.global.page_manager.commit_pages(
+                task.global.page_manager.write_vmem().commit_pages(
                     ptr,
                     PAGE_SIZE * 2,
                     MemoryRegionPermissions::empty(),
@@ -2405,8 +2424,7 @@ mod tests {
         ] {
             let query_base = base + offset * PAGE_SIZE;
             let info =
-                query_allocation_basic_information(allocation.clone(), query_base, &mappings)
-                    .unwrap();
+                query_allocation_basic_information(&allocation, query_base, &mappings).unwrap();
             assert_eq!(info.base_address, query_base);
             assert_eq!(info.region_size, count * PAGE_SIZE);
             assert_eq!(info.state, state.bits());
@@ -2427,7 +2445,13 @@ mod tests {
             let (base, _) = allocate_committed_rw(&task, PAGE_SIZE * 3);
             let middle = MutPtr::<TestPlatform, u8>::from_usize(base + PAGE_SIZE);
             // SAFETY: The test owns the allocation and does not access the page being decommitted.
-            unsafe { task.global.page_manager.decommit_pages(middle, PAGE_SIZE) }.unwrap();
+            unsafe {
+                task.global
+                    .page_manager
+                    .write_vmem()
+                    .decommit_pages(middle, PAGE_SIZE)
+            }
+            .unwrap();
 
             for (offset, state, protect) in [
                 (
@@ -2478,9 +2502,10 @@ mod tests {
                 PageProtection::PAGE_READWRITE.bits()
             );
 
-            task.process
-                .virtual_allocations
-                .write()
+            task.global
+                .page_manager
+                .write_vmem()
+                .allocations_mut()
                 .get_mut(&base)
                 .unwrap()
                 .page_protections
@@ -2615,7 +2640,7 @@ mod tests {
                     PageProtection::PAGE_READWRITE.bits()
                 );
                 assert_eq!(
-                    task.process.virtual_allocations.read()[&allocation_base]
+                    task.global.page_manager.read_vmem().allocations()[&allocation_base]
                         .page_protections
                         .get(&allocation_base),
                     Some(&protect)

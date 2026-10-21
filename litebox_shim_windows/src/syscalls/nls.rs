@@ -19,6 +19,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::nt_types::ProcessEnvironmentBlock;
+use crate::syscalls::mm::{MemoryType, PageProtection, record_committed_allocation};
 use crate::{MutPtr, ShimPlatform, Task, probe_guest_output_preserving_value, write_value};
 
 pub(crate) const DEFAULT_LOCALE_ID: u32 = 0x0409;
@@ -746,6 +747,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
         drop(section_file);
         let mapping = mapping.map_err(|_| copy_status.unwrap_or(NtStatus::NO_MEMORY))?;
+        record_committed_allocation(
+            &self.global.page_manager,
+            mapping.as_usize(),
+            alloc_len,
+            MemoryType::MEM_MAPPED,
+            PageProtection::PAGE_READONLY,
+        );
         Ok(MappedNlsSection {
             address: mapping.as_usize(),
             len: alloc_len,
@@ -930,10 +938,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     fn unmap_owned_nls_section(&self, mapped_section: MappedNlsSection) {
+        let mut vmem = self.global.page_manager.write_vmem();
+        vmem.allocations_mut().remove(&mapped_section.address);
         // SAFETY: The mapping was created by this syscall path and has not been published on the
         // failing path, so no guest execution can hold a valid reference to it yet.
         let _ = unsafe {
-            self.global.page_manager.remove_pages(
+            vmem.remove_pages(
                 MutPtr::<Platform, u8>::from_usize(mapped_section.address),
                 mapped_section.len,
             )

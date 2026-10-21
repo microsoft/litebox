@@ -199,8 +199,6 @@ pub(crate) trait WindowsHandleSubsystem: litebox::fd::FdEnabledSubsystem {
 }
 pub(crate) type WindowsNlsSectionMappings<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
-pub(crate) type WindowsVirtualAllocations<Platform> =
-    litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
 pub(crate) type WindowsSectionViews<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsSectionView<Platform>>>;
 pub(crate) type WindowsObjectManager<Platform> = ObjectManager<Platform>;
@@ -574,12 +572,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         let windows_shared_section = crate::syscalls::section::load_time_windows_shared_section(
             load_info.environment.windows_shared_section,
         );
-        let mut process = Process::new(
-            self.0.process_id,
-            self.0.parent_id,
-            Some(load_info.virtual_allocations),
-            windows_shared_section,
-        );
+        let mut process = Process::new(self.0.process_id, self.0.parent_id, windows_shared_section);
         process.ntdll = load_info.ntdll;
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
@@ -653,7 +646,6 @@ pub struct Process<Platform: ShimPlatform> {
     )]
     windows_shared_section: Arc<SectionObject<Platform>>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
-    virtual_allocations: WindowsVirtualAllocations<Platform>,
     system_lcid: AtomicU32,
     user_lcid: AtomicU32,
     user_ui_language: AtomicU32,
@@ -767,7 +759,6 @@ impl<Platform: ShimPlatform> Process<Platform> {
     fn new(
         process_id: usize,
         parent_id: Option<usize>,
-        virtual_allocations: Option<WindowsVirtualAllocations<Platform>>,
         windows_shared_section: Arc<SectionObject<Platform>>,
     ) -> Self {
         let object_manager = syscalls::object_manager::seed_object_manager();
@@ -793,8 +784,6 @@ impl<Platform: ShimPlatform> Process<Platform> {
             windows_shared_section,
             section_views: WindowsSectionViews::<Platform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
-            virtual_allocations: virtual_allocations
-                .unwrap_or_else(|| WindowsVirtualAllocations::<Platform>::new(BTreeMap::new())),
             system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
