@@ -16,18 +16,18 @@
 //! platform-neutral; it is suitable only when host namespace administration is trusted. On
 //! Windows, std's native deletion can remain pending while an ordinary file handle is open, so the
 //! same name may not be reusable until retained handles close.
-//!
-//! On Linux, file reads and writes transfer directly between the host file and a buffer's raw
-//! bytes, such as a runner's shared memory; other buffers are staged through a bounce buffer.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "linux")]
-mod direct;
 mod io_errors;
+// On Linux, file reads and writes transfer directly between the host file and a buffer's raw
+// bytes, such as a runner's shared memory. Buffers without raw bytes, and all buffers on other
+// hosts, are staged through a bounce buffer.
+#[cfg(target_os = "linux")]
+mod linux;
 
 #[cfg(unix)]
 use io_errors::chown_error;
@@ -650,7 +650,7 @@ impl Backend for LocalFs {
             .ok_or(ReadError::NotForReading)?;
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
         #[cfg(target_os = "linux")]
-        if let Some(result) = direct::read_at(file, buf, offset) {
+        if let Some(result) = linux::read_at(file, buf, offset) {
             return result.map_err(|_| ReadError::Io);
         }
         let mut staged = bounce_buffer(buf.len())?;
@@ -686,7 +686,7 @@ impl Backend for LocalFs {
             .ok_or(WriteError::NotForWriting)?;
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         #[cfg(target_os = "linux")]
-        if let Some(result) = direct::write_at(file, buf, offset) {
+        if let Some(result) = linux::write_at(file, buf, offset) {
             return result.map_err(|_| WriteError::Io);
         }
         let mut staged = bounce_buffer(buf.len())?;

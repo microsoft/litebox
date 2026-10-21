@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Host file I/O directly between a file and a buffer's [`RawBytes`], with no
-//! bounce buffer.
+//! Linux host file I/O directly between a file and a buffer's [`RawBytes`],
+//! with no bounce buffer.
 
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result};

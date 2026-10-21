@@ -692,6 +692,12 @@ impl ReceivingRole {
 /// on the same file. Other requests wait at most briefly for broker threads
 /// such as the socket reactor, and never for the guest, which learns of
 /// readiness through notifications instead.
+///
+/// This classifies by request type rather than by the backend serving a file,
+/// so requests on in-memory, archive, and device files pass the role too,
+/// though they never wait for the host. The only cost is an extra hand-off:
+/// the association's next request goes to another worker, possibly a newly
+/// started one, instead of this one with a warm cache.
 fn may_wait(operation: &BrokerOperation) -> bool {
     matches!(
         operation,
