@@ -7,6 +7,7 @@ use litebox::platform::{ForkError, ProcessHandle as _, ProcessProvider};
 use litebox::process::ProcessError;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use litebox_platform_linux_userland::SeccompScope;
+use litebox_platform_linux_userland::process::CloneStack;
 use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,8 +47,17 @@ struct NativeForkRunner {
     memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
 }
 
-/// A clone's pre-connected broker socket pair.
+/// A clone's pre-connected broker socket pair, and the stack it continues on.
 struct NativeForkChannel {
+    broker_end: OwnedFd,
+    runner_end: OwnedFd,
+    /// Mapped before cloning, so a failure falls back to copy-based fork in the parent. The clone
+    /// inherits the untouched mapping, and the parent unmaps its copy with the channel.
+    stack: CloneStack,
+}
+
+/// The parts of a [`NativeForkChannel`] the clone bootstraps with once on its new stack.
+struct NativeForkEndpoints {
     broker_end: OwnedFd,
     runner_end: OwnedFd,
 }
@@ -152,9 +162,14 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             litebox_util_log::warn!("native fork socket pair overlaps broker descriptors");
             return Err(ForkError::Unsupported);
         }
+        let stack = CloneStack::map().map_err(|error| {
+            litebox_util_log::error!("failed to map a native fork child stack: {error}");
+            ForkError::Unsupported
+        })?;
         Ok(NativeForkChannel {
             broker_end: broker_end.into(),
             runner_end: runner_end.into(),
+            stack,
         })
     }
 
@@ -166,8 +181,9 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         let NativeForkChannel {
             broker_end,
             runner_end,
+            stack,
         } = channel;
-        drop(runner_end);
+        drop((runner_end, stack));
         let process_id = process.process_id().map_err(|error| {
             litebox_util_log::error!("failed to identify native fork child: {error}");
             ProcessError::ServiceFailed
@@ -182,10 +198,41 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     }
 
     unsafe fn run_child(&self, channel: NativeForkChannel) -> ! {
+        // TODO: Free the parent runner's runtime (its shim, `LiteBox`, guest tasks, and broker
+        // endpoint). It stays in the clone's heap, owned by the frames the clone abandons and by
+        // threads the clone lacks, and every later generation of a fork chain inherits it again,
+        // because guest `execve` keeps the runner process. Dropping it would send the parent's
+        // requests (e.g., closing its handles or cancelling this pending child) on the clone's
+        // association, close the descriptors the clone's own association reuses, and might wait
+        // on locks of threads the clone lacks.
         let NativeForkChannel {
             broker_end,
             runner_end,
+            stack,
         } = channel;
+        let endpoints = NativeForkEndpoints {
+            broker_end,
+            runner_end,
+        };
+        let runner: *const Self = self;
+        // SAFETY: The clone contains only this thread, which abandons the copied frames, and the
+        // stack its parent continued on as a clone is dead here. The runner lives in the copied
+        // shim's heap, which the clone never frees.
+        unsafe { stack.run(Box::new(move || (*runner).continue_child(endpoints))) }
+    }
+}
+
+impl NativeForkRunner {
+    /// Bootstraps the clone on its new stack and runs the guest to its exit.
+    ///
+    /// # Safety
+    ///
+    /// As for [`ForkRunner::run_child`](litebox_shim_linux::syscalls::process::ForkRunner).
+    unsafe fn continue_child(&self, endpoints: NativeForkEndpoints) -> ! {
+        let NativeForkEndpoints {
+            broker_end,
+            runner_end,
+        } = endpoints;
         // SAFETY: The clone contains only this thread, and this function never returns through
         // the copied guest task or its thread-registration guard.
         let status = match unsafe { Platform::prepare_fork_child() }
