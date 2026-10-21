@@ -228,6 +228,22 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
     /// condition and interrupt condition. If it is running guest code, the
     /// platform will interrupt the thread and re-enter the shim.
     pub fn interrupt(&self) {
+        self.interrupt_in(true);
+    }
+
+    /// Interrupts the thread only if it is running guest code, and returns
+    /// whether it was: if so, it re-enters the shim, through whichever entry
+    /// point it reaches first, before it runs more guest code. A waiting
+    /// thread is not woken.
+    ///
+    /// If this returns `false`, the thread is in the shim and calls the
+    /// check of its next [`WaitState::prepare_to_run_guest`] after this
+    /// call, so it sees what the caller published before it.
+    pub fn interrupt_guest(&self) -> bool {
+        self.interrupt_in(false)
+    }
+
+    fn interrupt_in(&self, wake_waiting: bool) -> bool {
         // Orders the caller's publication of the interrupt condition before
         // the state read below; pairs with the SeqCst fences in
         // `WaitContext::start_wait` and `WaitState::prepare_to_run_guest`.
@@ -240,10 +256,11 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
                     Ordering::Release,
                     Ordering::Relaxed,
                     |state| match ThreadState(state) {
+                        ThreadState::WAITING if wake_waiting => Some(ThreadState::WOKEN.0),
                         ThreadState::RUNNING_IN_HOST
+                        | ThreadState::WAITING
                         | ThreadState::WOKEN
                         | ThreadState::INTERRUPTED_GUEST => None,
-                        ThreadState::WAITING => Some(ThreadState::WOKEN.0),
                         ThreadState::RUNNING_IN_GUEST => Some(ThreadState::INTERRUPTED_GUEST.0),
                         state => unreachable!("{state:?}"),
                     },
@@ -251,15 +268,19 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
         match v.map(ThreadState) {
             Ok(ThreadState::WAITING) => {
                 condvar.wake_one();
+                false
             }
             Ok(ThreadState::RUNNING_IN_GUEST) => {
                 self.waker.0.platform.interrupt_thread(&self.thread);
+                true
             }
             Ok(state) => unreachable!("{state:?}"),
-            Err(_) => {
+            Err(state) => {
                 // Provide a consistent release fence even if we didn't wake up
                 // the thread.
                 core::sync::atomic::fence(Ordering::Release);
+                // An earlier interrupt is still on its way.
+                ThreadState(state) == ThreadState::INTERRUPTED_GUEST
             }
         }
     }
@@ -529,6 +550,56 @@ mod tests {
 
     use super::{ThreadState, WaitState};
     use crate::platform::mock::MockPlatform;
+
+    /// `interrupt_guest` interrupts a thread running guest code once and
+    /// reports it until the thread is back in the host; it leaves a thread
+    /// in the host or waiting alone.
+    #[test]
+    fn interrupt_guest_only_interrupts_guest_execution() {
+        let platform = MockPlatform::new();
+        let (handle_sender, handle_receiver) = std::sync::mpsc::sync_channel(1);
+        let (step_sender, step_receiver) = std::sync::mpsc::sync_channel(0);
+        let thread = std::thread::spawn(move || {
+            let state = WaitState::new(platform);
+            handle_sender
+                .send((state.thread_handle(), state.waker.clone()))
+                .unwrap();
+            step_receiver.recv().unwrap();
+            assert!(state.prepare_to_run_guest(|| true));
+            step_receiver.recv().unwrap();
+            state.finish_running_guest();
+            step_receiver.recv().unwrap();
+            let cx = state.context().with_timeout(Duration::from_millis(200));
+            let mut checks = 0;
+            let timed_out = cx.wait_until(|| {
+                checks += 1;
+                false
+            });
+            (timed_out.is_err(), checks)
+        });
+        let (handle, waker) = handle_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let step = |state: ThreadState| {
+            step_sender.send(()).unwrap();
+            let start = Instant::now();
+            while waker.0.state_for_assert() != state {
+                assert!(start.elapsed() < Duration::from_secs(10), "{state:?}");
+                std::thread::yield_now();
+            }
+        };
+        assert!(!handle.interrupt_guest());
+        step(ThreadState::RUNNING_IN_GUEST);
+        assert!(handle.interrupt_guest());
+        assert!(handle.interrupt_guest());
+        assert_eq!(handle.thread.load(Ordering::Relaxed), 1);
+        step(ThreadState::RUNNING_IN_HOST);
+        assert!(!handle.interrupt_guest());
+        step(ThreadState::WAITING);
+        assert!(!handle.interrupt_guest());
+        assert_eq!(thread.join().unwrap(), (true, 1));
+        assert_eq!(handle.thread.load(Ordering::Relaxed), 1);
+    }
 
     /// A thread entering the guest while another publishes an interrupt
     /// condition and calls `ThreadHandle::interrupt` either sees the condition
