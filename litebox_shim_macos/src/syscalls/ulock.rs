@@ -11,7 +11,7 @@
 
 use crate::{
     ShimPlatform, Task, ThreadId,
-    wait::{WaitQueue, WaitResult},
+    wait::{CancelPoint, WaitQueue, WaitResult},
 };
 use alloc::collections::BTreeMap;
 use core::ops::Range;
@@ -266,7 +266,6 @@ impl<P: ShimPlatform> Task<P> {
     ) -> Result<u32, Errno> {
         let opcode = operation & op::OPCODE_MASK;
         let flags = operation & op::FLAGS_MASK;
-        // ULF_WAIT_CANCEL_POINT tests for cancellation, which is not emulated.
         if flags & flag::WAIT_MASK != flags {
             return Err(Errno::EINVAL);
         }
@@ -353,7 +352,12 @@ impl<P: ShimPlatform> Task<P> {
             deadline if flags & flag::DEADLINE != 0 => Some(self.mach_deadline_timeout(deadline)),
             nanoseconds => Some(core::time::Duration::from_nanos(nanoseconds)),
         };
-        let mut result = self.wait_for_wakeup(&waiter, timeout);
+        let cancel = if flags & flag::WAIT_CANCEL_POINT != 0 {
+            CancelPoint::Yes
+        } else {
+            CancelPoint::No
+        };
+        let mut result = self.wait_for_wakeup(&waiter, timeout, cancel);
         let mut table = self.global.ulocks.lock();
         if result != WaitResult::Awakened {
             let ull = table

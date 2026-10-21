@@ -15,6 +15,7 @@ use litebox_common_macos::VmProtection;
 use litebox_platform_macos_userland::MacosUserland as Platform;
 
 mod mach;
+mod psynch;
 mod thread;
 mod ulock;
 

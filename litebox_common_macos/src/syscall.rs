@@ -36,6 +36,20 @@ pub mod nr {
     pub const BSDTHREAD_TERMINATE: usize = 361;
     pub const BSDTHREAD_REGISTER: usize = 366;
     pub const BSDTHREAD_CTL: usize = 478;
+    pub const PSYNCH_RW_LONGRDLOCK: usize = 297;
+    pub const PSYNCH_RW_YIELDWRLOCK: usize = 298;
+    pub const PSYNCH_RW_DOWNGRADE: usize = 299;
+    pub const PSYNCH_RW_UPGRADE: usize = 300;
+    pub const PSYNCH_MUTEXWAIT: usize = 301;
+    pub const PSYNCH_MUTEXDROP: usize = 302;
+    pub const PSYNCH_CVBROAD: usize = 303;
+    pub const PSYNCH_CVSIGNAL: usize = 304;
+    pub const PSYNCH_CVWAIT: usize = 305;
+    pub const PSYNCH_RW_RDLOCK: usize = 306;
+    pub const PSYNCH_RW_WRLOCK: usize = 307;
+    pub const PSYNCH_RW_UNLOCK: usize = 308;
+    pub const PSYNCH_RW_UNLOCK2: usize = 309;
+    pub const PSYNCH_CVCLRPREPOST: usize = 312;
     pub const ULOCK_WAIT: usize = 515;
     pub const ULOCK_WAKE: usize = 516;
     pub const ULOCK_WAIT2: usize = 544;
@@ -252,6 +266,19 @@ pub struct MachTimebaseInfo {
     pub denom: u32,
 }
 
+/// The `psynch_rw_*` calls (BSD 297-300, 306-309).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PsynchRwOperation {
+    LongReadLock,
+    YieldWriteLock,
+    Downgrade,
+    Upgrade,
+    ReadLock,
+    WriteLock,
+    Unlock,
+    Unlock2,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum SyscallRequest {
     Exit {
@@ -395,6 +422,52 @@ pub enum SyscallRequest {
         operation: u32,
         address: usize,
         wake_value: u64,
+    },
+    /// `psynch_mutexwait` and `psynch_mutexdrop`.
+    PsynchMutex {
+        drop: bool,
+        mutex: usize,
+        mgen: u32,
+        ugen: u32,
+        tid: u64,
+        flags: u32,
+    },
+    /// `psynch_cvsignal` and `psynch_cvbroad`. A broadcast passes the old U
+    /// word and the waiter difference in `cvudgen`; a signal passes U and a
+    /// thread port to wake.
+    PsynchCvsignal {
+        cv: usize,
+        cvlsgen: u64,
+        cvudgen: u64,
+        thread_port: Option<MachPortName>,
+        flags: u32,
+    },
+    PsynchCvwait {
+        cv: usize,
+        cvlsgen: u64,
+        cvugen: u32,
+        mutex: usize,
+        mugen: u64,
+        flags: u32,
+        seconds: i64,
+        nanoseconds: u32,
+    },
+    PsynchCvclrprepost {
+        cv: usize,
+        cvgen: u32,
+        cvugen: u32,
+        cvsgen: u32,
+        preposeq: u32,
+        flags: u32,
+    },
+    /// The `psynch_rw_*` calls, all with the same arguments.
+    PsynchRw {
+        operation: PsynchRwOperation,
+        rwlock: usize,
+        lgenval: u32,
+        ugenval: u32,
+        rw_wc: u32,
+        flags: u32,
     },
     Csops {
         pid: i32,
@@ -811,6 +884,70 @@ impl SyscallRequest {
                 operation: TruncateExt::<u32>::trunc(args[0]),
                 address: args[1],
                 wake_value: u64_arg(2),
+            },
+            nr::PSYNCH_MUTEXWAIT | nr::PSYNCH_MUTEXDROP => Self::PsynchMutex {
+                drop: number == nr::PSYNCH_MUTEXDROP,
+                mutex: args[0],
+                mgen: TruncateExt::<u32>::trunc(args[1]),
+                ugen: TruncateExt::<u32>::trunc(args[2]),
+                tid: u64_arg(3),
+                flags: TruncateExt::<u32>::trunc(args[4]),
+            },
+            nr::PSYNCH_CVBROAD => Self::PsynchCvsignal {
+                cv: args[0],
+                cvlsgen: u64_arg(1),
+                cvudgen: u64_arg(2),
+                thread_port: None,
+                flags: TruncateExt::<u32>::trunc(args[3]),
+            },
+            nr::PSYNCH_CVSIGNAL => Self::PsynchCvsignal {
+                cv: args[0],
+                cvlsgen: u64_arg(1),
+                cvudgen: u64::from(TruncateExt::<u32>::trunc(args[2])),
+                thread_port: Some(port_arg(3)),
+                flags: TruncateExt::<u32>::trunc(args[7]),
+            },
+            nr::PSYNCH_CVWAIT => Self::PsynchCvwait {
+                cv: args[0],
+                cvlsgen: u64_arg(1),
+                cvugen: TruncateExt::<u32>::trunc(args[2]),
+                mutex: args[3],
+                mugen: u64_arg(4),
+                flags: TruncateExt::<u32>::trunc(args[5]),
+                seconds: args[6].reinterpret_as_signed() as i64,
+                nanoseconds: TruncateExt::<u32>::trunc(args[7]),
+            },
+            nr::PSYNCH_CVCLRPREPOST => Self::PsynchCvclrprepost {
+                cv: args[0],
+                cvgen: TruncateExt::<u32>::trunc(args[1]),
+                cvugen: TruncateExt::<u32>::trunc(args[2]),
+                cvsgen: TruncateExt::<u32>::trunc(args[3]),
+                preposeq: TruncateExt::<u32>::trunc(args[5]),
+                flags: TruncateExt::<u32>::trunc(args[6]),
+            },
+            nr::PSYNCH_RW_LONGRDLOCK
+            | nr::PSYNCH_RW_YIELDWRLOCK
+            | nr::PSYNCH_RW_DOWNGRADE
+            | nr::PSYNCH_RW_UPGRADE
+            | nr::PSYNCH_RW_RDLOCK
+            | nr::PSYNCH_RW_WRLOCK
+            | nr::PSYNCH_RW_UNLOCK
+            | nr::PSYNCH_RW_UNLOCK2 => Self::PsynchRw {
+                operation: match number {
+                    nr::PSYNCH_RW_LONGRDLOCK => PsynchRwOperation::LongReadLock,
+                    nr::PSYNCH_RW_YIELDWRLOCK => PsynchRwOperation::YieldWriteLock,
+                    nr::PSYNCH_RW_DOWNGRADE => PsynchRwOperation::Downgrade,
+                    nr::PSYNCH_RW_UPGRADE => PsynchRwOperation::Upgrade,
+                    nr::PSYNCH_RW_RDLOCK => PsynchRwOperation::ReadLock,
+                    nr::PSYNCH_RW_WRLOCK => PsynchRwOperation::WriteLock,
+                    nr::PSYNCH_RW_UNLOCK => PsynchRwOperation::Unlock,
+                    _ => PsynchRwOperation::Unlock2,
+                },
+                rwlock: args[0],
+                lgenval: TruncateExt::<u32>::trunc(args[1]),
+                ugenval: TruncateExt::<u32>::trunc(args[2]),
+                rw_wc: TruncateExt::<u32>::trunc(args[3]),
+                flags: TruncateExt::<u32>::trunc(args[4]),
             },
             nr::CSOPS_AUDITTOKEN if args[4] == 0 => return Err(Errno::EINVAL),
             nr::CSOPS | nr::CSOPS_AUDITTOKEN => Self::Csops {

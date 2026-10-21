@@ -24,7 +24,9 @@ pub(crate) struct Waiter<P: ShimPlatform> {
 }
 
 impl<P: ShimPlatform> Waiter<P> {
-    fn wake(&self) {
+    /// Mark the waiter woken and wake its thread. Callers hold the queue
+    /// owner's lock and have removed the waiter from its queue.
+    pub(crate) fn wake(&self) {
         self.woken.store(true, Ordering::Release);
         self.waker.wake();
     }
@@ -84,6 +86,16 @@ impl<P: ShimPlatform> WaitQueue<P> {
     }
 }
 
+/// Whether a wait is a pthread cancellation point: XNU tests for a pending
+/// cancellation before such a wait (`__pthread_testcancel`), and
+/// `__pthread_markcancel` aborts it (`thread_abort_safely`). Cancellation
+/// is not emulated yet, so no wait ends for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CancelPoint {
+    No,
+    Yes,
+}
+
 /// How a wait ended, like XNU's `wait_result_t`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WaitResult {
@@ -112,6 +124,7 @@ impl<P: ShimPlatform> Task<P> {
         &self,
         waiter: &Waiter<P>,
         timeout: Option<core::time::Duration>,
+        _cancel: CancelPoint,
     ) -> WaitResult {
         let cx = self.wait_cx().with_timeout(timeout);
         match cx.wait_until(|| waiter.woken.load(Ordering::Acquire)) {

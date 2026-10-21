@@ -32,7 +32,7 @@ use litebox_syscall_rewriter::{macho::CodeMetadata, macho::Rewriter};
 use litebox_trampoline::trampoline_allocation_range;
 
 use crate::syscalls::file::{FileFd, FileSubsystem};
-use crate::syscalls::ulock::UlockTable;
+use crate::syscalls::{psynch::PsynchTable, ulock::UlockTable};
 use crate::{ShimPlatform, Task};
 
 /// File provenance and rewrite state retained for a live guest mapping.
@@ -86,7 +86,7 @@ pub(crate) mod hook {
         /// An append made an existing trampoline's unpublished pages RW.
         GatePagesWritable,
         /// A mapping change replaced or removed mappings and has not retired
-        /// their shared ulock objects yet.
+        /// their shared wait objects yet.
         MappingsChanged,
         /// A MAP_FIXED mapping took its snapshot of the range it replaces and
         /// has not changed the range yet.
@@ -100,6 +100,12 @@ pub(crate) mod hook {
         /// A ulock wait or wake validated its arguments and has not locked
         /// the ulock table yet.
         UlockLookup,
+        /// A psynch call queued its thread and has not released the table
+        /// to block yet.
+        PsynchQueued,
+        /// A blocked psynch call's wait ended and it has not locked the
+        /// table again yet.
+        PsynchWaited,
     }
 
     type Hook = Box<dyn FnMut(Point) + Send>;
@@ -314,10 +320,16 @@ struct MmapRequest {
     direction: AllocationDirection,
 }
 
-/// The `macho_mappings` and `ulocks` guards a mapping change holds.
+/// The tables of wait objects keyed by what is mapped at an address.
+struct WaitObjectLocks<'a, P: ShimPlatform> {
+    ulocks: MutexGuard<'a, P, UlockTable<P>>,
+    psynch: MutexGuard<'a, P, PsynchTable<P>>,
+}
+
+/// The `macho_mappings` and wait-object guards a mapping change holds.
 type MappingChangeLocks<'a, P> = (
     MutexGuard<'a, P, BTreeMap<usize, MachoMapping>>,
-    MutexGuard<'a, P, UlockTable<P>>,
+    WaitObjectLocks<'a, P>,
 );
 
 /// Where [`Task::map_anonymous`] places pages.
@@ -370,35 +382,45 @@ fn forget_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usi
 
 impl<P: ShimPlatform> Task<P> {
     /// Lock what a mapping change that replaces or removes mappings holds
-    /// from before it touches the address space until its shared ulock
+    /// from before it touches the address space until its shared wait
     /// objects are retired and its Mach-O tracking is updated, so no
     /// executable transition sees stale or missing tracking and no wait or
     /// wake keys a replaced object. The lock order is `macho_mappings`,
-    /// `ulocks`, then trampoline, shared-cache, page-manager and IPC state.
+    /// `ulocks`, `psynch`, then trampoline, shared-cache, page-manager and
+    /// IPC state.
     fn lock_mapping_change(&self) -> MappingChangeLocks<'_, P> {
         let macho_mappings = self.global.macho_mappings.lock();
-        (macho_mappings, self.global.ulocks.lock())
+        (macho_mappings, self.lock_wait_objects())
+    }
+
+    fn lock_wait_objects(&self) -> WaitObjectLocks<'_, P> {
+        let ulocks = self.global.ulocks.lock();
+        WaitObjectLocks {
+            ulocks,
+            psynch: self.global.psynch.lock(),
+        }
     }
 
     /// A mapping change that took [`Self::lock_mapping_change`] replaced or
     /// removed the mappings in `range` if `changed`: retire their shared
-    /// ulock objects before `ulocks` is released, so a wait or wake that
-    /// starts after the change keys the new mapping and no later retirement
-    /// can strand it.
+    /// ulock and psynch objects before the tables are released, so a call
+    /// that starts after the change keys the new mapping and no later
+    /// retirement can strand it.
     #[cfg_attr(
         not(all(test, target_os = "macos")),
         expect(clippy::unused_self, reason = "only the test hook reads the task")
     )]
-    fn retire_ulock_objects(
+    fn retire_wait_objects(
         &self,
-        mut ulocks: MutexGuard<'_, P, UlockTable<P>>,
+        mut locks: WaitObjectLocks<'_, P>,
         range: Range<usize>,
         changed: bool,
     ) {
         if changed {
             #[cfg(all(test, target_os = "macos"))]
             self.global.mapping_hook.reach(hook::Point::MappingsChanged);
-            ulocks.retire_objects(range);
+            locks.ulocks.retire_objects(range.clone());
+            locks.psynch.retire_objects(range);
         }
     }
 
@@ -497,8 +519,8 @@ impl<P: ShimPlatform> Task<P> {
                 |_| Ok(0),
             )
         };
-        if let Some((mut macho_mappings, ulocks)) = locked {
-            self.retire_ulock_objects(ulocks, range.clone(), result.is_ok());
+        if let Some((mut macho_mappings, wait_objects)) = locked {
+            self.retire_wait_objects(wait_objects, range.clone(), result.is_ok());
             if result.is_ok() {
                 self.replace_macho_mappings(&mut macho_mappings, range, None);
             }
@@ -567,11 +589,11 @@ impl<P: ShimPlatform> Task<P> {
                     |_| Ok(0),
                 )
             };
-            if let Some((mut macho_mappings, ulocks)) = locked {
+            if let Some((mut macho_mappings, wait_objects)) = locked {
                 let replaced = result.is_ok()
                     || before
                         .is_some_and(|before| before != self.mapping_snapshot(fixed_range.clone()));
-                self.retire_ulock_objects(ulocks, fixed_range.clone(), replaced);
+                self.retire_wait_objects(wait_objects, fixed_range.clone(), replaced);
                 if replaced {
                     self.replace_macho_mappings(&mut macho_mappings, fixed_range.clone(), None);
                 }
@@ -612,7 +634,7 @@ impl<P: ShimPlatform> Task<P> {
         if let Some(patch_info) = rewritten {
             patch_info.hook.reach(hook::Point::Checkpointed);
         }
-        let ulocks = fixed.then(|| self.global.ulocks.lock());
+        let wait_objects = fixed.then(|| self.lock_wait_objects());
         let before = fixed.then(|| self.mapping_snapshot(fixed_range.clone()));
         #[cfg(all(test, target_os = "macos"))]
         if fixed {
@@ -666,8 +688,8 @@ impl<P: ShimPlatform> Task<P> {
         };
         let replaced = result.is_ok()
             || before.is_some_and(|before| before != self.mapping_snapshot(fixed_range.clone()));
-        if let Some(ulocks) = ulocks {
-            self.retire_ulock_objects(ulocks, fixed_range.clone(), replaced);
+        if let Some(wait_objects) = wait_objects {
+            self.retire_wait_objects(wait_objects, fixed_range.clone(), replaced);
         }
         let pointer = match result {
             Ok(pointer) => pointer,
@@ -1311,14 +1333,14 @@ impl<P: ShimPlatform> Task<P> {
             // the MAP_FIXED check in `mmap`.
             return Err(Errno::EINVAL);
         }
-        let (mut macho_mappings, ulocks) = self.lock_mapping_change();
+        let (mut macho_mappings, wait_objects) = self.lock_mapping_change();
         // SAFETY: Darwin munmap relinquishes the caller-selected guest range.
         let result = unsafe {
             self.global
                 .mm
                 .remove_pages(P::RawMutPointer::from_usize(address), length)
         };
-        self.retire_ulock_objects(ulocks, address..end, result.is_ok());
+        self.retire_wait_objects(wait_objects, address..end, result.is_ok());
         result.map_err(|_| Errno::EINVAL)?;
         self.replace_macho_mappings(&mut macho_mappings, address..end, None);
         Ok(())

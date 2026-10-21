@@ -105,6 +105,7 @@ impl<P: ShimPlatform> Task<P> {
             start: core::cell::Cell::new(None),
             terminated: core::cell::Cell::new(false),
             user_join: core::cell::Cell::new(None),
+            error_bits: core::cell::Cell::new(0),
             #[cfg(test)]
             platform_yields: core::cell::Cell::new(0),
         };

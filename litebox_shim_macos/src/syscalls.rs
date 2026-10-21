@@ -19,6 +19,7 @@ pub(crate) mod mig;
 pub mod misc;
 pub(crate) mod mm;
 pub(crate) mod process;
+pub(crate) mod psynch;
 pub(crate) mod thread;
 pub(crate) mod ulock;
 

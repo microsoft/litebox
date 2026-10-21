@@ -14,9 +14,9 @@
 //! Unsupported calls return XNU's error for them, logged once.
 //!
 //! Each guest thread runs on its own host thread with its own Mach thread
-//! port; the shim emulates XNU's thread lifecycle, ulock and yield calls on
-//! guest-private wait queues. Networking, workqueue (GCD) threads and signal
-//! delivery are unsupported.
+//! port; the shim emulates XNU's thread lifecycle, ulock, psynch and yield
+//! calls on guest-private wait queues. Networking, workqueue (GCD) threads
+//! and signal delivery are unsupported.
 
 #![no_std]
 #![cfg(target_arch = "aarch64")]
@@ -166,6 +166,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 main_stack_top: AtomicUsize::new(0),
                 pthread_registration: Mutex::new(None),
                 ulocks: Mutex::new(syscalls::ulock::UlockTable::default()),
+                psynch: Mutex::new(syscalls::psynch::PsynchTable::default()),
                 #[cfg(all(test, target_os = "macos"))]
                 mapping_hook: syscalls::mm::hook::Slot::default(),
             }),
@@ -344,7 +345,10 @@ struct GlobalState<P: ShimPlatform> {
     main_stack_top: AtomicUsize,
     /// `bsdthread_register` state; set once per process.
     pthread_registration: Mutex<P, Option<syscalls::thread::PthreadRegistration>>,
+    /// Lock order: `macho_mappings`, `ulocks`, `psynch`, then trampoline,
+    /// shared-cache, page-manager and IPC state.
     ulocks: Mutex<P, syscalls::ulock::UlockTable<P>>,
+    psynch: Mutex<P, syscalls::psynch::PsynchTable<P>>,
     /// Pauses mapping changes, which belong to no image, in tests.
     #[cfg(all(test, target_os = "macos"))]
     mapping_hook: syscalls::mm::hook::Slot,
@@ -448,6 +452,9 @@ struct ThreadState<P: ShimPlatform> {
     /// `bsdthread_terminate`'s user-join ulock address and the thread's port
     /// name, written and woken once the thread has terminated.
     user_join: core::cell::Cell<Option<(usize, u32)>>,
+    /// Bits a failing syscall returns above its errno in x0 (a failed
+    /// `psynch_cvwait`'s `ECVCLEARED` and `ECVPREPOST`).
+    error_bits: core::cell::Cell<u32>,
     /// How many times the yield traps called the platform's `yield_thread`.
     #[cfg(test)]
     platform_yields: core::cell::Cell<usize>,
@@ -524,6 +531,7 @@ impl<P: ShimPlatform> Task<P> {
         }
         let is_mach = litebox_common_macos::syscall::is_mach_trap_selector(ctx.regs[16]);
         let result = self.do_syscall(ctx);
+        let error_bits = self.thread.error_bits.take();
         litebox_util_log::trace!(
             number:? = ctx.regs[16].cast_signed(),
             args:? = format_args!("{:x?}", &ctx.regs[..6]),
@@ -550,7 +558,7 @@ impl<P: ShimPlatform> Task<P> {
                     }
                     .into();
                 } else {
-                    ctx.regs[0] = error.raw();
+                    ctx.regs[0] = error.raw() | error_bits as usize;
                     ctx.pstate |= CARRY;
                 }
             }
@@ -779,6 +787,67 @@ impl<P: ShimPlatform> Task<P> {
                 address,
                 wake_value,
             } => self.sys_ulock_wake(operation, address, wake_value),
+            SyscallRequest::PsynchMutex {
+                drop,
+                mutex,
+                mgen,
+                ugen,
+                tid,
+                flags,
+            } => self.sys_psynch_mutex(drop, mutex, mgen, ugen, tid, flags),
+            SyscallRequest::PsynchCvsignal {
+                cv,
+                cvlsgen,
+                cvudgen,
+                thread_port,
+                flags,
+            } => self.sys_psynch_cvsignal(
+                cv,
+                cvlsgen,
+                cvudgen,
+                thread_port.map(|port| port.0),
+                flags,
+            ),
+            SyscallRequest::PsynchCvwait {
+                cv,
+                cvlsgen,
+                cvugen,
+                mutex,
+                mugen,
+                flags,
+                seconds,
+                nanoseconds,
+            } => self
+                .sys_psynch_cvwait(
+                    cv,
+                    cvlsgen,
+                    cvugen,
+                    mutex,
+                    mugen,
+                    flags,
+                    seconds,
+                    nanoseconds,
+                )
+                .map_err(|(error, bits)| {
+                    self.thread.error_bits.set(bits);
+                    error
+                }),
+            SyscallRequest::PsynchCvclrprepost {
+                cv,
+                cvgen,
+                cvugen,
+                cvsgen,
+                preposeq,
+                flags,
+            } => self.sys_psynch_cvclrprepost(cv, cvgen, cvugen, cvsgen, preposeq, flags),
+            SyscallRequest::PsynchRw {
+                operation,
+                rwlock,
+                lgenval,
+                ugenval,
+                rw_wc,
+                flags,
+            } => self.sys_psynch_rw(operation, rwlock, lgenval, ugenval, rw_wc, flags),
             SyscallRequest::Csops {
                 pid,
                 operation,
