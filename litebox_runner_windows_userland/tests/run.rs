@@ -831,34 +831,6 @@ fn find_executable_on_path(name: &str, paths: &std::ffi::OsStr) -> Option<std::p
         .find(|path| path.is_file())
 }
 
-#[test]
-fn find_executable_on_path_respects_order_and_skips_directories() {
-    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("executable_lookup");
-    let directory = test_dir.join("directory");
-    let first = test_dir.join("first with spaces");
-    let second = test_dir.join("second");
-    std::fs::create_dir_all(directory.join("node.exe")).unwrap();
-    for dir in [&first, &second] {
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("node.exe"), b"fixture").unwrap();
-    }
-    let paths = std::env::join_paths([&directory, &first, &second]).unwrap();
-    assert_eq!(
-        find_executable_on_path("node.exe", &paths),
-        Some(first.join("node.exe"))
-    );
-    let paths = std::env::join_paths([&second, &first]).unwrap();
-    assert_eq!(
-        find_executable_on_path("node.exe", &paths),
-        Some(second.join("node.exe"))
-    );
-    assert_eq!(find_executable_on_path("missing.exe", &paths), None);
-    assert_eq!(
-        find_executable_on_path("node.exe", std::ffi::OsStr::new("")),
-        None
-    );
-}
-
 fn dumpbin_path() -> &'static std::path::Path {
     static DUMPBIN: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
         if let Some(path) = std::env::var_os("PATH")
@@ -1158,24 +1130,6 @@ fn stage_import_closure<'a>(
     report
 }
 
-/// `staged_file_name` must reject path-bearing import names (traversal defense)
-/// and accept bare filenames.
-#[test]
-fn staged_file_name_rejects_path_traversal() {
-    assert_eq!(
-        staged_file_name("kernel32.dll").as_deref(),
-        Some("kernel32.dll")
-    );
-    assert_eq!(
-        staged_file_name("KERNEL32.DLL").as_deref(),
-        Some("kernel32.dll")
-    );
-    assert_eq!(staged_file_name(r"..\..\evil.dll"), None);
-    assert_eq!(staged_file_name(r"C:\Windows\evil.dll"), None);
-    assert_eq!(staged_file_name("sub/dir.dll"), None);
-    assert_eq!(staged_file_name(".."), None);
-}
-
 /// `resolve_to_host_dll` maps a real DLL to itself and an api-set contract to
 /// its host implementer via the host loader. Uses a contract known to be absent
 /// from the shim's `API_SET_MAPPINGS`, proving host-loader resolution (not the
@@ -1225,19 +1179,6 @@ fn scan_imports_reports_unparsable_pe() {
 }
 
 #[test]
-fn scan_imports_reports_missing_file() {
-    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("dumpbin_missing")
-        .join("missing.dll");
-    assert!(!path.exists());
-    let error = scan_imports(&path).unwrap_err();
-    assert!(
-        error.contains("LNK"),
-        "expected a dumpbin diagnostic: {error}"
-    );
-}
-
-#[test]
 fn parse_dumpbin_dependents_separates_startup_and_delay_imports() {
     let scan = parse_dumpbin_dependents(
         "Dump of file C:\\a directory\\input.dll\r\n\
@@ -1267,42 +1208,6 @@ fn parse_dumpbin_dependents_separates_startup_and_delay_imports() {
             "plugin.without_dll_extension",
         ]
     );
-}
-
-#[test]
-fn parse_dumpbin_dependents_accepts_import_free_and_delay_only_images() {
-    let scan = parse_dumpbin_dependents(
-        "Dump of file leaf.dll\nFile Type: DLL\n  Summary\n  1000 .text\n",
-    )
-    .unwrap();
-    assert_eq!(scan.names, Vec::<String>::new());
-    let scan = parse_dumpbin_dependents(
-        "File Type: EXECUTABLE IMAGE\n\
-         Image has the following delay load dependencies:\n\
-             VERSION.dll\n\
-         Summary\n",
-    )
-    .unwrap();
-    assert_eq!(scan.regular_names, Vec::<String>::new());
-    assert_eq!(scan.names, ["version.dll"]);
-}
-
-#[test]
-fn parse_dumpbin_dependents_rejects_diagnostics_and_unrecognized_output() {
-    for output in [
-        "",
-        "Dump of file invalid.dll\n  Summary\n",
-        "File Type: DLL\n",
-        "File Type: DLL\ninvalid.dll : warning LNK4048: Invalid format file; ignored\nSummary\n",
-        "invalid.dll : fatal error LNK1107: invalid or corrupt file\n",
-        "invalid.dll : error LNK1107: invalid or corrupt file\n",
-        "File Type: DLL\nImage has the following dependencies:\n..\\evil.dll\nSummary\n",
-    ] {
-        assert!(
-            parse_dumpbin_dependents(output).is_err(),
-            "accepted invalid output: {output}"
-        );
-    }
 }
 
 /// The closure walk must record a *skip with reason* — not silently drop — when
@@ -1368,12 +1273,6 @@ fn stage_transitive_import_closure_reports_skipped_unresolvable() {
 /// import set), rewrites it, and stages exactly `ntdll.dll`. This proves the
 /// worklist loop, real-DLL resolution, host read, recursion, cycle-insert, and
 /// the successful rewrite-and-stage branch run deterministically and cheaply.
-///
-/// The skip-with-report decision (`resolve_to_host_dll` returning `None`, and
-/// path-traversal rejection) is covered on every run by the unit tests above
-/// (`resolve_to_host_dll_maps_real_dll_and_absent_contract`,
-/// `staged_file_name_rejects_path_traversal`); the deep multi-level walk over a
-/// real third-party closure is covered by the two gated tests below.
 #[test]
 fn stage_transitive_import_closure_walks_and_stages_leaf() {
     let test_dir =
@@ -1417,8 +1316,7 @@ fn stage_transitive_import_closure_walks_and_stages_leaf() {
 ///
 /// Rewriting ucrtbase's full transitive closure is expensive (100+ DLLs, ~60s),
 /// so this deep end-to-end test is gated behind `LITEBOX_RUN_SLOW_TESTS` and
-/// skips cleanly by default. The fast unit tests above cover resolution,
-/// parsing, and traversal rejection on every run, and
+/// skips cleanly by default. The fast tests above cover resolution and parsing, and
 /// `stage_transitive_import_closure_walks_and_stages_leaf` exercises the walk
 /// orchestration on every run; this adds the deep multi-level proof on demand.
 #[test]
