@@ -388,9 +388,8 @@ impl<P: ShimPlatform> Task<P> {
     /// from before it touches the address space until its shared wait
     /// objects are retired and its Mach-O tracking is updated, so no
     /// executable transition sees stale or missing tracking and no wait or
-    /// wake keys a replaced object. The lock order is `macho_mappings`,
-    /// `ulocks`, `psynch`, then trampoline, shared-cache, page-manager and
-    /// IPC state.
+    /// wake keys a replaced object, in the order [`crate::GlobalState`]
+    /// gives.
     fn lock_mapping_change(&self) -> MappingChangeLocks<'_, P> {
         let macho_mappings = self.global.macho_mappings.lock();
         (macho_mappings, self.lock_wait_objects())

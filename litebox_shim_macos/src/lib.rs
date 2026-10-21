@@ -327,6 +327,30 @@ pub struct MacosShimEntrypoints<P: ShimPlatform> {
     _not_send: core::marker::PhantomData<*const ()>,
 }
 
+/// The shim's locks, in the one order a thread may hold them (each lock
+/// is taken only while holding locks earlier in the list):
+///
+/// 1. `macho_mappings`, held across a mapping change, an `mprotect` and a
+///    Mach-O rewrite;
+/// 2. `ulocks`, then `psynch` (a mapping change holds both, after
+///    `macho_mappings`, until it retires their shared objects);
+/// 3. `macho_trampolines`, then `shared_cache` (an `mprotect` across the
+///    shared-cache instance takes `shared_cache` under `macho_mappings`),
+///    and `shared_cache_reservation`;
+/// 4. the page manager's vmem lock (`mm`; [`VmemManager`] takes it only
+///    briefly and releases it before a mapping's initializer runs);
+/// 5. leaves, which take no other shim lock: `ipc` (a `ulock_wait` resolves
+///    an owner under `ulocks`), the thread registry
+///    (`ProcessState::threads`, taken under `ipc` to turn a port name into a
+///    thread), `semaphores`, `restartable_ranges`, `pthread_registration`,
+///    `reported_unsupported`, `reported_syscalls`, and each
+///    [`GuestThread`]'s `policy` and `interrupt`.
+///
+/// Under any of these a thread may wake another, which takes the platform's
+/// per-thread wait-state locks; `interrupt` also takes the platform's thread
+/// identity and waker locks. Code that visits other threads (exit, a
+/// restartable-ranges synchronize) copies them out of the registry and locks
+/// each `interrupt` without it.
 struct GlobalState<P: ShimPlatform> {
     platform: &'static P,
     litebox: Arc<LiteBox<P>>,
@@ -350,9 +374,6 @@ struct GlobalState<P: ShimPlatform> {
     main_stack_top: AtomicUsize,
     /// `bsdthread_register` state; set once per process.
     pthread_registration: Mutex<P, Option<syscalls::thread::PthreadRegistration>>,
-    /// Lock order: `macho_mappings`, `ulocks`, `psynch`, then trampoline,
-    /// shared-cache, page-manager and IPC state. `semaphores` nests with no
-    /// other lock.
     ulocks: Mutex<P, syscalls::ulock::UlockTable<P>>,
     psynch: Mutex<P, syscalls::psynch::PsynchTable<P>>,
     semaphores: Mutex<P, syscalls::semaphore::SemaphoreTable<P>>,
