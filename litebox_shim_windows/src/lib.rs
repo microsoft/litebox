@@ -1843,6 +1843,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 length,
                 result_length,
             ),
+            SyscallRequest::NtSetInformationKey {
+                key_handle,
+                key_set_information_class,
+                key_set_information,
+                key_set_information_length,
+            } => self.sys_nt_set_information_key(
+                key_handle,
+                key_set_information_class,
+                key_set_information,
+                key_set_information_length,
+            ),
             SyscallRequest::NtEnumerateKey {
                 key_handle,
                 index,

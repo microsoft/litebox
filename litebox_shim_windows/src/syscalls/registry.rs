@@ -24,6 +24,7 @@
 //! object semantics rather than file semantics.
 
 use core::mem::{offset_of, size_of};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -71,6 +72,19 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for RegistryKe
 pub(crate) struct RegistryKeyObject<Platform: crate::ShimPlatform> {
     path: String,
     fd: litebox::fs::File<Platform>,
+    // Stored on the shared object because Windows shares tags across duplicated handles but not
+    // across independently opened ones.
+    handle_tags: AtomicU32,
+}
+
+impl<Platform: crate::ShimPlatform> RegistryKeyObject<Platform> {
+    fn new(path: String, fd: litebox::fs::File<Platform>) -> Self {
+        Self {
+            path,
+            fd,
+            handle_tags: AtomicU32::new(0),
+        }
+    }
 }
 
 pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
@@ -452,6 +466,12 @@ enum KeyInformationClass {
     HandleTags = 7,
     Trust = 8,
     Layer = 9,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum KeySetInformationClass {
+    HandleTags = 5,
 }
 
 #[repr(u32)]
@@ -899,10 +919,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-        let child = RegistryKeyObject {
-            path: child_path,
-            fd: child_fd,
-        };
+        let child = RegistryKeyObject::new(child_path, child_fd);
         self.key_summary(&child)
     }
 
@@ -1301,7 +1318,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let desired_access = RegistryKeyAccess::from_desired_access(desired_access);
         let fd = self.global.registry.open_key(&path, desired_access)?;
         let handle =
-            self.insert_registry_key_handle(RegistryKeyObject { path, fd }, desired_access)?;
+            self.insert_registry_key_handle(RegistryKeyObject::new(path, fd), desired_access)?;
         Ok((handle, disposition))
     }
 
@@ -1326,7 +1343,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     );
                 }
             })?;
-        self.insert_registry_key_handle(RegistryKeyObject { path, fd }, desired_access)
+        self.insert_registry_key_handle(RegistryKeyObject::new(path, fd), desired_access)
     }
 
     fn registry_key_path(&self, object_attributes: ObjectAttributes) -> Result<String, NtStatus> {
@@ -1632,6 +1649,43 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         NtStatus::PENDING
     }
 
+    /// Only `KeySetHandleTagsInformation` is modeled; it takes exactly one `u32`, keeps its low
+    /// 16 bits, and requires no granted access on the handle.
+    pub(crate) fn sys_nt_set_information_key(
+        &self,
+        key_handle: Handle,
+        key_set_information_class: u32,
+        key_set_information: ConstPtr<Platform, u8>,
+        key_set_information_length: u32,
+    ) -> NtStatus {
+        let Ok(KeySetInformationClass::HandleTags) =
+            KeySetInformationClass::try_from(key_set_information_class)
+        else {
+            litebox_util_log::debug!(
+                key_set_information_class;
+                "Unsupported NtSetInformationKey class"
+            );
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+        if key_set_information_length as usize != size_of::<u32>() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if key_set_information.as_usize() == 0 {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let information = ConstPtr::<Platform, u32>::from_usize(key_set_information.as_usize());
+        let Some(tags) = information.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let tags = tags & 0xffff;
+        let key = match self.typed_handle_entry::<RegistryKeyObject<Platform>>(key_handle) {
+            Ok(key) => key,
+            Err(status) => return status,
+        };
+        key.with_entry(|key| key.handle_tags.store(tags, Ordering::Relaxed));
+        NtStatus::SUCCESS
+    }
+
     pub(crate) fn sys_nt_query_key(
         &self,
         key_handle: Handle,
@@ -1682,16 +1736,16 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        let key = if key_information_class == KeyInformationClass::Name {
-            // Windows permits KeyNameInformation with any nonzero granted access.
-            self.typed_handle_entry_with_any_access::<RegistryKeyObject<Platform>>(key_handle)?
-        } else {
-            self.typed_handle_entry_with_access::<RegistryKeyObject<Platform>>(
+        let key = match key_information_class {
+            KeyInformationClass::Name | KeyInformationClass::HandleTags => {
+                // Windows permits these classes with any nonzero granted access.
+                self.typed_handle_entry_with_any_access::<RegistryKeyObject<Platform>>(key_handle)?
+            }
+            _ => self.typed_handle_entry_with_access::<RegistryKeyObject<Platform>>(
                 key_handle,
                 RegistryKeyAccess::QUERY_VALUE.bits(),
-            )?
+            )?,
         };
-        let path = key.with_entry(|key| key.path.clone());
         let summary = if matches!(
             key_information_class,
             KeyInformationClass::Full | KeyInformationClass::Cached
@@ -1700,11 +1754,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         } else {
             KeySummary::default()
         };
-        let leaf = path.rsplit('/').next().ok_or(NtStatus::UNSUCCESSFUL)?;
-        let leaf_name = utf16le(leaf);
+        let leaf_name = || {
+            key.with_entry(|key| key.path.rsplit('/').next().map(utf16le))
+                .ok_or(NtStatus::UNSUCCESSFUL)
+        };
 
         match key_information_class {
             KeyInformationClass::Basic => {
+                let leaf_name = leaf_name()?;
                 let header_len = offset_of!(KeyBasicInformation, name);
                 let required_length = header_len
                     .checked_add(leaf_name.len())
@@ -1727,6 +1784,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 )?;
             }
             KeyInformationClass::Node => {
+                let leaf_name = leaf_name()?;
                 let header_len = offset_of!(KeyNodeInformation, name);
                 let required_length = header_len
                     .checked_add(leaf_name.len())
@@ -1777,12 +1835,15 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             }
             KeyInformationClass::Name => {
                 // TODO(registry-case): Preserve original subkey casing in the registry store.
-                let name = utf16le(&format!(
-                    "\\{}",
-                    path.trim_start_matches('/')
-                        .replace('/', "\\")
-                        .to_ascii_uppercase()
-                ));
+                let name = key.with_entry(|key| {
+                    utf16le(&format!(
+                        "\\{}",
+                        key.path
+                            .trim_start_matches('/')
+                            .replace('/', "\\")
+                            .to_ascii_uppercase()
+                    ))
+                });
                 let header_len = offset_of!(KeyNameInformation, name);
                 let required_length = header_len
                     .checked_add(name.len())
@@ -1802,6 +1863,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 )?;
             }
             KeyInformationClass::Cached => {
+                let leaf_name = leaf_name()?;
                 let required_length = size_of::<KeyCachedInformation>();
                 let information = KeyCachedInformation {
                     last_write_time: [0; 8],
@@ -1828,9 +1890,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             KeyInformationClass::HandleTags => {
                 let required_length = size_of::<KeyHandleTagsInformation>();
                 let information = KeyHandleTagsInformation {
-                    // Non-virtualized keys have no tags.
-                    // TODO(registry-virtualization): Reflect tags once virtualization is modeled.
-                    handle_tags: 0,
+                    handle_tags: key.with_entry(|key| key.handle_tags.load(Ordering::Relaxed)),
                 };
                 write_query_information::<Platform>(
                     result_length,
@@ -2676,6 +2736,371 @@ mod tests {
         let code_page_name = unicode_string(&code_page_name);
         let object_attributes = object_attributes(&code_page_name, 0);
         open_key(task, object_attributes).expect("Failed to open code page key")
+    }
+
+    /// Observes `NtSetInformationKey`/`NtQueryKey` handle-tag behavior on the shim or the host.
+    trait KeyHandleTagsApi {
+        type Handle: Copy;
+
+        fn set_handle_tags(
+            &self,
+            key: Self::Handle,
+            class: u32,
+            information: Option<&[u32]>,
+            length: u32,
+        ) -> NtStatus;
+
+        /// Returns the status and tags of a `u32`-sized `KeyHandleTagsInformation` query.
+        fn query_handle_tags(&self, key: Self::Handle) -> (NtStatus, u32);
+    }
+
+    struct KeyHandleTagsHandles<H> {
+        /// Opened with `KEY_READ | KEY_SET_VALUE`.
+        key: H,
+        /// Duplicate of `key` granted only `KEY_SET_VALUE`.
+        duplicate: H,
+        /// Duplicate of `key` granted no access.
+        zero_access: H,
+        /// Independent open of the same key.
+        separate: H,
+    }
+
+    /// Expected labeled `(status, tags)` observations from [`observe_key_handle_tags`], verified
+    /// against Windows by `host_fidelity::key_handle_tags_match_host`.
+    const EXPECTED_KEY_HANDLE_TAGS: &[(&str, NtStatus, u32)] = &[
+        ("initial key query", NtStatus::SUCCESS, 0),
+        ("set through duplicate", NtStatus::SUCCESS, 0),
+        ("key after duplicate set", NtStatus::SUCCESS, 0x5678),
+        ("duplicate after duplicate set", NtStatus::SUCCESS, 0x5678),
+        ("separate after duplicate set", NtStatus::SUCCESS, 0),
+        ("set all bits through key", NtStatus::SUCCESS, 0),
+        ("duplicate after key set", NtStatus::SUCCESS, 0xffff),
+        ("query through zero-access", NtStatus::ACCESS_DENIED, 0),
+        ("set through zero-access", NtStatus::SUCCESS, 0),
+        ("key after zero-access set", NtStatus::SUCCESS, 1),
+        ("unsupported class", NtStatus::INVALID_INFO_CLASS, 0),
+        ("unknown class", NtStatus::INVALID_INFO_CLASS, 0),
+        ("zero length", NtStatus::INFO_LENGTH_MISMATCH, 0),
+        ("short length", NtStatus::INFO_LENGTH_MISMATCH, 0),
+        ("long length", NtStatus::INFO_LENGTH_MISMATCH, 0),
+        ("null information", NtStatus::ACCESS_VIOLATION, 0),
+        ("key after rejected sets", NtStatus::SUCCESS, 1),
+        ("clear tags", NtStatus::SUCCESS, 0),
+    ];
+
+    fn observe_key_handle_tags<Api: KeyHandleTagsApi>(
+        api: &Api,
+        handles: &KeyHandleTagsHandles<Api::Handle>,
+    ) -> Vec<(&'static str, NtStatus, u32)> {
+        let tags_class = u32::from(KeySetInformationClass::HandleTags);
+        let tags_length: u32 = size_of::<u32>().trunc();
+        let query = |label, key| {
+            let (status, tags) = api.query_handle_tags(key);
+            (label, status, tags)
+        };
+        let set = |label, key, class, information: Option<&'static [u32]>, length| {
+            (
+                label,
+                api.set_handle_tags(key, class, information, length),
+                0,
+            )
+        };
+        vec![
+            query("initial key query", handles.key),
+            set(
+                "set through duplicate",
+                handles.duplicate,
+                tags_class,
+                Some(&[0x1234_5678]),
+                tags_length,
+            ),
+            query("key after duplicate set", handles.key),
+            query("duplicate after duplicate set", handles.duplicate),
+            query("separate after duplicate set", handles.separate),
+            set(
+                "set all bits through key",
+                handles.key,
+                tags_class,
+                Some(&[u32::MAX]),
+                tags_length,
+            ),
+            query("duplicate after key set", handles.duplicate),
+            query("query through zero-access", handles.zero_access),
+            set(
+                "set through zero-access",
+                handles.zero_access,
+                tags_class,
+                Some(&[1]),
+                tags_length,
+            ),
+            query("key after zero-access set", handles.key),
+            set("unsupported class", handles.key, 6, Some(&[2]), tags_length),
+            set("unknown class", handles.key, 99, Some(&[2]), tags_length),
+            set("zero length", handles.key, tags_class, Some(&[2]), 0),
+            set("short length", handles.key, tags_class, Some(&[2]), 3),
+            set("long length", handles.key, tags_class, Some(&[2, 2]), 8),
+            set(
+                "null information",
+                handles.key,
+                tags_class,
+                None,
+                tags_length,
+            ),
+            query("key after rejected sets", handles.key),
+            set(
+                "clear tags",
+                handles.key,
+                tags_class,
+                Some(&[0]),
+                tags_length,
+            ),
+        ]
+    }
+
+    struct ShimKeyHandleTags<'a>(&'a Task<TestPlatform>);
+
+    impl KeyHandleTagsApi for ShimKeyHandleTags<'_> {
+        type Handle = Handle;
+
+        fn set_handle_tags(
+            &self,
+            key: Handle,
+            class: u32,
+            information: Option<&[u32]>,
+            length: u32,
+        ) -> NtStatus {
+            let information = ConstPtr::<TestPlatform, u8>::from_usize(
+                information.map_or(0, |information| information.as_ptr() as usize),
+            );
+            self.0
+                .sys_nt_set_information_key(key, class, information, length)
+        }
+
+        fn query_handle_tags(&self, key: Handle) -> (NtStatus, u32) {
+            let mut tags = 0u32;
+            let mut length = 0;
+            let status = self.0.sys_nt_query_key(
+                key,
+                u32::from(KeyInformationClass::HandleTags),
+                mut_byte_ptr(&mut tags),
+                size_of::<u32>().trunc(),
+                mut_ptr(&mut length),
+            );
+            (status, tags)
+        }
+    }
+
+    fn duplicate_key_handle(task: &Task<TestPlatform>, key: Handle, desired_access: u32) -> Handle {
+        let mut duplicate = Handle::default();
+        assert_eq!(
+            task.sys_nt_duplicate_object(
+                crate::syscalls::ProcessHandle::CURRENT,
+                key,
+                crate::syscalls::ProcessHandle::CURRENT,
+                Some(mut_ptr(&mut duplicate)),
+                desired_access,
+                0,
+                0,
+            ),
+            NtStatus::SUCCESS
+        );
+        duplicate
+    }
+
+    #[test]
+    fn nt_key_handle_tags_match_expected_windows_behavior() {
+        let task = crate::tests::test_task_with_broker_files(&[]);
+        let path = utf16(DEFAULT_CODE_PAGE_KEY);
+        let name = unicode_string(&path);
+        let key = task
+            .do_nt_open_key(
+                (RegistryKeyAccess::READ | RegistryKeyAccess::SET_VALUE).bits(),
+                object_attributes(&name, 0),
+            )
+            .unwrap();
+        let handles = KeyHandleTagsHandles {
+            key,
+            duplicate: duplicate_key_handle(&task, key, RegistryKeyAccess::SET_VALUE.bits()),
+            zero_access: duplicate_key_handle(&task, key, 0),
+            separate: open_code_page_key(&task),
+        };
+
+        assert_eq!(
+            observe_key_handle_tags(&ShimKeyHandleTags(&task), &handles),
+            EXPECTED_KEY_HANDLE_TAGS
+        );
+        for handle in [
+            handles.key,
+            handles.duplicate,
+            handles.zero_access,
+            handles.separate,
+        ] {
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        }
+    }
+
+    #[test]
+    fn nt_key_handle_tags_reject_invalid_handles() {
+        let task = crate::tests::test_task_with_broker_files(&[]);
+        let api = ShimKeyHandleTags(&task);
+        let tags = [1u32];
+        // Windows: an invalid handle fails with STATUS_INVALID_HANDLE for both calls.
+        assert_eq!(
+            api.set_handle_tags(
+                Handle::default(),
+                u32::from(KeySetInformationClass::HandleTags),
+                Some(&tags),
+                size_of::<u32>().trunc(),
+            ),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            api.query_handle_tags(Handle::default()),
+            (NtStatus::INVALID_HANDLE, 0)
+        );
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    mod host_fidelity {
+        use super::*;
+        use core::ffi::c_void;
+
+        const CURRENT_PROCESS: *mut c_void = usize::MAX as *mut c_void;
+
+        #[allow(non_snake_case)]
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtSetInformationKey(
+                KeyHandle: *mut c_void,
+                KeySetInformationClass: u32,
+                KeySetInformation: *const c_void,
+                KeySetInformationLength: u32,
+            ) -> i32;
+            fn NtQueryKey(
+                KeyHandle: *mut c_void,
+                KeyInformationClass: u32,
+                KeyInformation: *mut c_void,
+                Length: u32,
+                ResultLength: *mut u32,
+            ) -> i32;
+            fn NtDuplicateObject(
+                SourceProcessHandle: *mut c_void,
+                SourceHandle: *mut c_void,
+                TargetProcessHandle: *mut c_void,
+                TargetHandle: *mut c_void,
+                DesiredAccess: u32,
+                HandleAttributes: u32,
+                Options: u32,
+            ) -> i32;
+            fn NtClose(Handle: *mut c_void) -> i32;
+        }
+
+        fn host_status(status: i32) -> NtStatus {
+            NtStatus::from_raw(status.cast_unsigned())
+        }
+
+        struct HostKeyHandleTags;
+
+        impl KeyHandleTagsApi for HostKeyHandleTags {
+            type Handle = *mut c_void;
+
+            fn set_handle_tags(
+                &self,
+                key: *mut c_void,
+                class: u32,
+                information: Option<&[u32]>,
+                length: u32,
+            ) -> NtStatus {
+                assert!(
+                    information
+                        .is_none_or(|information| { size_of_val(information) >= length as usize })
+                );
+                let information = information.map_or(core::ptr::null(), <[u32]>::as_ptr);
+                // SAFETY: `key` is a live host registry handle and `information` is either null
+                // or valid for reads of `length` bytes, as asserted above.
+                host_status(unsafe { NtSetInformationKey(key, class, information.cast(), length) })
+            }
+
+            fn query_handle_tags(&self, key: *mut c_void) -> (NtStatus, u32) {
+                let mut tags = 0u32;
+                let mut length = 0u32;
+                // SAFETY: `key` is a live host registry handle and both outputs are live locals
+                // of the advertised sizes.
+                let status = unsafe {
+                    NtQueryKey(
+                        key,
+                        u32::from(KeyInformationClass::HandleTags),
+                        (&raw mut tags).cast(),
+                        size_of::<u32>().trunc(),
+                        &raw mut length,
+                    )
+                };
+                (host_status(status), tags)
+            }
+        }
+
+        fn host_open_software_key(desired_access: u32) -> *mut c_void {
+            let path = nul_terminated_utf16("Software");
+            let mut key = core::ptr::null_mut();
+            // SAFETY: The key path is NUL-terminated, `phkResult` points to a live output
+            // slot, and `HKEY_CURRENT_USER` is the documented predefined registry handle.
+            let status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    path.as_ptr(),
+                    0,
+                    desired_access,
+                    &raw mut key,
+                )
+            };
+            assert_eq!(status, ERROR_SUCCESS, "failed to open host registry key");
+            key
+        }
+
+        fn host_duplicate(key: *mut c_void, desired_access: u32) -> *mut c_void {
+            let mut duplicate: *mut c_void = core::ptr::null_mut();
+            // SAFETY: The process pseudo-handles and `key` are valid, and the output is a live
+            // local.
+            let status = unsafe {
+                NtDuplicateObject(
+                    CURRENT_PROCESS,
+                    key,
+                    CURRENT_PROCESS,
+                    (&raw mut duplicate).cast(),
+                    desired_access,
+                    0,
+                    0,
+                )
+            };
+            assert_eq!(host_status(status), NtStatus::SUCCESS);
+            duplicate
+        }
+
+        #[test]
+        fn key_handle_tags_match_host() {
+            let desired_access = (RegistryKeyAccess::READ | RegistryKeyAccess::SET_VALUE).bits();
+            let key = host_open_software_key(desired_access);
+            let handles = KeyHandleTagsHandles {
+                key,
+                duplicate: host_duplicate(key, RegistryKeyAccess::SET_VALUE.bits()),
+                zero_access: host_duplicate(key, 0),
+                separate: host_open_software_key(desired_access),
+            };
+
+            assert_eq!(
+                observe_key_handle_tags(&HostKeyHandleTags, &handles),
+                EXPECTED_KEY_HANDLE_TAGS
+            );
+            for handle in [
+                handles.key,
+                handles.duplicate,
+                handles.zero_access,
+                handles.separate,
+            ] {
+                // SAFETY: Each handle was opened or duplicated above and is closed once.
+                assert_eq!(host_status(unsafe { NtClose(handle) }), NtStatus::SUCCESS);
+            }
+        }
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

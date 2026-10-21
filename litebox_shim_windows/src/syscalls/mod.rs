@@ -554,6 +554,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         length: u32,
         result_length: Platform::RawMutPointer<u32>,
     },
+    NtSetInformationKey {
+        key_handle: Handle,
+        key_set_information_class: u32,
+        key_set_information: Platform::RawConstPointer<u8>,
+        key_set_information_length: u32,
+    },
     NtEnumerateKey {
         key_handle: Handle,
         index: u32,
@@ -1400,6 +1406,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 key_information:*,
                 length,
                 result_length:*,
+            })),
+            NtSysno::NtSetInformationKey => Some(sys_req!(NtSetInformationKey {
+                key_handle:{Handle::from_raw},
+                key_set_information_class,
+                key_set_information:*,
+                key_set_information_length,
             })),
             NtSysno::NtEnumerateKey => Some(sys_req!(NtEnumerateKey {
                 key_handle:{Handle::from_raw},
