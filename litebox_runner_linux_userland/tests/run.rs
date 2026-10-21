@@ -3520,9 +3520,19 @@ fn test_managed_egress_proxy_with_curl() {
         .with_fs_path(|root| {
             let destination = root.join(CA_BUNDLE.trim_start_matches('/'));
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            // `copy` keeps a read-only mode, so remove any earlier copy.
-            let _ = std::fs::remove_file(&destination);
-            std::fs::copy(CA_BUNDLE, destination).unwrap();
+            let source_metadata = std::fs::metadata(CA_BUNDLE).unwrap();
+            let modified = source_metadata.modified().unwrap();
+            if !std::fs::metadata(&destination).is_ok_and(|metadata| {
+                metadata.len() == source_metadata.len() && metadata.modified().unwrap() == modified
+            }) {
+                // `copy` keeps a read-only mode, so remove any earlier copy.
+                let _ = std::fs::remove_file(&destination);
+                std::fs::copy(CA_BUNDLE, &destination).unwrap();
+                std::fs::File::open(&destination)
+                    .unwrap()
+                    .set_modified(modified)
+                    .unwrap();
+            }
         })
         .args([
             "--silent",

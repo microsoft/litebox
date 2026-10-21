@@ -70,7 +70,17 @@ impl Runner {
             assert!(success, "failed to run litebox_syscall_rewriter");
         } else {
             std::fs::create_dir_all(target_dest_path.parent().unwrap()).unwrap();
-            std::fs::copy(target, &target_dest_path).unwrap();
+            let source_metadata = std::fs::metadata(target).unwrap();
+            let modified = source_metadata.modified().unwrap();
+            if !std::fs::metadata(&target_dest_path).is_ok_and(|metadata| {
+                metadata.len() == source_metadata.len() && metadata.modified().unwrap() == modified
+            }) {
+                std::fs::copy(target, &target_dest_path).unwrap();
+                std::fs::File::open(&target_dest_path)
+                    .unwrap()
+                    .set_modified(modified)
+                    .unwrap();
+            }
         }
 
         let libs = super::find_dependencies(target.to_str().unwrap());
