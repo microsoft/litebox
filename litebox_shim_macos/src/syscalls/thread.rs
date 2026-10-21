@@ -569,8 +569,8 @@ impl<P: ShimPlatform> Task<P> {
         self.ulock_wake_all_unfair(address);
     }
 
-    /// `__disable_threadsignal`: no signal is delivered to this thread again,
-    /// and it takes no further cancellation.
+    /// `__disable_threadsignal`: no signal is delivered to this thread again.
+    /// `UT_CANCELDISABLE` is recorded for when cancellation is emulated.
     pub(crate) fn sys_disable_threadsignal(&self) {
         let guest = &self.thread.guest;
         guest.no_signals.store(true, Ordering::Relaxed);
@@ -843,8 +843,16 @@ impl<P: ShimPlatform> Task<P> {
     /// the thread should still yield afterwards (`thread_should_yield`),
     /// which only the host scheduler knows; FALSE is one of XNU's answers.
     pub(crate) fn sys_swtch(&self) -> usize {
-        litebox::platform::ThreadProvider::yield_thread(self.global.platform);
+        self.yield_host_thread();
         0
+    }
+
+    fn yield_host_thread(&self) {
+        litebox::platform::ThreadProvider::yield_thread(self.global.platform);
+        #[cfg(test)]
+        self.thread
+            .platform_yields
+            .set(self.thread.platform_yields.get() + 1);
     }
 
     /// `thread_switch`: the WAIT options block for the option time, the
@@ -853,7 +861,7 @@ impl<P: ShimPlatform> Task<P> {
     pub(crate) fn sys_thread_switch(&self, option: i32, option_time: u32) -> KernReturn {
         let scale = match option {
             switch_option::NONE | switch_option::DEPRESS | switch_option::OSLOCK_DEPRESS => {
-                litebox::platform::ThreadProvider::yield_thread(self.global.platform);
+                self.yield_host_thread();
                 return KernReturn::SUCCESS;
             }
             switch_option::WAIT | switch_option::OSLOCK_WAIT => 1_000_000,

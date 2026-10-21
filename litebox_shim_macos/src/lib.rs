@@ -298,15 +298,6 @@ impl<P: ShimPlatform> Process<P> {
             .compare_exchange(-1, status, Ordering::SeqCst, Ordering::Acquire)
             .is_ok()
     }
-
-    /// Whether an exit is recorded, read after the caller's SeqCst store of
-    /// its running state. With the SeqCst fence in `Task::exit_process`
-    /// between recording and reading other threads' states, either this read
-    /// sees the exit or the exiting thread sees the caller running guest code
-    /// and interrupts it.
-    fn exit_recorded_seqcst(&self) -> bool {
-        self.0.exit_status.load(Ordering::SeqCst) >= 0
-    }
 }
 
 struct ProcessState<P: ShimPlatform> {
@@ -427,8 +418,8 @@ struct GuestThread<P: ShimPlatform> {
     signal_mask: AtomicU32,
     /// `UT_NO_SIGMASK`, set by `__disable_threadsignal`.
     no_signals: AtomicBool,
-    /// `UT_CANCELDISABLE`, set by `__disable_threadsignal`: the thread takes
-    /// no further cancellation.
+    /// `UT_CANCELDISABLE`, set by `__disable_threadsignal`. Only recorded:
+    /// thread cancellation is not emulated yet, so nothing reads it.
     cancel_disabled: AtomicBool,
     /// Scheduling policy set by the thread itself or, through `thread_policy`,
     /// by another thread (XNU's thread mutex).
@@ -452,6 +443,9 @@ struct ThreadState<P: ShimPlatform> {
     /// `bsdthread_terminate`'s user-join ulock address and the thread's port
     /// name, written and woken once the thread has terminated.
     user_join: core::cell::Cell<Option<(usize, u32)>>,
+    /// How many times the yield traps called the platform's `yield_thread`.
+    #[cfg(test)]
+    platform_yields: core::cell::Cell<usize>,
 }
 
 struct Task<P: ShimPlatform> {
@@ -991,7 +985,7 @@ impl<P: ShimPlatform> Task<P> {
             return ContinueOperation::Terminate;
         }
         let resume = self.thread.wait_state.prepare_to_run_guest(|| {
-            !self.take_host_signal() && !self.process.exit_recorded_seqcst()
+            !self.take_host_signal() && self.process.exit_status().is_none()
         });
         if resume {
             ContinueOperation::Resume

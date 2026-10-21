@@ -105,6 +105,8 @@ impl<P: ShimPlatform> Task<P> {
             start: core::cell::Cell::new(None),
             terminated: core::cell::Cell::new(false),
             user_join: core::cell::Cell::new(None),
+            #[cfg(test)]
+            platform_yields: core::cell::Cell::new(0),
         };
         Some(Self {
             global,
@@ -133,10 +135,6 @@ impl<P: ShimPlatform> Task<P> {
         if !self.process.record_exit(status) {
             return;
         }
-        // Pairs with `Process::exit_recorded_seqcst` (store-buffer pattern):
-        // a thread about to resume the guest either sees the exit or is seen
-        // running guest code by the interrupts below.
-        core::sync::atomic::fence(Ordering::SeqCst);
         let others: alloc::vec::Vec<_> = self
             .process
             .0

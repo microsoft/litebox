@@ -128,6 +128,11 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
         self.waker
             .0
             .set_state(ThreadState::RUNNING_IN_GUEST, Ordering::SeqCst);
+        // `f` reads the interrupt conditions after this; with the fence in
+        // `ThreadHandle::interrupt`, either `f` sees the interrupter's
+        // publication or the interrupter sees RUNNING_IN_GUEST (store-buffer
+        // pattern).
+        core::sync::atomic::fence(Ordering::SeqCst);
         let ready_to_run_guest = f();
         if !ready_to_run_guest {
             self.waker
@@ -224,9 +229,8 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
     /// platform will interrupt the thread and re-enter the shim.
     pub fn interrupt(&self) {
         // Orders the caller's publication of the interrupt condition before
-        // the state read below; pairs with the SeqCst fence in
-        // `WaitContext::start_wait` and the SeqCst state store in
-        // `WaitState::prepare_to_run_guest`.
+        // the state read below; pairs with the SeqCst fences in
+        // `WaitContext::start_wait` and `WaitState::prepare_to_run_guest`.
         core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.waker.0.condvar;
         let v =
@@ -513,4 +517,87 @@ pub enum WaitError {
     Interrupted,
     #[error("wait timed out")]
     TimedOut,
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::{ThreadState, WaitState};
+    use crate::platform::mock::MockPlatform;
+
+    /// A thread entering the guest while another publishes an interrupt
+    /// condition and calls `ThreadHandle::interrupt` either sees the condition
+    /// in its `prepare_to_run_guest` check or is interrupted (no store-buffer
+    /// outcome where both miss).
+    #[test]
+    fn prepare_to_run_guest_never_misses_a_concurrent_interrupt() {
+        const ROUNDS: u32 = 2_000_000;
+        #[derive(Default)]
+        struct Rounds {
+            /// The round both threads are running.
+            started: AtomicU32,
+            /// The last round whose interrupt condition is published.
+            condition: AtomicU32,
+            /// The last round whose `interrupt` call returned.
+            interrupted: AtomicU32,
+            /// The last round the guest thread finished.
+            guest_done: AtomicU32,
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let wait_for = move |counter: &AtomicU32, round: u32| {
+            while counter.load(Ordering::Acquire) < round {
+                assert!(Instant::now() < deadline, "round {round} stalled");
+                core::hint::spin_loop();
+            }
+        };
+        let rounds = Arc::new(Rounds::default());
+        let platform = MockPlatform::new();
+        let (handle_sender, handle_receiver) = std::sync::mpsc::sync_channel(1);
+        let guest_rounds = rounds.clone();
+        let guest = std::thread::spawn(move || {
+            let rounds = guest_rounds;
+            let state = WaitState::new(platform);
+            let handle = state.thread_handle();
+            let interrupts = handle.thread.clone();
+            handle_sender.send(handle).unwrap();
+            for round in 1..=ROUNDS {
+                wait_for(&rounds.started, round);
+                let resumed =
+                    state.prepare_to_run_guest(|| rounds.condition.load(Ordering::Relaxed) < round);
+                wait_for(&rounds.interrupted, round);
+                let interrupted = interrupts.swap(0, Ordering::Relaxed);
+                if resumed {
+                    assert_eq!(
+                        (state.waker.0.state_for_assert(), interrupted),
+                        (ThreadState::INTERRUPTED_GUEST, 1),
+                        "round {round}: resumed the guest and missed the interrupt"
+                    );
+                    state.finish_running_guest();
+                }
+                rounds.guest_done.store(round, Ordering::Release);
+            }
+        });
+        let handle = handle_receiver
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the guest thread started");
+        for round in 1..=ROUNDS {
+            rounds.started.store(round, Ordering::Release);
+            rounds.condition.store(round, Ordering::Relaxed);
+            handle.interrupt();
+            rounds.interrupted.store(round, Ordering::Release);
+            while rounds.guest_done.load(Ordering::Acquire) < round && !guest.is_finished() {
+                assert!(Instant::now() < deadline, "round {round} stalled");
+                core::hint::spin_loop();
+            }
+            if guest.is_finished() {
+                break;
+            }
+        }
+        guest.join().unwrap();
+    }
 }

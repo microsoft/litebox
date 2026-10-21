@@ -524,19 +524,23 @@ fn bsdthread_ctl_follows_xnu_for_a_non_workqueue_thread() {
     assert_eq!(ctl(0x20, [0, 0, 0]), errno(Errno::EINVAL));
 }
 
-/// The yield traps yield the host thread (see the platform's
-/// `yield_thread_gives_up_the_processor`) and return XNU's values.
+/// The yield traps yield the host thread through the platform (the WAIT
+/// options block instead) and return XNU's values.
 #[test]
 fn yield_traps_return_like_xnu() {
     let task = new_task();
+    let yields = || task.thread.platform_yields.get();
     assert_eq!(trap(&task, mach_trap::SWTCH_PRI, &[]), 0);
     assert_eq!(trap(&task, mach_trap::SWTCH, &[]), 0);
+    assert_eq!(yields(), 2);
+    // SWITCH_OPTION_NONE, _DEPRESS and _OSLOCK_DEPRESS.
     for option in [0, 1, 4] {
         assert_eq!(
             kr(&task, mach_trap::THREAD_SWITCH, &[0, option, 1000]),
             KernReturn::SUCCESS
         );
     }
+    assert_eq!(yields(), 5);
     let start = Instant::now();
     assert_eq!(
         kr(&task, mach_trap::THREAD_SWITCH, &[0, 2, 20]),
@@ -547,6 +551,7 @@ fn yield_traps_return_like_xnu() {
         kr(&task, mach_trap::THREAD_SWITCH, &[0, 6, 0]),
         KernReturn::INVALID_ARGUMENT
     );
+    assert_eq!(yields(), 5);
 }
 
 #[test]

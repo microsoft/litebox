@@ -226,15 +226,10 @@ static int blocked_on(void *address) {
   return 0;
 }
 
-// The word pthread_join waits on: libpthread's pthread_t::tl_exit_gate
-// (types_internal.h), which holds the target's port while a joiner waits.
-static uint32_t *exit_gate(pthread_t thread) {
-  uint32_t *gate = (uint32_t *)((char *)thread + 0x34);
-  for (int tries = 0; tries < 5000 && *gate != pthread_mach_thread_np(thread); tries++) {
-    sleep_ms(1);
-  }
-  return *gate == pthread_mach_thread_np(thread) ? gate : NULL;
-}
+// The word pthread_join waits on with __ulock_wait(UL_UNFAIR_LOCK):
+// libpthread's pthread_t::tl_exit_gate (types_internal.h). libpthread writes
+// it under a private lock, so only its address is used here.
+static void *exit_gate(pthread_t thread) { return (char *)thread + 0x34; }
 
 static void *exit_soon(void *argument) {
   (void)argument;
@@ -243,10 +238,7 @@ static void *exit_soon(void *argument) {
   // Every joiner (the chain's next thread, and main for its last) and every
   // unfair-lock waiter is blocked in the kernel when exit runs.
   int blocked = 0;
-  for (int i = 0; i < 4; i++) {
-    uint32_t *gate = exit_gate(chain[i]);
-    blocked += gate != NULL && blocked_on(gate);
-  }
+  for (int i = 0; i < 4; i++) blocked += blocked_on(exit_gate(chain[i]));
   for (int i = 0; i < 3; i++) blocked += blocked_on(&held[i]);
   exit(blocked == 7 ? 42 : 43);
 }
@@ -321,12 +313,29 @@ static int schedparam(void) {
   return 0;
 }
 
-// pthread_exit from main while workers sleep; the runner gets Ctrl-C.
-static int interrupt_after_main_exit(void) {
-  for (int i = 0; i < 2; i++) {
+static pthread_t main_thread;
+
+// Reports the main thread's exit with a third thread, which the runner test
+// observes as the host's thread count (guest output reaches the host only at
+// exit).
+static void *report_main_exit(void *argument) {
+  (void)argument;
+  if (pthread_join(main_thread, NULL) == 0) {
+    write(1, "main exited\n", 12);
     pthread_t thread;
     pthread_create(&thread, NULL, sleep_forever, NULL);
   }
+  mach_wait_until(UINT64_MAX);
+  return NULL;
+}
+
+// pthread_exit from main while workers sleep; one reports when its join of
+// main returns, and then the runner gets Ctrl-C.
+static int interrupt_after_main_exit(void) {
+  main_thread = pthread_self();
+  pthread_t thread;
+  pthread_create(&thread, NULL, sleep_forever, NULL);
+  pthread_create(&thread, NULL, report_main_exit, NULL);
   pthread_exit(NULL);
 }
 

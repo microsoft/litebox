@@ -270,3 +270,33 @@ unsafe impl ThreadLocalStorageProvider for MockPlatform {
         MOCK_TLS.replace(value)
     }
 }
+
+/// The mock platform runs no guest code, so it cannot spawn guest threads.
+#[derive(Debug, Error)]
+#[error("the mock platform cannot spawn guest threads")]
+pub(crate) struct MockThreadSpawnError;
+
+impl ThreadProvider for MockPlatform {
+    type ExecutionContext = ();
+    type ThreadSpawnError = MockThreadSpawnError;
+    /// Counts the interrupts sent through this handle and its clones.
+    type ThreadHandle = std::sync::Arc<core::sync::atomic::AtomicUsize>;
+
+    unsafe fn spawn_thread(
+        &self,
+        ctx: &Self::ExecutionContext,
+        init_thread: alloc::boxed::Box<
+            dyn crate::shim::InitThread<ExecutionContext = Self::ExecutionContext>,
+        >,
+    ) -> Result<(), Self::ThreadSpawnError> {
+        Err(MockThreadSpawnError)
+    }
+
+    fn current_thread(&self) -> Self::ThreadHandle {
+        std::sync::Arc::default()
+    }
+
+    fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
+        thread.fetch_add(1, Ordering::SeqCst);
+    }
+}

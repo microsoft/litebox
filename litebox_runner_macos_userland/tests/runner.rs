@@ -1127,13 +1127,33 @@ fn the_runner_thread_leaves_forwarded_signals_to_guest_threads() {
     }
 }
 
+/// Kills and reaps the runner child unless it was already reaped, so a failed
+/// test does not leave it running.
+#[cfg(feature = "test-broker")]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(feature = "test-broker")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 /// Ctrl-C after the main thread's `pthread_exit` ends the guest through its
 /// remaining threads with status 130; the runner thread waiting for them
-/// does not take the signal. (XNU picks the receiving thread, so this alone
-/// does not always catch a runner thread that takes it; the test above does.)
+/// does not take the signal. The signal is sent once a worker's
+/// `pthread_join` of the main thread returned, which the worker shows by
+/// creating a third guest thread. (XNU picks the receiving thread, so this
+/// alone does not always catch a runner thread that takes it; the test above
+/// does.)
 #[cfg(feature = "test-broker")]
 #[test]
 fn threads_take_ctrl_c_after_the_main_thread_exits() {
+    use std::io::Read as _;
+
     let dir = tempfile::tempdir().unwrap();
     let binary = compile(
         dir.path(),
@@ -1142,42 +1162,54 @@ fn threads_take_ctrl_c_after_the_main_thread_exits() {
         include_str!("fixtures/threads.c"),
         &["-O1"],
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
-        .arg(&binary)
-        .arg("interrupt_after_main_exit")
-        .env_remove("LITEBOX_LOG")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    // Signal once the guest runs: the runner thread and the two sleepers
-    // the guest's main thread creates right before its pthread_exit.
-    let pid = i32::try_from(child.id()).unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+            .arg(&binary)
+            .arg("interrupt_after_main_exit")
+            .env_remove("LITEBOX_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // The runner thread, the two workers main created, and the thread the
+    // reporting worker creates after its join of main returned.
+    let pid = i32::try_from(child.0.id()).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while host_thread_count(pid) < 3 {
+    while host_thread_count(pid) < 4 {
         assert!(
             std::time::Instant::now() < deadline,
-            "the guest never started its threads"
+            "the guest never reported the main thread's exit"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    std::thread::sleep(std::time::Duration::from_millis(300));
     // SAFETY: kill has no memory preconditions; the child has not been reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.0.try_wait().unwrap() {
             break status;
         }
-        if std::time::Instant::now() > deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("the guest did not end after Ctrl-C");
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the guest did not end after Ctrl-C"
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    assert_eq!(status.code(), Some(130), "{status:?}");
+    let mut stdout = String::new();
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert_eq!(
+        (status.code(), stdout.as_str()),
+        (Some(130), "main exited\n"),
+        "{status:?}"
+    );
 }
 
 /// When every thread terminates without `exit`, the process exits with

@@ -461,35 +461,12 @@ impl TimerHandle {
 
         // Block before spawning so the worker inherits the mask and cannot
         // consume guest-directed host signals during startup.
-        // SAFETY: both sigsets are initialized output storage and this changes
-        // only the calling thread's mask, which is restored below.
-        let old_mask = unsafe {
-            let mut signals = core::mem::zeroed::<libc::sigset_t>();
-            let mut old_mask = core::mem::zeroed::<libc::sigset_t>();
-            libc::sigemptyset(&raw mut signals);
-            for &(host_signal, _) in FORWARDED_SIGNALS {
-                libc::sigaddset(&raw mut signals, host_signal);
-            }
-            assert_eq!(
-                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old_mask),
-                0
-            );
-            old_mask
-        };
+        let old_mask = block_forwarded_signals_saving_mask()
+            .expect("blocking the forwarded signals for the macOS timer worker");
         let worker = std::thread::Builder::new()
             .name("litebox-macos-timer".into())
             .spawn(move || timer_worker(&worker_shared, signal));
-        // SAFETY: old_mask was returned by pthread_sigmask for this thread.
-        assert_eq!(
-            unsafe {
-                libc::pthread_sigmask(
-                    libc::SIG_SETMASK,
-                    &raw const old_mask,
-                    core::ptr::null_mut(),
-                )
-            },
-            0
-        );
+        restore_signal_mask(&old_mask);
         let worker = worker.expect("failed to create macOS timer worker");
         Self {
             shared,
@@ -1155,21 +1132,37 @@ fn forwarded_guest_signal(signal: i32) -> Option<litebox_common_linux::signal::S
 /// the guest's exit model handles them instead of the host's default
 /// disposition.
 pub fn block_forwarded_signals() -> std::io::Result<()> {
+    block_forwarded_signals_saving_mask().map(|_| ())
+}
+
+/// Block the forwarded host signals on the calling thread and return its
+/// previous mask, for [`restore_signal_mask`].
+fn block_forwarded_signals_saving_mask() -> std::io::Result<libc::sigset_t> {
     // SAFETY: zero is valid for this integer bitmask.
     let mut signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    // SAFETY: signals is live stack storage; only this thread's mask changes.
+    // SAFETY: zero is valid for this integer bitmask.
+    let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: both masks are live stack storage; only this thread's mask changes.
     let error = unsafe {
         libc::sigemptyset(&raw mut signals);
         for &(signal, _) in FORWARDED_SIGNALS {
             libc::sigaddset(&raw mut signals, signal);
         }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, core::ptr::null_mut())
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old_mask)
     };
     if error == 0 {
-        Ok(())
+        Ok(old_mask)
     } else {
         Err(std::io::Error::from_raw_os_error(error))
     }
+}
+
+fn restore_signal_mask(mask: &libc::sigset_t) {
+    assert_eq!(
+        // SAFETY: mask is a mask pthread_sigmask returned for this thread.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, mask, core::ptr::null_mut()) },
+        0
+    );
 }
 
 fn host_signals() -> impl Iterator<Item = i32> {
@@ -1354,8 +1347,15 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         let vector_state =
             litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
         let (ready, setup) = std::sync::mpsc::sync_channel(1);
-        let _handle = std::thread::Builder::new()
-            .spawn(move || thread_start(init_thread, ctx, vector_state, process, ready))?;
+        // The thread inherits the blocked forwarded signals, so its setup and
+        // the shim's teardown leave them to threads running guest code;
+        // `run_thread_inner_with_process` unblocks them only around guest
+        // execution.
+        let old_mask = block_forwarded_signals_saving_mask()?;
+        let spawned = std::thread::Builder::new()
+            .spawn(move || thread_start(init_thread, ctx, vector_state, process, ready));
+        restore_signal_mask(&old_mask);
+        let _handle = spawned?;
         // The thread's per-thread resources exist, or it failed without
         // running guest code.
         setup
@@ -2850,6 +2850,109 @@ mod tests {
             .expect("a wakeup was lost");
     }
 
+    /// A guest thread spawned while forwarded signals are unblocked (from
+    /// guest execution) has them blocked during its setup and the shim's
+    /// teardown, and unblocked only while the shim runs it.
+    #[test]
+    fn spawned_guest_threads_block_forwarded_signals_outside_the_guest() {
+        type Masks = std::sync::mpsc::SyncSender<(&'static str, bool)>;
+
+        fn forwarded_signals_blocked() -> bool {
+            // SAFETY: zero is valid for this integer bitmask.
+            let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            // SAFETY: a null new mask only reads this thread's mask.
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, core::ptr::null(), &raw mut mask) },
+                0
+            );
+            FORWARDED_SIGNALS.iter().all(|&(signal, _)| {
+                // SAFETY: mask is an initialized sigset_t.
+                unsafe { libc::sigismember(&raw const mask, signal) == 1 }
+            })
+        }
+
+        struct ChildInit(Masks);
+        struct ChildShim(Masks);
+        struct Parent(&'static MacosUserland);
+
+        impl litebox::shim::InitThread for ChildInit {
+            type ExecutionContext = PtRegs;
+
+            fn init(self: Box<Self>) -> Box<dyn EnterShim<ExecutionContext = PtRegs>> {
+                self.0.send(("setup", forwarded_signals_blocked())).unwrap();
+                Box::new(ChildShim(self.0))
+            }
+        }
+
+        impl Drop for ChildShim {
+            fn drop(&mut self) {
+                let _ = self.0.send(("teardown", forwarded_signals_blocked()));
+            }
+        }
+
+        impl EnterShim for ChildShim {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, _: &mut PtRegs) -> ContinueOperation {
+                self.0.send(("guest", forwarded_signals_blocked())).unwrap();
+                ContinueOperation::Terminate
+            }
+
+            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+        }
+
+        impl EnterShim for Parent {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, _: &mut PtRegs) -> ContinueOperation {
+                assert!(!forwarded_signals_blocked());
+                let (masks, observed) = std::sync::mpsc::sync_channel(3);
+                // SAFETY: the child's shim terminates before guest entry.
+                unsafe {
+                    self.0
+                        .spawn_thread(&PtRegs::default(), Box::new(ChildInit(masks)))
+                        .unwrap();
+                }
+                let observed: Vec<_> = (0..3)
+                    .map(|_| observed.recv_timeout(Duration::from_secs(30)).unwrap())
+                    .collect();
+                assert_eq!(
+                    observed,
+                    [("setup", true), ("guest", false), ("teardown", true)]
+                );
+                assert!(!forwarded_signals_blocked());
+                ContinueOperation::Terminate
+            }
+
+            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+        }
+
+        set_guest_abi(GuestAbi::Linux);
+        let platform = MacosUserland::new();
+        // SAFETY: both shims terminate before guest entry.
+        unsafe { run_thread(Parent(platform), &mut PtRegs::default()) };
+    }
+
     /// A signal stack that cannot be mapped is an error for the caller (a
     /// guest thread's creation), not a panic.
     #[test]
@@ -2861,10 +2964,13 @@ mod tests {
         assert!(SignalAltStack::new().is_ok());
     }
 
-    /// `yield_thread` gives the processor to other runnable threads: with
-    /// every CPU busy, yielding switches this thread out where spinning for
-    /// the same time does not.
+    /// Diagnostic: `yield_thread` gives the processor to other runnable
+    /// threads, so with every CPU busy, yielding switches this thread out
+    /// where spinning for the same time does not. Ignored by default because
+    /// the count is task-wide and depends on the host scheduler; run it with
+    /// `--run-ignored only`.
     #[test]
+    #[ignore = "host-scheduler-dependent diagnostic"]
     fn yield_thread_gives_up_the_processor() {
         fn context_switches() -> i32 {
             const TASK_EVENTS_INFO: i32 = 2;
