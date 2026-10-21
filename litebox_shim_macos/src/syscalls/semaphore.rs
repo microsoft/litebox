@@ -5,7 +5,10 @@
 //! `__semwait_signal`, after `bsd/kern/kern_sig.c`.
 //!
 //! A semaphore's count is its value while nonnegative; -1 means threads may
-//! be waiting (XNU keeps no count of them). Its port is a kernel object in
+//! be waiting (XNU keeps no count of them). A prepost past `INT_MAX`, which
+//! `semaphore_create` admits, wraps to `INT_MIN` as XNU's release kernel's
+//! `count++` does; the count then reads as one with waiters, so the next
+//! wait blocks and the next signal resets it. Its port is a kernel object in
 //! the task's IPC space; `semaphore_destroy` kills the port and removes the
 //! semaphore here, ending its waiters with `KERN_TERMINATED`.
 
@@ -137,7 +140,7 @@ impl<P: ShimPlatform> SemaphoreTable<P> {
                 };
             }
             if prepost {
-                semaphore.count += 1;
+                semaphore.count = semaphore.count.wrapping_add(1);
             }
             return KernReturn::SUCCESS;
         }
@@ -149,7 +152,7 @@ impl<P: ShimPlatform> SemaphoreTable<P> {
             semaphore.count = 0;
         }
         if prepost {
-            semaphore.count += 1;
+            semaphore.count = semaphore.count.wrapping_add(1);
         }
         KernReturn::NOT_WAITING
     }

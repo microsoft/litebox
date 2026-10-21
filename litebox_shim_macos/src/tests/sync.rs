@@ -410,6 +410,73 @@ fn semaphore_wait_signal_signals_after_queueing() {
     assert_eq!(count(&task, wait), Some(-1));
 }
 
+/// `semaphore_create` admits `INT_MAX`; a prepost past it wraps to
+/// `INT_MIN` like XNU's `int` count, which then reads as "may have
+/// waiters": through `semaphore_signal`, `signal_all`, the wait traps, a
+/// wait's signal and `__semwait_signal`.
+#[test]
+fn semaphore_counts_wrap_past_int_max_like_xnu() {
+    let task = new_task();
+    let _watchdog = Watchdog::new(&task);
+    let max = i32::MAX.cast_unsigned();
+    let signal = |semaphore| kr(&task, mach_trap::SEMAPHORE_SIGNAL, &[semaphore]);
+    let semaphore = create_semaphore(&task, SYNC_POLICY_FIFO, max);
+    assert_eq!(count(&task, semaphore), Some(i32::MAX));
+    assert_eq!(signal(semaphore), KernReturn::SUCCESS);
+    assert_eq!(count(&task, semaphore), Some(i32::MIN));
+    // The wrapped count does not satisfy a wait: a poll leaves it, a timed
+    // wait blocks (-1) and times out, and the next signal preposts.
+    assert_eq!(
+        kr(&task, mach_trap::SEMAPHORE_TIMEDWAIT, &[semaphore, 0, 0]),
+        KernReturn::OPERATION_TIMED_OUT
+    );
+    assert_eq!(count(&task, semaphore), Some(i32::MIN));
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::SEMAPHORE_TIMEDWAIT,
+            &[semaphore, 0, 1_000_000]
+        ),
+        KernReturn::OPERATION_TIMED_OUT
+    );
+    assert_eq!(count(&task, semaphore), Some(-1));
+    assert_eq!(signal(semaphore), KernReturn::SUCCESS);
+    assert_eq!(count(&task, semaphore), Some(1));
+
+    // signal_all resets a wrapped count and never preposts past INT_MAX.
+    let semaphore = create_semaphore(&task, SYNC_POLICY_FIFO, max);
+    assert_eq!(
+        kr(&task, mach_trap::SEMAPHORE_SIGNAL_ALL, &[semaphore]),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(count(&task, semaphore), Some(i32::MAX));
+    assert_eq!(signal(semaphore), KernReturn::SUCCESS);
+    assert_eq!(
+        kr(&task, mach_trap::SEMAPHORE_SIGNAL_ALL, &[semaphore]),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(count(&task, semaphore), Some(0));
+
+    // A wait takes one from INT_MAX; the signal of wait_signal and of
+    // __semwait_signal wraps its semaphore.
+    let full = create_semaphore(&task, SYNC_POLICY_FIFO, max);
+    assert_eq!(bounded_wait(&task, full), KernReturn::SUCCESS);
+    assert_eq!(count(&task, full), Some(i32::MAX - 1));
+    assert_eq!(signal(full), KernReturn::SUCCESS);
+    let taken = create_semaphore(&task, SYNC_POLICY_FIFO, 2);
+    assert_eq!(
+        kr(&task, mach_trap::SEMAPHORE_WAIT_SIGNAL, &[taken, full]),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(count(&task, full), Some(i32::MIN));
+    let full = create_semaphore(&task, SYNC_POLICY_FIFO, max);
+    assert_eq!(semwait(&task, nr::SEMWAIT_SIGNAL, taken, full, None), Ok(0));
+    assert_eq!(
+        (count(&task, taken), count(&task, full)),
+        (Some(0), Some(i32::MIN))
+    );
+}
+
 /// `semaphore_destroy` ends its waiters with `KERN_TERMINATED`; process exit
 /// ends a wait with `KERN_ABORTED`.
 #[test]
