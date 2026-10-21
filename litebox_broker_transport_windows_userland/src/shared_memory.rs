@@ -14,14 +14,14 @@ use litebox_broker_transport::control_ring::{
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use litebox_platform::buffer::RawBytes;
 use litebox_platform::peer_memory;
+use windows_sys::Wdk::System::Memory::{NtMapViewOfSection, ViewUnmap};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
+    RtlNtStatusToDosError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    PAGE_READWRITE, UnmapViewOfFile,
+    CreateFileMappingW, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE, UnmapViewOfFile,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject,
@@ -139,11 +139,35 @@ impl WindowsSharedMemory {
         length: usize,
         policy: MemoryAccessPolicy,
     ) -> IoResult<Self> {
-        // TODO: Map views that natively cloned runners do not inherit (ViewUnmap), so a clone,
-        // which negotiates its own association, cannot observe its parent's.
-        // SAFETY: `mapping` is a live file-mapping handle and `length` is its creation size.
-        let view = unsafe { MapViewOfFile(mapping.0, FILE_MAP_ALL_ACCESS, 0, 0, length) };
-        let view = NonNull::new(view.Value.cast::<u8>()).ok_or_else(Error::last_os_error)?;
+        let mut base = std::ptr::null_mut();
+        let mut view_size = length;
+        // SAFETY: `mapping` is a live section handle. A null `base` lets the kernel choose a
+        // fresh address, so no existing memory is replaced. `base` and `view_size` are writable
+        // locals, a null offset maps from the start, and the call fails rather than mapping a
+        // view that does not fit the section.
+        let status = unsafe {
+            NtMapViewOfSection(
+                mapping.0,
+                GetCurrentProcess(),
+                &raw mut base,
+                0,
+                0,
+                std::ptr::null_mut(),
+                &raw mut view_size,
+                // A natively cloned runner must not inherit, and so cannot observe or corrupt,
+                // its parent's association memory; it negotiates its own.
+                ViewUnmap,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        if status < 0 {
+            // SAFETY: `RtlNtStatusToDosError` only translates the status code.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(Error::from_raw_os_error(code.cast_signed()));
+        }
+        let view = NonNull::new(base.cast::<u8>())
+            .ok_or_else(|| Error::other("NtMapViewOfSection returned a null view"))?;
         let spin_limit = match policy {
             MemoryAccessPolicy::Bytes => 0,
             MemoryAccessPolicy::ControlRing => parallel_spin_limit(),
@@ -363,7 +387,7 @@ pub(crate) fn duplicate_handle_to_process(
 
 impl Drop for WindowsSharedMemory {
     fn drop(&mut self) {
-        // SAFETY: `view` is the live address returned by MapViewOfFile for this owner.
+        // SAFETY: `view` is the live address of the view mapped for this owner.
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                 Value: self.view.as_ptr().cast(),
@@ -536,6 +560,117 @@ mod tests {
     use litebox_broker_transport::control_ring::{
         ControlRing, ControlRingReadStatus, ControlRingWriteStatus,
     };
+    use windows_sys::Win32::System::Memory::{
+        FILE_MAP_ALL_ACCESS, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, MapViewOfFile,
+        VirtualQueryEx,
+    };
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+
+    const RTL_CLONE_PROCESS_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
+
+    #[repr(C)]
+    struct RtlUserProcessInformation {
+        length: u32,
+        process: HANDLE,
+        thread: HANDLE,
+        client_id: [usize; 2],
+        image_information: [u64; 8],
+    }
+
+    const _: () = assert!(size_of::<RtlUserProcessInformation>() == 0x68);
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlCloneUserProcess(
+            process_flags: u32,
+            process_security_descriptor: *const core::ffi::c_void,
+            thread_security_descriptor: *const core::ffi::c_void,
+            debug_port: HANDLE,
+            process_information: *mut RtlUserProcessInformation,
+        ) -> i32;
+    }
+
+    /// Clones this process with its only thread suspended, returns the allocation state of each
+    /// of `addresses` in the clone, then terminates the clone without ever running it.
+    fn allocation_states_in_suspended_clone(addresses: &[*const u8]) -> Vec<u32> {
+        let mut information = RtlUserProcessInformation {
+            length: 0,
+            process: std::ptr::null_mut(),
+            thread: std::ptr::null_mut(),
+            client_id: [0; 2],
+            image_information: [0; 8],
+        };
+        // SAFETY: `information` has the x64 RTL_USER_PROCESS_INFORMATION layout and is writable,
+        // and optional inputs are null. The clone is created suspended and is terminated without
+        // being resumed, so it never runs on the copied runtime state.
+        let clone_status = unsafe {
+            RtlCloneUserProcess(
+                RTL_CLONE_PROCESS_FLAGS_CREATE_SUSPENDED,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &raw mut information,
+            )
+        };
+        assert_eq!(clone_status, 0, "RtlCloneUserProcess failed");
+        let process = OwnedHandle(information.process);
+        let _thread = OwnedHandle(information.thread);
+        let states = addresses
+            .iter()
+            .map(|&address| {
+                let mut info = MEMORY_BASIC_INFORMATION::default();
+                // SAFETY: `process` is a live process handle and `info` is a writable buffer of
+                // the given size; querying an address never accesses its contents.
+                let written = unsafe {
+                    VirtualQueryEx(
+                        process.0,
+                        address.cast(),
+                        &raw mut info,
+                        size_of::<MEMORY_BASIC_INFORMATION>(),
+                    )
+                };
+                assert_ne!(written, 0, "VirtualQueryEx: {}", Error::last_os_error());
+                info.State
+            })
+            .collect();
+        // SAFETY: `process` is the suspended clone created above.
+        assert_ne!(unsafe { TerminateProcess(process.0, 0) }, 0);
+        states
+    }
+
+    #[test]
+    fn native_clones_do_not_inherit_association_views() {
+        let pool = WindowsSharedMemory::create(64).unwrap();
+        let ring = WindowsSharedMemory::create_control_ring().unwrap();
+        let transfer = ring
+            .duplicate_to_process(unsafe { GetCurrentProcess() })
+            .unwrap();
+        // SAFETY: DuplicateHandle created every transferred handle in this process.
+        let received_ring =
+            unsafe { WindowsSharedMemory::control_ring_from_transferred(transfer) }.unwrap();
+        // SAFETY: `pool.mapping` is a live section handle at least 64 bytes long.
+        let inherited = unsafe { MapViewOfFile(pool.mapping.0, FILE_MAP_ALL_ACCESS, 0, 0, 64) };
+        assert!(!inherited.Value.is_null(), "{}", Error::last_os_error());
+
+        let states = allocation_states_in_suspended_clone(&[
+            inherited.Value.cast_const().cast(),
+            pool.view.as_ptr(),
+            ring.view.as_ptr(),
+            received_ring.view.as_ptr(),
+        ]);
+        // SAFETY: `inherited` is the live view mapped above and is not used afterwards.
+        unsafe { UnmapViewOfFile(inherited) };
+
+        assert_eq!(
+            states[0], MEM_COMMIT,
+            "probe must see ordinary inherited views"
+        );
+        assert_eq!(states[1..], [MEM_FREE; 3]);
+        pool.write(0, &[5]).unwrap();
+        let mut byte = [0];
+        pool.read(0, &mut byte).unwrap();
+        assert_eq!(byte, [5]);
+    }
 
     #[test]
     fn cloned_views_share_control_ring_messages() {
