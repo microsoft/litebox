@@ -268,30 +268,33 @@ impl<P: ShimPlatform> Task<P> {
             Some(_) if timeout == Some(Duration::ZERO) => KernReturn::OPERATION_TIMED_OUT,
             Some(semaphore) => {
                 semaphore.count = -1;
-                let queued = self.new_waiter();
-                if semaphore.policy & SYNC_POLICY_REVERSED != 0 {
-                    semaphore.waiters.push_front(Arc::clone(&queued));
+                // thread_mark_wait_locked: a pending safe abort ends the
+                // wait before the thread is queued, so a signal of this
+                // semaphore below preposts.
+                if self.thread.guest.take_abort() {
+                    KernReturn::ABORTED
                 } else {
-                    semaphore.waiters.push(Arc::clone(&queued));
+                    let queued = self.new_waiter();
+                    if semaphore.policy & SYNC_POLICY_REVERSED != 0 {
+                        semaphore.waiters.push_front(Arc::clone(&queued));
+                    } else {
+                        semaphore.waiters.push(Arc::clone(&queued));
+                    }
+                    waiter = Some(queued);
+                    KernReturn::SUCCESS
                 }
-                waiter = Some(queued);
-                KernReturn::SUCCESS
             }
         };
         if let Some(signal) = signal
             && table.signal(signal, None, false, true) == KernReturn::TERMINATED
         {
             // The semaphore to signal died; the wait must not hang on it.
-            // A wakeup that already arrived still counts.
+            // The table lock is held from queueing to here, so nothing woke
+            // the waiter (XNU unlocks the wait semaphore first).
             if let Some(queued) = waiter.take()
                 && let Some(semaphore) = table.semaphores.get_mut(&id)
-                && !semaphore.waiters.withdraw(&queued)
-                && !queued.was_restarted()
             {
-                return WaitOutcome {
-                    result: KernReturn::SUCCESS,
-                    blocked: false,
-                };
+                semaphore.waiters.withdraw(&queued);
             }
             result = KernReturn::TERMINATED;
         }

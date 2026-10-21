@@ -368,17 +368,24 @@ fn semaphore_wait_signal_signals_after_queueing() {
         (count(&task, wait), count(&task, signal)),
         (Some(0), Some(1))
     );
-    // Ping-pong: the partner takes the signal and wakes the waiter.
+    // Ping-pong: the partner is already blocked on `signal`, so main's
+    // signal wakes it, and main is queued on `wait` by then.
     std::thread::scope(|scope| {
+        assert_eq!(bounded_wait(&task, signal), KernReturn::SUCCESS);
+        let wait_id = semaphore_id(&task, wait);
         let partner = spawn_sibling(scope, &task, move |partner| {
             let taken = kr(partner, mach_trap::SEMAPHORE_TIMEDWAIT, &[signal, 10, 0]);
-            let taken_again = kr(partner, mach_trap::SEMAPHORE_TIMEDWAIT, &[signal, 10, 0]);
+            let queued = {
+                let table = partner.global.semaphores.lock();
+                table.count(wait_id).zip(table.waiters(wait_id))
+            };
             (
                 taken,
-                taken_again,
+                queued,
                 kr(partner, mach_trap::SEMAPHORE_SIGNAL, &[wait]),
             )
         });
+        await_semaphore_waiters(&task, signal, 1);
         assert_eq!(
             kr(
                 &task,
@@ -389,13 +396,25 @@ fn semaphore_wait_signal_signals_after_queueing() {
         );
         assert_eq!(
             partner.join().unwrap(),
-            (
-                KernReturn::SUCCESS,
-                KernReturn::SUCCESS,
-                KernReturn::SUCCESS
-            )
+            (KernReturn::SUCCESS, Some((-1, 1)), KernReturn::SUCCESS)
         );
     });
+    assert_eq!(
+        (count(&task, wait), count(&task, signal)),
+        (Some(-1), Some(-1))
+    );
+    // Signaling the semaphore it waits on wakes the caller itself: the
+    // signal found it queued instead of preposting a count it then took.
+    let both = create_semaphore(&task, SYNC_POLICY_FIFO, 0);
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::SEMAPHORE_TIMEDWAIT_SIGNAL,
+            &[both, both, BOUND_SECONDS, 0]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(count(&task, both), Some(-1));
     // The semaphore to signal died after the lookup: the wait ends.
     let signal_id = semaphore_id(&task, signal);
     task.global.semaphores.lock().destroy(signal_id);
@@ -477,6 +496,37 @@ fn semaphore_counts_wrap_past_int_max_like_xnu() {
     );
 }
 
+/// A pending safe abort ends a semaphore wait before the thread queues
+/// (`thread_mark_wait_locked`), so the wait's signal of the same semaphore
+/// finds no waiter and preposts.
+#[test]
+fn a_pending_abort_ends_wait_signal_before_its_signal() {
+    let task = new_task();
+    let _watchdog = Watchdog::new(&task);
+    let semaphore = create_semaphore(&task, SYNC_POLICY_FIFO, 0);
+    task.thread.guest.abort_safely();
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::SEMAPHORE_WAIT_SIGNAL,
+            &[semaphore, semaphore]
+        ),
+        KernReturn::ABORTED
+    );
+    assert_eq!(count(&task, semaphore), Some(1));
+    assert!(!task.thread.guest.abort.load(Ordering::Relaxed), "consumed");
+    // A pending cancellation does the same through __semwait_signal.
+    let semaphore = create_semaphore(&task, SYNC_POLICY_FIFO, 0);
+    let own = trap(&task, mach_trap::THREAD_SELF, &[]);
+    assert_eq!(bsd(&task, nr::PTHREAD_MARKCANCEL, &[own]), Ok(0));
+    assert_eq!(
+        semwait(&task, nr::SEMWAIT_SIGNAL, semaphore, semaphore, None),
+        errno(Errno::EINTR)
+    );
+    assert_eq!(count(&task, semaphore), Some(1));
+    assert!(!task.thread.guest.abort.load(Ordering::Relaxed), "consumed");
+}
+
 /// `semaphore_destroy` ends its waiters with `KERN_TERMINATED`; process exit
 /// ends a wait with `KERN_ABORTED`.
 #[test]
@@ -538,16 +588,18 @@ fn semwait_signal_times_out_and_maps_results_like_xnu() {
         assert!(start.elapsed() >= Duration::from_millis(30));
     }
     assert_eq!(count(&task, mutex), Some(2), "signaled by each wait");
-    // An absolute time in the past polls; one 30 ms ahead waits.
+    // An absolute time in the past polls; one 30 ms ahead waits until it.
     assert_eq!(
         semwait(&task, nr::SEMWAIT_SIGNAL, semaphore, 0, Some((false, 1, 0))),
         errno(Errno::ETIMEDOUT)
     );
+    // Started before the deadline is read, so a delay before the call only
+    // lengthens the measurement.
+    let start = Instant::now();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         + Duration::from_millis(30);
-    let start = Instant::now();
     assert_eq!(
         semwait(
             &task,
