@@ -14,9 +14,10 @@
 //! Unsupported calls return XNU's error for them, logged once.
 //!
 //! Each guest thread runs on its own host thread with its own Mach thread
-//! port; the shim emulates XNU's thread lifecycle, ulock, psynch and yield
-//! calls on guest-private wait queues. Networking, workqueue (GCD) threads
-//! and signal delivery are unsupported.
+//! port; the shim emulates XNU's thread lifecycle, ulock, psynch, Mach
+//! semaphore, cancellation and yield calls on guest-private
+//! wait queues. Networking, workqueue (GCD) threads and signal delivery are
+//! unsupported.
 
 #![no_std]
 #![cfg(target_arch = "aarch64")]
@@ -167,6 +168,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 pthread_registration: Mutex::new(None),
                 ulocks: Mutex::new(syscalls::ulock::UlockTable::default()),
                 psynch: Mutex::new(syscalls::psynch::PsynchTable::default()),
+                semaphores: Mutex::new(syscalls::semaphore::SemaphoreTable::default()),
                 #[cfg(all(test, target_os = "macos"))]
                 mapping_hook: syscalls::mm::hook::Slot::default(),
             }),
@@ -346,9 +348,11 @@ struct GlobalState<P: ShimPlatform> {
     /// `bsdthread_register` state; set once per process.
     pthread_registration: Mutex<P, Option<syscalls::thread::PthreadRegistration>>,
     /// Lock order: `macho_mappings`, `ulocks`, `psynch`, then trampoline,
-    /// shared-cache, page-manager and IPC state.
+    /// shared-cache, page-manager and IPC state. `semaphores` nests with no
+    /// other lock.
     ulocks: Mutex<P, syscalls::ulock::UlockTable<P>>,
     psynch: Mutex<P, syscalls::psynch::PsynchTable<P>>,
+    semaphores: Mutex<P, syscalls::semaphore::SemaphoreTable<P>>,
     /// Pauses mapping changes, which belong to no image, in tests.
     #[cfg(all(test, target_os = "macos"))]
     mapping_hook: syscalls::mm::hook::Slot,
@@ -425,11 +429,13 @@ struct GuestThread<P: ShimPlatform> {
     is_main: bool,
     /// `uu_sigmask`; guest signals are never delivered.
     signal_mask: AtomicU32,
-    /// `UT_NO_SIGMASK`, set by `__disable_threadsignal`.
-    no_signals: AtomicBool,
-    /// `UT_CANCELDISABLE`, set by `__disable_threadsignal`. Only recorded:
-    /// thread cancellation is not emulated yet, so nothing reads it.
-    cancel_disabled: AtomicBool,
+    /// `uu_flag`'s signal and cancellation bits ([`syscalls::cancel::ut`]).
+    /// Other threads set bits with atomic read-modify-writes
+    /// (`__pthread_markcancel`).
+    flags: AtomicU32,
+    /// `TH_SFLAG_ABORTSAFELY`: a pending `thread_abort_safely`, consumed by
+    /// the thread's next abort-safe wait or its return to the guest.
+    abort: AtomicBool,
     /// Scheduling policy set by the thread itself or, through `thread_policy`,
     /// by another thread (XNU's thread mutex).
     policy: Mutex<P, syscalls::thread::ThreadPolicy>,
@@ -530,7 +536,13 @@ impl<P: ShimPlatform> Task<P> {
             return;
         }
         let is_mach = litebox_common_macos::syscall::is_mach_trap_selector(ctx.regs[16]);
+        if !is_mach {
+            self.enter_bsd_call();
+        }
         let result = self.do_syscall(ctx);
+        if !is_mach {
+            self.leave_bsd_call();
+        }
         let error_bits = self.thread.error_bits.take();
         litebox_util_log::trace!(
             number:? = ctx.regs[16].cast_signed(),
@@ -608,6 +620,9 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     fn do_syscall(&self, ctx: &PtRegs) -> Result<usize, Errno> {
+        if litebox_common_macos::syscall::is_cancelable_bsd(ctx.regs[16]) {
+            self.testcancel(syscalls::cancel::TestCancel::BeforeCall)?;
+        }
         let request = SyscallRequest::try_from_raw(ctx.regs[16], ctx, |args| {
             if self
                 .global
@@ -740,6 +755,27 @@ impl<P: ShimPlatform> Task<P> {
                 self.sys_disable_threadsignal();
                 Ok(0)
             }
+            SyscallRequest::PthreadMarkcancel { thread } => {
+                self.sys_pthread_markcancel(thread).to_syscall_result()
+            }
+            SyscallRequest::PthreadCanceled { action } => {
+                self.sys_pthread_canceled(action).to_syscall_result()
+            }
+            SyscallRequest::SemwaitSignal {
+                semaphore,
+                signal,
+                timeout,
+                relative,
+                seconds,
+                nanoseconds,
+            } => self
+                .sys_semwait_signal(
+                    ctx.regs[16] == litebox_common_macos::syscall::nr::SEMWAIT_SIGNAL,
+                    semaphore,
+                    signal,
+                    timeout.then_some((relative, seconds, nanoseconds)),
+                )
+                .to_syscall_result(),
             SyscallRequest::BsdthreadRegister {
                 threadstart,
                 wqthread,
@@ -1014,12 +1050,14 @@ impl<P: ShimPlatform> Task<P> {
                 receive_size,
                 timeout,
             ) as usize),
-            SyscallRequest::SemaphoreSignal { semaphore } => {
-                Ok(self.sys_semaphore_signal(semaphore).into())
+            SyscallRequest::SemaphoreSignal { semaphore, kind } => {
+                Ok(self.sys_semaphore_signal(semaphore, kind).into())
             }
-            SyscallRequest::SemaphoreWait { semaphore } => {
-                Ok(self.sys_semaphore_wait(semaphore).into())
-            }
+            SyscallRequest::SemaphoreWait {
+                semaphore,
+                signal,
+                timeout,
+            } => Ok(self.sys_semaphore_wait(semaphore, signal, timeout).into()),
             SyscallRequest::SwtchPri | SyscallRequest::Swtch => Ok(self.sys_swtch()),
             SyscallRequest::ThreadSwitch {
                 thread: _,
@@ -1066,6 +1104,7 @@ impl<P: ShimPlatform> Task<P> {
             return ContinueOperation::Terminate;
         }
         let resume = self.thread.wait_state.prepare_to_run_guest(|| {
+            self.clear_abort();
             !self.take_host_signal() && self.process.exit_status().is_none()
         });
         if resume {

@@ -321,16 +321,13 @@ fn bsdthread_terminate_releases_the_stack_signals_and_never_returns() {
     );
     assert!(worker.thread.terminated.get());
     assert_eq!(worker.global.mm.overlapping(stack..stack + 1), []);
-    assert!(matches!(
-        task.global
-            .ipc
-            .lock()
-            .object_for_send_name(MachPortName(semaphore)),
-        Some((
-            _,
-            syscalls::mach_ipc::KernelObject::Semaphore { count: 1, .. }
-        ))
-    ));
+    let id = task
+        .global
+        .ipc
+        .lock()
+        .semaphore_for_name(MachPortName(semaphore))
+        .unwrap();
+    assert_eq!(task.global.semaphores.lock().count(id), Some(1));
     assert_eq!(
         task.global.ipc.lock().thread_for_name(port.trunc()),
         None,
@@ -399,7 +396,10 @@ fn thread_ports_name_live_threads_and_die_with_them() {
         errno(Errno::ESRCH)
     );
     // UT_CANCELDISABLE too.
-    assert!(sibling.thread.guest.cancel_disabled.load(Ordering::Relaxed));
+    assert!(
+        sibling.thread.guest.flags.load(Ordering::Relaxed) & syscalls::cancel::ut::CANCELDISABLE
+            != 0
+    );
     drop(sibling);
     // The name became a dead name.
     assert_eq!(task.global.ipc.lock().thread_for_name(other.trunc()), None);

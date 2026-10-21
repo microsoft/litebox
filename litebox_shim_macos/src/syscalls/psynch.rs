@@ -26,8 +26,9 @@
 
 use crate::{
     ShimPlatform, Task, ThreadId,
+    syscalls::cancel::TestCancel,
     thread::TASK_THREADMAX,
-    wait::{CancelPoint, WaitResult, Waiter},
+    wait::{WaitResult, Waiter},
 };
 use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
 use core::ops::Range;
@@ -184,6 +185,14 @@ struct Kwe<P: ShimPlatform> {
 impl<P: ShimPlatform> Kwe<P> {
     fn thread(&self) -> Option<ThreadId> {
         self.blocked.as_ref().map(|blocked| blocked.waiter.thread)
+    }
+
+    /// A blocked thread whose cancellation is pending
+    /// (`uthread_is_cancelled`): signals pass it by.
+    fn is_cancelled(&self) -> bool {
+        self.blocked
+            .as_ref()
+            .is_some_and(|blocked| blocked.waiter.guest.is_cancelled())
     }
 }
 
@@ -421,9 +430,16 @@ impl<P: ShimPlatform> Kwq<P> {
                 queue.lastnum = lockseq;
             }
         } else if lockseq == queue.firstnum || lockseq == queue.lastnum {
-            // XNU admits a second prepost at the sequence of a canceled
-            // waiter; cancellation is not emulated.
-            return Err(Errno::EBUSY);
+            // A prepost for a canceled waiter's sequence, which the signal
+            // passed by, queues beside it.
+            let beside_canceled = kwe.state == KweState::Prepost
+                && queue
+                    .find_seq(lockseq)
+                    .is_some_and(|index| queue.entries[index].is_cancelled());
+            if !beside_canceled {
+                return Err(Errno::EBUSY);
+            }
+            queue.entries.push_back(kwe);
         } else if is_seqlower(queue.lastnum, lockseq) {
             queue.entries.push_back(kwe);
             queue.lastnum = lockseq;
@@ -829,16 +845,19 @@ fn handle_cvbroad<P: ShimPlatform>(
     updatebits: &mut u32,
 ) -> Result<(), Errno> {
     let mut woken = 0u32;
-    // Every entry up to `upto` leaves the queue, so the next is the first.
-    while let Some(kwe) = kwq.write.entries.front() {
+    // Every entry up to `upto` leaves the queue except canceled waiters.
+    let mut index = 0;
+    while let Some(kwe) = kwq.write.entries.get(index) {
         if is_seqhigher(kwe.lockseq, upto) {
             break;
         }
-        if kwe.state == KweState::InWait {
-            kwq.signal(QueueKind::Write, 0, PTH_RWL_MTX_WAIT);
-            woken = woken.wrapping_add(PTHRW_INC);
+        if kwe.state != KweState::InWait {
+            kwq.discard_fake(index, fakes);
+        } else if kwe.is_cancelled() {
+            index += 1;
         } else {
-            kwq.discard_fake(0, fakes);
+            kwq.signal(QueueKind::Write, index, PTH_RWL_MTX_WAIT);
+            woken = woken.wrapping_add(PTHRW_INC);
         }
     }
     let result = if diff_genseq(kwq.lword, kwq.sword) != 0 {
@@ -871,6 +890,9 @@ fn find_signalseq<P: ShimPlatform>(
             KweState::InWait => {
                 if is_seqhigher(kwe.lockseq, uptoseq) {
                     return result;
+                }
+                if kwe.is_cancelled() {
+                    continue;
                 }
                 if is_seqhigher_eq(kwe.lockseq, signalseq) {
                     return Some(index);
@@ -1007,9 +1029,9 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     /// `ksyn_wait`: queue the calling thread at `lockseq` and block until a
-    /// waker grants it a value, `timeout` passes, or the process exits. The
-    /// queue's reference keeps it in the table while the lock is released.
-    #[expect(clippy::too_many_arguments)]
+    /// waker grants it a value, `timeout` passes, the process exits, or the
+    /// thread is aborted (`THREAD_ABORTSAFE`). The queue's reference keeps it
+    /// in the table while the lock is released.
     fn psynch_block<'a>(
         &'a self,
         mut table: MutexGuard<'a, P, PsynchTable<P>>,
@@ -1018,7 +1040,6 @@ impl<P: ShimPlatform> Task<P> {
         lockseq: u32,
         firstfit: bool,
         timeout: Option<core::time::Duration>,
-        cancel: CancelPoint,
     ) -> (MutexGuard<'a, P, PsynchTable<P>>, Blocking) {
         let blocked = Arc::new(Blocked {
             waiter: self.new_waiter(),
@@ -1034,7 +1055,7 @@ impl<P: ShimPlatform> Task<P> {
             return (table, Blocking::Refused(error));
         }
         drop(table);
-        let result = self.wait_for_wakeup(&blocked.waiter, timeout, cancel);
+        let result = self.wait_for_wakeup(&blocked.waiter, timeout);
         #[cfg(all(test, target_os = "macos"))]
         self.global
             .mapping_hook
@@ -1140,15 +1161,8 @@ impl<P: ShimPlatform> Task<P> {
                 kwq.owner = Some(thread);
             }
         }
-        let (mut table, outcome) = self.psynch_block(
-            table,
-            key,
-            QueueKind::Write,
-            mgen,
-            firstfit,
-            None,
-            CancelPoint::No,
-        );
+        let (mut table, outcome) =
+            self.psynch_block(table, key, QueueKind::Write, mgen, firstfit, None);
         let result = match outcome {
             Blocking::Granted(value) => Ok(value & !PTH_RWL_MTX_WAIT),
             Blocking::Ended(error) | Blocking::Refused(error) => Err(error),
@@ -1351,6 +1365,8 @@ impl<P: ShimPlatform> Task<P> {
         seconds: i64,
         nanoseconds: u32,
     ) -> Result<u32, (Errno, u32)> {
+        // "for conformance reasons": a pending cancellation aborts the wait.
+        let _ = self.testcancel(TestCancel::BeforeWait);
         let csgen: u32 = (cvlsgen >> 32).trunc();
         let cgen: u32 = cvlsgen.trunc();
         let ugen: u32 = (mugen >> 32).trunc();
@@ -1413,15 +1429,8 @@ impl<P: ShimPlatform> Task<P> {
                 .wrapping_add(u64::from(nanoseconds & 0x3fff_ffff));
             core::time::Duration::from_nanos(nanoseconds)
         });
-        let (mut table, outcome) = self.psynch_block(
-            table,
-            key,
-            QueueKind::Write,
-            cgen,
-            false,
-            timeout,
-            CancelPoint::Yes,
-        );
+        let (mut table, outcome) =
+            self.psynch_block(table, key, QueueKind::Write, cgen, false, timeout);
         let result = match outcome {
             Blocking::Granted(value) => Ok(if value & PTH_RWS_CV_MBIT != 0 {
                 PTHRW_INC | PTH_RWS_CV_CBIT
@@ -1556,8 +1565,7 @@ impl<P: ShimPlatform> Task<P> {
             table.release(key, Some(now));
             return Ok(granted);
         }
-        let (mut table, outcome) =
-            self.psynch_block(table, key, which, lgenval, false, None, CancelPoint::No);
+        let (mut table, outcome) = self.psynch_block(table, key, which, lgenval, false, None);
         let result = match outcome {
             Blocking::Granted(value) => Ok(value),
             Blocking::Ended(error) | Blocking::Refused(error) => Err(error),

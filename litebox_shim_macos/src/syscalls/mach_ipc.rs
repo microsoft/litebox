@@ -38,10 +38,8 @@ pub(crate) enum KernelObject {
     Host,
     /// `SYSTEM_CLOCK` (`REALTIME_CLOCK`) or `CALENDAR_CLOCK`.
     Clock(mig::ClockId),
-    Semaphore {
-        policy: i32,
-        count: i32,
-    },
+    /// A semaphore of [`super::semaphore::SemaphoreTable`].
+    Semaphore(super::semaphore::SemaphoreId),
 }
 
 #[derive(Debug)]
@@ -393,7 +391,7 @@ impl IpcSpace {
                 self.clocks.push((id, port));
                 return Ok(port);
             }
-            KernelObject::Semaphore { .. } => return self.new_port(PortKind::Kernel(object)),
+            KernelObject::Semaphore(_) => return self.new_port(PortKind::Kernel(object)),
         };
         if let Some(port) = *slot {
             return Ok(port);
@@ -437,16 +435,6 @@ impl IpcSpace {
                 kind: PortKind::Kernel(object),
             }) => Some(*object),
             _ => None,
-        }
-    }
-
-    pub(crate) fn set_kernel_object(&mut self, port: PortId, object: KernelObject) {
-        if let Some(Port {
-            kind: PortKind::Kernel(current),
-            ..
-        }) = self.ports.get_mut(&port)
-        {
-            *current = object;
         }
     }
 
@@ -987,6 +975,26 @@ impl IpcSpace {
         }
         let port = entry.port?;
         Some((port, self.kernel_object(port)?))
+    }
+
+    /// `port_name_to_semaphore`: the semaphore a send right names.
+    pub(crate) fn semaphore_for_name(
+        &mut self,
+        name: MachPortName,
+    ) -> Result<super::semaphore::SemaphoreId, KernReturn> {
+        if !port_name_is_valid(name.0) {
+            return Err(KernReturn::INVALID_NAME);
+        }
+        // A right to a dead port is a dead name, which names no object.
+        let entry = self.check(name.0).ok_or(KernReturn::INVALID_NAME)?;
+        let port = entry.port.ok_or(KernReturn::INVALID_NAME)?;
+        if !entry.kind.contains(EntryType::SEND) {
+            return Err(KernReturn::INVALID_RIGHT);
+        }
+        match self.kernel_object(port) {
+            Some(KernelObject::Semaphore(id)) => Ok(id),
+            _ => Err(KernReturn::INVALID_CAPABILITY),
+        }
     }
 
     fn is_task_name(&mut self, name: MachPortName) -> bool {
@@ -2060,14 +2068,7 @@ mod tests {
             space.allocate_receive(MACH_PORT_QLIMIT_DEFAULT, 0),
             Err(KernReturn::RESOURCE_SHORTAGE)
         );
-        assert!(
-            space
-                .kernel_send_right(KernelObject::Semaphore {
-                    policy: 0,
-                    count: 0
-                })
-                .is_err()
-        );
+        assert!(space.kernel_send_right(KernelObject::Semaphore(0)).is_err());
         // Singleton kernel objects do not count against the budget.
         assert!(space.kernel_send_right(KernelObject::Task).is_ok());
     }

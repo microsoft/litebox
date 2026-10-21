@@ -27,16 +27,16 @@ const BOUND: Duration = Duration::from_secs(10);
 /// A cvwait timeout that bounds a wait another thread should end.
 const BOUND_SECONDS: usize = 10;
 
-const INC: u32 = 0x100;
-const KBIT: u32 = 0x01;
-const EBIT: u32 = 0x02;
+pub(super) const INC: u32 = 0x100;
+pub(super) const KBIT: u32 = 0x01;
+pub(super) const EBIT: u32 = 0x02;
 const WBIT: u32 = 0x04;
 const MBIT: u32 = 0x40;
 const CV_CBIT: u32 = 0x01;
 const CV_PBIT: u32 = 0x02;
 /// Mutex options: first-fit and fair-share policies, process-shared, and
 /// the mutex bit cvclrprepost reads.
-const FIRSTFIT: u32 = 0x080;
+pub(super) const FIRSTFIT: u32 = 0x080;
 const FAIRSHARE: u32 = 0x040;
 const PSHARED: u32 = 0x010;
 const MUTEX: u32 = 0x2000;
@@ -46,7 +46,7 @@ fn errno(error: Errno) -> Result<usize, usize> {
     Err(error.raw())
 }
 
-fn mutexwait(
+pub(super) fn mutexwait(
     task: &Task<Platform>,
     mutex: usize,
     mgen: u32,
@@ -67,7 +67,7 @@ fn mutexwait(
     )
 }
 
-fn mutexdrop(
+pub(super) fn mutexdrop(
     task: &Task<Platform>,
     mutex: usize,
     mgen: u32,
@@ -87,7 +87,7 @@ fn lsgen(l: u32, s: u32) -> usize {
 
 /// `psynch_cvwait` without a mutex.
 #[expect(clippy::too_many_arguments)]
-fn cvwait(
+pub(super) fn cvwait(
     task: &Task<Platform>,
     cv: usize,
     l: u32,
@@ -129,7 +129,7 @@ fn cvwait_mutex(
     )
 }
 
-fn cvsignal(
+pub(super) fn cvsignal(
     task: &Task<Platform>,
     cv: usize,
     l: u32,
@@ -145,7 +145,7 @@ fn cvsignal(
     )
 }
 
-fn cvbroad(
+pub(super) fn cvbroad(
     task: &Task<Platform>,
     cv: usize,
     l: u32,
@@ -177,18 +177,19 @@ fn rw(
     )
 }
 
-/// Bounds a test's psynch waits, most of which have no timeout: after
-/// [`BOUND`] it releases every blocked thread (with a zero grant) until the
-/// test ends, and then fails the test, so a broken implementation fails
-/// instead of hanging.
-struct Watchdog {
+/// Bounds a test's waits, most of which have no timeout: after [`BOUND`]
+/// it releases every thread blocked in psynch (with a zero grant), on a
+/// semaphore (as if it was destroyed) or in ulock until the test ends,
+/// and then fails the test, so a broken implementation fails instead of
+/// hanging.
+pub(super) struct Watchdog {
     done: Arc<core::sync::atomic::AtomicBool>,
     fired: Arc<core::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Watchdog {
-    fn new(task: &Task<Platform>) -> Self {
+    pub(super) fn new(task: &Task<Platform>) -> Self {
         use core::sync::atomic::{AtomicBool, Ordering};
         let done = Arc::new(AtomicBool::new(false));
         let fired = Arc::new(AtomicBool::new(false));
@@ -198,8 +199,13 @@ impl Watchdog {
             move || {
                 let start = Instant::now();
                 while !done.load(Ordering::Acquire) {
-                    if start.elapsed() >= BOUND && global.psynch.lock().release_all_waiters() > 0 {
-                        fired.store(true, Ordering::Release);
+                    if start.elapsed() >= BOUND {
+                        let released = global.psynch.lock().release_all_waiters()
+                            + global.semaphores.lock().release_all_waiters()
+                            + global.ulocks.lock().release_all_waiters();
+                        if released > 0 {
+                            fired.store(true, Ordering::Release);
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -220,13 +226,13 @@ impl Drop for Watchdog {
         self.thread.take().unwrap().join().unwrap();
         assert!(
             !self.fired.load(Ordering::Acquire) || std::thread::panicking(),
-            "a psynch wait was still blocked after {BOUND:?}"
+            "a wait was still blocked after {BOUND:?}"
         );
     }
 }
 
 /// Wait until `count` threads block on the private object at `address`.
-fn await_waiters(task: &Task<Platform>, address: usize, count: usize) {
+pub(super) fn await_waiters(task: &Task<Platform>, address: usize, count: usize) {
     let start = Instant::now();
     while task.global.psynch.lock().waiters(address) != count {
         assert!(start.elapsed() < BOUND, "waiters never blocked");

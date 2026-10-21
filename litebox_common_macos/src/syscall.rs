@@ -87,6 +87,59 @@ pub mod nr {
     pub const CLOSE_NOCANCEL: usize = 399;
     pub const GETENTROPY: usize = 500;
     pub const GETTIMEOFDAY: usize = 116;
+    pub const PTHREAD_MARKCANCEL: usize = 332;
+    pub const PTHREAD_CANCELED: usize = 333;
+    pub const SEMWAIT_SIGNAL: usize = 334;
+    pub const SEMWAIT_SIGNAL_NOCANCEL: usize = 423;
+
+    /// The BSD calls whose XNU handler starts with `__pthread_testcancel(1)`:
+    /// the cancelable twins of the `*_nocancel` calls (`syscalls.master`).
+    /// `__semwait_signal` (334, `__pthread_testcancel(0)`), `ulock_wait`
+    /// (515, 544, only with `ULF_WAIT_CANCEL_POINT`) and `psynch_cvwait`
+    /// (305, `__pthread_testcancel(0)`) test inside their handlers.
+    pub const CANCELABLE: [usize; 35] = [
+        3,   // read: sys_generic.c
+        4,   // write: sys_generic.c
+        5,   // open: vfs_syscalls.c
+        6,   // close: kern_descrip.c
+        7,   // wait4: kern_exit.c
+        27,  // recvmsg: uipc_syscalls.c
+        28,  // sendmsg: uipc_syscalls.c
+        29,  // recvfrom: uipc_syscalls.c
+        30,  // accept: uipc_syscalls.c
+        65,  // msync: kern_mman.c
+        92,  // fcntl: kern_descrip.c
+        93,  // select: sys_generic.c
+        95,  // fsync: vfs_syscalls.c
+        98,  // connect: uipc_syscalls.c
+        111, // sigsuspend: kern_sig.c
+        120, // readv: sys_generic.c
+        121, // writev: sys_generic.c
+        133, // sendto: uipc_syscalls.c
+        153, // pread: sys_generic.c
+        154, // pwrite: sys_generic.c
+        173, // waitid: kern_exit.c
+        187, // fdatasync: vfs_syscalls.c
+        230, // poll: sys_generic.c
+        260, // msgsnd: sysv_msg.c
+        261, // msgrcv: sysv_msg.c
+        271, // sem_wait: posix_sem.c
+        315, // aio_suspend: kern_aio.c
+        330, // __sigwait: kern_sig.c
+        394, // pselect: sys_generic.c
+        447, // connectx: uipc_syscalls.c
+        448, // disconnectx: uipc_syscalls.c
+        449, // peeloff: uipc_syscalls.c
+        463, // openat: vfs_syscalls.c
+        540, // preadv: sys_generic.c
+        541, // pwritev: sys_generic.c
+    ];
+}
+
+/// Whether the BSD call `number` (x16) tests for pthread cancellation before
+/// it runs ([`nr::CANCELABLE`]).
+pub fn is_cancelable_bsd(number: usize) -> bool {
+    nr::CANCELABLE.contains(&number)
 }
 
 /// Selector of XNU's AArch64 machine-dependent `platform_syscall` trap
@@ -149,7 +202,12 @@ pub mod mach_trap {
     pub const TASK_SELF: u32 = 28;
     pub const HOST_SELF: u32 = 29;
     pub const SEMAPHORE_SIGNAL: u32 = 33;
+    pub const SEMAPHORE_SIGNAL_ALL: u32 = 34;
+    pub const SEMAPHORE_SIGNAL_THREAD: u32 = 35;
     pub const SEMAPHORE_WAIT: u32 = 36;
+    pub const SEMAPHORE_WAIT_SIGNAL: u32 = 37;
+    pub const SEMAPHORE_TIMEDWAIT: u32 = 38;
+    pub const SEMAPHORE_TIMEDWAIT_SIGNAL: u32 = 39;
     pub const MACH_MSG2: u32 = 47;
     pub const SWTCH_PRI: u32 = 59;
     pub const SWTCH: u32 = 60;
@@ -267,6 +325,26 @@ pub struct MachTimebaseInfo {
     pub denom: u32,
 }
 
+/// Which threads a semaphore signal wakes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemaphoreSignalKind {
+    /// `semaphore_signal`: one waiter, or a prepost.
+    One,
+    /// `semaphore_signal_all`: every waiter.
+    All,
+    /// `semaphore_signal_thread`: the named thread, or any one waiter for
+    /// `MACH_PORT_NULL`; never a prepost.
+    Thread(MachPortName),
+}
+
+/// `mach_timespec_t` as the semaphore traps pass it: `unsigned int` seconds
+/// and `clock_res_t` nanoseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MachTimespec {
+    pub seconds: u32,
+    pub nanoseconds: i32,
+}
+
 /// The `psynch_rw_*` calls (BSD 297-300, 306-309).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PsynchRwOperation {
@@ -381,6 +459,24 @@ pub enum SyscallRequest {
         signal: i32,
     },
     DisableThreadsignal,
+    /// `__pthread_markcancel(thread_port)`.
+    PthreadMarkcancel {
+        thread: MachPortName,
+    },
+    /// `__pthread_canceled(action)`.
+    PthreadCanceled {
+        action: i32,
+    },
+    /// `__semwait_signal` and `__semwait_signal_nocancel(cond_sem,
+    /// mutex_sem, timeout, relative, tv_sec, tv_nsec)`.
+    SemwaitSignal {
+        semaphore: MachPortName,
+        signal: MachPortName,
+        timeout: bool,
+        relative: bool,
+        seconds: i64,
+        nanoseconds: i32,
+    },
     /// `bsdthread_register(threadstart, wqthread, pthsize, data, data_size,
     /// dispatchqueue_offset)`; libpthread passes its registration data where
     /// `syscalls.master` names `stack_addr_hint` and `targetconc_ptr`.
@@ -602,11 +698,19 @@ pub enum SyscallRequest {
         priority: u32,
         timeout: u32,
     },
+    /// `semaphore_signal_trap`, `semaphore_signal_all_trap` and
+    /// `semaphore_signal_thread_trap`.
     SemaphoreSignal {
         semaphore: MachPortName,
+        kind: SemaphoreSignalKind,
     },
+    /// `semaphore_wait_trap` and its `_signal` and `timedwait` variants:
+    /// wait on `semaphore` after signaling `signal` (`MACH_PORT_NULL` in
+    /// the variants without one), for at most `timeout`.
     SemaphoreWait {
         semaphore: MachPortName,
+        signal: Option<MachPortName>,
+        timeout: Option<MachTimespec>,
     },
     SwtchPri,
     Swtch,
@@ -736,9 +840,41 @@ impl SyscallRequest {
                 }
                 mach_trap::SEMAPHORE_SIGNAL => Ok(Self::SemaphoreSignal {
                     semaphore: port_arg(0),
+                    kind: SemaphoreSignalKind::One,
+                }),
+                mach_trap::SEMAPHORE_SIGNAL_ALL => Ok(Self::SemaphoreSignal {
+                    semaphore: port_arg(0),
+                    kind: SemaphoreSignalKind::All,
+                }),
+                mach_trap::SEMAPHORE_SIGNAL_THREAD => Ok(Self::SemaphoreSignal {
+                    semaphore: port_arg(0),
+                    kind: SemaphoreSignalKind::Thread(port_arg(1)),
                 }),
                 mach_trap::SEMAPHORE_WAIT => Ok(Self::SemaphoreWait {
                     semaphore: port_arg(0),
+                    signal: None,
+                    timeout: None,
+                }),
+                mach_trap::SEMAPHORE_WAIT_SIGNAL => Ok(Self::SemaphoreWait {
+                    semaphore: port_arg(0),
+                    signal: Some(port_arg(1)),
+                    timeout: None,
+                }),
+                mach_trap::SEMAPHORE_TIMEDWAIT => Ok(Self::SemaphoreWait {
+                    semaphore: port_arg(0),
+                    signal: None,
+                    timeout: Some(MachTimespec {
+                        seconds: TruncateExt::<u32>::trunc(args[1]),
+                        nanoseconds: int_arg(2),
+                    }),
+                }),
+                mach_trap::SEMAPHORE_TIMEDWAIT_SIGNAL => Ok(Self::SemaphoreWait {
+                    semaphore: port_arg(0),
+                    signal: Some(port_arg(1)),
+                    timeout: Some(MachTimespec {
+                        seconds: TruncateExt::<u32>::trunc(args[2]),
+                        nanoseconds: int_arg(3),
+                    }),
                 }),
                 mach_trap::SWTCH_PRI => Ok(Self::SwtchPri),
                 mach_trap::SWTCH => Ok(Self::Swtch),
@@ -850,6 +986,18 @@ impl SyscallRequest {
                 signal: int_arg(1),
             },
             nr::DISABLE_THREADSIGNAL => Self::DisableThreadsignal,
+            nr::PTHREAD_MARKCANCEL => Self::PthreadMarkcancel {
+                thread: port_arg(0),
+            },
+            nr::PTHREAD_CANCELED => Self::PthreadCanceled { action: int_arg(0) },
+            nr::SEMWAIT_SIGNAL | nr::SEMWAIT_SIGNAL_NOCANCEL => Self::SemwaitSignal {
+                semaphore: port_arg(0),
+                signal: port_arg(1),
+                timeout: int_arg(2) != 0,
+                relative: int_arg(3) != 0,
+                seconds: args[4].reinterpret_as_signed() as i64,
+                nanoseconds: int_arg(5),
+            },
             nr::BSDTHREAD_REGISTER => Self::BsdthreadRegister {
                 threadstart: args[0],
                 wqthread: args[1],

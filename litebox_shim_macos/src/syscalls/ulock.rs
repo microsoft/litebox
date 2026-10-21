@@ -11,7 +11,8 @@
 
 use crate::{
     ShimPlatform, Task, ThreadId,
-    wait::{CancelPoint, WaitQueue, WaitResult},
+    syscalls::cancel::TestCancel,
+    wait::{WaitQueue, WaitResult},
 };
 use alloc::collections::BTreeMap;
 use core::ops::Range;
@@ -117,6 +118,17 @@ impl<P: ShimPlatform> UlockTable<P> {
                 .queue
                 .wake_all();
         }
+    }
+
+    /// Wake every waiting thread; returns how many there were.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn release_all_waiters(&mut self) -> usize {
+        let mut released = 0;
+        for ull in self.locks.values_mut() {
+            released += ull.queue.len();
+            ull.queue.wake_all();
+        }
+        released
     }
 
     fn objects_at(&self, address: usize) -> impl Iterator<Item = (&UlockKey, &Ull<P>)> {
@@ -254,6 +266,10 @@ impl<P: ShimPlatform> Task<P> {
         timeout: u64,
     ) -> Result<usize, Errno> {
         let flags = operation & op::FLAGS_MASK;
+        if flags & flag::WAIT_CANCEL_POINT != 0 {
+            // Before any check, and an errno even with ULF_NO_ERRNO.
+            self.testcancel(TestCancel::BeforeCall)?;
+        }
         ulock_result(flags, self.ulock_wait(operation, address, value, timeout))
     }
 
@@ -352,12 +368,7 @@ impl<P: ShimPlatform> Task<P> {
             deadline if flags & flag::DEADLINE != 0 => Some(self.mach_deadline_timeout(deadline)),
             nanoseconds => Some(core::time::Duration::from_nanos(nanoseconds)),
         };
-        let cancel = if flags & flag::WAIT_CANCEL_POINT != 0 {
-            CancelPoint::Yes
-        } else {
-            CancelPoint::No
-        };
-        let mut result = self.wait_for_wakeup(&waiter, timeout, cancel);
+        let mut result = self.wait_for_wakeup(&waiter, timeout);
         let mut table = self.global.ulocks.lock();
         if result != WaitResult::Awakened {
             let ull = table

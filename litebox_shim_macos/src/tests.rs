@@ -16,6 +16,7 @@ use litebox_platform_macos_userland::MacosUserland as Platform;
 
 mod mach;
 mod psynch;
+mod sync;
 mod thread;
 mod ulock;
 

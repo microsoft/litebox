@@ -44,9 +44,10 @@ impl KernReturn {
     pub const INVALID_HOST: Self = Self(22);
     pub const POLICY_LIMIT: Self = Self(27);
     pub const INVALID_POLICY: Self = Self(28);
-    /// The target thread has terminated.
+    /// The target thread has terminated, or the object was destroyed.
     pub const TERMINATED: Self = Self(37);
     pub const NOT_SUPPORTED: Self = Self(46);
+    pub const NOT_WAITING: Self = Self(48);
     pub const OPERATION_TIMED_OUT: Self = Self(49);
     pub const DENIED: Self = Self(53);
 

@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use litebox_common_macos::{
     KernReturn, TaskParams, VmProtection,
     mach::{MachMsgPortDescriptor, NDR_RECORD, PORT_DESCRIPTOR, mig, msg_type},
-    syscall::{MachPortName, MachVmFlags},
+    syscall::MachVmFlags,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -597,16 +597,18 @@ impl<P: ShimPlatform> Task<P> {
         if value < 0 || policy & !SYNC_POLICY_USER_MASK != 0 {
             return error_reply(KernReturn::INVALID_ARGUMENT.raw());
         }
-        match self
+        let id = self.global.semaphores.lock().create(policy, value);
+        let right = self
             .global
             .ipc
             .lock()
-            .kernel_send_right(KernelObject::Semaphore {
-                policy,
-                count: value,
-            }) {
+            .kernel_send_right(KernelObject::Semaphore(id));
+        match right {
             Ok(right) => ports_reply(&[Some(right)]),
-            Err(code) => error_reply(code.raw()),
+            Err(code) => {
+                self.global.semaphores.lock().destroy(id);
+                error_reply(code.raw())
+            }
         }
     }
 
@@ -616,18 +618,25 @@ impl<P: ShimPlatform> Task<P> {
             (true, [(_, right)]) if request.body.len() == 16 => *right,
             _ => return error_reply(mig::BAD_ARGUMENTS),
         };
-        let mut ipc = self.global.ipc.lock();
-        let code = match right {
-            Some(Right::Send(port))
-                if matches!(
-                    ipc.kernel_object(port),
-                    Some(KernelObject::Semaphore { .. })
-                ) =>
-            {
-                ipc.destroy_port(port);
+        let destroyed = {
+            let mut ipc = self.global.ipc.lock();
+            match right {
+                Some(Right::Send(port)) => match ipc.kernel_object(port) {
+                    Some(KernelObject::Semaphore(id)) => {
+                        ipc.destroy_port(port);
+                        Some(id)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let code = match destroyed {
+            Some(id) => {
+                self.global.semaphores.lock().destroy(id);
                 KernReturn::SUCCESS
             }
-            _ => KernReturn::INVALID_ARGUMENT,
+            None => KernReturn::INVALID_ARGUMENT,
         };
         kern_reply(code, &[])
     }
@@ -719,46 +728,5 @@ impl<P: ShimPlatform> Task<P> {
             Ok(address) => kern_reply(KernReturn::SUCCESS, &(address as u64).to_ne_bytes()),
             Err(code) => error_reply(code.raw()),
         }
-    }
-
-    pub(crate) fn sys_semaphore_signal(&self, semaphore: MachPortName) -> KernReturn {
-        let mut ipc = self.global.ipc.lock();
-        let Some((port, KernelObject::Semaphore { policy, count })) =
-            ipc.object_for_send_name(semaphore)
-        else {
-            return KernReturn::INVALID_ARGUMENT;
-        };
-        ipc.set_kernel_object(
-            port,
-            KernelObject::Semaphore {
-                policy,
-                count: count.saturating_add(1),
-            },
-        );
-        KernReturn::SUCCESS
-    }
-
-    pub(crate) fn sys_semaphore_wait(&self, semaphore: MachPortName) -> KernReturn {
-        let mut ipc = self.global.ipc.lock();
-        let Some((port, KernelObject::Semaphore { policy, count })) =
-            ipc.object_for_send_name(semaphore)
-        else {
-            return KernReturn::INVALID_ARGUMENT;
-        };
-        if count > 0 {
-            ipc.set_kernel_object(
-                port,
-                KernelObject::Semaphore {
-                    policy,
-                    count: count - 1,
-                },
-            );
-            return KernReturn::SUCCESS;
-        }
-        drop(ipc);
-        // Only another thread could signal it, and a signal does not wake a
-        // blocked waiter yet: wait until interrupted, which aborts the wait.
-        let _ = self.wait_cx().sleep();
-        KernReturn::ABORTED
     }
 }

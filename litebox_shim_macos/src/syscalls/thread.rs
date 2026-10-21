@@ -538,7 +538,7 @@ impl<P: ShimPlatform> Task<P> {
             }
         }
         if semaphore != MachPortName::NULL {
-            let _ = self.sys_semaphore_signal(semaphore);
+            let _ = self.semaphore_signal_name(semaphore);
         }
         if port != MachPortName::NULL {
             let _ = self.global.ipc.lock().deallocate(port.0);
@@ -569,12 +569,14 @@ impl<P: ShimPlatform> Task<P> {
         self.ulock_wake_all_unfair(address);
     }
 
-    /// `__disable_threadsignal`: no signal is delivered to this thread again.
-    /// `UT_CANCELDISABLE` is recorded for when cancellation is emulated.
+    /// `__disable_threadsignal`: no signal is delivered to this thread again,
+    /// and it cannot be canceled.
     pub(crate) fn sys_disable_threadsignal(&self) {
-        let guest = &self.thread.guest;
-        guest.no_signals.store(true, Ordering::Relaxed);
-        guest.cancel_disabled.store(true, Ordering::Relaxed);
+        use super::cancel::ut;
+        self.thread
+            .guest
+            .flags
+            .fetch_or(ut::NO_SIGMASK | ut::CANCELDISABLE, Ordering::AcqRel);
     }
 
     /// `__pthread_kill`. Only signal 0 (a liveness check) is supported.
@@ -589,7 +591,7 @@ impl<P: ShimPlatform> Task<P> {
         if !(0..NSIG).contains(&signal) {
             return Err(Errno::EINVAL);
         }
-        if target.no_signals.load(Ordering::Relaxed) {
+        if target.flags.load(Ordering::Acquire) & super::cancel::ut::NO_SIGMASK != 0 {
             return Err(Errno::ESRCH);
         }
         if signal != 0 {
@@ -870,7 +872,7 @@ impl<P: ShimPlatform> Task<P> {
         };
         // assert_wait_timeout: an interrupted or expired wait both succeed.
         let timeout = core::time::Duration::from_nanos(u64::from(option_time) * scale);
-        let _ = self.wait_cx().with_timeout(timeout).sleep();
+        let _ = self.abortable_sleep(Some(timeout));
         KernReturn::SUCCESS
     }
 }

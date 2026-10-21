@@ -12,6 +12,7 @@ use litebox_common_macos::{
     user_pointers::{UserPtr, UserPtrMut},
 };
 
+pub(crate) mod cancel;
 pub(crate) mod file;
 pub(crate) mod mach;
 pub(crate) mod mach_ipc;
@@ -20,6 +21,7 @@ pub mod misc;
 pub(crate) mod mm;
 pub(crate) mod process;
 pub(crate) mod psynch;
+pub(crate) mod semaphore;
 pub(crate) mod thread;
 pub(crate) mod ulock;
 
@@ -122,16 +124,14 @@ impl<P: ShimPlatform> Task<P> {
         KernReturn::SUCCESS
     }
 
-    /// `mach_wait_until_trap` (`osfmk/kern/clock.c`): an abortable sleep
-    /// that process exit ends with `KERN_ABORTED`.
+    /// `mach_wait_until_trap` (`osfmk/kern/clock.c`): an abort-safe sleep
+    /// that process exit or an abort ends with `KERN_ABORTED`.
     pub(crate) fn sys_mach_wait_until(&self, deadline: u64) -> KernReturn {
-        match self
-            .wait_cx()
-            .with_timeout(self.mach_deadline_timeout(deadline))
-            .sleep()
-        {
-            litebox::event::wait::WaitError::TimedOut => KernReturn::SUCCESS,
-            litebox::event::wait::WaitError::Interrupted => KernReturn::ABORTED,
+        match self.abortable_sleep(Some(self.mach_deadline_timeout(deadline))) {
+            crate::wait::WaitResult::Interrupted => KernReturn::ABORTED,
+            crate::wait::WaitResult::TimedOut | crate::wait::WaitResult::Awakened => {
+                KernReturn::SUCCESS
+            }
         }
     }
 }
