@@ -7,12 +7,15 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 
 use litebox_broker_transport::call_lane_pool::{
     CallLanePool as GenericCallLanePool, CallLanePoolCondvar, CallLanePoolError, CallLanePoolMutex,
-    CallLanePoolSync,
+    CallLanePoolSync, LaneClaim as GenericLaneClaim,
 };
 
 use crate::setup::copy_io_error;
 
 pub(crate) type CallLanePool<Lane> = GenericCallLanePool<StdCallLanePoolSync, Lane, Error>;
+
+pub(crate) type LaneClaim<'lanes, Lane> =
+    GenericLaneClaim<'lanes, StdCallLanePoolSync, Lane, Error>;
 
 pub(crate) struct StdCallLanePoolSync;
 
@@ -144,6 +147,28 @@ mod tests {
             drop(held);
             assert!(claim.recv_timeout(Duration::from_secs(10)).unwrap());
         });
+    }
+
+    #[test]
+    fn a_release_frees_the_lane_only_if_live_and_its_operation_succeeds() {
+        let lanes = CallLanePool::new(vec![0, 1]);
+        let mut released = lanes.claim(no_demand).unwrap();
+        assert_eq!(released.release_if_live(|lane| Ok(*lane)).unwrap(), 0);
+        // Dropping a released claim leaves its lane free.
+        drop(released);
+        let mut held = lanes.claim(no_demand).unwrap();
+        assert_eq!(*held, 0);
+        assert!(matches!(
+            held.release_if_live(|_| Err::<(), _>(Error::other("release failed"))),
+            Err(CallLanePoolError::Operation(_))
+        ));
+        assert_eq!(*lanes.claim(|_| Ok(())).unwrap(), 1);
+        assert!(lanes.record_failure(Arc::new(Error::from(ErrorKind::BrokenPipe))));
+        assert!(matches!(
+            held.release_if_live(|_| -> Result<(), Error> { unreachable!() }),
+            Err(CallLanePoolError::AssociationFailed(_))
+        ));
+        assert_eq!(*held, 0);
     }
 
     #[test]
