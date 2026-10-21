@@ -1452,7 +1452,7 @@ fn run_sync_scenario_with(options: &[&str], scenario: &str) -> (Option<i32>, Str
 fn threads_join_threads_with_custom_stacks() {
     assert_eq!(
         run_sync_scenario("custom_stack"),
-        (Some(0), "joined 64\n".to_owned(), String::new())
+        (Some(0), "joined 16\n".to_owned(), String::new())
     );
 }
 

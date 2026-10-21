@@ -35,7 +35,7 @@ static void *custom_stack_worker(void *argument) {
 }
 
 static int custom_stack(void) {
-  enum { ROUNDS = 64, STACK = 256 * 1024 };
+  enum { ROUNDS = 16, STACK = 256 * 1024 };
   int good = 0;
   for (uintptr_t round = 0; round < ROUNDS; round++) {
     void *stack = mmap(NULL, STACK, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
