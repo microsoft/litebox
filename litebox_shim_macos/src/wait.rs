@@ -56,84 +56,8 @@ impl<P: ShimPlatform> Waiter<P> {
     }
 }
 
-/// Threads blocked on one address or object, in wakeup order. XNU orders a
-/// turnstile wait queue by priority; every guest thread shares one priority
-/// band, so the order is FIFO.
-pub(crate) struct WaitQueue<P: ShimPlatform> {
-    waiters: VecDeque<Arc<Waiter<P>>>,
-}
-
-impl<P: ShimPlatform> Default for WaitQueue<P> {
-    fn default() -> Self {
-        Self {
-            waiters: VecDeque::new(),
-        }
-    }
-}
-
-impl<P: ShimPlatform> WaitQueue<P> {
-    pub(crate) fn push(&mut self, waiter: Arc<Waiter<P>>) {
-        self.waiters.push_back(waiter);
-    }
-
-    /// Queue `waiter` first, as a `SYNC_POLICY_REVERSED` (LIFO) wait queue
-    /// does (`waitq_thread_insert`).
-    pub(crate) fn push_front(&mut self, waiter: Arc<Waiter<P>>) {
-        self.waiters.push_front(waiter);
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.waiters.is_empty()
-    }
-
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn len(&self) -> usize {
-        self.waiters.len()
-    }
-
-    /// Wake the first waiter (`waitq_wakeup64_identify`).
-    pub(crate) fn wake_one(&mut self) -> Option<ThreadId> {
-        let waiter = self.waiters.pop_front()?;
-        waiter.wake();
-        Some(waiter.thread)
-    }
-
-    pub(crate) fn wake_all(&mut self) {
-        for waiter in self.waiters.drain(..) {
-            waiter.wake();
-        }
-    }
-
-    /// Wake every waiter with `THREAD_RESTART`.
-    pub(crate) fn restart_all(&mut self) {
-        for waiter in self.waiters.drain(..) {
-            waiter.restart();
-        }
-    }
-
-    /// Wake `thread` if it waits here (`waitq_wakeup64_thread`).
-    pub(crate) fn wake_thread(&mut self, thread: ThreadId) -> bool {
-        let Some(index) = self.waiters.iter().position(|w| w.thread == thread) else {
-            return false;
-        };
-        let waiter = self.waiters.remove(index).expect("index was just found");
-        waiter.wake();
-        true
-    }
-
-    /// Withdraw a waiter whose wait ended without a wakeup. Returns `false`
-    /// if a waker took it first, so the wait was satisfied after all.
-    pub(crate) fn withdraw(&mut self, waiter: &Arc<Waiter<P>>) -> bool {
-        let Some(index) = self.waiters.iter().position(|w| Arc::ptr_eq(w, waiter)) else {
-            return false;
-        };
-        self.waiters.remove(index);
-        true
-    }
-}
-
-/// A [`Waiter`] whose platform type is erased, for wait queues kept in state
-/// that is not generic over the platform (Mach port queues).
+/// A [`Waiter`] whose platform type may be erased, for wait queues kept in
+/// state that is not generic over the platform (Mach port queues).
 pub(crate) trait AnyWaiter: Send + Sync {
     fn wake(&self);
     fn restart(&self);
@@ -149,35 +73,39 @@ impl<P: ShimPlatform> AnyWaiter for Waiter<P> {
     }
 }
 
-/// Threads blocked on a Mach port's message queue, as [`AnyWaiter`]s.
-#[derive(Default)]
-pub(crate) struct PortWaitQueue {
-    waiters: VecDeque<Arc<dyn AnyWaiter>>,
+/// Threads blocked on one address or object, in wakeup order. XNU orders a
+/// turnstile wait queue by priority; every guest thread shares one priority
+/// band, so the order is FIFO.
+pub(crate) struct WaitQueue<W: ?Sized> {
+    waiters: VecDeque<Arc<W>>,
 }
 
-impl core::fmt::Debug for PortWaitQueue {
+/// Threads blocked on a Mach port's message queue.
+pub(crate) type PortWaitQueue = WaitQueue<dyn AnyWaiter>;
+
+impl<W: ?Sized> Default for WaitQueue<W> {
+    fn default() -> Self {
+        Self {
+            waiters: VecDeque::new(),
+        }
+    }
+}
+
+impl<W: ?Sized> core::fmt::Debug for WaitQueue<W> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PortWaitQueue")
+        f.debug_struct("WaitQueue")
             .field("waiters", &self.waiters.len())
             .finish()
     }
 }
 
-impl PortWaitQueue {
-    pub(crate) fn push(&mut self, waiter: Arc<dyn AnyWaiter>) {
+impl<W: ?Sized + AnyWaiter> WaitQueue<W> {
+    pub(crate) fn push(&mut self, waiter: Arc<W>) {
         self.waiters.push_back(waiter);
     }
 
-    pub(crate) fn wake_all(&mut self) {
-        for waiter in self.waiters.drain(..) {
-            waiter.wake();
-        }
-    }
-
-    pub(crate) fn restart_all(&mut self) {
-        for waiter in self.waiters.drain(..) {
-            waiter.restart();
-        }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -185,8 +113,22 @@ impl PortWaitQueue {
         self.waiters.len()
     }
 
-    /// [`WaitQueue::withdraw`].
-    pub(crate) fn withdraw(&mut self, waiter: &Arc<dyn AnyWaiter>) -> bool {
+    pub(crate) fn wake_all(&mut self) {
+        for waiter in self.waiters.drain(..) {
+            AnyWaiter::wake(&*waiter);
+        }
+    }
+
+    /// Wake every waiter with `THREAD_RESTART`.
+    pub(crate) fn restart_all(&mut self) {
+        for waiter in self.waiters.drain(..) {
+            AnyWaiter::restart(&*waiter);
+        }
+    }
+
+    /// Withdraw a waiter whose wait ended without a wakeup. Returns `false`
+    /// if a waker took it first, so the wait was satisfied after all.
+    pub(crate) fn withdraw(&mut self, waiter: &Arc<W>) -> bool {
         let Some(index) = self
             .waiters
             .iter()
@@ -195,6 +137,31 @@ impl PortWaitQueue {
             return false;
         };
         self.waiters.remove(index);
+        true
+    }
+}
+
+impl<P: ShimPlatform> WaitQueue<Waiter<P>> {
+    /// Queue `waiter` first, as a `SYNC_POLICY_REVERSED` (LIFO) wait queue
+    /// does (`waitq_thread_insert`).
+    pub(crate) fn push_front(&mut self, waiter: Arc<Waiter<P>>) {
+        self.waiters.push_front(waiter);
+    }
+
+    /// Wake the first waiter (`waitq_wakeup64_identify`).
+    pub(crate) fn wake_one(&mut self) -> Option<ThreadId> {
+        let waiter = self.waiters.pop_front()?;
+        waiter.wake();
+        Some(waiter.thread)
+    }
+
+    /// Wake `thread` if it waits here (`waitq_wakeup64_thread`).
+    pub(crate) fn wake_thread(&mut self, thread: ThreadId) -> bool {
+        let Some(index) = self.waiters.iter().position(|w| w.thread == thread) else {
+            return false;
+        };
+        let waiter = self.waiters.remove(index).expect("index was just found");
+        waiter.wake();
         true
     }
 }

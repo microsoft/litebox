@@ -15,7 +15,7 @@
 use crate::{
     ShimPlatform, Task,
     syscalls::cancel::TestCancel,
-    wait::{WaitQueue, WaitResult},
+    wait::{WaitQueue, WaitResult, Waiter},
 };
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::time::Duration;
@@ -36,7 +36,7 @@ const NSEC_PER_SEC: i64 = 1_000_000_000;
 struct Semaphore<P: ShimPlatform> {
     policy: i32,
     count: i32,
-    waiters: WaitQueue<P>,
+    waiters: WaitQueue<Waiter<P>>,
 }
 
 /// The task's live semaphores. Each has a port, so the port budget bounds

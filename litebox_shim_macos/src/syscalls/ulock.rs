@@ -12,7 +12,7 @@
 use crate::{
     ShimPlatform, Task, ThreadId,
     syscalls::cancel::TestCancel,
-    wait::{WaitQueue, WaitResult},
+    wait::{WaitQueue, WaitResult, Waiter},
 };
 use alloc::collections::BTreeMap;
 use core::ops::Range;
@@ -67,7 +67,7 @@ struct Ull<P: ShimPlatform> {
     waiters: u32,
     /// The unfair lock's owner as the last waiter saw it.
     owner: Option<ThreadId>,
-    queue: WaitQueue<P>,
+    queue: WaitQueue<Waiter<P>>,
 }
 
 /// Every lock word with threads in `ulock_wait`.
