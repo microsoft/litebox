@@ -1277,8 +1277,10 @@ fn run_runner_with_timeout(arguments: &[&str]) -> (Option<i32>, Vec<u8>, String)
             let mut chunk = [0u8; 4096];
             loop {
                 match err.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(count) => stderr.lock().unwrap().extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
                 }
             }
         }
