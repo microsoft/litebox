@@ -4,7 +4,7 @@
 //! Darwin BSD shim for AArch64 Mach-O guests.
 //!
 //! Guest mappings and file operations use LiteBox. A runtime provider may
-//! supply dyld and an external shared cache for dynamically linked programs.
+//! supply dyld for dynamically linked programs.
 //! Networking is unsupported.
 
 #![no_std]
@@ -23,7 +23,7 @@ use litebox::{
 use litebox_common_linux::{PtRegs, mm::VmemManager, vmem::VmFlags};
 use litebox_common_macos::{
     KernReturn, PAGE_SIZE, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
-    VmProtection, errno::Errno, loader::MachoLoaderError,
+    errno::Errno, loader::MachoLoaderError,
 };
 use litebox_platform::time::TimeProvider;
 
@@ -109,9 +109,6 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 macho_mappings: Mutex::new(BTreeMap::new()),
                 macho_trampolines: Mutex::new(BTreeMap::new()),
                 shared_cache_base: AtomicUsize::new(0),
-                shared_cache_range: Mutex::new(None),
-                shared_cache_mappings: Mutex::new(Vec::new()),
-                privately_mapped_dyld_range: Mutex::new(None),
                 next_thread_id: core::sync::atomic::AtomicU64::new(1u64 << 32),
             }),
             files: self.files,
@@ -124,76 +121,6 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
 pub struct MacosShim<P: ShimPlatform> {
     global: Arc<GlobalState<P>>,
     files: Arc<syscalls::file::FilesState<P>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SharedCacheInstallError {
-    AlreadyInstalled,
-    InvalidCacheRange,
-    InvalidRegion,
-    UnreadableAlias,
-    Rewrite,
-}
-
-impl core::fmt::Display for SharedCacheInstallError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str(match self {
-            Self::AlreadyInstalled => "shared cache already installed",
-            Self::InvalidCacheRange => "invalid or uncovered shared-cache base",
-            Self::InvalidRegion => "invalid shared-cache region",
-            Self::UnreadableAlias => "shared-cache writable alias is unreadable",
-            Self::Rewrite => "failed to rewrite shared-cache executable code",
-        })
-    }
-}
-
-impl core::error::Error for SharedCacheInstallError {}
-
-/// Writable staging and final addresses for the cache's shared gate area.
-pub struct SharedCacheTrampoline {
-    pub range: core::ops::Range<usize>,
-    pub writable_alias: usize,
-}
-
-/// One mapping in an externally prepared shared cache.
-pub struct SharedCacheMapping {
-    pub range: core::ops::Range<usize>,
-    pub protection: VmProtection,
-}
-
-pub struct SharedCacheRegion<'a> {
-    pub range: core::ops::Range<usize>,
-    pub writable_alias: usize,
-    /// Code that executes only in the guest context.
-    pub guest_ranges: &'a [core::ops::Range<usize>],
-    /// Code shared between the host and guest contexts.
-    pub host_aware_ranges: &'a [core::ops::Range<usize>],
-    /// Code whose TPIDRRO reads must remain native.
-    pub native_thread_pointer_ranges: &'a [core::ops::Range<usize>],
-}
-
-/// Layout of an externally prepared shared cache.
-pub struct SharedCacheLayout<'a> {
-    pub range: core::ops::Range<usize>,
-    pub mappings: &'a [SharedCacheMapping],
-    pub executable_regions: &'a [SharedCacheRegion<'a>],
-    pub trampoline: SharedCacheTrampoline,
-}
-
-/// How TPIDRRO reads in dyld should behave for the selected runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DyldThreadPointerMode {
-    /// Read the physical thread register without rewriting it.
-    Native,
-    /// Read the guest thread pointer maintained by LiteBox.
-    Guest,
-}
-
-/// A dyld image prepared by the runtime provider.
-#[derive(Clone, Copy, Debug)]
-pub struct DyldImage<'a> {
-    pub data: &'a [u8],
-    pub thread_pointer: DyldThreadPointerMode,
 }
 
 impl<P: ShimPlatform> MacosShim<P> {
@@ -211,16 +138,14 @@ impl<P: ShimPlatform> MacosShim<P> {
         self.load(params, path, None, None, argv, envp)
     }
 
-    /// Load a dynamically linked executable with a runtime-provided dyld.
-    ///
-    /// The provider selects dyld's thread-pointer behavior and must install any
-    /// required shared cache before entering guest execution.
+    /// Load a dynamically linked executable with a runtime-provided, unrewritten
+    /// dyld image. dyld is rewritten like every other guest image.
     pub fn load_program_with_dyld(
         self,
         params: TaskParams,
         path: &str,
         image: &[u8],
-        dyld: DyldImage<'_>,
+        dyld: &[u8],
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
@@ -247,7 +172,7 @@ impl<P: ShimPlatform> MacosShim<P> {
         params: TaskParams,
         path: &str,
         image: Option<&[u8]>,
-        dyld: Option<DyldImage<'_>>,
+        dyld: Option<&[u8]>,
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
@@ -292,95 +217,6 @@ pub struct LoadedProgram<P: ShimPlatform> {
     pub initial_ctx: PtRegs,
 }
 
-impl<P: ShimPlatform> LoadedProgram<P> {
-    /// Rewrite and register an externally prepared shared cache.
-    ///
-    /// The provider must keep target mappings alive for the guest lifetime and
-    /// supply writable aliases for the same bytes. No cache code may execute
-    /// during installation. After success, publish staged mappings and
-    /// synchronize instruction caches before guest entry. Discard the process
-    /// on error because installation is not transactional.
-    pub fn install_shared_cache(
-        &self,
-        cache: &SharedCacheLayout<'_>,
-    ) -> Result<(), SharedCacheInstallError> {
-        if self
-            .entrypoints
-            .task
-            .global
-            .shared_cache_base
-            .load(Ordering::Acquire)
-            != 0
-        {
-            return Err(SharedCacheInstallError::AlreadyInstalled);
-        }
-        if cache.range.start == 0
-            || cache.range.start >= cache.range.end
-            || !cache.range.start.is_multiple_of(PAGE_SIZE)
-            || !cache.range.end.is_multiple_of(PAGE_SIZE)
-            || cache.trampoline.range.start >= cache.trampoline.range.end
-            || !cache.trampoline.range.start.is_multiple_of(PAGE_SIZE)
-            || !cache.trampoline.range.end.is_multiple_of(PAGE_SIZE)
-            || (cache.trampoline.range.start < cache.range.end
-                && cache.range.start < cache.trampoline.range.end)
-            || cache.trampoline.writable_alias == 0
-        {
-            return Err(SharedCacheInstallError::InvalidCacheRange);
-        }
-        if cache.mappings.is_empty()
-            || cache.mappings.iter().any(|mapping| {
-                mapping.range.start >= mapping.range.end
-                    || mapping.range.start < cache.range.start
-                    || mapping.range.end > cache.range.end
-                    || !mapping.range.start.is_multiple_of(PAGE_SIZE)
-                    || !mapping.range.end.is_multiple_of(PAGE_SIZE)
-            })
-            || cache
-                .mappings
-                .windows(2)
-                .any(|pair| pair[0].range.end > pair[1].range.start)
-        {
-            return Err(SharedCacheInstallError::InvalidCacheRange);
-        }
-        let mut trampoline_cursor = 0;
-        for region in cache.executable_regions {
-            if region.range.start >= region.range.end
-                || region.writable_alias == 0
-                || !region.range.start.is_multiple_of(PAGE_SIZE)
-                || !region.range.end.is_multiple_of(PAGE_SIZE)
-                || region.range.start < cache.range.start
-                || region.range.end > cache.range.end
-            {
-                return Err(SharedCacheInstallError::InvalidRegion);
-            }
-            trampoline_cursor = self.entrypoints.task.rewrite_shared_cache_region(
-                region,
-                &cache.trampoline,
-                trampoline_cursor,
-            )?;
-        }
-        let mut mappings = self.entrypoints.task.global.shared_cache_mappings.lock();
-        mappings.extend(
-            cache
-                .mappings
-                .iter()
-                .map(|mapping| (mapping.range.clone(), mapping.protection)),
-        );
-        mappings.push((
-            cache.trampoline.range.clone(),
-            VmProtection::READ | VmProtection::EXECUTE,
-        ));
-        drop(mappings);
-        *self.entrypoints.task.global.shared_cache_range.lock() = Some(cache.range.clone());
-        self.entrypoints
-            .task
-            .global
-            .shared_cache_base
-            .store(cache.range.start, Ordering::Release);
-        Ok(())
-    }
-}
-
 pub struct MacosShimEntrypoints<P: ShimPlatform> {
     task: Task<P>,
     // A bound task cannot be moved to another host thread.
@@ -394,9 +230,6 @@ struct GlobalState<P: ShimPlatform> {
     macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
     macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
     shared_cache_base: AtomicUsize,
-    shared_cache_range: Mutex<P, Option<core::ops::Range<usize>>>,
-    shared_cache_mappings: Mutex<P, Vec<(core::ops::Range<usize>, VmProtection)>>,
-    privately_mapped_dyld_range: Mutex<P, Option<core::ops::Range<usize>>>,
     next_thread_id: core::sync::atomic::AtomicU64,
 }
 

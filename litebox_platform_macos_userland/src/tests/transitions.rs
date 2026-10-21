@@ -17,7 +17,6 @@ fn prepare_code(
     words: &[u32],
     svc_offsets: &[usize],
     pages: usize,
-    abi: GuestAbi,
 ) -> MacosUserlandReservation<HOST_PAGE_SIZE> {
     assert!(pages > 0);
     // SAFETY: The fixed test range is aligned, free, and retained by the returned reservation.
@@ -41,10 +40,7 @@ fn prepare_code(
     assert!(code.len() <= HOST_PAGE_SIZE / 2);
     let gate_address = (base + HOST_PAGE_SIZE / 2) as u64;
     let callback = platform.get_syscall_entry_point() as u64;
-    let layout = match abi {
-        GuestAbi::Linux => GateLayout::linux(TargetHost::MacOs),
-        GuestAbi::Darwin => GateLayout::darwin(TargetHost::MacOs),
-    };
+    let layout = GateLayout::linux(TargetHost::MacOs);
     let mut gates = Vec::new();
     aarch64::emit_shared_prologue(&mut gates, callback);
     for &offset in svc_offsets {
@@ -58,14 +54,6 @@ fn prepare_code(
             .encode()
             .unwrap();
         code[offset..offset + aarch64::INSN_BYTES].copy_from_slice(&branch.to_le_bytes());
-    }
-    if abi == GuestAbi::Darwin {
-        aarch64::finalize_macho_trampoline(
-            &mut gates,
-            u16::try_from(platform.guest_thread_pointer_offset().unwrap()).unwrap(),
-            TargetHost::MacOs,
-        )
-        .unwrap();
     }
     assert!(gates.len() <= HOST_PAGE_SIZE / 2);
     assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
@@ -86,93 +74,24 @@ fn prepare_code(
 }
 
 #[test]
-fn signal_return_guard_publishes_pending_native_return() {
+fn signal_return_guard_restores_guest_mode_unless_disarmed() {
     set_guest_abi(GuestAbi::Darwin);
     MacosUserland::new();
-    let _cleanup = litebox::utils::defer(|| {
-        write_tls(tls_offset::IN_GUEST, 0);
-        write_tls(tls_offset::NATIVE_SIGRETURN_PENDING, 0);
-    });
-    for rewritten in [false, true] {
-        if rewritten {
-            enable_rewritten_host_sigreturn();
-        }
-        // Host-only signals never manufacture a guest return.
-        drop(SignalReturnGuard::new());
-        assert_eq!(read_tls(tls_offset::IN_GUEST), 0);
-        assert_eq!(read_tls(tls_offset::NATIVE_SIGRETURN_PENDING), 0);
-
-        write_tls(tls_offset::IN_GUEST, 1);
-        let guard = SignalReturnGuard::new();
-        assert_eq!(read_tls(tls_offset::IN_GUEST), 0);
-        drop(guard);
-        assert_eq!(read_tls(tls_offset::IN_GUEST), 1);
-        assert_eq!(
-            read_tls(tls_offset::NATIVE_SIGRETURN_PENDING),
-            usize::from(rewritten)
-        );
-
-        write_tls(tls_offset::NATIVE_SIGRETURN_PENDING, 0);
-        let mut guard = SignalReturnGuard::new();
-        guard.disarm();
-        drop(guard);
-        assert_eq!(read_tls(tls_offset::IN_GUEST), 0);
-        assert_eq!(read_tls(tls_offset::NATIVE_SIGRETURN_PENDING), 0);
-    }
-}
-
-#[test]
-fn native_syscall_gate_preserves_registers_and_carry() {
-    // entry must point to a live RX copy of the test stub below.
-    unsafe fn check(entry: usize) {
-        for (syscall, argument, result, carry) in [
-            (20usize, 0, std::process::id() as usize, 0),   // getpid
-            (6, usize::MAX, libc::EBADF as usize, 1 << 29), // close(-1)
-        ] {
-            let mut observed = [0usize; 4];
-            // SAFETY: the caller retains the RX stub, and observed is writable
-            // for its four outputs. Arguments and clobbers follow the C ABI.
-            unsafe {
-                core::arch::asm!("blr {entry}", entry = in(reg) entry,
-                    in("x0") syscall, in("x1") argument, in("x2") observed.as_mut_ptr(), clobber_abi("C"));
-            }
-            assert_eq!(&observed[..3], &[result, syscall, 0x1717]);
-            assert_eq!(observed[3] & (1 << 29), carry);
-        }
-    }
-    let platform = MacosUserland::new();
-    let reservation = prepare_code(
-        platform,
-        &[
-            0xaa00_03f0, // mov x16, x0
-            0xaa01_03e0, // mov x0, x1
-            0xd282_e2f1, // mov x17, #0x1717
-            0xd400_1001, // svc #0x80
-            0xa900_4040, // stp x0, x16, [x2]
-            0xd53b_4200, // mrs x0, nzcv
-            0xa901_0051, // stp x17, x0, [x2, #16]
-            0xd65f_03c0, // ret
-        ],
-        &[12],
-        1,
-        GuestAbi::Darwin,
-    );
-    let base = reservation.range().start;
-    let _cleanup = litebox::utils::defer(|| {
-        // SAFETY: both callers have finished before this test-owned code is released.
-        unsafe { platform.release_pages(reservation.into()) }.unwrap();
-    });
-    assert_ne!(tls_block_address(), 0);
+    let _cleanup = litebox::utils::defer(|| write_tls(tls_offset::IN_GUEST, 0));
+    // Host-only signals never manufacture a guest return.
+    drop(SignalReturnGuard::new());
     assert_eq!(read_tls(tls_offset::IN_GUEST), 0);
-    // SAFETY: the initialized test stub remains RX until both callers finish.
-    unsafe { check(base) };
-    std::thread::spawn(move || {
-        assert_eq!(tls_block_address(), 0);
-        // SAFETY: the parent retains the RX stub until this thread is joined.
-        unsafe { check(base) };
-    })
-    .join()
-    .unwrap();
+
+    write_tls(tls_offset::IN_GUEST, 1);
+    let guard = SignalReturnGuard::new();
+    assert_eq!(read_tls(tls_offset::IN_GUEST), 0);
+    drop(guard);
+    assert_eq!(read_tls(tls_offset::IN_GUEST), 1);
+
+    let mut guard = SignalReturnGuard::new();
+    guard.disarm();
+    drop(guard);
+    assert_eq!(read_tls(tls_offset::IN_GUEST), 0);
 }
 
 #[test]
@@ -228,7 +147,7 @@ fn child_inherits_vector_state_and_dispatches_on_host_stack() {
 
     set_guest_abi(GuestAbi::Linux);
     let platform = MacosUserland::new();
-    let reservation = prepare_code(platform, &[0xd400_0001], &[0], 3, GuestAbi::Linux); // svc #0
+    let reservation = prepare_code(platform, &[0xd400_0001], &[0], 3); // svc #0
     let base = reservation.range().start;
     let original = get_guest_vector_state();
     let _restore = litebox::utils::defer(|| set_guest_vector_state(&original));

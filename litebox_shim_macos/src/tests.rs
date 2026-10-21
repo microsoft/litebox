@@ -40,77 +40,6 @@ fn syscall_return_registers_and_carry() {
 }
 
 #[test]
-fn shared_cache_installation_validates_state_and_trampoline() {
-    let task = task(MacosShimBuilder::new(Platform::new()).build());
-    let process = task.process.clone();
-    let program = LoadedProgram {
-        entrypoints: MacosShimEntrypoints {
-            task,
-            _not_send: core::marker::PhantomData,
-        },
-        process,
-        initial_ctx: PtRegs::default(),
-    };
-    let mappings = [SharedCacheMapping {
-        range: PAGE_SIZE..3 * PAGE_SIZE,
-        protection: VmProtection::READ,
-    }];
-    let cache = SharedCacheLayout {
-        range: PAGE_SIZE..3 * PAGE_SIZE,
-        mappings: &mappings,
-        executable_regions: &[],
-        trampoline: SharedCacheTrampoline {
-            range: 2 * PAGE_SIZE..4 * PAGE_SIZE,
-            writable_alias: PAGE_SIZE,
-        },
-    };
-    assert_eq!(
-        program.install_shared_cache(&cache),
-        Err(SharedCacheInstallError::InvalidCacheRange)
-    );
-
-    program
-        .entrypoints
-        .task
-        .global
-        .shared_cache_base
-        .store(PAGE_SIZE, Ordering::Release);
-    assert_eq!(
-        program.install_shared_cache(&cache),
-        Err(SharedCacheInstallError::AlreadyInstalled)
-    );
-}
-
-#[test]
-fn dyld_data_remains_writable_during_bootstrap() {
-    use litebox_common_macos::VmProtection;
-
-    let task = task(MacosShimBuilder::new(Platform::new()).build());
-    // SAFETY: allocate one fresh page owned exclusively by this test task.
-    let page = unsafe {
-        task.global.mm.create_writable_pages(
-            NonZeroAddress::new(Platform::TASK_ADDR_MIN),
-            NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            |_| Ok(0),
-        )
-    }
-    .unwrap();
-    let base = page.as_usize();
-    *task.global.privately_mapped_dyld_range.lock() = Some(base..base + PAGE_SIZE);
-    task.sys_mprotect(base, PAGE_SIZE, VmProtection::READ)
-        .unwrap();
-    let flags = task
-        .global
-        .mm
-        .mappings()
-        .into_iter()
-        .find_map(|(range, flags)| range.contains(&base).then_some(flags))
-        .unwrap();
-    assert!(flags.contains(VmFlags::VM_WRITE));
-}
-
-#[test]
 fn mach_vm_map_honors_current_protection() {
     use litebox_common_macos::{
         KernReturn, VmProtection,
@@ -263,6 +192,11 @@ fn shared_region_check_handles_sentinel_and_copyout_fault() {
     use litebox_common_macos::{errno::Errno, user_pointers::UserPtrMut};
 
     let task = task(MacosShimBuilder::new(Platform::new()).build());
+    assert_eq!(
+        task.sys_shared_region_check_np(UserPtrMut::from_usize(usize::MAX)),
+        Err(Errno::EINVAL),
+        "no shared region"
+    );
     task.global
         .shared_cache_base
         .store(0x1800_0000, Ordering::Release);

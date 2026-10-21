@@ -166,37 +166,7 @@ impl<P: ShimPlatform> Task<P> {
         let MachPageRange::NonEmpty { address, size } = range else {
             return KernReturn::SUCCESS.into();
         };
-        let end = address + size;
         let permissions = protection.permissions();
-        if self
-            .global
-            .shared_cache_range
-            .lock()
-            .as_ref()
-            .is_some_and(|cache| address >= cache.start && end <= cache.end)
-        {
-            let mappings = self.global.shared_cache_mappings.lock();
-            let mut covered = address;
-            for (range, current) in mappings.iter() {
-                if range.end <= covered || range.start > covered {
-                    continue;
-                }
-                if *current != permissions {
-                    break;
-                }
-                covered = covered.max(range.end);
-                if covered >= end {
-                    break;
-                }
-            }
-            let unchanged = covered >= end;
-            return if unchanged {
-                KernReturn::SUCCESS
-            } else {
-                KernReturn::PROTECTION_FAILURE
-            }
-            .into();
-        }
         match self.sys_mprotect(address, size, permissions) {
             Ok(()) => KernReturn::SUCCESS,
             Err(error) => errno_to_kern_return(error),
