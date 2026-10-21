@@ -175,10 +175,20 @@ static void *reader(void *unused) {
   return NULL;
 }
 
+// Ends the process if the cancellation never takes effect, so a broken
+// implementation fails within seconds instead of at the runner's bound.
+static void *give_up(void *unused) {
+  (void)unused;
+  sleep(10);
+  _exit(4);
+}
+
 static int cancel_read(void) {
   struct timespec start;
   clock_gettime(CLOCK_MONOTONIC, &start);
   pthread_t thread;
+  pthread_create(&thread, NULL, give_up, NULL);
+  pthread_detach(thread);
   pthread_create(&thread, NULL, reader, NULL);
   while (!atomic_load(&reading)) usleep(1000);
   // Long enough for the read to block.

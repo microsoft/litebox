@@ -484,12 +484,19 @@ fn semaphore_counts_wrap_past_int_max_like_xnu() {
     assert_eq!(signal(full), KernReturn::SUCCESS);
     let taken = create_semaphore(&task, SYNC_POLICY_FIFO, 2);
     assert_eq!(
-        kr(&task, mach_trap::SEMAPHORE_WAIT_SIGNAL, &[taken, full]),
+        kr(
+            &task,
+            mach_trap::SEMAPHORE_TIMEDWAIT_SIGNAL,
+            &[taken, full, BOUND_SECONDS, 0]
+        ),
         KernReturn::SUCCESS
     );
     assert_eq!(count(&task, full), Some(i32::MIN));
     let full = create_semaphore(&task, SYNC_POLICY_FIFO, max);
-    assert_eq!(semwait(&task, nr::SEMWAIT_SIGNAL, taken, full, None), Ok(0));
+    assert_eq!(
+        semwait(&task, nr::SEMWAIT_SIGNAL, taken, full, Some((true, 10, 0))),
+        Ok(0)
+    );
     assert_eq!(
         (count(&task, taken), count(&task, full)),
         (Some(0), Some(i32::MIN))
@@ -508,8 +515,8 @@ fn a_pending_abort_ends_wait_signal_before_its_signal() {
     assert_eq!(
         kr(
             &task,
-            mach_trap::SEMAPHORE_WAIT_SIGNAL,
-            &[semaphore, semaphore]
+            mach_trap::SEMAPHORE_TIMEDWAIT_SIGNAL,
+            &[semaphore, semaphore, BOUND_SECONDS, 0]
         ),
         KernReturn::ABORTED
     );
@@ -520,7 +527,13 @@ fn a_pending_abort_ends_wait_signal_before_its_signal() {
     let own = trap(&task, mach_trap::THREAD_SELF, &[]);
     assert_eq!(bsd(&task, nr::PTHREAD_MARKCANCEL, &[own]), Ok(0));
     assert_eq!(
-        semwait(&task, nr::SEMWAIT_SIGNAL, semaphore, semaphore, None),
+        semwait(
+            &task,
+            nr::SEMWAIT_SIGNAL,
+            semaphore,
+            semaphore,
+            Some((true, 10, 0))
+        ),
         errno(Errno::EINTR)
     );
     assert_eq!(count(&task, semaphore), Some(1));
