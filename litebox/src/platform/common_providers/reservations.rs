@@ -52,6 +52,13 @@ macro_rules! define_page_reservation {
                     }),
                 )
             }
+
+            fn merge(self, next: Self) -> Self {
+                assert_eq!(self.range.end, next.range.start);
+                Self {
+                    range: self.range.start..next.range.end,
+                }
+            }
         }
 
         impl<const ALIGN: usize> From<$name<ALIGN>> for ::core::ops::Range<usize> {
@@ -146,7 +153,8 @@ impl<Reservation> Default for TrackedReservations<Reservation> {
 }
 
 impl<Reservation: PageReservation> TrackedReservations<Reservation> {
-    fn gaps(&self, range: Range<usize>) -> impl Iterator<Item = Range<usize>> {
+    /// Returns the ascending sub-ranges of `range` that no tracked reservation covers.
+    pub fn gaps(&self, range: Range<usize>) -> impl Iterator<Item = Range<usize>> {
         let mut cursor = range.start;
         self.overlapping(range.clone())
             .map(PageReservation::range)

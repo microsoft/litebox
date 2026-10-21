@@ -19,6 +19,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use litebox_broker_core::{
     BrokerCore, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
+    random::{RandomProvider, RandomProviderError},
     stdio::{StdioProvider, UnsupportedStdioProvider},
     test_support::{FailingRandomProvider, TestBrokerCoreBuilder},
 };
@@ -43,6 +44,33 @@ fn test_broker() -> BrokerCore {
     ))
     .build()
     .expect("a test process may build only one broker core")
+}
+
+/// Like [`litebox`], but the broker fills random requests with a fixed byte pattern.
+///
+/// # Panics
+///
+/// Panics if a broker core already exists in this process.
+pub(crate) fn litebox_with_random(
+    platform: &'static TestPlatform,
+) -> (litebox::LiteBox<TestPlatform>, usize) {
+    let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        ObjectRights::all(),
+    ))
+    .with_random_provider(Arc::new(FixedRandomProvider))
+    .build()
+    .expect("a test process may build only one broker core");
+    connect(platform, broker)
+}
+
+/// Deterministic random source for tests that need broker randomness to succeed.
+struct FixedRandomProvider;
+
+impl RandomProvider for FixedRandomProvider {
+    fn fill(&self, output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
+        output.fill(0x5a);
+        Ok(())
+    }
 }
 
 /// Returns a LiteBox associated with a broker core that serves `entries` from memory.

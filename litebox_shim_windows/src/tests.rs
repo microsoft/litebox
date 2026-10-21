@@ -125,6 +125,12 @@ pub(crate) fn test_task() -> Task<TestPlatform> {
     test_task_from_litebox_with_process_id(litebox, process_id, None)
 }
 
+/// Like [`test_task`], but broker randomness succeeds with a fixed byte pattern.
+pub(crate) fn test_task_with_random() -> Task<TestPlatform> {
+    let (litebox, process_id) = crate::test_broker::litebox_with_random(test_platform());
+    test_task_from_litebox_with_process_id(litebox, process_id, None)
+}
+
 /// Returns a task whose broker serves `files` from an in-memory filesystem.
 ///
 /// Reserved for tests that genuinely exercise file-backed behavior. Every other test must use
@@ -212,12 +218,7 @@ fn test_task_from_litebox_with_process_id(
     let windows_shared_section =
         crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base);
 
-    let process = Arc::new(Process::new(
-        process_id,
-        parent_id,
-        None,
-        windows_shared_section,
-    ));
+    let process = Arc::new(Process::new(process_id, parent_id, windows_shared_section));
     let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
         initial_thread_id as usize,
         0,

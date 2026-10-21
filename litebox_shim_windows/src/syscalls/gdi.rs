@@ -8,11 +8,12 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_linux::vmem::{CreatePagesFlags, MappingError};
 use litebox_common_windows::loader::PAGE_SIZE;
-use rangemap::RangeMap;
 
 use crate::nt_types::ProcessEnvironmentBlock;
-use crate::syscalls::mm::{ALLOCATION_GRANULARITY, MemoryType, PageProtection};
-use crate::{MutPtr, ShimPlatform, Task, WindowsVirtualAllocation};
+use crate::syscalls::mm::{
+    ALLOCATION_GRANULARITY, MemoryType, PageProtection, record_committed_allocation,
+};
+use crate::{MutPtr, ShimPlatform, Task};
 
 const GDI_SHARED_TABLE_SIZE: usize = 0x182000;
 const GDI_STOCK_OBJECT_TABLE_OFFSET: usize = 0x1800b0;
@@ -56,20 +57,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return 0;
         };
         let shared_table = mapping.as_usize();
-        let mut pages = RangeMap::new();
-        pages.insert(
-            shared_table..shared_table + GDI_SHARED_TABLE_SIZE,
-            PageProtection::PAGE_READWRITE,
-        );
-        self.process.virtual_allocations.write().insert(
+        record_committed_allocation(
+            &self.global.page_manager,
             shared_table,
-            WindowsVirtualAllocation {
-                base: shared_table,
-                size: GDI_SHARED_TABLE_SIZE,
-                allocation_protect: PageProtection::PAGE_READWRITE,
-                type_: MemoryType::MEM_MAPPED,
-                page_protections: pages,
-            },
+            GDI_SHARED_TABLE_SIZE,
+            MemoryType::MEM_MAPPED,
+            PageProtection::PAGE_READWRITE,
         );
 
         let new_state = GdiProcessState {
@@ -77,16 +70,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             cookie,
         };
         if self.publish_gdi_state(new_state) == 0 {
-            self.process
-                .virtual_allocations
-                .write()
-                .remove(&shared_table);
             // SAFETY: the mapping was just created and was not published to the process state.
             let _ = unsafe {
-                self.global.page_manager.remove_pages(
-                    MutPtr::<Platform, u8>::from_usize(shared_table),
-                    GDI_SHARED_TABLE_SIZE,
-                )
+                self.global
+                    .page_manager
+                    .write_vmem()
+                    .release_allocation(shared_table, GDI_SHARED_TABLE_SIZE)
             };
             return 0;
         }
@@ -122,4 +111,31 @@ fn initialize_gdi_shared_table<Platform: ShimPlatform>(
             .ok_or(MappingError::OutOfMemory)?;
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::run_with_test_platform_pointers;
+
+    #[test]
+    fn gdi_init_releases_shared_table_when_peb_publish_fails() {
+        run_with_test_platform_pointers(|| {
+            // The bare test task has no PEB, so publishing the shared table always fails after
+            // the table is mapped and recorded.
+            let task = crate::tests::test_task_with_random();
+            let snapshot = || {
+                let vmem = task.global.page_manager.read_vmem();
+                (
+                    vmem.allocations_in(..)
+                        .cloned()
+                        .collect::<alloc::vec::Vec<_>>(),
+                    vmem.mappings().clone(),
+                )
+            };
+            let before = snapshot();
+            assert_eq!(task.sys_nt_gdi_init2(), 0);
+            assert!(task.process.gdi_state.lock().is_none());
+            assert_eq!(snapshot(), before);
+        });
+    }
 }

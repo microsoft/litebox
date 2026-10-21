@@ -199,11 +199,22 @@ pub(crate) trait WindowsHandleSubsystem: litebox::fd::FdEnabledSubsystem {
 }
 pub(crate) type WindowsNlsSectionMappings<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
-pub(crate) type WindowsVirtualAllocations<Platform> =
-    litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
 pub(crate) type WindowsSectionViews<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsSectionView<Platform>>>;
 pub(crate) type WindowsObjectManager<Platform> = ObjectManager<Platform>;
+
+/// Windows placeholder lifecycle of a logical virtual allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WindowsPlaceholderState {
+    /// An ordinary allocation that never participates in placeholder operations.
+    None,
+    /// A `MEM_RESERVE_PLACEHOLDER` range that can be split, coalesced, or replaced, but not
+    /// committed directly.
+    Reserved,
+    /// A private allocation created with `MEM_REPLACE_PLACEHOLDER`; releasing it with
+    /// `MEM_PRESERVE_PLACEHOLDER` turns it back into a `Reserved` placeholder.
+    Replaced,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {
@@ -211,8 +222,34 @@ pub(crate) struct WindowsVirtualAllocation {
     pub(crate) size: usize,
     pub(crate) allocation_protect: syscalls::mm::PageProtection,
     pub(crate) type_: syscalls::mm::MemoryType,
+    /// Tracks both placeholders and private allocations that may be restored to placeholders.
+    pub(crate) placeholder_state: WindowsPlaceholderState,
     /// Exact Windows protections; commitment is determined by the page manager.
     pub(crate) page_protections: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
+}
+
+impl WindowsVirtualAllocation {
+    /// Creates an allocation record whose pages are either all committed with
+    /// `committed_protect`, or, when it is `None`, all reserved.
+    pub(crate) fn new(
+        base: usize,
+        size: usize,
+        type_: syscalls::mm::MemoryType,
+        allocation_protect: syscalls::mm::PageProtection,
+        placeholder_state: WindowsPlaceholderState,
+        committed_protect: Option<syscalls::mm::PageProtection>,
+    ) -> Self {
+        Self {
+            base,
+            size,
+            allocation_protect,
+            type_,
+            placeholder_state,
+            page_protections: committed_protect.map_or_else(rangemap::RangeMap::new, |protect| {
+                syscalls::mm::initial_page_protections(base, size, protect)
+            }),
+        }
+    }
 }
 
 pub(crate) struct WindowsSectionView<Platform: ShimPlatform> {
@@ -559,12 +596,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         let windows_shared_section = crate::syscalls::section::load_time_windows_shared_section(
             load_info.environment.windows_shared_section,
         );
-        let mut process = Process::new(
-            self.0.process_id,
-            self.0.parent_id,
-            Some(load_info.virtual_allocations),
-            windows_shared_section,
-        );
+        let mut process = Process::new(self.0.process_id, self.0.parent_id, windows_shared_section);
         process.ntdll = load_info.ntdll;
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
@@ -638,7 +670,6 @@ pub struct Process<Platform: ShimPlatform> {
     )]
     windows_shared_section: Arc<SectionObject<Platform>>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
-    virtual_allocations: WindowsVirtualAllocations<Platform>,
     system_lcid: AtomicU32,
     user_lcid: AtomicU32,
     user_ui_language: AtomicU32,
@@ -752,7 +783,6 @@ impl<Platform: ShimPlatform> Process<Platform> {
     fn new(
         process_id: usize,
         parent_id: Option<usize>,
-        virtual_allocations: Option<WindowsVirtualAllocations<Platform>>,
         windows_shared_section: Arc<SectionObject<Platform>>,
     ) -> Self {
         let object_manager = syscalls::object_manager::seed_object_manager();
@@ -778,8 +808,6 @@ impl<Platform: ShimPlatform> Process<Platform> {
             windows_shared_section,
             section_views: WindowsSectionViews::<Platform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
-            virtual_allocations: virtual_allocations
-                .unwrap_or_else(|| WindowsVirtualAllocations::<Platform>::new(BTreeMap::new())),
             system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
