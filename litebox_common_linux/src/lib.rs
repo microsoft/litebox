@@ -827,6 +827,7 @@ bitflags::bitflags! {
 
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
+type speed_t = ::core::ffi::c_uint;
 #[repr(C)]
 #[derive(Debug, Clone, FromBytes, IntoBytes)]
 pub struct Termios {
@@ -836,6 +837,15 @@ pub struct Termios {
     pub c_lflag: tcflag_t,
     pub c_line: cc_t,
     pub c_cc: [cc_t; 19usize],
+}
+
+/// Linux `struct termios2`: a [`Termios`] followed by explicit input and output speeds.
+#[repr(C)]
+#[derive(Debug, Clone, FromBytes, IntoBytes)]
+pub struct Termios2 {
+    pub termios: Termios,
+    pub c_ispeed: speed_t,
+    pub c_ospeed: speed_t,
 }
 
 #[derive(Debug, Clone, FromBytes, IntoBytes)]
@@ -880,6 +890,11 @@ const TERMIOS_LOCAL: &[(u32, LocalFlags)] = &[
 // The virtual endpoint transports eight-bit bytes, not a configurable UART:
 // CS8 | CREAD | B38400. Hardware configuration is deliberately unsupported.
 const TERMIOS_CONTROL: u32 = 0x30 | 0x80 | 0xf;
+// An input speed (CIBAUD) of B38400 equals the default B0, which means the
+// output speed; glibc 2.42 sets it explicitly.
+const TERMIOS_INPUT_SPEED: u32 = 0xf << 16;
+// The speed B38400 selects.
+const TERMIOS_SPEED: speed_t = 38400;
 // IGNBRK | BRKINT | IGNPAR | INPCK | IMAXBEL are accepted but not retained: the
 // virtual endpoint has no breaks or parity errors, and Linux ignores IMAXBEL.
 // POSIX lets `tcsetattr` succeed when only some changes take effect.
@@ -958,7 +973,7 @@ impl TryFrom<&Termios> for TerminalSettings {
             return Err(errno::Errno::EINVAL);
         };
         if termios.c_line != 0
-            || termios.c_cflag != TERMIOS_CONTROL
+            || ![TERMIOS_CONTROL, TERMIOS_CONTROL | TERMIOS_INPUT_SPEED].contains(&termios.c_cflag)
             || [5, 7, 10, 13, 17, 18]
                 .iter()
                 .any(|&index| termios.c_cc[index] != 0)
@@ -987,6 +1002,26 @@ impl TryFrom<&Termios> for TerminalSettings {
             },
             minimum_read: c[6],
         })
+    }
+}
+
+impl From<TerminalSettings> for Termios2 {
+    fn from(settings: TerminalSettings) -> Self {
+        Self {
+            termios: settings.into(),
+            c_ispeed: TERMIOS_SPEED,
+            c_ospeed: TERMIOS_SPEED,
+        }
+    }
+}
+
+impl TryFrom<&Termios2> for TerminalSettings {
+    type Error = errno::Errno;
+
+    /// Like Linux, ignores the explicit speeds, which `c_cflag` supersedes unless it selects
+    /// arbitrary speeds (BOTHER), an unsupported setting.
+    fn try_from(termios: &Termios2) -> Result<Self, errno::Errno> {
+        Self::try_from(&termios.termios)
     }
 }
 
@@ -1065,6 +1100,26 @@ mod termios_tests {
             assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
         }
     }
+
+    #[test]
+    fn termios2_reports_and_accepts_the_fixed_speed() {
+        assert_eq!(core::mem::size_of::<Termios2>(), 0x2c);
+        let settings = TerminalSettings::default();
+        let mut termios = Termios2::from(settings);
+        assert_eq!((termios.c_ispeed, termios.c_ospeed), (38400, 38400));
+        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
+        // glibc 2.42 sets the input speed in `c_cflag` (CIBAUD) to match the output speed.
+        termios.termios.c_cflag |= 0xf << 16;
+        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
+        // Like Linux, `c_cflag` speeds other than BOTHER supersede the explicit ones.
+        termios.c_ispeed = 9600;
+        termios.c_ospeed = 9600;
+        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
+        for input_speed in [0xd << 16, 0x1000 << 16] {
+            termios.termios.c_cflag = TERMIOS_CONTROL | input_speed; // B9600, BOTHER
+            assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
+        }
+    }
 }
 
 pub const TCGETS: u32 = 0x5401;
@@ -1076,6 +1131,10 @@ pub const TCFLSH: u32 = 0x540b;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
+pub const TCGETS2: u32 = 0x802c542a;
+pub const TCSETS2: u32 = 0x402c542b;
+pub const TCSETSW2: u32 = 0x402c542c;
+pub const TCSETSF2: u32 = 0x402c542d;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
 
@@ -1091,6 +1150,14 @@ pub enum IoctlArg {
     TCSETSW(UserPtr<Termios>),
     /// Set attributes after draining output and discarding input.
     TCSETSF(UserPtr<Termios>),
+    /// Like [`Self::TCGETS`], with explicit speeds.
+    TCGETS2(UserPtrMut<Termios2>),
+    /// Like [`Self::TCSETS`], with explicit speeds.
+    TCSETS2(UserPtr<Termios2>),
+    /// Like [`Self::TCSETSW`], with explicit speeds.
+    TCSETSW2(UserPtr<Termios2>),
+    /// Like [`Self::TCSETSF`], with explicit speeds.
+    TCSETSF2(UserPtr<Termios2>),
     /// Drain output when nonzero; zero requests an unsupported serial break.
     TCSBRK(u32),
     /// Discard input (0), output (1), or both (2).
@@ -3038,6 +3105,10 @@ impl SyscallRequest {
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
                         TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
                         TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
+                        TCGETS2 => IoctlArg::TCGETS2(ctx.sys_req_ptr(2)),
+                        TCSETS2 => IoctlArg::TCSETS2(ctx.sys_req_ptr(2)),
+                        TCSETSW2 => IoctlArg::TCSETSW2(ctx.sys_req_ptr(2)),
+                        TCSETSF2 => IoctlArg::TCSETSF2(ctx.sys_req_ptr(2)),
                         TCSBRK => IoctlArg::TCSBRK(ctx.sys_req_arg(2)),
                         TCFLSH => IoctlArg::TCFLSH(ctx.sys_req_arg(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),

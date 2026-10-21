@@ -20,6 +20,16 @@ static volatile sig_atomic_t interrupts;
 static volatile sig_atomic_t quits;
 static volatile sig_atomic_t resizes;
 
+// The kernel's `struct termios2`, which glibc 2.42 uses to implement tcgetattr and tcsetattr.
+struct kernel_termios2 {
+    tcflag_t c_iflag, c_oflag, c_cflag, c_lflag;
+    cc_t c_line;
+    cc_t c_cc[19];
+    speed_t c_ispeed, c_ospeed;
+};
+#define GET_TERMIOS2 _IOR('T', 0x2a, struct kernel_termios2)
+#define SET_TERMIOS2_DRAIN _IOW('T', 0x2c, struct kernel_termios2)
+
 static void on_signal(int signal) {
     if (signal == SIGINT) interrupts++;
     if (signal == SIGQUIT) quits++;
@@ -143,6 +153,24 @@ int main(int argc, char **argv) {
     attributes.c_cc[VMIN] = 2;
     assert(tcsetattr(0, TCSANOW, &attributes) == -1 && errno == EINVAL);
     assert(tcgetattr(0, &attributes) == 0 && attributes.c_cc[VTIME] == 0 && attributes.c_cc[VMIN] == 1);
+
+    // Like glibc 2.42, use termios2 and set the input speed explicitly.
+    struct kernel_termios2 attributes2;
+    assert(ioctl(0, GET_TERMIOS2, &attributes2) == 0);
+    assert(attributes2.c_ispeed == 38400 && attributes2.c_ospeed == 38400);
+    assert(attributes2.c_iflag == original.c_iflag && attributes2.c_oflag == original.c_oflag);
+    // glibc 2.42's tcgetattr fills in the input speed (CIBAUD), which the terminal reports as 0.
+    assert((attributes2.c_cflag & ~CIBAUD) == (original.c_cflag & ~CIBAUD));
+    assert(attributes2.c_lflag == original.c_lflag);
+    assert(memcmp(attributes2.c_cc, original.c_cc, sizeof(attributes2.c_cc)) == 0);
+    // Copy the output speed's kernel code to CIBAUD; glibc 2.42 redefines B38400 as the plain rate.
+    attributes2.c_cflag |= (attributes2.c_cflag & CBAUD) << 16;
+    attributes2.c_lflag &= ~ECHO;
+    assert(ioctl(1, SET_TERMIOS2_DRAIN, &attributes2) == 0);
+    assert(tcgetattr(0, &attributes) == 0 && !(attributes.c_lflag & ECHO));
+    assert(tcsetattr(0, TCSANOW, &original) == 0);
+    // Like a Linux pseudoterminal, the terminal rejects requests it does not know with ENOTTY.
+    assert(ioctl(1, TIOCGSERIAL, NULL) == -1 && errno == ENOTTY);
 
     // Pagers such as less request tab expansion.
     attributes = original;
