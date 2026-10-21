@@ -88,6 +88,12 @@ pub(crate) mod hook {
         /// A mapping change replaced or removed mappings and has not retired
         /// their shared ulock objects yet.
         MappingsChanged,
+        /// A MAP_FIXED mapping took its snapshot of the range it replaces and
+        /// has not changed the range yet.
+        FixedSnapshot,
+        /// An mprotect of task memory rewrote what it makes executable and has
+        /// not changed permissions yet.
+        Protecting,
         /// A ulock wait or wake validated its arguments and has not locked
         /// the ulock table yet.
         UlockLookup,
@@ -393,17 +399,23 @@ impl<P: ShimPlatform> Task<P> {
         }
     }
 
+    /// The mapped parts of `target` with the flags an mprotect cannot change,
+    /// merging neighbors that differ only in flags it can. A failed MAP_FIXED
+    /// replaced or removed mappings exactly if this changed, since the page
+    /// manager leaves a hole where a failed mapping replaced pages.
     fn mapping_snapshot(&self, target: Range<usize>) -> Vec<(Range<usize>, VmFlags)> {
-        self.global
-            .mm
-            .mappings()
-            .into_iter()
-            .filter_map(|(range, flags)| {
-                let start = range.start.max(target.start);
-                let end = range.end.min(target.end);
-                (start < end).then_some((start..end, flags))
-            })
-            .collect()
+        let mut snapshot: Vec<(Range<usize>, VmFlags)> = Vec::new();
+        for (range, flags) in self.global.mm.overlapping(target.clone()) {
+            let range = range.start.max(target.start)..range.end.min(target.end);
+            let flags = flags - VmFlags::VM_ACCESS_FLAGS - VmFlags::VM_HAS_CONTENTS;
+            match snapshot.last_mut() {
+                Some((last, last_flags)) if last.end == range.start && *last_flags == flags => {
+                    last.end = range.end;
+                }
+                _ => snapshot.push((range, flags)),
+            }
+        }
+        snapshot
     }
 
     pub(crate) fn sys_mmap(
@@ -528,6 +540,10 @@ impl<P: ShimPlatform> Task<P> {
         if flags.contains(MmapFlags::ANONYMOUS) {
             let locked = fixed.then(|| self.lock_mapping_change());
             let before = fixed.then(|| self.mapping_snapshot(fixed_range.clone()));
+            #[cfg(all(test, target_os = "macos"))]
+            if fixed {
+                self.global.mapping_hook.reach(hook::Point::FixedSnapshot);
+            }
             // SAFETY: MAP_FIXED has Darwin's replacement semantics; otherwise
             // PageManager treats `suggested` only as an allocation hint.
             let result = unsafe {
@@ -587,6 +603,10 @@ impl<P: ShimPlatform> Task<P> {
         }
         let ulocks = fixed.then(|| self.global.ulocks.lock());
         let before = fixed.then(|| self.mapping_snapshot(fixed_range.clone()));
+        #[cfg(all(test, target_os = "macos"))]
+        if fixed {
+            self.global.mapping_hook.reach(hook::Point::FixedSnapshot);
+        }
         let mut file_offset = offset;
         let mut buffer = [0; PAGE_SIZE];
         let mut initialization_error = None;
@@ -1113,7 +1133,13 @@ impl<P: ShimPlatform> Task<P> {
         Ok(patch_info)
     }
 
-    fn rewrite_mprotect_range(&self, address: usize, length: usize) -> Result<(), Errno> {
+    /// Rewrite what `range` makes executable. The caller holds
+    /// `macho_mappings` through the permission change.
+    fn rewrite_mprotect_range(
+        &self,
+        mappings: &mut BTreeMap<usize, MachoMapping>,
+        range: Range<usize>,
+    ) -> Result<(), Errno> {
         struct RewriteRange {
             mapping_start: usize,
             range: Range<usize>,
@@ -1121,11 +1147,7 @@ impl<P: ShimPlatform> Task<P> {
             patch_info: Arc<MachoPatchInfo>,
         }
 
-        let end = address + length;
-        // Serialize discovery, rewriting, and publication with munmap and other
-        // executable transitions. The page-manager operations below do not
-        // acquire `macho_mappings`.
-        let mut mappings = self.global.macho_mappings.lock();
+        let (address, end) = (range.start, range.end);
         let patches = {
             let mut patches = Vec::new();
             for (&mapping_start, mapping) in mappings.iter() {
@@ -1388,25 +1410,25 @@ impl<P: ShimPlatform> Task<P> {
         range: Range<usize>,
         protection: VmProtection,
     ) -> Result<(), Errno> {
+        // Held through the permission change, as XNU's vm_map_protect holds
+        // the map lock, so no mapping change lands between the rewrite and
+        // the change, rewrite state is invalidated as code becomes writable,
+        // and no permission change lands inside a MAP_FIXED.
+        let mut mappings = self.global.macho_mappings.lock();
         if protection.contains(VmProtection::EXECUTE) {
-            self.rewrite_mprotect_range(range.start, range.len())?;
+            self.rewrite_mprotect_range(&mut mappings, range.clone())?;
         }
+        #[cfg(all(test, target_os = "macos"))]
+        self.global.mapping_hook.reach(hook::Point::Protecting);
+        self.change_permissions(range.clone(), protection)?;
         if protection.contains(VmProtection::WRITE) {
-            // Publish writable permissions and invalidate rewrite state while
-            // holding the same lock used by executable transitions. Code may
-            // be changed as soon as this syscall returns.
-            let mut mappings = self.global.macho_mappings.lock();
-            self.change_permissions(range.clone(), protection)?;
             for mapping in mappings.values_mut().filter(|mapping| {
                 mapping.range.start < range.end && range.start < mapping.range.end
             }) {
                 forget_patched_range(&mut mapping.patched_ranges, range.clone());
             }
-            Ok(())
-        } else {
-            self.change_permissions(range.clone(), protection)?;
-            Ok(())
         }
+        Ok(())
     }
 }
 
@@ -2589,13 +2611,26 @@ mod tests {
     }
 
     /// Run `change` on this thread and `racer` on a sibling that starts
-    /// once `change` has changed the address space and before it has
-    /// updated Mach-O tracking. `change` resumes once the sibling has
-    /// checked whether `macho_mappings` is held, which this returns with
-    /// both results; `racer` needs `macho_mappings`, so if it is held,
-    /// `racer` completes only after `change` does.
+    /// once `change` reaches `at`: by default, after it has changed the
+    /// address space and before it has updated Mach-O tracking. `change`
+    /// resumes once the sibling has checked whether `macho_mappings` is
+    /// held, which this returns with both results; `racer` needs
+    /// `macho_mappings`, so if it is held, `racer` completes only after
+    /// `change` does.
     fn race_mapping_change<C, R>(
         task: &Task<Platform>,
+        change: impl FnOnce() -> C,
+        racer: impl FnOnce(&Task<Platform>) -> R + Send,
+    ) -> (bool, C, R)
+    where
+        R: Send,
+    {
+        race_at(task, hook::Point::MappingsChanged, change, racer)
+    }
+
+    fn race_at<C, R>(
+        task: &Task<Platform>,
+        at: hook::Point,
         change: impl FnOnce() -> C,
         racer: impl FnOnce(&Task<Platform>) -> R + Send,
     ) -> (bool, C, R)
@@ -2619,7 +2654,7 @@ mod tests {
             let (pass, excluded) = std::sync::mpsc::channel::<bool>();
             let mut go = Some(go);
             task.global.mapping_hook.set(move |point| {
-                if point == hook::Point::MappingsChanged {
+                if point == at {
                     go.take().unwrap().send(()).unwrap();
                     pass.send(held.recv_timeout(BOUND).unwrap()).unwrap();
                 }
@@ -2792,6 +2827,151 @@ mod tests {
         assert!(excluded, "the old tracking outlived the replacement");
         assert_eq!((mapped, protected), (Ok(address), Ok(())));
         assert_eq!(instruction_at(address + TEXT), SVC);
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    /// An `mprotect` holds mapping changes off from its rewrite through its
+    /// permission change: a read-only Mach-O MAP_FIXED racing it between
+    /// the two lands after it, so an executable transition never grants
+    /// execute to bytes it did not rewrite.
+    fn assert_map_fixed_racing_mprotect_waits_for_its_permission_change(
+        address: usize,
+        protection: VmProtection,
+    ) {
+        let task = task_with_file(&macho_image());
+        assert_eq!(
+            map_image_at(&task, address, MmapFlags::PRIVATE),
+            Ok(address)
+        );
+        let (excluded, protected, mapped) = race_at(
+            &task,
+            hook::Point::Protecting,
+            || task.sys_mprotect(address, PAGE_SIZE, protection),
+            |sibling| map_image_at(sibling, address, MmapFlags::PRIVATE),
+        );
+        assert!(
+            excluded,
+            "a mapping change could land before the permission change"
+        );
+        assert_eq!((protected, mapped), (Ok(()), Ok(address)));
+        assert!(
+            !flags_at(&task, address).contains(VmFlags::VM_EXEC),
+            "the replacement mapping is executable"
+        );
+        assert_eq!(instruction_at(address + TEXT), SVC);
+        task.sys_mprotect(
+            address,
+            PAGE_SIZE,
+            VmProtection::READ | VmProtection::EXECUTE,
+        )
+        .unwrap();
+        // Rewritten: to a gate branch, or to a trap if no gate is available.
+        assert_ne!(instruction_at(address + TEXT), SVC);
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn macho_map_fixed_racing_mprotect_exec_waits_for_its_permission_change() {
+        assert_map_fixed_racing_mprotect_waits_for_its_permission_change(
+            0x7e_0000_0000,
+            VmProtection::READ | VmProtection::EXECUTE,
+        );
+    }
+
+    #[test]
+    fn macho_map_fixed_racing_mprotect_read_waits_for_its_permission_change() {
+        assert_map_fixed_racing_mprotect_waits_for_its_permission_change(
+            0x7e_1000_0000,
+            VmProtection::READ,
+        );
+    }
+
+    /// A MAP_FIXED that fails without changing the address space keeps the
+    /// shared ulock objects and Mach-O tracking of its range, even when the
+    /// range's permissions change after its snapshot: whether it replaced
+    /// anything depends on what is mapped, not on permissions.
+    #[test]
+    fn failed_map_fixed_keeps_waiters_and_tracking_of_reprotected_pages() {
+        const UL_COMPARE_AND_WAIT_SHARED: usize = 3;
+        const BOUND_US: usize = 10_000_000;
+        fn syscall(task: &Task<Platform>, number: usize, args: &[usize]) -> Result<usize, Errno> {
+            let mut ctx = PtRegs::default();
+            ctx.regs[16] = number;
+            ctx.regs[..args.len()].copy_from_slice(args);
+            task.do_syscall(&ctx)
+        }
+
+        let task = task_with_file(&macho_image());
+        let address = map_image_at(&task, 0x7e_2000_0000, MmapFlags::PRIVATE).unwrap();
+        // The image's first word, the Mach-O magic.
+        let value = 0xfeed_facf;
+        std::thread::scope(|scope| {
+            let waiter = task.new_sibling(0);
+            let waiting = scope.spawn(move || {
+                syscall(
+                    &waiter,
+                    nr::ULOCK_WAIT,
+                    &[UL_COMPARE_AND_WAIT_SHARED, address, value, BOUND_US],
+                )
+            });
+            let start = std::time::Instant::now();
+            while task.global.ulocks.lock().object_waiters(address) != 1 {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(10),
+                    "the waiter never blocked"
+                );
+                std::thread::yield_now();
+            }
+            let global = Arc::clone(&task.global);
+            task.global.mapping_hook.set(move |point| {
+                if point == hook::Point::FixedSnapshot {
+                    // SAFETY: the page stays mapped; nothing runs from it.
+                    unsafe {
+                        global.mm.change_page_permissions(
+                            <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(address),
+                            PAGE_SIZE,
+                            Permissions::empty(),
+                        )
+                    }
+                    .unwrap();
+                }
+            });
+            // The second page is unmapped, so the mapping fails before it
+            // changes anything.
+            let mapped = task.sys_mmap(
+                address,
+                2 * PAGE_SIZE,
+                VmProtection::READ | VmProtection::WRITE,
+                MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED,
+                -1,
+                0,
+            );
+            task.global.mapping_hook.clear();
+            assert!(mapped.is_err());
+            assert!(!flags_at(&task, address).contains(VmFlags::VM_READ));
+            task.sys_mprotect(address, PAGE_SIZE, VmProtection::READ)
+                .unwrap();
+            assert_eq!(
+                syscall(
+                    &task,
+                    nr::ULOCK_WAKE,
+                    &[UL_COMPARE_AND_WAIT_SHARED, address, 0]
+                ),
+                Ok(0),
+                "the waiter's object was retired"
+            );
+            assert_eq!(waiting.join().unwrap(), Ok(0));
+        });
+        task.sys_mprotect(
+            address,
+            PAGE_SIZE,
+            VmProtection::READ | VmProtection::EXECUTE,
+        )
+        .unwrap();
+        assert!(
+            decode_branch_target(instruction_at(address + TEXT), (address + TEXT) as u64).is_some(),
+            "the Mach-O tracking was dropped"
+        );
         task.sys_munmap(address, PAGE_SIZE).unwrap();
     }
 
