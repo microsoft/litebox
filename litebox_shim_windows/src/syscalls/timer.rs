@@ -72,7 +72,9 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for TimerSubsystem<Platfo
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for TimerHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for TimerSubsystem<Platform> {
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
+    for TimerSubsystem<Platform>
+{
     fn normalize_desired_access(desired_access: u32) -> u32 {
         TimerAccess::from_desired_access(desired_access).bits()
     }
@@ -124,10 +126,6 @@ fn validate_timer2_after_output<Platform: RawPointerProvider>(
 }
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    pub(crate) fn close_timer(timer: TimerHandleObject<Platform>) {
-        drop(timer);
-    }
-
     pub(crate) fn sys_nt_create_timer2(&self, params: TimerCreateParameters<Platform>) -> NtStatus {
         if let Err(status) = validate_timer2_before_output(&params) {
             return status;

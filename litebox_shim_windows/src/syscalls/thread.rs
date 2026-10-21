@@ -94,7 +94,7 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for ThreadSubsystem<Platform> {
 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for ThreadHandleObject<Platform> {}
 
-impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for ThreadSubsystem<Platform> {
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem<Platform> for ThreadSubsystem<Platform> {
     fn normalize_desired_access(desired_access: u32) -> u32 {
         ThreadAccess::from_desired_access(desired_access).bits()
     }
@@ -797,10 +797,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
-    }
-
-    pub(crate) fn close_thread(thread: ThreadHandleObject<Platform>) {
-        drop(thread);
     }
 
     pub(crate) fn sys_nt_set_information_thread(

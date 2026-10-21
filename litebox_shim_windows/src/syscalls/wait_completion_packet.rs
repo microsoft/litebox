@@ -60,7 +60,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry
 {
 }
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     for WaitCompletionPacketSubsystem<Platform>
 {
     fn normalize_desired_access(desired_access: u32) -> u32 {
@@ -209,12 +209,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         // TODO: return the timer object's real signaled state after NtSetTimer2 models
         // due-time expiration and periodic re-signaling.
         Ok(Some(false))
-    }
-
-    pub(crate) fn close_wait_completion_packet(
-        wait_completion_packet: WaitCompletionPacketHandleObject<Platform>,
-    ) {
-        drop(wait_completion_packet);
     }
 
     pub(crate) fn sys_nt_create_wait_completion_packet(

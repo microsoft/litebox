@@ -63,7 +63,9 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for SectionSubsystem<Platform> {
 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for SectionHandleObject<Platform> {}
 
-impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for SectionSubsystem<Platform> {
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem<Platform>
+    for SectionSubsystem<Platform>
+{
     fn normalize_desired_access(desired_access: u32) -> u32 {
         SectionAccess::from_desired_access(desired_access).bits()
     }
@@ -210,10 +212,6 @@ struct SectionImageInformation {
 const _: () = assert!(size_of::<SectionImageInformation>() == 64);
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    pub(crate) fn close_section(section: SectionHandleObject<Platform>) {
-        drop(section);
-    }
-
     #[expect(
         clippy::too_many_arguments,
         reason = "NtCreateSection has seven ABI parameters; keeping ABI args explicit avoids reshuffling"

@@ -55,7 +55,9 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for SemaphoreSubsystem<Pl
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for SemaphoreHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for SemaphoreSubsystem<Platform> {
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
+    for SemaphoreSubsystem<Platform>
+{
     fn normalize_desired_access(desired_access: u32) -> u32 {
         SemaphoreAccess::from_desired_access(desired_access).bits()
     }
@@ -135,10 +137,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             SemaphoreHandleObject { semaphore },
             granted_access.bits(),
         )
-    }
-
-    pub(crate) fn close_semaphore(semaphore: SemaphoreHandleObject<Platform>) {
-        drop(semaphore);
     }
 
     pub(crate) fn sys_nt_create_semaphore(

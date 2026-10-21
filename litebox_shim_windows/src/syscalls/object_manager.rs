@@ -167,7 +167,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for DirectoryObjectSubsys
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for DirectoryHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     for DirectoryObjectSubsystem<Platform>
 {
     fn normalize_desired_access(desired_access: u32) -> u32 {
@@ -1330,10 +1330,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             DirectoryHandleObject { directory },
             granted_access.bits(),
         )
-    }
-
-    pub(crate) fn close_directory(directory: DirectoryHandleObject<Platform>) {
-        drop(directory);
     }
 
     pub(crate) fn sys_nt_create_directory_object(

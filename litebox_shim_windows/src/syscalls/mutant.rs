@@ -59,7 +59,9 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for MutantSubsystem<Platf
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for MutantHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for MutantSubsystem<Platform> {
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
+    for MutantSubsystem<Platform>
+{
     fn normalize_desired_access(desired_access: u32) -> u32 {
         MutantAccess::from_desired_access(desired_access).bits()
     }
@@ -223,10 +225,6 @@ struct MutantOwnerInformation {
 }
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    pub(crate) fn close_mutant(mutant: MutantHandleObject<Platform>) {
-        drop(mutant);
-    }
-
     pub(crate) fn sys_nt_create_mutant(
         &self,
         mutant_handle: MutPtr<Platform, Handle>,

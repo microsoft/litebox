@@ -324,7 +324,7 @@ impl FdEnabledSubsystem for TokenSubsystem {
 
 impl FdEnabledSubsystemEntry for TokenHandleObject {}
 
-impl WindowsHandleSubsystem for TokenSubsystem {
+impl<Platform: crate::ShimPlatform> WindowsHandleSubsystem<Platform> for TokenSubsystem {
     fn normalize_desired_access(desired_access: u32) -> u32 {
         TokenAccess::from_desired_access(desired_access).bits()
     }
@@ -914,10 +914,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
 
     pub(crate) fn close_token_handle(&self, handle: Handle) {
         self.close_typed_handle::<TokenSubsystem>(handle, drop);
-    }
-
-    pub(crate) fn close_token(token: TokenHandleObject) {
-        drop(token);
     }
 }
 

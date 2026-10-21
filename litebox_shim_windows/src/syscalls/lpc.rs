@@ -106,9 +106,15 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for LpcPortSubsystem<Platform> {
 
 impl FdEnabledSubsystemEntry for LpcPortHandleObject {}
 
-impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for LpcPortSubsystem<Platform> {
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem<Platform>
+    for LpcPortSubsystem<Platform>
+{
     fn normalize_desired_access(desired_access: u32) -> u32 {
         desired_access
+    }
+
+    fn close_entry(task: &Task<Platform>, port: Self::Entry) {
+        task.close_lpc_port(port);
     }
 
     fn resolve_duplicate_access(
@@ -1605,7 +1611,22 @@ mod tests {
             original_message.client_connect.as_bytes()
         );
 
+        let mapped_view_base = client_view.view_base;
+        assert!(
+            task.process
+                .section_views
+                .read()
+                .contains_key(&mapped_view_base)
+        );
         assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        assert!(
+            !task
+                .process
+                .section_views
+                .read()
+                .contains_key(&mapped_view_base),
+            "closing the CSR port must release its client view"
+        );
         client_view.view_size = crate::PAGE_SIZE * 3;
         client_view.view_base = 0;
         client_view.view_remote_base = 0;

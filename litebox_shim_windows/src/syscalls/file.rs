@@ -514,9 +514,13 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for FileObject<Platform> {
 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for FileObject<Platform> {}
 
-impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for FileObject<Platform> {
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem<Platform> for FileObject<Platform> {
     fn normalize_desired_access(desired_access: u32) -> u32 {
         FileAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn close_entry(task: &Task<Platform>, file: Self::Entry) {
+        task.close_file(file);
     }
 
     fn resolve_duplicate_access(entry: &Self::Entry, desired_access: u32) -> Result<u32, NtStatus> {

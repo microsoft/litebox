@@ -61,7 +61,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for IoCompletionSubsystem
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for IoCompletionHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     for IoCompletionSubsystem<Platform>
 {
     fn normalize_desired_access(desired_access: u32) -> u32 {
@@ -252,10 +252,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let mut worker = self.io_completion_worker.lock();
         debug_assert!(worker.port.is_none());
         worker.port = Some(Arc::downgrade(port));
-    }
-
-    pub(crate) fn close_io_completion(io_completion: IoCompletionHandleObject<Platform>) {
-        drop(io_completion);
     }
 
     pub(crate) fn sys_nt_create_io_completion(

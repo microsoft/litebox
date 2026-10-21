@@ -90,7 +90,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry
 {
 }
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     for WorkerFactorySubsystem<Platform>
 {
     fn normalize_desired_access(desired_access: u32) -> u32 {
@@ -179,10 +179,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         } else {
             Err(NtStatus::INVALID_HANDLE)
         }
-    }
-
-    pub(crate) fn close_worker_factory(worker_factory: WorkerFactoryHandleObject<Platform>) {
-        drop(worker_factory);
     }
 
     pub(crate) fn sys_nt_create_worker_factory(

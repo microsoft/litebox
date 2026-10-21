@@ -58,7 +58,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for SymbolicLinkSubsystem
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for SymbolicLinkHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     for SymbolicLinkSubsystem<Platform>
 {
     fn normalize_desired_access(desired_access: u32) -> u32 {
@@ -94,10 +94,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             SymbolicLinkHandleObject { link },
             granted_access.bits(),
         )
-    }
-
-    pub(crate) fn close_symbolic_link(link: SymbolicLinkHandleObject<Platform>) {
-        drop(link);
     }
 
     pub(crate) fn sys_nt_create_symbolic_link_object(
