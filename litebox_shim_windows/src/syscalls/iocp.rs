@@ -17,8 +17,9 @@ use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
+use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
+use crate::syscalls::object_manager::check_open_existing_object;
 use crate::{
     ConstPtr, MutPtr, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
 };
@@ -253,22 +254,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         worker.port = Some(Arc::downgrade(port));
     }
 
-    fn insert_io_completion_handle(
-        &self,
-        port: Arc<IoCompletionObject<Platform>>,
-        granted_access: IoCompletionAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<IoCompletionSubsystem<Platform>>(
-            IoCompletionHandleObject { port },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
-    pub(crate) fn close_io_completion_handle(&self, handle: Handle) {
-        self.close_typed_handle::<IoCompletionSubsystem<Platform>>(handle, drop);
-    }
-
     pub(crate) fn close_io_completion(io_completion: IoCompletionHandleObject<Platform>) {
         drop(io_completion);
     }
@@ -297,56 +282,47 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 &io_completion_name,
                 &port,
                 |port| {
-                    let Some(object_attributes) = object_attributes else {
-                        return NtStatus::INVALID_PARAMETER;
-                    };
-                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                        .contains(ObjectAttributesFlags::OPENIF)
-                    {
-                        return NtStatus::OBJECT_NAME_COLLISION;
+                    if let Err(status) = check_open_existing_object(object_attributes) {
+                        return status;
                     }
-                    self.publish_io_completion_handle(
+                    match self.write_new_io_completion_handle(
                         io_completion_handle,
                         port,
                         granted_access,
-                        NtStatus::OBJECT_NAME_EXISTS,
-                    )
+                    ) {
+                        Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
+                        Err(status) => status,
+                    }
                 },
-                || {
-                    self.publish_io_completion_handle(
-                        io_completion_handle,
-                        Arc::clone(&port),
-                        granted_access,
-                        NtStatus::SUCCESS,
-                    )
+                || match self.write_new_io_completion_handle(
+                    io_completion_handle,
+                    Arc::clone(&port),
+                    granted_access,
+                ) {
+                    Ok(()) => NtStatus::SUCCESS,
+                    Err(status) => status,
                 },
             );
         }
 
         let port = Arc::new(IoCompletionObject::new(number_of_concurrent_threads));
-        self.publish_io_completion_handle(
-            io_completion_handle,
-            port,
-            granted_access,
-            NtStatus::SUCCESS,
-        )
+        match self.write_new_io_completion_handle(io_completion_handle, port, granted_access) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
     }
 
-    fn publish_io_completion_handle(
+    fn write_new_io_completion_handle(
         &self,
-        io_completion_handle: MutPtr<Platform, Handle>,
+        output: MutPtr<Platform, Handle>,
         port: Arc<IoCompletionObject<Platform>>,
         granted_access: IoCompletionAccess,
-        success_status: NtStatus,
-    ) -> NtStatus {
-        let Ok(handle) = self.insert_io_completion_handle(port, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if io_completion_handle.write_at_offset(0, handle).is_none() {
-            self.close_io_completion_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        success_status
+    ) -> Result<(), NtStatus> {
+        self.write_new_typed_handle::<IoCompletionSubsystem<Platform>>(
+            output,
+            IoCompletionHandleObject { port },
+            granted_access.bits(),
+        )
     }
 
     pub(crate) fn sys_nt_open_io_completion(
@@ -374,12 +350,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Ok(port) => port,
             Err(status) => return status,
         };
-        self.publish_io_completion_handle(
+        match self.write_new_io_completion_handle(
             io_completion_handle,
             port,
             IoCompletionAccess::from_desired_access(desired_access),
-            NtStatus::SUCCESS,
-        )
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
     }
 
     pub(crate) fn sys_nt_set_io_completion(
@@ -435,12 +413,9 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         {
             return status;
         }
-        let timeout = match timeout {
-            Some(timeout) => match timeout.read_at_offset(0) {
-                Some(timeout) => Some(self.wait_timeout_duration(timeout)),
-                None => return NtStatus::ACCESS_VIOLATION,
-            },
-            None => None,
+        let timeout = match self.read_optional_wait_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(status) => return status,
         };
         let entry = match self.typed_handle_entry_with_access::<IoCompletionSubsystem<Platform>>(
             io_completion_handle,

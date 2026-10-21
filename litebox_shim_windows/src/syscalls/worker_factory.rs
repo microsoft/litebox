@@ -181,22 +181,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         }
     }
 
-    fn insert_worker_factory_handle(
-        &self,
-        factory: Arc<WorkerFactoryObject<Platform>>,
-        granted_access: WorkerFactoryAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<WorkerFactorySubsystem<Platform>>(
-            WorkerFactoryHandleObject { factory },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
-    pub(crate) fn close_worker_factory_handle(&self, handle: Handle) {
-        self.close_typed_handle::<WorkerFactorySubsystem<Platform>>(handle, drop);
-    }
-
     pub(crate) fn close_worker_factory(worker_factory: WorkerFactoryHandleObject<Platform>) {
         drop(worker_factory);
     }
@@ -239,18 +223,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             _stack_commit: params.stack_commit,
         });
         let granted_access = WorkerFactoryAccess::from_desired_access(params.desired_access);
-        let Ok(handle) = self.insert_worker_factory_handle(factory, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if params
-            .worker_factory_handle
-            .write_at_offset(0, handle)
-            .is_none()
-        {
-            self.close_worker_factory_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        match self.write_new_typed_handle::<WorkerFactorySubsystem<Platform>>(
+            params.worker_factory_handle,
+            WorkerFactoryHandleObject { factory },
+            granted_access.bits(),
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_set_information_worker_factory(

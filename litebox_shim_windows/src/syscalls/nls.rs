@@ -914,22 +914,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return;
         }
 
-        let Some(field_offset) = (match section_data {
-            ANSI_CODE_PAGE => Some(core::mem::offset_of!(
-                ProcessEnvironmentBlock,
-                ansi_code_page_data
-            )),
-            OEM_CODE_PAGE => Some(core::mem::offset_of!(
-                ProcessEnvironmentBlock,
-                oem_code_page_data
-            )),
-            UNICODE_CASE_TABLE => Some(core::mem::offset_of!(
-                ProcessEnvironmentBlock,
-                unicode_case_table_data
-            )),
-            _ => None,
-        }) else {
-            return;
+        let field_offset = match section_data {
+            ANSI_CODE_PAGE => core::mem::offset_of!(ProcessEnvironmentBlock, ansi_code_page_data),
+            OEM_CODE_PAGE => core::mem::offset_of!(ProcessEnvironmentBlock, oem_code_page_data),
+            UNICODE_CASE_TABLE => {
+                core::mem::offset_of!(ProcessEnvironmentBlock, unicode_case_table_data)
+            }
+            _ => return,
         };
 
         let peb_field =

@@ -108,14 +108,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(object) => object,
             Err(status) => return status,
         };
-        let timeout = match timeout {
-            Some(timeout) => {
-                let Some(timeout) = timeout.read_at_offset(0) else {
-                    return NtStatus::ACCESS_VIOLATION;
-                };
-                Some(self.wait_timeout_duration(timeout))
-            }
-            None => None,
+        let timeout = match self.read_optional_wait_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(status) => return status,
         };
         match self.wait_on_events(
             false,
@@ -135,10 +130,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(TryOpError::<NtStatus>::TryAgain)
             },
         ) {
-            Ok(acquire_result) => match acquire_result {
-                WaitAcquireResult::Acquired => NtStatus::SUCCESS,
-                WaitAcquireResult::Abandoned => NtStatus::ABANDONED_WAIT_0,
-            },
+            Ok(WaitAcquireResult::Acquired) => NtStatus::SUCCESS,
+            Ok(WaitAcquireResult::Abandoned) => NtStatus::ABANDONED_WAIT_0,
             Err(TryOpError::WaitError(WaitError::TimedOut)) => NtStatus::TIMEOUT,
             Err(TryOpError::WaitError(WaitError::Interrupted)) => NtStatus::ALERTED,
             Err(TryOpError::TryAgain) => unreachable!("blocking wait cannot return TryAgain"),
@@ -174,6 +167,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .try_into()
                 .expect("subsecond 100ns intervals fit in u32 nanoseconds"),
         )
+    }
+
+    /// Reads an optional guest NT timeout and converts it to a relative wait duration.
+    pub(crate) fn read_optional_wait_timeout(
+        &self,
+        timeout: Option<ConstPtr<Platform, i64>>,
+    ) -> Result<Option<core::time::Duration>, NtStatus> {
+        Ok(crate::read_optional_guest_value::<Platform, _>(timeout)?
+            .map(|timeout| self.wait_timeout_duration(timeout)))
     }
 
     pub(crate) fn wait_timeout_duration(&self, timeout: i64) -> core::time::Duration {

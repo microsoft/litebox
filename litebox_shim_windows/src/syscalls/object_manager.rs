@@ -1115,6 +1115,24 @@ fn write_directory_records<Platform: RawPointerProvider>(
     Ok(())
 }
 
+/// Checks whether a create that found an existing named object may open it instead.
+///
+/// The existing object may only be opened when the caller passed object attributes with
+/// `OBJ_OPENIF` set.
+pub(super) fn check_open_existing_object(
+    object_attributes: Option<ObjectAttributes>,
+) -> Result<(), NtStatus> {
+    let Some(object_attributes) = object_attributes else {
+        return Err(NtStatus::INVALID_PARAMETER);
+    };
+    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+        .contains(ObjectAttributesFlags::OPENIF)
+    {
+        return Err(NtStatus::OBJECT_NAME_COLLISION);
+    }
+    Ok(())
+}
+
 impl<Platform: crate::ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_query_object(
         &self,
@@ -1301,20 +1319,17 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         ))
     }
 
-    fn insert_directory_handle(
+    fn write_new_directory_handle(
         &self,
+        output: MutPtr<Platform, Handle>,
         directory: Arc<ObjectNode<Platform>>,
         granted_access: DirectoryAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<DirectoryObjectSubsystem<Platform>>(
+    ) -> Result<(), NtStatus> {
+        self.write_new_typed_handle::<DirectoryObjectSubsystem<Platform>>(
+            output,
             DirectoryHandleObject { directory },
             granted_access.bits(),
-            drop,
         )
-    }
-
-    pub(crate) fn close_directory_handle(&self, handle: Handle) {
-        self.close_typed_handle::<DirectoryObjectSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_directory(directory: DirectoryHandleObject<Platform>) {
@@ -1357,32 +1372,25 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             return self.process.object_manager.create_directory(
                 &directory_name.original_path,
                 |directory| {
-                    let Some(object_attributes) = object_attributes else {
-                        return NtStatus::INVALID_PARAMETER;
-                    };
-                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                        .contains(ObjectAttributesFlags::OPENIF)
-                    {
-                        return NtStatus::OBJECT_NAME_COLLISION;
+                    if let Err(status) = check_open_existing_object(object_attributes) {
+                        return status;
                     }
-                    let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
-                        return NtStatus::QUOTA_EXCEEDED;
-                    };
-                    if directory_handle.write_at_offset(0, handle).is_none() {
-                        self.close_directory_handle(handle);
-                        return NtStatus::ACCESS_VIOLATION;
+                    match self.write_new_directory_handle(
+                        directory_handle,
+                        directory,
+                        granted_access,
+                    ) {
+                        Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
+                        Err(status) => status,
                     }
-                    NtStatus::OBJECT_NAME_EXISTS
                 },
-                |directory| {
-                    let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
-                        return NtStatus::QUOTA_EXCEEDED;
-                    };
-                    if directory_handle.write_at_offset(0, handle).is_none() {
-                        self.close_directory_handle(handle);
-                        return NtStatus::ACCESS_VIOLATION;
-                    }
-                    NtStatus::SUCCESS
+                |directory| match self.write_new_directory_handle(
+                    directory_handle,
+                    directory,
+                    granted_access,
+                ) {
+                    Ok(()) => NtStatus::SUCCESS,
+                    Err(status) => status,
                 },
             );
         }
@@ -1392,14 +1400,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             None,
             String::new(),
         ));
-        let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if directory_handle.write_at_offset(0, handle).is_none() {
-            self.close_directory_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        match self.write_new_directory_handle(directory_handle, directory, granted_access) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_open_directory_object(
@@ -1424,25 +1428,20 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Ok((None, Some(_))) => return NtStatus::INVALID_PARAMETER,
             Err(status) => return status,
         };
-        let directory = {
-            match self
-                .process
-                .object_manager
-                .resolve_directory(&directory_name.original_path)
-            {
-                Ok(directory) => directory,
-                Err(status) => return status,
-            }
+        let directory = match self
+            .process
+            .object_manager
+            .resolve_directory(&directory_name.original_path)
+        {
+            Ok(directory) => directory,
+            Err(status) => return status,
         };
-        let Ok(handle) = self.insert_directory_handle(
+        if let Err(status) = self.write_new_directory_handle(
+            directory_handle,
             directory,
             DirectoryAccess::from_desired_access(desired_access),
-        ) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if directory_handle.write_at_offset(0, handle).is_none() {
-            self.close_directory_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        ) {
+            return status;
         }
         litebox_util_log::debug!(
             object_name:% = directory_name.original_path.as_str(),

@@ -15,8 +15,9 @@ use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
+use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
+use crate::syscalls::object_manager::check_open_existing_object;
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 #[repr(u32)]
@@ -189,20 +190,17 @@ const _: () =
     assert!(size_of::<EventBasicInformation>() == EVENT_BASIC_INFORMATION_SIZE_U32 as usize);
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    fn insert_event_handle(
+    fn write_new_event_handle(
         &self,
+        output: MutPtr<Platform, Handle>,
         event: Arc<EventObject<Platform>>,
         granted_access: EventAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<EventSubsystem<Platform>>(
+    ) -> Result<(), NtStatus> {
+        self.write_new_typed_handle::<EventSubsystem<Platform>>(
+            output,
             EventHandleObject { event },
             granted_access.bits(),
-            drop,
         )
-    }
-
-    pub(crate) fn close_event_handle(&self, handle: Handle) {
-        self.close_typed_handle::<EventSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_event(event: EventHandleObject<Platform>) {
@@ -237,45 +235,26 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 &event_name,
                 &event,
                 |event| {
-                    let Some(object_attributes) = object_attributes else {
-                        return NtStatus::INVALID_PARAMETER;
-                    };
-                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                        .contains(ObjectAttributesFlags::OPENIF)
-                    {
-                        return NtStatus::OBJECT_NAME_COLLISION;
+                    if let Err(status) = check_open_existing_object(object_attributes) {
+                        return status;
                     }
-                    let Ok(handle) = self.insert_event_handle(event, granted_access) else {
-                        return NtStatus::QUOTA_EXCEEDED;
-                    };
-                    if event_handle.write_at_offset(0, handle).is_none() {
-                        self.close_event_handle(handle);
-                        return NtStatus::ACCESS_VIOLATION;
+                    match self.write_new_event_handle(event_handle, event, granted_access) {
+                        Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
+                        Err(status) => status,
                     }
-                    NtStatus::OBJECT_NAME_EXISTS
                 },
-                || {
-                    let Ok(handle) = self.insert_event_handle(event.clone(), granted_access) else {
-                        return NtStatus::QUOTA_EXCEEDED;
-                    };
-                    if event_handle.write_at_offset(0, handle).is_none() {
-                        self.close_event_handle(handle);
-                        return NtStatus::ACCESS_VIOLATION;
-                    }
-                    NtStatus::SUCCESS
+                || match self.write_new_event_handle(event_handle, event.clone(), granted_access) {
+                    Ok(()) => NtStatus::SUCCESS,
+                    Err(status) => status,
                 },
             );
         }
 
         let event = Arc::new(EventObject::new(event_type, initial_state != 0));
-        let Ok(handle) = self.insert_event_handle(event, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if event_handle.write_at_offset(0, handle).is_none() {
-            self.close_event_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        match self.write_new_event_handle(event_handle, event, granted_access) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_open_event(
@@ -297,16 +276,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Err(status) => return status,
         };
 
-        let Ok(handle) =
-            self.insert_event_handle(event, EventAccess::from_desired_access(desired_access))
-        else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if event_handle.write_at_offset(0, handle).is_none() {
-            self.close_event_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        match self.write_new_event_handle(
+            event_handle,
+            event,
+            EventAccess::from_desired_access(desired_access),
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_set_event(

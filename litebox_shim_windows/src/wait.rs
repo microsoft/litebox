@@ -37,21 +37,35 @@ impl<Platform: ShimPlatform> WaitState<Platform> {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    fn with_io_completion_worker_suspended<R>(&self, wait: impl FnOnce() -> R) -> R {
+    /// Runs `wait` with an interruptible wait context.
+    ///
+    /// For the duration of `wait`, the thread stops counting as an active worker of its I/O
+    /// completion port and, if `alertable`, is marked as being in a classic alertable wait.
+    fn with_wait_context<R>(
+        &self,
+        alertable: bool,
+        wait: impl FnOnce(litebox::event::wait::WaitContext<'_, Platform>) -> R,
+    ) -> R {
+        if alertable {
+            self.thread_object.begin_classic_alert_wait();
+        }
+        let _end_alert_wait = litebox::utils::defer(|| {
+            if alertable {
+                self.thread_object.end_classic_alert_wait();
+            }
+        });
         self.suspend_io_completion_worker();
         let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
-        wait()
-    }
-
-    /// Returns a wait context to use to perform interruptible waits.
-    fn wait_cx<'a>(
-        &'a self,
-        interrupt: &'a WaitInterrupt<'a, Platform>,
-    ) -> litebox::event::wait::WaitContext<'a, Platform> {
-        self.wait_state
-            .0
-            .context()
-            .with_check_for_interrupt(interrupt)
+        let interrupt = WaitInterrupt {
+            task: self,
+            alertable,
+        };
+        wait(
+            self.wait_state
+                .0
+                .context()
+                .with_check_for_interrupt(&interrupt),
+        )
     }
 
     pub(crate) fn wait_on_events<R, E>(
@@ -71,21 +85,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // The core helper probes again before blocking, so readiness racing with this point can
         // briefly release the IOCP slot without a host block. Exact accounting requires a hook
         // around WaitContext's platform block; keep this approximation local to the Windows shim.
-        if alertable {
-            self.thread_object.begin_classic_alert_wait();
-        }
-        let _end_alert_wait = litebox::utils::defer(|| {
-            if alertable {
-                self.thread_object.end_classic_alert_wait();
-            }
-        });
-        self.with_io_completion_worker_suspended(|| {
-            let interrupt = WaitInterrupt {
-                task: self,
-                alertable,
-            };
-            let wait_context = self.wait_cx(&interrupt).with_timeout(timeout);
-            wait_context.wait_on_events(false, events, register_observer, try_op)
+        self.with_wait_context(alertable, |cx| {
+            cx.with_timeout(timeout)
+                .wait_on_events(false, events, register_observer, try_op)
         })
     }
 
@@ -98,13 +100,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         io: impl FnOnce(&litebox::event::wait::WaitContext<'_, Platform>) -> R,
     ) -> R {
-        self.with_io_completion_worker_suspended(|| {
-            let interrupt = WaitInterrupt {
-                task: self,
-                alertable: false,
-            };
-            io(&self.wait_cx(&interrupt))
-        })
+        self.with_wait_context(false, |cx| io(&cx))
     }
 
     pub(crate) fn wait_until(
@@ -115,15 +111,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if ready() {
             return Ok(());
         }
-        self.with_io_completion_worker_suspended(|| {
-            let interrupt = WaitInterrupt {
-                task: self,
-                alertable: false,
-            };
-            self.wait_cx(&interrupt)
-                .with_timeout(timeout)
-                .wait_until(ready)
-        })
+        self.with_wait_context(false, |cx| cx.with_timeout(timeout).wait_until(ready))
     }
 
     pub(crate) fn sleep(
@@ -131,21 +119,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         alertable: bool,
         timeout: core::time::Duration,
     ) -> litebox::event::wait::WaitError {
-        if alertable {
-            self.thread_object.begin_classic_alert_wait();
-        }
-        let _end_alert_wait = litebox::utils::defer(|| {
-            if alertable {
-                self.thread_object.end_classic_alert_wait();
-            }
-        });
-        self.with_io_completion_worker_suspended(|| {
-            let interrupt = WaitInterrupt {
-                task: self,
-                alertable,
-            };
-            self.wait_cx(&interrupt).with_timeout(timeout).sleep()
-        })
+        self.with_wait_context(alertable, |cx| cx.with_timeout(timeout).sleep())
     }
 
     /// Publishes the handle used by other threads to interrupt this one.

@@ -1140,15 +1140,15 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         key: RegistryKeyObject<Platform>,
         granted_access: RegistryKeyAccess,
     ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<RegistryKeyObject<Platform>>(key, granted_access.bits(), |key| {
-            Self::close_registry_key(key);
-        })
+        self.insert_typed_handle::<RegistryKeyObject<Platform>>(
+            key,
+            granted_access.bits(),
+            Self::close_registry_key,
+        )
     }
 
     pub(crate) fn close_registry_key_handle(&self, handle: Handle) {
-        self.close_typed_handle::<RegistryKeyObject<Platform>>(handle, |key| {
-            Self::close_registry_key(key);
-        });
+        self.close_typed_handle::<RegistryKeyObject<Platform>>(handle, Self::close_registry_key);
     }
 
     pub(crate) fn close_registry_key(key: RegistryKeyObject<Platform>) {

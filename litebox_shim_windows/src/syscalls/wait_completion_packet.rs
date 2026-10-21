@@ -136,30 +136,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             .ok_or(NtStatus::OBJECT_TYPE_MISMATCH)
     }
 
-    fn wait_completion_packet_entry_for_cancel(
-        &self,
-        handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, WaitCompletionPacketSubsystem<Platform>>, NtStatus>
-    {
-        let Some(raw_fd) = handle.raw_fd() else {
-            return Err(NtStatus::INVALID_HANDLE);
-        };
-        let typed = {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<WaitCompletionPacketSubsystem<Platform>>(raw_fd) {
-                Ok(typed) => typed,
-                Err(ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
-                Err(ErrRawIntFd::InvalidSubsystem) => return Err(NtStatus::OBJECT_TYPE_MISMATCH),
-            }
-        };
-        self.require_typed_handle_access(&typed, WaitCompletionPacketAccess::SET_STATE.bits())?;
-        self.global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&typed)
-            .ok_or(NtStatus::INVALID_HANDLE)
-    }
-
     fn validate_io_completion_for_wait_completion_packet(
         &self,
         handle: Handle,
@@ -235,22 +211,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         Ok(Some(false))
     }
 
-    fn insert_wait_completion_packet_handle(
-        &self,
-        packet: Arc<WaitCompletionPacketObject<Platform>>,
-        granted_access: WaitCompletionPacketAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<WaitCompletionPacketSubsystem<Platform>>(
-            WaitCompletionPacketHandleObject { packet },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
-    pub(crate) fn close_wait_completion_packet_handle(&self, handle: Handle) {
-        self.close_typed_handle::<WaitCompletionPacketSubsystem<Platform>>(handle, drop);
-    }
-
     pub(crate) fn close_wait_completion_packet(
         wait_completion_packet: WaitCompletionPacketHandleObject<Platform>,
     ) {
@@ -279,17 +239,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             _not_send_without_platform: PhantomData,
         });
         let granted_access = WaitCompletionPacketAccess::from_desired_access(desired_access);
-        let Ok(handle) = self.insert_wait_completion_packet_handle(packet, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if wait_completion_packet_handle
-            .write_at_offset(0, handle)
-            .is_none()
-        {
-            self.close_wait_completion_packet_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        match self.write_new_typed_handle::<WaitCompletionPacketSubsystem<Platform>>(
+            wait_completion_packet_handle,
+            WaitCompletionPacketHandleObject { packet },
+            granted_access.bits(),
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_associate_wait_completion_packet(
@@ -348,11 +305,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         wait_completion_packet_handle: Handle,
         remove_signaled_packet: u8,
     ) -> NtStatus {
-        let entry =
-            match self.wait_completion_packet_entry_for_cancel(wait_completion_packet_handle) {
-                Ok(entry) => entry,
-                Err(status) => return status,
-            };
+        let entry = match self
+            .typed_handle_entry_with_access::<WaitCompletionPacketSubsystem<Platform>>(
+                wait_completion_packet_handle,
+                WaitCompletionPacketAccess::SET_STATE.bits(),
+            ) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
         let packet = entry.with_entry(|entry| Arc::clone(&entry.packet));
 
         let mut association = packet.association.lock();

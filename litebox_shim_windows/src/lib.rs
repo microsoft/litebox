@@ -317,6 +317,21 @@ where
     Some(())
 }
 
+/// Reads the value behind an optional guest input pointer.
+///
+/// Returns `Ok(None)` when no pointer was supplied and `ACCESS_VIOLATION` when the pointer is
+/// unreadable.
+pub(crate) fn read_optional_guest_value<Platform, T>(
+    ptr: Option<ConstPtr<Platform, T>>,
+) -> Result<Option<T>, NtStatus>
+where
+    Platform: RawPointerProvider,
+    T: zerocopy::FromBytes,
+{
+    ptr.map(|ptr| ptr.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION))
+        .transpose()
+}
+
 pub(crate) fn probe_guest_output_preserving_value<Platform, T>(
     ptr: MutPtr<Platform, T>,
 ) -> Result<(), NtStatus>
@@ -1108,6 +1123,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
             handle,
             cleanup_entry,
         );
+    }
+
+    /// Inserts `entry` as a new handle and writes that handle to the guest pointer `output`.
+    ///
+    /// If `output` is not writable, the new handle is closed again and `ACCESS_VIOLATION` is
+    /// returned.
+    fn write_new_typed_handle<Subsystem>(
+        &self,
+        output: MutPtr<Platform, syscalls::Handle>,
+        entry: Subsystem::Entry,
+        granted_access: u32,
+    ) -> Result<(), NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let handle = self.insert_typed_handle::<Subsystem>(entry, granted_access, drop)?;
+        if output.write_at_offset(0, handle).is_none() {
+            self.close_typed_handle::<Subsystem>(handle, drop);
+            return Err(NtStatus::ACCESS_VIOLATION);
+        }
+        Ok(())
     }
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {

@@ -96,10 +96,9 @@ pub(crate) fn sys_nt_apphelp_cache_control<Platform: ShimPlatform>(
 
     let status = match service_class {
         AhcServiceClass::LookupCdb => handle_lookup_cdb::<Platform>(service_data),
-        AhcServiceClass::Lookup | AhcServiceClass::LookupAndWriteToProcess => {
-            NtStatus::NOT_SUPPORTED
-        }
-        AhcServiceClass::Remove
+        AhcServiceClass::Lookup
+        | AhcServiceClass::LookupAndWriteToProcess
+        | AhcServiceClass::Remove
         | AhcServiceClass::Update
         | AhcServiceClass::Clear
         | AhcServiceClass::SnapStatistics

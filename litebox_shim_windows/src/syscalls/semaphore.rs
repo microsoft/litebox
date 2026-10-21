@@ -12,8 +12,9 @@ use litebox::platform::RawMutPointer as _;
 use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 
-use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
+use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
+use crate::syscalls::object_manager::check_open_existing_object;
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
@@ -123,20 +124,17 @@ impl<Platform: crate::ShimPlatform> IOPollable for SemaphoreObject<Platform> {
 }
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    fn insert_semaphore_handle(
+    fn write_new_semaphore_handle(
         &self,
+        output: MutPtr<Platform, Handle>,
         semaphore: Arc<SemaphoreObject<Platform>>,
         granted_access: SemaphoreAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<SemaphoreSubsystem<Platform>>(
+    ) -> Result<(), NtStatus> {
+        self.write_new_typed_handle::<SemaphoreSubsystem<Platform>>(
+            output,
             SemaphoreHandleObject { semaphore },
             granted_access.bits(),
-            drop,
         )
-    }
-
-    pub(crate) fn close_semaphore_handle(&self, handle: Handle) {
-        self.close_typed_handle::<SemaphoreSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_semaphore(semaphore: SemaphoreHandleObject<Platform>) {
@@ -171,47 +169,34 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 &semaphore_name,
                 &semaphore,
                 |semaphore| {
-                    let Some(object_attributes) = object_attributes else {
-                        return NtStatus::INVALID_PARAMETER;
-                    };
-                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                        .contains(ObjectAttributesFlags::OPENIF)
-                    {
-                        return NtStatus::OBJECT_NAME_COLLISION;
+                    if let Err(status) = check_open_existing_object(object_attributes) {
+                        return status;
                     }
-                    let Ok(handle) = self.insert_semaphore_handle(semaphore, granted_access) else {
-                        return NtStatus::QUOTA_EXCEEDED;
-                    };
-                    if semaphore_handle.write_at_offset(0, handle).is_none() {
-                        self.close_semaphore_handle(handle);
-                        return NtStatus::ACCESS_VIOLATION;
+                    match self.write_new_semaphore_handle(
+                        semaphore_handle,
+                        semaphore,
+                        granted_access,
+                    ) {
+                        Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
+                        Err(status) => status,
                     }
-                    NtStatus::OBJECT_NAME_EXISTS
                 },
-                || {
-                    let Ok(handle) =
-                        self.insert_semaphore_handle(semaphore.clone(), granted_access)
-                    else {
-                        return NtStatus::QUOTA_EXCEEDED;
-                    };
-                    if semaphore_handle.write_at_offset(0, handle).is_none() {
-                        self.close_semaphore_handle(handle);
-                        return NtStatus::ACCESS_VIOLATION;
-                    }
-                    NtStatus::SUCCESS
+                || match self.write_new_semaphore_handle(
+                    semaphore_handle,
+                    semaphore.clone(),
+                    granted_access,
+                ) {
+                    Ok(()) => NtStatus::SUCCESS,
+                    Err(status) => status,
                 },
             );
         }
 
         let semaphore = Arc::new(SemaphoreObject::new(initial_count, maximum_count));
-        let Ok(handle) = self.insert_semaphore_handle(semaphore, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if semaphore_handle.write_at_offset(0, handle).is_none() {
-            self.close_semaphore_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        match self.write_new_semaphore_handle(semaphore_handle, semaphore, granted_access) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_open_semaphore(
@@ -237,17 +222,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Err(status) => return status,
         };
 
-        let Ok(handle) = self.insert_semaphore_handle(
+        match self.write_new_semaphore_handle(
+            semaphore_handle,
             semaphore,
             SemaphoreAccess::from_desired_access(desired_access),
-        ) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if semaphore_handle.write_at_offset(0, handle).is_none() {
-            self.close_semaphore_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_release_semaphore(

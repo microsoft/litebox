@@ -1511,10 +1511,7 @@ fn windows_environment_block(envp: &[CString]) -> Vec<u16> {
 }
 
 fn cstring_to_string(value: &CString) -> String {
-    match core::str::from_utf8(value.as_bytes()) {
-        Ok(value) => String::from(value),
-        Err(_) => String::from_utf8_lossy(value.as_bytes()).into_owned(),
-    }
+    String::from_utf8_lossy(value.as_bytes()).into_owned()
 }
 
 struct InitialProcessHeaps {

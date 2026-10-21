@@ -86,47 +86,7 @@ pub(crate) struct X64Context {
 
 impl Default for X64Context {
     fn default() -> Self {
-        Self {
-            p1_home: 0,
-            p2_home: 0,
-            p3_home: 0,
-            p4_home: 0,
-            p5_home: 0,
-            p6_home: 0,
-            context_flags: 0,
-            mx_csr: 0,
-            seg_cs: 0,
-            seg_ds: 0,
-            seg_es: 0,
-            seg_fs: 0,
-            seg_gs: 0,
-            seg_ss: 0,
-            e_flags: 0,
-            dr0: 0,
-            dr1: 0,
-            dr2: 0,
-            dr3: 0,
-            dr6: 0,
-            dr7: 0,
-            rax: 0,
-            rcx: 0,
-            rdx: 0,
-            rbx: 0,
-            rsp: 0,
-            rbp: 0,
-            rsi: 0,
-            rdi: 0,
-            r8: 0,
-            r9: 0,
-            r10: 0,
-            r11: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rip: 0,
-            extended_state: [0; 0x3d0],
-        }
+        <Self as zerocopy::FromZeros>::new_zeroed()
     }
 }
 

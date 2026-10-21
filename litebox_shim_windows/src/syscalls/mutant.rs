@@ -16,7 +16,8 @@ use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ClientId, ObjectAttributes, ObjectAttributesFlags};
+use crate::nt_types::{AccessMask, ClientId, ObjectAttributes};
+use crate::syscalls::object_manager::check_open_existing_object;
 use crate::syscalls::thread::ThreadObject;
 use crate::syscalls::{Handle, WaitAcquireResult};
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
@@ -222,18 +223,6 @@ struct MutantOwnerInformation {
 }
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    fn insert_mutant_handle(
-        &self,
-        mutant: Arc<MutantObject<Platform>>,
-        granted_access: MutantAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<MutantSubsystem<Platform>>(
-            MutantHandleObject { mutant },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
     pub(crate) fn close_mutant(mutant: MutantHandleObject<Platform>) {
         drop(mutant);
     }
@@ -265,16 +254,13 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 &mutant_name,
                 &mutant,
                 |mutant| {
-                    let Some(object_attributes) = object_attributes else {
-                        return NtStatus::INVALID_PARAMETER;
-                    };
-                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                        .contains(ObjectAttributesFlags::OPENIF)
-                    {
-                        return NtStatus::OBJECT_NAME_COLLISION;
+                    if let Err(status) = check_open_existing_object(object_attributes) {
+                        return status;
                     }
-                    self.write_new_mutant_handle(mutant_handle, mutant, granted_access)
-                        .map_or_else(|status| status, |()| NtStatus::OBJECT_NAME_EXISTS)
+                    match self.write_new_mutant_handle(mutant_handle, mutant, granted_access) {
+                        Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
+                        Err(status) => status,
+                    }
                 },
                 || {
                     self.write_created_mutant_handle(
@@ -312,12 +298,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Ok(mutant) => mutant,
             Err(status) => return status,
         };
-        self.write_new_mutant_handle(
+        match self.write_new_mutant_handle(
             mutant_handle,
             mutant,
             MutantAccess::from_desired_access(desired_access),
-        )
-        .map_or_else(|status| status, |()| NtStatus::SUCCESS)
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
     }
 
     pub(crate) fn sys_nt_release_mutant(
@@ -436,14 +424,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         mutant: Arc<MutantObject<Platform>>,
         granted_access: MutantAccess,
     ) -> Result<(), NtStatus> {
-        let handle = self
-            .insert_mutant_handle(mutant, granted_access)
-            .map_err(|_| NtStatus::QUOTA_EXCEEDED)?;
-        if output.write_at_offset(0, handle).is_none() {
-            self.close_typed_handle::<MutantSubsystem<Platform>>(handle, drop);
-            return Err(NtStatus::ACCESS_VIOLATION);
-        }
-        Ok(())
+        self.write_new_typed_handle::<MutantSubsystem<Platform>>(
+            output,
+            MutantHandleObject { mutant },
+            granted_access.bits(),
+        )
     }
 }
 

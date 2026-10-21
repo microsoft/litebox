@@ -83,20 +83,17 @@ fn utf16_units(value: &str) -> Result<Vec<u16>, NtStatus> {
 }
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    fn insert_symbolic_link_handle(
+    fn write_new_symbolic_link_handle(
         &self,
+        output: MutPtr<Platform, Handle>,
         link: Arc<ObjectNode<Platform>>,
         granted_access: SymbolicLinkAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<SymbolicLinkSubsystem<Platform>>(
+    ) -> Result<(), NtStatus> {
+        self.write_new_typed_handle::<SymbolicLinkSubsystem<Platform>>(
+            output,
             SymbolicLinkHandleObject { link },
             granted_access.bits(),
-            drop,
         )
-    }
-
-    fn close_symbolic_link_handle(&self, handle: Handle) {
-        self.close_typed_handle::<SymbolicLinkSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_symbolic_link(link: SymbolicLinkHandleObject<Platform>) {
@@ -160,24 +157,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 if !open_if {
                     return NtStatus::OBJECT_NAME_COLLISION;
                 }
-                let Ok(handle) = self.insert_symbolic_link_handle(link, granted_access) else {
-                    return NtStatus::QUOTA_EXCEEDED;
-                };
-                if link_handle.write_at_offset(0, handle).is_none() {
-                    self.close_symbolic_link_handle(handle);
-                    return NtStatus::ACCESS_VIOLATION;
+                match self.write_new_symbolic_link_handle(link_handle, link, granted_access) {
+                    Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
+                    Err(status) => status,
                 }
-                NtStatus::OBJECT_NAME_EXISTS
             },
-            |link| {
-                let Ok(handle) = self.insert_symbolic_link_handle(link, granted_access) else {
-                    return NtStatus::QUOTA_EXCEEDED;
-                };
-                if link_handle.write_at_offset(0, handle).is_none() {
-                    self.close_symbolic_link_handle(handle);
-                    return NtStatus::ACCESS_VIOLATION;
-                }
-                NtStatus::SUCCESS
+            |link| match self.write_new_symbolic_link_handle(link_handle, link, granted_access) {
+                Ok(()) => NtStatus::SUCCESS,
+                Err(status) => status,
             },
         )
     }
@@ -205,17 +192,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Ok(link) => link,
             Err(status) => return status,
         };
-        let Ok(handle) = self.insert_symbolic_link_handle(
+        match self.write_new_symbolic_link_handle(
+            link_handle,
             link,
             SymbolicLinkAccess::from_desired_access(desired_access),
-        ) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if link_handle.write_at_offset(0, handle).is_none() {
-            self.close_symbolic_link_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_query_symbolic_link_object(

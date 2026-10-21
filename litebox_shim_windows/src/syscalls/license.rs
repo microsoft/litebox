@@ -21,10 +21,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(value_name) = value_name.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
-        match value_name.character_count() {
-            Ok(0) | Err(_) => return NtStatus::INVALID_PARAMETER,
-            Ok(_) if value_name.buffer != 0 => {}
-            Ok(_) => return NtStatus::INVALID_PARAMETER,
+        let has_characters = value_name.character_count().is_ok_and(|count| count != 0);
+        if !has_characters || value_name.buffer == 0 {
+            return NtStatus::INVALID_PARAMETER;
         }
         if !value_name
             .buffer
