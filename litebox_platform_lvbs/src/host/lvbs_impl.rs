@@ -296,7 +296,7 @@ fn crng_seed_in_vault(rdrand: CrngSeed) -> Option<CrngSeed> {
     Some(ctx.1)
 }
 
-fn rdrand_seed() -> Option<CrngSeed> {
+pub(crate) fn rdrand_seed() -> Option<CrngSeed> {
     let mut seed = CrngSeed::default();
     for chunk in seed.chunks_mut(8) {
         let mut word = 0;

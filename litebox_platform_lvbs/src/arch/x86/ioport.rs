@@ -3,7 +3,6 @@
 
 //! I/O Port-based serial communication
 
-use crate::mshv::ringbuffer::ringbuffer;
 use core::{arch::asm, fmt};
 use spin::{Mutex, Once};
 
@@ -138,8 +137,9 @@ impl ComPort {
     }
 }
 
+static COM_ONCE: Once<Mutex<ComPort>> = Once::new();
+
 fn com() -> &'static Mutex<ComPort> {
-    static COM_ONCE: Once<Mutex<ComPort>> = Once::new();
     COM_ONCE.call_once(|| {
         let mut com_port = ComPort::new(DEST_COM_PORT);
         com_port.init();
@@ -158,9 +158,6 @@ impl fmt::Write for ComPort {
 pub fn print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     let _ = com().lock().write_fmt(args);
-    if let Some(rb) = ringbuffer() {
-        let _ = rb.lock().write_fmt(args);
-    }
 }
 
 #[macro_export]
@@ -187,4 +184,14 @@ macro_rules! debug_serial_println {
 
 pub fn serial_print_string(s: &str) {
     com().lock().write_string(s);
+}
+
+// On panic, use COM_ONCE instead of com() to avoid possible
+// first time init, and also avoid waiting for lock while
+// another CPU may be writing to a "slow" serial port.
+// Potentially garbled log on panic is better than no log
+pub fn serial_print_panic_string(s: &str) {
+    if let Some(mut com) = COM_ONCE.get().and_then(Mutex::try_lock) {
+        com.write_string(s);
+    }
 }

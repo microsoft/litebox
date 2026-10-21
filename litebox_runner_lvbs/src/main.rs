@@ -9,6 +9,7 @@ use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_platform_lvbs::{
     arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap, enable_umip},
+    crash_log,
     host::{
         bootparam::save_boot_info,
         per_cpu_variables::{
@@ -20,25 +21,6 @@ use litebox_platform_lvbs::{
 };
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
-
-/// `log` backend that forwards to the serial console.
-struct HostLogger;
-
-impl log::Log for HostLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
-    }
-
-    fn log(&self, record: &log::Record) {
-        let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
-        let _ = litebox_util_log::format_record(&mut buf, record);
-        litebox_platform_lvbs::arch::ioport::serial_print_string(&buf);
-    }
-
-    fn flush(&self) {}
-}
-
-static HOST_LOGGER: HostLogger = HostLogger;
 
 /// Spinlock protecting the shared AP boot stack (`VTL1_KERNEL_STACK_PAGE`).
 ///
@@ -447,11 +429,14 @@ pub unsafe extern "C" fn _start(possible_cpus: u64, mem_pa: u64, mem_size: u64) 
 
 unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
     if is_bsp {
-        let _ = log::set_logger(&HOST_LOGGER);
-        #[cfg(debug_assertions)]
-        log::set_max_level(log::LevelFilter::Debug);
-        #[cfg(not(debug_assertions))]
-        log::set_max_level(log::LevelFilter::Warn);
+        let _ = log::set_logger(crash_log::crash_logger());
+
+        if cfg!(debug_assertions) {
+            crash_log::crash_logger().mirror_to_serial(true);
+            log::set_max_level(log::LevelFilter::Debug);
+        } else {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
 
         serial_println!("==============================");
         serial_println!(" Hello from LiteBox for LVBS! ");

@@ -33,6 +33,9 @@ rand_chacha = { version = "0.3.1", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
+log = { version = "0.4.28", default-features = false }
+rsa = { version = "0.9.10", default-features = false }
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
