@@ -938,15 +938,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     fn unmap_owned_nls_section(&self, mapped_section: MappedNlsSection) {
-        let mut vmem = self.global.page_manager.write_vmem();
-        vmem.allocations_mut().remove(&mapped_section.address);
         // SAFETY: The mapping was created by this syscall path and has not been published on the
         // failing path, so no guest execution can hold a valid reference to it yet.
         let _ = unsafe {
-            vmem.remove_pages(
-                MutPtr::<Platform, u8>::from_usize(mapped_section.address),
-                mapped_section.len,
-            )
+            self.global
+                .page_manager
+                .write_vmem()
+                .release_allocation(mapped_section.address, mapped_section.len)
         };
     }
 }
@@ -1455,6 +1453,46 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(second_section_pointer, section_pointer);
+    }
+
+    #[test]
+    fn nls_section_view_cannot_be_made_writable() {
+        let task = crate::tests::test_task_with_broker_files(&[(
+            "/Windows/System32/c_1252.nls",
+            [1u8, 2, 3].as_slice(),
+        )]);
+        let mut section_pointer = 0usize;
+        assert_eq!(
+            task.sys_nt_get_nls_section_ptr(
+                NLS_SECTION_CODEPAGE,
+                ANSI_CODE_PAGE,
+                0,
+                mut_ptr(&mut section_pointer),
+                None,
+            ),
+            NtStatus::SUCCESS
+        );
+        let protect = |protection: PageProtection| {
+            let mut base = section_pointer;
+            let mut size = PAGE_SIZE;
+            let mut old_protect = 0u32;
+            task.sys_nt_protect_virtual_memory(
+                crate::syscalls::ProcessHandle::CURRENT,
+                mut_ptr(&mut base),
+                mut_ptr(&mut size),
+                protection.bits(),
+                mut_ptr(&mut old_protect),
+            )
+        };
+        assert_eq!(
+            protect(PageProtection::PAGE_READWRITE),
+            NtStatus::SECTION_PROTECTION
+        );
+        assert_eq!(
+            protect(PageProtection::PAGE_EXECUTE_READWRITE),
+            NtStatus::SECTION_PROTECTION
+        );
+        assert_eq!(protect(PageProtection::PAGE_READONLY), NtStatus::SUCCESS);
     }
 
     #[test]

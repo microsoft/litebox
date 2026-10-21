@@ -25,7 +25,7 @@ type Reservations<Platform> = TrackedReservations<<Platform as crate::ShimPlatfo
 
 /// Initial state of freshly allocated private pages.
 #[derive(Clone, Copy)]
-enum PrivatePages {
+pub(crate) enum PrivatePages {
     /// Inaccessible reserved address space.
     Reserved,
     /// Inaccessible reserved address space that [`WindowsVmem::merge_reservations`] can later
@@ -33,12 +33,6 @@ enum PrivatePages {
     Mergeable,
     /// Address space committed with the given permissions.
     Committed(MemoryRegionPermissions),
-}
-
-impl From<Option<MemoryRegionPermissions>> for PrivatePages {
-    fn from(permissions: Option<MemoryRegionPermissions>) -> Self {
-        permissions.map_or(Self::Reserved, Self::Committed)
-    }
 }
 
 pub(crate) struct WindowsVmem<Platform>
@@ -173,58 +167,10 @@ where
         {
             return Err(AllocationError::AddressInUse.into());
         }
-        let platform_allocation_error = |error| match error {
-            AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-            other => other,
-        };
-
         let reservation = match pages {
+            // SAFETY: Existing reservations were checked above and replacement is disabled.
             PrivatePages::Committed(permissions) => {
-                // SAFETY: Existing reservations were checked above and replacement is disabled.
-                match unsafe {
-                    self.platform.reserve_and_commit_pages(
-                        core::iter::empty,
-                        requested.clone(),
-                        permissions,
-                        false,
-                        flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                        FixedAddressBehavior::NoReplace,
-                    )
-                } {
-                    Ok(reservation) => reservation,
-                    Err(AllocationError::UnsupportedByPlatform) => {
-                        // SAFETY: This fresh request cannot replace existing ownership.
-                        let reservation = unsafe {
-                            self.platform.reserve_pages(
-                                core::iter::empty,
-                                requested.clone(),
-                                false,
-                                FixedAddressBehavior::NoReplace,
-                            )
-                        }
-                        .map_err(platform_allocation_error)?;
-                        let actual = reservation.range();
-                        // SAFETY: The fresh reservation exclusively covers `actual` and is
-                        // unpublished.
-                        if let Err(error) = unsafe {
-                            self.platform.commit_pages(
-                                || core::iter::once(&reservation),
-                                actual,
-                                permissions,
-                                flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                            )
-                        } {
-                            // SAFETY: Failed commitment leaves this unpublished reservation unused.
-                            let _ = unsafe {
-                                self.platform
-                                    .release_pages(into_release_target::<Platform>(reservation))
-                            };
-                            return Err(error.into());
-                        }
-                        reservation
-                    }
-                    Err(error) => return Err(platform_allocation_error(error).into()),
-                }
+                unsafe { self.reserve_and_commit_private(requested.clone(), flags, permissions) }?
             }
             // SAFETY: Existing reservations were checked above and replacement is disabled.
             PrivatePages::Mergeable => unsafe {
@@ -258,6 +204,64 @@ where
         }
         assert!(self.reservations.insert(range.start, reservation).is_none());
         Ok(ptr)
+    }
+
+    /// Reserves and commits `requested` natively, falling back to a separate reserve and commit
+    /// when the platform cannot do both at once.
+    ///
+    /// # Safety
+    /// `requested` must not overlap any owned reservation.
+    unsafe fn reserve_and_commit_private(
+        &self,
+        requested: Range<usize>,
+        flags: CreatePagesFlags,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Platform::Reservation, MappingError> {
+        let populate = flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY);
+        // SAFETY: The caller guarantees the range is unowned; replacement is disabled.
+        match unsafe {
+            self.platform.reserve_and_commit_pages(
+                core::iter::empty,
+                requested.clone(),
+                permissions,
+                false,
+                populate,
+                FixedAddressBehavior::NoReplace,
+            )
+        } {
+            Ok(reservation) => Ok(reservation),
+            Err(AllocationError::UnsupportedByPlatform) => {
+                // SAFETY: This fresh request cannot replace existing ownership.
+                let reservation = unsafe {
+                    self.platform.reserve_pages(
+                        core::iter::empty,
+                        requested,
+                        false,
+                        FixedAddressBehavior::NoReplace,
+                    )
+                }
+                .map_err(platform_allocation_error)?;
+                let actual = reservation.range();
+                // SAFETY: The fresh reservation exclusively covers `actual` and is unpublished.
+                if let Err(error) = unsafe {
+                    self.platform.commit_pages(
+                        || core::iter::once(&reservation),
+                        actual,
+                        permissions,
+                        populate,
+                    )
+                } {
+                    // SAFETY: Failed commitment leaves this unpublished reservation unused.
+                    let _ = unsafe {
+                        self.platform
+                            .release_pages(into_release_target::<Platform>(reservation))
+                    };
+                    return Err(error.into());
+                }
+                Ok(reservation)
+            }
+            Err(error) => Err(platform_allocation_error(error).into()),
+        }
     }
 
     pub(crate) unsafe fn commit_pages(
@@ -327,12 +331,8 @@ where
         let start = ptr.as_usize();
         let range = page_range(start, len)
             .ok_or_else(|| VmemProtectError::UnAligned(start..start.saturating_add(len)))?;
-        if !ranges_cover(
-            self.reservations
-                .overlapping(range.clone())
-                .map(litebox::platform::page_mgmt::PageReservation::range),
-            &range,
-        ) || self.mappings.overlapping(range.clone()).next().is_some()
+        if self.mappings.overlapping(range.clone()).next().is_some()
+            || self.reservations.gaps(range.clone()).next().is_some()
         {
             return Err(VmemProtectError::InvalidRange(range));
         }
@@ -348,10 +348,29 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn reservation_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
         self.reservations
             .iter()
             .map(|(_, reservation)| reservation.range())
+    }
+
+    /// Returns the range of the reservation containing `address`, if any.
+    pub(crate) fn reservation_containing(&self, address: usize) -> Option<Range<usize>> {
+        let end = address.checked_add(1)?;
+        self.reservations
+            .overlapping(address..end)
+            .next()
+            .map(litebox::platform::page_mgmt::PageReservation::range)
+    }
+
+    /// Returns the start of the first reservation beginning above `address` and below `limit`.
+    pub(crate) fn next_reservation_start(&self, address: usize, limit: usize) -> Option<usize> {
+        self.reservations
+            .overlapping(address..limit)
+            .map(litebox::platform::page_mgmt::PageReservation::range)
+            .find(|range| range.start > address)
+            .map(|range| range.start)
     }
 
     pub(crate) fn get_memory_permissions(
@@ -436,6 +455,24 @@ where
     pub(crate) fn mappings(&self) -> &RangeMap<usize, VmFlags> {
         &self.mappings
     }
+
+    /// Releases the pages of the allocation recorded at `base` together with its record, so
+    /// no other thread can observe one without the other.
+    ///
+    /// On failure the record is retained.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::remove_pages`].
+    pub(crate) unsafe fn release_allocation(
+        &mut self,
+        base: usize,
+        len: usize,
+    ) -> Result<(), VmemUnmapError> {
+        // SAFETY: Forwarded caller contract.
+        unsafe { self.remove_pages(Platform::RawMutPointer::<u8>::from_usize(base), len) }?;
+        self.allocations.remove(&base);
+        Ok(())
+    }
 }
 
 /// Owns Windows guest reservations independently from their committed page ranges.
@@ -456,7 +493,8 @@ where
         }
     }
 
-    /// Reserves aligned private address space within exclusive bounds, optionally committing it.
+    /// Reserves aligned private address space within exclusive bounds in the initial state
+    /// described by `pages`.
     ///
     /// # Safety
     /// The caller must not access uncommitted pages and must exclude accesses conflicting with
@@ -468,7 +506,7 @@ where
         length: NonZeroPageSize<PAGE_SIZE>,
         alignment: usize,
         flags: CreatePagesFlags,
-        permissions: Option<MemoryRegionPermissions>,
+        pages: PrivatePages,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let mut vmem = self.vmem.write();
         // SAFETY: The write guard provides exclusive state access and forwards the caller contract.
@@ -479,34 +517,7 @@ where
                 length,
                 alignment,
                 flags,
-                permissions.into(),
-            )
-        }
-    }
-
-    /// Reserves inaccessible private address space that can later be joined with adjacent
-    /// mergeable reservations by [`WindowsVmem::merge_reservations`].
-    ///
-    /// # Safety
-    /// The caller must not access the reserved pages until they are committed.
-    pub(crate) unsafe fn create_mergeable_reserved_pages(
-        &self,
-        suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
-        address_bounds: Range<usize>,
-        length: NonZeroPageSize<PAGE_SIZE>,
-        alignment: usize,
-        flags: CreatePagesFlags,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
-        let mut vmem = self.vmem.write();
-        // SAFETY: The write guard provides exclusive state access and forwards the caller contract.
-        unsafe {
-            vmem.create_private_pages(
-                suggested_address,
-                address_bounds,
-                length,
-                alignment,
-                flags,
-                PrivatePages::Mergeable,
+                pages,
             )
         }
     }
@@ -526,7 +537,7 @@ where
                 length,
                 alignment,
                 flags,
-                None,
+                PrivatePages::Reserved,
             )
         }
     }
@@ -547,7 +558,7 @@ where
                 length,
                 alignment,
                 flags,
-                Some(permissions),
+                PrivatePages::Committed(permissions),
             )
         }
     }
@@ -610,24 +621,6 @@ where
         unsafe { vmem.protect_pages(ptr, len, permissions) }
     }
 
-    pub(crate) unsafe fn make_pages_inaccessible(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-    ) -> Result<(), VmemProtectError> {
-        // SAFETY: Forwarded caller contract.
-        unsafe { self.protect_pages(ptr, len, MemoryRegionPermissions::empty()) }
-    }
-
-    pub(crate) unsafe fn make_pages_readable(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-    ) -> Result<(), VmemProtectError> {
-        // SAFETY: Forwarded caller contract.
-        unsafe { self.protect_pages(ptr, len, MemoryRegionPermissions::READ) }
-    }
-
     pub(crate) unsafe fn make_pages_writable(
         &self,
         ptr: Platform::RawMutPointer<u8>,
@@ -639,38 +632,6 @@ where
                 ptr,
                 len,
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-            )
-        }
-    }
-
-    pub(crate) unsafe fn make_pages_executable(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-    ) -> Result<(), VmemProtectError> {
-        // SAFETY: Forwarded caller contract.
-        unsafe {
-            self.protect_pages(
-                ptr,
-                len,
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
-            )
-        }
-    }
-
-    pub(crate) unsafe fn make_pages_rwx(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-    ) -> Result<(), VmemProtectError> {
-        // SAFETY: Forwarded caller contract.
-        unsafe {
-            self.protect_pages(
-                ptr,
-                len,
-                MemoryRegionPermissions::READ
-                    | MemoryRegionPermissions::WRITE
-                    | MemoryRegionPermissions::EXEC,
             )
         }
     }
@@ -755,6 +716,14 @@ where
     is_available(candidate)
 }
 
+/// Distinguishes host-side collisions from overlaps with guest-owned reservations.
+fn platform_allocation_error(error: AllocationError) -> AllocationError {
+    match error {
+        AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+        other => other,
+    }
+}
+
 fn page_range(start: usize, len: usize) -> Option<Range<usize>> {
     let end = start.checked_add(len)?;
     (len != 0 && start.is_multiple_of(PAGE_SIZE) && end.is_multiple_of(PAGE_SIZE))
@@ -779,24 +748,6 @@ where
             let extent = reservation.range();
             extent.start <= range.start && range.end <= extent.end
         })
-}
-
-/// Returns whether ascending, non-overlapping `extents` contiguously cover a non-empty `range`.
-fn ranges_cover(extents: impl Iterator<Item = Range<usize>>, range: &Range<usize>) -> bool {
-    if range.is_empty() {
-        return false;
-    }
-    let mut covered_until = range.start;
-    for extent in extents {
-        if extent.start > covered_until {
-            return false;
-        }
-        covered_until = covered_until.max(extent.end);
-        if covered_until >= range.end {
-            return true;
-        }
-    }
-    false
 }
 
 fn into_release_target<Platform>(

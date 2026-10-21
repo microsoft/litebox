@@ -14,7 +14,6 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_linux::vmem::CreatePagesFlags;
 use litebox_common_windows::nt_status::NtStatus;
-use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
@@ -617,20 +616,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let owns_pages = view.section.as_ref().is_none_or(|section| {
             !matches!(section.backing, SectionBacking::CsrSharedSection { .. })
         });
+        let mut vmem = self.global.page_manager.write_vmem();
         if owns_pages {
-            let ptr = MutPtr::<Platform, u8>::from_usize(view_base);
             // SAFETY: Section views are tracked only after this shim successfully creates the pages;
             // unmapping consumes the tracked view and removes the exact owned range.
-            if unsafe { self.global.page_manager.remove_pages(ptr, view.size) }.is_err() {
+            if unsafe { vmem.release_allocation(view_base, view.size) }.is_err() {
+                drop(vmem);
                 self.process.section_views.write().insert(view_base, view);
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
+        } else {
+            vmem.allocations_mut().remove(&view_base);
         }
-        self.global
-            .page_manager
-            .write_vmem()
-            .allocations_mut()
-            .remove(&view_base);
         NtStatus::SUCCESS
     }
 
@@ -814,18 +811,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .allocations_mut()
             .insert(
                 base,
-                crate::WindowsVirtualAllocation {
+                crate::WindowsVirtualAllocation::new(
                     base,
-                    size: mapped_size,
-                    allocation_protect: section.protection,
-                    type_: MemoryType::MEM_MAPPED,
-                    placeholder_state: crate::WindowsPlaceholderState::None,
-                    page_protections: if is_reserved {
-                        RangeMap::new()
-                    } else {
-                        mm::initial_page_protections(base, mapped_size, page_protection)
-                    },
-                },
+                    mapped_size,
+                    MemoryType::MEM_MAPPED,
+                    section.protection,
+                    crate::WindowsPlaceholderState::None,
+                    (!is_reserved).then_some(page_protection),
+                ),
             );
         Ok(MappedPagefileSectionView { base, view_size })
     }
@@ -839,12 +832,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             section.pagefile_view_active.store(false, Ordering::Release);
         }
-        let _ = remove_view_pages::<Platform>(&self.global.page_manager, view_base, view.size);
-        self.global
-            .page_manager
-            .write_vmem()
-            .allocations_mut()
-            .remove(&view_base);
+        let _ =
+            release_view_allocation::<Platform>(&self.global.page_manager, view_base, view.size);
     }
 
     fn map_csr_shared_section(
@@ -918,20 +907,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .allocations_mut()
             .insert(
                 base,
-                crate::WindowsVirtualAllocation {
+                // TODO(section-subsystem): honor per-view CSR protections only after
+                // the backing is no longer aliased by PEB direct-deref pointers.
+                crate::WindowsVirtualAllocation::new(
                     base,
-                    size: mapped_size,
-                    allocation_protect: section.protection,
-                    type_: MemoryType::MEM_MAPPED,
-                    placeholder_state: crate::WindowsPlaceholderState::None,
-                    // TODO(section-subsystem): honor per-view CSR protections only after
-                    // the backing is no longer aliased by PEB direct-deref pointers.
-                    page_protections: mm::initial_page_protections(
-                        base,
-                        mapped_size,
-                        section.protection,
-                    ),
-                },
+                    mapped_size,
+                    MemoryType::MEM_MAPPED,
+                    section.protection,
+                    crate::WindowsPlaceholderState::None,
+                    Some(section.protection),
+                ),
             );
         NtStatus::SUCCESS
     }
@@ -992,16 +977,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .write_at_offset(0, mapping.image_size)
                 .is_none()
         {
-            let _ = remove_view_pages::<Platform>(
+            let _ = release_view_allocation::<Platform>(
                 &self.global.page_manager,
                 mapping.base_addr,
                 mapping.mapping_size,
             );
-            self.global
-                .page_manager
-                .write_vmem()
-                .allocations_mut()
-                .remove(&mapping.base_addr);
             return NtStatus::ACCESS_VIOLATION;
         }
         self.process.section_views.write().insert(
@@ -1279,15 +1259,15 @@ fn write_section_image_information<Platform: ShimPlatform>(
     NtStatus::SUCCESS
 }
 
-fn remove_view_pages<Platform: ShimPlatform>(
+/// Releases a view's pages and its allocation record under one page-manager lock.
+fn release_view_allocation<Platform: ShimPlatform>(
     page_manager: &crate::WindowsPageManager<Platform>,
     base: usize,
     size: usize,
 ) -> Result<(), ()> {
-    let ptr = MutPtr::<Platform, u8>::from_usize(base);
     // SAFETY: The caller passes a section view range created by this module and not yet exposed,
     // or a tracked view being rolled back after output write failure.
-    unsafe { page_manager.remove_pages(ptr, size) }.map_err(|_| ())
+    unsafe { page_manager.write_vmem().release_allocation(base, size) }.map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -1570,6 +1550,77 @@ mod tests {
             NtStatus::INFO_LENGTH_MISMATCH
         );
         assert_eq!(return_length, 0x5555_5555);
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn failed_image_view_releases_reserved_image_allocation() {
+        let mut image = host_kernel32_image();
+        let optional_header =
+            usize::try_from(u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap())).unwrap()
+                + 24;
+        let size_of_image = usize::try_from(u32::from_le_bytes(
+            image[optional_header + 56..optional_header + 60]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
+        // Prefer a base the host heap already occupies so the image must be relocated, then drop
+        // the relocation directory: loading fails only after the image range is reserved.
+        let occupied = alloc::vec![0u8; size_of_image + super::mm::ALLOCATION_GRANULARITY * 2];
+        let preferred_base =
+            (occupied.as_ptr() as usize).next_multiple_of(super::mm::ALLOCATION_GRANULARITY);
+        image[optional_header + 24..optional_header + 32]
+            .copy_from_slice(&u64::try_from(preferred_base).unwrap().to_le_bytes());
+        image[optional_header + 156..optional_header + 160].fill(0);
+        let task = crate::tests::test_task_with_broker_files(&[("/tmp/norelocs.dll", &image)]);
+        let file_handle = open_image_file(&task, r"\Device\HarddiskVolume1\tmp\norelocs.dll");
+        let mut section_handle = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_section(
+                mut_ptr(&mut section_handle),
+                (SectionAccess::QUERY | SectionAccess::MAP_READ | SectionAccess::MAP_EXECUTE)
+                    .bits(),
+                None,
+                None,
+                PageProtection::PAGE_EXECUTE.bits(),
+                SectionAllocationAttributes::SEC_IMAGE.bits(),
+                file_handle,
+            ),
+            NtStatus::SUCCESS
+        );
+        let image_allocations = || {
+            task.global
+                .page_manager
+                .read_vmem()
+                .allocations()
+                .values()
+                .filter(|allocation| allocation.type_ == MemoryType::MEM_IMAGE)
+                .count()
+        };
+        let image_allocations_before = image_allocations();
+
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+        // `NO_MEMORY` reports a load (not parse) failure, i.e. one after the reservation.
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_EXECUTE_READ.bits(),
+            }),
+            NtStatus::NO_MEMORY
+        );
+        assert_eq!(image_allocations(), image_allocations_before);
+        assert_eq!(base, 0);
+        drop(occupied);
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -1916,6 +1967,71 @@ mod tests {
                 NtStatus::SUCCESS
             );
         }
+    }
+
+    #[test]
+    fn protecting_readonly_pagefile_view_respects_section_protection() {
+        let task = test_task();
+        let readonly = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_READONLY,
+        );
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: readonly,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_READONLY.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        let protect = |protection: PageProtection| {
+            let mut protect_base = base;
+            let mut protect_size = PAGE_SIZE;
+            let mut old_protect = 0u32;
+            task.sys_nt_protect_virtual_memory(
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut protect_base),
+                mut_ptr(&mut protect_size),
+                protection.bits(),
+                mut_ptr(&mut old_protect),
+            )
+        };
+        // Host 25H2 rejects protections the section does not grant, but allows copy-on-write,
+        // no-access, and the original protection.
+        assert_eq!(
+            protect(PageProtection::PAGE_READWRITE),
+            NtStatus::SECTION_PROTECTION
+        );
+        assert_eq!(
+            protect(PageProtection::PAGE_EXECUTE_READ),
+            NtStatus::SECTION_PROTECTION
+        );
+        assert_eq!(protect(PageProtection::PAGE_WRITECOPY), NtStatus::SUCCESS);
+        assert_eq!(protect(PageProtection::PAGE_NOACCESS), NtStatus::SUCCESS);
+        assert_eq!(protect(PageProtection::PAGE_READONLY), NtStatus::SUCCESS);
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
+            NtStatus::SUCCESS
+        );
+        assert!(
+            !task
+                .global
+                .page_manager
+                .read_vmem()
+                .allocations()
+                .contains_key(&base)
+        );
     }
 
     #[test]

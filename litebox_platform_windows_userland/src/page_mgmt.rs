@@ -61,44 +61,54 @@ macro_rules! debug_assert_alignment {
     };
 }
 
+/// Initial state of a fresh native reservation.
+#[derive(Clone, Copy)]
+enum NativeReservation {
+    /// Inaccessible reserved address space.
+    Reserved,
+    /// Inaccessible reserved address space that can later be coalesced with adjacent
+    /// mergeable reservations.
+    Mergeable,
+    /// Address space committed with the given permissions.
+    Committed(MemoryRegionPermissions),
+}
+
 impl<const ALIGN: usize> WindowsUserland<ALIGN> {
     fn allocate_native_reservation(
         range: core::ops::Range<usize>,
         behavior: FixedAddressBehavior,
-        permissions: Option<MemoryRegionPermissions>,
-        mergeable: bool,
+        kind: NativeReservation,
     ) -> Result<WindowsUserlandReservation<ALIGN>, AllocationError> {
         debug_assert!(range.start.is_multiple_of(
             <Self as litebox::platform::PageManagementProvider<ALIGN>>::RESERVATION_ALIGNMENT,
         ));
         debug_assert!(range.end.is_multiple_of(ALIGN));
-        debug_assert!(!mergeable || permissions.is_none());
-        // A mergeable reservation starts as a native placeholder so it can be coalesced later.
+        let (state_flags, protection) = match kind {
+            NativeReservation::Reserved => (0, Win32_Memory::PAGE_NOACCESS),
+            // A mergeable reservation starts as a native placeholder so it can be coalesced later.
+            NativeReservation::Mergeable => (
+                Win32_Memory::MEM_RESERVE_PLACEHOLDER,
+                Win32_Memory::PAGE_NOACCESS,
+            ),
+            NativeReservation::Committed(permissions) => {
+                (Win32_Memory::MEM_COMMIT, prot_flags(permissions))
+            }
+        };
+        let top_down = if matches!(
+            behavior,
+            FixedAddressBehavior::Hint(AllocationDirection::TopDown)
+        ) {
+            MEM_TOP_DOWN
+        } else {
+            0
+        };
         let reserve = |address| unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
                 address,
                 range.len(),
-                Win32_Memory::MEM_RESERVE
-                    | if mergeable {
-                        Win32_Memory::MEM_RESERVE_PLACEHOLDER
-                    } else {
-                        0
-                    }
-                    | if permissions.is_some() {
-                        Win32_Memory::MEM_COMMIT
-                    } else {
-                        0
-                    }
-                    | if matches!(
-                        behavior,
-                        FixedAddressBehavior::Hint(AllocationDirection::TopDown)
-                    ) {
-                        MEM_TOP_DOWN
-                    } else {
-                        0
-                    },
-                permissions.map_or(Win32_Memory::PAGE_NOACCESS, prot_flags),
+                Win32_Memory::MEM_RESERVE | state_flags | top_down,
+                protection,
                 core::ptr::null_mut(),
                 0,
             )
@@ -117,7 +127,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
 
         let base = ptr as usize;
         let extent = base..base + range.len();
-        if mergeable && !Self::replace_placeholder(&extent) {
+        if matches!(kind, NativeReservation::Mergeable) && !Self::replace_placeholder(&extent) {
             // SAFETY: The placeholder was just created by this call and has no other users.
             unsafe { VirtualFree(ptr, 0, Win32_Memory::MEM_RELEASE) };
             return Err(AllocationError::OutOfMemory);
@@ -149,7 +159,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         suggested_range: core::ops::Range<usize>,
         can_grow_down: bool,
         fixed_address_behavior: FixedAddressBehavior,
-        mergeable: bool,
+        kind: NativeReservation,
     ) -> Result<WindowsUserlandReservation<ALIGN>, AllocationError> {
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
         debug_assert_alignment!(suggested_range, ALIGN);
@@ -168,7 +178,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         }
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
         let _ = can_grow_down;
-        Self::allocate_native_reservation(suggested_range, fixed_address_behavior, None, mergeable)
+        Self::allocate_native_reservation(suggested_range, fixed_address_behavior, kind)
     }
 
     fn release_reservation(reservation: WindowsUserlandReservation<ALIGN>) {
@@ -305,8 +315,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         let reservation = Self::allocate_native_reservation(
             suggested_range,
             fixed_address_behavior,
-            Some(permissions),
-            false,
+            NativeReservation::Committed(permissions),
         )?;
         if populate_pages_immediately {
             let extent = reservation.range();
@@ -329,7 +338,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
             suggested_range,
             can_grow_down,
             fixed_address_behavior,
-            false,
+            NativeReservation::Reserved,
         )
     }
 
@@ -343,7 +352,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     where
         Reservations: Iterator<Item = WindowsUserlandReservation<ALIGN>>,
     {
-        self.reserve_native_pages(suggested_range, can_grow_down, fixed_address_behavior, true)
+        self.reserve_native_pages(
+            suggested_range,
+            can_grow_down,
+            fixed_address_behavior,
+            NativeReservation::Mergeable,
+        )
     }
 
     unsafe fn merge_reservations(

@@ -70,14 +70,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             cookie,
         };
         if self.publish_gdi_state(new_state) == 0 {
-            let mut vmem = self.global.page_manager.write_vmem();
-            vmem.allocations_mut().remove(&shared_table);
             // SAFETY: the mapping was just created and was not published to the process state.
             let _ = unsafe {
-                vmem.remove_pages(
-                    MutPtr::<Platform, u8>::from_usize(shared_table),
-                    GDI_SHARED_TABLE_SIZE,
-                )
+                self.global
+                    .page_manager
+                    .write_vmem()
+                    .release_allocation(shared_table, GDI_SHARED_TABLE_SIZE)
             };
             return 0;
         }
@@ -113,4 +111,26 @@ fn initialize_gdi_shared_table<Platform: ShimPlatform>(
             .ok_or(MappingError::OutOfMemory)?;
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::run_with_test_platform_pointers;
+
+    #[test]
+    fn gdi_init_releases_shared_table_when_peb_publish_fails() {
+        run_with_test_platform_pointers(|| {
+            // The bare test task has no PEB, so publishing the shared table always fails after
+            // the table is mapped and recorded.
+            let task = crate::tests::test_task_with_random();
+            let snapshot = || {
+                let vmem = task.global.page_manager.read_vmem();
+                (vmem.allocations().clone(), vmem.mappings().clone())
+            };
+            let before = snapshot();
+            assert_eq!(task.sys_nt_gdi_init2(), 0);
+            assert!(task.process.gdi_state.lock().is_none());
+            assert_eq!(snapshot(), before);
+        });
+    }
 }

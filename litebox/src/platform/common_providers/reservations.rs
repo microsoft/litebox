@@ -153,7 +153,8 @@ impl<Reservation> Default for TrackedReservations<Reservation> {
 }
 
 impl<Reservation: PageReservation> TrackedReservations<Reservation> {
-    fn gaps(&self, range: Range<usize>) -> impl Iterator<Item = Range<usize>> {
+    /// Returns the ascending sub-ranges of `range` that no tracked reservation covers.
+    pub fn gaps(&self, range: Range<usize>) -> impl Iterator<Item = Range<usize>> {
         let mut cursor = range.start;
         self.overlapping(range.clone())
             .map(PageReservation::range)

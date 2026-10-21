@@ -19,7 +19,6 @@ use litebox_common_windows::loader::{
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, MapMemory, MappingInfo, PAGE_SIZE, PeExportError,
     PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt, page_align_down,
 };
-use rangemap::RangeMap;
 use thiserror::Error;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
@@ -1190,49 +1189,47 @@ struct PeImageMapper<'a, Platform: crate::ShimPlatform> {
 }
 
 impl<Platform: crate::ShimPlatform> PeImageMapper<'_, Platform> {
-    fn record_pages(
-        &mut self,
-        address: usize,
-        len: usize,
-        protect: PageProtection,
-    ) -> Result<(), PeImageAccessError> {
-        let (start, len) = page_range(address, len)?;
-        if len == 0 {
-            return Ok(());
-        }
-        let end = start
-            .checked_add(len)
-            .ok_or(PeImageAccessError::AddressOverflow)?;
-        let (base, _) = self.reserved.ok_or(PeImageAccessError::MemoryAccess)?;
-        let mut vmem = self.page_manager.write_vmem();
-        let allocation = vmem
-            .allocations_mut()
-            .get_mut(&base)
-            .ok_or(PeImageAccessError::MemoryAccess)?;
-        allocation.page_protections.insert(start..end, protect);
-        Ok(())
-    }
-
     /// Releases a partially loaded image and its allocation record.
     fn release_reserved(&mut self) {
         let Some((base, len)) = self.reserved.take() else {
             return;
         };
-        let mut vmem = self.page_manager.write_vmem();
-        vmem.allocations_mut().remove(&base);
         // SAFETY: The image failed to load before its base was returned, so nothing references
         // the reserved pages.
-        let _ = unsafe { vmem.remove_pages(MutPtr::<Platform, u8>::from_usize(base), len) };
+        let _ = unsafe { self.page_manager.write_vmem().release_allocation(base, len) };
     }
 
+    /// Applies `prot` to the pages and records the matching Windows protection under one
+    /// page-manager lock.
     fn protect_and_record_pages(
         &mut self,
         address: usize,
         len: usize,
         prot: Protection,
     ) -> Result<(), PeImageAccessError> {
-        protect_pages(self.page_manager, address, len, prot)?;
-        self.record_pages(address, len, page_protection_from_loader_protection(prot))
+        let (start, len) = page_range(address, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        let (base, _) = self.reserved.ok_or(PeImageAccessError::MemoryAccess)?;
+        let mut vmem = self.page_manager.write_vmem();
+        let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(start);
+        // SAFETY: All protection changes happen during PE load, before the initial guest thread
+        // starts, so there is no concurrent read/write/execute on these pages. The RWX case is
+        // only reached when a section's COFF characteristics demand WRITE|EXECUTE; the bytes
+        // copied into the section come from the attacker-controlled PE file and are not executed
+        // until protections are set, so this is no looser than running the same PE under the
+        // real Windows loader.
+        unsafe { vmem.protect_pages(ptr, len, loader_permissions(prot)) }?;
+        vmem.allocations_mut()
+            .get_mut(&base)
+            .ok_or(PeImageAccessError::MemoryAccess)?
+            .page_protections
+            .insert(
+                start..start + len,
+                page_protection_from_loader_protection(prot),
+            );
+        Ok(())
     }
 }
 
@@ -1261,18 +1258,16 @@ impl<Platform: crate::ShimPlatform> MapMemory for PeImageMapper<'_, Platform> {
             |_| Ok(0),
         )?;
         let base = ptr.as_usize();
-        let mut pages = RangeMap::new();
-        pages.insert(base..base + len, PageProtection::PAGE_NOACCESS);
         self.page_manager.write_vmem().allocations_mut().insert(
             base,
-            crate::WindowsVirtualAllocation {
+            crate::WindowsVirtualAllocation::new(
                 base,
-                size: len,
-                allocation_protect: PageProtection::PAGE_EXECUTE_WRITECOPY,
-                type_: MemoryType::MEM_IMAGE,
-                placeholder_state: crate::WindowsPlaceholderState::None,
-                page_protections: pages,
-            },
+                len,
+                MemoryType::MEM_IMAGE,
+                PageProtection::PAGE_EXECUTE_WRITECOPY,
+                crate::WindowsPlaceholderState::None,
+                Some(PageProtection::PAGE_NOACCESS),
+            ),
         );
         self.reserved = Some((base, len));
         Ok(base)
@@ -1399,31 +1394,18 @@ fn make_pages_writable<Platform: crate::ShimPlatform>(
     Ok(())
 }
 
-fn protect_pages<Platform: crate::ShimPlatform>(
-    page_manager: &crate::WindowsPageManager<Platform>,
-    address: usize,
-    len: usize,
-    prot: Protection,
-) -> Result<(), PeImageAccessError> {
-    let (start, len) = page_range(address, len)?;
-    if len == 0 {
-        return Ok(());
-    }
-    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(start);
-    // SAFETY: All `make_pages_*` calls happen during PE load, before the initial
-    // guest thread starts, so there is no concurrent read/write/execute on these
-    // pages. The RWX arm is only reached when a section's COFF characteristics
-    // demand WRITE|EXECUTE; the bytes copied into the section come from the
-    // attacker-controlled PE file and are not executed until protections are set,
-    // so this is no looser than running the same PE under the real Windows loader.
+fn loader_permissions(prot: Protection) -> MemoryRegionPermissions {
     match (prot.read, prot.write, prot.execute) {
-        (_, true, true) => unsafe { page_manager.make_pages_rwx(ptr, len)? },
-        (_, true, false) => unsafe { page_manager.make_pages_writable(ptr, len)? },
-        (_, false, true) => unsafe { page_manager.make_pages_executable(ptr, len)? },
-        (true, false, false) => unsafe { page_manager.make_pages_readable(ptr, len)? },
-        (false, false, false) => unsafe { page_manager.make_pages_inaccessible(ptr, len)? },
+        (_, true, true) => {
+            MemoryRegionPermissions::READ
+                | MemoryRegionPermissions::WRITE
+                | MemoryRegionPermissions::EXEC
+        }
+        (_, true, false) => MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        (_, false, true) => MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+        (true, false, false) => MemoryRegionPermissions::READ,
+        (false, false, false) => MemoryRegionPermissions::empty(),
     }
-    Ok(())
 }
 
 fn page_range(address: usize, len: usize) -> Result<(usize, usize), PeImageAccessError> {

@@ -228,6 +228,30 @@ pub(crate) struct WindowsVirtualAllocation {
     pub(crate) page_protections: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
 }
 
+impl WindowsVirtualAllocation {
+    /// Creates an allocation record whose pages are either all committed with
+    /// `committed_protect`, or, when it is `None`, all reserved.
+    pub(crate) fn new(
+        base: usize,
+        size: usize,
+        type_: syscalls::mm::MemoryType,
+        allocation_protect: syscalls::mm::PageProtection,
+        placeholder_state: WindowsPlaceholderState,
+        committed_protect: Option<syscalls::mm::PageProtection>,
+    ) -> Self {
+        Self {
+            base,
+            size,
+            allocation_protect,
+            type_,
+            placeholder_state,
+            page_protections: committed_protect.map_or_else(rangemap::RangeMap::new, |protect| {
+                syscalls::mm::initial_page_protections(base, size, protect)
+            }),
+        }
+    }
+}
+
 pub(crate) struct WindowsSectionView<Platform: ShimPlatform> {
     pub(crate) size: usize,
     pub(crate) section_offset: usize,
