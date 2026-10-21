@@ -89,10 +89,11 @@ struct CallLanePoolInner<Lane, Error> {
     failure: Option<Arc<Error>>,
 }
 
-/// A lane held by one call; dropping it frees the lane.
+/// A lane held by one call; releasing or dropping the claim frees the lane.
 pub struct LaneClaim<'lanes, Sync: CallLanePoolSync, Lane, Error> {
     lanes: &'lanes CallLanePool<Sync, Lane, Error>,
     index: usize,
+    /// The lane, or `None` once released.
     lane: Option<Lane>,
 }
 
@@ -102,7 +103,7 @@ impl<Sync: CallLanePoolSync, Lane, Error> Deref for LaneClaim<'_, Sync, Lane, Er
     fn deref(&self) -> &Lane {
         self.lane
             .as_ref()
-            .expect("claimed lane is present until drop")
+            .expect("claimed lane is present until released")
     }
 }
 
@@ -110,13 +111,42 @@ impl<Sync: CallLanePoolSync, Lane, Error> DerefMut for LaneClaim<'_, Sync, Lane,
     fn deref_mut(&mut self) -> &mut Lane {
         self.lane
             .as_mut()
-            .expect("claimed lane is present until drop")
+            .expect("claimed lane is present until released")
     }
 }
 
 impl<Sync: CallLanePoolSync, Lane, Error> Drop for LaneClaim<'_, Sync, Lane, Error> {
     fn drop(&mut self) {
-        let mut state = self.lanes.state.lock();
+        if self.lane.is_some() {
+            let lanes = self.lanes;
+            self.free(&mut lanes.state.lock());
+        }
+    }
+}
+
+impl<Sync: CallLanePoolSync, Lane, Error> LaneClaim<'_, Sync, Lane, Error> {
+    /// Runs `operation` on the lane and frees the lane, both while excluding
+    /// failure recording, so a call completes only while the association is
+    /// live.
+    ///
+    /// If the association has failed or `operation` fails, the claim keeps
+    /// the lane until dropped, so the caller can fail the association first.
+    pub fn release_if_live<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Lane) -> Result<T, Error>,
+    ) -> Result<T, CallLanePoolError<Error>> {
+        let lanes = self.lanes;
+        let mut state = lanes.state.lock();
+        if let Some(error) = state.failure.as_ref() {
+            return Err(CallLanePoolError::AssociationFailed(Arc::clone(error)));
+        }
+        let value = operation(self).map_err(CallLanePoolError::Operation)?;
+        self.free(&mut state);
+        Ok(value)
+    }
+
+    /// Returns the lane to its slot, under the admission lock.
+    fn free(&mut self, state: &mut CallLanePoolInner<Lane, Error>) {
         state.lanes[self.index] = self.lane.take();
         if state.waiting > 0 {
             self.lanes.lane_freed.notify_one();

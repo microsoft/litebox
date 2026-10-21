@@ -32,7 +32,7 @@ use litebox_broker_transport::control_ring::{
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
-use crate::call_lane_pool::{CallLanePool, call_lane_pool_error};
+use crate::call_lane_pool::{CallLanePool, LaneClaim, call_lane_pool_error};
 use crate::control_ring::PipeLiveness;
 use crate::named_pipe::{TRANSFER_FRAME_TAG, WindowsNamedPipeStream};
 use crate::process_image::WindowsReceivedProcessImage;
@@ -277,8 +277,8 @@ impl LocalCallChannel for WindowsControlRingLocalCallChannel {
             }
         };
         let result = association.call_on_lane(&mut lane, request);
-        // Fail before freeing the lane, so no other call can find it midway
-        // through this call.
+        // A failed call can leave its lane mid-exchange: fail the association
+        // before freeing the lane, so no other call uses it.
         if let Err(error) = &result {
             let _ = association.fail(copy_io_error(error));
         }
@@ -380,10 +380,11 @@ impl LocalRingAssociation {
         self.lane_demand.wake_broker()
     }
 
-    /// Writes `request` to `lane` and reads the broker's response from it.
+    /// Writes `request` to `lane` and reads the broker's response from it,
+    /// releasing the lane once the call succeeds.
     fn call_on_lane(
         &self,
-        lane: &mut LocalLane,
+        lane: &mut LaneClaim<'_, LocalLane>,
         request: BrokerRequest,
     ) -> IoResult<BrokerResponse> {
         let request_id = request.request_id;
@@ -417,15 +418,17 @@ impl LocalRingAssociation {
                 Err(ControlRingReadError::Decode(error)) => return Err(wire_error(error)),
             }
         };
-        // Accepting the response excludes failure recording, so no call
-        // succeeds once the association has failed.
-        self.lanes
-            .run_if_live(|| consumer.publish_head().map_err(ring_error))
-            .map_err(call_lane_pool_error)?;
-        consumer.wake_producer()?;
         if response.request_id != request_id {
             return Err(invalid_data("broker answered a different request"));
         }
+        // Accepting the response with the lane's release excludes failure
+        // recording, so no call succeeds once the association has failed.
+        lane.release_if_live(|lane| {
+            let consumer = &mut lane.response_consumer;
+            consumer.publish_head().map_err(ring_error)?;
+            consumer.wake_producer()
+        })
+        .map_err(call_lane_pool_error)?;
         Ok(response)
     }
 
