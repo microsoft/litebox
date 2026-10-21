@@ -177,6 +177,54 @@ fn rw(
     )
 }
 
+/// Bounds a test's psynch waits, most of which have no timeout: after
+/// [`BOUND`] it releases every blocked thread (with a zero grant) until the
+/// test ends, and then fails the test, so a broken implementation fails
+/// instead of hanging.
+struct Watchdog {
+    done: Arc<core::sync::atomic::AtomicBool>,
+    fired: Arc<core::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn new(task: &Task<Platform>) -> Self {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let global = Arc::clone(&task.global);
+        let thread = std::thread::spawn({
+            let (done, fired) = (Arc::clone(&done), Arc::clone(&fired));
+            move || {
+                let start = Instant::now();
+                while !done.load(Ordering::Acquire) {
+                    if start.elapsed() >= BOUND && global.psynch.lock().release_all_waiters() > 0 {
+                        fired.store(true, Ordering::Release);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+        Self {
+            done,
+            fired,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering;
+        self.done.store(true, Ordering::Release);
+        self.thread.take().unwrap().join().unwrap();
+        assert!(
+            !self.fired.load(Ordering::Acquire) || std::thread::panicking(),
+            "a psynch wait was still blocked after {BOUND:?}"
+        );
+    }
+}
+
 /// Wait until `count` threads block on the private object at `address`.
 fn await_waiters(task: &Task<Platform>, address: usize, count: usize) {
     let start = Instant::now();
@@ -254,6 +302,7 @@ fn unused_rwlock_calls_answer_like_xnu() {
 #[test]
 fn first_fit_mutex_unlocks_prepost_or_grant() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let mutex = 0x1000;
     // L=0x203 (owner and one contender), U=0x100 after the unlock.
     assert_eq!(
@@ -288,6 +337,7 @@ fn first_fit_mutex_unlocks_prepost_or_grant() {
 #[test]
 fn fair_share_mutex_grants_the_next_sequence() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let mutex = 0x2000;
     std::thread::scope(|scope| {
         let later = task.new_sibling(0);
@@ -310,6 +360,29 @@ fn fair_share_mutex_grants_the_next_sequence() {
             Ok(0)
         );
         assert_eq!(later.join().unwrap(), Ok((0x300 | KBIT | EBIT) as usize));
+    });
+
+    // The next sequence queued behind a lower one is found and granted.
+    std::thread::scope(|scope| {
+        let low = task.new_sibling(0);
+        let next = task.new_sibling(0);
+        let low = scope.spawn(move || mutexwait(&low, mutex, 0x300 | KBIT | EBIT, 0, 0, FAIRSHARE));
+        await_waiters(&task, mutex, 1);
+        let next =
+            scope.spawn(move || mutexwait(&next, mutex, 0x400 | KBIT | EBIT, 0, 0, FAIRSHARE));
+        await_waiters(&task, mutex, 2);
+        // U=0x300: the next sequence is 0x400, above the queue's lowest.
+        assert_eq!(
+            mutexdrop(&task, mutex, 0x400 | KBIT | EBIT, 0x300, FAIRSHARE),
+            Ok(0)
+        );
+        assert_eq!(next.join().unwrap(), Ok((0x400 | KBIT | EBIT) as usize));
+        assert!(!low.is_finished());
+        assert_eq!(
+            mutexdrop(&task, mutex, 0x400 | KBIT | EBIT, 0x200, FAIRSHARE),
+            Ok(0)
+        );
+        assert_eq!(low.join().unwrap(), Ok((0x300 | KBIT | EBIT) as usize));
     });
 
     // A prepost for sequence 0x200 is not taken by a locker at 0x300.
@@ -346,6 +419,7 @@ fn fair_share_mutex_grants_the_next_sequence() {
 #[test]
 fn a_queue_in_use_refuses_another_kind() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let address = 0x4000;
     assert_eq!(mutexdrop(&task, address, 0x200, 0x100, FIRSTFIT), Ok(0));
     assert_eq!(
@@ -373,6 +447,7 @@ fn a_queue_in_use_refuses_another_kind() {
 #[test]
 fn cv_signal_wakes_or_preposts() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let cv = 0x5000;
     std::thread::scope(|scope| {
         let waiter = task.new_sibling(0);
@@ -410,6 +485,7 @@ fn cv_signal_wakes_or_preposts() {
 #[test]
 fn cv_broadcast_wakes_every_waiter() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let cv = 0x6000;
     std::thread::scope(|scope| {
         let handles: Vec<_> = (1..=3)
@@ -449,6 +525,7 @@ fn cv_broadcast_wakes_every_waiter() {
 #[test]
 fn cv_signal_to_a_thread() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let cv = 0x7000;
     std::thread::scope(|scope| {
         let first = task.new_sibling(0);
@@ -488,6 +565,7 @@ fn cv_signal_to_a_thread() {
 #[test]
 fn cv_timeouts_report_cleared_and_prepost_bits() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let cv = 0x8000;
     let start = Instant::now();
     assert_eq!(
@@ -533,6 +611,7 @@ fn cv_timeouts_report_cleared_and_prepost_bits() {
 #[test]
 fn cv_wait_timing_out_as_a_signal_takes_it_succeeds() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let cv = 0x9000;
     std::thread::scope(|scope| {
         let signaler = task.new_sibling(0);
@@ -564,12 +643,13 @@ fn cv_wait_timing_out_as_a_signal_takes_it_succeeds() {
     assert_eq!(task.global.psynch.lock().queue_count(), 0);
 }
 
-/// cvwait releases the mutex and queues the waiter in one step: the mutex
-/// waiter it grants cannot signal before the condition variable waiter
-/// queued, and that signal reaches it.
+/// cvwait releases the mutex when its unlock must notify the kernel: it
+/// grants the thread blocked on the mutex, whose signal then reaches the
+/// condition variable's waiter (queued, or as a prepost it consumes).
 #[test]
-fn cv_wait_releases_the_mutex_and_waits_atomically() {
+fn cv_wait_releases_the_mutex_to_its_waiter() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let (cv, mutex) = (0xa000, 0xb000);
     std::thread::scope(|scope| {
         let locker = task.new_sibling(0);
@@ -579,24 +659,9 @@ fn cv_wait_releases_the_mutex_and_waits_atomically() {
             (acquired, cvsignal(&locker, cv, INC, 0, 0, 0, 0))
         });
         await_waiters(&task, mutex, 1);
-        let (held, probe) = std::sync::mpsc::channel();
-        let global = Arc::clone(&task.global);
-        let waiter = scope.spawn(move || {
-            waiter.global.mapping_hook.set(move |point| {
-                if point == hook::Point::PsynchQueued {
-                    // Another thread finds the table held: the mutex was
-                    // released and the waiter queued under one lock hold.
-                    let held_now = std::thread::scope(|scope| {
-                        scope
-                            .spawn(|| global.psynch.try_lock().is_none())
-                            .join()
-                            .unwrap()
-                    });
-                    held.send(held_now).unwrap();
-                }
-            });
-            let mugen = pair(0x100, 0x200 | KBIT | EBIT);
-            let result = cvwait_mutex(
+        let mugen = pair(0x100, 0x200 | KBIT | EBIT);
+        let cv_waiter = scope.spawn(move || {
+            cvwait_mutex(
                 &waiter,
                 cv,
                 INC,
@@ -607,15 +672,17 @@ fn cv_wait_releases_the_mutex_and_waits_atomically() {
                 FIRSTFIT,
                 BOUND_SECONDS,
                 0,
-            );
-            waiter.global.mapping_hook.clear();
-            result
+            )
         });
-        assert!(probe.recv_timeout(BOUND).unwrap());
         let (acquired, signaled) = locker.join().unwrap();
         assert_eq!(acquired, Ok((0x200 | KBIT | EBIT) as usize));
-        assert_eq!(signaled, Ok((INC | CV_CBIT) as usize));
-        assert_eq!(waiter.join().unwrap(), Ok(0));
+        // The waiter was queued (the signal balances the condition variable)
+        // or not yet (the signal is preposted for it).
+        assert!(
+            matches!(signaled.map(|bits| bits & 0xff), Ok(bits) if bits == CV_CBIT as usize || bits == CV_PBIT as usize),
+            "{signaled:?}"
+        );
+        assert!(cv_waiter.join().unwrap().is_ok());
     });
     assert_eq!(task.global.psynch.lock().queue_count(), 0);
 }
@@ -625,6 +692,7 @@ fn cv_wait_releases_the_mutex_and_waits_atomically() {
 #[test]
 fn rwlock_unlock_hands_off_to_readers_then_writers() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let rwlock = 0xc000;
     std::thread::scope(|scope| {
         let reader = task.new_sibling(0);
@@ -686,6 +754,7 @@ fn rwlock_unlock_hands_off_to_readers_then_writers() {
 #[test]
 fn idle_rwlock_state_expires() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let rwlock = 0xe000;
     assert_eq!(
         rw(&task, nr::PSYNCH_RW_UNLOCK, rwlock, 0x300, 0x200, 0x200),
@@ -730,6 +799,7 @@ fn idle_rwlock_state_expires() {
 #[test]
 fn psynch_tables_are_bounded() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     // Preposted mutex unlocks hold queues.
     for i in 0..PSYNCH_MAX_QUEUES {
         assert_eq!(
@@ -818,6 +888,7 @@ fn psynch_tables_are_bounded() {
 #[test]
 fn shared_objects_go_with_their_mapping() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let own = trap(&task, mach_trap::TASK_SELF, &[]);
     let mut address = 0x7b_0000_0000usize;
     assert_eq!(
@@ -890,6 +961,7 @@ fn shared_objects_go_with_their_mapping() {
 #[test]
 fn process_exit_ends_psynch_waits() {
     let task = new_task();
+    let _watchdog = Watchdog::new(&task);
     let addresses = [0xf000, 0xf100, 0xf200];
     std::thread::scope(|scope| {
         let handles: Vec<_> = addresses

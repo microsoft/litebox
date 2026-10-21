@@ -620,6 +620,26 @@ impl<P: ShimPlatform> PsynchTable<P> {
         self.fakes.0
     }
 
+    /// Wake every blocked thread with a zero grant; returns how many.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn release_all_waiters(&mut self) -> usize {
+        let mut released = 0;
+        for kwq in self.queues.values_mut() {
+            for which in [QueueKind::Read, QueueKind::Write] {
+                while let Some(index) = kwq
+                    .queue(which)
+                    .entries
+                    .iter()
+                    .position(|kwe| kwe.state == KweState::InWait)
+                {
+                    kwq.signal(which, index, 0);
+                    released += 1;
+                }
+            }
+        }
+        released
+    }
+
     /// Move every idle queue's release `ticks` into the past.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn age_idle_queues(&mut self, ticks: u64) {
@@ -1013,10 +1033,6 @@ impl<P: ShimPlatform> Task<P> {
         if let Err(error) = table.kwq(key).insert(which, kwe, firstfit) {
             return (table, Blocking::Refused(error));
         }
-        #[cfg(all(test, target_os = "macos"))]
-        self.global
-            .mapping_hook
-            .reach(crate::syscalls::mm::hook::Point::PsynchQueued);
         drop(table);
         let result = self.wait_for_wakeup(&blocked.waiter, timeout, cancel);
         #[cfg(all(test, target_os = "macos"))]

@@ -100,9 +100,6 @@ pub(crate) mod hook {
         /// A ulock wait or wake validated its arguments and has not locked
         /// the ulock table yet.
         UlockLookup,
-        /// A psynch call queued its thread and has not released the table
-        /// to block yet.
-        PsynchQueued,
         /// A blocked psynch call's wait ended and it has not locked the
         /// table again yet.
         PsynchWaited,
