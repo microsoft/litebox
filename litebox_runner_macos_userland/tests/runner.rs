@@ -1405,3 +1405,106 @@ fn threads_use_cpp_std_mutex_and_condition_variable() {
         )
     );
 }
+
+/// The scenarios of `fixtures/sync.c`.
+#[cfg(feature = "test-broker")]
+fn run_sync_scenario(scenario: &str) -> (Option<i32>, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "sync.c",
+        include_str!("fixtures/sync.c"),
+        &["-O1"],
+    );
+    let (code, stdout, stderr) = run_runner_with_timeout(&[binary.to_str().unwrap(), scenario]);
+    (code, String::from_utf8(stdout).unwrap(), stderr)
+}
+
+/// `pthread_join` of threads on stacks the program allocated: the joiner
+/// waits on the semaphore `bsdthread_terminate` signals before it frees the
+/// stack.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_join_threads_with_custom_stacks() {
+    assert_eq!(
+        run_sync_scenario("custom_stack"),
+        (Some(0), "joined 64\n".to_owned(), String::new())
+    );
+}
+
+/// `dispatch_semaphore` ping-pong between two pthreads (Mach semaphores, no
+/// dispatch queues), and a timed wait that times out.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_ping_pong_on_dispatch_semaphores() {
+    assert_eq!(
+        run_sync_scenario("dispatch"),
+        (
+            Some(0),
+            "rounds 20000 timeout 1\n".to_owned(),
+            String::new()
+        )
+    );
+}
+
+/// `pthread_cancel` of threads blocked in `pthread_cond_wait` (the cleanup
+/// handler runs with the mutex reacquired) and `sleep()`, and of a thread
+/// calling `write()` in a loop.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_cancel_threads_at_cancellation_points() {
+    assert_eq!(
+        run_sync_scenario("cancel"),
+        (
+            Some(0),
+            "cond 1 cleanup 1 relocked 1 sleep 1 write 1 fast 1\n".to_owned(),
+            String::new()
+        )
+    );
+}
+
+/// `usleep`, `nanosleep` and `sleep` in threads sleep for their time.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_sleep_with_nanosleep_usleep_and_sleep() {
+    assert_eq!(
+        run_sync_scenario("sleep"),
+        (Some(0), "slept 4\n".to_owned(), String::new())
+    );
+}
+
+/// Mach message ping-pong between two threads: receives block until the
+/// other thread's message arrives.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_ping_pong_mach_messages() {
+    assert_eq!(
+        run_sync_scenario("mach"),
+        (Some(0), "main 10000 peer 9999\n".to_owned(), String::new())
+    );
+}
+
+/// C++ `std::async(std::launch::async)`, `std::promise` and
+/// `std::this_thread::sleep_for`.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_run_cpp_std_async() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang++",
+        "sync.cpp",
+        include_str!("fixtures/sync_cxx.h"),
+        &["-std=c++17", "-O1"],
+    );
+    let (code, stdout, stderr) = run_runner_with_timeout(&[binary.to_str().unwrap()]);
+    assert_eq!(
+        (code, String::from_utf8(stdout).unwrap(), stderr),
+        (
+            Some(0),
+            "total 31996000 promised 42 waited 1\n".to_owned(),
+            String::new()
+        )
+    );
+}

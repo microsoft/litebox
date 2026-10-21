@@ -221,8 +221,7 @@ static int rwlock_contention(void) {
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static atomic_int initialized, saw_initialized;
 
-// Holds the other callers in pthread_once's wait for a while
-// (mach_wait_until: nanosleep's __semwait_signal is not emulated yet).
+// Holds the other callers in pthread_once's wait for a while.
 static void initialize(void) {
   mach_timebase_info_data_t timebase;
   mach_timebase_info(&timebase);

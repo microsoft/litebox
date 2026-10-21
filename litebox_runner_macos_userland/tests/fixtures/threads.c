@@ -2,8 +2,9 @@
 // Licensed under the MIT license.
 
 // Guest thread scenarios for the runner's end-to-end tests, selected by argv[1].
-// pthread mutexes, condition variables and rwlocks are exercised by psynch.c.
-// Delays use mach_wait_until: nanosleep's __semwait_signal is not emulated yet.
+// pthread mutexes, condition variables and rwlocks are exercised by psynch.c,
+// and sleeps, semaphores, cancellation and Mach messages by sync.c.
+// Delays use mach_wait_until.
 
 #include <errno.h>
 #include <mach/mach.h>
