@@ -17,7 +17,9 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
-use crate::syscalls::mm::{self, MemoryType, PageProtection};
+use crate::syscalls::mm::{
+    self, MemoryType, PageProtection, record_allocation, record_committed_allocation,
+};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task, WindowsSectionView};
 
@@ -626,7 +628,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
         } else {
-            vmem.allocations_mut().remove(&view_base);
+            vmem.remove_allocation(view_base);
         }
         NtStatus::SUCCESS
     }
@@ -805,21 +807,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 section: Some(Arc::clone(section)),
             },
         );
-        self.global
-            .page_manager
-            .write_vmem()
-            .allocations_mut()
-            .insert(
-                base,
-                crate::WindowsVirtualAllocation::new(
-                    base,
-                    mapped_size,
-                    MemoryType::MEM_MAPPED,
-                    section.protection,
-                    crate::WindowsPlaceholderState::None,
-                    (!is_reserved).then_some(page_protection),
-                ),
-            );
+        record_allocation(
+            &self.global.page_manager,
+            base,
+            mapped_size,
+            MemoryType::MEM_MAPPED,
+            section.protection,
+            (!is_reserved).then_some(page_protection),
+        );
         Ok(MappedPagefileSectionView { base, view_size })
     }
 
@@ -901,23 +896,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 section: Some(Arc::clone(section)),
             },
         );
-        self.global
-            .page_manager
-            .write_vmem()
-            .allocations_mut()
-            .insert(
-                base,
-                // TODO(section-subsystem): honor per-view CSR protections only after
-                // the backing is no longer aliased by PEB direct-deref pointers.
-                crate::WindowsVirtualAllocation::new(
-                    base,
-                    mapped_size,
-                    MemoryType::MEM_MAPPED,
-                    section.protection,
-                    crate::WindowsPlaceholderState::None,
-                    Some(section.protection),
-                ),
-            );
+        // TODO(section-subsystem): honor per-view CSR protections only after
+        // the backing is no longer aliased by PEB direct-deref pointers.
+        record_committed_allocation(
+            &self.global.page_manager,
+            base,
+            mapped_size,
+            MemoryType::MEM_MAPPED,
+            section.protection,
+        );
         NtStatus::SUCCESS
     }
 
@@ -1593,8 +1580,7 @@ mod tests {
             task.global
                 .page_manager
                 .read_vmem()
-                .allocations()
-                .values()
+                .allocations_in(..)
                 .filter(|allocation| allocation.type_ == MemoryType::MEM_IMAGE)
                 .count()
         };
@@ -2025,12 +2011,11 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert!(
-            !task
-                .global
+            task.global
                 .page_manager
                 .read_vmem()
-                .allocations()
-                .contains_key(&base)
+                .allocation_at(base)
+                .is_none()
         );
     }
 

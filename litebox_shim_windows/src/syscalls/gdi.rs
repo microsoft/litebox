@@ -125,7 +125,12 @@ mod tests {
             let task = crate::tests::test_task_with_random();
             let snapshot = || {
                 let vmem = task.global.page_manager.read_vmem();
-                (vmem.allocations().clone(), vmem.mappings().clone())
+                (
+                    vmem.allocations_in(..)
+                        .cloned()
+                        .collect::<alloc::vec::Vec<_>>(),
+                    vmem.mappings().clone(),
+                )
             };
             let before = snapshot();
             assert_eq!(task.sys_nt_gdi_init2(), 0);

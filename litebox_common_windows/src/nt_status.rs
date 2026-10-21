@@ -522,7 +522,7 @@ impl NtStatus {
     /// STATUS_SERVER_DISABLED
     pub const SERVER_DISABLED: Self = Self::from_raw(0xC0000080);
 
-    /// STATUS_MEMORY_NOT_ALLOCATED
+    /// STATUS_MEMORY_NOT_ALLOCATED: the address does not lie within any allocated region.
     pub const MEMORY_NOT_ALLOCATED: Self = Self::from_raw(0xC00000A0);
 
     /// STATUS_MEDIA_WRITE_PROTECTED

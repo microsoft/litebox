@@ -102,6 +102,8 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         } else {
             0
         };
+        // SAFETY: `range` is a nonempty, aligned request; any extent VirtualAlloc2 returns is
+        // freshly allocated and exclusively owned by this call.
         let reserve = |address| unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
@@ -129,7 +131,13 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         let extent = base..base + range.len();
         if matches!(kind, NativeReservation::Mergeable) && !Self::replace_placeholder(&extent) {
             // SAFETY: The placeholder was just created by this call and has no other users.
-            unsafe { VirtualFree(ptr, 0, Win32_Memory::MEM_RELEASE) };
+            let freed = unsafe { VirtualFree(ptr, 0, Win32_Memory::MEM_RELEASE) };
+            debug_assert_ne!(
+                freed,
+                0,
+                "VirtualFree(RELEASE) of an unreplaced placeholder failed: {}",
+                std::io::Error::last_os_error()
+            );
             return Err(AllocationError::OutOfMemory);
         }
         // SAFETY: VirtualAlloc2 successfully returned exclusive ownership of this aligned extent.
@@ -371,6 +379,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         // Native allocations cannot be joined directly: convert each uncommitted piece back to a
         // placeholder, coalesce the placeholders, and replace the result with one reservation.
         // The address range stays owned by placeholders throughout, so nothing can claim it.
+        // Check contiguity before the first irreversible placeholder conversion.
+        assert!(
+            reservations
+                .windows(2)
+                .all(|pair| pair[0].range().end == pair[1].range().start),
+            "merge_reservations requires ascending, contiguous reservations"
+        );
         for reservation in &reservations {
             let extent = reservation.range();
             assert_ne!(
@@ -694,6 +709,98 @@ mod tests {
         // SAFETY: The merged reservation is unused after the checks above.
         unsafe { <Provider as PageManagementProvider<PAGE_SIZE>>::release_pages(platform, merged) }
             .unwrap();
+        assert_eq!(
+            collect_regions(base..base + 3 * UNIT),
+            vec![(base..base + 3 * UNIT, Win32_Memory::MEM_FREE)]
+        );
+    }
+
+    #[test]
+    fn test_mergeable_reservation_failure_paths() {
+        type Provider = WindowsUserland;
+        const UNIT: usize = 0x1_0000;
+        let platform = WindowsUserland::new();
+        // SAFETY: The fixture retains exclusive ownership of the returned reservation.
+        let reservation = unsafe {
+            <Provider as PageManagementProvider<PAGE_SIZE>>::reserve_mergeable_pages(
+                platform,
+                core::iter::empty,
+                0..3 * UNIT,
+                false,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let base = reservation.range().start;
+
+        // A fixed mergeable reservation over owned space fails without disturbing it.
+        // SAFETY: NoReplace cannot affect the existing reservation.
+        let conflict = unsafe {
+            <Provider as PageManagementProvider<PAGE_SIZE>>::reserve_mergeable_pages(
+                platform,
+                core::iter::empty,
+                base..base + UNIT,
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        };
+        assert!(matches!(conflict, Err(AllocationError::AddressInUse)));
+        // An ordinary reservation is not a placeholder, so replacing it fails.
+        assert!(!WindowsUserland::<PAGE_SIZE>::replace_placeholder(
+            &(base..base + 3 * UNIT)
+        ));
+        assert_eq!(
+            collect_regions(base..base + 3 * UNIT),
+            vec![(base..base + 3 * UNIT, Win32_Memory::MEM_RESERVE)]
+        );
+
+        let (head, middle, tail) = reservation.split(base + UNIT..base + 2 * UNIT);
+        let (head, tail) = (head.unwrap(), tail.unwrap());
+        // SAFETY: The split handle exclusively owns the unused middle extent.
+        unsafe { <Provider as PageManagementProvider<PAGE_SIZE>>::release_pages(platform, middle) }
+            .unwrap();
+
+        // A single reservation is returned unchanged.
+        // SAFETY: The head is mergeable, uncommitted, and unused.
+        let head = unsafe {
+            <Provider as PageManagementProvider<PAGE_SIZE>>::merge_reservations(
+                platform,
+                vec![head],
+            )
+        };
+        assert_eq!(head.range(), base..base + UNIT);
+
+        // Non-contiguous pieces are rejected before any is converted to a placeholder.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: Deliberately violates contiguity to exercise the up-front check.
+            unsafe {
+                <Provider as PageManagementProvider<PAGE_SIZE>>::merge_reservations(
+                    platform,
+                    vec![head, tail],
+                )
+            }
+        }));
+        assert!(result.is_err());
+        for start in [base, base + 2 * UNIT] {
+            // Committing fails on a placeholder, so success proves the piece is still reserved.
+            // SAFETY: The fixture owns this unused extent.
+            let committed = unsafe {
+                VirtualAlloc2(
+                    GetCurrentProcess(),
+                    start as *mut c_void,
+                    UNIT,
+                    Win32_Memory::MEM_COMMIT,
+                    Win32_Memory::PAGE_READWRITE,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(committed as usize, start);
+            // SAFETY: The fixture owns this extent, whose handle was consumed by the panic.
+            let piece =
+                unsafe { WindowsUserlandReservation::<PAGE_SIZE>::new(start..start + UNIT) };
+            WindowsUserland::<PAGE_SIZE>::release_reservation(piece);
+        }
         assert_eq!(
             collect_regions(base..base + 3 * UNIT),
             vec![(base..base + 3 * UNIT, Win32_Memory::MEM_FREE)]

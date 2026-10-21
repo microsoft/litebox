@@ -1196,7 +1196,15 @@ impl<Platform: crate::ShimPlatform> PeImageMapper<'_, Platform> {
         };
         // SAFETY: The image failed to load before its base was returned, so nothing references
         // the reserved pages.
-        let _ = unsafe { self.page_manager.write_vmem().release_allocation(base, len) };
+        if let Err(error) = unsafe { self.page_manager.write_vmem().release_allocation(base, len) }
+        {
+            litebox_util_log::warn!(
+                error:? = error,
+                base:% = format_args!("{base:#x}"),
+                len:% = format_args!("{len:#x}");
+                "Failed to release partially loaded image"
+            );
+        }
     }
 
     /// Applies `prot` to the pages and records the matching Windows protection under one
@@ -1221,14 +1229,15 @@ impl<Platform: crate::ShimPlatform> PeImageMapper<'_, Platform> {
         // until protections are set, so this is no looser than running the same PE under the
         // real Windows loader.
         unsafe { vmem.protect_pages(ptr, len, loader_permissions(prot)) }?;
-        vmem.allocations_mut()
-            .get_mut(&base)
-            .ok_or(PeImageAccessError::MemoryAccess)?
-            .page_protections
-            .insert(
-                start..start + len,
-                page_protection_from_loader_protection(prot),
-            );
+        if vmem.allocation_at(base).is_none()
+            || !vmem.set_page_protections(
+                start,
+                len,
+                Some(page_protection_from_loader_protection(prot)),
+            )
+        {
+            return Err(PeImageAccessError::MemoryAccess);
+        }
         Ok(())
     }
 }
@@ -1258,17 +1267,16 @@ impl<Platform: crate::ShimPlatform> MapMemory for PeImageMapper<'_, Platform> {
             |_| Ok(0),
         )?;
         let base = ptr.as_usize();
-        self.page_manager.write_vmem().allocations_mut().insert(
-            base,
-            crate::WindowsVirtualAllocation::new(
+        self.page_manager
+            .write_vmem()
+            .insert_allocation(crate::WindowsVirtualAllocation::new(
                 base,
                 len,
                 MemoryType::MEM_IMAGE,
                 PageProtection::PAGE_EXECUTE_WRITECOPY,
                 crate::WindowsPlaceholderState::None,
                 Some(PageProtection::PAGE_NOACCESS),
-            ),
-        );
+            ));
         self.reserved = Some((base, len));
         Ok(base)
     }
