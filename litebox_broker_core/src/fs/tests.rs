@@ -1840,8 +1840,7 @@ mod devices {
     /// Device I/O and terminal queries reach the providers the backend was built with.
     #[test]
     fn devices_use_their_providers() {
-        let provider =
-            Arc::new(TestStdioProvider::default().with_uncontrolled_terminal(StdioStream::Stdout));
+        let provider = Arc::new(TestStdioProvider::default());
         let fs = devices_fs(provider.clone());
 
         let mut stdout = fs
@@ -1875,25 +1874,19 @@ mod devices {
         assert!(matches!(fs.read(&mut urandom, &mut buffer, None), Ok(4)));
         assert_eq!(buffer, [0x5a; 4]);
 
-        assert!(fs.is_terminal(&stdout));
-        assert!(!fs.is_terminal(&stderr));
-        assert!(!fs.is_terminal(&stdin));
-        assert!(!fs.is_terminal(&urandom));
-        let stdout_path = fs
-            .open(USER, "/dev/stdout", OFlags::PATH, Mode::empty())
-            .expect("Failed to open /dev/stdout with O_PATH");
-        assert!(!fs.is_terminal(&stdout_path));
+        for file in [&stdin, &stdout, &stderr, &urandom] {
+            assert!(fs.terminal(file).is_none());
+        }
     }
 
-    /// `/dev/tty` and terminal-backed standard streams share the terminal
-    /// endpoint's I/O.
+    /// `/dev/tty` and the standard streams referring to the guest terminal
+    /// share its endpoint's I/O; other streams go to the host streams.
     #[test]
     fn terminal_devices_use_the_terminal_endpoint() {
         let provider = Arc::new(
             TestStdioProvider::default()
                 .with_terminal(StdioStream::Stdin)
-                .with_terminal(StdioStream::Stdout)
-                .with_controlling_terminal(),
+                .with_terminal(StdioStream::Stdout),
         );
         let fs = devices_fs(provider.clone());
 
@@ -1906,15 +1899,29 @@ mod devices {
         let mut stdout = fs
             .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
-        assert!(fs.is_terminal(&tty));
+        let mut stderr = fs
+            .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stderr");
+        for file in [&tty, &stdin, &stdout] {
+            assert!(fs.terminal(file).is_some());
+        }
+        assert!(fs.terminal(&stderr).is_none());
+        let stdout_path = fs
+            .open(USER, "/dev/stdout", OFlags::PATH, Mode::empty())
+            .expect("Failed to open /dev/stdout with O_PATH");
+        assert!(fs.terminal(&stdout_path).is_none());
 
         assert!(matches!(fs.write(&mut tty, b"tty", None), Ok(3)));
         assert!(matches!(fs.write(&mut stdout, b"out", None), Ok(3)));
+        assert!(matches!(fs.write(&mut stderr, b"err", None), Ok(3)));
         assert_eq!(
             provider.terminal_writes(),
             vec![b"tty".to_vec(), b"out".to_vec()]
         );
-        assert_eq!(provider.writes(), vec![]);
+        assert_eq!(
+            provider.writes(),
+            vec![(StdioOutputStream::Stderr, b"err".to_vec())]
+        );
 
         provider.push_terminal_input(b"line");
         let mut buffer = [0; 2];
@@ -1924,13 +1931,29 @@ mod devices {
         assert_eq!(&buffer, b"ne");
     }
 
-    /// Without a controlling terminal, `/dev/tty` exists but cannot be opened
-    /// for I/O.
+    /// The guest terminal stays reachable through `/dev/tty` when no standard
+    /// stream refers to it.
     #[test]
-    fn tty_without_controlling_terminal() {
-        let fs = devices_fs(Arc::new(
-            TestStdioProvider::default().with_terminal(StdioStream::Stdout),
-        ));
+    fn tty_without_terminal_streams() {
+        let provider = Arc::new(TestStdioProvider::default().with_controlling_terminal());
+        let fs = devices_fs(provider.clone());
+
+        let mut tty = fs
+            .open(USER, "/dev/tty", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/tty");
+        assert!(fs.terminal(&tty).is_some());
+        assert!(matches!(fs.write(&mut tty, b"tty", None), Ok(3)));
+        let stdout = fs
+            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stdout");
+        assert!(fs.terminal(&stdout).is_none());
+        assert_eq!(provider.terminal_writes(), vec![b"tty".to_vec()]);
+    }
+
+    /// Without a terminal, `/dev/tty` exists but cannot be opened for I/O.
+    #[test]
+    fn tty_without_terminal() {
+        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
 
         assert!(matches!(
             fs.open(USER, "/dev/tty", OFlags::RDWR, Mode::empty()),
@@ -1939,7 +1962,7 @@ mod devices {
         let tty = fs
             .open(USER, "/dev/tty", OFlags::PATH, Mode::empty())
             .expect("Failed to open /dev/tty with O_PATH");
-        assert!(!fs.is_terminal(&tty));
+        assert!(fs.terminal(&tty).is_none());
 
         let status = fs
             .file_status(USER, "/dev/tty", true)

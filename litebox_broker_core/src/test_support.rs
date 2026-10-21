@@ -15,7 +15,7 @@ use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{ReceiveFlags, ReceiveFromFlags, SocketOutcome};
 use litebox_broker_protocol::terminal::{
-    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
+    TerminalEvents, TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
 };
 use litebox_platform::buffer::{Buffer, Fault, RawBytes, ReadBuffer, WriteBuffer};
 use spin::Mutex;
@@ -124,21 +124,18 @@ impl RandomProvider for FailingRandomProvider {
 
 /// Functional standard-I/O provider for tests.
 ///
-/// Reads drain buffered input, and writes and terminal queries are recorded.
-/// Reads of empty input report end-of-file unless [`Self::with_open_input`]
-/// keeps standard input open. Streams marked with [`Self::with_terminal`]
-/// share one terminal endpoint, whose I/O
-/// [`Self::push_terminal_input`] and [`Self::terminal_writes`] drive.
+/// Reads drain buffered input, and writes are recorded. Reads of empty input
+/// report end-of-file unless [`Self::with_open_input`] keeps standard input
+/// open. The guest terminal, which streams marked with [`Self::with_terminal`]
+/// refer to, has I/O that [`Self::push_terminal_input`] and
+/// [`Self::terminal_writes`] drive.
 pub struct TestStdioProvider {
     input: Mutex<TestStdioInput>,
     input_watchers: Mutex<ReadinessWatchers>,
     writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
-    terminal_queries: Mutex<Vec<StdioStream>>,
-    /// Whether each stream, indexed by [`StdioStream`], is a terminal.
-    terminals: [bool; 3],
-    uncontrolled_terminal: Option<StdioStream>,
-    controlling_terminal: bool,
-    terminal: Arc<TestTerminal>,
+    /// Whether each stream, indexed by [`StdioStream`], refers to the terminal.
+    views: [bool; 3],
+    terminal: Option<Arc<TestTerminal>>,
 }
 
 impl Default for TestStdioProvider {
@@ -151,36 +148,25 @@ impl Default for TestStdioProvider {
             }),
             input_watchers: Mutex::new(ReadinessWatchers::default()),
             writes: Mutex::new(Vec::new()),
-            terminal_queries: Mutex::new(Vec::new()),
-            terminals: [false; 3],
-            uncontrolled_terminal: None,
-            controlling_terminal: false,
-            terminal: Arc::new(TestTerminal::default()),
+            views: [false; 3],
+            terminal: None,
         }
     }
 }
 
 impl TestStdioProvider {
-    /// Marks `stream` as connected to a terminal.
+    /// Makes `stream` refer to the guest terminal.
     #[must_use]
-    pub const fn with_terminal(mut self, stream: StdioStream) -> Self {
-        self.terminals[stream as usize] = true;
-        self
+    pub fn with_terminal(mut self, stream: StdioStream) -> Self {
+        self.views[stream as usize] = true;
+        self.with_controlling_terminal()
     }
 
-    /// Marks `stream` as connected to a terminal without an endpoint, like a
-    /// host terminal the provider cannot take over.
+    /// Gives the guest a terminal, which no stream refers to unless marked
+    /// with [`Self::with_terminal`].
     #[must_use]
-    pub const fn with_uncontrolled_terminal(mut self, stream: StdioStream) -> Self {
-        self.uncontrolled_terminal = Some(stream);
-        self.with_terminal(stream)
-    }
-
-    /// Serves the terminal endpoint as the controlling terminal behind
-    /// `/dev/tty`.
-    #[must_use]
-    pub const fn with_controlling_terminal(mut self) -> Self {
-        self.controlling_terminal = true;
+    pub fn with_controlling_terminal(mut self) -> Self {
+        self.terminal.get_or_insert_default();
         self
     }
 
@@ -220,14 +206,19 @@ impl TestStdioProvider {
         self.writes.lock().clone()
     }
 
-    /// Returns a snapshot of the recorded terminal queries.
-    pub fn terminal_queries(&self) -> Vec<StdioStream> {
-        self.terminal_queries.lock().clone()
+    fn test_terminal(&self) -> &TestTerminal {
+        self.terminal
+            .as_deref()
+            .expect("the test provider has no terminal")
     }
 
     /// Appends bytes that subsequent terminal endpoint reads will drain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the provider has no terminal.
     pub fn push_terminal_input(&self, input: &[u8]) {
-        let mut state = self.terminal.0.lock();
+        let mut state = self.test_terminal().0.lock();
         state.input.extend(input.iter().copied());
         state
             .watchers
@@ -235,21 +226,35 @@ impl TestStdioProvider {
     }
 
     /// Returns a snapshot of the recorded terminal endpoint writes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the provider has no terminal.
     pub fn terminal_writes(&self) -> Vec<Vec<u8>> {
-        self.terminal.0.lock().writes.clone()
+        self.test_terminal().0.lock().writes.clone()
+    }
+
+    /// Posts `events` from the terminal to the process group attached to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the provider has no terminal or none is attached.
+    pub fn post_terminal_events(&self, events: TerminalEvents) {
+        let sink = self.test_terminal().0.lock().sink.clone();
+        sink.expect("no process group is attached to the terminal")
+            .post(events);
     }
 }
 
 impl StdioProvider for TestStdioProvider {
-    fn terminal(&self, stream: StdioStream) -> Option<Arc<dyn TerminalEndpoint>> {
-        let connected =
-            self.terminals[stream as usize] && self.uncontrolled_terminal != Some(stream);
-        connected.then(|| Arc::clone(&self.terminal) as Arc<dyn TerminalEndpoint>)
+    fn terminal(&self) -> Option<Arc<dyn TerminalEndpoint>> {
+        self.terminal
+            .clone()
+            .map(|terminal| terminal as Arc<dyn TerminalEndpoint>)
     }
 
-    fn controlling_terminal(&self) -> Option<Arc<dyn TerminalEndpoint>> {
-        self.controlling_terminal
-            .then(|| Arc::clone(&self.terminal) as Arc<dyn TerminalEndpoint>)
+    fn is_terminal(&self, stream: StdioStream) -> bool {
+        self.views[stream as usize]
     }
 
     fn read(&self, output: &mut dyn ReadBuffer) -> core::result::Result<usize, StdioProviderError> {
@@ -272,11 +277,6 @@ impl StdioProvider for TestStdioProvider {
         input.copy_to_slice_at(0, &mut data)?;
         self.writes.lock().push((stream, data));
         Ok(input.len())
-    }
-
-    fn is_terminal(&self, stream: StdioStream) -> bool {
-        self.terminal_queries.lock().push(stream);
-        self.terminals[stream as usize]
     }
 
     fn readiness(&self, stream: StdioStream) -> ReadinessFlags {
@@ -319,6 +319,7 @@ struct TestTerminalState {
     input: VecDeque<u8>,
     writes: Vec<Vec<u8>>,
     watchers: ReadinessWatchers,
+    sink: Option<Arc<dyn TerminalEventSink>>,
 }
 
 impl ReadinessSource for TestTerminal {
@@ -352,7 +353,9 @@ impl TerminalEndpoint for TestTerminal {
         Ok(input.len())
     }
 
-    fn attach(&self, _sink: Arc<dyn TerminalEventSink>) {}
+    fn attach(&self, sink: Arc<dyn TerminalEventSink>) {
+        self.0.lock().sink.get_or_insert(sink);
+    }
 
     fn control(&self, operation: TerminalOperation) -> Result<FileResult<TerminalResponse>> {
         let mut state = self.0.lock();

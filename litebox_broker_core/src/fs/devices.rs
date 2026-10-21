@@ -173,10 +173,10 @@ impl Devices {
 
     /// Terminal endpoint behind `device`, through which its I/O goes.
     fn endpoint(&self, device: Device) -> Option<Arc<dyn TerminalEndpoint>> {
-        match device {
-            Device::Tty => self.stdio.controlling_terminal(),
-            _ => self.stdio.terminal(device.stdio_stream()?),
+        if device != Device::Tty && !self.stdio.is_terminal(device.stdio_stream()?) {
+            return None;
         }
+        self.stdio.terminal()
     }
 }
 
@@ -294,9 +294,7 @@ impl Backend for Devices {
         }
 
         // Like Linux, only opening the device itself needs a controlling terminal.
-        if device == Device::Tty
-            && !flags.contains(OFlags::PATH)
-            && self.stdio.controlling_terminal().is_none()
+        if device == Device::Tty && !flags.contains(OFlags::PATH) && self.stdio.terminal().is_none()
         {
             return Err(OpenError::NoSuchDevice);
         }
@@ -387,15 +385,6 @@ impl Backend for Devices {
                 SeekBehavior::NonSeekable
             }
             Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
-        }
-    }
-
-    fn is_terminal(&self, h: &FileHandle) -> bool {
-        match h.get_typed::<Self>().device {
-            Device::Tty => true,
-            device => device
-                .stdio_stream()
-                .is_some_and(|stream| self.stdio.is_terminal(stream)),
         }
     }
 

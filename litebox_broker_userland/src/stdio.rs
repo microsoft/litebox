@@ -42,7 +42,10 @@ const ATOMIC_WRITE_SIZE: usize = 4096;
 pub struct UserlandStdioProvider {
     input: Arc<HostIo<InputState>>,
     output: Arc<HostIo<OutputState>>,
-    terminals: [Option<Arc<HostTerminal>>; 3],
+    terminal: Option<Arc<HostTerminal>>,
+    /// Whether each standard stream, indexed by [`StdioStream`], refers to
+    /// `terminal`.
+    views: [bool; 3],
 }
 
 impl Default for UserlandStdioProvider {
@@ -52,70 +55,50 @@ impl Default for UserlandStdioProvider {
 }
 
 impl UserlandStdioProvider {
-    /// Opens the host terminal behind the inherited standard input and output
-    /// in raw mode. Streams not referring to it, and all streams unless
-    /// standard input and output share a terminal the broker can take over,
-    /// keep the ordinary stdio path. Call
-    /// [`close_terminals`](Self::close_terminals) to restore the terminal.
+    /// Opens the broker's host controlling terminal in raw mode as the guest's
+    /// terminal if the broker can emulate it alone, as
+    /// [`open_controlling_terminal`] decides; otherwise the guest has no
+    /// terminal. Call [`close_terminal`](Self::close_terminal) to restore it.
+    ///
+    /// [`open_controlling_terminal`]: litebox_broker_platform_linux_userland::terminal::open_controlling_terminal
     // Only Linux hosts have a terminal transport so far; other hosts pass
     // their standard streams through without terminal control until support
     // for them is added.
     #[cfg(target_os = "linux")]
-    pub fn open_terminals() -> std::io::Result<Self> {
-        let transports =
-            match litebox_broker_platform_linux_userland::terminal::open_stdio_terminals() {
-                Ok(transports) => transports.map(|transport| {
-                    transport.map(|transport| transport as Arc<dyn TerminalTransport>)
-                }),
-                Err(error) => {
-                    // For example, a terminal owned by another user after `su`.
-                    litebox_util_log::warn!(
-                        error:% = error;
-                        "serving the standard streams without terminal control"
-                    );
-                    Default::default()
-                }
-            };
-        Self::with_terminals(transports)
+    pub fn open_terminal() -> std::io::Result<Self> {
+        match litebox_broker_platform_linux_userland::terminal::open_controlling_terminal() {
+            Ok(Some((transport, views))) => Self::with_terminal(Arc::new(transport), views),
+            Ok(None) => Ok(Self::default()),
+            Err(error) => {
+                litebox_util_log::warn!(
+                    error:% = error;
+                    "serving the guest without a terminal"
+                );
+                Ok(Self::default())
+            }
+        }
     }
 
-    /// Serves the standard streams with host terminals in place of
-    /// `transports`, indexed standard input, output, and error. Streams sharing
-    /// a transport share one terminal.
-    pub fn with_terminals(
-        transports: [Option<Arc<dyn TerminalTransport>>; 3],
+    /// Serves `transport` as the guest's terminal, with `views` marking the
+    /// standard streams, indexed by [`StdioStream`], that refer to it.
+    pub fn with_terminal(
+        transport: Arc<dyn TerminalTransport>,
+        views: [bool; 3],
     ) -> std::io::Result<Self> {
-        let mut provider = Self::default();
-        for (index, transport) in transports.iter().enumerate() {
-            let Some(transport) = transport else {
-                continue;
-            };
-            let existing = transports[..index]
-                .iter()
-                .zip(&provider.terminals)
-                .find_map(|(other, terminal)| {
-                    other
-                        .as_ref()
-                        .filter(|other| Arc::ptr_eq(other, transport))
-                        .and(terminal.clone())
-                });
-            provider.terminals[index] = Some(match existing {
-                Some(terminal) => terminal,
-                None => Arc::new(HostTerminal::new(Arc::clone(transport))?),
-            });
-        }
-        Ok(provider)
+        Ok(Self {
+            terminal: Some(Arc::new(HostTerminal::new(transport)?)),
+            views,
+            ..Self::default()
+        })
     }
 
     /// Drains terminal output and restores host terminal settings. Detached
-    /// broker threads may still hold the terminals at exit, so restoration
+    /// broker threads may still hold the terminal at exit, so restoration
     /// cannot be left to `Drop`.
-    pub fn close_terminals(&self) -> std::io::Result<()> {
-        let mut result = Ok(());
-        for terminal in self.terminals.iter().flatten() {
-            result = result.and(terminal.close());
-        }
-        result
+    pub fn close_terminal(&self) -> std::io::Result<()> {
+        self.terminal
+            .as_ref()
+            .map_or(Ok(()), |terminal| terminal.close())
     }
 
     fn with_host(
@@ -124,7 +107,8 @@ impl UserlandStdioProvider {
         stderr: impl Write + Send + 'static,
     ) -> Self {
         Self {
-            terminals: Default::default(),
+            terminal: None,
+            views: [false; 3],
             input: Arc::new(HostIo::new(InputState {
                 host: Some(Box::new(stdin)),
                 data: VecDeque::new(),
@@ -172,36 +156,14 @@ impl UserlandStdioProvider {
 }
 
 impl StdioProvider for UserlandStdioProvider {
-    fn terminal(&self, stream: StdioStream) -> Option<Arc<dyn TerminalEndpoint>> {
-        let index = match stream {
-            StdioStream::Stdin => 0,
-            StdioStream::Stdout => 1,
-            StdioStream::Stderr => 2,
-        };
-        self.terminals[index]
-            .as_ref()
-            .map(|terminal| Arc::clone(terminal) as Arc<dyn TerminalEndpoint>)
-    }
-
-    /// The terminal standard input and output share, which is the only one
-    /// [`open_terminals`](Self::open_terminals) takes over.
-    fn controlling_terminal(&self) -> Option<Arc<dyn TerminalEndpoint>> {
-        match &self.terminals {
-            [Some(input), Some(output), _] if Arc::ptr_eq(input, output) => {
-                Some(Arc::clone(input) as Arc<dyn TerminalEndpoint>)
-            }
-            _ => None,
-        }
+    fn terminal(&self) -> Option<Arc<dyn TerminalEndpoint>> {
+        self.terminal
+            .clone()
+            .map(|terminal| terminal as Arc<dyn TerminalEndpoint>)
     }
 
     fn is_terminal(&self, stream: StdioStream) -> bool {
-        use std::io::IsTerminal as _;
-
-        match stream {
-            StdioStream::Stdin => std::io::stdin().is_terminal(),
-            StdioStream::Stdout => std::io::stdout().is_terminal(),
-            StdioStream::Stderr => std::io::stderr().is_terminal(),
-        }
+        self.views[stream as usize]
     }
 
     fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize, StdioProviderError> {

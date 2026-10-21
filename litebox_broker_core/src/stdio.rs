@@ -63,22 +63,22 @@ impl From<Fault> for StdioProviderError {
 /// [`StdioProviderError::WouldBlock`], and the provider later publishes the
 /// stream's readiness to its watchers. Providers whose operations always make
 /// progress can keep the default readiness methods.
+///
+/// A provider gives the guest at most one terminal, its controlling terminal
+/// behind `/dev/tty`. Each standard stream that refers to it is a view of it,
+/// whose reads, writes, and readiness go through the terminal instead of this
+/// provider. Without a terminal, no stream is a terminal. Neither the terminal
+/// nor which streams refer to it changes over the provider's lifetime.
 pub trait StdioProvider: Send + Sync {
-    /// Shared endpoint behind a terminal stream, if terminal control is
-    /// supported. The stream's reads, writes, and readiness then go through
-    /// the endpoint instead of this provider.
-    fn terminal(
-        &self,
-        _stream: StdioStream,
-    ) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {
+    /// The guest's terminal, if any.
+    fn terminal(&self) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {
         None
     }
 
-    /// The controlling terminal behind `/dev/tty`, if any.
-    fn controlling_terminal(
-        &self,
-    ) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {
-        None
+    /// Whether `stream` refers to [`terminal`](Self::terminal), which must
+    /// then exist.
+    fn is_terminal(&self, _stream: StdioStream) -> bool {
+        false
     }
 
     /// Reads available bytes from standard input into the start of `output`
@@ -92,10 +92,6 @@ pub trait StdioProvider: Send + Sync {
         stream: StdioOutputStream,
         input: &dyn WriteBuffer,
     ) -> core::result::Result<usize, StdioProviderError>;
-
-    /// Determines whether the selected standard stream is connected to a
-    /// terminal.
-    fn is_terminal(&self, stream: StdioStream) -> bool;
 
     /// Returns the selected stream's readiness: [`ReadinessFlags::READ`] once
     /// a standard-input read would not return
@@ -132,9 +128,5 @@ impl StdioProvider for UnsupportedStdioProvider {
         _input: &dyn WriteBuffer,
     ) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
-    }
-
-    fn is_terminal(&self, _stream: StdioStream) -> bool {
-        false
     }
 }

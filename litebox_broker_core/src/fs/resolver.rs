@@ -1187,14 +1187,6 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         self.backend.status(entry.handle.as_ref())
     }
 
-    /// Whether an open entry refers to a terminal. Path-only entries never do.
-    pub fn is_terminal(&self, entry: &ResolverEntry<Backend>) -> bool {
-        match &entry.handle {
-            Handle::File(file) if !entry.path_only => self.backend.is_terminal(file),
-            Handle::File(_) | Handle::Dir(_) => false,
-        }
-    }
-
     /// Shared terminal backing a non-path-only entry.
     pub fn terminal(
         &self,

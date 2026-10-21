@@ -205,7 +205,7 @@ mod tests {
             ("/dev/stdin", OFlags::RDONLY, Err(Errno::ENOTTY)),
             ("/dev/stdout", OFlags::WRONLY, Ok(0)),
             ("/dev/stdout", OFlags::RDONLY, Ok(0)),
-            ("/dev/stderr", OFlags::WRONLY, Ok(0)),
+            ("/dev/stderr", OFlags::WRONLY, Err(Errno::ENOTTY)),
             ("/dev/./stdout", OFlags::WRONLY, Ok(0)),
         ] {
             let fd = i32::try_from(task.sys_open(path, flags, Mode::empty()).unwrap()).unwrap();
@@ -234,27 +234,19 @@ mod tests {
         // Like Linux, the descriptor is checked before the request's argument.
         for (fd, expected) in [
             (1, Errno::EINVAL),
-            (2, Errno::EINVAL),
+            (2, Errno::ENOTTY),
             (0, Errno::ENOTTY),
             (path, Errno::EBADF),
         ] {
             assert_eq!(task.sys_ioctl(fd, IoctlArg::TCFLSH(3)), Err(expected));
         }
 
-        // A terminal the broker cannot take over keeps default settings and an unknown size.
+        // A stream not referring to the terminal accepts no terminal requests.
         let mut raw = Termios::from(TerminalSettings::default());
         raw.c_lflag = 0;
         assert_eq!(
             task.sys_ioctl(2, IoctlArg::TCSETS(UserPtr::from_ptr(&raw mut raw))),
-            Ok(0)
-        );
-        assert_eq!(
-            task.sys_ioctl(2, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios))),
-            Ok(0)
-        );
-        assert_eq!(
-            TerminalSettings::try_from(&termios),
-            Ok(TerminalSettings::default())
+            Err(Errno::ENOTTY)
         );
         let mut size = Winsize {
             row: 1,
@@ -264,9 +256,8 @@ mod tests {
         };
         assert_eq!(
             task.sys_ioctl(2, IoctlArg::TIOCGWINSZ(UserPtrMut::from_ptr(&raw mut size))),
-            Ok(0)
+            Err(Errno::ENOTTY)
         );
-        assert_eq!((size.row, size.col), (0, 0));
     }
 
     #[test]
