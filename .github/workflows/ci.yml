@@ -20,6 +20,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: 0.9.114
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   build_and_test:
