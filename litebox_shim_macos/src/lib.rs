@@ -160,7 +160,8 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 shared_cache: Mutex::new(None),
                 host_sysctls: self.host_sysctls,
                 ipc: Mutex::new(syscalls::mach_ipc::IpcSpace::default()),
-                restartable_ranges: Mutex::new(None),
+                restartable_ranges: Mutex::new(syscalls::restartable::RestartableRanges::default()),
+                restartable_ranges_registered: AtomicBool::new(false),
                 reported_unsupported: Mutex::new(alloc::collections::BTreeSet::new()),
                 reported_syscalls: Mutex::new(ReportedSyscalls::default()),
                 next_thread_id: AtomicU64::new(FIRST_THREAD_ID),
@@ -338,8 +339,10 @@ struct GlobalState<P: ShimPlatform> {
     shared_cache: Mutex<P, Option<shared_cache::SharedCacheState>>,
     host_sysctls: Vec<HostSysctl>,
     ipc: Mutex<P, syscalls::mach_ipc::IpcSpace>,
-    /// `task_restartable_ranges_register` state.
-    restartable_ranges: Mutex<P, Option<Vec<syscalls::mig::RestartableRange>>>,
+    restartable_ranges: Mutex<P, syscalls::restartable::RestartableRanges<P>>,
+    /// Whether `restartable_ranges` has ranges; set before the task has a
+    /// second thread, so every later thread sees it.
+    restartable_ranges_registered: AtomicBool,
     reported_unsupported: Mutex<P, alloc::collections::BTreeSet<&'static str>>,
     reported_syscalls: Mutex<P, ReportedSyscalls>,
     next_thread_id: AtomicU64,
@@ -444,6 +447,12 @@ struct GuestThread<P: ShimPlatform> {
     /// Interrupts the thread's waits or guest execution; set when the thread
     /// first enters the shim.
     interrupt: Mutex<P, Option<litebox::event::wait::ThreadHandle<P>>>,
+    /// `AST_RESET_PCS`: a restartable-ranges synchronize marked the thread,
+    /// which resets its PC before it next returns to the guest.
+    reset_pcs: AtomicBool,
+    /// `trr_ipi_ack_pending`: the synchronizer waits until the thread,
+    /// interrupted in the guest, has left it.
+    reset_pcs_ack: AtomicBool,
 }
 
 /// A guest thread's own state, used only by that thread.
@@ -1096,10 +1105,16 @@ impl<P: ShimPlatform> Task<P> {
         Ok(count.min(MAX_KERNEL_BUF_SIZE))
     }
 
+    /// The thread entered the shim from guest code.
+    fn leave_guest(&self) {
+        self.thread.wait_state.finish_running_guest();
+        self.acknowledge_reset_pcs();
+    }
+
     /// Whether the thread resumes the guest. Arms interruption of guest
     /// execution, so a process exit recorded from here on reaches the thread
     /// at its next shim entry.
-    fn continuation(&self, ctx: &PtRegs) -> ContinueOperation {
+    fn continuation(&self, ctx: &mut PtRegs) -> ContinueOperation {
         if self.thread.terminated.get() {
             return ContinueOperation::Terminate;
         }
@@ -1109,6 +1124,7 @@ impl<P: ShimPlatform> Task<P> {
         }
         let resume = self.thread.wait_state.prepare_to_run_guest(|| {
             self.clear_abort();
+            self.reset_pcs(ctx);
             !self.take_host_signal() && self.process.exit_status().is_none()
         });
         if resume {
@@ -1128,13 +1144,13 @@ impl<P: ShimPlatform> EnterShim for MacosShimEntrypoints<P> {
     }
 
     fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
-        self.task.thread.wait_state.finish_running_guest();
+        self.task.leave_guest();
         self.task.handle_syscall_request(ctx);
         self.task.continuation(ctx)
     }
 
     fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
-        self.task.thread.wait_state.finish_running_guest();
+        self.task.leave_guest();
         if info.exception == litebox::shim::Exception::DATA_ABORT_LOWER_EL
             && (self.task.page_in_shared_cache(info.fault_address)
                 || self
@@ -1159,7 +1175,7 @@ impl<P: ShimPlatform> EnterShim for MacosShimEntrypoints<P> {
     }
 
     fn interrupt(&self, ctx: &mut PtRegs) -> ContinueOperation {
-        self.task.thread.wait_state.finish_running_guest();
+        self.task.leave_guest();
         // A host signal (Ctrl-C) ends the guest, since guest signal delivery
         // is unsupported; another thread's exit ends this one.
         self.task.continuation(ctx)

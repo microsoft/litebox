@@ -332,12 +332,10 @@ impl<P: ShimPlatform> Task<P> {
                 self.mig_restartable_ranges_register(&request)
             }
             (KernelObject::Task, routine::TASK_RESTARTABLE_RANGES_SYNCHRONIZE) => {
-                // Without signal delivery no thread is ever redirected out of
-                // a range, so there is nothing to synchronize with.
                 if request.complex || !request.body.is_empty() {
                     error_reply(mig::BAD_ARGUMENTS)
                 } else {
-                    kern_reply(KernReturn::SUCCESS, &[])
+                    kern_reply(self.synchronize_restartable_ranges(), &[])
                 }
             }
             _ => {
@@ -487,9 +485,7 @@ impl<P: ShimPlatform> Task<P> {
         kern_reply(self.thread_policy(thread, policy, &base, set_limit), &[])
     }
 
-    /// `task_restartable_ranges_register`. Guest signals are never delivered,
-    /// so nothing ever interrupts a range; the ranges are recorded so that
-    /// the one-shot rule holds.
+    /// `task_restartable_ranges_register`.
     fn mig_restartable_ranges_register(&self, request: &Message) -> Message {
         const ENTRY: usize = size_of::<RestartableRange>();
         let fields = (!request.complex)
@@ -511,13 +507,7 @@ impl<P: ShimPlatform> Task<P> {
             .collect();
         let mut code = validate_restartable_ranges(&mut ranges);
         if code == KernReturn::SUCCESS {
-            let mut registered = self.global.restartable_ranges.lock();
-            if registered.is_some() {
-                // Release kernels allow one registration per task.
-                code = KernReturn::NOT_SUPPORTED;
-            } else {
-                *registered = Some(ranges);
-            }
+            code = self.register_restartable_ranges(ranges);
         }
         kern_reply(code, &[])
     }

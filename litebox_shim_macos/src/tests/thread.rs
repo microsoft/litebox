@@ -334,7 +334,7 @@ fn bsdthread_terminate_releases_the_stack_signals_and_never_returns() {
         "the port name was released"
     );
     assert_eq!(
-        worker.continuation(&PtRegs::default()),
+        worker.continuation(&mut PtRegs::default()),
         ContinueOperation::Terminate
     );
 
@@ -1113,7 +1113,7 @@ fn process_exit_ends_blocked_waits_and_the_last_thread_exits() {
                     <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
                         waiter.start_thread();
                         let result = ulock_wait(&waiter, UL_COMPARE_AND_WAIT, page, 0, 0);
-                        (result, waiter.continuation(&PtRegs::default()))
+                        (result, waiter.continuation(&mut PtRegs::default()))
                     })
                 })
             })

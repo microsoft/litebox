@@ -1519,6 +1519,25 @@ fn threads_ping_pong_mach_messages() {
     );
 }
 
+/// `task_restartable_ranges_synchronize` with libobjc's ranges registered:
+/// it interrupts a sibling spinning in guest code and waits for it to leave
+/// the guest, without waiting for a sibling blocked in `semaphore_wait`.
+/// The program's own registration is refused because libobjc registered
+/// first, as on a release kernel. The tests in the shim's
+/// `tests/restartable.rs` cover moving a thread to its recovery address.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_synchronize_restartable_ranges() {
+    assert_eq!(
+        run_sync_scenario("restartable"),
+        (
+            Some(0),
+            "register 46 synchronized 100 blocked 0\n".to_owned(),
+            String::new()
+        )
+    );
+}
+
 /// C++ `std::async(std::launch::async)`, `std::promise` and
 /// `std::this_thread::sleep_for`.
 #[cfg(feature = "test-broker")]

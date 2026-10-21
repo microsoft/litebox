@@ -21,6 +21,7 @@ pub mod misc;
 pub(crate) mod mm;
 pub(crate) mod process;
 pub(crate) mod psynch;
+pub(crate) mod restartable;
 pub(crate) mod semaphore;
 pub(crate) mod thread;
 pub(crate) mod ulock;

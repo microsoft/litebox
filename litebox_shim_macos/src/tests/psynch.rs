@@ -1383,7 +1383,7 @@ fn process_exit_ends_psynch_waits() {
                             1 => cvwait(&waiter, address, INC, 0, 0, 0, 0, 0),
                             _ => rw(&waiter, nr::PSYNCH_RW_WRLOCK, address, 0x200, 0x100, 0),
                         };
-                        (result, waiter.continuation(&PtRegs::default()))
+                        (result, waiter.continuation(&mut PtRegs::default()))
                     })
                 })
             })

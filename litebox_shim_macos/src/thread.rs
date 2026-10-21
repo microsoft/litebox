@@ -97,6 +97,8 @@ impl<P: ShimPlatform> Task<P> {
             policy: Mutex::new(crate::syscalls::thread::ThreadPolicy::DEFAULT),
             tsd_base: AtomicUsize::new(0),
             interrupt: Mutex::new(None),
+            reset_pcs: AtomicBool::new(false),
+            reset_pcs_ack: AtomicBool::new(false),
         });
         process.0.threads.lock().insert(id, Arc::clone(&guest));
         let thread = ThreadState {
@@ -130,22 +132,26 @@ impl<P: ShimPlatform> Task<P> {
         }
     }
 
-    /// End the process with `status` (`exit1`): the first exit wins, and
-    /// every other thread is interrupted so it ends at its next shim entry.
-    pub(crate) fn exit_process(&self, status: i32) {
-        if !self.process.record_exit(status) {
-            return;
-        }
-        let others: alloc::vec::Vec<_> = self
-            .process
+    /// Every other live guest thread of this process, taken from the
+    /// registry so that the caller can lock each without holding it.
+    pub(crate) fn sibling_threads(&self) -> alloc::vec::Vec<Arc<GuestThread<P>>> {
+        self.process
             .0
             .threads
             .lock()
             .values()
             .filter(|thread| thread.id != self.thread.guest.id)
             .cloned()
-            .collect();
-        for thread in others {
+            .collect()
+    }
+
+    /// End the process with `status` (`exit1`): the first exit wins, and
+    /// every other thread is interrupted so it ends at its next shim entry.
+    pub(crate) fn exit_process(&self, status: i32) {
+        if !self.process.record_exit(status) {
+            return;
+        }
+        for thread in self.sibling_threads() {
             if let Some(handle) = &*thread.interrupt.lock() {
                 handle.interrupt();
             }
@@ -184,6 +190,10 @@ impl<P: ShimPlatform> Drop for Task<P> {
         // bsdthread_terminate), then the saved port name is released
         // (uthread_joiner_wake) and the port dies.
         self.process.0.threads.lock().remove(&guest.id);
+        // A synchronize that interrupted the thread sees it acknowledge; one
+        // after this finds nothing to interrupt.
+        *guest.interrupt.lock() = None;
+        self.acknowledge_reset_pcs();
         if let Some((address, port)) = self.thread.user_join.take() {
             self.wake_user_joiner(address, port);
             let _ = self.global.ipc.lock().deallocate(port);

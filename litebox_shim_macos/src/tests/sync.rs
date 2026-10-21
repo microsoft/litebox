@@ -572,7 +572,7 @@ fn semaphore_waits_end_for_destroy_and_exit() {
             <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
                 sibling.start_thread();
                 let result = bounded_wait(&sibling, semaphore);
-                (result, sibling.continuation(&PtRegs::default()))
+                (result, sibling.continuation(&mut PtRegs::default()))
             })
         });
         await_semaphore_waiters(&task, semaphore, 1);
@@ -898,7 +898,7 @@ fn a_pending_abort_ends_the_next_wait_or_clears_on_return() {
     assert_eq!(wait(&sibling), KernReturn::SUCCESS, "consumed");
     sibling.thread.guest.abort_safely();
     assert_eq!(
-        sibling.continuation(&PtRegs::default()),
+        sibling.continuation(&mut PtRegs::default()),
         ContinueOperation::Resume
     );
     sibling.thread.wait_state.finish_running_guest();

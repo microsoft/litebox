@@ -286,6 +286,61 @@ static int mach_ping_pong(void) {
   return 0;
 }
 
+// Restartable ranges: libobjc registers its ranges and synchronizes once
+// before main, so the program's own registration is refused (one per task
+// on release kernels). A synchronize interrupts a sibling running guest
+// code and waits for it to leave the guest, and does not wait for one
+// blocked in a syscall; both carry on afterwards.
+extern kern_return_t task_restartable_ranges_register(task_t, void *, mach_msg_type_number_t);
+extern kern_return_t task_restartable_ranges_synchronize(task_t);
+
+static atomic_int spinning, stop_spinning;
+static semaphore_t blocker_semaphore;
+
+static void *spinner(void *unused) {
+  (void)unused;
+  atomic_store(&spinning, 1);
+  while (!atomic_load(&stop_spinning)) {
+  }
+  return NULL;
+}
+
+static void *blocker(void *unused) {
+  (void)unused;
+  return (void *)(uintptr_t)semaphore_wait(blocker_semaphore);
+}
+
+static int restartable(void) {
+  struct {
+    uint64_t location;
+    uint16_t length, recovery_offs;
+    uint32_t flags;
+  } range = {(uintptr_t)restartable, 4, 0, 0};
+  kern_return_t registered = task_restartable_ranges_register(mach_task_self(), &range, 1);
+  pthread_t thread;
+  pthread_create(&thread, NULL, give_up, NULL);
+  pthread_detach(thread);
+  semaphore_create(mach_task_self(), &blocker_semaphore, SYNC_POLICY_FIFO, 0);
+  pthread_t spinning_thread, blocked;
+  pthread_create(&blocked, NULL, blocker, NULL);
+  pthread_create(&spinning_thread, NULL, spinner, NULL);
+  while (!atomic_load(&spinning)) usleep(1000);
+  // Long enough for the blocker to block.
+  usleep(20000);
+  int synchronized = 0;
+  for (int i = 0; i < 100; i++) {
+    synchronized += task_restartable_ranges_synchronize(mach_task_self()) == KERN_SUCCESS;
+  }
+  atomic_store(&stop_spinning, 1);
+  pthread_join(spinning_thread, NULL);
+  semaphore_signal(blocker_semaphore);
+  void *waited;
+  pthread_join(blocked, &waited);
+  printf("register %d synchronized %d blocked %d\n", registered, synchronized,
+         (int)(uintptr_t)waited);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) return 2;
   if (strcmp(argv[1], "custom_stack") == 0) return custom_stack();
@@ -294,5 +349,6 @@ int main(int argc, char **argv) {
   if (strcmp(argv[1], "cancel_read") == 0) return cancel_read();
   if (strcmp(argv[1], "sleep") == 0) return sleeps();
   if (strcmp(argv[1], "mach") == 0) return mach_ping_pong();
+  if (strcmp(argv[1], "restartable") == 0) return restartable();
   return 3;
 }
