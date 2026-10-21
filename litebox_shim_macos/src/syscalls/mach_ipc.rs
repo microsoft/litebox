@@ -15,7 +15,10 @@
 //! port dies (`ipc_mqueue`). Unlike XNU, which hands a message to a blocked
 //! receiver and a queue slot to a blocked sender, a woken thread tries again,
 //! so another thread may take the message or slot first; the woken thread
-//! then waits again until its deadline.
+//! then waits again until its deadline. For the same reason a receiver a
+//! message woke whose receive right moves before it retries returns
+//! `MACH_RCV_PORT_CHANGED`, where XNU's receiver already holds the message;
+//! the message stays queued and moves with the right.
 //!
 //! XNU copies a send's header and body rights into the message before it
 //! blocks on a full queue. Here a blocked send copies nothing in until the
