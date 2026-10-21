@@ -52,6 +52,10 @@ impl RingBuffer {
             write_slow(&self.pvmap, self.rb_pa, self.size, self.write_offset, buf)
         };
     }
+
+    pub fn capacity(&self) -> usize {
+        self.size
+    }
 }
 
 #[inline]

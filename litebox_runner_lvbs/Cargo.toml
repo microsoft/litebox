@@ -17,6 +17,7 @@ litebox_service_heki = { path = "../litebox_service_heki/", version = "0.1.0" }
 litebox_shim_optee = { path = "../litebox_shim_optee/", version = "0.1.0" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 log = { version = "0.4", default-features = false }
+num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
 
@@ -34,6 +35,7 @@ vault-slots-16 = ["litebox_platform_lvbs/vault-slots-16"]
 vault-slots-32 = ["litebox_platform_lvbs/vault-slots-32"]
 idks-production = ["litebox_shim_optee/idks-production"]
 allow-unsigned-dynamic-ta = ["litebox_shim_optee/allow-unsigned-dynamic-ta"]
+lvbs-test = []
 
 [lints]
 workspace = true
