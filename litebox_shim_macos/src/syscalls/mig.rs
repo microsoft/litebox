@@ -33,6 +33,7 @@ pub(crate) enum ClockId {
 
 /// MIG routine ids (`msgh_id`) served here.
 mod routine {
+    pub const CLOCK_GET_TIME: i32 = 1000;
     pub const HOST_INFO: i32 = 200;
     pub const HOST_GET_CLOCK_SERVICE: i32 = 206;
     pub const MACH_PORTS_LOOKUP: i32 = 3404;
@@ -286,6 +287,9 @@ impl<P: ShimPlatform> Task<P> {
     /// Every routine served here replies.
     pub(crate) fn serve_mig(&self, object: KernelObject, mut request: Message) -> Message {
         let reply = match (object, request.id) {
+            (KernelObject::Clock(clock), routine::CLOCK_GET_TIME) => {
+                self.mig_clock_get_time(clock, &request)
+            }
             (KernelObject::Host, routine::HOST_INFO) => self.mig_host_info(&request),
             (KernelObject::Host, routine::HOST_GET_CLOCK_SERVICE) => {
                 self.mig_host_get_clock_service(&request)
@@ -346,6 +350,37 @@ impl<P: ShimPlatform> Task<P> {
         };
         self.global.ipc.lock().destroy_message(request);
         reply
+    }
+
+    /// `clock_get_time` (`osfmk/kern/clock_oldops.c`): the system clock's
+    /// `rtclock_gettime` reads the uptime, the calendar clock's
+    /// `calend_gettime` the time of day. The reply's `mach_timespec_t` has
+    /// 32-bit seconds.
+    fn mig_clock_get_time(&self, clock: ClockId, request: &Message) -> Message {
+        if request.complex || !request.body.is_empty() {
+            return error_reply(mig::BAD_ARGUMENTS);
+        }
+        let platform = self.global.platform;
+        let since = match clock {
+            ClockId::System => {
+                let timebase = platform.mach_timebase_info();
+                let nanoseconds = u128::from(platform.mach_absolute_time())
+                    * u128::from(timebase.numer)
+                    / u128::from(timebase.denom.max(1));
+                core::time::Duration::from_nanos(u64::try_from(nanoseconds).unwrap_or(u64::MAX))
+            }
+            ClockId::Calendar => {
+                use litebox_platform::time::{SystemTime as _, TimeProvider};
+                platform
+                    .current_time()
+                    .duration_since(&<P as TimeProvider>::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+            }
+        };
+        let seconds: u32 = litebox::utils::TruncateExt::trunc(since.as_secs());
+        let mut fields = seconds.to_ne_bytes().to_vec();
+        fields.extend_from_slice(&since.subsec_nanos().to_ne_bytes());
+        kern_reply(KernReturn::SUCCESS, &fields)
     }
 
     fn mig_host_info(&self, request: &Message) -> Message {

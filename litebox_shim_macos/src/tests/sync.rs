@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Mach semaphores, `__semwait_signal` and pthread cancellation, driven
-//! through the syscall dispatcher. Other guest threads are sibling tasks on
-//! host test threads; every wait another thread must end is bounded, so a
-//! broken implementation fails instead of hanging.
+//! Mach semaphores, `__semwait_signal`, pthread cancellation and
+//! `clock_get_time`, driven through the syscall dispatcher. Other guest
+//! threads are sibling tasks on host test threads; every wait another thread
+//! must end is bounded, so a broken implementation fails instead of hanging.
 
 use super::mach::{bsd, kr, mig_call, ndr, new_task, trap, word};
 use super::psynch::{
@@ -844,4 +844,49 @@ fn psynch_signals_pass_canceled_waiters_by() {
             Errno::EINTR.raw()
         );
     });
+}
+
+/// `clock_get_time` on the system (uptime) and calendar clocks.
+#[test]
+fn clock_get_time_reads_uptime_and_calendar_time() {
+    let task = new_task();
+    let _watchdog = Watchdog::new(&task);
+    let host = trap(&task, mach_trap::HOST_SELF, &[]);
+    let platform = Platform::new();
+    let uptime = || {
+        let timebase = platform.mach_timebase_info();
+        Duration::from_nanos(
+            u64::try_from(
+                u128::from(platform.mach_absolute_time()) * u128::from(timebase.numer)
+                    / u128::from(timebase.denom),
+            )
+            .unwrap(),
+        )
+    };
+    let calendar = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+    };
+    for (clock_id, now) in [(0, &uptime as &dyn Fn() -> Duration), (1, &calendar)] {
+        let reply = mig_call(&task, host.trunc(), 206, &ndr(&[clock_id]), false);
+        let clock = word(&reply, 28);
+        let before = now();
+        let reply = mig_call(&task, clock, 1000, &[], false);
+        let after = now();
+        assert_eq!(reply.len(), 44);
+        assert_eq!(word(&reply, 32), 0);
+        let read = Duration::new(u64::from(word(&reply, 36)), word(&reply, 40));
+        assert!(
+            before.saturating_sub(Duration::from_micros(1)) <= read
+                && read <= after + Duration::from_micros(1),
+            "{before:?} <= {read:?} <= {after:?}"
+        );
+        // A request with arguments is malformed.
+        let reply = mig_call(&task, clock, 1000, &ndr(&[0]), false);
+        assert_eq!(
+            word(&reply, 32).cast_signed(),
+            litebox_common_macos::mach::mig::BAD_ARGUMENTS
+        );
+    }
 }
