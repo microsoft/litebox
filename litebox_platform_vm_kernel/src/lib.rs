@@ -5,19 +5,24 @@
 //! allocators, logging, interrupt-controller setup, a [`clock::ClockSource`],
 //! and the root key ([`providers::set_platform_root_key`]).
 //!
-//! After boot mappings and the heap are ready, [`VmKernel::boot`] owns CPU
-//! initialization and the kernel-stack handoff. Its continuation receives the
-//! initialized platform; key provisioning remains separate and must precede
-//! execution that needs derived keys.
+//! After boot mappings and the heap are ready, [`VmKernel::boot`] owns the
+//! boot CPU's initialization and the kernel-stack handoff. Its continuation
+//! receives the initialized platform; key provisioning remains separate and
+//! must precede execution that needs derived keys. The runner may then start
+//! the other CPUs ([`VmKernel::start_cpus`], [`cpu`]), which run its entry.
 //!
-//! Assumptions: a single CPU, no kernel threads (the runner may switch user
-//! threads), and not a confidential VM (no #VE/#VC/#HV).
+//! Assumptions: no kernel threads (the runner may switch user threads); a
+//! task's address space current on at most one CPU at a time, which alone
+//! changes its mappings, and kernel mappings changed after boot only to add
+//! some or to unmap a stack's guard page, which only its CPU uses: TLB
+//! flushes are local; synchronized TSCs (see [`cpu`]); and not a confidential
+//! VM (no #VE/#VC/#HV).
 //!
 //! Devices: [`VmKernel`] is the drivers' [`litebox_hal::dma::Hal`].
 //!
 //! Interrupts: the kernel runs with interrupts disabled, except while it
-//! halts ([`VmKernel::halt_until_interrupt`]); user code runs with them
-//! enabled. External interrupts go to the handler the runner installs
+//! halts ([`cpu::halt`]); user code runs with them enabled. External
+//! interrupts, on any CPU, go to the handler the runner installs
 //! ([`set_interrupt_handler`]); one that interrupted user code then also
 //! enters the shim's `interrupt` (e.g., for the runner's one-shot timer, or
 //! a device's input); ending the run there lets the runner preempt the
@@ -76,6 +81,7 @@ extern crate alloc;
 mod arch;
 mod boot;
 pub mod clock;
+pub mod cpu;
 mod dma;
 pub mod mm;
 mod per_cpu;
@@ -84,7 +90,7 @@ pub mod providers;
 mod syscall_entry;
 pub mod worker;
 
-/// Inputs to the single-CPU kernel handoff. The runner owns device setup and
+/// Inputs to the boot CPU's kernel handoff. The runner owns device setup and
 /// must keep the clock and allocator alive until reset.
 pub struct BootConfig<'a> {
     pub page_allocator: &'static dyn mm::PageAllocator,
@@ -114,9 +120,11 @@ pub type InterruptHandler = dyn Fn(u8) -> bool + Sync;
 /// panics.
 ///
 /// The handler runs with interrupts disabled, on the interrupted context's GS
-/// (user mode, or [`VmKernel::halt_until_interrupt`]): it must not touch
-/// per-CPU data, block, or take locks; it should only end the interrupt and
-/// leave the work to the kernel after the halt.
+/// (user mode, or [`cpu::halt`]), on any CPU: it must not touch per-CPU data,
+/// block, or take locks; it should only end the interrupt, maybe wake CPUs
+/// (e.g., [`cpu::wake`]), and leave the work to the kernel after the
+/// halt. It also handles the wake IPI ([`cpu::Ipi::Wake`]), on every CPU,
+/// the boot CPU too, from [`VmKernel::start_cpus`] on.
 ///
 /// # Panics
 ///
@@ -525,10 +533,7 @@ impl VmKernel {
         if let Err(e) = base_pt.map_kernel(image_frames, KERNEL_IMAGE_OFFSET, text, read_only) {
             panic!("failed to map the kernel image: {e:?}");
         }
-        per_cpu::unmap_stack_guards(&base_pt);
-
-        crate::arch::enable_dep();
-        crate::arch::enable_write_protect();
+        per_cpu::with_per_cpu_variables(|pcv| pcv.unmap_stack_guards(&base_pt));
 
         // Safety: maps the image, which holds the running code, and the rest
         // of `ram`, which holds the stack (from the heap) at the same
@@ -547,13 +552,13 @@ impl VmKernel {
         platform
     }
 
-    /// Halts until an interrupt is handled, with interrupts enabled only for
-    /// the halt. An interrupt that became pending while they were disabled
-    /// ends the halt at once, so check for work first and halt after: none
-    /// is missed.
+    /// [`cpu::halt`]: halts until an interrupt is handled, or another CPU
+    /// wakes this one, with interrupts enabled only for the halt. An
+    /// interrupt that became pending while they were disabled, or a wakeup
+    /// since the last halt, ends it at once, so check for work first and halt
+    /// after: none is missed.
     pub fn halt_until_interrupt(&self) {
-        x86_64::instructions::interrupts::enable_and_hlt();
-        x86_64::instructions::interrupts::disable();
+        cpu::halt();
     }
 
     /// A kernel stack of `size` bytes (a multiple of the page size), with an
@@ -686,7 +691,9 @@ impl VmKernel {
     /// A new address space with `source`'s user mappings, whose frames the
     /// two share copy-on-write: each gets its own copy of a page once either
     /// writes it. Pinned pages (see [`Self::pin_user_pages`]) are not cloned:
-    /// the new address space leaves them unmapped.
+    /// the new address space leaves them unmapped. `source` must be current on
+    /// no other CPU (see the crate docs): its leaves become read-only, which
+    /// only this CPU's TLB learns.
     ///
     /// # Errors
     ///

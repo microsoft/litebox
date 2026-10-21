@@ -15,6 +15,9 @@
 //! sockets reach the VM's network device, if there is one; programs also see
 //! the host directories of virtio-9p devices, read-only, at their mount tags
 //! ([`devices`]).
+//!
+//! The boot CPU runs everything; the other CPUs, once online, only idle
+//! ([`cpu_main`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -31,6 +34,8 @@ mod service;
 use core::panic::PanicInfo;
 use litebox_bootloader::Kernel;
 use litebox_hal::{power, serial, serial_println};
+use litebox_platform_vm_kernel::VmKernel;
+use litebox_platform_vm_kernel::cpu::{self, CpuId};
 use litebox_platform_vm_kernel::providers::set_platform_root_key;
 
 litebox_bootloader::entry!(kernel_main, &SerialLogger);
@@ -40,6 +45,7 @@ fn kernel_main(kernel: Kernel) -> ! {
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
+    kernel.start_cpus(devices, cpu_main);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
     let broker = |console, shares, allow_process_duplication| {
         litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
@@ -84,6 +90,15 @@ fn kernel_main(kernel: Kernel) -> ! {
     }
     serial_println!("[litebox] ALL TESTS PASSED");
     power::exit(true)
+}
+
+/// Each other CPU's kernel, once online: it idles.
+fn cpu_main(platform: &'static VmKernel, _cpu: CpuId) -> ! {
+    loop {
+        // A wakeup left from its start would end every halt at once.
+        cpu::acknowledge();
+        platform.halt_until_interrupt();
+    }
 }
 
 struct SerialLogger;

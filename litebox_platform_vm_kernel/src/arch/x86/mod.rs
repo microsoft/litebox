@@ -4,6 +4,7 @@
 pub mod gdt;
 pub mod interrupts;
 pub(crate) mod mm;
+pub(crate) mod trampoline;
 
 pub(crate) use x86_64::{
     addr::{PhysAddr, VirtAddr},
@@ -18,6 +19,15 @@ use x86_64::registers::{
     control::{Cr4, Cr4Flags},
     model_specific::{Efer, EferFlags, KernelGsBase},
 };
+
+/// The control registers and MSRs each CPU sets before it has its per-CPU
+/// variables: FSGSBASE, extended states, NX, and WP.
+pub(crate) fn init_cpu_registers() {
+    enable_fsgsbase();
+    enable_extended_states();
+    enable_dep();
+    enable_write_protect();
+}
 
 /// Enable `rd/wr{fs,gs}base`, which per-CPU data and TLS depend on.
 ///

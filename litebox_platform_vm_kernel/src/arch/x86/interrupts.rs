@@ -47,15 +47,6 @@ struct Interrupts {
 
 static INTERRUPTS: Once<Interrupts> = Once::new();
 
-fn idt(ignored_vectors: &[u8]) -> &'static InterruptDescriptorTable {
-    &INTERRUPTS
-        .call_once(|| Interrupts {
-            idt: build_idt(ignored_vectors),
-            handler: Once::new(),
-        })
-        .idt
-}
-
 fn build_idt(ignored_vectors: &[u8]) -> InterruptDescriptorTable {
     let mut idt = InterruptDescriptorTable::new();
 
@@ -107,8 +98,10 @@ fn build_idt(ignored_vectors: &[u8]) -> InterruptDescriptorTable {
     idt
 }
 
-/// Requires [`super::gdt::init`]. The first call fixes `ignored_vectors`;
-/// these handlers return without acknowledging the interrupt controller.
+/// Builds the IDT, shared by all CPUs ([`load_idt`]). Requires
+/// [`super::gdt::init`]: its handlers take the current code segment. The
+/// first call fixes `ignored_vectors`; these handlers return without
+/// acknowledging the interrupt controller.
 ///
 /// # Panics
 ///
@@ -118,7 +111,23 @@ pub fn init_idt(ignored_vectors: &[u8]) {
         ignored_vectors.iter().all(|&v| v >= 32),
         "vectors below 32 are CPU exceptions"
     );
-    idt(ignored_vectors).load();
+    INTERRUPTS.call_once(|| Interrupts {
+        idt: build_idt(ignored_vectors),
+        handler: Once::new(),
+    });
+}
+
+/// Loads the IDT on the calling CPU. Requires [`super::gdt::init`].
+///
+/// # Panics
+///
+/// Before [`init_idt`].
+pub fn load_idt() {
+    INTERRUPTS
+        .get()
+        .expect("the IDT is built at boot")
+        .idt
+        .load();
 }
 
 /// # Panics

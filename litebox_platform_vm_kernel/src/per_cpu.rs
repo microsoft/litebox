@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Per-CPU kernel variables, reached through GSBASE.
+//! Per-CPU kernel variables, each CPU's reached through its GSBASE.
 
 use crate::AddressSpaceId;
 use crate::arch::{gdt, mm::paging::UnmapOptions};
+use crate::cpu::CpuId;
 use alloc::{
     alloc::{alloc_zeroed, handle_alloc_error},
     boxed::Box,
@@ -30,6 +31,7 @@ pub(crate) const KERNEL_STACK_SIZE: usize = 47 * PAGE_SIZE;
 pub(crate) struct PerCpuVariables {
     /// Must be first: assembly reads it at `gs:[offset]`.
     pub(crate) asm: PerCpuVariablesAsm,
+    pub(crate) cpu: CpuId,
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<*mut ()>,
     /// See `with_user_faults`; null otherwise.
@@ -319,7 +321,7 @@ impl PerCpuVariablesAsm {
     }
 }
 
-/// Requires kernel GSBASE from [`allocate_per_cpu_variables`].
+/// Requires kernel GSBASE from [`install`].
 ///
 /// # Panics
 /// Panics if GSBASE is not set or contains a non-canonical address.
@@ -337,10 +339,7 @@ where
 fn per_cpu_variables_ptr() -> *mut PerCpuVariables {
     // Safety: FSGSBASE is enabled before any per-CPU access.
     let gsbase = unsafe { rdgsbase() };
-    assert!(
-        gsbase != 0,
-        "GSBASE not set. Call allocate_per_cpu_variables() first"
-    );
+    assert!(gsbase != 0, "GSBASE not set. Call install() first");
     assert!(
         VirtAddr::try_new(gsbase as u64).is_ok(),
         "GS contains a non-canonical address"
@@ -348,30 +347,43 @@ fn per_cpu_variables_ptr() -> *mut PerCpuVariables {
     gsbase as *mut PerCpuVariables
 }
 
-/// Call once per core after enabling FSGSBASE and seeding the global allocator.
+/// `cpu`'s variables and stacks, for [`install`]; they live as long as the
+/// CPU.
 ///
 /// # Panics
 /// Panics if the allocation fails.
-pub(crate) fn allocate_per_cpu_variables() {
-    let pcv = Box::leak(Box::new(PerCpuVariables {
+pub(crate) fn allocate_per_cpu_variables(cpu: CpuId) -> &'static PerCpuVariables {
+    Box::leak(Box::new(PerCpuVariables {
         asm: PerCpuVariablesAsm::default(),
+        cpu,
         gdt: Cell::new(None),
         tls: Cell::new(core::ptr::null_mut()),
         fault_context: Cell::new(core::ptr::null()),
         worker: crate::worker::Worker::new(),
         active_page_table: UnsafeCell::new(None),
         stacks: PerCpuStacks::allocate(),
-    }));
+    }))
+}
+
+/// Makes `pcv` the calling CPU's.
+///
+/// # Safety
+///
+/// FSGSBASE must be enabled. `pcv` must be no other CPU's: from here on, only
+/// this one may use it.
+pub(crate) unsafe fn install(pcv: &'static PerCpuVariables) {
     // Safety: FSGSBASE is enabled, and `pcv` lives forever.
     unsafe { wrgsbase(core::ptr::from_ref(pcv) as usize) };
 }
 
-/// The arena must remain allocated after its guard pages are unmapped.
-pub(crate) fn unmap_stack_guards(page_table: &crate::mm::PageTable<PAGE_SIZE>) {
-    let base = with_per_cpu_variables(|pcv| pcv.stacks.base);
-    for offset in STACK_GUARD_OFFSETS {
-        // Safety: aligned, unused guards in a leaked allocation.
-        unsafe { unmap_guard(page_table, base + offset) };
+impl PerCpuVariables {
+    /// Unmaps the guard pages of the CPU's stacks, which stay allocated. Only
+    /// that CPU uses its stacks, so other CPUs' TLBs need no flush.
+    pub(crate) fn unmap_stack_guards(&self, page_table: &crate::mm::PageTable<PAGE_SIZE>) {
+        for offset in STACK_GUARD_OFFSETS {
+            // Safety: aligned, unused guards in a leaked allocation.
+            unsafe { unmap_guard(page_table, self.stacks.base + offset) };
+        }
     }
 }
 
@@ -389,8 +401,8 @@ pub(crate) unsafe fn unmap_guard(page_table: &crate::mm::PageTable<PAGE_SIZE>, s
         .expect("failed to unmap a stack guard page");
 }
 
-/// Allocate the current core's kernel XSAVE area. Must run after
-/// [`allocate_per_cpu_variables`] and [`crate::arch::enable_extended_states`].
+/// Allocate the current core's kernel XSAVE area. Must run after [`install`]
+/// and [`crate::arch::enable_extended_states`].
 pub(crate) fn allocate_xsave_area() {
     with_per_cpu_variables(|pcv| {
         PerCpuVariables::allocate_xsave_area(&pcv.asm);

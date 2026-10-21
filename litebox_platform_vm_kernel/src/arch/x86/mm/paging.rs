@@ -53,8 +53,10 @@ pub(crate) const KERNEL_PML4_START: usize =
 /// slots above it, up to [`KERNEL_PML4_START`], hold no user address.
 const USER_PML4_END: usize = (1 << PAGE_TABLE_LEVEL_BITS) / 2;
 
-/// Flush the local TLB only; correct for a single CPU.
-/// TODO(SMP): shoot down other cores.
+/// Flush the local TLB only: a task's address space is current on at most
+/// one CPU, which alone changes its mappings, and the kernel's mappings
+/// shrink only by stack guard pages, which only their CPU uses (see the
+/// crate docs).
 #[cfg(not(test))]
 fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
     if count == 0 {

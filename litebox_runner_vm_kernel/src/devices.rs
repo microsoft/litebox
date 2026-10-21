@@ -13,13 +13,16 @@
 //!   `SetTimer` deadline and time slice.
 //! - [`Devices::shares`]: the VM's virtio-9p devices, each a host directory
 //!   mounted at its tag.
+//! - [`InterruptController`]: the local APICs, to start and wake the other
+//!   CPUs.
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
-//! The interrupt handler only ends the interrupt, noting a device's; the
-//! broker looks at the devices when it next runs, which, if the interrupt
-//! stopped a process, the shim has it do at once (see
-//! `litebox_platform_vm_kernel`).
+//! Each CPU has its own local APIC, so its own timer; devices interrupt the
+//! boot CPU. The interrupt handler only ends the interrupt, noting a
+//! device's; the broker looks at the devices when it next runs, which, if
+//! the interrupt stopped a process, the shim has it do at once (see
+//! `litebox_platform_vm_kernel`). A wake IPI only ends a halt.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -33,8 +36,9 @@ use litebox_broker_vm_kernel::share::{Share, Transport, TransportError};
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
 use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice};
-use litebox_hal::interrupt::LocalApic;
+use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_platform::time::{Instant as _, TimeProvider as _};
+use litebox_platform_vm_kernel::cpu::{self, InterruptController, Ipi, MAX_CPUS};
 use litebox_platform_vm_kernel::{Instant, VmKernel};
 use litebox_shim_vm_kernel::ProcessTimer;
 use spin::Mutex;
@@ -55,6 +59,19 @@ const TIMER_VECTOR: u8 = 0x30;
 /// Shared by every device: the broker looks at all of them when it runs.
 const DEVICE_VECTOR: u8 = 0x31;
 
+/// Ends a halt ([`Ipi::Wake`]).
+const WAKE_VECTOR: u8 = 0x32;
+
+// So `send_fixed_ipi` cannot panic (it runs in interrupt handlers).
+const _: () = {
+    assert!(WAKE_VECTOR >= 32);
+    let mut i = 0;
+    while i < SPURIOUS_VECTORS.len() {
+        assert!(WAKE_VECTOR != SPURIOUS_VECTORS[i]);
+        i += 1;
+    }
+};
+
 /// [`Devices::armed`]: the timer is in a state no deadline matches.
 const ARMED_UNKNOWN: u64 = u64::MAX;
 
@@ -68,10 +85,10 @@ pub struct Devices {
     network: Option<Mutex<NetworkDevice>>,
     /// Whether the network device interrupts; else it is polled.
     network_interrupts: bool,
-    /// What [`ProcessTimer::arm`] last programmed into the timer (see
-    /// [`armed`]), so it can skip rewriting it: under KVM each write is a VM
-    /// exit, and it rearms before every resume of a process.
-    armed: AtomicU64,
+    /// Per CPU, what [`ProcessTimer::arm`] last programmed into its timer
+    /// (see [`armed`]), so it can skip rewriting it: under KVM each write is
+    /// a VM exit, and it rearms before every resume of a process.
+    armed: [AtomicU64; MAX_CPUS],
     /// See [`Events::take_device_interrupt`].
     device_interrupted: AtomicBool,
 }
@@ -113,7 +130,7 @@ impl Devices {
             console_interrupts: console.interrupts(),
             network_interrupts: network.as_ref().is_some_and(NetworkDevice::interrupts),
             network: network.map(Mutex::new),
-            armed: AtomicU64::new(ARMED_UNKNOWN),
+            armed: [const { AtomicU64::new(ARMED_UNKNOWN) }; MAX_CPUS],
             device_interrupted: AtomicBool::new(false),
             console: Mutex::new(console),
         }));
@@ -180,18 +197,26 @@ impl Devices {
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
     /// per-CPU data.
     fn on_interrupt(&self, vector: u8) -> bool {
-        if !matches!(vector, TIMER_VECTOR | DEVICE_VECTOR) {
-            return false;
-        }
-        if vector == TIMER_VECTOR {
+        match vector {
             // Fired: arming the same deadline again (e.g., after an early
-            // fire) must reprogram it.
-            self.armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
-        } else {
-            self.device_interrupted.store(true, Ordering::Relaxed);
+            // fire) must reprogram it. Which CPU's timer it was is per-CPU
+            // data: forget them all.
+            TIMER_VECTOR => {
+                for armed in &self.armed {
+                    armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
+                }
+            }
+            DEVICE_VECTOR => self.device_interrupted.store(true, Ordering::Relaxed),
+            WAKE_VECTOR => {}
+            _ => return false,
         }
         self.apic.end_of_interrupt();
         true
+    }
+
+    /// The calling CPU's [`Self::armed`].
+    fn armed(&self) -> &AtomicU64 {
+        &self.armed[cpu::current().index()]
     }
 
     /// For drivers: waits until a device may have changed (an interrupt) or
@@ -205,7 +230,7 @@ impl Devices {
         }
     }
 
-    /// Halts until an interrupt, or until `deadline`.
+    /// Halts the calling CPU until an interrupt, or until `deadline`.
     fn halt(&self, deadline: Option<Instant>) {
         if let Some(deadline) = deadline {
             self.apic
@@ -214,8 +239,27 @@ impl Devices {
         self.platform.halt_until_interrupt();
         if deadline.is_some() {
             self.apic.disarm_timer();
-            self.armed.store(armed(None), Ordering::Relaxed);
+            self.armed().store(armed(None), Ordering::Relaxed);
         }
+    }
+}
+
+// Safety: `send_ipi` sends `Init` and `Startup` as the HAL's, and `Wake` as
+// a fixed interrupt, to the APIC ID it is given, or nothing (false); and
+// `init_cpu` sets up the calling CPU's local APIC only.
+unsafe impl InterruptController for Devices {
+    fn init_cpu(&self) {
+        self.apic.init_cpu();
+    }
+
+    unsafe fn send_ipi(&self, apic_id: u32, ipi: Ipi) -> bool {
+        let startup = match ipi {
+            Ipi::Init => StartupIpi::Init,
+            Ipi::Startup { page } => StartupIpi::Startup { page },
+            Ipi::Wake => return self.apic.send_fixed_ipi(apic_id, WAKE_VECTOR),
+        };
+        // Safety: the caller's, as `send_ipi`'s.
+        unsafe { self.apic.send_startup_ipi(apic_id, startup) }
     }
 }
 
@@ -234,13 +278,13 @@ impl Events for Devices {
 }
 
 impl ProcessTimer for Devices {
-    /// Shares the same one-shot timer as [`Self::halt`]: a bounded halt
-    /// replaces the deadline and disarms the timer afterward (the process
+    /// The calling CPU's timer, which its [`Self::halt`]s share: a bounded
+    /// halt replaces the deadline and disarms the timer afterward (the process
     /// re-arms it as it resumes), and one without a deadline keeps it, so it
     /// may end such a halt early (harmless: waits recheck). Writes the timer
     /// only when the deadline changed, or it fired since.
     fn arm(&self, deadline: Option<Instant>) {
-        if self.armed.swap(armed(deadline), Ordering::Relaxed) == armed(deadline) {
+        if self.armed().swap(armed(deadline), Ordering::Relaxed) == armed(deadline) {
             return;
         }
         match deadline {

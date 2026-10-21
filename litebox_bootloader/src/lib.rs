@@ -2,8 +2,9 @@
 // Licensed under the MIT license.
 
 //! Boots a LiteBox kernel-mode runner: takes the handoff from a boot front
-//! end, brings up a `VmKernel` (heap, interrupts, TSC), and runs the runner's
-//! `entry!` function.
+//! end, finds the CPUs (ACPI), brings up a `VmKernel` (heap, interrupts, TSC)
+//! on the boot CPU, and runs the runner's `entry!` function, which may start
+//! the others (`Kernel::start_cpus`).
 //!
 //! Front ends: PVH.
 //!
@@ -27,17 +28,16 @@ mod heap;
 mod layout;
 mod pvh;
 
-use core::ops::Range;
-use handoff::BootInfo;
+use handoff::{BootInfo, PAGE_SIZE};
 use layout::{
     image_end_address, rodata_end_address, rodata_start_address, text_end_address,
     text_start_address,
 };
+use litebox_hal::acpi::{self, MappedMemory};
 use litebox_hal::clock::Clock;
+use litebox_platform_vm_kernel::cpu::{CpuEntry, InterruptController, MAX_CPUS};
 use litebox_platform_vm_kernel::{BootConfig, KERNEL_IMAGE_OFFSET, KERNEL_OFFSET, VmKernel};
 use x86_64::PhysAddr;
-
-const PAGE_SIZE: u64 = 4096;
 
 pub struct Kernel {
     pub platform: &'static VmKernel,
@@ -45,6 +45,55 @@ pub struct Kernel {
     /// RAM, for the kernel's lifetime.
     pub boot_info: &'static BootInfo,
     pub clock: Clock,
+}
+
+impl Kernel {
+    /// Starts the other CPUs that the bootloader found (in the ACPI MADT,
+    /// at most `litebox.cpus` on the command line), each running `entry`
+    /// once online; see [`VmKernel::start_cpus`]. Call once, when
+    /// `controller`'s wake IPI is handled, even with one CPU. `controller`'s
+    /// IPIs start the CPUs, and just those (its trait's safety contract
+    /// guarantees it: see [`InterruptController`]).
+    ///
+    /// # Panics
+    ///
+    /// On a second call, or off the boot CPU.
+    pub fn start_cpus(&self, controller: &'static dyn InterruptController, entry: CpuEntry) {
+        let (_, _, cpus) = BOOT.get().expect("boot info captured");
+        litebox_util_log::info!(
+            count:% = cpus.apic_ids.len(),
+            apic_ids:? = cpus.apic_ids,
+            trampoline:? = cpus.trampoline;
+            "CPUs found"
+        );
+        // Safety: from the bootloader's own record, which nothing else makes
+        // or changes: the trampoline's page is usable, unreserved RAM below
+        // the image (see `find_cpus`), so never the heap's, and the
+        // bootloader uses it for nothing else; the CPUs are the MADT's,
+        // without repeats, and nothing started them (the platform panics on a
+        // second call). `controller` sends the IPIs it is told to (its
+        // trait's contract).
+        unsafe {
+            self.platform.start_cpus(
+                &cpus.apic_ids,
+                cpus.limit,
+                cpus.trampoline,
+                controller,
+                entry,
+            );
+        }
+    }
+}
+
+/// The CPUs found at boot, for [`Kernel::start_cpus`].
+struct Cpus {
+    /// Local APIC IDs: the enabled processors in the ACPI MADT (only the
+    /// boot CPU without a usable one), the boot CPU first.
+    apic_ids: alloc::vec::Vec<u32>,
+    /// How many to run at most: `litebox.cpus` on the command line, if set.
+    limit: usize,
+    /// The page for the trampoline that starts the others, if there is one.
+    trampoline: Option<PhysAddr>,
 }
 
 /// Declares the kernel's `fn(Kernel) -> !`, run on the kernel stack once the
@@ -71,7 +120,7 @@ unsafe extern "Rust" {
     safe fn __litebox_kernel_logger() -> &'static dyn log::Log;
 }
 
-static BOOT: spin::Once<(BootInfo, Clock)> = spin::Once::new();
+static BOOT: spin::Once<(BootInfo, Clock, Cpus)> = spin::Once::new();
 
 fn early_console_init() {
     let _ = log::set_logger(__litebox_kernel_logger());
@@ -92,6 +141,8 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
     litebox_util_log::info!(cmdline:% = info.cmdline.as_str(); "boot");
 
     seed_heap(&info);
+    // ACPI tables are reachable only through the boot mapping.
+    let cpus = find_cpus(&info);
     let ram_end = ram_end(&info);
     report_unused_ram(&info, ram_end);
     let ram: arrayvec::ArrayVec<_, { handoff::MAX_RAM_REGIONS }> = info
@@ -103,7 +154,7 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
     let to_pa = |va: u64| PhysAddr::new(va - KERNEL_IMAGE_OFFSET);
     litebox_hal::interrupt::init_legacy_pics();
     let clock = Clock::measure();
-    BOOT.call_once(|| (info, clock));
+    BOOT.call_once(|| (info, clock, cpus));
     let clock = alloc::boxed::Box::leak(alloc::boxed::Box::new(clock));
     // Safety: the front end established the direct and image mappings with
     // IRQs off on one CPU. The heap contains only `ram` above the image, image
@@ -126,7 +177,7 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
 }
 
 fn kernel_main(platform: &'static VmKernel) -> ! {
-    let (boot_info, clock) = BOOT.get().expect("boot info captured");
+    let (boot_info, clock, _) = BOOT.get().expect("boot info captured");
     for m in &boot_info.modules {
         assert!(
             platform.contains_ram(m.clone()),
@@ -140,6 +191,39 @@ fn kernel_main(platform: &'static VmKernel) -> ! {
         boot_info,
         clock: *clock,
     })
+}
+
+/// See [`Cpus`]. Logs only what goes wrong: a runner may start no CPUs.
+fn find_cpus(info: &BootInfo) -> Cpus {
+    let boot = litebox_hal::interrupt::initial_apic_id();
+    let rsdp = info.rsdp.map(PhysAddr::as_u64);
+    // Safety: the front end maps physical memory below `mapped_limit` at
+    // `PA + KERNEL_OFFSET`, in the kernel half (so nonzero addresses), until
+    // `VmKernel::boot` replaces its page table, after `memory` is gone; the
+    // parser reads the firmware's tables and areas, which nothing writes,
+    // and which the firmware is trusted to point only at.
+    let memory = unsafe { MappedMemory::new(KERNEL_OFFSET, info.mapped_limit.as_u64()) };
+    let apic_ids = acpi::cpus(&memory, rsdp, boot).unwrap_or_else(|error| {
+        litebox_util_log::warn!(error:% = error; "no CPUs from ACPI: only the boot CPU runs");
+        alloc::vec![boot]
+    });
+    let limit = info.cpu_limit().unwrap_or_else(|value| {
+        litebox_util_log::warn!(value:% = value; "litebox.cpus is not a positive number: ignored");
+        MAX_CPUS
+    });
+    if apic_ids.len() > MAX_CPUS {
+        litebox_util_log::warn!(
+            count:% = apic_ids.len(),
+            max:% = MAX_CPUS;
+            "more CPUs than supported: not all used"
+        );
+    }
+    Cpus {
+        apic_ids,
+        limit,
+        // Below the image, so the heap never gets it (see `seed_heap`).
+        trampoline: info.trampoline_page(PhysAddr::new(text_start_address() - KERNEL_IMAGE_OFFSET)),
+    }
 }
 
 /// Heap seeding precedes the permanent mapping, so RAM must fit the boot mapping.
@@ -170,24 +254,8 @@ fn report_unused_ram(info: &BootInfo, ram_end: PhysAddr) {
 
 fn seed_heap(info: &BootInfo) {
     let heap_floor = PhysAddr::new(image_end_address() - KERNEL_IMAGE_OFFSET);
-    let ram_end = ram_end(info);
-    // Each reserved range splits at most one free range in two.
-    let mut free = arrayvec::ArrayVec::<
-        Range<PhysAddr>,
-        { handoff::MAX_RAM_REGIONS + handoff::MAX_RESERVED },
-    >::new();
-    for r in &info.usable {
-        let start = r.start.max(heap_floor);
-        let end = r.end.min(ram_end);
-        if start < end {
-            free.push(start..end);
-        }
-    }
-    for hole in &info.reserved {
-        subtract(&mut free, hole);
-    }
     let mut total = 0;
-    for r in &free {
+    for r in &info.free_ranges(heap_floor..ram_end(info)) {
         let start = r.start.align_up(PAGE_SIZE);
         let end = r.end.align_down(PAGE_SIZE);
         if start >= end {
@@ -206,30 +274,4 @@ fn seed_heap(info: &BootInfo) {
         );
     }
     litebox_util_log::info!(mib:% = total >> 20; "heap seeded");
-}
-
-fn subtract<const N: usize>(
-    ranges: &mut arrayvec::ArrayVec<Range<PhysAddr>, N>,
-    hole: &Range<PhysAddr>,
-) {
-    let mut out = arrayvec::ArrayVec::<Range<PhysAddr>, N>::new();
-    let mut keep = |r: Range<PhysAddr>| {
-        assert!(
-            out.try_push(r).is_ok(),
-            "free-memory list overflowed ({N} ranges)"
-        );
-    };
-    for r in ranges.iter() {
-        if hole.end <= r.start || hole.start >= r.end {
-            keep(r.clone());
-            continue;
-        }
-        if r.start < hole.start {
-            keep(r.start..hole.start);
-        }
-        if hole.end < r.end {
-            keep(hole.end..r.end);
-        }
-    }
-    *ranges = out;
 }

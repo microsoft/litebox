@@ -24,6 +24,7 @@ use super::{
     pgtable::{COW, PageTableImpl},
 };
 use crate::arch::mm::paging::{UnmapOptions, X64PageTable, shared_frames, vmflags_to_pteflags};
+use crate::boot::TrampolineTable;
 
 #[derive(Default)]
 struct HostState {
@@ -712,5 +713,20 @@ fn clone_failure_for_the_heap_shares_only_counted_frames() {
         write_fault(&parent, address(page), RW);
         assert_eq!(read(mapped_frame(&parent, address(page))), page as u64);
     }
+    assert_eq!(live_frames(), before);
+}
+
+/// The CPU trampoline's page is not its table's: dropping the table frees
+/// the table's frames, but not the page (which would be a foreign free).
+#[test]
+fn trampoline_table_leaves_the_trampoline() {
+    #[repr(C, align(4096))]
+    struct Page([u8; PAGE_SIZE]);
+    let page = std::boxed::Box::new(Page([0; PAGE_SIZE]));
+    let base = new_table();
+    let before = live_frames();
+    let table = TrampolineTable::new(&base, PhysAddr::new(core::ptr::from_ref(&*page) as u64));
+    assert!(live_frames() > before);
+    drop(table);
     assert_eq!(live_frames(), before);
 }

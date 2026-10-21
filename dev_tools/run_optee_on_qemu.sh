@@ -19,6 +19,8 @@
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
 #   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
+#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1); the kernel uses
+#                 only the first
 #   TIMEOUT       per-run timeout in seconds (default: 120)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runner, run in its directory
@@ -55,7 +57,7 @@ echo "[*] building litebox_runner_optee_on_qemu ($profile)"
 (cd "$RUNNER_DIR" && $CARGO_BUILD "${cargo_flags[@]}")
 [[ -x $KERNEL ]] || { echo "error: the build did not produce $KERNEL" >&2; exit 2; }
 echo "[*] kernel: $KERNEL"
-echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU"
+echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, -smp $QEMU_SMP"
 
 for ta in "${tas[@]}"; do
     name=${ta%@default}
