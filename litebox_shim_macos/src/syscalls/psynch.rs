@@ -88,21 +88,36 @@ const KSYN_CLEANUP_DEADLINE: core::time::Duration = core::time::Duration::from_s
 /// Wait queues a process may have. XNU allocates them from a zone without a
 /// per-process limit; here a lookup that needs a new queue in a full table
 /// first frees idle rwlock queues early, then fails with ENOMEM before any
-/// effect. A queue that is not idle holds a thread blocked on it or a
-/// prepost for a thread on its way to it, so libpthread traffic needs at
-/// most `TASK_THREADMAX` of them. Past the limit libpthread's mutexwait
+/// effect. A queue that is not idle holds a thread blocked on it, a prepost
+/// for a thread on its way to it, or a condition variable's fake entry. A
+/// `pthread_cond_signal_thread_np` to a waiter below U wakes it without
+/// counting it in S (`_ksyn_cvsignal_thread`), so its condition variable
+/// keeps L != S and a broadcast entry, and with it a queue, until
+/// `pthread_cond_destroy` clears it, as in XNU. So libpthread traffic needs
+/// one queue per thread plus one per live condition variable left so; the
+/// limit leaves room for 7 such condition variables per possible thread.
+/// Each queue costs at most about 1 KiB (its map slot and spare entry
+/// capacity), 32 MiB at the limit. Past the limit libpthread's mutexwait
 /// retries forever, an unlock or rwlock call aborts the process
 /// (`PTHREAD_INTERNAL_CRASH`), a cvwait whose mutex unlock fails returns
 /// EINVAL and leaves that mutex's waiter blocked, and a condition variable
 /// signal is lost (libpthread ignores its error).
-pub(crate) const PSYNCH_MAX_QUEUES: usize = 4 * TASK_THREADMAX as usize;
+pub(crate) const PSYNCH_MAX_QUEUES: usize = 8 * TASK_THREADMAX as usize;
 /// Prepost and broadcast entries (`kw_fakecount`) of all condition
 /// variables. XNU's allocations of them never fail; here a signal that needs
 /// one more in a full budget first drops the entries no later call can tell
-/// apart from the ones kept ([`Kwq::compact_fakes`]), which leaves libpthread
-/// traffic at most two per thread. Only then does it fail with ENOMEM,
-/// before any effect; libpthread ignores the error, so the signal is lost.
-pub(crate) const PSYNCH_MAX_FAKES: usize = 4 * TASK_THREADMAX as usize;
+/// apart from the ones kept ([`Kwq::compact_fakes`]). What remains for
+/// libpthread traffic is at most one entry per condition variable with a
+/// queue, one per thread holding a ticket at or below its L, and one per
+/// wakeup S never counted (the targeted signals above): within the limit
+/// while live condition variables hold fewer than 7 such wakeups per
+/// possible thread. An entry costs at most 96 bytes (24 and spare
+/// capacity), 6 MiB at the limit. Only past it does a signal fail with
+/// ENOMEM, before any effect; libpthread ignores the error, so the signal
+/// is lost.
+pub(crate) const PSYNCH_MAX_FAKES: usize = 2 * PSYNCH_MAX_QUEUES;
+/// Entries a queue may keep capacity for beyond twice what it holds.
+const SPARE_ENTRIES: usize = 8;
 
 fn is_seqlower(x: u32, y: u32) -> bool {
     let (x, y) = (x & PTHRW_COUNT_MASK, y & PTHRW_COUNT_MASK);
@@ -251,6 +266,14 @@ impl<P: ShimPlatform> KsynQueue<P> {
 
     fn find_seq(&self, seq: u32) -> Option<usize> {
         self.entries.iter().position(|kwe| kwe.lockseq == seq)
+    }
+
+    /// Give back capacity a longer queue left, so the table's memory follows
+    /// the entries it holds.
+    fn shrink(&mut self) {
+        if self.entries.capacity() > SPARE_ENTRIES.max(4 * self.entries.len()) {
+            self.entries.shrink_to(2 * self.entries.len());
+        }
     }
 }
 
@@ -485,6 +508,7 @@ impl<P: ShimPlatform> Kwq<P> {
     fn remove(&mut self, which: QueueKind, index: usize) -> Kwe<P> {
         let queue = self.queue(which);
         let kwe = queue.entries.remove(index).expect("a queued entry");
+        queue.shrink();
         if let (Some(first), Some(last)) = (queue.entries.front(), queue.entries.back()) {
             queue.firstnum = first.lockseq;
             queue.lastnum = last.lockseq;
@@ -603,6 +627,7 @@ impl<P: ShimPlatform> Kwq<P> {
         if let Some(first) = self.write.entries.front() {
             self.write.firstnum = first.lockseq;
         }
+        self.write.shrink();
         self.fakecount -= u32::try_from(dropped).expect("queued entries fit in u32");
         fakes.0 -= dropped;
     }
@@ -778,6 +803,16 @@ impl<P: ShimPlatform> PsynchTable<P> {
         self.queues
             .get(&PsynchKey::Private(address))
             .map_or(0, Kwq::inqueue)
+    }
+
+    /// Entries the private queue at `address` has room for.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn capacity(&self, address: usize) -> usize {
+        self.queues
+            .get(&PsynchKey::Private(address))
+            .map_or(0, |kwq| {
+                kwq.read.entries.capacity() + kwq.write.entries.capacity()
+            })
     }
 
     #[cfg(all(test, target_os = "macos"))]

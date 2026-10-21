@@ -292,6 +292,52 @@ pub(super) fn clear_fillers(task: &Task<Platform>, base: usize, lwords: &[u32]) 
     }
 }
 
+/// On a fresh condition variable, A takes L=1 and is withheld while B and C
+/// queue at 2 and 3, and a signal wakes B. Then A queues, and
+/// `pthread_cond_signal_thread_np` to A (U=1) finds it below its signal's
+/// sequence: A wakes without being counted in S and the broadcast wakes C.
+/// That leaves L=3, S=2 and a broadcast entry no thread will take, which
+/// XNU keeps until `pthread_cond_destroy`.
+fn leave_targeted_signal_residue(task: &Task<Platform>, cv: usize) {
+    std::thread::scope(|scope| {
+        let wait = |l: u32| {
+            let waiter = task.new_sibling(0);
+            let (port, port_rx) = std::sync::mpsc::channel();
+            let handle = scope.spawn(move || {
+                port.send(own_port(&waiter)).unwrap();
+                cvwait(&waiter, cv, l, 0, 0, 0, BOUND_SECONDS, 0)
+            });
+            (handle, port_rx)
+        };
+        let (b, _b_port) = wait(2 * INC);
+        let (c, _c_port) = wait(3 * INC);
+        await_waiters(task, cv, 2);
+        assert_eq!(cvsignal(task, cv, 3 * INC, 0, 0, 0, 0), Ok(INC as usize));
+        assert_eq!(b.join().unwrap(), Ok(0));
+        let (a, port) = wait(INC);
+        await_waiters(task, cv, 2);
+        let port = port.recv_timeout(BOUND).unwrap();
+        assert_eq!(
+            cvsignal(task, cv, 3 * INC, INC, INC, port, 0),
+            Ok((INC | CV_PBIT) as usize)
+        );
+        assert_eq!(a.join().unwrap(), Ok(0));
+        assert_eq!(c.join().unwrap(), Ok(0));
+    });
+}
+
+/// `pthread_cond_destroy` of a condition variable whose P bit is set.
+fn destroy_cv(task: &Task<Platform>, cv: usize, l: u32, u: u32, s: u32) {
+    assert_eq!(
+        bsd(
+            task,
+            nr::PSYNCH_CVCLRPREPOST,
+            &[cv, l as usize, u as usize, s as usize, 0, l as usize, 0]
+        ),
+        Ok(0)
+    );
+}
+
 #[test]
 fn psynch_syscalls_decode_like_xnu() {
     use litebox_common_macos::syscall::{PsynchRwOperation, SyscallRequest};
@@ -966,8 +1012,8 @@ fn idle_rwlock_state_expires() {
 /// variables `PSYNCH_MAX_FAKES` preposts; beyond either a call fails with
 /// ENOMEM before any effect, idle rwlock queues are freed early to make
 /// room, and freed entries return to the budget. Signals that leave L - S
-/// beyond any thread count keep every prepost, so only such a guest fills
-/// the budget.
+/// as high as their preposts keep every prepost, so such a guest fills the
+/// budget.
 #[test]
 fn psynch_tables_are_bounded() {
     let task = new_task();
@@ -1013,18 +1059,14 @@ fn psynch_tables_are_bounded() {
     );
     assert_eq!(task.global.psynch.lock().queue_count(), 0);
 
-    // Signals at ever higher sequences each prepost.
-    let cv = 0x3;
-    let mut l = 0;
-    for _ in 0..PSYNCH_MAX_FAKES {
-        l += INC;
-        assert_eq!(
-            cvsignal(&task, cv, l, 0, l - INC, 0, 0),
-            Ok(CV_PBIT as usize)
-        );
-    }
+    // Signals at ever higher sequences each prepost, on condition variables
+    // whose L - S keeps every prepost.
+    let fillers = 0x20_0000;
+    let lwords = fill_fake_budget(&task, fillers, PSYNCH_MAX_FAKES);
+    let full = fillers + 8 * (lwords.len() - 1);
+    let l = *lwords.last().unwrap();
     assert_eq!(
-        cvsignal(&task, cv, l + INC, 0, l, 0, 0),
+        cvsignal(&task, full, l + INC, 0, l, 0, 0),
         errno(Errno::ENOMEM)
     );
     assert_eq!(task.global.psynch.lock().fake_count(), PSYNCH_MAX_FAKES);
@@ -1050,31 +1092,23 @@ fn psynch_tables_are_bounded() {
             errno(Errno::ENOMEM)
         );
         assert_eq!(task.global.psynch.lock().waiters(other), 1);
-        // A broadcast folds the full condition variable's entries into one.
-        assert_eq!(cvbroad(&task, cv, l, 0, 0, 0, 0), Ok(CV_PBIT as usize));
-        assert_eq!(task.global.psynch.lock().fake_count(), 1);
+        // A broadcast folds a full condition variable's entries into one.
+        assert_eq!(
+            cvbroad(&task, fillers, lwords[0], 0, 0, 0, 0),
+            Ok(CV_PBIT as usize)
+        );
+        assert_eq!(
+            task.global.psynch.lock().fake_count(),
+            PSYNCH_MAX_FAKES - FILLER_ENTRIES as usize + 1
+        );
         assert_eq!(
             cvbroad(&task, other, 2 * INC, 0, 0, 2, 0),
             Ok((INC | CV_PBIT) as usize)
         );
         assert_eq!(queued.join().unwrap(), Ok(0));
     });
-    assert_eq!(
-        bsd(
-            &task,
-            nr::PSYNCH_CVCLRPREPOST,
-            &[other, 2 * INC as usize, 0, 0, 0, 2 * INC as usize, 0]
-        ),
-        Ok(0)
-    );
-    assert_eq!(
-        bsd(
-            &task,
-            nr::PSYNCH_CVCLRPREPOST,
-            &[cv, l as usize, 0, 0, 0, l as usize, 0]
-        ),
-        Ok(0)
-    );
+    destroy_cv(&task, other, 2 * INC, 0, 0);
+    clear_fillers(&task, fillers, &lwords);
     assert_eq!(task.global.psynch.lock().fake_count(), 0);
     assert_eq!(task.global.psynch.lock().queue_count(), 0);
     // cvclrprepost of a mutex clears its first-fit prepost.
@@ -1093,18 +1127,31 @@ fn psynch_tables_are_bounded() {
 /// libpthread's own traffic: a waiter took L=1 and released its mutex but
 /// has not reached the kernel, so L - S stays one while another thread's
 /// timed waits time out and its signals each prepost above that waiter.
-/// Far past the fake-entry budget, the entries no later call can reach are
-/// dropped instead of failing: a signal on another condition variable still
-/// preposts for its waiter, and withheld waiters still take their signals,
-/// also when one takes the highest prepost before the other arrives.
+/// Condition variables left with a targeted signal's residue keep theirs,
+/// as in XNU. With the rest of the budget held by pathological preposts,
+/// these rounds cross it again and again; the entries no later call can
+/// reach are dropped instead of failing: a signal on another condition
+/// variable still preposts for its waiter, and withheld waiters still take
+/// their signals, also when one takes the highest prepost before the other
+/// arrives.
 #[test]
 fn timed_waits_and_signals_past_a_withheld_waiter_keep_preposting() {
+    const RESIDUES: usize = 16;
     let task = new_task();
     // Every wait here times out on its own after 1 ns; the bound covers the
-    // whole loop of them, which takes several seconds and more under load.
+    // whole loop of them, which takes seconds and more under load.
     let _watchdog = Watchdog::with_bound(&task, Duration::from_secs(60));
+    let residues = 0x1_0000;
+    for index in 0..RESIDUES {
+        leave_targeted_signal_residue(&task, residues + 8 * index);
+    }
+    assert_eq!(task.global.psynch.lock().fake_count(), RESIDUES);
+    assert_eq!(task.global.psynch.lock().queue_count(), RESIDUES);
+    let fillers = 0x20_0000;
+    let lwords = fill_fake_budget(&task, fillers, PSYNCH_MAX_FAKES - 256);
+
     let (cv, other) = (0x1_6000, 0x1_7000);
-    let rounds = u32::try_from(PSYNCH_MAX_FAKES).unwrap() + 100;
+    let rounds = 2048;
     for round in 1..=rounds {
         let l = (round + 1) * INC;
         let s = (round - 1) * INC;
@@ -1121,6 +1168,11 @@ fn timed_waits_and_signals_past_a_withheld_waiter_keep_preposting() {
         );
     }
     assert!(task.global.psynch.lock().fake_count() < PSYNCH_MAX_FAKES);
+    // Compaction gave back the room the dropped entries took.
+    {
+        let table = task.global.psynch.lock();
+        assert!(table.capacity(cv) <= 8.max(4 * table.waiters(cv)));
+    }
     assert_eq!(
         cvsignal(&task, other, INC, 0, 0, 0, 0),
         Ok(CV_PBIT as usize)
@@ -1137,23 +1189,18 @@ fn timed_waits_and_signals_past_a_withheld_waiter_keep_preposting() {
         cvsignal(&task, cv, top, rounds * INC, (rounds + 1) * INC, 0, 0),
         Ok(CV_PBIT as usize)
     );
-    // Another condition variable whose L - S no thread count explains keeps
-    // all its preposts and fills the budget, so the next signal drops
+    // More pathological preposts fill the budget, so the next signal drops
     // entries here again.
-    let filler = 0x1_8000;
-    let mut l = 0;
-    while task.global.psynch.lock().fake_count() < PSYNCH_MAX_FAKES {
-        l += INC;
-        assert_eq!(
-            cvsignal(&task, filler, l, 0, l - INC, 0, 0),
-            Ok(CV_PBIT as usize)
-        );
-    }
+    let more = 0x40_0000;
+    let more_lwords = fill_fake_budget(&task, more, PSYNCH_MAX_FAKES);
+    let held = task.global.psynch.lock().fake_count();
+    let last = more + 8 * (more_lwords.len() - 1);
+    let l = *more_lwords.last().unwrap();
     assert_eq!(
-        cvsignal(&task, filler, l + INC, 0, l, 0, 0),
+        cvsignal(&task, last, l + INC, 0, l, 0, 0),
         Ok(CV_PBIT as usize)
     );
-    assert!(task.global.psynch.lock().fake_count() < PSYNCH_MAX_FAKES);
+    assert!(task.global.psynch.lock().fake_count() < held);
     // The second waiter takes its own prepost; the first, arriving later
     // with the words it saw, still finds a signal.
     assert_eq!(
@@ -1164,18 +1211,13 @@ fn timed_waits_and_signals_past_a_withheld_waiter_keep_preposting() {
         cvwait(&task, cv, INC, 0, 0, 0, 0, 1_000_000),
         Ok((INC | CV_CBIT) as usize)
     );
-    assert_eq!(
-        cvbroad(&task, filler, l + INC, 0, 0, 0, 0),
-        Ok(CV_PBIT as usize)
-    );
-    assert_eq!(
-        bsd(
-            &task,
-            nr::PSYNCH_CVCLRPREPOST,
-            &[filler, (l + INC) as usize, 0, 0, 0, (l + INC) as usize, 0]
-        ),
-        Ok(0)
-    );
+    destroy_cv(&task, last, l + INC, l, 0);
+    clear_fillers(&task, more, &more_lwords);
+    clear_fillers(&task, fillers, &lwords);
+    assert_eq!(task.global.psynch.lock().fake_count(), RESIDUES);
+    for index in 0..RESIDUES {
+        destroy_cv(&task, residues + 8 * index, 3 * INC, INC, 2 * INC);
+    }
     assert_eq!(task.global.psynch.lock().fake_count(), 0);
     assert_eq!(task.global.psynch.lock().queue_count(), 0);
 }
