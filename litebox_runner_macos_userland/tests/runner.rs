@@ -1223,3 +1223,185 @@ fn threads_that_all_terminate_end_the_process() {
         (Some(0), &b""[..], "")
     );
 }
+
+/// The scenarios of `fixtures/psynch.c` with the guest environment `env`.
+#[cfg(feature = "test-broker")]
+fn run_psynch_scenario(scenario: &str, env: &[&str]) -> (Option<i32>, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "psynch.c",
+        include_str!("fixtures/psynch.c"),
+        &["-O1"],
+    );
+    let mut arguments = Vec::new();
+    for entry in env {
+        arguments.extend(["--env", entry]);
+    }
+    arguments.extend(["--", binary.to_str().unwrap(), scenario]);
+    let (code, stdout, stderr) = run_runner_with_timeout(&arguments);
+    (code, String::from_utf8(stdout).unwrap(), stderr)
+}
+
+/// Run the runner with `arguments`, failing if it has not exited within a
+/// minute.
+#[cfg(feature = "test-broker")]
+fn run_runner_with_timeout(arguments: &[&str]) -> (Option<i32>, Vec<u8>, String) {
+    use std::io::Read as _;
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+            .args(arguments)
+            .env_remove("LITEBOX_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdout = Vec::new();
+    let mut out = child.0.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        out.read_to_end(&mut stdout).unwrap();
+        stdout
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "guest {arguments:?} did not exit within a minute"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status.code(), reader.join().unwrap(), stderr)
+}
+
+/// A contended `pthread_mutex` (psynch): 8 threads x 100k increments with
+/// the default first-fit policy and with fair share.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_contend_on_a_pthread_mutex() {
+    assert_eq!(
+        run_psynch_scenario("mutex", &[]),
+        (
+            Some(0),
+            "firstfit 800000 fairshare 800000 ulock 0\n".to_owned(),
+            String::new()
+        )
+    );
+}
+
+/// Producers and consumers on psynch condition variables, and
+/// `pthread_cond_timedwait` (absolute, relative, and ended by a signal).
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_share_pthread_condition_variables() {
+    assert_eq!(
+        run_psynch_scenario("condvar", &[]),
+        (
+            Some(0),
+            "consumed 80000 sum 1 absolute 1 waited 1 relative 1 signaled 1 ulock 0\n".to_owned(),
+            String::new()
+        )
+    );
+}
+
+/// The same mutex and condition variable programs on the ulock path
+/// (`PTHREAD_MUTEX_USE_ULOCK=1` in the guest's environment).
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_use_ulock_pthread_mutexes_and_condition_variables() {
+    let ulock = ["PTHREAD_MUTEX_USE_ULOCK=1"];
+    assert_eq!(
+        run_psynch_scenario("mutex", &ulock),
+        (
+            Some(0),
+            "firstfit 800000 fairshare 800000 ulock 1\n".to_owned(),
+            String::new()
+        )
+    );
+    assert_eq!(
+        run_psynch_scenario("condvar", &ulock),
+        (
+            Some(0),
+            "consumed 80000 sum 1 absolute 1 waited 1 relative 1 signaled 1 ulock 1\n".to_owned(),
+            String::new()
+        )
+    );
+}
+
+/// Readers and writers on a `pthread_rwlock`: readers never see a write
+/// half done.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_share_a_pthread_rwlock() {
+    assert_eq!(
+        run_psynch_scenario("rwlock", &[]),
+        (
+            Some(0),
+            "writes 4000 reads 12000 torn 0\n".to_owned(),
+            String::new()
+        )
+    );
+}
+
+/// `pthread_once` from 16 threads at once runs the initializer once, and
+/// every caller returns after it finished.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_call_pthread_once_together() {
+    assert_eq!(
+        run_psynch_scenario("once", &[]),
+        (Some(0), "initialized 1 saw 16\n".to_owned(), String::new())
+    );
+}
+
+/// `printf` from 8 threads at once: stdout's FILE lock (a pthread mutex)
+/// keeps each of the 1600 lines whole.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_printf_concurrently() {
+    let (code, stdout, stderr) = run_psynch_scenario("printf", &[]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort_unstable();
+    let expected: Vec<String> = (0..8)
+        .flat_map(|thread| (0..200).map(move |line| format!("thread {thread:02} line {line:03}")))
+        .collect();
+    assert_eq!(lines, expected);
+}
+
+/// C++ `std::thread`, `std::mutex` and `std::condition_variable`
+/// (including `wait_for` timing out) on the guest's libc++ and libpthread.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_use_cpp_std_mutex_and_condition_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang++",
+        "psynch.cpp",
+        include_str!("fixtures/psynch.cpp"),
+        &["-std=c++17", "-O1"],
+    );
+    let (code, stdout, stderr) = run_runner_with_timeout(&[binary.to_str().unwrap()]);
+    assert_eq!(
+        (code, String::from_utf8(stdout).unwrap(), stderr),
+        (
+            Some(0),
+            "counter 800000 sum 199990000 timeout 1 waited 1\n".to_owned(),
+            String::new()
+        )
+    );
+}
