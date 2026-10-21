@@ -178,11 +178,12 @@ fn rw(
 }
 
 /// Bounds a test's waits, most of which have no timeout: after [`BOUND`]
-/// it releases every thread blocked in psynch (with a zero grant), on a
+/// (or the bound it is given) it releases every thread blocked in psynch (with a zero grant), on a
 /// semaphore or Mach port (as if it died) or in ulock until the test ends,
 /// and then fails the test, so a broken implementation fails instead of
 /// hanging.
 pub(super) struct Watchdog {
+    bound: Duration,
     done: Arc<core::sync::atomic::AtomicBool>,
     fired: Arc<core::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -190,6 +191,10 @@ pub(super) struct Watchdog {
 
 impl Watchdog {
     pub(super) fn new(task: &Task<Platform>) -> Self {
+        Self::with_bound(task, BOUND)
+    }
+
+    pub(super) fn with_bound(task: &Task<Platform>, bound: Duration) -> Self {
         use core::sync::atomic::{AtomicBool, Ordering};
         let done = Arc::new(AtomicBool::new(false));
         let fired = Arc::new(AtomicBool::new(false));
@@ -199,7 +204,7 @@ impl Watchdog {
             move || {
                 let start = Instant::now();
                 while !done.load(Ordering::Acquire) {
-                    if start.elapsed() >= BOUND {
+                    if start.elapsed() >= bound {
                         let released = global.psynch.lock().release_all_waiters()
                             + global.semaphores.lock().release_all_waiters()
                             + global.ipc.lock().release_all_waiters()
@@ -213,6 +218,7 @@ impl Watchdog {
             }
         });
         Self {
+            bound,
             done,
             fired,
             thread: Some(thread),
@@ -227,7 +233,8 @@ impl Drop for Watchdog {
         self.thread.take().unwrap().join().unwrap();
         assert!(
             !self.fired.load(Ordering::Acquire) || std::thread::panicking(),
-            "a wait was still blocked after {BOUND:?}"
+            "a wait was still blocked after {:?}",
+            self.bound
         );
     }
 }
@@ -1054,7 +1061,9 @@ fn psynch_tables_are_bounded() {
 #[test]
 fn timed_waits_and_signals_past_a_withheld_waiter_keep_preposting() {
     let task = new_task();
-    let _watchdog = Watchdog::new(&task);
+    // Every wait here times out on its own after 1 ns; the bound covers the
+    // whole loop of them, which takes several seconds and more under load.
+    let _watchdog = Watchdog::with_bound(&task, Duration::from_secs(60));
     let (cv, other) = (0x1_6000, 0x1_7000);
     let rounds = u32::try_from(PSYNCH_MAX_FAKES).unwrap() + 100;
     for round in 1..=rounds {
