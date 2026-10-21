@@ -1484,7 +1484,10 @@ fn threads_cancel_threads_at_cancellation_points() {
 }
 
 /// `pthread_cancel` of a thread blocked in `read` of open, empty standard
-/// input ends the read with `EINTR`, and the thread is canceled.
+/// input ends the read with `EINTR`, and the thread is canceled. The guest
+/// cannot tell whether its read had blocked when the cancel came;
+/// `syscalls::file::tests::markcancel_ends_blocked_reads_and_writes` in the
+/// shim proves the blocked case.
 #[cfg(feature = "test-broker")]
 #[test]
 fn threads_cancel_a_thread_blocked_in_read() {
