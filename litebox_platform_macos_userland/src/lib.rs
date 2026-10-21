@@ -1163,24 +1163,9 @@ impl ProcessState {
     }
 }
 
-/// Signal a host thread without libpthread's thread-list lock, which guest code
-/// may hold because it shares the host libpthread.
-fn signal_host_thread(port: libc::mach_port_t, signal: i32) {
-    unsafe extern "C" {
-        fn __pthread_kill(port: libc::mach_port_t, signal: i32) -> i32;
-    }
-    // SAFETY: callers hold the port's identity lock, so the thread is live.
-    unsafe { __pthread_kill(port, signal) };
-}
-
-fn current_host_thread_port() -> libc::mach_port_t {
-    // SAFETY: pthread_self has no preconditions.
-    unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) }
-}
-
 struct ThreadState {
-    // Mach thread port, cleared before thread exit to prevent name-reuse races.
-    identity: Mutex<Option<libc::mach_port_t>>,
+    // Cleared before thread exit to prevent pthread ID-reuse races.
+    identity: Mutex<Option<usize>>,
     interrupted: AtomicBool,
     /// State shared by all host threads belonging to one guest process.
     process: Arc<ProcessState>,
@@ -1222,9 +1207,9 @@ impl ThreadHandle {
         self.0.interrupted.store(true, Ordering::Release);
         {
             let identity = self.0.identity.lock().unwrap();
-            if let Some(port) = *identity {
-                // This lock prevents unregistering/reusing the port during delivery.
-                signal_host_thread(port, interrupt_signal());
+            if let Some(identity) = *identity {
+                // SAFETY: this lock prevents unregistering/reusing the saved pthread_t during delivery.
+                unsafe { libc::pthread_kill(identity as libc::pthread_t, interrupt_signal()) };
             }
         }
         let waker = self.0.waker.lock().unwrap().clone();
@@ -1283,7 +1268,8 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         })
         .expect("initialized thread TLS");
         let handle = ThreadHandle(Arc::new(ThreadState {
-            identity: Mutex::new(Some(current_host_thread_port())),
+            // SAFETY: pthread_self has no preconditions.
+            identity: Mutex::new(Some(unsafe { libc::pthread_self() } as usize)),
             interrupted: AtomicBool::new(false),
             process: Arc::new(ProcessState::default()),
             waker: Mutex::new(None),
@@ -1440,7 +1426,7 @@ unsafe extern "C" fn syscall_callback() {
         "adrp x17, {tls_key_offset}@PAGE",
         "ldr x17, [x17, {tls_key_offset}@PAGEOFF]",
         "add x16, x16, x17",
-        "ldr x16, [x16]", // LiteBox TlsBlock pointer, or zero for host-only threads
+        "ldr x16, [x16]", // LiteBox TlsBlock pointer, or zero if this thread never registered
         "cbz x16, 90f",
         "ldr x17, [x16, #{in_guest}]",
         "cbz x17, 90f",
@@ -1515,7 +1501,7 @@ unsafe extern "C" fn syscall_callback() {
         "str xzr, [x16, #{in_guest}]",
         "b _litebox_macos_syscall_callback_in_guest_cleared",
         ".cfi_endproc",
-        // Keep the continuation and native path in this Mach-O atom: local
+        // Keep the continuation and the trap in this Mach-O atom: local
         // CBZ targets and the prologue's signal-PC bounds must not be split.
         ".globl _litebox_macos_syscall_callback_in_guest_cleared",
         ".alt_entry _litebox_macos_syscall_callback_in_guest_cleared",
@@ -1616,115 +1602,101 @@ unsafe extern "C" fn switch_to_guest_via_sigreturn() -> ! {
     );
 }
 
-// Restores the guest registers and installs the interrupt boundary. x0
-// (ThreadContext) stays intact until the saved stack is selected.
-macro_rules! restore_guest_registers {
-    (
-        $name:literal,
-        stack = ($stack_base:literal, $stack_offset:expr),
-        branch = ($branch_base:literal, $branch_offset:expr)
-    ) => {
-        core::arch::naked_asm!(
-            "ldr x16, [x0, #{context}]",
-            "mrs x17, tpidrro_el0",
-            "and x17, x17, #0xfffffffffffffff8",
-            "adrp x1, {tls_key_offset}@PAGE",
-            "ldr x1, [x1, {tls_key_offset}@PAGEOFF]",
-            "add x17, x17, x1",
-            "ldr x17, [x17]",
-            "mrs x1, fpsr",
-            "mrs x2, fpcr",
-            "stp w1, w2, [x17, #{host_fp_state}]",
-            concat!(".globl _", $name, "_start"),
-            concat!(".alt_entry _", $name, "_start"),
-            concat!("_", $name, "_start:"),
-            "mov x1, #1",
-            "str x1, [x17, #{in_guest}]",
-            "ldr x1, [x0, #{interrupted}]",
-            "ldarb w1, [x1]",
-            "cbz w1, 1f",
-            "str xzr, [x17, #{in_guest}]",
-            "b _litebox_macos_interrupt_callback",
-            "1:",
-            "ldr x1, [x16, #{regs_x18}]",
-            "str x1, [x17, #{guest_x18}]",
-            "ldr x1, [x17, #{vector_state}]",
-            "ldp q0, q1, [x1, #0]",
-            "ldp q2, q3, [x1, #32]",
-            "ldp q4, q5, [x1, #64]",
-            "ldp q6, q7, [x1, #96]",
-            "ldp q8, q9, [x1, #128]",
-            "ldp q10, q11, [x1, #160]",
-            "ldp q12, q13, [x1, #192]",
-            "ldp q14, q15, [x1, #224]",
-            "ldp q16, q17, [x1, #256]",
-            "ldp q18, q19, [x1, #288]",
-            "ldp q20, q21, [x1, #320]",
-            "ldp q22, q23, [x1, #352]",
-            "ldp q24, q25, [x1, #384]",
-            "ldp q26, q27, [x1, #416]",
-            "ldp q28, q29, [x1, #448]",
-            "ldp q30, q31, [x1, #480]",
-            "ldr w2, [x1, #{vector_fpsr}]",
-            "msr fpsr, x2",
-            "ldr w2, [x1, #{vector_fpcr}]",
-            "msr fpcr, x2",
-            "ldr x1, [x16, #{regs_pstate}]",
-            "msr nzcv, x1",
-            concat!("ldr x9, [", $stack_base, ", #{resume_sp}]"),
-            "mov sp, x9",
-            "ldp x0, x1, [x16, #0]",
-            "ldp x2, x3, [x16, #16]",
-            "ldp x4, x5, [x16, #32]",
-            "ldp x6, x7, [x16, #48]",
-            "ldp x8, x9, [x16, #64]",
-            "ldp x10, x11, [x16, #80]",
-            "ldp x12, x13, [x16, #96]",
-            "ldp x14, x15, [x16, #112]",
-            "ldr x17, [x16, #{regs_x17}]",
-            "ldp x19, x20, [x16, #{regs_x19}]",
-            "ldp x21, x22, [x16, #{regs_x21}]",
-            "ldp x23, x24, [x16, #{regs_x23}]",
-            "ldp x25, x26, [x16, #{regs_x25}]",
-            "ldp x27, x28, [x16, #{regs_x27}]",
-            "ldp x29, x30, [x16, #{regs_x29}]",
-            concat!("ldr x16, [", $branch_base, ", #{resume_pc}]"),
-            "br x16",
-            concat!(".globl _", $name, "_end"),
-            concat!(".alt_entry _", $name, "_end"),
-            concat!("_", $name, "_end:"),
-            "brk #0",
-            tls_key_offset = sym TLS_KEY_OFFSET,
-            context = const core::mem::offset_of!(ThreadContext, ctx),
-            in_guest = const tls_offset::IN_GUEST,
-            guest_x18 = const tls_offset::GUEST_X18,
-            vector_state = const tls_offset::VECTOR_STATE,
-            host_fp_state = const tls_offset::HOST_FP_STATE,
-            interrupted = const core::mem::offset_of!(ThreadContext, interrupted),
-            resume_sp = const $stack_offset,
-            resume_pc = const $branch_offset,
-            regs_pstate = const core::mem::offset_of!(PtRegs, pstate),
-            regs_x17 = const core::mem::offset_of!(PtRegs, regs) + 17 * size_of::<usize>(),
-            regs_x18 = const core::mem::offset_of!(PtRegs, regs) + 18 * size_of::<usize>(),
-            regs_x19 = const core::mem::offset_of!(PtRegs, regs) + 19 * size_of::<usize>(),
-            regs_x21 = const core::mem::offset_of!(PtRegs, regs) + 21 * size_of::<usize>(),
-            regs_x23 = const core::mem::offset_of!(PtRegs, regs) + 23 * size_of::<usize>(),
-            regs_x25 = const core::mem::offset_of!(PtRegs, regs) + 25 * size_of::<usize>(),
-            regs_x27 = const core::mem::offset_of!(PtRegs, regs) + 27 * size_of::<usize>(),
-            regs_x29 = const core::mem::offset_of!(PtRegs, regs) + 29 * size_of::<usize>(),
-            vector_fpsr = const core::mem::offset_of!(GuestVectorState, fpsr),
-            vector_fpcr = const core::mem::offset_of!(GuestVectorState, fpcr),
-        );
-    };
-}
-
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) -> ! {
-    // Resume at the captured SVC frame; the outbound stub restores x16 and pops it.
-    restore_guest_registers!(
-        "switch_to_guest_via_outbound_stub",
-        stack = ("x0", core::mem::offset_of!(ThreadContext, svc_frame)),
-        branch = ("sp", SVC_FRAME_OFF_STUB)
+    // x0 (ThreadContext) stays intact until the saved stack is selected, so a
+    // pending interrupt can still reach the callback. Resume at the captured
+    // SVC frame; the outbound stub restores guest x16 and pops the frame.
+    core::arch::naked_asm!(
+        "ldr x16, [x0, #{context}]",
+        "mrs x17, tpidrro_el0",
+        "and x17, x17, #0xfffffffffffffff8",
+        "adrp x1, {tls_key_offset}@PAGE",
+        "ldr x1, [x1, {tls_key_offset}@PAGEOFF]",
+        "add x17, x17, x1",
+        "ldr x17, [x17]",
+        "mrs x1, fpsr",
+        "mrs x2, fpcr",
+        "stp w1, w2, [x17, #{host_fp_state}]",
+        ".globl _switch_to_guest_via_outbound_stub_start",
+        ".alt_entry _switch_to_guest_via_outbound_stub_start",
+        "_switch_to_guest_via_outbound_stub_start:",
+        "mov x1, #1",
+        "str x1, [x17, #{in_guest}]",
+        "ldr x1, [x0, #{interrupted}]",
+        "ldarb w1, [x1]",
+        "cbz w1, 1f",
+        "str xzr, [x17, #{in_guest}]",
+        "b _litebox_macos_interrupt_callback",
+        "1:",
+        "ldr x1, [x16, #{regs_x18}]",
+        "str x1, [x17, #{guest_x18}]",
+        "ldr x1, [x17, #{vector_state}]",
+        "ldp q0, q1, [x1, #0]",
+        "ldp q2, q3, [x1, #32]",
+        "ldp q4, q5, [x1, #64]",
+        "ldp q6, q7, [x1, #96]",
+        "ldp q8, q9, [x1, #128]",
+        "ldp q10, q11, [x1, #160]",
+        "ldp q12, q13, [x1, #192]",
+        "ldp q14, q15, [x1, #224]",
+        "ldp q16, q17, [x1, #256]",
+        "ldp q18, q19, [x1, #288]",
+        "ldp q20, q21, [x1, #320]",
+        "ldp q22, q23, [x1, #352]",
+        "ldp q24, q25, [x1, #384]",
+        "ldp q26, q27, [x1, #416]",
+        "ldp q28, q29, [x1, #448]",
+        "ldp q30, q31, [x1, #480]",
+        "ldr w2, [x1, #{vector_fpsr}]",
+        "msr fpsr, x2",
+        "ldr w2, [x1, #{vector_fpcr}]",
+        "msr fpcr, x2",
+        "ldr x1, [x16, #{regs_pstate}]",
+        "msr nzcv, x1",
+        "ldr x9, [x0, #{thread_svc_frame}]",
+        "mov sp, x9",
+        "ldp x0, x1, [x16, #0]",
+        "ldp x2, x3, [x16, #16]",
+        "ldp x4, x5, [x16, #32]",
+        "ldp x6, x7, [x16, #48]",
+        "ldp x8, x9, [x16, #64]",
+        "ldp x10, x11, [x16, #80]",
+        "ldp x12, x13, [x16, #96]",
+        "ldp x14, x15, [x16, #112]",
+        "ldr x17, [x16, #{regs_x17}]",
+        "ldp x19, x20, [x16, #{regs_x19}]",
+        "ldp x21, x22, [x16, #{regs_x21}]",
+        "ldp x23, x24, [x16, #{regs_x23}]",
+        "ldp x25, x26, [x16, #{regs_x25}]",
+        "ldp x27, x28, [x16, #{regs_x27}]",
+        "ldp x29, x30, [x16, #{regs_x29}]",
+        "ldr x16, [sp, #{frame_stub}]",
+        "br x16",
+        ".globl _switch_to_guest_via_outbound_stub_end",
+        ".alt_entry _switch_to_guest_via_outbound_stub_end",
+        "_switch_to_guest_via_outbound_stub_end:",
+        "brk #0",
+        tls_key_offset = sym TLS_KEY_OFFSET,
+        context = const core::mem::offset_of!(ThreadContext, ctx),
+        in_guest = const tls_offset::IN_GUEST,
+        guest_x18 = const tls_offset::GUEST_X18,
+        vector_state = const tls_offset::VECTOR_STATE,
+        host_fp_state = const tls_offset::HOST_FP_STATE,
+        interrupted = const core::mem::offset_of!(ThreadContext, interrupted),
+        thread_svc_frame = const core::mem::offset_of!(ThreadContext, svc_frame),
+        frame_stub = const SVC_FRAME_OFF_STUB,
+        regs_pstate = const core::mem::offset_of!(PtRegs, pstate),
+        regs_x17 = const core::mem::offset_of!(PtRegs, regs) + 17 * size_of::<usize>(),
+        regs_x18 = const core::mem::offset_of!(PtRegs, regs) + 18 * size_of::<usize>(),
+        regs_x19 = const core::mem::offset_of!(PtRegs, regs) + 19 * size_of::<usize>(),
+        regs_x21 = const core::mem::offset_of!(PtRegs, regs) + 21 * size_of::<usize>(),
+        regs_x23 = const core::mem::offset_of!(PtRegs, regs) + 23 * size_of::<usize>(),
+        regs_x25 = const core::mem::offset_of!(PtRegs, regs) + 25 * size_of::<usize>(),
+        regs_x27 = const core::mem::offset_of!(PtRegs, regs) + 27 * size_of::<usize>(),
+        regs_x29 = const core::mem::offset_of!(PtRegs, regs) + 29 * size_of::<usize>(),
+        vector_fpsr = const core::mem::offset_of!(GuestVectorState, fpsr),
+        vector_fpcr = const core::mem::offset_of!(GuestVectorState, fpcr),
     );
 }
 
@@ -1754,7 +1726,7 @@ fn run_thread_inner_with_process(
 ) {
     let guest_abi = *GUEST_ABI.get().expect("guest ABI must be configured first");
     initialize_thread_tls();
-    register_exception_handlers().expect("re-registering macOS exception handlers");
+    register_exception_handlers().expect("installing macOS exception handlers");
     assert!(
         read_tls(tls_offset::ACTIVE) == 0,
         "nested guest entry is not supported"
@@ -1769,8 +1741,8 @@ fn run_thread_inner_with_process(
     // Entry/resume installs x18 from PtRegs.
     set_guest_x18(0);
     let thread = ThreadHandle(Arc::new(ThreadState {
-        // Unregistered before thread exit.
-        identity: Mutex::new(Some(current_host_thread_port())),
+        // SAFETY: pthread_self has no preconditions; unregister before thread exit.
+        identity: Mutex::new(Some(unsafe { libc::pthread_self() } as usize)),
         interrupted: AtomicBool::new(false),
         process,
         waker: Mutex::new(None),
@@ -2084,24 +2056,6 @@ fn restore_signal_context(regs: &PtRegs, mc: &mut libc::__darwin_mcontext64) {
     mc.__ns.__fpcr = state.fpcr;
 }
 
-fn raw_signal_write(bytes: &[u8]) {
-    let result: usize;
-    // SAFETY: bytes is readable for x2 bytes; registers follow Darwin SYS_write,
-    // and x1 is declared inlateout because XNU may overwrite it on return.
-    unsafe {
-        core::arch::asm!(
-            "svc #0x80",
-            in("x0") libc::STDERR_FILENO as usize,
-            inlateout("x1") bytes.as_ptr() => _,
-            in("x2") bytes.len(),
-            in("x16") 4usize,
-            lateout("x0") result,
-            options(nostack),
-        );
-    }
-    let _ = result;
-}
-
 fn fatal_signal(message: &[u8], pc: usize) -> ! {
     const DIGITS: usize = size_of::<usize>() * 2;
     let mut address = [b'0'; DIGITS + 1];
@@ -2109,17 +2063,12 @@ fn fatal_signal(message: &[u8], pc: usize) -> ! {
         *byte = b"0123456789abcdef"[(pc >> ((DIGITS - index - 1) * 4)) & 15];
     }
     address[DIGITS] = b'\n';
-    raw_signal_write(message);
-    raw_signal_write(b" pc=0x");
-    raw_signal_write(&address);
-    // SAFETY: SYS_exit accepts the status in x0 and never returns.
+    // SAFETY: all buffers are live for their lengths; write and _exit are async-signal-safe.
     unsafe {
-        core::arch::asm!(
-            "svc #0x80",
-            in("x0") (128 + libc::SIGABRT) as usize,
-            in("x16") 1usize,
-            options(noreturn),
-        );
+        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+        libc::write(libc::STDERR_FILENO, b" pc=0x".as_ptr().cast(), 6);
+        libc::write(libc::STDERR_FILENO, address.as_ptr().cast(), address.len());
+        libc::_exit(128 + libc::SIGABRT);
     }
 }
 
@@ -3256,6 +3205,38 @@ mod tests {
         unsafe { libc::alarm(5) };
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
         panic!("SIGINT returned on a non-guest thread");
+    }
+
+    #[test]
+    fn fatal_signal_reports_the_pc_and_exits_like_sigabrt() {
+        const CHILD_ENV: &str = "LITEBOX_MACOS_FATAL_SIGNAL_TEST";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::fatal_signal_reports_the_pc_and_exits_like_sigabrt",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(128 + libc::SIGABRT),
+                "{output:?}"
+            );
+            assert!(
+                output
+                    .stderr
+                    .ends_with(b"fatal test message pc=0x00000001234abcde\n"),
+                "{output:?}"
+            );
+            return;
+        }
+
+        // Bound a fatal path that blocks instead of exiting.
+        unsafe { libc::alarm(5) };
+        fatal_signal(b"fatal test message", 0x1_234a_bcde);
     }
 
     #[test]

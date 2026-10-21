@@ -138,8 +138,9 @@ impl<P: ShimPlatform> MacosShim<P> {
         self.load(params, path, None, None, argv, envp)
     }
 
-    /// Load a dynamically linked executable with a runtime-provided, unrewritten
-    /// dyld image. dyld is rewritten like every other guest image.
+    /// Load a dynamically linked executable with a runtime-provided dyld image.
+    /// Like every other guest image, an unrewritten dyld is rewritten during
+    /// loading and an AOT-rewritten dyld must carry valid rewrite metadata.
     pub fn load_program_with_dyld(
         self,
         params: TaskParams,

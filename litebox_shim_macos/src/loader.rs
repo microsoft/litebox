@@ -4,8 +4,8 @@
 //! Mach-O loading through the shim's file and virtual-memory subsystems.
 //!
 //! Parsing and rewriting use the same in-memory snapshot, isolating the load plan
-//! from later file changes. The runtime provider supplies dyld and any shared
-//! cache required by dynamically linked executables.
+//! from later file changes. The runtime provider supplies dyld for dynamically
+//! linked executables.
 
 use crate::{ShimPlatform, Task};
 use alloc::{borrow::Cow, ffi::CString, format, vec, vec::Vec};
@@ -104,9 +104,6 @@ impl<'a> Image<'a> {
         let data = arm64_slice(data)?;
         let mut plan = MachoParsedFile::parse(data)?;
         let (data, trampoline) = match plan.parse_trampoline(data) {
-            Ok(_) if plan.is_dyld => {
-                return Err(MachoLoaderError::Unsupported("pre-rewritten dyld"));
-            }
             Ok(trampoline) => (Cow::Borrowed(data), trampoline),
             Err(MachoLoaderError::Unrewritten) => {
                 // Only absent rewrite metadata permits rewriting; invalid metadata is an error.
