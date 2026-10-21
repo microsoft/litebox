@@ -4,8 +4,8 @@
 //! Active Windows-userland broker endpoints over a shared control ring.
 
 pub use crate::host::{
-    WindowsControlRingHostNotificationChannel, WindowsControlRingHostRequestSource,
-    WindowsControlRingHostResponseSink, WindowsControlRingHostShutdown,
+    WindowsControlRingHostCallLane, WindowsControlRingHostCallLaneSource,
+    WindowsControlRingHostNotificationChannel, WindowsControlRingHostShutdown,
 };
 pub use crate::local::{
     WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,

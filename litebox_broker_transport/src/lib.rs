@@ -28,8 +28,8 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod call_lane_pool;
 pub mod channel;
 pub mod control_ring;
-pub mod pending_calls;
 pub mod setup_frame;
 pub mod shared_memory;

@@ -17,11 +17,11 @@ mod host;
 mod local;
 
 pub use host::{
-    UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
-    UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
-    validate_peer_process,
+    UnixControlRingHostCallLane, UnixControlRingHostCallLaneSource,
+    UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown,
+    UnixStreamHostSetupChannel, validate_peer_process,
 };
 pub use local::{
-    MAX_PENDING_CALLS, UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
+    UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
     UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
 };

@@ -20,7 +20,7 @@ use litebox_broker_protocol::shared_buffer::{
 #[cfg(target_os = "linux")]
 use litebox_broker_protocol::socket::{ReceiveFromFlags, SendFlags, SocketConnectionStatus};
 use litebox_broker_transport::channel::LocalCallChannel;
-use litebox_broker_transport::control_ring::ControlRing;
+use litebox_broker_transport::control_ring::{ControlRing, ControlRingLayout};
 #[cfg(target_os = "linux")]
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
 #[cfg(windows)]
@@ -159,8 +159,10 @@ fn run_fake_runner(args: &[OsString]) {
                 SHARED_BUFFER_POOL_SIZE,
                 Some(Instant::now() + Duration::from_secs(5)),
             )?;
-            let control_memory =
-                setup.receive_control_ring(Some(Instant::now() + Duration::from_secs(5)))?;
+            let control_memory = setup.receive_control_ring(
+                ControlRingLayout::MULTI_LANE,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )?;
             let process_image =
                 setup.receive_process_image(Some(Instant::now() + Duration::from_secs(5)))?;
             (shared_memory, control_memory, process_image)
@@ -168,17 +170,18 @@ fn run_fake_runner(args: &[OsString]) {
         #[cfg(windows)]
         let (shared_memory, control_memory, process_image) = {
             let shared_memory = setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?;
-            let control_memory = setup.receive_control_ring()?;
+            let control_memory = setup.receive_control_ring(ControlRingLayout::MULTI_LANE)?;
             let process_image = setup.receive_process_image()?;
             (shared_memory, control_memory, process_image)
         };
         assert!(process_image.is_none());
-        let control_ring = ControlRing::new(control_memory).map_err(|error| {
-            std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!("invalid test control ring: {error:?}"),
-            )
-        })?;
+        let control_ring = ControlRing::new(control_memory, ControlRingLayout::MULTI_LANE)
+            .map_err(|error| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid test control ring: {error:?}"),
+                )
+            })?;
         #[cfg(target_os = "linux")]
         let (call_channel, _notifications, _shutdown) = setup.into_active(control_ring, || {})?;
         #[cfg(windows)]

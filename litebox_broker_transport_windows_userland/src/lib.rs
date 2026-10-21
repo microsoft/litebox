@@ -8,12 +8,12 @@
 
 #![cfg(all(windows, target_arch = "x86_64"))]
 
+mod call_lane_pool;
 pub mod control_ring;
 pub mod existing_runner;
 mod host;
 mod local;
 pub mod named_pipe;
-mod pending_calls;
 pub mod process_image;
 mod setup;
 pub mod shared_memory;

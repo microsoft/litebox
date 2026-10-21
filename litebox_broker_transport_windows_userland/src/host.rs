@@ -17,12 +17,13 @@ use litebox_broker_protocol::wire::{
     encode_notification, encode_response,
 };
 use litebox_broker_transport::channel::{
-    HostAssociationShutdown, HostNotificationChannel, HostReceive, HostRequestSource,
-    HostResponseSink, HostSetupChannel, PeerCredential,
+    HostAssociationShutdown, HostCallLane, HostCallLaneSource, HostNotificationChannel,
+    HostReceive, HostSetupChannel, PeerCredential,
 };
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_READY, ControlRing, ControlRingConsumer, ControlRingProducer,
-    ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+    BrokerControlRingEndpoints, BrokerControlRingLane, BrokerLaneDemand, ControlRing,
+    ControlRingConsumer, ControlRingDemandStatus, ControlRingProducer, ControlRingReadError,
+    ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
 };
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
@@ -45,16 +46,20 @@ pub struct WindowsNamedPipeHostSetupChannel {
     negotiated: bool,
 }
 
-/// Request-reading endpoint of an active host control-ring association.
-pub struct WindowsControlRingHostRequestSource {
-    consumer: ControlRingConsumer<WindowsSharedMemory>,
+type BrokerLane = BrokerControlRingLane<WindowsSharedMemory>;
+
+/// Source of the call lanes of an active host control-ring association, which
+/// hands out each lane once the runner starts using it.
+pub struct WindowsControlRingHostCallLaneSource {
+    /// Each lane, or `None` once handed out.
+    lanes: Vec<Option<BrokerLane>>,
+    demand: BrokerLaneDemand<WindowsSharedMemory>,
     association: Arc<HostRingAssociation>,
 }
 
-/// Shared response-writing endpoint of an active host control-ring association.
-#[derive(Clone)]
-pub struct WindowsControlRingHostResponseSink {
-    producer: Arc<Mutex<ControlRingProducer<WindowsSharedMemory>>>,
+/// One call lane of an active host control-ring association.
+pub struct WindowsControlRingHostCallLane {
+    lane: BrokerLane,
     association: Arc<HostRingAssociation>,
 }
 
@@ -69,12 +74,13 @@ pub struct WindowsControlRingHostShutdown {
     association: Arc<HostRingAssociation>,
 }
 
+/// State shared by every activated host endpoint of one association: terminal
+/// status, the pipe liveness used for teardown, and the wake handles of every
+/// ring wait.
 struct HostRingAssociation {
     status: Mutex<HostAssociationStatus>,
     liveness: PipeLiveness,
-    request_wake: ControlRingWakeHandle<WindowsSharedMemory>,
-    response_wake: ControlRingWakeHandle<WindowsSharedMemory>,
-    notification_wake: ControlRingWakeHandle<WindowsSharedMemory>,
+    wakes: Vec<ControlRingWakeHandle<WindowsSharedMemory>>,
 }
 
 enum HostAssociationStatus {
@@ -146,13 +152,14 @@ impl WindowsNamedPipeHostSetupChannel {
         )
     }
 
-    /// Activates host request, response, and notification control-ring endpoints.
+    /// Activates host call-lane, notification, and shutdown control-ring endpoints.
+    ///
+    /// The ring must have a layout of more than one lane.
     pub fn into_active(
         self,
         ring: ControlRing<WindowsSharedMemory>,
     ) -> IoResult<(
-        WindowsControlRingHostRequestSource,
-        WindowsControlRingHostResponseSink,
+        WindowsControlRingHostCallLaneSource,
         WindowsControlRingHostNotificationChannel,
         WindowsControlRingHostShutdown,
     )> {
@@ -214,8 +221,7 @@ fn activate_host(
     setup_deadline: Option<Instant>,
     ring: ControlRing<WindowsSharedMemory>,
 ) -> IoResult<(
-    WindowsControlRingHostRequestSource,
-    WindowsControlRingHostResponseSink,
+    WindowsControlRingHostCallLaneSource,
     WindowsControlRingHostNotificationChannel,
     WindowsControlRingHostShutdown,
 )> {
@@ -224,43 +230,47 @@ fn activate_host(
             "broker host setup channel activated before negotiation completed",
         ));
     }
+    let ready_token = ring.layout().ready_token();
+    let endpoints = ring.into_broker();
+    let wakes = endpoints.wake_handles();
+    let BrokerControlRingEndpoints {
+        lanes,
+        lane_demand: Some(demand),
+        notification_producer,
+    } = endpoints
+    else {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "broker control-ring layout has a single lane",
+        ));
+    };
     let ready = read_frame(file_handle(&stream), setup_deadline)?.ok_or_else(|| {
         Error::new(
             ErrorKind::UnexpectedEof,
             "runner closed before control-ring setup acknowledgement",
         )
     })?;
-    if ready != CONTROL_RING_READY {
+    if ready != ready_token {
         return Err(invalid_data(
             "runner sent an invalid control-ring setup acknowledgement",
         ));
     }
-    write_frame(file_handle(&stream), CONTROL_RING_READY, setup_deadline)?;
+    write_frame(file_handle(&stream), ready_token, setup_deadline)?;
 
-    let litebox_broker_transport::control_ring::BrokerControlRingEndpoints {
-        request_consumer,
-        response_producer,
-        notification_producer,
-    } = ring.into_broker();
     let stream = Arc::new(stream);
     let association = Arc::new(HostRingAssociation {
         liveness: PipeLiveness::new(Arc::clone(&stream), true)?,
         status: Mutex::new(HostAssociationStatus::Live),
-        request_wake: request_consumer.wake_handle(),
-        response_wake: response_producer.wake_handle(),
-        notification_wake: notification_producer.wake_handle(),
+        wakes,
     });
     let monitor_association = Arc::clone(&association);
     thread::Builder::new()
         .name("litebox-runner-liveness".to_owned())
         .spawn(move || monitor_host_pipe(&stream, &monitor_association))?;
     Ok((
-        WindowsControlRingHostRequestSource {
-            consumer: request_consumer,
-            association: Arc::clone(&association),
-        },
-        WindowsControlRingHostResponseSink {
-            producer: Arc::new(Mutex::new(response_producer)),
+        WindowsControlRingHostCallLaneSource {
+            lanes: lanes.into_iter().map(Some).collect(),
+            demand,
             association: Arc::clone(&association),
         },
         WindowsControlRingHostNotificationChannel {
@@ -298,23 +308,78 @@ impl Drop for WindowsControlRingHostShutdown {
     }
 }
 
-impl WindowsControlRingHostRequestSource {
-    /// Receives one active broker request.
+impl WindowsControlRingHostCallLaneSource {
+    /// Blocks until the runner starts using another lane and returns it.
+    ///
+    /// Once every lane is handed out, this blocks until the association ends.
+    /// Returns `Ok(None)` once the runner closed the association.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lane demand hands out a lane more than once.
+    pub fn next_lane(&mut self) -> IoResult<Option<WindowsControlRingHostCallLane>> {
+        loop {
+            if let Some(ended) = self.association.ended() {
+                return ended.map(|()| None);
+            }
+            match self.demand.try_next_lane() {
+                Ok(ControlRingDemandStatus::Lane(index)) => {
+                    let lane = self.lanes[index]
+                        .take()
+                        .expect("lane demand hands out each lane once");
+                    return Ok(Some(WindowsControlRingHostCallLane {
+                        lane,
+                        association: Arc::clone(&self.association),
+                    }));
+                }
+                Ok(ControlRingDemandStatus::Satisfied { wait_epoch }) => {
+                    if let Some(ended) = self.association.ended() {
+                        return ended.map(|()| None);
+                    }
+                    if let Err(error) = self.demand.wait_for_demand(wait_epoch) {
+                        let result = Err(copy_io_error(&error));
+                        let _ = self.association.fail(error);
+                        return result;
+                    }
+                }
+                Err(error) => {
+                    let error = ring_error(error);
+                    let result = Err(copy_io_error(&error));
+                    let _ = self.association.fail(error);
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+impl HostCallLaneSource for WindowsControlRingHostCallLaneSource {
+    type Error = Error;
+    type Lane = WindowsControlRingHostCallLane;
+
+    fn next_lane(&mut self) -> IoResult<Option<WindowsControlRingHostCallLane>> {
+        Self::next_lane(self)
+    }
+}
+
+impl WindowsControlRingHostCallLane {
+    /// Receives this lane's next broker request.
     pub fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+        let consumer = &mut self.lane.request_consumer;
         loop {
             if let Some(error) = self.association.current_failure() {
                 return Err(error);
             }
-            match self.consumer.try_read(decode_request) {
+            match consumer.try_read(decode_request) {
                 Ok(ControlRingReadStatus::Message(request)) => {
-                    self.association.acknowledge_request(&mut self.consumer)?;
+                    self.association.acknowledge_request(consumer)?;
                     return Ok(HostReceive::Message(request));
                 }
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                    if let Some(terminal) = self.association.request_terminal_result() {
-                        return terminal;
+                    if let Some(ended) = self.association.ended() {
+                        return ended.map(|()| HostReceive::PeerClosed);
                     }
-                    if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
+                    if let Err(error) = consumer.wait_for_message(wait_epoch) {
                         let result = Err(copy_io_error(&error));
                         let _ = self.association.fail(error);
                         return result;
@@ -338,26 +403,13 @@ impl WindowsControlRingHostRequestSource {
             }
         }
     }
-}
 
-impl HostRequestSource for WindowsControlRingHostRequestSource {
-    type Error = Error;
-
-    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
-        Self::recv_request(self)
-    }
-}
-
-impl WindowsControlRingHostResponseSink {
-    /// Serializes and sends one complete active broker response.
-    pub fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
+    /// Serializes and sends the response to this lane's last request.
+    pub fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
         let frame = encode_response(response.clone());
-        let mut producer = self
-            .producer
-            .lock()
-            .map_err(|_| Error::other("broker response writer mutex poisoned"))?;
+        let producer = &mut self.lane.response_producer;
         loop {
-            match self.association.try_publish(&mut producer, &frame)? {
+            match self.association.try_publish(producer, &frame)? {
                 ControlRingWriteStatus::Written => return Ok(()),
                 ControlRingWriteStatus::Full { wait_epoch } => {
                     if let Err(error) = producer.wait_for_capacity(wait_epoch) {
@@ -371,10 +423,14 @@ impl WindowsControlRingHostResponseSink {
     }
 }
 
-impl HostResponseSink for WindowsControlRingHostResponseSink {
+impl HostCallLane for WindowsControlRingHostCallLane {
     type Error = Error;
 
-    fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
+    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+        Self::recv_request(self)
+    }
+
+    fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
         Self::send_response(self, response)
     }
 }
@@ -453,20 +509,22 @@ impl HostRingAssociation {
     }
 
     fn interrupt_waits(&self) -> IoResult<()> {
-        self.request_wake
-            .interrupt_wait()
-            .and(self.response_wake.interrupt_wait())
-            .and(self.notification_wake.interrupt_wait())
+        self.wakes
+            .iter()
+            .map(ControlRingWakeHandle::interrupt_wait)
+            .fold(Ok(()), IoResult::and)
     }
 
-    fn request_terminal_result(&self) -> Option<IoResult<HostReceive<BrokerRequest>>> {
+    /// Returns how the association ended, if it has: `Ok` if the runner
+    /// closed it.
+    fn ended(&self) -> Option<IoResult<()>> {
         match &*self
             .status
             .lock()
             .expect("broker host association mutex poisoned")
         {
             HostAssociationStatus::Live => None,
-            HostAssociationStatus::PeerClosed => Some(Ok(HostReceive::PeerClosed)),
+            HostAssociationStatus::PeerClosed => Some(Ok(())),
             HostAssociationStatus::Failed(error) => Some(Err(copy_io_error(error))),
         }
     }

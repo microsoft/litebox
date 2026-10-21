@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use litebox_broker_core::test_support::TestBrokerCoreBuilder;
 use litebox_broker_core::{ObjectRights, PolicyEngine};
-use litebox_broker_host::{ConnectionTermination, setup_connection};
+use litebox_broker_host::{BrokerHostAssociation, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::FileOpenFlags;
@@ -20,11 +20,14 @@ use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_transport::channel::{HostNotificationChannel, HostReceive};
-use litebox_broker_transport::control_ring::{CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing};
+use litebox_broker_transport::control_ring::{
+    CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing, ControlRingLayout,
+};
 use litebox_broker_transport::shared_memory::SharedBufferPool;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
-    UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
+    UnixControlRingHostCallLaneSource, UnixControlRingHostNotificationChannel,
+    UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
 };
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
@@ -38,11 +41,33 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOCK_DELAY: Duration = Duration::from_millis(50);
 /// More objects than the notification ring holds, so publication must block.
 const OVERSUBSCRIBED_OBJECT_COUNT: u64 = CONTROL_RING_NOTIFICATION_SLOT_COUNT * 3;
+/// Layout of every test association's control ring.
+const LAYOUT: ControlRingLayout = ControlRingLayout::MULTI_LANE;
+
+/// Serves each call lane the local endpoint starts using on its own thread,
+/// until the association ends: `Ok` if the local endpoint closed it.
+fn serve_lanes(
+    mut lanes: UnixControlRingHostCallLaneSource,
+    association: &BrokerHostAssociation<MemfdSharedMemory>,
+) -> std::io::Result<()> {
+    std::thread::scope(|scope| {
+        while let Some(mut lane) = lanes.next_lane()? {
+            scope.spawn(move || {
+                while let Ok(HostReceive::Message(request)) = lane.recv_request() {
+                    association
+                        .execute_request(request, |response| lane.send_response(response))
+                        .unwrap();
+                }
+            });
+        }
+        Ok(())
+    })
+}
 
 /// Runs one host association whose only traffic is readiness notifications.
 ///
-/// The reader thread mirrors production: it is the endpoint that observes local
-/// termination and interrupts every ring wait of the association.
+/// Its call lanes are served as in production, so the association ends when
+/// the local endpoint closes it.
 fn spawn_host(
     stream: UnixStream,
     host: impl FnOnce(UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown)
@@ -58,8 +83,8 @@ fn spawn_host(
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
         let shared_buffers =
             Arc::new(SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap());
-        let control_memory = MemfdSharedMemory::create_control_ring().unwrap();
-        let control_ring = ControlRing::new(control_memory).unwrap();
+        let control_memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
+        let control_ring = ControlRing::new(control_memory, LAYOUT).unwrap();
         let mut control = UnixStreamHostSetupChannel::from_accepted(stream);
         let association = setup_connection(
             &broker,
@@ -76,15 +101,12 @@ fn spawn_host(
         )
         .unwrap()
         .unwrap();
-        let (mut request_source, response_sink, notifications, shutdown) =
-            control.into_active(control_ring).unwrap();
+        let (lanes, notifications, shutdown) = control.into_active(control_ring).unwrap();
         std::thread::scope(|scope| {
+            // Dropping `shutdown` when `host` returns can end the association
+            // before the local endpoint closes it.
             scope.spawn(|| {
-                while let Ok(HostReceive::Message(request)) = request_source.recv_request() {
-                    association
-                        .execute_request(request, |response| response_sink.send_response(response))
-                        .unwrap();
-                }
+                let _ = serve_lanes(lanes, &association);
             });
             host(notifications, shutdown);
         });
@@ -102,8 +124,8 @@ fn negotiate_local(
         UnixStreamLocalSetupChannel::from_connected(stream),
         |mut setup| {
             let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
-            let control_memory = setup.receive_control_ring(None)?;
-            let control_ring = ControlRing::new(control_memory).map_err(|error| {
+            let control_memory = setup.receive_control_ring(LAYOUT, None)?;
+            let control_ring = ControlRing::new(control_memory, LAYOUT).map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("invalid test control ring: {error:?}"),
@@ -145,8 +167,8 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let host_shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
     let host_shared_buffers =
         Arc::new(SharedBufferPool::new(host_shared_memory, SHARED_BUFFER_LAYOUT).unwrap());
-    let host_control_memory = MemfdSharedMemory::create_control_ring().unwrap();
-    let host_control_ring = ControlRing::new(host_control_memory).unwrap();
+    let host_control_memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
+    let host_control_ring = ControlRing::new(host_control_memory, LAYOUT).unwrap();
     let notification = BrokerNotification::Readiness(ReadinessNotification {
         handle: ObjectHandle(7),
         readiness: ReadinessFlags::READ,
@@ -170,28 +192,17 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         )
         .unwrap()
         .unwrap();
-        let (mut request_source, response_sink, mut notifications, _shutdown) =
-            control.into_active(host_control_ring).unwrap();
+        let (lanes, mut notifications, _shutdown) = control.into_active(host_control_ring).unwrap();
         notifications.send_notification(&host_notification).unwrap();
-        loop {
-            match request_source.recv_request().unwrap() {
-                HostReceive::Message(request) => association
-                    .execute_request(request, |response| response_sink.send_response(response))
-                    .unwrap(),
-                HostReceive::PeerClosed => return ConnectionTermination::PeerClosed,
-                HostReceive::ProtocolViolation => {
-                    return ConnectionTermination::ProtocolViolation;
-                }
-            }
-        }
+        serve_lanes(lanes, &association)
     });
 
     let (local, _startup, notification_channel) = BrokerLocal::negotiate(
         UnixStreamLocalSetupChannel::from_connected(local_control),
         |mut setup| {
             let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
-            let control_memory = setup.receive_control_ring(None)?;
-            let control_ring = ControlRing::new(control_memory).map_err(|error| {
+            let control_memory = setup.receive_control_ring(LAYOUT, None)?;
+            let control_ring = ControlRing::new(control_memory, LAYOUT).map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("invalid test control ring: {error:?}"),
@@ -216,10 +227,10 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     assert_eq!(local.add_event(handle, 1).unwrap(), readiness);
 
     drop(local);
-    assert_eq!(
-        host_thread.join().unwrap(),
-        ConnectionTermination::PeerClosed
-    );
+    host_thread
+        .join()
+        .unwrap()
+        .expect("the host must see a clean close");
 }
 
 #[test]
