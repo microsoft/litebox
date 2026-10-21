@@ -109,10 +109,14 @@ pub(crate) const PSYNCH_MAX_QUEUES: usize = 8 * TASK_THREADMAX as usize;
 /// apart from the ones kept ([`Kwq::compact_fakes`]). What remains for
 /// libpthread traffic is at most one entry per condition variable with a
 /// queue, one per thread holding a ticket at or below its L, and one per
-/// wakeup S never counted (the targeted signals above): within the limit
-/// while live condition variables hold fewer than 7 such wakeups per
-/// possible thread. An entry costs at most 96 bytes (24 and spare
-/// capacity), 6 MiB at the limit. Only past it does a signal fail with
+/// wakeup S never counted (the targeted signals above), plus what the
+/// segment rule keeps where a delayed signal preposted beside a canceled
+/// waiter: such an entry, below a higher one before it, stays until a
+/// broadcast, a clear or L == S, and each run in sequence order it leaves
+/// behind keeps its own highest `outstanding + 1` sequences. Without such
+/// delayed signals this is within the limit while live condition variables
+/// hold fewer than 7 uncounted wakeups per possible thread. An entry costs
+/// at most 96 bytes (24 and spare capacity), 6 MiB at the limit. Only past it does a signal fail with
 /// ENOMEM, before any effect; libpthread ignores the error, so the signal
 /// is lost.
 pub(crate) const PSYNCH_MAX_FAKES: usize = 2 * PSYNCH_MAX_QUEUES;
@@ -550,10 +554,12 @@ impl<P: ShimPlatform> Kwq<P> {
     /// return S does not count yet that is not queued (`outstanding`, which
     /// only over-counts). With the highest `outstanding + 1` sequences of a
     /// segment kept, a cvwait that would meet a dropped entry meets the
-    /// lowest kept one instead and returns the same; it removes at most one
-    /// kept sequence (a conversion removes its segment's entries up to the
-    /// one it met), so a kept entry remains above the dropped ones after
-    /// every outstanding return. A signal up to a dropped sequence is
+    /// lowest kept one instead and returns the same. A consume removes at
+    /// most one kept sequence, so a kept entry remains above the dropped ones
+    /// after every outstanding return; a conversion removes every entry
+    /// before the first one above the entry it met, kept, dropped or outside
+    /// any segment, and leaves at the front a broadcast entry that covers
+    /// them all. A signal up to a dropped sequence is
     /// absorbed by a kept entry as it would have been by the dropped one,
     /// waking no one; with a thread blocked before the fake entries (behind
     /// a canceled one above it) it would wake that thread instead, so such

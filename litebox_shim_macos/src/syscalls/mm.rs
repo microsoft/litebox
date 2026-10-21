@@ -436,10 +436,9 @@ impl<P: ShimPlatform> Task<P> {
     /// no-replace Mach allocation) into a hole of the range. One that refills
     /// a failed replacement's hole with the same flags hides it, so the old
     /// shared wait objects (ulock and psynch) and Mach-O tracking stay over
-    /// the new pages; one
-    /// that fills a hole a failed, non-replacing MAP_FIXED left alone retires
-    /// the untouched pages' objects and tracking. Only two threads mapping
-    /// into one range at once can hit either.
+    /// the new pages; one that fills a hole a failed, non-replacing MAP_FIXED
+    /// left alone retires the untouched pages' objects and tracking. Only two
+    /// threads mapping into one range at once can hit either.
     fn mapping_snapshot(&self, target: Range<usize>) -> Vec<(Range<usize>, VmFlags)> {
         let mut snapshot: Vec<(Range<usize>, VmFlags)> = Vec::new();
         for (range, flags) in self.global.mm.overlapping(target.clone()) {
