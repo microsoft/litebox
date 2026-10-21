@@ -146,6 +146,9 @@ pub enum FileError {
     InvalidTerminalControl,
     #[error("too many symbolic links encountered")]
     TooManySymlinks,
+    /// The device behind the path is absent, as `/dev/tty` is without a controlling terminal.
+    #[error("no such device or address")]
+    NoSuchDevice,
 }
 
 /// Seek origin.

@@ -15,8 +15,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use litebox_broker_core::fs::FileResult;
+use litebox_broker_core::fs::errors::{ReadError, WriteError};
 use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessSource, ReadinessWatchers};
-use litebox_broker_core::stdio::StdioProviderError;
 use litebox_broker_core::terminal::{
     TerminalEndpoint, TerminalEngine, TerminalEventSink, TerminalTransport, TerminalTransportError,
 };
@@ -330,47 +330,6 @@ impl HostTerminal {
         })
     }
 
-    pub(crate) fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize, StdioProviderError> {
-        let mut state = self.shared.lock();
-        if state.status == Status::Failed {
-            return Err(StdioProviderError::Failed);
-        }
-        if state.status == Status::HungUp {
-            state.process_input();
-        }
-        if let Some(count) = state.engine.read(output)? {
-            state.publish_if_changed();
-            self.shared.wake();
-            return Ok(count);
-        }
-        if state.status == Status::HungUp {
-            return Ok(0);
-        }
-        Err(StdioProviderError::WouldBlock)
-    }
-
-    pub(crate) fn write(&self, input: &dyn WriteBuffer) -> Result<usize, StdioProviderError> {
-        let mut state = self.shared.lock();
-        if state.status != Status::Active {
-            return Err(StdioProviderError::Failed);
-        }
-        let available = (OUTPUT_CAPACITY - state.output.len()) / state.engine.output_expansion();
-        if (available == 0 && !input.is_empty())
-            || (input.len() <= ATOMIC_WRITE_SIZE && input.len() > available)
-        {
-            return Err(StdioProviderError::WouldBlock);
-        }
-        // Output processing rewrites bytes, so stage them first.
-        let mut staged = bounce_buffer(input.len().min(available))?;
-        input.copy_to_slice_at(0, &mut staged)?;
-        let state = &mut *state;
-        state.engine.output(&staged, &mut state.output);
-        state.drained = false;
-        state.publish_if_changed();
-        self.shared.wake();
-        Ok(staged.len())
-    }
-
     pub(crate) fn flush(&self) -> io::Result<()> {
         let mut state = self.shared.lock();
         state.drained = false;
@@ -430,6 +389,47 @@ impl ReadinessSource for HostTerminal {
 }
 
 impl TerminalEndpoint for HostTerminal {
+    fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize, ReadError> {
+        let mut state = self.shared.lock();
+        if state.status == Status::Failed {
+            return Err(ReadError::Io);
+        }
+        if state.status == Status::HungUp {
+            state.process_input();
+        }
+        if let Some(count) = state.engine.read(output)? {
+            state.publish_if_changed();
+            self.shared.wake();
+            return Ok(count);
+        }
+        if state.status == Status::HungUp {
+            return Ok(0);
+        }
+        Err(ReadError::WouldBlock)
+    }
+
+    fn write(&self, input: &dyn WriteBuffer) -> Result<usize, WriteError> {
+        let mut state = self.shared.lock();
+        if state.status != Status::Active {
+            return Err(WriteError::Io);
+        }
+        let available = (OUTPUT_CAPACITY - state.output.len()) / state.engine.output_expansion();
+        if (available == 0 && !input.is_empty())
+            || (input.len() <= ATOMIC_WRITE_SIZE && input.len() > available)
+        {
+            return Err(WriteError::WouldBlock);
+        }
+        // Output processing rewrites bytes, so stage them first.
+        let mut staged = bounce_buffer(input.len().min(available))?;
+        input.copy_to_slice_at(0, &mut staged)?;
+        let state = &mut *state;
+        state.engine.output(&staged, &mut state.output);
+        state.drained = false;
+        state.publish_if_changed();
+        self.shared.wake();
+        Ok(staged.len())
+    }
+
     fn attach(&self, sink: Arc<dyn TerminalEventSink>) {
         let mut state = self.shared.lock();
         if state.sink.is_none() {
@@ -585,10 +585,10 @@ mod tests {
         // Writability promises room for a whole atomic write.
         let tabs = vec![b'\t'; OUTPUT_CAPACITY];
         assert!(!terminal.readiness().contains(ReadinessFlags::WRITE));
-        assert_eq!(
+        assert!(matches!(
             terminal.write(&&tabs[..ATOMIC_WRITE_SIZE]),
-            Err(StdioProviderError::WouldBlock)
-        );
+            Err(WriteError::WouldBlock)
+        ));
         assert!(terminal.write(&tabs).unwrap() > 0);
         assert!(terminal.shared.lock().output.len() <= OUTPUT_CAPACITY);
     }
@@ -597,13 +597,13 @@ mod tests {
     fn terminal_abandoned_drain_does_not_block_other_writers() {
         let (_master, terminal) = open_terminal();
         terminal.shared.lock().engine.receive(b"\x13");
-        assert_eq!(terminal.write(b"first"), Ok(5));
+        assert_eq!(terminal.write(b"first").unwrap(), 5);
         assert_eq!(
             terminal.control(TerminalOperation::Drain),
             Err(litebox_broker_core::BrokerError::WouldBlock)
         );
         assert!(terminal.readiness().contains(ReadinessFlags::WRITE));
-        assert_eq!(terminal.write(b"second"), Ok(6));
+        assert_eq!(terminal.write(b"second").unwrap(), 6);
         terminal.shared.lock().engine.receive(b"\x11");
         terminal.shared.wake();
         terminal.flush().unwrap();
@@ -614,7 +614,7 @@ mod tests {
         let (_master, terminal) = open_terminal();
         let terminal = Arc::new(terminal);
         terminal.shared.lock().engine.receive(b"\x13");
-        assert_eq!(terminal.write(b"output"), Ok(6));
+        assert_eq!(terminal.write(b"output").unwrap(), 6);
         let (sender, receiver) = std::sync::mpsc::channel();
         let flusher = Arc::clone(&terminal);
         std::thread::spawn(move || sender.send(flusher.flush().is_ok()).unwrap());
@@ -663,11 +663,11 @@ mod tests {
         );
         drop(state);
         let mut bytes = [0; 32];
-        assert_eq!(terminal.read(&mut bytes), Ok(9));
+        assert_eq!(terminal.read(&mut bytes).unwrap(), 9);
         assert_eq!(&bytes[..9], b"buffered\n");
-        assert_eq!(terminal.read(&mut bytes), Ok(5));
+        assert_eq!(terminal.read(&mut bytes).unwrap(), 5);
         assert_eq!(&bytes[..5], b"tail\n");
-        assert_eq!(terminal.read(&mut bytes), Ok(0));
+        assert_eq!(terminal.read(&mut bytes).unwrap(), 0);
     }
 
     #[test]
@@ -702,11 +702,11 @@ mod tests {
             state.hang_up();
             drop(state);
             let mut bytes = vec![0; prefix.len()];
-            assert_eq!(terminal.read(&mut bytes), Ok(prefix.len()));
+            assert_eq!(terminal.read(&mut bytes).unwrap(), prefix.len());
             assert_eq!(bytes, prefix);
-            assert_eq!(terminal.read(&mut bytes), Ok(4));
+            assert_eq!(terminal.read(&mut bytes).unwrap(), 4);
             assert_eq!(&bytes[..4], b"tail");
-            assert_eq!(terminal.read(&mut bytes), Ok(0));
+            assert_eq!(terminal.read(&mut bytes).unwrap(), 0);
         }
     }
 }

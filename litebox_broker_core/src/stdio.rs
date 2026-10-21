@@ -64,10 +64,19 @@ impl From<Fault> for StdioProviderError {
 /// stream's readiness to its watchers. Providers whose operations always make
 /// progress can keep the default readiness methods.
 pub trait StdioProvider: Send + Sync {
-    /// Shared endpoint behind a terminal stream, if terminal control is supported.
+    /// Shared endpoint behind a terminal stream, if terminal control is
+    /// supported. The stream's reads, writes, and readiness then go through
+    /// the endpoint instead of this provider.
     fn terminal(
         &self,
         _stream: StdioStream,
+    ) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {
+        None
+    }
+
+    /// The controlling terminal behind `/dev/tty`, if any.
+    fn controlling_terminal(
+        &self,
     ) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {
         None
     }

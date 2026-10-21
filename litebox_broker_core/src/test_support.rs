@@ -22,7 +22,10 @@ use spin::Mutex;
 
 use crate::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, Result,
-    fs::{FileResult, FileService, UnsupportedFileService},
+    fs::{
+        FileResult, FileService, UnsupportedFileService,
+        errors::{ReadError, WriteError},
+    },
     random::{RandomProvider, RandomProviderError},
     readiness::{
         ReadinessRegistration, ReadinessSource, ReadinessWatchers, SharedReadinessWatchers,
@@ -123,16 +126,18 @@ impl RandomProvider for FailingRandomProvider {
 ///
 /// Reads drain buffered input, and writes and terminal queries are recorded.
 /// Reads of empty input report end-of-file unless [`Self::with_open_input`]
-/// keeps standard input open.
+/// keeps standard input open. Streams marked with [`Self::with_terminal`]
+/// share one terminal endpoint, whose I/O
+/// [`Self::push_terminal_input`] and [`Self::terminal_writes`] drive.
 pub struct TestStdioProvider {
     input: Mutex<TestStdioInput>,
     input_watchers: Mutex<ReadinessWatchers>,
     writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
     terminal_queries: Mutex<Vec<StdioStream>>,
-    stdin_terminal: bool,
-    stdout_terminal: bool,
-    stderr_terminal: bool,
+    /// Whether each stream, indexed by [`StdioStream`], is a terminal.
+    terminals: [bool; 3],
     uncontrolled_terminal: Option<StdioStream>,
+    controlling_terminal: bool,
     terminal: Arc<TestTerminal>,
 }
 
@@ -147,14 +152,10 @@ impl Default for TestStdioProvider {
             input_watchers: Mutex::new(ReadinessWatchers::default()),
             writes: Mutex::new(Vec::new()),
             terminal_queries: Mutex::new(Vec::new()),
-            stdin_terminal: false,
-            stdout_terminal: false,
-            stderr_terminal: false,
+            terminals: [false; 3],
             uncontrolled_terminal: None,
-            terminal: Arc::new(TestTerminal(Mutex::new((
-                TerminalSettings::default(),
-                WindowSize::default(),
-            )))),
+            controlling_terminal: false,
+            terminal: Arc::new(TestTerminal::default()),
         }
     }
 }
@@ -163,11 +164,7 @@ impl TestStdioProvider {
     /// Marks `stream` as connected to a terminal.
     #[must_use]
     pub const fn with_terminal(mut self, stream: StdioStream) -> Self {
-        match stream {
-            StdioStream::Stdin => self.stdin_terminal = true,
-            StdioStream::Stdout => self.stdout_terminal = true,
-            StdioStream::Stderr => self.stderr_terminal = true,
-        }
+        self.terminals[stream as usize] = true;
         self
     }
 
@@ -177,6 +174,14 @@ impl TestStdioProvider {
     pub const fn with_uncontrolled_terminal(mut self, stream: StdioStream) -> Self {
         self.uncontrolled_terminal = Some(stream);
         self.with_terminal(stream)
+    }
+
+    /// Serves the terminal endpoint as the controlling terminal behind
+    /// `/dev/tty`.
+    #[must_use]
+    pub const fn with_controlling_terminal(mut self) -> Self {
+        self.controlling_terminal = true;
+        self
     }
 
     /// Keeps standard input open, so reads of empty input fail with
@@ -219,16 +224,32 @@ impl TestStdioProvider {
     pub fn terminal_queries(&self) -> Vec<StdioStream> {
         self.terminal_queries.lock().clone()
     }
+
+    /// Appends bytes that subsequent terminal endpoint reads will drain.
+    pub fn push_terminal_input(&self, input: &[u8]) {
+        let mut state = self.terminal.0.lock();
+        state.input.extend(input.iter().copied());
+        state
+            .watchers
+            .publish(ReadinessFlags::READ | ReadinessFlags::WRITE);
+    }
+
+    /// Returns a snapshot of the recorded terminal endpoint writes.
+    pub fn terminal_writes(&self) -> Vec<Vec<u8>> {
+        self.terminal.0.lock().writes.clone()
+    }
 }
 
 impl StdioProvider for TestStdioProvider {
     fn terminal(&self, stream: StdioStream) -> Option<Arc<dyn TerminalEndpoint>> {
-        let connected = match stream {
-            StdioStream::Stdin => self.stdin_terminal,
-            StdioStream::Stdout => self.stdout_terminal,
-            StdioStream::Stderr => self.stderr_terminal,
-        } && self.uncontrolled_terminal != Some(stream);
+        let connected =
+            self.terminals[stream as usize] && self.uncontrolled_terminal != Some(stream);
         connected.then(|| Arc::clone(&self.terminal) as Arc<dyn TerminalEndpoint>)
+    }
+
+    fn controlling_terminal(&self) -> Option<Arc<dyn TerminalEndpoint>> {
+        self.controlling_terminal
+            .then(|| Arc::clone(&self.terminal) as Arc<dyn TerminalEndpoint>)
     }
 
     fn read(&self, output: &mut dyn ReadBuffer) -> core::result::Result<usize, StdioProviderError> {
@@ -255,11 +276,7 @@ impl StdioProvider for TestStdioProvider {
 
     fn is_terminal(&self, stream: StdioStream) -> bool {
         self.terminal_queries.lock().push(stream);
-        match stream {
-            StdioStream::Stdin => self.stdin_terminal,
-            StdioStream::Stdout => self.stdout_terminal,
-            StdioStream::Stderr => self.stderr_terminal,
-        }
+        self.terminals[stream as usize]
     }
 
     fn readiness(&self, stream: StdioStream) -> ReadinessFlags {
@@ -290,34 +307,67 @@ struct TestStdioInput {
     blocked_reads: usize,
 }
 
-struct TestTerminal(Mutex<(TerminalSettings, WindowSize)>);
+/// Terminal endpoint whose reads drain buffered input, waiting while it is
+/// empty, and whose writes are recorded.
+#[derive(Default)]
+struct TestTerminal(Mutex<TestTerminalState>);
+
+#[derive(Default)]
+struct TestTerminalState {
+    settings: TerminalSettings,
+    size: WindowSize,
+    input: VecDeque<u8>,
+    writes: Vec<Vec<u8>>,
+    watchers: ReadinessWatchers,
+}
 
 impl ReadinessSource for TestTerminal {
     fn readiness(&self) -> ReadinessFlags {
-        ReadinessFlags::WRITE
+        if self.0.lock().input.is_empty() {
+            ReadinessFlags::WRITE
+        } else {
+            ReadinessFlags::READ | ReadinessFlags::WRITE
+        }
     }
-    fn watch(&self, _registration: &ReadinessRegistration) -> Result<()> {
-        Ok(())
+    fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
+        self.0.lock().watchers.watch(registration)
     }
 }
 
 impl TerminalEndpoint for TestTerminal {
+    fn read(&self, output: &mut dyn ReadBuffer) -> core::result::Result<usize, ReadError> {
+        let input = &mut self.0.lock().input;
+        if input.is_empty() && !output.is_empty() {
+            return Err(ReadError::WouldBlock);
+        }
+        let read = input.len().min(output.len());
+        take_from_queue(input, read, output)?;
+        Ok(read)
+    }
+
+    fn write(&self, input: &dyn WriteBuffer) -> core::result::Result<usize, WriteError> {
+        let mut data = alloc::vec![0; input.len()];
+        input.copy_to_slice_at(0, &mut data)?;
+        self.0.lock().writes.push(data);
+        Ok(input.len())
+    }
+
     fn attach(&self, _sink: Arc<dyn TerminalEventSink>) {}
 
     fn control(&self, operation: TerminalOperation) -> Result<FileResult<TerminalResponse>> {
         let mut state = self.0.lock();
         Ok(Ok(match operation {
-            TerminalOperation::GetSettings => TerminalResponse::Settings(state.0),
+            TerminalOperation::GetSettings => TerminalResponse::Settings(state.settings),
             TerminalOperation::SetSettings { settings, .. } => {
                 if settings.minimum_read > 1 {
                     return Ok(Err(FileError::InvalidTerminalControl));
                 }
-                state.0 = settings;
+                state.settings = settings;
                 TerminalResponse::Done
             }
-            TerminalOperation::GetWindowSize => TerminalResponse::WindowSize(state.1),
+            TerminalOperation::GetWindowSize => TerminalResponse::WindowSize(state.size),
             TerminalOperation::SetWindowSize(size) => {
-                state.1 = size;
+                state.size = size;
                 TerminalResponse::Done
             }
             TerminalOperation::Flush { .. } | TerminalOperation::Drain => TerminalResponse::Done,

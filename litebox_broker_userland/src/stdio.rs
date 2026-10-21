@@ -11,7 +11,7 @@ use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessWatchers};
 use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
-use litebox_broker_core::terminal::TerminalTransport;
+use litebox_broker_core::terminal::{TerminalEndpoint, TerminalTransport};
 use litebox_broker_core::transfer::{bounce_buffer, take_from_queue};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -172,18 +172,26 @@ impl UserlandStdioProvider {
 }
 
 impl StdioProvider for UserlandStdioProvider {
-    fn terminal(
-        &self,
-        stream: StdioStream,
-    ) -> Option<Arc<dyn litebox_broker_core::terminal::TerminalEndpoint>> {
+    fn terminal(&self, stream: StdioStream) -> Option<Arc<dyn TerminalEndpoint>> {
         let index = match stream {
             StdioStream::Stdin => 0,
             StdioStream::Stdout => 1,
             StdioStream::Stderr => 2,
         };
-        self.terminals[index].as_ref().map(|terminal| {
-            Arc::clone(terminal) as Arc<dyn litebox_broker_core::terminal::TerminalEndpoint>
-        })
+        self.terminals[index]
+            .as_ref()
+            .map(|terminal| Arc::clone(terminal) as Arc<dyn TerminalEndpoint>)
+    }
+
+    /// The terminal standard input and output share, which is the only one
+    /// [`open_terminals`](Self::open_terminals) takes over.
+    fn controlling_terminal(&self) -> Option<Arc<dyn TerminalEndpoint>> {
+        match &self.terminals {
+            [Some(input), Some(output), _] if Arc::ptr_eq(input, output) => {
+                Some(Arc::clone(input) as Arc<dyn TerminalEndpoint>)
+            }
+            _ => None,
+        }
     }
 
     fn is_terminal(&self, stream: StdioStream) -> bool {
@@ -197,9 +205,6 @@ impl StdioProvider for UserlandStdioProvider {
     }
 
     fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize, StdioProviderError> {
-        if let Some(terminal) = &self.terminals[0] {
-            return terminal.read(output);
-        }
         if output.is_empty() {
             return Ok(0);
         }
@@ -225,12 +230,6 @@ impl StdioProvider for UserlandStdioProvider {
         stream: StdioOutputStream,
         input: &dyn WriteBuffer,
     ) -> Result<usize, StdioProviderError> {
-        if let Some(terminal) = &self.terminals[match stream {
-            StdioOutputStream::Stdout => 1,
-            StdioOutputStream::Stderr => 2,
-        }] {
-            return terminal.write(input);
-        }
         let index = OutputState::index(stream);
         let mut state = self.output.lock();
         if let Some(error) = state.errors[index] {
@@ -263,9 +262,6 @@ impl StdioProvider for UserlandStdioProvider {
     }
 
     fn readiness(&self, stream: StdioStream) -> ReadinessFlags {
-        if let Some(terminal) = self.terminal(stream) {
-            return terminal.readiness();
-        }
         let index = match stream {
             StdioStream::Stdin => {
                 let mut state = self.input.lock();
@@ -290,9 +286,6 @@ impl StdioProvider for UserlandStdioProvider {
         stream: StdioStream,
         registration: &ReadinessRegistration,
     ) -> litebox_broker_core::Result<()> {
-        if let Some(terminal) = self.terminal(stream) {
-            return terminal.watch(registration);
-        }
         match stream {
             StdioStream::Stdin => self.input.lock().watchers.watch(registration),
             StdioStream::Stdout | StdioStream::Stderr => {

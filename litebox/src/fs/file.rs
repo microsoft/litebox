@@ -682,6 +682,7 @@ impl From<FileError> for OpenError {
             FileError::IsDirectory => Self::TruncateError(TruncateError::IsDirectory),
             FileError::NotForWriting => Self::TruncateError(TruncateError::NotForWriting),
             FileError::IsTerminalDevice => Self::TruncateError(TruncateError::IsTerminalDevice),
+            FileError::NoSuchDevice => Self::NoSuchDevice,
             _ => Self::Io,
         }
     }

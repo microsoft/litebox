@@ -11,6 +11,8 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -69,6 +71,10 @@ int main(int argc, char **argv) {
         // the host, answering as a fixed terminal.
         assert(!isatty(1));
         assert(tcgetattr(1, &attributes) == -1 && errno == ENOTTY);
+        // Nor is it the guest's controlling terminal.
+        struct stat tty_status;
+        assert(stat("/dev/tty", &tty_status) == 0 && S_ISCHR(tty_status.st_mode));
+        assert(open("/dev/tty", O_RDWR) == -1 && errno == ENXIO);
         attributes = original;
         cfmakeraw(&attributes);
         assert(tcsetattr(0, TCSANOW, &attributes) == 0);
@@ -99,12 +105,19 @@ int main(int argc, char **argv) {
     assert(tcgetattr(alias, &attributes) == 0 && (attributes.c_lflag & ECHO));
     assert(close(alias) == 0);
 
-    puts("CANONICAL READY");
+    // The controlling terminal is the one behind the standard streams.
+    int tty = open("/dev/tty", O_RDWR);
+    assert(tty >= 0 && isatty(tty));
+    struct stat tty_status;
+    assert(fstat(tty, &tty_status) == 0 && S_ISCHR(tty_status.st_mode));
+    assert(major(tty_status.st_rdev) == 5 && minor(tty_status.st_rdev) == 0);
+    assert(write(tty, "CANONICAL READY\n", 16) == 16);
     unsigned char buffer[64];
     assert(read(0, buffer, sizeof(buffer)) == 6);
     assert(memcmp(buffer, "hello\n", 6) == 0);
-    assert(read(0, buffer, sizeof(buffer)) == 7);
+    assert(read(tty, buffer, sizeof(buffer)) == 7);
     assert(memcmp(buffer, "second\n", 7) == 0);
+    assert(close(tty) == 0);
     puts("EOF READY");
     assert(read(0, buffer, sizeof(buffer)) == 0);
     puts("POLL READY");

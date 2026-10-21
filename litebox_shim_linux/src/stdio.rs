@@ -320,6 +320,58 @@ mod tests {
     }
 
     #[test]
+    fn test_dev_tty_reaches_the_controlling_terminal() {
+        let task = init_platform();
+        let tty = i32::try_from(
+            task.sys_open("/dev/tty", OFlags::RDWR, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        let rdev = task.sys_fstat(tty).unwrap().st_rdev;
+        assert_eq!(rdev, 0x500);
+
+        // The controlling terminal is the one behind standard output.
+        let mut tty_termios = termios();
+        assert_eq!(
+            task.sys_ioctl(
+                tty,
+                IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut tty_termios))
+            ),
+            Ok(0)
+        );
+        tty_termios.c_lflag &= !0x8; // ECHO
+        assert_eq!(
+            task.sys_ioctl(
+                tty,
+                IoctlArg::TCSETS(UserPtr::from_ptr(&raw const tty_termios))
+            ),
+            Ok(0)
+        );
+        let mut stdout_termios = termios();
+        assert_eq!(
+            task.sys_ioctl(
+                1,
+                IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut stdout_termios))
+            ),
+            Ok(0)
+        );
+        assert_eq!(stdout_termios.c_lflag & 0x8, 0);
+
+        assert_eq!(task.sys_write(tty, b"prompt", None), Ok(6));
+        assert_eq!(
+            test_broker::stdio()
+                .terminal_writes()
+                .last()
+                .map(std::vec::Vec::as_slice),
+            Some(&b"prompt"[..])
+        );
+        test_broker::stdio().push_terminal_input(b"x");
+        let mut buf = [0; 4];
+        assert_eq!(task.sys_read(tty, &mut buf, None), Ok(1));
+        assert_eq!(buf[0], b'x');
+    }
+
+    #[test]
     fn test_unknown_ioctl_fails_with_enotty() {
         let task = init_platform();
         let mut byte = 0u8;
@@ -436,12 +488,9 @@ mod tests {
         let buf = std::vec![b'x'; len];
 
         assert_eq!(task.sys_write(1, &buf, None), Ok(len));
-        let writes = test_broker::stdio().writes();
+        let writes = test_broker::stdio().terminal_writes();
         assert!(writes.len() > 1);
-        assert_eq!(
-            writes.iter().map(|(_, bytes)| bytes.len()).sum::<usize>(),
-            len
-        );
+        assert_eq!(writes.iter().map(std::vec::Vec::len).sum::<usize>(), len);
     }
 
     #[test]

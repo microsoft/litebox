@@ -28,6 +28,8 @@ pub enum OpenError {
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
+    #[error("no such device or address")]
+    NoSuchDevice,
 }
 
 /// Possible errors from [`super::File::read`].

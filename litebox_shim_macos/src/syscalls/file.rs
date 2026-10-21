@@ -276,6 +276,7 @@ fn open_error(error: OpenError) -> Errno {
         OpenError::AccessNotAllowed | OpenError::NoWritePerms => Errno::EACCES,
         OpenError::ReadOnlyFileSystem => Errno::EROFS,
         OpenError::AlreadyExists => Errno::EEXIST,
+        OpenError::NoSuchDevice => Errno::ENXIO,
         OpenError::PathError(error) => path_error(error),
         OpenError::TruncateError(error) => match error {
             TruncateError::ClosedFd => Errno::EBADF,

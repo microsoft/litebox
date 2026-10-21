@@ -913,6 +913,7 @@ fn file_open_error(error: OpenError) -> FileError {
         OpenError::TruncateError(error) => file_truncate_error(error),
         OpenError::PathError(error) => file_path_error(error),
         OpenError::Io => FileError::Io,
+        OpenError::NoSuchDevice => FileError::NoSuchDevice,
     }
 }
 
