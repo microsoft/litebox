@@ -1658,11 +1658,15 @@ fn run_test_broker_connection(
         )
         .expect("failed to attach broker test shared-buffer layout"),
     );
+    let layout = litebox_broker_transport::control_ring::ControlRingLayout::MULTI_LANE;
     let control_memory =
-        litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create_control_ring()
-            .expect("failed to create broker test control ring");
-    let control_ring = litebox_broker_transport::control_ring::ControlRing::new(control_memory)
-        .expect("failed to attach broker test control ring");
+        litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create_control_ring(
+            layout,
+        )
+        .expect("failed to create broker test control ring");
+    let control_ring =
+        litebox_broker_transport::control_ring::ControlRing::new(control_memory, layout)
+            .expect("failed to attach broker test control ring");
     let setup_deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
     let mut channel =
         litebox_broker_transport_linux_userland::unix_socket::UnixStreamHostSetupChannel::from_host_guaranteed(
@@ -1687,57 +1691,73 @@ fn run_test_broker_connection(
     )
     .expect("broker host setup failed")
     .expect("broker setup terminated before activation");
-    let (mut request_source, response_sink, mut notifications, _shutdown) = channel
+    let (mut lanes, mut notifications, shutdown) = channel
         .into_active(control_ring)
         .expect("failed to activate broker test control ring");
     let publisher_readiness = readiness.clone();
     let publisher = std::thread::spawn(move || publisher_readiness.run(&mut notifications));
-    let mut close_object_count = 0;
-    // Files and the process's signals are not counted, since every runner opens them.
-    let mut uncounted_handles = Vec::new();
-    let termination = loop {
-        match request_source
-            .recv_request()
-            .expect("failed to receive broker test request")
+    // The number of objects closed, and the open file and signal handles excluded from it since
+    // every runner opens them.
+    let counts = std::sync::Mutex::new((0, Vec::new()));
+    // Serves each call lane the runner starts using on its own thread, until the runner closes the
+    // association.
+    std::thread::scope(|scope| {
+        while let Some(mut lane) = lanes
+            .next_lane()
+            .expect("failed to receive a broker test call lane")
         {
-            litebox_broker_transport::channel::HostReceive::Message(request) => {
-                if let litebox_broker_protocol::message::BrokerOperation::CloseObject(handle) =
-                    &request.operation
-                {
-                    if let Some(index) = uncounted_handles.iter().position(|value| value == handle)
+            let (association, counts, shutdown) = (&association, &counts, &shutdown);
+            scope.spawn(move || {
+                loop {
+                    match lane
+                        .recv_request()
+                        .expect("failed to receive broker test request")
                     {
-                        uncounted_handles.swap_remove(index);
-                    } else {
-                        close_object_count += 1;
+                        litebox_broker_transport::channel::HostReceive::Message(request) => {
+                            if let litebox_broker_protocol::message::BrokerOperation::CloseObject(
+                                handle,
+                            ) = &request.operation
+                            {
+                                let (close_object_count, uncounted_handles) =
+                                    &mut *counts.lock().unwrap();
+                                if let Some(index) =
+                                    uncounted_handles.iter().position(|value| value == handle)
+                                {
+                                    uncounted_handles.swap_remove(index);
+                                } else {
+                                    *close_object_count += 1;
+                                }
+                            }
+                            association
+                                .execute_request(request, |response| {
+                                    match &response.result {
+                                        litebox_broker_protocol::message::BrokerResult::File(
+                                            litebox_broker_protocol::message::FileResponse::Open(
+                                                open,
+                                            ),
+                                        ) => counts.lock().unwrap().1.push(open.handle),
+                                        litebox_broker_protocol::message::BrokerResult::Signal(
+                                            litebox_broker_protocol::message::SignalResponse::Open(
+                                                open,
+                                            ),
+                                        ) => counts.lock().unwrap().1.push(open.handle),
+                                        _ => {}
+                                    }
+                                    lane.send_response(response)
+                                })
+                                .expect("failed to execute broker test request");
+                        }
+                        litebox_broker_transport::channel::HostReceive::PeerClosed => return,
+                        litebox_broker_transport::channel::HostReceive::ProtocolViolation => {
+                            // Ends the wait for lanes, so the test fails instead of hanging.
+                            let _ = shutdown.shutdown();
+                            panic!("broker test request violated the protocol");
+                        }
                     }
                 }
-                association
-                    .execute_request(request, |response| {
-                        match &response.result {
-                            litebox_broker_protocol::message::BrokerResult::File(
-                                litebox_broker_protocol::message::FileResponse::Open(open),
-                            ) => uncounted_handles.push(open.handle),
-                            litebox_broker_protocol::message::BrokerResult::Signal(
-                                litebox_broker_protocol::message::SignalResponse::Open(open),
-                            ) => uncounted_handles.push(open.handle),
-                            _ => {}
-                        }
-                        response_sink.send_response(response)
-                    })
-                    .expect("failed to execute broker test request");
-            }
-            litebox_broker_transport::channel::HostReceive::PeerClosed => {
-                break litebox_broker_host::ConnectionTermination::PeerClosed;
-            }
-            litebox_broker_transport::channel::HostReceive::ProtocolViolation => {
-                break litebox_broker_host::ConnectionTermination::ProtocolViolation;
-            }
+            });
         }
-    };
-    assert_eq!(
-        termination,
-        litebox_broker_host::ConnectionTermination::PeerClosed
-    );
+    });
     readiness.close();
     // The runner's clean close can fail a notification send already in flight, which the broker
     // runtime likewise ignores; any other publication failure is a real error.
@@ -1757,6 +1777,7 @@ fn run_test_broker_connection(
         );
     }
     association.finish();
+    let (close_object_count, _) = counts.into_inner().unwrap();
     close_object_count_tx
         .send(close_object_count)
         .expect("failed to report broker close-object count");
