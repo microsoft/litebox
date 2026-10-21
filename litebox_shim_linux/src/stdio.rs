@@ -67,7 +67,7 @@ mod tests {
     use litebox_broker_protocol::terminal::TerminalSettings;
     use litebox_common_linux::{
         EpollCreateFlags, EpollEvent, EpollOp, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags,
-        Termios, Winsize, errno::Errno,
+        Termios, Termios2, Winsize, errno::Errno,
     };
 
     use crate::{
@@ -267,6 +267,81 @@ mod tests {
             Ok(0)
         );
         assert_eq!((size.row, size.col), (0, 0));
+    }
+
+    #[test]
+    fn test_stdio_termios2_matches_termios() {
+        let task = init_platform();
+        let mut termios2 = Termios2 {
+            termios: termios(),
+            c_ispeed: 0,
+            c_ospeed: 0,
+        };
+        let mut termios = termios();
+        assert_eq!(
+            task.sys_ioctl(
+                1,
+                IoctlArg::TCGETS2(UserPtrMut::from_ptr(&raw mut termios2))
+            ),
+            Ok(0)
+        );
+        assert_eq!((termios2.c_ispeed, termios2.c_ospeed), (38400, 38400));
+        assert_eq!(
+            task.sys_ioctl(1, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios))),
+            Ok(0)
+        );
+        assert_eq!(
+            TerminalSettings::try_from(&termios2),
+            TerminalSettings::try_from(&termios)
+        );
+
+        // Like glibc 2.42's `tcsetattr`, set the input speed explicitly.
+        termios2.termios.c_cflag |= 0xf << 16;
+        termios2.termios.c_lflag &= !0x8; // ECHO
+        assert_eq!(
+            task.sys_ioctl(
+                1,
+                IoctlArg::TCSETSW2(UserPtr::from_ptr(&raw const termios2))
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            task.sys_ioctl(1, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios))),
+            Ok(0)
+        );
+        assert_eq!(termios.c_lflag & 0x8, 0);
+        assert_eq!(
+            task.sys_ioctl(
+                0,
+                IoctlArg::TCGETS2(UserPtrMut::from_ptr(&raw mut termios2))
+            ),
+            Err(Errno::ENOTTY)
+        );
+    }
+
+    #[test]
+    fn test_unknown_ioctl_fails_with_enotty() {
+        let task = init_platform();
+        let mut byte = 0u8;
+        let mut unknown = || IoctlArg::Raw {
+            cmd: 0x54ff,
+            arg: UserPtrMut::from_ptr(&raw mut byte),
+        };
+        let (pipe, _writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let path = task
+            .sys_open("/dev/stdout", OFlags::PATH, Mode::empty())
+            .unwrap();
+        // Like Linux, the descriptor is checked before the request.
+        for (fd, expected) in [
+            (0, Errno::ENOTTY),
+            (1, Errno::ENOTTY),
+            (i32::try_from(pipe).unwrap(), Errno::ENOTTY),
+            (i32::try_from(path).unwrap(), Errno::EBADF),
+            (99, Errno::EBADF),
+            (-1, Errno::EBADF),
+        ] {
+            assert_eq!(task.sys_ioctl(fd, unknown()), Err(expected));
+        }
     }
 
     #[test]
