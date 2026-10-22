@@ -58,8 +58,8 @@ const SYNC_WORDS_SIZE: usize = 24;
 /// Cache-line size assumed when separating words that different threads poll.
 const CACHE_LINE_SIZE: usize = 64;
 /// Number of lanes the local peer asks the broker to serve.
-const REQUESTED_LANES_OFFSET: usize = 0;
-/// Incremented whenever the local peer raises its requested lane count.
+const DEMANDED_LANE_COUNT_OFFSET: usize = 0;
+/// Incremented whenever the local peer raises its demanded lane count.
 const DEMAND_EPOCH_OFFSET: usize = 4;
 const DEMAND_WORDS_SIZE: usize = 8;
 
@@ -195,7 +195,7 @@ impl ControlRingLayout {
         self.lane_count > 1
             && matches!(
                 relative - self.sync_size(),
-                REQUESTED_LANES_OFFSET | DEMAND_EPOCH_OFFSET
+                DEMANDED_LANE_COUNT_OFFSET | DEMAND_EPOCH_OFFSET
             )
     }
 
@@ -602,7 +602,7 @@ impl<Memory: ControlRingMemory> ControlRing<Memory> {
                 .collect(),
             lane_demand: (layout.lane_count() > 1).then(|| BrokerLaneDemand {
                 ring: Arc::clone(&ring),
-                started: 0,
+                started_lane_count: 0,
             }),
             notification_producer: ControlRingProducer::new(ring, layout.notifications()),
         }
@@ -715,7 +715,7 @@ impl<Memory: ControlRingMemory> LocalLaneDemand<Memory> {
         let demand = layout.demand_offset();
         self.ring
             .memory
-            .store_u32_release(demand + REQUESTED_LANES_OFFSET, lanes.to_le())?;
+            .store_u32_release(demand + DEMANDED_LANE_COUNT_OFFSET, lanes.to_le())?;
         self.ring
             .memory
             .increment_u32_release(demand + DEMAND_EPOCH_OFFSET)?;
@@ -754,7 +754,7 @@ pub enum ControlRingDemandStatus {
 /// lanes and never takes a lane back.
 pub struct BrokerLaneDemand<Memory: ControlRingMemory> {
     ring: Arc<ControlRing<Memory>>,
-    started: usize,
+    started_lane_count: usize,
 }
 
 impl<Memory: ControlRingMemory> BrokerLaneDemand<Memory> {
@@ -766,17 +766,17 @@ impl<Memory: ControlRingMemory> BrokerLaneDemand<Memory> {
             .ring
             .memory
             .load_u32_acquire(demand + DEMAND_EPOCH_OFFSET)?;
-        let requested = u32::from_le(
+        let demanded_lane_count = u32::from_le(
             self.ring
                 .memory
-                .load_u32_acquire(demand + REQUESTED_LANES_OFFSET)?,
+                .load_u32_acquire(demand + DEMANDED_LANE_COUNT_OFFSET)?,
         );
-        let demanded = usize::try_from(requested)
+        let demanded_lane_count = usize::try_from(demanded_lane_count)
             .unwrap_or(usize::MAX)
             .clamp(1, layout.lane_count());
-        if self.started < demanded {
-            let lane = self.started;
-            self.started += 1;
+        if self.started_lane_count < demanded_lane_count {
+            let lane = self.started_lane_count;
+            self.started_lane_count += 1;
             return Ok(ControlRingDemandStatus::Lane(lane));
         }
         Ok(ControlRingDemandStatus::Satisfied { wait_epoch })
@@ -1303,7 +1303,7 @@ mod tests {
         assert!(!multi_lane.permits_u32(padding));
         assert!(!multi_lane.permits_u64(padding));
         let demand = multi_lane.demand_offset();
-        assert!(multi_lane.permits_u32(demand + REQUESTED_LANES_OFFSET));
+        assert!(multi_lane.permits_u32(demand + DEMANDED_LANE_COUNT_OFFSET));
         assert!(multi_lane.permits_u32(demand + DEMAND_EPOCH_OFFSET));
         assert!(!multi_lane.permits_u64(demand));
         assert!(!multi_lane.permits_byte_range(demand, 1));
@@ -1533,7 +1533,7 @@ mod tests {
         };
         let mut broker = BrokerLaneDemand {
             ring: Arc::clone(&ring),
-            started: 0,
+            started_lane_count: 0,
         };
         assert_eq!(broker.try_next_lane(), Ok(ControlRingDemandStatus::Lane(0)));
         let Ok(ControlRingDemandStatus::Satisfied { wait_epoch }) = broker.try_next_lane() else {
@@ -1561,7 +1561,7 @@ mod tests {
         ));
         ring.memory
             .store_u32_release(
-                ring.layout.demand_offset() + REQUESTED_LANES_OFFSET,
+                ring.layout.demand_offset() + DEMANDED_LANE_COUNT_OFFSET,
                 u32::MAX.to_le(),
             )
             .unwrap();
