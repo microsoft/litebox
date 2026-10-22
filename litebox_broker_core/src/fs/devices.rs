@@ -293,7 +293,8 @@ impl Backend for Devices {
             ));
         }
 
-        // Like Linux, only opening the device itself needs a controlling terminal.
+        // Like Linux, opening `/dev/tty` for I/O needs a controlling terminal;
+        // `O_PATH` opens and `stat` do not.
         if device == Device::Tty && !flags.contains(OFlags::PATH) && self.stdio.terminal().is_none()
         {
             return Err(OpenError::NoSuchDevice);

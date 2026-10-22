@@ -2820,8 +2820,8 @@ fn test_runner_broker_tty_with_piped_stdout() {
     assert_eq!(stdout, b"pipe\n");
 }
 
-/// Standard input from a file leaves the guest the terminal behind `/dev/tty`
-/// and the other standard streams.
+/// With standard input from a file, the guest keeps the terminal, behind
+/// `/dev/tty` and the other standard streams.
 #[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_tty_with_file_stdin() {

@@ -126,9 +126,10 @@ impl RandomProvider for FailingRandomProvider {
 ///
 /// Reads drain buffered input, and writes are recorded. Reads of empty input
 /// report end-of-file unless [`Self::with_open_input`] keeps standard input
-/// open. The guest terminal, which streams marked with [`Self::with_terminal`]
-/// refer to, has I/O that [`Self::push_terminal_input`] and
-/// [`Self::terminal_writes`] drive.
+/// open. The guest terminal, given by [`Self::with_controlling_terminal`] or
+/// [`Self::with_terminal`], reads input queued by
+/// [`Self::push_terminal_input`] and records writes that
+/// [`Self::terminal_writes`] returns.
 pub struct TestStdioProvider {
     input: Mutex<TestStdioInput>,
     input_watchers: Mutex<ReadinessWatchers>,
@@ -307,8 +308,8 @@ struct TestStdioInput {
     blocked_reads: usize,
 }
 
-/// Terminal endpoint whose reads drain buffered input, waiting while it is
-/// empty, and whose writes are recorded.
+/// Terminal endpoint whose reads drain buffered input, failing with
+/// `WouldBlock` while it is empty, and whose writes are recorded.
 #[derive(Default)]
 struct TestTerminal(Mutex<TestTerminalState>);
 

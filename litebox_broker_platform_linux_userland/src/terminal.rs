@@ -276,7 +276,8 @@ impl TerminalTransport for LinuxTerminal {
 impl Drop for LinuxTerminal {
     fn drop(&mut self) {
         // Owners restore explicitly to observe failures. This covers a
-        // transport dropped without that, such as on an early error.
+        // transport dropped without being restored, such as when
+        // `HostTerminal::new` fails.
         let _ = self.restore();
     }
 }
