@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod errno;
 pub mod loader;
+pub mod mach;
 pub mod shared_cache;
 pub mod syscall;
 
@@ -24,8 +25,26 @@ impl KernReturn {
     pub const SUCCESS: Self = Self(0);
     pub const INVALID_ADDRESS: Self = Self(1);
     pub const PROTECTION_FAILURE: Self = Self(2);
+    pub const NO_SPACE: Self = Self(3);
     pub const INVALID_ARGUMENT: Self = Self(4);
+    pub const FAILURE: Self = Self(5);
     pub const RESOURCE_SHORTAGE: Self = Self(6);
+    /// `task_set_special_port` refused a special port the task may not set.
+    pub const NO_ACCESS: Self = Self(8);
+    /// A trap's `mach_copyin`/`mach_copyout` of a user argument faulted.
+    pub const MEMORY_ERROR: Self = Self(10);
+    pub const NAME_EXISTS: Self = Self(13);
+    pub const ABORTED: Self = Self(14);
+    pub const INVALID_NAME: Self = Self(15);
+    pub const INVALID_TASK: Self = Self(16);
+    pub const INVALID_RIGHT: Self = Self(17);
+    pub const INVALID_VALUE: Self = Self(18);
+    pub const INVALID_CAPABILITY: Self = Self(20);
+    pub const RIGHT_EXISTS: Self = Self(21);
+    pub const INVALID_HOST: Self = Self(22);
+    pub const NOT_SUPPORTED: Self = Self(46);
+    pub const OPERATION_TIMED_OUT: Self = Self(49);
+    pub const DENIED: Self = Self(53);
 
     pub const fn from_raw(value: i32) -> Self {
         Self(value)

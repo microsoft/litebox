@@ -9,8 +9,10 @@ use litebox::platform::{
     RawConstPointer as _,
     page_mgmt::{AllocationOptions, MemoryRegionPermissions as Permissions},
 };
-use litebox_common_linux::vmem::{CreatePagesFlags, VmFlags};
+use litebox_common_linux::vmem::CreatePagesFlags;
 use litebox_platform_macos_userland::MacosUserland as Platform;
+
+mod mach;
 
 fn task(shim: MacosShim<Platform>) -> Task<Platform> {
     let thread = ThreadState::new(1u64 << 32, shim.global.platform);
@@ -45,128 +47,6 @@ fn syscall_return_registers_and_carry() {
     ctx.regs[16] = litebox_common_macos::syscall::nr::GETPPID;
     task.handle_syscall_request(&mut ctx);
     assert_eq!(ctx.regs[0], 1);
-}
-
-#[test]
-fn mach_vm_map_honors_current_protection() {
-    use litebox_common_macos::{
-        KernReturn, VmProtection,
-        syscall::{MachVmAddressMask, MachVmFlags, MachVmProtection, synthetic_port},
-        user_pointers::UserPtrMut,
-    };
-
-    let task = task(MacosShimBuilder::new(Platform::new()).build());
-    // SAFETY: allocate fresh address-output storage in this idle guest task.
-    let slot = unsafe {
-        task.global.mm.create_writable_pages(
-            NonZeroAddress::new(Platform::TASK_ADDR_MIN),
-            NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            |_| Ok(0),
-        )
-    }
-    .unwrap();
-    let address = UserPtrMut::from_usize(slot.as_usize());
-    address
-        .write_at_offset::<Platform>(0, Platform::TASK_ADDR_MIN + 1)
-        .unwrap();
-
-    assert_eq!(
-        task.sys_mach_vm_map_compat(
-            synthetic_port::TASK_SELF,
-            address,
-            PAGE_SIZE,
-            MachVmAddressMask(PAGE_SIZE - 1),
-            MachVmFlags::ANYWHERE,
-            MachVmProtection::new(VmProtection::READ, false),
-        ),
-        usize::from(KernReturn::INVALID_ARGUMENT)
-    );
-    assert_eq!(
-        address.read_at_offset::<Platform>(0),
-        Some(Platform::TASK_ADDR_MIN + 1)
-    );
-
-    assert_eq!(
-        task.sys_mach_vm_map_compat(
-            synthetic_port::TASK_SELF,
-            address,
-            PAGE_SIZE,
-            MachVmAddressMask(0),
-            MachVmFlags::ANYWHERE,
-            MachVmProtection::new(VmProtection::READ, false),
-        ),
-        usize::from(KernReturn::SUCCESS)
-    );
-    let mapped = address.read_at_offset::<Platform>(0).unwrap();
-    let flags = task
-        .global
-        .mm
-        .mappings()
-        .into_iter()
-        .find_map(|(range, flags)| range.contains(&mapped).then_some(flags))
-        .unwrap();
-    assert!(flags.contains(VmFlags::VM_READ));
-    assert!(!flags.contains(VmFlags::VM_WRITE));
-
-    assert_eq!(
-        task.sys_mach_vm_protect_compat(
-            synthetic_port::TASK_SELF,
-            mapped + 1,
-            1,
-            false,
-            MachVmProtection::new(VmProtection::READ | VmProtection::WRITE, true),
-        ),
-        usize::from(KernReturn::SUCCESS)
-    );
-    let flags = task
-        .global
-        .mm
-        .mappings()
-        .into_iter()
-        .find_map(|(range, flags)| range.contains(&mapped).then_some(flags))
-        .unwrap();
-    assert!(flags.contains(VmFlags::VM_WRITE));
-    assert_eq!(
-        task.sys_mach_vm_deallocate_compat(synthetic_port::TASK_SELF, mapped + 1, 1),
-        usize::from(KernReturn::SUCCESS)
-    );
-    assert!(
-        task.global
-            .mm
-            .mappings()
-            .into_iter()
-            .all(|(range, _)| !range.contains(&mapped))
-    );
-
-    address
-        .write_at_offset::<Platform>(0, Platform::TASK_ADDR_MIN + 1)
-        .unwrap();
-    assert_eq!(
-        task.sys_mach_vm_map_compat(
-            synthetic_port::TASK_SELF,
-            address,
-            0,
-            MachVmAddressMask(0),
-            MachVmFlags::ANYWHERE,
-            MachVmProtection::new(VmProtection::READ | VmProtection::WRITE, false),
-        ),
-        usize::from(KernReturn::INVALID_ARGUMENT)
-    );
-    assert_eq!(
-        address.read_at_offset::<Platform>(0),
-        Some(Platform::TASK_ADDR_MIN + 1)
-    );
-    assert_eq!(
-        task.sys_mach_vm_allocate_compat(
-            synthetic_port::TASK_SELF,
-            address,
-            0,
-            MachVmFlags::ANYWHERE,
-        ),
-        usize::from(KernReturn::SUCCESS)
-    );
-    assert_eq!(address.read_at_offset::<Platform>(0), Some(0));
 }
 
 #[test]
@@ -229,6 +109,12 @@ fn platform_syscall_sets_and_gets_tsd_base_like_xnu() {
         0
     );
     assert_eq!(task.process.exit_status(), None);
+}
+
+fn read_guest(address: usize, length: usize) -> Option<Vec<u8>> {
+    litebox_common_macos::user_pointers::UserPtr::<u8>::from_usize(address)
+        .to_owned_slice::<Platform>(length)
+        .map(<[u8]>::into_vec)
 }
 
 #[test]

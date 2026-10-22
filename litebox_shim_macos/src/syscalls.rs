@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Typed BSD syscall implementations.
+//! Typed BSD syscall and Mach trap implementations.
 
 use crate::{ShimPlatform, Task};
 use core::sync::atomic::Ordering;
@@ -10,6 +10,8 @@ use litebox_common_macos::{KernReturn, syscall::MachTimebaseInfo, user_pointers:
 
 pub(crate) mod file;
 pub(crate) mod mach;
+pub(crate) mod mach_ipc;
+pub(crate) mod mig;
 pub(crate) mod misc;
 pub(crate) mod mm;
 

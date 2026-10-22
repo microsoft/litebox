@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bitflags = { version = "2.13.1", default-features = false }
 litebox_trampoline = { path = "../litebox_trampoline", version = "0.1.0" }
 litebox = { path = "../litebox", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0", default-features = false }
@@ -12,6 +13,7 @@ litebox_common_macos = { path = "../litebox_common_macos", version = "0.1.0" }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_util_log = { path = "../litebox_util_log", version = "0.1.0" }
 litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["alloc", "derive"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
 tempfile = "3"

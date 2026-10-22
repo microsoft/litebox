@@ -239,6 +239,15 @@ struct MmapRequest {
     direction: AllocationDirection,
 }
 
+/// Where [`Task::map_anonymous`] places pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnonymousPlacement {
+    /// Prefer the address hint; otherwise any free range.
+    Hint,
+    /// Exactly at the address, replacing existing mappings or failing.
+    Fixed { replace: bool },
+}
+
 fn record_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usize>) {
     let mut merged = range;
     let mut remove = Vec::new();
@@ -327,6 +336,58 @@ impl<P: ShimPlatform> Task<P> {
             offset: 0,
             direction,
         })
+    }
+
+    /// Map zero-filled pages for Mach VM. `Fixed { replace: false }` fails
+    /// with `MappingError::MapError(AddressInUse)` (or `...ByPlatform`) if
+    /// any page is already mapped. Later protection changes cannot exceed
+    /// `maximum`, which must contain `protection`.
+    pub(crate) fn map_anonymous(
+        &self,
+        address: usize,
+        length: usize,
+        placement: AnonymousPlacement,
+        protection: VmProtection,
+        maximum: VmProtection,
+    ) -> Result<usize, MappingError> {
+        let length = NonZeroPageSize::new(length).ok_or(MappingError::UnAligned)?;
+        let mut flags = CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY;
+        if let AnonymousPlacement::Fixed { replace } = placement {
+            flags |= CreatePagesFlags::FIXED_ADDR;
+            flags.set(CreatePagesFlags::NOREPLACE, !replace);
+        }
+        let range = address..address.saturating_add(length.as_usize());
+        let replacing = placement == (AnonymousPlacement::Fixed { replace: true });
+        // A failed replacement can still have destroyed the old pages.
+        let before = replacing.then(|| self.mapping_snapshot(range.clone()));
+        // SAFETY: a replacing fixed mapping has Mach's VM_FLAGS_OVERWRITE
+        // semantics; otherwise nothing existing is replaced.
+        let result = unsafe {
+            if maximum == VmProtection::all() {
+                self.global.mm.create_pages_with_permissions(
+                    NonZeroAddress::new(address),
+                    length,
+                    flags,
+                    permissions(protection),
+                    None,
+                    |_| Ok(0),
+                )
+            } else {
+                self.global.mm.create_pages_with_maximum(
+                    NonZeroAddress::new(address),
+                    length,
+                    flags,
+                    permissions(protection),
+                    permissions(maximum),
+                )
+            }
+        };
+        let replaced = result.is_ok()
+            || before.is_some_and(|before| before != self.mapping_snapshot(range.clone()));
+        if replacing && replaced {
+            self.replace_macho_mappings(range, None);
+        }
+        Ok(result?.as_usize())
     }
 
     fn mmap(&self, request: MmapRequest) -> Result<usize, Errno> {
@@ -1344,6 +1405,34 @@ mod tests {
         task.sys_close(0).unwrap();
         task.sys_munmap(first, PAGE_SIZE).unwrap();
         assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    /// A replacing Mach allocation whose final protection the host refuses
+    /// (W+X) fails after it destroyed the old mapping, so the old mapping's
+    /// Mach-O tracking goes with it.
+    #[test]
+    fn failed_overwrite_drops_the_macho_tracking_it_destroyed() {
+        let task = task_with_file(&macho_image());
+        let address = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        assert!(task.global.macho_mappings.lock().contains_key(&address));
+        assert!(
+            task.map_anonymous(
+                address,
+                PAGE_SIZE,
+                AnonymousPlacement::Fixed { replace: true },
+                VmProtection::all(),
+                VmProtection::all(),
+            )
+            .is_err()
+        );
+        assert!(
+            task.global
+                .mm
+                .overlapping(address..address + PAGE_SIZE)
+                .is_empty(),
+            "the failed overwrite left the old mapping"
+        );
+        assert!(task.global.macho_mappings.lock().is_empty());
     }
 
     #[test]

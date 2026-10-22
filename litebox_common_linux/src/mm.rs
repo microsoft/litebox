@@ -173,6 +173,57 @@ where
         }
     }
 
+    /// Create pages with `permissions` whose permissions can never exceed `maximum`, like a
+    /// mapping with a maximum protection: a later permission change beyond `maximum` fails
+    /// with [`VmemProtectError::NoAccess`]. `permissions` must be within `maximum`.
+    ///
+    /// The pages are created readable and writable and changed to `permissions` under the same
+    /// lock, so no other permission change can observe them in between.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new pages cannot be removed after changing their permissions failed.
+    ///
+    /// # Safety
+    ///
+    /// If a suggested address is given and `flags` contains [`CreatePagesFlags::FIXED_ADDR`],
+    /// overlapping mappings may be unmapped. The caller must ensure they are not in use.
+    pub unsafe fn create_pages_with_maximum(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        permissions: MemoryRegionPermissions,
+        maximum: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        if !maximum.contains(permissions) {
+            return Err(MappingError::InvalidPermissions);
+        }
+        let mut vmem = self.vmem.write();
+        // SAFETY: The caller authorizes any replacements.
+        let addr = unsafe {
+            vmem.create_pages_with_maximum(
+                suggested_address,
+                length,
+                flags,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                maximum,
+                None,
+            )
+        }?;
+        let range = PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize())
+            .expect("successful mapping must return an aligned, non-empty range");
+        // Lowering access to `permissions`, which `maximum` allows, needs no `VM_MAY*` flag.
+        // SAFETY: The mapping was just created; the lock excludes every other access to it.
+        if let Err(error) = unsafe { vmem.protect_mapping(range, permissions) } {
+            // SAFETY: as above.
+            unsafe { vmem.remove_mapping(range) }
+                .expect("failed to remove mapping after permission update failure");
+            return Err(MappingError::ProtectError(error));
+        }
+        Ok(addr)
+    }
+
     /// Create readable and executable pages.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.

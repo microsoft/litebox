@@ -1513,11 +1513,47 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
+        unsafe {
+            self.create_pages_with_maximum(
+                suggested_new_address,
+                length,
+                flags,
+                perms,
+                MemoryRegionPermissions::READ
+                    | MemoryRegionPermissions::WRITE
+                    | MemoryRegionPermissions::EXEC,
+                allowed_range,
+            )
+        }
+    }
+
+    /// Same as [`Self::create_pages`], but the `VM_MAY*` flags are also limited to `maximum`,
+    /// so a later [`Self::protect_mapping`] cannot add access beyond it.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::create_pages`].
+    pub(super) unsafe fn create_pages_with_maximum(
+        &mut self,
+        suggested_new_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        perms: MemoryRegionPermissions,
+        maximum: MemoryRegionPermissions,
+        allowed_range: Option<Range<usize>>,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
+        // VM_MAY% is VM_% << 4.
+        let maximum = VmFlags::from_bits_truncate(
+            (VmFlags::from(maximum) & VmFlags::VM_ACCESS_FLAGS).bits() << 4,
+        ) | !VmFlags::VM_MAY_ACCESS_FLAGS;
         let mut vma = VmArea::new(
             VmFlags::from(perms)
-                | VmFlags::may_flags_for_mapping(shared, file_backed)
+                | (VmFlags::may_flags_for_mapping(shared, file_backed) & maximum)
                 | if flags.contains(CreatePagesFlags::IS_STACK) {
                     VmFlags::VM_GROWSDOWN
                 } else {
@@ -3156,6 +3192,82 @@ mod tests {
             unsafe { vmm.insert_mapping(above_max, vma, false, FixedAddressBehavior::NoReplace,) },
             Err(AllocationError::AboveMaxAddress)
         ));
+    }
+
+    #[test]
+    fn maximum_permissions_bound_protection_changes_and_survive_splits() {
+        let start = DummyVmemBackend::<false>::TASK_ADDR_MIN;
+        let mut vmm = Vmem::new(dummy_backend::<false>(None));
+        let read = MemoryRegionPermissions::READ;
+        let rw = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        unsafe {
+            vmm.create_pages_with_maximum(
+                Some(NonZeroAddress::new(start).unwrap()),
+                NonZeroPageSize::new(3 * PAGE_SIZE).unwrap(),
+                CreatePagesFlags::FIXED_ADDR,
+                read,
+                read,
+                None,
+            )
+        }
+        .unwrap();
+        let all = PageRange::new(start, start + 3 * PAGE_SIZE).unwrap();
+        let middle = PageRange::new(start + PAGE_SIZE, start + 2 * PAGE_SIZE).unwrap();
+        let maximum = |vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>| {
+            vmm.iter()
+                .map(|(range, vma)| (range.clone(), vma.flags() & VmFlags::VM_MAY_ACCESS_FLAGS))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            maximum(&vmm),
+            [(start..start + 3 * PAGE_SIZE, VmFlags::VM_MAYREAD)]
+        );
+        // Within the maximum: lowering and restoring access, which splits the area.
+        unsafe { vmm.protect_mapping(middle, MemoryRegionPermissions::empty()) }.unwrap();
+        assert_eq!(vmm.iter().count(), 3);
+        assert!(
+            vmm.iter().all(|(_, vma)| {
+                vma.flags() & VmFlags::VM_MAY_ACCESS_FLAGS == VmFlags::VM_MAYREAD
+            })
+        );
+        unsafe { vmm.protect_mapping(middle, read) }.unwrap();
+        // Beyond it, on a split piece and on the whole range.
+        for range in [middle, all] {
+            assert!(matches!(
+                unsafe { vmm.protect_mapping(range, rw) },
+                Err(VmemProtectError::NoAccess { .. })
+            ));
+        }
+        // Unmapping part of the area leaves the rest bounded.
+        unsafe { vmm.remove_mapping(middle) }.unwrap();
+        assert_eq!(
+            maximum(&vmm),
+            [
+                (start..start + PAGE_SIZE, VmFlags::VM_MAYREAD),
+                (
+                    start + 2 * PAGE_SIZE..start + 3 * PAGE_SIZE,
+                    VmFlags::VM_MAYREAD
+                ),
+            ]
+        );
+        assert!(matches!(
+            unsafe { vmm.protect_mapping(PageRange::new(start, start + PAGE_SIZE).unwrap(), rw) },
+            Err(VmemProtectError::NoAccess { .. })
+        ));
+        // A default mapping keeps every VM_MAY* flag.
+        unsafe {
+            vmm.create_pages(
+                NonZeroAddress::new(start + PAGE_SIZE),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                CreatePagesFlags::FIXED_ADDR,
+                read,
+                None,
+            )
+        }
+        .unwrap();
+        unsafe { vmm.protect_mapping(middle, rw) }.unwrap();
+        assert!(vmm.iter().any(|(range, vma)| *range == Range::from(middle)
+            && vma.flags().contains(VmFlags::VM_MAY_ACCESS_FLAGS)));
     }
 
     #[test]

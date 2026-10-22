@@ -1,11 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Darwin BSD shim for AArch64 Mach-O guests.
+//! Darwin BSD and Mach shim for AArch64 Mach-O guests.
 //!
 //! Guest mappings and file operations use LiteBox. A runtime provider may
 //! supply dyld for dynamically linked programs.
-//! Networking is unsupported.
+//!
+//! Mach IPC is emulated per guest: the task has its own port name space,
+//! messages between its ports queue in the shim, and its kernel objects
+//! (task, thread, host, clocks, semaphores) are served by a typed MIG server.
+//! No host Mach right is ever exposed to or used on behalf of the guest.
+//! Networking and threads are unsupported.
 
 #![no_std]
 #![cfg(target_arch = "aarch64")]
@@ -20,7 +25,7 @@ use litebox::{
     platform::PageManagementProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
-use litebox_common_linux::{PtRegs, mm::VmemManager, vmem::VmFlags};
+use litebox_common_linux::{PtRegs, mm::VmemManager};
 use litebox_common_macos::{
     KernReturn, PAGE_SIZE, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
     errno::Errno, loader::MachoLoaderError,
@@ -123,6 +128,9 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 macho_mappings: Mutex::new(BTreeMap::new()),
                 macho_trampolines: Mutex::new(BTreeMap::new()),
                 shared_cache_base: AtomicUsize::new(0),
+                ipc: Mutex::new(syscalls::mach_ipc::IpcSpace::default()),
+                restartable_ranges: Mutex::new(None),
+                reported_unsupported: Mutex::new(alloc::collections::BTreeSet::new()),
                 next_thread_id: core::sync::atomic::AtomicU64::new(1u64 << 32),
             }),
             files: self.files,
@@ -248,18 +256,20 @@ struct GlobalState<P: ShimPlatform> {
     macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
     macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
     shared_cache_base: AtomicUsize,
+    ipc: Mutex<P, syscalls::mach_ipc::IpcSpace>,
+    /// `task_restartable_ranges_register` state.
+    restartable_ranges: Mutex<P, Option<Vec<syscalls::mig::RestartableRange>>>,
+    /// `(feature, id)` pairs [`Task::log_unsupported_once`] logged.
+    reported_unsupported: Mutex<P, alloc::collections::BTreeSet<(&'static str, i64)>>,
     next_thread_id: core::sync::atomic::AtomicU64,
 }
 
 impl<P: ShimPlatform> Drop for GlobalState<P> {
     fn drop(&mut self) {
         // SAFETY: the last task/loader owner is gone, so none of these mappings
-        // are executing or borrowed. Vmem's platform reservations have empty
-        // flags; our anonymous mappings have VM_MAY_ACCESS_FLAGS, even guards.
-        for (range, flags) in self.mm.mappings() {
-            if !flags.intersects(VmFlags::VM_MAY_ACCESS_FLAGS) {
-                continue;
-            }
+        // are executing or borrowed. Every area is a guest mapping, including
+        // those whose maximum protection is VM_PROT_NONE.
+        for (range, _) in self.mm.mappings() {
             let ptr = litebox_common_macos::user_pointers::UserPtrMut::from_usize(range.start)
                 .to_platform_ptr::<P>();
             // Best effort during Drop, including unwinding: a failed unmap
@@ -357,7 +367,14 @@ impl<P: ShimPlatform> Task<P> {
             }
             Err(error) => {
                 if is_mach {
-                    ctx.regs[0] = KernReturn::INVALID_ARGUMENT.into();
+                    // A trap XNU has but the shim does not implement reports
+                    // KERN_NOT_SUPPORTED; malformed arguments are invalid.
+                    ctx.regs[0] = if error == Errno::ENOSYS {
+                        KernReturn::NOT_SUPPORTED
+                    } else {
+                        KernReturn::INVALID_ARGUMENT
+                    }
+                    .into();
                 } else {
                     ctx.regs[0] = error.raw();
                     ctx.pstate |= CARRY;
@@ -480,21 +497,23 @@ impl<P: ShimPlatform> Task<P> {
                 address,
                 size,
                 flags,
-            } => Ok(self.sys_mach_vm_allocate_compat(target, address, size, flags)),
+            } => Ok(self
+                .sys_mach_vm_allocate(target, address, size, flags)
+                .into()),
             SyscallRequest::MachVmDeallocate {
                 target,
                 address,
                 size,
-            } => Ok(self.sys_mach_vm_deallocate_compat(target, address, size)),
+            } => Ok(self.sys_mach_vm_deallocate(target, address, size).into()),
             SyscallRequest::MachVmProtect {
                 target,
                 address,
                 size,
                 set_maximum,
                 protection,
-            } => {
-                Ok(self.sys_mach_vm_protect_compat(target, address, size, set_maximum, protection))
-            }
+            } => Ok(self
+                .sys_mach_vm_protect(target, address, size, set_maximum, protection)
+                .into()),
             SyscallRequest::MachVmMap {
                 target,
                 address,
@@ -502,15 +521,79 @@ impl<P: ShimPlatform> Task<P> {
                 mask,
                 flags,
                 current_protection,
-            } => Ok(self.sys_mach_vm_map_compat(
+            } => Ok(self
+                .sys_mach_vm_map(target, address, size, mask, flags, current_protection)
+                .into()),
+            SyscallRequest::MachTaskSelf => Ok(self.sys_task_self()),
+            SyscallRequest::MachThreadSelf => Ok(self.sys_thread_self()),
+            SyscallRequest::MachHostSelf => Ok(self.sys_host_self()),
+            SyscallRequest::MachReplyPort => Ok(self.sys_mach_reply_port()),
+            SyscallRequest::MachPortAllocate {
                 target,
-                address,
-                size,
-                mask,
-                flags,
-                current_protection,
-            )),
-            SyscallRequest::MachTaskSelf => Ok(Self::synthetic_task_port().into()),
+                right,
+                name,
+            } => Ok(self.sys_mach_port_allocate(target, right, name).into()),
+            SyscallRequest::MachPortDeallocate { target, name } => {
+                Ok(self.sys_mach_port_deallocate(target, name).into())
+            }
+            SyscallRequest::MachPortModRefs {
+                target,
+                name,
+                right,
+                delta,
+            } => Ok(self
+                .sys_mach_port_mod_refs(target, name, right, delta)
+                .into()),
+            SyscallRequest::MachPortInsertRight {
+                target,
+                name,
+                poly,
+                poly_disposition,
+            } => Ok(self
+                .sys_mach_port_insert_right(target, name, poly, poly_disposition)
+                .into()),
+            SyscallRequest::MachPortConstruct {
+                target,
+                options,
+                context,
+                name,
+            } => Ok(self
+                .sys_mach_port_construct(target, options, context, name)
+                .into()),
+            SyscallRequest::MachPortDestruct {
+                target,
+                name,
+                send_right_delta,
+                guard,
+            } => Ok(self
+                .sys_mach_port_destruct(target, name, send_right_delta, guard)
+                .into()),
+            SyscallRequest::MachMsg2 {
+                data,
+                options,
+                header,
+                send_size,
+                descriptor_count,
+                receive_name,
+                receive_size,
+                priority: _,
+                timeout,
+            } => Ok(self.sys_mach_msg2(
+                data,
+                options,
+                header,
+                send_size,
+                descriptor_count,
+                receive_name,
+                receive_size,
+                timeout,
+            ) as usize),
+            SyscallRequest::SemaphoreSignal { semaphore } => {
+                Ok(self.sys_semaphore_signal(semaphore).into())
+            }
+            SyscallRequest::SemaphoreWait { semaphore } => {
+                Ok(self.sys_semaphore_wait(semaphore).into())
+            }
             SyscallRequest::SharedRegionCheckNp { start_address } => self
                 .sys_shared_region_check_np(start_address)
                 .to_syscall_result(),
