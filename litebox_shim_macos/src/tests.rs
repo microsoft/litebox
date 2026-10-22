@@ -83,11 +83,12 @@ fn unsupported_syscall_reports_use_bounded_state() {
 fn mach_vm_map_honors_current_protection() {
     use litebox_common_macos::{
         KernReturn, VmProtection,
-        syscall::{MachVmAddressMask, MachVmFlags, MachVmProtection, synthetic_port},
+        syscall::{MachPortName, MachVmAddressMask, MachVmFlags, MachVmProtection},
         user_pointers::UserPtrMut,
     };
 
     let task = task(MacosShimBuilder::new(Platform::new()).build());
+    let own = MachPortName(u32::try_from(task.sys_task_self()).unwrap());
     // SAFETY: allocate fresh address-output storage in this idle guest task.
     let slot = unsafe {
         task.global.mm.create_writable_pages(
@@ -105,7 +106,7 @@ fn mach_vm_map_honors_current_protection() {
 
     assert_eq!(
         task.sys_mach_vm_map_compat(
-            synthetic_port::TASK_SELF,
+            own,
             address,
             PAGE_SIZE,
             MachVmAddressMask(PAGE_SIZE - 1),
@@ -121,7 +122,7 @@ fn mach_vm_map_honors_current_protection() {
 
     assert_eq!(
         task.sys_mach_vm_map_compat(
-            synthetic_port::TASK_SELF,
+            own,
             address,
             PAGE_SIZE,
             MachVmAddressMask(0),
@@ -143,7 +144,7 @@ fn mach_vm_map_honors_current_protection() {
 
     assert_eq!(
         task.sys_mach_vm_protect_compat(
-            synthetic_port::TASK_SELF,
+            own,
             mapped + 1,
             1,
             false,
@@ -160,7 +161,7 @@ fn mach_vm_map_honors_current_protection() {
         .unwrap();
     assert!(flags.contains(VmFlags::VM_WRITE));
     assert_eq!(
-        task.sys_mach_vm_deallocate_compat(synthetic_port::TASK_SELF, mapped + 1, 1),
+        task.sys_mach_vm_deallocate_compat(own, mapped + 1, 1),
         usize::from(KernReturn::SUCCESS)
     );
     assert!(
@@ -176,7 +177,7 @@ fn mach_vm_map_honors_current_protection() {
         .unwrap();
     assert_eq!(
         task.sys_mach_vm_map_compat(
-            synthetic_port::TASK_SELF,
+            own,
             address,
             0,
             MachVmAddressMask(0),
@@ -190,12 +191,7 @@ fn mach_vm_map_honors_current_protection() {
         Some(Platform::TASK_ADDR_MIN + 1)
     );
     assert_eq!(
-        task.sys_mach_vm_allocate_compat(
-            synthetic_port::TASK_SELF,
-            address,
-            0,
-            MachVmFlags::ANYWHERE,
-        ),
+        task.sys_mach_vm_allocate_compat(own, address, 0, MachVmFlags::ANYWHERE),
         usize::from(KernReturn::SUCCESS)
     );
     assert_eq!(address.read_at_offset::<Platform>(0), Some(0));

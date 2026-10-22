@@ -1,21 +1,24 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Minimal Mach trap compatibility used by dyld startup.
+//! Minimal Mach VM traps used by dyld startup.
 //!
-//! LiteBox does not expose host Mach rights. Port-returning traps use stable
-//! synthetic names, and VM traps operate only on the shim's PageManager.
-//!
-//! TODO: Replace these bootstrap-only approximations when guests require
-//! observable Mach port, IPC, memory-object, or task semantics.
+//! The target must be the guest's task port; requests operate only on the
+//! shim's PageManager. Only anonymous ANYWHERE mappings are supported, and
+//! maximum protection is not modeled.
 
 use crate::{ShimPlatform, Task};
 use litebox_common_macos::{
     KernReturn, MmapFlags, PAGE_SIZE, VmProtection,
     errno::Errno,
-    syscall::{MachPortName, MachVmAddressMask, MachVmFlags, MachVmProtection, synthetic_port},
+    mach::msg_return,
+    syscall::{MachPortName, MachVmAddressMask, MachVmFlags, MachVmProtection},
     user_pointers::UserPtrMut,
 };
+
+/// `port_name_to_current_task` failure.
+pub(crate) const INVALID_TASK_DEST: KernReturn =
+    KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed());
 
 fn errno_to_kern_return(error: Errno) -> KernReturn {
     match error {
@@ -57,7 +60,7 @@ impl<P: ShimPlatform> Task<P> {
         // Approximation: VM tags are ignored. Fixed-address allocation is not
         // needed by the supported dyld path and fails closed.
         if size == 0 {
-            if target != synthetic_port::TASK_SELF || !flags.contains(MachVmFlags::ANYWHERE) {
+            if !self.is_own_task(target) || !flags.contains(MachVmFlags::ANYWHERE) {
                 return KernReturn::INVALID_ARGUMENT.into();
             }
             return if address.write_at_offset::<P>(0, 0).is_some() {
@@ -89,10 +92,7 @@ impl<P: ShimPlatform> Task<P> {
         // Approximation: memory objects, copy semantics, inheritance, and max
         // protection are not modeled. Current protection is enforced for the
         // anonymous mapping used by the supported bootstrap path.
-        if target != synthetic_port::TASK_SELF
-            || !mask.is_zero()
-            || !flags.contains(MachVmFlags::ANYWHERE)
-        {
+        if !self.is_own_task(target) || !mask.is_zero() || !flags.contains(MachVmFlags::ANYWHERE) {
             return KernReturn::INVALID_ARGUMENT.into();
         }
         if size == 0 {
@@ -131,7 +131,7 @@ impl<P: ShimPlatform> Task<P> {
         address: usize,
         size: usize,
     ) -> usize {
-        if target != synthetic_port::TASK_SELF {
+        if !self.is_own_task(target) {
             return KernReturn::INVALID_ARGUMENT.into();
         }
         let Ok(range) = mach_page_range(address, size) else {
@@ -155,7 +155,7 @@ impl<P: ShimPlatform> Task<P> {
         set_maximum: bool,
         protection: MachVmProtection,
     ) -> usize {
-        if target != synthetic_port::TASK_SELF || set_maximum {
+        if !self.is_own_task(target) || set_maximum {
             // Maximum-protection changes are not modeled; accepting one would
             // overstate rights that PageManager cannot subsequently enforce.
             return KernReturn::INVALID_ARGUMENT.into();
@@ -172,9 +172,5 @@ impl<P: ShimPlatform> Task<P> {
             Err(error) => errno_to_kern_return(error),
         }
         .into()
-    }
-
-    pub(crate) const fn synthetic_task_port() -> MachPortName {
-        synthetic_port::TASK_SELF
     }
 }
