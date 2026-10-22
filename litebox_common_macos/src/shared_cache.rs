@@ -420,7 +420,7 @@ pub struct TableLocation {
     pub count: u32,
 }
 
-/// The fields of `dyld_cache_header` this module reads.
+/// The fields of `dyld_cache_header` the guest cache instance needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheHeader {
     pub magic: [u8; 16],
@@ -754,7 +754,7 @@ impl DylibAttributes {
     }
 }
 
-/// A dylib load command of a cache image.
+/// A dylib load command of a cache image or executable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheDependency {
     pub path: String,
@@ -775,6 +775,41 @@ impl CacheDependency {
             attributes: DylibAttributes::decode(command, body),
         }))
     }
+
+    /// Decode an executable's dylib load command like
+    /// [`Self::from_load_command`], but reject only what dyld rejects (see
+    /// [`load_command_bytes`]). Names that are not UTF-8 are not cache image
+    /// paths and give `None`.
+    pub fn from_executable_load_command(command: u32, body: &[u8]) -> Result<Option<Self>> {
+        if !DYLIB_LOAD_COMMANDS.contains(&command) {
+            return Ok(None);
+        }
+        let Ok(path) = core::str::from_utf8(load_command_bytes(body)?) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            path: String::from(path),
+            attributes: DylibAttributes::decode(command, body),
+        }))
+    }
+}
+
+/// The bytes of the `lc_str` of a load command (`body` is the whole command)
+/// up to its NUL, checked like dyld's `stringOverflow`
+/// (`mach_o/UnsafeHeader.cpp`): the offset (at byte 8, as in every command
+/// with a string) must lie inside the command and a NUL must follow it
+/// inside the command.
+pub fn load_command_bytes(body: &[u8]) -> Result<&[u8]> {
+    let offset = u32_at(body, 8)? as usize;
+    let bytes = body
+        .get(offset..)
+        .filter(|bytes| !bytes.is_empty())
+        .ok_or(SharedCacheError::Malformed("load command string offset"))?;
+    let length = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or(SharedCacheError::Malformed("unterminated string"))?;
+    Ok(&bytes[..length])
 }
 
 /// A `section_64` of a cache image segment.
