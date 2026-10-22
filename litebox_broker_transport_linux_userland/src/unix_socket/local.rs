@@ -30,7 +30,7 @@ use litebox_broker_protocol::wire::{
     decode_handshake_response, decode_notification, decode_response, encode_handshake_request,
     encode_request,
 };
-use litebox_broker_transport::call_lane_pool::CallLanePoolError;
+use litebox_broker_transport::call_lane_pool::{LaneClaim, LocalCallLanePool};
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
@@ -40,7 +40,6 @@ use litebox_broker_transport::control_ring::{
     LocalControlRingEndpoints, LocalControlRingLane, LocalLaneDemand,
 };
 
-use crate::call_lane_pool::{CallLanePool, LaneClaim, call_lane_pool_error};
 use crate::memfd::MemfdSharedMemory;
 use crate::setup::{
     copy_io_error, invalid_data, read_setup_frame, ring_error, shutdown_socket, wire_error,
@@ -73,7 +72,7 @@ type LocalLane = LocalControlRingLane<MemfdSharedMemory>;
 /// call lanes and their demand, the setup socket used for liveness and
 /// teardown, and the wake handles of every ring wait.
 struct LocalRingAssociation {
-    lanes: CallLanePool<LocalLane>,
+    lanes: LocalCallLanePool<LocalLane>,
     lane_demand: LocalLaneDemand<MemfdSharedMemory>,
     control_stream: UnixStream,
     /// Whether the call channel was dropped, which ends the association as a
@@ -206,7 +205,7 @@ impl UnixStreamLocalSetupChannel {
 
         let shutdown_stream = setup_stream.try_clone()?;
         let association = Arc::new(LocalRingAssociation {
-            lanes: CallLanePool::new(lanes),
+            lanes: LocalCallLanePool::new(lanes),
             lane_demand,
             control_stream: shutdown_stream,
             closed: AtomicBool::new(false),
@@ -348,8 +347,7 @@ impl LocalCallChannel for UnixControlRingLocalCallChannel {
             .claim(|lanes| association.demand_lanes(lanes))
         {
             Ok(lane) => lane,
-            Err(CallLanePoolError::AssociationFailed(error)) => return Err(copy_io_error(&error)),
-            Err(CallLanePoolError::Operation(error)) => {
+            Err(error) => {
                 let result = Err(copy_io_error(&error));
                 let _ = association.fail(error);
                 return result;
@@ -372,7 +370,7 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
     fn recv_notification(&mut self) -> IoResult<Option<BrokerNotification>> {
         loop {
             if let Some(error) = self.association.lanes.current_failure() {
-                return self.association.end_notifications(&error);
+                return self.association.end_notifications(error);
             }
             match self.consumer.try_read(decode_notification) {
                 Ok(ControlRingReadStatus::Message(notification)) => {
@@ -380,13 +378,13 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
                         .association
                         .acknowledge_notification(&mut self.consumer)
                     {
-                        return self.association.end_notifications(&error);
+                        return self.association.end_notifications(error);
                     }
                     return Ok(Some(notification));
                 }
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
                     if let Some(error) = self.association.lanes.current_failure() {
-                        return self.association.end_notifications(&error);
+                        return self.association.end_notifications(error);
                     }
                     if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
                         let result = Err(copy_io_error(&error));
@@ -414,11 +412,11 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
 impl LocalRingAssociation {
     /// Ends notification receipt once the association has ended with
     /// `failure`: cleanly if the local side closed it.
-    fn end_notifications(&self, failure: &Error) -> IoResult<Option<BrokerNotification>> {
+    fn end_notifications(&self, failure: Error) -> IoResult<Option<BrokerNotification>> {
         if self.closed.load(Ordering::Acquire) {
             Ok(None)
         } else {
-            Err(copy_io_error(failure))
+            Err(failure)
         }
     }
 
@@ -426,15 +424,12 @@ impl LocalRingAssociation {
         &self,
         consumer: &mut ControlRingConsumer<MemfdSharedMemory>,
     ) -> IoResult<()> {
-        let result = self
-            .lanes
-            .run_if_live(|| {
-                consumer
-                    .publish_head()
-                    .map_err(ring_error)
-                    .and_then(|()| consumer.wake_producer())
-            })
-            .map_err(call_lane_pool_error);
+        let result = self.lanes.run_if_live(|| {
+            consumer
+                .publish_head()
+                .map_err(ring_error)
+                .and_then(|()| consumer.wake_producer())
+        });
         if let Err(error) = result {
             let result = Err(copy_io_error(&error));
             let _ = self.fail(error);
@@ -462,8 +457,7 @@ impl LocalRingAssociation {
         loop {
             let write_status = self
                 .lanes
-                .run_if_live(|| producer.try_write(&request_frame).map_err(ring_error))
-                .map_err(call_lane_pool_error)?;
+                .run_if_live(|| producer.try_write(&request_frame).map_err(ring_error))?;
             match write_status {
                 ControlRingWriteStatus::Written => break,
                 ControlRingWriteStatus::Full { wait_epoch } => {
@@ -479,7 +473,7 @@ impl LocalRingAssociation {
                 Ok(ControlRingReadStatus::Message(response)) => break response,
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
                     if let Some(error) = self.lanes.current_failure() {
-                        return Err(copy_io_error(&error));
+                        return Err(error);
                     }
                     consumer.wait_for_message(wait_epoch)?;
                 }
@@ -496,13 +490,12 @@ impl LocalRingAssociation {
             let consumer = &mut lane.response_consumer;
             consumer.publish_head().map_err(ring_error)?;
             consumer.wake_producer()
-        })
-        .map_err(call_lane_pool_error)?;
+        })?;
         Ok(response)
     }
 
     fn fail(&self, error: Error) -> IoResult<()> {
-        let first_failure = self.lanes.record_failure(Arc::new(error));
+        let first_failure = self.lanes.record_failure(error);
         let wakes = self
             .wakes
             .iter()
@@ -1039,7 +1032,7 @@ mod control_ring_tests {
 
     #[test]
     fn failure_recording_waits_for_in_progress_publication() {
-        let pending = Arc::new(CallLanePool::new(vec![()]));
+        let pending = Arc::new(LocalCallLanePool::new(vec![()]));
         let publication_state = Arc::new(AtomicUsize::new(0));
         let (publication_started, wait_for_publication) = std::sync::mpsc::sync_channel(0);
         let (release_publication, publication_released) = std::sync::mpsc::sync_channel(0);
@@ -1064,10 +1057,8 @@ mod control_ring_tests {
         let failure_state = Arc::clone(&publication_state);
         let failure = thread::spawn(move || {
             failure_started.send(()).unwrap();
-            failure_pending.record_failure(Arc::new(Error::new(
-                ErrorKind::ConnectionAborted,
-                "test failure",
-            )));
+            failure_pending
+                .record_failure(Error::new(ErrorKind::ConnectionAborted, "test failure"));
             assert_eq!(failure_state.load(Ordering::Acquire), 2);
             failure_recorded.send(()).unwrap();
         });
@@ -1085,8 +1076,7 @@ mod control_ring_tests {
         failure.join().unwrap();
         assert!(matches!(
             pending.claim(|_| Ok(())),
-            Err(CallLanePoolError::AssociationFailed(error))
-                if error.kind() == ErrorKind::ConnectionAborted
+            Err(error) if error.kind() == ErrorKind::ConnectionAborted
         ));
     }
 }
