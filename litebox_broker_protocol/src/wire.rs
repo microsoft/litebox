@@ -1393,6 +1393,7 @@ mod tests {
             (FileError::NotTerminal, 23),
             (FileError::InvalidTerminalControl, 24),
             (FileError::TooManySymlinks, 25),
+            (FileError::NoSuchDevice, 26),
         ] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,

@@ -146,6 +146,8 @@ pub enum FileError {
     InvalidTerminalControl,
     #[error("too many symbolic links encountered")]
     TooManySymlinks,
+    #[error("no such device or address")]
+    NoSuchDevice,
 }
 
 /// Seek origin.

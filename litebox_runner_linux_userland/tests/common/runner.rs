@@ -323,23 +323,35 @@ impl Runner {
             .expect("Failed to spawn litebox_runner_linux_userland")
     }
 
+    /// Spawns the runner as the leader of a new session whose controlling
+    /// terminal is `terminal`, as a terminal emulator starts a shell. With
+    /// `stderr_alias`, standard error instead reopens the terminal through
+    /// `/dev/tty`.
     #[cfg(target_os = "linux")]
-    pub(crate) fn spawn_with_controlling_tty_alias(
+    pub(crate) fn spawn_with_controlling_terminal(
         &mut self,
+        terminal: &std::fs::File,
         stdin: std::process::Stdio,
         stdout: std::process::Stdio,
         stderr: std::process::Stdio,
+        stderr_alias: bool,
     ) -> std::process::Child {
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
 
+        let terminal = terminal.as_raw_fd();
         self.prepare_command();
         self.command.stdin(stdin).stdout(stdout).stderr(stderr);
         // SAFETY: the child only calls async-signal-safe syscalls before exec.
-        // fd 0 is the supplied PTY slave; the path is a static NUL-terminated string.
+        // `terminal` stays open in the child until exec; the path is a static
+        // NUL-terminated string.
         unsafe {
-            self.command.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+            self.command.pre_exec(move || {
+                if libc::setsid() < 0 || libc::ioctl(terminal, libc::TIOCSCTTY, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if !stderr_alias {
+                    return Ok(());
                 }
                 let fd = libc::open(c"/dev/tty".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
                 if fd < 0 {
@@ -356,6 +368,6 @@ impl Runner {
         }
         self.command
             .spawn()
-            .expect("Failed to spawn runner with a controlling terminal alias")
+            .expect("Failed to spawn runner with a controlling terminal")
     }
 }

@@ -18,9 +18,10 @@ use litebox_broker_protocol::terminal::{
     InputFlags as I, LocalFlags as L, OutputFlags as O, TerminalEvents, TerminalOperation,
     TerminalResponse, TerminalSettings, WindowSize,
 };
-use litebox_platform::buffer::ReadBuffer;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::fs::FileResult;
+use crate::fs::errors::{ReadError, WriteError};
 use crate::readiness::ReadinessSource;
 use crate::transfer::take_from_queue;
 
@@ -36,13 +37,23 @@ pub trait TerminalEventSink: Send + Sync {
 }
 
 /// A shared terminal endpoint implemented over a platform transport.
+///
+/// Reads and writes never block. One that cannot make progress fails with
+/// `WouldBlock`, and the endpoint later publishes its readiness.
 pub trait TerminalEndpoint: ReadinessSource {
+    /// Reads processed input into the start of `output` (see
+    /// [`crate::transfer`]), returning zero at end-of-file.
+    fn read(&self, output: &mut dyn ReadBuffer) -> Result<usize, ReadError>;
+
+    /// Processes and queues output from the start of `input` (see
+    /// [`crate::transfer`]).
+    fn write(&self, input: &dyn WriteBuffer) -> Result<usize, WriteError>;
+
     /// Controls the endpoint without blocking. Output-draining operations may
     /// return `WouldBlock` and later publish writable readiness.
     fn control(&self, operation: TerminalOperation) -> crate::Result<FileResult<TerminalResponse>>;
 
-    /// Attaches the initial process group once. Later opens must not replace
-    /// this association.
+    /// Attaches the initial process group once, ignoring later attachments.
     fn attach(&self, sink: Arc<dyn TerminalEventSink>);
 }
 

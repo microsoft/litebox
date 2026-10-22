@@ -346,6 +346,8 @@ pub struct BrokerCore {
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) fs: Arc<dyn FileService>,
+    /// Guest terminal whose events reach the first root process's group.
+    pub(crate) terminal: Option<Arc<dyn terminal::TerminalEndpoint>>,
     pub(crate) socket_ports: BrokerSocketPorts,
     pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
 }
@@ -411,9 +413,19 @@ impl BrokerCore {
             socket_provider,
             timer_provider,
             fs,
+            terminal: None,
             socket_ports: BrokerSocketPorts::default(),
             process_lifecycle_sink: Arc::new(NoopProcessLifecycleSink),
         })
+    }
+
+    /// Makes `terminal`, which the file service serves as `/dev/tty`, the
+    /// controlling terminal of the first root process's session: the terminal
+    /// then signals that process's group. Set it before sharing the core.
+    #[must_use]
+    pub fn with_terminal(mut self, terminal: Arc<dyn terminal::TerminalEndpoint>) -> Self {
+        self.terminal = Some(terminal);
+        self
     }
 
     /// Returns a broker handle that publishes process lifecycle changes to `sink`.
@@ -536,7 +548,8 @@ impl BrokerCore {
     /// Creates one process and its initial thread.
     ///
     /// If initial-thread creation fails, the process is discarded before the
-    /// error is returned.
+    /// error is returned. A root process's group receives the events of the
+    /// [terminal](Self::with_terminal) unless an earlier root's does.
     ///
     /// # Panics
     ///
@@ -549,7 +562,12 @@ impl BrokerCore {
     ) -> Result<Arc<BrokerProcess>> {
         let process = self.allocate_process(caller_credential, parent_id)?;
         match process.create_initial_thread() {
-            Ok(()) => Ok(process),
+            Ok(()) => {
+                if let (None, Some(terminal)) = (parent_id, &self.terminal) {
+                    terminal.attach(process_group::terminal_sink(&process));
+                }
+                Ok(process)
+            }
             Err(error) => {
                 let _ = process.fail_start(error, false, true);
                 process.retire(true);

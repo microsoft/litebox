@@ -1016,12 +1016,6 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn is_terminal(&self, h: &FileHandle) -> bool {
-        self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
-            backend.is_terminal(handle)
-        })
-    }
-
     fn terminal(&self, h: &FileHandle) -> Option<Arc<dyn crate::terminal::TerminalEndpoint>> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
             backend.terminal(handle)

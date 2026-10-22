@@ -1173,7 +1173,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
-                | OpenError::TruncateError(_) => FileStatusError::Io,
+                | OpenError::TruncateError(_)
+                | OpenError::NoSuchDevice => FileStatusError::Io,
             })?;
         self.handle_status(&entry)
     }
@@ -1184,14 +1185,6 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         entry: &ResolverEntry<Backend>,
     ) -> Result<super::FileStatus, FileStatusError> {
         self.backend.status(entry.handle.as_ref())
-    }
-
-    /// Whether an open entry refers to a terminal. Path-only entries never do.
-    pub fn is_terminal(&self, entry: &ResolverEntry<Backend>) -> bool {
-        match &entry.handle {
-            Handle::File(file) if !entry.path_only => self.backend.is_terminal(file),
-            Handle::File(_) | Handle::Dir(_) => false,
-        }
     }
 
     /// Shared terminal backing a non-path-only entry.

@@ -254,10 +254,6 @@ impl Backend for ShareFs {
         self.0.status(h)
     }
 
-    fn is_terminal(&self, h: &FileHandle) -> bool {
-        self.0.is_terminal(h)
-    }
-
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
         self.0.readiness_source(h)
     }

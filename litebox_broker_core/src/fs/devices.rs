@@ -3,7 +3,7 @@
 
 //! Unix-y devices [`super::backend::Backend`].
 //!
-//! Provides `{stdin,stdout,null,urandom,...}` entries, intended to be mounted at `/dev`.
+//! Provides `{stdin,stdout,tty,null,urandom,...}` entries, intended to be mounted at `/dev`.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -26,9 +26,10 @@ use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::random::RandomProvider;
 use crate::readiness::{ReadinessRegistration, ReadinessSource};
 use crate::stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream};
+use crate::terminal::TerminalEndpoint;
 use crate::transfer::bounce_buffer;
 
-/// Block size for stdio devices
+/// Block size for stdio devices and /dev/tty
 const STDIO_BLOCK_SIZE: u64 = 1024;
 /// Block size for null device
 const NULL_BLOCK_SIZE: u64 = 0x1000;
@@ -47,6 +48,13 @@ const STDIO_NODE_INFO: NodeInfo = NodeInfo {
     dev: 64,
     ino: 9,
     rdev: core::num::NonZeroU64::new(34822),
+};
+/// Node info for /dev/tty
+const TTY_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 12,
+    // major=5, minor=0
+    rdev: core::num::NonZeroU64::new(0x500),
 };
 /// Node info for /dev/null
 const NULL_NODE_INFO: NodeInfo = NodeInfo {
@@ -68,6 +76,7 @@ enum Device {
     Stdin,
     Stdout,
     Stderr,
+    Tty,
     Null,
     URandom,
 }
@@ -77,6 +86,7 @@ impl Device {
         ("stdin", Device::Stdin),
         ("stdout", Device::Stdout),
         ("stderr", Device::Stderr),
+        ("tty", Device::Tty),
         ("null", Device::Null),
         ("urandom", Device::URandom),
     ];
@@ -90,7 +100,7 @@ impl Device {
             Device::Stdin => Some(StdioStream::Stdin),
             Device::Stdout => Some(StdioStream::Stdout),
             Device::Stderr => Some(StdioStream::Stderr),
-            Device::Null | Device::URandom => None,
+            Device::Tty | Device::Null | Device::URandom => None,
         }
     }
 
@@ -102,6 +112,14 @@ impl Device {
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: STDIO_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+            },
+            Device::Tty => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: TTY_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
             },
             Device::Null => FileStatus {
@@ -128,7 +146,8 @@ impl Device {
 pub struct Devices {
     /// Stable inode info for this backend's root directory.
     root_inode: NodeInfo,
-    /// Host standard streams behind `stdin`, `stdout`, and `stderr`.
+    /// Host standard streams behind `stdin`, `stdout`, and `stderr`, and the
+    /// controlling terminal behind `tty`.
     stdio: Arc<dyn StdioProvider>,
     /// Randomness behind `urandom`.
     random: Arc<dyn RandomProvider>,
@@ -150,6 +169,14 @@ impl Devices {
             random,
             _alloc: allocator,
         }
+    }
+
+    /// Terminal endpoint behind `device`, through which its I/O goes.
+    fn endpoint(&self, device: Device) -> Option<Arc<dyn TerminalEndpoint>> {
+        if device != Device::Tty && !self.stdio.is_terminal(device.stdio_stream()?) {
+            return None;
+        }
+        self.stdio.terminal()
     }
 }
 
@@ -188,11 +215,8 @@ impl BackendHandles for Devices {
 }
 
 impl Backend for Devices {
-    fn terminal(&self, h: &FileHandle) -> Option<Arc<dyn crate::terminal::TerminalEndpoint>> {
-        h.get_typed::<Self>()
-            .device
-            .stdio_stream()
-            .and_then(|stream| self.stdio.terminal(stream))
+    fn terminal(&self, h: &FileHandle) -> Option<Arc<dyn TerminalEndpoint>> {
+        self.endpoint(h.get_typed::<Self>().device)
     }
 
     fn root(&self) -> WalkingDirHandle<'_> {
@@ -269,6 +293,13 @@ impl Backend for Devices {
             ));
         }
 
+        // Like Linux, opening `/dev/tty` for I/O needs a controlling terminal;
+        // `O_PATH` opens and `stat` do not.
+        if device == Device::Tty && !flags.contains(OFlags::PATH) && self.stdio.terminal().is_none()
+        {
+            return Err(OpenError::NoSuchDevice);
+        }
+
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
             permissions: PermissionCheck::ByBackend,
@@ -293,16 +324,20 @@ impl Backend for Devices {
         buf: &mut dyn ReadBuffer,
         _offset: usize,
     ) -> Result<usize, ReadError> {
-        let h = h.get_typed::<Self>();
-        match h.device {
+        let device = h.get_typed::<Self>().device;
+        match device {
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
-            Device::Stdin if buf.is_empty() => Ok(0),
-            Device::Stdin => self.stdio.read(buf).map_err(|error| match error {
-                StdioProviderError::WouldBlock => ReadError::WouldBlock,
-                StdioProviderError::Broker(error) => ReadError::Broker(error),
-                _ => ReadError::Io,
-            }),
+            Device::Stdin | Device::Tty if buf.is_empty() => Ok(0),
+            Device::Stdin | Device::Tty => match (self.endpoint(device), device) {
+                (Some(terminal), _) => terminal.read(buf),
+                (None, Device::Stdin) => self.stdio.read(buf).map_err(|error| match error {
+                    StdioProviderError::WouldBlock => ReadError::WouldBlock,
+                    StdioProviderError::Broker(error) => ReadError::Broker(error),
+                    _ => ReadError::Io,
+                }),
+                (None, _) => Err(ReadError::Io),
+            },
             Device::URandom => {
                 let mut bytes = bounce_buffer(buf.len())?;
                 self.random.fill(&mut bytes).map_err(|_| ReadError::Io)?;
@@ -318,16 +353,21 @@ impl Backend for Devices {
         buf: &dyn WriteBuffer,
         _offset: usize,
     ) -> Result<usize, WriteError> {
-        let h = h.get_typed::<Self>();
-        let stream = match h.device {
+        let device = h.get_typed::<Self>().device;
+        match device {
             Device::Stdin => return Err(WriteError::NotForWriting),
+            Device::Null | Device::URandom => return Ok(buf.len()),
+            Device::Stdout | Device::Stderr | Device::Tty if buf.is_empty() => return Ok(0),
+            Device::Stdout | Device::Stderr | Device::Tty => {}
+        }
+        if let Some(terminal) = self.endpoint(device) {
+            return terminal.write(buf);
+        }
+        let stream = match device {
             Device::Stdout => StdioOutputStream::Stdout,
             Device::Stderr => StdioOutputStream::Stderr,
-            Device::Null | Device::URandom => return Ok(buf.len()),
+            _ => return Err(WriteError::Io),
         };
-        if buf.is_empty() {
-            return Ok(0);
-        }
         self.stdio.write(stream, buf).map_err(|error| match error {
             StdioProviderError::WouldBlock => WriteError::WouldBlock,
             StdioProviderError::Broker(error) => WriteError::Broker(error),
@@ -342,20 +382,19 @@ impl Backend for Devices {
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin | Device::Stdout | Device::Stderr => SeekBehavior::NonSeekable,
+            Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty => {
+                SeekBehavior::NonSeekable
+            }
             Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
         }
     }
 
-    fn is_terminal(&self, h: &FileHandle) -> bool {
-        h.get_typed::<Self>()
-            .device
-            .stdio_stream()
-            .is_some_and(|stream| self.stdio.is_terminal(stream))
-    }
-
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
-        let stream = h.get_typed::<Self>().device.stdio_stream()?;
+        let device = h.get_typed::<Self>().device;
+        if let Some(terminal) = self.endpoint(device) {
+            return Some(terminal);
+        }
+        let stream = device.stdio_stream()?;
         Some(Arc::new(StdioReadiness {
             stdio: Arc::clone(&self.stdio),
             stream,

@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use litebox_broker_core::fs::{FileService, UnsupportedFileService};
 use litebox_broker_core::socket::SocketProvider;
+use litebox_broker_core::terminal::TerminalEndpoint;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
 
 use crate::random::UserlandRandomProvider;
@@ -78,6 +79,7 @@ pub struct BrokerCoreBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     fs: Arc<dyn FileService>,
+    terminal: Option<Arc<dyn TerminalEndpoint>>,
 }
 
 impl BrokerCoreBuilder {
@@ -89,6 +91,7 @@ impl BrokerCoreBuilder {
             policy,
             limits: BrokerCoreLimits::DEFAULT,
             fs: Arc::new(UnsupportedFileService),
+            terminal: None,
         }
     }
 
@@ -106,6 +109,14 @@ impl BrokerCoreBuilder {
         self
     }
 
+    /// Installs the guest terminal, if any, that the file service serves as
+    /// `/dev/tty`; see [`BrokerCore::with_terminal`].
+    #[must_use]
+    pub fn with_terminal(mut self, terminal: Option<Arc<dyn TerminalEndpoint>>) -> Self {
+        self.terminal = terminal;
+        self
+    }
+
     /// Applies platform setup and constructs the [`BrokerCore`].
     ///
     /// A broker process may construct only one broker core for its process
@@ -120,7 +131,7 @@ impl BrokerCoreBuilder {
         }
 
         let socket_provider = platform_socket_provider(&self.limits)?;
-        let broker = BrokerCore::new_with_limits(
+        let mut broker = BrokerCore::new_with_limits(
             self.policy,
             self.limits,
             socket_provider,
@@ -128,6 +139,9 @@ impl BrokerCoreBuilder {
             Arc::new(UserlandTimerProvider::new()?),
             self.fs,
         )?;
+        if let Some(terminal) = self.terminal {
+            broker = broker.with_terminal(terminal);
+        }
         Ok(broker)
     }
 }

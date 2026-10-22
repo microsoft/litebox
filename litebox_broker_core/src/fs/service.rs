@@ -12,9 +12,7 @@ use litebox_broker_protocol::fs::{
     FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::terminal::{
-    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
-};
+use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
@@ -147,10 +145,6 @@ mod private {
         }
 
         fn handle_status(&self, _file: &File) -> ServiceResult<FileStatus> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn is_terminal(&self, _file: &File) -> ServiceResult<bool> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -406,13 +400,6 @@ where
         Ok(Ok(status))
     }
 
-    fn is_terminal(&self, file: &File) -> ServiceResult<bool> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        Ok(Ok(Resolver::is_terminal(self, &entry)))
-    }
-
     fn get_status_flags(&self, file: &File) -> Result<FileStatusFlags> {
         let entry = file
             .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
@@ -528,9 +515,6 @@ pub fn open(
         Err(error) => return Ok(Err(error)),
     };
     let readiness = file.watch(reference.handle(), readiness_sink)?;
-    if let Some(terminal) = &file.terminal {
-        terminal.attach(crate::process_group::terminal_sink(process));
-    }
     reference
         .commit_with_readiness(ObjectEntry::File(file), readiness)
         .map(Ok)
@@ -638,10 +622,11 @@ pub fn handle_status(
     process.core.fs.handle_status(&file)
 }
 
-/// Returns whether a broker-owned open object refers to a terminal.
+/// Returns whether a broker-owned open object refers to a terminal, which it does exactly when it
+/// has a terminal endpoint.
 pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<bool>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.core.fs.is_terminal(&file)
+    Ok(Ok(file.terminal.is_some()))
 }
 
 /// Controls a shared terminal through any open file handle that refers to it.
@@ -650,9 +635,6 @@ pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<File
 /// stricter guest rules belong in the guest's shim. Reports [`FileError::PathOnly`] for a file
 /// opened only for path-based operations and [`FileError::NotTerminal`] for any other file that is
 /// not a terminal, so a caller can classify a handle with a single request.
-///
-/// A terminal without an endpoint, such as a host terminal the broker cannot take over, reports
-/// default settings and an unknown window size, and accepts changes without applying them.
 pub fn terminal_control(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -661,18 +643,10 @@ pub fn terminal_control(
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     let Some(terminal) = &file.terminal else {
         let flags = process.core.fs.get_status_flags(&file)?.flags;
-        if flags.contains(FileOpenFlags::PATH) {
-            return Ok(Err(FileError::PathOnly));
-        }
-        if !matches!(process.core.fs.is_terminal(&file)?, Ok(true)) {
-            return Ok(Err(FileError::NotTerminal));
-        }
-        return Ok(Ok(match operation {
-            TerminalOperation::GetSettings => {
-                TerminalResponse::Settings(TerminalSettings::default())
-            }
-            TerminalOperation::GetWindowSize => TerminalResponse::WindowSize(WindowSize::default()),
-            _ => TerminalResponse::Done,
+        return Ok(Err(if flags.contains(FileOpenFlags::PATH) {
+            FileError::PathOnly
+        } else {
+            FileError::NotTerminal
         }));
     };
     terminal.control(operation)
@@ -913,6 +887,7 @@ fn file_open_error(error: OpenError) -> FileError {
         OpenError::TruncateError(error) => file_truncate_error(error),
         OpenError::PathError(error) => file_path_error(error),
         OpenError::Io => FileError::Io,
+        OpenError::NoSuchDevice => FileError::NoSuchDevice,
     }
 }
 

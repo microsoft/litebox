@@ -324,19 +324,23 @@ mod tests {
     }
 
     #[test]
-    fn terminal_events_reach_only_the_attached_group_and_coalesce() {
-        let broker = broker();
+    fn terminal_events_reach_only_the_first_root_group_and_coalesce() {
+        use crate::stdio::StdioProvider as _;
+        use crate::test_support::TestStdioProvider;
+
+        let stdio = TestStdioProvider::default().with_controlling_terminal();
+        let broker = broker().with_terminal(stdio.terminal().unwrap());
         let root = process(&broker, None);
         let child = process(&broker, Some(&root));
         let background = process(&broker, Some(&root));
         super::set(&root, background.id(), background.id().into()).unwrap();
-        let handles = [&root, &child, &background].map(|process| {
+        let other_root = process(&broker, None);
+        let handles = [&root, &child, &background, &other_root].map(|process| {
             crate::signal::open(process, Arc::new(TestReadinessSink::default())).unwrap()
         });
-        let sink = super::terminal_sink(&root);
-        sink.post(TerminalEvents::INTERRUPT);
-        sink.post(TerminalEvents::INTERRUPT);
-        sink.post(TerminalEvents::RESIZE);
+        stdio.post_terminal_events(TerminalEvents::INTERRUPT);
+        stdio.post_terminal_events(TerminalEvents::INTERRUPT);
+        stdio.post_terminal_events(TerminalEvents::RESIZE);
         for (process, handle) in [(&root, handles[0]), (&child, handles[1])] {
             assert_eq!(process.check_readiness(handle), Ok(ReadinessFlags::READ));
             assert_eq!(
@@ -350,9 +354,11 @@ mod tests {
                 Err(BrokerError::WouldBlock)
             );
         }
-        assert_eq!(
-            crate::signal::take(&background, handles[2]),
-            Err(BrokerError::WouldBlock)
-        );
+        for (process, handle) in [(&background, handles[2]), (&other_root, handles[3])] {
+            assert_eq!(
+                crate::signal::take(process, handle),
+                Err(BrokerError::WouldBlock)
+            );
+        }
     }
 }

@@ -84,11 +84,6 @@ impl StdioProvider for ConsoleStdio {
         }
     }
 
-    /// No terminal control.
-    fn is_terminal(&self, _stream: StdioStream) -> bool {
-        false
-    }
-
     fn readiness(&self, stream: StdioStream) -> ReadinessFlags {
         match stream {
             StdioStream::Stdin if !self.console.has_input() => ReadinessFlags(0),

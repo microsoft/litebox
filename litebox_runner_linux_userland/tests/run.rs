@@ -32,10 +32,6 @@ struct CapturingStdioProvider {
 
 #[cfg(target_os = "linux")]
 impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
-    fn is_terminal(&self, _stream: litebox_broker_core::stdio::StdioStream) -> bool {
-        false
-    }
-
     fn read(
         &self,
         _output: &mut dyn litebox_platform::buffer::ReadBuffer,
@@ -2697,7 +2693,8 @@ fn test_runner_with_python_repl_pty() {
     let mut runner = python_runner("python_repl_pty_rewriter");
     let mut pty = common::pty::Pty::open();
     let (stdin, stdout, stderr) = pty.slave_stdio();
-    let mut child = runner.spawn_with_stdio(stdin, stdout, stderr);
+    let mut child =
+        runner.spawn_with_controlling_terminal(pty.slave(), stdin, stdout, stderr, false);
     pty.close_slave();
 
     let mut output = Vec::new();
@@ -2741,21 +2738,12 @@ fn check_broker_tty_line_discipline(alias: bool) {
     let mut runner = Runner::new(&target, name);
     runner.allow_process_duplication();
     let mut pty = common::pty::Pty::open();
-    // SAFETY: termios contains only integer fields and slave is a live descriptor.
-    let mut original: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: original is writable storage for the slave's terminal attributes.
-    assert_eq!(
-        unsafe { libc::tcgetattr(pty.slave().as_raw_fd(), &raw mut original) },
-        0
-    );
+    let original = pty.attributes();
     // SAFETY: slave is a live descriptor and F_GETFL takes no argument.
     let flags = unsafe { libc::fcntl(pty.slave().as_raw_fd(), libc::F_GETFL) };
     let (stdin, stdout, stderr) = pty.slave_stdio();
-    let mut child = if alias {
-        runner.spawn_with_controlling_tty_alias(stdin, stdout, stderr)
-    } else {
-        runner.spawn_with_stdio(stdin, stdout, stderr)
-    };
+    let mut child =
+        runner.spawn_with_controlling_terminal(pty.slave(), stdin, stdout, stderr, alias);
     let mut output = Vec::new();
     for (prompt, input) in [
         (
@@ -2782,28 +2770,7 @@ fn check_broker_tty_line_discipline(alias: bool) {
     );
     assert!(output.windows(8).any(|bytes| bytes == b"TTY DONE"));
     assert!(output.windows(11).any(|bytes| bytes == b"a       b\r\n"));
-    let mut restored = original;
-    // SAFETY: restored is writable and slave remains live after the broker exits.
-    assert_eq!(
-        unsafe { libc::tcgetattr(pty.slave().as_raw_fd(), &raw mut restored) },
-        0
-    );
-    assert_eq!(
-        (
-            restored.c_iflag,
-            restored.c_oflag,
-            restored.c_cflag,
-            restored.c_lflag,
-            restored.c_cc
-        ),
-        (
-            original.c_iflag,
-            original.c_oflag,
-            original.c_cflag,
-            original.c_lflag,
-            original.c_cc
-        )
-    );
+    assert_eq!(pty.attributes(), original);
     // SAFETY: slave is still live; F_GETFL takes no argument.
     assert_eq!(
         unsafe { libc::fcntl(pty.slave().as_raw_fd(), libc::F_GETFL) },
@@ -2811,37 +2778,36 @@ fn check_broker_tty_line_discipline(alias: bool) {
     );
 }
 
+/// A piped standard stream leaves the terminal to the host: the guest has none.
 #[cfg(target_os = "linux")]
 #[test]
-fn test_runner_broker_tty_with_redirected_stdout() {
+fn test_runner_broker_tty_with_piped_stdout() {
     use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
-    let target = common::compile("./tests/tty.c", "tty_redirect", true, false);
-    let mut runner = Runner::new(&target, "tty_redirect");
-    runner.arg("redirect");
+    let target = common::compile("./tests/tty.c", "tty_pipe", true, false);
+    let mut runner = Runner::new(&target, "tty_pipe");
+    runner.arg("pipe");
     let mut pty = common::pty::Pty::open();
+    let original = pty.attributes();
     let (stdin, _stdout, stderr) = pty.slave_stdio();
-    let mut child = runner.spawn_with_stdio(stdin, std::process::Stdio::piped(), stderr);
+    let mut child = runner.spawn_with_controlling_terminal(
+        pty.slave(),
+        stdin,
+        std::process::Stdio::piped(),
+        stderr,
+        false,
+    );
     let mut output = Vec::new();
-    pty.wait_for_output(&mut output, b"REDIRECT READY");
-    // SAFETY: termios contains only integer fields and slave is a live descriptor.
-    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: attributes is writable storage for the slave's terminal attributes.
+    pty.wait_for_output(&mut output, b"PIPE READY");
     assert_eq!(
-        unsafe { libc::tcgetattr(pty.slave().as_raw_fd(), &raw mut attributes) },
-        0
+        pty.attributes(),
+        original,
+        "the broker took over a terminal shared with a pipe"
     );
-    assert_eq!(
-        attributes.c_lflag & (libc::ICANON | libc::ECHO),
-        libc::ICANON | libc::ECHO,
-        "the broker took over a terminal shared with a redirected stream"
-    );
-    pty.close_slave();
     pty.write_all(b"input\n");
     let status = pty.wait_for_child_exit(&mut child, &mut output);
     assert!(
         status.success(),
-        "redirected TTY fixture failed with {status}:\n{}",
+        "piped TTY fixture failed with {status}:\n{}",
         String::from_utf8_lossy(&output)
     );
     let mut stdout = Vec::new();
@@ -2851,7 +2817,98 @@ fn test_runner_broker_tty_with_redirected_stdout() {
         .unwrap()
         .read_to_end(&mut stdout)
         .unwrap();
-    assert_eq!(stdout, b"redirect\n");
+    assert_eq!(stdout, b"pipe\n");
+}
+
+/// With standard input from a file, the guest keeps the terminal, behind
+/// `/dev/tty` and the other standard streams.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_runner_broker_tty_with_file_stdin() {
+    let target = common::compile("./tests/tty.c", "tty_file", true, false);
+    let mut runner = Runner::new(&target, "tty_file");
+    runner.arg("file");
+    let input = unlinked_test_file("tty-file-stdin", b"file\n");
+    let mut pty = common::pty::Pty::open();
+    let original = pty.attributes();
+    let (_stdin, stdout, stderr) = pty.slave_stdio();
+    let mut child =
+        runner.spawn_with_controlling_terminal(pty.slave(), input.into(), stdout, stderr, false);
+    let mut output = Vec::new();
+    pty.wait_for_output(&mut output, b"FILE READY");
+    pty.write_all(b"keys\n");
+    let status = pty.wait_for_child_exit(&mut child, &mut output);
+    assert!(
+        status.success(),
+        "file-input TTY fixture failed with {status}:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(output.windows(9).any(|bytes| bytes == b"FILE DONE"));
+    assert_eq!(pty.attributes(), original);
+}
+
+/// The terminal signals the guest even when no standard stream refers to it
+/// and the guest has not opened it.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_runner_broker_tty_signals_without_terminal_streams() {
+    use std::os::unix::fs::FileExt as _;
+    let target = common::compile("./tests/tty.c", "tty_detached", true, false);
+    let mut runner = Runner::new(&target, "tty_detached");
+    runner.arg("detached");
+    let log = unlinked_test_file("tty-detached-stdout", b"");
+    let read_log = || {
+        let mut contents = [0; 64];
+        let len = log.read_at(&mut contents, 0).unwrap();
+        contents[..len].to_vec()
+    };
+    let mut pty = common::pty::Pty::open();
+    let original = pty.attributes();
+    let mut child = runner.spawn_with_controlling_terminal(
+        pty.slave(),
+        std::process::Stdio::null(),
+        log.try_clone().unwrap().into(),
+        std::process::Stdio::null(),
+        false,
+    );
+    let mut output = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while read_log() != b"DETACHED READY\n" {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timed out waiting for the fixture");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    pty.write_all(b"\x03");
+    let status = pty.wait_for_child_exit(&mut child, &mut output);
+    assert!(
+        status.success(),
+        "detached TTY fixture failed with {status}:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(read_log(), b"DETACHED READY\nDETACHED DONE\n");
+    assert_eq!(pty.attributes(), original);
+}
+
+/// Opens a temporary file holding `contents` for reading and writing, already
+/// unlinked so that it never outlives the test.
+#[cfg(target_os = "linux")]
+fn unlinked_test_file(name: &str, contents: &[u8]) -> std::fs::File {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("litebox-{name}-{}-{nonce}", std::process::id()));
+    std::fs::write(&path, contents).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    file
 }
 
 #[cfg(target_os = "linux")]

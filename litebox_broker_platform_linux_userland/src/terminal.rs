@@ -3,92 +3,89 @@
 
 //! Linux host terminal transport.
 
-use std::ffi::c_uint;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::MetadataExt as _;
-use std::sync::{Arc, Mutex};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use litebox_broker_core::terminal::{TerminalTransport, TerminalTransportError};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::WindowSize;
 use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec};
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::Errno;
 use rustix::termios::{OptionalActions, QueueSelector, Termios, Winsize};
 
-/// Identifies a terminal: its device number and, unless it is the caller's
-/// controlling terminal, the filesystem holding its device node, since
-/// separate devpts instances may reuse device numbers.
-type Identity = (c_uint, Option<u64>);
-
-/// Opens the host terminal that both the inherited standard input and output
-/// refer to, returning it for each of standard input, output, and error that
-/// refers to it, in that order.
+/// Opens this process's controlling terminal in raw mode for the guest,
+/// returning it with whether each of standard input, output, and error, in
+/// that order, refers to it.
 ///
-/// Every stream yields `None` unless standard input and output are the same
-/// terminal and it is not the controlling terminal of a background job.
-/// Otherwise the terminal may be shared with other processes, such as the rest
-/// of a shell pipeline, which would lose input to the broker and find the
-/// terminal in raw mode.
-pub fn open_stdio_terminals() -> io::Result<[Option<Arc<LinuxTerminal>>; 3]> {
+/// Returns `None` unless the terminal is this process's to emulate alone:
+/// this process must be verifiably in the terminal's foreground process
+/// group, which a shell gives the job it runs in the foreground, and no
+/// standard stream may be a pipe or socket, since every member of a shell
+/// pipeline has one. A process without a controlling terminal, such as one
+/// started by `setsid`, has none to open.
+pub fn open_controlling_terminal() -> io::Result<Option<(LinuxTerminal, [bool; 3])>> {
     let (stdin, stdout, stderr) = (io::stdin(), io::stdout(), io::stderr());
-    let terminal = identity(stdin.as_fd())?;
-    if terminal.is_none() || identity(stdout.as_fd())? != terminal {
-        return Ok([None, None, None]);
-    }
-    let stderr_shared = identity(stderr.as_fd())? == terminal;
-    // Any alias can open the terminal when an earlier one cannot, as /dev/tty
-    // can after a user switch denies reopening /dev/pts/N.
-    let mut opened = LinuxTerminal::open(stdin.as_fd());
-    for (fd, shared) in [(stdout.as_fd(), true), (stderr.as_fd(), stderr_shared)] {
-        if opened.is_err() && shared {
-            opened = LinuxTerminal::open(fd);
+    let fds = [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()];
+    let mut is_terminal = [false; 3];
+    for (stream_is_terminal, fd) in is_terminal.iter_mut().zip(fds) {
+        let status = match rustix::fs::fstat(fd) {
+            Ok(status) => status,
+            Err(Errno::BADF) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        match FileType::from_raw_mode(status.st_mode) {
+            FileType::Fifo | FileType::Socket => return Ok(None),
+            FileType::CharacterDevice => {
+                *stream_is_terminal = is_controlling_terminal(fd, status.st_rdev);
+            }
+            _ => {}
         }
     }
-    let opened = Arc::new(opened?);
-    Ok([
-        Some(Arc::clone(&opened)),
-        Some(Arc::clone(&opened)),
-        stderr_shared.then_some(opened),
-    ])
-}
-
-/// Identifies the terminal `fd` refers to, or returns `None` if it is not a
-/// terminal this process may take over.
-fn identity(fd: BorrowedFd<'_>) -> io::Result<Option<Identity>> {
-    const TIOCGDEV: rustix::ioctl::Opcode = rustix::ioctl::opcode::read::<c_uint>(b'T', 0x32);
-    if !rustix::termios::isatty(fd) {
-        return Ok(None);
-    }
-    // SAFETY: TIOCGDEV is `_IOR('T', 0x32, unsigned int)`, so the kernel
-    // writes exactly the getter's `c_uint` output.
-    let device =
-        unsafe { rustix::ioctl::ioctl(fd, rustix::ioctl::Getter::<TIOCGDEV, c_uint>::new()) }?;
-    let mount = match rustix::termios::tcgetpgrp(fd) {
-        Err(Errno::NOTTY) => {
-            Some(std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd()))?.dev())
-        }
-        // A background job leaves its controlling terminal to the foreground
-        // job: changing it would stop this process with SIGTTOU.
-        Ok(foreground) if foreground.as_raw_nonzero().get() != process_group() => {
-            return Ok(None);
-        }
-        // This process's controlling terminal, whose foreground process group
-        // is this process's or, failing with OPNOTSUPP, is not visible in
-        // this PID namespace. /dev/tty and its direct device node can live on
-        // different mounts. A process has only one controlling terminal, so
-        // both aliases agree.
-        Ok(_) | Err(Errno::OPNOTSUPP) => None,
+    // Opened only now, since a closed standard stream's descriptor could
+    // otherwise come to refer to it.
+    let file = match rustix::fs::open(
+        "/dev/tty",
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(file) => file,
+        Err(Errno::NXIO) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    Ok(Some((device, mount)))
+    let foreground = match rustix::termios::tcgetpgrp(&file) {
+        Ok(group) => group.as_raw_nonzero().get() == process_group(),
+        // The foreground group lies outside this PID namespace, so it cannot
+        // be verified to be this process's group.
+        Err(Errno::OPNOTSUPP) => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !foreground {
+        return Ok(None);
+    }
+    Ok(Some((LinuxTerminal::new(file)?, is_terminal)))
 }
 
-/// This process's group ID, or 0 if the group lies outside this process's PID
-/// namespace, as under `unshare --pid --fork`. Rustix's nonzero `Pid` cannot
-/// represent the latter.
+/// Whether `fd`, a character device numbered `device`, is this process's
+/// controlling terminal, the only terminal whose foreground process group
+/// Linux reports to it.
+fn is_controlling_terminal(fd: BorrowedFd<'_>, device: u64) -> bool {
+    // Except through a PTY master (`/dev/ptmx` or a legacy BSD master), which
+    // reports its slave's group without checking.
+    let (major, minor) = (rustix::fs::major(device), rustix::fs::minor(device));
+    let master = (major, minor) == (5, 2) || major == 2;
+    !master
+        && matches!(
+            rustix::termios::tcgetpgrp(fd),
+            Ok(_) | Err(Errno::OPNOTSUPP)
+        )
+}
+
+/// This process's group ID, or 0, which matches no foreground group, if the
+/// group lies outside this process's PID namespace, as under
+/// `unshare --pid --fork`. Rustix's nonzero `Pid` cannot represent the latter.
 fn process_group() -> libc::pid_t {
     // SAFETY: getpgrp has no preconditions and cannot fail.
     unsafe { libc::getpgrp() }
@@ -107,15 +104,10 @@ pub struct LinuxTerminal {
 }
 
 impl LinuxTerminal {
-    /// Switches the terminal `fd` refers to into raw mode.
-    pub fn open(fd: BorrowedFd<'_>) -> io::Result<Self> {
-        // Reopen rather than dup: O_NONBLOCK must not change the inherited
-        // open file description.
-        let file = rustix::fs::open(
-            format!("/proc/self/fd/{}", fd.as_raw_fd()),
-            OFlags::RDWR | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
+    /// Switches the terminal `file` refers to into raw mode. `file` must be
+    /// nonblocking and its open file description not shared with other
+    /// processes.
+    pub fn new(file: OwnedFd) -> io::Result<Self> {
         let original = rustix::termios::tcgetattr(&file)?;
         let wake = rustix::event::eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
         let mut raw = original.clone();
@@ -284,7 +276,8 @@ impl TerminalTransport for LinuxTerminal {
 impl Drop for LinuxTerminal {
     fn drop(&mut self) {
         // Owners restore explicitly to observe failures. This covers a
-        // transport dropped first, such as when a later stream fails to open.
+        // transport dropped without being restored, such as when
+        // `HostTerminal::new` fails.
         let _ = self.restore();
     }
 }

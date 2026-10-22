@@ -2322,7 +2322,7 @@ mod tests {
         association_shared_buffer_sequences_stage_unix_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
         association_shared_buffer_sequences_stage_ready_events(&broker);
-        active_request_queries_file_terminal(&broker, &stdio_provider);
+        active_request_queries_file_terminal(&broker);
         active_requests_change_file_status_flags(&broker);
         association_shared_buffer_sequences_stage_file_data(&broker);
         shared_buffer_usage_rejects_invalid_sequences();
@@ -2668,7 +2668,7 @@ mod tests {
         process.close_object_reference(event).unwrap();
     }
 
-    fn active_request_queries_file_terminal(broker: &BrokerCore, provider: &TestStdioProvider) {
+    fn active_request_queries_file_terminal(broker: &BrokerCore) {
         let process = broker
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
@@ -2713,10 +2713,6 @@ mod tests {
         assert_eq!(
             is_terminal(b"/dev/null"),
             BrokerResult::File(FileResponse::IsTerminal(false))
-        );
-        assert_eq!(
-            provider.terminal_queries().as_slice(),
-            [StdioStream::Stderr, StdioStream::Stdout]
         );
     }
 

@@ -82,6 +82,34 @@ impl Pty {
         self.slave.as_ref().expect("PTY slave is already closed")
     }
 
+    /// The slave's terminal attributes: input, output, control, and local
+    /// modes, and control characters.
+    pub fn attributes(
+        &self,
+    ) -> (
+        libc::tcflag_t,
+        libc::tcflag_t,
+        libc::tcflag_t,
+        libc::tcflag_t,
+        [libc::cc_t; libc::NCCS],
+    ) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: termios contains only integer fields.
+        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: the slave is live and attributes is writable storage for its attributes.
+        assert_eq!(
+            unsafe { libc::tcgetattr(self.slave().as_raw_fd(), &raw mut attributes) },
+            0
+        );
+        (
+            attributes.c_iflag,
+            attributes.c_oflag,
+            attributes.c_cflag,
+            attributes.c_lflag,
+            attributes.c_cc,
+        )
+    }
+
     pub fn set_window_size(&self, rows: u16, columns: u16) {
         use std::os::fd::AsRawFd as _;
         let size = libc::winsize {

@@ -110,8 +110,7 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
         let stdio = Arc::new(
             TestStdioProvider::default()
                 .with_open_input()
-                .with_terminal(StdioStream::Stdout)
-                .with_uncontrolled_terminal(StdioStream::Stderr),
+                .with_terminal(StdioStream::Stdout),
         );
         let devices_stdio = Arc::clone(&stdio);
         let fs = litebox_broker_core::fs::composer::Composer::builder()

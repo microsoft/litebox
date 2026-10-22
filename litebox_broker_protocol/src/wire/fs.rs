@@ -404,6 +404,7 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::NotTerminal => 23,
         FileError::InvalidTerminalControl => 24,
         FileError::TooManySymlinks => 25,
+        FileError::NoSuchDevice => 26,
     });
 }
 
@@ -434,6 +435,7 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         23 => Ok(FileError::NotTerminal),
         24 => Ok(FileError::InvalidTerminalControl),
         25 => Ok(FileError::TooManySymlinks),
+        26 => Ok(FileError::NoSuchDevice),
         _ => Err(WireError::InvalidTag),
     }
 }

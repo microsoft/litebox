@@ -410,7 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     // Terminal workers are host threads, so guest signals must not reach them.
     let stdio = Arc::new(litebox_platform_linux_userland::with_guest_signals_blocked(
-        UserlandStdioProvider::open_terminals,
+        UserlandStdioProvider::open_terminal,
     )?);
     #[cfg(not(target_os = "linux"))]
     let stdio = Arc::new(UserlandStdioProvider::default());
@@ -420,7 +420,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = windows::run(args, Arc::clone(&stdio));
     // Guest output accepted before the runner exited must reach the host.
     stdio.flush();
-    stdio.close_terminals()?;
+    stdio.close_terminal()?;
     result
 }
 

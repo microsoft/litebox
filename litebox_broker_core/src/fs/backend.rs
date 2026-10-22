@@ -162,13 +162,8 @@ pub trait Backend: Send + Sync + Any {
     /// Status of an open file or directory handle.
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
-    /// Whether an open file handle refers to a terminal.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn is_terminal(&self, h: &FileHandle) -> bool {
-        false
-    }
-
-    /// Shared terminal endpoint, independent of this open file description.
+    /// Shared terminal endpoint, independent of this open file description. A
+    /// file is a terminal exactly when it has one.
     fn terminal(
         &self,
         _h: &FileHandle,

@@ -11,6 +11,8 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -53,30 +55,61 @@ static void read_exact(unsigned char *buffer, size_t count) {
 int main(int argc, char **argv) {
     alarm(8);
     setvbuf(stdout, NULL, _IONBF, 0);
-    assert(isatty(0) && isatty(2));
     struct termios original, attributes;
+    unsigned char bytes[6];
+    const char *mode = argc > 1 ? argv[1] : "";
+
+    if (strcmp(mode, "pipe") == 0) {
+        // A job with a piped standard stream may share the terminal with the
+        // rest of its pipeline, so the guest gets no terminal at all.
+        assert(!isatty(0) && !isatty(1) && !isatty(2));
+        assert(tcgetattr(0, &attributes) == -1 && errno == ENOTTY);
+        memset(&attributes, 0, sizeof(attributes));
+        assert(tcsetattr(0, TCSANOW, &attributes) == -1 && errno == ENOTTY);
+        struct stat tty_status;
+        assert(stat("/dev/tty", &tty_status) == 0 && S_ISCHR(tty_status.st_mode));
+        assert(open("/dev/tty", O_RDWR) == -1 && errno == ENXIO);
+        assert(write(2, "PIPE READY\n", 11) == 11);
+        read_exact(bytes, sizeof(bytes));
+        assert(memcmp(bytes, "input\n", sizeof(bytes)) == 0);
+        assert(write(1, "pipe\n", 5) == 5);
+        return 0;
+    }
+    if (strcmp(mode, "file") == 0) {
+        // Standard input is a file, but the terminal stays the guest's.
+        assert(!isatty(0) && isatty(1) && isatty(2));
+        assert(tcgetattr(0, &attributes) == -1 && errno == ENOTTY);
+        read_exact(bytes, 5);
+        assert(memcmp(bytes, "file\n", 5) == 0);
+        int tty = open("/dev/tty", O_RDWR);
+        assert(tty >= 0 && tcgetattr(tty, &attributes) == 0 && (attributes.c_lflag & ICANON));
+        puts("FILE READY");
+        assert(read(tty, bytes, sizeof(bytes)) == 5 && memcmp(bytes, "keys\n", 5) == 0);
+        puts("FILE DONE");
+        return 0;
+    }
+    if (strcmp(mode, "detached") == 0) {
+        // No standard stream is the terminal, yet it signals the guest.
+        assert(!isatty(0) && !isatty(1) && !isatty(2));
+        struct sigaction action = {.sa_handler = on_signal};
+        sigemptyset(&action.sa_mask);
+        assert(sigaction(SIGINT, &action, NULL) == 0);
+        assert(write(1, "DETACHED READY\n", 15) == 15);
+        await_signal(&interrupts);
+        int tty = open("/dev/tty", O_RDWR);
+        assert(tty >= 0 && isatty(tty));
+        assert(write(1, "DETACHED DONE\n", 14) == 14);
+        return 0;
+    }
+
+    assert(isatty(0) && isatty(2));
     assert(tcgetattr(0, &original) == 0);
     assert(original.c_lflag & ICANON);
 
-    if (argc > 1 && strcmp(argv[1], "child") == 0) {
+    if (strcmp(mode, "child") == 0) {
         assert(!(original.c_lflag & ECHO));
         original.c_lflag |= ECHO;
         assert(tcsetattr(2, TCSANOW, &original) == 0);
-        return 0;
-    }
-    if (argc > 1) {
-        // The broker leaves a terminal it shares with redirected streams to
-        // the host, answering as a fixed terminal.
-        assert(!isatty(1));
-        assert(tcgetattr(1, &attributes) == -1 && errno == ENOTTY);
-        attributes = original;
-        cfmakeraw(&attributes);
-        assert(tcsetattr(0, TCSANOW, &attributes) == 0);
-        assert(write(2, "REDIRECT READY\n", 15) == 15);
-        unsigned char bytes[6];
-        read_exact(bytes, sizeof(bytes));
-        assert(memcmp(bytes, "input\n", sizeof(bytes)) == 0);
-        assert(write(1, "redirect\n", 9) == 9);
         return 0;
     }
 
@@ -99,12 +132,19 @@ int main(int argc, char **argv) {
     assert(tcgetattr(alias, &attributes) == 0 && (attributes.c_lflag & ECHO));
     assert(close(alias) == 0);
 
-    puts("CANONICAL READY");
+    // The controlling terminal is the one behind the standard streams.
+    int tty = open("/dev/tty", O_RDWR);
+    assert(tty >= 0 && isatty(tty));
+    struct stat tty_status;
+    assert(fstat(tty, &tty_status) == 0 && S_ISCHR(tty_status.st_mode));
+    assert(major(tty_status.st_rdev) == 5 && minor(tty_status.st_rdev) == 0);
+    assert(write(tty, "CANONICAL READY\n", 16) == 16);
     unsigned char buffer[64];
     assert(read(0, buffer, sizeof(buffer)) == 6);
     assert(memcmp(buffer, "hello\n", 6) == 0);
-    assert(read(0, buffer, sizeof(buffer)) == 7);
+    assert(read(tty, buffer, sizeof(buffer)) == 7);
     assert(memcmp(buffer, "second\n", 7) == 0);
+    assert(close(tty) == 0);
     puts("EOF READY");
     assert(read(0, buffer, sizeof(buffer)) == 0);
     puts("POLL READY");
