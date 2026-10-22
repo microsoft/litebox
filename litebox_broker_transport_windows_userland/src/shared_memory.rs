@@ -674,9 +674,7 @@ mod tests {
         let local_memory = WindowsSharedMemory::create_control_ring(LAYOUT).unwrap();
         let broker_memory = local_memory.try_clone_view().unwrap();
         let mut local = ControlRing::new(local_memory, LAYOUT).unwrap().into_local();
-        let mut broker = ControlRing::new(broker_memory, LAYOUT)
-            .unwrap()
-            .into_broker();
+        let mut broker = ControlRing::new(broker_memory, LAYOUT).unwrap().into_host();
 
         assert_eq!(
             local.lanes[0]
@@ -706,7 +704,7 @@ mod tests {
             .unwrap();
         let mut broker = ControlRing::new(broker_memory, LAYOUT)
             .unwrap()
-            .into_broker()
+            .into_host()
             .lanes
             .pop()
             .unwrap();
@@ -746,7 +744,7 @@ mod tests {
             .unwrap();
         let mut broker_demand = ControlRing::new(broker_memory, LAYOUT)
             .unwrap()
-            .into_broker()
+            .into_host()
             .lane_demand
             .unwrap();
 
@@ -830,9 +828,7 @@ mod tests {
             unsafe { WindowsSharedMemory::control_ring_from_transferred(transfer, LAYOUT) }
                 .unwrap();
         let mut local = ControlRing::new(local_memory, LAYOUT).unwrap().into_local();
-        let mut broker = ControlRing::new(broker_memory, LAYOUT)
-            .unwrap()
-            .into_broker();
+        let mut broker = ControlRing::new(broker_memory, LAYOUT).unwrap().into_host();
 
         assert_eq!(
             local.lanes[0]

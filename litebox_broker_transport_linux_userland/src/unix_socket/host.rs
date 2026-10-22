@@ -28,9 +28,9 @@ use litebox_broker_transport::channel::{
     HostReceive, HostSetupChannel, PeerCredential,
 };
 use litebox_broker_transport::control_ring::{
-    BrokerControlRingEndpoints, BrokerControlRingLane, BrokerLaneDemand, ControlRing,
-    ControlRingConsumer, ControlRingDemandStatus, ControlRingProducer, ControlRingReadError,
-    ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+    ControlRing, ControlRingConsumer, ControlRingDemandStatus, ControlRingProducer,
+    ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+    HostControlRingEndpoints, HostControlRingLane, HostLaneDemand,
 };
 
 use crate::memfd::{MemfdProcessImage, MemfdSharedMemory};
@@ -100,14 +100,14 @@ pub struct UnixStreamHostSetupChannel {
     negotiated: bool,
 }
 
-type BrokerLane = BrokerControlRingLane<MemfdSharedMemory>;
+type BrokerLane = HostControlRingLane<MemfdSharedMemory>;
 
 /// Source of the call lanes of an active host control-ring association, which
 /// hands out each lane once the runner starts using it.
 pub struct UnixControlRingHostCallLaneSource {
     /// Each lane, or `None` once handed out.
     lanes: Vec<Option<BrokerLane>>,
-    demand: BrokerLaneDemand<MemfdSharedMemory>,
+    demand: HostLaneDemand<MemfdSharedMemory>,
     association: Arc<HostRingAssociation>,
 }
 
@@ -202,9 +202,9 @@ impl UnixStreamHostSetupChannel {
             ));
         }
         let ready_token = ring.layout().ready_token();
-        let endpoints = ring.into_broker();
+        let endpoints = ring.into_host();
         let wakes = endpoints.wake_handles();
-        let BrokerControlRingEndpoints {
+        let HostControlRingEndpoints {
             lanes,
             lane_demand: Some(demand),
             notification_producer,

@@ -552,7 +552,7 @@ mod control_ring_tests {
     use litebox_broker_protocol::{ObjectHandle, RequestId};
     use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_transport::control_ring::{
-        BrokerControlRingEndpoints, ControlRingDemandStatus, ControlRingProducer,
+        ControlRingDemandStatus, ControlRingProducer, HostControlRingEndpoints,
     };
     use rustix::fs::{OFlags, fcntl_getfl};
     use std::io::{Read, Write};
@@ -564,7 +564,7 @@ mod control_ring_tests {
 
     type Producer = ControlRingProducer<MemfdSharedMemory>;
     type Consumer = ControlRingConsumer<MemfdSharedMemory>;
-    type Broker = BrokerControlRingEndpoints<MemfdSharedMemory>;
+    type Broker = HostControlRingEndpoints<MemfdSharedMemory>;
 
     const LAYOUT: ControlRingLayout = ControlRingLayout::MULTI_LANE;
 
@@ -664,7 +664,7 @@ mod control_ring_tests {
             channel,
             notifications,
             shutdown,
-            broker_ring.into_broker(),
+            broker_ring.into_host(),
             peer_stream,
         )
     }
