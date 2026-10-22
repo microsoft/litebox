@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Typed BSD syscall implementations.
+//! Typed BSD syscall and Mach trap implementations.
 
 use crate::{ShimPlatform, Task};
 use alloc::vec::Vec;
@@ -13,6 +13,8 @@ use litebox_common_macos::{
 
 pub(crate) mod file;
 pub(crate) mod mach;
+pub(crate) mod mach_ipc;
+pub(crate) mod mig;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod process;
@@ -39,31 +41,7 @@ pub struct HostSysctl {
     pub value: Result<Vec<u8>, Errno>,
 }
 
-/// Distinct unsupported `(feature, id)` pairs logged per guest. Bounds what a
-/// guest cycling through unknown routine ids, flavors or commands makes the
-/// host remember; later new pairs are not logged.
-pub(crate) const MAX_REPORTS: usize = 256;
-
 impl<P: ShimPlatform> Task<P> {
-    /// Log an unsupported Mach or BSD feature once per guest for each `id`:
-    /// the MIG routine id, info flavor, fcntl command or other selector the
-    /// guest used, or 0 for a feature without one. Returns whether this call
-    /// logged.
-    pub(crate) fn log_unsupported_once(
-        &self,
-        feature: &'static str,
-        id: i64,
-        detail: core::fmt::Arguments<'_>,
-    ) -> bool {
-        let mut reported = self.global.reported_unsupported.lock();
-        if reported.len() >= MAX_REPORTS || !reported.insert((feature, id)) {
-            return false;
-        }
-        drop(reported);
-        litebox_util_log::warn!(feature:% = feature, id:% = id, detail:% = detail; "unsupported");
-        true
-    }
-
     pub(crate) fn sys_exit(&self, status: i32) {
         self.process.exit(status & 0xff);
     }

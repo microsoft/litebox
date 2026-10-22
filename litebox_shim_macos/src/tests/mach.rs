@@ -1,13 +1,34 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Process-syscall behavior, driven through the syscall dispatcher like guest
-//! code.
+//! Mach IPC and process-syscall behavior, driven through the syscall
+//! dispatcher like guest code.
 
 use super::*;
-use litebox_common_macos::{errno::Errno, syscall::nr};
+use litebox_common_macos::{
+    errno::Errno,
+    mach::{
+        MACH_PORT_DEAD, MACH_PORT_QLIMIT_KERNEL, MACH_PORT_UREFS_MAX, MachMsgHeader,
+        MachMsgPortDescriptor, MachPortOptions, mpo, msg_return, msg_type, msgh_bits, port_right,
+    },
+    syscall::{mach_trap, nr},
+};
 
 const CARRY: u64 = 1 << 29;
+
+/// Every trap leaves the name table's reverse index and free list consistent.
+fn trap(task: &Task<Platform>, number: u32, args: &[usize]) -> usize {
+    let mut ctx = PtRegs::default();
+    ctx.regs[16] = 0u32.wrapping_sub(number) as usize;
+    ctx.regs[..args.len()].copy_from_slice(args);
+    task.handle_syscall_request(&mut ctx);
+    task.global.ipc.lock().check_index();
+    ctx.regs[0]
+}
+
+fn kr(task: &Task<Platform>, number: u32, args: &[usize]) -> KernReturn {
+    KernReturn::from_raw(i32::try_from(trap(task, number, args)).unwrap())
+}
 
 fn bsd(task: &Task<Platform>, number: usize, args: &[usize]) -> Result<usize, usize> {
     let mut ctx = PtRegs::default();
@@ -23,6 +44,1316 @@ fn bsd(task: &Task<Platform>, number: usize, args: &[usize]) -> Result<usize, us
 
 fn new_task() -> Task<Platform> {
     task(MacosShimBuilder::new(Platform::new()).build())
+}
+
+/// `mach_msg2` with a scalar buffer, as libsyscall packs it.
+#[expect(clippy::too_many_arguments)]
+fn msg2(
+    task: &Task<Platform>,
+    buffer: &mut [u8],
+    options: u64,
+    header: MachMsgHeader,
+    send_size: u32,
+    descriptors: u32,
+    receive_name: u32,
+    receive_size: u32,
+) -> u32 {
+    buffer[..24].copy_from_slice(zerocopy::IntoBytes::as_bytes(&header));
+    msg2_at(
+        task,
+        buffer.as_mut_ptr() as usize,
+        options,
+        header,
+        send_size,
+        descriptors,
+        receive_name,
+        receive_size,
+    )
+}
+
+/// `mach_msg2` with the message buffer at guest address `data`.
+#[expect(clippy::too_many_arguments)]
+fn msg2_at(
+    task: &Task<Platform>,
+    data: usize,
+    options: u64,
+    header: MachMsgHeader,
+    send_size: u32,
+    descriptors: u32,
+    receive_name: u32,
+    receive_size: u32,
+) -> u32 {
+    let pack =
+        |low: u32, high: u32| usize::try_from(u64::from(high) << 32 | u64::from(low)).unwrap();
+    let result = trap(
+        task,
+        mach_trap::MACH_MSG2,
+        &[
+            data,
+            usize::try_from(options).unwrap(),
+            pack(header.bits, send_size),
+            pack(header.remote_port, header.local_port),
+            pack(header.voucher_port, header.id.cast_unsigned()),
+            pack(descriptors, receive_name),
+            pack(receive_size, 0),
+            0,
+        ],
+    );
+    u32::try_from(result).unwrap()
+}
+
+fn header_of(buffer: &[u8]) -> MachMsgHeader {
+    zerocopy::FromBytes::read_from_bytes(&buffer[..24]).unwrap()
+}
+
+fn construct(task: &Task<Platform>, flags: u32) -> u32 {
+    let options = MachPortOptions {
+        flags,
+        ..Default::default()
+    };
+    let mut name = 0u32;
+    let own = trap(task, mach_trap::TASK_SELF, &[]);
+    assert_eq!(
+        kr(
+            task,
+            mach_trap::MACH_PORT_CONSTRUCT,
+            &[
+                own,
+                core::ptr::from_ref(&options) as usize,
+                0x1234,
+                core::ptr::from_mut(&mut name) as usize,
+            ],
+        ),
+        KernReturn::SUCCESS
+    );
+    name
+}
+
+#[test]
+fn self_traps_name_one_send_right_per_object() {
+    let task = new_task();
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    // The first name in a fresh space, like a native task's mach_task_self().
+    assert_eq!(own, 0x103);
+    assert_eq!(trap(&task, mach_trap::TASK_SELF, &[]), own);
+    let thread = trap(&task, mach_trap::THREAD_SELF, &[]);
+    let host = trap(&task, mach_trap::HOST_SELF, &[]);
+    assert!(thread != own && host != own && host != thread);
+    // Each trap added a user reference: two deallocations release the name,
+    // after which it no longer names the task.
+    for _ in 0..2 {
+        assert_eq!(
+            kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, own]),
+            KernReturn::SUCCESS
+        );
+    }
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, host]),
+        KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed())
+    );
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    // ipc_entry_claim reuses the released index with the next generation.
+    assert_eq!(own, 0x113);
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, 0x103]),
+        KernReturn::INVALID_NAME
+    );
+    // A name that is not a task port is not a valid target.
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[host, own]),
+        KernReturn::from_raw(msg_return::SEND_INVALID_DEST.cast_signed())
+    );
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, 0xdead_0003]),
+        KernReturn::INVALID_NAME
+    );
+    // MACH_PORT_NULL and MACH_PORT_DEAD deallocate trivially.
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, 0]),
+        KernReturn::SUCCESS
+    );
+}
+
+#[test]
+fn port_rights_follow_xnu_reference_rules() {
+    let task = new_task();
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let receive = construct(&task, mpo::INSERT_SEND_RIGHT) as usize;
+    // Send references: add, reject underflow, drop to zero (receive remains).
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_MOD_REFS,
+            &[own, receive, port_right::SEND as usize, 2]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_MOD_REFS,
+            &[
+                own,
+                receive,
+                port_right::SEND as usize,
+                (-4i32).cast_unsigned() as usize
+            ]
+        ),
+        KernReturn::INVALID_VALUE
+    );
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_MOD_REFS,
+            &[
+                own,
+                receive,
+                port_right::SEND as usize,
+                (-3i32).cast_unsigned() as usize
+            ]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, receive]),
+        KernReturn::INVALID_RIGHT
+    );
+    // MAKE_SEND inserts a send right under the receive right's name only.
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_INSERT_RIGHT,
+            &[own, receive, receive, msg_type::MAKE_SEND as usize]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_INSERT_RIGHT,
+            &[own, 0x7_0003, receive, msg_type::MAKE_SEND as usize]
+        ),
+        KernReturn::RIGHT_EXISTS
+    );
+    // Destroying the receive right with the send right's reference.
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_DESTRUCT,
+            &[own, receive, (-1i32).cast_unsigned() as usize, 0]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, receive]),
+        KernReturn::INVALID_NAME
+    );
+
+    // A guarded port needs its guard; other port types and bad options fail.
+    let guarded = construct(&task, mpo::CONTEXT_AS_GUARD) as usize;
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DESTRUCT, &[own, guarded, 0, 1]),
+        KernReturn::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_MOD_REFS,
+            &[
+                own,
+                guarded,
+                port_right::RECEIVE as usize,
+                (-1i32).cast_unsigned() as usize
+            ]
+        ),
+        KernReturn::INVALID_RIGHT
+    );
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_DESTRUCT,
+            &[own, guarded, 0, 0x1234]
+        ),
+        KernReturn::SUCCESS
+    );
+    for flags in [mpo::SERVICE_PORT, 0x4_0000, mpo::QLIMIT] {
+        let options = MachPortOptions {
+            flags,
+            qlimit: 4096,
+            ..Default::default()
+        };
+        let mut name = 0u32;
+        assert_ne!(
+            kr(
+                &task,
+                mach_trap::MACH_PORT_CONSTRUCT,
+                &[
+                    own,
+                    core::ptr::from_ref(&options) as usize,
+                    0,
+                    core::ptr::from_mut(&mut name) as usize
+                ]
+            ),
+            KernReturn::SUCCESS
+        );
+        assert_eq!(name, 0);
+    }
+    // Dead names come from mach_port_allocate.
+    let mut dead = 0u32;
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_ALLOCATE,
+            &[
+                own,
+                port_right::DEAD_NAME as usize,
+                core::ptr::from_mut(&mut dead) as usize
+            ]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_DEALLOCATE,
+            &[own, dead as usize]
+        ),
+        KernReturn::SUCCESS
+    );
+}
+
+#[test]
+fn mach_msg_queues_messages_and_send_once_notifications() {
+    const ID: i32 = 0x4242;
+    let task = new_task();
+    let port = construct(&task, mpo::INSERT_SEND_RIGHT);
+    let reply = u32::try_from(trap(&task, mach_trap::MACH_REPLY_PORT, &[])).unwrap();
+    let mut buffer = [0u8; 256];
+    buffer[24..28].copy_from_slice(&7u32.to_ne_bytes());
+    let send = MachMsgHeader {
+        bits: msgh_bits::ports(msg_type::COPY_SEND, msg_type::MAKE_SEND_ONCE),
+        size: 0,
+        remote_port: port,
+        local_port: reply,
+        voucher_port: 0,
+        id: ID,
+    };
+    assert_eq!(
+        msg2(&task, &mut buffer, 1, send, 28, 0, 0, 0),
+        msg_return::SUCCESS
+    );
+    // An audit trailer (MACH_RCV_TRAILER_ELEMENTS(3)) is too large for 40 bytes.
+    let audit_trailer = 3 << 24;
+    let receive_header = MachMsgHeader::default();
+    assert_eq!(
+        msg2(
+            &task,
+            &mut buffer,
+            2 | 4 | audit_trailer,
+            receive_header,
+            0,
+            0,
+            port,
+            40
+        ),
+        msg_return::RCV_TOO_LARGE
+    );
+    assert_eq!(header_of(&buffer).size, 28);
+    buffer.fill(0);
+    assert_eq!(
+        msg2(
+            &task,
+            &mut buffer,
+            2 | audit_trailer,
+            receive_header,
+            0,
+            0,
+            port,
+            256
+        ),
+        msg_return::SUCCESS
+    );
+    let received = header_of(&buffer);
+    assert_eq!(received.id, ID);
+    assert_eq!(received.size, 28);
+    assert_eq!(received.local_port, port);
+    assert_eq!(
+        received.bits,
+        msgh_bits::ports(msg_type::PORT_SEND_ONCE, msg_type::PORT_SEND)
+    );
+    assert_eq!(buffer[24..28], 7u32.to_ne_bytes());
+    // The trailer: format 0, 52 bytes, seqno 0, sender uid/gid, audit pid.
+    let trailer = &buffer[28..80];
+    assert_eq!(trailer[4..8], 52u32.to_ne_bytes());
+    assert_eq!(trailer[12..16], 1000u32.to_ne_bytes());
+    assert_eq!(trailer[40..44], 2u32.to_ne_bytes());
+    // Dropping the received send-once right notifies the reply port.
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_DEALLOCATE,
+            &[own, received.remote_port as usize]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        msg2(&task, &mut buffer, 2, receive_header, 0, 0, reply, 256),
+        msg_return::SUCCESS
+    );
+    // MACH_NOTIFY_SEND_ONCE.
+    assert_eq!(header_of(&buffer).id, 0o107);
+    // Empty queue with a zero timeout; bad names; bad destinations.
+    assert_eq!(
+        msg2(
+            &task,
+            &mut buffer,
+            2 | 0x100,
+            receive_header,
+            0,
+            0,
+            reply,
+            256
+        ),
+        msg_return::RCV_TIMED_OUT
+    );
+    assert_eq!(
+        msg2(&task, &mut buffer, 2, receive_header, 0, 0, 0x99_0003, 256),
+        msg_return::RCV_INVALID_NAME
+    );
+    let bad = MachMsgHeader {
+        remote_port: 0x99_0003,
+        ..send
+    };
+    assert_eq!(
+        msg2(&task, &mut buffer, 1, bad, 24, 0, 0, 0),
+        msg_return::SEND_INVALID_DEST
+    );
+    assert_eq!(
+        msg2(&task, &mut buffer, 1, send, 20, 0, 0, 0),
+        msg_return::SEND_MSG_TOO_SMALL
+    );
+}
+
+/// [`mig_call_on`] with a new reply port.
+fn mig_call(task: &Task<Platform>, remote: u32, id: i32, body: &[u8], complex: bool) -> Vec<u8> {
+    let reply = u32::try_from(trap(task, mach_trap::MACH_REPLY_PORT, &[])).unwrap();
+    mig_call_on(task, reply, remote, id, body, complex)
+}
+
+/// Send a MIG request to `remote` with reply port `reply` and return the
+/// reply, asserting its kernel-reply header.
+fn mig_call_on(
+    task: &Task<Platform>,
+    reply: u32,
+    remote: u32,
+    id: i32,
+    body: &[u8],
+    complex: bool,
+) -> Vec<u8> {
+    let mut buffer = vec![0u8; 512];
+    buffer[24..24 + body.len()].copy_from_slice(body);
+    let mut bits = msgh_bits::ports(msg_type::COPY_SEND, msg_type::MAKE_SEND_ONCE);
+    let descriptors = if complex {
+        bits |= msgh_bits::COMPLEX;
+        u32::from_ne_bytes(body[..4].try_into().unwrap())
+    } else {
+        0
+    };
+    let header = MachMsgHeader {
+        bits,
+        size: 0,
+        remote_port: remote,
+        local_port: reply,
+        voucher_port: 0,
+        id,
+    };
+    let size = u32::try_from(24 + body.len()).unwrap();
+    assert_eq!(
+        msg2(task, &mut buffer, 3, header, size, descriptors, reply, 512),
+        msg_return::SUCCESS
+    );
+    let received = header_of(&buffer);
+    assert_eq!(received.id, id.wrapping_add(100));
+    assert_eq!(
+        received.remote_port, 0,
+        "kernel replies carry no reply port"
+    );
+    // ipc_object_copyout_dest: the consumed send-once destination reads as
+    // the reply port's own receive name.
+    assert_eq!(received.local_port, reply);
+    buffer.truncate(received.size as usize);
+    buffer
+}
+
+fn ndr(fields: &[u32]) -> Vec<u8> {
+    let mut body = litebox_common_macos::mach::NDR_RECORD.to_vec();
+    for field in fields {
+        body.extend_from_slice(&field.to_ne_bytes());
+    }
+    body
+}
+
+fn word(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+const SEND: u64 = 0x1;
+const RECEIVE: u64 = 0x2;
+const RCV_LARGE: u64 = 0x4;
+const SEND_TIMEOUT: u64 = 0x10;
+const RCV_TIMEOUT: u64 = 0x100;
+
+fn mod_refs(task: &Task<Platform>, name: u32, right: u32, delta: i32) -> KernReturn {
+    let own = trap(task, mach_trap::TASK_SELF, &[]);
+    kr(
+        task,
+        mach_trap::MACH_PORT_MOD_REFS,
+        &[
+            own,
+            name as usize,
+            right as usize,
+            delta.cast_unsigned() as usize,
+        ],
+    )
+}
+
+/// A simple message from `remote_type` of `remote` and `local_type` of
+/// `local`, with a four-byte body.
+fn simple_send(
+    task: &Task<Platform>,
+    remote_type: u32,
+    remote: u32,
+    local_type: u32,
+    local: u32,
+) -> u32 {
+    let header = MachMsgHeader {
+        bits: msgh_bits::ports(remote_type, local_type),
+        size: 0,
+        remote_port: remote,
+        local_port: local,
+        voucher_port: 0,
+        id: 7,
+    };
+    msg2(task, &mut [0u8; 64], SEND, header, 28, 0, 0, 0)
+}
+
+/// A complex message to `remote` carrying `name` with `disposition` in one
+/// port descriptor.
+fn send_port(task: &Task<Platform>, remote: u32, name: u32, disposition: u32) -> u32 {
+    let mut buffer = [0u8; 64];
+    buffer[24..28].copy_from_slice(&1u32.to_ne_bytes());
+    let descriptor = MachMsgPortDescriptor {
+        name,
+        disposition: u8::try_from(disposition).unwrap(),
+        ..Default::default()
+    };
+    buffer[28..40].copy_from_slice(zerocopy::IntoBytes::as_bytes(&descriptor));
+    let header = MachMsgHeader {
+        bits: msgh_bits::ports(msg_type::MAKE_SEND, 0) | msgh_bits::COMPLEX,
+        size: 0,
+        remote_port: remote,
+        local_port: 0,
+        voucher_port: 0,
+        id: 9,
+    };
+    msg2(task, &mut buffer, SEND, header, 40, 1, 0, 0)
+}
+
+fn receive_now(task: &Task<Platform>, port: u32, buffer: &mut [u8]) -> u32 {
+    let size = u32::try_from(buffer.len()).unwrap();
+    msg2(
+        task,
+        buffer,
+        RECEIVE | RCV_TIMEOUT,
+        MachMsgHeader::default(),
+        0,
+        0,
+        port,
+        size,
+    )
+}
+
+#[test]
+fn aliased_destination_and_reply_copy_in_jointly() {
+    let task = new_task();
+    // One send reference to the task port: MOVE_SEND plus COPY_SEND of the
+    // same name needs only that reference (DEST_EXTRA_COPY).
+    let own = u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap();
+    assert_eq!(
+        simple_send(&task, msg_type::MOVE_SEND, own, msg_type::COPY_SEND, own),
+        msg_return::SUCCESS
+    );
+    assert_eq!(
+        mod_refs(&task, own, port_right::SEND, 0),
+        KernReturn::INVALID_NAME,
+        "the only reference moved"
+    );
+
+    // MOVE_SEND twice needs two references; with one, nothing moves.
+    let port = construct(&task, mpo::INSERT_SEND_RIGHT);
+    assert_eq!(
+        simple_send(&task, msg_type::MOVE_SEND, port, msg_type::MOVE_SEND, port),
+        msg_return::SEND_INVALID_DEST
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, -1),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, 2),
+        KernReturn::INVALID_RIGHT
+    );
+    assert_eq!(
+        simple_send(&task, msg_type::MAKE_SEND, port, msg_type::MAKE_SEND, port),
+        msg_return::SUCCESS
+    );
+    let mut buffer = [0u8; 128];
+    assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+    // The receiver gets the reply send right under its receive name.
+    assert_eq!(header_of(&buffer).remote_port, port);
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, 1),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        simple_send(&task, msg_type::MOVE_SEND, port, msg_type::MOVE_SEND, port),
+        msg_return::SUCCESS
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, 0),
+        KernReturn::INVALID_RIGHT,
+        "both references moved"
+    );
+    // COPY_SEND twice moves nothing.
+    assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+    assert_eq!(
+        simple_send(&task, msg_type::COPY_SEND, port, msg_type::COPY_SEND, port),
+        msg_return::SUCCESS
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, 0),
+        KernReturn::SUCCESS
+    );
+}
+
+#[test]
+fn long_receive_right_chain_is_destroyed_without_recursion() {
+    const CHAIN: usize = 100_000;
+    let task = new_task();
+    let counts = || task.global.ipc.lock().live_counts();
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let before = counts();
+    // Each port's queue holds a message carrying the previous port's
+    // receive right.
+    let mut previous = construct(&task, 0);
+    for _ in 0..CHAIN {
+        let holder = construct(&task, 0);
+        assert_eq!(
+            send_port(&task, holder, previous, msg_type::MOVE_RECEIVE),
+            msg_return::SUCCESS
+        );
+        previous = holder;
+    }
+    assert_eq!(counts().0, before.0 + CHAIN + 1);
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_DESTRUCT,
+            &[own, previous as usize, 0, 0]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(counts(), before);
+}
+
+#[test]
+fn send_once_messages_stop_at_the_kernel_queue_limit() {
+    let task = new_task();
+    let port = construct(&task, 0);
+    let header = MachMsgHeader {
+        bits: msgh_bits::ports(msg_type::MAKE_SEND_ONCE, 0),
+        size: 0,
+        remote_port: port,
+        local_port: 0,
+        voucher_port: 0,
+        id: 1,
+    };
+    let mut buffer = [0u8; 64];
+    // Send-once messages pass the queue limit of 5, up to the hard limit.
+    for _ in 0..MACH_PORT_QLIMIT_KERNEL {
+        assert_eq!(
+            msg2(&task, &mut buffer, SEND | SEND_TIMEOUT, header, 24, 0, 0, 0),
+            msg_return::SUCCESS
+        );
+    }
+    assert_eq!(
+        msg2(&task, &mut buffer, SEND | SEND_TIMEOUT, header, 24, 0, 0, 0),
+        msg_return::SEND_TIMED_OUT
+    );
+    assert_eq!(
+        msg2(&task, &mut buffer, SEND, header, 24, 0, 0, 0),
+        msg_return::SEND_NO_BUFFER
+    );
+    // A failed send keeps the sender's rights.
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let once = 0x7_0003;
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_INSERT_RIGHT,
+            &[own, once, port as usize, msg_type::MAKE_SEND_ONCE as usize]
+        ),
+        KernReturn::SUCCESS
+    );
+    let moved = MachMsgHeader {
+        bits: msgh_bits::ports(msg_type::MOVE_SEND_ONCE, 0),
+        remote_port: u32::try_from(once).unwrap(),
+        ..header
+    };
+    assert_eq!(
+        msg2(&task, &mut buffer, SEND, moved, 24, 0, 0, 0),
+        msg_return::SEND_NO_BUFFER
+    );
+    assert_eq!(
+        mod_refs(
+            &task,
+            u32::try_from(once).unwrap(),
+            port_right::SEND_ONCE,
+            0
+        ),
+        KernReturn::SUCCESS
+    );
+}
+
+#[test]
+fn unread_mig_replies_stop_at_the_kernel_queue_limit() {
+    let task = new_task();
+    let own = u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap();
+    let reply = u32::try_from(trap(&task, mach_trap::MACH_REPLY_PORT, &[])).unwrap();
+    let mut buffer = [0u8; 64];
+    buffer[24..32].copy_from_slice(&litebox_common_macos::mach::NDR_RECORD);
+    let request = MachMsgHeader {
+        bits: msgh_bits::ports(msg_type::COPY_SEND, msg_type::MAKE_SEND_ONCE),
+        size: 0,
+        remote_port: own,
+        local_port: reply,
+        voucher_port: 0,
+        id: 3499,
+    };
+    for _ in 0..MACH_PORT_QLIMIT_KERNEL + 3 {
+        assert_eq!(
+            msg2(&task, &mut buffer, SEND, request, 32, 0, 0, 0),
+            msg_return::SUCCESS
+        );
+    }
+    // Replies past the hard limit were destroyed, without notifications.
+    for _ in 0..MACH_PORT_QLIMIT_KERNEL {
+        assert_eq!(receive_now(&task, reply, &mut buffer), msg_return::SUCCESS);
+        assert_eq!(header_of(&buffer).id, 3599);
+    }
+    assert_eq!(
+        receive_now(&task, reply, &mut buffer),
+        msg_return::RCV_TIMED_OUT
+    );
+}
+
+#[test]
+fn overflowing_guest_pointers_and_ids_fail_without_panicking() {
+    let task = new_task();
+    let port = construct(&task, mpo::INSERT_SEND_RIGHT);
+    let header = MachMsgHeader {
+        bits: msgh_bits::ports(msg_type::COPY_SEND, 0),
+        size: 0,
+        remote_port: port,
+        local_port: 0,
+        voucher_port: 0,
+        id: 7,
+    };
+    assert_eq!(
+        msg2_at(&task, usize::MAX - 8, SEND, header, 28, 0, 0, 0),
+        msg_return::SEND_INVALID_DATA
+    );
+    assert_eq!(
+        simple_send(&task, msg_type::COPY_SEND, port, 0, 0),
+        msg_return::SUCCESS
+    );
+    assert_eq!(
+        msg2_at(
+            &task,
+            usize::MAX - 1,
+            RECEIVE | RCV_LARGE,
+            MachMsgHeader::default(),
+            0,
+            0,
+            port,
+            16
+        ),
+        msg_return::RCV_INVALID_DATA
+    );
+    // MIG reply ids wrap like the generated C.
+    let own = u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap();
+    let reply = mig_call(&task, own, i32::MAX, &ndr(&[]), false);
+    assert_eq!(header_of(&reply).id, i32::MAX.wrapping_add(100));
+}
+
+#[test]
+fn received_destination_rights_are_consumed() {
+    let task = new_task();
+    let port = construct(&task, mpo::INSERT_SEND_RIGHT);
+    let mut buffer = [0u8; 128];
+    for _ in 0..3 {
+        assert_eq!(
+            simple_send(&task, msg_type::COPY_SEND, port, 0, 0),
+            msg_return::SUCCESS
+        );
+        assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+        assert_eq!(header_of(&buffer).local_port, port);
+    }
+    // Still exactly the one send reference INSERT_SEND_RIGHT made.
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, -1),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, -1),
+        KernReturn::INVALID_RIGHT
+    );
+    // A destructive RCV_TOO_LARGE also reports the receive name.
+    assert_eq!(
+        simple_send(&task, msg_type::MAKE_SEND_ONCE, port, 0, 0),
+        msg_return::SUCCESS
+    );
+    let mut small = [0u8; 24];
+    assert_eq!(
+        receive_now(&task, port, &mut small),
+        msg_return::RCV_TOO_LARGE
+    );
+    assert_eq!(header_of(&small).local_port, port);
+    assert_eq!(
+        receive_now(&task, port, &mut buffer),
+        msg_return::RCV_TIMED_OUT,
+        "the consumed send-once right sent no notification"
+    );
+}
+
+#[test]
+fn generated_names_skip_inserted_names() {
+    let task = new_task();
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let port = construct(&task, 0);
+    // The next generated index is 3: take it explicitly.
+    assert_eq!(port, 0x203);
+    let inserted = 0x303;
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_INSERT_RIGHT,
+            &[
+                own,
+                inserted,
+                port as usize,
+                msg_type::MAKE_SEND_ONCE as usize
+            ]
+        ),
+        KernReturn::SUCCESS
+    );
+    let generated = trap(&task, mach_trap::MACH_REPLY_PORT, &[]);
+    assert_eq!(generated, 0x403);
+    // The inserted send-once right survived: releasing it notifies `port`.
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, inserted]),
+        KernReturn::SUCCESS
+    );
+    let mut buffer = [0u8; 128];
+    assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+    assert_eq!(header_of(&buffer).id, 0o107);
+    // A different generation of a used index is refused.
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_INSERT_RIGHT,
+            &[own, 0x407, port as usize, msg_type::MAKE_SEND as usize]
+        ),
+        KernReturn::FAILURE
+    );
+}
+
+#[test]
+fn inserted_names_need_roll_bits_and_a_nonzero_index() {
+    let task = new_task();
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let port = construct(&task, 0);
+    let insert = |name: usize| {
+        kr(
+            &task,
+            mach_trap::MACH_PORT_INSERT_RIGHT,
+            &[own, name, port as usize, msg_type::MAKE_SEND_ONCE as usize],
+        )
+    };
+    // ipc_entry_alloc_name: the low two bits must be set, index 0 is
+    // reserved.
+    for name in [0xf0, 0x500, 0x501, 0x502] {
+        assert_eq!(insert(name), KernReturn::INVALID_VALUE, "{name:#x}");
+    }
+    assert_eq!(insert(0x03), KernReturn::FAILURE);
+    assert_eq!(insert(0xf3), KernReturn::FAILURE);
+    // The refused rights were destroyed: each sent a send-once notification.
+    let mut buffer = [0u8; 128];
+    for _ in 0..6 {
+        assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+    }
+    let generated = trap(&task, mach_trap::MACH_REPLY_PORT, &[]);
+    assert_ne!(generated >> 8, 0);
+    assert_eq!(generated & 0x3, 0x3);
+}
+
+#[test]
+fn released_inserted_names_come_back_with_a_new_generation() {
+    let task = new_task();
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let port = construct(&task, 0);
+    // An index above every generated one.
+    let inserted = 0x5003;
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_INSERT_RIGHT,
+            &[
+                own,
+                inserted,
+                port as usize,
+                msg_type::MAKE_SEND_ONCE as usize
+            ]
+        ),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        kr(&task, mach_trap::MACH_PORT_DEALLOCATE, &[own, inserted]),
+        KernReturn::SUCCESS
+    );
+    // Generate names until index 0x50 is reached again: the stale name is
+    // never handed out.
+    let generated: Vec<usize> = (0..0x60)
+        .map(|_| trap(&task, mach_trap::MACH_REPLY_PORT, &[]))
+        .collect();
+    assert_eq!(generated[0], 0x5013);
+    assert!(generated.iter().all(|&name| name != inserted));
+    assert!(generated.iter().any(|&name| name >> 8 > 0x50));
+}
+
+fn insert_right(task: &Task<Platform>, name: u32, poly: u32, disposition: u32) -> KernReturn {
+    let own = trap(task, mach_trap::TASK_SELF, &[]);
+    kr(
+        task,
+        mach_trap::MACH_PORT_INSERT_RIGHT,
+        &[own, name as usize, poly as usize, disposition as usize],
+    )
+}
+
+#[test]
+fn a_send_right_never_joins_a_send_once_name() {
+    let task = new_task();
+    let port = construct(&task, 0);
+    let send_once = 0x5003;
+    assert_eq!(
+        insert_right(&task, send_once, port, msg_type::MAKE_SEND_ONCE),
+        KernReturn::SUCCESS
+    );
+    // ipc_object_copyout_name: the port's send right belongs under its
+    // receive name.
+    assert_eq!(
+        insert_right(&task, send_once, port, msg_type::MAKE_SEND),
+        KernReturn::RIGHT_EXISTS
+    );
+    assert_eq!(
+        mod_refs(&task, send_once, port_right::SEND, 0),
+        KernReturn::INVALID_RIGHT,
+        "the name still holds only the send-once right"
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, 0),
+        KernReturn::INVALID_RIGHT,
+        "the refused send right was destroyed"
+    );
+    assert_eq!(
+        mod_refs(&task, send_once, port_right::SEND_ONCE, 0),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        simple_send(&task, msg_type::MOVE_SEND_ONCE, send_once, 0, 0),
+        msg_return::SUCCESS
+    );
+    assert_eq!(
+        mod_refs(&task, send_once, port_right::SEND_ONCE, 0),
+        KernReturn::INVALID_NAME
+    );
+    let mut buffer = [0u8; 128];
+    assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+    assert_eq!(header_of(&buffer).id, 7);
+    assert_eq!(
+        receive_now(&task, port, &mut buffer),
+        msg_return::RCV_TIMED_OUT
+    );
+
+    // With the receive right in transit, the send right's own name is the
+    // other name; once the last send reference moves, none is left and the
+    // send-once name is simply in use.
+    let port = construct(&task, mpo::INSERT_SEND_RIGHT);
+    let holder = construct(&task, 0);
+    let send_once = 0x6003;
+    assert_eq!(
+        insert_right(&task, send_once, port, msg_type::MAKE_SEND_ONCE),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        send_port(&task, holder, port, msg_type::MOVE_RECEIVE),
+        msg_return::SUCCESS
+    );
+    assert_eq!(
+        insert_right(&task, send_once, port, msg_type::COPY_SEND),
+        KernReturn::RIGHT_EXISTS
+    );
+    assert_eq!(
+        insert_right(&task, send_once, port, msg_type::MOVE_SEND),
+        KernReturn::NAME_EXISTS
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, 0),
+        KernReturn::INVALID_NAME,
+        "the moved send right was destroyed"
+    );
+    assert_eq!(
+        mod_refs(&task, send_once, port_right::SEND_ONCE, -1),
+        KernReturn::SUCCESS
+    );
+}
+
+#[test]
+fn insert_right_merges_send_and_receive_rights_under_one_name() {
+    let task = new_task();
+    let port = construct(&task, 0);
+    // The trap's fast path, then a copied-in send right merging back.
+    for disposition in [
+        msg_type::MAKE_SEND,
+        msg_type::COPY_SEND,
+        msg_type::MOVE_SEND,
+    ] {
+        assert_eq!(
+            insert_right(&task, port, port, disposition),
+            KernReturn::SUCCESS
+        );
+    }
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, -2),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, 0),
+        KernReturn::INVALID_RIGHT
+    );
+    // User references stay pegged at the maximum.
+    assert_eq!(
+        insert_right(&task, port, port, msg_type::MAKE_SEND),
+        KernReturn::SUCCESS
+    );
+    let pegged = i32::try_from(MACH_PORT_UREFS_MAX).unwrap() - 1;
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, pegged),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        insert_right(&task, port, port, msg_type::COPY_SEND),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::SEND, -pegged),
+        KernReturn::SUCCESS,
+        "pegged references do not move"
+    );
+    // A receive right moves back into its send name, or to a new name.
+    assert_eq!(
+        insert_right(&task, port, port, msg_type::MOVE_RECEIVE),
+        KernReturn::SUCCESS
+    );
+    let mut buffer = [0u8; 128];
+    assert_eq!(
+        receive_now(&task, port, &mut buffer),
+        msg_return::RCV_TIMED_OUT
+    );
+    let renamed = 0x7003;
+    let other = construct(&task, 0);
+    assert_eq!(
+        insert_right(&task, renamed, other, msg_type::MOVE_RECEIVE),
+        KernReturn::SUCCESS
+    );
+    assert_eq!(
+        receive_now(&task, renamed, &mut buffer),
+        msg_return::RCV_TIMED_OUT
+    );
+    assert_eq!(
+        receive_now(&task, other, &mut buffer),
+        msg_return::RCV_INVALID_NAME
+    );
+    // The send right keeps `port`: a receive right named elsewhere is
+    // destroyed with the refused insertion, and the port dies.
+    assert_eq!(
+        insert_right(&task, 0x8003, port, msg_type::MOVE_RECEIVE),
+        KernReturn::RIGHT_EXISTS
+    );
+    assert_eq!(
+        mod_refs(&task, port, port_right::DEAD_NAME, 0),
+        KernReturn::SUCCESS
+    );
+}
+
+#[test]
+fn insert_right_fails_in_the_traps_order() {
+    let task = new_task();
+    let port = construct(&task, 0);
+    let mut dead = 0u32;
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    assert_eq!(
+        kr(
+            &task,
+            mach_trap::MACH_PORT_ALLOCATE,
+            &[
+                own,
+                port_right::DEAD_NAME as usize,
+                core::ptr::from_mut(&mut dead) as usize
+            ]
+        ),
+        KernReturn::SUCCESS
+    );
+    // ipc_object_copyin first, then mach_port_insert_right's checks.
+    let cases = [
+        (
+            0x9003,
+            0,
+            msg_type::MAKE_SEND_ONCE,
+            KernReturn::INVALID_NAME,
+        ),
+        (0, 0, msg_type::MAKE_SEND, KernReturn::INVALID_NAME),
+        (
+            0x9003,
+            MACH_PORT_DEAD,
+            msg_type::MOVE_SEND,
+            KernReturn::INVALID_NAME,
+        ),
+        (
+            0x9003,
+            0xa003,
+            msg_type::MAKE_SEND,
+            KernReturn::INVALID_NAME,
+        ),
+        (0x9003, port, 99, KernReturn::INVALID_RIGHT),
+        (0x9003, port, msg_type::COPY_SEND, KernReturn::INVALID_RIGHT),
+        (0, port, msg_type::MAKE_SEND_ONCE, KernReturn::INVALID_VALUE),
+        (
+            0x9003,
+            dead,
+            msg_type::COPY_SEND,
+            KernReturn::INVALID_CAPABILITY,
+        ),
+        (
+            dead,
+            dead,
+            msg_type::COPY_SEND,
+            KernReturn::INVALID_CAPABILITY,
+        ),
+        (port, port, msg_type::COPY_SEND, KernReturn::INVALID_RIGHT),
+        (0x9003, port, msg_type::MAKE_SEND_ONCE, KernReturn::SUCCESS),
+        (
+            0x9003,
+            port,
+            msg_type::MAKE_SEND_ONCE,
+            KernReturn::NAME_EXISTS,
+        ),
+    ];
+    for (name, poly, disposition, expected) in cases {
+        assert_eq!(
+            insert_right(&task, name, poly, disposition),
+            expected,
+            "insert {poly:#x} as {name:#x} with {disposition}"
+        );
+    }
+    // The refused send-once rights notified the port.
+    let mut buffer = [0u8; 128];
+    for _ in 0..2 {
+        assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+        assert_eq!(header_of(&buffer).id, 0o107);
+    }
+    assert_eq!(
+        receive_now(&task, port, &mut buffer),
+        msg_return::RCV_TIMED_OUT
+    );
+}
+
+/// A complex message to the send right `remote` carrying the receive right
+/// `name`.
+fn send_receive_right(task: &Task<Platform>, remote: u32, name: u32) -> u32 {
+    let mut buffer = [0u8; 64];
+    buffer[24..28].copy_from_slice(&1u32.to_ne_bytes());
+    let descriptor = MachMsgPortDescriptor {
+        name,
+        disposition: u8::try_from(msg_type::MOVE_RECEIVE).unwrap(),
+        ..Default::default()
+    };
+    buffer[28..40].copy_from_slice(zerocopy::IntoBytes::as_bytes(&descriptor));
+    let header = MachMsgHeader {
+        bits: msgh_bits::ports(msg_type::COPY_SEND, 0) | msgh_bits::COMPLEX,
+        size: 0,
+        remote_port: remote,
+        local_port: 0,
+        voucher_port: 0,
+        id: 9,
+    };
+    msg2(task, &mut buffer, SEND, header, 40, 1, 0, 0)
+}
+
+#[test]
+fn circular_receive_rights_are_destroyed() {
+    let task = new_task();
+    let counts = || task.global.ipc.lock().live_counts();
+    let own = trap(&task, mach_trap::TASK_SELF, &[]);
+    let before = counts();
+    for length in [1, 2, 3, 5] {
+        let ports: Vec<u32> = (0..length)
+            .map(|_| construct(&task, mpo::INSERT_SEND_RIGHT))
+            .collect();
+        // Each port's receive right travels to the next port's queue ...
+        for pair in ports.windows(2) {
+            assert_eq!(
+                send_receive_right(&task, pair[1], pair[0]),
+                msg_return::SUCCESS
+            );
+        }
+        assert_eq!(counts().0, before.0 + length);
+        // ... and closing the loop destroys the message instead, and with
+        // it every port of the loop.
+        assert_eq!(
+            send_receive_right(&task, ports[0], ports[length - 1]),
+            msg_return::SUCCESS,
+            "loop of {length}"
+        );
+        assert_eq!(counts().0, before.0, "loop of {length} leaked ports");
+        // The remaining send rights name dead ports.
+        assert_eq!(
+            simple_send(&task, msg_type::COPY_SEND, ports[0], 0, 0),
+            msg_return::SEND_INVALID_DEST
+        );
+        for &port in &ports {
+            assert_eq!(
+                mod_refs(&task, port, port_right::DEAD_NAME, -1),
+                KernReturn::SUCCESS
+            );
+        }
+        assert_eq!(counts(), before, "loop of {length}");
+    }
+    // A loop closed through a chain hanging off it.
+    let (a, b, c) = (
+        construct(&task, mpo::INSERT_SEND_RIGHT),
+        construct(&task, mpo::INSERT_SEND_RIGHT),
+        construct(&task, mpo::INSERT_SEND_RIGHT),
+    );
+    assert_eq!(send_receive_right(&task, b, a), msg_return::SUCCESS);
+    assert_eq!(send_receive_right(&task, a, c), msg_return::SUCCESS);
+    assert_eq!(send_receive_right(&task, c, b), msg_return::SUCCESS);
+    assert_eq!(counts().0, before.0);
+    for port in [a, b, c] {
+        assert_eq!(
+            kr(
+                &task,
+                mach_trap::MACH_PORT_DEALLOCATE,
+                &[own, port as usize]
+            ),
+            KernReturn::SUCCESS
+        );
+    }
+    assert_eq!(counts(), before);
+}
+
+#[test]
+fn received_receive_rights_leave_transit() {
+    let task = new_task();
+    let a = construct(&task, mpo::INSERT_SEND_RIGHT);
+    let b = construct(&task, mpo::INSERT_SEND_RIGHT);
+    let mut buffer = [0u8; 128];
+    for _ in 0..3 {
+        // A's receive right travels to B and is received back into A's send
+        // name; B's receive right may then travel to A.
+        assert_eq!(send_receive_right(&task, b, a), msg_return::SUCCESS);
+        assert_eq!(receive_now(&task, b, &mut buffer), msg_return::SUCCESS);
+        assert_eq!(word(&buffer, 28), a);
+        assert_eq!(send_receive_right(&task, a, b), msg_return::SUCCESS);
+        assert_eq!(receive_now(&task, a, &mut buffer), msg_return::SUCCESS);
+        assert_eq!(word(&buffer, 28), b);
+    }
+    // Both still live and receive.
+    for port in [a, b] {
+        assert_eq!(
+            simple_send(&task, msg_type::COPY_SEND, port, 0, 0),
+            msg_return::SUCCESS
+        );
+        assert_eq!(receive_now(&task, port, &mut buffer), msg_return::SUCCESS);
+    }
+}
+
+#[test]
+fn feature_reports_are_deduplicated_and_capped() {
+    let task = new_task();
+    let own = u32::try_from(trap(&task, mach_trap::TASK_SELF, &[])).unwrap();
+    let reported = || task.global.reported_unsupported.lock().clone();
+    // Two unknown MIG routines are both reported.
+    for id in [4_000_001, 4_000_002, 4_000_001] {
+        mig_call(&task, own, id, &[], false);
+    }
+    assert_eq!(
+        reported(),
+        [("MIG routine", 4_000_001), ("MIG routine", 4_000_002)].into()
+    );
+    assert!(!task.log_unsupported_once("MIG routine", 4_000_001, format_args!("")));
+    assert!(task.log_unsupported_once("task_info flavor", 4_000_001, format_args!("")));
+    let mut id = 0;
+    while reported().len() < crate::syscalls::mach_ipc::MAX_REPORTS {
+        assert!(task.log_unsupported_once("fcntl command", id, format_args!("")));
+        id += 1;
+    }
+    assert!(!task.log_unsupported_once("fcntl command", id, format_args!("")));
+    assert!(!task.log_unsupported_once("another feature", 0, format_args!("")));
+    assert_eq!(reported().len(), crate::syscalls::mach_ipc::MAX_REPORTS);
+}
+
+#[test]
+fn moving_a_receive_right_drops_its_guard() {
+    let task = new_task();
+    let carrier = construct(&task, 0);
+    let guarded = construct(&task, mpo::CONTEXT_AS_GUARD);
+    assert_eq!(
+        send_port(&task, carrier, guarded, msg_type::MOVE_RECEIVE),
+        msg_return::SUCCESS
+    );
+    let mut buffer = [0u8; 128];
+    assert_eq!(
+        receive_now(&task, carrier, &mut buffer),
+        msg_return::SUCCESS
+    );
+    let moved = word(&buffer, 28);
+    // Unguarded now, so mod_refs may destroy it.
+    assert_eq!(
+        mod_refs(&task, moved, port_right::RECEIVE, -1),
+        KernReturn::SUCCESS
+    );
+    // MPO_IMMOVABLE_RECEIVE rights cannot move at all.
+    let immovable = construct(&task, mpo::CONTEXT_AS_GUARD | mpo::IMMOVABLE_RECEIVE);
+    assert_eq!(
+        send_port(&task, carrier, immovable, msg_type::MOVE_RECEIVE),
+        msg_return::SEND_INVALID_RIGHT
+    );
+    assert_eq!(
+        receive_now(&task, carrier, &mut buffer),
+        msg_return::RCV_TIMED_OUT
+    );
 }
 
 #[test]

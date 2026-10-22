@@ -1,10 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Darwin BSD shim for AArch64 Mach-O guests.
+//! Darwin BSD and Mach shim for AArch64 Mach-O guests.
 //!
 //! Guest mappings and file operations use LiteBox. A runtime provider may
 //! supply dyld for dynamically linked programs.
+//!
+//! Mach IPC is emulated per guest: the task has its own port name space,
+//! messages between its ports queue in the shim, and its kernel objects
+//! (task, thread, host) answer every MIG request with `MIG_BAD_ID`.
+//! No host Mach right is ever exposed to or used on behalf of the guest.
 //! Networking, threads and signal delivery are not implemented yet; calls
 //! the shim does not implement fail closed with XNU's error, logged once.
 
@@ -146,6 +151,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 macho_trampolines: Mutex::new(BTreeMap::new()),
                 shared_cache_base: AtomicUsize::new(0),
                 host_sysctls: self.host_sysctls,
+                ipc: Mutex::new(syscalls::mach_ipc::IpcSpace::default()),
                 reported_unsupported: Mutex::new(alloc::collections::BTreeSet::new()),
                 reported_syscalls: Mutex::new(ReportedSyscalls::default()),
                 next_thread_id: core::sync::atomic::AtomicU64::new(1u64 << 32),
@@ -274,6 +280,7 @@ struct GlobalState<P: ShimPlatform> {
     macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
     shared_cache_base: AtomicUsize,
     host_sysctls: Vec<HostSysctl>,
+    ipc: Mutex<P, syscalls::mach_ipc::IpcSpace>,
     /// `(feature, id)` pairs [`Task::log_unsupported_once`] logged.
     reported_unsupported: Mutex<P, alloc::collections::BTreeSet<(&'static str, i64)>>,
     reported_syscalls: Mutex<P, ReportedSyscalls>,
@@ -433,7 +440,14 @@ impl<P: ShimPlatform> Task<P> {
             }
             Err(error) => {
                 if is_mach {
-                    ctx.regs[0] = KernReturn::INVALID_ARGUMENT.into();
+                    // A trap XNU has but the shim does not implement reports
+                    // KERN_NOT_SUPPORTED; malformed arguments are invalid.
+                    ctx.regs[0] = if error == Errno::ENOSYS {
+                        KernReturn::NOT_SUPPORTED
+                    } else {
+                        KernReturn::INVALID_ARGUMENT
+                    }
+                    .into();
                 } else {
                     ctx.regs[0] = error.raw();
                     ctx.pstate |= CARRY;
@@ -691,7 +705,70 @@ impl<P: ShimPlatform> Task<P> {
                 flags,
                 current_protection,
             )),
-            SyscallRequest::MachTaskSelf => Ok(Self::synthetic_task_port().into()),
+            SyscallRequest::MachTaskSelf => Ok(self.sys_task_self()),
+            SyscallRequest::MachThreadSelf => Ok(self.sys_thread_self()),
+            SyscallRequest::MachHostSelf => Ok(self.sys_host_self()),
+            SyscallRequest::MachReplyPort => Ok(self.sys_mach_reply_port()),
+            SyscallRequest::MachPortAllocate {
+                target,
+                right,
+                name,
+            } => Ok(self.sys_mach_port_allocate(target, right, name).into()),
+            SyscallRequest::MachPortDeallocate { target, name } => {
+                Ok(self.sys_mach_port_deallocate(target, name).into())
+            }
+            SyscallRequest::MachPortModRefs {
+                target,
+                name,
+                right,
+                delta,
+            } => Ok(self
+                .sys_mach_port_mod_refs(target, name, right, delta)
+                .into()),
+            SyscallRequest::MachPortInsertRight {
+                target,
+                name,
+                poly,
+                poly_disposition,
+            } => Ok(self
+                .sys_mach_port_insert_right(target, name, poly, poly_disposition)
+                .into()),
+            SyscallRequest::MachPortConstruct {
+                target,
+                options,
+                context,
+                name,
+            } => Ok(self
+                .sys_mach_port_construct(target, options, context, name)
+                .into()),
+            SyscallRequest::MachPortDestruct {
+                target,
+                name,
+                send_right_delta,
+                guard,
+            } => Ok(self
+                .sys_mach_port_destruct(target, name, send_right_delta, guard)
+                .into()),
+            SyscallRequest::MachMsg2 {
+                data,
+                options,
+                header,
+                send_size,
+                descriptor_count,
+                receive_name,
+                receive_size,
+                priority: _,
+                timeout,
+            } => Ok(self.sys_mach_msg2(
+                data,
+                options,
+                header,
+                send_size,
+                descriptor_count,
+                receive_name,
+                receive_size,
+                timeout,
+            ) as usize),
             SyscallRequest::SharedRegionCheckNp { start_address } => self
                 .sys_shared_region_check_np(start_address)
                 .to_syscall_result(),

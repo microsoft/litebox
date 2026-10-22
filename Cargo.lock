@@ -2552,6 +2552,7 @@ dependencies = [
 name = "litebox_shim_macos"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.13.1",
  "litebox",
  "litebox_broker_core",
  "litebox_broker_host",
@@ -2565,6 +2566,7 @@ dependencies = [
  "litebox_trampoline",
  "litebox_util_log",
  "tempfile",
+ "zerocopy",
 ]
 
 [[package]]
