@@ -70,6 +70,8 @@ pub type MacosUserland = MacosUserlandWithPageSize<HOST_PAGE_SIZE>;
 /// Opt-in 4 KiB guest pages with best-effort subpage permissions.
 #[cfg(feature = "subpage_compat")]
 pub type MacosUserland4K = MacosUserlandWithPageSize<4096>;
+mod native;
+#[cfg(feature = "subpage_compat")]
 mod subpage;
 /// The macOS host's Mach-O `__PAGEZERO` reserves the first 4 GiB.
 pub const TASK_ADDR_MIN: usize = 0x1_0000_0000;
@@ -79,7 +81,64 @@ pub const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000;
 /// Shared platform implementation. Use [`MacosUserland`] for native pages or
 /// `MacosUserland4K` (requires `subpage_compat`) for 4 KiB guests.
 pub struct MacosUserlandWithPageSize<const PAGE_SIZE: usize> {
-    pages: Mutex<subpage::Pages<PAGE_SIZE>>,
+    pages: Mutex<PageTable>,
+}
+
+/// Page-management backend, chosen once from the guest page size.
+enum PageTable {
+    Native(native::Pages),
+    #[cfg(feature = "subpage_compat")]
+    Subpage(subpage::Pages),
+}
+
+impl PageTable {
+    fn allocate(
+        &mut self,
+        range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+        behavior: FixedAddressBehavior,
+    ) -> Result<usize, AllocationError> {
+        match self {
+            Self::Native(pages) => pages.allocate(range, permissions, behavior),
+            #[cfg(feature = "subpage_compat")]
+            Self::Subpage(pages) => pages.allocate(range, permissions, behavior),
+        }
+    }
+
+    fn update_permissions(
+        &mut self,
+        range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), PermissionUpdateError> {
+        match self {
+            Self::Native(pages) => pages.update_permissions(range, permissions),
+            #[cfg(feature = "subpage_compat")]
+            Self::Subpage(pages) => pages.update_permissions(range, permissions),
+        }
+    }
+
+    fn decommit(&mut self, range: Range<usize>) -> Result<(), DeallocationError> {
+        match self {
+            Self::Native(pages) => pages.decommit(range),
+            #[cfg(feature = "subpage_compat")]
+            Self::Subpage(pages) => pages.decommit(range),
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "subpage_compat"),
+        expect(clippy::unnecessary_wraps, reason = "subpage deallocation can fail")
+    )]
+    fn deallocate(&mut self, range: Range<usize>) -> Result<(), DeallocationError> {
+        match self {
+            Self::Native(pages) => {
+                pages.deallocate(range);
+                Ok(())
+            }
+            #[cfg(feature = "subpage_compat")]
+            Self::Subpage(pages) => pages.deallocate(range),
+        }
+    }
 }
 
 impl<const PAGE_SIZE: usize> core::fmt::Debug for MacosUserlandWithPageSize<PAGE_SIZE> {
@@ -115,8 +174,16 @@ impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
             .unwrap_or_else(|error| panic!("failed to initialize macOS TLS: {error}"));
         initialize_thread_tls();
         register_exception_handlers().expect("failed to install macOS signal handlers");
+        #[cfg(feature = "subpage_compat")]
+        let pages = if PAGE_SIZE == HOST_PAGE_SIZE {
+            PageTable::Native(native::Pages::default())
+        } else {
+            PageTable::Subpage(subpage::Pages::default())
+        };
+        #[cfg(not(feature = "subpage_compat"))]
+        let pages = PageTable::Native(native::Pages::default());
         Box::leak(Box::new(Self {
-            pages: Mutex::new(subpage::Pages::default()),
+            pages: Mutex::new(pages),
         }))
     }
 }
@@ -603,9 +670,13 @@ bitflags::bitflags! {
     struct MachVmFlags: i32 {
         /// Mach uses zero to request the supplied fixed address.
         const FIXED = 0;
+        #[cfg(feature = "subpage_compat")]
         const ANYWHERE = 0x0000_0001;
     }
+}
 
+#[cfg(any(test, feature = "subpage_compat"))]
+bitflags::bitflags! {
     #[repr(transparent)]
     struct MachVmProtection: i32 {
         const READ = libc::VM_PROT_READ;
@@ -615,16 +686,20 @@ bitflags::bitflags! {
     }
 }
 
+#[cfg(any(test, feature = "subpage_compat"))]
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 struct MachBoolean(i32);
 
+#[cfg(any(test, feature = "subpage_compat"))]
 impl MachBoolean {
+    #[cfg(feature = "subpage_compat")]
     const FALSE: Self = Self(0);
     #[cfg(test)]
     const TRUE: Self = Self(1);
 }
 
+#[cfg(feature = "subpage_compat")]
 #[derive(Clone, Copy)]
 #[repr(u32)]
 enum MachVmInheritance {
@@ -645,6 +720,7 @@ unsafe extern "C" {
         set_maximum: MachBoolean,
         protection: MachVmProtection,
     ) -> KernReturn;
+    #[cfg(feature = "subpage_compat")]
     fn mach_vm_remap(
         task: u32,
         target: *mut u64,
@@ -755,6 +831,9 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
         MacosUserlandReservation<PAGE_SIZE>: 'reservation,
     {
         let _ = populate_pages_immediately;
+        if !is_page_aligned::<PAGE_SIZE>(&range) {
+            return Err(AllocationError::Unaligned);
+        }
         self.pages
             .lock()
             .unwrap()
@@ -776,6 +855,9 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
         Reservations: Iterator<Item = &'reservation MacosUserlandReservation<PAGE_SIZE>>,
         MacosUserlandReservation<PAGE_SIZE>: 'reservation,
     {
+        if !is_page_aligned::<PAGE_SIZE>(&range) {
+            return Err(DeallocationError::Unaligned);
+        }
         self.pages.lock().unwrap().decommit(range)
     }
 
@@ -823,6 +905,7 @@ struct TlsBlock {
     host_fp_state: usize,
     pending_host_signals: AtomicU32,
     wait_waker_addr: AtomicPtr<core::task::Waker>,
+    #[cfg(feature = "subpage_compat")]
     page_recovery_lock: usize,
 }
 
@@ -838,6 +921,7 @@ mod tls_offset {
     pub const HOST_FP_STATE: usize = core::mem::offset_of!(TlsBlock, host_fp_state);
     pub const PENDING_HOST_SIGNALS: usize = core::mem::offset_of!(TlsBlock, pending_host_signals);
     pub const WAIT_WAKER_ADDR: usize = core::mem::offset_of!(TlsBlock, wait_waker_addr);
+    #[cfg(feature = "subpage_compat")]
     pub const PAGE_RECOVERY_LOCK: usize = core::mem::offset_of!(TlsBlock, page_recovery_lock);
 }
 
@@ -1003,6 +1087,7 @@ fn initialize_thread_tls() {
         host_fp_state: 0,
         pending_host_signals: AtomicU32::new(0),
         wait_waker_addr: AtomicPtr::new(core::ptr::null_mut()),
+        #[cfg(feature = "subpage_compat")]
         page_recovery_lock: 0,
     });
     let block = Box::into_raw(block);
@@ -2710,9 +2795,14 @@ mod tests {
                     .unwrap();
             }
         });
-        // Reject both a subpage length and a subpage-aligned start. These
-        // assertions also run with subpage_compat enabled through another crate.
-        for range in [base..base + 4096, base + 4096..base + HOST_PAGE_SIZE] {
+        // Reject a subpage length, a subpage-aligned start, and an empty range (the native
+        // backend's `RangeSet` panics on empty ranges). These assertions also run with
+        // subpage_compat enabled through another crate.
+        for range in [
+            base..base + 4096,
+            base + 4096..base + HOST_PAGE_SIZE,
+            base..base,
+        ] {
             assert!(matches!(
                 unsafe {
                     platform.reserve_and_commit_pages(
@@ -2735,6 +2825,19 @@ mod tests {
                         MemoryRegionPermissions::READ,
                     ),
                     Err(PermissionUpdateError::Unaligned)
+                ));
+                assert!(matches!(
+                    platform.commit_pages(
+                        || core::iter::once(&reservation),
+                        range.clone(),
+                        MemoryRegionPermissions::READ,
+                        false,
+                    ),
+                    Err(AllocationError::Unaligned)
+                ));
+                assert!(matches!(
+                    platform.decommit_pages(|| core::iter::once(&reservation), range.clone()),
+                    Err(DeallocationError::Unaligned)
                 ));
                 assert!(matches!(
                     platform.release_pages(range.clone()),
@@ -3740,6 +3843,89 @@ mod tests {
     }
 
     #[test]
+    fn native_decommit_and_replace_discard_only_the_requested_pages() {
+        let p = MacosUserland::new();
+        // Other tests hint at TASK_ADDR_MIN; keep them out of the pages this test releases and
+        // expects to stay free.
+        let hint = TASK_ADDR_MIN + (1 << 40);
+        // SAFETY: Hint allocation chooses fresh pages that this test exclusively owns.
+        let base = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                hint..hint + 3 * HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap()
+        .range()
+        .start;
+        let _unmap = litebox::utils::defer(|| {
+            // SAFETY: the test-owned pages are no longer accessed.
+            unsafe { p.release_pages(base..base + 3 * HOST_PAGE_SIZE) }.unwrap();
+        });
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                base,
+            );
+        let page = |index: usize| (index * HOST_PAGE_SIZE).cast_signed();
+        for index in 0..3 {
+            assert_eq!(ptr.write_at_offset(page(index), 0x5a), Some(()));
+        }
+
+        let middle = base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE;
+        // SAFETY: the test-owned middle page has no users while it is decommitted.
+        unsafe { p.decommit_pages(core::iter::empty, middle.clone()) }.unwrap();
+        assert_eq!(ptr.read_at_offset(page(1)), None);
+        // SAFETY: the test-owned middle page has no users while it is recommitted.
+        unsafe { p.commit_pages(core::iter::empty, middle.clone(), RW, false) }.unwrap();
+        assert_eq!(ptr.read_at_offset(page(1)), Some(0));
+        assert_eq!(ptr.read_at_offset(page(0)), Some(0x5a));
+        assert_eq!(ptr.read_at_offset(page(2)), Some(0x5a));
+
+        // Replace across owned memory and a free gap.
+        // SAFETY: the test-owned middle page is idle; later probes use fallible accesses.
+        unsafe { p.release_pages(middle.clone()) }.unwrap();
+        assert_eq!(ptr.read_at_offset(page(1)), None);
+        // SAFETY: the first page is test-owned and idle, and the free gap is the page this test
+        // released.
+        unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                base..base + 2 * HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Replace,
+            )
+        }
+        .unwrap();
+        assert_eq!(ptr.read_at_offset(page(0)), Some(0));
+        assert_eq!(ptr.read_at_offset(page(1)), Some(0));
+        assert_eq!(ptr.read_at_offset(page(2)), Some(0x5a));
+
+        // A fixed allocation into free memory installs the requested protection.
+        // SAFETY: the test-owned middle page is idle; later probes use fallible accesses.
+        unsafe { p.release_pages(middle.clone()) }.unwrap();
+        // SAFETY: the middle page is the free page this test just released.
+        unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                middle,
+                MemoryRegionPermissions::READ,
+                false,
+                true,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        assert_eq!(ptr.read_at_offset(page(1)), Some(0));
+        assert_eq!(ptr.write_at_offset(page(1), 1), None);
+    }
+
+    #[test]
     fn fixed_mappings_never_replace_host_memory() {
         let p = MacosUserland::new();
         // SAFETY: request fresh anonymous memory with no fixed-address replacement.
@@ -3787,5 +3973,190 @@ mod tests {
         unsafe {
             libc::munmap(host, HOST_PAGE_SIZE);
         }
+    }
+
+    #[test]
+    fn native_operations_never_touch_unowned_memory() {
+        let p = MacosUserland::new();
+        // Keep these pages apart from other tests' hinted pages: the test frees two of them.
+        let hint = TASK_ADDR_MIN + (2 << 40);
+        // SAFETY: Hint allocation chooses fresh pages that this test exclusively owns.
+        let base = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                hint..hint + 4 * HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap()
+        .range()
+        .start;
+        let _unmap = litebox::utils::defer(|| {
+            // SAFETY: the test-owned pages are no longer accessed.
+            unsafe { p.release_pages(base..base + 4 * HOST_PAGE_SIZE) }.unwrap();
+        });
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                base,
+            );
+        let page = |index: usize| (index * HOST_PAGE_SIZE).cast_signed();
+        let span = |indices: Range<usize>| {
+            base + indices.start * HOST_PAGE_SIZE..base + indices.end * HOST_PAGE_SIZE
+        };
+        let markers = [0x10, 0x11, 0x12, 0x13];
+        for (index, marker) in markers.into_iter().enumerate() {
+            assert_eq!(ptr.write_at_offset(page(index), marker), Some(()));
+        }
+
+        // Layout: page0 owned | page1 free | page2 owned | page3 host.
+        for index in [1, 3] {
+            // SAFETY: the test-owned page is idle; later probes use fallible accesses.
+            unsafe { p.release_pages(span(index..index + 1)) }.unwrap();
+        }
+        let mut host = span(3..4).start as u64;
+        // SAFETY: a FIXED allocation without OVERWRITE fails instead of replacing a mapping.
+        let result = unsafe {
+            mach_vm_allocate(
+                mach_task_self(),
+                &raw mut host,
+                HOST_PAGE_SIZE as u64,
+                MachVmFlags::FIXED,
+            )
+        };
+        assert_eq!(result, KernReturn::SUCCESS);
+        let _unmap_host = litebox::utils::defer(|| {
+            // SAFETY: the test exclusively owns the host page, which is no longer accessed.
+            unsafe { libc::munmap(host as *mut _, HOST_PAGE_SIZE) };
+        });
+        let host_marker = 0x42;
+        assert_eq!(ptr.write_at_offset(page(3), host_marker), Some(()));
+
+        // Replace reserves the free gap, then fails on the host page and rolls the gap back.
+        // SAFETY: the owned pages are idle and the host page must be rejected; later probes use
+        // fallible accesses.
+        let replaced = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                span(0..4),
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Replace,
+            )
+        };
+        assert!(matches!(
+            replaced,
+            Err(AllocationError::AddressInUseByPlatform)
+        ));
+        assert_eq!(ptr.read_at_offset(page(1)), None);
+        for index in [0, 2] {
+            assert_eq!(ptr.read_at_offset(page(index)), Some(markers[index]));
+        }
+        assert_eq!(ptr.read_at_offset(page(3)), Some(host_marker));
+
+        // Operations spanning an owned page and the host page change neither.
+        // SAFETY: the owned page is idle and the host page must be rejected.
+        unsafe {
+            assert!(matches!(
+                p.protect_pages(core::iter::empty, span(2..4), MemoryRegionPermissions::READ),
+                Err(PermissionUpdateError::Unallocated)
+            ));
+            assert!(matches!(
+                p.commit_pages(
+                    core::iter::empty,
+                    span(2..4),
+                    MemoryRegionPermissions::READ,
+                    false
+                ),
+                Err(AllocationError::AddressInUse)
+            ));
+            assert!(matches!(
+                p.decommit_pages(core::iter::empty, span(2..4)),
+                Err(DeallocationError::AlreadyUnallocated)
+            ));
+        }
+        for (index, marker) in [(2, markers[2]), (3, host_marker)] {
+            assert_eq!(ptr.read_at_offset(page(index)), Some(marker));
+            assert_eq!(ptr.write_at_offset(page(index), marker), Some(()));
+        }
+
+        // Release unmaps only the owned pages.
+        // SAFETY: the owned pages are idle; later probes use fallible accesses.
+        unsafe { p.release_pages(span(0..4)) }.unwrap();
+        for index in [0, 2] {
+            assert_eq!(ptr.read_at_offset(page(index)), None);
+        }
+        assert_eq!(ptr.read_at_offset(page(3)), Some(host_marker));
+    }
+
+    #[test]
+    fn native_reused_address_runs_newly_written_code() {
+        let p = MacosUserland::new();
+        // Keep this page apart from other tests' hinted pages.
+        let hint = TASK_ADDR_MIN + (3 << 40);
+        // SAFETY: Hint allocation chooses a fresh page that this test exclusively owns.
+        let range = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                hint..hint + HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap()
+        .range();
+        let _unmap = litebox::utils::defer(|| {
+            // SAFETY: the test owns the page and its code has returned before cleanup.
+            unsafe { p.release_pages(range.clone()) }.unwrap();
+        });
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                range.start,
+            );
+        let run = |value: u32| {
+            // mov x0, #value; ret
+            let mov = (0xd280_0000 | (value << 5)).to_le_bytes();
+            let ret = 0xd65f_03c0u32.to_le_bytes();
+            assert_eq!(ptr.write_slice_at_offset(0, &mov), Some(()));
+            assert_eq!(ptr.write_slice_at_offset(4, &ret), Some(()));
+            let returned: usize;
+            // SAFETY: the test exclusively owns the page; its RX code is the C-ABI mov/ret stub
+            // just written. The assembly declares the call's register clobbers.
+            unsafe {
+                p.protect_pages(
+                    core::iter::empty,
+                    range.clone(),
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                )
+                .unwrap();
+                core::arch::asm!("blr {entry}", entry = in(reg) range.start,
+                    lateout("x0") returned, clobber_abi("C"));
+            }
+            returned
+        };
+        assert_eq!(run(42), 42);
+        // SAFETY: the test-owned page is idle; its old code has returned.
+        unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                range.clone(),
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Replace,
+            )
+        }
+        .unwrap();
+        assert_eq!(run(43), 43);
+        // Only this step relies on `update_permissions`' explicit icache invalidation: the page
+        // was already mapped executable, so the kernel does not resync it as it does fresh pages.
+        // SAFETY: the test-owned page is idle; its old code has returned.
+        unsafe { p.protect_pages(core::iter::empty, range.clone(), RW) }.unwrap();
+        assert_eq!(run(44), 44);
     }
 }

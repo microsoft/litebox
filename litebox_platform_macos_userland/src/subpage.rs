@@ -1,17 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Page ownership on 16 KiB macOS backing.
+//! 4 KiB guest pages on 16 KiB macOS backing.
 //!
-//! Native instances track one slot per host page. With `subpage_compat`, 4 KiB
-//! instances fuse permissions across live subpages: RO/PROT_NONE subpages and
-//! unmapped holes can inherit neighboring access. Only these instances publish
-//! recovery state for switching mixed W/X pages between RW and RX.
+//! Permissions are fused across live subpages of each host page: RO/PROT_NONE subpages and
+//! unmapped holes can inherit neighboring access. Recovery state is published for switching
+//! mixed W/X pages between RW and RX.
 
 use litebox::utils::TruncateExt as _;
 use std::collections::HashMap;
 use std::ops::Range;
 
+use super::native::{Mapping, allocation_error, permission_error};
 use super::{
     AllocationError, DeallocationError, FixedAddressBehavior, HOST_PAGE_SIZE, KernReturn,
     MachBoolean, MachVmFlags, MachVmInheritance, MachVmProtection, MemoryRegionPermissions as Perm,
@@ -19,12 +19,12 @@ use super::{
     mach_vm_remap, prot_flags, sys_icache_invalidate,
 };
 
-// Fixed-capacity storage for the smallest supported granularity.
-const MAX_SUBPAGES: usize = HOST_PAGE_SIZE / 4096;
+const PAGE_SIZE: usize = 4096;
+const MAX_SUBPAGES: usize = HOST_PAGE_SIZE / PAGE_SIZE;
 type Slots = [Option<Perm>; MAX_SUBPAGES];
 
 #[derive(Default)]
-pub(super) struct Pages<const PAGE_SIZE: usize>(HashMap<usize, Slots>);
+pub(super) struct Pages(HashMap<usize, Slots>);
 
 fn host_base(address: usize) -> usize {
     address & !(HOST_PAGE_SIZE - 1)
@@ -47,45 +47,11 @@ fn fused(slots: Slots) -> Perm {
     permissions
 }
 
-fn change_slots<const PAGE_SIZE: usize>(
-    slots: &mut Slots,
-    base: usize,
-    range: &Range<usize>,
-    value: Option<Perm>,
-) {
+fn change_slots(slots: &mut Slots, base: usize, range: &Range<usize>, value: Option<Perm>) {
     for address in
         (base.max(range.start)..(base + HOST_PAGE_SIZE).min(range.end)).step_by(PAGE_SIZE)
     {
         slots[(address - base) / PAGE_SIZE] = value;
-    }
-}
-
-fn permission_error() -> PermissionUpdateError {
-    // SAFETY: __error returns this thread's errno slot.
-    match unsafe { *libc::__error() } {
-        libc::EACCES | libc::EPERM => PermissionUpdateError::PermissionDenied,
-        libc::ENOMEM => PermissionUpdateError::OutOfMemory,
-        _ => PermissionUpdateError::PlatformFailure,
-    }
-}
-
-fn allocation_error(error: PermissionUpdateError) -> AllocationError {
-    match error {
-        PermissionUpdateError::PermissionDenied => AllocationError::PermissionDenied,
-        _ => AllocationError::OutOfMemory,
-    }
-}
-
-/// Owned native mapping.
-struct Mapping {
-    base: usize,
-    len: usize,
-}
-
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        // SAFETY: this object exclusively owns the entire native mapping.
-        assert_eq!(unsafe { libc::munmap(self.base as *mut _, self.len) }, 0);
     }
 }
 
@@ -115,16 +81,13 @@ impl Mapping {
         if result != KernReturn::SUCCESS {
             return Err(result.into());
         }
-        let alias = Self {
-            base: target.trunc(),
-            len: HOST_PAGE_SIZE,
-        };
-        protect(alias.base, Perm::READ | Perm::WRITE).map_err(allocation_error)?;
+        // SAFETY: mach_vm_remap just created this alias mapping.
+        let alias = unsafe { Self::new(target.trunc(), HOST_PAGE_SIZE) };
+        protect(alias.base(), Perm::READ | Perm::WRITE).map_err(allocation_error)?;
         Ok(alias)
     }
 }
 
-#[cfg(feature = "subpage_compat")]
 pub(super) fn recover_fault(pc: usize, fault_address: usize, esr: u64) -> bool {
     recovery::recover(pc, fault_address, esr) != recovery::Recovery::Unhandled
 }
@@ -150,7 +113,7 @@ fn flush(base: usize, permissions: Perm) {
     }
 }
 
-impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
+impl Pages {
     pub(super) fn contains_range(&self, range: Range<usize>) -> bool {
         range.step_by(PAGE_SIZE).all(|address| {
             self.0
@@ -211,11 +174,9 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
                     error = allocation_error(permission_error());
                     continue;
                 }
-                let mapping = Mapping {
-                    base: mapped as usize,
-                    len,
-                };
-                let base = mapping.base;
+                // SAFETY: mmap just created this mapping.
+                let mapping = unsafe { Mapping::new(mapped as usize, len) };
+                let base = mapping.base();
                 if base < TASK_ADDR_MIN
                     || base.checked_add(len).is_none_or(|end| end > TASK_ADDR_MAX)
                 {
@@ -226,14 +187,14 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
                     .step_by(HOST_PAGE_SIZE)
                     .map(|address| {
                         let mut slots = [None; MAX_SUBPAGES];
-                        change_slots::<PAGE_SIZE>(&mut slots, address, &range, Some(permissions));
+                        change_slots(&mut slots, address, &range, Some(permissions));
                         (address, slots)
                     })
                     .collect();
                 let mut update = self.protect_changes(&changes).map_err(allocation_error)?;
                 for (base, slots) in changes {
                     flush(base, fused(slots));
-                    update.set::<PAGE_SIZE>(base, Some(fused(slots)));
+                    update.set(base, Some(fused(slots)));
                     self.0.insert(base, slots);
                 }
                 std::mem::forget(mapping); // Ownership transferred to the registry.
@@ -254,7 +215,7 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
                     }
                 }
             }
-            change_slots::<PAGE_SIZE>(&mut slots, base, &range, Some(permissions));
+            change_slots(&mut slots, base, &range, Some(permissions));
             changes.push((base, slots));
         }
         let mut reservations = Vec::new();
@@ -276,10 +237,8 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
                 if result != KernReturn::SUCCESS {
                     return Err(result.into());
                 }
-                reservations.push(Mapping {
-                    base: *base,
-                    len: HOST_PAGE_SIZE,
-                });
+                // SAFETY: mach_vm_allocate just reserved this host page.
+                reservations.push(unsafe { Mapping::new(*base, HOST_PAGE_SIZE) });
             }
         }
         let mut update = self.protect_changes(&changes).map_err(allocation_error)?;
@@ -289,12 +248,12 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
             // SAFETY: the temporary alias is writable, shares this owned guest page,
             // and only the subpages being replaced/allocated are touched.
             unsafe {
-                std::ptr::write_bytes((alias.base + start - base) as *mut u8, 0, end - start);
+                std::ptr::write_bytes((alias.base() + start - base) as *mut u8, 0, end - start);
             };
         }
         for (base, slots) in changes {
             flush(base, fused(slots));
-            update.set::<PAGE_SIZE>(base, Some(fused(slots)));
+            update.set(base, Some(fused(slots)));
             self.0.insert(base, slots);
         }
         for reservation in reservations {
@@ -318,13 +277,13 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
         let mut changes = Vec::new();
         for base in host_range(&range).step_by(HOST_PAGE_SIZE) {
             let mut slots = self.0[&base];
-            change_slots::<PAGE_SIZE>(&mut slots, base, &range, Some(permissions));
+            change_slots(&mut slots, base, &range, Some(permissions));
             changes.push((base, slots));
         }
         let mut update = self.protect_changes(&changes)?;
         for (base, slots) in changes {
             flush(base, fused(slots));
-            update.set::<PAGE_SIZE>(base, Some(fused(slots)));
+            update.set(base, Some(fused(slots)));
             self.0.insert(base, slots);
         }
         Ok(())
@@ -350,7 +309,7 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
             // SAFETY: the temporary alias is writable, shares this owned guest page, and the
             // caller excludes users while the decommitted bytes are reset.
             unsafe {
-                std::ptr::write_bytes((alias.base + start - base) as *mut u8, 0, end - start);
+                std::ptr::write_bytes((alias.base() + start - base) as *mut u8, 0, end - start);
             }
         }
         Ok(())
@@ -372,22 +331,20 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
                 .collect()
         };
         for (base, slots) in &mut changes {
-            change_slots::<PAGE_SIZE>(slots, *base, &range, None);
+            change_slots(slots, *base, &range, None);
         }
         let mut update = self
             .protect_changes(&changes)
             .map_err(|_| DeallocationError::AlreadyUnallocated)?;
         for (base, slots) in changes {
             if slots.iter().all(Option::is_none) {
-                drop(Mapping {
-                    base,
-                    len: HOST_PAGE_SIZE,
-                });
+                // SAFETY: the table owned this host page and removes it below.
+                drop(unsafe { Mapping::new(base, HOST_PAGE_SIZE) });
                 self.0.remove(&base);
-                update.set::<PAGE_SIZE>(base, None);
+                update.set(base, None);
             } else {
                 self.0.insert(base, slots);
-                update.set::<PAGE_SIZE>(base, Some(fused(slots)));
+                update.set(base, Some(fused(slots)));
             }
         }
         Ok(())
@@ -406,12 +363,8 @@ mod recovery {
     use std::marker::PhantomData;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    #[cfg(feature = "subpage_compat")]
-    use super::host_base;
-    use super::{HOST_PAGE_SIZE, Perm};
-    #[cfg(feature = "subpage_compat")]
-    use crate::{Exception, exception_class};
-    use crate::{read_tls, tls_offset, write_tls};
+    use super::{HOST_PAGE_SIZE, Perm, host_base};
+    use crate::{Exception, exception_class, read_tls, tls_offset, write_tls};
 
     struct Registry {
         busy: AtomicBool,
@@ -436,7 +389,6 @@ mod recovery {
         _not_send: PhantomData<*mut ()>,
     }
 
-    #[cfg(feature = "subpage_compat")]
     impl Guard {
         fn permissions(&self, base: usize) -> Option<Perm> {
             // SAFETY: the guard owns exclusive access to REGISTRY.pages.
@@ -486,15 +438,7 @@ mod recovery {
     }
 
     impl Update {
-        pub(super) fn set<const PAGE_SIZE: usize>(
-            &mut self,
-            base: usize,
-            permissions: Option<Perm>,
-        ) {
-            // Native mappings must never participate in compatibility fault recovery.
-            if PAGE_SIZE == HOST_PAGE_SIZE {
-                return;
-            }
+        pub(super) fn set(&mut self, base: usize, permissions: Option<Perm>) {
             // SAFETY: Update owns the exclusive gate; only ordinary threads call set.
             let pages = unsafe { &mut *self.guard.registry.pages.get() };
             if let Some(permissions) = permissions {
@@ -504,13 +448,12 @@ mod recovery {
             }
         }
 
-        #[cfg(all(test, feature = "subpage_compat"))]
+        #[cfg(test)]
         pub(super) fn permissions(&self, base: usize) -> Option<Perm> {
             self.guard.permissions(base)
         }
     }
 
-    #[cfg(feature = "subpage_compat")]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Recovery {
         Unhandled,
@@ -521,7 +464,6 @@ mod recovery {
 
     /// For synchronous SIGSEGV/SIGBUS only. Never allocates or blocks.
     /// Defer when the gate is busy; never retry our own interrupted update.
-    #[cfg(feature = "subpage_compat")]
     pub(super) fn recover(pc: usize, fault_address: usize, esr: u64) -> Recovery {
         #[derive(PartialEq, Eq)]
         enum Access {
@@ -613,7 +555,7 @@ mod recovery {
     }
 }
 
-#[cfg(all(test, feature = "subpage_compat"))]
+#[cfg(test)]
 mod tests {
     #![expect(
         clippy::cast_possible_wrap,
@@ -628,7 +570,6 @@ mod tests {
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
-    use litebox_common_linux::PAGE_SIZE;
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::loader::{ElfParsedFile, MapMemory, Protection, ReadAt};
     use std::boxed::Box;
@@ -906,7 +847,7 @@ mod tests {
         println!("{COMPLETED}");
     }
 
-    struct TestPages(Pages<PAGE_SIZE>);
+    struct TestPages(Pages);
     impl TestPages {
         fn new() -> Self {
             MacosUserland::new(); // Install exception-table recovery for fault-safe probes.
@@ -1217,7 +1158,12 @@ mod tests {
         assert_eq!(moved.read_at_offset(0), Some(42));
         assert_eq!(moved.read_at_offset(PAGE_SIZE as isize), Some(0));
         assert_eq!(neighbor.read_at_offset(0), Some(99));
-        assert!(!platform.pages.lock().unwrap().contains_range(source_range));
+        {
+            let crate::PageTable::Subpage(pages) = &*platform.pages.lock().unwrap() else {
+                unreachable!("4 KiB instances use subpage tables");
+            };
+            assert!(!pages.contains_range(source_range));
+        }
 
         // SAFETY: both mappings are idle and exclusively owned by this test.
         unsafe {
@@ -1319,10 +1265,8 @@ mod tests {
             },
             KernReturn::SUCCESS
         );
-        let host = Mapping {
-            base,
-            len: HOST_PAGE_SIZE,
-        };
+        // SAFETY: mach_vm_allocate just reserved this host page for the test.
+        let host = unsafe { Mapping::new(base, HOST_PAGE_SIZE) };
         assert_eq!(ptr(base).write_at_offset(0, 42), Some(()));
         assert!(!recover_fault(base, base, INSTRUCTION_PERMISSION));
         assert!(!recover_fault(0, base, WRITE_PERMISSION));
@@ -1378,10 +1322,8 @@ mod tests {
             },
             KernReturn::SUCCESS
         );
-        let host = Mapping {
-            base,
-            len: HOST_PAGE_SIZE,
-        };
+        // SAFETY: mach_vm_allocate just reserved this host page for the test.
+        let host = unsafe { Mapping::new(base, HOST_PAGE_SIZE) };
         assert_eq!(ptr(base).write_at_offset(0, 42), Some(()));
         assert!(matches!(
             pages
