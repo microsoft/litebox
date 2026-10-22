@@ -610,7 +610,7 @@ fn run_thread_inner(
         GuestVectorStateMode::Inherited(state) => Some(state.as_ref()),
         GuestVectorStateMode::Fresh | GuestVectorStateMode::Resume => None,
     });
-    process::record_guest_stack_base();
+    process::record_first_guest_entry_depth();
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     let _guest_thread = GuestThreadMarker::enter();
@@ -1557,8 +1557,12 @@ impl Drop for GuardedStack {
         } = self.0;
         // SAFETY: This value exclusively owns the mapping, which nothing runs on once it drops.
         let result = unsafe { libc::munmap(mapping.as_ptr(), guard_size + size) };
-        // Unmapping a whole mapping splits nothing, so it cannot fail.
-        debug_assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(
+            result,
+            0,
+            "failed to free memory for alternate signal stack: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -1581,8 +1585,7 @@ enum SignalAltStack {
 }
 
 thread_local! {
-    static SIGNAL_ALT_STACK: core::cell::Cell<SignalAltStack> =
-        const { core::cell::Cell::new(SignalAltStack::None) };
+    static SIGNAL_ALT_STACK: Cell<SignalAltStack> = const { Cell::new(SignalAltStack::None) };
 }
 
 /// Runs `f` with an alternate signal stack set up.
@@ -1604,14 +1607,14 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
                 ss_flags: 0,
                 ss_size: 0,
             };
-            unsafe {
-                let r = libc::sigaltstack(&raw const alt_stack, &raw mut oss);
-                assert!(
-                    r >= 0,
-                    "failed to set up alternate signal stack: {}",
-                    std::io::Error::last_os_error(),
-                );
-            }
+            // SAFETY: `alt_stack` describes the usable part of `stack`, which this call owns and
+            // keeps mapped until it restores `oss`, and `oss` is writable.
+            let r = unsafe { libc::sigaltstack(&raw const alt_stack, &raw mut oss) };
+            assert!(
+                r >= 0,
+                "failed to set up alternate signal stack: {}",
+                std::io::Error::last_os_error(),
+            );
             (stack, oss)
         }
         // A process clone inherits its thread's alternate signal stack setting, so the adopted
@@ -1628,9 +1631,11 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
         stack: stack.parts(),
         previous,
     }));
-    let _restore_guard = litebox::utils::defer(|| unsafe {
+    let _restore_guard = litebox::utils::defer(|| {
         SIGNAL_ALT_STACK.set(SignalAltStack::None);
-        let r = libc::sigaltstack(&raw const previous, std::ptr::null_mut());
+        // SAFETY: `previous` is the setting `stack` replaced, and `stack` stays mapped until
+        // after this guard drops.
+        let r = unsafe { libc::sigaltstack(&raw const previous, std::ptr::null_mut()) };
         assert!(
             r >= 0,
             "failed to restore original signal stack: {}",

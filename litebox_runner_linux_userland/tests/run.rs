@@ -1298,6 +1298,12 @@ const DEEP_FORK_CHAIN_DEPTH: u32 = 32;
 /// Runs a deep `fork_chain_parent.c` chain in `mode` and checks that every generation ran.
 #[cfg(target_os = "linux")]
 fn run_deep_fork_chain(mode: &str) {
+    // Copy-based fork never deepens the runner stack, so the chain would pass vacuously.
+    assert!(
+        std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none()
+            && litebox_platform_linux_userland::process::native_fork_supported(),
+        "deep fork-chain tests require native fork support"
+    );
     let name = format!("fork_chain_{mode}");
     let parent = common::compile("./tests/fork_chain_parent.c", &name, true, false);
     let mut runner = Runner::new(&parent, &name);

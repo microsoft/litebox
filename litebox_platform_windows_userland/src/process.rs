@@ -82,53 +82,80 @@ pub unsafe fn exit_fork_child(status: i32) -> ! {
 }
 
 thread_local! {
-    static GUEST_STACK_BASE: Cell<usize> = const { Cell::new(0) };
+    /// An address near the stack pointer at which this thread first entered the guest, or zero if
+    /// it has not. A process clone inherits its forking thread's value.
+    static GUEST_ENTRY_STACK_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
-pub(crate) fn record_guest_stack_base() {
-    if GUEST_STACK_BASE.get() == 0 {
+/// Records the stack depth at which this thread first entered the guest, unless it has already,
+/// directly or as the thread a process clone copied.
+pub(crate) fn record_first_guest_entry_depth() {
+    if GUEST_ENTRY_STACK_DEPTH.get() == 0 {
         let marker = 0u8;
-        GUEST_STACK_BASE.set(core::ptr::from_ref(&marker).addr());
+        GUEST_ENTRY_STACK_DEPTH.set(core::ptr::from_ref(&marker).addr());
     }
 }
 
-/// Runs `f` at the stack depth where this thread first entered the guest, abandoning the
-/// copied runtime frames so successive native fork generations do not deepen the stack.
-/// If the thread has not entered the guest, runs `f` in place.
+/// Continues the calling thread with `f` at the stack depth at which it first entered the guest,
+/// abandoning every frame below that depth and reusing their memory.
+///
+/// A native fork clone's only thread starts on a copy of the stack it forked on, under every frame
+/// of its parent's runtime; continuing there would deepen the stack with each generation of a fork
+/// chain until it overflows. Rewinding to the depth the clone inherits keeps every generation at
+/// the same depth. If the thread never entered the guest, `f` runs in place.
+///
+/// `f` is `'static` because the calling frames' memory is reused.
 ///
 /// # Safety
 ///
-/// The caller must be the sole thread of a newly cloned process. Nothing may subsequently use
-/// the abandoned frames or any frame below the recorded guest-entry depth. The closure must own
-/// everything it needs, since the abandoned stack memory will be reused.
+/// The caller must be the sole thread of a newly cloned process. Nothing may use the calling
+/// frames, or any frame of the thread below the depth at which it first entered the guest,
+/// afterwards.
 pub unsafe fn rewind_stack_and_run<F: FnOnce() -> Infallible + 'static>(f: F) -> ! {
-    let base = GUEST_STACK_BASE.get();
+    let base = GUEST_ENTRY_STACK_DEPTH.get();
     if base == 0 {
         match f() {}
     }
     let f = Box::into_raw(Box::new(f)).cast::<()>();
-    // SAFETY: The recorded address is within this thread's stack and the caller abandons the
-    // frames below it. Align RSP and reserve the Windows x64 ABI's 32-byte shadow space before
-    // calling the non-returning entry point with the owned closure in RCX.
-    unsafe {
-        core::arch::asm!(
-            "mov rsp, {base}",
-            "and rsp, -16",
-            "sub rsp, 32",
-            "call {entry}",
-            "ud2",
-            base = in(reg) base,
-            entry = sym rewound_stack_entry::<F>,
-            in("rcx") f,
-            options(noreturn),
-        )
-    }
+    // SAFETY: The aligned `base` lies within this thread's stack, below the data that outlives its
+    // frames, and the caller guarantees that nothing uses the frames there.
+    // `rewound_stack_entry::<F>` takes `f`, a `Box<F>`.
+    unsafe { switch_stack(base & !0xf, f, rewound_stack_entry::<F>) }
 }
 
+/// Runs `f` on the stack [`rewind_stack_and_run`] rewound.
+///
+/// # Safety
+///
+/// `f` must come from `Box::<F>::into_raw`.
 unsafe extern "C" fn rewound_stack_entry<F: FnOnce() -> Infallible>(f: *mut ()) -> ! {
-    // SAFETY: `rewind_stack_and_run` passes the pointer returned by `Box::<F>::into_raw`.
+    // SAFETY: The caller passes `f` from `Box::<F>::into_raw`.
     let f = unsafe { *Box::from_raw(f.cast::<F>()) };
     match f() {}
+}
+
+/// Moves the stack pointer to `top`, then calls `entry` with `arg`.
+///
+/// # Safety
+///
+/// `top` must be 16-byte aligned, with stack below it that nothing uses, and `entry` must accept
+/// `arg`. Nothing may use the calling frames afterwards.
+#[unsafe(naked)]
+unsafe extern "C" fn switch_stack(
+    top: usize,
+    arg: *mut (),
+    entry: unsafe extern "C" fn(*mut ()) -> !,
+) -> ! {
+    // The Windows x64 ABI passes arguments in RCX, RDX, and R8, and the caller reserves 32 bytes
+    // of shadow space.
+    core::arch::naked_asm!(
+        "mov rsp, rcx",
+        "xor ebp, ebp",
+        "sub rsp, 32",
+        "mov rcx, rdx",
+        "call r8",
+        "ud2",
+    );
 }
 
 impl ProcessHandle for ClonedProcess {
@@ -303,8 +330,8 @@ mod tests {
     #[test]
     fn clones_rewind_to_the_same_depth_in_every_generation() {
         in_forked_child(|| {
-            record_guest_stack_base();
-            let base = GUEST_STACK_BASE.get();
+            record_first_guest_entry_depth();
+            let base = GUEST_ENTRY_STACK_DEPTH.get();
             let payload = String::from("owned bootstrap state");
             deeper(64, &mut || {
                 let payload = payload.clone();
@@ -316,7 +343,7 @@ mod tests {
                             exit_fork_child(1);
                         }
                         deeper(8, &mut || {
-                            record_guest_stack_base();
+                            record_first_guest_entry_depth();
                             deeper(64, &mut || {
                                 let payload = payload.clone();
                                 rewind_stack_and_run(move || {

@@ -178,15 +178,15 @@ impl ProcessHandle for ClonedProcess {
 thread_local! {
     /// An address near the stack pointer at which this thread first entered the guest, or zero if
     /// it has not. A process clone inherits its forking thread's value.
-    static GUEST_STACK_BASE: Cell<usize> = const { Cell::new(0) };
+    static GUEST_ENTRY_STACK_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Records the stack depth at which this thread first entered the guest, unless it has already,
 /// directly or as the thread a process clone copied.
-pub(crate) fn record_guest_stack_base() {
-    if GUEST_STACK_BASE.get() == 0 {
+pub(crate) fn record_first_guest_entry_depth() {
+    if GUEST_ENTRY_STACK_DEPTH.get() == 0 {
         let marker = 0u8;
-        GUEST_STACK_BASE.set(core::ptr::from_ref(&marker).addr());
+        GUEST_ENTRY_STACK_DEPTH.set(core::ptr::from_ref(&marker).addr());
     }
 }
 
@@ -206,7 +206,7 @@ pub(crate) fn record_guest_stack_base() {
 /// frames, or any frame of the thread below the depth at which it first entered the guest,
 /// afterwards.
 pub unsafe fn rewind_stack_and_run<F: FnOnce() -> Infallible + 'static>(f: F) -> ! {
-    let base = GUEST_STACK_BASE.get();
+    let base = GUEST_ENTRY_STACK_DEPTH.get();
     if base == 0 {
         match f() {}
     }
@@ -329,8 +329,8 @@ mod tests {
         const NOT_REWOUND: libc::c_int = 1;
         const DEPTH_CHANGED: libc::c_int = 2;
         let status = in_forked_child(|| {
-            record_guest_stack_base();
-            let base = GUEST_STACK_BASE.get();
+            record_first_guest_entry_depth();
+            let base = GUEST_ENTRY_STACK_DEPTH.get();
             // Each generation starts below the frames of the one before, as a fork does.
             let mut first_generation = || {
                 // SAFETY: The forked child has only this thread, and nothing uses the frames.
@@ -348,7 +348,7 @@ mod tests {
                         // Like a clone bootstrapping, this generation enters the guest deeper than
                         // it started, but the next one inherits the depth it was rewound to.
                         deeper(8, &mut || {
-                            record_guest_stack_base();
+                            record_first_guest_entry_depth();
                             deeper(64, &mut second_generation);
                         });
                         unreachable!()
@@ -365,5 +365,17 @@ mod tests {
             _ => "the rewinding child did not exit normally",
         };
         panic!("{failure} (status {status:#x})");
+    }
+
+    #[test]
+    fn rewind_without_guest_entry_runs_in_place() {
+        let status = in_forked_child(|| {
+            // SAFETY: The forked child has only this thread, and the continuation exits at once.
+            unsafe { rewind_stack_and_run(|| libc::_exit(0)) }
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the in-place child failed (status {status:#x})"
+        );
     }
 }

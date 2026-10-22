@@ -23,6 +23,7 @@ use litebox_broker_transport_windows_userland::existing_runner::{
 
 type Platform = WindowsUserland<{ litebox_common_linux::PAGE_SIZE }>;
 
+#[derive(Clone)]
 struct NativeForkRunner {
     memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
 }
@@ -35,6 +36,29 @@ impl NativeForkRunner {
         // SAFETY: `run_child` abandons the copied task, resets platform state,
         // and reconnects to the broker before running the guest in a fresh shim.
         unsafe { builder.with_native_fork_runner(|memory| Self { memory }) }
+    }
+
+    /// Bootstraps the clone on its rewound stack and runs the guest to its exit.
+    ///
+    /// # Safety
+    ///
+    /// As for [`litebox_shim_linux::syscalls::process::ForkRunner::run_child`].
+    unsafe fn continue_child(&self, control_pipe: std::ffi::OsString) -> ! {
+        // SAFETY: RtlCloneUserProcess cloned only this thread, and this path never returns through
+        // the copied parent task or its registration guard.
+        let status = match unsafe { Platform::prepare_fork_child() }
+            .context("failed to prepare native fork child")
+            .and_then(|()| self.bootstrap_child(&control_pipe))
+        {
+            Ok(status) => status,
+            Err(error) => {
+                litebox_util_log::error!("native fork child bootstrap failed: {error:#}");
+                127
+            }
+        };
+        // Skip CRT and DLL teardown of state copied from the multithreaded parent runtime.
+        // SAFETY: This is a clone whose copied runtime must not be torn down.
+        unsafe { litebox_platform_windows_userland::process::exit_fork_child(status) }
     }
 
     /// Rebuilds the runtime in a clone and returns the guest's exit status.
@@ -106,9 +130,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     }
 
     unsafe fn run_child(&self, control_pipe: std::ffi::OsString) -> ! {
-        let runner = Self {
-            memory: Arc::clone(&self.memory),
-        };
+        let runner = self.clone();
         let continue_child = move || -> core::convert::Infallible {
             // SAFETY: `run_child`'s caller meets `continue_child`'s requirements.
             unsafe { runner.continue_child(control_pipe) }
@@ -118,30 +140,6 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     }
 }
 
-impl NativeForkRunner {
-    /// Bootstraps the clone on its rewound stack and runs the guest to its exit.
-    ///
-    /// # Safety
-    ///
-    /// As for [`litebox_shim_linux::syscalls::process::ForkRunner::run_child`].
-    unsafe fn continue_child(&self, control_pipe: std::ffi::OsString) -> ! {
-        // SAFETY: RtlCloneUserProcess cloned only this thread, and this path never returns through
-        // the copied parent task or its registration guard.
-        let status = match unsafe { Platform::prepare_fork_child() }
-            .context("failed to prepare native fork child")
-            .and_then(|()| self.bootstrap_child(&control_pipe))
-        {
-            Ok(status) => status,
-            Err(error) => {
-                litebox_util_log::error!("native fork child bootstrap failed: {error:#}");
-                127
-            }
-        };
-        // Skip CRT and DLL teardown of state copied from the multithreaded parent runtime.
-        // SAFETY: This is a clone whose copied runtime must not be torn down.
-        unsafe { litebox_platform_windows_userland::process::exit_fork_child(status) }
-    }
-}
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///
 /// The program binary and all its dependencies must be available in the

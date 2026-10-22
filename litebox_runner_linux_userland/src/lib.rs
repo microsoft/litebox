@@ -43,6 +43,7 @@ const NATIVE_FORK_STREAM_FD: RawFd = 3;
 const NATIVE_FORK_POSITIONAL_IO_FDS: [RawFd; 2] = [4, 5];
 /// Shutdown descriptor of a native fork-capable runner.
 const NATIVE_FORK_SHUTDOWN_FD: RawFd = 6;
+#[derive(Clone)]
 struct NativeForkRunner {
     memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
 }
@@ -217,9 +218,7 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             broker_end,
             runner_end,
         } = channel;
-        let runner = Self {
-            memory: Arc::clone(&self.memory),
-        };
+        let runner = self.clone();
         let continue_child = move || -> Infallible {
             // SAFETY: `run_child`'s caller meets `continue_child`'s requirements.
             unsafe { runner.continue_child(broker_end, runner_end) }

@@ -192,7 +192,7 @@ impl Runner {
         self
     }
 
-    /// Caps the launched host's stack, including the default stacks of its new threads.
+    /// Caps `RLIMIT_STACK`, which bounds the main-thread stacks of the launched broker and runners.
     #[cfg(target_os = "linux")]
     pub(crate) fn host_stack_limit(&mut self, bytes: libc::rlim_t) -> &mut Self {
         self.host_stack_limit = Some(bytes);
