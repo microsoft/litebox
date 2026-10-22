@@ -156,10 +156,10 @@ pub trait HostCallLane {
 
 /// Host-side source of the call lanes of an active association.
 ///
-/// The peer starts using lanes as its concurrent calls grow, and this source
-/// hands out each lane once the peer starts using it, so a broker serves only
-/// lanes in use. The peer always uses the first lane, so the first
-/// [`next_lane`](Self::next_lane) returns it without blocking unless the
+/// The local peer starts using lanes as its concurrent calls grow, and this
+/// source hands out each lane once the local peer starts using it, so a broker
+/// serves only lanes in use. The local peer always uses the first lane, so the
+/// first [`next_lane`](Self::next_lane) returns it without blocking unless the
 /// association has already ended.
 pub trait HostCallLaneSource {
     /// Channel-specific error type.
@@ -168,11 +168,11 @@ pub trait HostCallLaneSource {
     /// Lane type handed out by this source.
     type Lane: HostCallLane<Error = Self::Error>;
 
-    /// Blocks until the peer starts using another lane and returns it.
+    /// Blocks until the local peer starts using another lane and returns it.
     ///
     /// Once every lane is handed out, this blocks until the association ends.
-    /// Returns `Ok(None)` when the peer closed the association cleanly. An
-    /// error is terminal: before returning it, the transport must terminate
+    /// Returns `Ok(None)` when the local peer closed the association cleanly.
+    /// An error is terminal: before returning it, the transport must terminate
     /// the association and unblock every endpoint.
     fn next_lane(&mut self) -> Result<Option<Self::Lane>, Self::Error>;
 }
