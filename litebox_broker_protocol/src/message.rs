@@ -7,12 +7,13 @@ use crate::event::{
     CreateEventRequest, CreateEventResponse,
 };
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FileError, FileStatus, FileStatusFlags,
+    ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
     HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
     OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -127,7 +128,9 @@ impl BrokerOperation {
                 | FileRequest::Chown(ChownFileRequest { path: buffer, .. })
                 | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
-                | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
+                | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. })
+                | FileRequest::ReadLink(ReadLinkFileRequest { buffer, .. })
+                | FileRequest::ResolvePath(ResolvePathFileRequest { buffer, .. }),
             )
             | Self::Process(
                 ProcessRequest::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
@@ -744,6 +747,10 @@ pub enum FileRequest {
     Mkdir(MkdirFileRequest),
     /// Remove a directory by path.
     Rmdir(RmdirFileRequest),
+    /// Read a symbolic link's target by path.
+    ReadLink(ReadLinkFileRequest),
+    /// Resolve a path to its physical location.
+    ResolvePath(ResolvePathFileRequest),
 }
 
 /// Broker-owned fs response.
@@ -779,6 +786,10 @@ pub enum FileResponse {
     Mkdir,
     /// Directory removal completed.
     Rmdir,
+    /// Symbolic-link target response.
+    ReadLink(FilePathResponse),
+    /// Resolved-path response.
+    ResolvePath(FilePathResponse),
     /// File operation failed with a guest-visible error.
     Failed(FileError),
 }

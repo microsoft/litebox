@@ -294,6 +294,8 @@ fn path_error(error: PathError) -> Errno {
         PathError::NoSearchPerms => Errno::EACCES,
         PathError::InvalidPathname => Errno::EINVAL,
         PathError::ComponentNotADirectory => Errno::ENOTDIR,
+        // XNU's `namei` and `vn_authorize_open_existing` (`O_NOFOLLOW` on a link) return ELOOP.
+        PathError::TooManySymlinks => Errno::ELOOP,
     }
 }
 
