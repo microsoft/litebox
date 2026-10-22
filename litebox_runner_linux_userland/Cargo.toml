@@ -39,6 +39,10 @@ aarch64_virtualize_x18 = [
     "litebox_platform_linux_userland/aarch64_virtualize_x18",
     "litebox_shim_linux/aarch64_virtualize_x18",
 ]
+# Copy-based fork where native fork is unavailable, at the cost of pointer authentication, which
+# runners then disable. Without it, AArch64 runners keep pointer authentication and fork only
+# natively. This only enables the shim's feature, whose setting the runner follows.
+aarch64_copy_based_fork = ["litebox_shim_linux/aarch64_copy_based_fork"]
 
 [lints]
 workspace = true

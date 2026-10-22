@@ -414,8 +414,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         }
     }
 
-    /// Starts native fork children with the runner `make_runner` creates, replacing the
-    /// copy-based default.
+    /// Starts native fork children with the runner `make_runner` creates, ahead of copy-based
+    /// fork, if available ([`COPY_BASED_FORK`](syscalls::process::COPY_BASED_FORK)).
     ///
     /// `make_runner` receives this shim's memory manager, which a native child inherits and must
     /// pass to [`Self::new_for_native_fork`].
@@ -438,7 +438,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         self.with_fork_launcher(launcher)
     }
 
-    /// Uses `launcher` to start native fork children, replacing the copy-based default.
+    /// Uses `launcher` to start native fork children, ahead of copy-based fork, if available.
     #[must_use]
     pub(crate) fn with_fork_launcher(mut self, launcher: ForkLauncher) -> Self {
         self.fork_launcher = Some(launcher);
@@ -1637,7 +1637,7 @@ struct GlobalState<Platform: ShimPlatform> {
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.
     process_id: i32,
-    /// Native fork launcher, or `None` to use copy-based fork directly.
+    /// Native fork launcher, or `None` to use only copy-based fork, if available.
     fork_launcher: Option<ForkLauncher>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, loader::patch::ElfPatchCache<Platform>>,

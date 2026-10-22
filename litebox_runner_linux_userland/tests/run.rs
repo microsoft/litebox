@@ -1068,6 +1068,15 @@ fn fork_and_vfork_preserve_aarch64_state() {
             .find(|line| line.starts_with(prefix))
             .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
     };
+    // Runners disable pointer authentication only for copy-based fork.
+    let pac_enabled = !litebox_shim_linux::syscalls::process::COPY_BASED_FORK
+        && std::arch::is_aarch64_feature_detected!("paca");
+    let pac_line = line("pac ");
+    assert_eq!(
+        numeric_field(pac_line, "enabled="),
+        i32::from(pac_enabled),
+        "{pac_line}"
+    );
     let fork_line = line("fork ");
     assert_eq!(numeric_field(fork_line, "parent="), 1, "{fork_line}");
     assert_eq!(numeric_field(fork_line, "child="), 1, "{fork_line}");
