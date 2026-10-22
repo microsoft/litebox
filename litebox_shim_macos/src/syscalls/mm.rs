@@ -7,7 +7,12 @@
 //! previously mapped range becomes executable through `mprotect`. Mappings
 //! retain cached rewrite metadata after their descriptors are closed.
 
-use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use core::ops::Range;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
@@ -20,7 +25,7 @@ use litebox::{
 };
 use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, VmFlags, VmemProtectError};
 use litebox_common_macos::{
-    MmapFlags, PAGE_SIZE, VmProtection, errno::Errno, loader::MAX_IMAGE_SIZE,
+    KernReturn, MmapFlags, PAGE_SIZE, VmProtection, errno::Errno, loader::MAX_IMAGE_SIZE,
 };
 use litebox_syscall_rewriter::{macho::CodeMetadata, macho::Rewriter};
 use litebox_trampoline::trampoline_allocation_range;
@@ -239,6 +244,57 @@ struct MmapRequest {
     direction: AllocationDirection,
 }
 
+/// Where [`Task::map_anonymous`] places pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnonymousPlacement {
+    /// Prefer the address hint; otherwise any free range.
+    Hint,
+    /// Exactly at the address, replacing existing mappings or failing.
+    Fixed { replace: bool },
+}
+
+/// Mapped guest ranges whose maximum protection is below `VM_PROT_ALL`,
+/// keyed by start; disjoint. A mapped page without an entry has the maximum
+/// `VM_PROT_ALL`, still bounded by its area's `VM_MAY*` flags. Every change
+/// that replaces or removes mappings updates the entries of its range.
+#[derive(Default)]
+pub(crate) struct MaximumProtections(BTreeMap<usize, (usize, VmProtection)>);
+
+impl MaximumProtections {
+    /// Record `maximum` for `range`, replacing what overlaps it.
+    fn set(&mut self, range: Range<usize>, maximum: VmProtection) {
+        let overlapping: Vec<_> = self
+            .0
+            .range(..range.end)
+            .rev()
+            .take_while(|&(_, &(end, _))| end > range.start)
+            .map(|(&start, &entry)| (start, entry))
+            .collect();
+        for (start, (end, entry_maximum)) in overlapping {
+            self.0.remove(&start);
+            if start < range.start {
+                self.0.insert(start, (range.start, entry_maximum));
+            }
+            if end > range.end {
+                self.0.insert(range.end, (end, entry_maximum));
+            }
+        }
+        if maximum != VmProtection::all() {
+            self.0.insert(range.start, (range.end, maximum));
+        }
+    }
+
+    /// Whether every maximum in `range` allows `protection`, as
+    /// `vm_map_protect_preflight` requires of each entry.
+    fn allows(&self, range: &Range<usize>, protection: VmProtection) -> bool {
+        self.0
+            .range(..range.end)
+            .rev()
+            .take_while(|&(_, &(end, _))| end > range.start)
+            .all(|(_, &(_, maximum))| maximum.contains(protection))
+    }
+}
+
 fn record_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usize>) {
     let mut merged = range;
     let mut remove = Vec::new();
@@ -279,6 +335,37 @@ fn forget_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usi
 }
 
 impl<P: ShimPlatform> Task<P> {
+    /// Drop the maximum protections of the unmapped parts of `range`, after
+    /// a change that may have removed some of its pages. Pages it left
+    /// mapped keep theirs.
+    fn forget_unmapped_maximum_protections(
+        &self,
+        maximums: &mut MaximumProtections,
+        range: Range<usize>,
+    ) {
+        let mut cursor = range.start;
+        for (mapping, _) in self.global.mm.overlapping(range.clone()) {
+            if mapping.start > cursor {
+                maximums.set(cursor..mapping.start, VmProtection::all());
+            }
+            cursor = cursor.max(mapping.end);
+        }
+        if cursor < range.end {
+            maximums.set(cursor..range.end, VmProtection::all());
+        }
+    }
+
+    /// Drop the maximum protections of `range` after an mmap or munmap that
+    /// replaced or removed all of it (`complete`) or failed part way.
+    fn forget_replaced_maximum_protections(&self, range: Range<usize>, complete: bool) {
+        let mut maximums = self.global.maximum_protections.lock();
+        if complete {
+            maximums.set(range, VmProtection::all());
+        } else {
+            self.forget_unmapped_maximum_protections(&mut maximums, range);
+        }
+    }
+
     fn mapping_snapshot(&self, target: Range<usize>) -> Vec<(Range<usize>, VmFlags)> {
         self.global
             .mm
@@ -327,6 +414,57 @@ impl<P: ShimPlatform> Task<P> {
             offset: 0,
             direction,
         })
+    }
+
+    /// Map zero-filled pages for Mach VM. `Fixed { replace: false }` fails
+    /// with `MappingError::MapError(AddressInUse)` (or `...ByPlatform`) if
+    /// any page is already mapped. Later protection changes cannot exceed
+    /// `maximum`, which must contain `protection`.
+    pub(crate) fn map_anonymous(
+        &self,
+        address: usize,
+        length: usize,
+        placement: AnonymousPlacement,
+        protection: VmProtection,
+        maximum: VmProtection,
+    ) -> Result<usize, MappingError> {
+        let length = NonZeroPageSize::new(length).ok_or(MappingError::UnAligned)?;
+        let mut flags = CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY;
+        if let AnonymousPlacement::Fixed { replace } = placement {
+            flags |= CreatePagesFlags::FIXED_ADDR;
+            flags.set(CreatePagesFlags::NOREPLACE, !replace);
+        }
+        let range = address..address.saturating_add(length.as_usize());
+        let replacing = placement == (AnonymousPlacement::Fixed { replace: true });
+        // A failed replacement can still have destroyed the old pages.
+        let before = replacing.then(|| self.mapping_snapshot(range.clone()));
+        // SAFETY: a replacing fixed mapping has Mach's VM_FLAGS_OVERWRITE
+        // semantics; otherwise nothing existing is replaced.
+        let result = unsafe {
+            self.global.mm.create_pages_with_permissions(
+                NonZeroAddress::new(address),
+                length,
+                flags,
+                permissions(protection),
+                None,
+                |_| Ok(0),
+            )
+        };
+        let replaced = result.is_ok()
+            || before.is_some_and(|before| before != self.mapping_snapshot(range.clone()));
+        if replacing && replaced {
+            self.replace_macho_mappings(range.clone(), None);
+        }
+        let mut maximums = self.global.maximum_protections.lock();
+        match &result {
+            Ok(pointer) => {
+                let start = pointer.as_usize();
+                maximums.set(start..start + length.as_usize(), maximum);
+            }
+            Err(_) if replacing => self.forget_unmapped_maximum_protections(&mut maximums, range),
+            Err(_) => {}
+        }
+        Ok(result?.as_usize())
     }
 
     fn mmap(&self, request: MmapRequest) -> Result<usize, Errno> {
@@ -386,6 +524,9 @@ impl<P: ShimPlatform> Task<P> {
                     .is_some_and(|before| *before != self.mapping_snapshot(fixed_range.clone()));
             if flags.contains(MmapFlags::FIXED) && replaced {
                 self.replace_macho_mappings(fixed_range.clone(), None);
+            }
+            if flags.contains(MmapFlags::FIXED) {
+                self.forget_replaced_maximum_protections(fixed_range.clone(), result.is_ok());
             }
             return result
                 .map(|pointer| pointer.as_usize())
@@ -471,6 +612,9 @@ impl<P: ShimPlatform> Task<P> {
                 if flags.contains(MmapFlags::FIXED) && replaced {
                     self.replace_macho_mappings(fixed_range.clone(), None);
                 }
+                if flags.contains(MmapFlags::FIXED) {
+                    self.forget_replaced_maximum_protections(fixed_range.clone(), false);
+                }
                 return Err(
                     initialization_error.map_or_else(|| mapping_error(error), mmap_read_error)
                 );
@@ -492,6 +636,9 @@ impl<P: ShimPlatform> Task<P> {
         });
         if flags.contains(MmapFlags::FIXED) || mapping.is_some() {
             self.replace_macho_mappings(address..address + length.as_usize(), mapping);
+        }
+        if flags.contains(MmapFlags::FIXED) {
+            self.forget_replaced_maximum_protections(fixed_range, true);
         }
         Ok(address)
     }
@@ -1074,13 +1221,84 @@ impl<P: ShimPlatform> Task<P> {
             .ok_or(Errno::EINVAL)?;
         address.checked_add(length).ok_or(Errno::EINVAL)?;
         // SAFETY: Darwin munmap relinquishes the caller-selected guest range.
-        unsafe {
+        let result = unsafe {
             self.global
                 .mm
                 .remove_pages(P::RawMutPointer::from_usize(address), length)
-        }
-        .map_err(|_| Errno::EINVAL)?;
+        };
+        self.forget_replaced_maximum_protections(address..address + length, result.is_ok());
+        result.map_err(|_| Errno::EINVAL)?;
         self.replace_macho_mappings(address..address + length, None);
+        Ok(())
+    }
+
+    /// `vm_map_protect` with `set_max`: lower the maximum protection of the
+    /// page-aligned `range` to `maximum` and each page's current protection
+    /// to what it allows. All or nothing: every page must be mapped
+    /// (`KERN_INVALID_ADDRESS`) and its maximum must allow `maximum`
+    /// (`KERN_PROTECTION_FAILURE`), checked in address order. A range
+    /// overlapping a live runtime trampoline fails closed with
+    /// `KERN_NOT_SUPPORTED`: appending gates makes its unpublished pages RW
+    /// and then RX without consulting recorded maxima.
+    pub(crate) fn set_maximum_protection(
+        &self,
+        range: Range<usize>,
+        maximum: VmProtection,
+    ) -> Result<(), KernReturn> {
+        let requested = permissions(maximum);
+        let trampoline = self
+            .global
+            .macho_trampolines
+            .lock()
+            .values()
+            .filter(|state| !state.invalidated)
+            .filter_map(|state| state.range.as_ref())
+            .any(|trampoline| trampoline.start < range.end && range.start < trampoline.end);
+        if trampoline {
+            self.log_unsupported_once(
+                "mach_vm_protect(set_maximum) of a runtime trampoline",
+                0,
+                format_args!(""),
+            );
+            return Err(KernReturn::NOT_SUPPORTED);
+        }
+        let mut maximums = self.global.maximum_protections.lock();
+        let mappings = self.global.mm.overlapping(range.clone());
+        let mut cursor = range.start;
+        for (mapping, flags) in &mappings {
+            if mapping.start > cursor {
+                return Err(KernReturn::INVALID_ADDRESS);
+            }
+            // VM_MAY% is VM_% << 4.
+            let may = Permissions::from(VmFlags::from_bits_truncate(flags.bits() >> 4));
+            let part = mapping.start.max(range.start)..mapping.end.min(range.end);
+            if !may.contains(requested) || !maximums.allows(&part, maximum) {
+                return Err(KernReturn::PROTECTION_FAILURE);
+            }
+            cursor = mapping.end;
+        }
+        if cursor < range.end {
+            return Err(KernReturn::INVALID_ADDRESS);
+        }
+        // Pages are lowered before the new maximum is recorded, so a host
+        // failure part way never leaves a page above its recorded maximum.
+        for (mapping, flags) in mappings {
+            let current = Permissions::from(flags);
+            if requested.contains(current) {
+                continue;
+            }
+            let part = mapping.start.max(range.start)..mapping.end.min(range.end);
+            // SAFETY: only removes access from guest pages found mapped above.
+            unsafe {
+                self.global.mm.change_page_permissions(
+                    P::RawMutPointer::from_usize(part.start),
+                    part.len(),
+                    current & requested,
+                )
+            }
+            .map_err(|_| KernReturn::FAILURE)?;
+        }
+        maximums.set(range, maximum);
         Ok(())
     }
 
@@ -1100,10 +1318,11 @@ impl<P: ShimPlatform> Task<P> {
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::EINVAL)?;
         let end = address.checked_add(length).ok_or(Errno::EINVAL)?;
+        let range = address..end;
+        self.check_task_memory_protection(range.clone(), protection)?;
         if protection.contains(VmProtection::EXECUTE) {
             self.rewrite_mprotect_range(address, length)?;
         }
-        let range = address..end;
         if protection.contains(VmProtection::WRITE) {
             // Publish writable permissions and invalidate rewrite state while
             // holding the same lock used by executable transitions. Code may
@@ -1120,6 +1339,38 @@ impl<P: ShimPlatform> Task<P> {
             self.change_permissions(range.clone(), protection)?;
             Ok(())
         }
+    }
+
+    /// `vm_map_protect_preflight` for an mprotect of `range`, before anything
+    /// changes and in address order: a hole fails with ENOMEM, a mapping whose
+    /// `VM_MAY*` flags or recorded maximum protection do not allow
+    /// `protection` with EACCES.
+    fn check_task_memory_protection(
+        &self,
+        range: Range<usize>,
+        protection: VmProtection,
+    ) -> Result<(), Errno> {
+        let requested = VmFlags::from_bits_truncate(u32::from(permissions(protection).bits()))
+            & VmFlags::VM_ACCESS_FLAGS;
+        let maximums = self.global.maximum_protections.lock();
+        let mut cursor = range.start;
+        for (mapping, flags) in self.global.mm.overlapping(range.clone()) {
+            if mapping.start > cursor {
+                return Err(Errno::ENOMEM);
+            }
+            let may = VmFlags::from_bits_truncate(flags.bits() >> 4);
+            let part = mapping.start.max(range.start)..mapping.end.min(range.end);
+            if (flags & VmFlags::VM_ACCESS_FLAGS != requested && !may.contains(requested))
+                || !maximums.allows(&part, protection)
+            {
+                return Err(Errno::EACCES);
+            }
+            cursor = mapping.end;
+        }
+        if cursor < range.end {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(())
     }
 }
 
@@ -1352,6 +1603,127 @@ mod tests {
         task.sys_close(0).unwrap();
         task.sys_munmap(first, PAGE_SIZE).unwrap();
         assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    /// A file mapping that replaces pages with MAP_FIXED drops their
+    /// maximum protection, like any other replacement.
+    #[test]
+    fn file_map_fixed_drops_the_maximum_protection_it_replaced() {
+        let task = task_with_file(&macho_image());
+        let rw = VmProtection::READ | VmProtection::WRITE;
+        let address = task
+            .map_anonymous(
+                0,
+                PAGE_SIZE,
+                AnonymousPlacement::Hint,
+                VmProtection::empty(),
+                VmProtection::empty(),
+            )
+            .unwrap();
+        assert_eq!(
+            task.sys_mprotect(address, PAGE_SIZE, rw),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            task.sys_mmap(
+                address,
+                PAGE_SIZE,
+                VmProtection::READ,
+                MmapFlags::PRIVATE | MmapFlags::FIXED,
+                0,
+                0,
+            ),
+            Ok(address)
+        );
+        assert_eq!(task.sys_mprotect(address, PAGE_SIZE, rw), Ok(()));
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    /// A read-only shared file mapping's maximum (no `VM_MAYWRITE`) bounds a
+    /// new maximum too.
+    #[test]
+    fn set_maximum_protection_stays_within_the_mapping_maximum() {
+        let task = task_with_file(&macho_image());
+        let address = task
+            .sys_mmap(0, PAGE_SIZE, VmProtection::READ, MmapFlags::SHARED, 0, 0)
+            .unwrap();
+        let range = address..address + PAGE_SIZE;
+        assert_eq!(
+            task.set_maximum_protection(range.clone(), VmProtection::READ | VmProtection::WRITE),
+            Err(KernReturn::PROTECTION_FAILURE)
+        );
+        assert_eq!(
+            task.set_maximum_protection(range, VmProtection::READ),
+            Ok(())
+        );
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    /// Appending gates makes a runtime trampoline's pages RW and then RX,
+    /// so a maximum is never recorded over them: lowering one fails and
+    /// changes nothing, and a later append still publishes its gates RX.
+    #[test]
+    fn set_maximum_protection_refuses_runtime_trampoline_pages() {
+        let rx = VmProtection::READ | VmProtection::EXECUTE;
+        let task = task_with_file(&macho_image());
+        let first = mmap_with_protection(&task, rx).unwrap();
+        let trampoline = || {
+            let trampolines = task.global.macho_trampolines.lock();
+            let state = trampolines.values().next().unwrap();
+            (state.range.clone().unwrap(), state.cursor)
+        };
+        let (range, cursor) = trampoline();
+        let last_page = range.end - PAGE_SIZE..range.end;
+        assert_eq!(
+            task.set_maximum_protection(last_page, VmProtection::empty()),
+            Err(KernReturn::NOT_SUPPORTED)
+        );
+        assert!(
+            task.global
+                .maximum_protections
+                .lock()
+                .allows(&range, VmProtection::all())
+        );
+        let second = mmap_with_protection(&task, rx).unwrap();
+        assert_eq!(trampoline().0, range);
+        assert!(trampoline().1 > cursor, "no gates were appended");
+        assert_eq!(
+            task.global.mm.get_memory_permissions(
+                NonZeroAddress::new(range.start).unwrap(),
+                NonZeroPageSize::new(range.len()).unwrap(),
+            ),
+            Some(Permissions::READ | Permissions::EXEC),
+        );
+        task.sys_munmap(second, PAGE_SIZE).unwrap();
+        task.sys_munmap(first, PAGE_SIZE).unwrap();
+    }
+
+    /// A replacing Mach allocation whose final protection the host refuses
+    /// (W+X) fails after it destroyed the old mapping, so the old mapping's
+    /// Mach-O tracking goes with it.
+    #[test]
+    fn failed_overwrite_drops_the_macho_tracking_it_destroyed() {
+        let task = task_with_file(&macho_image());
+        let address = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        assert!(task.global.macho_mappings.lock().contains_key(&address));
+        assert!(
+            task.map_anonymous(
+                address,
+                PAGE_SIZE,
+                AnonymousPlacement::Fixed { replace: true },
+                VmProtection::all(),
+                VmProtection::all(),
+            )
+            .is_err()
+        );
+        assert!(
+            task.global
+                .mm
+                .overlapping(address..address + PAGE_SIZE)
+                .is_empty(),
+            "the failed overwrite left the old mapping"
+        );
+        assert!(task.global.macho_mappings.lock().is_empty());
     }
 
     #[test]

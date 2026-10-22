@@ -29,9 +29,12 @@ impl KernReturn {
     pub const INVALID_ARGUMENT: Self = Self(4);
     pub const FAILURE: Self = Self(5);
     pub const RESOURCE_SHORTAGE: Self = Self(6);
+    /// `task_set_special_port` refused a special port the task may not set.
+    pub const NO_ACCESS: Self = Self(8);
     /// A trap's `mach_copyin`/`mach_copyout` of a user argument faulted.
     pub const MEMORY_ERROR: Self = Self(10);
     pub const NAME_EXISTS: Self = Self(13);
+    pub const ABORTED: Self = Self(14);
     pub const INVALID_NAME: Self = Self(15);
     pub const INVALID_TASK: Self = Self(16);
     pub const INVALID_RIGHT: Self = Self(17);
