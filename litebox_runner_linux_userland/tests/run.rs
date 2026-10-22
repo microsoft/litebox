@@ -1290,10 +1290,10 @@ fn orphans_are_adopted_by_subreapers_and_the_initial_process() {
     );
 }
 
-/// Generations in a deep fork chain, beyond the about 260 at which the runner overflowed its
-/// host stack when each native fork clone continued on the stack it forked on.
+/// A 512 KiB host stack makes 32 generations exceed the old native fork stack-growth limit,
+/// without retaining the hundreds of live runtimes needed to exhaust the default 8 MiB stack.
 #[cfg(target_os = "linux")]
-const DEEP_FORK_CHAIN_DEPTH: u32 = 300;
+const DEEP_FORK_CHAIN_DEPTH: u32 = 32;
 
 /// Runs a deep `fork_chain_parent.c` chain in `mode` and checks that every generation ran.
 #[cfg(target_os = "linux")]
@@ -1303,6 +1303,7 @@ fn run_deep_fork_chain(mode: &str) {
     let mut runner = Runner::new(&parent, &name);
     runner
         .allow_process_duplication()
+        .host_stack_limit(512 * 1024)
         .args([mode, DEEP_FORK_CHAIN_DEPTH.to_string().as_str()]);
     let output = String::from_utf8(runner.output()).unwrap();
     let expected = format!("{mode}-chain depth={DEEP_FORK_CHAIN_DEPTH} code=42");

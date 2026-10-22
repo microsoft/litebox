@@ -33,6 +33,8 @@ pub(crate) struct Runner {
     allow_process_duplication: bool,
     #[cfg(target_os = "linux")]
     ignored_host_signals: Vec<libc::c_int>,
+    #[cfg(target_os = "linux")]
+    host_stack_limit: Option<libc::rlim_t>,
     has_run: bool,
 }
 
@@ -109,6 +111,8 @@ impl Runner {
             allow_process_duplication: false,
             #[cfg(target_os = "linux")]
             ignored_host_signals: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_stack_limit: None,
             has_run: false,
             unique_name: unique_name.to_owned(),
         }
@@ -185,6 +189,13 @@ impl Runner {
     #[cfg(target_os = "linux")]
     pub(crate) fn ignore_host_signal(&mut self, signal: libc::c_int) -> &mut Self {
         self.ignored_host_signals.push(signal);
+        self
+    }
+
+    /// Caps the launched host's stack, including the default stacks of its new threads.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn host_stack_limit(&mut self, bytes: libc::rlim_t) -> &mut Self {
+        self.host_stack_limit = Some(bytes);
         self
     }
 
@@ -268,6 +279,28 @@ impl Runner {
             }
             command.args(runner_arguments);
             self.command = command;
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(bytes) = self.host_stack_limit {
+            // SAFETY: The closure only calls async-signal-safe resource-limit functions and
+            // allocates nothing. The limit is inherited across exec by the broker and runners.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut self.command, move || {
+                    let mut limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_STACK, &raw mut limit) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = limit.rlim_cur.min(bytes);
+                    if libc::setrlimit(libc::RLIMIT_STACK, &raw const limit) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
 
         #[cfg(target_os = "linux")]
