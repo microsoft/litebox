@@ -1599,42 +1599,41 @@ thread_local! {
 ///
 /// In a process clone, this adopts the stack the cloned thread had, so a fork chain keeps one.
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
-    let (stack, inherited_previous) = match SIGNAL_ALT_STACK.take() {
+    let (stack, previous) = match SIGNAL_ALT_STACK.take() {
         SignalAltStack::None => {
             let stack = GuardedStack::map(0x1000, libc::SIGSTKSZ * 2, 0).unwrap_or_else(|error| {
                 panic!("failed to allocate memory for alternate signal stack: {error}")
             });
-            (stack, None)
+            let alt_stack = libc::stack_t {
+                ss_sp: stack.bottom(),
+                ss_flags: 0,
+                ss_size: stack.size(),
+            };
+            let mut oss = libc::stack_t {
+                ss_sp: std::ptr::null_mut(),
+                ss_flags: 0,
+                ss_size: 0,
+            };
+            unsafe {
+                let r = libc::sigaltstack(&raw const alt_stack, &raw mut oss);
+                assert!(
+                    r >= 0,
+                    "failed to set up alternate signal stack: {}",
+                    std::io::Error::last_os_error(),
+                );
+            }
+            (stack, oss)
         }
+        // A process clone inherits its thread's alternate signal stack setting, so the adopted
+        // stack is still installed. Restore what the call that mapped it replaced.
         SignalAltStack::Orphaned(record) => {
             // SAFETY: Only `reset_current_thread_after_process_clone` orphans a record, once the
             // call that owned its stack is abandoned, and taking it leaves this call the only owner.
             let stack = unsafe { GuardedStack::from_parts(record.stack) };
-            (stack, Some(record.previous))
+            (stack, record.previous)
         }
         SignalAltStack::Active(_) => panic!("nested with_signal_alt_stack calls are not supported"),
     };
-
-    let alt_stack = libc::stack_t {
-        ss_sp: stack.bottom(),
-        ss_flags: 0,
-        ss_size: stack.size(),
-    };
-    let mut oss = libc::stack_t {
-        ss_sp: std::ptr::null_mut(),
-        ss_flags: 0,
-        ss_size: 0,
-    };
-    unsafe {
-        let r = libc::sigaltstack(&raw const alt_stack, &raw mut oss);
-        assert!(
-            r >= 0,
-            "failed to set up alternate signal stack: {}",
-            std::io::Error::last_os_error(),
-        );
-    }
-    // An adopted stack is still installed, so restore what the call that mapped it replaced.
-    let previous = inherited_previous.unwrap_or(oss);
     SIGNAL_ALT_STACK.set(SignalAltStack::Active(SignalAltStackRecord {
         stack: stack.parts(),
         previous,
