@@ -223,8 +223,6 @@ impl CloneStack {
     /// The caller must be the sole thread of a newly cloned process. Nothing may use the calling
     /// frames afterwards, or anything on the stack the parent process continued on as a clone.
     pub unsafe fn run_freeing_parent_stack<F: FnOnce() -> Infallible + 'static>(self, f: F) -> ! {
-        // This process runs on the mapping from now on; the next generation of a fork chain unmaps
-        // it.
         let stack = core::mem::ManuallyDrop::new(self.0);
         let f = Box::into_raw(Box::new(f)).cast::<()>();
         // SAFETY: `stack.top()` is the 16-byte-aligned end of a fresh stack that nothing uses, and
