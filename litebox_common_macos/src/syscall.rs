@@ -122,6 +122,8 @@ pub mod mach_trap {
     pub const THREAD_SELF: u32 = 27;
     pub const TASK_SELF: u32 = 28;
     pub const HOST_SELF: u32 = 29;
+    pub const SEMAPHORE_SIGNAL: u32 = 33;
+    pub const SEMAPHORE_WAIT: u32 = 36;
     pub const MACH_MSG2: u32 = 47;
     /// `mach_timebase_info(mach_timebase_info_t)`.
     pub const MACH_TIMEBASE_INFO: u32 = 89;
@@ -145,12 +147,47 @@ impl From<MachPortName> for usize {
 }
 
 bitflags::bitflags! {
-    /// Raw Mach VM flags. XNU combines behavioral bits with a VM allocation tag,
-    /// so callers retain unknown bits even though the shim only honors `ANYWHERE`.
+    /// Raw Mach VM flags (`VM_FLAGS_*`). XNU combines behavioral bits with a
+    /// VM allocation tag in the top byte.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MachVmFlags: i32 {
         const ANYWHERE = 0x0000_0001;
+        const PURGABLE = 0x0000_0002;
+        const CHUNK_4GB = 0x0000_0004;
+        const RANDOM_ADDR = 0x0000_0008;
+        const NO_CACHE = 0x0000_0010;
+        const RESILIENT_CODESIGN = 0x0000_0020;
+        const RESILIENT_MEDIA = 0x0000_0040;
+        const PERMANENT = 0x0000_0080;
+        const TPRO = 0x0000_1000;
+        const MTE = 0x0000_2000;
+        const OVERWRITE = 0x0000_4000;
+        const SUPERPAGE_MASK = 0x0007_0000;
+        const RETURN_DATA_ADDR = 0x0010_0000;
+        const GUARD_OBJECT_OPTOUT = 0x0040_0000;
+        const RETURN_4K_DATA_ADDR = 0x0080_0000;
+        const ALIAS_MASK = 0xff00_0000_u32.cast_signed();
     }
+}
+
+impl MachVmFlags {
+    /// `VM_FLAGS_USER_ALLOCATE`: what `mach_vm_allocate` accepts.
+    pub const USER_ALLOCATE: Self = Self::ANYWHERE
+        .union(Self::PURGABLE)
+        .union(Self::CHUNK_4GB)
+        .union(Self::RANDOM_ADDR)
+        .union(Self::NO_CACHE)
+        .union(Self::PERMANENT)
+        .union(Self::OVERWRITE)
+        .union(Self::GUARD_OBJECT_OPTOUT)
+        .union(Self::SUPERPAGE_MASK)
+        .union(Self::TPRO)
+        .union(Self::MTE)
+        .union(Self::ALIAS_MASK);
+    /// `VM_FLAGS_USER_MAP`: what `mach_vm_map` accepts.
+    pub const USER_MAP: Self = Self::USER_ALLOCATE
+        .union(Self::RETURN_4K_DATA_ADDR)
+        .union(Self::RETURN_DATA_ADDR);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -415,6 +452,12 @@ pub enum SyscallRequest {
         priority: u32,
         timeout: u32,
     },
+    SemaphoreSignal {
+        semaphore: MachPortName,
+    },
+    SemaphoreWait {
+        semaphore: MachPortName,
+    },
     SharedRegionCheckNp {
         start_address: UserPtrMut<usize>,
     },
@@ -528,6 +571,12 @@ impl SyscallRequest {
                         timeout: low(7),
                     })
                 }
+                mach_trap::SEMAPHORE_SIGNAL => Ok(Self::SemaphoreSignal {
+                    semaphore: port_arg(0),
+                }),
+                mach_trap::SEMAPHORE_WAIT => Ok(Self::SemaphoreWait {
+                    semaphore: port_arg(0),
+                }),
                 mach_trap::MACH_TIMEBASE_INFO => Ok(Self::MachTimebaseInfo {
                     info: UserPtrMut::from_usize(args[0]),
                 }),

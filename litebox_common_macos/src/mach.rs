@@ -35,7 +35,9 @@ pub mod msg_return {
 
 /// MIG `RetCode` values (`mig_errors.h`).
 pub mod mig {
+    pub const TYPE_ERROR: i32 = -300;
     pub const BAD_ID: i32 = -303;
+    pub const BAD_ARGUMENTS: i32 = -304;
     /// MIG reply ids are the request id plus this.
     pub const REPLY_ID_OFFSET: i32 = 100;
 }

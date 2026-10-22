@@ -6,9 +6,9 @@
 //!
 //! The space follows XNU's `ipc_entry`/`ipc_right` rules. Ports are either
 //! guest ports (a receive right lives in this space and messages queue) or
-//! kernel objects (task, thread, host) whose messages go to [`super::mig`].
-//! Nothing is forwarded to the host: every right names an object owned by
-//! this guest.
+//! kernel objects (task, thread, host, clock, semaphore) served by the typed
+//! MIG server in [`super::mig`]. Nothing is forwarded to the host: every
+//! right names an object owned by this guest.
 
 use super::{mach::INVALID_TASK_DEST, mig};
 use crate::{ShimPlatform, Task};
@@ -35,6 +35,12 @@ pub(crate) enum KernelObject {
     Task,
     Thread,
     Host,
+    /// `SYSTEM_CLOCK` (`REALTIME_CLOCK`) or `CALENDAR_CLOCK`.
+    Clock(mig::ClockId),
+    Semaphore {
+        policy: i32,
+        count: i32,
+    },
 }
 
 #[derive(Debug)]
@@ -270,6 +276,10 @@ pub(crate) struct IpcSpace {
     task: Option<PortId>,
     thread: Option<PortId>,
     host: Option<PortId>,
+    clocks: Vec<(mig::ClockId, PortId)>,
+    /// Settable task special ports (`itk_bootstrap`, ...): a send right held
+    /// by the task, keyed by `TASK_*_PORT` selector.
+    special_ports: BTreeMap<i32, Right>,
     /// Sum of [`Message::charge`] over every queued message plus the slots
     /// every guest port's queue has allocated ([`GuestQueue::storage`]).
     queued_bytes: usize,
@@ -289,8 +299,8 @@ const NAME_GENERATION_STEP: u8 = 0x10;
 /// `ipc_entry_table_count_max()`: `CONFIG_IPC_TABLE_ENTRIES_SIZE_MAX` (7 MiB
 /// on macOS) of 24-byte entries. Index 0 is reserved.
 const NAME_INDEX_LIMIT: u32 = (7 * 1024 * 1024 / 24) as u32;
-/// Live guest ports. Every such port is created with a name, so this matches
-/// the name table limit.
+/// Live guest ports and semaphores. Every such port is created with a name,
+/// so this matches the name table limit.
 const LIVE_PORT_LIMIT: usize = NAME_INDEX_LIMIT as usize;
 /// Host memory all queued messages of this guest may use; past it a send
 /// fails like an `ipc_kmsg_alloc` failure (`MACH_SEND_NO_BUFFER`).
@@ -307,7 +317,7 @@ impl IpcSpace {
         self.next_port
     }
 
-    /// A guest-created port (receive right).
+    /// A guest-created port (receive right or semaphore).
     fn new_port(&mut self, kind: PortKind) -> Result<PortId, KernReturn> {
         if self.ports.len() >= LIVE_PORT_LIMIT {
             return Err(KernReturn::RESOURCE_SHORTAGE);
@@ -397,15 +407,24 @@ impl IpcSpace {
         }
     }
 
-    /// The port of a singleton kernel object.
-    fn kernel_port(&mut self, object: KernelObject) -> PortId {
+    /// The port of a singleton kernel object, or a new semaphore port.
+    fn kernel_port(&mut self, object: KernelObject) -> Result<PortId, KernReturn> {
         let slot = match object {
             KernelObject::Task => &mut self.task,
             KernelObject::Thread => &mut self.thread,
             KernelObject::Host => &mut self.host,
+            KernelObject::Clock(id) => {
+                if let Some((_, port)) = self.clocks.iter().find(|(clock, _)| *clock == id) {
+                    return Ok(*port);
+                }
+                let port = self.insert_port(PortKind::Kernel(object));
+                self.clocks.push((id, port));
+                return Ok(port);
+            }
+            KernelObject::Semaphore { .. } => return self.new_port(PortKind::Kernel(object)),
         };
         if let Some(port) = *slot {
-            return port;
+            return Ok(port);
         }
         self.next_port += 1;
         let port = self.next_port;
@@ -416,7 +435,28 @@ impl IpcSpace {
                 kind: PortKind::Kernel(object),
             },
         );
-        port
+        Ok(port)
+    }
+
+    /// Replace a task special port, releasing the old right.
+    pub(crate) fn set_special_port(&mut self, which: i32, right: Option<Right>) {
+        let old = match right {
+            Some(right) => self.special_ports.insert(which, right),
+            None => self.special_ports.remove(&which),
+        };
+        if let Some(old) = old {
+            self.release(old);
+        }
+    }
+
+    /// A copy of the send right stashed as special port `which`
+    /// (`ipc_port_copy_send`); a dead port reads as a dead name.
+    pub(crate) fn special_port(&self, which: i32) -> Option<Right> {
+        match self.special_ports.get(&which)? {
+            Right::Send(port) if self.port_is_active(*port) => Some(Right::Send(*port)),
+            Right::Send(_) | Right::Dead => Some(Right::Dead),
+            Right::SendOnce(_) | Right::Receive(_) => None,
+        }
     }
 
     pub(crate) fn kernel_object(&self, port: PortId) -> Option<KernelObject> {
@@ -425,6 +465,16 @@ impl IpcSpace {
                 kind: PortKind::Kernel(object),
             }) => Some(*object),
             _ => None,
+        }
+    }
+
+    pub(crate) fn set_kernel_object(&mut self, port: PortId, object: KernelObject) {
+        if let Some(Port {
+            kind: PortKind::Kernel(current),
+            ..
+        }) = self.ports.get_mut(&port)
+        {
+            *current = object;
         }
     }
 
@@ -565,6 +615,12 @@ impl IpcSpace {
         0
     }
 
+    /// A send right to a kernel object, like `task_self_trap` and friends.
+    /// Only a new semaphore can fail, when the port budget is exhausted.
+    pub(crate) fn kernel_send_right(&mut self, object: KernelObject) -> Result<Right, KernReturn> {
+        self.kernel_port(object).map(Right::Send)
+    }
+
     fn allocate_receive(&mut self, qlimit: u32, context: u64) -> Result<u32, KernReturn> {
         let port = self.new_port(PortKind::Guest(GuestQueue {
             messages: VecDeque::new(),
@@ -586,8 +642,9 @@ impl IpcSpace {
         })
     }
 
-    /// Destroy a receive right: the port dies, queued messages are
-    /// destroyed, and other names for it become dead names.
+    /// Destroy a receive right or a kernel object (`semaphore_destroy`): the
+    /// port dies, queued messages are destroyed, and other names for it
+    /// become dead names.
     pub(crate) fn destroy_port(&mut self, port: PortId) {
         self.kill_port(port);
         self.reap();
@@ -1395,8 +1452,10 @@ impl<P: ShimPlatform> Task<P> {
 
     fn self_trap(&self, object: KernelObject) -> usize {
         let mut ipc = self.global.ipc.lock();
-        let port = ipc.kernel_port(object);
-        ipc.copyout_send(port) as usize
+        match ipc.kernel_port(object) {
+            Ok(port) => ipc.copyout_send(port) as usize,
+            Err(_) => 0,
+        }
     }
 
     pub(crate) fn sys_task_self(&self) -> usize {
@@ -2143,6 +2202,16 @@ mod tests {
             space.allocate_receive(MACH_PORT_QLIMIT_DEFAULT, 0),
             Err(KernReturn::RESOURCE_SHORTAGE)
         );
+        assert!(
+            space
+                .kernel_send_right(KernelObject::Semaphore {
+                    policy: 0,
+                    count: 0
+                })
+                .is_err()
+        );
+        // Singleton kernel objects do not count against the budget.
+        assert!(space.kernel_send_right(KernelObject::Task).is_ok());
     }
 
     #[test]
