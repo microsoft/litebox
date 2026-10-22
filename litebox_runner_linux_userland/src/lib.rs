@@ -279,17 +279,21 @@ pub struct CliArgs {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<i32> {
-    // Only out-of-process runners continue forked children.
+    // Only out-of-process runners continue forked children. The shim's own setting decides, as it
+    // may come from the shim's feature alone.
     #[cfg(target_arch = "aarch64")]
-    disable_pointer_authentication();
+    if litebox_shim_linux::syscalls::process::COPY_BASED_FORK {
+        disable_pointer_authentication();
+    }
     run_with_seccomp(cli_args, SeccompScope::AllThreads)
 }
 
 /// Disables pointer-authentication address keys for this thread and threads it creates later.
 ///
-/// A forked child continues in a fresh runner, whose `exec` chose new keys, so return addresses
-/// the parent signed would fail to authenticate. Disabled keys leave pointers unsigned in every
-/// runner. The generic key cannot be disabled.
+/// A copy-based fork child continues in a fresh runner, whose `exec` chose new keys, so return
+/// addresses the parent signed would fail to authenticate. Disabled keys leave pointers unsigned
+/// in every runner. A native fork child inherits its parent's keys, so without copy-based fork
+/// they stay enabled. The generic key cannot be disabled.
 ///
 /// Frames that signed their return address before the call must not return.
 #[cfg(target_arch = "aarch64")]
@@ -368,7 +372,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         )
     })?;
     // A runner whose broker descriptors a clone could not recreate, such as one started from a
-    // process image, uses copy-based fork.
+    // process image, forks only by copying, if available.
     let native_fork_stream_fd = (seccomp_scope == SeccompScope::AllThreads
         && std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none()
         && positional_io_fds == NATIVE_FORK_POSITIONAL_IO_FDS

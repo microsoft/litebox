@@ -28,6 +28,10 @@ rangemap = { version = "1.5.1", default-features = false }
 [features]
 alarm_fallback = []
 aarch64_virtualize_x18 = []
+# Lets AArch64 `fork` copy the process into a fresh runner where it cannot fork natively. That
+# runner's new pointer-authentication keys cannot authenticate return addresses the parent signed,
+# so runners disable pointer authentication if `syscalls::process::COPY_BASED_FORK` is set.
+aarch64_copy_based_fork = []
 
 [dev-dependencies]
 litebox_broker_core = { path = "../litebox_broker_core/", version = "0.1.0", features = ["test-support"] }

@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 // Checks AArch64 state across `fork` and `vfork`: d8 and FPCR survive in the fork child and the
-// vfork parent, and return addresses signed before `fork` authenticate in the child.
+// vfork parent, and return addresses signed before `fork` authenticate in the child. Also reports
+// whether pointer authentication signs pointers.
 
 #define _GNU_SOURCE
 #include <sched.h>
@@ -97,6 +98,28 @@ __attribute__((noinline, target("branch-protection=pac-ret+leaf"))) static long 
     return ret;
 }
 
+// Signs `pointer` with the IA key and `modifier`, or leaves it unchanged if pointer authentication
+// is unsupported or its IA key is disabled.
+static uintptr_t pac_sign(uintptr_t pointer, uintptr_t modifier) {
+    register uintptr_t x17 __asm__("x17") = pointer;
+    register uintptr_t x16 __asm__("x16") = modifier;
+    // PACIA1716, which is in the hint space.
+    __asm__("hint #8" : "+r"(x17) : "r"(x16));
+    return x17;
+}
+
+// Reports whether signing changes a pointer. A PAC field can be as narrow as 7 bits, so a signature
+// matches the unsigned pointer about once in 128 tries; 16 modifiers make that chance 2^-112.
+static int pac_enabled(void) {
+    uintptr_t probe = (uintptr_t)&pac_enabled;
+    for (uintptr_t modifier = 0; modifier < 16; modifier++) {
+        if (pac_sign(probe, modifier) != probe) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int intact(const struct observed *observed) {
     return observed->d8 == D8_MARKER && observed->fpcr == FPCR_MARKER;
 }
@@ -110,6 +133,7 @@ static int wait_exit_code(pid_t child) {
 }
 
 int main(void) {
+    printf("pac enabled=%d\n", pac_enabled());
     uint64_t original_fpcr = read_fpcr();
     fflush(stdout);
 

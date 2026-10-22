@@ -46,6 +46,16 @@ use litebox_common_linux::{
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
 
+/// Whether `fork` copies the process into a fresh runner where it cannot fork natively.
+///
+/// On AArch64 this needs the `aarch64_copy_based_fork` feature: the fresh runner's new
+/// pointer-authentication keys cannot authenticate return addresses the parent signed, so runners
+/// must disable pointer authentication if this is set.
+pub const COPY_BASED_FORK: bool = cfg!(any(
+    not(target_arch = "aarch64"),
+    feature = "aarch64_copy_based_fork"
+));
+
 trait StartRunner: Send + Sync {
     /// Requires the same guarantees as [`ForkLauncher::start`].
     unsafe fn start(
@@ -66,7 +76,8 @@ pub trait ForkRunner<Platform: ProcessProvider>: Send + Sync + 'static {
 
     /// Creates the rendezvous state immediately before forking.
     ///
-    /// Returning [`ForkError::Unsupported`] requests copy-based startup instead.
+    /// Returning [`ForkError::Unsupported`] requests copy-based startup instead, which fails the
+    /// fork without [`COPY_BASED_FORK`].
     fn create_control_channel(&self) -> Result<Self::ControlChannel, ForkError<ProcessError>>;
 
     /// Encodes the child runner's host identity and control endpoint for broker adoption.
@@ -173,8 +184,9 @@ impl ForkLauncher {
 
     /// Starts `child` from the finalized Linux startup payload.
     ///
-    /// `Unsupported` requests copy-based startup before any native child is created or the
-    /// pending child's startup state changes. Other failures propagate without retrying.
+    /// `Unsupported` requests copy-based startup, or fails the fork without [`COPY_BASED_FORK`],
+    /// before any native child is created or the pending child's startup state changes. Other
+    /// failures propagate without retrying.
     ///
     /// # Safety
     ///
@@ -1305,7 +1317,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Only a process outside a `vfork` window, with default resource-limit state, no shared
     /// memory mappings, no ELF file mid-load, and only descriptors a fresh runner can inherit is
-    /// duplicated; otherwise this fails with `EAGAIN`.
+    /// duplicated; otherwise this fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process
+    /// that cannot fork natively is not duplicated either; this fails with `ENOSYS`.
     fn fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1382,6 +1395,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     return Err(Errno::from(error));
                 }
             }
+        }
+        if !COPY_BASED_FORK {
+            log_unsupported!(
+                "fork without native fork; copy-based fork needs the aarch64_copy_based_fork feature"
+            );
+            return Err(Errno::ENOSYS);
         }
         (startup.initial_program_break, startup.program_break) = self.global.mm.program_break();
         startup.regions = self
@@ -3186,7 +3205,9 @@ mod tests {
         use litebox_broker_protocol::message::ProcessRequest;
         use litebox_common_linux::{MapFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};
 
-        let copies_memory = !shared
+        // Without copy-based fork, falling back fails as a launcher failure does.
+        let copies_memory = super::COPY_BASED_FORK
+            && !shared
             && matches!(
                 mode,
                 ForkLauncherMode::Default | ForkLauncherMode::Unsupported
@@ -3282,12 +3303,12 @@ mod tests {
     }
 
     #[test]
-    fn fork_launcher_default_copies_memory_and_starts_fresh_runner() {
+    fn fork_launcher_default_copies_memory_if_copy_based_fork() {
         check_fork_launcher_fallback(ForkLauncherMode::Default, false);
     }
 
     #[test]
-    fn fork_launcher_unsupported_copies_memory_and_starts_fresh_runner() {
+    fn fork_launcher_unsupported_copies_memory_if_copy_based_fork() {
         check_fork_launcher_fallback(ForkLauncherMode::Unsupported, false);
     }
 
@@ -4501,7 +4522,8 @@ mod fork_tests {
         type ControlChannel = u32;
 
         fn create_control_channel(&self) -> Result<u32, ForkError<ProcessError>> {
-            // A runner that cannot prepare its rendezvous requests copy-based startup.
+            // A runner that cannot prepare its rendezvous requests copy-based startup, if
+            // available.
             record(Stage::Channel).map_err(|_| ForkError::Unsupported)?;
             Ok(self.channel)
         }
