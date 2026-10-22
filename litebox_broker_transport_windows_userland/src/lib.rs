@@ -8,7 +8,6 @@
 
 #![cfg(all(windows, target_arch = "x86_64"))]
 
-mod call_lane_pool;
 pub mod control_ring;
 pub mod existing_runner;
 mod host;

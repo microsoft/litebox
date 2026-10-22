@@ -19,7 +19,6 @@
 
 #![cfg(target_os = "linux")]
 
-mod call_lane_pool;
 mod setup;
 
 pub mod existing_runner;
