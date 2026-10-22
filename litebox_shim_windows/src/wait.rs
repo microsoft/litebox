@@ -4,7 +4,7 @@
 //! Wait state management.
 //!
 //! Use a dedicated module to prevent code from accidentally accessing
-//! `wait_state` without going through `wait_on_events()`.
+//! `wait_state` without going through `with_wait_context()`.
 
 use alloc::sync::Weak;
 

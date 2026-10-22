@@ -20,7 +20,7 @@ use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::mm::{
     self, MemoryType, PageProtection, record_allocation, record_committed_allocation,
 };
-use crate::syscalls::{Handle, ProcessHandle};
+use crate::syscalls::{Handle, ProcessHandle, status_from_result};
 use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task, WindowsSectionView};
 
 const VIEW_SHARE: u32 = 1;
@@ -622,14 +622,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         section: Arc<SectionObject<Platform>>,
         granted_access: SectionAccess,
     ) -> NtStatus {
-        match self.write_new_typed_handle::<SectionSubsystem<Platform>>(
+        status_from_result(self.write_new_typed_handle::<SectionSubsystem<Platform>>(
             section_handle,
             SectionHandleObject { section },
             granted_access.bits(),
-        ) {
-            Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
-        }
+        ))
     }
 
     fn map_pagefile_section(
@@ -1553,7 +1550,7 @@ mod tests {
             task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
             NtStatus::SUCCESS
         );
-        task.close_typed_handle::<SectionSubsystem<crate::tests::TestPlatform>>(handle, drop);
+        task.close_typed_handle::<SectionSubsystem<crate::tests::TestPlatform>>(handle);
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -2338,7 +2335,7 @@ mod tests {
                 0x001f_0003,
                 Some(const_ptr(&attrs)),
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );

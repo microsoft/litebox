@@ -320,7 +320,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 fn create_event(task: &Task<TestPlatform>, desired_access: u32) -> Handle {
     let mut handle = Handle::default();
     assert_eq!(
-        task.sys_nt_create_event(mut_ptr(&mut handle), desired_access, None, 0, 0,),
+        task.sys_nt_create_event(mut_ptr(&mut handle), desired_access, None, 0, false,),
         litebox_common_windows::nt_status::NtStatus::SUCCESS
     );
     handle

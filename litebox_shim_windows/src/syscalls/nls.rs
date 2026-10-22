@@ -655,16 +655,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     pub(crate) fn sys_nt_query_default_locale(
         &self,
-        user_profile: u8,
+        user_profile: bool,
         default_locale_id: MutPtr<Platform, u32>,
     ) -> NtStatus {
-        let locale_id = if user_profile == 0 {
+        let locale_id = if user_profile {
             self.process
-                .system_lcid
+                .user_lcid
                 .load(core::sync::atomic::Ordering::Relaxed)
         } else {
             self.process
-                .user_lcid
+                .system_lcid
                 .load(core::sync::atomic::Ordering::Relaxed)
         };
         write_required_output::<Platform, u32>(default_locale_id, locale_id)
@@ -672,16 +672,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     pub(crate) fn sys_nt_set_default_locale(
         &self,
-        user_profile: u8,
+        user_profile: bool,
         default_locale_id: u32,
     ) -> NtStatus {
-        if user_profile == 0 {
+        if user_profile {
             self.process
-                .system_lcid
+                .user_lcid
                 .store(default_locale_id, core::sync::atomic::Ordering::Relaxed);
         } else {
             self.process
-                .user_lcid
+                .system_lcid
                 .store(default_locale_id, core::sync::atomic::Ordering::Relaxed);
         }
         NtStatus::SUCCESS
@@ -1375,12 +1375,12 @@ mod tests {
             let mut locale_id = 0u32;
             let mut language = 0u16;
             assert_eq!(
-                task.sys_nt_query_default_locale(0, mut_ptr(&mut locale_id)),
+                task.sys_nt_query_default_locale(false, mut_ptr(&mut locale_id)),
                 NtStatus::SUCCESS
             );
             assert_eq!(locale_id, host_system_locale);
             assert_eq!(
-                task.sys_nt_query_default_locale(1, mut_ptr(&mut locale_id)),
+                task.sys_nt_query_default_locale(true, mut_ptr(&mut locale_id)),
                 NtStatus::SUCCESS
             );
             assert_eq!(locale_id, host_user_locale);
@@ -1581,14 +1581,17 @@ mod tests {
         let mut language = 0u16;
 
         assert_eq!(
-            task.sys_nt_query_default_locale(0, mut_ptr(&mut locale_id)),
+            task.sys_nt_query_default_locale(false, mut_ptr(&mut locale_id)),
             NtStatus::SUCCESS
         );
         assert_eq!(locale_id, DEFAULT_LOCALE_ID);
 
-        assert_eq!(task.sys_nt_set_default_locale(0, 0x0411), NtStatus::SUCCESS);
         assert_eq!(
-            task.sys_nt_query_default_locale(0, mut_ptr(&mut locale_id)),
+            task.sys_nt_set_default_locale(false, 0x0411),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_query_default_locale(false, mut_ptr(&mut locale_id)),
             NtStatus::SUCCESS
         );
         assert_eq!(locale_id, 0x0411);

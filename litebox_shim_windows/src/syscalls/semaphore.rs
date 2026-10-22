@@ -60,6 +60,14 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     fn normalize_desired_access(desired_access: u32) -> u32 {
         SemaphoreAccess::from_desired_access(desired_access).bits()
     }
+
+    fn waitable_object(
+        entry: &Self::Entry,
+    ) -> Option<crate::syscalls::wait::WaitableObject<Platform>> {
+        Some(crate::syscalls::wait::WaitableObject::Semaphore(
+            alloc::sync::Arc::clone(&entry.semaphore),
+        ))
+    }
 }
 
 pub(crate) struct SemaphoreHandleObject<Platform: crate::ShimPlatform> {
@@ -133,17 +141,16 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         initial_count: i32,
         maximum_count: i32,
     ) -> NtStatus {
-        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(semaphore_handle) {
-            return status;
-        }
-        if maximum_count <= 0 || initial_count < 0 || initial_count > maximum_count {
-            return NtStatus::INVALID_PARAMETER;
-        }
         self.create_named_dispatcher_object(
             semaphore_handle,
             desired_access,
             object_attributes,
-            || Arc::new(SemaphoreObject::new(initial_count, maximum_count)),
+            || {
+                if maximum_count <= 0 || initial_count < 0 || initial_count > maximum_count {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
+                Ok(Arc::new(SemaphoreObject::new(initial_count, maximum_count)))
+            },
             |_| {},
         )
     }

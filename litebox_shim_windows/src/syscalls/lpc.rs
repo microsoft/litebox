@@ -920,9 +920,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             usersrv_backing_base,
             basesrv_backing_base,
         };
-        let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(port, 0, |port| {
-            self.close_lpc_port(port);
-        }) {
+        let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(port, 0) {
             Ok(handle) => handle,
             Err(status) => return status,
         };
@@ -1252,9 +1250,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn close_lpc_port_handle(&self, handle: Handle) {
-        self.close_typed_handle::<LpcPortSubsystem<Platform>>(handle, |port| {
-            self.close_lpc_port(port);
-        });
+        self.close_typed_handle::<LpcPortSubsystem<Platform>>(handle);
     }
 
     pub(crate) fn close_lpc_port(&self, port: LpcPortHandleObject) {

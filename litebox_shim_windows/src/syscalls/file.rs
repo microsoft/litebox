@@ -943,15 +943,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
 
     fn insert_file_handle(&self, file: FileObject<Platform>) -> Result<Handle, NtStatus> {
         let granted_access = file.create_time_access.bits();
-        self.insert_typed_handle::<FileObject<Platform>>(file, granted_access, |file| {
-            self.close_file(file);
-        })
+        self.insert_typed_handle::<FileObject<Platform>>(file, granted_access)
     }
 
     pub(crate) fn close_file_handle(&self, handle: Handle) {
-        self.close_typed_handle::<FileObject<Platform>>(handle, |file| {
-            self.close_file(file);
-        });
+        self.close_typed_handle::<FileObject<Platform>>(handle);
     }
 
     pub(crate) fn close_file(&self, file: FileObject<Platform>) {

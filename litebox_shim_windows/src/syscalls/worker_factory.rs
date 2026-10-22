@@ -434,7 +434,7 @@ mod tests {
         let value = 1;
         let mut event = Handle::default();
         assert_eq!(
-            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, 0),
+            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, false),
             NtStatus::SUCCESS
         );
         assert_eq!(
@@ -559,7 +559,7 @@ mod tests {
         let mut pending_worker_count = 1;
         let mut event = Handle::default();
         assert_eq!(
-            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, 0),
+            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, false),
             NtStatus::SUCCESS
         );
         assert_eq!(
@@ -817,7 +817,7 @@ mod tests {
         assert_eq!(status, NtStatus::SUCCESS.as_raw());
         let mut shim_event = Handle::default();
         assert_eq!(
-            task.sys_nt_create_event(mut_ptr(&mut shim_event), EVENT_ALL_ACCESS, None, 0, 0),
+            task.sys_nt_create_event(mut_ptr(&mut shim_event), EVENT_ALL_ACCESS, None, 0, false),
             NtStatus::SUCCESS
         );
 
@@ -992,7 +992,7 @@ mod tests {
         assert_eq!(status, NtStatus::SUCCESS.as_raw());
         let mut shim_event = Handle::default();
         assert_eq!(
-            task.sys_nt_create_event(mut_ptr(&mut shim_event), EVENT_ALL_ACCESS, None, 0, 0),
+            task.sys_nt_create_event(mut_ptr(&mut shim_event), EVENT_ALL_ACCESS, None, 0, false),
             NtStatus::SUCCESS
         );
 

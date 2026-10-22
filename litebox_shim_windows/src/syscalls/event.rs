@@ -82,6 +82,14 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     fn normalize_desired_access(desired_access: u32) -> u32 {
         EventAccess::from_desired_access(desired_access).bits()
     }
+
+    fn waitable_object(
+        entry: &Self::Entry,
+    ) -> Option<crate::syscalls::wait::WaitableObject<Platform>> {
+        Some(crate::syscalls::wait::WaitableObject::Event(
+            alloc::sync::Arc::clone(&entry.event),
+        ))
+    }
 }
 
 pub(crate) struct EventHandleObject<Platform: crate::ShimPlatform> {
@@ -197,19 +205,16 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         desired_access: u32,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
         event_type: u32,
-        initial_state: u8,
+        initial_state: bool,
     ) -> NtStatus {
         let Ok(event_type) = EventType::try_from(event_type) else {
             return NtStatus::INVALID_PARAMETER;
         };
-        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(event_handle) {
-            return status;
-        }
         self.create_named_dispatcher_object(
             event_handle,
             desired_access,
             object_attributes,
-            || Arc::new(EventObject::new(event_type, initial_state != 0)),
+            || Ok(Arc::new(EventObject::new(event_type, initial_state))),
             |_| {},
         )
     }
@@ -407,7 +412,7 @@ mod tests {
         let mut handle = Handle::from_raw(usize::MAX);
 
         assert_eq!(
-            task.sys_nt_create_event(mut_ptr(&mut handle), EVENT_ALL_ACCESS, None, 2, 0),
+            task.sys_nt_create_event(mut_ptr(&mut handle), EVENT_ALL_ACCESS, None, 2, false),
             NtStatus::INVALID_PARAMETER
         );
         assert_eq!(handle, Handle::from_raw(usize::MAX));
@@ -423,7 +428,7 @@ mod tests {
                 EVENT_ALL_ACCESS,
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -469,7 +474,7 @@ mod tests {
                 EVENT_ALL_ACCESS,
                 None,
                 EventType::Synchronization as u32,
-                1,
+                true,
             ),
             NtStatus::SUCCESS
         );
@@ -509,7 +514,7 @@ mod tests {
                 EVENT_ALL_ACCESS,
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -550,7 +555,7 @@ mod tests {
                 EVENT_QUERY_STATE,
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -561,7 +566,7 @@ mod tests {
                 EVENT_MODIFY_STATE,
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -601,7 +606,7 @@ mod tests {
                 EVENT_ALL_ACCESS,
                 Some(const_ptr(&attrs)),
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -681,7 +686,7 @@ mod tests {
                 EVENT_ALL_ACCESS,
                 Some(const_ptr(&attrs)),
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -692,7 +697,7 @@ mod tests {
                 EVENT_ALL_ACCESS,
                 Some(const_ptr(&attrs)),
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::OBJECT_NAME_COLLISION
         );
@@ -702,11 +707,66 @@ mod tests {
                 EVENT_MODIFY_STATE,
                 Some(const_ptr(&openif_attrs)),
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::OBJECT_NAME_EXISTS
         );
         assert_eq!(task.sys_nt_set_event(collision, None), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn create_openif_returns_existing_event_and_ignores_new_initial_state() {
+        let task = test_task();
+        let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxOpenIfShared");
+        let name = unicode_string(&name_units);
+        let openif_attrs = object_attributes(
+            &name,
+            (ObjectAttributesFlags::CASE_INSENSITIVE | ObjectAttributesFlags::OPENIF).bits(),
+        );
+        let query_state = |handle| {
+            let mut info = EventBasicInformation {
+                event_type: 0,
+                event_state: 0,
+            };
+            assert_eq!(
+                task.sys_nt_query_event(
+                    handle,
+                    EventInformationClass::Basic as u32,
+                    mut_ptr(&mut info),
+                    event_basic_information_size(),
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            (info.event_type, info.event_state)
+        };
+
+        let mut created = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_event(
+                mut_ptr(&mut created),
+                EVENT_ALL_ACCESS,
+                Some(const_ptr(&openif_attrs)),
+                EventType::Notification as u32,
+                false,
+            ),
+            NtStatus::SUCCESS
+        );
+        let mut reopened = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_event(
+                mut_ptr(&mut reopened),
+                EVENT_ALL_ACCESS,
+                Some(const_ptr(&openif_attrs)),
+                EventType::Synchronization as u32,
+                true,
+            ),
+            NtStatus::OBJECT_NAME_EXISTS
+        );
+        assert_eq!(query_state(reopened), (EventType::Notification as u32, 0));
+
+        assert_eq!(task.sys_nt_set_event(reopened, None), NtStatus::SUCCESS);
+        assert_eq!(query_state(created), (EventType::Notification as u32, 1));
     }
 
     #[test]
@@ -719,7 +779,7 @@ mod tests {
                 EVENT_ALL_ACCESS,
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -856,7 +916,7 @@ mod tests {
                 EVENT_ALL_ACCESS,
                 None,
                 EventType::Notification as u32,
-                1,
+                true,
             );
             assert_status_eq(shim_create_status, host_create_status);
             let (shim_query_status, shim_info, shim_length) = shim_query_event(&task, shim_handle);
@@ -897,7 +957,7 @@ mod tests {
                     EVENT_ALL_ACCESS,
                     None,
                     EventType::Notification as u32,
-                    0,
+                    false,
                 ),
                 NtStatus::SUCCESS
             );
@@ -960,7 +1020,7 @@ mod tests {
                     EVENT_ALL_ACCESS,
                     None,
                     EventType::Synchronization as u32,
-                    0,
+                    false,
                 ),
                 NtStatus::SUCCESS
             );
@@ -1016,7 +1076,7 @@ mod tests {
                 EVENT_ALL_ACCESS,
                 Some(const_ptr(&attributes)),
                 EventType::Notification as u32,
-                0,
+                false,
             );
             assert_status_eq(shim_create_status, host_create_status);
             let mut shim_opened = Handle::default();
@@ -1034,6 +1094,76 @@ mod tests {
             assert_queries_match(&task, host_created, shim_created);
 
             close_host_handle(host_opened);
+            close_host_handle(host_created);
+        }
+
+        #[test]
+        fn openif_create_of_existing_event_matches_host() {
+            let unique = 0u8;
+            let name_units = utf16_units(&alloc::format!(
+                r"\BaseNamedObjects\LiteBoxEventOpenIfFidelity{:p}",
+                &unique,
+            ));
+            let name = unicode_string(&name_units);
+            let attributes = object_attributes(
+                &name,
+                (ObjectAttributesFlags::CASE_INSENSITIVE | ObjectAttributesFlags::OPENIF).bits(),
+            );
+
+            let mut host_created = core::ptr::null_mut();
+            let mut host_reopened = core::ptr::null_mut();
+            // SAFETY: Pointers reference live stack locals and ObjectAttributes points to a live
+            // UnicodeString naming a BaseNamedObjects event for the duration of the calls.
+            let (host_create_status, host_reopen_status) = unsafe {
+                (
+                    NtCreateEvent(
+                        &raw mut host_created,
+                        EVENT_ALL_ACCESS,
+                        &raw const attributes,
+                        EventType::Notification as u32,
+                        0,
+                    ),
+                    NtCreateEvent(
+                        &raw mut host_reopened,
+                        EVENT_ALL_ACCESS,
+                        &raw const attributes,
+                        EventType::Synchronization as u32,
+                        1,
+                    ),
+                )
+            };
+
+            let task = test_task();
+            let mut shim_created = Handle::default();
+            let mut shim_reopened = Handle::default();
+            assert_status_eq(
+                task.sys_nt_create_event(
+                    mut_ptr(&mut shim_created),
+                    EVENT_ALL_ACCESS,
+                    Some(const_ptr(&attributes)),
+                    EventType::Notification as u32,
+                    false,
+                ),
+                host_create_status,
+            );
+            assert_status_eq(
+                task.sys_nt_create_event(
+                    mut_ptr(&mut shim_reopened),
+                    EVENT_ALL_ACCESS,
+                    Some(const_ptr(&attributes)),
+                    EventType::Synchronization as u32,
+                    true,
+                ),
+                host_reopen_status,
+            );
+            assert_queries_match(&task, host_reopened, shim_reopened);
+
+            // SAFETY: `host_reopened` is a live event handle with EVENT_ALL_ACCESS.
+            let host_set_status = unsafe { NtSetEvent(host_reopened, core::ptr::null_mut()) };
+            assert_status_eq(task.sys_nt_set_event(shim_reopened, None), host_set_status);
+            assert_queries_match(&task, host_created, shim_created);
+
+            close_host_handle(host_reopened);
             close_host_handle(host_created);
         }
     }

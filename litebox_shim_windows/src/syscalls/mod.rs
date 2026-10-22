@@ -41,6 +41,14 @@ pub(crate) enum WaitAcquireResult {
     Abandoned,
 }
 
+/// Returns `SUCCESS` for `Ok(())` and the failure status otherwise.
+pub(crate) fn status_from_result(result: Result<(), NtStatus>) -> NtStatus {
+    match result {
+        Ok(()) => NtStatus::SUCCESS,
+        Err(status) => status,
+    }
+}
+
 const FIRST_STACK_ARGUMENT_OFFSET: usize = 0x28;
 const HANDLE_SHIFT: u32 = 2;
 const HANDLE_TAG_MASK: usize = (1usize << HANDLE_SHIFT) - 1;
@@ -207,6 +215,31 @@ impl ReinterpretTruncatedFromUsize for isize {
 impl ReinterpretTruncatedFromUsize for NtStatus {
     fn reinterpret_truncated_from_usize(value: usize) -> Self {
         Self::from_raw(value.trunc())
+    }
+}
+
+/// A Windows `BOOLEAN` argument: only the low byte is significant.
+impl ReinterpretTruncatedFromUsize for bool {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self {
+        u8::reinterpret_truncated_from_usize(value) != 0
+    }
+}
+
+impl ReinterpretTruncatedFromUsize for Handle {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self {
+        Self::from_raw(value)
+    }
+}
+
+impl ReinterpretTruncatedFromUsize for ProcessHandle {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self {
+        Self::from_raw(value)
+    }
+}
+
+impl ReinterpretTruncatedFromUsize for ThreadHandle {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self {
+        Self::from_raw(value)
     }
 }
 

@@ -131,7 +131,7 @@ pub(crate) struct WnfCreateStateNameParameters<Platform: litebox::platform::RawP
     pub(crate) state_name: MutPtr<Platform, u64>,
     pub(crate) name_lifetime: u32,
     pub(crate) data_scope: u32,
-    pub(crate) persist_data: u8,
+    pub(crate) persist_data: bool,
     pub(crate) type_id: Option<ConstPtr<Platform, Guid>>,
     pub(crate) maximum_state_size: u32,
     pub(crate) security_descriptor: ConstPtr<Platform, u8>,
@@ -370,7 +370,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             WnfStateNameLifetime::Temporary => {}
         }
-        if data_scope == WnfDataScope::Process || params.persist_data != 0 {
+        if data_scope == WnfDataScope::Process || params.persist_data {
             return NtStatus::INVALID_PARAMETER;
         }
 
@@ -694,7 +694,7 @@ mod tests {
                 state_name: mut_ptr(&mut state_name),
                 name_lifetime: WnfStateNameLifetime::Temporary as u32,
                 data_scope: WnfDataScope::Machine as u32,
-                persist_data: 0,
+                persist_data: false,
                 type_id: type_id.as_ref().map(const_ptr),
                 maximum_state_size,
                 security_descriptor: const_ptr(&SECURITY_DESCRIPTOR_REVISION),
@@ -749,7 +749,7 @@ mod tests {
                 EventAccess::QUERY_STATE.bits(),
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -765,7 +765,7 @@ mod tests {
                 EventAccess::ALL_ACCESS.bits(),
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -791,7 +791,7 @@ mod tests {
                 EventAccess::ALL_ACCESS.bits(),
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -840,7 +840,7 @@ mod tests {
                 EventAccess::ALL_ACCESS.bits(),
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );

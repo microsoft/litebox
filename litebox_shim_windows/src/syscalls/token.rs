@@ -514,13 +514,12 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             },
             TokenAccess::from_desired_access(desired_access).bits(),
             attributes,
-            drop,
         ) {
             Ok(handle) => handle,
             Err(status) => return status,
         };
         if token_handle.write_at_offset(0, handle).is_none() {
-            self.close_token_handle(handle);
+            self.close_typed_handle::<TokenSubsystem>(handle);
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
@@ -910,10 +909,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
-    }
-
-    pub(crate) fn close_token_handle(&self, handle: Handle) {
-        self.close_typed_handle::<TokenSubsystem>(handle, drop);
     }
 }
 

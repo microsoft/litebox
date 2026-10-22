@@ -69,7 +69,7 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
 }
 
 pub(crate) struct IoCompletionHandleObject<Platform: crate::ShimPlatform> {
-    pub(crate) port: Arc<IoCompletionObject<Platform>>,
+    pub(super) port: Arc<IoCompletionObject<Platform>>,
 }
 
 pub(crate) struct IoCompletionObject<Platform: crate::ShimPlatform> {
@@ -260,16 +260,15 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
         number_of_concurrent_threads: u32,
     ) -> NtStatus {
-        if let Err(status) =
-            probe_guest_output_preserving_value::<Platform, _>(io_completion_handle)
-        {
-            return status;
-        }
         self.create_named_dispatcher_object(
             io_completion_handle,
             desired_access,
             object_attributes,
-            || Arc::new(IoCompletionObject::new(number_of_concurrent_threads)),
+            || {
+                Ok(Arc::new(IoCompletionObject::new(
+                    number_of_concurrent_threads,
+                )))
+            },
             |_| {},
         )
     }

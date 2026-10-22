@@ -98,6 +98,14 @@ impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem<Platform> for ThreadS
     fn normalize_desired_access(desired_access: u32) -> u32 {
         ThreadAccess::from_desired_access(desired_access).bits()
     }
+
+    fn waitable_object(
+        entry: &Self::Entry,
+    ) -> Option<crate::syscalls::wait::WaitableObject<Platform>> {
+        Some(crate::syscalls::wait::WaitableObject::Thread(Arc::clone(
+            &entry.thread,
+        )))
+    }
 }
 
 pub(crate) struct ThreadHandleObject<Platform: ShimPlatform> {
@@ -158,7 +166,7 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
         Self::new_with_suspend_count(thread_id, teb_address, 0)
     }
 
-    pub(crate) fn new_suspended(thread_id: usize, teb_address: usize) -> Self {
+    fn new_suspended(thread_id: usize, teb_address: usize) -> Self {
         Self::new_with_suspend_count(thread_id, teb_address, 1)
     }
 
@@ -561,7 +569,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 thread: thread.clone(),
             },
             granted_access.bits(),
-            drop,
         ) {
             Ok(handle) => handle,
             Err(status) => {
@@ -596,7 +603,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )
         } {
             litebox_util_log::error!(error:% = error; "Failed to spawn Windows guest thread");
-            self.close_typed_handle::<ThreadSubsystem<Platform>>(handle, drop);
+            self.close_typed_handle::<ThreadSubsystem<Platform>>(handle);
             self.process.detach_thread(thread_id);
             let litebox_thread = litebox_thread
                 .lock()
@@ -935,7 +942,6 @@ mod tests {
                         thread: Arc::clone(&child.thread_object),
                     },
                     AccessMask::SYNCHRONIZE.bits(),
-                    drop,
                 )
                 .expect("thread handle insertion should succeed");
             let child = WindowsShimEntrypoints {
@@ -1161,7 +1167,6 @@ mod tests {
                         thread: Arc::clone(&suspended_thread),
                     },
                     ThreadAccess::SUSPEND_RESUME.bits(),
-                    drop,
                 )
                 .unwrap();
             let handle = ThreadHandle::from_raw(handle.as_raw());

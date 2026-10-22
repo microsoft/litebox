@@ -297,7 +297,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_cancel_wait_completion_packet(
         &self,
         wait_completion_packet_handle: Handle,
-        remove_signaled_packet: u8,
+        remove_signaled_packet: bool,
     ) -> NtStatus {
         let entry = match self
             .typed_handle_entry_with_access::<WaitCompletionPacketSubsystem<Platform>>(
@@ -313,7 +313,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let Some(current_association) = *association else {
             return NtStatus::CANCELLED;
         };
-        if current_association.already_signaled && remove_signaled_packet == 0 {
+        if current_association.already_signaled && !remove_signaled_packet {
             return NtStatus::PENDING;
         }
 
@@ -383,13 +383,7 @@ mod tests {
         desired_access: u32,
         initial_state: bool,
     ) -> NtStatus {
-        task.sys_nt_create_event(
-            mut_ptr(handle),
-            desired_access,
-            None,
-            0,
-            u8::from(initial_state),
-        )
+        task.sys_nt_create_event(mut_ptr(handle), desired_access, None, 0, initial_state)
     }
 
     fn create_timer(
@@ -430,7 +424,7 @@ mod tests {
         packet: Handle,
         remove_signaled_packet: bool,
     ) -> NtStatus {
-        task.sys_nt_cancel_wait_completion_packet(packet, u8::from(remove_signaled_packet))
+        task.sys_nt_cancel_wait_completion_packet(packet, remove_signaled_packet)
     }
 
     #[test]
