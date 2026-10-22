@@ -1248,6 +1248,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     pub fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
         let entry = self.litebox.descriptor_table().entry_handle(fd)?;
         let entry = entry.get_entry();
+        if entry.entry.path_only || !entry.entry.read_allowed {
+            return None;
+        }
         match &entry.entry.handle {
             Handle::File(file) => self.backend.get_static_backing_data(file),
             Handle::Dir(_) => None,
