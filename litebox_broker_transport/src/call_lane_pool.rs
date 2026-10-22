@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Local-side admission of concurrent calls to call lanes, for hosted peers.
+//! Local-side admission of concurrent calls to call lanes.
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
