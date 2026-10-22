@@ -1940,6 +1940,7 @@ dependencies = [
  "litebox_common_macos",
  "litebox_platform",
  "litebox_trampoline",
+ "rangemap",
  "zerocopy",
 ]
 
