@@ -21,13 +21,13 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString};
 use crate::syscalls::Handle;
-use crate::syscalls::event::EventObject;
-use crate::syscalls::iocp::IoCompletionObject;
-use crate::syscalls::mutant::MutantObject;
+use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
+use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionObject, IoCompletionSubsystem};
+use crate::syscalls::mutant::{MutantHandleObject, MutantObject, MutantSubsystem};
 use crate::syscalls::section::{
     SectionObject, WINDOWS_SESSION_SHARED_SECTION_OBJECT, WINDOWS_SHARED_SECTION_OBJECT,
 };
-use crate::syscalls::semaphore::SemaphoreObject;
+use crate::syscalls::semaphore::{SemaphoreHandleObject, SemaphoreObject, SemaphoreSubsystem};
 use crate::{
     ConstPtr, MutPtr, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
 };
@@ -226,6 +226,58 @@ enum NamedObject<Platform: crate::ShimPlatform> {
         device: FileDeviceObject,
     },
     Port,
+}
+
+/// A dispatcher object type that `NtCreate*` can create in, and `NtOpen*` can open from, the
+/// object namespace.
+pub(super) trait NamedDispatcherObject<Platform: crate::ShimPlatform>: Sized {
+    /// The handle subsystem that handles to this object belong to.
+    type Subsystem: crate::WindowsHandleSubsystem<Platform>;
+
+    fn handle_entry(object: Arc<Self>) -> <Self::Subsystem as FdEnabledSubsystem>::Entry;
+
+    fn lookup(node: &Arc<ObjectNode<Platform>>) -> ObjectLeafLookup<Arc<Self>>;
+
+    fn new_node(
+        path: String,
+        parent: Option<Weak<ObjectNode<Platform>>>,
+        name: String,
+        object: Weak<Self>,
+    ) -> ObjectNode<Platform>;
+}
+
+macro_rules! named_dispatcher_objects {
+    ($($object:ident: $subsystem:ident, $handle_object:ident { $field:ident }, $lookup:ident, $new_node:ident;)+) => {
+        $(
+            impl<Platform: crate::ShimPlatform> NamedDispatcherObject<Platform> for $object<Platform> {
+                type Subsystem = $subsystem<Platform>;
+
+                fn handle_entry(object: Arc<Self>) -> $handle_object<Platform> {
+                    $handle_object { $field: object }
+                }
+
+                fn lookup(node: &Arc<ObjectNode<Platform>>) -> ObjectLeafLookup<Arc<Self>> {
+                    node.$lookup()
+                }
+
+                fn new_node(
+                    path: String,
+                    parent: Option<Weak<ObjectNode<Platform>>>,
+                    name: String,
+                    object: Weak<Self>,
+                ) -> ObjectNode<Platform> {
+                    ObjectNode::$new_node(path, parent, name, object)
+                }
+            }
+        )+
+    };
+}
+
+named_dispatcher_objects! {
+    EventObject: EventSubsystem, EventHandleObject { event }, event_object, new_event;
+    IoCompletionObject: IoCompletionSubsystem, IoCompletionHandleObject { port }, io_completion_object, new_io_completion;
+    MutantObject: MutantSubsystem, MutantHandleObject { mutant }, mutant_object, new_mutant;
+    SemaphoreObject: SemaphoreSubsystem, SemaphoreHandleObject { semaphore }, semaphore_object, new_semaphore;
 }
 
 pub(super) enum ObjectLeafLookup<T> {
@@ -538,72 +590,18 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         )
     }
 
-    pub(super) fn create_event(
+    pub(super) fn create_dispatcher_object<Object: NamedDispatcherObject<Platform>>(
         &self,
         path: &str,
-        event: &Arc<EventObject<Platform>>,
-        on_exists: impl FnOnce(Arc<EventObject<Platform>>) -> NtStatus,
+        object: &Arc<Object>,
+        on_exists: impl FnOnce(Arc<Object>) -> NtStatus,
         on_created: impl FnOnce() -> NtStatus,
     ) -> NtStatus {
-        let event = Arc::downgrade(event);
+        let object = Arc::downgrade(object);
         self.create_child(
             path,
-            |node| node.event_object(),
-            |path, parent, name| ObjectNode::new_event(path, parent, name, event),
-            NtStatus::OBJECT_TYPE_MISMATCH,
-            on_exists,
-            |_| on_created(),
-        )
-    }
-
-    pub(super) fn create_io_completion(
-        &self,
-        path: &str,
-        io_completion: &Arc<IoCompletionObject<Platform>>,
-        on_exists: impl FnOnce(Arc<IoCompletionObject<Platform>>) -> NtStatus,
-        on_created: impl FnOnce() -> NtStatus,
-    ) -> NtStatus {
-        let io_completion = Arc::downgrade(io_completion);
-        self.create_child(
-            path,
-            |node| node.io_completion_object(),
-            |path, parent, name| ObjectNode::new_io_completion(path, parent, name, io_completion),
-            NtStatus::OBJECT_TYPE_MISMATCH,
-            on_exists,
-            |_| on_created(),
-        )
-    }
-
-    pub(super) fn create_mutant(
-        &self,
-        path: &str,
-        mutant: &Arc<MutantObject<Platform>>,
-        on_exists: impl FnOnce(Arc<MutantObject<Platform>>) -> NtStatus,
-        on_created: impl FnOnce() -> NtStatus,
-    ) -> NtStatus {
-        let mutant = Arc::downgrade(mutant);
-        self.create_child(
-            path,
-            |node| node.mutant_object(),
-            |path, parent, name| ObjectNode::new_mutant(path, parent, name, mutant),
-            NtStatus::OBJECT_TYPE_MISMATCH,
-            on_exists,
-            |_| on_created(),
-        )
-    }
-
-    pub(super) fn create_semaphore(
-        &self,
-        path: &str,
-        semaphore: &Arc<SemaphoreObject<Platform>>,
-        on_exists: impl FnOnce(Arc<SemaphoreObject<Platform>>) -> NtStatus,
-        on_created: impl FnOnce() -> NtStatus,
-    ) -> NtStatus {
-        let semaphore = Arc::downgrade(semaphore);
-        self.create_child(
-            path,
-            |node| node.semaphore_object(),
-            |path, parent, name| ObjectNode::new_semaphore(path, parent, name, semaphore),
+            Object::lookup,
+            |path, parent, name| Object::new_node(path, parent, name, object),
             NtStatus::OBJECT_TYPE_MISMATCH,
             on_exists,
             |_| on_created(),
@@ -735,29 +733,11 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         })
     }
 
-    pub(super) fn resolve_event(&self, path: &str) -> Result<Arc<EventObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| node.event_object())
-    }
-
-    pub(super) fn resolve_io_completion(
+    pub(super) fn resolve_dispatcher_object<Object: NamedDispatcherObject<Platform>>(
         &self,
         path: &str,
-    ) -> Result<Arc<IoCompletionObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| node.io_completion_object())
-    }
-
-    pub(super) fn resolve_mutant(
-        &self,
-        path: &str,
-    ) -> Result<Arc<MutantObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| node.mutant_object())
-    }
-
-    pub(super) fn resolve_semaphore(
-        &self,
-        path: &str,
-    ) -> Result<Arc<SemaphoreObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| node.semaphore_object())
+    ) -> Result<Arc<Object>, NtStatus> {
+        self.resolve_object_leaf(path, false, Object::lookup)
     }
 
     pub(super) fn resolve_section(
@@ -1317,6 +1297,99 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             object_attributes,
             name.map(|DirectoryName { original_path }| original_path),
         ))
+    }
+
+    /// Implements `NtCreate*` for a named dispatcher object after the caller has probed `output`
+    /// and validated its type-specific arguments.
+    ///
+    /// A new object is created by `new_object`. If the name already exists, the existing object is
+    /// opened when `OBJ_OPENIF` allows it. `on_created` runs only after a handle to a newly created
+    /// object has been written to `output`.
+    pub(super) fn create_named_dispatcher_object<Object: NamedDispatcherObject<Platform>>(
+        &self,
+        output: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        new_object: impl FnOnce() -> Arc<Object>,
+        on_created: impl FnOnce(&Arc<Object>),
+    ) -> NtStatus {
+        let (object_attributes, name) =
+            match self.read_dispatcher_object_attributes(object_attributes, false) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+        let granted_access =
+            <Object::Subsystem as crate::WindowsHandleSubsystem<Platform>>::normalize_desired_access(
+                desired_access,
+            );
+        let write_handle = |object: Arc<Object>| {
+            self.write_new_typed_handle::<Object::Subsystem>(
+                output,
+                Object::handle_entry(object),
+                granted_access,
+            )
+        };
+        let write_created_handle = |object: Arc<Object>| match write_handle(Arc::clone(&object)) {
+            Ok(()) => {
+                on_created(&object);
+                NtStatus::SUCCESS
+            }
+            Err(status) => status,
+        };
+
+        let object = new_object();
+        let Some(name) = name else {
+            return write_created_handle(object);
+        };
+        self.process.object_manager.create_dispatcher_object(
+            &name,
+            &object,
+            |existing| {
+                if let Err(status) = check_open_existing_object(object_attributes) {
+                    return status;
+                }
+                match write_handle(existing) {
+                    Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
+                    Err(status) => status,
+                }
+            },
+            || write_created_handle(Arc::clone(&object)),
+        )
+    }
+
+    /// Implements `NtOpen*` for a named dispatcher object.
+    pub(super) fn open_named_dispatcher_object<Object: NamedDispatcherObject<Platform>>(
+        &self,
+        output: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+    ) -> NtStatus {
+        if let Err(status) = crate::probe_guest_output_preserving_value::<Platform, _>(output) {
+            return status;
+        }
+        let name = match self.read_dispatcher_object_attributes(object_attributes, true) {
+            Ok((_, Some(name))) => name,
+            Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
+            Err(status) => return status,
+        };
+        let object = match self
+            .process
+            .object_manager
+            .resolve_dispatcher_object::<Object>(&name)
+        {
+            Ok(object) => object,
+            Err(status) => return status,
+        };
+        match self.write_new_typed_handle::<Object::Subsystem>(
+            output,
+            Object::handle_entry(object),
+            <Object::Subsystem as crate::WindowsHandleSubsystem<Platform>>::normalize_desired_access(
+                desired_access,
+            ),
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
     }
 
     fn write_new_directory_handle(

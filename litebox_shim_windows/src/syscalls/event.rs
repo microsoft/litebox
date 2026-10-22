@@ -17,7 +17,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
-use crate::syscalls::object_manager::check_open_existing_object;
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 #[repr(u32)]
@@ -192,19 +191,6 @@ const _: () =
     assert!(size_of::<EventBasicInformation>() == EVENT_BASIC_INFORMATION_SIZE_U32 as usize);
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    fn write_new_event_handle(
-        &self,
-        output: MutPtr<Platform, Handle>,
-        event: Arc<EventObject<Platform>>,
-        granted_access: EventAccess,
-    ) -> Result<(), NtStatus> {
-        self.write_new_typed_handle::<EventSubsystem<Platform>>(
-            output,
-            EventHandleObject { event },
-            granted_access.bits(),
-        )
-    }
-
     pub(crate) fn sys_nt_create_event(
         &self,
         event_handle: MutPtr<Platform, Handle>,
@@ -219,40 +205,13 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(event_handle) {
             return status;
         }
-
-        let (object_attributes, event_name) =
-            match self.read_dispatcher_object_attributes(object_attributes, false) {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-        let granted_access = EventAccess::from_desired_access(desired_access);
-
-        if let Some(event_name) = event_name {
-            let event = Arc::new(EventObject::new(event_type, initial_state != 0));
-            return self.process.object_manager.create_event(
-                &event_name,
-                &event,
-                |event| {
-                    if let Err(status) = check_open_existing_object(object_attributes) {
-                        return status;
-                    }
-                    match self.write_new_event_handle(event_handle, event, granted_access) {
-                        Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
-                        Err(status) => status,
-                    }
-                },
-                || match self.write_new_event_handle(event_handle, event.clone(), granted_access) {
-                    Ok(()) => NtStatus::SUCCESS,
-                    Err(status) => status,
-                },
-            );
-        }
-
-        let event = Arc::new(EventObject::new(event_type, initial_state != 0));
-        match self.write_new_event_handle(event_handle, event, granted_access) {
-            Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
-        }
+        self.create_named_dispatcher_object(
+            event_handle,
+            desired_access,
+            object_attributes,
+            || Arc::new(EventObject::new(event_type, initial_state != 0)),
+            |_| {},
+        )
     }
 
     pub(crate) fn sys_nt_open_event(
@@ -261,27 +220,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         desired_access: u32,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
     ) -> NtStatus {
-        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(event_handle) {
-            return status;
-        }
-        let event_name = match self.read_dispatcher_object_attributes(object_attributes, true) {
-            Ok((_, Some(event_name))) => event_name,
-            Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
-            Err(status) => return status,
-        };
-        let event = match self.process.object_manager.resolve_event(&event_name) {
-            Ok(event) => event,
-            Err(status) => return status,
-        };
-
-        match self.write_new_event_handle(
+        self.open_named_dispatcher_object::<EventObject<Platform>>(
             event_handle,
-            event,
-            EventAccess::from_desired_access(desired_access),
-        ) {
-            Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
-        }
+            desired_access,
+            object_attributes,
+        )
     }
 
     pub(crate) fn sys_nt_set_event(

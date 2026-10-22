@@ -14,7 +14,6 @@ use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
-use crate::syscalls::object_manager::check_open_existing_object;
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
@@ -126,19 +125,6 @@ impl<Platform: crate::ShimPlatform> IOPollable for SemaphoreObject<Platform> {
 }
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    fn write_new_semaphore_handle(
-        &self,
-        output: MutPtr<Platform, Handle>,
-        semaphore: Arc<SemaphoreObject<Platform>>,
-        granted_access: SemaphoreAccess,
-    ) -> Result<(), NtStatus> {
-        self.write_new_typed_handle::<SemaphoreSubsystem<Platform>>(
-            output,
-            SemaphoreHandleObject { semaphore },
-            granted_access.bits(),
-        )
-    }
-
     pub(crate) fn sys_nt_create_semaphore(
         &self,
         semaphore_handle: MutPtr<Platform, Handle>,
@@ -153,48 +139,13 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         if maximum_count <= 0 || initial_count < 0 || initial_count > maximum_count {
             return NtStatus::INVALID_PARAMETER;
         }
-
-        let (object_attributes, semaphore_name) =
-            match self.read_dispatcher_object_attributes(object_attributes, false) {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-        let granted_access = SemaphoreAccess::from_desired_access(desired_access);
-
-        if let Some(semaphore_name) = semaphore_name {
-            let semaphore = Arc::new(SemaphoreObject::new(initial_count, maximum_count));
-            return self.process.object_manager.create_semaphore(
-                &semaphore_name,
-                &semaphore,
-                |semaphore| {
-                    if let Err(status) = check_open_existing_object(object_attributes) {
-                        return status;
-                    }
-                    match self.write_new_semaphore_handle(
-                        semaphore_handle,
-                        semaphore,
-                        granted_access,
-                    ) {
-                        Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
-                        Err(status) => status,
-                    }
-                },
-                || match self.write_new_semaphore_handle(
-                    semaphore_handle,
-                    semaphore.clone(),
-                    granted_access,
-                ) {
-                    Ok(()) => NtStatus::SUCCESS,
-                    Err(status) => status,
-                },
-            );
-        }
-
-        let semaphore = Arc::new(SemaphoreObject::new(initial_count, maximum_count));
-        match self.write_new_semaphore_handle(semaphore_handle, semaphore, granted_access) {
-            Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
-        }
+        self.create_named_dispatcher_object(
+            semaphore_handle,
+            desired_access,
+            object_attributes,
+            || Arc::new(SemaphoreObject::new(initial_count, maximum_count)),
+            |_| {},
+        )
     }
 
     pub(crate) fn sys_nt_open_semaphore(
@@ -203,31 +154,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         desired_access: u32,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
     ) -> NtStatus {
-        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(semaphore_handle) {
-            return status;
-        }
-        let semaphore_name = match self.read_dispatcher_object_attributes(object_attributes, true) {
-            Ok((_, Some(semaphore_name))) => semaphore_name,
-            Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
-            Err(status) => return status,
-        };
-        let semaphore = match self
-            .process
-            .object_manager
-            .resolve_semaphore(&semaphore_name)
-        {
-            Ok(semaphore) => semaphore,
-            Err(status) => return status,
-        };
-
-        match self.write_new_semaphore_handle(
+        self.open_named_dispatcher_object::<SemaphoreObject<Platform>>(
             semaphore_handle,
-            semaphore,
-            SemaphoreAccess::from_desired_access(desired_access),
-        ) {
-            Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
-        }
+            desired_access,
+            object_attributes,
+        )
     }
 
     pub(crate) fn sys_nt_release_semaphore(

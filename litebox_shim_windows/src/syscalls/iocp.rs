@@ -19,7 +19,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
-use crate::syscalls::object_manager::check_open_existing_object;
 use crate::{
     ConstPtr, MutPtr, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
 };
@@ -70,7 +69,7 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
 }
 
 pub(crate) struct IoCompletionHandleObject<Platform: crate::ShimPlatform> {
-    port: Arc<IoCompletionObject<Platform>>,
+    pub(crate) port: Arc<IoCompletionObject<Platform>>,
 }
 
 pub(crate) struct IoCompletionObject<Platform: crate::ShimPlatform> {
@@ -266,58 +265,12 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         {
             return status;
         }
-        let (object_attributes, io_completion_name) =
-            match self.read_dispatcher_object_attributes(object_attributes, false) {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-        let granted_access = IoCompletionAccess::from_desired_access(desired_access);
-        if let Some(io_completion_name) = io_completion_name {
-            let port = Arc::new(IoCompletionObject::new(number_of_concurrent_threads));
-            return self.process.object_manager.create_io_completion(
-                &io_completion_name,
-                &port,
-                |port| {
-                    if let Err(status) = check_open_existing_object(object_attributes) {
-                        return status;
-                    }
-                    match self.write_new_io_completion_handle(
-                        io_completion_handle,
-                        port,
-                        granted_access,
-                    ) {
-                        Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
-                        Err(status) => status,
-                    }
-                },
-                || match self.write_new_io_completion_handle(
-                    io_completion_handle,
-                    Arc::clone(&port),
-                    granted_access,
-                ) {
-                    Ok(()) => NtStatus::SUCCESS,
-                    Err(status) => status,
-                },
-            );
-        }
-
-        let port = Arc::new(IoCompletionObject::new(number_of_concurrent_threads));
-        match self.write_new_io_completion_handle(io_completion_handle, port, granted_access) {
-            Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
-        }
-    }
-
-    fn write_new_io_completion_handle(
-        &self,
-        output: MutPtr<Platform, Handle>,
-        port: Arc<IoCompletionObject<Platform>>,
-        granted_access: IoCompletionAccess,
-    ) -> Result<(), NtStatus> {
-        self.write_new_typed_handle::<IoCompletionSubsystem<Platform>>(
-            output,
-            IoCompletionHandleObject { port },
-            granted_access.bits(),
+        self.create_named_dispatcher_object(
+            io_completion_handle,
+            desired_access,
+            object_attributes,
+            || Arc::new(IoCompletionObject::new(number_of_concurrent_threads)),
+            |_| {},
         )
     }
 
@@ -327,33 +280,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         desired_access: u32,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
     ) -> NtStatus {
-        if let Err(status) =
-            probe_guest_output_preserving_value::<Platform, _>(io_completion_handle)
-        {
-            return status;
-        }
-        let io_completion_name =
-            match self.read_dispatcher_object_attributes(object_attributes, true) {
-                Ok((_, Some(name))) => name,
-                Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
-                Err(status) => return status,
-            };
-        let port = match self
-            .process
-            .object_manager
-            .resolve_io_completion(&io_completion_name)
-        {
-            Ok(port) => port,
-            Err(status) => return status,
-        };
-        match self.write_new_io_completion_handle(
+        self.open_named_dispatcher_object::<IoCompletionObject<Platform>>(
             io_completion_handle,
-            port,
-            IoCompletionAccess::from_desired_access(desired_access),
-        ) {
-            Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
-        }
+            desired_access,
+            object_attributes,
+        )
     }
 
     pub(crate) fn sys_nt_set_io_completion(
