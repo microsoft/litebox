@@ -20,7 +20,7 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
-    errno::Errno,
+    errno::Errno, signal::Siginfo,
 };
 
 /// Process-management-related state on [`Task`].
@@ -93,6 +93,12 @@ struct ThreadRemote<Platform: ShimPlatform> {
     is_exiting: AtomicBool,
     /// Handle to interrupt waits on this thread.
     handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
+    /// Thread-directed signals sent by other threads, waiting for this thread
+    /// to move them into its own pending set.
+    signals: Mutex<Platform, Vec<Siginfo>>,
+    /// Set when `signals` may be non-empty, so the owning thread can skip
+    /// taking the lock in the common case. Only set under the `signals` lock.
+    has_signals: AtomicBool,
 }
 
 impl<Platform: ShimPlatform> ThreadRemote<Platform> {
@@ -100,7 +106,28 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
         Self {
             is_exiting: AtomicBool::new(false),
             handle: once_cell::race::OnceBox::new(),
+            signals: Mutex::new(Vec::new()),
+            has_signals: AtomicBool::new(false),
         }
+    }
+
+    /// Queues a thread-directed signal and interrupts the thread so that it
+    /// notices the signal, even if it is blocked or running guest code.
+    fn queue_signal(&self, siginfo: Siginfo) {
+        {
+            let mut signals = self.signals.lock();
+            signals.push(siginfo);
+            self.has_signals.store(true, Ordering::Release);
+        }
+        self.interrupt();
+    }
+
+    /// Takes all signals queued by [`Self::queue_signal`].
+    fn take_signals(&self) -> Vec<Siginfo> {
+        if !self.has_signals.swap(false, Ordering::Acquire) {
+            return Vec::new();
+        }
+        core::mem::take(&mut *self.signals.lock())
     }
 
     fn interrupt(&self) {
@@ -310,6 +337,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         self.thread.process.inner.lock().is_killing_other_threads = false;
         true
+    }
+
+    /// Sends a thread-directed signal to another thread `tid` in this process.
+    ///
+    /// Returns `false` if there is no such thread in this process.
+    pub(crate) fn send_signal_to_thread(&self, tid: i32, siginfo: Siginfo) -> bool {
+        let Some(remote) = self.thread.process.inner.lock().threads.get(&tid).cloned() else {
+            return false;
+        };
+        remote.queue_signal(siginfo);
+        true
+    }
+
+    /// Returns whether `tid` is a thread in this process.
+    pub(crate) fn has_thread(&self, tid: i32) -> bool {
+        self.thread.process.inner.lock().threads.contains_key(&tid)
+    }
+
+    /// Calls `f` for each signal that other threads have sent to this thread
+    /// via [`Self::send_signal_to_thread`].
+    pub(crate) fn take_remote_signals(&self, f: impl FnMut(Siginfo)) {
+        self.thread.remote.take_signals().into_iter().for_each(f);
     }
 
     /// Returns true if the task is exiting and should not continue running
@@ -1935,6 +1984,92 @@ mod tests {
                 "cancelled alarm should not produce SIGALRM"
             );
         });
+    }
+
+    /// `tgkill` from one thread to a sibling queues the signal on the sibling
+    /// only, and the sibling sees it once it checks for signals.
+    #[test]
+    fn test_tgkill_sibling_thread_receives_signal() {
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let sibling = task.clone_for_test().unwrap();
+
+        task.sys_tgkill(task.pid, sibling.tid, Signal::SIGUSR1.as_i32())
+            .expect("tgkill to sibling failed");
+        assert!(
+            !task.has_pending_signals(),
+            "signal must not be delivered to the sending thread"
+        );
+
+        sibling.take_signals_from_other_threads();
+        let pending = sibling.pending_signal_set();
+        assert!(
+            pending.contains(Signal::SIGUSR1),
+            "expected SIGUSR1 pending"
+        );
+        let siginfo = sibling.take_pending_siginfo(Signal::SIGUSR1);
+        assert_eq!(siginfo.code, litebox_common_linux::signal::SI_USER);
+    }
+
+    /// A thread blocked in `pause` is woken up by `tgkill` from a sibling thread.
+    #[test]
+    fn test_tgkill_wakes_blocked_thread() {
+        use litebox_common_linux::{PtRegs, errno::Errno, signal::Signal};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            // Attach the thread handle so that this thread can be interrupted.
+            task.handle_init_request(&mut PtRegs::default());
+
+            let (pid, tid) = (task.pid, task.tid);
+            let sender = task.spawn_clone_for_test(move |sender| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                sender.sys_tgkill(pid, tid, Signal::SIGUSR1.as_i32())
+            });
+
+            assert_eq!(task.sys_pause(), Err(Errno::EINTR));
+            assert_eq!(sender.join().unwrap(), Ok(0));
+            assert!(task.pending_signal_set().contains(Signal::SIGUSR1));
+        });
+    }
+
+    #[test]
+    fn test_tgkill_errors() {
+        use litebox_common_linux::{errno::Errno, signal::Signal};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let sibling = task.clone_for_test().unwrap();
+        let sig = Signal::SIGUSR1.as_i32();
+
+        // Invalid pid or tid.
+        assert_eq!(task.sys_tgkill(0, sibling.tid, sig), Err(Errno::EINVAL));
+        assert_eq!(task.sys_tgkill(task.pid, 0, sig), Err(Errno::EINVAL));
+        assert_eq!(task.sys_tkill(-1, sig), Err(Errno::EINVAL));
+
+        // `pid` is not the thread group of `tid`.
+        assert_eq!(
+            task.sys_tgkill(sibling.tid, sibling.tid, sig),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            task.sys_tgkill(sibling.tid, task.tid, sig),
+            Err(Errno::ESRCH)
+        );
+
+        // No such thread.
+        assert_eq!(task.sys_tkill(i32::MAX, sig), Err(Errno::ESRCH));
+        assert_eq!(task.sys_tgkill(task.pid, i32::MAX, sig), Err(Errno::ESRCH));
+
+        // Nothing was queued by the failed calls.
+        sibling.take_signals_from_other_threads();
+        assert!(!sibling.has_pending_signals());
+        assert!(!task.has_pending_signals());
+
+        // tkill to a sibling works.
+        assert_eq!(task.sys_tkill(sibling.tid, sig), Ok(0));
+        sibling.take_signals_from_other_threads();
+        assert!(sibling.pending_signal_set().contains(Signal::SIGUSR1));
     }
 
     #[test]
