@@ -34,7 +34,7 @@ macro_rules! ensure {
 
 unsafe extern "C" {
     fn _dyld_get_shared_cache_range(length: *mut usize) -> *const u8;
-    fn mach_vm_region(
+    pub(super) fn mach_vm_region(
         task: u32,
         address: *mut u64,
         size: *mut u64,

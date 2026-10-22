@@ -29,6 +29,16 @@ pub mod nr {
     pub const CROSSARCH_TRAP: usize = 38;
     pub const GETPPID: usize = 39;
     pub const SIGPROCMASK: usize = 48;
+    pub const PTHREAD_KILL: usize = 328;
+    pub const PTHREAD_SIGMASK: usize = 329;
+    pub const DISABLE_THREADSIGNAL: usize = 331;
+    pub const BSDTHREAD_CREATE: usize = 360;
+    pub const BSDTHREAD_TERMINATE: usize = 361;
+    pub const BSDTHREAD_REGISTER: usize = 366;
+    pub const BSDTHREAD_CTL: usize = 478;
+    pub const ULOCK_WAIT: usize = 515;
+    pub const ULOCK_WAKE: usize = 516;
+    pub const ULOCK_WAIT2: usize = 544;
     pub const IOCTL: usize = 54;
     pub const CSOPS: usize = 169;
     pub const CSOPS_AUDITTOKEN: usize = 170;
@@ -126,6 +136,9 @@ pub mod mach_trap {
     pub const SEMAPHORE_SIGNAL: u32 = 33;
     pub const SEMAPHORE_WAIT: u32 = 36;
     pub const MACH_MSG2: u32 = 47;
+    pub const SWTCH_PRI: u32 = 59;
+    pub const SWTCH: u32 = 60;
+    pub const THREAD_SWITCH: u32 = 61;
     /// `mach_timebase_info(mach_timebase_info_t)`.
     pub const MACH_TIMEBASE_INFO: u32 = 89;
     /// `mach_wait_until(deadline)`.
@@ -423,6 +436,103 @@ impl From<i32> for SigmaskHow {
 #[repr(transparent)]
 pub struct SigSet(pub u32);
 
+/// A `ulock` operation code (`UL_*`, `sys/ulock.h`): the low byte of the
+/// operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UlockOpcode {
+    /// `UL_COMPARE_AND_WAIT`.
+    CompareAndWait,
+    /// `UL_UNFAIR_LOCK`.
+    UnfairLock,
+    /// `UL_COMPARE_AND_WAIT_SHARED`.
+    CompareAndWaitShared,
+    /// `UL_COMPARE_AND_WAIT64`.
+    CompareAndWait64,
+    /// `UL_COMPARE_AND_WAIT64_SHARED`.
+    CompareAndWait64Shared,
+    /// Any other code: EINVAL, in the order `ulock_wait2` and `ulock_wake`
+    /// check it.
+    Unknown(u8),
+}
+
+impl From<u8> for UlockOpcode {
+    fn from(opcode: u8) -> Self {
+        match opcode {
+            1 => Self::CompareAndWait,
+            2 => Self::UnfairLock,
+            3 => Self::CompareAndWaitShared,
+            5 => Self::CompareAndWait64,
+            6 => Self::CompareAndWait64Shared,
+            opcode => Self::Unknown(opcode),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// `ulock` flags (`ULF_*`, `sys/ulock.h`): the operation's upper 24 bits.
+    /// Decoded with every bit retained: `ulock_wait2` and `ulock_wake`
+    /// reject unknown bits in their own order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct UlockFlags: u32 {
+        const WAKE_ALL = 0x0000_0100;
+        const WAKE_THREAD = 0x0000_0200;
+        const WAKE_ALLOW_NON_OWNER = 0x0000_0400;
+        const WAIT_WORKQ_DATA_CONTENTION = 0x0001_0000;
+        const WAIT_CANCEL_POINT = 0x0002_0000;
+        const WAIT_ADAPTIVE_SPIN = 0x0004_0000;
+        const NO_ERRNO = 0x0100_0000;
+        const DEADLINE = 0x0200_0000;
+    }
+}
+
+impl UlockFlags {
+    /// `ULF_WAIT_MASK`.
+    pub const WAIT_MASK: Self = Self::NO_ERRNO
+        .union(Self::DEADLINE)
+        .union(Self::WAIT_WORKQ_DATA_CONTENTION)
+        .union(Self::WAIT_CANCEL_POINT)
+        .union(Self::WAIT_ADAPTIVE_SPIN);
+    /// `ULF_WAKE_MASK`.
+    pub const WAKE_MASK: Self = Self::NO_ERRNO
+        .union(Self::WAKE_ALL)
+        .union(Self::WAKE_THREAD)
+        .union(Self::WAKE_ALLOW_NON_OWNER);
+}
+
+/// Split a `ulock` operation into its opcode and flags, as `sys_ulock.c` does.
+fn ulock_operation(operation: usize) -> (UlockOpcode, UlockFlags) {
+    // `bsd/sys/ulock.h`.
+    const UL_OPCODE_MASK: u32 = 0x0000_00ff;
+    const UL_FLAGS_MASK: u32 = 0xffff_ff00;
+    let operation = TruncateExt::<u32>::trunc(operation);
+    (
+        UlockOpcode::from(TruncateExt::<u8>::trunc(operation & UL_OPCODE_MASK)),
+        UlockFlags::from_bits_retain(operation & UL_FLAGS_MASK),
+    )
+}
+
+bitflags::bitflags! {
+    /// `bsdthread_create` flags (`PTHREAD_START_*`, libpthread
+    /// `kern/kern_support.c`). Decoded with every bit retained: XNU checks
+    /// them once the thread and its port exist. The low 24 bits hold a QoS
+    /// class, or with `SETSCHED` a policy and an importance.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BsdthreadCreateFlags: u32 {
+        const CUSTOM = 0x0100_0000;
+        const SETSCHED = 0x0200_0000;
+        const QOSCLASS = 0x0800_0000;
+        const TSD_BASE_SET = 0x1000_0000;
+        const SUSPENDED = 0x2000_0000;
+    }
+}
+
+impl BsdthreadCreateFlags {
+    /// `PTHREAD_START_QOSCLASS_MASK`: an encoded `pthread_priority_t`.
+    pub const fn qos_class(self) -> u32 {
+        self.bits() & 0x00ff_ffff
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum SyscallRequest {
     Exit {
@@ -509,6 +619,62 @@ pub enum SyscallRequest {
         how: SigmaskHow,
         mask: Option<UserPtr<SigSet>>,
         old_mask: Option<UserPtrMut<SigSet>>,
+    },
+    /// `__pthread_sigmask`: like `sigprocmask`, on the calling thread only.
+    PthreadSigmask {
+        how: SigmaskHow,
+        mask: Option<UserPtr<SigSet>>,
+        old_mask: Option<UserPtrMut<SigSet>>,
+    },
+    /// `__pthread_kill(thread_port, sig)`.
+    PthreadKill {
+        thread: MachPortName,
+        signal: i32,
+    },
+    DisableThreadsignal,
+    /// `bsdthread_register(threadstart, wqthread, pthsize, data, data_size,
+    /// dispatchqueue_offset)`; libpthread passes its registration data where
+    /// `syscalls.master` names `stack_addr_hint` and `targetconc_ptr`.
+    BsdthreadRegister {
+        threadstart: usize,
+        pthread_size: i32,
+        data: usize,
+        data_size: usize,
+        dispatch_queue_offset: u32,
+    },
+    BsdthreadCreate {
+        function: usize,
+        argument: usize,
+        stack: usize,
+        pthread: usize,
+        flags: BsdthreadCreateFlags,
+    },
+    BsdthreadTerminate {
+        stack: usize,
+        size: usize,
+        port: MachPortName,
+        /// A semaphore name, or the address of a ulock to wake.
+        semaphore_or_ulock: usize,
+    },
+    BsdthreadCtl {
+        command: usize,
+        arguments: [usize; 3],
+    },
+    /// `ulock_wait` (timeout in microseconds) and `ulock_wait2` (timeout in
+    /// nanoseconds, or a deadline with `ULF_DEADLINE`), normalized to
+    /// nanoseconds.
+    UlockWait {
+        opcode: UlockOpcode,
+        flags: UlockFlags,
+        address: usize,
+        value: u64,
+        timeout: u64,
+    },
+    UlockWake {
+        opcode: UlockOpcode,
+        flags: UlockFlags,
+        address: usize,
+        wake_value: u64,
     },
     Csops {
         pid: i32,
@@ -641,6 +807,13 @@ pub enum SyscallRequest {
     SemaphoreWait {
         semaphore: MachPortName,
     },
+    SwtchPri,
+    Swtch,
+    ThreadSwitch {
+        thread: MachPortName,
+        option: i32,
+        option_time: u32,
+    },
     SharedRegionCheckNp {
         start_address: UserPtrMut<usize>,
     },
@@ -768,6 +941,13 @@ impl SyscallRequest {
                 mach_trap::SEMAPHORE_WAIT => Ok(Self::SemaphoreWait {
                     semaphore: port_arg(0),
                 }),
+                mach_trap::SWTCH_PRI => Ok(Self::SwtchPri),
+                mach_trap::SWTCH => Ok(Self::Swtch),
+                mach_trap::THREAD_SWITCH => Ok(Self::ThreadSwitch {
+                    thread: port_arg(0),
+                    option: int_arg(1),
+                    option_time: TruncateExt::<u32>::trunc(args[2]),
+                }),
                 mach_trap::MACH_TIMEBASE_INFO => Ok(Self::MachTimebaseInfo {
                     info: UserPtrMut::from_usize(args[0]),
                 }),
@@ -859,6 +1039,64 @@ impl SyscallRequest {
                 mask: (args[1] != 0).then(|| UserPtr::from_usize(args[1])),
                 old_mask: (args[2] != 0).then(|| UserPtrMut::from_usize(args[2])),
             },
+            nr::PTHREAD_SIGMASK => Self::PthreadSigmask {
+                how: SigmaskHow::from(int_arg(0)),
+                mask: (args[1] != 0).then(|| UserPtr::from_usize(args[1])),
+                old_mask: (args[2] != 0).then(|| UserPtrMut::from_usize(args[2])),
+            },
+            nr::PTHREAD_KILL => Self::PthreadKill {
+                thread: port_arg(0),
+                signal: int_arg(1),
+            },
+            nr::DISABLE_THREADSIGNAL => Self::DisableThreadsignal,
+            nr::BSDTHREAD_REGISTER => Self::BsdthreadRegister {
+                threadstart: args[0],
+                pthread_size: int_arg(2),
+                data: args[3],
+                data_size: args[4],
+                dispatch_queue_offset: TruncateExt::<u32>::trunc(args[5]),
+            },
+            nr::BSDTHREAD_CREATE => Self::BsdthreadCreate {
+                function: args[0],
+                argument: args[1],
+                stack: args[2],
+                pthread: args[3],
+                flags: BsdthreadCreateFlags::from_bits_retain(TruncateExt::<u32>::trunc(args[4])),
+            },
+            nr::BSDTHREAD_TERMINATE => Self::BsdthreadTerminate {
+                stack: args[0],
+                size: args[1],
+                port: port_arg(2),
+                semaphore_or_ulock: args[3],
+            },
+            nr::BSDTHREAD_CTL => Self::BsdthreadCtl {
+                command: args[0],
+                arguments: [args[1], args[2], args[3]],
+            },
+            nr::ULOCK_WAIT | nr::ULOCK_WAIT2 => {
+                let (opcode, flags) = ulock_operation(args[0]);
+                Self::UlockWait {
+                    opcode,
+                    flags,
+                    address: args[1],
+                    value: u64_arg(2),
+                    timeout: if number == nr::ULOCK_WAIT {
+                        // sys_ulock_wait: a 32-bit count of microseconds.
+                        u64::from(TruncateExt::<u32>::trunc(args[3])) * 1000
+                    } else {
+                        u64_arg(3)
+                    },
+                }
+            }
+            nr::ULOCK_WAKE => {
+                let (opcode, flags) = ulock_operation(args[0]);
+                Self::UlockWake {
+                    opcode,
+                    flags,
+                    address: args[1],
+                    wake_value: u64_arg(2),
+                }
+            }
             nr::CSOPS_AUDITTOKEN if args[4] == 0 => return Err(Errno::EINVAL),
             nr::CSOPS | nr::CSOPS_AUDITTOKEN => Self::Csops {
                 pid: int_arg(0),
@@ -1074,6 +1312,53 @@ mod tests {
         assert_eq!((send_size, descriptor_count), (0x28, 0));
         assert_eq!((receive_name, receive_size), (MachPortName(0x603), 0xc8));
         assert_eq!((priority, timeout), (0, 7));
+    }
+
+    #[test]
+    fn thread_and_ulock_arguments() {
+        // The flags of bsdthread_create and the operation of ulock_wake are
+        // 32-bit; the upper half is dropped.
+        assert!(matches!(
+            SyscallRequest::from_args(
+                nr::BSDTHREAD_CREATE,
+                [1, 2, 3, 4, 0xffff_ffff_0100_0000, 0, 0, 0]
+            ),
+            Ok(SyscallRequest::BsdthreadCreate {
+                function: 1,
+                argument: 2,
+                stack: 3,
+                pthread: 4,
+                flags: BsdthreadCreateFlags::CUSTOM,
+            })
+        ));
+        // Unknown opcodes (UL_UNFAIR_LOCK64_SHARED) and flag bits are kept for
+        // the handlers to reject in XNU's order.
+        assert!(matches!(
+            SyscallRequest::from_args(
+                nr::ULOCK_WAKE,
+                [0xffff_ffff_8000_0104, 0x1000, 7, 0, 0, 0, 0, 0]
+            ),
+            Ok(SyscallRequest::UlockWake {
+                opcode: UlockOpcode::Unknown(4),
+                flags,
+                address: 0x1000,
+                wake_value: 7,
+            }) if flags.bits() == 0x8000_0100
+                && flags.contains(UlockFlags::WAKE_ALL)
+                && !UlockFlags::WAKE_MASK.contains(flags)
+        ));
+        // thread_switch's option is a signed 32-bit int.
+        assert!(matches!(
+            SyscallRequest::from_args(
+                0u32.wrapping_sub(mach_trap::THREAD_SWITCH) as usize,
+                [0x103, 0xffff_ffff_ffff_ffff, 10, 0, 0, 0, 0, 0],
+            ),
+            Ok(SyscallRequest::ThreadSwitch {
+                thread: MachPortName(0x103),
+                option: -1,
+                option_time: 10,
+            })
+        ));
     }
 
     #[test]

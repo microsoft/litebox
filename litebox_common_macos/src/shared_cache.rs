@@ -1486,6 +1486,24 @@ pub trait HostSharedCache {
         target: usize,
         permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
     ) -> core::result::Result<(), HostSharedCacheError>;
+
+    /// Replace the pages at `target`, which the caller has mapped through
+    /// this platform, with private pages holding `bytes` (whole native pages)
+    /// and `permissions`, in one VM operation, so that, like a page XNU's
+    /// shared-region pager supplies, no access sees part of `bytes`.
+    /// Never executable. Refused for guest pages smaller than native pages.
+    /// On failure the pages at `target` are unchanged.
+    ///
+    /// # Safety
+    ///
+    /// Nothing may write the pages at `target` during the call, and the
+    /// caller's records of them must allow `permissions`.
+    unsafe fn publish_cache_pages(
+        &self,
+        target: usize,
+        bytes: &[u8],
+        permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> core::result::Result<(), HostSharedCacheError>;
 }
 
 /// The host's verified shared cache, borrowed from its platform.

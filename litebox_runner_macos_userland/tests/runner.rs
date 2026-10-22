@@ -841,3 +841,280 @@ fn dynamic_guest_cache_instance_is_private() {
         "host libsystem_kernel __TEXT changed"
     );
 }
+
+/// Run the runner with `arguments`, failing if it has not exited within a
+/// minute.
+#[cfg(feature = "test-broker")]
+fn run_runner_with_timeout(arguments: &[&str]) -> (Option<i32>, Vec<u8>, String) {
+    use std::io::Read as _;
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+            .args(arguments)
+            .env_remove("LITEBOX_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    // Both pipes drain while the guest runs, so neither fills and blocks
+    // it, and a guest that does not exit still reports its stderr.
+    let mut out = child.0.stdout.take().unwrap();
+    let stdout = std::thread::spawn(move || {
+        let mut stdout = Vec::new();
+        out.read_to_end(&mut stdout).unwrap();
+        stdout
+    });
+    let mut err = child.0.stderr.take().unwrap();
+    let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_reader = std::thread::spawn({
+        let stderr = std::sync::Arc::clone(&stderr);
+        move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match err.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => stderr.lock().unwrap().extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "guest {arguments:?} did not exit within a minute; stderr so far:\n{}",
+            String::from_utf8_lossy(&stderr.lock().unwrap())
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    stderr_reader.join().unwrap();
+    let stderr = String::from_utf8(std::mem::take(&mut *stderr.lock().unwrap())).unwrap();
+    (status.code(), stdout.join().unwrap(), stderr)
+}
+
+/// The guest-thread scenarios of `fixtures/threads.c`, compiled once per test.
+#[cfg(feature = "test-broker")]
+fn run_thread_scenario(scenario: &str) -> (Option<i32>, Vec<u8>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "threads.c",
+        include_str!("fixtures/threads.c"),
+        &["-O1"],
+    );
+    run_runner_with_timeout(&[binary.to_str().unwrap(), scenario])
+}
+
+/// Threads created and joined with return values, detached threads, TSD
+/// destructors, `_Thread_local`, per-thread errno, unique thread IDs and
+/// ports, and `mach_thread_self() == pthread_mach_thread_np(pthread_self())`.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_create_join_and_keep_per_thread_state() {
+    let (code, stdout, stderr) = run_thread_scenario("join");
+    assert_eq!(
+        (
+            code,
+            String::from_utf8_lossy(&stdout).as_ref(),
+            stderr.as_str()
+        ),
+        (
+            Some(0),
+            "results 0 distinct 1 consistent 16 destructors 20 tls -1 main 1\n",
+            ""
+        )
+    );
+}
+
+/// `os_unfair_lock` under contention: 8 threads x 20k increments.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_contend_on_an_unfair_lock() {
+    let (code, stdout, stderr) = run_thread_scenario("unfair");
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b"counter 160000\n"[..], "")
+    );
+}
+
+/// `pthread_exit` from main while workers run: the status is 0 once the
+/// last thread exits.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_outlive_a_main_thread_that_exits() {
+    let (code, stdout, stderr) = run_thread_scenario("main_exit");
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(0), &b"finished 4\n"[..], "")
+    );
+}
+
+/// `exit(42)` from a worker ends threads that run guest code, sleep, and
+/// wait in `pthread_join` and on unfair locks, promptly and with its status.
+/// The exiting thread first checks that every join and unfair-lock waiter is
+/// blocked in the kernel (status 43 otherwise).
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_end_with_the_status_of_an_exit_from_any_thread() {
+    let (code, stdout, stderr) = run_thread_scenario("exit_blocked");
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (Some(42), &b""[..], "")
+    );
+}
+
+/// `task_restartable_ranges_synchronize` with libobjc's ranges registered:
+/// it interrupts a sibling spinning in guest code and waits for it to leave
+/// the guest, without waiting for a sibling blocked in `ulock_wait`. Release
+/// XNU permits one registration per task (`restartable.c`) and libobjc
+/// registered first, so the program's own fails with `KERN_NOT_SUPPORTED`.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_synchronize_restartable_ranges() {
+    let (code, stdout, stderr) = run_thread_scenario("restartable");
+    assert_eq!(
+        (code, stdout.as_slice(), stderr.as_str()),
+        (
+            Some(0),
+            &b"register 46 synchronized 100 blocked 0\n"[..],
+            ""
+        )
+    );
+}
+
+/// The number of threads of process `pid` (`proc_pidinfo`'s
+/// `PROC_PIDTASKINFO`), 0 if it cannot be read.
+#[cfg(feature = "test-broker")]
+fn host_thread_count(pid: i32) -> i32 {
+    // SAFETY: proc_taskinfo is plain integers, zero-valid.
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_taskinfo>() };
+    let size = i32::try_from(size_of::<libc::proc_taskinfo>()).unwrap();
+    // SAFETY: info is writable storage of `size` bytes.
+    let read =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+    if read == size { info.pti_threadnum } else { 0 }
+}
+
+/// The runner's thread keeps the forwarded signals (SIGINT, SIGALRM) blocked
+/// outside guest execution, so while it waits for the guest's other threads
+/// after the main thread's `pthread_exit`, XNU delivers Ctrl-C to one of them.
+#[cfg(feature = "test-broker")]
+#[test]
+fn the_runner_thread_leaves_forwarded_signals_to_guest_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "main.c",
+        "#include <stdio.h>\nint main(void) { printf(\"Hello, world!\\n\"); return 0; }\n",
+        &[],
+    );
+    let status = litebox_runner_macos_userland::run(litebox_runner_macos_userland::CliArgs {
+        program_and_arguments: vec![binary.to_str().unwrap().to_owned()],
+        environment_variables: Vec::new(),
+        test_mmap_image: None,
+    })
+    .unwrap();
+    assert_eq!(status, 0);
+    // SAFETY: zero is valid for this integer bitmask.
+    let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: a null new mask only reads this thread's mask into live storage.
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, core::ptr::null(), &raw mut mask) },
+        0
+    );
+    for signal in [libc::SIGINT, libc::SIGALRM] {
+        // SAFETY: mask is an initialized sigset_t.
+        assert_eq!(unsafe { libc::sigismember(&raw const mask, signal) }, 1);
+    }
+}
+
+/// Kills and reaps the runner child unless it was already reaped, so a failed
+/// test does not leave it running.
+#[cfg(feature = "test-broker")]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(feature = "test-broker")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// Ctrl-C after the main thread's `pthread_exit` ends the guest through its
+/// remaining threads with status 130. It is sent once a worker's join of the
+/// main thread returned, which the worker shows by creating a third thread.
+/// XNU picks the receiving thread, so the mask test above, not this one,
+/// catches a runner thread that takes it.
+#[cfg(feature = "test-broker")]
+#[test]
+fn threads_take_ctrl_c_after_the_main_thread_exits() {
+    use std::io::Read as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let binary = compile(
+        dir.path(),
+        "clang",
+        "threads.c",
+        include_str!("fixtures/threads.c"),
+        &["-O1"],
+    );
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+            .arg(&binary)
+            .arg("interrupt_after_main_exit")
+            .env_remove("LITEBOX_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // The runner thread, the two workers main created, and the thread the
+    // reporting worker creates after its join of main returned.
+    let pid = i32::try_from(child.0.id()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while host_thread_count(pid) < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the guest never reported the main thread's exit"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // SAFETY: kill has no memory preconditions; the child has not been reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the guest did not end after Ctrl-C"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut stdout = String::new();
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert_eq!(
+        (status.code(), stdout.as_str()),
+        (Some(130), "main exited\n"),
+        "{status:?}"
+    );
+}

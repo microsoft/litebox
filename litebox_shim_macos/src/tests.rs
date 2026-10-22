@@ -18,16 +18,17 @@ use litebox_common_macos::VmProtection;
 use litebox_platform_macos_userland::MacosUserland as Platform;
 
 mod mach;
+mod restartable;
+mod thread;
+mod ulock;
 
 pub(crate) fn task(shim: MacosShim<Platform>) -> Task<Platform> {
-    let thread = ThreadState::new(1u64 << 32, shim.global.platform);
-    Task {
-        global: shim.global,
-        files: shim.files,
-        params: TaskParams::default(),
-        process: Process(Arc::new(AtomicI32::new(-1))),
-        thread,
-    }
+    Task::new_main(
+        shim.global,
+        shim.files,
+        TaskParams::default(),
+        Process::new(),
+    )
 }
 
 #[test]
@@ -732,6 +733,81 @@ fn shared_cache_page_in_uses_the_recorded_protection() {
     assert!(task.page_in_shared_cache(page.start));
     assert_eq!(read_guest(page.start, 1).unwrap(), [0x77]);
     assert!(!guest_flags(task, page.start).contains(VmFlags::VM_WRITE));
+}
+
+/// A thread that faults on a page another thread has just supplied retries
+/// its access if it was a VM fault and the page now allows it.
+#[test]
+fn shared_cache_fault_after_a_concurrent_page_in_is_retried() {
+    /// ESR of a data abort from EL0 (EC 0x24, IL set) with this DFSC.
+    const fn data_abort(dfsc: u64) -> u64 {
+        (0x24 << 26) | (1 << 25) | dfsc
+    }
+    /// A level 3 translation fault on a read.
+    const READ_TRANSLATION: u64 = data_abort(0x07);
+    /// A level 3 permission fault on a write (WnR).
+    const WRITE_PERMISSION: u64 = data_abort(0x0f) | (1 << 6);
+    let base = 0x76_0000_0000;
+    let program = install_test_cache(base);
+    let task = &program.entrypoints.task;
+    let page = base + 4 * PAGE_SIZE;
+    assert!(
+        !task.shared_cache_fault_resolved(page, READ_TRANSLATION),
+        "not supplied yet"
+    );
+    assert_eq!(
+        task.sys_mprotect(page, PAGE_SIZE, VmProtection::READ),
+        Ok(())
+    );
+    // The first fault supplies the page; a fault racing it then retries.
+    assert!(task.page_in_shared_cache(page + 8));
+    assert!(!task.page_in_shared_cache(page + 16));
+    assert!(task.shared_cache_fault_resolved(page + 16, READ_TRANSLATION));
+    // A write to the read-only page stays a fault.
+    assert!(!task.shared_cache_fault_resolved(page + 16, WRITE_PERMISSION));
+    assert!(!task.shared_cache_fault_resolved(base - PAGE_SIZE, READ_TRANSLATION));
+    // Supplying a page cannot fix an alignment fault or a fault that is not
+    // from EL0.
+    assert!(!task.shared_cache_fault_resolved(page + 16, data_abort(0x21)));
+    assert!(!task.shared_cache_fault_resolved(page + 16, (0x25 << 26) | 0x07));
+}
+
+/// A thread reading a page another thread is supplying faults (and then
+/// waits for the page-in) or sees the complete page, never a partial one.
+#[test]
+fn shared_cache_page_in_publishes_only_the_complete_page() {
+    use ulock::BOUND;
+    let base = 0x77_0000_0000;
+    let program = install_test_cache(base);
+    let task = &program.entrypoints.task;
+    let page = base + 4 * PAGE_SIZE;
+    let (supplying, start) = std::sync::mpsc::channel::<()>();
+    let (read, done) = std::sync::mpsc::channel::<()>();
+    let observed = std::thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            start.recv_timeout(BOUND).unwrap();
+            let observed = read_guest(page, PAGE_SIZE);
+            read.send(()).unwrap();
+            observed
+        });
+        let mut supplying = Some(supplying);
+        task.global.mapping_hook.set(move |point| {
+            if point == crate::syscalls::mm::hook::Point::PageInSupplied {
+                supplying.take().unwrap().send(()).unwrap();
+                done.recv_timeout(BOUND).unwrap();
+            }
+        });
+        let supplied = task.page_in_shared_cache(page + 8);
+        task.global.mapping_hook.clear();
+        assert!(supplied);
+        reader.join().unwrap()
+    });
+    let complete = vec![0x77; PAGE_SIZE];
+    assert!(
+        observed.as_ref().is_none_or(|bytes| *bytes == complete),
+        "a concurrent read saw a partial page"
+    );
+    assert_eq!(read_guest(page, PAGE_SIZE), Some(complete));
 }
 
 #[test]

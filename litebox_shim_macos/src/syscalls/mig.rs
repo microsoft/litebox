@@ -41,6 +41,7 @@ mod routine {
     pub const TASK_SET_SPECIAL_PORT: i32 = 3410;
     pub const SEMAPHORE_CREATE: i32 = 3418;
     pub const SEMAPHORE_DESTROY: i32 = 3419;
+    pub const THREAD_INFO: i32 = 3612;
     pub const MACH_VM_ALLOCATE: i32 = 4800;
     pub const MACH_VM_DEALLOCATE: i32 = 4801;
     pub const MACH_VM_MAP: i32 = 4811;
@@ -245,6 +246,13 @@ mod task_flavor {
     pub const AUDIT_TOKEN: i32 = 15;
 }
 
+/// `thread_info` flavors.
+mod thread_flavor {
+    pub const IDENTIFIER_INFO: i32 = 4;
+    /// `THREAD_IDENTIFIER_INFO_COUNT`.
+    pub const IDENTIFIER_INFO_COUNT: u32 = 6;
+}
+
 /// `task_get_special_port` selectors.
 mod special_port {
     pub const KERNEL: i32 = 1;
@@ -309,15 +317,17 @@ impl<P: ShimPlatform> Task<P> {
             (KernelObject::Task, routine::MACH_VM_ALLOCATE) => self.mig_vm_allocate(&request),
             (KernelObject::Task, routine::MACH_VM_DEALLOCATE) => self.mig_vm_deallocate(&request),
             (KernelObject::Task, routine::MACH_VM_MAP) => self.mig_vm_map(&request),
+            (KernelObject::Thread(thread), routine::THREAD_INFO) => {
+                self.mig_thread_info(thread, &request)
+            }
             (KernelObject::Task, routine::TASK_RESTARTABLE_RANGES_REGISTER) => {
                 self.mig_restartable_ranges_register(&request)
             }
             (KernelObject::Task, routine::TASK_RESTARTABLE_RANGES_SYNCHRONIZE) => {
-                // No other thread can be inside a range.
                 if request.complex || !request.body.is_empty() {
                     error_reply(mig::BAD_ARGUMENTS)
                 } else {
-                    kern_reply(KernReturn::SUCCESS, &[])
+                    kern_reply(self.synchronize_restartable_ranges(), &[])
                 }
             }
             _ => {
@@ -379,9 +389,47 @@ impl<P: ShimPlatform> Task<P> {
         info_reply(code, &info, count)
     }
 
-    /// `task_restartable_ranges_register`. The guest is single-threaded and
-    /// receives no signals, so nothing ever interrupts a range; the ranges
-    /// are recorded so that the one-shot rule holds.
+    /// `thread_info` of `THREAD_IDENTIFIER_INFO`; other flavors fail closed
+    /// with KERN_INVALID_ARGUMENT.
+    fn mig_thread_info(&self, thread: crate::ThreadId, request: &Message) -> Message {
+        let Some(FlavorCountRequest { flavor, count }) = simple_request(request) else {
+            return error_reply(mig::BAD_ARGUMENTS);
+        };
+        // thread_info_out[THREAD_INFO_MAX]
+        let count = count.min(32);
+        let Some(target) = self.guest_thread(thread) else {
+            return error_reply(KernReturn::TERMINATED.raw());
+        };
+        if flavor != thread_flavor::IDENTIFIER_INFO {
+            self.log_unsupported_once(
+                "thread_info flavor",
+                flavor.into(),
+                format_args!("{flavor}"),
+            );
+            return error_reply(KernReturn::INVALID_ARGUMENT.raw());
+        }
+        if count < thread_flavor::IDENTIFIER_INFO_COUNT {
+            return error_reply(KernReturn::INVALID_ARGUMENT.raw());
+        }
+        let handle = target.tsd_base.load(core::sync::atomic::Ordering::Relaxed) as u64;
+        // thread_dispatchqaddr: the TSD base plus the registered offset.
+        let dispatch_queue = if handle == 0 {
+            0
+        } else {
+            let offset = (*self.global.pthread_registration.lock())
+                .map_or(0, |registration| registration.dispatch_queue_offset);
+            handle.wrapping_add(offset)
+        };
+        // The out-count stays the caller's, as thread_info_internal leaves it.
+        let mut info = alloc::vec![0u32; count as usize];
+        for (index, value) in [target.id, handle, dispatch_queue].into_iter().enumerate() {
+            info[2 * index] = litebox::utils::TruncateExt::<u32>::trunc(value);
+            info[2 * index + 1] = litebox::utils::TruncateExt::<u32>::trunc(value >> 32);
+        }
+        info_reply(KernReturn::SUCCESS, &info, count)
+    }
+
+    /// `task_restartable_ranges_register`.
     fn mig_restartable_ranges_register(&self, request: &Message) -> Message {
         const ENTRY: usize = size_of::<RestartableRange>();
         let fields = (!request.complex)
@@ -403,13 +451,7 @@ impl<P: ShimPlatform> Task<P> {
             .collect();
         let mut code = validate_restartable_ranges(&mut ranges);
         if code == KernReturn::SUCCESS {
-            let mut registered = self.global.restartable_ranges.lock();
-            if registered.is_some() {
-                // Release kernels allow one registration per task.
-                code = KernReturn::NOT_SUPPORTED;
-            } else {
-                *registered = Some(ranges);
-            }
+            code = self.register_restartable_ranges(ranges);
         }
         kern_reply(code, &[])
     }
@@ -681,8 +723,8 @@ impl<P: ShimPlatform> Task<P> {
             return KernReturn::SUCCESS;
         }
         drop(ipc);
-        // Only another thread could signal it: wait until interrupted, which
-        // aborts the wait.
+        // Semaphore waiters do not queue, so no signal wakes one: wait until
+        // interrupted, which aborts the wait.
         let _ = self.wait_cx().sleep();
         KernReturn::ABORTED
     }

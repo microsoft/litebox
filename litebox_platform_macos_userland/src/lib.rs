@@ -26,7 +26,9 @@ use litebox_common_linux::{GuestVectorState, PtRegs};
 use litebox_common_macos::shared_cache::{
     HostCache, HostCachePage, HostSharedCache, HostSharedCacheError,
 };
-use litebox_common_macos::{KernReturn, MachClock, syscall::MachTimebaseInfo};
+use litebox_common_macos::{
+    KernReturn, MachClock, QosParallelism, ThreadYield, syscall::MachTimebaseInfo,
+};
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -240,6 +242,33 @@ impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
             PageTable::Subpage(_) => Err(PermissionUpdateError::PermissionDenied),
         }
     }
+
+    /// Replace the owned pages of `range` with private pages holding `bytes`; see
+    /// [`HostSharedCache::publish_cache_pages`].
+    ///
+    /// # Safety
+    ///
+    /// Nothing may write the pages of `range` during the call.
+    unsafe fn publish_pages(
+        &self,
+        range: Range<usize>,
+        bytes: &[u8],
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), PermissionUpdateError> {
+        if range.is_empty()
+            || range.len() != bytes.len()
+            || !range.start.is_multiple_of(HOST_PAGE_SIZE)
+            || !range.end.is_multiple_of(HOST_PAGE_SIZE)
+        {
+            return Err(PermissionUpdateError::Unaligned);
+        }
+        match &mut *self.pages.lock().unwrap() {
+            PageTable::Native(pages) => pages.publish(&range, bytes, permissions),
+            // A 4 KiB guest page cannot own a host page of the published pages.
+            #[cfg(feature = "subpage_compat")]
+            PageTable::Subpage(_) => Err(PermissionUpdateError::PermissionDenied),
+        }
+    }
 }
 
 #[cfg(feature = "shared_cache")]
@@ -285,6 +314,25 @@ impl<const PAGE_SIZE: usize> HostSharedCache for MacosUserlandWithPageSize<PAGE_
         unsafe { self.map_file_view(range, file, offset, permissions) }.map_err(|error| {
             HostSharedCacheError::new(format_args!(
                 "mapping cache bytes {address:#x}+{length:#x} at {target:#x}: {error}"
+            ))
+        })
+    }
+
+    unsafe fn publish_cache_pages(
+        &self,
+        target: usize,
+        bytes: &[u8],
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), HostSharedCacheError> {
+        let range = target
+            ..target
+                .checked_add(bytes.len())
+                .ok_or_else(|| HostSharedCacheError::new("pages outside the address space"))?;
+        // SAFETY: the caller excludes writers of the target pages.
+        unsafe { self.publish_pages(range, bytes, permissions) }.map_err(|error| {
+            HostSharedCacheError::new(format_args!(
+                "publishing {:#x} bytes at {target:#x}: {error}",
+                bytes.len()
             ))
         })
     }
@@ -335,10 +383,32 @@ impl<const PAGE_SIZE: usize> MachClock for MacosUserlandWithPageSize<PAGE_SIZE> 
         assert_eq!(result, KernReturn::SUCCESS, "mach_timebase_info failed");
         info
     }
+}
 
-    fn mach_wait_until(&self, deadline: u64) -> KernReturn {
-        // SAFETY: the deadline is a scalar in mach_absolute_time's clock domain.
-        unsafe { mach_wait_until(deadline) }
+impl<const PAGE_SIZE: usize> ThreadYield for MacosUserlandWithPageSize<PAGE_SIZE> {
+    fn yield_thread(&self) {
+        std::thread::yield_now();
+    }
+}
+
+impl<const PAGE_SIZE: usize> QosParallelism for MacosUserlandWithPageSize<PAGE_SIZE> {
+    fn qos_max_parallelism(&self, qos: Option<u8>, logical: bool) -> Option<u32> {
+        // libpthread's qos_private.h: PTHREAD_MAX_PARALLELISM_PHYSICAL.
+        const PHYSICAL: libc::c_ulong = 0x1;
+        // _pthread_qos_class_from_thread_qos, for THREAD_QOS_MAINTENANCE
+        // through THREAD_QOS_USER_INTERACTIVE.
+        const QOS_CLASSES: [u32; 6] = [0x05, 0x09, 0x11, 0x15, 0x19, 0x21];
+        let flags = if logical { 0 } else { PHYSICAL };
+        let count = match qos {
+            // SAFETY: a scalar query; libpthread only updates its own cache.
+            None => unsafe { pthread_time_constraint_max_parallelism(flags) },
+            Some(qos) => {
+                let class = *QOS_CLASSES.get(usize::from(qos).checked_sub(1)?)?;
+                // SAFETY: a scalar query; libpthread only updates its own cache.
+                unsafe { pthread_qos_max_parallelism(class, flags) }
+            }
+        };
+        u32::try_from(count).ok()
     }
 }
 
@@ -678,35 +748,12 @@ impl TimerHandle {
 
         // Block before spawning so the worker inherits the mask and cannot
         // consume guest-directed host signals during startup.
-        // SAFETY: both sigsets are initialized output storage and this changes
-        // only the calling thread's mask, which is restored below.
-        let old_mask = unsafe {
-            let mut signals = core::mem::zeroed::<libc::sigset_t>();
-            let mut old_mask = core::mem::zeroed::<libc::sigset_t>();
-            libc::sigemptyset(&raw mut signals);
-            for &(host_signal, _) in FORWARDED_SIGNALS {
-                libc::sigaddset(&raw mut signals, host_signal);
-            }
-            assert_eq!(
-                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old_mask),
-                0
-            );
-            old_mask
-        };
+        let old_mask = block_forwarded_signals_saving_mask()
+            .expect("blocking the forwarded signals for the macOS timer worker");
         let worker = std::thread::Builder::new()
             .name("litebox-macos-timer".into())
             .spawn(move || timer_worker(&worker_shared, signal));
-        // SAFETY: old_mask was returned by pthread_sigmask for this thread.
-        assert_eq!(
-            unsafe {
-                libc::pthread_sigmask(
-                    libc::SIG_SETMASK,
-                    &raw const old_mask,
-                    core::ptr::null_mut(),
-                )
-            },
-            0
-        );
+        restore_signal_mask(&old_mask);
         let worker = worker.expect("failed to create macOS timer worker");
         Self {
             shared,
@@ -822,10 +869,12 @@ bitflags::bitflags! {
         const FIXED = 0;
         #[cfg(feature = "subpage_compat")]
         const ANYWHERE = 0x0000_0001;
+        #[cfg(feature = "shared_cache")]
+        const OVERWRITE = 0x0000_4000;
     }
 }
 
-#[cfg(any(test, feature = "subpage_compat"))]
+#[cfg(any(test, feature = "subpage_compat", feature = "shared_cache"))]
 bitflags::bitflags! {
     #[repr(transparent)]
     struct MachVmProtection: i32 {
@@ -836,30 +885,34 @@ bitflags::bitflags! {
     }
 }
 
-#[cfg(any(test, feature = "subpage_compat"))]
+#[cfg(any(test, feature = "subpage_compat", feature = "shared_cache"))]
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 struct MachBoolean(i32);
 
-#[cfg(any(test, feature = "subpage_compat"))]
+#[cfg(any(test, feature = "subpage_compat", feature = "shared_cache"))]
 impl MachBoolean {
-    #[cfg(feature = "subpage_compat")]
+    #[cfg(any(feature = "subpage_compat", feature = "shared_cache"))]
     const FALSE: Self = Self(0);
     #[cfg(test)]
     const TRUE: Self = Self(1);
 }
 
-#[cfg(feature = "subpage_compat")]
+#[cfg(any(feature = "subpage_compat", feature = "shared_cache"))]
 #[derive(Clone, Copy)]
 #[repr(u32)]
 enum MachVmInheritance {
+    #[cfg(feature = "shared_cache")]
+    Copy = 1,
+    #[cfg(feature = "subpage_compat")]
     None = 2,
 }
 
 unsafe extern "C" {
+    fn pthread_qos_max_parallelism(qos: u32, flags: libc::c_ulong) -> libc::c_int;
+    fn pthread_time_constraint_max_parallelism(flags: libc::c_ulong) -> libc::c_int;
     fn mach_absolute_time() -> u64;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> KernReturn;
-    fn mach_wait_until(deadline: u64) -> KernReturn;
     fn mach_task_self() -> u32;
     fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: MachVmFlags) -> KernReturn;
     #[cfg(test)]
@@ -870,7 +923,7 @@ unsafe extern "C" {
         set_maximum: MachBoolean,
         protection: MachVmProtection,
     ) -> KernReturn;
-    #[cfg(feature = "subpage_compat")]
+    #[cfg(any(feature = "subpage_compat", feature = "shared_cache"))]
     fn mach_vm_remap(
         task: u32,
         target: *mut u64,
@@ -1233,10 +1286,15 @@ fn write_tls(offset: usize, value: usize) {
 }
 
 fn initialize_thread_tls() {
+    try_initialize_thread_tls()
+        .unwrap_or_else(|error| panic!("failed to initialize macOS thread TLS: {error}"));
+}
+
+fn try_initialize_thread_tls() -> std::io::Result<()> {
     let key = tls_key();
     // SAFETY: the process-wide key remains allocated for the process lifetime.
     if !unsafe { libc::pthread_getspecific(key) }.is_null() {
-        return;
+        return Ok(());
     }
     let vector_area = Box::into_raw(Box::new(GuestVectorState::default()));
     let block = Box::new(TlsBlock {
@@ -1260,11 +1318,9 @@ fn initialize_thread_tls() {
     if error != 0 {
         // SAFETY: pthread did not take ownership after the failed call.
         unsafe { drop_tls_block(block.cast()) };
-        panic!(
-            "failed to initialize macOS thread TLS: {}",
-            std::io::Error::from_raw_os_error(error)
-        );
+        return Err(std::io::Error::from_raw_os_error(error));
     }
+    Ok(())
 }
 
 fn guest_thread_pointer_tp_offset() -> usize {
@@ -1432,6 +1488,46 @@ fn forwarded_guest_signal(signal: i32) -> Option<litebox_common_linux::signal::S
         .find_map(|&(host, guest)| (host == signal).then_some(guest))
 }
 
+/// Block the host signals forwarded to the guest (SIGINT, SIGALRM) on the
+/// calling thread. [`run_thread`] unblocks them while it runs guest code and
+/// restores the caller's mask afterwards, so a host thread that waits for a
+/// guest's other threads after calling this leaves those signals to them:
+/// the guest's exit model handles them instead of the host's default
+/// disposition.
+pub fn block_forwarded_signals() -> std::io::Result<()> {
+    block_forwarded_signals_saving_mask().map(|_| ())
+}
+
+/// Block the forwarded host signals on the calling thread and return its
+/// previous mask, for [`restore_signal_mask`].
+fn block_forwarded_signals_saving_mask() -> std::io::Result<libc::sigset_t> {
+    // SAFETY: zero is valid for this integer bitmask.
+    let mut signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: zero is valid for this integer bitmask.
+    let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: both masks are live stack storage; only this thread's mask changes.
+    let error = unsafe {
+        libc::sigemptyset(&raw mut signals);
+        for &(signal, _) in FORWARDED_SIGNALS {
+            libc::sigaddset(&raw mut signals, signal);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old_mask)
+    };
+    if error == 0 {
+        Ok(old_mask)
+    } else {
+        Err(std::io::Error::from_raw_os_error(error))
+    }
+}
+
+fn restore_signal_mask(mask: &libc::sigset_t) {
+    assert_eq!(
+        // SAFETY: mask is a mask pthread_sigmask returned for this thread.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, mask, core::ptr::null_mut()) },
+        0
+    );
+}
+
 fn host_signals() -> impl Iterator<Item = i32> {
     EXCEPTION_SIGNALS
         .into_iter()
@@ -1462,17 +1558,31 @@ struct ThreadContext<'a> {
     exit: GuestExit,
 }
 
+/// A spawned guest thread: its resource setup is reported to the spawner
+/// through `ready` before the shim's initializer runs. On failure the thread
+/// drops `init_thread` before reporting, so the shim's thread is gone when
+/// `spawn_thread` returns the error.
 fn thread_start(
     init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = PtRegs>>,
     mut ctx: PtRegs,
     vector_state: GuestVectorState,
     process: Arc<ProcessState>,
+    ready: std::sync::mpsc::SyncSender<std::io::Result<()>>,
 ) {
-    initialize_thread_tls();
+    let alt_stack = try_initialize_thread_tls().and_then(|()| SignalAltStack::new());
+    let alt_stack = match alt_stack {
+        Ok(alt_stack) => alt_stack,
+        Err(error) => {
+            drop(init_thread);
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(()));
     set_guest_vector_state(&vector_state);
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
-    run_thread_inner_with_process(shim.as_ref(), &mut ctx, process);
+    run_thread_inner_with_process(shim.as_ref(), &mut ctx, process, alt_stack);
 }
 
 #[derive(Default)]
@@ -1584,12 +1694,21 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         let ctx = ctx.clone();
         let vector_state =
             litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
-        // TODO: report child TLS setup failures synchronously. pthread_setspecific
-        // can still fail after spawn_thread has returned success, causing the child
-        // to exit before running its initialization callback.
-        let _handle = std::thread::Builder::new()
-            .spawn(move || thread_start(init_thread, ctx, vector_state, process))?;
-        Ok(())
+        let (ready, setup) = std::sync::mpsc::sync_channel(1);
+        // The thread inherits the blocked forwarded signals, so its setup and
+        // the shim's teardown leave them to threads running guest code;
+        // `run_thread_inner_with_process` unblocks them only around guest
+        // execution.
+        let old_mask = block_forwarded_signals_saving_mask()?;
+        let spawned = std::thread::Builder::new()
+            .spawn(move || thread_start(init_thread, ctx, vector_state, process, ready));
+        restore_signal_mask(&old_mask);
+        let _handle = spawned?;
+        // The thread's per-thread resources exist, or it failed without
+        // running guest code.
+        setup
+            .recv()
+            .unwrap_or_else(|_| Err(std::io::Error::other("guest thread ended during its setup")))
     }
     fn current_thread(&self) -> Self::ThreadHandle {
         ThreadHandle::current()
@@ -2078,13 +2197,15 @@ where
 }
 
 fn run_thread_inner(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut PtRegs) {
-    run_thread_inner_with_process(shim, ctx, Arc::new(ProcessState::default()));
+    let alt_stack = SignalAltStack::new().expect("failed to allocate signal stack");
+    run_thread_inner_with_process(shim, ctx, Arc::new(ProcessState::default()), alt_stack);
 }
 
 fn run_thread_inner_with_process(
     shim: &dyn EnterShim<ExecutionContext = PtRegs>,
     ctx: &mut PtRegs,
     process: Arc<ProcessState>,
+    alt_stack: SignalAltStack,
 ) {
     let guest_abi = *GUEST_ABI.get().expect("guest ABI must be configured first");
     initialize_thread_tls();
@@ -2098,7 +2219,8 @@ fn run_thread_inner_with_process(
         pending.store(0, Ordering::Relaxed);
     })
     .expect("initialized thread TLS");
-    // Darwin guests set their TSD base through the platform syscall.
+    // Darwin guests set their TSD base through the platform syscall; child
+    // threads receive theirs from the shim initializer.
     set_guest_thread_pointer(0);
     // Entry/resume installs x18 from PtRegs.
     set_guest_x18(0);
@@ -2163,80 +2285,105 @@ fn run_thread_inner_with_process(
             0,
         );
     });
-    with_signal_alt_stack(|| {
+    alt_stack.install(|| {
         // SAFETY: thread state, handlers and stack are initialized; the caller supplies valid guest mappings.
         unsafe { run_thread_arch(&mut thread_ctx) };
     });
 }
 
-fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
-    let alt_stack_size = (libc::SIGSTKSZ * 2).next_multiple_of(HOST_PAGE_SIZE);
-    let mapping_size = HOST_PAGE_SIZE + alt_stack_size;
-    // SAFETY: allocate fresh anonymous memory without replacing any existing mapping.
-    let stack_base = unsafe {
-        libc::mmap(
-            core::ptr::null_mut(),
-            mapping_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    assert_ne!(
-        stack_base,
-        libc::MAP_FAILED,
-        "failed to allocate signal stack"
-    );
-    let unmap_guard = litebox::utils::defer(|| {
+/// A signal stack mapping with a guard page below it, unmapped on drop.
+struct SignalAltStack {
+    base: *mut libc::c_void,
+    size: usize,
+}
+
+impl SignalAltStack {
+    /// Failing to map the stack is an error, not a panic, so thread creation
+    /// under memory pressure fails cleanly.
+    fn new() -> std::io::Result<Self> {
+        let size = (libc::SIGSTKSZ * 2).next_multiple_of(HOST_PAGE_SIZE);
+        let mapping_size = size + HOST_PAGE_SIZE;
+        // SAFETY: allocate fresh anonymous memory without replacing any existing mapping.
+        let base = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                mapping_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stack = Self { base, size };
+        // SAFETY: the first page is exclusively owned and outside the usable signal stack.
+        if unsafe { libc::mprotect(base, HOST_PAGE_SIZE, libc::PROT_NONE) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(stack)
+    }
+
+    /// Run `f` with this stack installed as the thread's signal stack, then
+    /// restore the previous one and release the mapping.
+    fn install<R>(self, f: impl FnOnce() -> R) -> R {
+        let alternate = libc::stack_t {
+            ss_sp: self.base.wrapping_byte_add(HOST_PAGE_SIZE),
+            ss_size: self.size,
+            ss_flags: 0,
+        };
+        let unmap_guard = self;
+        // SAFETY: stack_t consists of a nullable pointer and integers, all zero-valid.
+        let mut previous = unsafe { std::mem::zeroed::<libc::stack_t>() };
+        // SAFETY: the writable mapping stays live until the previous altstack is restored.
+        let install_result = unsafe { libc::sigaltstack(&raw const alternate, &raw mut previous) };
         assert_eq!(
-            // SAFETY: this mapping was never installed, or cleanup restored the
-            // previous altstack before releasing this guard.
-            unsafe { libc::munmap(stack_base, mapping_size) },
+            install_result,
+            0,
+            "sigaltstack failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // Darwin libc checks the minimum size even for SS_DISABLE. The kernel
+        // ignores that field when disabling a stack, including a previously absent one.
+        if previous.ss_flags & libc::SS_DISABLE != 0 {
+            previous.ss_size = libc::MINSIGSTKSZ;
+        }
+        // Transfer mapping ownership to the cleanup that must restore the stack first.
+        let _cleanup = litebox::utils::defer(move || {
+            // SAFETY: previous was returned by sigaltstack for this thread and stays live.
+            let result = unsafe { libc::sigaltstack(&raw const previous, core::ptr::null_mut()) };
+            if result != 0 {
+                // The kernel may still reference this mapping. Prevent its guard
+                // from unmapping it during unwinding; process exit reclaims it.
+                core::mem::forget(unmap_guard);
+                panic!(
+                    "failed to restore the host signal stack: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            drop(unmap_guard);
+        });
+        f()
+    }
+}
+
+impl Drop for SignalAltStack {
+    fn drop(&mut self) {
+        assert_eq!(
+            // SAFETY: this mapping was never installed, or `install` restored the
+            // previous altstack before dropping it.
+            unsafe { libc::munmap(self.base, self.size + HOST_PAGE_SIZE) },
             0,
         );
-    });
-    assert_eq!(
-        // SAFETY: the first page is exclusively owned and outside the usable signal stack.
-        unsafe { libc::mprotect(stack_base, HOST_PAGE_SIZE, libc::PROT_NONE) },
-        0,
-    );
-    let alternate = libc::stack_t {
-        ss_sp: stack_base.wrapping_byte_add(HOST_PAGE_SIZE),
-        ss_size: alt_stack_size,
-        ss_flags: 0,
-    };
-    // SAFETY: stack_t consists of a nullable pointer and integers, all zero-valid.
-    let mut previous = unsafe { std::mem::zeroed::<libc::stack_t>() };
-    // SAFETY: the writable mapping stays live until the previous altstack is restored.
-    let install_result = unsafe { libc::sigaltstack(&raw const alternate, &raw mut previous) };
-    assert_eq!(
-        install_result,
-        0,
-        "sigaltstack failed: {}",
-        std::io::Error::last_os_error()
-    );
-    // Darwin libc checks the minimum size even for SS_DISABLE. The kernel
-    // ignores that field when disabling a stack, including a previously absent one.
-    if previous.ss_flags & libc::SS_DISABLE != 0 {
-        previous.ss_size = libc::MINSIGSTKSZ;
     }
-    // Transfer mapping ownership to the cleanup that must restore the stack first.
-    let _cleanup = litebox::utils::defer(move || {
-        // SAFETY: previous was returned by sigaltstack for this thread and stays live.
-        let result = unsafe { libc::sigaltstack(&raw const previous, core::ptr::null_mut()) };
-        if result != 0 {
-            // The kernel may still reference this mapping. Prevent its guard
-            // from unmapping it during unwinding; process exit reclaims it.
-            core::mem::forget(unmap_guard);
-            panic!(
-                "failed to restore the host signal stack: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        drop(unmap_guard);
-    });
-    f()
+}
+
+#[cfg(test)]
+fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
+    SignalAltStack::new()
+        .expect("failed to allocate signal stack")
+        .install(f)
 }
 
 impl ThreadContext<'_> {
@@ -2981,6 +3128,97 @@ mod tests {
     const RW: MemoryRegionPermissions =
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
 
+    /// A shim whose `init` runs its function and terminates the thread.
+    struct InitShim<F>(std::cell::RefCell<F>);
+
+    impl<F: FnMut()> EnterShim for InitShim<F> {
+        type ExecutionContext = PtRegs;
+
+        fn init(&self, _: &mut PtRegs) -> ContinueOperation {
+            (self.0.borrow_mut())();
+            ContinueOperation::Terminate
+        }
+        fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+            unreachable!()
+        }
+        fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+            unreachable!()
+        }
+        fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+            unreachable!()
+        }
+    }
+
+    /// A guest thread spawned while forwarded signals are unblocked (from
+    /// guest execution) has them blocked during its setup and the shim's
+    /// teardown, and unblocked only while the shim runs it.
+    #[test]
+    fn spawned_guest_threads_block_forwarded_signals_outside_the_guest() {
+        type Masks = std::sync::mpsc::SyncSender<(&'static str, bool)>;
+
+        fn forwarded_signals_blocked() -> bool {
+            // SAFETY: zero is valid for this integer bitmask.
+            let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            // SAFETY: a null new mask only reads this thread's mask.
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, core::ptr::null(), &raw mut mask) },
+                0
+            );
+            FORWARDED_SIGNALS.iter().all(|&(signal, _)| {
+                // SAFETY: mask is an initialized sigset_t.
+                unsafe { libc::sigismember(&raw const mask, signal) == 1 }
+            })
+        }
+
+        struct ChildInit(Masks);
+        /// Reports the mask when the child's shim is torn down.
+        struct Teardown(Masks);
+
+        impl litebox::shim::InitThread for ChildInit {
+            type ExecutionContext = PtRegs;
+
+            fn init(self: Box<Self>) -> Box<dyn EnterShim<ExecutionContext = PtRegs>> {
+                self.0.send(("setup", forwarded_signals_blocked())).unwrap();
+                let teardown = Teardown(self.0);
+                Box::new(InitShim(std::cell::RefCell::new(move || {
+                    teardown
+                        .0
+                        .send(("guest", forwarded_signals_blocked()))
+                        .unwrap();
+                })))
+            }
+        }
+
+        impl Drop for Teardown {
+            fn drop(&mut self) {
+                let _ = self.0.send(("teardown", forwarded_signals_blocked()));
+            }
+        }
+
+        set_guest_abi(GuestAbi::Linux);
+        let platform = MacosUserland::new();
+        let parent = InitShim(std::cell::RefCell::new(|| {
+            assert!(!forwarded_signals_blocked());
+            let (masks, observed) = std::sync::mpsc::sync_channel(3);
+            // SAFETY: the child's shim terminates before guest entry.
+            unsafe {
+                platform
+                    .spawn_thread(&PtRegs::default(), Box::new(ChildInit(masks)))
+                    .unwrap();
+            }
+            let observed: Vec<_> = (0..3)
+                .map(|_| observed.recv_timeout(Duration::from_secs(30)).unwrap())
+                .collect();
+            assert_eq!(
+                observed,
+                [("setup", true), ("guest", false), ("teardown", true)]
+            );
+            assert!(!forwarded_signals_blocked());
+        }));
+        // SAFETY: both shims terminate before guest entry.
+        unsafe { run_thread(parent, &mut PtRegs::default()) };
+    }
+
     #[test]
     fn signal_altstack_restores_disabled_and_enabled_stacks() {
         extern "C" fn check(_: *mut libc::c_void) -> *mut libc::c_void {
@@ -3201,29 +3439,13 @@ mod tests {
 
     /// Run host-only test code with the same registration as a guest sibling.
     fn run_process_test_thread(process: Arc<ProcessState>, f: impl FnOnce()) {
-        struct InitOnly<F>(std::cell::RefCell<Option<F>>);
-        impl<F: FnOnce()> EnterShim for InitOnly<F> {
-            type ExecutionContext = PtRegs;
-
-            fn init(&self, _: &mut PtRegs) -> ContinueOperation {
-                self.0.borrow_mut().take().unwrap()();
-                ContinueOperation::Terminate
-            }
-            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
-                unreachable!()
-            }
-            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
-                unreachable!()
-            }
-            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
-                unreachable!()
-            }
-        }
         set_guest_abi(GuestAbi::Linux);
+        let mut f = Some(f);
         run_thread_inner_with_process(
-            &InitOnly(std::cell::RefCell::new(Some(f))),
+            &InitShim(std::cell::RefCell::new(|| f.take().unwrap()())),
             &mut PtRegs::default(),
             process,
+            SignalAltStack::new().unwrap(),
         );
     }
 
@@ -4664,8 +4886,56 @@ mod tests {
         }
 
         #[test]
+        fn published_pages_replace_only_owned_pages() {
+            const VM_REGION_EXTENDED_INFO: i32 = 13;
+            let p = MacosUserland::new();
+            let (range, _release) = owned_marked_pages(p, TASK_ADDR_MIN + (7 << 40), 2, 0x5a);
+            let ptr =
+                <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                    range.start,
+                );
+            let owned = range.start..range.start + HOST_PAGE_SIZE;
+            // SAFETY: the test-owned page is idle; later probes use fallible accesses.
+            unsafe { p.release_pages(owned.end..range.end) }.unwrap();
+            let read = MemoryRegionPermissions::READ;
+            let bytes = vec![0x11; 2 * HOST_PAGE_SIZE];
+            // SAFETY: the test-owned page is idle; the free page must be refused.
+            let result = unsafe { p.publish_pages(range.clone(), &bytes, read) };
+            assert!(matches!(result, Err(PermissionUpdateError::Unallocated)));
+            assert_eq!(ptr.read_at_offset(0), Some(0x5a));
+            assert_eq!(ptr.write_at_offset(1, 0x6b), Some(()));
+            assert_eq!(ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed()), None);
+
+            // SAFETY: the test-owned page is idle.
+            unsafe { p.publish_pages(owned.clone(), &bytes[..HOST_PAGE_SIZE], read) }.unwrap();
+            assert_eq!(
+                ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed() - 1),
+                Some(0x11)
+            );
+            assert_eq!(ptr.write_at_offset(0, 0x44), None);
+            // `vm_region_extended_info.ref_count`: no staging mapping shares the page.
+            let (mut address, mut size, mut object) = (owned.start as u64, 0, 0);
+            let mut info = [0i32; 9];
+            let mut count = 9u32;
+            // SAFETY: all outputs are valid; VM_REGION_EXTENDED_INFO writes 9 ints.
+            let result = unsafe {
+                shared_cache::mach_vm_region(
+                    mach_task_self(),
+                    &raw mut address,
+                    &raw mut size,
+                    VM_REGION_EXTENDED_INFO,
+                    info.as_mut_ptr(),
+                    &raw mut count,
+                    &raw mut object,
+                )
+            };
+            assert_eq!(result, KernReturn::SUCCESS);
+            assert_eq!((address, info[6]), (owned.start as u64, 1));
+        }
+
+        #[test]
         #[cfg(feature = "subpage_compat")]
-        fn subpage_instances_refuse_file_views() {
+        fn subpage_instances_refuse_file_views_and_published_pages() {
             use std::os::fd::AsFd as _;
 
             let p = MacosUserland4K::new();
@@ -4676,6 +4946,18 @@ mod tests {
                     TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                     file.as_fd(),
                     0,
+                    MemoryRegionPermissions::READ,
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(PermissionUpdateError::PermissionDenied)
+            ));
+            // SAFETY: a refused request has no side effects.
+            let result = unsafe {
+                p.publish_pages(
+                    TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
+                    &[0; HOST_PAGE_SIZE],
                     MemoryRegionPermissions::READ,
                 )
             };

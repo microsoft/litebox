@@ -16,6 +16,8 @@ use super::{
     MemoryRegionPermissions as Perm, PermissionUpdateError, TASK_ADDR_MAX, TASK_ADDR_MIN,
     mach_task_self, mach_vm_allocate, prot_flags, sys_icache_invalidate,
 };
+#[cfg(feature = "shared_cache")]
+use super::{MachBoolean, MachVmInheritance, MachVmProtection, mach_vm_remap};
 
 #[derive(Default)]
 pub(super) struct Pages {
@@ -219,6 +221,78 @@ impl Pages {
         };
         if mapped == libc::MAP_FAILED {
             return Err(permission_error());
+        }
+        Ok(())
+    }
+
+    /// Replace the owned pages of `range` with private pages holding `bytes` (as long as `range`)
+    /// and `permissions`. They are built in a staging mapping and moved in by one `mach_vm_remap`
+    /// with `VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`: XNU's `vm_map_remap` removes the old entries
+    /// with `vm_map_delete_and_iunlock(VM_MAP_REMOVE_TO_OVERWRITE)`, which holds the range with a
+    /// sentinel entry and then under the map interlock until the new entries are inserted, and
+    /// fails having removed nothing (`vm_map_locate_space_fixed`, osfmk/vm/vm_map.c). An access
+    /// therefore faults or sees all of `bytes`. `owned` is unchanged: the new pages take over the old pages' ownership.
+    #[cfg(feature = "shared_cache")]
+    pub(super) fn publish(
+        &mut self,
+        range: &Range<usize>,
+        bytes: &[u8],
+        permissions: Perm,
+    ) -> Result<(), PermissionUpdateError> {
+        // As in `map_file`, only `update_permissions`, which invalidates the icache, may make
+        // the pages executable.
+        if permissions.contains(Perm::EXEC) {
+            return Err(PermissionUpdateError::PermissionDenied);
+        }
+        if self.owned.gaps(range).next().is_some() {
+            return Err(PermissionUpdateError::Unallocated);
+        }
+        // SAFETY: without MAP_FIXED the kernel chooses unused pages.
+        let staging = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                range.len(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if staging == libc::MAP_FAILED {
+            return Err(permission_error());
+        }
+        // SAFETY: mmap just created this mapping, which this call exclusively owns.
+        let staging = unsafe { Mapping::new(staging as usize, range.len()) };
+        let pages = staging.base() as *mut libc::c_void;
+        // SAFETY: the staging mapping is writable, private to this call, and as long as `bytes`.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), pages.cast(), bytes.len()) };
+        // SAFETY: the staging mapping is private to this call.
+        if unsafe { libc::mprotect(pages, range.len(), native_prot(permissions)) } != 0 {
+            return Err(permission_error());
+        }
+        let mut target = range.start as u64;
+        let mut current = MachVmProtection::empty();
+        let mut maximum = MachVmProtection::empty();
+        // SAFETY: the caller owns the whole range and excludes its writers, so OVERWRITE replaces
+        // only this instance's pages. copy=false shares the staging pages, with their protection,
+        // instead of copying them; dropping `staging` leaves the target their only mapping.
+        let result = unsafe {
+            mach_vm_remap(
+                mach_task_self(),
+                &raw mut target,
+                range.len() as u64,
+                0,
+                MachVmFlags::FIXED | MachVmFlags::OVERWRITE,
+                mach_task_self(),
+                staging.base() as u64,
+                MachBoolean::FALSE,
+                &raw mut current,
+                &raw mut maximum,
+                MachVmInheritance::Copy,
+            )
+        };
+        if result != KernReturn::SUCCESS {
+            return Err(PermissionUpdateError::PlatformFailure);
         }
         Ok(())
     }

@@ -12,8 +12,11 @@ use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::{
     RawConstPointer as _, RawMutPointer as _, page_mgmt::MemoryRegionPermissions as Permissions,
 };
-use litebox_common_linux::vmem::CreatePagesFlags;
-use litebox_common_macos::{PAGE_SIZE, VmProtection, shared_cache::HostSharedCache};
+use litebox_common_linux::vmem::{CreatePagesFlags, VmFlags};
+use litebox_common_macos::{
+    PAGE_SIZE, VmProtection,
+    shared_cache::{HostSharedCache, HostSharedCacheError},
+};
 use litebox_syscall_rewriter::macho::Rewriter;
 
 mod layout;
@@ -126,6 +129,14 @@ pub(crate) struct SharedCachePage {
 /// the instance locked, so it must not re-enter the shim.
 pub(crate) type SharedCachePager = Arc<dyn Fn(usize) -> Option<SharedCachePage> + Send + Sync>;
 
+/// Replaces the reserved page at a page-aligned guest address of a
+/// [`SharedCacheBacking::Paged`] piece with a page of bytes and the given
+/// permissions in one VM operation ([`HostSharedCache::publish_cache_pages`]).
+/// Captured at installation, since [`ShimPlatform`] does not include
+/// [`HostSharedCache`]; called with the instance locked.
+type SharedCachePublisher =
+    Arc<dyn Fn(usize, &[u8], Permissions) -> Result<(), HostSharedCacheError> + Send + Sync>;
+
 /// Layout of a guest-private shared-cache instance.
 pub(crate) struct SharedCacheLayout<'a> {
     /// The range reserved with [`LoadedProgram::reserve_shared_cache`].
@@ -160,7 +171,8 @@ pub(crate) struct SharedCacheState {
     /// they touch with equal neighbors (same protection, maximum and paged
     /// state), so repeated page-ins keep the count bounded.
     pub(crate) mappings: Vec<SharedCacheMapping>,
-    pub(crate) pager: Option<SharedCachePager>,
+    /// The pager and the publisher of its pages.
+    pub(crate) pager: Option<(SharedCachePager, SharedCachePublisher)>,
 }
 
 impl SharedCacheState {
@@ -388,7 +400,10 @@ impl<P: ShimPlatform> LoadedProgram<P> {
         }
         // The pieces replace the reservation's pages; `SharedCacheState`
         // holds their maximum protections.
-        task.forget_replaced_maximum_protections(cache.range.clone(), true);
+        {
+            let _mappings = task.global.macho_mappings.lock();
+            task.forget_replaced_maximum_protections(cache.range.clone(), true);
+        }
         let mut gates: Vec<Vec<u8>> = vec![Vec::new(); cache.gate_islands.len()];
         for (piece, ranges) in cache.pieces.iter().zip(&code_ranges) {
             match (piece.backing, ranges) {
@@ -474,10 +489,16 @@ impl<P: ShimPlatform> LoadedProgram<P> {
             litebox_util_log::error!(range:? = unexpected; "unrewritten executable shared-cache memory");
             return Err(Error::InvalidRegion);
         }
+        let platform: &'static P = task.global.platform;
+        let publish: SharedCachePublisher = Arc::new(move |target, bytes, permissions| {
+            // SAFETY: the page-in calling this holds the instance lock, so nothing else maps or
+            // writes the reserved page, and the page's records allow `permissions`.
+            unsafe { platform.publish_cache_pages(target, bytes, permissions) }
+        });
         *task.global.shared_cache.lock() = Some(SharedCacheState {
             range: cache.range.clone(),
             mappings,
-            pager: cache.pager.clone(),
+            pager: cache.pager.clone().map(|pager| (pager, publish)),
         });
         task.global
             .shared_cache_base
@@ -897,7 +918,10 @@ impl<P: ShimPlatform> Task<P> {
         if recorded.protection.is_empty() {
             return false;
         }
-        let Some(supplied) = cache.pager.as_ref().and_then(|pager| pager(page.start)) else {
+        let Some((pager, publish)) = cache.pager.as_ref() else {
+            return false;
+        };
+        let Some(supplied) = pager(page.start) else {
             litebox_util_log::warn!(page:? = page; "shared-cache pager cannot supply a page");
             return false;
         };
@@ -908,10 +932,27 @@ impl<P: ShimPlatform> Task<P> {
             litebox_util_log::warn!(page:? = page; "shared-cache pager supplied an invalid page");
             return false;
         }
-        if self
-            .map_shared_cache_copy(&page, &supplied.bytes, recorded.protection)
-            .is_err()
-        {
+        #[cfg(all(test, target_os = "macos"))]
+        self.global
+            .mapping_hook
+            .reach(crate::syscalls::mm::hook::Point::PageInSupplied);
+        // The reserved page stays inaccessible until the complete page replaces it, so a sibling
+        // reading it without faulting sees all of the supplied bytes.
+        let protection = permissions(recorded.protection);
+        if let Err(error) = publish(page.start, &supplied.bytes, protection) {
+            litebox_util_log::warn!(error:%, page:?; "cannot publish a shared-cache page");
+            return false;
+        }
+        // SAFETY: the page now holds the supplied bytes with `protection`, which this records.
+        let recorded = unsafe {
+            self.global.mm.change_page_permissions(
+                P::RawMutPointer::<u8>::from_usize(page.start),
+                PAGE_SIZE,
+                protection,
+            )
+        };
+        if let Err(error) = recorded {
+            litebox_util_log::warn!(error:?, page:?; "cannot record a shared-cache page");
             return false;
         }
         litebox_util_log::debug!(
@@ -921,6 +962,46 @@ impl<P: ShimPlatform> Task<P> {
         );
         cache.page_in(&page);
         true
+    }
+
+    /// Whether a data abort at `address` in the shared-cache instance raced
+    /// with another thread supplying the page: it is a VM fault and the guest
+    /// map now allows the access (`esr`'s WnR bit tells a write), so it is
+    /// retried.
+    pub(crate) fn shared_cache_fault_resolved(&self, address: usize, esr: u64) -> bool {
+        /// ESR_ELx.EC of a data abort from EL0.
+        const EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
+        const EC_SHIFT: u32 = 26;
+        const EC_MASK: u64 = 0x3f;
+        /// ESR_ELx.ISS.DFSC.
+        const DFSC_MASK: u64 = 0x3f;
+        /// ESR_ELx.ISS.WnR of a data abort: the access was a write.
+        const ESR_WNR: u64 = 1 << 6;
+        // sleh.c `is_vm_fault`: translation, access-flag and permission
+        // faults go to vm_fault; anything else (e.g. an alignment fault)
+        // cannot be resolved by supplying a page.
+        let vm_fault = matches!(esr & DFSC_MASK, 0x04..=0x07 | 0x09..=0x0b | 0x0d..=0x0f);
+        if (esr >> EC_SHIFT) & EC_MASK != EC_DATA_ABORT_LOWER_EL || !vm_fault {
+            return false;
+        }
+        // Waits for a page-in in progress on another thread.
+        let cache = self.global.shared_cache.lock();
+        if !cache
+            .as_ref()
+            .is_some_and(|cache| cache.range.contains(&address))
+        {
+            return false;
+        }
+        let needed = if esr & ESR_WNR != 0 {
+            VmFlags::VM_WRITE
+        } else {
+            VmFlags::VM_READ
+        };
+        self.global
+            .mm
+            .overlapping(address..address + 1)
+            .first()
+            .is_some_and(|(_, flags)| flags.contains(needed))
     }
 }
 

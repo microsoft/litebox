@@ -978,7 +978,6 @@ mod tests {
     use super::*;
     use crate::{MAX_KERNEL_BUF_SIZE, MacosShimBuilder, Process};
     use alloc::vec;
-    use core::sync::atomic::AtomicI32;
     use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
@@ -1046,14 +1045,7 @@ mod tests {
 
     fn task_with(builder: MacosShimBuilder<Platform>, params: TaskParams) -> Task<Platform> {
         let shim = builder.build();
-        let thread = crate::ThreadState::new(1u64 << 32, shim.global.platform);
-        Task {
-            global: shim.global,
-            files: shim.files,
-            params,
-            process: Process(Arc::new(AtomicI32::new(-1))),
-            thread,
-        }
+        Task::new_main(shim.global, shim.files, params, Process::new())
     }
 
     #[test]
@@ -2111,19 +2103,18 @@ mod tests {
         close(dir);
 
         // Root: everything except executing a regular file with no x bit.
-        let root = Task {
-            global: Arc::clone(&task.global),
-            files: Arc::clone(&task.files),
-            params: TaskParams {
+        let root = Task::new_main(
+            Arc::clone(&task.global),
+            Arc::clone(&task.files),
+            TaskParams {
                 uid: 0,
                 euid: 0,
                 gid: 0,
                 egid: 0,
                 ..TaskParams::default()
             },
-            process: Process(Arc::new(AtomicI32::new(-1))),
-            thread: crate::ThreadState::new(2u64 << 32, task.global.platform),
-        };
+            Process::new(),
+        );
         let root_access = |path: &str, mode: AccessFlags| root.sys_access(path, mode);
         let (r, w, x) = (AccessFlags::R_OK, AccessFlags::W_OK, AccessFlags::X_OK);
         assert_eq!(root_access("/locked", r | w | x), Ok(()));

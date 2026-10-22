@@ -17,7 +17,7 @@ use litebox_common_macos::{
 const CARRY: u64 = 1 << 29;
 
 /// Every trap leaves the name table's reverse index and free list consistent.
-fn trap(task: &Task<Platform>, number: u32, args: &[usize]) -> usize {
+pub(super) fn trap(task: &Task<Platform>, number: u32, args: &[usize]) -> usize {
     let mut ctx = PtRegs::default();
     ctx.regs[16] = 0u32.wrapping_sub(number) as usize;
     ctx.regs[..args.len()].copy_from_slice(args);
@@ -26,11 +26,11 @@ fn trap(task: &Task<Platform>, number: u32, args: &[usize]) -> usize {
     ctx.regs[0]
 }
 
-fn kr(task: &Task<Platform>, number: u32, args: &[usize]) -> KernReturn {
+pub(super) fn kr(task: &Task<Platform>, number: u32, args: &[usize]) -> KernReturn {
     KernReturn::from_raw(i32::try_from(trap(task, number, args)).unwrap())
 }
 
-fn bsd(task: &Task<Platform>, number: usize, args: &[usize]) -> Result<usize, usize> {
+pub(super) fn bsd(task: &Task<Platform>, number: usize, args: &[usize]) -> Result<usize, usize> {
     let mut ctx = PtRegs::default();
     ctx.regs[16] = number;
     ctx.regs[..args.len()].copy_from_slice(args);
@@ -42,8 +42,23 @@ fn bsd(task: &Task<Platform>, number: usize, args: &[usize]) -> Result<usize, us
     }
 }
 
-fn new_task() -> Task<Platform> {
+pub(super) fn new_task() -> Task<Platform> {
     task(MacosShimBuilder::new(Platform::new()).build())
+}
+
+/// One new page of guest memory, zeroed.
+pub(super) fn guest_page(task: &Task<Platform>) -> usize {
+    let own = trap(task, mach_trap::TASK_SELF, &[]);
+    let mut address = 0usize;
+    assert_eq!(
+        kr(
+            task,
+            mach_trap::MACH_VM_ALLOCATE,
+            &[own, (&raw mut address) as usize, PAGE_SIZE, 1]
+        ),
+        KernReturn::SUCCESS
+    );
+    address
 }
 
 /// `mach_msg2` with a scalar buffer, as libsyscall packs it.
@@ -322,6 +337,79 @@ fn port_rights_follow_xnu_reference_rules() {
     );
 }
 
+/// `ipc_mqueue_receive` finds and claims a message under one lock hold: of
+/// two receivers racing for the last message on a live port, one gets it and
+/// the other times out, never reporting the receive right invalid.
+#[test]
+fn racing_receivers_for_one_message_never_report_an_invalid_name() {
+    use super::ulock::BOUND;
+    use crate::syscalls::mm::hook;
+    let task = new_task();
+    let port = construct(&task, mpo::INSERT_SEND_RIGHT);
+    let send = MachMsgHeader {
+        bits: msgh_bits::ports(msg_type::COPY_SEND, 0),
+        size: 0,
+        remote_port: port,
+        local_port: 0,
+        voucher_port: 0,
+        id: 1,
+    };
+    let mut buffer = [0u8; 256];
+    assert_eq!(
+        msg2(&task, &mut buffer, 1, send, 24, 0, 0, 0),
+        msg_return::SUCCESS
+    );
+    let receive = |task: &Task<Platform>, options: u64| {
+        let mut buffer = [0u8; 256];
+        msg2(
+            task,
+            &mut buffer,
+            options,
+            MachMsgHeader::default(),
+            0,
+            0,
+            port,
+            256,
+        )
+    };
+    let racer = task.new_sibling(0);
+    let (go, start) = std::sync::mpsc::channel::<()>();
+    let (report, held) = std::sync::mpsc::channel::<bool>();
+    let (finish, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let racer = scope.spawn(move || {
+            <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                start.recv_timeout(BOUND).unwrap();
+                report.send(racer.global.ipc.try_lock().is_none()).unwrap();
+                // A zero-timeout receive.
+                let result = receive(&racer, 2 | 0x100);
+                // Only a hook that let this racer run first waits for this.
+                let _ = finish.send(());
+                result
+            })
+        });
+        let mut go = Some(go);
+        task.global.mapping_hook.set(move |point| {
+            if point == hook::Point::MessageFound
+                && let Some(go) = go.take()
+            {
+                go.send(()).unwrap();
+                // A racer that can take the IPC lock may receive before this
+                // receiver resumes; one that cannot resumes after it.
+                if !held.recv_timeout(BOUND).unwrap() {
+                    finished.recv_timeout(BOUND).unwrap();
+                }
+            }
+        });
+        let received = receive(&task, 2);
+        task.global.mapping_hook.clear();
+        assert_eq!(
+            (received, racer.join().unwrap()),
+            (msg_return::SUCCESS, msg_return::RCV_TIMED_OUT)
+        );
+    });
+}
+
 #[test]
 fn mach_msg_queues_messages_and_send_once_notifications() {
     const ID: i32 = 0x4242;
@@ -436,7 +524,13 @@ fn mach_msg_queues_messages_and_send_once_notifications() {
 }
 
 /// [`mig_call_on`] with a new reply port.
-fn mig_call(task: &Task<Platform>, remote: u32, id: i32, body: &[u8], complex: bool) -> Vec<u8> {
+pub(super) fn mig_call(
+    task: &Task<Platform>,
+    remote: u32,
+    id: i32,
+    body: &[u8],
+    complex: bool,
+) -> Vec<u8> {
     let reply = u32::try_from(trap(task, mach_trap::MACH_REPLY_PORT, &[])).unwrap();
     mig_call_on(task, reply, remote, id, body, complex)
 }
@@ -486,7 +580,7 @@ fn mig_call_on(
     buffer
 }
 
-fn ndr(fields: &[u32]) -> Vec<u8> {
+pub(super) fn ndr(fields: &[u32]) -> Vec<u8> {
     let mut body = litebox_common_macos::mach::NDR_RECORD.to_vec();
     for field in fields {
         body.extend_from_slice(&field.to_ne_bytes());
@@ -494,7 +588,7 @@ fn ndr(fields: &[u32]) -> Vec<u8> {
     body
 }
 
-fn word(bytes: &[u8], offset: usize) -> u32 {
+pub(super) fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 

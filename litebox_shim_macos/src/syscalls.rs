@@ -21,6 +21,9 @@ pub(crate) mod mig;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod process;
+pub(crate) mod restartable;
+pub(crate) mod thread;
+pub(crate) mod ulock;
 
 /// The only sysctl nodes the shim exposes: read-only system identity that
 /// any sandboxed process can read, which the guest's own OS components
@@ -46,7 +49,7 @@ pub struct HostSysctl {
 
 impl<P: ShimPlatform> Task<P> {
     pub(crate) fn sys_exit(&self, status: i32) {
-        self.process.exit(status & 0xff);
+        self.exit_process(status & 0xff);
     }
 
     pub(crate) fn sys_getpid(&self) -> i32 {
@@ -152,7 +155,16 @@ impl<P: ShimPlatform> Task<P> {
         KernReturn::SUCCESS
     }
 
+    /// `mach_wait_until_trap` (`osfmk/kern/clock.c`): an abortable sleep
+    /// that process exit ends with `KERN_ABORTED`.
     pub(crate) fn sys_mach_wait_until(&self, deadline: u64) -> KernReturn {
-        self.global.platform.mach_wait_until(deadline)
+        match self
+            .wait_cx()
+            .with_timeout(self.mach_deadline_timeout(deadline))
+            .sleep()
+        {
+            litebox::event::wait::WaitError::TimedOut => KernReturn::SUCCESS,
+            litebox::event::wait::WaitError::Interrupted => KernReturn::ABORTED,
+        }
     }
 }

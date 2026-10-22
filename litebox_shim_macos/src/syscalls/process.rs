@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Process identity, signal-mask, code-signing and security-policy syscalls.
+//! Process identity, code-signing and security-policy syscalls.
 //!
 //! The guest is an unsigned, non-platform process with no MAC policies, SIP
 //! configuration, or Rosetta: each call returns what XNU returns to such a
@@ -12,12 +12,10 @@ use litebox_broker_protocol::fs::{FileMode, FileType};
 use litebox_common_macos::{
     SIGABRT, SIGKILL,
     errno::Errno,
-    syscall::{AccessFlags, SigSet, SigmaskHow},
+    syscall::AccessFlags,
     user_pointers::{UserPtr, UserPtrMut},
 };
 
-/// `sigcantmask`: SIGKILL and SIGSTOP.
-const UNMASKABLE_SIGNALS: u32 = (1 << (9 - 1)) | (1 << (17 - 1));
 /// `CROSSARCH_MAX_VALID_NAMESPACE` (`CROSSARCH_ROSETTA`).
 const CROSSARCH_MAX_VALID_NAMESPACE: u32 = 0;
 /// `csrctl` operations.
@@ -30,32 +28,6 @@ impl<P: ShimPlatform> Task<P> {
     /// `issetugid`: the guest did not change identity at exec.
     pub(crate) fn sys_issetugid() -> usize {
         0
-    }
-
-    /// `sigprocmask` on the thread's mask. Guest signal delivery is not
-    /// supported, so the mask has no further effect.
-    pub(crate) fn sys_sigprocmask(
-        &self,
-        how: SigmaskHow,
-        mask: Option<UserPtr<SigSet>>,
-        old_mask: Option<UserPtrMut<SigSet>>,
-    ) -> Result<(), Errno> {
-        let old = self.thread.signal_mask.get();
-        if let Some(mask) = mask {
-            let new = mask.read_at_offset::<P>(0).ok_or(Errno::EFAULT)?.0 & !UNMASKABLE_SIGNALS;
-            let updated = match how {
-                SigmaskHow::Block => old | new,
-                SigmaskHow::Unblock => old & !new,
-                SigmaskHow::SetMask => new,
-                SigmaskHow::Unknown(_) => return Err(Errno::EINVAL),
-            };
-            self.thread.signal_mask.set(updated);
-        }
-        if let Some(old_mask) = old_mask {
-            // XNU ignores this copyout's failure.
-            let _ = old_mask.write_at_offset::<P>(0, SigSet(old));
-        }
-        Ok(())
     }
 
     /// `crossarch_trap`: Rosetta is not present.
@@ -153,7 +125,7 @@ impl<P: ShimPlatform> Task<P> {
             reason:? = reason;
             "guest aborted"
         );
-        self.process.exit(128 + SIGABRT);
+        self.exit_process(128 + SIGABRT);
     }
 
     /// `terminate_with_payload`: only the guest itself is visible, and
@@ -178,7 +150,7 @@ impl<P: ShimPlatform> Task<P> {
             reason:? = reason;
             "guest terminated itself"
         );
-        self.process.exit(128 + SIGKILL);
+        self.exit_process(128 + SIGKILL);
         Ok(())
     }
 

@@ -42,6 +42,9 @@ impl KernReturn {
     pub const INVALID_CAPABILITY: Self = Self(20);
     pub const RIGHT_EXISTS: Self = Self(21);
     pub const INVALID_HOST: Self = Self(22);
+    pub const ALREADY_WAITING: Self = Self(30);
+    /// The target thread has terminated.
+    pub const TERMINATED: Self = Self(37);
     pub const NOT_SUPPORTED: Self = Self(46);
     pub const OPERATION_TIMED_OUT: Self = Self(49);
     pub const DENIED: Self = Self(53);
@@ -65,7 +68,23 @@ impl From<KernReturn> for usize {
 pub trait MachClock {
     fn mach_absolute_time(&self) -> u64;
     fn mach_timebase_info(&self) -> syscall::MachTimebaseInfo;
-    fn mach_wait_until(&self, deadline: u64) -> KernReturn;
+}
+
+/// Darwin's processor yield (`swtch`, `swtch_pri`, `thread_switch`).
+pub trait ThreadYield {
+    /// Offer the processor to another runnable thread, if the host scheduler
+    /// has one.
+    fn yield_thread(&self);
+}
+
+/// The host's answer to `bsdthread_ctl(BSDTHREAD_CTL_QOS_MAX_PARALLELISM)`
+/// (`qos_max_parallelism`): how many threads can run in parallel.
+pub trait QosParallelism {
+    /// For threads of `qos` (a `thread_qos_t` from `THREAD_QOS_MAINTENANCE`
+    /// to `THREAD_QOS_USER_INTERACTIVE`), or for realtime threads if `qos` is
+    /// `None`; in logical or physical processors. `None` if the host has no
+    /// answer.
+    fn qos_max_parallelism(&self, qos: Option<u8>, logical: bool) -> Option<u32>;
 }
 
 impl From<KernReturn> for litebox::platform::page_mgmt::AllocationError {

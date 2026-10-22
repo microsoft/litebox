@@ -90,6 +90,9 @@ fn host_sysctls() -> Vec<litebox_shim_macos::syscalls::HostSysctl> {
     sysctls
 }
 
+/// Run the guest on the calling thread and return its exit status once every
+/// guest thread has ended. The calling thread is left with the forwarded
+/// signals (SIGINT, SIGALRM) blocked, so they reach the guest's threads.
 pub fn run(cli_args: CliArgs) -> Result<i32> {
     // Log to stderr, filtered by `LITEBOX_LOG` (for example `LITEBOX_LOG=debug`).
     let _ = tracing_subscriber::fmt()
@@ -181,14 +184,17 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let program = shim.load_program_from_bytes(TaskParams::default(), path, &data, argv, envp);
     let program = program.context("loading Mach-O")?;
     let (entrypoints, process, mut initial_ctx) = program.into_parts();
+    // The main thread may end (pthread_exit) before the guest's other
+    // threads. Ctrl-C while this thread waits for them must reach one of them.
+    litebox_platform_macos_userland::block_forwarded_signals()
+        .context("blocking forwarded signals")?;
     // SAFETY: the loader owns valid mappings and has finalized Darwin gates;
     // entrypoints retain those mappings until guest execution stops.
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
+    let status = process.wait_for_exit();
     #[cfg(feature = "test-broker")]
     test_broker::flush_output(&stdio)?;
-    process
-        .exit_status()
-        .context("guest stopped without an exit status")
+    Ok(status)
 }
