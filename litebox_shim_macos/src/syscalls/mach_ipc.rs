@@ -1495,6 +1495,7 @@ impl<P: ShimPlatform> Task<P> {
             }
             _ => Err(KernReturn::INVALID_VALUE),
         };
+        drop(ipc);
         match allocated {
             Ok(allocated) => copyout::<P, u32>(name, allocated),
             Err(error) => error,
@@ -1548,14 +1549,14 @@ impl<P: ShimPlatform> Task<P> {
         context: u64,
         name: UserPtrMut<u32>,
     ) -> KernReturn {
-        let mut ipc = self.global.ipc.lock();
-        if !ipc.is_task_name(target) {
+        if !self.global.ipc.lock().is_task_name(target) {
             return INVALID_TASK_DEST;
         }
         let Some(options) = options.read_at_offset::<P>(0) else {
             return KernReturn::MEMORY_ERROR;
         };
-        match ipc.construct(&options, context) {
+        let constructed = self.global.ipc.lock().construct(&options, context);
+        match constructed {
             Ok(constructed) => copyout::<P, u32>(name, constructed),
             Err(error) => error,
         }
@@ -1926,6 +1927,7 @@ impl<P: ShimPlatform> Task<P> {
         if receive_size < message_size + trailer_size {
             if options.contains(MachMsgOptions::RCV_LARGE) {
                 // The message stays queued; report its size.
+                drop(ipc);
                 if receive_size >= 8 {
                     let size_address = data.checked_add(4).ok_or(msg_return::RCV_INVALID_DATA)?;
                     let size_field = UserPtrMut::<u32>::from_usize(size_address);

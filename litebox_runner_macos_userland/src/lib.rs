@@ -132,11 +132,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     #[cfg(not(feature = "test-broker"))]
     let program = shim.load_program_from_bytes(TaskParams::default(), path, &data, argv, envp);
     let program = program.context("loading Mach-O")?;
-    let litebox_shim_macos::LoadedProgram {
-        entrypoints,
-        process,
-        mut initial_ctx,
-    } = program;
+    let (entrypoints, process, mut initial_ctx) = program.into_parts();
     // SAFETY: the loader owns valid mappings and has finalized Darwin gates;
     // entrypoints retain those mappings until guest execution stops.
     unsafe {

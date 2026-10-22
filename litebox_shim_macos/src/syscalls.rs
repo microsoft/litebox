@@ -8,7 +8,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use litebox::utils::TruncateExt as _;
 use litebox_common_macos::{
-    KernReturn, errno::Errno, syscall::MachTimebaseInfo, user_pointers::UserPtrMut,
+    KernReturn,
+    errno::Errno,
+    syscall::MachTimebaseInfo,
+    user_pointers::{UserPtr, UserPtrMut},
 };
 
 pub(crate) mod file;
@@ -82,6 +85,58 @@ impl<P: ShimPlatform> Task<P> {
         start_address
             .write_at_offset::<P>(0, base)
             .ok_or(Errno::EFAULT)
+    }
+
+    /// `shared_region_map_and_slide_2_np`: dyld maps a cache into the
+    /// task's shared region only when it cannot reuse one. The guest's region
+    /// already holds its private instance, and no other region can be
+    /// mapped, so this never reaches the host. Like XNU
+    /// (`bsd/vm/vm_unix.c`), empty requests succeed, oversized counts fail
+    /// with a raw `KERN_FAILURE` (the guest sees errno 5, `EIO`) and
+    /// unreadable file arrays with `EFAULT`. When the region already holds a
+    /// mapping, `vm_shared_region_map_file` fails with `KERN_FAILURE`, which
+    /// `_shared_region_map_and_slide` converts to `EINVAL` (it maps only
+    /// `KERN_INVALID_ADDRESS`, `KERN_PROTECTION_FAILURE` and `KERN_NO_SPACE`
+    /// to other errnos), so the request is refused with `EINVAL` whether or
+    /// not an instance is installed. The mappings array is not read, so its
+    /// raw `kern_return_t` failures (`vm_unix.c`, the mappings copy-in, count
+    /// and slide checks) are not reproduced.
+    #[expect(
+        clippy::unused_self,
+        reason = "dispatched like every other syscall; the result never depends on the task"
+    )]
+    pub(crate) fn sys_shared_region_map_and_slide_2_np(
+        &self,
+        files_count: u32,
+        files: UserPtr<u8>,
+        mappings_count: u32,
+    ) -> Result<(), Errno> {
+        /// `_SR_FILE_MAPPINGS_MAX_FILES`.
+        const MAX_FILES: u32 = 256;
+        /// `SFM_MAX`.
+        const MAX_MAPPINGS: u32 = MAX_FILES * 8;
+        /// `sizeof(struct shared_file_np)`.
+        const FILE_BYTES: usize = 12;
+        // XNU returns the count-limit kern_return_t as an errno value.
+        const KERN_FAILURE: Errno = Errno::EIO;
+
+        // vm_unix.c checks each count in this order.
+        if files_count == 0 {
+            return Ok(());
+        }
+        if files_count > MAX_FILES {
+            return Err(KERN_FAILURE);
+        }
+        if mappings_count == 0 {
+            return Ok(());
+        }
+        if mappings_count > MAX_MAPPINGS {
+            return Err(KERN_FAILURE);
+        }
+        files
+            .to_owned_slice::<P>(files_count as usize * FILE_BYTES)
+            .ok_or(Errno::EFAULT)?;
+        Err(Errno::EINVAL)
     }
 
     pub(crate) fn sys_mach_absolute_time(&self) -> usize {
