@@ -10,8 +10,9 @@
 //! [`CacheFileReader`], so multi-GiB cache files need not be loaded.
 //!
 //! Intended use: parse the main cache file with [`CacheFile::parse`], open each
-//! [`CacheFile::subcache_entries`] file (main path + suffix), and combine them
-//! with [`SharedCache::new`] (which verifies subcache identity and layout).
+//! [`CacheFile::subcache_entries`] file (main path + suffix), combine them with
+//! [`SharedCache::new`] (which verifies subcache identity and layout), and
+//! rebase DATA pages with [`SlideInfoV5::rebase_page`].
 
 use crate::VmProtection;
 use alloc::{string::String, vec, vec::Vec};
@@ -84,6 +85,8 @@ pub enum SharedCacheError {
     SubcacheUuidMismatch { index: usize },
     #[error("no cache mapping covers {length:#x} bytes at {address:#x}")]
     Unmapped { address: u64, length: u64 },
+    #[error("slide chain leaves page {page_index} at offset {offset:#x}")]
+    ChainOutOfPage { page_index: usize, offset: usize },
 }
 
 type Result<T> = core::result::Result<T, SharedCacheError>;
@@ -895,6 +898,36 @@ impl<R: CacheFileReader> SharedCache<R> {
     }
 }
 
+/// Which A key signs an authenticated pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerAuthKey {
+    /// Instruction key A (`pacia`).
+    Ia,
+    /// Data key A (`pacda`).
+    Da,
+}
+
+/// Signs rebased authenticated pointers for the task that will use them.
+pub trait PointerSigner {
+    fn sign(&self, value: u64, key: PointerAuthKey, discriminator: u64) -> u64;
+}
+
+/// Leaves authenticated pointers unsigned, as XNU does for a task without
+/// JOP keys (an arm64 process, where pointer authentication is disabled).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnsignedPointers;
+
+impl PointerSigner for UnsignedPointers {
+    fn sign(&self, value: u64, _: PointerAuthKey, _: u64) -> u64 {
+        value
+    }
+}
+
+/// `__builtin_ptrauth_blend_discriminator(slot_address, diversity)`.
+pub const fn blended_discriminator(slot_address: u64, diversity: u16) -> u64 {
+    (slot_address & 0x0000_ffff_ffff_ffff) | ((diversity as u64) << 48)
+}
+
 /// Parsed `dyld_cache_slide_info5` for one mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlideInfoV5 {
@@ -955,6 +988,80 @@ impl SlideInfoV5 {
             Some(&SLIDE_V5_PAGE_NO_REBASE) => Ok(None),
             Some(&start) => Ok(Some(start)),
         }
+    }
+
+    /// Rebase one DATA page like xnu `vm_shared_region_slide_page_v5`.
+    ///
+    /// `page` holds the page's file bytes, `page_index` is its index within
+    /// the mapping, `slide` is the instance base minus `sharedRegionStart`, and
+    /// `page_address` is the page's slid address, used for address-diversified
+    /// discriminators. `page` is left unchanged on error.
+    pub fn rebase_page(
+        &self,
+        page: &mut [u8],
+        page_index: usize,
+        slide: u64,
+        page_address: u64,
+        signer: &impl PointerSigner,
+    ) -> Result<()> {
+        const TARGET_MASK: u64 = 0x3_ffff_ffff;
+        const AUTHENTICATED: u64 = 1 << 63;
+        const ADDRESS_DIVERSIFIED: u64 = 1 << 50;
+        const KEY_IS_DATA: u64 = 1 << 51;
+
+        if page.len() != self.page_size {
+            return Err(SharedCacheError::Malformed("slide page length"));
+        }
+        let Some(start) = self.page_start(page_index)? else {
+            return Ok(());
+        };
+        let overflow = SharedCacheError::Malformed("rebased pointer overflows");
+        let mut rebased = page.to_vec();
+        let mut offset = usize::from(start);
+        loop {
+            let out_of_page = SharedCacheError::ChainOutOfPage { page_index, offset };
+            if !offset.is_multiple_of(size_of::<u64>()) {
+                return Err(out_of_page);
+            }
+            let slot: [u8; 8] = offset
+                .checked_add(size_of::<u64>())
+                .and_then(|end| rebased.get(offset..end))
+                .and_then(|slot| slot.try_into().ok())
+                .ok_or(out_of_page)?;
+            let raw = u64::from_le_bytes(slot);
+            let next = ((raw >> 52) & 0x7ff) as usize;
+            let target = (raw & TARGET_MASK)
+                .checked_add(self.value_add)
+                .and_then(|value| value.checked_add(slide))
+                .ok_or(overflow.clone())?;
+            let value = if raw & AUTHENTICATED == 0 {
+                let high8 = (raw << 22) & 0xff00_0000_0000_0000;
+                target.checked_add(high8).ok_or(overflow.clone())?
+            } else {
+                let diversity = ((raw >> 34) & 0xffff) as u16;
+                let discriminator = if raw & ADDRESS_DIVERSIFIED == 0 {
+                    u64::from(diversity)
+                } else {
+                    let slot_address = page_address
+                        .checked_add(offset as u64)
+                        .ok_or(overflow.clone())?;
+                    blended_discriminator(slot_address, diversity)
+                };
+                let key = if raw & KEY_IS_DATA == 0 {
+                    PointerAuthKey::Ia
+                } else {
+                    PointerAuthKey::Da
+                };
+                signer.sign(target, key, discriminator)
+            };
+            rebased[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+            if next == 0 {
+                break;
+            }
+            offset += next * size_of::<u64>();
+        }
+        page.copy_from_slice(&rebased);
+        Ok(())
     }
 }
 
