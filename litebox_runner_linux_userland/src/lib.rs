@@ -7,7 +7,6 @@ use litebox::platform::{ForkError, ProcessHandle as _, ProcessProvider};
 use litebox::process::ProcessError;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use litebox_platform_linux_userland::SeccompScope;
-use litebox_platform_linux_userland::process::CloneStack;
 use std::convert::Infallible;
 use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::path::PathBuf;
@@ -48,12 +47,10 @@ struct NativeForkRunner {
     memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
 }
 
-/// What a native fork clone needs, prepared before cloning: its pre-connected broker socket pair
-/// and the stack it continues on.
-struct NativeForkChildSetup {
+/// A clone's pre-connected broker socket pair.
+struct NativeForkChannel {
     broker_end: OwnedFd,
     runner_end: OwnedFd,
-    stack: CloneStack,
 }
 
 impl NativeForkRunner {
@@ -66,7 +63,7 @@ impl NativeForkRunner {
         unsafe { builder.with_native_fork_runner(|memory| Self { memory }) }
     }
 
-    /// Bootstraps the clone on its new stack and runs the guest to its exit.
+    /// Bootstraps the clone on its rewound stack and runs the guest to its exit.
     ///
     /// # Safety
     ///
@@ -167,9 +164,9 @@ impl NativeForkRunner {
 }
 
 impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkRunner {
-    type ControlChannel = NativeForkChildSetup;
+    type ControlChannel = NativeForkChannel;
 
-    fn create_control_channel(&self) -> Result<NativeForkChildSetup, ForkError<ProcessError>> {
+    fn create_control_channel(&self) -> Result<NativeForkChannel, ForkError<ProcessError>> {
         let (broker_end, runner_end) = std::os::unix::net::UnixStream::pair().map_err(|error| {
             litebox_util_log::error!("failed to create native fork socket pair: {error}");
             ForkError::Unsupported
@@ -179,29 +176,22 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             litebox_util_log::warn!("native fork socket pair overlaps broker descriptors");
             return Err(ForkError::Unsupported);
         }
-        // Mapped before cloning, so a failure falls back to copy-based fork.
-        let stack = CloneStack::map().map_err(|error| {
-            litebox_util_log::error!("failed to map a native fork child stack: {error}");
-            ForkError::Unsupported
-        })?;
-        Ok(NativeForkChildSetup {
+        Ok(NativeForkChannel {
             broker_end: broker_end.into(),
             runner_end: runner_end.into(),
-            stack,
         })
     }
 
     fn encode_runner_descriptor(
         &self,
         process: &<Platform as ProcessProvider>::ProcessHandle,
-        setup: NativeForkChildSetup,
+        channel: NativeForkChannel,
     ) -> Result<Vec<u8>, ProcessError> {
-        let NativeForkChildSetup {
+        let NativeForkChannel {
             broker_end,
             runner_end,
-            stack,
-        } = setup;
-        drop((runner_end, stack));
+        } = channel;
+        drop(runner_end);
         let process_id = process.process_id().map_err(|error| {
             litebox_util_log::error!("failed to identify native fork child: {error}");
             ProcessError::ServiceFailed
@@ -215,21 +205,18 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
         .map_err(|_| ProcessError::OutOfMemory)
     }
 
-    unsafe fn run_child(&self, setup: NativeForkChildSetup) -> ! {
+    unsafe fn run_child(&self, channel: NativeForkChannel) -> ! {
         // TODO: Free the parent runner's runtime (its shim, `LiteBox`, guest tasks, and broker
         // endpoint) and the stacks of its other threads. They stay in the clone, owned by the
         // frames the clone abandons and by threads the clone lacks, and every later generation of
         // a fork chain inherits them again, because guest `execve` keeps the runner process.
         // Dropping the runtime would send the parent's requests (e.g., closing its handles or
         // cancelling this pending child) on the clone's association, close the descriptors the
-        // clone's own association reuses, and might wait on locks of threads the clone lacks. The
-        // stack of the thread the clone forked on, unless that was its parent's initial thread,
-        // also holds the TLS the clone keeps using.
-        let NativeForkChildSetup {
+        // clone's own association reuses, and might wait on locks of threads the clone lacks.
+        let NativeForkChannel {
             broker_end,
             runner_end,
-            stack,
-        } = setup;
+        } = channel;
         let runner = Self {
             memory: Arc::clone(&self.memory),
         };
@@ -237,9 +224,9 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
             // SAFETY: `run_child`'s caller meets `continue_child`'s requirements.
             unsafe { runner.continue_child(broker_end, runner_end) }
         };
-        // SAFETY: The clone contains only this thread, which abandons the copied frames, and
-        // nothing in it uses the stack its parent continued on as a clone.
-        unsafe { stack.run_freeing_parent_stack(continue_child) }
+        // SAFETY: The clone contains only this thread, which abandons the copied frames, including
+        // those below the depth at which it first entered the guest.
+        unsafe { litebox_platform_linux_userland::process::rewind_stack_and_run(continue_child) }
     }
 }
 

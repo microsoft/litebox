@@ -3,10 +3,10 @@
 
 //! Native Linux process operations.
 
+use std::cell::Cell;
 use std::convert::Infallible;
 use std::io::{Error, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox::platform::{
     ForkError, ForkResult as ProviderForkResult, ProcessHandle, ProcessProvider,
@@ -175,86 +175,56 @@ impl ProcessHandle for ClonedProcess {
     }
 }
 
-/// Usable size of a [`CloneStack`], matching Linux's default main-thread `RLIMIT_STACK`.
-const CLONE_STACK_SIZE: usize = 8 << 20;
-/// Size of the inaccessible guard below a [`CloneStack`], a multiple of every x86_64 and aarch64
-/// page size.
-const CLONE_STACK_GUARD_SIZE: usize = 64 << 10;
-const CLONE_STACK_MAPPING_SIZE: usize = CLONE_STACK_GUARD_SIZE + CLONE_STACK_SIZE;
+thread_local! {
+    /// An address near the stack pointer at which this thread first entered the guest, or zero if
+    /// it has not. A process clone inherits its forking thread's value.
+    static GUEST_STACK_BASE: Cell<usize> = const { Cell::new(0) };
+}
 
-/// Mapping base of the [`CloneStack`] this process started on, or zero if it is not a native fork
-/// clone.
-static CURRENT_CLONE_STACK: AtomicUsize = AtomicUsize::new(0);
-
-/// A fresh stack for a native fork clone to continue on.
-///
-/// The clone's only thread starts on a copy of the stack it forked on, under every frame of its
-/// parent's runtime; continuing there would deepen the stack with each generation of a fork chain
-/// until it overflows. Map it before cloning, so a failure is reported before any clone exists.
-///
-/// A clone still inherits the stack mappings of its parent's other threads. If it forked on one of
-/// them rather than on the thread its parent started on, it also keeps that thread's stack, which
-/// holds the TLS the clone still uses.
-pub struct CloneStack(crate::GuardedStack);
-
-impl CloneStack {
-    /// Maps an 8 MiB stack, reserving no memory until it is touched, above a 64 KiB inaccessible
-    /// guard.
-    ///
-    /// # Errors
-    ///
-    /// Returns the OS error if the mapping or its guard cannot be set up.
-    pub fn map() -> Result<Self> {
-        crate::GuardedStack::map(
-            CLONE_STACK_GUARD_SIZE,
-            CLONE_STACK_SIZE,
-            libc::MAP_NORESERVE | libc::MAP_STACK,
-        )
-        .map(Self)
-    }
-
-    /// Continues the calling thread with `f` on this stack after unmapping the clone stack the
-    /// parent process continued on, if any, abandoning the calling frames.
-    ///
-    /// `f` is `'static` because the calling frames may be on the unmapped stack.
-    ///
-    /// # Safety
-    ///
-    /// The caller must be the sole thread of a newly cloned process. Nothing may use the calling
-    /// frames afterwards, or anything on the stack the parent process continued on as a clone.
-    pub unsafe fn run_freeing_parent_stack<F: FnOnce() -> Infallible + 'static>(self, f: F) -> ! {
-        let stack = core::mem::ManuallyDrop::new(self.0);
-        let f = Box::into_raw(Box::new(f)).cast::<()>();
-        // SAFETY: `stack.top()` is the 16-byte-aligned end of a fresh stack that nothing uses, and
-        // `clone_stack_entry::<F>` takes the mapping base and `f`, a `Box<F>`. The caller
-        // guarantees the rest of `clone_stack_entry`'s requirements.
-        unsafe {
-            crate::arch::switch_stack(stack.top(), stack.mapping_base(), f, clone_stack_entry::<F>)
-        }
+/// Records the stack depth at which this thread first entered the guest, unless it has already,
+/// directly or as the thread a process clone copied.
+pub(crate) fn record_guest_stack_base() {
+    if GUEST_STACK_BASE.get() == 0 {
+        let marker = 0u8;
+        GUEST_STACK_BASE.set(core::ptr::from_ref(&marker).addr());
     }
 }
 
-/// Records that this process runs on the [`CloneStack`] mapped at `base`, unmaps the one its
-/// parent continued on, if any, and runs `f`.
+/// Continues the calling thread with `f` at the stack depth at which it first entered the guest,
+/// abandoning every frame below that depth and reusing their memory.
+///
+/// A native fork clone's only thread starts on a copy of the stack it forked on, under every frame
+/// of its parent's runtime; continuing there would deepen the stack with each generation of a fork
+/// chain until it overflows. Rewinding to the depth the clone inherits keeps every generation at
+/// the same depth. If the thread never entered the guest, `f` runs in place.
+///
+/// `f` is `'static` because the calling frames' memory is reused.
 ///
 /// # Safety
 ///
-/// `f` must come from `Box::<F>::into_raw`, the calling thread must have left the stack its parent
-/// continued on, and the caller must meet [`CloneStack::run_freeing_parent_stack`]'s requirements.
-unsafe extern "C" fn clone_stack_entry<F: FnOnce() -> Infallible>(base: usize, f: *mut ()) -> ! {
+/// The caller must be the sole thread of a newly cloned process. Nothing may use the calling
+/// frames, or any frame of the thread below the depth at which it first entered the guest,
+/// afterwards.
+pub unsafe fn rewind_stack_and_run<F: FnOnce() -> Infallible + 'static>(f: F) -> ! {
+    let base = GUEST_STACK_BASE.get();
+    if base == 0 {
+        match f() {}
+    }
+    let f = Box::into_raw(Box::new(f)).cast::<()>();
+    // SAFETY: The aligned `base` lies within this thread's stack, below the data that outlives its
+    // frames, and the caller guarantees that nothing uses the frames there.
+    // `rewound_stack_entry::<F>` takes `f`, a `Box<F>`.
+    unsafe { crate::arch::switch_stack(base & !0xf, f, rewound_stack_entry::<F>) }
+}
+
+/// Runs `f` on the stack [`rewind_stack_and_run`] rewound.
+///
+/// # Safety
+///
+/// `f` must come from `Box::<F>::into_raw`.
+unsafe extern "C" fn rewound_stack_entry<F: FnOnce() -> Infallible>(f: *mut ()) -> ! {
     // SAFETY: The caller passes `f` from `Box::<F>::into_raw`.
     let f = unsafe { *Box::from_raw(f.cast::<F>()) };
-    let parent_stack_base = CURRENT_CLONE_STACK.swap(base, Ordering::Relaxed);
-    if parent_stack_base != 0 {
-        // SAFETY: The caller guarantees that nothing uses the stack the parent continued on. Its
-        // thread is either absent from this clone or this thread, which has left it.
-        unsafe {
-            libc::munmap(
-                parent_stack_base as *mut libc::c_void,
-                CLONE_STACK_MAPPING_SIZE,
-            )
-        };
-    }
     match f() {}
 }
 
@@ -321,13 +291,7 @@ pub unsafe fn fork_process() -> Result<ForkResult> {
 mod tests {
     use super::*;
 
-    fn is_mapped(address: usize) -> bool {
-        let page = address & !(CLONE_STACK_GUARD_SIZE - 1);
-        // SAFETY: `msync` only queries the range, which it rejects with ENOMEM if unmapped.
-        unsafe { libc::msync(page as *mut libc::c_void, 1, libc::MS_ASYNC) == 0 }
-    }
-
-    /// Runs `f` in a forked child, whose only thread may switch stacks, and returns its status.
+    /// Runs `f` in a forked child, whose only thread may rewind its stack, and returns its status.
     fn in_forked_child(f: fn() -> libc::c_int) -> libc::c_int {
         // SAFETY: `libc::fork` runs glibc's fork handlers, so the single-threaded child may
         // allocate, and it `_exit`s without returning to the harness.
@@ -343,42 +307,62 @@ mod tests {
         status
     }
 
+    /// Calls `f` from `depth` frames, each holding 1 KiB, below the caller.
+    #[inline(never)]
+    fn deeper(depth: usize, f: &mut dyn FnMut()) {
+        let frame = core::hint::black_box([0u8; 1024]);
+        if depth == 0 {
+            f();
+        } else {
+            deeper(depth - 1, f);
+        }
+        core::hint::black_box(frame);
+    }
+
+    fn stack_address() -> usize {
+        let marker = 0u8;
+        core::hint::black_box(core::ptr::from_ref(&marker).addr())
+    }
+
     #[test]
-    fn clones_continue_on_a_fresh_stack_and_free_their_parents() {
-        const MAP_FAILED: libc::c_int = 1;
-        const NOT_ON_NEW_STACK: libc::c_int = 2;
-        const PARENT_STACK_MAPPED: libc::c_int = 3;
+    fn clones_rewind_to_the_same_depth_in_every_generation() {
+        const NOT_REWOUND: libc::c_int = 1;
+        const DEPTH_CHANGED: libc::c_int = 2;
         let status = in_forked_child(|| {
-            let Ok(first) = CloneStack::map() else {
-                return MAP_FAILED;
-            };
-            let first_base = first.0.mapping_base();
-            // SAFETY: The forked child has only this thread, and nothing uses the calling frames.
-            unsafe {
-                first.run_freeing_parent_stack(move || {
-                    let local = 0u8;
-                    if !(first_base..first_base + CLONE_STACK_MAPPING_SIZE)
-                        .contains(&core::ptr::from_ref(&local).addr())
-                    {
-                        libc::_exit(NOT_ON_NEW_STACK);
-                    }
-                    // The next generation of a fork chain starts on this stack.
-                    let Ok(second) = CloneStack::map() else {
-                        libc::_exit(MAP_FAILED);
-                    };
-                    second.run_freeing_parent_stack(move || {
-                        let freed = !is_mapped(first_base + CLONE_STACK_GUARD_SIZE);
-                        libc::_exit(if freed { 0 } else { PARENT_STACK_MAPPED });
+            record_guest_stack_base();
+            let base = GUEST_STACK_BASE.get();
+            // Each generation starts below the frames of the one before, as a fork does.
+            let mut first_generation = || {
+                // SAFETY: The forked child has only this thread, and nothing uses the frames.
+                unsafe {
+                    rewind_stack_and_run(move || {
+                        if !(base - 4096..base).contains(&stack_address()) {
+                            libc::_exit(NOT_REWOUND);
+                        }
+                        let mut second_generation = || {
+                            rewind_stack_and_run(move || {
+                                let rewound = (base - 4096..base).contains(&stack_address());
+                                libc::_exit(if rewound { 0 } else { DEPTH_CHANGED })
+                            })
+                        };
+                        // Like a clone bootstrapping, this generation enters the guest deeper than
+                        // it started, but the next one inherits the depth it was rewound to.
+                        deeper(8, &mut || {
+                            record_guest_stack_base();
+                            deeper(64, &mut second_generation);
+                        });
+                        unreachable!()
                     })
-                })
-            }
+                }
+            };
+            deeper(64, &mut first_generation);
+            unreachable!()
         });
         let failure = match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
             Some(0) => return,
-            Some(MAP_FAILED) => "a clone stack could not be mapped",
-            Some(NOT_ON_NEW_STACK) => "the first clone did not run on its new stack",
-            Some(PARENT_STACK_MAPPED) => "the second clone did not unmap its parent's stack",
-            _ => "the clone stack child did not exit normally",
+            Some(NOT_REWOUND) => "the first generation did not rewind to the recorded depth",
+            Some(DEPTH_CHANGED) => "the second generation started at a different depth",
+            _ => "the rewinding child did not exit normally",
         };
         panic!("{failure} (status {status:#x})");
     }

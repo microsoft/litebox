@@ -610,6 +610,7 @@ fn run_thread_inner(
         GuestVectorStateMode::Inherited(state) => Some(state.as_ref()),
         GuestVectorStateMode::Fresh | GuestVectorStateMode::Resume => None,
     });
+    process::record_guest_stack_base();
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     let _guest_thread = GuestThreadMarker::enter();
@@ -1479,20 +1480,19 @@ fn register_exception_handlers() {
 
 /// An anonymous read-write stack mapping with an inaccessible guard below it, which overflows of
 /// the stack fault on. Dropping it unmaps the whole mapping.
-pub(crate) struct GuardedStack(GuardedStackParts);
+struct GuardedStack(GuardedStackParts);
 
 /// The mapping a [`GuardedStack`] owns, without ownership.
 #[derive(Clone, Copy)]
-pub(crate) struct GuardedStackParts {
+struct GuardedStackParts {
     mapping: core::ptr::NonNull<libc::c_void>,
     guard_size: usize,
     size: usize,
 }
 
 impl GuardedStack {
-    /// Maps `size` usable bytes above a `guard_size`-byte guard, both multiples of the page size,
-    /// adding `flags` to `MAP_PRIVATE | MAP_ANONYMOUS`.
-    pub(crate) fn map(guard_size: usize, size: usize, flags: libc::c_int) -> std::io::Result<Self> {
+    /// Maps `size` usable bytes above a `guard_size`-byte guard, both multiples of the page size.
+    fn map(guard_size: usize, size: usize) -> std::io::Result<Self> {
         // SAFETY: An anonymous private mapping at a kernel-chosen address affects no existing
         // memory.
         let mapping = unsafe {
@@ -1500,7 +1500,7 @@ impl GuardedStack {
                 core::ptr::null_mut(),
                 guard_size + size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | flags,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
                 0,
             )
@@ -1528,33 +1528,23 @@ impl GuardedStack {
     /// # Safety
     ///
     /// `parts` must describe a mapping a [`GuardedStack`] created, which nothing else owns.
-    pub(crate) unsafe fn from_parts(parts: GuardedStackParts) -> Self {
+    unsafe fn from_parts(parts: GuardedStackParts) -> Self {
         Self(parts)
     }
 
     /// Describes the mapping, without giving up ownership.
-    pub(crate) fn parts(&self) -> GuardedStackParts {
+    fn parts(&self) -> GuardedStackParts {
         self.0
     }
 
-    /// Lowest address of the mapping, where its guard starts.
-    pub(crate) fn mapping_base(&self) -> usize {
-        self.0.mapping.addr().get()
-    }
-
     /// Lowest usable address, just above the guard.
-    pub(crate) fn bottom(&self) -> *mut libc::c_void {
+    fn bottom(&self) -> *mut libc::c_void {
         self.0.mapping.as_ptr().wrapping_byte_add(self.0.guard_size)
     }
 
     /// Usable size, above the guard.
-    pub(crate) fn size(&self) -> usize {
+    fn size(&self) -> usize {
         self.0.size
-    }
-
-    /// End of the stack, where it starts growing down from.
-    pub(crate) fn top(&self) -> usize {
-        self.mapping_base() + self.0.guard_size + self.0.size
     }
 }
 
@@ -1601,7 +1591,7 @@ thread_local! {
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let (stack, previous) = match SIGNAL_ALT_STACK.take() {
         SignalAltStack::None => {
-            let stack = GuardedStack::map(0x1000, libc::SIGSTKSZ * 2, 0).unwrap_or_else(|error| {
+            let stack = GuardedStack::map(0x1000, libc::SIGSTKSZ * 2).unwrap_or_else(|error| {
                 panic!("failed to allocate memory for alternate signal stack: {error}")
             });
             let alt_stack = libc::stack_t {
