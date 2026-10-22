@@ -13,7 +13,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{
-    ExchangeSecretsRequest, NUM_VTLCALL_PARAMS, PAGE_SIZE, PRK_LEN, VsmError, VsmFunction,
+    ExchangeSecretsRequest, NUM_VTLCALL_PARAMS, PAGE_SIZE, VsmError, VsmFunction,
 };
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand,
@@ -42,6 +42,7 @@ use litebox_platform_lvbs::{
 };
 use litebox_platform_lvbs::{mshv::vsm_intercept::panic_to_vtl0, serial_println};
 use litebox_shim_optee::ClientPta;
+use litebox_shim_optee::idk::IDENTITY_SIGNING_PUBLIC_KEY_LEN;
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
 use litebox_shim_optee::{
@@ -318,42 +319,22 @@ fn exchange_secrets(platform: &'static Platform, request_pa: u64) -> i64 {
         return Errno::EFAULT.as_neg().into();
     };
 
-    let vtl1 = LvbsVtl1Gate::mint(platform);
-    let result = vtl1
-        .set_platform_root_key(request_pa)
-        .and_then(|()| {
-            request_pa
-                .checked_add(PRK_LEN as u64)
-                .ok_or(VsmError::IntegerOverflow)
-        })
-        .and_then(|crng_seed_pa| vtl1.set_crng_seed(crng_seed_pa));
-    if let Err(error) = result {
-        return vsm_error_to_errno(error).as_neg().into();
-    }
-
-    let public_key_pa = request_pa
-        .checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub) as u64)
-        .ok_or(Errno::EINVAL);
-    let public_key_pa = match public_key_pa {
-        Ok(pa) => pa,
-        Err(error) => return error.as_neg().into(),
+    let Some(public_key_pa) =
+        request_pa.checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub) as u64)
+    else {
+        return Errno::EINVAL.as_neg().into();
     };
-
-    let return_code = litebox_shim_optee::idk::generate_identity_signing_key(
-        platform,
-        public_key_pa,
-        u64::from(request.key_alg_variant),
-    );
-    if return_code < 0 {
-        return return_code;
-    }
-
-    let public_key_len_pa = request_pa
-        .checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub_len) as u64)
-        .ok_or(Errno::EINVAL);
-    let public_key_len_pa = match public_key_len_pa {
-        Ok(pa) => pa,
-        Err(error) => return error.as_neg().into(),
+    let Ok(public_key_ptr) = NormalWorldMutPtr::<
+        Platform,
+        [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN],
+        PAGE_SIZE,
+    >::with_usize(platform, public_key_pa.trunc()) else {
+        return Errno::EFAULT.as_neg().into();
+    };
+    let Some(public_key_len_pa) =
+        request_pa.checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub_len) as u64)
+    else {
+        return Errno::EINVAL.as_neg().into();
     };
     let Ok(public_key_len_ptr) = NormalWorldMutPtr::<Platform, u32, PAGE_SIZE>::with_usize(
         platform,
@@ -361,11 +342,26 @@ fn exchange_secrets(platform: &'static Platform, request_pa: u64) -> i64 {
     ) else {
         return Errno::EFAULT.as_neg().into();
     };
-    let Ok(public_key_len) = u32::try_from(request.idks_pub.len()) else {
-        return Errno::EINVAL.as_neg().into();
-    };
+
+    let vtl1 = LvbsVtl1Gate::mint(platform);
+    let result = vtl1
+        .set_platform_root_key(request_pa)
+        .and_then(|()| vtl1.set_crng_seed(&request.idks_seed));
+    if let Err(error) = result {
+        return vsm_error_to_errno(error).as_neg().into();
+    }
+
+    let return_code = litebox_shim_optee::idk::generate_identity_signing_key(
+        platform,
+        public_key_ptr,
+        u64::from(request.key_alg_variant),
+    );
+    if return_code < 0 {
+        return return_code;
+    }
+
     if public_key_len_ptr
-        .write_at_offset(0, public_key_len)
+        .write_at_offset(0, IDENTITY_SIGNING_PUBLIC_KEY_LEN as u32)
         .is_err()
     {
         return Errno::EFAULT.as_neg().into();

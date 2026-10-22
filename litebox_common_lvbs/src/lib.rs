@@ -911,7 +911,7 @@ pub trait Vtl1Gate {
     fn set_platform_root_key(&self, key_pa: u64) -> Result<(), VsmError>;
 
     /// Read a CRNG seed from VTL0 `trusted_seed_pa` and store it in VTL1.
-    fn set_crng_seed(&self, trusted_seed_pa: u64) -> Result<(), VsmError>;
+    fn set_crng_seed(&self, seed: &[u8; CRNG_SEED_LEN]) -> Result<(), VsmError>;
 
     /// Close VTL1's window of trusting VTL0, making
     /// [`Vtl0Gate::end_of_boot_reached`] report `true` from here on. One-way:

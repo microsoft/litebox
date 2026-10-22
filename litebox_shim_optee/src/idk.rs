@@ -8,12 +8,8 @@ use crate::{
 use alloc::vec::Vec;
 use ecdsa::hazmat::{SignPrimitive as _, bits2field};
 use hmac::{Hmac, Mac};
-use litebox::{
-    platform::{
-        ComputeParams, DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _,
-        RootKey,
-    },
-    utils::TruncateExt,
+use litebox::platform::{
+    ComputeParams, DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _, RootKey,
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::PAGE_SIZE;
@@ -28,7 +24,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const IDENTITY_SIGNING_KEY_LABEL: &[u8] = b"litebox-optee-idks-v1";
 const IDENTITY_SIGNING_PRIVATE_KEY_LEN: usize = 48;
-const IDENTITY_SIGNING_PUBLIC_KEY_LEN: usize = 97;
+pub const IDENTITY_SIGNING_PUBLIC_KEY_LEN: usize = 97;
 const SHA384_DIGEST_LEN: usize = 48;
 const KEY_ALGORITHM_MASK: u64 = 0xff00;
 const KEY_VARIANT_MASK: u64 = 0xff;
@@ -341,12 +337,17 @@ enum EcdsaCurve {
     P521 = 0x03,
 }
 
-pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
+pub fn generate_identity_signing_key<'a, Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
-    public_key_pa: u64,
+    public_key_ptr: NormalWorldMutPtr<
+        'a,
+        Platform,
+        [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN],
+        PAGE_SIZE,
+    >,
     key_alg: u64,
 ) -> i64 {
-    match generate_identity_signing_key_inner(platform, public_key_pa, key_alg) {
+    match generate_identity_signing_key_inner(platform, public_key_ptr, key_alg) {
         Ok(res) => res,
         Err(e) => e.as_neg().into(),
     }
@@ -355,7 +356,7 @@ pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
 /// This function returns the public portion of the identity signing key (IDK_S),
 /// deriving it on first use.
 ///
-/// - `public_key_pa`: VTL0/Normal-world physical address where an uncompressed SEC1 P-384
+/// - `public_key_ptr`: Validated VTL0/Normal-world pointer where an uncompressed SEC1 P-384
 ///   public key will be written. The private key is derived from the platform's per-boot root
 ///   key inside `compute_with_derived_key` and never leaves the platform.
 /// - `key_alg`: Key algorithm namespace and variant. Only ECDSA P-384 is supported.
@@ -366,22 +367,20 @@ pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
 /// This function assumes that the caller prepares a buffer at the given physical
 /// address (in a single or contiguous physical memory page(s)) whose length is equal to
 /// or greater than `IDENTITY_SIGNING_PUBLIC_KEY_LEN`.
-fn generate_identity_signing_key_inner<Platform: crate::OpteeShimPlatform>(
+fn generate_identity_signing_key_inner<'a, Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
-    public_key_pa: u64,
+    public_key_ptr: NormalWorldMutPtr<
+        'a,
+        Platform,
+        [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN],
+        PAGE_SIZE,
+    >,
     key_alg: u64,
 ) -> Result<i64, Errno> {
     validate_key_algorithm(key_alg)?;
 
-    let pubkey_ptr =
-        NormalWorldMutPtr::<Platform, [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], PAGE_SIZE>::with_usize(
-            platform,
-            public_key_pa.trunc(),
-        )
-        .map_err(|_| Errno::EINVAL)?;
-
     let public_key = get_identity_signing_public_key(platform)?;
-    pubkey_ptr
+    public_key_ptr
         .write_at_offset(0, *public_key)
         .map_err(|_| Errno::EFAULT)?;
     Ok(0)

@@ -106,16 +106,10 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
 
 impl litebox::platform::CrngProvider for LvbsLinuxKernel {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        static RANDOM: spin::mutex::SpinMutex<Option<LvbsCrng>> = spin::mutex::SpinMutex::new(None);
-
-        let mut random = RANDOM.lock();
-        random
-            .get_or_insert_with(|| {
-                LvbsCrng::from_seed(crng_seed_from_rot_and_rdrand(
-                    CRNG_SEED_ONCE.get().expect("CRNG seed not set"),
-                    rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
-                ))
-            })
+        RANDOM
+            .lock()
+            .as_mut()
+            .expect("CRNG seed not set")
             .fill_bytes(buf, rdrand_seed);
     }
 }
@@ -172,20 +166,18 @@ impl LvbsCrng {
     }
 }
 
-// The PRK lives only in `crate::vault`. Never expose a raw PRK getter; use
-// `DerivedKeyProvider`. `derive_key` uses the PRK; `compute_with_derived_key`
-// supports only the per-boot key (`RootKey::PerBoot`) derived from it.
-static CRNG_SEED_ONCE: spin::Once<[u8; CRNG_SEED_LEN]> = spin::Once::new();
+static RANDOM: spin::mutex::SpinMutex<Option<LvbsCrng>> = spin::mutex::SpinMutex::new(None);
 
 /// Sets the trusted CRNG seed for this platform.
 ///
 /// This should be called once during platform initialization with a seed
 /// derived from a hardware root of trust (e.g., a TPM).
 pub(crate) fn set_crng_seed(seed: &[u8; CRNG_SEED_LEN]) {
-    CRNG_SEED_ONCE.call_once(|| {
-        let mut s = Zeroizing::new([0u8; CRNG_SEED_LEN]);
-        s.copy_from_slice(seed);
-        *s
+    RANDOM.lock().get_or_insert_with(|| {
+        LvbsCrng::from_seed(crng_seed_from_rot_and_rdrand(
+            seed,
+            rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
+        ))
     });
 }
 
