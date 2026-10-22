@@ -25,14 +25,35 @@ pub mod nr {
     pub const GETPID: usize = 20;
     pub const GETUID: usize = 24;
     pub const GETEUID: usize = 25;
+    pub const ACCESS: usize = 33;
+    pub const CROSSARCH_TRAP: usize = 38;
     pub const GETPPID: usize = 39;
+    pub const SIGPROCMASK: usize = 48;
+    pub const IOCTL: usize = 54;
+    pub const CSOPS: usize = 169;
+    pub const CSOPS_AUDITTOKEN: usize = 170;
+    pub const ISSETUGID: usize = 327;
+    pub const STAT64: usize = 338;
+    pub const FSTAT64: usize = 339;
+    pub const LSTAT64: usize = 340;
+    pub const MAC_SYSCALL: usize = 381;
+    pub const OPENAT: usize = 463;
+    pub const OPENAT_NOCANCEL: usize = 464;
+    pub const CSRCTL: usize = 483;
+    pub const TERMINATE_WITH_PAYLOAD: usize = 520;
+    pub const ABORT_WITH_PAYLOAD: usize = 521;
+    pub const MAP_WITH_LINKING_NP: usize = 550;
     pub const DUP: usize = 41;
+    pub const DUP2: usize = 90;
+    pub const FCNTL: usize = 92;
+    pub const FCNTL_NOCANCEL: usize = 406;
     pub const GETEGID: usize = 43;
     pub const GETGID: usize = 47;
     pub const MUNMAP: usize = 73;
     pub const MPROTECT: usize = 74;
     pub const MMAP: usize = 197;
     pub const SYSCTL: usize = 202;
+    pub const FSCTL: usize = 242;
     pub const SHARED_REGION_CHECK_NP: usize = 294;
     pub const THREAD_SELFID: usize = 372;
     pub const READ_NOCANCEL: usize = 396;
@@ -237,11 +258,31 @@ pub enum SyscallRequest {
         flags: OpenFlags,
         mode: FileMode,
     },
+    Openat {
+        dirfd: i32,
+        path: UserPtr<core::ffi::c_char>,
+        flags: OpenFlags,
+        mode: FileMode,
+    },
+    Ioctl {
+        fd: i32,
+        command: u32,
+        data: usize,
+    },
     Close {
         fd: i32,
     },
     Dup {
         fd: i32,
+    },
+    Dup2 {
+        old: i32,
+        new: i32,
+    },
+    Fcntl {
+        fd: i32,
+        command: i32,
+        argument: usize,
     },
     Sysctl {
         name: UserPtr<i32>,
@@ -250,6 +291,12 @@ pub enum SyscallRequest {
         old_length: UserPtrMut<usize>,
         new_value: UserPtr<u8>,
         new_length: usize,
+    },
+    Fsctl {
+        path: UserPtr<core::ffi::c_char>,
+        command: u32,
+        data: usize,
+        options: u32,
     },
     Mmap {
         address: usize,
@@ -268,6 +315,57 @@ pub enum SyscallRequest {
         length: usize,
         protection: VmProtection,
     },
+    Access {
+        path: UserPtr<core::ffi::c_char>,
+        mode: i32,
+    },
+    CrossarchTrap {
+        name: u32,
+    },
+    Sigprocmask {
+        how: i32,
+        mask: UserPtr<u32>,
+        old_mask: UserPtrMut<u32>,
+    },
+    Csops {
+        pid: i32,
+        operation: u32,
+        buffer: UserPtrMut<u8>,
+        size: usize,
+        audit_token: Option<UserPtr<[u32; 8]>>,
+    },
+    Issetugid,
+    Stat64 {
+        path: UserPtr<core::ffi::c_char>,
+        buffer: UserPtrMut<crate::Stat64>,
+        follow: bool,
+    },
+    Fstat64 {
+        fd: i32,
+        buffer: UserPtrMut<crate::Stat64>,
+    },
+    MacSyscall {
+        policy: UserPtr<core::ffi::c_char>,
+        call: i32,
+        argument: usize,
+    },
+    Csrctl {
+        operation: u32,
+        buffer: UserPtrMut<u32>,
+        size: usize,
+    },
+    AbortWithPayload {
+        reason_namespace: u32,
+        reason_code: u64,
+        reason_string: UserPtr<core::ffi::c_char>,
+    },
+    TerminateWithPayload {
+        pid: i32,
+        reason_namespace: u32,
+        reason_code: u64,
+        reason_string: UserPtr<core::ffi::c_char>,
+    },
+    MapWithLinkingNp,
     Getpid,
     Getppid,
     Getuid,
@@ -505,8 +603,28 @@ impl SyscallRequest {
                 flags: OpenFlags::from_bits_retain(int_arg(1)),
                 mode: FileMode::from_u32_bits_truncate(int_arg(2).reinterpret_as_unsigned()),
             },
+            nr::OPENAT | nr::OPENAT_NOCANCEL => Self::Openat {
+                dirfd: int_arg(0),
+                path: UserPtr::from_usize(args[1]),
+                flags: OpenFlags::from_bits_retain(int_arg(2)),
+                mode: FileMode::from_u32_bits_truncate(int_arg(3).reinterpret_as_unsigned()),
+            },
+            nr::IOCTL => Self::Ioctl {
+                fd: int_arg(0),
+                command: TruncateExt::<u32>::trunc(args[1]),
+                data: args[2],
+            },
             nr::CLOSE | nr::CLOSE_NOCANCEL => Self::Close { fd: int_arg(0) },
             nr::DUP => Self::Dup { fd: int_arg(0) },
+            nr::DUP2 => Self::Dup2 {
+                old: int_arg(0),
+                new: int_arg(1),
+            },
+            nr::FCNTL | nr::FCNTL_NOCANCEL => Self::Fcntl {
+                fd: int_arg(0),
+                command: int_arg(1),
+                argument: args[2],
+            },
             nr::SYSCTL => Self::Sysctl {
                 name: UserPtr::from_usize(args[0]),
                 name_length: TruncateExt::<u32>::trunc(args[1]),
@@ -514,6 +632,12 @@ impl SyscallRequest {
                 old_length: UserPtrMut::from_usize(args[3]),
                 new_value: UserPtr::from_usize(args[4]),
                 new_length: args[5],
+            },
+            nr::FSCTL => Self::Fsctl {
+                path: UserPtr::from_usize(args[0]),
+                command: TruncateExt::<u32>::trunc(args[1]),
+                data: args[2],
+                options: TruncateExt::<u32>::trunc(args[3]),
             },
             nr::MMAP => Self::Mmap {
                 address: args[0],
@@ -534,6 +658,58 @@ impl SyscallRequest {
                 protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
             },
             nr::GETPID => Self::Getpid,
+            nr::ACCESS => Self::Access {
+                path: UserPtr::from_usize(args[0]),
+                mode: int_arg(1),
+            },
+            nr::CROSSARCH_TRAP => Self::CrossarchTrap {
+                name: TruncateExt::<u32>::trunc(args[0]),
+            },
+            nr::SIGPROCMASK => Self::Sigprocmask {
+                how: int_arg(0),
+                mask: UserPtr::from_usize(args[1]),
+                old_mask: UserPtrMut::from_usize(args[2]),
+            },
+            nr::CSOPS_AUDITTOKEN if args[4] == 0 => return Err(Errno::EINVAL),
+            nr::CSOPS | nr::CSOPS_AUDITTOKEN => Self::Csops {
+                pid: int_arg(0),
+                operation: TruncateExt::<u32>::trunc(args[1]),
+                buffer: UserPtrMut::from_usize(args[2]),
+                size: args[3],
+                audit_token: (number == nr::CSOPS_AUDITTOKEN).then(|| UserPtr::from_usize(args[4])),
+            },
+            nr::ISSETUGID => Self::Issetugid,
+            nr::STAT64 | nr::LSTAT64 => Self::Stat64 {
+                path: UserPtr::from_usize(args[0]),
+                buffer: UserPtrMut::from_usize(args[1]),
+                follow: number == nr::STAT64,
+            },
+            nr::FSTAT64 => Self::Fstat64 {
+                fd: int_arg(0),
+                buffer: UserPtrMut::from_usize(args[1]),
+            },
+            nr::MAC_SYSCALL => Self::MacSyscall {
+                policy: UserPtr::from_usize(args[0]),
+                call: int_arg(1),
+                argument: args[2],
+            },
+            nr::CSRCTL => Self::Csrctl {
+                operation: TruncateExt::<u32>::trunc(args[0]),
+                buffer: UserPtrMut::from_usize(args[1]),
+                size: args[2],
+            },
+            nr::ABORT_WITH_PAYLOAD => Self::AbortWithPayload {
+                reason_namespace: TruncateExt::<u32>::trunc(args[0]),
+                reason_code: u64_arg(1),
+                reason_string: UserPtr::from_usize(args[4]),
+            },
+            nr::TERMINATE_WITH_PAYLOAD => Self::TerminateWithPayload {
+                pid: int_arg(0),
+                reason_namespace: TruncateExt::<u32>::trunc(args[1]),
+                reason_code: u64_arg(2),
+                reason_string: UserPtr::from_usize(args[5]),
+            },
+            nr::MAP_WITH_LINKING_NP => Self::MapWithLinkingNp,
             nr::GETENTROPY => Self::Getentropy {
                 buffer: UserPtrMut::from_usize(args[0]),
                 count: args[1],
@@ -552,15 +728,19 @@ impl SyscallRequest {
     }
 
     /// Decode arguments from the saved x0–x7 registers. The caller supplies
-    /// the syscall number from x16.
+    /// the syscall number from x16. Only selectors the decoder does not know
+    /// (ENOSYS) are reported through `log_unsupported`; malformed arguments of
+    /// known calls are ordinary errors.
     #[cfg(target_arch = "aarch64")]
     pub fn try_from_raw(
         number: usize,
         ctx: &PtRegs,
         log_unsupported: impl Fn(core::fmt::Arguments<'_>),
     ) -> Result<Self, Errno> {
-        Self::from_args(number, core::array::from_fn(|i| ctx.regs[i])).inspect_err(|_| {
-            log_unsupported(format_args!("unsupported Darwin syscall {number:#x}"));
+        Self::from_args(number, core::array::from_fn(|i| ctx.regs[i])).inspect_err(|error| {
+            if *error == Errno::ENOSYS {
+                log_unsupported(format_args!("unsupported Darwin syscall {number:#x}"));
+            }
         })
     }
 }
@@ -740,6 +920,50 @@ mod tests {
         assert!(matches!(
             SyscallRequest::try_from_raw(ctx.regs[16], &ctx, |_| {}),
             Ok(SyscallRequest::Exit { status: 7 })
+        ));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn only_unknown_selectors_are_logged_as_unsupported() {
+        let logged = core::cell::Cell::new(0);
+        let log = |_: core::fmt::Arguments<'_>| logged.set(logged.get() + 1);
+        let mut ctx = PtRegs::default();
+        // A known call with a malformed argument (mmap protection 8) is EINVAL, not unsupported.
+        ctx.regs[16] = nr::MMAP;
+        ctx.regs[2] = 8;
+        ctx.regs[3] = 2;
+        assert_eq!(
+            SyscallRequest::try_from_raw(ctx.regs[16], &ctx, log).unwrap_err(),
+            Errno::EINVAL
+        );
+        assert_eq!(logged.get(), 0);
+        ctx.regs[16] = 999;
+        assert_eq!(
+            SyscallRequest::try_from_raw(ctx.regs[16], &ctx, log).unwrap_err(),
+            Errno::ENOSYS
+        );
+        assert_eq!(logged.get(), 1);
+    }
+
+    #[test]
+    fn csops_audittoken_requires_a_token() {
+        // kern_proc.c csops_audittoken: a NULL token is EINVAL, not a plain csops.
+        assert_eq!(
+            SyscallRequest::from_args(nr::CSOPS_AUDITTOKEN, [0, 0, 0x1000, 4, 0, 0, 0, 0])
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+        assert!(matches!(
+            SyscallRequest::from_args(nr::CSOPS_AUDITTOKEN, [0, 0, 0x1000, 4, 0x2000, 0, 0, 0]),
+            Ok(SyscallRequest::Csops { audit_token: Some(token), .. }) if token.as_usize() == 0x2000
+        ));
+        assert!(matches!(
+            SyscallRequest::from_args(nr::CSOPS, [0, 0, 0x1000, 4, 0x2000, 0, 0, 0]),
+            Ok(SyscallRequest::Csops {
+                audit_token: None,
+                ..
+            })
         ));
     }
 }

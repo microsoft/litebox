@@ -34,6 +34,55 @@ pub struct CliArgs {
 #[cfg(feature = "test-broker")]
 mod test_broker;
 
+/// Mirror the allowlisted system-identity sysctls from the host, including
+/// their MIBs and read errors; nodes absent on the host stay absent.
+fn host_sysctls() -> Vec<litebox_shim_macos::syscalls::HostSysctl> {
+    use litebox_common_macos::CTL_MAXNAME;
+    const MAX_VALUE_BYTES: usize = 4096;
+    let mut sysctls = Vec::new();
+    for name in litebox_shim_macos::syscalls::HOST_SYSCTL_NAMES {
+        let c_name = CString::new(name).expect("sysctl names have no NUL");
+        let mut mib = [0i32; CTL_MAXNAME];
+        let mut length = mib.len();
+        // SAFETY: `mib` holds `length` ints; `c_name` is NUL-terminated.
+        if unsafe { libc::sysctlnametomib(c_name.as_ptr(), mib.as_mut_ptr(), &raw mut length) } != 0
+        {
+            continue;
+        }
+        let mut value = vec![0u8; MAX_VALUE_BYTES];
+        let mut size = value.len();
+        // SAFETY: `value` is writable for `size` bytes; no new value is set.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                u32::try_from(length).expect("CTL_MAXNAME fits"),
+                value.as_mut_ptr().cast(),
+                &raw mut size,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        let value = if result == 0 {
+            value.truncate(size);
+            Ok(value)
+        } else {
+            use litebox_common_macos::errno::Errno;
+            // Read failures of these nodes; anything else is denied.
+            Err(match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENOENT) => Errno::ENOENT,
+                Some(libc::EINVAL) => Errno::EINVAL,
+                _ => Errno::EPERM,
+            })
+        };
+        sysctls.push(litebox_shim_macos::syscalls::HostSysctl {
+            name,
+            mib: mib[..length].to_vec(),
+            value,
+        });
+    }
+    sysctls
+}
+
 pub fn run(cli_args: CliArgs) -> Result<i32> {
     set_guest_abi(GuestAbi::Darwin);
     let Some(path) = cli_args.program_and_arguments.first() else {
@@ -74,15 +123,14 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             .context("reading mmap test image")?;
         test_broker::setup(platform, data, mmap_image.as_deref())?
     };
+    let shim = builder
+        .host_sysctls(host_sysctls())
+        .map_err(|error| anyhow::anyhow!("mirroring host sysctls: {error}"))?
+        .build();
     #[cfg(feature = "test-broker")]
-    let program = builder
-        .build()
-        .load_program(TaskParams::default(), "/executable", argv, envp);
+    let program = shim.load_program(TaskParams::default(), "/executable", argv, envp);
     #[cfg(not(feature = "test-broker"))]
-    let program =
-        builder
-            .build()
-            .load_program_from_bytes(TaskParams::default(), path, &data, argv, envp);
+    let program = shim.load_program_from_bytes(TaskParams::default(), path, &data, argv, envp);
     let program = program.context("loading Mach-O")?;
     let litebox_shim_macos::LoadedProgram {
         entrypoints,
