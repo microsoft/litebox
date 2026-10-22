@@ -1,15 +1,89 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Darwin startup stack.
+//! Darwin startup stack and apple[] vector.
 //!
 //! Static `LC_UNIXTHREAD` entry points receive `argc` at SP. For dyld, the
 //! kernel's `mainExecutable` Mach header pointer precedes `argc`.
 
 use super::{MachoLoaderError, STACK_SIZE};
 use crate::ShimPlatform;
-use alloc::{ffi::CString, vec, vec::Vec};
+use alloc::{ffi::CString, format, string::String, vec, vec::Vec};
 use litebox_common_macos::{STACK_ALIGNMENT, user_pointers::UserPtrMut};
+
+/// The main thread's stack as XNU reports it in `main_stack=`: the stack top
+/// and usable size, then the whole allocation including its guard page.
+pub(super) struct MainStack {
+    pub(super) top: usize,
+    pub(super) size: usize,
+    pub(super) allocation: usize,
+    pub(super) allocation_size: usize,
+}
+
+/// Random values XNU supplies for `stack_guard=` (1), `malloc_entropy=` (2)
+/// and `ptr_munge=` (1).
+pub(super) struct AppleEntropy {
+    stack_guard: u64,
+    malloc_entropy: [u64; 2],
+    ptr_munge: u64,
+}
+
+pub(super) const APPLE_ENTROPY_BYTES: usize = 4 * size_of::<u64>();
+
+impl AppleEntropy {
+    pub(super) fn from_bytes(bytes: &[u8; APPLE_ENTROPY_BYTES]) -> Self {
+        let words = bytes.as_chunks::<{ size_of::<u64>() }>().0;
+        let word = |index: usize| u64::from_le_bytes(words[index]);
+        Self {
+            // Like XNU's exec_add_entropy_key, embed a NUL byte in the stack
+            // guard so it also stops C-string overflows.
+            stack_guard: word(0) & !(0xff << 8),
+            malloc_entropy: [word(1), word(2)],
+            ptr_munge: word(3),
+        }
+    }
+}
+
+/// Build apple[] like xnu `exec_add_apple_strings` for an arm64 process.
+///
+/// Omitted keys: `pfz=` (no commpage text), `executable_file=`/`dyld_file=`
+/// and `executable_cdhash=`/`executable_boothash=` (no guest file identity or
+/// code signature), `th_port=` (no guest Mach thread port name exists yet;
+/// libpthread then falls back to `mach_thread_self()`), `ptrauth_disabled=1`
+/// (only for arm64e mains run as arm64) and `dyld_hw_tpro*` (no TPRO). The
+/// entropy keys are omitted when `entropy` is `None`, which the loader allows
+/// only for static executables without a random source.
+pub(super) fn apple_strings(
+    executable_path: &str,
+    main_stack: &MainStack,
+    entropy: Option<&AppleEntropy>,
+) -> Result<Vec<CString>, MachoLoaderError> {
+    let mut strings: Vec<String> = vec![format!("executable_path={executable_path}")];
+    if let Some(entropy) = entropy {
+        strings.extend([
+            format!("stack_guard={:#x}", entropy.stack_guard),
+            format!(
+                "malloc_entropy={:#x},{:#x}",
+                entropy.malloc_entropy[0], entropy.malloc_entropy[1]
+            ),
+            format!("ptr_munge={:#x}", entropy.ptr_munge),
+        ]);
+    }
+    strings.extend([
+        format!(
+            "main_stack={:#x},{:#x},{:#x},{:#x}",
+            main_stack.top, main_stack.size, main_stack.allocation, main_stack.allocation_size
+        ),
+        // No task security features are active.
+        String::from("security_config=0x0"),
+    ]);
+    strings
+        .into_iter()
+        .map(|string| {
+            CString::new(string).map_err(|_| MachoLoaderError::Invalid("executable path"))
+        })
+        .collect()
+}
 
 // argc and the terminators for argv, envp and apple.
 const FIXED_STACK_WORDS: usize = 4;
@@ -91,6 +165,42 @@ fn stack_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn main_stack() -> MainStack {
+        MainStack {
+            top: 0x7000_0000,
+            size: STACK_SIZE,
+            allocation: 0x7000_0000 - STACK_SIZE - litebox_common_macos::PAGE_SIZE,
+            allocation_size: STACK_SIZE + litebox_common_macos::PAGE_SIZE,
+        }
+    }
+
+    #[test]
+    fn apple_strings_follow_xnu_order_and_format() {
+        let mut bytes = [0u8; APPLE_ENTROPY_BYTES];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::try_from(index + 1).unwrap();
+        }
+        let entropy = AppleEntropy::from_bytes(&bytes);
+        let strings = apple_strings("/bin/main", &main_stack(), Some(&entropy)).unwrap();
+        let strings: Vec<_> = strings.iter().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(
+            strings,
+            [
+                "executable_path=/bin/main",
+                // The second byte is cleared to embed a NUL in the guard.
+                "stack_guard=0x807060504030001",
+                "malloc_entropy=0x100f0e0d0c0b0a09,0x1817161514131211",
+                "ptr_munge=0x201f1e1d1c1b1a19",
+                "main_stack=0x70000000,0x800000,0x6f7fc000,0x804000",
+                "security_config=0x0",
+            ]
+        );
+        assert!(matches!(
+            apple_strings("/bin/\0main", &main_stack(), None),
+            Err(MachoLoaderError::Invalid(_))
+        ));
+    }
 
     #[test]
     fn static_stack_layout() {

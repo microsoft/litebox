@@ -2096,6 +2096,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "getrandom 0.3.4",
  "litebox",
  "litebox_broker_core",
  "litebox_broker_host",

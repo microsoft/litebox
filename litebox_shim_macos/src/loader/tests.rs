@@ -14,12 +14,13 @@ use litebox::{
     platform::{PageManagementProvider, page_mgmt::MemoryRegionPermissions as Permissions},
 };
 use litebox_broker_core::{
-    ObjectRights, PolicyEngine,
+    BrokerCore, ObjectRights, PolicyEngine,
     fs::{
         in_mem::{InMem, InitialNode},
         resolver::Resolver,
     },
-    test_support::TestBrokerCoreBuilder,
+    random::{RandomProvider, RandomProviderError},
+    test_support::{FailingRandomProvider, TestBrokerCoreBuilder},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -76,8 +77,7 @@ fn link(assembly: &str, link_args: &[&str]) -> Vec<u8> {
     std::fs::read(executable).unwrap()
 }
 
-fn builder(executable: Vec<u8>) -> MacosShimBuilder<Platform> {
-    let platform = Platform::new();
+fn builder(executable: Vec<u8>, random: Arc<dyn RandomProvider>) -> MacosShimBuilder<Platform> {
     let mode = FileMode::from_u32_bits_truncate(0o755);
     let directory = || InitialNode::Directory {
         mode,
@@ -99,8 +99,14 @@ fn builder(executable: Vec<u8>) -> MacosShimBuilder<Platform> {
         ObjectRights::all(),
     ))
     .with_file_service(Arc::new(Resolver::<Platform, _>::new(fs)))
+    .with_random_provider(random)
     .build()
     .unwrap();
+    builder_for(Platform::new(), core)
+}
+
+/// A shim builder associated with `core` as its own broker process.
+fn builder_for(platform: &'static Platform, core: BrokerCore) -> MacosShimBuilder<Platform> {
     let setup = InProcessBrokerSetup::new(core);
     let readiness = setup.readiness_sink();
     let (local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
@@ -111,6 +117,16 @@ fn builder(executable: Vec<u8>) -> MacosShimBuilder<Platform> {
     let litebox = LiteBox::new_with_broker_local(platform, local);
     readiness.attach(litebox.broker_notification_dispatcher());
     MacosShimBuilder::new_with_litebox(platform, litebox)
+}
+
+/// Fixed bytes for the apple[] entropy keys dynamic executables require.
+struct FixedRandomProvider;
+
+impl RandomProvider for FixedRandomProvider {
+    fn fill(&self, output: &mut [u8]) -> Result<(), RandomProviderError> {
+        output.fill(0x5a);
+        Ok(())
+    }
 }
 
 fn read_bytes(address: usize, size: usize) -> Vec<u8> {
@@ -128,7 +144,7 @@ fn filesystem_loader_runs_linked_static_macho() {
     set_guest_abi(GuestAbi::Darwin);
     let executable = image();
     let plan = MachoParsedFile::parse(&executable).unwrap();
-    let mut builder = builder(executable.clone());
+    let mut builder = builder(executable.clone(), Arc::new(FixedRandomProvider));
     // Executable descriptors must not consume or close inherited guest FDs.
     let fd = builder
         .litebox()
@@ -199,16 +215,29 @@ fn filesystem_loader_runs_linked_static_macho() {
         Platform::TASK_ADDR_MIN + (Platform::TASK_ADDR_MAX - Platform::TASK_ADDR_MIN) / 2;
     assert!(sp >= midpoint, "stack was not placed top-down: {sp:#x}");
     assert_eq!(word(sp), argument_count);
-    for terminator in [argv_end, envp_end, apple_start + 1] {
-        assert_eq!(word(sp + terminator * size_of::<usize>()), 0);
-    }
-    let apple = b"executable_path=/bin/main\0";
-    assert_eq!(
-        read_bytes(word(sp + apple_start * size_of::<usize>()), apple.len()),
-        apple
-    );
     let stack_end = (sp + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let guard = stack_end - STACK_SIZE - PAGE_SIZE;
+    let apple = [
+        std::string::String::from("executable_path=/bin/main"),
+        std::string::String::from("stack_guard=0x5a5a5a5a5a5a005a"),
+        std::format!("malloc_entropy={0:#x},{0:#x}", 0x5a5a_5a5a_5a5a_5a5a_u64),
+        std::format!("ptr_munge={:#x}", 0x5a5a_5a5a_5a5a_5a5a_u64),
+        std::format!(
+            "main_stack={stack_end:#x},{STACK_SIZE:#x},{guard:#x},{:#x}",
+            STACK_SIZE + PAGE_SIZE
+        ),
+        std::string::String::from("security_config=0x0"),
+    ];
+    for terminator in [argv_end, envp_end, apple_start + apple.len()] {
+        assert_eq!(word(sp + terminator * size_of::<usize>()), 0);
+    }
+    for (index, expected) in apple.iter().enumerate() {
+        let address = word(sp + (apple_start + index) * size_of::<usize>());
+        assert_eq!(
+            read_bytes(address, expected.len() + 1),
+            [expected.as_bytes(), b"\0"].concat()
+        );
+    }
     assert!(
         !task
             .global
@@ -260,19 +289,83 @@ fn byte_snapshot_path_is_independent_of_argv() {
     assert_eq!(read_bytes(apple, expected.len()), expected);
 }
 
+/// A broker random request that fails would abort the broker association,
+/// so the load fails instead of starting a static executable without entropy.
 #[test]
-fn aot_rewritten_dyld_loads_like_raw_dyld() {
+fn failed_random_request_fails_static_load() {
     set_guest_abi(GuestAbi::Darwin);
+    let result = builder(image(), Arc::new(FailingRandomProvider))
+        .build()
+        .load_program(TaskParams::default(), "/bin/main", Vec::new(), Vec::new());
+    assert!(matches!(result, Err(MachoLoaderError::Entropy)));
+}
+
+#[test]
+fn static_load_without_random_source_omits_entropy_keys() {
+    set_guest_abi(GuestAbi::Darwin);
+    let program = MacosShimBuilder::new(Platform::new())
+        .build()
+        .load_program_from_bytes(
+            TaskParams::default(),
+            "/bin/main",
+            &image(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+    // argc, the empty argv and envp terminators, then apple[].
+    let apple_start = 3;
+    let sp = program.initial_ctx.sp;
+    let apple = |index: usize| word(sp + (apple_start + index) * size_of::<usize>());
+    for (index, prefix) in [
+        &b"executable_path="[..],
+        b"main_stack=",
+        b"security_config=",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(read_bytes(apple(index), prefix.len()), prefix);
+    }
+    assert_eq!(apple(3), 0);
+}
+
+/// A minimal executable linked against libSystem, so it requires dyld.
+fn dynamic_main() -> Vec<u8> {
     let sdk = Command::new("xcrun")
         .arg("--show-sdk-path")
         .output()
         .expect("Xcode command-line tools are required");
     assert!(sdk.status.success());
     let sdk = std::string::String::from_utf8(sdk.stdout).unwrap();
-    let main = link(
+    link(
         ".global _main\n.p2align 2\n_main:\n mov x0, #42\n ret\n",
         &["-e", "_main", "-lSystem", "-syslibroot", sdk.trim()],
-    );
+    )
+}
+
+/// libSystem's initializers require the entropy keys.
+#[test]
+fn dynamic_load_without_random_source_fails() {
+    set_guest_abi(GuestAbi::Darwin);
+    let host_dyld = std::fs::read("/usr/lib/dyld").unwrap();
+    let result = MacosShimBuilder::new(Platform::new())
+        .build()
+        .load_program_with_dyld(
+            TaskParams::default(),
+            "/bin/main",
+            &dynamic_main(),
+            arm64_slice(&host_dyld).unwrap(),
+            Vec::new(),
+            Vec::new(),
+        );
+    assert!(matches!(result, Err(MachoLoaderError::Entropy)));
+}
+
+#[test]
+fn aot_rewritten_dyld_loads_like_raw_dyld() {
+    set_guest_abi(GuestAbi::Darwin);
+    let main = dynamic_main();
     let host_dyld = std::fs::read("/usr/lib/dyld").unwrap();
     let raw = arm64_slice(&host_dyld).unwrap();
     let aot =
@@ -281,10 +374,16 @@ fn aot_rewritten_dyld_loads_like_raw_dyld() {
         MachoParsedFile::parse(&aot).unwrap().parse_trampoline(&aot),
         Ok(Some(_))
     ));
+    let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        ObjectRights::all(),
+    ))
+    .with_random_provider(Arc::new(FixedRandomProvider))
+    .build()
+    .unwrap();
     // The loader rewrites raw dyld itself and uses the AOT image as supplied;
     // both must yield the same dyld entry code.
     let entry_code = |dyld: &[u8]| {
-        let program = MacosShimBuilder::new(Platform::new())
+        let program = builder_for(Platform::new(), broker.clone())
             .build()
             .load_program_with_dyld(
                 TaskParams::default(),

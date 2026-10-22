@@ -348,7 +348,7 @@ fn runner_executes_mmap_mprotect_rewritten_macho_code() {
              ldr x9, 1f\n\
              add x9, x19, x9\n\
              blr x9\n\
-             cmp x0, #1\n\
+             cmp x0, #2\n\
              mov x0, #43\n\
              mov x10, #42\n\
              csel x0, x10, x0, eq\n\

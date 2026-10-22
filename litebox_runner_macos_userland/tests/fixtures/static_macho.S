@@ -9,7 +9,8 @@
 .global _start
 .p2align 2
 _start:
-    // argc, argv terminator, envp, and executable_path apple entry.
+    // argc, argv terminator, envp, and apple[] in XNU's order. With a broker
+    // random source (TEST_STDIO), apple[] also has the entropy keys.
     ldr x9, [sp]
     cmp x9, #3
     b.ne fail
@@ -21,12 +22,22 @@ _start:
     b.ne fail
     ldr x9, [sp, #48]
     cbnz x9, fail
-    ldr x9, [sp, #56]
+    add x11, sp, #56
+.if TEST_STDIO
+    adr x12, apple_with_entropy
+.else
+    adr x12, apple_without_entropy
+.endif
+apple_entry:
+    ldrb w13, [x12], #1
+    ldr x9, [x11], #8
+    cbz w13, apple_end
     cbz x9, fail
     ldrb w10, [x9]
-    cmp w10, #'e'
+    cmp w10, w13
     b.ne fail
-    ldr x9, [sp, #64]
+    b apple_entry
+apple_end:
     cbnz x9, fail
 
     mov x19, sp
@@ -58,7 +69,7 @@ again:
     mov x9, #0x90000000
     cmp x10, x9
     b.ne fail
-    cmp x0, #1 // Virtual PID, not the host process's PID.
+    cmp x0, #2 // Virtual PID, not the host process's PID.
     b.ne fail
     cmp x1, #88
     b.ne fail
@@ -111,9 +122,10 @@ redzone:
     b.cc fail
     cmp x0, #78 // positive Darwin ENOSYS
     b.ne fail
-    mov x16, #39 // getppid
+    mov x16, #39 // getppid: launchd
     svc #0x80
-    cbnz x0, fail
+    cmp x0, #1
+    b.ne fail
     mov x16, #24 // getuid
     svc #0x80
     cmp x0, #1000
@@ -280,6 +292,14 @@ exit:
     mov x16, #1
     svc #0x80
     brk #0
+
+// First letters of the expected apple[] entries: executable_path,
+// [stack_guard, malloc_entropy, ptr_munge,] main_stack, security_config.
+apple_with_entropy:
+    .asciz "esmpms"
+apple_without_entropy:
+    .asciz "ems"
+.p2align 2
 
 .if TEST_STDIO
 .bss

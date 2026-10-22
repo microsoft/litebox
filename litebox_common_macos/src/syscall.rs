@@ -42,11 +42,45 @@ pub mod nr {
     pub const GETENTROPY: usize = 500;
 }
 
+/// Selector of XNU's AArch64 machine-dependent `platform_syscall` trap
+/// (`PLATFORM_SYSCALL_TRAP_NO`). It is negative as an `int`, but XNU checks it
+/// before dispatching Mach traps.
+pub const PLATFORM_SYSCALL_SELECTOR: u32 = 0x8000_0000;
+
+/// Whether the low 32 bits of an AArch64 syscall selector encode XNU's
+/// machine-dependent platform trap.
+pub fn is_platform_syscall_selector(number: usize) -> bool {
+    TruncateExt::<u32>::trunc(number) == PLATFORM_SYSCALL_SELECTOR
+}
+
 /// Whether the low 32 bits of an AArch64 syscall selector encode a Mach trap.
 /// XNU interprets the selector as signed `int`, regardless of x16's upper bits.
 pub fn is_mach_trap_selector(number: usize) -> bool {
     let selector: i32 = number.reinterpret_as_signed().trunc();
-    selector < 0
+    selector < 0 && !is_platform_syscall_selector(number)
+}
+
+/// A request to XNU's AArch64 `platform_syscall`, selected by the low 32 bits
+/// of x3. It never sets the carry flag and changes x0 only for
+/// [`Self::GetCthreadSelf`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlatformSyscall {
+    /// Code 2, `thread_set_cthread_self(x0)`: set the TSD base (TPIDRRO_EL0).
+    SetCthreadSelf { tsd_base: usize },
+    /// Code 3, `thread_get_cthread_self()`: return the TSD base in x0.
+    GetCthreadSelf,
+    /// Codes 0 and 1 (removed cache flushes) and unknown codes: no effect.
+    Ignored { code: u32 },
+}
+
+impl PlatformSyscall {
+    pub fn from_args(x0: usize, x3: usize) -> Self {
+        match TruncateExt::<u32>::trunc(x3) {
+            2 => Self::SetCthreadSelf { tsd_base: x0 },
+            3 => Self::GetCthreadSelf,
+            code => Self::Ignored { code },
+        }
+    }
 }
 
 /// Mach trap numbers. AArch64 Darwin passes their negation in w16.
@@ -250,6 +284,10 @@ impl SyscallRequest {
         let int_arg = |i: usize| -> i32 { args[i].reinterpret_as_signed().trunc() };
         let u64_arg = |i: usize| -> u64 { args[i] as u64 };
         let port_arg = |i: usize| MachPortName(TruncateExt::<u32>::trunc(args[i]));
+        if is_platform_syscall_selector(number) {
+            // Not a BSD or Mach request; see `PlatformSyscall`.
+            return Err(Errno::ENOSYS);
+        }
         if is_mach_trap_selector(number) {
             let selector: i32 = number.reinterpret_as_signed().trunc();
             let trap = selector.wrapping_neg().reinterpret_as_unsigned();
@@ -435,6 +473,37 @@ mod tests {
                 )
                 .unwrap_err(),
                 Errno::EINVAL
+            );
+        }
+    }
+
+    #[test]
+    fn platform_syscall_precedes_mach_trap_classification() {
+        for number in [0x8000_0000usize, 0xffff_ffff_8000_0000] {
+            assert!(is_platform_syscall_selector(number));
+            assert!(!is_mach_trap_selector(number));
+            assert_eq!(
+                SyscallRequest::from_args(number, [0; 8]).unwrap_err(),
+                Errno::ENOSYS
+            );
+        }
+        for number in [0x7fff_ffffusize, 0x8000_0001, 0, nr::EXIT] {
+            assert!(!is_platform_syscall_selector(number));
+        }
+        assert!(is_mach_trap_selector(0x8000_0001));
+        assert!(is_mach_trap_selector(u32::MAX as usize));
+        assert_eq!(
+            PlatformSyscall::from_args(0x1234, 2),
+            PlatformSyscall::SetCthreadSelf { tsd_base: 0x1234 }
+        );
+        assert_eq!(
+            PlatformSyscall::from_args(0x1234, 0xffff_ffff_0000_0003),
+            PlatformSyscall::GetCthreadSelf
+        );
+        for code in [0, 1, 4, u32::MAX] {
+            assert_eq!(
+                PlatformSyscall::from_args(0x1234, code as usize),
+                PlatformSyscall::Ignored { code }
             );
         }
     }
