@@ -115,25 +115,20 @@ impl CondrvObject {
     }
 
     fn from_component(name: &str) -> Option<Self> {
-        if name.eq_ignore_ascii_case("Input") {
-            Some(Self::Input)
-        } else if name.eq_ignore_ascii_case("Output") {
-            Some(Self::Output)
-        } else if name.eq_ignore_ascii_case("CurrentIn") {
-            Some(Self::CurrentInput)
-        } else if name.eq_ignore_ascii_case("CurrentOut") {
-            Some(Self::CurrentOutput)
-        } else if name.eq_ignore_ascii_case("ScreenBuffer") {
-            Some(Self::ScreenBuffer)
-        } else if name.eq_ignore_ascii_case("Server") {
-            Some(Self::Server)
-        } else if name.eq_ignore_ascii_case("Reference") {
-            Some(Self::Reference)
-        } else if name.eq_ignore_ascii_case("Connect") {
-            Some(Self::Connect)
-        } else {
-            None
-        }
+        const COMPONENTS: [(&str, CondrvObject); 8] = [
+            ("Input", CondrvObject::Input),
+            ("Output", CondrvObject::Output),
+            ("CurrentIn", CondrvObject::CurrentInput),
+            ("CurrentOut", CondrvObject::CurrentOutput),
+            ("ScreenBuffer", CondrvObject::ScreenBuffer),
+            ("Server", CondrvObject::Server),
+            ("Reference", CondrvObject::Reference),
+            ("Connect", CondrvObject::Connect),
+        ];
+        COMPONENTS
+            .iter()
+            .find(|(component, _)| name.eq_ignore_ascii_case(component))
+            .map(|&(_, object)| object)
     }
 
     pub(crate) fn relative_child(self, name: &str) -> Result<Self, NtStatus> {

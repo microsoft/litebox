@@ -31,31 +31,21 @@ use litebox_common_windows::{NtSysno, Win32Sysno};
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::TimeProvider;
 
-use crate::syscalls::event::{EventHandleObject, EventSubsystem};
+use crate::syscalls::event::EventSubsystem;
 use crate::syscalls::file::FileObject;
-use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
-use crate::syscalls::lpc::{LpcPortHandleObject, LpcPortSubsystem};
-use crate::syscalls::mutant::{MutantHandleObject, MutantSubsystem};
-use crate::syscalls::object_manager::{
-    DirectoryHandleObject, DirectoryObjectSubsystem, ObjectManager,
-};
-use crate::syscalls::registry::{NtNotifyChangeKeyRequest, RegistryKeyObject};
-use crate::syscalls::section::{
-    MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
-};
-use crate::syscalls::semaphore::{SemaphoreHandleObject, SemaphoreSubsystem};
-use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
+use crate::syscalls::iocp::IoCompletionSubsystem;
+use crate::syscalls::lpc::LpcPortSubsystem;
+use crate::syscalls::mutant::MutantSubsystem;
+use crate::syscalls::object_manager::{DirectoryObjectSubsystem, ObjectManager};
+use crate::syscalls::registry::RegistryKeyObject;
+use crate::syscalls::section::{SectionObject, SectionSubsystem};
+use crate::syscalls::semaphore::SemaphoreSubsystem;
+use crate::syscalls::symlink::SymbolicLinkSubsystem;
 use crate::syscalls::thread::{ThreadAccess, ThreadHandleObject, ThreadSubsystem};
-use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
-use crate::syscalls::token::{TokenHandleObject, TokenObject, TokenSubsystem};
-use crate::syscalls::wait_completion_packet::{
-    WaitCompletionPacketAssociateParameters, WaitCompletionPacketHandleObject,
-    WaitCompletionPacketSubsystem,
-};
-use crate::syscalls::worker_factory::{
-    WorkerFactoryCreateParameters, WorkerFactoryHandleObject, WorkerFactorySubsystem,
-};
-use crate::syscalls::{SyscallRequest, ThreadHandle, mm};
+use crate::syscalls::timer::TimerSubsystem;
+use crate::syscalls::token::{TokenObject, TokenSubsystem};
+use crate::syscalls::wait_completion_packet::WaitCompletionPacketSubsystem;
+use crate::syscalls::worker_factory::WorkerFactorySubsystem;
 
 mod fs;
 mod loader;
@@ -178,8 +168,22 @@ struct WindowsHandleMetadata {
     attributes: HandleAttributes,
 }
 
-pub(crate) trait WindowsHandleSubsystem: litebox::fd::FdEnabledSubsystem {
+pub(crate) trait WindowsHandleSubsystem<Platform: ShimPlatform>:
+    litebox::fd::FdEnabledSubsystem
+{
     fn normalize_desired_access(desired_access: u32) -> u32;
+
+    /// Releases an entry once its last handle is closed, or when a handle that was just
+    /// created is rolled back.
+    fn close_entry(_task: &Task<Platform>, entry: Self::Entry) {
+        drop(entry);
+    }
+
+    /// Returns the dispatcher object that a wait on `entry` observes, or `None` if handles of
+    /// this subsystem are not waitable.
+    fn waitable_object(_entry: &Self::Entry) -> Option<syscalls::wait::WaitableObject<Platform>> {
+        None
+    }
 
     fn resolve_duplicate_access(
         _entry: &Self::Entry,
@@ -317,6 +321,21 @@ where
     Some(())
 }
 
+/// Reads the value behind an optional guest input pointer.
+///
+/// Returns `Ok(None)` when no pointer was supplied and `ACCESS_VIOLATION` when the pointer is
+/// unreadable.
+pub(crate) fn read_optional_guest_value<Platform, T>(
+    ptr: Option<ConstPtr<Platform, T>>,
+) -> Result<Option<T>, NtStatus>
+where
+    Platform: RawPointerProvider,
+    T: zerocopy::FromBytes,
+{
+    ptr.map(|ptr| ptr.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION))
+        .transpose()
+}
+
 pub(crate) fn probe_guest_output_preserving_value<Platform, T>(
     ptr: MutPtr<Platform, T>,
 ) -> Result<(), NtStatus>
@@ -360,30 +379,20 @@ fn set_guest_teb<Platform: ArchSpecificProvider>(platform: &Platform, teb_addres
     true
 }
 
-fn insert_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
-    litebox: &LiteBox<Platform>,
-    handles: &WindowsHandleStore<Platform>,
-    typed: litebox::fd::TypedFd<Subsystem>,
-    cleanup_entry: impl FnOnce(Subsystem::Entry),
-) -> Result<syscalls::Handle, NtStatus>
-where
-    Platform: RawSyncPrimitivesProvider,
-{
-    let mut handles = handles.write();
-    let raw_fd = handles.fd_into_raw_integer(typed);
-    let Some(handle) = syscalls::Handle::from_raw_fd(raw_fd) else {
-        let typed = handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok();
-        drop(handles);
-        let entry = typed.and_then(|typed| {
-            let mut descriptor_table = litebox.descriptor_table_mut();
-            descriptor_table.remove(&typed)
-        });
-        if let Some(entry) = entry {
-            cleanup_entry(entry);
-        }
-        return Err(NtStatus::QUOTA_EXCEEDED);
-    };
-    Ok(handle)
+/// Looks up `raw_fd` in `handles` as a handle of `Subsystem`.
+///
+/// Returns `INVALID_HANDLE` for an unknown handle and `OBJECT_TYPE_MISMATCH` for a handle of
+/// another subsystem.
+fn typed_fd_from_raw<Subsystem: litebox::fd::FdEnabledSubsystem>(
+    handles: &litebox::fd::RawDescriptorStorage,
+    raw_fd: usize,
+) -> Result<Arc<litebox::fd::TypedFd<Subsystem>>, NtStatus> {
+    handles
+        .fd_from_raw_integer::<Subsystem>(raw_fd)
+        .map_err(|error| match error {
+            litebox::fd::ErrRawIntFd::NotFound => NtStatus::INVALID_HANDLE,
+            litebox::fd::ErrRawIntFd::InvalidSubsystem => NtStatus::OBJECT_TYPE_MISMATCH,
+        })
 }
 
 pub(crate) fn raw_handle_entry<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
@@ -400,47 +409,6 @@ where
         handles.fd_from_raw_integer::<Subsystem>(raw_fd).ok()
     }?;
     litebox.descriptor_table().entry_handle(&typed)
-}
-
-fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
-    litebox: &LiteBox<Platform>,
-    handles: &WindowsHandleStore<Platform>,
-    handle: syscalls::Handle,
-    cleanup_entry: impl FnOnce(Subsystem::Entry),
-) where
-    Platform: RawSyncPrimitivesProvider,
-{
-    let Some(raw_fd) = handle.raw_fd() else {
-        return;
-    };
-    let _ =
-        remove_raw_handle_by_raw_fd::<Platform, Subsystem>(litebox, handles, raw_fd, cleanup_entry);
-}
-
-fn remove_raw_handle_by_raw_fd<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
-    litebox: &LiteBox<Platform>,
-    handles: &WindowsHandleStore<Platform>,
-    raw_fd: usize,
-    cleanup_entry: impl FnOnce(Subsystem::Entry),
-) -> bool
-where
-    Platform: RawSyncPrimitivesProvider,
-{
-    let typed = {
-        let mut handles = handles.write();
-        handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok()
-    };
-    let Some(typed) = typed else {
-        return false;
-    };
-    let entry = {
-        let mut descriptor_table = litebox.descriptor_table_mut();
-        descriptor_table.remove(&typed)
-    };
-    if let Some(entry) = entry {
-        cleanup_entry(entry);
-    }
-    true
 }
 
 /// Builds a Windows NT shim instance.
@@ -904,6 +872,38 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
+    fn sys_nt_terminate_process(
+        &self,
+        process_handle: syscalls::ProcessHandle,
+        exit_status: i32,
+    ) -> NtStatus {
+        if process_handle.is_null() {
+            // A null handle terminates every other thread in the current process but spares the
+            // caller.
+            self.exit_other_threads(exit_status);
+            NtStatus::SUCCESS
+        } else if process_handle.is_current() {
+            self.exit_process(exit_status);
+            NtStatus::SUCCESS
+        } else {
+            // TODO: allow terminating other processes
+            litebox_util_log::error!("Terminating other processes is not yet supported");
+            NtStatus::INVALID_HANDLE
+        }
+    }
+
+    fn sys_nt_terminate_thread(
+        &self,
+        thread_handle: syscalls::ThreadHandle,
+        exit_status: i32,
+    ) -> NtStatus {
+        if !thread_handle.is_null() && !thread_handle.is_current() {
+            return NtStatus::NOT_SUPPORTED;
+        }
+        self.exit_thread(exit_status);
+        NtStatus::SUCCESS
+    }
+
     fn init(&self, ctx: &mut litebox_common_linux::PtRegs) {
         // Publish the handle used to interrupt this thread. This must happen on
         // the thread itself, because the handle captures the current platform
@@ -939,10 +939,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Subsystem: litebox::fd::FdEnabledSubsystem,
     {
         let typed = self.typed_handle::<Subsystem>(handle)?;
+        self.entry_handle_for(&typed)
+    }
+
+    fn entry_handle_for<Subsystem>(
+        &self,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+    ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
+    where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
         self.global
             .litebox
             .descriptor_table()
-            .entry_handle(&typed)
+            .entry_handle(typed)
             .ok_or(NtStatus::INVALID_HANDLE)
     }
 
@@ -952,7 +962,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         required_access: u32,
     ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
     where
-        Subsystem: WindowsHandleSubsystem,
+        Subsystem: WindowsHandleSubsystem<Platform>,
     {
         self.typed_handle_entry_with_access_check(handle, |granted_access| {
             granted_access & required_access == required_access
@@ -964,7 +974,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         handle: syscalls::Handle,
     ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
     where
-        Subsystem: WindowsHandleSubsystem,
+        Subsystem: WindowsHandleSubsystem<Platform>,
     {
         self.typed_handle_entry_with_access_check(handle, |granted_access| granted_access != 0)
     }
@@ -975,17 +985,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         access_check: impl FnOnce(u32) -> bool,
     ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
     where
-        Subsystem: WindowsHandleSubsystem,
+        Subsystem: WindowsHandleSubsystem<Platform>,
     {
         let typed = self.typed_handle::<Subsystem>(handle)?;
         if !access_check(self.typed_handle_metadata(&typed)?.granted_access) {
             return Err(NtStatus::ACCESS_DENIED);
         }
-        self.global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&typed)
-            .ok_or(NtStatus::INVALID_HANDLE)
+        self.entry_handle_for(&typed)
     }
 
     fn typed_handle<Subsystem>(
@@ -995,15 +1001,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     where
         Subsystem: litebox::fd::FdEnabledSubsystem,
     {
-        let Some(raw_fd) = handle.raw_fd() else {
-            return Err(NtStatus::INVALID_HANDLE);
-        };
-        let handles = self.process.handles.read();
-        match handles.fd_from_raw_integer::<Subsystem>(raw_fd) {
-            Ok(typed) => Ok(typed),
-            Err(litebox::fd::ErrRawIntFd::NotFound) => Err(NtStatus::INVALID_HANDLE),
-            Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
-        }
+        let raw_fd = handle.raw_fd().ok_or(NtStatus::INVALID_HANDLE)?;
+        typed_fd_from_raw::<Subsystem>(&self.process.handles.read(), raw_fd)
     }
 
     fn typed_handle_metadata<Subsystem>(
@@ -1011,7 +1010,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         typed: &litebox::fd::TypedFd<Subsystem>,
     ) -> Result<WindowsHandleMetadata, NtStatus>
     where
-        Subsystem: WindowsHandleSubsystem,
+        Subsystem: WindowsHandleSubsystem<Platform>,
     {
         self.global
             .litebox
@@ -1026,7 +1025,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         required_access: u32,
     ) -> Result<(), NtStatus>
     where
-        Subsystem: WindowsHandleSubsystem,
+        Subsystem: WindowsHandleSubsystem<Platform>,
     {
         let typed = self.typed_handle::<Subsystem>(handle)?;
         self.require_typed_handle_access(&typed, required_access)
@@ -1038,7 +1037,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         required_access: u32,
     ) -> Result<(), NtStatus>
     where
-        Subsystem: WindowsHandleSubsystem,
+        Subsystem: WindowsHandleSubsystem<Platform>,
     {
         if self.typed_handle_metadata(typed)?.granted_access & required_access == required_access {
             Ok(())
@@ -1051,16 +1050,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         entry: Subsystem::Entry,
         granted_access: u32,
-        cleanup_entry: impl FnOnce(Subsystem::Entry),
     ) -> Result<syscalls::Handle, NtStatus>
     where
-        Subsystem: WindowsHandleSubsystem,
+        Subsystem: WindowsHandleSubsystem<Platform>,
     {
         self.insert_typed_handle_with_attributes::<Subsystem>(
             entry,
             granted_access,
             HandleAttributes::empty(),
-            cleanup_entry,
         )
     }
 
@@ -1069,10 +1066,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         entry: Subsystem::Entry,
         granted_access: u32,
         attributes: HandleAttributes,
-        cleanup_entry: impl FnOnce(Subsystem::Entry),
     ) -> Result<syscalls::Handle, NtStatus>
     where
-        Subsystem: WindowsHandleSubsystem,
+        Subsystem: WindowsHandleSubsystem<Platform>,
     {
         let typed = {
             let mut descriptors = self.global.litebox.descriptor_table_mut();
@@ -1087,27 +1083,85 @@ impl<Platform: ShimPlatform> Task<Platform> {
             debug_assert!(old.is_none());
             typed
         };
-        insert_raw_handle::<Platform, Subsystem>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
-            cleanup_entry,
-        )
+        self.publish_typed_handle(typed)
     }
 
-    fn close_typed_handle<Subsystem>(
+    /// Assigns a handle value to `typed` in the process handle table.
+    ///
+    /// If no handle value is available, the descriptor is closed through
+    /// [`WindowsHandleSubsystem::close_entry`] and `QUOTA_EXCEEDED` is returned.
+    fn publish_typed_handle<Subsystem>(
         &self,
-        handle: syscalls::Handle,
-        cleanup_entry: impl FnOnce(Subsystem::Entry),
-    ) where
-        Subsystem: litebox::fd::FdEnabledSubsystem,
+        typed: litebox::fd::TypedFd<Subsystem>,
+    ) -> Result<syscalls::Handle, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem<Platform>,
     {
-        remove_raw_handle::<Platform, Subsystem>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            cleanup_entry,
-        );
+        let mut handles = self.process.handles.write();
+        let raw_fd = handles.fd_into_raw_integer(typed);
+        if let Some(handle) = syscalls::Handle::from_raw_fd(raw_fd) {
+            return Ok(handle);
+        }
+        let typed = handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok();
+        drop(handles);
+        if let Some(typed) = typed {
+            self.close_descriptor(&typed);
+        }
+        Err(NtStatus::QUOTA_EXCEEDED)
+    }
+
+    /// Removes `handle` from the process handle table and closes its descriptor.
+    ///
+    /// Does nothing if `handle` does not name a `Subsystem` handle.
+    fn close_typed_handle<Subsystem>(&self, handle: syscalls::Handle)
+    where
+        Subsystem: WindowsHandleSubsystem<Platform>,
+    {
+        let Some(raw_fd) = handle.raw_fd() else {
+            return;
+        };
+        let typed = self
+            .process
+            .handles
+            .write()
+            .fd_consume_raw_integer::<Subsystem>(raw_fd)
+            .ok();
+        if let Some(typed) = typed {
+            self.close_descriptor(&typed);
+        }
+    }
+
+    /// Removes `typed` from the descriptor table and releases its entry through
+    /// [`WindowsHandleSubsystem::close_entry`] once no other descriptor refers to it.
+    fn close_descriptor<Subsystem>(&self, typed: &litebox::fd::TypedFd<Subsystem>)
+    where
+        Subsystem: WindowsHandleSubsystem<Platform>,
+    {
+        let entry = self.global.litebox.descriptor_table_mut().remove(typed);
+        if let Some(entry) = entry {
+            Subsystem::close_entry(self, entry);
+        }
+    }
+
+    /// Inserts `entry` as a new handle and writes that handle to the guest pointer `output`.
+    ///
+    /// If `output` is not writable, the new handle is closed again and `ACCESS_VIOLATION` is
+    /// returned.
+    fn write_new_typed_handle<Subsystem>(
+        &self,
+        output: MutPtr<Platform, syscalls::Handle>,
+        entry: Subsystem::Entry,
+        granted_access: u32,
+    ) -> Result<(), NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem<Platform>,
+    {
+        let handle = self.insert_typed_handle::<Subsystem>(entry, granted_access)?;
+        if output.write_at_offset(0, handle).is_none() {
+            self.close_typed_handle::<Subsystem>(handle);
+            return Err(NtStatus::ACCESS_VIOLATION);
+        }
+        Ok(())
     }
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
@@ -1119,1449 +1173,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return;
         }
 
-        let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
-            let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
-                .read_at_offset(0)
-                .unwrap_or_default();
-            #[cfg(debug_assertions)]
-            if NtSysno::from_raw(ctx.orig_rax) == Some(NtSysno::NtRaiseHardError) {
-                log_loader_hard_error::<Platform>(ctx);
-            }
-            litebox_util_log::error!(
-                syscall:? = NtSysno::from_raw(ctx.orig_rax),
-                rip:% = format_args!("{:#x}", ctx.rip),
-                caller:% = format_args!("{caller:#x}"),
-                arg0:% = format_args!("{:#x}", ctx.r10),
-                arg1:% = format_args!("{:#x}", ctx.rdx),
-                arg2:% = format_args!("{:#x}", ctx.r8),
-                arg3:% = format_args!("{:#x}", ctx.r9);
-                "Unsupported Windows syscall; terminating Windows guest"
-            );
-            self.exit_thread(NtStatus::NOT_SUPPORTED.as_raw());
+        if self.dispatch_nt_syscall(ctx) {
             return;
-        };
-        litebox_util_log::debug!(
-            syscall:? = NtSysno::from_raw(ctx.orig_rax);
-            "Handling Windows syscall"
-        );
-        let result = match req {
-            SyscallRequest::NtAccessCheck {
-                security_descriptor,
-                client_token,
-                desired_access,
-                generic_mapping,
-                privilege_set,
-                privilege_set_length,
-                granted_access,
-                access_status,
-            } => self.sys_nt_access_check(syscalls::token::AccessCheckParameters {
-                security_descriptor,
-                client_token,
-                desired_access,
-                generic_mapping,
-                privilege_set,
-                privilege_set_length,
-                granted_access,
-                access_status,
-            }),
-            SyscallRequest::NtClose { handle } => self.sys_nt_close(handle),
-            SyscallRequest::NtDuplicateObject {
-                source_process_handle,
-                source_handle,
-                target_process_handle,
-                target_handle,
-                desired_access,
-                handle_attributes,
-                options,
-            } => self.sys_nt_duplicate_object(
-                source_process_handle,
-                source_handle,
-                target_process_handle,
-                target_handle,
-                desired_access,
-                handle_attributes,
-                options,
-            ),
-            SyscallRequest::NtCreateEvent {
-                event_handle,
-                desired_access,
-                object_attributes,
-                event_type,
-                initial_state,
-            } => self.sys_nt_create_event(
-                event_handle,
-                desired_access,
-                object_attributes,
-                event_type,
-                initial_state,
-            ),
-            SyscallRequest::NtCreateMutant {
-                mutant_handle,
-                desired_access,
-                object_attributes,
-                initial_owner,
-            } => self.sys_nt_create_mutant(
-                mutant_handle,
-                desired_access,
-                object_attributes,
-                initial_owner,
-            ),
-            SyscallRequest::NtCreateSemaphore {
-                semaphore_handle,
-                desired_access,
-                object_attributes,
-                initial_count,
-                maximum_count,
-            } => self.sys_nt_create_semaphore(
-                semaphore_handle,
-                desired_access,
-                object_attributes,
-                initial_count,
-                maximum_count,
-            ),
-            SyscallRequest::NtCreateDirectoryObject {
-                directory_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_create_directory_object(
-                directory_handle,
-                desired_access,
-                object_attributes,
-                syscalls::Handle::default(),
-                0,
-            ),
-            SyscallRequest::NtCreateDirectoryObjectEx {
-                directory_handle,
-                desired_access,
-                object_attributes,
-                shadow_directory_handle,
-                flags,
-            } => self.sys_nt_create_directory_object(
-                directory_handle,
-                desired_access,
-                object_attributes,
-                shadow_directory_handle,
-                flags,
-            ),
-            SyscallRequest::NtOpenDirectoryObject {
-                directory_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_open_directory_object(
-                directory_handle,
-                desired_access,
-                object_attributes,
-            ),
-            SyscallRequest::NtOpenSection {
-                section_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_open_section(section_handle, desired_access, object_attributes),
-            SyscallRequest::NtQueryDirectoryObject {
-                directory_handle,
-                buffer,
-                buffer_length,
-                return_single_entry,
-                restart_scan,
-                context,
-                return_length,
-            } => self.sys_nt_query_directory_object(
-                syscalls::object_manager::DirectoryQueryParameters {
-                    directory_handle,
-                    buffer,
-                    buffer_length,
-                    return_single_entry,
-                    restart_scan,
-                    context,
-                    return_length,
-                },
-            ),
-            SyscallRequest::NtCreateSymbolicLinkObject {
-                link_handle,
-                desired_access,
-                object_attributes,
-                link_target,
-            } => self.sys_nt_create_symbolic_link_object(
-                link_handle,
-                desired_access,
-                object_attributes,
-                link_target,
-            ),
-            SyscallRequest::NtOpenSymbolicLinkObject {
-                link_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_open_symbolic_link_object(
-                link_handle,
-                desired_access,
-                object_attributes,
-            ),
-            SyscallRequest::NtQuerySymbolicLinkObject {
-                link_handle,
-                link_target,
-                returned_length,
-            } => self.sys_nt_query_symbolic_link_object(link_handle, link_target, returned_length),
-            SyscallRequest::NtCreateIoCompletion {
-                io_completion_handle,
-                desired_access,
-                object_attributes,
-                number_of_concurrent_threads,
-            } => self.sys_nt_create_io_completion(
-                io_completion_handle,
-                desired_access,
-                object_attributes,
-                number_of_concurrent_threads,
-            ),
-            SyscallRequest::NtOpenIoCompletion {
-                io_completion_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_open_io_completion(
-                io_completion_handle,
-                desired_access,
-                object_attributes,
-            ),
-            SyscallRequest::NtSetIoCompletion {
-                io_completion_handle,
-                completion_key,
-                completion_value,
-                status,
-                information,
-            } => self.sys_nt_set_io_completion(
-                io_completion_handle,
-                completion_key,
-                completion_value,
-                status,
-                information,
-            ),
-            SyscallRequest::NtRemoveIoCompletionEx {
-                io_completion_handle,
-                io_completion_information,
-                count,
-                num_entries_removed,
-                timeout,
-                alertable,
-            } => self.sys_nt_remove_io_completion_ex(
-                io_completion_handle,
-                io_completion_information,
-                count,
-                num_entries_removed,
-                timeout,
-                alertable,
-            ),
-            SyscallRequest::NtAlpcConnectPort {
-                port_handle,
-                port_name,
-            } => Self::sys_nt_alpc_connect_port(port_handle, port_name),
-            SyscallRequest::NtConnectPort {
-                port_handle,
-                port_name,
-                security_qos,
-                client_view,
-                server_view,
-                max_message_length,
-                connection_information,
-                connection_information_length,
-            } => self.sys_nt_connect_port(syscalls::lpc::ConnectPortParameters {
-                port_handle,
-                port_name,
-                security_qos,
-                client_view,
-                server_view,
-                max_message_length,
-                connection_information,
-                connection_information_length,
-            }),
-            SyscallRequest::NtAlpcSendWaitReceivePort {
-                port_handle,
-                flags,
-                send_message,
-                send_message_attributes,
-                receive_message,
-                buffer_length,
-                receive_message_attributes,
-                timeout,
-            } => self.sys_nt_alpc_send_wait_receive_port(
-                port_handle,
-                flags,
-                send_message,
-                send_message_attributes,
-                receive_message,
-                buffer_length,
-                receive_message_attributes,
-                timeout,
-            ),
-            SyscallRequest::NtSecureConnectPort => {
-                litebox_util_log::debug!(
-                    "Rejected NtSecureConnectPort; only the CSR NtConnectPort subset is modeled"
-                );
-                NtStatus::NOT_SUPPORTED
-            }
-            SyscallRequest::NtCreateSection {
-                section_handle,
-                desired_access,
-                object_attributes,
-                maximum_size,
-                section_page_protection,
-                allocation_attributes,
-                file_handle,
-            } => self.sys_nt_create_section(
-                section_handle,
-                desired_access,
-                object_attributes,
-                maximum_size,
-                section_page_protection,
-                allocation_attributes,
-                file_handle,
-            ),
-            SyscallRequest::NtCreateSectionEx {
-                section_handle,
-                desired_access,
-                object_attributes,
-                maximum_size,
-                section_page_protection,
-                allocation_attributes,
-                file_handle,
-                extended_parameters,
-                extended_parameter_count,
-            } => self.sys_nt_create_section_ex(
-                section_handle,
-                desired_access,
-                object_attributes,
-                maximum_size,
-                section_page_protection,
-                allocation_attributes,
-                file_handle,
-                extended_parameters,
-                extended_parameter_count,
-            ),
-            SyscallRequest::NtCreateWaitCompletionPacket {
-                wait_completion_packet_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_create_wait_completion_packet(
-                wait_completion_packet_handle,
-                desired_access,
-                object_attributes,
-            ),
-            SyscallRequest::NtAssociateWaitCompletionPacket {
-                wait_completion_packet_handle,
-                io_completion_handle,
-                target_object_handle,
-                key_context,
-                apc_context,
-                io_status,
-                io_status_information,
-                already_signaled,
-            } => self.sys_nt_associate_wait_completion_packet(
-                WaitCompletionPacketAssociateParameters {
-                    wait_completion_packet_handle,
-                    io_completion_handle,
-                    target_object_handle,
-                    key_context,
-                    apc_context,
-                    io_status,
-                    io_status_information,
-                    already_signaled,
-                },
-            ),
-            SyscallRequest::NtCancelWaitCompletionPacket {
-                wait_completion_packet_handle,
-                remove_signaled_packet,
-            } => self.sys_nt_cancel_wait_completion_packet(
-                wait_completion_packet_handle,
-                remove_signaled_packet,
-            ),
-            SyscallRequest::NtCreateWorkerFactory {
-                worker_factory_handle,
-                desired_access,
-                object_attributes,
-                completion_port_handle,
-                worker_process_handle,
-                start_routine,
-                start_parameter,
-                max_thread_count,
-                stack_reserve,
-                stack_commit,
-            } => self.sys_nt_create_worker_factory(WorkerFactoryCreateParameters {
-                worker_factory_handle,
-                desired_access,
-                object_attributes,
-                completion_port_handle,
-                worker_process_handle,
-                start_routine,
-                start_parameter,
-                max_thread_count,
-                stack_reserve,
-                stack_commit,
-            }),
-            SyscallRequest::NtSetInformationWorkerFactory {
-                worker_factory_handle,
-                worker_factory_information_class,
-                worker_factory_information,
-                worker_factory_information_length,
-            } => self.sys_nt_set_information_worker_factory(
-                worker_factory_handle,
-                worker_factory_information_class,
-                worker_factory_information,
-                worker_factory_information_length,
-            ),
-            SyscallRequest::NtShutdownWorkerFactory {
-                worker_factory_handle,
-                pending_worker_count,
-            } => self.sys_nt_shutdown_worker_factory(worker_factory_handle, pending_worker_count),
-            SyscallRequest::NtCreateTimer2 {
-                timer_handle,
-                timer_id,
-                object_attributes,
-                attributes,
-                desired_access,
-            } => self.sys_nt_create_timer2(TimerCreateParameters {
-                timer_handle,
-                timer_id,
-                object_attributes,
-                attributes,
-                desired_access,
-            }),
-            SyscallRequest::NtSetTimer2 {
-                timer_handle,
-                due_time,
-                period,
-                parameters,
-            } => self.sys_nt_set_timer2(timer_handle, due_time, period, parameters),
-            SyscallRequest::NtOpenEvent {
-                event_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_open_event(event_handle, desired_access, object_attributes),
-            SyscallRequest::NtOpenMutant {
-                mutant_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_open_mutant(mutant_handle, desired_access, object_attributes),
-            SyscallRequest::NtOpenSemaphore {
-                semaphore_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_open_semaphore(semaphore_handle, desired_access, object_attributes),
-            SyscallRequest::NtReleaseMutant {
-                mutant_handle,
-                previous_count,
-            } => self.sys_nt_release_mutant(mutant_handle, previous_count),
-            SyscallRequest::NtReleaseSemaphore {
-                semaphore_handle,
-                release_count,
-                previous_count,
-            } => self.sys_nt_release_semaphore(semaphore_handle, release_count, previous_count),
-            SyscallRequest::NtSetEvent {
-                event_handle,
-                previous_state,
-            } => self.sys_nt_set_event(event_handle, previous_state),
-            SyscallRequest::NtResetEvent {
-                event_handle,
-                previous_state,
-            } => self.sys_nt_reset_event(event_handle, previous_state),
-            SyscallRequest::NtClearEvent { event_handle } => self.sys_nt_clear_event(event_handle),
-            SyscallRequest::NtPulseEvent {
-                event_handle,
-                previous_state,
-            } => self.sys_nt_pulse_event(event_handle, previous_state),
-            SyscallRequest::NtQueryEvent {
-                event_handle,
-                event_information_class,
-                event_information,
-                event_information_length,
-                return_length,
-            } => self.sys_nt_query_event(
-                event_handle,
-                event_information_class,
-                event_information,
-                event_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtQueryMutant {
-                mutant_handle,
-                mutant_information_class,
-                mutant_information,
-                mutant_information_length,
-                return_length,
-            } => self.sys_nt_query_mutant(
-                mutant_handle,
-                mutant_information_class,
-                mutant_information,
-                mutant_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtSetEventBoostPriority { event_handle } => {
-                self.sys_nt_set_event_boost_priority(event_handle)
-            }
-            SyscallRequest::NtOpenFile {
-                file_handle,
-                desired_access,
-                object_attributes,
-                io_status_block,
-                share_access,
-                open_options,
-            } => self.sys_nt_open_file(
-                file_handle,
-                desired_access,
-                object_attributes,
-                io_status_block,
-                share_access,
-                open_options,
-            ),
-            SyscallRequest::NtQueryAttributesFile {
-                object_attributes,
-                file_information,
-            } => self.sys_nt_query_attributes_file(object_attributes, file_information),
-            SyscallRequest::NtQueryFullAttributesFile {
-                object_attributes,
-                file_information,
-            } => self.sys_nt_query_full_attributes_file(object_attributes, file_information),
-            SyscallRequest::NtQueryInformationByName {
-                object_attributes,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            } => self.sys_nt_query_information_by_name(
-                object_attributes,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            ),
-            SyscallRequest::NtQueryInformationFile {
-                file_handle,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            } => self.sys_nt_query_information_file(
-                file_handle,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            ),
-            SyscallRequest::NtSetInformationFile {
-                file_handle,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            } => self.sys_nt_set_information_file(
-                file_handle,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            ),
-            SyscallRequest::NtCreateFile {
-                file_handle,
-                desired_access,
-                object_attributes,
-                io_status_block,
-                allocation_size,
-                file_attributes,
-                share_access,
-                create_disposition,
-                create_options,
-                ea_buffer,
-                ea_length,
-            } => self.sys_nt_create_file(
-                file_handle,
-                desired_access,
-                object_attributes,
-                io_status_block,
-                allocation_size,
-                file_attributes,
-                share_access,
-                create_disposition,
-                create_options,
-                ea_buffer,
-                ea_length,
-            ),
-            SyscallRequest::NtWriteFile {
-                file_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                buffer,
-                length,
-                byte_offset,
-                key,
-            } => self.sys_nt_write_file(
-                file_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                buffer,
-                length,
-                byte_offset,
-                key,
-            ),
-            SyscallRequest::NtReadFile {
-                file_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                buffer,
-                length,
-                byte_offset,
-                key,
-            } => self.sys_nt_read_file(
-                file_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                buffer,
-                length,
-                byte_offset,
-                key,
-            ),
-            SyscallRequest::NtGetCurrentProcessorNumberEx { processor_number } => {
-                self.sys_nt_get_current_processor_number_ex(processor_number)
-            }
-            SyscallRequest::NtQueryDebugFilterState {
-                component_id,
-                level,
-            } => {
-                litebox_util_log::debug!(
-                    component_id,
-                    level;
-                    "NtQueryDebugFilterState reports no attached debugger"
-                );
-                NtStatus::DEBUGGER_INACTIVE
-            }
-            SyscallRequest::NtQueryDirectoryFileEx {
-                file_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-                query_flags,
-                file_name,
-            } => self.sys_nt_query_directory_file_ex(
-                file_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-                query_flags,
-                file_name,
-            ),
-            SyscallRequest::NtQueryVolumeInformationFile {
-                file_handle,
-                io_status_block,
-                fs_information,
-                length,
-                fs_information_class,
-            } => self.sys_nt_query_volume_information_file(
-                file_handle,
-                io_status_block,
-                fs_information,
-                length,
-                fs_information_class,
-            ),
-            SyscallRequest::NtDeviceIoControlFile {
-                file_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                io_control_code,
-                input_buffer,
-                input_buffer_length,
-                output_buffer,
-                output_buffer_length,
-            } => self.sys_nt_device_io_control_file(
-                file_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                io_control_code,
-                input_buffer,
-                input_buffer_length,
-                output_buffer,
-                output_buffer_length,
-            ),
-            SyscallRequest::NtApphelpCacheControl {
-                service_class,
-                service_data,
-            } => syscalls::apphelp::sys_nt_apphelp_cache_control::<Platform>(
-                service_class,
-                service_data,
-            ),
-            SyscallRequest::NtCreateKey {
-                key_handle,
-                desired_access,
-                object_attributes,
-                title_index,
-                class,
-                create_options,
-                disposition,
-            } => self.sys_nt_create_key(
-                key_handle,
-                desired_access,
-                object_attributes,
-                title_index,
-                class,
-                create_options,
-                disposition,
-            ),
-            SyscallRequest::NtOpenKey {
-                key_handle,
-                desired_access,
-                object_attributes,
-            } => self.sys_nt_open_key(key_handle, desired_access, object_attributes),
-            SyscallRequest::NtOpenKeyEx {
-                key_handle,
-                desired_access,
-                object_attributes,
-                open_options,
-            } => {
-                self.sys_nt_open_key_ex(key_handle, desired_access, object_attributes, open_options)
-            }
-            SyscallRequest::NtQueryKey {
-                key_handle,
-                key_information_class,
-                key_information,
-                length,
-                result_length,
-            } => self.sys_nt_query_key(
-                key_handle,
-                key_information_class,
-                key_information,
-                length,
-                result_length,
-            ),
-            SyscallRequest::NtSetInformationKey {
-                key_handle,
-                key_set_information_class,
-                key_set_information,
-                key_set_information_length,
-            } => self.sys_nt_set_information_key(
-                key_handle,
-                key_set_information_class,
-                key_set_information,
-                key_set_information_length,
-            ),
-            SyscallRequest::NtEnumerateKey {
-                key_handle,
-                index,
-                key_information_class,
-                key_information,
-                length,
-                result_length,
-            } => self.sys_nt_enumerate_key(
-                key_handle,
-                index,
-                key_information_class,
-                key_information,
-                length,
-                result_length,
-            ),
-            SyscallRequest::NtQueryValueKey {
-                key_handle,
-                value_name,
-                key_value_information_class,
-                key_value_information,
-                length,
-                result_length,
-            } => self.sys_nt_query_value_key(
-                key_handle,
-                value_name,
-                key_value_information_class,
-                key_value_information,
-                length,
-                result_length,
-            ),
-            SyscallRequest::NtEnumerateValueKey {
-                key_handle,
-                index,
-                key_value_information_class,
-                key_value_information,
-                length,
-                result_length,
-            } => self.sys_nt_enumerate_value_key(
-                key_handle,
-                index,
-                key_value_information_class,
-                key_value_information,
-                length,
-                result_length,
-            ),
-            SyscallRequest::NtSetValueKey {
-                key_handle,
-                value_name,
-                title_index,
-                value_type,
-                data,
-                data_size,
-            } => self.sys_nt_set_value_key(
-                key_handle,
-                value_name,
-                title_index,
-                value_type,
-                data,
-                data_size,
-            ),
-            SyscallRequest::NtNotifyChangeKey {
-                key_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                completion_filter,
-                watch_tree,
-                buffer,
-                buffer_size,
-                asynchronous,
-            } => self.sys_nt_notify_change_key(NtNotifyChangeKeyRequest {
-                key_handle,
-                event,
-                apc_routine,
-                apc_context,
-                io_status_block,
-                completion_filter,
-                watch_tree,
-                buffer,
-                buffer_size,
-                asynchronous,
-            }),
-            SyscallRequest::NtGetMUIRegistryInfo {
-                flags,
-                data_size,
-                data,
-            } => self.sys_nt_get_mui_registry_info(flags, data_size, data),
-            SyscallRequest::NtGetNlsSectionPtr {
-                section_type,
-                section_data,
-                context_data,
-                section_pointer,
-                section_size,
-            } => self.sys_nt_get_nls_section_ptr(
-                section_type,
-                section_data,
-                context_data,
-                section_pointer,
-                section_size,
-            ),
-            SyscallRequest::NtInitializeNlsFiles {
-                base_address,
-                default_locale_id,
-                default_casing_table_size,
-            } => self.sys_nt_initialize_nls_files(
-                base_address,
-                default_locale_id,
-                default_casing_table_size,
-            ),
-            SyscallRequest::NtQueryDefaultLocale {
-                user_profile,
-                default_locale_id,
-            } => self.sys_nt_query_default_locale(user_profile, default_locale_id),
-            SyscallRequest::NtSetDefaultLocale {
-                user_profile,
-                default_locale_id,
-            } => self.sys_nt_set_default_locale(user_profile, default_locale_id),
-            SyscallRequest::NtQueryDefaultUILanguage {
-                default_ui_language,
-            } => self.sys_nt_query_default_ui_language(default_ui_language),
-            SyscallRequest::NtSetDefaultUILanguage {
-                default_ui_language,
-            } => self.sys_nt_set_default_ui_language(default_ui_language),
-            SyscallRequest::NtQueryInstallUILanguage {
-                install_ui_language,
-            } => self.sys_nt_query_install_ui_language(install_ui_language),
-            SyscallRequest::NtQueryPerformanceCounter {
-                performance_counter,
-                performance_frequency,
-            } => self.sys_nt_query_performance_counter(performance_counter, performance_frequency),
-            SyscallRequest::NtQueryTimerResolution {
-                minimum_resolution,
-                maximum_resolution,
-                current_resolution,
-            } => Self::sys_nt_query_timer_resolution(
-                minimum_resolution,
-                maximum_resolution,
-                current_resolution,
-            ),
-            SyscallRequest::NtQueryLicenseValue {
-                value_name,
-                value_type,
-                data,
-                data_size,
-                result_data_size,
-            } => Self::sys_nt_query_license_value(
-                value_name,
-                value_type,
-                data,
-                data_size,
-                result_data_size,
-            ),
-            SyscallRequest::NtQuerySystemInformation {
-                system_information_class,
-                system_information,
-                system_information_length,
-                return_length,
-            } => Self::sys_nt_query_system_information(
-                system_information_class,
-                system_information,
-                system_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtQuerySystemInformationEx {
-                system_information_class,
-                input_buffer,
-                input_buffer_length,
-                system_information,
-                system_information_length,
-                return_length,
-            } => Self::sys_nt_query_system_information_ex(
-                system_information_class,
-                input_buffer,
-                input_buffer_length,
-                system_information,
-                system_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtQueryWnfStateData {
-                state_name,
-                type_id,
-                explicit_scope,
-                change_stamp,
-                buffer,
-                buffer_size,
-            } => self.sys_nt_query_wnf_state_data(
-                state_name,
-                type_id,
-                explicit_scope,
-                change_stamp,
-                buffer,
-                buffer_size,
-            ),
-            SyscallRequest::NtCreateWnfStateName {
-                state_name,
-                name_lifetime,
-                data_scope,
-                persist_data,
-                type_id,
-                maximum_state_size,
-                security_descriptor,
-            } => self.sys_nt_create_wnf_state_name(syscalls::wnf::WnfCreateStateNameParameters {
-                state_name,
-                name_lifetime,
-                data_scope,
-                persist_data,
-                type_id,
-                maximum_state_size,
-                security_descriptor,
-            }),
-            SyscallRequest::NtUpdateWnfStateData {
-                state_name,
-                buffer,
-                buffer_size,
-                type_id,
-                explicit_scope,
-                matching_change_stamp,
-                check_stamp,
-            } => self.sys_nt_update_wnf_state_data(syscalls::wnf::WnfUpdateStateDataParameters {
-                state_name,
-                buffer,
-                buffer_size,
-                type_id,
-                explicit_scope,
-                matching_change_stamp,
-                check_stamp,
-            }),
-            SyscallRequest::NtDeleteWnfStateData {
-                state_name,
-                explicit_scope,
-            } => self.sys_nt_delete_wnf_state_data(state_name, explicit_scope),
-            SyscallRequest::NtDeleteWnfStateName { state_name } => {
-                self.sys_nt_delete_wnf_state_name(state_name)
-            }
-            SyscallRequest::NtQueryWnfStateNameInformation {
-                state_name,
-                name_information_class,
-                explicit_scope,
-                buffer,
-                buffer_size,
-            } => self.sys_nt_query_wnf_state_name_information(
-                state_name,
-                name_information_class,
-                explicit_scope,
-                buffer,
-                buffer_size,
-            ),
-            SyscallRequest::NtSetWnfProcessNotificationEvent { notification_event } => {
-                self.sys_nt_set_wnf_process_notification_event(notification_event)
-            }
-            SyscallRequest::NtGetCompleteWnfStateSubscription {
-                old_state_name,
-                old_subscription_id,
-                old_event_mask,
-                old_status,
-                delivery_descriptor,
-                descriptor_size,
-            } => self.sys_nt_get_complete_wnf_state_subscription(
-                old_state_name,
-                old_subscription_id,
-                old_event_mask,
-                old_status,
-                delivery_descriptor,
-                descriptor_size,
-            ),
-            SyscallRequest::NtSubscribeWnfStateChange {
-                state_name,
-                change_stamp,
-                event_mask,
-                subscription_id,
-            } => self.sys_nt_subscribe_wnf_state_change(
-                state_name,
-                change_stamp,
-                event_mask,
-                subscription_id,
-            ),
-            SyscallRequest::NtUnsubscribeWnfStateChange { state_name } => {
-                self.sys_nt_unsubscribe_wnf_state_change(state_name)
-            }
-            SyscallRequest::NtQuerySection {
-                section_handle,
-                section_information_class,
-                section_information,
-                section_information_length,
-                return_length,
-            } => self.sys_nt_query_section(
-                section_handle,
-                section_information_class,
-                section_information,
-                section_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtQueryObject {
-                handle,
-                object_information_class,
-                object_information,
-                object_information_length,
-                return_length,
-            } => self.sys_nt_query_object(
-                handle,
-                object_information_class,
-                object_information,
-                object_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtSetInformationObject {
-                handle,
-                object_information_class,
-                object_information,
-                object_information_length,
-            } => self.sys_nt_set_information_object(
-                handle,
-                object_information_class,
-                object_information,
-                object_information_length,
-            ),
-            SyscallRequest::NtQueryInformationProcess {
-                process_handle,
-                process_information_class,
-                process_information,
-                process_information_length,
-                return_length,
-            } => self.sys_nt_query_information_process(
-                process_handle,
-                process_information_class,
-                process_information,
-                process_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtSetInformationProcess {
-                process_handle,
-                process_information_class,
-                process_information,
-                process_information_length,
-            } => self.sys_nt_set_information_process(
-                process_handle,
-                process_information_class,
-                process_information,
-                process_information_length,
-            ),
-            SyscallRequest::NtSetInformationThread {
-                thread_handle,
-                thread_information_class,
-                thread_information,
-                thread_information_length,
-            } => Self::sys_nt_set_information_thread(
-                thread_handle,
-                thread_information_class,
-                thread_information,
-                thread_information_length,
-            ),
-            SyscallRequest::NtQueryInformationThread {
-                thread_handle,
-                thread_information_class,
-                thread_information,
-                thread_information_length,
-                return_length,
-            } => self.sys_nt_query_information_thread(
-                thread_handle,
-                thread_information_class,
-                thread_information,
-                thread_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtCreateThreadEx {
-                thread_handle,
-                desired_access,
-                object_attributes,
-                process_handle,
-                start_routine,
-                argument,
-                create_flags,
-                zero_bits,
-                stack_size,
-                maximum_stack_size,
-                attribute_list,
-            } => self.sys_nt_create_thread_ex(
-                ctx,
-                thread_handle,
-                desired_access,
-                object_attributes,
-                process_handle,
-                start_routine,
-                argument,
-                create_flags,
-                zero_bits,
-                stack_size,
-                maximum_stack_size,
-                attribute_list,
-            ),
-            SyscallRequest::NtResumeThread {
-                thread_handle,
-                previous_suspend_count,
-            } => self.sys_nt_resume_thread(thread_handle, previous_suspend_count),
-            SyscallRequest::NtAlertThread { thread_handle } => {
-                self.sys_nt_alert_thread(thread_handle)
-            }
-            SyscallRequest::NtWaitForAlertByThreadId { address, timeout } => {
-                self.sys_nt_wait_for_alert_by_thread_id(address, timeout)
-            }
-            SyscallRequest::NtAlertThreadByThreadIdEx { thread_id, lock } => {
-                self.sys_nt_alert_thread_by_thread_id_ex(thread_id, lock)
-            }
-            SyscallRequest::NtAlertThreadByThreadId { thread_id } => {
-                self.sys_nt_alert_thread_by_thread_id(thread_id)
-            }
-            SyscallRequest::NtWaitForSingleObject {
-                handle,
-                alertable,
-                timeout,
-            } => self.sys_nt_wait_for_single_object(handle, alertable, timeout),
-            SyscallRequest::NtDelayExecution {
-                alertable,
-                delay_interval,
-            } => self.sys_nt_delay_execution(alertable, delay_interval),
-            SyscallRequest::NtOpenThreadToken {
-                thread_handle,
-                desired_access,
-                open_as_self,
-                token_handle,
-            } => Self::sys_nt_open_thread_token(
-                thread_handle,
-                desired_access,
-                open_as_self,
-                token_handle,
-            ),
-            SyscallRequest::NtOpenThreadTokenEx {
-                thread_handle,
-                desired_access,
-                open_as_self,
-                handle_attributes,
-                token_handle,
-            } => Self::sys_nt_open_thread_token_ex(
-                thread_handle,
-                desired_access,
-                open_as_self,
-                handle_attributes,
-                token_handle,
-            ),
-            SyscallRequest::NtOpenProcessToken {
-                process_handle,
-                desired_access,
-                token_handle,
-            } => self.sys_nt_open_process_token(process_handle, desired_access, token_handle),
-            SyscallRequest::NtOpenProcessTokenEx {
-                process_handle,
-                desired_access,
-                handle_attributes,
-                token_handle,
-            } => self.sys_nt_open_process_token_ex(
-                process_handle,
-                desired_access,
-                handle_attributes,
-                token_handle,
-            ),
-            SyscallRequest::NtQueryInformationToken {
-                token_handle,
-                token_information_class,
-                token_information,
-                token_information_length,
-                return_length,
-            } => self.sys_nt_query_information_token(
-                token_handle,
-                token_information_class,
-                token_information,
-                token_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtQuerySecurityAttributesToken {
-                token_handle,
-                attributes,
-                number_of_attributes,
-                buffer,
-                length,
-                return_length,
-            } => self.sys_nt_query_security_attributes_token(
-                token_handle,
-                attributes,
-                number_of_attributes,
-                buffer,
-                length,
-                return_length,
-            ),
-            SyscallRequest::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
-                flag,
-                source,
-                destination,
-                conversion_error,
-            } => Self::sys_nt_convert_between_auxiliary_counter_and_performance_counter(
-                flag,
-                source,
-                destination,
-                conversion_error,
-            ),
-            SyscallRequest::NtAllocateVirtualMemory {
-                process_handle,
-                base_address,
-                zero_bits,
-                region_size,
-                allocation_type,
-                protect,
-            } => self.sys_nt_allocate_virtual_memory(
-                process_handle,
-                base_address,
-                zero_bits,
-                region_size,
-                allocation_type,
-                protect,
-            ),
-            SyscallRequest::NtAllocateVirtualMemoryEx {
-                process_handle,
-                base_address,
-                region_size,
-                allocation_type,
-                protect,
-                extended_parameters,
-                extended_parameter_count,
-            } => self.sys_nt_allocate_virtual_memory_ex(
-                process_handle,
-                base_address,
-                region_size,
-                allocation_type,
-                protect,
-                mm::MemoryExtendedParameters {
-                    parameters: extended_parameters,
-                    count: extended_parameter_count,
-                },
-            ),
-            SyscallRequest::NtFreeVirtualMemory {
-                process_handle,
-                base_address,
-                region_size,
-                free_type,
-            } => self.sys_nt_free_virtual_memory(
-                process_handle,
-                base_address,
-                region_size,
-                free_type,
-            ),
-            SyscallRequest::NtProtectVirtualMemory {
-                process_handle,
-                base_address,
-                region_size,
-                new_protect,
-                old_protect,
-            } => self.sys_nt_protect_virtual_memory(
-                process_handle,
-                base_address,
-                region_size,
-                new_protect,
-                old_protect,
-            ),
-            SyscallRequest::NtReadVirtualMemory {
-                process_handle,
-                base_address,
-                buffer,
-                number_of_bytes_to_read,
-                number_of_bytes_read,
-            } => Self::sys_nt_read_virtual_memory(
-                process_handle,
-                base_address,
-                buffer,
-                number_of_bytes_to_read,
-                number_of_bytes_read,
-            ),
-            SyscallRequest::NtQueryVirtualMemory {
-                process_handle,
-                base_address,
-                memory_information_class,
-                memory_information,
-                memory_information_length,
-                return_length,
-            } => self.sys_nt_query_virtual_memory(
-                process_handle,
-                base_address,
-                memory_information_class,
-                memory_information,
-                memory_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtMapViewOfSection {
-                section_handle,
-                process_handle,
-                base_address,
-                zero_bits,
-                commit_size,
-                section_offset,
-                view_size,
-                inherit_disposition,
-                allocation_type,
-                page_protection,
-            } => self.sys_nt_map_view_of_section(MapViewOfSectionParameters {
-                section_handle,
-                process_handle,
-                base_address,
-                zero_bits,
-                commit_size,
-                section_offset,
-                view_size,
-                inherit_disposition,
-                allocation_type,
-                page_protection,
-            }),
-            SyscallRequest::NtMapViewOfSectionEx {
-                section_handle,
-                process_handle,
-                base_address,
-                zero_bits,
-                commit_size,
-                section_offset,
-                view_size,
-                inherit_disposition,
-                allocation_type,
-                page_protection,
-                extended_parameters,
-                extended_parameter_count,
-            } => self.sys_nt_map_view_of_section_ex(
-                MapViewOfSectionParameters {
-                    section_handle,
-                    process_handle,
-                    base_address,
-                    zero_bits,
-                    commit_size,
-                    section_offset,
-                    view_size,
-                    inherit_disposition,
-                    allocation_type,
-                    page_protection,
-                },
-                extended_parameters,
-                extended_parameter_count,
-            ),
-            SyscallRequest::NtUnmapViewOfSection {
-                process_handle,
-                base_address,
-            } => self.sys_nt_unmap_view_of_section(process_handle, base_address),
-            SyscallRequest::NtUnmapViewOfSectionEx {
-                process_handle,
-                base_address,
-                flags,
-            } => self.sys_nt_unmap_view_of_section_ex(process_handle, base_address, flags),
-            SyscallRequest::NtContinue {
-                context,
-                test_alert,
-            } => match self.sys_nt_continue(ctx, context, test_alert) {
-                Ok(()) => return,
-                Err(status) => status,
-            },
-            SyscallRequest::NtTraceEvent {
-                trace_handle,
-                flags,
-                field_size,
-                fields,
-            } => self.sys_nt_trace_event(trace_handle, flags, field_size, fields),
-            SyscallRequest::NtTraceControl {
-                function_code,
-                input_buffer,
-                input_buffer_length,
-                output_buffer,
-                output_buffer_length,
-                return_length,
-            } => self.sys_nt_trace_control(
-                function_code,
-                input_buffer,
-                input_buffer_length,
-                output_buffer,
-                output_buffer_length,
-                return_length,
-            ),
-            SyscallRequest::NtTerminateProcess {
-                process_handle,
-                exit_status,
-            } => {
-                if process_handle.is_null() {
-                    // A null handle terminates every other thread in the
-                    // current process but spares the caller.
-                    self.exit_other_threads(exit_status);
-                    NtStatus::SUCCESS
-                } else if process_handle.is_current() {
-                    self.exit_process(exit_status);
-                    NtStatus::SUCCESS
-                } else {
-                    // TODO: allow terminating other processes
-                    litebox_util_log::error!("Terminating other processes is not yet supported");
-                    NtStatus::INVALID_HANDLE
-                }
-            }
-            SyscallRequest::NtTerminateThread {
-                thread_handle,
-                exit_status,
-            } => {
-                if !thread_handle.is_null() && thread_handle != ThreadHandle::CURRENT {
-                    NtStatus::NOT_SUPPORTED
-                } else {
-                    self.exit_thread(exit_status);
-                    NtStatus::SUCCESS
-                }
-            }
-            SyscallRequest::NtTestAlert => self.test_alert(),
-            SyscallRequest::NtManageHotPatch => NtStatus::NOT_IMPLEMENTED,
-        };
+        }
 
-        ctx.rax = result.as_raw().cast_unsigned() as usize;
+        let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
+            .read_at_offset(0)
+            .unwrap_or_default();
+        #[cfg(debug_assertions)]
+        if NtSysno::from_raw(ctx.orig_rax) == Some(NtSysno::NtRaiseHardError) {
+            log_loader_hard_error::<Platform>(ctx);
+        }
+        litebox_util_log::error!(
+            syscall:? = NtSysno::from_raw(ctx.orig_rax),
+            rip:% = format_args!("{:#x}", ctx.rip),
+            caller:% = format_args!("{caller:#x}"),
+            arg0:% = format_args!("{:#x}", ctx.r10),
+            arg1:% = format_args!("{:#x}", ctx.rdx),
+            arg2:% = format_args!("{:#x}", ctx.r8),
+            arg3:% = format_args!("{:#x}", ctx.r9);
+            "Unsupported Windows syscall; terminating Windows guest"
+        );
+        self.exit_thread(NtStatus::NOT_SUPPORTED.as_raw());
     }
 
     fn sys_nt_continue(
@@ -2639,52 +1272,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn sys_nt_close(&self, handle: syscalls::Handle) -> NtStatus {
-        self.close_handle(handle, CloseRawHandleVisitor { task: self })
+        self.remove_handle(handle, true)
     }
 
     fn handle_metadata(&self, handle: syscalls::Handle) -> Result<WindowsHandleMetadata, NtStatus> {
-        macro_rules! try_metadata {
-            ($subsystem:ty) => {
-                if let Some(result) =
-                    self.try_get_handle_metadata_for_subsystem::<$subsystem>(handle)
-                {
-                    return result;
-                }
-            };
-        }
-
-        try_metadata!(FileObject<Platform>);
-        try_metadata!(RegistryKeyObject<Platform>);
-        try_metadata!(EventSubsystem<Platform>);
-        try_metadata!(MutantSubsystem<Platform>);
-        try_metadata!(SemaphoreSubsystem<Platform>);
-        try_metadata!(DirectoryObjectSubsystem<Platform>);
-        try_metadata!(SymbolicLinkSubsystem<Platform>);
-        try_metadata!(IoCompletionSubsystem<Platform>);
-        try_metadata!(LpcPortSubsystem<Platform>);
-        try_metadata!(TimerSubsystem<Platform>);
-        try_metadata!(WaitCompletionPacketSubsystem<Platform>);
-        try_metadata!(WorkerFactorySubsystem<Platform>);
-        try_metadata!(SectionSubsystem<Platform>);
-        try_metadata!(TokenSubsystem);
-        try_metadata!(ThreadSubsystem<Platform>);
-
-        Err(NtStatus::INVALID_HANDLE)
-    }
-
-    fn try_get_handle_metadata_for_subsystem<Subsystem>(
-        &self,
-        handle: syscalls::Handle,
-    ) -> Option<Result<WindowsHandleMetadata, NtStatus>>
-    where
-        Subsystem: WindowsHandleSubsystem,
-    {
-        let typed = match self.typed_handle::<Subsystem>(handle) {
-            Ok(typed) => typed,
-            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
-            Err(status) => return Some(Err(status)),
-        };
-        Some(self.typed_handle_metadata(&typed))
+        self.with_typed_handle(handle, QueryHandleMetadata)
     }
 
     fn set_handle_attributes(
@@ -2693,59 +1285,51 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mask: HandleAttributes,
         attributes: HandleAttributes,
     ) -> Result<(), NtStatus> {
-        macro_rules! try_set_attributes {
+        self.with_typed_handle(handle, SetHandleAttributes { mask, attributes })
+    }
+
+    /// Resolves `handle` to its handle subsystem and applies `operation` to it.
+    ///
+    /// This is the single list of every subsystem that can back a Windows handle.
+    fn with_typed_handle<Operation: TypedHandleOperation<Platform>>(
+        &self,
+        handle: syscalls::Handle,
+        operation: Operation,
+    ) -> Result<Operation::Output, NtStatus> {
+        let raw_fd = handle.raw_fd().ok_or(NtStatus::INVALID_HANDLE)?;
+        // Resolve the subsystem under one read guard, then release it before `apply`, which may
+        // take the handle table for writing.
+        let handles = self.process.handles.read();
+        macro_rules! try_subsystem {
             ($subsystem:ty) => {
-                if let Some(result) =
-                    self.try_set_handle_attributes::<$subsystem>(handle, mask, attributes)
-                {
-                    return result;
+                match typed_fd_from_raw::<$subsystem>(&handles, raw_fd) {
+                    Ok(typed) => {
+                        drop(handles);
+                        return operation.apply(self, handle, &typed);
+                    }
+                    Err(NtStatus::OBJECT_TYPE_MISMATCH) => {}
+                    Err(status) => return Err(status),
                 }
             };
         }
 
-        try_set_attributes!(FileObject<Platform>);
-        try_set_attributes!(RegistryKeyObject<Platform>);
-        try_set_attributes!(EventSubsystem<Platform>);
-        try_set_attributes!(MutantSubsystem<Platform>);
-        try_set_attributes!(SemaphoreSubsystem<Platform>);
-        try_set_attributes!(DirectoryObjectSubsystem<Platform>);
-        try_set_attributes!(SymbolicLinkSubsystem<Platform>);
-        try_set_attributes!(IoCompletionSubsystem<Platform>);
-        try_set_attributes!(LpcPortSubsystem<Platform>);
-        try_set_attributes!(TimerSubsystem<Platform>);
-        try_set_attributes!(WaitCompletionPacketSubsystem<Platform>);
-        try_set_attributes!(WorkerFactorySubsystem<Platform>);
-        try_set_attributes!(SectionSubsystem<Platform>);
-        try_set_attributes!(TokenSubsystem);
-        try_set_attributes!(ThreadSubsystem<Platform>);
+        try_subsystem!(FileObject<Platform>);
+        try_subsystem!(RegistryKeyObject<Platform>);
+        try_subsystem!(EventSubsystem<Platform>);
+        try_subsystem!(MutantSubsystem<Platform>);
+        try_subsystem!(SemaphoreSubsystem<Platform>);
+        try_subsystem!(DirectoryObjectSubsystem<Platform>);
+        try_subsystem!(SymbolicLinkSubsystem<Platform>);
+        try_subsystem!(IoCompletionSubsystem<Platform>);
+        try_subsystem!(LpcPortSubsystem<Platform>);
+        try_subsystem!(TimerSubsystem<Platform>);
+        try_subsystem!(WaitCompletionPacketSubsystem<Platform>);
+        try_subsystem!(WorkerFactorySubsystem<Platform>);
+        try_subsystem!(SectionSubsystem<Platform>);
+        try_subsystem!(TokenSubsystem);
+        try_subsystem!(ThreadSubsystem<Platform>);
 
         Err(NtStatus::INVALID_HANDLE)
-    }
-
-    fn try_set_handle_attributes<Subsystem>(
-        &self,
-        handle: syscalls::Handle,
-        mask: HandleAttributes,
-        attributes: HandleAttributes,
-    ) -> Option<Result<(), NtStatus>>
-    where
-        Subsystem: WindowsHandleSubsystem,
-    {
-        let typed = match self.typed_handle::<Subsystem>(handle) {
-            Ok(typed) => typed,
-            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
-            Err(status) => return Some(Err(status)),
-        };
-        Some(
-            self.global
-                .litebox
-                .descriptor_table_mut()
-                .with_metadata_mut::<Subsystem, WindowsHandleMetadata, _>(&typed, |metadata| {
-                    metadata.attributes.remove(mask);
-                    metadata.attributes.insert(attributes & mask);
-                })
-                .map_err(|_| NtStatus::INVALID_HANDLE),
-        )
     }
 
     #[expect(
@@ -2823,7 +1407,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(target_handle) = target_handle
             && target_handle.write_at_offset(0, duplicate).is_none()
         {
-            let _ = self.remove_handle(duplicate, CloseRawHandleVisitor { task: self }, false);
+            let _ = self.remove_handle(duplicate, false);
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
@@ -2840,7 +1424,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let duplicate_access = if options.contains(DuplicateOptions::SAME_ACCESS) {
                 ThreadAccess::ALL_ACCESS.bits()
             } else {
-                <ThreadSubsystem<Platform> as WindowsHandleSubsystem>::normalize_desired_access(
+                <ThreadSubsystem<Platform> as WindowsHandleSubsystem<Platform>>::normalize_desired_access(
                     desired_access,
                 )
             };
@@ -2858,189 +1442,33 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 },
                 duplicate_access,
                 duplicate_attributes,
-                drop,
             );
         }
 
-        macro_rules! try_duplicate {
-            ($subsystem:ty) => {
-                if let Some(result) = self.try_duplicate_handle::<$subsystem>(
-                    source_handle,
-                    desired_access,
-                    handle_attributes,
-                    options,
-                ) {
-                    return result;
-                }
-            };
-        }
-
-        try_duplicate!(FileObject<Platform>);
-        try_duplicate!(RegistryKeyObject<Platform>);
-        try_duplicate!(EventSubsystem<Platform>);
-        try_duplicate!(MutantSubsystem<Platform>);
-        try_duplicate!(SemaphoreSubsystem<Platform>);
-        try_duplicate!(DirectoryObjectSubsystem<Platform>);
-        try_duplicate!(SymbolicLinkSubsystem<Platform>);
-        try_duplicate!(IoCompletionSubsystem<Platform>);
-        try_duplicate!(LpcPortSubsystem<Platform>);
-        try_duplicate!(TimerSubsystem<Platform>);
-        try_duplicate!(WaitCompletionPacketSubsystem<Platform>);
-        try_duplicate!(WorkerFactorySubsystem<Platform>);
-        try_duplicate!(SectionSubsystem<Platform>);
-        try_duplicate!(TokenSubsystem);
-        try_duplicate!(ThreadSubsystem<Platform>);
-
-        Err(NtStatus::INVALID_HANDLE)
-    }
-
-    fn try_duplicate_handle<Subsystem>(
-        &self,
-        source_handle: syscalls::Handle,
-        desired_access: u32,
-        handle_attributes: u32,
-        options: DuplicateOptions,
-    ) -> Option<Result<syscalls::Handle, NtStatus>>
-    where
-        Subsystem: WindowsHandleSubsystem,
-    {
-        let typed = match self.typed_handle::<Subsystem>(source_handle) {
-            Ok(typed) => typed,
-            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
-            Err(status) => return Some(Err(status)),
-        };
-        let source_metadata = match self.typed_handle_metadata(&typed) {
-            Ok(metadata) => metadata,
-            Err(status) => return Some(Err(status)),
-        };
-
-        let source_access = source_metadata.granted_access;
-        let duplicate_access = if options.contains(DuplicateOptions::SAME_ACCESS) {
-            source_access
-        } else {
-            let descriptors = self.global.litebox.descriptor_table();
-            match descriptors.with_entry(&typed, |entry| {
-                Subsystem::resolve_duplicate_access(entry, desired_access)
-            }) {
-                Some(Ok(access)) => access,
-                Some(Err(status)) => return Some(Err(status)),
-                None => return Some(Err(NtStatus::INVALID_HANDLE)),
-            }
-        };
-        let duplicate_attributes = if options.contains(DuplicateOptions::SAME_ATTRIBUTES) {
-            source_metadata.attributes
-        } else {
-            let Some(attributes) = HandleAttributes::from_duplicate_attributes(handle_attributes)
-            else {
-                return Some(Err(NtStatus::INVALID_PARAMETER));
-            };
-            attributes
-        };
-
-        let duplicate = {
-            let mut descriptors = self.global.litebox.descriptor_table_mut();
-            let Some(duplicate) = descriptors.duplicate(&typed) else {
-                return Some(Err(NtStatus::INVALID_HANDLE));
-            };
-            let old = descriptors.set_fd_metadata(
-                &duplicate,
-                WindowsHandleMetadata {
-                    granted_access: duplicate_access,
-                    attributes: duplicate_attributes,
-                },
-            );
-            debug_assert!(old.is_none());
-            duplicate
-        };
-        Some(insert_raw_handle::<Platform, Subsystem>(
-            &self.global.litebox,
-            &self.process.handles,
-            duplicate,
-            drop,
-        ))
-    }
-
-    fn close_handle(
-        &self,
-        handle: syscalls::Handle,
-        visitor: impl RawHandleVisitor<Platform>,
-    ) -> NtStatus {
-        self.remove_handle(handle, visitor, true)
+        self.with_typed_handle(
+            source_handle,
+            DuplicateHandle {
+                desired_access,
+                handle_attributes,
+                options,
+            },
+        )
     }
 
     fn remove_handle(
         &self,
         handle: syscalls::Handle,
-        visitor: impl RawHandleVisitor<Platform>,
         enforce_protect_from_close: bool,
     ) -> NtStatus {
-        macro_rules! try_close {
-            ($subsystem:ty, $visit:ident) => {
-                if let Some(status) = self.try_remove_handle::<$subsystem>(
-                    handle,
-                    enforce_protect_from_close,
-                    |entry| visitor.$visit(entry),
-                ) {
-                    return status;
-                }
-            };
-        }
-
-        try_close!(FileObject<Platform>, file);
-        try_close!(RegistryKeyObject<Platform>, registry_key);
-        try_close!(EventSubsystem<Platform>, event);
-        try_close!(MutantSubsystem<Platform>, mutant);
-        try_close!(SemaphoreSubsystem<Platform>, semaphore);
-        try_close!(DirectoryObjectSubsystem<Platform>, directory);
-        try_close!(SymbolicLinkSubsystem<Platform>, symbolic_link);
-        try_close!(IoCompletionSubsystem<Platform>, io_completion);
-        try_close!(LpcPortSubsystem<Platform>, lpc_port);
-        try_close!(TimerSubsystem<Platform>, timer);
-        try_close!(
-            WaitCompletionPacketSubsystem<Platform>,
-            wait_completion_packet
-        );
-        try_close!(WorkerFactorySubsystem<Platform>, worker_factory);
-        try_close!(SectionSubsystem<Platform>, section);
-        try_close!(TokenSubsystem, token);
-        try_close!(ThreadSubsystem<Platform>, thread);
-
-        NtStatus::INVALID_HANDLE
-    }
-
-    fn try_remove_handle<Subsystem>(
-        &self,
-        handle: syscalls::Handle,
-        enforce_protect_from_close: bool,
-        cleanup_entry: impl FnOnce(Subsystem::Entry),
-    ) -> Option<NtStatus>
-    where
-        Subsystem: WindowsHandleSubsystem,
-    {
-        let typed = match self.typed_handle::<Subsystem>(handle) {
-            Ok(typed) => typed,
-            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
-            Err(status) => return Some(status),
-        };
-        let metadata = match self.typed_handle_metadata(&typed) {
-            Ok(metadata) => metadata,
-            Err(status) => return Some(status),
-        };
-        if enforce_protect_from_close
-            && metadata
-                .attributes
-                .contains(HandleAttributes::PROTECT_FROM_CLOSE)
-        {
-            return Some(NtStatus::HANDLE_NOT_CLOSABLE);
-        }
-
-        remove_raw_handle::<Platform, Subsystem>(
-            &self.global.litebox,
-            &self.process.handles,
+        match self.with_typed_handle(
             handle,
-            cleanup_entry,
-        );
-        Some(NtStatus::SUCCESS)
+            RemoveHandle {
+                enforce_protect_from_close,
+            },
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
     }
 
     fn handle_interrupt_request(&self, _ctx: &mut litebox_common_linux::PtRegs) {
@@ -3151,107 +1579,135 @@ fn is_api_set_contract(dll_name: &str) -> bool {
     })
 }
 
-trait RawHandleVisitor<Platform: ShimPlatform> {
-    fn file(&self, file: FileObject<Platform>);
+/// An operation applied by [`Task::with_typed_handle`] once a handle's subsystem is known.
+trait TypedHandleOperation<Platform: ShimPlatform> {
+    type Output;
 
-    fn registry_key(&self, key: RegistryKeyObject<Platform>);
-
-    fn event(&self, event: EventHandleObject<Platform>);
-
-    fn mutant(&self, mutant: MutantHandleObject<Platform>);
-
-    fn semaphore(&self, semaphore: SemaphoreHandleObject<Platform>);
-
-    fn directory(&self, directory: DirectoryHandleObject<Platform>);
-
-    fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>);
-
-    fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
-
-    fn lpc_port(&self, lpc_port: LpcPortHandleObject);
-
-    fn timer(&self, timer: TimerHandleObject<Platform>);
-
-    fn wait_completion_packet(
-        &self,
-        wait_completion_packet: WaitCompletionPacketHandleObject<Platform>,
-    );
-
-    fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
-
-    fn section(&self, section: SectionHandleObject<Platform>);
-
-    fn token(&self, token: TokenHandleObject);
-
-    fn thread(&self, thread: ThreadHandleObject<Platform>);
+    fn apply<Subsystem: WindowsHandleSubsystem<Platform>>(
+        self,
+        task: &Task<Platform>,
+        handle: syscalls::Handle,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+    ) -> Result<Self::Output, NtStatus>;
 }
 
-struct CloseRawHandleVisitor<'task, Platform: ShimPlatform> {
-    task: &'task Task<Platform>,
+struct QueryHandleMetadata;
+
+impl<Platform: ShimPlatform> TypedHandleOperation<Platform> for QueryHandleMetadata {
+    type Output = WindowsHandleMetadata;
+
+    fn apply<Subsystem: WindowsHandleSubsystem<Platform>>(
+        self,
+        task: &Task<Platform>,
+        _handle: syscalls::Handle,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+    ) -> Result<WindowsHandleMetadata, NtStatus> {
+        task.typed_handle_metadata(typed)
+    }
 }
 
-impl<Platform: ShimPlatform> RawHandleVisitor<Platform> for CloseRawHandleVisitor<'_, Platform> {
-    fn file(&self, file: FileObject<Platform>) {
-        self.task.close_file(file);
-    }
+struct SetHandleAttributes {
+    mask: HandleAttributes,
+    attributes: HandleAttributes,
+}
 
-    fn registry_key(&self, key: RegistryKeyObject<Platform>) {
-        Task::<Platform>::close_registry_key(key);
-    }
+impl<Platform: ShimPlatform> TypedHandleOperation<Platform> for SetHandleAttributes {
+    type Output = ();
 
-    fn event(&self, event: EventHandleObject<Platform>) {
-        Task::<Platform>::close_event(event);
+    fn apply<Subsystem: WindowsHandleSubsystem<Platform>>(
+        self,
+        task: &Task<Platform>,
+        _handle: syscalls::Handle,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+    ) -> Result<(), NtStatus> {
+        task.global
+            .litebox
+            .descriptor_table_mut()
+            .with_metadata_mut::<Subsystem, WindowsHandleMetadata, _>(typed, |metadata| {
+                metadata.attributes.remove(self.mask);
+                metadata.attributes.insert(self.attributes & self.mask);
+            })
+            .map_err(|_| NtStatus::INVALID_HANDLE)
     }
+}
 
-    fn mutant(&self, mutant: MutantHandleObject<Platform>) {
-        Task::<Platform>::close_mutant(mutant);
+struct DuplicateHandle {
+    desired_access: u32,
+    handle_attributes: u32,
+    options: DuplicateOptions,
+}
+
+impl<Platform: ShimPlatform> TypedHandleOperation<Platform> for DuplicateHandle {
+    type Output = syscalls::Handle;
+
+    fn apply<Subsystem: WindowsHandleSubsystem<Platform>>(
+        self,
+        task: &Task<Platform>,
+        _handle: syscalls::Handle,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+    ) -> Result<syscalls::Handle, NtStatus> {
+        let source_metadata = task.typed_handle_metadata(typed)?;
+        let duplicate_access = if self.options.contains(DuplicateOptions::SAME_ACCESS) {
+            source_metadata.granted_access
+        } else {
+            task.global
+                .litebox
+                .descriptor_table()
+                .with_entry(typed, |entry| {
+                    Subsystem::resolve_duplicate_access(entry, self.desired_access)
+                })
+                .ok_or(NtStatus::INVALID_HANDLE)??
+        };
+        let duplicate_attributes = if self.options.contains(DuplicateOptions::SAME_ATTRIBUTES) {
+            source_metadata.attributes
+        } else {
+            HandleAttributes::from_duplicate_attributes(self.handle_attributes)
+                .ok_or(NtStatus::INVALID_PARAMETER)?
+        };
+
+        let duplicate = {
+            let mut descriptors = task.global.litebox.descriptor_table_mut();
+            let duplicate = descriptors
+                .duplicate(typed)
+                .ok_or(NtStatus::INVALID_HANDLE)?;
+            let old = descriptors.set_fd_metadata(
+                &duplicate,
+                WindowsHandleMetadata {
+                    granted_access: duplicate_access,
+                    attributes: duplicate_attributes,
+                },
+            );
+            debug_assert!(old.is_none());
+            duplicate
+        };
+        task.publish_typed_handle(duplicate)
     }
+}
 
-    fn semaphore(&self, semaphore: SemaphoreHandleObject<Platform>) {
-        Task::<Platform>::close_semaphore(semaphore);
-    }
+struct RemoveHandle {
+    enforce_protect_from_close: bool,
+}
 
-    fn directory(&self, directory: DirectoryHandleObject<Platform>) {
-        Task::<Platform>::close_directory(directory);
-    }
+impl<Platform: ShimPlatform> TypedHandleOperation<Platform> for RemoveHandle {
+    type Output = ();
 
-    fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>) {
-        Task::<Platform>::close_symbolic_link(link);
-    }
+    fn apply<Subsystem: WindowsHandleSubsystem<Platform>>(
+        self,
+        task: &Task<Platform>,
+        handle: syscalls::Handle,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+    ) -> Result<(), NtStatus> {
+        let metadata = task.typed_handle_metadata(typed)?;
+        if self.enforce_protect_from_close
+            && metadata
+                .attributes
+                .contains(HandleAttributes::PROTECT_FROM_CLOSE)
+        {
+            return Err(NtStatus::HANDLE_NOT_CLOSABLE);
+        }
 
-    fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
-        Task::<Platform>::close_io_completion(io_completion);
-    }
-
-    fn lpc_port(&self, lpc_port: LpcPortHandleObject) {
-        self.task.close_lpc_port(lpc_port);
-    }
-
-    fn timer(&self, timer: TimerHandleObject<Platform>) {
-        Task::<Platform>::close_timer(timer);
-    }
-
-    fn wait_completion_packet(
-        &self,
-        wait_completion_packet: WaitCompletionPacketHandleObject<Platform>,
-    ) {
-        Task::<Platform>::close_wait_completion_packet(wait_completion_packet);
-    }
-
-    fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {
-        Task::<Platform>::close_worker_factory(worker_factory);
-    }
-
-    fn section(&self, section: SectionHandleObject<Platform>) {
-        Task::<Platform>::close_section(section);
-    }
-
-    fn token(&self, token: TokenHandleObject) {
-        Task::<Platform>::close_token(token);
-    }
-
-    fn thread(&self, thread: ThreadHandleObject<Platform>) {
-        Task::<Platform>::close_thread(thread);
+        task.close_typed_handle::<Subsystem>(handle);
+        Ok(())
     }
 }
 

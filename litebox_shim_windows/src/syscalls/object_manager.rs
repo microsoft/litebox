@@ -20,14 +20,14 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString};
-use crate::syscalls::Handle;
-use crate::syscalls::event::EventObject;
-use crate::syscalls::iocp::IoCompletionObject;
-use crate::syscalls::mutant::MutantObject;
+use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
+use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionObject, IoCompletionSubsystem};
+use crate::syscalls::mutant::{MutantHandleObject, MutantObject, MutantSubsystem};
 use crate::syscalls::section::{
     SectionObject, WINDOWS_SESSION_SHARED_SECTION_OBJECT, WINDOWS_SHARED_SECTION_OBJECT,
 };
-use crate::syscalls::semaphore::SemaphoreObject;
+use crate::syscalls::semaphore::{SemaphoreHandleObject, SemaphoreObject, SemaphoreSubsystem};
+use crate::syscalls::{Handle, status_from_result};
 use crate::{
     ConstPtr, MutPtr, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
 };
@@ -148,14 +148,18 @@ bitflags::bitflags! {
 }
 
 impl DirectoryAccess {
+    /// Expands generic rights and drops rights outside the directory type's valid access mask
+    /// (for example `SYNCHRONIZE`), as the host does.
     fn from_desired_access(desired_access: u32) -> Self {
-        Self::from_bits_retain(AccessMask::expand_generic_access(
-            desired_access,
-            Self::READ.bits(),
-            Self::WRITE.bits(),
-            Self::EXECUTE.bits(),
-            Self::ALL_ACCESS.bits(),
-        ))
+        Self::from_bits_retain(
+            AccessMask::expand_generic_access(
+                desired_access,
+                Self::READ.bits(),
+                Self::WRITE.bits(),
+                Self::EXECUTE.bits(),
+                Self::ALL_ACCESS.bits(),
+            ) & Self::ALL_ACCESS.bits(),
+        )
     }
 }
 
@@ -167,7 +171,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for DirectoryObjectSubsys
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for DirectoryHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     for DirectoryObjectSubsystem<Platform>
 {
     fn normalize_desired_access(desired_access: u32) -> u32 {
@@ -226,6 +230,57 @@ enum NamedObject<Platform: crate::ShimPlatform> {
         device: FileDeviceObject,
     },
     Port,
+}
+
+/// A dispatcher object type that `NtCreate*` can create in, and `NtOpen*` can open from, the
+/// object namespace.
+pub(super) trait NamedDispatcherObject<Platform: crate::ShimPlatform>: Sized {
+    type Subsystem: crate::WindowsHandleSubsystem<Platform>;
+
+    fn handle_entry(object: Arc<Self>) -> <Self::Subsystem as FdEnabledSubsystem>::Entry;
+
+    fn lookup(node: &Arc<ObjectNode<Platform>>) -> ObjectLeafLookup<Arc<Self>>;
+
+    fn new_node(
+        path: String,
+        parent: Option<Weak<ObjectNode<Platform>>>,
+        name: String,
+        object: Weak<Self>,
+    ) -> ObjectNode<Platform>;
+}
+
+macro_rules! named_dispatcher_objects {
+    ($($object:ident: $subsystem:ident, $handle_object:ident { $field:ident }, $lookup:ident, $new_node:ident;)+) => {
+        $(
+            impl<Platform: crate::ShimPlatform> NamedDispatcherObject<Platform> for $object<Platform> {
+                type Subsystem = $subsystem<Platform>;
+
+                fn handle_entry(object: Arc<Self>) -> $handle_object<Platform> {
+                    $handle_object { $field: object }
+                }
+
+                fn lookup(node: &Arc<ObjectNode<Platform>>) -> ObjectLeafLookup<Arc<Self>> {
+                    node.$lookup()
+                }
+
+                fn new_node(
+                    path: String,
+                    parent: Option<Weak<ObjectNode<Platform>>>,
+                    name: String,
+                    object: Weak<Self>,
+                ) -> ObjectNode<Platform> {
+                    ObjectNode::$new_node(path, parent, name, object)
+                }
+            }
+        )+
+    };
+}
+
+named_dispatcher_objects! {
+    EventObject: EventSubsystem, EventHandleObject { event }, event_object, new_event;
+    IoCompletionObject: IoCompletionSubsystem, IoCompletionHandleObject { port }, io_completion_object, new_io_completion;
+    MutantObject: MutantSubsystem, MutantHandleObject { mutant }, mutant_object, new_mutant;
+    SemaphoreObject: SemaphoreSubsystem, SemaphoreHandleObject { semaphore }, semaphore_object, new_semaphore;
 }
 
 pub(super) enum ObjectLeafLookup<T> {
@@ -368,8 +423,8 @@ pub(crate) struct DirectoryQueryParameters<Platform: RawPointerProvider> {
     pub(crate) directory_handle: Handle,
     pub(crate) buffer: MutPtr<Platform, u8>,
     pub(crate) buffer_length: u32,
-    pub(crate) return_single_entry: u8,
-    pub(crate) restart_scan: u8,
+    pub(crate) return_single_entry: bool,
+    pub(crate) restart_scan: bool,
     pub(crate) context: MutPtr<Platform, u32>,
     pub(crate) return_length: Option<MutPtr<Platform, u32>>,
 }
@@ -538,72 +593,18 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         )
     }
 
-    pub(super) fn create_event(
+    fn create_dispatcher_object<Object: NamedDispatcherObject<Platform>>(
         &self,
         path: &str,
-        event: &Arc<EventObject<Platform>>,
-        on_exists: impl FnOnce(Arc<EventObject<Platform>>) -> NtStatus,
+        object: &Arc<Object>,
+        on_exists: impl FnOnce(Arc<Object>) -> NtStatus,
         on_created: impl FnOnce() -> NtStatus,
     ) -> NtStatus {
-        let event = Arc::downgrade(event);
+        let object = Arc::downgrade(object);
         self.create_child(
             path,
-            |node| node.event_object(),
-            |path, parent, name| ObjectNode::new_event(path, parent, name, event),
-            NtStatus::OBJECT_TYPE_MISMATCH,
-            on_exists,
-            |_| on_created(),
-        )
-    }
-
-    pub(super) fn create_io_completion(
-        &self,
-        path: &str,
-        io_completion: &Arc<IoCompletionObject<Platform>>,
-        on_exists: impl FnOnce(Arc<IoCompletionObject<Platform>>) -> NtStatus,
-        on_created: impl FnOnce() -> NtStatus,
-    ) -> NtStatus {
-        let io_completion = Arc::downgrade(io_completion);
-        self.create_child(
-            path,
-            |node| node.io_completion_object(),
-            |path, parent, name| ObjectNode::new_io_completion(path, parent, name, io_completion),
-            NtStatus::OBJECT_TYPE_MISMATCH,
-            on_exists,
-            |_| on_created(),
-        )
-    }
-
-    pub(super) fn create_mutant(
-        &self,
-        path: &str,
-        mutant: &Arc<MutantObject<Platform>>,
-        on_exists: impl FnOnce(Arc<MutantObject<Platform>>) -> NtStatus,
-        on_created: impl FnOnce() -> NtStatus,
-    ) -> NtStatus {
-        let mutant = Arc::downgrade(mutant);
-        self.create_child(
-            path,
-            |node| node.mutant_object(),
-            |path, parent, name| ObjectNode::new_mutant(path, parent, name, mutant),
-            NtStatus::OBJECT_TYPE_MISMATCH,
-            on_exists,
-            |_| on_created(),
-        )
-    }
-
-    pub(super) fn create_semaphore(
-        &self,
-        path: &str,
-        semaphore: &Arc<SemaphoreObject<Platform>>,
-        on_exists: impl FnOnce(Arc<SemaphoreObject<Platform>>) -> NtStatus,
-        on_created: impl FnOnce() -> NtStatus,
-    ) -> NtStatus {
-        let semaphore = Arc::downgrade(semaphore);
-        self.create_child(
-            path,
-            |node| node.semaphore_object(),
-            |path, parent, name| ObjectNode::new_semaphore(path, parent, name, semaphore),
+            Object::lookup,
+            |path, parent, name| Object::new_node(path, parent, name, object),
             NtStatus::OBJECT_TYPE_MISMATCH,
             on_exists,
             |_| on_created(),
@@ -695,7 +696,12 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         let leaf_key = ObjectName::new(leaf_name);
         if let Some(existing) = children.get(&leaf_key).cloned() {
             match existing_object(&existing) {
-                ObjectLeafLookup::Live(object) => return on_exists(object),
+                ObjectLeafLookup::Live(object) => {
+                    // Opening an existing object does not change the namespace, so publish its
+                    // handle without holding the directory lock.
+                    drop(body);
+                    return on_exists(object);
+                }
                 ObjectLeafLookup::Stale => {
                     children.remove(&leaf_key);
                 }
@@ -735,29 +741,11 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         })
     }
 
-    pub(super) fn resolve_event(&self, path: &str) -> Result<Arc<EventObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| node.event_object())
-    }
-
-    pub(super) fn resolve_io_completion(
+    fn resolve_dispatcher_object<Object: NamedDispatcherObject<Platform>>(
         &self,
         path: &str,
-    ) -> Result<Arc<IoCompletionObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| node.io_completion_object())
-    }
-
-    pub(super) fn resolve_mutant(
-        &self,
-        path: &str,
-    ) -> Result<Arc<MutantObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| node.mutant_object())
-    }
-
-    pub(super) fn resolve_semaphore(
-        &self,
-        path: &str,
-    ) -> Result<Arc<SemaphoreObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| node.semaphore_object())
+    ) -> Result<Arc<Object>, NtStatus> {
+        self.resolve_object_leaf(path, false, Object::lookup)
     }
 
     pub(super) fn resolve_section(
@@ -1115,6 +1103,47 @@ fn write_directory_records<Platform: RawPointerProvider>(
     Ok(())
 }
 
+/// Checks whether a create that found an existing named object may open it instead.
+///
+/// The existing object may only be opened when the caller passed object attributes with
+/// `OBJ_OPENIF` set.
+fn check_open_existing_object(object_attributes: Option<ObjectAttributes>) -> Result<(), NtStatus> {
+    let Some(object_attributes) = object_attributes else {
+        return Err(NtStatus::INVALID_PARAMETER);
+    };
+    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+        .contains(ObjectAttributesFlags::OPENIF)
+    {
+        return Err(NtStatus::OBJECT_NAME_COLLISION);
+    }
+    Ok(())
+}
+
+/// Completes a named `NtCreate*` that found `existing` under the requested name.
+///
+/// Publishes a handle to `existing` with `write_handle` and returns `OBJECT_NAME_EXISTS` when
+/// `OBJ_OPENIF` allows opening it; otherwise returns the [`check_open_existing_object`] failure.
+pub(super) fn open_existing_named_object<T>(
+    object_attributes: Option<ObjectAttributes>,
+    existing: T,
+    write_handle: impl FnOnce(T) -> Result<(), NtStatus>,
+) -> NtStatus {
+    match check_open_existing_object(object_attributes).and_then(|()| write_handle(existing)) {
+        Ok(()) => NtStatus::OBJECT_NAME_EXISTS,
+        Err(status) => status,
+    }
+}
+
+/// Rejects `OBJ_OPENLINK` for object types that do not support it.
+pub(super) fn reject_open_link(object_attributes: &ObjectAttributes) -> Result<(), NtStatus> {
+    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+        .contains(ObjectAttributesFlags::OPENLINK)
+    {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    Ok(())
+}
+
 impl<Platform: crate::ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_query_object(
         &self,
@@ -1276,7 +1305,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         ))
     }
 
-    pub(super) fn read_dispatcher_object_attributes(
+    fn read_dispatcher_object_attributes(
         &self,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
         require_name: bool,
@@ -1289,11 +1318,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         };
         let (object_attributes, name) =
             self.read_directory_object_attributes(Some(object_attributes_ptr), require_name)?;
-        if object_attributes.is_some_and(|object_attributes| {
-            ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                .contains(ObjectAttributesFlags::OPENLINK)
-        }) {
-            return Err(NtStatus::INVALID_PARAMETER);
+        if let Some(object_attributes) = &object_attributes {
+            reject_open_link(object_attributes)?;
         }
         Ok((
             object_attributes,
@@ -1301,24 +1327,92 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         ))
     }
 
-    fn insert_directory_handle(
+    /// Implements `NtCreate*` for a named dispatcher object.
+    ///
+    /// `output` is probed first; `new_object` then validates the type-specific arguments and
+    /// builds the object. If the name already exists, the existing object is opened when
+    /// `OBJ_OPENIF` allows it. `on_created` runs only after a handle to a newly created object has
+    /// been written to `output`.
+    pub(super) fn create_named_dispatcher_object<Object: NamedDispatcherObject<Platform>>(
         &self,
-        directory: Arc<ObjectNode<Platform>>,
-        granted_access: DirectoryAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<DirectoryObjectSubsystem<Platform>>(
-            DirectoryHandleObject { directory },
-            granted_access.bits(),
-            drop,
+        output: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        new_object: impl FnOnce() -> Result<Arc<Object>, NtStatus>,
+        on_created: impl FnOnce(&Arc<Object>),
+    ) -> NtStatus {
+        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(output) {
+            return status;
+        }
+        let object = match new_object() {
+            Ok(object) => object,
+            Err(status) => return status,
+        };
+        let (object_attributes, name) =
+            match self.read_dispatcher_object_attributes(object_attributes, false) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+        let granted_access =
+            <Object::Subsystem as crate::WindowsHandleSubsystem<Platform>>::normalize_desired_access(
+                desired_access,
+            );
+        let write_handle = |object: Arc<Object>| {
+            self.write_new_typed_handle::<Object::Subsystem>(
+                output,
+                Object::handle_entry(object),
+                granted_access,
+            )
+        };
+        let write_created_handle = |object: Arc<Object>| match write_handle(Arc::clone(&object)) {
+            Ok(()) => {
+                on_created(&object);
+                NtStatus::SUCCESS
+            }
+            Err(status) => status,
+        };
+
+        let Some(name) = name else {
+            return write_created_handle(object);
+        };
+        self.process.object_manager.create_dispatcher_object(
+            &name,
+            &object,
+            |existing| open_existing_named_object(object_attributes, existing, write_handle),
+            || write_created_handle(Arc::clone(&object)),
         )
     }
 
-    pub(crate) fn close_directory_handle(&self, handle: Handle) {
-        self.close_typed_handle::<DirectoryObjectSubsystem<Platform>>(handle, drop);
-    }
-
-    pub(crate) fn close_directory(directory: DirectoryHandleObject<Platform>) {
-        drop(directory);
+    /// Implements `NtOpen*` for a named dispatcher object.
+    pub(super) fn open_named_dispatcher_object<Object: NamedDispatcherObject<Platform>>(
+        &self,
+        output: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+    ) -> NtStatus {
+        if let Err(status) = crate::probe_guest_output_preserving_value::<Platform, _>(output) {
+            return status;
+        }
+        let name = match self.read_dispatcher_object_attributes(object_attributes, true) {
+            Ok((_, Some(name))) => name,
+            Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
+            Err(status) => return status,
+        };
+        let object = match self
+            .process
+            .object_manager
+            .resolve_dispatcher_object::<Object>(&name)
+        {
+            Ok(object) => object,
+            Err(status) => return status,
+        };
+        status_from_result(self.write_new_typed_handle::<Object::Subsystem>(
+            output,
+            Object::handle_entry(object),
+            <Object::Subsystem as crate::WindowsHandleSubsystem<Platform>>::normalize_desired_access(
+                desired_access,
+            ),
+        ))
     }
 
     pub(crate) fn sys_nt_create_directory_object(
@@ -1345,45 +1439,25 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 Ok(value) => value,
                 Err(status) => return status,
             };
-        if let Some(object_attributes) = object_attributes
-            && ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                .contains(ObjectAttributesFlags::OPENLINK)
+        if let Some(object_attributes) = &object_attributes
+            && let Err(status) = reject_open_link(object_attributes)
         {
-            return NtStatus::INVALID_PARAMETER;
+            return status;
         }
         let granted_access = DirectoryAccess::from_desired_access(desired_access);
+        let write_handle = |directory| {
+            self.write_new_typed_handle::<DirectoryObjectSubsystem<Platform>>(
+                directory_handle,
+                DirectoryHandleObject { directory },
+                granted_access.bits(),
+            )
+        };
 
         if let Some(directory_name) = directory_name {
             return self.process.object_manager.create_directory(
                 &directory_name.original_path,
-                |directory| {
-                    let Some(object_attributes) = object_attributes else {
-                        return NtStatus::INVALID_PARAMETER;
-                    };
-                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                        .contains(ObjectAttributesFlags::OPENIF)
-                    {
-                        return NtStatus::OBJECT_NAME_COLLISION;
-                    }
-                    let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
-                        return NtStatus::QUOTA_EXCEEDED;
-                    };
-                    if directory_handle.write_at_offset(0, handle).is_none() {
-                        self.close_directory_handle(handle);
-                        return NtStatus::ACCESS_VIOLATION;
-                    }
-                    NtStatus::OBJECT_NAME_EXISTS
-                },
-                |directory| {
-                    let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
-                        return NtStatus::QUOTA_EXCEEDED;
-                    };
-                    if directory_handle.write_at_offset(0, handle).is_none() {
-                        self.close_directory_handle(handle);
-                        return NtStatus::ACCESS_VIOLATION;
-                    }
-                    NtStatus::SUCCESS
-                },
+                |directory| open_existing_named_object(object_attributes, directory, write_handle),
+                |directory| status_from_result(write_handle(directory)),
             );
         }
 
@@ -1392,14 +1466,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             None,
             String::new(),
         ));
-        let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if directory_handle.write_at_offset(0, handle).is_none() {
-            self.close_directory_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        NtStatus::SUCCESS
+        status_from_result(write_handle(directory))
     }
 
     pub(crate) fn sys_nt_open_directory_object(
@@ -1413,10 +1480,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         }
         let directory_name = match self.read_directory_object_attributes(object_attributes, true) {
             Ok((Some(object_attributes), Some(directory_name))) => {
-                if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                    .contains(ObjectAttributesFlags::OPENLINK)
-                {
-                    return NtStatus::INVALID_PARAMETER;
+                if let Err(status) = reject_open_link(&object_attributes) {
+                    return status;
                 }
                 directory_name
             }
@@ -1424,25 +1489,20 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Ok((None, Some(_))) => return NtStatus::INVALID_PARAMETER,
             Err(status) => return status,
         };
-        let directory = {
-            match self
-                .process
-                .object_manager
-                .resolve_directory(&directory_name.original_path)
-            {
-                Ok(directory) => directory,
-                Err(status) => return status,
-            }
+        let directory = match self
+            .process
+            .object_manager
+            .resolve_directory(&directory_name.original_path)
+        {
+            Ok(directory) => directory,
+            Err(status) => return status,
         };
-        let Ok(handle) = self.insert_directory_handle(
-            directory,
-            DirectoryAccess::from_desired_access(desired_access),
-        ) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if directory_handle.write_at_offset(0, handle).is_none() {
-            self.close_directory_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        if let Err(status) = self.write_new_typed_handle::<DirectoryObjectSubsystem<Platform>>(
+            directory_handle,
+            DirectoryHandleObject { directory },
+            DirectoryAccess::from_desired_access(desired_access).bits(),
+        ) {
+            return status;
         }
         litebox_util_log::debug!(
             object_name:% = directory_name.original_path.as_str(),
@@ -1473,7 +1533,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             return status;
         }
 
-        let start_index = if params.restart_scan != 0 {
+        let start_index = if params.restart_scan {
             0
         } else {
             let Some(context) = params.context.read_at_offset(0) else {
@@ -1497,7 +1557,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             return NtStatus::NO_MORE_ENTRIES;
         }
 
-        let end_for_required = if params.return_single_entry != 0 {
+        let end_for_required = if params.return_single_entry {
             start_index + 1
         } else {
             entries.len()
@@ -1522,7 +1582,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     return NtStatus::ACCESS_VIOLATION;
                 }
             }
-            return if params.return_single_entry != 0 {
+            return if params.return_single_entry {
                 NtStatus::BUFFER_TOO_SMALL
             } else {
                 NtStatus::MORE_ENTRIES
@@ -1545,7 +1605,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             }
             required_for_written += entry_size;
             next_index += 1;
-            if params.return_single_entry != 0 {
+            if params.return_single_entry {
                 break;
             }
         }
@@ -2267,8 +2327,8 @@ mod tests {
                     directory_handle: parent,
                     buffer: mut_ptr(&mut buffer[0]),
                     buffer_length: buffer.len().trunc(),
-                    return_single_entry: 0,
-                    restart_scan: 1,
+                    return_single_entry: false,
+                    restart_scan: true,
                     context: mut_ptr(&mut context),
                     return_length: Some(mut_ptr(&mut return_length)),
                 }),
@@ -2479,8 +2539,8 @@ mod tests {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
                     buffer_length: buffer.len().trunc(),
-                    return_single_entry: 0,
-                    restart_scan: 1,
+                    return_single_entry: false,
+                    restart_scan: true,
                     context: mut_ptr(&mut context),
                     return_length: Some(mut_ptr(&mut return_length)),
                 },),
@@ -2511,8 +2571,8 @@ mod tests {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
                     buffer_length: buffer.len().trunc(),
-                    return_single_entry: 0,
-                    restart_scan: 1,
+                    return_single_entry: false,
+                    restart_scan: true,
                     context: mut_ptr(&mut context),
                     return_length: Some(mut_ptr(&mut return_length)),
                 },),
@@ -2576,8 +2636,8 @@ mod tests {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
                     buffer_length: buffer.len().trunc(),
-                    return_single_entry: 1,
-                    restart_scan: 1,
+                    return_single_entry: true,
+                    restart_scan: true,
                     context: mut_ptr(&mut context),
                     return_length: Some(mut_ptr(&mut return_length)),
                 },),
@@ -2598,8 +2658,8 @@ mod tests {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
                     buffer_length: buffer.len().trunc(),
-                    return_single_entry: 1,
-                    restart_scan: 0,
+                    return_single_entry: true,
+                    restart_scan: false,
                     context: mut_ptr(&mut context),
                     return_length: Some(mut_ptr(&mut return_length)),
                 },),
@@ -2636,8 +2696,8 @@ mod tests {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
                     buffer_length: buffer.len().trunc(),
-                    return_single_entry: 0,
-                    restart_scan: 1,
+                    return_single_entry: false,
+                    restart_scan: true,
                     context: mut_ptr(&mut context),
                     return_length: Some(mut_ptr(&mut return_length)),
                 },),
@@ -2677,8 +2737,8 @@ mod tests {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer),
                     buffer_length: 1,
-                    return_single_entry: 0,
-                    restart_scan: 1,
+                    return_single_entry: false,
+                    restart_scan: true,
                     context: mut_ptr(&mut context),
                     return_length: None,
                 },),

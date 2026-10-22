@@ -14,9 +14,9 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProv
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 
-use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString};
-use crate::syscalls::Handle;
-use crate::syscalls::object_manager::{DirectoryName, ObjectNode};
+use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString};
+use crate::syscalls::object_manager::{ObjectNode, open_existing_named_object, reject_open_link};
+use crate::syscalls::{Handle, status_from_result};
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
@@ -58,7 +58,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for SymbolicLinkSubsystem
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for SymbolicLinkHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     for SymbolicLinkSubsystem<Platform>
 {
     fn normalize_desired_access(desired_access: u32) -> u32 {
@@ -83,26 +83,6 @@ fn utf16_units(value: &str) -> Result<Vec<u16>, NtStatus> {
 }
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    fn insert_symbolic_link_handle(
-        &self,
-        link: Arc<ObjectNode<Platform>>,
-        granted_access: SymbolicLinkAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<SymbolicLinkSubsystem<Platform>>(
-            SymbolicLinkHandleObject { link },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
-    fn close_symbolic_link_handle(&self, handle: Handle) {
-        self.close_typed_handle::<SymbolicLinkSubsystem<Platform>>(handle, drop);
-    }
-
-    pub(crate) fn close_symbolic_link(link: SymbolicLinkHandleObject<Platform>) {
-        drop(link);
-    }
-
     pub(crate) fn sys_nt_create_symbolic_link_object(
         &self,
         link_handle: MutPtr<Platform, Handle>,
@@ -127,58 +107,26 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             },
             None => return NtStatus::ACCESS_VIOLATION,
         };
-        let attributes = ObjectAttributesFlags::from_bits_retain(object_attributes.attributes);
-        if attributes.contains(ObjectAttributesFlags::OPENLINK) {
-            return NtStatus::INVALID_PARAMETER;
+        if let Err(status) = reject_open_link(&object_attributes) {
+            return status;
         }
 
         // NT stores the target as an opaque string at creation time. Wine's
         // create_symlink only copies the target and ReactOS leaves LinkTargetObject
         // null; both defer namespace lookup until the link is traversed.
         let granted_access = SymbolicLinkAccess::from_desired_access(desired_access);
-        self.create_symbolic_link(
-            link_handle,
-            granted_access,
-            link_name,
-            target,
-            attributes.contains(ObjectAttributesFlags::OPENIF),
-        )
-    }
-
-    fn create_symbolic_link(
-        &self,
-        link_handle: MutPtr<Platform, Handle>,
-        granted_access: SymbolicLinkAccess,
-        link_name: DirectoryName,
-        target: String,
-        open_if: bool,
-    ) -> NtStatus {
+        let write_handle = |link| {
+            self.write_new_typed_handle::<SymbolicLinkSubsystem<Platform>>(
+                link_handle,
+                SymbolicLinkHandleObject { link },
+                granted_access.bits(),
+            )
+        };
         self.process.object_manager.create_symlink(
             &link_name.original_path,
             target,
-            |link| {
-                if !open_if {
-                    return NtStatus::OBJECT_NAME_COLLISION;
-                }
-                let Ok(handle) = self.insert_symbolic_link_handle(link, granted_access) else {
-                    return NtStatus::QUOTA_EXCEEDED;
-                };
-                if link_handle.write_at_offset(0, handle).is_none() {
-                    self.close_symbolic_link_handle(handle);
-                    return NtStatus::ACCESS_VIOLATION;
-                }
-                NtStatus::OBJECT_NAME_EXISTS
-            },
-            |link| {
-                let Ok(handle) = self.insert_symbolic_link_handle(link, granted_access) else {
-                    return NtStatus::QUOTA_EXCEEDED;
-                };
-                if link_handle.write_at_offset(0, handle).is_none() {
-                    self.close_symbolic_link_handle(handle);
-                    return NtStatus::ACCESS_VIOLATION;
-                }
-                NtStatus::SUCCESS
-            },
+            |link| open_existing_named_object(Some(object_attributes), link, write_handle),
+            |link| status_from_result(write_handle(link)),
         )
     }
 
@@ -205,17 +153,13 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Ok(link) => link,
             Err(status) => return status,
         };
-        let Ok(handle) = self.insert_symbolic_link_handle(
-            link,
-            SymbolicLinkAccess::from_desired_access(desired_access),
-        ) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if link_handle.write_at_offset(0, handle).is_none() {
-            self.close_symbolic_link_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        NtStatus::SUCCESS
+        status_from_result(
+            self.write_new_typed_handle::<SymbolicLinkSubsystem<Platform>>(
+                link_handle,
+                SymbolicLinkHandleObject { link },
+                SymbolicLinkAccess::from_desired_access(desired_access).bits(),
+            ),
+        )
     }
 
     pub(crate) fn sys_nt_query_symbolic_link_object(

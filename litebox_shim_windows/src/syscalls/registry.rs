@@ -63,7 +63,9 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for RegistryKeyObject<Pla
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for RegistryKeyObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for RegistryKeyObject<Platform> {
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
+    for RegistryKeyObject<Platform>
+{
     fn normalize_desired_access(desired_access: u32) -> u32 {
         RegistryKeyAccess::from_desired_access(desired_access).bits()
     }
@@ -1140,19 +1142,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         key: RegistryKeyObject<Platform>,
         granted_access: RegistryKeyAccess,
     ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<RegistryKeyObject<Platform>>(key, granted_access.bits(), |key| {
-            Self::close_registry_key(key);
-        })
+        self.insert_typed_handle::<RegistryKeyObject<Platform>>(key, granted_access.bits())
     }
 
     pub(crate) fn close_registry_key_handle(&self, handle: Handle) {
-        self.close_typed_handle::<RegistryKeyObject<Platform>>(handle, |key| {
-            Self::close_registry_key(key);
-        });
-    }
-
-    pub(crate) fn close_registry_key(key: RegistryKeyObject<Platform>) {
-        drop(key);
+        self.close_typed_handle::<RegistryKeyObject<Platform>>(handle);
     }
 
     pub(crate) fn sys_nt_open_key(

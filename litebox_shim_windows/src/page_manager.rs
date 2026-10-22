@@ -802,15 +802,14 @@ where
 {
     let is_available = |start: usize| {
         let end = start.checked_add(len)?;
-        (start >= address_bounds.start && end <= address_bounds.end)
-            .then(|| {
-                reservations
-                    .overlapping(start..end)
-                    .next()
-                    .is_none()
-                    .then_some(start)
-            })
-            .flatten()
+        if start < address_bounds.start || end > address_bounds.end {
+            return None;
+        }
+        reservations
+            .overlapping(start..end)
+            .next()
+            .is_none()
+            .then_some(start)
     };
     if preferred != 0
         && let Some(start) = is_available(preferred)

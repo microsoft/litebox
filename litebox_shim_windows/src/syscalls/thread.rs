@@ -94,9 +94,17 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for ThreadSubsystem<Platform> {
 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for ThreadHandleObject<Platform> {}
 
-impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for ThreadSubsystem<Platform> {
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem<Platform> for ThreadSubsystem<Platform> {
     fn normalize_desired_access(desired_access: u32) -> u32 {
         ThreadAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn waitable_object(
+        entry: &Self::Entry,
+    ) -> Option<crate::syscalls::wait::WaitableObject<Platform>> {
+        Some(crate::syscalls::wait::WaitableObject::Thread(Arc::clone(
+            &entry.thread,
+        )))
     }
 }
 
@@ -158,6 +166,10 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
         Self::new_with_suspend_count(thread_id, teb_address, 0)
     }
 
+    fn new_suspended(thread_id: usize, teb_address: usize) -> Self {
+        Self::new_with_suspend_count(thread_id, teb_address, 1)
+    }
+
     fn new_with_suspend_count(thread_id: usize, teb_address: usize, suspend_count: u32) -> Self {
         Self {
             thread_id,
@@ -210,10 +222,6 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
         }
     }
 
-    pub(crate) fn new_suspended(thread_id: usize, teb_address: usize) -> Self {
-        Self::new_with_suspend_count(thread_id, teb_address, 1)
-    }
-
     pub(crate) fn is_suspended(&self) -> bool {
         self.suspend_count.load(Ordering::Acquire) != 0
     }
@@ -260,10 +268,7 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
     }
 
     fn set_thread_id_alert(&self) {
-        let waiting = self.thread_id_alert_state.lock().set_pending();
-        if waiting && let Some(handle) = self.wait_handle.get() {
-            handle.interrupt();
-        }
+        self.set_alert(&self.thread_id_alert_state);
     }
 
     pub(crate) fn begin_classic_alert_wait(&self) {
@@ -279,7 +284,12 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
     }
 
     fn set_classic_alert(&self) {
-        let waiting = self.alert_state.lock().set_pending();
+        self.set_alert(&self.alert_state);
+    }
+
+    /// Marks an alert pending and interrupts the thread if it is waiting for that alert.
+    fn set_alert(&self, alert_state: &Mutex<Platform, AlertState>) {
+        let waiting = alert_state.lock().set_pending();
         if waiting && let Some(handle) = self.wait_handle.get() {
             handle.interrupt();
         }
@@ -559,7 +569,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 thread: thread.clone(),
             },
             granted_access.bits(),
-            drop,
         ) {
             Ok(handle) => handle,
             Err(status) => {
@@ -594,7 +603,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )
         } {
             litebox_util_log::error!(error:% = error; "Failed to spawn Windows guest thread");
-            self.close_typed_handle::<ThreadSubsystem<Platform>>(handle, drop);
+            self.close_typed_handle::<ThreadSubsystem<Platform>>(handle);
             self.process.detach_thread(thread_id);
             let litebox_thread = litebox_thread
                 .lock()
@@ -628,18 +637,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return status;
         }
-        let previous = if thread_handle.is_current() {
-            self.thread_object.resume()
-        } else {
-            let entry = match self.typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
-                thread_handle.as_handle(),
-                ThreadAccess::SUSPEND_RESUME.bits(),
-            ) {
-                Ok(entry) => entry,
+        let thread =
+            match self.thread_object_with_access(thread_handle, ThreadAccess::SUSPEND_RESUME) {
+                Ok(thread) => thread,
                 Err(status) => return status,
             };
-            entry.with_entry(|entry| entry.thread.resume())
-        };
+        let previous = thread.resume();
         if let Some(previous_suspend_count) = previous_suspend_count
             && previous_suspend_count
                 .write_at_offset(0, previous)
@@ -651,19 +654,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn sys_nt_alert_thread(&self, thread_handle: ThreadHandle) -> NtStatus {
-        if thread_handle.is_current() {
-            self.thread_object.set_classic_alert();
-        } else {
-            let entry = match self.typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
-                thread_handle.as_handle(),
-                ThreadAccess::ALERT.bits(),
-            ) {
-                Ok(entry) => entry,
-                Err(status) => return status,
-            };
-            entry.with_entry(|entry| entry.thread.set_classic_alert());
+        match self.thread_object_with_access(thread_handle, ThreadAccess::ALERT) {
+            Ok(thread) => {
+                thread.set_classic_alert();
+                NtStatus::SUCCESS
+            }
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
+    }
+
+    /// Resolves `thread_handle` to its thread object, requiring `access` unless it names the
+    /// current thread.
+    fn thread_object_with_access(
+        &self,
+        thread_handle: ThreadHandle,
+        access: ThreadAccess,
+    ) -> Result<Arc<ThreadObject<Platform>>, NtStatus> {
+        if thread_handle.is_current() {
+            return Ok(Arc::clone(&self.thread_object));
+        }
+        let entry = self.typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
+            thread_handle.as_handle(),
+            access.bits(),
+        )?;
+        Ok(entry.with_entry(|entry| Arc::clone(&entry.thread)))
     }
 
     pub(crate) fn sys_nt_wait_for_alert_by_thread_id(
@@ -671,12 +685,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         _address: usize,
         timeout: Option<ConstPtr<Platform, i64>>,
     ) -> NtStatus {
-        let timeout = match timeout {
-            Some(timeout) => match timeout.read_at_offset(0) {
-                Some(timeout) => Some(self.wait_timeout_duration(timeout)),
-                None => return NtStatus::ACCESS_VIOLATION,
-            },
-            None => None,
+        let timeout = match self.read_optional_wait_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(status) => return status,
         };
         self.thread_object.begin_thread_id_alert_wait();
         let result = self.wait_until(timeout, || self.thread_object.take_thread_id_alert());
@@ -731,18 +742,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         match thread_information_class {
             QueryThreadInformationClass::BasicInformation => {
-                let thread = if thread_handle.is_current() {
-                    Arc::clone(&self.thread_object)
-                } else {
-                    let entry = match self
-                        .typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
-                            thread_handle.as_handle(),
-                            ThreadAccess::QUERY_INFORMATION.bits(),
-                        ) {
-                        Ok(entry) => entry,
-                        Err(status) => return status,
-                    };
-                    entry.with_entry(|entry| Arc::clone(&entry.thread))
+                let thread = match self
+                    .thread_object_with_access(thread_handle, ThreadAccess::QUERY_INFORMATION)
+                {
+                    Ok(thread) => thread,
+                    Err(status) => return status,
                 };
                 let information = ThreadBasicInformation {
                     exit_status: thread.exit_status(),
@@ -800,10 +804,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
-    }
-
-    pub(crate) fn close_thread(thread: ThreadHandleObject<Platform>) {
-        drop(thread);
     }
 
     pub(crate) fn sys_nt_set_information_thread(
@@ -942,7 +942,6 @@ mod tests {
                         thread: Arc::clone(&child.thread_object),
                     },
                     AccessMask::SYNCHRONIZE.bits(),
-                    drop,
                 )
                 .expect("thread handle insertion should succeed");
             let child = WindowsShimEntrypoints {
@@ -1168,7 +1167,6 @@ mod tests {
                         thread: Arc::clone(&suspended_thread),
                     },
                     ThreadAccess::SUSPEND_RESUME.bits(),
-                    drop,
                 )
                 .unwrap();
             let handle = ThreadHandle::from_raw(handle.as_raw());

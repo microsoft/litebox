@@ -20,7 +20,7 @@ use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::mm::{
     self, MemoryType, PageProtection, record_allocation, record_committed_allocation,
 };
-use crate::syscalls::{Handle, ProcessHandle};
+use crate::syscalls::{Handle, ProcessHandle, status_from_result};
 use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task, WindowsSectionView};
 
 const VIEW_SHARE: u32 = 1;
@@ -63,7 +63,9 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for SectionSubsystem<Platform> {
 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for SectionHandleObject<Platform> {}
 
-impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for SectionSubsystem<Platform> {
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem<Platform>
+    for SectionSubsystem<Platform>
+{
     fn normalize_desired_access(desired_access: u32) -> u32 {
         SectionAccess::from_desired_access(desired_access).bits()
     }
@@ -144,13 +146,6 @@ bitflags::bitflags! {
     }
 }
 
-bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct UnmapViewOfSectionFlags: u32 {
-        const _ = 0;
-    }
-}
-
 impl SectionAccess {
     fn from_desired_access(desired_access: u32) -> Self {
         let mut access = Self::from_bits_retain(desired_access);
@@ -217,26 +212,6 @@ struct SectionImageInformation {
 const _: () = assert!(size_of::<SectionImageInformation>() == 64);
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    fn insert_section_handle(
-        &self,
-        section: Arc<SectionObject<Platform>>,
-        granted_access: SectionAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<SectionSubsystem<Platform>>(
-            SectionHandleObject { section },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
-    pub(crate) fn close_section_handle(&self, handle: Handle) {
-        self.close_typed_handle::<SectionSubsystem<Platform>>(handle, drop);
-    }
-
-    pub(crate) fn close_section(section: SectionHandleObject<Platform>) {
-        drop(section);
-    }
-
     #[expect(
         clippy::too_many_arguments,
         reason = "NtCreateSection has seven ABI parameters; keeping ABI args explicit avoids reshuffling"
@@ -284,10 +259,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !allocation_attributes
             .difference(supported_create_attributes)
             .is_empty()
+            || !allocation_attributes.intersects(supported_create_attributes)
         {
-            return NtStatus::INVALID_PARAMETER;
-        }
-        if !allocation_attributes.intersects(supported_create_attributes) {
             return NtStatus::INVALID_PARAMETER;
         }
 
@@ -354,12 +327,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(path) => path,
             Err(status) => return status,
         };
-        let metadata = match crate::loader::image_section_metadata(Arc::clone(&self.fs), &fs_path) {
-            Ok(metadata) => metadata,
-            Err(crate::loader::WindowsLoadError::Access(_)) => {
-                return NtStatus::INVALID_FILE_FOR_SECTION;
-            }
-            Err(_) => return NtStatus::INVALID_FILE_FOR_SECTION,
+        let Ok(metadata) = crate::loader::image_section_metadata(Arc::clone(&self.fs), &fs_path)
+        else {
+            return NtStatus::INVALID_FILE_FOR_SECTION;
         };
         let section = Arc::new(SectionObject {
             fs_path: Some(fs_path),
@@ -578,9 +548,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 page_protection,
                 permissions,
             ),
-            SectionBacking::CsrSharedSection { .. } => self.map_csr_shared_section(
+            SectionBacking::CsrSharedSection { base } => self.map_csr_shared_section(
                 request,
                 &section,
+                base,
                 requested_view_size,
                 section_offset,
                 page_protection,
@@ -639,8 +610,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         base_address: usize,
         flags: u32,
     ) -> NtStatus {
-        let flags = UnmapViewOfSectionFlags::from_bits_retain(flags);
-        if !flags.is_empty() {
+        if flags != 0 {
             return NtStatus::INVALID_PARAMETER;
         }
         self.sys_nt_unmap_view_of_section(process_handle, base_address)
@@ -652,15 +622,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         section: Arc<SectionObject<Platform>>,
         granted_access: SectionAccess,
     ) -> NtStatus {
-        let handle = match self.insert_section_handle(section, granted_access) {
-            Ok(handle) => handle,
-            Err(status) => return status,
-        };
-        if section_handle.write_at_offset(0, handle).is_none() {
-            self.close_section_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        NtStatus::SUCCESS
+        status_from_result(self.write_new_typed_handle::<SectionSubsystem<Platform>>(
+            section_handle,
+            SectionHandleObject { section },
+            granted_access.bits(),
+        ))
     }
 
     fn map_pagefile_section(
@@ -835,6 +801,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         request: MapViewOfSectionParameters<Platform>,
         section: &Arc<SectionObject<Platform>>,
+        base: usize,
         requested_view_size: usize,
         section_offset: usize,
         page_protection: PageProtection,
@@ -878,10 +845,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return NtStatus::NOT_SUPPORTED;
         }
         // TODO: we just return the pre-mapped base address for now, but we should support mapping at a different base address in the future.
-        let base = match section.backing {
-            SectionBacking::CsrSharedSection { base } => base,
-            SectionBacking::Pagefile | SectionBacking::ImageFile => unreachable!(),
-        };
         if request.base_address.write_at_offset(0, base).is_none()
             || request.view_size.write_at_offset(0, view_size).is_none()
         {
@@ -988,14 +951,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Option<(usize, WindowsSectionView<Platform>)> {
         let mut views = self.process.section_views.write();
         let (&view_base, view) = views.range(..=base_address).next_back()?;
-        let view = view.clone();
         let view_end = view_base.checked_add(view.size)?;
-        if base_address < view_end {
-            views.remove(&view_base);
-            Some((view_base, view))
-        } else {
-            None
+        if base_address >= view_end {
+            return None;
         }
+        views.remove_entry(&view_base)
     }
 
     fn read_section_name(
@@ -1079,21 +1039,9 @@ fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
 }
 
 fn required_map_access(protection: PageProtection) -> SectionAccess {
-    let base = protection.bits() & PageProtection::BASE_MASK;
-    if base == PageProtection::PAGE_NOACCESS.bits() {
-        SectionAccess::MAP_READ
-    } else if matches!(
-        base,
-        value if value == PageProtection::PAGE_READWRITE.bits()
-            || value == PageProtection::PAGE_EXECUTE_READWRITE.bits()
-    ) {
+    if page_protection_has_direct_write(protection) {
         SectionAccess::MAP_WRITE
-    } else if matches!(
-        base,
-        value if value == PageProtection::PAGE_EXECUTE.bits()
-            || value == PageProtection::PAGE_EXECUTE_READ.bits()
-            || value == PageProtection::PAGE_EXECUTE_WRITECOPY.bits()
-    ) {
+    } else if page_protection_has_execute(protection) {
         SectionAccess::MAP_EXECUTE
     } else {
         SectionAccess::MAP_READ
@@ -1345,6 +1293,215 @@ mod tests {
     }
 
     #[test]
+    fn map_access_classification_ignores_protection_modifiers() {
+        for base in 0..=PageProtection::BASE_MASK {
+            let expected = match base {
+                0x04 | 0x40 => SectionAccess::MAP_WRITE,
+                0x10 | 0x20 | 0x80 => SectionAccess::MAP_EXECUTE,
+                _ => SectionAccess::MAP_READ,
+            };
+            for modifiers in [
+                PageProtection::empty(),
+                PageProtection::PAGE_GUARD,
+                PageProtection::PAGE_NOCACHE | PageProtection::PAGE_WRITECOMBINE,
+                PageProtection::PAGE_TARGETS_INVALID,
+            ] {
+                let protection = PageProtection::from_bits_retain(base) | modifiers;
+                assert_eq!(required_map_access(protection), expected, "{protection:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pagefile_view_protection_compatibility_matrix() {
+        use PageProtection as P;
+
+        let protections = [
+            P::PAGE_NOACCESS,
+            P::PAGE_READONLY,
+            P::PAGE_READWRITE,
+            P::PAGE_WRITECOPY,
+            P::PAGE_EXECUTE,
+            P::PAGE_EXECUTE_READ,
+            P::PAGE_EXECUTE_READWRITE,
+            P::PAGE_EXECUTE_WRITECOPY,
+        ];
+        let compatible_views = [
+            [true, false, false, false, false, false, false, false],
+            [true, true, false, true, false, false, false, false],
+            [true, true, true, true, false, false, false, false],
+            [true, true, false, true, false, false, false, false],
+            [true, false, false, false, true, false, false, false],
+            [true, true, false, true, true, true, false, true],
+            [true, true, true, true, true, true, true, true],
+            [true, true, false, true, true, true, false, true],
+        ];
+        for (section_index, section) in protections.into_iter().enumerate() {
+            for (view_index, view) in protections.into_iter().enumerate() {
+                for modifiers in [P::empty(), P::PAGE_GUARD, P::PAGE_TARGETS_INVALID] {
+                    assert_eq!(
+                        pagefile_view_protection_is_compatible(
+                            section | modifiers,
+                            view | modifiers,
+                        ),
+                        compatible_views[section_index][view_index],
+                        "section={section:?}, view={view:?}, modifiers={modifiers:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section_view_lookup_preserves_noncontaining_views() {
+        let task = test_task();
+        let base = PAGE_SIZE;
+        task.process.section_views.write().insert(
+            base,
+            WindowsSectionView {
+                size: PAGE_SIZE,
+                section_offset: 0,
+                section: None,
+            },
+        );
+        assert!(task.remove_section_view_for_address(base - 1).is_none());
+        assert!(
+            task.remove_section_view_for_address(base + PAGE_SIZE)
+                .is_none()
+        );
+        let (view_base, view) = task
+            .remove_section_view_for_address(base + PAGE_SIZE - 1)
+            .unwrap();
+        assert_eq!(view_base, base);
+        assert_eq!(view.size, PAGE_SIZE);
+        assert!(task.process.section_views.read().is_empty());
+
+        let overflowing_base = usize::MAX - PAGE_SIZE + 1;
+        task.process.section_views.write().insert(
+            overflowing_base,
+            WindowsSectionView {
+                size: PAGE_SIZE,
+                section_offset: 0,
+                section: None,
+            },
+        );
+        assert!(
+            task.remove_section_view_for_address(overflowing_base)
+                .is_none()
+        );
+        assert_eq!(task.process.section_views.read().len(), 1);
+    }
+
+    #[test]
+    fn csr_section_view_uses_existing_backing_and_rejects_unmap_flags() {
+        let task = test_task();
+        let shared_section = task
+            .process
+            .object_manager
+            .resolve_section(WINDOWS_SHARED_SECTION_OBJECT)
+            .unwrap();
+        let SectionBacking::CsrSharedSection { base: shared_base } = shared_section.backing else {
+            panic!("the test task must have CSR shared backing");
+        };
+        let name = wide(WINDOWS_SHARED_SECTION_OBJECT);
+        let unicode = unicode(&name);
+        let attrs = object_attributes(&unicode);
+        let mut handle = Handle::default();
+        assert_eq!(
+            task.sys_nt_open_section(
+                mut_ptr(&mut handle),
+                SectionAccess::ALL_ACCESS.bits(),
+                Some(const_ptr(&attrs)),
+            ),
+            NtStatus::SUCCESS
+        );
+        let mut base = 0;
+        let mut view_size = PAGE_SIZE + 1;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_READWRITE.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(base, shared_base);
+        assert_eq!(view_size, PAGE_SIZE + 1);
+        assert_eq!(task.process.section_views.read()[&base].size, 2 * PAGE_SIZE);
+        let mapped = MutPtr::<TestPlatform, u32>::from_usize(base);
+        assert_eq!(mapped.write_at_offset(0, 0xfeed_cafe), Some(()));
+
+        for bit in 0..u32::BITS {
+            assert_eq!(
+                task.sys_nt_unmap_view_of_section_ex(ProcessHandle::CURRENT, base, 1 << bit),
+                NtStatus::INVALID_PARAMETER,
+            );
+            assert!(task.process.section_views.read().contains_key(&base));
+        }
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section_ex(ProcessHandle::CURRENT, base, 0),
+            NtStatus::SUCCESS
+        );
+        assert!(!task.process.section_views.read().contains_key(&base));
+        assert_eq!(mapped.read_at_offset(0), Some(0xfeed_cafe));
+    }
+
+    #[test]
+    fn pagefile_create_validates_attributes_before_maximum_size() {
+        let task = test_task();
+        let sentinel = Handle::from_raw(0x3333_4444);
+        for (attributes, expected) in [
+            (0, NtStatus::INVALID_PARAMETER),
+            (
+                SectionAllocationAttributes::SEC_FILE.bits(),
+                NtStatus::INVALID_PARAMETER,
+            ),
+            (
+                SectionAllocationAttributes::SEC_IMAGE.bits(),
+                NtStatus::INVALID_PARAMETER,
+            ),
+            (u32::MAX, NtStatus::INVALID_PARAMETER),
+            (
+                SectionAllocationAttributes::SEC_COMMIT.bits(),
+                NtStatus::INVALID_PARAMETER_4,
+            ),
+            (
+                SectionAllocationAttributes::SEC_RESERVE.bits(),
+                NtStatus::INVALID_PARAMETER_4,
+            ),
+            (
+                (SectionAllocationAttributes::SEC_COMMIT
+                    | SectionAllocationAttributes::SEC_RESERVE)
+                    .bits(),
+                NtStatus::INVALID_PARAMETER_4,
+            ),
+        ] {
+            let mut handle = sentinel;
+            assert_eq!(
+                task.sys_nt_create_section(
+                    mut_ptr(&mut handle),
+                    SectionAccess::ALL_ACCESS.bits(),
+                    None,
+                    None,
+                    PageProtection::PAGE_READWRITE.bits(),
+                    attributes,
+                    Handle::default(),
+                ),
+                expected,
+                "attributes={attributes:#x}",
+            );
+            assert_eq!(handle, sentinel);
+        }
+    }
+
+    #[test]
     fn section_apis_handle_page_targets_invalid() {
         let task = test_task();
         let size = i64::try_from(PAGE_SIZE).unwrap();
@@ -1393,7 +1550,7 @@ mod tests {
             task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
             NtStatus::SUCCESS
         );
-        task.close_section_handle(handle);
+        task.close_typed_handle::<SectionSubsystem<crate::tests::TestPlatform>>(handle);
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -2178,7 +2335,7 @@ mod tests {
                 0x001f_0003,
                 Some(const_ptr(&attrs)),
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );

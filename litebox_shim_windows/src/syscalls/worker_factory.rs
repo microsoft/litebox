@@ -90,7 +90,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry
 {
 }
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     for WorkerFactorySubsystem<Platform>
 {
     fn normalize_desired_access(desired_access: u32) -> u32 {
@@ -181,26 +181,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         }
     }
 
-    fn insert_worker_factory_handle(
-        &self,
-        factory: Arc<WorkerFactoryObject<Platform>>,
-        granted_access: WorkerFactoryAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<WorkerFactorySubsystem<Platform>>(
-            WorkerFactoryHandleObject { factory },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
-    pub(crate) fn close_worker_factory_handle(&self, handle: Handle) {
-        self.close_typed_handle::<WorkerFactorySubsystem<Platform>>(handle, drop);
-    }
-
-    pub(crate) fn close_worker_factory(worker_factory: WorkerFactoryHandleObject<Platform>) {
-        drop(worker_factory);
-    }
-
     pub(crate) fn sys_nt_create_worker_factory(
         &self,
         params: WorkerFactoryCreateParameters<Platform>,
@@ -239,18 +219,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             _stack_commit: params.stack_commit,
         });
         let granted_access = WorkerFactoryAccess::from_desired_access(params.desired_access);
-        let Ok(handle) = self.insert_worker_factory_handle(factory, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if params
-            .worker_factory_handle
-            .write_at_offset(0, handle)
-            .is_none()
-        {
-            self.close_worker_factory_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        match self.write_new_typed_handle::<WorkerFactorySubsystem<Platform>>(
+            params.worker_factory_handle,
+            WorkerFactoryHandleObject { factory },
+            granted_access.bits(),
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_set_information_worker_factory(
@@ -458,7 +434,7 @@ mod tests {
         let value = 1;
         let mut event = Handle::default();
         assert_eq!(
-            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, 0),
+            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, false),
             NtStatus::SUCCESS
         );
         assert_eq!(
@@ -583,7 +559,7 @@ mod tests {
         let mut pending_worker_count = 1;
         let mut event = Handle::default();
         assert_eq!(
-            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, 0),
+            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, false),
             NtStatus::SUCCESS
         );
         assert_eq!(
@@ -841,7 +817,7 @@ mod tests {
         assert_eq!(status, NtStatus::SUCCESS.as_raw());
         let mut shim_event = Handle::default();
         assert_eq!(
-            task.sys_nt_create_event(mut_ptr(&mut shim_event), EVENT_ALL_ACCESS, None, 0, 0),
+            task.sys_nt_create_event(mut_ptr(&mut shim_event), EVENT_ALL_ACCESS, None, 0, false),
             NtStatus::SUCCESS
         );
 
@@ -1016,7 +992,7 @@ mod tests {
         assert_eq!(status, NtStatus::SUCCESS.as_raw());
         let mut shim_event = Handle::default();
         assert_eq!(
-            task.sys_nt_create_event(mut_ptr(&mut shim_event), EVENT_ALL_ACCESS, None, 0, 0),
+            task.sys_nt_create_event(mut_ptr(&mut shim_event), EVENT_ALL_ACCESS, None, 0, false),
             NtStatus::SUCCESS
         );
 

@@ -17,7 +17,7 @@ use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
+use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
 use crate::{
     ConstPtr, MutPtr, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
@@ -60,7 +60,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for IoCompletionSubsystem
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for IoCompletionHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
     for IoCompletionSubsystem<Platform>
 {
     fn normalize_desired_access(desired_access: u32) -> u32 {
@@ -69,7 +69,7 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
 }
 
 pub(crate) struct IoCompletionHandleObject<Platform: crate::ShimPlatform> {
-    port: Arc<IoCompletionObject<Platform>>,
+    pub(super) port: Arc<IoCompletionObject<Platform>>,
 }
 
 pub(crate) struct IoCompletionObject<Platform: crate::ShimPlatform> {
@@ -253,26 +253,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         worker.port = Some(Arc::downgrade(port));
     }
 
-    fn insert_io_completion_handle(
-        &self,
-        port: Arc<IoCompletionObject<Platform>>,
-        granted_access: IoCompletionAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<IoCompletionSubsystem<Platform>>(
-            IoCompletionHandleObject { port },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
-    pub(crate) fn close_io_completion_handle(&self, handle: Handle) {
-        self.close_typed_handle::<IoCompletionSubsystem<Platform>>(handle, drop);
-    }
-
-    pub(crate) fn close_io_completion(io_completion: IoCompletionHandleObject<Platform>) {
-        drop(io_completion);
-    }
-
     pub(crate) fn sys_nt_create_io_completion(
         &self,
         io_completion_handle: MutPtr<Platform, Handle>,
@@ -280,73 +260,17 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
         number_of_concurrent_threads: u32,
     ) -> NtStatus {
-        if let Err(status) =
-            probe_guest_output_preserving_value::<Platform, _>(io_completion_handle)
-        {
-            return status;
-        }
-        let (object_attributes, io_completion_name) =
-            match self.read_dispatcher_object_attributes(object_attributes, false) {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-        let granted_access = IoCompletionAccess::from_desired_access(desired_access);
-        if let Some(io_completion_name) = io_completion_name {
-            let port = Arc::new(IoCompletionObject::new(number_of_concurrent_threads));
-            return self.process.object_manager.create_io_completion(
-                &io_completion_name,
-                &port,
-                |port| {
-                    let Some(object_attributes) = object_attributes else {
-                        return NtStatus::INVALID_PARAMETER;
-                    };
-                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                        .contains(ObjectAttributesFlags::OPENIF)
-                    {
-                        return NtStatus::OBJECT_NAME_COLLISION;
-                    }
-                    self.publish_io_completion_handle(
-                        io_completion_handle,
-                        port,
-                        granted_access,
-                        NtStatus::OBJECT_NAME_EXISTS,
-                    )
-                },
-                || {
-                    self.publish_io_completion_handle(
-                        io_completion_handle,
-                        Arc::clone(&port),
-                        granted_access,
-                        NtStatus::SUCCESS,
-                    )
-                },
-            );
-        }
-
-        let port = Arc::new(IoCompletionObject::new(number_of_concurrent_threads));
-        self.publish_io_completion_handle(
+        self.create_named_dispatcher_object(
             io_completion_handle,
-            port,
-            granted_access,
-            NtStatus::SUCCESS,
+            desired_access,
+            object_attributes,
+            || {
+                Ok(Arc::new(IoCompletionObject::new(
+                    number_of_concurrent_threads,
+                )))
+            },
+            |_| {},
         )
-    }
-
-    fn publish_io_completion_handle(
-        &self,
-        io_completion_handle: MutPtr<Platform, Handle>,
-        port: Arc<IoCompletionObject<Platform>>,
-        granted_access: IoCompletionAccess,
-        success_status: NtStatus,
-    ) -> NtStatus {
-        let Ok(handle) = self.insert_io_completion_handle(port, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if io_completion_handle.write_at_offset(0, handle).is_none() {
-            self.close_io_completion_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        success_status
     }
 
     pub(crate) fn sys_nt_open_io_completion(
@@ -355,30 +279,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         desired_access: u32,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
     ) -> NtStatus {
-        if let Err(status) =
-            probe_guest_output_preserving_value::<Platform, _>(io_completion_handle)
-        {
-            return status;
-        }
-        let io_completion_name =
-            match self.read_dispatcher_object_attributes(object_attributes, true) {
-                Ok((_, Some(name))) => name,
-                Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
-                Err(status) => return status,
-            };
-        let port = match self
-            .process
-            .object_manager
-            .resolve_io_completion(&io_completion_name)
-        {
-            Ok(port) => port,
-            Err(status) => return status,
-        };
-        self.publish_io_completion_handle(
+        self.open_named_dispatcher_object::<IoCompletionObject<Platform>>(
             io_completion_handle,
-            port,
-            IoCompletionAccess::from_desired_access(desired_access),
-            NtStatus::SUCCESS,
+            desired_access,
+            object_attributes,
         )
     }
 
@@ -435,12 +339,9 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         {
             return status;
         }
-        let timeout = match timeout {
-            Some(timeout) => match timeout.read_at_offset(0) {
-                Some(timeout) => Some(self.wait_timeout_duration(timeout)),
-                None => return NtStatus::ACCESS_VIOLATION,
-            },
-            None => None,
+        let timeout = match self.read_optional_wait_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(status) => return status,
         };
         let entry = match self.typed_handle_entry_with_access::<IoCompletionSubsystem<Platform>>(
             io_completion_handle,

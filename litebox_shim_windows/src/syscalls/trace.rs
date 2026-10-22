@@ -520,7 +520,7 @@ mod tests {
                 EventAccess::MODIFY_STATE.bits(),
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );

@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
+use litebox::platform::RawPointerProvider;
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
@@ -72,7 +72,9 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for TimerSubsystem<Platfo
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for TimerHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for TimerSubsystem<Platform> {
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
+    for TimerSubsystem<Platform>
+{
     fn normalize_desired_access(desired_access: u32) -> u32 {
         TimerAccess::from_desired_access(desired_access).bits()
     }
@@ -124,26 +126,6 @@ fn validate_timer2_after_output<Platform: RawPointerProvider>(
 }
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    fn insert_timer_handle(
-        &self,
-        timer: Arc<TimerObject<Platform>>,
-        granted_access: TimerAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<TimerSubsystem<Platform>>(
-            TimerHandleObject { _timer: timer },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
-    pub(crate) fn close_timer_handle(&self, handle: Handle) {
-        self.close_typed_handle::<TimerSubsystem<Platform>>(handle, drop);
-    }
-
-    pub(crate) fn close_timer(timer: TimerHandleObject<Platform>) {
-        drop(timer);
-    }
-
     pub(crate) fn sys_nt_create_timer2(&self, params: TimerCreateParameters<Platform>) -> NtStatus {
         if let Err(status) = validate_timer2_before_output(&params) {
             return status;
@@ -163,14 +145,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             _not_send_without_platform: PhantomData,
         });
         let granted_access = TimerAccess::from_desired_access(params.desired_access);
-        let Ok(handle) = self.insert_timer_handle(timer, granted_access) else {
-            return NtStatus::QUOTA_EXCEEDED;
-        };
-        if params.timer_handle.write_at_offset(0, handle).is_none() {
-            self.close_timer_handle(handle);
-            return NtStatus::ACCESS_VIOLATION;
+        match self.write_new_typed_handle::<TimerSubsystem<Platform>>(
+            params.timer_handle,
+            TimerHandleObject { _timer: timer },
+            granted_access.bits(),
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
         }
-        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_set_timer2(
@@ -186,19 +168,13 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         ) {
             return status;
         }
-        let _due_time = match due_time {
-            Some(due_time) => match due_time.read_at_offset(0) {
-                Some(due_time) => Some(due_time),
-                None => return NtStatus::ACCESS_VIOLATION,
-            },
-            None => None,
+        let _due_time = match crate::read_optional_guest_value::<Platform, _>(due_time) {
+            Ok(due_time) => due_time,
+            Err(status) => return status,
         };
-        let _period = match period {
-            Some(period) => match period.read_at_offset(0) {
-                Some(period) => Some(period),
-                None => return NtStatus::ACCESS_VIOLATION,
-            },
-            None => None,
+        let _period = match crate::read_optional_guest_value::<Platform, _>(period) {
+            Ok(period) => period,
+            Err(status) => return status,
         };
 
         // TODO: parse T2_SET_PARAMETERS and model callbacks/tolerable delay when the timer

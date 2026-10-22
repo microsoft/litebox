@@ -88,11 +88,7 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
     ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let mut entries = file.read_directory()?;
         if self.namespace.hides_registry_entry(context, directory_path) {
-            entries.retain(|entry| {
-                !entry
-                    .name
-                    .eq_ignore_ascii_case(REGISTRY_ROOT.trim_start_matches('/'))
-            });
+            entries.retain(|entry| !is_registry_root_name(&entry.name));
         }
         Ok(entries)
     }
@@ -141,9 +137,11 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
 fn is_registry_path(path: &str) -> bool {
     path.split('/')
         .find(|component| !component.is_empty())
-        .is_some_and(|component| {
-            component.eq_ignore_ascii_case(REGISTRY_ROOT.trim_start_matches('/'))
-        })
+        .is_some_and(is_registry_root_name)
+}
+
+fn is_registry_root_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(REGISTRY_ROOT.trim_start_matches('/'))
 }
 
 #[cfg(test)]

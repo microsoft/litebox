@@ -126,78 +126,97 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
     };
 
     match io_control_code {
-        KsecIoControlCode::RandomFillBuffer => {
-            let output_length = output_buffer_length as usize;
-            let Some(output_buffer) = output_buffer.filter(|_| output_length != 0) else {
-                return IoStatusBlock::failure(NtStatus::INVALID_PARAMETER);
-            };
-            let output_address = output_buffer.as_usize();
-            if output_address.checked_add(output_length).is_none() {
-                return IoStatusBlock::failure(NtStatus::ACCESS_VIOLATION);
-            }
-            if let Err(status) = probe_guest_output_buffer::<Platform>(output_buffer, output_length)
-            {
-                return IoStatusBlock::failure(status);
-            }
+        KsecIoControlCode::RandomFillBuffer => handle_random_fill_buffer::<Platform>(
+            litebox,
+            output_buffer,
+            output_buffer_length as usize,
+        ),
+        KsecIoControlCode::CngRequest => handle_cng_request::<Platform>(
+            input_buffer,
+            input_buffer_length,
+            output_buffer,
+            output_buffer_length,
+            validate_cng_event,
+        ),
+    }
+}
 
-            let mut random = [0; KSEC_RANDOM_CHUNK_SIZE];
-            let mut offset = 0;
-            while offset < output_length {
-                let chunk_length = (output_length - offset).min(random.len());
-                if litebox.fill_random(&mut random[..chunk_length]).is_err() {
-                    return IoStatusBlock::failure(NtStatus::UNSUCCESSFUL);
-                }
-                if write_slice::<Platform, u8>(output_address + offset, &random[..chunk_length])
-                    .is_none()
-                {
-                    return IoStatusBlock::failure(NtStatus::ACCESS_VIOLATION);
-                }
-                offset += chunk_length;
-            }
-            IoStatusBlock::success(output_length)
-        }
-        KsecIoControlCode::CngRequest => {
-            let input_length = input_buffer_length as usize;
-            if input_length < size_of::<KsecCngRequestHeader>() {
-                return IoStatusBlock::failure(NtStatus::INFO_LENGTH_MISMATCH);
-            }
-            let Some(input_buffer) = input_buffer else {
-                return IoStatusBlock::failure(NtStatus::ACCESS_VIOLATION);
-            };
-            let header =
-                ConstPtr::<Platform, KsecCngRequestHeader>::from_usize(input_buffer.as_usize());
-            let Some(header) = header.read_at_offset(0) else {
-                return IoStatusBlock::failure(NtStatus::ACCESS_VIOLATION);
-            };
-            if header.magic != KSEC_CNG_REQUEST_MAGIC {
-                return IoStatusBlock::failure(NtStatus::INVALID_DEVICE_REQUEST);
-            }
-            let Ok(operation) = KsecCngOperation::try_from(header.operation) else {
-                litebox_util_log::debug!(
-                    operation:% = format_args!("{:#x}", header.operation),
-                    input_buffer_length,
-                    output_buffer_length;
-                    "Unsupported KsecDD CNG operation"
-                );
-                return IoStatusBlock::failure(NtStatus::NOT_SUPPORTED);
-            };
+fn handle_random_fill_buffer<Platform: crate::ShimPlatform>(
+    litebox: &litebox::LiteBox<Platform>,
+    output_buffer: Option<MutPtr<Platform, u8>>,
+    output_length: usize,
+) -> IoStatusBlock {
+    let Some(output_buffer) = output_buffer.filter(|_| output_length != 0) else {
+        return IoStatusBlock::failure(NtStatus::INVALID_PARAMETER);
+    };
+    let output_address = output_buffer.as_usize();
+    if output_address.checked_add(output_length).is_none() {
+        return IoStatusBlock::failure(NtStatus::ACCESS_VIOLATION);
+    }
+    if let Err(status) = probe_guest_output_buffer::<Platform>(output_buffer, output_length) {
+        return IoStatusBlock::failure(status);
+    }
 
-            match operation {
-                KsecCngOperation::Initialize => handle_cng_initialize::<Platform>(
-                    input_buffer,
-                    input_length,
-                    output_buffer,
-                    output_buffer_length as usize,
-                    validate_cng_event,
-                ),
-                KsecCngOperation::ResolveProviders => handle_cng_resolve_providers::<Platform>(
-                    input_buffer,
-                    input_length,
-                    output_buffer,
-                    output_buffer_length as usize,
-                ),
-            }
+    let mut random = [0; KSEC_RANDOM_CHUNK_SIZE];
+    let mut offset = 0;
+    while offset < output_length {
+        let chunk_length = (output_length - offset).min(random.len());
+        if litebox.fill_random(&mut random[..chunk_length]).is_err() {
+            return IoStatusBlock::failure(NtStatus::UNSUCCESSFUL);
         }
+        if write_slice::<Platform, u8>(output_address + offset, &random[..chunk_length]).is_none() {
+            return IoStatusBlock::failure(NtStatus::ACCESS_VIOLATION);
+        }
+        offset += chunk_length;
+    }
+    IoStatusBlock::success(output_length)
+}
+
+fn handle_cng_request<Platform: crate::ShimPlatform>(
+    input_buffer: Option<ConstPtr<Platform, u8>>,
+    input_buffer_length: u32,
+    output_buffer: Option<MutPtr<Platform, u8>>,
+    output_buffer_length: u32,
+    validate_event: impl FnOnce(Handle) -> Result<(), NtStatus>,
+) -> IoStatusBlock {
+    let input_length = input_buffer_length as usize;
+    if input_length < size_of::<KsecCngRequestHeader>() {
+        return IoStatusBlock::failure(NtStatus::INFO_LENGTH_MISMATCH);
+    }
+    let Some(input_buffer) = input_buffer else {
+        return IoStatusBlock::failure(NtStatus::ACCESS_VIOLATION);
+    };
+    let header = ConstPtr::<Platform, KsecCngRequestHeader>::from_usize(input_buffer.as_usize());
+    let Some(header) = header.read_at_offset(0) else {
+        return IoStatusBlock::failure(NtStatus::ACCESS_VIOLATION);
+    };
+    if header.magic != KSEC_CNG_REQUEST_MAGIC {
+        return IoStatusBlock::failure(NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let Ok(operation) = KsecCngOperation::try_from(header.operation) else {
+        litebox_util_log::debug!(
+            operation:% = format_args!("{:#x}", header.operation),
+            input_buffer_length,
+            output_buffer_length;
+            "Unsupported KsecDD CNG operation"
+        );
+        return IoStatusBlock::failure(NtStatus::NOT_SUPPORTED);
+    };
+
+    match operation {
+        KsecCngOperation::Initialize => handle_cng_initialize::<Platform>(
+            input_buffer,
+            input_length,
+            output_buffer,
+            output_buffer_length as usize,
+            validate_event,
+        ),
+        KsecCngOperation::ResolveProviders => handle_cng_resolve_providers::<Platform>(
+            input_buffer,
+            input_length,
+            output_buffer,
+            output_buffer_length as usize,
+        ),
     }
 }
 

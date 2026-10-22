@@ -16,7 +16,7 @@ use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ClientId, ObjectAttributes, ObjectAttributesFlags};
+use crate::nt_types::{AccessMask, ClientId, ObjectAttributes};
 use crate::syscalls::thread::ThreadObject;
 use crate::syscalls::{Handle, WaitAcquireResult};
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
@@ -58,9 +58,19 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for MutantSubsystem<Platf
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for MutantHandleObject<Platform> {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for MutantSubsystem<Platform> {
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem<Platform>
+    for MutantSubsystem<Platform>
+{
     fn normalize_desired_access(desired_access: u32) -> u32 {
         MutantAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn waitable_object(
+        entry: &Self::Entry,
+    ) -> Option<crate::syscalls::wait::WaitableObject<Platform>> {
+        Some(crate::syscalls::wait::WaitableObject::Mutant(
+            alloc::sync::Arc::clone(&entry.mutant),
+        ))
     }
 }
 
@@ -222,76 +232,29 @@ struct MutantOwnerInformation {
 }
 
 impl<Platform: crate::ShimPlatform> Task<Platform> {
-    fn insert_mutant_handle(
-        &self,
-        mutant: Arc<MutantObject<Platform>>,
-        granted_access: MutantAccess,
-    ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<MutantSubsystem<Platform>>(
-            MutantHandleObject { mutant },
-            granted_access.bits(),
-            drop,
-        )
-    }
-
-    pub(crate) fn close_mutant(mutant: MutantHandleObject<Platform>) {
-        drop(mutant);
-    }
-
     pub(crate) fn sys_nt_create_mutant(
         &self,
         mutant_handle: MutPtr<Platform, Handle>,
         desired_access: u32,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
-        initial_owner: u8,
+        initial_owner: bool,
     ) -> NtStatus {
-        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(mutant_handle) {
-            return status;
-        }
-        let (object_attributes, mutant_name) =
-            match self.read_dispatcher_object_attributes(object_attributes, false) {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-        let granted_access = MutantAccess::from_desired_access(desired_access);
-
-        if let Some(mutant_name) = mutant_name {
-            litebox_util_log::debug!(mutant_name:% = mutant_name; "Creating named mutant");
-            let mutant = Arc::new(MutantObject::new(
-                initial_owner != 0,
-                self.thread_object.thread_id(),
-            ));
-            return self.process.object_manager.create_mutant(
-                &mutant_name,
-                &mutant,
-                |mutant| {
-                    let Some(object_attributes) = object_attributes else {
-                        return NtStatus::INVALID_PARAMETER;
-                    };
-                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                        .contains(ObjectAttributesFlags::OPENIF)
-                    {
-                        return NtStatus::OBJECT_NAME_COLLISION;
-                    }
-                    self.write_new_mutant_handle(mutant_handle, mutant, granted_access)
-                        .map_or_else(|status| status, |()| NtStatus::OBJECT_NAME_EXISTS)
-                },
-                || {
-                    self.write_created_mutant_handle(
-                        mutant_handle,
-                        Arc::clone(&mutant),
-                        granted_access,
-                        initial_owner != 0,
-                    )
-                },
-            );
-        }
-
-        let mutant = Arc::new(MutantObject::new(
-            initial_owner != 0,
-            self.thread_object.thread_id(),
-        ));
-        self.write_created_mutant_handle(mutant_handle, mutant, granted_access, initial_owner != 0)
+        self.create_named_dispatcher_object(
+            mutant_handle,
+            desired_access,
+            object_attributes,
+            || {
+                Ok(Arc::new(MutantObject::new(
+                    initial_owner,
+                    self.thread_object.thread_id(),
+                )))
+            },
+            |mutant| {
+                if initial_owner {
+                    self.thread_object.register_owned_mutant(mutant);
+                }
+            },
+        )
     }
 
     pub(crate) fn sys_nt_open_mutant(
@@ -300,24 +263,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         desired_access: u32,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
     ) -> NtStatus {
-        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(mutant_handle) {
-            return status;
-        }
-        let mutant_name = match self.read_dispatcher_object_attributes(object_attributes, true) {
-            Ok((_, Some(mutant_name))) => mutant_name,
-            Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
-            Err(status) => return status,
-        };
-        let mutant = match self.process.object_manager.resolve_mutant(&mutant_name) {
-            Ok(mutant) => mutant,
-            Err(status) => return status,
-        };
-        self.write_new_mutant_handle(
+        self.open_named_dispatcher_object::<MutantObject<Platform>>(
             mutant_handle,
-            mutant,
-            MutantAccess::from_desired_access(desired_access),
+            desired_access,
+            object_attributes,
         )
-        .map_or_else(|status| status, |()| NtStatus::SUCCESS)
     }
 
     pub(crate) fn sys_nt_release_mutant(
@@ -411,40 +361,6 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         }
         NtStatus::SUCCESS
     }
-
-    fn write_created_mutant_handle(
-        &self,
-        output: MutPtr<Platform, Handle>,
-        mutant: Arc<MutantObject<Platform>>,
-        granted_access: MutantAccess,
-        initial_owner: bool,
-    ) -> NtStatus {
-        match self.write_new_mutant_handle(output, Arc::clone(&mutant), granted_access) {
-            Ok(()) => {
-                if initial_owner {
-                    self.thread_object.register_owned_mutant(&mutant);
-                }
-                NtStatus::SUCCESS
-            }
-            Err(status) => status,
-        }
-    }
-
-    fn write_new_mutant_handle(
-        &self,
-        output: MutPtr<Platform, Handle>,
-        mutant: Arc<MutantObject<Platform>>,
-        granted_access: MutantAccess,
-    ) -> Result<(), NtStatus> {
-        let handle = self
-            .insert_mutant_handle(mutant, granted_access)
-            .map_err(|_| NtStatus::QUOTA_EXCEEDED)?;
-        if output.write_at_offset(0, handle).is_none() {
-            self.close_typed_handle::<MutantSubsystem<Platform>>(handle, drop);
-            return Err(NtStatus::ACCESS_VIOLATION);
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -464,7 +380,7 @@ mod tests {
             let waiter = owner.clone_for_test().expect("process is live");
             let mut handle = Handle::default();
             assert_eq!(
-                owner.sys_nt_create_mutant(mut_ptr(&mut handle), MUTANT_ALL_ACCESS, None, 1),
+                owner.sys_nt_create_mutant(mut_ptr(&mut handle), MUTANT_ALL_ACCESS, None, true),
                 NtStatus::SUCCESS
             );
 
@@ -492,5 +408,354 @@ mod tests {
             );
             thread.join().unwrap();
         });
+    }
+
+    #[test]
+    fn named_create_registers_initial_owner_and_open_shares_the_mutant() {
+        use crate::nt_types::ObjectAttributesFlags;
+        use crate::tests::{object_attributes, unicode_string, utf16_units};
+
+        run_with_test_platform_pointers(|| {
+            let owner = test_task();
+            let waiter = owner.clone_for_test().expect("process is live");
+            let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxNamedMutant");
+            let name = unicode_string(&name_units);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
+            let openif_attrs = ObjectAttributes {
+                attributes: (ObjectAttributesFlags::CASE_INSENSITIVE
+                    | ObjectAttributesFlags::OPENIF)
+                    .bits(),
+                ..attrs
+            };
+
+            let mut created = Handle::default();
+            assert_eq!(
+                owner.sys_nt_create_mutant(
+                    mut_ptr(&mut created),
+                    MUTANT_ALL_ACCESS,
+                    Some(const_ptr(&attrs)),
+                    true,
+                ),
+                NtStatus::SUCCESS
+            );
+            let mut collision = Handle::default();
+            assert_eq!(
+                waiter.sys_nt_create_mutant(
+                    mut_ptr(&mut collision),
+                    MUTANT_ALL_ACCESS,
+                    Some(const_ptr(&attrs)),
+                    true,
+                ),
+                NtStatus::OBJECT_NAME_COLLISION
+            );
+            assert_eq!(
+                waiter.sys_nt_create_mutant(
+                    mut_ptr(&mut collision),
+                    MUTANT_ALL_ACCESS,
+                    Some(const_ptr(&openif_attrs)),
+                    true,
+                ),
+                NtStatus::OBJECT_NAME_EXISTS
+            );
+            assert_eq!(waiter.sys_nt_close(collision), NtStatus::SUCCESS);
+            let mut opened = Handle::default();
+            assert_eq!(
+                waiter.sys_nt_open_mutant(
+                    mut_ptr(&mut opened),
+                    MUTANT_ALL_ACCESS,
+                    Some(const_ptr(&attrs)),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let timeout = -10_000_000i64;
+                let status =
+                    waiter.sys_nt_wait_for_single_object(opened, false, Some(const_ptr(&timeout)));
+                result_tx.send(status).unwrap();
+                assert_eq!(
+                    waiter.sys_nt_release_mutant(opened, None),
+                    NtStatus::SUCCESS
+                );
+            });
+
+            std::thread::sleep(Duration::from_millis(20));
+            owner.complete_current_thread();
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                NtStatus::ABANDONED_WAIT_0
+            );
+            thread.join().unwrap();
+        });
+    }
+
+    fn named_attributes(
+        name: &crate::nt_types::UnicodeString,
+        open_if: bool,
+    ) -> crate::nt_types::ObjectAttributes {
+        use crate::nt_types::ObjectAttributesFlags;
+
+        let mut flags = ObjectAttributesFlags::CASE_INSENSITIVE;
+        if open_if {
+            flags |= ObjectAttributesFlags::OPENIF;
+        }
+        crate::tests::object_attributes(name, flags.bits())
+    }
+
+    /// Statuses observed for create/open/release calls that reuse a name; compared against the
+    /// host by the `host_fidelity` tests.
+    #[derive(Debug, Eq, PartialEq)]
+    struct OpenIfOwnershipStatuses {
+        create: i32,
+        openif_create: i32,
+        release_reopened: i32,
+    }
+
+    fn shim_openif_ownership(name: &crate::nt_types::UnicodeString) -> OpenIfOwnershipStatuses {
+        let task = test_task();
+        let attributes = named_attributes(name, true);
+        let mut created = Handle::default();
+        let mut reopened = Handle::default();
+        let create = task.sys_nt_create_mutant(
+            mut_ptr(&mut created),
+            MUTANT_ALL_ACCESS,
+            Some(const_ptr(&attributes)),
+            false,
+        );
+        let openif_create = task.sys_nt_create_mutant(
+            mut_ptr(&mut reopened),
+            MUTANT_ALL_ACCESS,
+            Some(const_ptr(&attributes)),
+            true,
+        );
+        let release_reopened = task.sys_nt_release_mutant(reopened, None);
+        OpenIfOwnershipStatuses {
+            create: create.as_raw(),
+            openif_create: openif_create.as_raw(),
+            release_reopened: release_reopened.as_raw(),
+        }
+    }
+
+    #[test]
+    fn openif_create_of_existing_mutant_does_not_take_initial_ownership() {
+        let name_units = crate::tests::utf16_units("\\BaseNamedObjects\\LiteBoxOpenIfMutant");
+        let name = crate::tests::unicode_string(&name_units);
+        assert_eq!(
+            shim_openif_ownership(&name),
+            OpenIfOwnershipStatuses {
+                create: NtStatus::SUCCESS.as_raw(),
+                openif_create: NtStatus::OBJECT_NAME_EXISTS.as_raw(),
+                release_reopened: NtStatus::MUTANT_NOT_OWNED.as_raw(),
+            }
+        );
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct TypeMismatchStatuses {
+        open: i32,
+        create: i32,
+        openif_create: i32,
+        output_untouched: bool,
+    }
+
+    fn shim_mutant_on_event_name(name: &crate::nt_types::UnicodeString) -> TypeMismatchStatuses {
+        let task = test_task();
+        let attributes = named_attributes(name, false);
+        let openif_attributes = named_attributes(name, true);
+        let mut event = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_event(
+                mut_ptr(&mut event),
+                MUTANT_ALL_ACCESS,
+                Some(const_ptr(&attributes)),
+                0,
+                false,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let sentinel = Handle::from_raw(0x1234);
+        let mut output = sentinel;
+        let open = task.sys_nt_open_mutant(
+            mut_ptr(&mut output),
+            MUTANT_ALL_ACCESS,
+            Some(const_ptr(&attributes)),
+        );
+        let create = task.sys_nt_create_mutant(
+            mut_ptr(&mut output),
+            MUTANT_ALL_ACCESS,
+            Some(const_ptr(&attributes)),
+            false,
+        );
+        let openif_create = task.sys_nt_create_mutant(
+            mut_ptr(&mut output),
+            MUTANT_ALL_ACCESS,
+            Some(const_ptr(&openif_attributes)),
+            false,
+        );
+        TypeMismatchStatuses {
+            open: open.as_raw(),
+            create: create.as_raw(),
+            openif_create: openif_create.as_raw(),
+            output_untouched: output == sentinel,
+        }
+    }
+
+    #[test]
+    fn mutant_create_and_open_reject_a_name_owned_by_another_type() {
+        let name_units = crate::tests::utf16_units("\\BaseNamedObjects\\LiteBoxEventNotMutant");
+        let name = crate::tests::unicode_string(&name_units);
+        assert_eq!(
+            shim_mutant_on_event_name(&name),
+            TypeMismatchStatuses {
+                open: NtStatus::OBJECT_TYPE_MISMATCH.as_raw(),
+                create: NtStatus::OBJECT_TYPE_MISMATCH.as_raw(),
+                openif_create: NtStatus::OBJECT_TYPE_MISMATCH.as_raw(),
+                output_untouched: true,
+            }
+        );
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    mod host_fidelity {
+        use core::ffi::c_void;
+
+        use super::*;
+        use crate::nt_types::{ObjectAttributes, UnicodeString};
+
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtCreateMutant(
+                handle: *mut *mut c_void,
+                access: u32,
+                attributes: *const ObjectAttributes,
+                initial_owner: u8,
+            ) -> i32;
+            fn NtOpenMutant(
+                handle: *mut *mut c_void,
+                access: u32,
+                attributes: *const ObjectAttributes,
+            ) -> i32;
+            fn NtReleaseMutant(handle: *mut c_void, previous_count: *mut i32) -> i32;
+            fn NtCreateEvent(
+                handle: *mut *mut c_void,
+                access: u32,
+                attributes: *const ObjectAttributes,
+                event_type: u32,
+                initial_state: u8,
+            ) -> i32;
+            fn NtClose(handle: *mut c_void) -> i32;
+        }
+
+        fn close_host_handle(handle: *mut c_void) {
+            if !handle.is_null() {
+                // SAFETY: The handle was returned by a successful host ntdll call in this test.
+                assert_eq!(unsafe { NtClose(handle) }, NtStatus::SUCCESS.as_raw());
+            }
+        }
+
+        fn unique_name(prefix: &str, unique: *const u8) -> alloc::vec::Vec<u16> {
+            crate::tests::utf16_units(&alloc::format!(r"\BaseNamedObjects\{prefix}{unique:p}"))
+        }
+
+        fn host_openif_ownership(name: &UnicodeString) -> OpenIfOwnershipStatuses {
+            let attributes = named_attributes(name, true);
+            let mut created = core::ptr::null_mut();
+            let mut reopened = core::ptr::null_mut();
+            // SAFETY: Pointers reference live stack locals and `attributes` names a live
+            // UnicodeString for the duration of the calls; `reopened` is only released after a
+            // successful open.
+            let statuses = unsafe {
+                let create = NtCreateMutant(
+                    &raw mut created,
+                    MUTANT_ALL_ACCESS,
+                    &raw const attributes,
+                    0,
+                );
+                let openif_create = NtCreateMutant(
+                    &raw mut reopened,
+                    MUTANT_ALL_ACCESS,
+                    &raw const attributes,
+                    1,
+                );
+                OpenIfOwnershipStatuses {
+                    create,
+                    openif_create,
+                    release_reopened: NtReleaseMutant(reopened, core::ptr::null_mut()),
+                }
+            };
+            close_host_handle(reopened);
+            close_host_handle(created);
+            statuses
+        }
+
+        fn host_mutant_on_event_name(name: &UnicodeString) -> TypeMismatchStatuses {
+            let attributes = named_attributes(name, false);
+            let openif_attributes = named_attributes(name, true);
+            let mut event = core::ptr::null_mut();
+            // SAFETY: Pointers reference live stack locals and `attributes` names a live
+            // UnicodeString for the duration of the call.
+            let event_status = unsafe {
+                NtCreateEvent(
+                    &raw mut event,
+                    MUTANT_ALL_ACCESS,
+                    &raw const attributes,
+                    0,
+                    0,
+                )
+            };
+            assert_eq!(event_status, NtStatus::SUCCESS.as_raw());
+
+            let sentinel = 0x1234 as *mut c_void;
+            let mut output = sentinel;
+            // SAFETY: As above; every call targets the same live `output` local.
+            let statuses = unsafe {
+                TypeMismatchStatuses {
+                    open: NtOpenMutant(&raw mut output, MUTANT_ALL_ACCESS, &raw const attributes),
+                    create: NtCreateMutant(
+                        &raw mut output,
+                        MUTANT_ALL_ACCESS,
+                        &raw const attributes,
+                        0,
+                    ),
+                    openif_create: NtCreateMutant(
+                        &raw mut output,
+                        MUTANT_ALL_ACCESS,
+                        &raw const openif_attributes,
+                        0,
+                    ),
+                    output_untouched: false,
+                }
+            };
+            let statuses = TypeMismatchStatuses {
+                output_untouched: output == sentinel,
+                ..statuses
+            };
+            close_host_handle(event);
+            statuses
+        }
+
+        #[test]
+        fn openif_mutant_ownership_matches_host() {
+            let unique = 0u8;
+            let host_units = unique_name("LiteBoxOpenIfMutantHost", &raw const unique);
+            let shim_units = unique_name("LiteBoxOpenIfMutantShim", &raw const unique);
+            assert_eq!(
+                shim_openif_ownership(&crate::tests::unicode_string(&shim_units)),
+                host_openif_ownership(&crate::tests::unicode_string(&host_units)),
+            );
+        }
+
+        #[test]
+        fn mutant_type_mismatch_matches_host() {
+            let unique = 0u8;
+            let host_units = unique_name("LiteBoxEventNotMutantHost", &raw const unique);
+            let shim_units = unique_name("LiteBoxEventNotMutantShim", &raw const unique);
+            assert_eq!(
+                shim_mutant_on_event_name(&crate::tests::unicode_string(&shim_units)),
+                host_mutant_on_event_name(&crate::tests::unicode_string(&host_units)),
+            );
+        }
     }
 }

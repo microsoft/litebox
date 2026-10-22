@@ -131,7 +131,7 @@ pub(crate) struct WnfCreateStateNameParameters<Platform: litebox::platform::RawP
     pub(crate) state_name: MutPtr<Platform, u64>,
     pub(crate) name_lifetime: u32,
     pub(crate) data_scope: u32,
-    pub(crate) persist_data: u8,
+    pub(crate) persist_data: bool,
     pub(crate) type_id: Option<ConstPtr<Platform, Guid>>,
     pub(crate) maximum_state_size: u32,
     pub(crate) security_descriptor: ConstPtr<Platform, u8>,
@@ -192,20 +192,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return NtStatus::ACCESS_VIOLATION;
         }
-        let old_state_name = match old_state_name
-            .map(|value| value.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION))
-            .transpose()
-        {
+        let old_state_name = match crate::read_optional_guest_value::<Platform, _>(old_state_name) {
             Ok(value) => value,
             Err(status) => return status,
         };
-        let old_subscription_id = match old_subscription_id
-            .map(|value| value.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION))
-            .transpose()
-        {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
+        let old_subscription_id =
+            match crate::read_optional_guest_value::<Platform, _>(old_subscription_id) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
 
         let mut subscriptions = self.process.wnf_subscriptions.lock();
         if let (Some(state_name), Some(subscription_id)) = (old_state_name, old_subscription_id)
@@ -275,16 +270,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if decode_state_name_lifetime(state_name).is_none() {
             return NtStatus::INVALID_PARAMETER;
         }
-        let current_state = self
+        let Some(current_state) = self
             .global
             .wnf_states
             .read()
             .states
             .get(&state_name)
-            .cloned();
-        if current_state.is_none() {
+            .cloned()
+        else {
             return NtStatus::OBJECT_NAME_NOT_FOUND;
-        }
+        };
 
         let mut subscriptions = self.process.wnf_subscriptions.lock();
         let (id, inserted) =
@@ -316,12 +311,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return NtStatus::ACCESS_VIOLATION;
         }
         drop(subscriptions);
-        if inserted
-            && let Some(state) = current_state
-            && state.data.is_some()
-            && state.change_stamp != change_stamp
-        {
-            self.queue_wnf_delivery(state_name, &state);
+        if inserted && current_state.data.is_some() && current_state.change_stamp != change_stamp {
+            self.queue_wnf_delivery(state_name, &current_state);
         }
         NtStatus::SUCCESS
     }
@@ -354,7 +345,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if probe_guest_output_preserving_value::<Platform, u64>(params.state_name).is_err() {
             return NtStatus::ACCESS_VIOLATION;
         }
-        let type_id = match read_type_id::<Platform>(params.type_id) {
+        let type_id = match crate::read_optional_guest_value::<Platform, _>(params.type_id) {
             Ok(type_id) => type_id,
             Err(status) => return status,
         };
@@ -379,7 +370,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             WnfStateNameLifetime::Temporary => {}
         }
-        if data_scope == WnfDataScope::Process || params.persist_data != 0 {
+        if data_scope == WnfDataScope::Process || params.persist_data {
             return NtStatus::INVALID_PARAMETER;
         }
 
@@ -428,7 +419,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(state_name) = params.state_name.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
-        let type_id = match read_type_id::<Platform>(params.type_id) {
+        let type_id = match crate::read_optional_guest_value::<Platform, _>(params.type_id) {
             Ok(type_id) => type_id,
             Err(status) => return status,
         };
@@ -574,12 +565,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(state_name) = state_name.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
-        let type_id = match type_id {
-            Some(type_id) => match type_id.read_at_offset(0) {
-                Some(type_id) => Some(type_id),
-                None => return NtStatus::ACCESS_VIOLATION,
-            },
-            None => None,
+        let type_id = match crate::read_optional_guest_value::<Platform, _>(type_id) {
+            Ok(type_id) => type_id,
+            Err(status) => return status,
         };
         let Some(available_size) = buffer_size.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
@@ -657,14 +645,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
-fn read_type_id<Platform: ShimPlatform>(
-    type_id: Option<ConstPtr<Platform, Guid>>,
-) -> Result<Option<Guid>, NtStatus> {
-    type_id
-        .map(|type_id| type_id.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION))
-        .transpose()
-}
-
 fn type_id_matches(expected: Option<Guid>, supplied: Option<Guid>) -> bool {
     expected.is_none()
         || matches!((expected, supplied), (Some(expected), Some(supplied)) if expected.data == supplied.data)
@@ -714,7 +694,7 @@ mod tests {
                 state_name: mut_ptr(&mut state_name),
                 name_lifetime: WnfStateNameLifetime::Temporary as u32,
                 data_scope: WnfDataScope::Machine as u32,
-                persist_data: 0,
+                persist_data: false,
                 type_id: type_id.as_ref().map(const_ptr),
                 maximum_state_size,
                 security_descriptor: const_ptr(&SECURITY_DESCRIPTOR_REVISION),
@@ -769,7 +749,7 @@ mod tests {
                 EventAccess::QUERY_STATE.bits(),
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -785,7 +765,7 @@ mod tests {
                 EventAccess::ALL_ACCESS.bits(),
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -811,7 +791,7 @@ mod tests {
                 EventAccess::ALL_ACCESS.bits(),
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -860,7 +840,7 @@ mod tests {
                 EventAccess::ALL_ACCESS.bits(),
                 None,
                 EventType::Notification as u32,
-                0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -1043,6 +1023,48 @@ mod tests {
             task.sys_nt_subscribe_wnf_state_change(const_ptr(&malformed), 0, 0x11, None,),
             NtStatus::INVALID_PARAMETER
         );
+    }
+
+    #[test]
+    fn query_typed_state_preserves_outputs_on_type_mismatch() {
+        let task = test_task();
+        let expected = Guid { data: [0x5a; 16] };
+        let different = Guid { data: [0xa5; 16] };
+        let state_name = create_state(&task, Some(expected), 4);
+        assert_eq!(
+            update_state(&task, state_name, &[7], Some(&expected), 0, 0),
+            NtStatus::SUCCESS
+        );
+
+        for (type_id, status) in [
+            (None, NtStatus::INVALID_PARAMETER),
+            (Some(&different), NtStatus::INVALID_PARAMETER),
+            (Some(&expected), NtStatus::SUCCESS),
+        ] {
+            let mut change_stamp = 99;
+            let mut buffer = [0xcc; 4];
+            let mut buffer_size = 4;
+            assert_eq!(
+                task.sys_nt_query_wnf_state_data(
+                    const_ptr(&state_name),
+                    type_id.map(const_ptr),
+                    None,
+                    mut_ptr(&mut change_stamp),
+                    mut_byte_ptr(&mut buffer),
+                    mut_ptr(&mut buffer_size),
+                ),
+                status
+            );
+            if status == NtStatus::SUCCESS {
+                assert_eq!(change_stamp, 1);
+                assert_eq!(buffer_size, 1);
+                assert_eq!(buffer, [7, 0xcc, 0xcc, 0xcc]);
+            } else {
+                assert_eq!(change_stamp, 99);
+                assert_eq!(buffer_size, 4);
+                assert_eq!(buffer, [0xcc; 4]);
+            }
+        }
     }
 
     #[test]

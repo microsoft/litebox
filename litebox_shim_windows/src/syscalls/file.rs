@@ -514,9 +514,13 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for FileObject<Platform> {
 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for FileObject<Platform> {}
 
-impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for FileObject<Platform> {
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem<Platform> for FileObject<Platform> {
     fn normalize_desired_access(desired_access: u32) -> u32 {
         FileAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn close_entry(task: &Task<Platform>, file: Self::Entry) {
+        task.close_file(file);
     }
 
     fn resolve_duplicate_access(entry: &Self::Entry, desired_access: u32) -> Result<u32, NtStatus> {
@@ -939,15 +943,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
 
     fn insert_file_handle(&self, file: FileObject<Platform>) -> Result<Handle, NtStatus> {
         let granted_access = file.create_time_access.bits();
-        self.insert_typed_handle::<FileObject<Platform>>(file, granted_access, |file| {
-            self.close_file(file);
-        })
+        self.insert_typed_handle::<FileObject<Platform>>(file, granted_access)
     }
 
     pub(crate) fn close_file_handle(&self, handle: Handle) {
-        self.close_typed_handle::<FileObject<Platform>>(handle, |file| {
-            self.close_file(file);
-        });
+        self.close_typed_handle::<FileObject<Platform>>(handle);
     }
 
     pub(crate) fn close_file(&self, file: FileObject<Platform>) {
@@ -1900,20 +1900,14 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             information = output.len();
             "Handled NtQueryDirectoryFileEx syscall"
         );
-        if write_slice::<Platform, u8>(file_information.as_usize(), &output).is_none()
-            || io_status_block
-                .write_at_offset(0, IoStatusBlock::new(status, output.len()))
-                .is_none()
-        {
+        if write_slice::<Platform, u8>(file_information.as_usize(), &output).is_none() {
             return NtStatus::ACCESS_VIOLATION;
         }
-        if !event.is_null() {
-            let event_status = self.set_event(event);
-            if event_status != NtStatus::SUCCESS {
-                return event_status;
-            }
-        }
-        status
+        self.complete_file_io(
+            event,
+            io_status_block,
+            IoStatusBlock::new(status, output.len()),
+        )
     }
 
     fn query_directory(
@@ -2122,16 +2116,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 return NtStatus::INVALID_DEVICE_REQUEST;
             }
         };
-        if io_status_block.write_at_offset(0, status).is_none() {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        if !event.is_null() {
-            let event_status = self.set_event(event);
-            if event_status != NtStatus::SUCCESS {
-                return event_status;
-            }
-        }
-        NtStatus::from_raw(status.status.cast_unsigned())
+        self.complete_file_io(event, io_status_block, status)
     }
 
     fn write_file_fs_device_information(
@@ -3280,6 +3265,41 @@ mod tests {
             file_attributes: 0xcccc_cccc,
             _reserved: 0xdddd_dddd,
         }
+    }
+
+    #[test]
+    fn complete_file_io_preserves_completion_and_writeback_precedence() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task_with_broker_files(&[]);
+            let invalid_event = Handle::from_raw(0x1234);
+            for status in [
+                NtStatus::SUCCESS,
+                NtStatus::BUFFER_OVERFLOW,
+                NtStatus::NO_MORE_FILES,
+                NtStatus::NOT_SUPPORTED,
+            ] {
+                let completion = IoStatusBlock::new(status, 17);
+                let mut io_status = IoStatusBlock::default();
+                assert_eq!(
+                    task.complete_file_io(Handle::default(), mut_ptr(&mut io_status), completion),
+                    status
+                );
+                assert_eq!(io_status.status, completion.status);
+                assert_eq!(io_status.information, completion.information);
+
+                io_status = IoStatusBlock::default();
+                assert_eq!(
+                    task.complete_file_io(invalid_event, mut_ptr(&mut io_status), completion),
+                    NtStatus::INVALID_HANDLE
+                );
+                assert_eq!(io_status.status, completion.status);
+                assert_eq!(io_status.information, completion.information);
+                assert_eq!(
+                    task.complete_file_io(invalid_event, null_mut_ptr(), completion),
+                    NtStatus::ACCESS_VIOLATION
+                );
+            }
+        });
     }
 
     #[test]
