@@ -3,6 +3,8 @@
 
 //! Native Linux process operations.
 
+use std::cell::Cell;
+use std::convert::Infallible;
 use std::io::{Error, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
@@ -173,6 +175,59 @@ impl ProcessHandle for ClonedProcess {
     }
 }
 
+thread_local! {
+    /// An address near the stack pointer at which this thread first entered the guest, or zero if
+    /// it has not. A process clone inherits its forking thread's value.
+    static GUEST_ENTRY_STACK_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Records the stack depth at which this thread first entered the guest, unless it has already,
+/// directly or as the thread a process clone copied.
+pub(crate) fn record_first_guest_entry_depth() {
+    if GUEST_ENTRY_STACK_DEPTH.get() == 0 {
+        let marker = 0u8;
+        GUEST_ENTRY_STACK_DEPTH.set(core::ptr::from_ref(&marker).addr());
+    }
+}
+
+/// Continues the calling thread with `f` at the stack depth at which it first entered the guest,
+/// abandoning every frame below that depth and reusing their memory.
+///
+/// A native fork clone's only thread starts on a copy of the stack it forked on, under every frame
+/// of its parent's runtime; continuing there would deepen the stack with each generation of a fork
+/// chain until it overflows. Rewinding to the depth the clone inherits keeps every generation at
+/// the same depth. If the thread never entered the guest, `f` runs in place.
+///
+/// `f` is `'static` because the calling frames' memory is reused.
+///
+/// # Safety
+///
+/// The caller must be the sole thread of a newly cloned process. Nothing may use the calling
+/// frames, or any frame of the thread below the depth at which it first entered the guest,
+/// afterwards.
+pub unsafe fn rewind_stack_and_run<F: FnOnce() -> Infallible + 'static>(f: F) -> ! {
+    let base = GUEST_ENTRY_STACK_DEPTH.get();
+    if base == 0 {
+        match f() {}
+    }
+    let f = Box::into_raw(Box::new(f)).cast::<()>();
+    // SAFETY: The aligned `base` lies within this thread's stack, below the data that outlives its
+    // frames, and the caller guarantees that nothing uses the frames there.
+    // `rewound_stack_entry::<F>` takes `f`, a `Box<F>`.
+    unsafe { crate::arch::switch_stack(base & !0xf, f, rewound_stack_entry::<F>) }
+}
+
+/// Runs `f` on the stack [`rewind_stack_and_run`] rewound.
+///
+/// # Safety
+///
+/// `f` must come from `Box::<F>::into_raw`.
+unsafe extern "C" fn rewound_stack_entry<F: FnOnce() -> Infallible>(f: *mut ()) -> ! {
+    // SAFETY: The caller passes `f` from `Box::<F>::into_raw`.
+    let f = unsafe { *Box::from_raw(f.cast::<F>()) };
+    match f() {}
+}
+
 /// Result returned by [`fork_process`].
 pub enum ForkResult {
     /// The original process receives the cloned process ID.
@@ -229,5 +284,98 @@ pub unsafe fn fork_process() -> Result<ForkResult> {
                 process,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs `f` in a forked child, whose only thread may rewind its stack, and returns its status.
+    fn in_forked_child(f: fn() -> libc::c_int) -> libc::c_int {
+        // SAFETY: `libc::fork` runs glibc's fork handlers, so the single-threaded child may
+        // allocate, and it `_exit`s without returning to the harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "{}", Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: `_exit` ends the child without running the harness's handlers.
+            unsafe { libc::_exit(f()) };
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is this process's unreaped child, and `status` is writable.
+        assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+        status
+    }
+
+    /// Calls `f` from `depth` frames, each holding 1 KiB, below the caller.
+    #[inline(never)]
+    fn deeper(depth: usize, f: &mut dyn FnMut()) {
+        let frame = core::hint::black_box([0u8; 1024]);
+        if depth == 0 {
+            f();
+        } else {
+            deeper(depth - 1, f);
+        }
+        core::hint::black_box(frame);
+    }
+
+    fn stack_address() -> usize {
+        let marker = 0u8;
+        core::hint::black_box(core::ptr::from_ref(&marker).addr())
+    }
+
+    #[test]
+    fn clones_rewind_to_the_same_depth_in_every_generation() {
+        const NOT_REWOUND: libc::c_int = 1;
+        const DEPTH_CHANGED: libc::c_int = 2;
+        let status = in_forked_child(|| {
+            record_first_guest_entry_depth();
+            let base = GUEST_ENTRY_STACK_DEPTH.get();
+            // Each generation starts below the frames of the one before, as a fork does.
+            let mut first_generation = || {
+                // SAFETY: The forked child has only this thread, and nothing uses the frames.
+                unsafe {
+                    rewind_stack_and_run(move || {
+                        if !(base - 4096..base).contains(&stack_address()) {
+                            libc::_exit(NOT_REWOUND);
+                        }
+                        let mut second_generation = || {
+                            rewind_stack_and_run(move || {
+                                let rewound = (base - 4096..base).contains(&stack_address());
+                                libc::_exit(if rewound { 0 } else { DEPTH_CHANGED })
+                            })
+                        };
+                        // Like a clone bootstrapping, this generation enters the guest deeper than
+                        // it started, but the next one inherits the depth it was rewound to.
+                        deeper(8, &mut || {
+                            record_first_guest_entry_depth();
+                            deeper(64, &mut second_generation);
+                        });
+                        unreachable!()
+                    })
+                }
+            };
+            deeper(64, &mut first_generation);
+            unreachable!()
+        });
+        let failure = match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
+            Some(0) => return,
+            Some(NOT_REWOUND) => "the first generation did not rewind to the recorded depth",
+            Some(DEPTH_CHANGED) => "the second generation started at a different depth",
+            _ => "the rewinding child did not exit normally",
+        };
+        panic!("{failure} (status {status:#x})");
+    }
+
+    #[test]
+    fn rewind_without_guest_entry_runs_in_place() {
+        let status = in_forked_child(|| {
+            // SAFETY: The forked child has only this thread, and the continuation exits at once.
+            unsafe { rewind_stack_and_run(|| libc::_exit(0)) }
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the in-place child failed (status {status:#x})"
+        );
     }
 }

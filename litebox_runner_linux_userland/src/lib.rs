@@ -7,6 +7,7 @@ use litebox::platform::{ForkError, ProcessHandle as _, ProcessProvider};
 use litebox::process::ProcessError;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use litebox_platform_linux_userland::SeccompScope;
+use std::convert::Infallible;
 use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +43,7 @@ const NATIVE_FORK_STREAM_FD: RawFd = 3;
 const NATIVE_FORK_POSITIONAL_IO_FDS: [RawFd; 2] = [4, 5];
 /// Shutdown descriptor of a native fork-capable runner.
 const NATIVE_FORK_SHUTDOWN_FD: RawFd = 6;
+#[derive(Clone)]
 struct NativeForkRunner {
     memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
 }
@@ -60,6 +62,29 @@ impl NativeForkRunner {
         // SAFETY: `run_child` abandons the copied task, resets platform state,
         // and negotiates over its own socket before running the guest in a fresh shim.
         unsafe { builder.with_native_fork_runner(|memory| Self { memory }) }
+    }
+
+    /// Bootstraps the clone on its rewound stack and runs the guest to its exit.
+    ///
+    /// # Safety
+    ///
+    /// As for [`ForkRunner::run_child`](litebox_shim_linux::syscalls::process::ForkRunner::run_child).
+    unsafe fn continue_child(&self, broker_end: OwnedFd, runner_end: OwnedFd) -> ! {
+        // SAFETY: The clone contains only this thread, and this function never returns through
+        // the copied guest task or its thread-registration guard.
+        let status = match unsafe { Platform::prepare_fork_child() }
+            .context("failed to prepare native fork child")
+            .and_then(|()| self.bootstrap_child(broker_end, runner_end))
+        {
+            Ok(status) => status,
+            Err(error) => {
+                litebox_util_log::error!("native fork child bootstrap failed: {error:#}");
+                127
+            }
+        };
+        // Do not run destructors or atexit handlers copied from the multithreaded parent runtime.
+        // SAFETY: `_exit` terminates this process immediately with a conventional shell status.
+        unsafe { libc::_exit(status) }
     }
 
     /// Rebuilds the runtime in a clone and returns the guest's exit status.
@@ -182,27 +207,28 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     }
 
     unsafe fn run_child(&self, channel: NativeForkChannel) -> ! {
+        // TODO: Free the parent runner's runtime (its shim, `LiteBox`, guest tasks, and broker
+        // endpoint) and the stacks of its other threads. They stay in the clone, owned by the
+        // frames the clone abandons and by threads the clone lacks, and every later generation of
+        // a fork chain inherits them again, because guest `execve` keeps the runner process.
+        // Dropping the runtime would send the parent's requests (e.g., closing its handles or
+        // cancelling this pending child) on the clone's association, close the descriptors the
+        // clone's own association reuses, and might wait on locks of threads the clone lacks.
         let NativeForkChannel {
             broker_end,
             runner_end,
         } = channel;
-        // SAFETY: The clone contains only this thread, and this function never returns through
-        // the copied guest task or its thread-registration guard.
-        let status = match unsafe { Platform::prepare_fork_child() }
-            .context("failed to prepare native fork child")
-            .and_then(|()| self.bootstrap_child(broker_end, runner_end))
-        {
-            Ok(status) => status,
-            Err(error) => {
-                litebox_util_log::error!("native fork child bootstrap failed: {error:#}");
-                127
-            }
+        let runner = self.clone();
+        let continue_child = move || -> Infallible {
+            // SAFETY: `run_child`'s caller meets `continue_child`'s requirements.
+            unsafe { runner.continue_child(broker_end, runner_end) }
         };
-        // Do not run destructors or atexit handlers copied from the multithreaded parent runtime.
-        // SAFETY: `_exit` terminates this process immediately with a conventional shell status.
-        unsafe { libc::_exit(status) }
+        // SAFETY: The clone contains only this thread, which abandons the copied frames, including
+        // those below the depth at which it first entered the guest.
+        unsafe { litebox_platform_linux_userland::process::rewind_stack_and_run(continue_child) }
     }
 }
+
 /// Runs a Linux program with LiteBox on unmodified Linux and returns its exit code.
 ///
 /// Detailed logging can be controlled via the `LITEBOX_LOG` environment variable. For example:

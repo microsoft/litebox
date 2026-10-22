@@ -610,6 +610,7 @@ fn run_thread_inner(
         GuestVectorStateMode::Inherited(state) => Some(state.as_ref()),
         GuestVectorStateMode::Fresh | GuestVectorStateMode::Resume => None,
     });
+    process::record_first_guest_entry_depth();
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     let _guest_thread = GuestThreadMarker::enter();
@@ -762,7 +763,8 @@ thread_local! {
     static CURRENT_THREAD: std::cell::RefCell<Option<ThreadHandle>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Clears inherited guest-thread registration in the fork child.
+/// Clears inherited guest-thread registration in the fork child, and hands the alternate signal
+/// stack of the abandoned guest-thread call to the clone's next one.
 ///
 /// # Panics
 ///
@@ -776,6 +778,9 @@ pub unsafe fn reset_current_thread_after_process_clone() {
     let current = CURRENT_THREAD.take();
     if let Some(current) = current {
         *current.0.lock().expect("thread handle mutex poisoned") = None;
+    }
+    if let SignalAltStack::Active(record) = SIGNAL_ALT_STACK.get() {
+        SIGNAL_ALT_STACK.set(SignalAltStack::Orphaned(record));
     }
     replace_guest_thread_marker(false);
 }
@@ -1473,62 +1478,164 @@ fn register_exception_handlers() {
     });
 }
 
-/// Runs `f` with an alternate signal stack set up.
-fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
-    let alt_stack_size = libc::SIGSTKSZ * 2;
-    let guard_page_size = 0x1000;
-    let stack_base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            guard_page_size + alt_stack_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
+/// An anonymous read-write stack mapping with an inaccessible guard below it, which overflows of
+/// the stack fault on. Dropping it unmaps the whole mapping.
+struct GuardedStack(GuardedStackParts);
+
+/// The mapping a [`GuardedStack`] owns, without ownership.
+#[derive(Clone, Copy)]
+struct GuardedStackParts {
+    mapping: core::ptr::NonNull<libc::c_void>,
+    guard_size: usize,
+    size: usize,
+}
+
+impl GuardedStack {
+    /// Maps `size` usable bytes above a `guard_size`-byte guard, both multiples of the page size.
+    fn map(guard_size: usize, size: usize) -> std::io::Result<Self> {
+        // SAFETY: An anonymous private mapping at a kernel-chosen address affects no existing
+        // memory.
+        let mapping = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                guard_size + size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let Some(mapping) = core::ptr::NonNull::new(mapping) else {
+            return Err(std::io::Error::other("mmap returned a null stack"));
+        };
+        let stack = Self(GuardedStackParts {
+            mapping,
+            guard_size,
+            size,
+        });
+        // SAFETY: The guard lies within the mapping this function just created.
+        if unsafe { libc::mprotect(mapping.as_ptr(), guard_size, libc::PROT_NONE) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(stack)
+    }
+
+    /// Takes ownership of the mapping `parts` describes.
+    ///
+    /// # Safety
+    ///
+    /// `parts` must describe a mapping a [`GuardedStack`] created, which nothing else owns.
+    unsafe fn from_parts(parts: GuardedStackParts) -> Self {
+        Self(parts)
+    }
+
+    /// Describes the mapping, without giving up ownership.
+    fn parts(&self) -> GuardedStackParts {
+        self.0
+    }
+
+    /// Lowest usable address, just above the guard.
+    fn bottom(&self) -> *mut libc::c_void {
+        self.0.mapping.as_ptr().wrapping_byte_add(self.0.guard_size)
+    }
+
+    /// Usable size, above the guard.
+    fn size(&self) -> usize {
+        self.0.size
+    }
+}
+
+impl Drop for GuardedStack {
+    fn drop(&mut self) {
+        let GuardedStackParts {
+            mapping,
+            guard_size,
+            size,
+        } = self.0;
+        // SAFETY: This value exclusively owns the mapping, which nothing runs on once it drops.
+        let result = unsafe { libc::munmap(mapping.as_ptr(), guard_size + size) };
+        assert_eq!(
+            result,
             0,
-        )
-    };
-    assert!(
-        stack_base != libc::MAP_FAILED,
-        "failed to allocate memory for alternate signal stack: {}",
-        std::io::Error::last_os_error()
-    );
-    let _unmap_guard = litebox::utils::defer(|| {
-        let r = unsafe { libc::munmap(stack_base, guard_page_size + alt_stack_size) };
-        assert!(
-            r == 0,
             "failed to free memory for alternate signal stack: {}",
             std::io::Error::last_os_error()
         );
-    });
-
-    // Set up a guard page to catch stack overflows.
-    let r = unsafe { libc::mprotect(stack_base, guard_page_size, libc::PROT_NONE) };
-    assert!(
-        r == 0,
-        "failed to set guard page for alternate signal stack: {}",
-        std::io::Error::last_os_error()
-    );
-
-    let alt_stack = libc::stack_t {
-        ss_sp: stack_base.cast(),
-        ss_flags: 0,
-        ss_size: alt_stack_size,
-    };
-    let mut oss = libc::stack_t {
-        ss_sp: std::ptr::null_mut(),
-        ss_flags: 0,
-        ss_size: 0,
-    };
-    unsafe {
-        let r = libc::sigaltstack(&raw const alt_stack, &raw mut oss);
-        assert!(
-            r >= 0,
-            "failed to set up alternate signal stack: {}",
-            std::io::Error::last_os_error(),
-        );
     }
-    let _restore_guard = litebox::utils::defer(|| unsafe {
-        let r = libc::sigaltstack(&raw const oss, std::ptr::null_mut());
+}
+
+/// A [`with_signal_alt_stack`] call's alternate signal stack, and the stack it restores.
+#[derive(Clone, Copy)]
+struct SignalAltStackRecord {
+    stack: GuardedStackParts,
+    previous: libc::stack_t,
+}
+
+/// This thread's [`with_signal_alt_stack`] state.
+#[derive(Clone, Copy, Default)]
+enum SignalAltStack {
+    #[default]
+    None,
+    /// Owned by a running [`with_signal_alt_stack`] call.
+    Active(SignalAltStackRecord),
+    /// Owned by a call whose frames a process clone abandoned, for the clone's next call to adopt.
+    Orphaned(SignalAltStackRecord),
+}
+
+thread_local! {
+    static SIGNAL_ALT_STACK: Cell<SignalAltStack> = const { Cell::new(SignalAltStack::None) };
+}
+
+/// Runs `f` with an alternate signal stack set up.
+///
+/// In a process clone, this adopts the stack the cloned thread had, so a fork chain keeps one.
+fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
+    let (stack, previous) = match SIGNAL_ALT_STACK.take() {
+        SignalAltStack::None => {
+            let stack = GuardedStack::map(0x1000, libc::SIGSTKSZ * 2).unwrap_or_else(|error| {
+                panic!("failed to allocate memory for alternate signal stack: {error}")
+            });
+            let alt_stack = libc::stack_t {
+                ss_sp: stack.bottom(),
+                ss_flags: 0,
+                ss_size: stack.size(),
+            };
+            let mut oss = libc::stack_t {
+                ss_sp: std::ptr::null_mut(),
+                ss_flags: 0,
+                ss_size: 0,
+            };
+            // SAFETY: `alt_stack` describes the usable part of `stack`, which this call owns and
+            // keeps mapped until it restores `oss`, and `oss` is writable.
+            let r = unsafe { libc::sigaltstack(&raw const alt_stack, &raw mut oss) };
+            assert!(
+                r >= 0,
+                "failed to set up alternate signal stack: {}",
+                std::io::Error::last_os_error(),
+            );
+            (stack, oss)
+        }
+        // A process clone inherits its thread's alternate signal stack setting, so the adopted
+        // stack is still installed. Restore what the call that mapped it replaced.
+        SignalAltStack::Orphaned(record) => {
+            // SAFETY: Only `reset_current_thread_after_process_clone` orphans a record, once the
+            // call that owned its stack is abandoned, and taking it leaves this call the only owner.
+            let stack = unsafe { GuardedStack::from_parts(record.stack) };
+            (stack, record.previous)
+        }
+        SignalAltStack::Active(_) => panic!("nested with_signal_alt_stack calls are not supported"),
+    };
+    SIGNAL_ALT_STACK.set(SignalAltStack::Active(SignalAltStackRecord {
+        stack: stack.parts(),
+        previous,
+    }));
+    let _restore_guard = litebox::utils::defer(|| {
+        SIGNAL_ALT_STACK.set(SignalAltStack::None);
+        // SAFETY: `previous` is the setting `stack` replaced, and `stack` stays mapped until
+        // after this guard drops.
+        let r = unsafe { libc::sigaltstack(&raw const previous, std::ptr::null_mut()) };
         assert!(
             r >= 0,
             "failed to restore original signal stack: {}",
@@ -2142,6 +2249,86 @@ mod tests {
             "clone did not exit normally: {status}"
         );
         assert_eq!(libc::WEXITSTATUS(status), 0, "clone was not interrupted");
+    }
+
+    #[test]
+    fn process_clone_adopts_the_alternate_signal_stack_it_inherited() {
+        const MAPPED_NEW_STACK: i32 = 1;
+        const DID_NOT_RESTORE_PREDECESSOR: i32 = 2;
+        const KEPT_ADOPTED_STACK_MAPPED: i32 = 3;
+        fn current_alt_stack() -> *mut libc::c_void {
+            // SAFETY: A zeroed stack_t is valid output storage for sigaltstack.
+            let mut current = unsafe { core::mem::zeroed::<libc::stack_t>() };
+            // SAFETY: A null new stack only queries the current one into `current`.
+            assert_eq!(
+                unsafe { libc::sigaltstack(core::ptr::null(), &raw mut current) },
+                0
+            );
+            current.ss_sp
+        }
+        fn is_mapped(address: *mut libc::c_void) -> bool {
+            // SAFETY: `msync` only queries the page, which it rejects with ENOMEM if unmapped.
+            unsafe { libc::msync(address, 1, libc::MS_ASYNC) == 0 }
+        }
+
+        let predecessor = current_alt_stack();
+        super::with_signal_alt_stack(|| {
+            let inherited = current_alt_stack();
+            // SAFETY: A null stack creates a fork-like clone. Only the child uses the copied
+            // runtime below, and it exits without returning through the test harness.
+            let child = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    libc::SIGCHLD,
+                    0usize,
+                    core::ptr::null_mut::<libc::pid_t>(),
+                    core::ptr::null_mut::<libc::pid_t>(),
+                    0usize,
+                )
+            };
+            assert!(
+                child >= 0,
+                "clone failed: {}",
+                std::io::Error::last_os_error()
+            );
+            if child == 0 {
+                // SAFETY: The child is the only surviving thread and never returns to copied
+                // state.
+                unsafe { super::reset_current_thread_after_process_clone() };
+                let adopted = super::with_signal_alt_stack(|| current_alt_stack() == inherited);
+                let code = if !adopted {
+                    MAPPED_NEW_STACK
+                } else if current_alt_stack() != predecessor {
+                    DID_NOT_RESTORE_PREDECESSOR
+                } else if is_mapped(inherited) {
+                    KEPT_ADOPTED_STACK_MAPPED
+                } else {
+                    0
+                };
+                // SAFETY: Do not unwind through or destroy the copied test runtime.
+                unsafe { libc::_exit(code) };
+            }
+            let child = libc::pid_t::try_from(child).expect("clone returned a valid process ID");
+            let mut status = 0;
+            // SAFETY: This test owns the clone, and `status` is writable.
+            while unsafe { libc::waitpid(child, &raw mut status, 0) } != child {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINTR),
+                    "waitpid failed"
+                );
+            }
+            let failure = match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
+                Some(0) => return,
+                Some(MAPPED_NEW_STACK) => "the clone mapped a new alternate signal stack",
+                Some(DID_NOT_RESTORE_PREDECESSOR) => {
+                    "the clone did not restore the stack the parent's call replaced"
+                }
+                Some(KEPT_ADOPTED_STACK_MAPPED) => "the clone did not unmap the adopted stack",
+                _ => "the clone did not exit normally",
+            };
+            panic!("{failure} (status {status:#x})");
+        });
     }
 
     /// An interrupt pending at guest entry diverts to the interrupt handler
