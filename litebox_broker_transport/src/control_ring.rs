@@ -80,7 +80,7 @@ const DEMAND_WORDS_SIZE: usize = 8;
 /// Lane 0 is always in use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControlRingLayout {
-    lanes: usize,
+    lane_count: usize,
     call_slots: u64,
     sync_stride: usize,
     ready: &'static [u8],
@@ -92,7 +92,7 @@ const _: () = assert!(ControlRingLayout::MULTI_LANE.memory_size() == 11_336);
 impl ControlRingLayout {
     /// One lane of 64 slots per direction, served by one broker thread.
     pub const SINGLE_LANE: Self = Self {
-        lanes: 1,
+        lane_count: 1,
         call_slots: 64,
         sync_stride: SYNC_WORDS_SIZE,
         ready: b"litebox-control-ring-ready-v1",
@@ -104,7 +104,7 @@ impl ControlRingLayout {
     /// themselves, so neither the two directions of a call nor lanes in use at
     /// the same time contend for one.
     pub const MULTI_LANE: Self = Self {
-        lanes: 8,
+        lane_count: 8,
         call_slots: 1,
         sync_stride: CACHE_LINE_SIZE,
         ready: b"litebox-control-ring-lanes-ready-v1",
@@ -112,7 +112,7 @@ impl ControlRingLayout {
 
     /// Returns the number of lanes.
     pub const fn lane_count(self) -> usize {
-        self.lanes
+        self.lane_count
     }
 
     /// Returns the versioned token endpoints exchange before activating a
@@ -123,7 +123,11 @@ impl ControlRingLayout {
 
     /// Returns the exact size of a mapping with this layout.
     pub const fn memory_size(self) -> usize {
-        self.demand_offset() + if self.lanes > 1 { DEMAND_WORDS_SIZE } else { 0 }
+        if self.lane_count > 1 {
+            self.demand_offset() + DEMAND_WORDS_SIZE
+        } else {
+            self.demand_offset()
+        }
     }
 
     /// Returns the local-to-broker request direction of `lane`.
@@ -132,7 +136,7 @@ impl ControlRingLayout {
     ///
     /// Panics if `lane` is not less than [`Self::lane_count`].
     pub const fn requests(self, lane: usize) -> ControlRingDirection {
-        assert!(lane < self.lanes, "control-ring lane out of range");
+        assert!(lane < self.lane_count, "control-ring lane out of range");
         self.direction(2 * lane)
     }
 
@@ -142,13 +146,13 @@ impl ControlRingLayout {
     ///
     /// Panics if `lane` is not less than [`Self::lane_count`].
     pub const fn responses(self, lane: usize) -> ControlRingDirection {
-        assert!(lane < self.lanes, "control-ring lane out of range");
+        assert!(lane < self.lane_count, "control-ring lane out of range");
         self.direction(2 * lane + 1)
     }
 
     /// Returns the broker-to-local notification direction.
     pub const fn notifications(self) -> ControlRingDirection {
-        self.direction(2 * self.lanes)
+        self.direction(2 * self.lane_count)
     }
 
     /// Returns whether this layout permits a byte-copy range.
@@ -188,7 +192,7 @@ impl ControlRingLayout {
                     | PRODUCER_WAITING_OFFSET
             );
         }
-        self.lanes > 1
+        self.lane_count > 1
             && matches!(
                 relative - self.sync_size(),
                 REQUESTED_LANES_OFFSET | DEMAND_EPOCH_OFFSET
@@ -208,7 +212,7 @@ impl ControlRingLayout {
     /// producer and consumer epochs of every direction and, with more than one
     /// lane, the lane-demand epoch.
     pub const fn waitable_word_count(self) -> usize {
-        2 * self.direction_count() + if self.lanes > 1 { 1 } else { 0 }
+        2 * self.direction_count() + if self.lane_count > 1 { 1 } else { 0 }
     }
 
     /// Returns the position of the waitable `u32` at `offset` among the
@@ -226,7 +230,7 @@ impl ControlRingLayout {
                 _ => None,
             };
         }
-        if self.lanes > 1 && relative - self.sync_size() == DEMAND_EPOCH_OFFSET {
+        if self.lane_count > 1 && relative - self.sync_size() == DEMAND_EPOCH_OFFSET {
             Some(2 * self.direction_count())
         } else {
             None
@@ -234,7 +238,7 @@ impl ControlRingLayout {
     }
 
     const fn direction_count(self) -> usize {
-        2 * self.lanes + 1
+        2 * self.lane_count + 1
     }
 
     // Layout slot counts are small constants representable by `usize`.
@@ -244,7 +248,7 @@ impl ControlRingLayout {
     }
 
     const fn data_size(self) -> usize {
-        2 * self.lanes * self.call_direction_size() + CONTROL_RING_NOTIFICATION_DIRECTION_SIZE
+        2 * self.lane_count * self.call_direction_size() + CONTROL_RING_NOTIFICATION_DIRECTION_SIZE
     }
 
     const fn sync_size(self) -> usize {
@@ -260,7 +264,7 @@ impl ControlRingLayout {
     const fn direction(self, index: usize) -> ControlRingDirection {
         ControlRingDirection {
             data_offset: index * self.call_direction_size(),
-            slot_count: if index == 2 * self.lanes {
+            slot_count: if index == 2 * self.lane_count {
                 CONTROL_RING_NOTIFICATION_SLOT_COUNT
             } else {
                 self.call_slots
