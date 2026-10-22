@@ -6,7 +6,6 @@
 
 use super::*;
 use litebox_common_macos::{
-    VmProtection,
     errno::Errno,
     mach::{
         MACH_PORT_DEAD, MACH_PORT_QLIMIT_KERNEL, MACH_PORT_UREFS_MAX, MachMsgHeader,

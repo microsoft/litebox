@@ -8,7 +8,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use litebox::utils::TruncateExt as _;
 use litebox_common_macos::{
-    KernReturn, errno::Errno, syscall::MachTimebaseInfo, user_pointers::UserPtrMut,
+    KernReturn,
+    errno::Errno,
+    syscall::MachTimebaseInfo,
+    user_pointers::{UserPtr, UserPtrMut},
 };
 
 pub(crate) mod file;
@@ -82,6 +85,61 @@ impl<P: ShimPlatform> Task<P> {
         start_address
             .write_at_offset::<P>(0, base)
             .ok_or(Errno::EFAULT)
+    }
+
+    /// `shared_region_map_and_slide_2_np`: the guest's region is its private
+    /// instance, so no other cache is mapped. Empty requests, count limits and
+    /// the file- and mapping-array copy-ins behave like XNU
+    /// (`bsd/vm/vm_unix.c`: success, raw `KERN_FAILURE`, seen as errno 5, and
+    /// `EFAULT`); anything else fails with `EINVAL`, which
+    /// `_shared_region_map_and_slide` returns when `vm_shared_region_map_file`
+    /// finds a mapping in the region.
+    #[expect(
+        clippy::unused_self,
+        reason = "dispatched like every other syscall; the result never depends on the task"
+    )]
+    pub(crate) fn sys_shared_region_map_and_slide_2_np(
+        &self,
+        files_count: u32,
+        files: UserPtr<u8>,
+        mappings_count: u32,
+        mappings: UserPtr<u8>,
+    ) -> Result<(), Errno> {
+        /// `_SR_FILE_MAPPINGS_MAX_FILES`.
+        const MAX_FILES: u32 = 256;
+        /// `SFM_MAX`.
+        const MAX_MAPPINGS: u32 = MAX_FILES * 8;
+        /// `sizeof(struct shared_file_np)`.
+        const FILE_BYTES: usize = 12;
+        /// `sizeof(struct shared_file_mapping_slide_np)`.
+        const MAPPING_BYTES: usize = 48;
+        // XNU returns the count-limit kern_return_t as an errno value.
+        const KERN_FAILURE: Errno = Errno::EIO;
+
+        // vm_unix.c checks each count in this order.
+        if files_count == 0 {
+            return Ok(());
+        }
+        if files_count > MAX_FILES {
+            return Err(KERN_FAILURE);
+        }
+        if mappings_count == 0 {
+            return Ok(());
+        }
+        if mappings_count > MAX_MAPPINGS {
+            return Err(KERN_FAILURE);
+        }
+        files
+            .to_owned_slice::<P>(files_count as usize * FILE_BYTES)
+            .ok_or(Errno::EFAULT)?;
+        mappings
+            .to_owned_slice::<P>(mappings_count as usize * MAPPING_BYTES)
+            .ok_or(Errno::EFAULT)?;
+        // TODO: XNU also checks before the region: it copies in and sanitizes
+        // each mapping in turn (`shared_region_map_and_slide_2_np_sanitize`),
+        // then checks the files' `sf_mappings_count` against `mappings_count`,
+        // slide overflow, and the files (`shared_region_map_and_slide_setup`).
+        Err(Errno::EINVAL)
     }
 
     pub(crate) fn sys_mach_absolute_time(&self) -> usize {

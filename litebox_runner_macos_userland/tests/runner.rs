@@ -517,11 +517,7 @@ fn loader_teardown_and_argument_limit() {
         .build()
         .load_program_from_bytes(TaskParams::default(), "/guest", &data, vec![], vec![])
         .unwrap();
-    let litebox_shim_macos::LoadedProgram {
-        entrypoints,
-        process,
-        mut initial_ctx,
-    } = program;
+    let (entrypoints, process, mut initial_ctx) = program.into_parts();
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }

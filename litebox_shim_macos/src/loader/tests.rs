@@ -362,7 +362,7 @@ fn dynamic_load_without_random_source_fails() {
         .load_program_with_dyld(
             TaskParams::default(),
             "/bin/main",
-            &dynamic_main(),
+            Some(&dynamic_main()),
             arm64_slice(&host_dyld).unwrap(),
             Vec::new(),
             Vec::new(),
@@ -396,7 +396,7 @@ fn aot_rewritten_dyld_loads_like_raw_dyld() {
             .load_program_with_dyld(
                 TaskParams::default(),
                 "/bin/main",
-                &main,
+                Some(&main),
                 dyld,
                 Vec::new(),
                 Vec::new(),
