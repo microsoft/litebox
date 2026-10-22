@@ -81,11 +81,11 @@ struct CallLanePoolInner<Lane, Error> {
     /// Each lane, or `None` while a call holds it.
     lanes: Vec<Option<Lane>>,
     /// Number of lanes demanded so far.
-    demanded: usize,
+    demanded_lane_count: usize,
     /// Number of claims waiting for a free lane. Freeing a lane notifies only
     /// if one waits, since a notification can cost a system call even with no
     /// waiters.
-    waiting: usize,
+    waiting_claim_count: usize,
     failure: Option<Arc<Error>>,
 }
 
@@ -148,7 +148,7 @@ impl<Sync: CallLanePoolSync, Lane, Error> LaneClaim<'_, Sync, Lane, Error> {
     /// Returns the lane to its slot, under the admission lock.
     fn free(&mut self, state: &mut CallLanePoolInner<Lane, Error>) {
         state.lanes[self.index] = self.lane.take();
-        if state.waiting > 0 {
+        if state.waiting_claim_count > 0 {
             self.lanes.lane_freed.notify_one();
         }
     }
@@ -165,8 +165,8 @@ impl<Sync: CallLanePoolSync, Lane, Error> CallLanePool<Sync, Lane, Error> {
         Self {
             state: Sync::mutex(CallLanePoolInner {
                 lanes: lanes.into_iter().map(Some).collect(),
-                demanded: 1,
-                waiting: 0,
+                demanded_lane_count: 1,
+                waiting_claim_count: 0,
                 failure: None,
             }),
             lane_freed: Sync::condvar(),
@@ -190,13 +190,13 @@ impl<Sync: CallLanePoolSync, Lane, Error> CallLanePool<Sync, Lane, Error> {
             if let Some(index) = state.lanes.iter().position(Option::is_some) {
                 break index;
             }
-            state.waiting += 1;
+            state.waiting_claim_count += 1;
             state = self.lane_freed.wait(state);
-            state.waiting -= 1;
+            state.waiting_claim_count -= 1;
         };
-        if index >= state.demanded {
+        if index >= state.demanded_lane_count {
             demand(index + 1).map_err(CallLanePoolError::Operation)?;
-            state.demanded = index + 1;
+            state.demanded_lane_count = index + 1;
         }
         Ok(LaneClaim {
             lanes: self,
