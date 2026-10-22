@@ -11,11 +11,17 @@
 //!
 //! Intended use: parse the main cache file with [`CacheFile::parse`], open each
 //! [`CacheFile::subcache_entries`] file (main path + suffix), combine them with
-//! [`SharedCache::new`] (which verifies subcache identity and layout), and
-//! rebase DATA pages with [`SlideInfoV5::rebase_page`].
+//! [`SharedCache::new`] (which verifies subcache identity and layout), compute
+//! the libSystem closure with [`SharedCache::closure`], and rebase DATA pages
+//! with [`SlideInfoV5::rebase_page`].
 
 use crate::VmProtection;
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec,
+    vec::Vec,
+};
 use core::ops::Range;
 
 /// Magic of an arm64e cache file (main cache and subcaches).
@@ -85,6 +91,8 @@ pub enum SharedCacheError {
     SubcacheUuidMismatch { index: usize },
     #[error("no cache mapping covers {length:#x} bytes at {address:#x}")]
     Unmapped { address: u64, length: u64 },
+    #[error("{image} requires {dependency}, which is not in the shared cache")]
+    MissingDependency { image: String, dependency: String },
     #[error("slide chain leaves page {page_index} at offset {offset:#x}")]
     ChainOutOfPage { page_index: usize, offset: usize },
 }
@@ -747,6 +755,14 @@ fn dylib_name(body: &[u8]) -> Result<&str> {
     c_string(body, offset, body.len())
 }
 
+/// One image of a dependency closure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosureImage {
+    /// Index of the image's first entry in [`SharedCache::images`].
+    pub index: usize,
+    pub image: CacheImage,
+}
+
 /// A main cache file and its subcaches, verified to form one cache.
 pub struct SharedCache<R> {
     files: Vec<CacheFile<R>>,
@@ -895,6 +911,72 @@ impl<R: CacheFileReader> SharedCache<R> {
         }
         let bytes = self.read_at_address(address, MACH_HEADER_64_BYTES + commands as usize)?;
         CacheImage::parse(address, &bytes)
+    }
+
+    /// The transitive dylib closure of `roots` (image table indices): the
+    /// images dyld initializes at launch. It follows regular, weak, re-export
+    /// and upward links, but not [`DylibAttributes::DELAYED_INIT`] links, whose
+    /// targets dyld initializes only on first use. Aliases resolve to one
+    /// image, cycles are visited once, and only missing weak dependencies are
+    /// tolerated. Results are sorted by address.
+    pub fn closure(&self, roots: &[usize]) -> Result<Vec<ClosureImage>> {
+        self.closure_with(roots, false)
+    }
+
+    /// Like [`Self::closure`], but also following
+    /// [`DylibAttributes::DELAYED_INIT`] links: every image dyld creates a
+    /// loader for (maps, binds and exposes to debuggers) at launch, including
+    /// those whose initializers it delays.
+    pub fn launch_set(&self, roots: &[usize]) -> Result<Vec<ClosureImage>> {
+        self.closure_with(roots, true)
+    }
+
+    fn closure_with(
+        &self,
+        roots: &[usize],
+        follow_delayed_init: bool,
+    ) -> Result<Vec<ClosureImage>> {
+        let mut pending = Vec::new();
+        for &root in roots {
+            pending.push(
+                self.images
+                    .get(root)
+                    .ok_or(SharedCacheError::Malformed("closure root index"))?
+                    .address,
+            );
+        }
+        let mut visited = BTreeMap::new();
+        let mut queued: BTreeSet<u64> = pending.iter().copied().collect();
+        while let Some(address) = pending.pop() {
+            let index = self
+                .image_index_by_address(address)
+                .ok_or(SharedCacheError::Malformed("closure image address"))?;
+            let image = self.parse_image(address)?;
+            for dependency in &image.dependencies {
+                if !follow_delayed_init
+                    && dependency
+                        .attributes
+                        .contains(DylibAttributes::DELAYED_INIT)
+                {
+                    continue;
+                }
+                let Some(target) = self.image_index_by_path(&dependency.path) else {
+                    if dependency.attributes.contains(DylibAttributes::WEAK) {
+                        continue;
+                    }
+                    return Err(SharedCacheError::MissingDependency {
+                        image: self.images[index].path.clone(),
+                        dependency: dependency.path.clone(),
+                    });
+                };
+                let target = self.images[target].address;
+                if queued.insert(target) {
+                    pending.push(target);
+                }
+            }
+            visited.insert(address, ClosureImage { index, image });
+        }
+        Ok(visited.into_values().collect())
     }
 }
 
