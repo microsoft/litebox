@@ -60,9 +60,10 @@
 //!
 //! LiteBox copies the loaded binary into trusted memory, then releases the VTL0
 //! allocation with a `SHM_FREE` RPC tracked by [`RpcContext::ShmFree`]. The
-//! trusted cached binary is dropped after ldelf loads it into TA runtime memory.
+//! trusted binary is dropped once the TA is prepared for its first entry, or with
+//! the TA instance.
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use litebox::utils::id_pool::IdPool;
 use litebox_common_optee::{OpteeSmcReturnCode, TeeUuid};
@@ -79,9 +80,12 @@ pub enum RpcContextError {
 }
 
 /// Action to take after an in-flight shared-memory free RPC returns.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum RpcCompletion {
-    OpenSession { ta_binary: Arc<[u8]> },
+    /// `ta_binary` is `None` once the open took it.
+    OpenSession {
+        ta_binary: Option<Vec<u8>>,
+    },
     ReturnError(OpteeSmcReturnCode),
 }
 
@@ -96,7 +100,7 @@ pub struct RpcCommon {
 }
 
 /// Continuation state for an RPC-backed Dynamic TA request.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum RpcContext {
     LoadTaSize {
         common: RpcCommon,
@@ -228,9 +232,12 @@ mod tests {
             Err(RpcContextError::Full)
         );
 
-        contexts.insert(first_id, first.clone()).unwrap();
+        contexts.insert(first_id, first).unwrap();
 
-        assert_eq!(contexts.take(first_id), Some(first));
+        assert_eq!(
+            contexts.take(first_id),
+            Some(RpcContext::new(test_uuid(1), 1, 0))
+        );
         contexts.release(first_id);
         assert_eq!(contexts.allocate(test_uuid(3), 3, 0).unwrap(), first_id);
     }

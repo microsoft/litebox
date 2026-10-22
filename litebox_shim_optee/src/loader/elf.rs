@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! ELF loader for LiteBox customized for loading and running `ldelf` and
-//! eventially the target OP-TEE TA.
+//! eventually the target OP-TEE TA.
 //!
 //! Unlike the ELF loader for Linux Shim, this loader does not load the main
 //! ELF. This is because OP-TEE's `ldelf` has several non-standard features
@@ -14,7 +14,7 @@
 //!
 //! Since OP-TEE Shim does not support file-backed mapping, this module uses
 //! anonymous mappings and manually loads the ELF segments into memory, which
-//! result in uncessary data copies and higher memory usage. To avoid this,
+//! result in unnecessary data copies and higher memory usage. To avoid this,
 //! we need to implement file-backed mapping, demand paging, and/or shared
 //! mapping in the future.
 use crate::{MutPtr, Task, ThreadInitState, UserMutPtr};
@@ -28,42 +28,13 @@ use litebox_common_linux::{
     loader::{ElfParseError, ElfParsedFile},
     vmem::MappingError,
 };
-use litebox_common_optee::PAGE_SIZE;
-use litebox_common_optee::{LdelfArg, TeeUuid};
+use litebox_common_optee::{LdelfArg, PAGE_SIZE};
 use thiserror::Error;
 
 /// An ELF file loaded in memory
 struct ElfFileInMemory<'a, Platform: crate::OpteeShimPlatform> {
     task: &'a Task<Platform>,
-    buffer: alloc::boxed::Box<[u8]>,
-}
-
-fn read_at<Platform: crate::OpteeShimPlatform>(
-    elf: &ElfFileInMemory<Platform>,
-    offset: u64,
-    buf: &mut [u8],
-) -> Result<(), Errno> {
-    if buf.is_empty() {
-        return Ok(());
-    }
-    let offset = offset.trunc();
-    if offset >= elf.buffer.len() {
-        return Err(Errno::ENODATA);
-    }
-    let available = elf.buffer.len() - offset;
-    let end = offset + core::cmp::min(buf.len(), available);
-    let len = end - offset;
-    buf[..len].copy_from_slice(&elf.buffer[offset..end]);
-    Ok(())
-}
-
-impl<'a, Platform: crate::OpteeShimPlatform> ElfFileInMemory<'a, Platform> {
-    fn new(task: &'a Task<Platform>, elf_buf: &[u8]) -> Self {
-        Self {
-            task,
-            buffer: elf_buf.into(),
-        }
-    }
+    buffer: &'a [u8],
 }
 
 impl<Platform: crate::OpteeShimPlatform> litebox_common_linux::loader::ReadAt
@@ -72,7 +43,14 @@ impl<Platform: crate::OpteeShimPlatform> litebox_common_linux::loader::ReadAt
     type Error = Errno;
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
-        read_at(self, offset, buf)
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let start: usize = offset.trunc();
+        let end = start.checked_add(buf.len()).ok_or(Errno::ENODATA)?;
+        let src = self.buffer.get(start..end).ok_or(Errno::ENODATA)?;
+        buf.copy_from_slice(src);
+        Ok(())
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
@@ -209,37 +187,20 @@ impl<Platform: crate::OpteeShimPlatform> litebox_common_linux::loader::MapMemory
 
 /// Loader for ELF files
 pub(crate) struct ElfLoader<'a, Platform: crate::OpteeShimPlatform> {
-    main: FileAndParsed<'a, Platform>,
-    is_ldelf: bool,
-}
-
-struct FileAndParsed<'a, Platform: crate::OpteeShimPlatform> {
     file: ElfFileInMemory<'a, Platform>,
     parsed: ElfParsedFile,
 }
 
-impl<'a, Platform: crate::OpteeShimPlatform> FileAndParsed<'a, Platform> {
-    fn new(task: &'a Task<Platform>, elf_buf: &[u8]) -> Result<Self, ElfLoaderError> {
-        let file = ElfFileInMemory::new(task, elf_buf);
-        let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
-            .map_err(ElfLoaderError::ParseError)?;
+impl<'a, Platform: crate::OpteeShimPlatform> ElfLoader<'a, Platform> {
+    /// Parse a given ELF binary in memory.
+    pub fn new(task: &'a Task<Platform>, elf: &'a [u8]) -> Result<Self, ElfLoaderError> {
+        let file = ElfFileInMemory { task, buffer: elf };
+        let mut parsed = ElfParsedFile::parse(&mut &file).map_err(ElfLoaderError::ParseError)?;
         match parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point()) {
             Ok(()) | Err(ElfParseError::UnpatchedBinary) => {}
             Err(e) => return Err(e.into()),
         }
         Ok(Self { file, parsed })
-    }
-}
-
-impl<'a, Platform: crate::OpteeShimPlatform> ElfLoader<'a, Platform> {
-    /// Parse a given ELF binary in memory.
-    pub fn new(
-        task: &'a Task<Platform>,
-        elf_bin: &[u8],
-        is_ldelf: bool,
-    ) -> Result<Self, ElfLoaderError> {
-        let main = FileAndParsed::new(task, elf_bin)?;
-        Ok(Self { main, is_ldelf })
     }
 
     /// The pages the TA's trampoline occupies, relative to the TA's load
@@ -249,30 +210,17 @@ impl<'a, Platform: crate::OpteeShimPlatform> ElfLoader<'a, Platform> {
     /// at, whereas [`Self::load_ta_trampoline`] anchors at
     /// `entry_point - e_entry`. The two agree as long as the first `PT_LOAD`
     /// starts at vaddr 0, which `ldelf` assumes too.
-    pub(crate) fn ta_trampoline_relative_page_range(
-        task: &'a Task<Platform>,
-        ta_uuid: &TeeUuid,
-    ) -> Result<Option<core::ops::Range<usize>>, ElfLoaderError> {
-        let ta_bin = task
-            .global
-            .get_ta_bin(ta_uuid)
-            .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
-        // Constructing the loader only parses headers; it maps nothing.
-        let loader = Self::new(task, &ta_bin, false)?;
-        Ok(loader.main.parsed.trampoline_page_range(0))
+    pub(crate) fn trampoline_relative_page_range(&self) -> Option<core::ops::Range<usize>> {
+        self.parsed.trampoline_page_range(0)
     }
 
     /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID.
     pub fn load_ldelf(&mut self, ldelf_arg: &LdelfArg) -> Result<ThreadInitState, ElfLoaderError> {
-        if !self.is_ldelf {
-            return Err(ElfLoaderError::OpenError(Errno::ENOENT));
-        }
-        let task = self.main.file.task;
+        let task = self.file.task;
         let global = &task.global;
-        let ldelf_info =
-            self.main
-                .parsed
-                .load(&mut self.main.file, &mut &*global.platform, None)?;
+        let ldelf_info = self
+            .parsed
+            .load(&mut self.file, &mut &*global.platform, None)?;
 
         let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, None).ok_or(
             ElfLoaderError::MappingError(litebox_common_linux::vmem::MappingError::OutOfMemory),
@@ -295,15 +243,11 @@ impl<'a, Platform: crate::OpteeShimPlatform> ElfLoader<'a, Platform> {
     /// Since `ldelf` is not aware of the LiteBox trampoline, we should call this function after `ldelf` has
     /// loaded the TA into memory whose base address is different from that of `ldelf`.
     pub fn load_ta_trampoline(&mut self, ta_entry_point: usize) -> Result<(), ElfLoaderError> {
-        if self.is_ldelf {
-            return Err(ElfLoaderError::OpenError(Errno::ENOENT));
-        }
-        let task = self.main.file.task;
+        let task = self.file.task;
         let global = &task.global;
 
-        self.main
-            .parsed
-            .load_secondary_trampoline(&mut self.main.file, &mut &*global.platform, ta_entry_point)
+        self.parsed
+            .load_secondary_trampoline(&mut self.file, &mut &*global.platform, ta_entry_point)
             .map_err(|_| {
                 ElfLoaderError::MappingError(litebox_common_linux::vmem::MappingError::OutOfMemory)
             })
@@ -311,6 +255,7 @@ impl<'a, Platform: crate::OpteeShimPlatform> ElfLoader<'a, Platform> {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum ElfLoaderError {
     #[error("failed to open the ELF file")]
     OpenError(#[from] Errno),
@@ -324,8 +269,8 @@ pub enum ElfLoaderError {
     ProtectError(Errno),
     #[error("failed to mmap")]
     MappingError(#[from] MappingError),
-    #[error("TA binary UUID does not match expected UUID")]
-    InvalidUuid,
+    #[error("dynamic TA failed signature or UUID verification")]
+    UnverifiedTa,
 }
 
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
@@ -337,7 +282,7 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
                 litebox_common_linux::errno::Errno::ENOMEM
             }
             ElfLoaderError::LoadError(e) => e.into(),
-            ElfLoaderError::InvalidUuid => litebox_common_linux::errno::Errno::EINVAL,
+            ElfLoaderError::UnverifiedTa => litebox_common_linux::errno::Errno::EACCES,
         }
     }
 }
