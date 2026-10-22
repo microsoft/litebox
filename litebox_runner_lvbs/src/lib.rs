@@ -421,6 +421,9 @@ fn vsm_dispatch(platform: &'static Platform, func_id: VsmFunction, params: &[u64
             params[0],
             params[1],
         ),
+        VsmFunction::AllocateRingbufferMemory => {
+            heki.allocate_ringbuffer_memory(params[0], params[1])
+        }
         VsmFunction::ExchangeSecrets => Err(VsmError::OperationNotSupported(
             "exchange secrets boot set up",
         )),
