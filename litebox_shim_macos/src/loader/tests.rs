@@ -30,11 +30,19 @@ use std::process::Command;
 
 /// Requires Xcode command-line tools; the executable needs neither libc nor dyld.
 fn image() -> Vec<u8> {
+    link(
+        include_str!("fixtures/static.S"),
+        &["-static", "-e", "_start"],
+    )
+}
+
+/// Assemble and link an AArch64 Mach-O with Xcode command-line tools.
+fn link(assembly: &str, link_args: &[&str]) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("static.S");
-    let object = dir.path().join("static.o");
-    let executable = dir.path().join("static");
-    std::fs::write(&source, include_str!("fixtures/static.S")).unwrap();
+    let source = dir.path().join("image.S");
+    let object = dir.path().join("image.o");
+    let executable = dir.path().join("image");
+    std::fs::write(&source, assembly).unwrap();
     for mut command in [
         {
             let mut command = Command::new("xcrun");
@@ -48,7 +56,8 @@ fn image() -> Vec<u8> {
         {
             let mut command = Command::new("xcrun");
             command
-                .args(["ld", "-arch", "arm64", "-static", "-e", "_start"])
+                .args(["ld", "-arch", "arm64"])
+                .args(link_args)
                 .arg(&object)
                 .arg("-o")
                 .arg(&executable);
@@ -249,4 +258,48 @@ fn byte_snapshot_path_is_independent_of_argv() {
     let apple = word(sp + apple_index * size_of::<usize>());
     let expected = b"executable_path=/bin/actual-executable\0";
     assert_eq!(read_bytes(apple, expected.len()), expected);
+}
+
+#[test]
+fn aot_rewritten_dyld_loads_like_raw_dyld() {
+    set_guest_abi(GuestAbi::Darwin);
+    let sdk = Command::new("xcrun")
+        .arg("--show-sdk-path")
+        .output()
+        .expect("Xcode command-line tools are required");
+    assert!(sdk.status.success());
+    let sdk = std::string::String::from_utf8(sdk.stdout).unwrap();
+    let main = link(
+        ".global _main\n.p2align 2\n_main:\n mov x0, #42\n ret\n",
+        &["-e", "_main", "-lSystem", "-syslibroot", sdk.trim()],
+    );
+    let host_dyld = std::fs::read("/usr/lib/dyld").unwrap();
+    let raw = arm64_slice(&host_dyld).unwrap();
+    let aot =
+        hook_syscalls_in_macho_with_options(raw, None, crate::aarch64_rewrite_options()).unwrap();
+    assert!(matches!(
+        MachoParsedFile::parse(&aot).unwrap().parse_trampoline(&aot),
+        Ok(Some(_))
+    ));
+    // The loader rewrites raw dyld itself and uses the AOT image as supplied;
+    // both must yield the same dyld entry code.
+    let entry_code = |dyld: &[u8]| {
+        let program = MacosShimBuilder::new(Platform::new())
+            .build()
+            .load_program_with_dyld(
+                TaskParams::default(),
+                "/bin/main",
+                &main,
+                dyld,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let sp = program.initial_ctx.sp;
+        let main_header = word(sp);
+        let code = read_bytes(program.initial_ctx.pc, 64);
+        assert_eq!(read_bytes(main_header, 4), 0xfeed_facf_u32.to_le_bytes());
+        code
+    };
+    assert_eq!(entry_code(raw), entry_code(&aot));
 }

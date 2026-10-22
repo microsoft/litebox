@@ -148,8 +148,6 @@ pub enum UnpatchableSyscalls {
 pub struct RewriteOptions {
     target_host: TargetHost,
     virtualize_x18: bool,
-    preserve_host_thread_state: bool,
-    native_guest_thread_pointer: bool,
     unpatchable_syscalls: UnpatchableSyscalls,
 }
 
@@ -175,43 +173,8 @@ impl RewriteOptions {
         Self {
             target_host,
             virtualize_x18: virtualize_x18 || !matches!(target_host, TargetHost::Linux),
-            preserve_host_thread_state: false,
-            native_guest_thread_pointer: false,
             unpatchable_syscalls: UnpatchableSyscalls::Trap,
         }
-    }
-
-    /// Rewrites Darwin syscalls and thread-pointer reads in code shared between
-    /// the host and guest execution contexts.
-    pub const fn host_aware_thread_pointer(target_host: TargetHost) -> Self {
-        Self {
-            target_host,
-            virtualize_x18: false,
-            preserve_host_thread_state: true,
-            native_guest_thread_pointer: false,
-            unpatchable_syscalls: UnpatchableSyscalls::Trap,
-        }
-    }
-
-    /// Rewrites live macOS shared-cache code.
-    pub const fn macos_host_shared_cache() -> Self {
-        Self::host_aware_thread_pointer(TargetHost::MacOs)
-    }
-
-    /// Rewrite Darwin syscalls while leaving TPIDRRO reads native.
-    pub const fn native_guest_thread_pointer(target_host: TargetHost) -> Self {
-        Self {
-            target_host,
-            virtualize_x18: false,
-            preserve_host_thread_state: false,
-            native_guest_thread_pointer: true,
-            unpatchable_syscalls: UnpatchableSyscalls::Trap,
-        }
-    }
-
-    /// Rewrite Darwin syscalls for a macOS host while leaving TPIDRRO reads native.
-    pub const fn macos_native_guest_tpidrro() -> Self {
-        Self::native_guest_thread_pointer(TargetHost::MacOs)
     }
 
     /// Returns the selected AArch64 host ABI.
@@ -234,14 +197,6 @@ impl RewriteOptions {
 
     pub const fn unpatchable_syscalls(self) -> UnpatchableSyscalls {
         self.unpatchable_syscalls
-    }
-
-    pub(crate) const fn preserves_host_thread_state(self) -> bool {
-        self.preserve_host_thread_state
-    }
-
-    pub(crate) const fn uses_native_guest_thread_pointer(self) -> bool {
-        self.native_guest_thread_pointer
     }
 }
 

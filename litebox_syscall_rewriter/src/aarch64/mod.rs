@@ -42,11 +42,11 @@ use core::ops::Range;
 use litebox_trampoline::TargetHost;
 use litebox_trampoline::aarch64::{
     DARWIN_SVC, ExclusiveBoundary, GATE_ALIGNMENT, GATES_START_OFFSET, GateLayout, GateMetadata,
-    HOST_AWARE_MRS_SLOT_BYTES, INSN_BYTES, INSN_BYTES_U64, Insn, MAX_GATE_SLOT_BYTES,
-    MRS_TPIDR_EL0_BITS, MRS_TPIDR_EL0_MASK, MSR_TPIDR_EL0_BITS, MSR_TPIDR_EL0_MASK, Opcode,
-    REG_MASK, SVC_OPCODE_BITS, SVC_OPCODE_MASK, TRAP_BRK_IMM, X18, X18Adr, X18Classification,
-    X18CompareBranch, X18IndirectBranchKind, X18StackWriteback, X18TransformResult, X18Unsupported,
-    XZR, classify_adr_x18, classify_pc_relative_x18, classify_x18, classify_x18_conditional_branch,
+    INSN_BYTES, INSN_BYTES_U64, Insn, MAX_GATE_SLOT_BYTES, MRS_TPIDR_EL0_BITS, MRS_TPIDR_EL0_MASK,
+    MSR_TPIDR_EL0_BITS, MSR_TPIDR_EL0_MASK, Opcode, REG_MASK, SVC_OPCODE_BITS, SVC_OPCODE_MASK,
+    TRAP_BRK_IMM, X18, X18Adr, X18Classification, X18CompareBranch, X18IndirectBranchKind,
+    X18StackWriteback, X18TransformResult, X18Unsupported, XZR, classify_adr_x18,
+    classify_pc_relative_x18, classify_x18, classify_x18_conditional_branch,
     classify_x18_stack_writeback, emit_shared_prologue, exclusive_boundary, gate,
 };
 use object::read::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
@@ -355,7 +355,6 @@ fn ranges_to_sections(
 pub(crate) struct RewriteConfig {
     host: TargetHost,
     virtualize_x18: bool,
-    preserve_host_thread_state: bool,
 }
 
 impl RewriteConfig {
@@ -363,13 +362,7 @@ impl RewriteConfig {
         Self {
             host: target,
             virtualize_x18,
-            preserve_host_thread_state: false,
         }
-    }
-
-    fn with_host_thread_state_preservation(mut self, preserve: bool) -> Self {
-        self.preserve_host_thread_state = preserve;
-        self
     }
 }
 
@@ -685,9 +678,8 @@ pub(crate) fn hook_macho(
     callback: u64,
     options: crate::RewriteOptions,
 ) -> Result<Option<HookOutcome>> {
-    let config = RewriteConfig::new(options.target_host(), false)
-        .with_host_thread_state_preservation(options.preserves_host_thread_state());
-    let sites = find_macho_patch_sites(sections, buf, !options.uses_native_guest_thread_pointer())?;
+    let config = RewriteConfig::new(options.target_host(), false);
+    let sites = find_macho_patch_sites(sections, buf)?;
     hook_sites(
         buf,
         &sites,
@@ -698,11 +690,7 @@ pub(crate) fn hook_macho(
     )
 }
 
-fn find_macho_patch_sites(
-    sections: &[TextSectionInfo],
-    buf: &[u8],
-    rewrite_tpidrro: bool,
-) -> Result<Vec<PatchSite>> {
+fn find_macho_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<PatchSite>> {
     let mut sites = Vec::new();
     for section in sections {
         let data = crate::section_slice(buf, section)?;
@@ -728,9 +716,6 @@ fn find_macho_patch_sites(
                 }
                 PatchKind::Svc
             } else if opcode == Opcode::MrsTpidrroEl0.bits() {
-                if !rewrite_tpidrro {
-                    continue;
-                }
                 let destination = (word & REG_MASK) as u8;
                 if destination == XZR {
                     continue;
@@ -758,7 +743,7 @@ pub(crate) fn trap_macho_patch_sites(
     buf: &mut [u8],
     sections: &[TextSectionInfo],
 ) -> Result<usize> {
-    let sites = find_macho_patch_sites(sections, buf, true)?;
+    let sites = find_macho_patch_sites(sections, buf)?;
     for site in &sites {
         trap_site(buf, site.file_offset);
     }
@@ -770,16 +755,10 @@ pub(crate) fn macho_trampoline_size_upper_bound(
     sections: &[TextSectionInfo],
     options: crate::RewriteOptions,
 ) -> Result<usize> {
-    let sites = find_macho_patch_sites(sections, buf, !options.uses_native_guest_thread_pointer())?;
+    let sites = find_macho_patch_sites(sections, buf)?;
     sites.iter().try_fold(0usize, |total, site| {
         let gate_bytes = site.kind.metadata().map_or(0, |metadata| {
-            if options.preserves_host_thread_state()
-                && matches!(metadata, GateMetadata::MrsTpidr { .. })
-            {
-                HOST_AWARE_MRS_SLOT_BYTES
-            } else {
-                metadata.slot_size_for_host(options.target_host())
-            }
+            metadata.slot_size_for_host(options.target_host())
         });
         // Allow a separate callback header for each mapping batch.
         total
@@ -882,14 +861,7 @@ fn emit_gate(
             GateLayout::linux(config.host),
         ),
         PatchKind::MrsTpidr(destination) => (
-            gate::GateInstance::new(
-                if config.preserve_host_thread_state {
-                    GateMetadata::HostAwareMrsTpidr { destination }
-                } else {
-                    GateMetadata::MrsTpidr { destination }
-                },
-                next("MRS return")?,
-            ),
+            gate::GateInstance::new(GateMetadata::MrsTpidr { destination }, next("MRS return")?),
             GateLayout::linux(config.host),
         ),
         PatchKind::X18(X18TransformResult::Supported(transform)) => {
@@ -1024,18 +996,17 @@ mod tests {
         Boundary, ClassifiedGate, EncodedGateMetadata, FIRST_SCANNABLE_OFFSET, Frame, FrameBase,
         GATE_METADATA_BYTES, GATE_METADATA_REGISTER_SHIFT, GATE_SLOT_SIZES,
         GUEST_TPIDR_OFFSET_ALIGN, GUEST_TPIDR_OFFSET_PLACEHOLDER, GuestSp, IMM26_MASK,
-        IN_GUEST_OFFSET_FROM_GUEST_TP, LDST_UIMM12_IMM_MASK, LDST_UIMM12_IMM_SHIFT,
-        MAX_GUEST_TPIDR_OFFSET, MIN_GUEST_TPIDR_OFFSET, MRS_SLOT_BYTES, MSR_FRAME_OFF_VALUE,
-        MSR_SLOT_BYTES, NOP, OPCODE_TOP6_MASK, Resume, SP, SVC_0, SVC_FRAME_BYTES,
-        SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16, SVC_GATE_BYTES,
-        SVC_OUTBOUND_STUB_BYTES, SVC_SLOT_BYTES, Stage, Value, X16, X17, X18_ADR_SLOT_BYTES,
-        X18_BRANCH_SLOT_BYTES, X18_COMPARE_BRANCH_SLOT_BYTES, X18_SLOT_BYTES,
-        X18_STACK_WRITEBACK_SLOT_BYTES, anchor_mask, classify_copied_gate_slot_for_host,
-        classify_copied_gate_slot_with_layout, classify_gate_pc, classify_gate_pc_with_candidates,
-        decode_adrp_add_target_for, decode_adrp_target, decode_branch_target,
-        decode_gate_metadata_word, finalize_macho_trampoline, finalize_trampoline_gates,
-        finalize_trampoline_gates_for_host, find_guest_tpidr_placeholder,
-        find_guest_x18_placeholder,
+        LDST_UIMM12_IMM_MASK, LDST_UIMM12_IMM_SHIFT, MAX_GUEST_TPIDR_OFFSET,
+        MIN_GUEST_TPIDR_OFFSET, MRS_SLOT_BYTES, MSR_FRAME_OFF_VALUE, MSR_SLOT_BYTES, NOP,
+        OPCODE_TOP6_MASK, Resume, SP, SVC_0, SVC_FRAME_BYTES, SVC_FRAME_OFF_RETADDR,
+        SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16, SVC_GATE_BYTES, SVC_OUTBOUND_STUB_BYTES,
+        SVC_SLOT_BYTES, Stage, Value, X16, X17, X18_ADR_SLOT_BYTES, X18_BRANCH_SLOT_BYTES,
+        X18_COMPARE_BRANCH_SLOT_BYTES, X18_SLOT_BYTES, X18_STACK_WRITEBACK_SLOT_BYTES, anchor_mask,
+        classify_copied_gate_slot_for_host, classify_copied_gate_slot_with_layout,
+        classify_gate_pc, classify_gate_pc_with_candidates, decode_adrp_add_target_for,
+        decode_adrp_target, decode_branch_target, decode_gate_metadata_word,
+        finalize_trampoline_gates, finalize_trampoline_gates_for_host,
+        find_guest_tpidr_placeholder, find_guest_x18_placeholder,
     };
     #[test]
     fn macos_fallback_traps_use_shared_marker() {
@@ -1104,183 +1075,6 @@ mod tests {
             decode_gate_metadata_word(word_at(&trampoline, 112 + SVC_SLOT_BYTES - 4)),
             Some(GateMetadata::Svc)
         ));
-    }
-    #[test]
-    fn macos_host_cache_gate_selects_guest_state_without_changing_host_tpidrro() {
-        let mut code = Insn::MrsTpidrroEl0(9).encode().unwrap().to_le_bytes();
-        let sections = [TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: code.len() as u64,
-        }];
-        let outcome = hook_macho(
-            &mut code,
-            &sections,
-            0x400000,
-            0,
-            crate::RewriteOptions::macos_host_shared_cache(),
-        )
-        .unwrap()
-        .unwrap();
-        let gate = &outcome.trampoline[GATES_START_OFFSET..];
-        assert_eq!(gate.len(), HOST_AWARE_MRS_SLOT_BYTES);
-        assert_eq!(
-            decode_gate_metadata_word(word_at(gate, HOST_AWARE_MRS_SLOT_BYTES - 4)),
-            Some(GateMetadata::HostAwareMrsTpidr { destination: 9 })
-        );
-        assert_eq!(word_at(gate, 0), Insn::MrsTpidrroEl0(9).encode().unwrap());
-        assert_eq!(
-            word_at(gate, 16),
-            Insn::LdrUimm {
-                rt: 9,
-                rn: 9,
-                imm_bytes: IN_GUEST_OFFSET_FROM_GUEST_TP,
-            }
-            .encode()
-            .unwrap()
-        );
-        assert_eq!(word_at(gate, 44), Insn::MrsTpidrroEl0(9).encode().unwrap());
-
-        let mut finalized = outcome.trampoline;
-        finalize_macho_trampoline(&mut finalized, 24, litebox_trampoline::TargetHost::MacOs)
-            .unwrap();
-        for offset in [GATES_START_OFFSET + 8, GATES_START_OFFSET + 32] {
-            assert_eq!(
-                word_at(&finalized, offset),
-                Insn::LdrUimm {
-                    rt: 9,
-                    rn: 9,
-                    imm_bytes: 24,
-                }
-                .encode()
-                .unwrap()
-            );
-        }
-        let gate_vaddr = 0x400000 + GATES_START_OFFSET as u64;
-        let executable_end = GateMetadata::HostAwareMrsTpidr { destination: 9 }
-            .executable_end_for_host(TargetHost::MacOs);
-        assert_eq!(executable_end, 52);
-        for offset in (0..executable_end).step_by(INSN_BYTES) {
-            let classified = classify_copied_gate_slot_with_layout(
-                &finalized[GATES_START_OFFSET..],
-                gate_vaddr,
-                gate_vaddr + offset as u64,
-                GateLayout::darwin(TargetHost::MacOs),
-            )
-            .unwrap();
-            assert_eq!(classified.original_site(), 0x1000);
-        }
-        // The host-path MRS is reachable only from host mode.
-        assert_eq!(
-            classify_copied_gate_slot_with_layout(
-                &finalized[GATES_START_OFFSET..],
-                gate_vaddr,
-                gate_vaddr + 44,
-                GateLayout::darwin(TargetHost::MacOs),
-            )
-            .map(ClassifiedGate::stage),
-            Some(Stage::Invalid)
-        );
-
-        let mut malformed = finalized[GATES_START_OFFSET..].to_vec();
-        malformed[16..20].copy_from_slice(
-            &Insn::LdrUimm {
-                rt: 9,
-                rn: 9,
-                imm_bytes: IN_GUEST_OFFSET_FROM_GUEST_TP + 8,
-            }
-            .encode()
-            .unwrap()
-            .to_le_bytes(),
-        );
-        assert!(
-            classify_copied_gate_slot_with_layout(
-                &malformed,
-                gate_vaddr,
-                gate_vaddr,
-                GateLayout::darwin(TargetHost::MacOs),
-            )
-            .is_none()
-        );
-    }
-    #[test]
-    fn host_aware_mrs_stages_cover_every_executable_boundary() {
-        let mut code = Insn::MrsTpidrroEl0(9).encode().unwrap().to_le_bytes();
-        let sections = [TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: code.len() as u64,
-        }];
-        let outcome = hook_macho(
-            &mut code,
-            &sections,
-            0x400000,
-            0,
-            crate::RewriteOptions::macos_host_shared_cache(),
-        )
-        .unwrap()
-        .unwrap();
-        let incomplete = recover(
-            Frame::None,
-            GuestSp::Signal,
-            Value::None,
-            Resume::Site,
-            false,
-        );
-        let from_slot = recover(
-            Frame::None,
-            GuestSp::Signal,
-            Value::Slot,
-            Resume::Next,
-            true,
-        );
-        let from_register = recover(
-            Frame::None,
-            GuestSp::Signal,
-            Value::None,
-            Resume::Next,
-            false,
-        );
-        let mut expected = vec![Some(incomplete)];
-        expected.extend([Some(from_slot); 9]);
-        expected.extend([
-            Some(from_register),
-            Some(Stage::Invalid),
-            Some(from_register),
-            None,
-        ]);
-        assert_eq!(
-            slot_stages(
-                &outcome.trampoline[GATES_START_OFFSET..],
-                0x400000 + GATES_START_OFFSET as u64,
-                GateLayout::darwin(TargetHost::MacOs),
-            )[..expected.len()],
-            expected
-        );
-    }
-    #[test]
-    fn macos_native_guest_tpidrro_leaves_reads_native() {
-        let options = crate::RewriteOptions::macos_native_guest_tpidrro();
-        assert!(!options.preserves_host_thread_state());
-        let mrs = Insn::MrsTpidrroEl0(9).encode().unwrap();
-        let mut code = [mrs.to_le_bytes(), DARWIN_SVC.to_le_bytes()].concat();
-        let sections = [TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: code.len() as u64,
-        }];
-        let outcome = hook_macho(&mut code, &sections, 0x400000, 0, options)
-            .unwrap()
-            .unwrap();
-        assert_eq!(word_at(&code, 0), mrs);
-        assert_ne!(word_at(&code, 4), DARWIN_SVC);
-        assert_eq!(
-            decode_gate_metadata_word(word_at(
-                &outcome.trampoline,
-                GATES_START_OFFSET + SVC_SLOT_BYTES - GATE_METADATA_BYTES,
-            )),
-            Some(GateMetadata::Svc)
-        );
     }
     #[test]
     fn macos_masks_every_emitted_tpidrro_anchor() {
@@ -1441,7 +1235,6 @@ mod tests {
                 RewriteConfig {
                     host: TargetHost::Linux,
                     virtualize_x18: true,
-                    preserve_host_thread_state: false,
                 },
             )
         };
@@ -1509,7 +1302,6 @@ mod tests {
         RewriteConfig {
             host,
             virtualize_x18: true,
-            preserve_host_thread_state: false,
         }
     }
     fn word_at(data: &[u8], byte_off: usize) -> u32 {
@@ -1590,7 +1382,6 @@ mod tests {
             RewriteConfig {
                 host: TargetHost::Linux,
                 virtualize_x18: false,
-                preserve_host_thread_state: false,
             },
         )
         .unwrap()
@@ -1607,7 +1398,6 @@ mod tests {
             RewriteConfig {
                 host: TargetHost::Linux,
                 virtualize_x18: false,
-                preserve_host_thread_state: false,
             },
         )
     }
@@ -1643,7 +1433,6 @@ mod tests {
             RewriteConfig {
                 host: TargetHost::Linux,
                 virtualize_x18: true,
-                preserve_host_thread_state: false,
             },
         );
         let mut outcome = outcome.unwrap();
@@ -2115,7 +1904,6 @@ mod tests {
         let enabled = RewriteConfig {
             host: TargetHost::Linux,
             virtualize_x18: true,
-            preserve_host_thread_state: false,
         };
         let sites = find_patch_sites(&[section], &bytes, enabled).unwrap();
         assert!(sites.iter().all(|site| matches!(
@@ -2264,25 +2052,6 @@ mod tests {
         assert_eq!(ranges[0].vaddr, 0x1000);
         assert_eq!(ranges[0].file_offset, 0x200);
         assert_eq!(ranges[0].size, 0xc);
-    }
-    #[test]
-    fn host_aware_mrs_trampoline_size_bound_covers_emitted_gate() {
-        let mut bytes = Insn::MrsTpidrroEl0(9).encode().unwrap().to_le_bytes();
-        let sections = [TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: bytes.len() as u64,
-        }];
-        let options = crate::RewriteOptions::macos_host_shared_cache();
-
-        let bound = macho_trampoline_size_upper_bound(&bytes, &sections, options).unwrap();
-        let emitted = hook_macho(&mut bytes, &sections, 0x400000, 0x800000, options)
-            .unwrap()
-            .unwrap()
-            .trampoline;
-
-        assert_eq!(bound, GATES_START_OFFSET + HOST_AWARE_MRS_SLOT_BYTES);
-        assert_eq!(emitted.len(), bound);
     }
     #[test]
     fn trampoline_size_upper_bound_accounts_for_per_mapping_prologues() {
@@ -2880,7 +2649,6 @@ mod tests {
                 RewriteConfig {
                     host: TargetHost::Linux,
                     virtualize_x18: false,
-                    preserve_host_thread_state: false,
                 },
             ),
             Err(Error::AddressOverflow(_))

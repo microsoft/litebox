@@ -4,10 +4,10 @@
 //! Mach-O loading through the shim's file and virtual-memory subsystems.
 //!
 //! Parsing and rewriting use the same in-memory snapshot, isolating the load plan
-//! from later file changes. The runtime provider supplies dyld and any shared
-//! cache required by dynamically linked executables.
+//! from later file changes. The runtime provider supplies dyld for dynamically
+//! linked executables.
 
-use crate::{DyldImage, DyldThreadPointerMode, ShimPlatform, Task};
+use crate::{ShimPlatform, Task};
 use alloc::{borrow::Cow, ffi::CString, format, vec, vec::Vec};
 use core::ops::Range;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
@@ -18,9 +18,8 @@ use litebox_common_macos::{
     OpenFlags, PAGE_SIZE, VmProtection,
     loader::{MAX_IMAGE_SIZE, MachoParsedFile, TrampolineInfo, arm64_slice},
 };
-use litebox_syscall_rewriter::{
-    RewriteOptions,
-    macho::{CodeMetadata, Rewriter, hook_syscalls_in_macho_with_options},
+use litebox_syscall_rewriter::macho::{
+    CodeMetadata, Rewriter, hook_syscalls_in_macho_with_options,
 };
 
 use crate::MachoLoaderError;
@@ -101,35 +100,18 @@ struct Image<'a> {
 }
 
 impl<'a> Image<'a> {
-    fn prepare(
-        data: &'a [u8],
-        dyld_thread_pointer: Option<DyldThreadPointerMode>,
-    ) -> Result<Self, MachoLoaderError> {
+    fn prepare(data: &'a [u8]) -> Result<Self, MachoLoaderError> {
         let data = arm64_slice(data)?;
         let mut plan = MachoParsedFile::parse(data)?;
         let (data, trampoline) = match plan.parse_trampoline(data) {
-            Ok(_) if plan.is_dyld => {
-                return Err(MachoLoaderError::Unsupported("pre-rewritten dyld"));
-            }
             Ok(trampoline) => (Cow::Borrowed(data), trampoline),
             Err(MachoLoaderError::Unrewritten) => {
                 // Only absent rewrite metadata permits rewriting; invalid metadata is an error.
-                let rewritten = match dyld_thread_pointer {
-                    Some(DyldThreadPointerMode::Native) => hook_syscalls_in_macho_with_options(
-                        data,
-                        None,
-                        RewriteOptions::native_guest_thread_pointer(
-                            crate::aarch64_rewrite_options().target_host(),
-                        ),
-                    ),
-                    Some(DyldThreadPointerMode::Guest) | None => {
-                        hook_syscalls_in_macho_with_options(
-                            data,
-                            None,
-                            crate::aarch64_rewrite_options(),
-                        )
-                    }
-                }
+                let rewritten = hook_syscalls_in_macho_with_options(
+                    data,
+                    None,
+                    crate::aarch64_rewrite_options(),
+                )
                 .map_err(|_| MachoLoaderError::Rewrite)?;
                 plan = MachoParsedFile::parse(&rewritten)?;
                 let trampoline = plan.parse_trampoline(&rewritten)?;
@@ -189,17 +171,7 @@ impl<'a> Image<'a> {
                 .ok_or(MachoLoaderError::Memory)?;
             // Anonymous pages supply zero-filled BSS/padding; holes remain
             // inaccessible. macOS synchronizes instruction caches on RW -> RX.
-            // Dyld mutates its DATA_CONST/authenticated bookkeeping
-            // during bootstrap and normally asks the kernel mapping machinery
-            // to toggle those pages. Keep non-executable dyld data writable in
-            // this minimal loader; executable segments still remain W^X.
-            let final_protection =
-                if self.plan.is_dyld && !segment.protection.contains(VmProtection::EXECUTE) {
-                    segment.protection | VmProtection::WRITE
-                } else {
-                    segment.protection
-                };
-            protect(task, range, final_protection)?;
+            protect(task, range, segment.protection)?;
         }
         if let Some(trampoline) = &self.trampoline {
             let start = relocate(trampoline.virtual_range.start);
@@ -217,7 +189,6 @@ impl<'a> Image<'a> {
         Ok(MappedImage {
             entry: relocate(self.plan.entry),
             header: relocate(self.plan.virtual_range.start),
-            end: base + self.plan.virtual_range.len(),
         })
     }
 }
@@ -225,14 +196,13 @@ impl<'a> Image<'a> {
 struct MappedImage {
     entry: usize,
     header: usize,
-    end: usize,
 }
 
 pub(super) fn load<P: ShimPlatform>(
     task: &Task<P>,
     path: &str,
     image: Option<&[u8]>,
-    dyld: Option<DyldImage<'_>>,
+    dyld: Option<&[u8]>,
     argv: &[CString],
     envp: &[CString],
 ) -> Result<PtRegs, MachoLoaderError> {
@@ -243,7 +213,7 @@ pub(super) fn load<P: ShimPlatform>(
         owned_image = read_image(task, path)?;
         &owned_image
     };
-    let image = Image::prepare(data, None)?;
+    let image = Image::prepare(data)?;
     let uses_dyld = image.plan.uses_dyld;
     if image.plan.is_dyld {
         return Err(MachoLoaderError::Unsupported(
@@ -264,7 +234,7 @@ pub(super) fn load<P: ShimPlatform>(
             ));
         }
         (true, Some(dyld)) => {
-            let image = Image::prepare(dyld.data, Some(dyld.thread_pointer))?;
+            let image = Image::prepare(dyld)?;
             if !image.plan.is_dyld {
                 return Err(MachoLoaderError::Invalid(
                     "supplied dyld is not MH_DYLINKER",
@@ -273,19 +243,8 @@ pub(super) fn load<P: ShimPlatform>(
             Some(image.map(task)?)
         }
     };
-    if let Some(dyld) = &dyld {
-        *task.global.privately_mapped_dyld_range.lock() = Some(dyld.header..dyld.end);
-    }
-    let mut apple = vec![
-        CString::new(format!("executable_path={path}"))
-            .map_err(|_| MachoLoaderError::Invalid("executable path"))?,
-    ];
-    if uses_dyld {
-        apple.push(
-            CString::new(format!("executable_mh=0x{:x}", main.header))
-                .map_err(|_| MachoLoaderError::Invalid("executable header"))?,
-        );
-    }
+    let apple = [CString::new(format!("executable_path={path}"))
+        .map_err(|_| MachoLoaderError::Invalid("executable path"))?];
     let stack_base = reserve(
         task,
         STACK_SIZE + PAGE_SIZE,

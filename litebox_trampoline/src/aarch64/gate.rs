@@ -22,13 +22,13 @@
 use super::{
     ADD_IMM_SHAPE_MASK, ADRP_SHAPE_MASK, Boundary, Frame, FrameBase, GATE_METADATA_BYTES,
     GUEST_TPIDR_OFFSET_ALIGN, GUEST_TPIDR_OFFSET_PLACEHOLDER, GUEST_X18_OFFSET_PLACEHOLDER,
-    GateLayout, GateMetadata, GuestSp, IMM26_BITS, IMM26_MASK, IN_GUEST_OFFSET_FROM_GUEST_TP,
-    INSN_BYTES, Insn, LDST_UIMM12_IMM_MASK, LDST_UIMM12_IMM_SHIFT, MAX_GATE_SLOT_BYTES,
-    MSR_FRAME_BYTES, MSR_FRAME_OFF_VALUE, NOP, OPCODE_TOP6_MASK, Opcode, PAGE_OFFSET_MASK,
-    REG_MASK, RT2_SHIFT, Resume, SP, SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16,
-    Stage, TargetHost, Value, X16, X17, X18_BRANCH_BRK_IMM, X18_FRAME_BYTES, X18BranchKind,
-    X18PcRelative, X18StackWritebackLayout, anchor_mask, classify_x18_stack_writeback,
-    decode_ldr_literal_target, pcrel_bytes, valid_emitted_tpidr_offset, valid_emitted_x18_offset,
+    GateLayout, GateMetadata, GuestSp, IMM26_BITS, IMM26_MASK, INSN_BYTES, Insn,
+    LDST_UIMM12_IMM_MASK, LDST_UIMM12_IMM_SHIFT, MAX_GATE_SLOT_BYTES, MSR_FRAME_BYTES,
+    MSR_FRAME_OFF_VALUE, NOP, OPCODE_TOP6_MASK, Opcode, PAGE_OFFSET_MASK, REG_MASK, RT2_SHIFT,
+    Resume, SP, SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16, Stage, TargetHost,
+    Value, X16, X17, X18_BRANCH_BRK_IMM, X18_FRAME_BYTES, X18BranchKind, X18PcRelative,
+    X18StackWritebackLayout, anchor_mask, classify_x18_stack_writeback, decode_ldr_literal_target,
+    pcrel_bytes, valid_emitted_tpidr_offset, valid_emitted_x18_offset,
 };
 
 /// Most words any gate slot holds, including padding and metadata.
@@ -501,7 +501,6 @@ fn build_into(
     let template = match instance.metadata {
         GateMetadata::Svc => build_svc,
         GateMetadata::MrsTpidr { .. } => build_mrs,
-        GateMetadata::HostAwareMrsTpidr { .. } => build_host_aware_mrs,
         GateMetadata::MsrTpidr { .. } => build_msr,
         GateMetadata::X18 { .. } => build_x18,
         GateMetadata::X18StackWriteback { .. } => build_x18_stack_writeback,
@@ -593,63 +592,6 @@ fn build_mrs(asm: &mut GateAsm, gate: &Gate<'_>) -> Result<(), BuildError> {
         Role::Return,
         ret,
     )?;
-    Ok(())
-}
-
-/// Darwin shared-cache `MRS Xd, TPIDRRO_EL0`: guest state while LiteBox runs
-/// guest code, the physical register otherwise.
-#[inline(never)]
-fn build_host_aware_mrs(asm: &mut GateAsm, gate: &Gate<'_>) -> Result<(), BuildError> {
-    let instance = gate.instance;
-    let ret = instance.return_addr;
-    let none = Frame::None;
-    let GateMetadata::HostAwareMrsTpidr { destination: rd } = instance.metadata else {
-        return Err(BuildError::Metadata);
-    };
-    if asm.host != TargetHost::MacOs {
-        return Err(BuildError::Unsupported(
-            "host-aware TPIDRRO gates require macOS",
-        ));
-    }
-    let entry = Boundary::new(none, Signal, Value::None, Site).stage();
-    let lookup = Boundary::new(none, Signal, Slot, Next).fault().stage();
-    let done = Boundary::new(none, Signal, Value::None, Next).stage();
-    // First lookup: is this a LiteBox thread executing guest code? The
-    // destination is the only scratch: an architectural MRS overwrites
-    // it anyway. The pthread key slot is null on threads LiteBox never
-    // registered, and that null branch is the only guard.
-    asm.op(entry, Insn::MrsTpidrroEl0(rd))?;
-    asm.op(lookup, anchor_mask(rd))?;
-    asm.tls(lookup, TlsField::Tp, Opcode::LdrUimm, rd, rd)?;
-    asm.op(lookup, Insn::CbzX { rt: rd, offset: 32 })?;
-    asm.op(
-        lookup,
-        Insn::LdrUimm {
-            rt: rd,
-            rn: rd,
-            imm_bytes: IN_GUEST_OFFSET_FROM_GUEST_TP,
-        },
-    )?;
-    asm.op(lookup, Insn::CbzX { rt: rd, offset: 24 })?;
-    // Guest path: repeat the lookup, since the block pointer was
-    // consumed by the mode load.
-    asm.op(lookup, Insn::MrsTpidrroEl0(rd))?;
-    asm.op(lookup, anchor_mask(rd))?;
-    asm.tls(lookup, TlsField::Tp, Opcode::LdrUimm, rd, rd)?;
-    asm.op(
-        lookup,
-        Insn::LdrUimm {
-            rt: rd,
-            rn: rd,
-            imm_bytes: 0,
-        },
-    )?;
-    asm.op(done, Insn::B(8))?;
-    // Native host path: reproduce the original instruction, including the CPU
-    // tag. Host signals are forwarded without gate canonicalization,
-    // so reaching here from a guest-mode signal is a runtime bug.
-    asm.op(Some(Stage::Invalid), Insn::MrsTpidrroEl0(rd))?;
-    asm.branch(done, Role::Return, ret)?;
     Ok(())
 }
 
@@ -1293,14 +1235,9 @@ impl GateMetadata {
     /// # Panics
     /// Panics if the metadata cannot describe an encodable gate for this host.
     pub fn executable_end_for_host(self, host: TargetHost) -> usize {
-        let layout = if matches!(self, GateMetadata::HostAwareMrsTpidr { .. }) {
-            GateLayout::darwin(host)
-        } else {
-            GateLayout::linux(host)
-        };
         let slot = build(
             &probe_instance(self, 0x10_0000),
-            layout,
+            GateLayout::linux(host),
             0x10_0000,
             0x10_0000,
         )
