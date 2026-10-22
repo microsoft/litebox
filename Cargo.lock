@@ -2097,6 +2097,7 @@ dependencies = [
  "anyhow",
  "clap",
  "getrandom 0.3.4",
+ "libc",
  "litebox",
  "litebox_broker_core",
  "litebox_broker_host",

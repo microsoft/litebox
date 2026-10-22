@@ -4,45 +4,112 @@
 //! Miscellaneous Darwin syscalls.
 
 use crate::{ShimPlatform, Task};
+use alloc::vec::Vec;
 use litebox_common_macos::{
+    CTL_MAXNAME,
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
 };
 
 const SYSCTL_NAME_TO_OID_MIB: [i32; 2] = [0, 3];
-const OPTIONAL_DYLD_TUNABLES: [&[u8]; 2] = [b"kern.bootargs", b"security.mac.lockdown_mode_state"];
 /// Maximum byte count accepted by XNU's `getentropy` syscall.
 const GETENTROPY_MAX_BYTES: usize = 256;
 
+/// Copy `bytes` out as one `SYSCTL_OUT` transfer, like XNU's `sysctl` and
+/// `sysctl_old_user`: without a buffer, report the full length; with one too
+/// small, fail with ENOMEM before copying and report 0 (the output cursor is
+/// not advanced); otherwise copy and report the length.
+fn sysctl_copyout<P: ShimPlatform>(
+    old_value: UserPtrMut<u8>,
+    old_length: UserPtrMut<usize>,
+    bytes: &[u8],
+) -> Result<usize, Errno> {
+    // `fuulong`: an unreadable length reads as -1, clamped to SIZE_T_MAX.
+    let available = if old_length.as_usize() == 0 {
+        0
+    } else {
+        old_length.read_at_offset::<P>(0).unwrap_or(usize::MAX)
+    };
+    let (reported, result) = if old_value.as_usize() == 0 {
+        (bytes.len(), Ok(0))
+    } else if available < bytes.len() {
+        (0, Err(Errno::ENOMEM))
+    } else {
+        old_value
+            .copy_from_slice::<P>(0, bytes)
+            .ok_or(Errno::EFAULT)?;
+        (bytes.len(), Ok(0))
+    };
+    if old_length.as_usize() != 0 {
+        old_length
+            .write_at_offset::<P>(0, reported)
+            .ok_or(Errno::EFAULT)?;
+    }
+    result
+}
+
 impl<P: ShimPlatform> Task<P> {
-    pub(crate) fn sys_sysctl_compat(
+    /// XNU's `sysctl` over [`super::HOST_SYSCTL_NAMES`] plus
+    /// `sysctl.name2oid`. All nodes are read-only; other names and MIBs do
+    /// not exist.
+    pub(crate) fn sys_sysctl(
+        &self,
         name: UserPtr<i32>,
         name_length: u32,
+        old_value: UserPtrMut<u8>,
+        old_length: UserPtrMut<usize>,
         new_value: UserPtr<u8>,
         new_length: usize,
     ) -> Result<usize, Errno> {
-        if name_length != 2 {
-            return Err(Errno::ENOSYS);
+        if !(2..=CTL_MAXNAME).contains(&(name_length as usize)) {
+            return Err(Errno::EINVAL);
         }
-        for (offset, expected) in [0isize, 1].into_iter().zip(SYSCTL_NAME_TO_OID_MIB) {
-            if name.read_at_offset::<P>(offset).ok_or(Errno::EFAULT)? != expected {
-                return Err(Errno::ENOSYS);
+        let mib = (0..name_length.cast_signed() as isize)
+            .map(|index| name.read_at_offset::<P>(index).ok_or(Errno::EFAULT))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sysctls = &self.global.host_sysctls;
+        if mib == SYSCTL_NAME_TO_OID_MIB {
+            // sysctl_sysctl_name2oid: bound the name, copy it in, look it up.
+            if new_length < 1 {
+                return Err(Errno::ENOENT);
             }
-        }
-        if new_value.as_usize() == 0
-            || !OPTIONAL_DYLD_TUNABLES
+            if new_length >= litebox_common_macos::PATH_MAX {
+                return Err(Errno::ENAMETOOLONG);
+            }
+            let requested = new_value
+                .to_owned_slice::<P>(new_length)
+                .ok_or(Errno::EFAULT)?;
+            // XNU terminates the copied name at `new_length`.
+            let requested = requested.split(|byte| *byte == 0).next().unwrap_or(&[]);
+            let Some(sysctl) = sysctls
                 .iter()
-                .any(|name| name.len() == new_length)
-        {
-            return Err(Errno::ENOSYS);
+                .find(|sysctl| sysctl.name.as_bytes() == requested)
+            else {
+                litebox_util_log::debug!(
+                    name:? = alloc::string::String::from_utf8_lossy(requested);
+                    "sysctl name has no OID"
+                );
+                return Err(Errno::ENOENT);
+            };
+            let oid: Vec<u8> = sysctl
+                .mib
+                .iter()
+                .flat_map(|part| part.to_ne_bytes())
+                .collect();
+            return sysctl_copyout::<P>(old_value, old_length, &oid);
         }
-        let name = new_value
-            .to_owned_slice::<P>(new_length)
-            .ok_or(Errno::EFAULT)?;
-        if OPTIONAL_DYLD_TUNABLES.contains(&name.as_ref()) {
-            Err(Errno::ENOENT)
-        } else {
-            Err(Errno::ENOSYS)
+        let Some(sysctl) = sysctls.iter().find(|sysctl| sysctl.mib == mib) else {
+            litebox_util_log::debug!(mib:?; "sysctl MIB does not exist");
+            return Err(Errno::ENOENT);
+        };
+        // sysctl_create_user_req ignores `newp` unless `newlen` is nonzero.
+        if new_value.as_usize() != 0 && new_length != 0 {
+            // Read-only node (no CTLFLAG_WR).
+            return Err(Errno::EPERM);
+        }
+        match &sysctl.value {
+            Ok(bytes) => sysctl_copyout::<P>(old_value, old_length, bytes),
+            Err(error) => Err(*error),
         }
     }
 

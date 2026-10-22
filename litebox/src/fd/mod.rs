@@ -676,6 +676,23 @@ impl RawDescriptorStorage {
         }
     }
 
+    /// Grow the store to at least `len` slots, so a descriptor can then be stored at any raw
+    /// integer below `len` (see [`Self::fd_into_specific_raw_integer`]), however sparse.
+    ///
+    /// Callers bound `len` (for example by their descriptor limit). Fails without changing the
+    /// store if the slots cannot be allocated; never shrinks it.
+    pub fn try_reserve_slots(
+        &mut self,
+        len: usize,
+    ) -> Result<(), alloc::collections::TryReserveError> {
+        let additional = len.saturating_sub(self.stored_fds.len());
+        self.stored_fds.try_reserve(additional)?;
+        if additional != 0 {
+            self.stored_fds.resize_with(len, || None);
+        }
+        Ok(())
+    }
+
     /// Get the corresponding integer value of the provided `fd`.
     ///
     /// This explicitly consumes the `fd`.

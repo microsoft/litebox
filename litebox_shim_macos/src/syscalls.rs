@@ -4,16 +4,66 @@
 //! Typed BSD syscall implementations.
 
 use crate::{ShimPlatform, Task};
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use litebox::utils::TruncateExt as _;
-use litebox_common_macos::{KernReturn, syscall::MachTimebaseInfo, user_pointers::UserPtrMut};
+use litebox_common_macos::{
+    KernReturn, errno::Errno, syscall::MachTimebaseInfo, user_pointers::UserPtrMut,
+};
 
 pub(crate) mod file;
 pub(crate) mod mach;
 pub(crate) mod misc;
 pub(crate) mod mm;
+pub(crate) mod process;
+
+/// The only sysctl nodes the shim exposes: read-only system identity that
+/// any sandboxed process can read, which the guest's own OS components
+/// (libignition in dyld) cross-check. A runtime provider mirrors each from
+/// the host it runs on with [`HostSysctl`], including its MIB and read error.
+pub const HOST_SYSCTL_NAMES: [&str; 4] = [
+    "kern.bootuuid",
+    "hw.target",
+    "hw.osenvironment",
+    "security.mac.img4.ignition_blob",
+];
+
+/// One host sysctl node mirrored read-only into the guest.
+#[derive(Clone, Debug)]
+pub struct HostSysctl {
+    /// One of [`HOST_SYSCTL_NAMES`].
+    pub name: &'static str,
+    /// The host's MIB for `name`.
+    pub mib: Vec<i32>,
+    /// The host's read result: the value, or the errno reading it fails with.
+    pub value: Result<Vec<u8>, Errno>,
+}
+
+/// Distinct unsupported `(feature, id)` pairs logged per guest. Bounds what a
+/// guest cycling through unknown routine ids, flavors or commands makes the
+/// host remember; later new pairs are not logged.
+pub(crate) const MAX_REPORTS: usize = 256;
 
 impl<P: ShimPlatform> Task<P> {
+    /// Log an unsupported Mach or BSD feature once per guest for each `id`:
+    /// the MIG routine id, info flavor, fcntl command or other selector the
+    /// guest used, or 0 for a feature without one. Returns whether this call
+    /// logged.
+    pub(crate) fn log_unsupported_once(
+        &self,
+        feature: &'static str,
+        id: i64,
+        detail: core::fmt::Arguments<'_>,
+    ) -> bool {
+        let mut reported = self.global.reported_unsupported.lock();
+        if reported.len() >= MAX_REPORTS || !reported.insert((feature, id)) {
+            return false;
+        }
+        drop(reported);
+        litebox_util_log::warn!(feature:% = feature, id:% = id, detail:% = detail; "unsupported");
+        true
+    }
+
     pub(crate) fn sys_exit(&self, status: i32) {
         self.process.exit(status & 0xff);
     }

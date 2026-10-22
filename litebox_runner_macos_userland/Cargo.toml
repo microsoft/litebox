@@ -15,6 +15,7 @@ litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0", op
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0", optional = true }
 litebox = { path = "../litebox", version = "0.1.0", optional = true }
 getrandom = { version = "0.3.4", default-features = false, optional = true }
+libc = "0.2"
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
 litebox_trampoline = { path = "../litebox_trampoline", version = "0.1.0" }
