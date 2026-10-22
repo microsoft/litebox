@@ -6,12 +6,12 @@ use core::num::NonZeroU64;
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
     FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
-    HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse, file_type_from_raw, file_type_raw,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
+    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -37,6 +37,7 @@ const REQUEST_TAG_IS_TERMINAL: u8 = 13;
 const REQUEST_TAG_TERMINAL_CONTROL: u8 = 14;
 const REQUEST_TAG_READ_LINK: u8 = 15;
 const REQUEST_TAG_RESOLVE_PATH: u8 = 16;
+const REQUEST_TAG_HANDLE_PATH: u8 = 17;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -55,6 +56,7 @@ const RESPONSE_TAG_IS_TERMINAL: u8 = 13;
 const RESPONSE_TAG_TERMINAL_CONTROL: u8 = 14;
 const RESPONSE_TAG_READ_LINK: u8 = 15;
 const RESPONSE_TAG_RESOLVE_PATH: u8 = 16;
+const RESPONSE_TAG_HANDLE_PATH: u8 = 17;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -74,6 +76,7 @@ const _: () = {
     assert!(REQUEST_TAG_IS_TERMINAL == RESPONSE_TAG_IS_TERMINAL);
     assert!(REQUEST_TAG_READ_LINK == RESPONSE_TAG_READ_LINK);
     assert!(REQUEST_TAG_RESOLVE_PATH == RESPONSE_TAG_RESOLVE_PATH);
+    assert!(REQUEST_TAG_HANDLE_PATH == RESPONSE_TAG_HANDLE_PATH);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -176,6 +179,11 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.u32(request.path_length);
             encode_user(encoder, request.user);
         }
+        FileRequest::HandlePath(request) => {
+            encoder.u8(REQUEST_TAG_HANDLE_PATH);
+            encoder.handle(request.handle);
+            encoder.shared_buffer_sequence(request.buffer);
+        }
     }
 }
 
@@ -268,6 +276,10 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             path_length: decoder.u32()?,
             user: decode_user(decoder)?,
         })),
+        REQUEST_TAG_HANDLE_PATH => Ok(FileRequest::HandlePath(HandleFilePathRequest {
+            handle: decoder.handle()?,
+            buffer: decoder.shared_buffer_sequence()?,
+        })),
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -325,6 +337,10 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_RESOLVE_PATH);
             encoder.u32(length);
         }
+        FileResponse::HandlePath(FilePathResponse { length }) => {
+            encoder.u8(RESPONSE_TAG_HANDLE_PATH);
+            encoder.u32(length);
+        }
         FileResponse::Failed(error) => {
             encoder.u8(RESPONSE_TAG_FAILED);
             encode_file_error(encoder, error);
@@ -370,6 +386,9 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
             length: decoder.u32()?,
         })),
         RESPONSE_TAG_RESOLVE_PATH => Ok(FileResponse::ResolvePath(FilePathResponse {
+            length: decoder.u32()?,
+        })),
+        RESPONSE_TAG_HANDLE_PATH => Ok(FileResponse::HandlePath(FilePathResponse {
             length: decoder.u32()?,
         })),
         RESPONSE_TAG_FAILED => Ok(FileResponse::Failed(decode_file_error(decoder)?)),

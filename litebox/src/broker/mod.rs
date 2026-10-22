@@ -450,6 +450,11 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError>;
 
+    fn handle_file_path(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
+
     fn is_terminal_file(
         &self,
         handle: ObjectHandle,
@@ -1429,6 +1434,14 @@ where
         handle: ObjectHandle,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
         self.request(|local| local.handle_file_status(handle))
+    }
+
+    fn handle_file_path(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError> {
+        let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
+        self.request(|local| local.handle_file_path(handle, lease.sequence()))
     }
 
     fn is_terminal_file(

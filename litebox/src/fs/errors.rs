@@ -238,6 +238,16 @@ pub enum WalkError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`super::File::path`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum FilePathError {
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("I/O error")]
+    Io,
+}
+
 /// Possible errors from [`super::File::is_terminal`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

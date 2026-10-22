@@ -933,6 +933,56 @@ mod in_mem {
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"NewContent");
     }
+
+    #[test]
+    fn open_returns_symlink_resolved_path() {
+        use crate::fs::in_mem::InitialNode;
+        use alloc::string::String;
+
+        const ALL_PERMS: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
+        let directory = || InitialNode::Directory {
+            mode: ALL_PERMS,
+            owner: ROOT,
+        };
+        let symlink = |target: &str| InitialNode::Symlink {
+            mode: ALL_PERMS,
+            owner: ROOT,
+            target: target.into(),
+        };
+        let fs: InMemFs = Resolver::new(InMem::new_initialized([
+            ("/", directory()),
+            ("/dir", directory()),
+            (
+                "/dir/file",
+                InitialNode::File {
+                    mode: ALL_PERMS,
+                    owner: ROOT,
+                    data: (&[][..]).into(),
+                },
+            ),
+            ("/dir/file-link", symlink("file")),
+            ("/dir-link", symlink("/dir")),
+            ("/dangling", symlink("dir/created")),
+        ]));
+        let path = |path: &str, flags: OFlags| -> String {
+            fs.open_with_path(USER, path, flags, Mode::RWXU)
+                .unwrap_or_else(|error| panic!("open {path:?} failed: {error:?}"))
+                .1
+        };
+
+        assert_eq!(path("/", OFlags::RDONLY), "/");
+        assert_eq!(path("/dir-link", OFlags::RDONLY), "/dir");
+        assert_eq!(path("/dir-link/file-link", OFlags::RDONLY), "/dir/file");
+        assert_eq!(path("/dir/../dir-link/./file", OFlags::RDONLY), "/dir/file");
+        assert_eq!(
+            path("/dir-link/file-link", OFlags::PATH | OFlags::NOFOLLOW),
+            "/dir/file-link"
+        );
+        assert_eq!(
+            path("/dangling", OFlags::CREAT | OFlags::WRONLY),
+            "/dir/created"
+        );
+    }
 }
 
 mod tar_ro {

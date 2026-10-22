@@ -487,6 +487,15 @@ pub struct HandleFileStatusRequest {
     pub handle: ObjectHandle,
 }
 
+/// Reads the absolute path of an open file, with symbolic links resolved, as of when it was opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandleFilePathRequest {
+    /// Broker-owned file handle.
+    pub handle: ObjectHandle,
+    /// Shared-buffer region the broker writes the absolute path to.
+    pub buffer: SharedBufferSequence,
+}
+
 /// Determines whether an open file is connected to a terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IsTerminalFileRequest {

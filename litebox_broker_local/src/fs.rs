@@ -9,11 +9,11 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FilePathResponse,
-    FileSeekWhence, FileStatus, FileUser, HandleFileStatusRequest, IsTerminalFileRequest,
-    MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, PathFileStatusRequest,
-    ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
+    FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
+    IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -488,6 +488,35 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Failed(error) => Ok(Err(error)),
             response => {
                 panic!("broker returned unexpected file resolve-path response: {response:?}")
+            }
+        }
+    }
+
+    /// Reads the absolute path of an open file, with symbolic links resolved, as of when it was
+    /// opened.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation or an invalid path.
+    pub fn handle_file_path(
+        &self,
+        handle: ObjectHandle,
+        buffer: SharedBufferSequence,
+    ) -> Result<FileOperationResult<String>, Channel::Error> {
+        if buffer.length() > SHARED_BUFFER_SLOT_SIZE {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+        match self.request_file(FileRequest::HandlePath(HandleFilePathRequest {
+            handle,
+            buffer,
+        }))? {
+            FileResponse::HandlePath(response) => {
+                Ok(Ok(self.read_path_response_buffer(buffer, response)?))
+            }
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected file handle-path response: {response:?}")
             }
         }
     }

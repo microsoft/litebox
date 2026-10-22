@@ -954,3 +954,61 @@ fn exec_inherits_only_transferable_descriptors() {
     .unwrap();
     assert_eq!(inherited(), Err(Errno::EAGAIN));
 }
+
+#[test]
+fn proc_self_fd_names_open_descriptions() {
+    let task = init_platform();
+    let readlink = |path: &str| {
+        let mut buffer = [0; 128];
+        task.sys_readlink(path, &mut buffer)
+            .map(|length| std::string::String::from_utf8(buffer[..length].to_vec()).unwrap())
+    };
+    let link = |fd: u32| readlink(&std::format!("/proc/self/fd/{fd}"));
+    let stat = |fd: u32| task.sys_stat(&std::format!("/proc/self/fd/{fd}"));
+    let fstat = |fd: u32| task.sys_fstat(i32::try_from(fd).unwrap());
+
+    create_directory(&task, "/proc_self_fd");
+    create_file(&task, "/proc_self_fd/file", b"");
+    let file = task
+        .sys_open(
+            "/proc_self_fd/../proc_self_fd/./file",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
+        .unwrap();
+    assert_eq!(link(file).as_deref(), Ok("/proc_self_fd/file"));
+    assert_eq!(stat(file), fstat(file));
+    let tty = task
+        .sys_open("/dev/tty", OFlags::RDWR, Mode::empty())
+        .unwrap();
+    assert_eq!(link(tty).as_deref(), Ok("/dev/tty"));
+
+    let (read_end, write_end) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let eventfd = task.sys_eventfd2(0, EfdFlags::empty()).unwrap();
+    let epoll = task.sys_epoll_create(EpollCreateFlags::empty()).unwrap();
+    for (fd, expected) in [
+        (read_end, "pipe:[0]"),
+        (write_end, "pipe:[0]"),
+        (eventfd, "anon_inode:[eventfd]"),
+        (epoll, "anon_inode:[eventpoll]"),
+    ] {
+        assert_eq!(link(fd).as_deref(), Ok(expected));
+        assert_eq!(stat(fd), fstat(fd));
+    }
+
+    // Links follow what each descriptor refers to, including the standard streams.
+    task.sys_dup(i32::try_from(read_end).unwrap(), Some(0), None)
+        .unwrap();
+    assert_eq!(link(0).as_deref(), Ok("pipe:[0]"));
+    assert_eq!(stat(0), fstat(0));
+    task.sys_dup(i32::try_from(file).unwrap(), Some(1), None)
+        .unwrap();
+    assert_eq!(link(1).as_deref(), Ok("/proc_self_fd/file"));
+
+    // Only open descriptors have links.
+    task.sys_close(i32::try_from(file).unwrap()).unwrap();
+    assert_eq!(link(file), Err(Errno::ENOENT));
+    assert_eq!(stat(file), Err(Errno::ENOENT));
+    assert_eq!(readlink("/proc/self/fd/+1"), Err(Errno::ENOENT));
+    assert_eq!(readlink("/proc/self/fd/x"), Err(Errno::ENOENT));
+}

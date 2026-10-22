@@ -627,12 +627,12 @@ mod tests {
     use crate::fs::{
         ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
         FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileType,
-        FileUser, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
-        OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-        ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-        ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-        SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-        WriteFileRequest, WriteFileResponse,
+        FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
+        MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+        ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+        ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
+        SeekFileResponse, SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest,
+        UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
@@ -987,6 +987,10 @@ mod tests {
                 buffer: sequence(12, 256),
                 path_length: 9,
                 user: FileUser { user: 2, group: 3 },
+            })),
+            BrokerOperation::File(FileRequest::HandlePath(HandleFilePathRequest {
+                handle,
+                buffer: sequence(13, 256),
             })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
@@ -1704,6 +1708,7 @@ mod tests {
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::ReadLink(FilePathResponse { length: 31 })),
             BrokerResult::File(FileResponse::ResolvePath(FilePathResponse { length: 37 })),
+            BrokerResult::File(FileResponse::HandlePath(FilePathResponse { length: 41 })),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
                 process_id: process_id(19),
