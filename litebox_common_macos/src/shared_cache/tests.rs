@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Synthetic-buffer tests for shared-cache parsing and v5 rebasing.
+//! Synthetic-buffer tests for shared-cache parsing, closure and v5 rebasing.
 #![allow(clippy::cast_possible_truncation)]
 
 use super::*;
@@ -422,6 +422,61 @@ fn header_mappings_and_subcache_entries_parse() {
         (macho::MH_DYLINKER, None)
     );
     assert_eq!(dyld.dependencies, Vec::new());
+}
+
+#[test]
+fn closure_follows_all_dylib_commands_across_cycles_and_aliases() {
+    let files = files();
+    let cache = parse(&files).unwrap();
+    let roots = [
+        cache.image_index_by_path(LIBSYSTEM).unwrap(),
+        cache.dyld_image_index().unwrap(),
+    ];
+    let closure = cache.closure(&roots).unwrap();
+    assert_eq!(
+        closure
+            .iter()
+            .map(|image| cache.images()[image.index].path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            LIBSYSTEM,
+            "/usr/lib/system/libb.dylib",
+            "/usr/lib/libc.dylib",
+            "/usr/lib/libe.dylib",
+            "/usr/lib/dyld",
+            "/usr/lib/libf.dylib",
+        ]
+    );
+    assert!(
+        closure
+            .windows(2)
+            .all(|pair| pair[0].image.address < pair[1].image.address)
+    );
+
+    let unused = cache
+        .image_index_by_path("/usr/lib/libunused.dylib")
+        .unwrap();
+    assert_eq!(
+        cache.closure(&[unused]),
+        Err(SharedCacheError::MissingDependency {
+            image: "/usr/lib/libunused.dylib".into(),
+            dependency: "/usr/lib/not-in-cache.dylib".into(),
+        })
+    );
+    let bad_root = SharedCacheError::InvalidArgument("closure root is not an image table index");
+    assert_eq!(cache.closure(&[IMAGES_SPEC.len()]), Err(bad_root.clone()));
+    assert_eq!(cache.launch_set(&[0, IMAGES_SPEC.len()]), Err(bad_root));
+    // The launch set also follows the delayed-init link to libunused, whose
+    // own non-weak dependency is missing.
+    assert_eq!(
+        cache.launch_set(&roots),
+        Err(SharedCacheError::MissingDependency {
+            image: "/usr/lib/libunused.dylib".into(),
+            dependency: "/usr/lib/not-in-cache.dylib".into(),
+        })
+    );
+    let libe = cache.image_index_by_path("/usr/lib/libe.dylib").unwrap();
+    assert_eq!(cache.launch_set(&[libe]), cache.closure(&[libe]));
 }
 
 #[test]

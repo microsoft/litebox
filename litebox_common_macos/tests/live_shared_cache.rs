@@ -8,9 +8,12 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use litebox_common_macos::shared_cache::{
-    CacheFile, CacheFileReader, CacheHeader, DYNAMIC_REGION_SIZE, MappingFlags, SharedCache,
-    SharedCacheError, UnsignedPointers, dynamic_region_cache_path,
+use litebox_common_macos::{
+    VmProtection,
+    shared_cache::{
+        CacheFile, CacheFileReader, CacheHeader, DYNAMIC_REGION_SIZE, MappingFlags, SharedCache,
+        SharedCacheError, UnsignedPointers, dynamic_region_cache_path,
+    },
 };
 use std::os::unix::fs::FileExt as _;
 
@@ -134,7 +137,7 @@ fn live_cache() -> Option<LiveCache> {
 }
 
 #[test]
-fn live_host_cache_parses() {
+fn live_host_cache_closure_covers_libsystem() {
     let Some(LiveCache { live, cache, .. }) = live_cache() else {
         return;
     };
@@ -150,6 +153,52 @@ fn live_host_cache_parses() {
                 return;
             }
         }
+    }
+
+    let libsystem = cache
+        .image_index_by_path("/usr/lib/libSystem.B.dylib")
+        .expect("libSystem is in the cache");
+    let dyld = cache.dyld_image_index().expect("dyld is in the cache");
+    let closure = cache.closure(&[libsystem, dyld]).unwrap();
+    let paths: Vec<_> = closure
+        .iter()
+        .map(|image| cache.images()[image.index].path.as_str())
+        .collect();
+    println!("closure: {} images including dyld", closure.len());
+    // Delayed-init links (such as libxpc -> CoreFoundation) are not followed.
+    assert!(
+        paths.iter().all(|path| path.starts_with("/usr/lib/")),
+        "closure reaches beyond /usr/lib: {paths:?}"
+    );
+    for required in [
+        "/usr/lib/dyld",
+        "/usr/lib/libSystem.B.dylib",
+        "/usr/lib/system/libsystem_kernel.dylib",
+        "/usr/lib/system/libsystem_pthread.dylib",
+        "/usr/lib/system/libsystem_platform.dylib",
+        "/usr/lib/system/libsystem_c.dylib",
+        "/usr/lib/system/libsystem_malloc.dylib",
+        "/usr/lib/system/libdispatch.dylib",
+        "/usr/lib/system/libxpc.dylib",
+    ] {
+        assert!(paths.contains(&required), "closure lacks {required}");
+    }
+    for image in &closure {
+        let text = image
+            .image
+            .segment("__TEXT")
+            .unwrap_or_else(|| panic!("{} has no __TEXT", cache.images()[image.index].path));
+        let start = text.address_range.start;
+        let size = text.address_range.end - start;
+        let (_, mapping) = cache
+            .mapping_containing(start, size)
+            .unwrap_or_else(|| panic!("__TEXT at {start:#x} is not in one mapping"));
+        assert!(
+            mapping
+                .initial_protection
+                .contains(VmProtection::READ | VmProtection::EXECUTE),
+            "__TEXT at {start:#x} is not in an executable mapping"
+        );
     }
 }
 
