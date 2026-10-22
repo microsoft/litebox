@@ -181,6 +181,48 @@ impl Pages {
         Ok(range.start)
     }
 
+    /// Replace the owned pages of `range` with a private view of `file` at `offset` (host-page
+    /// aligned). `owned` is unchanged: the view takes over the pages' ownership. Written copies of
+    /// signed file pages lose their code-signing validation (`vm_page_copy`), so making them
+    /// executable requires a runner without code-signing enforcement (no hardened runtime).
+    #[cfg(feature = "shared_cache")]
+    pub(super) fn map_file(
+        &mut self,
+        range: &Range<usize>,
+        file: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        permissions: Perm,
+    ) -> Result<(), PermissionUpdateError> {
+        // On arm64 XNU syncs the icache only on a page's first executable mapping
+        // (`vm_fault_enter_set_mapped`, osfmk/vm/vm_fault.c), so only `update_permissions`, which
+        // invalidates, may make the view executable.
+        if permissions.contains(Perm::EXEC) {
+            return Err(PermissionUpdateError::PermissionDenied);
+        }
+        if self.owned.gaps(range).next().is_some() {
+            return Err(PermissionUpdateError::Unallocated);
+        }
+        let offset = libc::off_t::try_from(offset).map_err(|_| PermissionUpdateError::Unaligned)?;
+        // Like `map_fixed`, a failed MAP_FIXED leaves the replaced pages in place: the file path
+        // also ends in `vm_map_enter` (`vm_map_enter_mem_object_control`).
+        // SAFETY: the caller owns the whole range and excludes its users, so MAP_FIXED replaces
+        // only this instance's idle pages.
+        let mapped = unsafe {
+            libc::mmap(
+                range.start as *mut _,
+                range.len(),
+                native_prot(permissions),
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                offset,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(permission_error());
+        }
+        Ok(())
+    }
+
     pub(super) fn update_permissions(
         &mut self,
         range: Range<usize>,

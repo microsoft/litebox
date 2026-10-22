@@ -1403,5 +1403,157 @@ pub fn dynamic_region_cache_path(region: &[u8]) -> Result<&str> {
     c_string(region, offset, limit)
 }
 
+/// The host's dyld shared cache as a platform supplies it to guest-private
+/// instances. The cache files never leave the platform.
+pub trait HostSharedCache {
+    /// The on-disk cache matching the host's live cache, verified (main and
+    /// subcache UUIDs, mappings, slide info) and parsed. Opened on first use
+    /// and kept for the platform's lifetime; fails closed on any mismatch.
+    fn host_shared_cache(&self) -> core::result::Result<HostCache<'_>, HostSharedCacheError>;
+
+    /// The native page at unslid `page` of a cache mapping, rebased for
+    /// `slide` like XNU's shared-region pagers and with authenticated
+    /// pointers signed for this task.
+    fn host_cache_page(
+        &self,
+        page: u64,
+        slide: u64,
+    ) -> core::result::Result<HostCachePage, HostSharedCacheError>;
+
+    /// The lowest page-aligned address at or above `from` where `length`
+    /// bytes are free in the host and end at or below `limit`; `Ok(None)` if
+    /// there is none.
+    fn free_host_range(
+        &self,
+        from: u64,
+        length: u64,
+        limit: u64,
+    ) -> core::result::Result<Option<u64>, HostSharedCacheError>;
+
+    /// Whether any host mapping overlaps `range`.
+    fn host_range_occupied(
+        &self,
+        range: Range<u64>,
+    ) -> core::result::Result<bool, HostSharedCacheError>;
+
+    /// Replace the pages at `target`, which the caller has mapped through
+    /// this platform, with a private view of the cache file bytes at unslid
+    /// `address..address + length` (inside one mapping) with `permissions`,
+    /// like the file-backed parts of XNU's shared region
+    /// (`vm_shared_region_map_file_setup`). Writes never reach the file.
+    /// All three must be native-page aligned and the view is never
+    /// executable: the caller changes its permissions afterwards. Refused for
+    /// guest pages smaller than native pages. On failure the pages at
+    /// `target` are unchanged.
+    ///
+    /// # Safety
+    ///
+    /// Nothing may access the pages at `target` during the call, and the
+    /// caller's records of them must allow `permissions`.
+    unsafe fn map_host_cache_range(
+        &self,
+        address: u64,
+        length: u64,
+        target: usize,
+        permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> core::result::Result<(), HostSharedCacheError>;
+}
+
+/// The host's verified shared cache, borrowed from its platform.
+#[derive(Clone, Copy)]
+pub struct HostCache<'a> {
+    pub cache: &'a SharedCache<&'a [u8]>,
+    /// The host's live DynamicRegion page ([`DYNAMIC_REGION_SIZE`] bytes).
+    pub dynamic_region: &'a [u8],
+}
+
+/// One page supplied by [`HostSharedCache::host_cache_page`].
+pub struct HostCachePage {
+    /// Exactly one native page of bytes.
+    pub bytes: Vec<u8>,
+    /// The maximum protection of the page's cache mapping.
+    pub max_protection: VmProtection,
+}
+
+/// A failure of the host's shared cache or a guest instance of it, with its
+/// context and complete source chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostSharedCacheError(String);
+
+impl HostSharedCacheError {
+    pub fn new(message: impl core::fmt::Display) -> Self {
+        Self(alloc::format!("{message}"))
+    }
+
+    #[must_use]
+    pub fn context(self, context: impl core::fmt::Display) -> Self {
+        Self(alloc::format!("{context}: {}", self.0))
+    }
+}
+
+impl core::fmt::Display for HostSharedCacheError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+// Like `anyhow::Error`, this type is not itself a `core::error::Error`, so
+// that every error converts into it.
+impl<E: core::error::Error> From<E> for HostSharedCacheError {
+    fn from(error: E) -> Self {
+        let mut message = alloc::format!("{error}");
+        let mut source = error.source();
+        while let Some(cause) = source {
+            message = alloc::format!("{message}: {cause}");
+            source = cause.source();
+        }
+        Self(message)
+    }
+}
+
+pub trait HostSharedCacheContext<T> {
+    fn context(
+        self,
+        context: impl core::fmt::Display,
+    ) -> core::result::Result<T, HostSharedCacheError>;
+
+    fn with_context<C: core::fmt::Display>(
+        self,
+        context: impl FnOnce() -> C,
+    ) -> core::result::Result<T, HostSharedCacheError>;
+}
+
+impl<T, E: Into<HostSharedCacheError>> HostSharedCacheContext<T> for core::result::Result<T, E> {
+    fn context(
+        self,
+        context: impl core::fmt::Display,
+    ) -> core::result::Result<T, HostSharedCacheError> {
+        self.map_err(|error| error.into().context(context))
+    }
+
+    fn with_context<C: core::fmt::Display>(
+        self,
+        context: impl FnOnce() -> C,
+    ) -> core::result::Result<T, HostSharedCacheError> {
+        self.map_err(|error| error.into().context(context()))
+    }
+}
+
+impl<T> HostSharedCacheContext<T> for Option<T> {
+    fn context(
+        self,
+        context: impl core::fmt::Display,
+    ) -> core::result::Result<T, HostSharedCacheError> {
+        self.ok_or_else(|| HostSharedCacheError::new(context))
+    }
+
+    fn with_context<C: core::fmt::Display>(
+        self,
+        context: impl FnOnce() -> C,
+    ) -> core::result::Result<T, HostSharedCacheError> {
+        self.ok_or_else(|| HostSharedCacheError::new(context()))
+    }
+}
+
 #[cfg(test)]
 mod tests;
