@@ -162,9 +162,9 @@ mod tests {
         LocalNotificationChannel, LocalSetupChannel,
     };
     use litebox_broker_transport::control_ring::{
-        BrokerControlRingEndpoints, ControlRing, ControlRingConsumer, ControlRingDemandStatus,
-        ControlRingLayout, ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus,
-        LocalControlRingEndpoints,
+        ControlRing, ControlRingConsumer, ControlRingDemandStatus, ControlRingLayout,
+        ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus,
+        HostControlRingEndpoints, LocalControlRingEndpoints,
     };
     use litebox_broker_transport::shared_memory::SharedMemory as _;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -172,7 +172,7 @@ mod tests {
     type Producer = ControlRingProducer<WindowsSharedMemory>;
     type Consumer = ControlRingConsumer<WindowsSharedMemory>;
     type Local = LocalControlRingEndpoints<WindowsSharedMemory>;
-    type Broker = BrokerControlRingEndpoints<WindowsSharedMemory>;
+    type Broker = HostControlRingEndpoints<WindowsSharedMemory>;
 
     const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
     const LAYOUT: ControlRingLayout = ControlRingLayout::MULTI_LANE;
@@ -324,7 +324,7 @@ mod tests {
             });
             local.into_active(local_ring).unwrap()
         });
-        (calls, notifications, broker_ring.into_broker(), host)
+        (calls, notifications, broker_ring.into_host(), host)
     }
 
     fn demand_lanes(local: &Local, lanes: usize) {

@@ -762,7 +762,7 @@ mod tests {
         };
         let producer = ControlRing::new(ring(), LAYOUT)
             .expect("ring")
-            .into_broker()
+            .into_host()
             .notification_producer;
         (notifications, producer)
     }

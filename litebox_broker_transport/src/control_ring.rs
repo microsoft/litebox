@@ -478,7 +478,7 @@ pub struct LocalControlRingLane<Memory: ControlRingMemory> {
 }
 
 /// The broker peer's ends of one call lane.
-pub struct BrokerControlRingLane<Memory: ControlRingMemory> {
+pub struct HostControlRingLane<Memory: ControlRingMemory> {
     /// Local-to-broker request consumer.
     pub request_consumer: ControlRingConsumer<Memory>,
     /// Broker-to-local response producer.
@@ -496,11 +496,11 @@ pub struct LocalControlRingEndpoints<Memory: ControlRingMemory> {
 }
 
 /// Role-bound association ring endpoints owned by the broker peer.
-pub struct BrokerControlRingEndpoints<Memory: ControlRingMemory> {
+pub struct HostControlRingEndpoints<Memory: ControlRingMemory> {
     /// Call lanes, in lane order.
-    pub lanes: Vec<BrokerControlRingLane<Memory>>,
+    pub lanes: Vec<HostControlRingLane<Memory>>,
     /// Lane-demand observer, present when the layout has more than one lane.
-    pub lane_demand: Option<BrokerLaneDemand<Memory>>,
+    pub lane_demand: Option<HostLaneDemand<Memory>>,
     /// Broker-to-local notification producer.
     pub notification_producer: ControlRingProducer<Memory>,
 }
@@ -521,7 +521,7 @@ impl<Memory: ControlRingMemory> LocalControlRingEndpoints<Memory> {
     }
 }
 
-impl<Memory: ControlRingMemory> BrokerControlRingEndpoints<Memory> {
+impl<Memory: ControlRingMemory> HostControlRingEndpoints<Memory> {
     /// Returns handles that interrupt every wait these endpoints offer.
     pub fn wake_handles(&self) -> Vec<ControlRingWakeHandle<Memory>> {
         self.lanes
@@ -533,7 +533,7 @@ impl<Memory: ControlRingMemory> BrokerControlRingEndpoints<Memory> {
                 ]
             })
             .chain([self.notification_producer.wake_handle()])
-            .chain(self.lane_demand.as_ref().map(BrokerLaneDemand::wake_handle))
+            .chain(self.lane_demand.as_ref().map(HostLaneDemand::wake_handle))
             .collect()
     }
 }
@@ -584,12 +584,12 @@ impl<Memory: ControlRingMemory> ControlRing<Memory> {
     }
 
     /// Consumes the mapping into endpoints owned by the broker peer.
-    pub fn into_broker(self) -> BrokerControlRingEndpoints<Memory> {
+    pub fn into_host(self) -> HostControlRingEndpoints<Memory> {
         let layout = self.layout;
         let ring = Arc::new(self);
-        BrokerControlRingEndpoints {
+        HostControlRingEndpoints {
             lanes: (0..layout.lane_count())
-                .map(|lane| BrokerControlRingLane {
+                .map(|lane| HostControlRingLane {
                     request_consumer: ControlRingConsumer::new(
                         Arc::clone(&ring),
                         layout.requests(lane),
@@ -600,7 +600,7 @@ impl<Memory: ControlRingMemory> ControlRing<Memory> {
                     ),
                 })
                 .collect(),
-            lane_demand: (layout.lane_count() > 1).then(|| BrokerLaneDemand {
+            lane_demand: (layout.lane_count() > 1).then(|| HostLaneDemand {
                 ring: Arc::clone(&ring),
                 started_lane_count: 0,
             }),
@@ -735,7 +735,7 @@ impl<Memory: WaitableSharedMemory> LocalLaneDemand<Memory> {
     }
 }
 
-/// Result of polling a [`BrokerLaneDemand`].
+/// Result of polling a [`HostLaneDemand`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlRingDemandStatus {
     /// The local peer demands this lane, which the broker has yet to serve.
@@ -752,12 +752,12 @@ pub enum ControlRingDemandStatus {
 /// It hands out each lane, in lane order, once the local peer demands it.
 /// The local peer can publish any count; the broker clamps it to the layout's
 /// lanes and never takes a lane back.
-pub struct BrokerLaneDemand<Memory: ControlRingMemory> {
+pub struct HostLaneDemand<Memory: ControlRingMemory> {
     ring: Arc<ControlRing<Memory>>,
     started_lane_count: usize,
 }
 
-impl<Memory: ControlRingMemory> BrokerLaneDemand<Memory> {
+impl<Memory: ControlRingMemory> HostLaneDemand<Memory> {
     /// Returns the next demanded lane the broker has yet to serve, if any.
     pub fn try_next_lane(&mut self) -> Result<ControlRingDemandStatus, ControlRingError> {
         let layout = self.ring.layout;
@@ -791,7 +791,7 @@ impl<Memory: ControlRingMemory> BrokerLaneDemand<Memory> {
     }
 }
 
-impl<Memory: WaitableSharedMemory> BrokerLaneDemand<Memory> {
+impl<Memory: WaitableSharedMemory> HostLaneDemand<Memory> {
     /// Waits for new demand after [`ControlRingDemandStatus::Satisfied`].
     ///
     /// The caller must poll again after this possibly spurious wakeup.
@@ -1436,7 +1436,7 @@ mod tests {
             );
             assert_eq!(local.wake_handles().len(), 2 * layout.lane_count() + 1);
 
-            let broker = test_ring_with(layout).into_broker();
+            let broker = test_ring_with(layout).into_host();
             assert_eq!(broker.lanes.len(), layout.lane_count());
             assert_eq!(broker.lane_demand.is_some(), layout.lane_count() > 1);
             for (index, lane) in broker.lanes.iter().enumerate() {
@@ -1478,7 +1478,7 @@ mod tests {
                         layout.responses(lane),
                     ),
                 };
-                let broker = BrokerControlRingLane {
+                let broker = HostControlRingLane {
                     request_consumer: ControlRingConsumer::new(
                         Arc::clone(&ring),
                         layout.requests(lane),
@@ -1531,7 +1531,7 @@ mod tests {
         let local = LocalLaneDemand {
             ring: Arc::clone(&ring),
         };
-        let mut broker = BrokerLaneDemand {
+        let mut broker = HostLaneDemand {
             ring: Arc::clone(&ring),
             started_lane_count: 0,
         };

@@ -1090,7 +1090,7 @@ mod tests {
             .request_producer;
         let mut consumer = ControlRing::new(broker_memory, LAYOUT)
             .unwrap()
-            .into_broker()
+            .into_host()
             .lanes
             .swap_remove(0)
             .request_consumer;

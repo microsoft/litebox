@@ -80,8 +80,8 @@ use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER
 use litebox_broker_protocol::wire;
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::control_ring::{
-    BrokerControlRingEndpoints, ControlRing, ControlRingConsumer, ControlRingLayout,
-    ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus,
+    ControlRing, ControlRingConsumer, ControlRingLayout, ControlRingProducer,
+    ControlRingReadStatus, ControlRingWriteStatus, HostControlRingEndpoints,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool};
 use litebox_common_vm_abi::{Status, UserRange, WireFrame};
@@ -572,11 +572,11 @@ impl Association {
                 return Err(Status::Denied);
             }
             let words = ring.memory().clone();
-            let BrokerControlRingEndpoints {
+            let HostControlRingEndpoints {
                 lanes,
                 lane_demand: _,
                 notification_producer,
-            } = ring.into_broker();
+            } = ring.into_host();
             let [lane] = <[_; 1]>::try_from(lanes)
                 .unwrap_or_else(|_| unreachable!("a single-lane layout has one lane"));
             self.readiness.activate(notification_producer);

@@ -21,9 +21,9 @@ use litebox_broker_transport::channel::{
     HostReceive, HostSetupChannel, PeerCredential,
 };
 use litebox_broker_transport::control_ring::{
-    BrokerControlRingEndpoints, BrokerControlRingLane, BrokerLaneDemand, ControlRing,
-    ControlRingConsumer, ControlRingDemandStatus, ControlRingProducer, ControlRingReadError,
-    ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+    ControlRing, ControlRingConsumer, ControlRingDemandStatus, ControlRingProducer,
+    ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+    HostControlRingEndpoints, HostControlRingLane, HostLaneDemand,
 };
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
@@ -46,14 +46,14 @@ pub struct WindowsNamedPipeHostSetupChannel {
     negotiated: bool,
 }
 
-type BrokerLane = BrokerControlRingLane<WindowsSharedMemory>;
+type BrokerLane = HostControlRingLane<WindowsSharedMemory>;
 
 /// Source of the call lanes of an active host control-ring association, which
 /// hands out each lane once the runner starts using it.
 pub struct WindowsControlRingHostCallLaneSource {
     /// Each lane, or `None` once handed out.
     lanes: Vec<Option<BrokerLane>>,
-    demand: BrokerLaneDemand<WindowsSharedMemory>,
+    demand: HostLaneDemand<WindowsSharedMemory>,
     association: Arc<HostRingAssociation>,
 }
 
@@ -231,9 +231,9 @@ fn activate_host(
         ));
     }
     let ready_token = ring.layout().ready_token();
-    let endpoints = ring.into_broker();
+    let endpoints = ring.into_host();
     let wakes = endpoints.wake_handles();
-    let BrokerControlRingEndpoints {
+    let HostControlRingEndpoints {
         lanes,
         lane_demand: Some(demand),
         notification_producer,
