@@ -3,6 +3,8 @@
 
 //! Experimental native Windows process operations.
 
+use core::cell::Cell;
+use core::convert::Infallible;
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr::null_mut;
@@ -77,6 +79,56 @@ pub unsafe fn exit_fork_child(status: i32) -> ! {
         );
     }
     unreachable!("TerminateProcess on the current process returned")
+}
+
+thread_local! {
+    static GUEST_STACK_BASE: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn record_guest_stack_base() {
+    if GUEST_STACK_BASE.get() == 0 {
+        let marker = 0u8;
+        GUEST_STACK_BASE.set(core::ptr::from_ref(&marker).addr());
+    }
+}
+
+/// Runs `f` at the stack depth where this thread first entered the guest, abandoning the
+/// copied runtime frames so successive native fork generations do not deepen the stack.
+/// If the thread has not entered the guest, runs `f` in place.
+///
+/// # Safety
+///
+/// The caller must be the sole thread of a newly cloned process. Nothing may subsequently use
+/// the abandoned frames or any frame below the recorded guest-entry depth. The closure must own
+/// everything it needs, since the abandoned stack memory will be reused.
+pub unsafe fn rewind_stack_and_run<F: FnOnce() -> Infallible + 'static>(f: F) -> ! {
+    let base = GUEST_STACK_BASE.get();
+    if base == 0 {
+        match f() {}
+    }
+    let f = Box::into_raw(Box::new(f)).cast::<()>();
+    // SAFETY: The recorded address is within this thread's stack and the caller abandons the
+    // frames below it. Align RSP and reserve the Windows x64 ABI's 32-byte shadow space before
+    // calling the non-returning entry point with the owned closure in RCX.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {base}",
+            "and rsp, -16",
+            "sub rsp, 32",
+            "call {entry}",
+            "ud2",
+            base = in(reg) base,
+            entry = sym rewound_stack_entry::<F>,
+            in("rcx") f,
+            options(noreturn),
+        )
+    }
+}
+
+unsafe extern "C" fn rewound_stack_entry<F: FnOnce() -> Infallible>(f: *mut ()) -> ! {
+    // SAFETY: `rewind_stack_and_run` passes the pointer returned by `Box::<F>::into_raw`.
+    let f = unsafe { *Box::from_raw(f.cast::<F>()) };
+    match f() {}
 }
 
 impl ProcessHandle for ClonedProcess {
@@ -196,5 +248,97 @@ pub unsafe fn fork_process() -> Result<ForkResult> {
         }
         STATUS_PROCESS_CLONED => Ok(ForkResult::Child),
         status => Err(Error::from_raw_os_error(status)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+    fn in_forked_child(run: fn() -> !) {
+        // SAFETY: RtlCloneUserProcess synchronizes native runtime state; the child only runs
+        // the supplied bootstrap and exits without returning to the copied test harness.
+        let clone = unsafe { fork_process() }.expect("failed to clone test process");
+        match clone {
+            ForkResult::Child => run(),
+            ForkResult::Parent { process, thread } => {
+                // SAFETY: The handles belong to this suspended child.
+                assert_ne!(unsafe { ResumeThread(thread.as_raw_handle()) }, u32::MAX);
+                // SAFETY: The owned process handle remains valid throughout the wait.
+                let wait = unsafe { WaitForSingleObject(process.as_raw_handle(), 10_000) };
+                if wait != WAIT_OBJECT_0 {
+                    // SAFETY: The handle refers to the child created by this test.
+                    unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+                    panic!("rewinding child did not exit: wait status {wait:#x}");
+                }
+                let mut status = 0;
+                // SAFETY: The child handle is valid and `status` is writable.
+                assert_ne!(
+                    unsafe { GetExitCodeProcess(process.as_raw_handle(), &raw mut status) },
+                    0
+                );
+                assert_eq!(status, 0, "rewinding child failed with status {status:#x}");
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn deeper(depth: usize, run: &mut dyn FnMut()) {
+        let frame = core::hint::black_box([0u8; 1024]);
+        if depth == 0 {
+            run();
+        } else {
+            deeper(depth - 1, run);
+        }
+        core::hint::black_box(frame);
+    }
+
+    fn stack_address() -> usize {
+        let marker = 0u8;
+        core::hint::black_box(core::ptr::from_ref(&marker).addr())
+    }
+
+    #[test]
+    fn clones_rewind_to_the_same_depth_in_every_generation() {
+        in_forked_child(|| {
+            record_guest_stack_base();
+            let base = GUEST_STACK_BASE.get();
+            let payload = String::from("owned bootstrap state");
+            deeper(64, &mut || {
+                let payload = payload.clone();
+                // SAFETY: This is the clone's only thread, and all reused stack frames are
+                // abandoned. The continuation owns its bootstrap state and never returns.
+                unsafe {
+                    rewind_stack_and_run(move || {
+                        if !(base - 4096..base).contains(&stack_address()) {
+                            exit_fork_child(1);
+                        }
+                        deeper(8, &mut || {
+                            record_guest_stack_base();
+                            deeper(64, &mut || {
+                                let payload = payload.clone();
+                                rewind_stack_and_run(move || {
+                                    let rewound = (base - 4096..base).contains(&stack_address());
+                                    let owned = payload == "owned bootstrap state";
+                                    exit_fork_child(if rewound && owned { 0 } else { 2 })
+                                })
+                            });
+                        });
+                        unreachable!()
+                    })
+                }
+            });
+            unreachable!()
+        });
+    }
+
+    #[test]
+    fn rewind_without_guest_entry_runs_in_place() {
+        in_forked_child(|| {
+            // SAFETY: This is the clone's only thread and the continuation exits immediately.
+            unsafe { rewind_stack_and_run(|| exit_fork_child(0)) }
+        });
     }
 }

@@ -473,6 +473,7 @@ fn run_thread_inner_with_xstate(
     ctx: &mut litebox_common_linux::PtRegs,
     guest_xsave_area: XsaveArea,
 ) {
+    process::record_guest_stack_base();
     let tls_state = TlsState::with_guest_xsave_area(guest_xsave_area);
     tls_state
         .guest_context_top

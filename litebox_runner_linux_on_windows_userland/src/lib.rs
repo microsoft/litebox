@@ -106,10 +106,25 @@ impl litebox_shim_linux::syscalls::process::ForkRunner<Platform> for NativeForkR
     }
 
     unsafe fn run_child(&self, control_pipe: std::ffi::OsString) -> ! {
-        // TODO: Rewind the stack to where the forking thread first entered the guest, as the Linux
-        // runner's native fork child does. The clone runs on a copy of the stack it forked on,
-        // under every frame of its parent's runtime, and guest `execve` keeps the runner process,
-        // so a long fork chain deepens the stack with each generation until it overflows.
+        let runner = Self {
+            memory: Arc::clone(&self.memory),
+        };
+        let continue_child = move || -> core::convert::Infallible {
+            // SAFETY: `run_child`'s caller meets `continue_child`'s requirements.
+            unsafe { runner.continue_child(control_pipe) }
+        };
+        // SAFETY: The clone contains only this thread, which abandons the copied runtime frames.
+        unsafe { litebox_platform_windows_userland::process::rewind_stack_and_run(continue_child) }
+    }
+}
+
+impl NativeForkRunner {
+    /// Bootstraps the clone on its rewound stack and runs the guest to its exit.
+    ///
+    /// # Safety
+    ///
+    /// As for [`litebox_shim_linux::syscalls::process::ForkRunner::run_child`].
+    unsafe fn continue_child(&self, control_pipe: std::ffi::OsString) -> ! {
         // SAFETY: RtlCloneUserProcess cloned only this thread, and this path never returns through
         // the copied parent task or its registration guard.
         let status = match unsafe { Platform::prepare_fork_child() }
