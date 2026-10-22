@@ -4,8 +4,9 @@
 //! Darwin BSD and Mach shim for AArch64 Mach-O guests.
 //!
 //! Guest mappings and file operations use LiteBox. A runtime provider may
-//! supply dyld and a guest-private dyld shared-cache instance for dynamically
-//! linked programs, which then run their own libSystem against this shim.
+//! supply dyld for dynamically linked programs, which then run their own
+//! libSystem against this shim on a guest-private instance of the platform's
+//! host dyld shared cache.
 //!
 //! Mach IPC is emulated per guest: the task has its own port name space,
 //! messages between its ports queue in the shim, and its kernel objects
@@ -30,7 +31,9 @@ use litebox::{
 use litebox_common_linux::{PtRegs, mm::VmemManager, vmem::VmFlags};
 use litebox_common_macos::{
     KernReturn, PAGE_SIZE, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
-    errno::Errno, loader::MachoLoaderError,
+    errno::Errno,
+    loader::MachoLoaderError,
+    shared_cache::{CacheDependency, HostSharedCache},
 };
 use litebox_platform::time::TimeProvider;
 
@@ -190,6 +193,7 @@ impl<P: ShimPlatform> MacosShim<P> {
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
         self.load(params, path, None, None, argv, envp)
+            .map(|(program, _)| program)
     }
 
     /// Load a dynamically linked executable with a runtime-provided dyld image.
@@ -197,8 +201,8 @@ impl<P: ShimPlatform> MacosShim<P> {
     /// loading and an AOT-rewritten dyld must carry valid rewrite metadata.
     ///
     /// Without `image`, the executable is read from `path` in the guest
-    /// filesystem. The provider must install the shared cache dyld uses before
-    /// entering guest execution.
+    /// filesystem. Installs a guest-private instance of the platform's verified
+    /// host shared cache.
     pub fn load_program_with_dyld(
         self,
         params: TaskParams,
@@ -207,8 +211,18 @@ impl<P: ShimPlatform> MacosShim<P> {
         dyld: &[u8],
         argv: Vec<CString>,
         envp: Vec<CString>,
-    ) -> Result<LoadedProgram<P>, MachoLoaderError> {
-        self.load(params, path, image, Some(dyld), argv, envp)
+    ) -> Result<LoadedProgram<P>, MachoLoaderError>
+    where
+        P: HostSharedCache,
+    {
+        let host_cache = self.global.platform.host_shared_cache().map_err(|error| {
+            MachoLoaderError::SharedCache(error.context("preparing the guest shared cache"))
+        })?;
+        let (program, dependencies) = self.load(params, path, image, Some(dyld), argv, envp)?;
+        program
+            .install_host_shared_cache(host_cache, &dependencies)
+            .map_err(MachoLoaderError::SharedCache)?;
+        Ok(program)
     }
 
     /// Load a self-contained static executable snapshot without file I/O.
@@ -224,6 +238,7 @@ impl<P: ShimPlatform> MacosShim<P> {
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
         self.load(params, path, Some(image), None, argv, envp)
+            .map(|(program, _)| program)
     }
 
     fn load(
@@ -234,7 +249,7 @@ impl<P: ShimPlatform> MacosShim<P> {
         dyld: Option<&[u8]>,
         argv: Vec<CString>,
         envp: Vec<CString>,
-    ) -> Result<LoadedProgram<P>, MachoLoaderError> {
+    ) -> Result<(LoadedProgram<P>, Vec<CacheDependency>), MachoLoaderError> {
         let random_source = self.random_source;
         let process = Process(Arc::new(AtomicI32::new(-1)));
         let thread_id = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
@@ -246,15 +261,17 @@ impl<P: ShimPlatform> MacosShim<P> {
             process: process.clone(),
             thread,
         };
-        let initial_ctx = loader::load(&task, path, image, dyld, random_source, &argv, &envp)?;
-        Ok(LoadedProgram {
+        let (initial_ctx, dependencies) =
+            loader::load(&task, path, image, dyld, random_source, &argv, &envp)?;
+        let program = LoadedProgram {
             entrypoints: MacosShimEntrypoints {
                 task,
                 _not_send: core::marker::PhantomData,
             },
             process,
             initial_ctx,
-        })
+        };
+        Ok((program, dependencies))
     }
 }
 

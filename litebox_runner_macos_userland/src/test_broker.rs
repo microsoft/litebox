@@ -27,6 +27,9 @@ use std::{
     sync::Arc,
 };
 
+/// Guest path of the executable under test.
+pub(crate) const EXECUTABLE_PATH: &str = "/executable";
+
 /// Host randomness for apple[] entropy keys, `/dev/random` and `getentropy`.
 // TODO: the runner needs `getrandom` only because the broker runs in process.
 // An out-of-process broker should provide randomness, as on the other platforms.
@@ -58,7 +61,7 @@ pub(crate) fn setup(
             },
         ),
         (
-            "/executable",
+            EXECUTABLE_PATH,
             InitialNode::File {
                 mode: FileMode::from_u32_bits_truncate(0o555),
                 owner: FileUser::ROOT,

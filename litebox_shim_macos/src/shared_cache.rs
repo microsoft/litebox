@@ -16,6 +16,8 @@ use litebox_common_linux::vmem::CreatePagesFlags;
 use litebox_common_macos::{PAGE_SIZE, VmProtection, shared_cache::HostSharedCache};
 use litebox_syscall_rewriter::macho::Rewriter;
 
+mod layout;
+
 /// Lowest guest address of a shared-cache instance: above the host shared
 /// region and the `[16, 63)` GiB window that xzone malloc reserves for its
 /// fixed pointer ranges.
@@ -23,10 +25,10 @@ pub const SHARED_CACHE_MIN_ADDRESS: usize = 64 << 30;
 
 /// Why reserving or installing a shared-cache instance failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SharedCacheInstallError {
+pub(crate) enum SharedCacheInstallError {
     AlreadyInstalled,
     /// Part of the range is already mapped by the guest, or the host refused the
-    /// fixed range.
+    /// fixed range (see `layout::reserve_free_range`).
     ReservationConflict,
     /// The address range cannot be reserved for another reason.
     Reservation,
@@ -69,7 +71,7 @@ impl core::error::Error for SharedCacheInstallError {}
 
 /// Initial contents of one page-aligned piece of a shared-cache instance.
 #[derive(Clone, Copy)]
-pub enum SharedCacheBacking<'a> {
+pub(crate) enum SharedCacheBacking<'a> {
     /// Inaccessible; the reservation remains.
     Reserved,
     /// A private view of the platform's cache file bytes at this unslid
@@ -88,7 +90,7 @@ pub enum SharedCacheBacking<'a> {
 }
 
 /// One page-aligned piece of a shared-cache instance and its protections.
-pub struct SharedCachePiece<'a> {
+pub(crate) struct SharedCachePiece<'a> {
     pub range: Range<usize>,
     pub backing: SharedCacheBacking<'a>,
     /// Initial protection.
@@ -101,7 +103,7 @@ pub struct SharedCachePiece<'a> {
 }
 
 /// File-view code, rewritten before it can execute.
-pub struct SharedCacheCodeRegion<'a> {
+pub(crate) struct SharedCacheCodeRegion<'a> {
     /// Index of a [`SharedCacheBacking::FileView`] piece whose maximum
     /// protection is read-execute.
     pub piece: usize,
@@ -111,7 +113,7 @@ pub struct SharedCacheCodeRegion<'a> {
 }
 
 /// Contents of one demand-paged page.
-pub struct SharedCachePage {
+pub(crate) struct SharedCachePage {
     /// Exactly one page of bytes.
     pub bytes: Vec<u8>,
     /// The maximum protection of the page's cache mapping without execute;
@@ -122,10 +124,10 @@ pub struct SharedCachePage {
 /// Supplies the page at a page-aligned guest address of a
 /// [`SharedCacheBacking::Paged`] piece, or `None` if it cannot. Called with
 /// the instance locked, so it must not re-enter the shim.
-pub type SharedCachePager = Arc<dyn Fn(usize) -> Option<SharedCachePage> + Send + Sync>;
+pub(crate) type SharedCachePager = Arc<dyn Fn(usize) -> Option<SharedCachePage> + Send + Sync>;
 
 /// Layout of a guest-private shared-cache instance.
-pub struct SharedCacheLayout<'a> {
+pub(crate) struct SharedCacheLayout<'a> {
     /// The range reserved with [`LoadedProgram::reserve_shared_cache`].
     pub range: Range<usize>,
     /// Pieces in address order that exactly tile `range`.
@@ -299,7 +301,10 @@ fn subtract(range: &Range<usize>, holes: &[Range<usize>]) -> Vec<Range<usize>> {
 impl<P: ShimPlatform> LoadedProgram<P> {
     /// Reserve exactly `range`, page-aligned and at or above
     /// [`SHARED_CACHE_MIN_ADDRESS`], without replacing guest or host mappings.
-    pub fn reserve_shared_cache(&self, range: Range<usize>) -> Result<(), SharedCacheInstallError> {
+    pub(crate) fn reserve_shared_cache(
+        &self,
+        range: Range<usize>,
+    ) -> Result<(), SharedCacheInstallError> {
         let task = &self.entrypoints.task;
         let mut reservation = task.global.shared_cache_reservation.lock();
         if reservation.is_some() {
@@ -341,7 +346,7 @@ impl<P: ShimPlatform> LoadedProgram<P> {
     /// Install `cache` in the range reserved by [`Self::reserve_shared_cache`].
     /// No cache code may run during installation. Discard the process on
     /// error: installation is not transactional.
-    pub fn install_shared_cache(
+    pub(crate) fn install_shared_cache(
         &self,
         cache: &SharedCacheLayout<'_>,
     ) -> Result<(), SharedCacheInstallError>

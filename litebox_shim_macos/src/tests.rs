@@ -19,7 +19,7 @@ use litebox_platform_macos_userland::MacosUserland as Platform;
 
 mod mach;
 
-fn task(shim: MacosShim<Platform>) -> Task<Platform> {
+pub(crate) fn task(shim: MacosShim<Platform>) -> Task<Platform> {
     let thread = ThreadState::new(1u64 << 32, shim.global.platform);
     Task {
         global: shim.global,

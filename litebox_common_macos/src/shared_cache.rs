@@ -754,7 +754,7 @@ impl DylibAttributes {
     }
 }
 
-/// A dylib load command of a cache image.
+/// A dylib load command of a cache image or executable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheDependency {
     pub path: String,
@@ -772,6 +772,30 @@ impl CacheDependency {
         }
         Ok(Some(Self {
             path: String::from(dylib_name(body)?),
+            attributes: DylibAttributes::decode(command, body),
+        }))
+    }
+
+    /// Decode an executable's dylib load command, rejecting only what dyld
+    /// rejects (`stringOverflow`, `mach_o/UnsafeHeader.cpp`): a name offset
+    /// outside the command or no NUL after it. Non-UTF-8 names give `None`.
+    pub fn from_executable_load_command(command: u32, body: &[u8]) -> Result<Option<Self>> {
+        if !DYLIB_LOAD_COMMANDS.contains(&command) {
+            return Ok(None);
+        }
+        let bytes = body
+            .get(u32_at(body, 8)? as usize..)
+            .filter(|bytes| !bytes.is_empty())
+            .ok_or(SharedCacheError::Malformed("load command string offset"))?;
+        let length = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .ok_or(SharedCacheError::Malformed("unterminated string"))?;
+        let Ok(path) = core::str::from_utf8(&bytes[..length]) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            path: String::from(path),
             attributes: DylibAttributes::decode(command, body),
         }))
     }
@@ -820,6 +844,8 @@ pub struct CacheImage {
     pub install_name: Option<String>,
     pub segments: Vec<CacheSegment>,
     pub dependencies: Vec<CacheDependency>,
+    /// Whether `LC_DATA_IN_CODE` has a non-zero `datasize`.
+    pub has_data_in_code: bool,
 }
 
 impl CacheImage {
@@ -854,6 +880,7 @@ impl CacheImage {
             install_name: None,
             segments: Vec::new(),
             dependencies: Vec::new(),
+            has_data_in_code: false,
         };
         let mut offset = size_of::<MachHeader64>();
         for _ in 0..command_count {
@@ -886,6 +913,8 @@ impl CacheImage {
                     }
                     image.install_name = Some(String::from(dylib_name(body)?));
                 }
+                // `linkedit_data_command.datasize`.
+                macho::LC_DATA_IN_CODE => image.has_data_in_code |= u32_at(body, 12)? != 0,
                 // Like dyld's forEachLinkedDylib, dyld itself links nothing.
                 _ if file_type == macho::MH_DYLIB => {
                     image
