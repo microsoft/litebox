@@ -1209,8 +1209,12 @@ impl<const PAGE_SIZE: usize> litebox::platform::ArchSpecificProvider
         &self,
         reg: &ArchSpecificRegister,
     ) -> Result<usize, ArchSpecificError> {
+        // Linux guests virtualize TPIDR_EL0 and Darwin guests TPIDRRO_EL0 in
+        // the same per-thread slot, which rewritten gates read.
         match reg {
-            ArchSpecificRegister::TpidrEl0 => Ok(get_guest_thread_pointer()),
+            ArchSpecificRegister::TpidrEl0 | ArchSpecificRegister::TpidrroEl0 => {
+                Ok(get_guest_thread_pointer())
+            }
             _ => Err(ArchSpecificError::RegisterUnsupported),
         }
     }
@@ -1227,6 +1231,11 @@ impl<const PAGE_SIZE: usize> litebox::platform::ArchSpecificProvider
                 } else {
                     Err(ArchSpecificError::RegisterUnpermittedValue)
                 }
+            }
+            // Darwin's TSD base. The caller applies XNU's address-range policy.
+            ArchSpecificRegister::TpidrroEl0 => {
+                set_guest_thread_pointer(value);
+                Ok(())
             }
             _ => Err(ArchSpecificError::RegisterUnsupported),
         }
@@ -1928,7 +1937,7 @@ fn run_thread_inner_with_process(
         pending.store(0, Ordering::Relaxed);
     })
     .expect("initialized thread TLS");
-    // Darwin child threads receive their guest TSD from the shim initializer.
+    // Darwin guests set their TSD base through the platform syscall.
     set_guest_thread_pointer(0);
     // Entry/resume installs x18 from PtRegs.
     set_guest_x18(0);

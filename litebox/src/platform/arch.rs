@@ -59,6 +59,9 @@ pub enum ArchSpecificRegister {
 #[non_exhaustive]
 pub enum ArchSpecificRegister {
     TpidrEl0,
+    /// The read-only thread pointer register; Darwin keeps the thread's TSD
+    /// base here.
+    TpidrroEl0,
 }
 
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.

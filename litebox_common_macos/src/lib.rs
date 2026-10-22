@@ -128,6 +128,10 @@ pub const SIGINT: i32 = 2;
 pub const SIGSEGV: i32 = 11;
 
 /// Virtual process credentials, not the runner's host identity.
+///
+/// The default is an ordinary process whose parent is PID 1: macOS reserves
+/// PID 1 for launchd, and a guest's own system libraries take launchd-only
+/// paths for it (such as libignition's boot-time cryptex activation in dyld).
 #[derive(Clone, Copy, Debug)]
 pub struct TaskParams {
     pub pid: i32,
@@ -141,8 +145,8 @@ pub struct TaskParams {
 impl Default for TaskParams {
     fn default() -> Self {
         Self {
-            pid: 1,
-            ppid: 0,
+            pid: 2,
+            ppid: 1,
             uid: 1000,
             euid: 1000,
             gid: 1000,
