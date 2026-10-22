@@ -29,6 +29,17 @@ impl Pty {
             )
         };
         assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+        // Only the stdio a test chooses may reach its children.
+        for fd in [master, slave] {
+            // SAFETY: fd is an owned file descriptor returned by openpty above.
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            assert_eq!(
+                rc,
+                0,
+                "fcntl(F_SETFD) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
 
         // SAFETY: master is an owned file descriptor returned by openpty above.
         let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
