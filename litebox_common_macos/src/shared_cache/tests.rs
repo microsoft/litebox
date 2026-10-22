@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Synthetic-buffer tests for shared-cache parsing.
+//! Synthetic-buffer tests for shared-cache parsing and v5 rebasing.
 #![allow(clippy::cast_possible_truncation)]
 
 use super::*;
@@ -624,8 +624,151 @@ fn malformed_images_are_rejected() {
     );
 }
 
+/// A plain v5 chain entry; `next` counts 8-byte strides.
+fn regular(target: u64, high8: u8, next: u64) -> u64 {
+    target | (u64::from(high8) << 34) | (next << 52)
+}
+
+fn authenticated(target: u64, diversity: u16, address: bool, data: bool, next: u64) -> u64 {
+    target
+        | (u64::from(diversity) << 34)
+        | (u64::from(address) << 50)
+        | (u64::from(data) << 51)
+        | (next << 52)
+        | (1 << 63)
+}
+
+struct RecordingSigner(core::cell::RefCell<Vec<(u64, PointerAuthKey, u64)>>);
+
+impl PointerSigner for RecordingSigner {
+    fn sign(&self, value: u64, key: PointerAuthKey, discriminator: u64) -> u64 {
+        self.0.borrow_mut().push((value, key, discriminator));
+        value ^ 0x00a5_0000_0000_0000
+    }
+}
+
+fn page_with(words: &[(usize, u64)]) -> Vec<u8> {
+    let mut page = vec![0; 0x1000];
+    for (offset, value) in words {
+        put64(&mut page, *offset, *value);
+    }
+    page
+}
+
 #[test]
-fn slide_v5_parse_rejects_bad_headers() {
+fn slide_v5_rebases_regular_and_authenticated_chains() {
+    const VALUE_ADD: u64 = 0x1_8000_0000;
+    const SLIDE: u64 = 0xe_8000_0000;
+    const PAGE_ADDRESS: u64 = 0x10_0000_4000;
+    let info = SlideInfoV5::parse(&slide_info(
+        0x1000,
+        VALUE_ADD,
+        &[SLIDE_V5_PAGE_NO_REBASE, 0x10],
+    ))
+    .unwrap();
+    assert_eq!(info.value_add(), VALUE_ADD);
+    let original = page_with(&[
+        (0x10, regular(0x1234, 0, 1)),
+        (0x18, regular(0x2_0000_0000, 0x5a, 2)),
+        (0x28, authenticated(0x3000, 0xbeef, true, false, 3)),
+        (0x40, authenticated(0x4000, 0x1234, false, true, 0)),
+        (0x48, 0xdead_beef),
+    ]);
+    let signer = RecordingSigner(core::cell::RefCell::new(Vec::new()));
+
+    let mut page = original.clone();
+    info.rebase_page(&mut page, 0, SLIDE, PAGE_ADDRESS, &signer)
+        .unwrap();
+    assert_eq!(page, original, "NO_REBASE pages are unchanged");
+
+    info.rebase_page(&mut page, 1, SLIDE, PAGE_ADDRESS, &signer)
+        .unwrap();
+    let word = |offset: usize| u64::from_le_bytes(page[offset..offset + 8].try_into().unwrap());
+    let base = VALUE_ADD + SLIDE;
+    assert_eq!(word(0x10), base + 0x1234);
+    assert_eq!(word(0x18), (base + 0x2_0000_0000) | (0x5a << 56));
+    assert_eq!(word(0x28), (base + 0x3000) ^ 0x00a5_0000_0000_0000);
+    assert_eq!(word(0x40), (base + 0x4000) ^ 0x00a5_0000_0000_0000);
+    assert_eq!(word(0x48), 0xdead_beef, "chain ended before this slot");
+    assert_eq!(
+        *signer.0.borrow(),
+        [
+            (
+                base + 0x3000,
+                PointerAuthKey::Ia,
+                blended_discriminator(PAGE_ADDRESS + 0x28, 0xbeef)
+            ),
+            (base + 0x4000, PointerAuthKey::Da, 0x1234),
+        ]
+    );
+    assert_eq!(
+        blended_discriminator(0xffff_1234_5678_9abc, 0xbeef),
+        0xbeef_1234_5678_9abc
+    );
+
+    // Unsigned pointers keep authenticated values plain, as XNU without JOP keys.
+    let mut page = original;
+    info.rebase_page(&mut page, 1, SLIDE, PAGE_ADDRESS, &UnsignedPointers)
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(page[0x28..0x30].try_into().unwrap()),
+        base + 0x3000
+    );
+}
+
+#[test]
+fn slide_v5_rejects_chains_leaving_the_page_and_bad_input() {
+    let info = SlideInfoV5::parse(&slide_info(0x1000, 0, &[0xff8, 0x10, 0x14, 0x1000])).unwrap();
+    // The second pointer would start at 0x1000, past the page.
+    let original = page_with(&[(0xff8, regular(1, 0, 1))]);
+    let mut page = original.clone();
+    assert_eq!(
+        info.rebase_page(&mut page, 0, 0, 0, &UnsignedPointers),
+        Err(SharedCacheError::ChainOutOfPage {
+            page_index: 0,
+            offset: 0x1000
+        })
+    );
+    assert_eq!(page, original, "failed rebases leave the page unchanged");
+    // A long chain that runs off the page.
+    let mut page = page_with(&[(0x10, regular(1, 0, 0x7ff))]);
+    assert_eq!(
+        info.rebase_page(&mut page, 1, 0, 0, &UnsignedPointers),
+        Err(SharedCacheError::ChainOutOfPage {
+            page_index: 1,
+            offset: 0x10 + 0x7ff * 8
+        })
+    );
+    // Misaligned (with a whole slot inside the page) and out-of-page starts.
+    for (index, offset) in [(2, 0x14), (3, 0x1000)] {
+        let mut page = page_with(&[]);
+        assert_eq!(
+            info.rebase_page(&mut page, index, 0, 0, &UnsignedPointers),
+            Err(SharedCacheError::ChainOutOfPage {
+                page_index: index,
+                offset
+            })
+        );
+    }
+    // Bad page index, page length and arithmetic overflow.
+    let mut page = page_with(&[(0x10, regular(1, 0, 0))]);
+    assert_eq!(
+        info.rebase_page(&mut page, 4, 0, 0, &UnsignedPointers),
+        Err(SharedCacheError::InvalidArgument(
+            "slide page index beyond the slide info"
+        ))
+    );
+    assert_eq!(
+        info.rebase_page(&mut page[..0x800], 1, 0, 0, &UnsignedPointers),
+        Err(SharedCacheError::InvalidArgument(
+            "slide page length differs from the slide info's page size"
+        ))
+    );
+    assert_eq!(
+        info.rebase_page(&mut page, 1, u64::MAX, 0, &UnsignedPointers),
+        Err(SharedCacheError::Malformed("rebased pointer overflows"))
+    );
+    // Header validation.
     let mut wrong_version = slide_info(0x1000, 0, &[0]);
     put32(&mut wrong_version, 0, 3);
     assert_eq!(
@@ -773,7 +916,21 @@ fn random_and_mutated_input_never_panics() {
         let info_length = info.len();
         random.mutate(&mut info, 0..info_length);
         let _ = SlideInfoV5::parse(&info[..random.below(info_length + 1)]);
-        let _ = SlideInfoV5::parse(&info);
+        if let Ok(info) = SlideInfoV5::parse(&info) {
+            let mut page: Vec<u8> = (0..info.page_size()).map(|_| random.next() as u8).collect();
+            let length = if random.below(8) == 0 {
+                random.below(page.len())
+            } else {
+                page.len()
+            };
+            let _ = info.rebase_page(
+                &mut page[..length],
+                random.below(info.page_count() + 1),
+                random.next() >> random.below(64),
+                random.next(),
+                &UnsignedPointers,
+            );
+        }
 
         let mut mutated = Files {
             main: valid.main.clone(),
