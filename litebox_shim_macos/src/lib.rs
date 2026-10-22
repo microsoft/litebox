@@ -47,6 +47,7 @@ pub trait ShimPlatform:
     + TimeProvider
     + litebox::platform::SignalProvider
     + litebox::platform::SystemInfoProvider
+    + litebox::platform::ArchSpecificProvider
     + litebox_common_macos::MachClock
     + 'static
     + Sized
@@ -60,6 +61,7 @@ where
         + TimeProvider
         + litebox::platform::SignalProvider
         + litebox::platform::SystemInfoProvider
+        + litebox::platform::ArchSpecificProvider
         + litebox_common_macos::MachClock
         + 'static
         + Sized,
@@ -72,21 +74,33 @@ pub struct MacosShimBuilder<P: ShimPlatform> {
     platform: &'static P,
     litebox: Arc<LiteBox<P>>,
     files: Arc<syscalls::file::FilesState<P>>,
+    random_source: bool,
 }
 
 impl<P: ShimPlatform> MacosShimBuilder<P> {
+    /// Build a shim without a broker, so without file I/O or a random source:
+    /// only static executables load, without the apple[] entropy keys.
     pub fn new(platform: &'static P) -> Self {
-        Self::new_with_litebox(platform, LiteBox::new(platform))
+        Self::with_litebox(platform, LiteBox::new(platform), false)
     }
 
-    /// Build a shim around an existing LiteBox instance. `platform` must be
-    /// the same platform used to construct `litebox`.
+    /// Build a shim around an existing broker-backed LiteBox instance.
+    /// `platform` must be the same platform used to construct `litebox`.
+    ///
+    /// Loading requests the apple[] entropy keys from the broker's random
+    /// source and fails with [`MachoLoaderError::Entropy`] if it cannot supply
+    /// them.
     pub fn new_with_litebox(platform: &'static P, litebox: LiteBox<P>) -> Self {
+        Self::with_litebox(platform, litebox, true)
+    }
+
+    fn with_litebox(platform: &'static P, litebox: LiteBox<P>, random_source: bool) -> Self {
         let litebox = Arc::new(litebox);
         Self {
             platform,
             files: Arc::new(syscalls::file::FilesState::new(Arc::clone(&litebox))),
             litebox,
+            random_source,
         }
     }
 
@@ -112,6 +126,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 next_thread_id: core::sync::atomic::AtomicU64::new(1u64 << 32),
             }),
             files: self.files,
+            random_source: self.random_source,
         }
     }
 }
@@ -121,6 +136,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
 pub struct MacosShim<P: ShimPlatform> {
     global: Arc<GlobalState<P>>,
     files: Arc<syscalls::file::FilesState<P>>,
+    random_source: bool,
 }
 
 impl<P: ShimPlatform> MacosShim<P> {
@@ -177,6 +193,7 @@ impl<P: ShimPlatform> MacosShim<P> {
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
+        let random_source = self.random_source;
         let process = Process(Arc::new(AtomicI32::new(-1)));
         let thread_id = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let thread = ThreadState::new(thread_id, self.global.platform);
@@ -187,7 +204,7 @@ impl<P: ShimPlatform> MacosShim<P> {
             process: process.clone(),
             thread,
         };
-        let initial_ctx = loader::load(&task, path, image, dyld, &argv, &envp)?;
+        let initial_ctx = loader::load(&task, path, image, dyld, random_source, &argv, &envp)?;
         Ok(LoadedProgram {
             entrypoints: MacosShimEntrypoints {
                 task,
@@ -326,6 +343,10 @@ impl<P: ShimPlatform> Task<P> {
         // BSD calls report errno through carry. Mach traps update x0 without
         // changing condition flags.
         const CARRY: u64 = 1 << 29;
+        if litebox_common_macos::syscall::is_platform_syscall_selector(ctx.regs[16]) {
+            self.handle_platform_syscall(ctx);
+            return;
+        }
         let is_mach = litebox_common_macos::syscall::is_mach_trap_selector(ctx.regs[16]);
         match self.do_syscall(ctx) {
             Ok(value) => {
@@ -341,6 +362,43 @@ impl<P: ShimPlatform> Task<P> {
                     ctx.regs[0] = error.raw();
                     ctx.pstate |= CARRY;
                 }
+            }
+        }
+    }
+
+    /// XNU's AArch64 `platform_syscall`: only the get path writes x0, and no
+    /// path changes the condition flags.
+    fn handle_platform_syscall(&self, ctx: &mut PtRegs) {
+        use litebox::platform::ArchSpecificRegister;
+        use litebox_common_macos::syscall::PlatformSyscall;
+
+        let platform = self.global.platform;
+        match PlatformSyscall::from_args(ctx.regs[0], ctx.regs[3]) {
+            PlatformSyscall::SetCthreadSelf { tsd_base } => {
+                // machine_thread_set_tsd_base: addresses beyond the map become 0.
+                let tsd_base = if tsd_base > P::TASK_ADDR_MAX {
+                    0
+                } else {
+                    tsd_base
+                };
+                if let Err(error) =
+                    platform.set_arch_specific_register(&ArchSpecificRegister::TpidrroEl0, tsd_base)
+                {
+                    litebox_util_log::error!(error:?; "cannot set the guest TSD base");
+                    self.process.exit(128 + SIGSEGV);
+                }
+            }
+            PlatformSyscall::GetCthreadSelf => {
+                match platform.get_arch_specific_register(&ArchSpecificRegister::TpidrroEl0) {
+                    Ok(tsd_base) => ctx.regs[0] = tsd_base,
+                    Err(error) => {
+                        litebox_util_log::error!(error:?; "cannot read the guest TSD base");
+                        self.process.exit(128 + SIGSEGV);
+                    }
+                }
+            }
+            PlatformSyscall::Ignored { code } => {
+                litebox_util_log::debug!(code:?; "ignored Darwin platform syscall");
             }
         }
     }

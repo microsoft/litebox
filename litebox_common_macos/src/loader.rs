@@ -67,6 +67,8 @@ pub enum MachoLoaderError {
     Rewrite,
     #[error("Mach-O is not rewritten; run litebox_syscall_rewriter first")]
     Unrewritten,
+    #[error("no random source for the startup apple vector")]
+    Entropy,
 }
 
 #[derive(Debug)]

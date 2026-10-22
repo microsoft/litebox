@@ -13,8 +13,9 @@ use litebox_broker_core::{
         in_mem::{InMem, InitialNode},
         resolver::Resolver,
     },
+    random::{RandomProvider, RandomProviderError},
     stdio::StdioOutputStream,
-    test_support::{FailingRandomProvider, TestBrokerBuilder, TestStdioProvider},
+    test_support::{TestBrokerBuilder, TestStdioProvider},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -25,6 +26,17 @@ use std::{
     io::{Read as _, Write as _},
     sync::Arc,
 };
+
+/// Host randomness for apple[] entropy keys, `/dev/random` and `getentropy`.
+// TODO: the runner needs `getrandom` only because the broker runs in process.
+// An out-of-process broker should provide randomness, as on the other platforms.
+struct HostRandomProvider;
+
+impl RandomProvider for HostRandomProvider {
+    fn fill(&self, output: &mut [u8]) -> Result<(), RandomProviderError> {
+        getrandom::fill(output).map_err(|_| RandomProviderError)
+    }
+}
 
 pub(crate) fn setup(
     platform: &'static MacosUserland,
@@ -68,7 +80,7 @@ pub(crate) fn setup(
     let fs = Composer::builder()
         .mount("/", |_| fs)
         .mount("/dev", |allocator| {
-            Devices::new(allocator, stdio.clone(), Arc::new(FailingRandomProvider))
+            Devices::new(allocator, stdio.clone(), Arc::new(HostRandomProvider))
         })
         .build()
         .map_err(|error| anyhow!("test filesystem: {error:?}"))?;
@@ -76,6 +88,7 @@ pub(crate) fn setup(
         ObjectRights::all(),
     ))
     .with_file_service(Arc::new(Resolver::<MacosUserland, _>::new(fs)))
+    .with_random_provider(Arc::new(HostRandomProvider))
     .build()
     .map_err(|error| anyhow!("test broker: {error:?}"))?;
     let root = broker
