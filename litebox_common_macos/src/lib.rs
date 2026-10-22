@@ -68,6 +68,63 @@ pub trait MachClock {
     fn mach_wait_until(&self, deadline: u64) -> KernReturn;
 }
 
+/// Private copy-on-write views of immutable host bytes, for shared-cache
+/// instances.
+pub trait CopyOnWritePages {
+    /// Replace the pages at `start`, which the caller has already mapped, with
+    /// a private copy-on-write view of `source` with `permissions`. Writes
+    /// never reach `source`, and later changes to `source` need not become
+    /// visible. `start` and `source` must be host-page aligned. Executable
+    /// views are refused. On failure the pages at `start` are unchanged.
+    /// `source` need only stay mapped for the call.
+    ///
+    /// # Safety
+    ///
+    /// Nothing may access the pages at `start` during the call.
+    unsafe fn replace_with_copy_on_write(
+        &self,
+        start: usize,
+        source: &[u8],
+        permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<(), CopyOnWriteError>;
+}
+
+/// Why [`CopyOnWritePages::replace_with_copy_on_write`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CopyOnWriteError {
+    /// Empty, or not aligned to the host page size.
+    #[error("copy-on-write range is empty or not host-page aligned")]
+    Unaligned,
+    /// Executable permissions, or guest pages smaller than host pages.
+    #[error("copy-on-write view is executable or smaller than a host page")]
+    Unsupported,
+    /// Part of the target range is not mapped by the caller.
+    #[error("copy-on-write target is not mapped by the caller")]
+    NotMapped,
+    /// The host mapping of `source` cannot be copied privately.
+    #[error("copy-on-write source cannot be copied privately")]
+    UnsupportedSource,
+    /// The host refused the copy.
+    #[error("the host refused the copy-on-write mapping")]
+    Host,
+}
+
+/// Recovery of fallible user copies that fail on guest memory the shim
+/// supplies on demand, like XNU's `copyin`/`copyout` faulting a page in.
+pub trait UserCopyFaults {
+    /// Run `f` with `supply` registered for this thread: when a fallible
+    /// access through this platform's user pointers fails, `supply` gets the
+    /// byte range the access covers and returns whether a retry may succeed,
+    /// and the access is then retried once. `supply` runs in normal
+    /// context and is unregistered while it runs, so user accesses it makes
+    /// fail without retrying.
+    fn with_user_copy_supplier<R>(
+        &self,
+        supply: &dyn Fn(core::ops::Range<usize>) -> bool,
+        f: impl FnOnce() -> R,
+    ) -> R;
+}
+
 impl From<KernReturn> for litebox::platform::page_mgmt::AllocationError {
     fn from(result: KernReturn) -> Self {
         match result {
