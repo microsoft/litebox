@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! Devices behind device-neutral types ([`ConsoleDevice`],
-//! [`NetworkDevice`], [`NinePDevice`]), each probing
+//! [`NetworkDevice`], [`NinePDevice`], [`VsockDevice`]), each probing
 //! the drivers the HAL has for its kind. Runners choose which devices to
 //! probe, where they interrupt, and what to do without one.
 
@@ -11,6 +11,7 @@ use crate::interrupt::InterruptTarget;
 use crate::virtio::console::VirtioConsole;
 use crate::virtio::net::VirtioNet;
 use crate::virtio::nine_p::Virtio9p;
+use crate::virtio::vsock::{VirtioVsock, VsockConnection};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
@@ -226,6 +227,80 @@ impl fmt::Display for NinePDevice {
             "virtio (pci {}, interrupts {})",
             self.0.transport().function(),
             self.interrupts()
+        )
+    }
+}
+
+/// A stream listener on one port of the VM's vsock device, for the host:
+/// one connection at a time, others reset. Not internally synchronized. See
+/// [`crate::virtio::vsock`].
+pub struct VsockDevice(Box<VirtioVsock>);
+
+impl VsockDevice {
+    /// The VM's socket device, interrupting `interrupt` if it can (see
+    /// [`Self::interrupts`]), listening on `port`; `None` if there is none.
+    ///
+    /// # Errors
+    ///
+    /// The device cannot be driven.
+    pub fn probe(
+        hal: &'static dyn Hal,
+        interrupt: InterruptTarget,
+        port: u32,
+    ) -> Result<Option<Self>, crate::virtio::Error> {
+        // Virtio over PCI.
+        let device = VirtioVsock::probe(hal, interrupt.msi_message(), port).transpose()?;
+        Ok(device.map(|device| Self(Box::new(device))))
+    }
+
+    /// Whether the device raises its interrupt; else it must be polled.
+    pub fn interrupts(&self) -> bool {
+        self.0.transport().interrupts()
+    }
+
+    /// Whether events (packets, a transport reset) await another call: make
+    /// it before waiting for an interrupt.
+    pub fn has_backlog(&self) -> bool {
+        self.0.has_backlog()
+    }
+
+    /// The live connection, if any.
+    pub fn connection(&mut self) -> Option<VsockConnection> {
+        self.0.connection()
+    }
+
+    /// Copies data `connection` received into `output`: how much (zero if
+    /// none is waiting); `None` unless it is the live connection.
+    pub fn read(&mut self, connection: VsockConnection, output: &mut [u8]) -> Option<usize> {
+        self.0.read(connection, output)
+    }
+
+    /// Queues as much of `bytes` for `connection` as the device and host
+    /// take now: how much; `None` unless it is the live connection.
+    pub fn write(&mut self, connection: VsockConnection, bytes: &[u8]) -> Option<usize> {
+        self.0.write(connection, bytes)
+    }
+
+    /// Resets `connection` if it is live; the listener then accepts the next.
+    pub fn close(&mut self, connection: VsockConnection) {
+        self.0.close(connection);
+    }
+
+    /// Whether everything written reached the host's socket.
+    pub fn flushed(&mut self) -> bool {
+        self.0.flushed()
+    }
+}
+
+impl fmt::Display for VsockDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "virtio (pci {}, interrupts {}, cid {}, port {})",
+            self.0.transport().function(),
+            self.interrupts(),
+            self.0.guest_cid(),
+            self.0.port()
         )
     }
 }

@@ -6,8 +6,8 @@
 //! [`crate::dma::Hal`]) and interrupts by MSI-X. Split virtqueues
 //! ([`queue`]).
 //!
-//! Devices: [`console`], [`net`], and [`nine_p`]. The transport and queues
-//! are device-independent, for further devices.
+//! Devices: [`console`], [`net`], [`nine_p`], and [`vsock`]. The transport
+//! and queues are device-independent, for further devices.
 //!
 //! Devices are not trusted: the capability list, BAR ranges, queue sizes and
 //! used-ring entries are checked, and lengths the device reports are clamped
@@ -19,6 +19,7 @@ pub mod net;
 pub mod nine_p;
 pub mod pci;
 pub mod queue;
+pub mod vsock;
 
 const PCI_VENDOR: u16 = 0x1af4;
 
@@ -41,6 +42,8 @@ pub enum Error {
     MissingStructure(&'static str),
     /// A structure is outside its BAR, too short, or not in a memory BAR.
     BadStructure(&'static str),
+    /// A device configuration field has an unusable value.
+    InvalidConfig(&'static str),
     /// The platform could not map a structure.
     MapFailed,
     ResetTimedOut,
@@ -59,6 +62,7 @@ impl core::fmt::Display for Error {
         match self {
             Self::MissingStructure(what) => write!(f, "no {what} structure"),
             Self::BadStructure(what) => write!(f, "malformed {what} structure"),
+            Self::InvalidConfig(what) => write!(f, "invalid {what} in the device configuration"),
             Self::MapFailed => f.write_str("cannot map device registers"),
             Self::ResetTimedOut => f.write_str("reset timed out"),
             Self::NotModern => f.write_str("VIRTIO_F_VERSION_1 not offered"),
