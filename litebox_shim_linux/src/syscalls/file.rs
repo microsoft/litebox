@@ -135,6 +135,11 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(self.file.status()?)
     }
 
+    /// Absolute path of the file, with symbolic links resolved, as of when it was opened.
+    pub(crate) fn path(&self) -> Result<String, Errno> {
+        Ok(self.file.path()?)
+    }
+
     /// Controls the shared terminal, waiting interruptibly for output-draining operations.
     pub(crate) fn terminal_control(
         &self,
@@ -1959,19 +1964,37 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
+    /// The open descriptor named by a `/proc/self/fd/<fd>` path, or `None` for any other path.
+    ///
+    /// Like Linux, a name that is not an open descriptor fails with `ENOENT`.
+    // XXX(jayb): `/proc/self/fd/<fd>` should be backed by the file system rather than handled here.
+    fn proc_self_fd(&self, path: &str) -> Option<Result<AnyTypedFd<Platform>, Errno>> {
+        let name = path.strip_prefix("/proc/self/fd/")?;
+        Some(
+            name.bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| name.parse::<i32>().ok())
+                .flatten()
+                .and_then(|fd| self.typed_fd(fd).ok())
+                .ok_or(Errno::ENOENT),
+        )
+    }
+
     /// Read the target of a symbolic link
     ///
     /// The caller must pass an absolute path.
-    // XXX(jayb): `/proc/self/fd/<fd>` should be backed by the file system rather than hardcoded.
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
-        if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
-            let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-            match fd {
-                0 => return Ok("/dev/stdin".to_string()),
-                1 => return Ok("/dev/stdout".to_string()),
-                2 => return Ok("/dev/stderr".to_string()),
-                _ => unimplemented!(),
-            }
+        if let Some(fd) = self.proc_self_fd(fullpath) {
+            // Like Linux, a non-file descriptor names its kind; the inode numbers match `fstat`.
+            return fd?.dispatch(
+                |fd| self.global.with_file(fd, File::path),
+                |_fd| Ok("socket:[0]".into()),
+                |_fd| Ok("pipe:[0]".into()),
+                |_fd| Ok("anon_inode:[eventfd]".into()),
+                |_fd| Ok("anon_inode:[eventpoll]".into()),
+                |_fd| Ok("socket:[0]".into()),
+                |_fd| Ok("anon_inode:[timerfd]".into()),
+            );
         }
 
         let fs = self.fs.borrow();
@@ -2080,24 +2103,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
-    fn do_path_stat<T: TryFrom<FileStatus, Error = Errno>>(
-        &self,
-        pathname: &str,
-        follow_symlink: bool,
-    ) -> Result<T, Errno> {
-        // `/proc/self/fd/<fd>` is not backed by the file system, so it is followed here.
-        let path = if follow_symlink && pathname.starts_with("/proc/self/fd/") {
-            self.do_readlink(pathname)
-                .unwrap_or_else(|_| pathname.into())
-        } else {
-            pathname.into()
-        };
+    fn do_path_stat<T>(&self, pathname: &str, follow_symlink: bool) -> Result<T, Errno>
+    where
+        T: TryFrom<FileStatus, Error = Errno> + From<FileStat>,
+    {
+        // `/proc/self/fd/<fd>` is not backed by the file system; following it reaches the open
+        // descriptor itself.
+        if follow_symlink && let Some(fd) = self.proc_self_fd(pathname) {
+            return self.do_stat(&fd?);
+        }
         let status = {
             let fs = self.fs.borrow();
             let context = fs.context.read();
             self.global
                 .litebox
-                .path_file_status(&context, &path, follow_symlink)?
+                .path_file_status(&context, pathname, follow_symlink)?
         };
         T::try_from(status)
     }

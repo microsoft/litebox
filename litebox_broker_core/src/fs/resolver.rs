@@ -97,6 +97,16 @@ struct ResolvedPath {
 }
 
 impl ResolvedPath {
+    /// The path as an absolute string.
+    fn to_absolute(&self) -> String {
+        if self.components.is_empty() {
+            return String::from("/");
+        }
+        self.components
+            .iter()
+            .fold(String::new(), |path, component| path + "/" + component)
+    }
+
     fn parent_and_name(&self) -> Option<(Vec<&str>, &str)> {
         let (name, parent) = self.components.split_last()?;
         Some((parent.iter().map(String::as_str).collect(), name.as_str()))
@@ -130,14 +140,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         user: UserInfo,
         path: &str,
     ) -> Result<String, WalkError> {
-        let path = self.resolve_path(&Context::new(user), path, true, false)?;
-        if path.components.is_empty() {
-            return Ok(String::from("/"));
-        }
-        Ok(path
-            .components
-            .iter()
-            .fold(String::new(), |path, component| path + "/" + component))
+        Ok(self
+            .resolve_path(&Context::new(user), path, true, false)?
+            .to_absolute())
     }
 
     // XXX(jayb): callers rewalk the result, so this is non-atomic and walks twice; returning the
@@ -574,9 +579,22 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         &self,
         user: UserInfo,
         path: &str,
-        mut flags: OFlags,
+        flags: OFlags,
         mode: Mode,
     ) -> Result<ResolverEntry<Backend>, OpenError> {
+        self.open_with_path(user, path, flags, mode)
+            .map(|(entry, _)| entry)
+    }
+
+    /// Opens a file like [`Self::open`], also returning the absolute path of the opened object, with
+    /// symbolic links resolved.
+    pub(crate) fn open_with_path(
+        &self,
+        user: UserInfo,
+        path: &str,
+        mut flags: OFlags,
+        mode: Mode,
+    ) -> Result<(ResolverEntry<Backend>, String), OpenError> {
         const CURRENTLY_SUPPORTED_OFLAGS: OFlags = OFlags::CREAT
             .union(OFlags::RDONLY)
             .union(OFlags::WRONLY)
@@ -618,16 +636,20 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
         let append_mode = flags.contains(OFlags::APPEND);
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let entry = |handle, seek_behavior| ResolverEntry {
-            handle,
-            _backend: core::marker::PhantomData,
-            read_allowed,
-            write_allowed,
-            position: 0,
-            append_mode,
-            nonblocking,
-            path_only,
-            seek_behavior,
+        let absolute_path = path.to_absolute();
+        let entry = |handle, seek_behavior| {
+            let entry = ResolverEntry {
+                handle,
+                _backend: core::marker::PhantomData,
+                read_allowed,
+                write_allowed,
+                position: 0,
+                append_mode,
+                nonblocking,
+                path_only,
+                seek_behavior,
+            };
+            (entry, absolute_path)
         };
 
         if path.components.is_empty() {

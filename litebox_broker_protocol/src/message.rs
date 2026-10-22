@@ -8,12 +8,12 @@ use crate::event::{
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
+    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -129,6 +129,7 @@ impl BrokerOperation {
                 | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. })
+                | FileRequest::HandlePath(HandleFilePathRequest { buffer, .. })
                 | FileRequest::ReadLink(ReadLinkFileRequest { buffer, .. })
                 | FileRequest::ResolvePath(ResolvePathFileRequest { buffer, .. }),
             )
@@ -733,6 +734,9 @@ pub enum FileRequest {
     PathStatus(PathFileStatusRequest),
     /// Read status by open handle.
     HandleStatus(HandleFileStatusRequest),
+    /// Read the absolute path of an open file, with symbolic links resolved, as of when it was
+    /// opened.
+    HandlePath(HandleFilePathRequest),
     /// Determine whether an open file is connected to a terminal.
     IsTerminal(IsTerminalFileRequest),
     /// Control the shared terminal backing an open file.
@@ -772,6 +776,8 @@ pub enum FileResponse {
     PathStatus(FileStatus),
     /// Handle-status response.
     HandleStatus(FileStatus),
+    /// Handle-path response.
+    HandlePath(FilePathResponse),
     /// Terminal query response.
     IsTerminal(bool),
     /// Terminal-control response.
