@@ -4,6 +4,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use litebox::fs::Mode;
+use litebox::platform::CrngProvider;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
@@ -377,8 +378,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();
 
     let mut stack_padding = [0u8; 16];
-    getrandom::fill(&mut stack_padding)
-        .map_err(|e| anyhow!("Could not create randomness for stack padding: {e}"))?;
+    platform.fill_bytes_crng(&mut stack_padding);
+
     let program = shim.load_program(
         initial_file_system,
         task_params,
