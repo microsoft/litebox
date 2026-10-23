@@ -3,7 +3,6 @@
 
 //! Windows-style explicit reservation, commitment, decommitment, and release.
 
-use alloc::vec::Vec;
 use core::ops::{Bound, Range, RangeBounds};
 
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
@@ -41,6 +40,7 @@ pub(crate) enum PrivatePages {
 /// Commitment of an owned page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageState {
+    /// Reserved address space with no backing storage.
     Reserved,
     /// Committed with this guest-visible protection, which may differ from the native
     /// permissions of pages LiteBox initialized itself.
@@ -52,6 +52,7 @@ pub(crate) enum PageState {
 pub(crate) struct WindowsArea {
     /// The owning guest allocation, or `None` for LiteBox-internal pages.
     pub(crate) allocation: Option<WindowsVirtualAllocation>,
+    /// Whether the pages are committed, and with which protection.
     pub(crate) state: PageState,
 }
 
@@ -82,25 +83,22 @@ where
         &self.areas
     }
 
-    /// Returns the area containing `address` together with its range.
-    pub(crate) fn area_containing(&self, address: usize) -> Option<(&Range<usize>, &WindowsArea)> {
-        self.areas.get_key_value(&address)
-    }
-
-    /// Rewrites every area overlapping `range`, clipped to it.
+    /// Rewrites every area overlapping `range`, clipped to it. `update` must be idempotent,
+    /// because an updated piece may coalesce with the next area before that area is visited.
     fn update_areas(&mut self, range: Range<usize>, update: impl Fn(WindowsArea) -> WindowsArea) {
-        let updates = self
-            .areas
-            .overlapping(range.clone())
-            .map(|(area_range, area)| {
-                (
-                    area_range.start.max(range.start)..area_range.end.min(range.end),
-                    update(*area),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (area_range, area) in updates {
-            self.areas.insert(area_range, area);
+        let mut cursor = range.start;
+        while cursor < range.end {
+            let Some((area_range, area)) = self
+                .areas
+                .overlapping(cursor..range.end)
+                .next()
+                .map(|(area_range, area)| (area_range.clone(), *area))
+            else {
+                break;
+            };
+            let clipped = area_range.start.max(cursor)..area_range.end.min(range.end);
+            cursor = clipped.end;
+            self.areas.insert(clipped, update(area));
         }
     }
 
@@ -643,8 +641,8 @@ where
     /// Releases the pages of the allocation recorded at `base` together with its record, so
     /// no other thread can observe one without the other.
     ///
-    /// The record is retained only when the range is not owned; once native release starts,
-    /// the range is untracked even if it fails.
+    /// The range stays tracked only if `len` is unaligned or the range is not within one owned
+    /// reservation; once native release starts, the range is untracked even if it fails.
     ///
     /// # Safety
     /// Same contract as [`Self::remove_pages`].
@@ -773,16 +771,9 @@ where
             return Err(error);
         }
         if permissions != writable {
+            let protect = permissions_to_page_protect(permissions);
             // SAFETY: The mapping is unpublished and exclusively owned during initialization.
-            if unsafe {
-                self.protect_pages(
-                    ptr,
-                    length.as_usize(),
-                    permissions_to_page_protect(permissions),
-                )
-            }
-            .is_err()
-            {
+            if unsafe { self.protect_pages(ptr, length.as_usize(), protect) }.is_err() {
                 // SAFETY: Protection failed before publication, so the mapping has no users.
                 unsafe { self.remove_pages(ptr, length.as_usize()) }
                     .expect("failed to release unpublished mapping");

@@ -1426,10 +1426,22 @@ fn scan_protect_range<Platform: ShimPlatform>(
     let allocation = vmem.allocation_containing(base)?;
     let end = base.checked_add(size)?;
     let allocation_end = allocation.base.checked_add(allocation.size)?;
-    if end > allocation_end || !vmem.is_range_committed(&(base..end)) {
+    if end > allocation_end {
         return Some(PageRangeScan::ContainsUncommitted);
     }
-    let PageState::Committed(first_protect) = vmem.area_containing(base)?.1.state else {
+    let mut covered_until = base;
+    let mut first_protect = None;
+    for (range, area) in vmem.areas().overlapping(base..end) {
+        let PageState::Committed(protect) = area.state else {
+            return Some(PageRangeScan::ContainsUncommitted);
+        };
+        if range.start > covered_until {
+            return Some(PageRangeScan::ContainsUncommitted);
+        }
+        first_protect.get_or_insert(protect);
+        covered_until = range.end;
+    }
+    let Some(first_protect) = first_protect.filter(|_| covered_until >= end) else {
         return Some(PageRangeScan::ContainsUncommitted);
     };
     Some(PageRangeScan::FullyCommitted {
@@ -1720,8 +1732,15 @@ mod tests {
                 pieces,
                 [(base, PAGE_SIZE * 2), (base + PAGE_SIZE * 3, PAGE_SIZE)]
             );
+            // The head piece starts before the queried range, so only the tail is based in it.
             assert_eq!(
-                vmem.area_containing(base + PAGE_SIZE).unwrap().1.state,
+                vmem.allocations_in(base + PAGE_SIZE..end)
+                    .map(|allocation| allocation.base)
+                    .collect::<alloc::vec::Vec<_>>(),
+                [base + PAGE_SIZE * 3]
+            );
+            assert_eq!(
+                vmem.areas().get(&(base + PAGE_SIZE)).unwrap().state,
                 PageState::Committed(PageProtection::PAGE_READONLY)
             );
             assert!(vmem.allocation_containing(base + PAGE_SIZE * 2).is_none());
@@ -2343,6 +2362,51 @@ mod tests {
     }
 
     #[test]
+    fn query_adjacent_untracked_reservations_reports_each_reservation() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let manager = &task.global.page_manager;
+            let reserve = |address: Option<usize>, len: usize| {
+                let flags = if address.is_some() {
+                    CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE
+                } else {
+                    CreatePagesFlags::empty()
+                };
+                // SAFETY: The manager reserves fresh address space without replacement.
+                unsafe {
+                    manager.create_reserved_pages(
+                        address.and_then(NonZeroAddress::new),
+                        NonZeroPageSize::new(len).unwrap(),
+                        ALLOCATION_GRANULARITY,
+                        flags,
+                    )
+                }
+                .unwrap()
+            };
+            // Find a free span for two reservations, then reserve its halves separately.
+            let span = reserve(None, ALLOCATION_GRANULARITY * 2);
+            let base = span.as_usize();
+            // SAFETY: The test owns the reservation and never accesses it.
+            unsafe { manager.remove_pages(span, ALLOCATION_GRANULARITY * 2) }.unwrap();
+            let first = reserve(Some(base), ALLOCATION_GRANULARITY);
+            let second = reserve(Some(base + ALLOCATION_GRANULARITY), ALLOCATION_GRANULARITY);
+
+            let info = query_basic_information(&task, base + PAGE_SIZE);
+            assert_eq!(info.allocation_base, base);
+            assert_eq!(info.region_size, ALLOCATION_GRANULARITY - PAGE_SIZE);
+            assert_eq!(info.state, MemoryState::MEM_RESERVE.bits());
+            let info = query_basic_information(&task, base + ALLOCATION_GRANULARITY);
+            assert_eq!(info.allocation_base, base + ALLOCATION_GRANULARITY);
+            assert_eq!(info.region_size, ALLOCATION_GRANULARITY);
+
+            for ptr in [first, second] {
+                // SAFETY: The test owns the reservation and never accesses it.
+                unsafe { manager.remove_pages(ptr, ALLOCATION_GRANULARITY) }.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn query_regions_follow_page_state_boundaries() {
         let base = ALLOCATION_GRANULARITY;
         let allocation = WindowsVirtualAllocation::new(
@@ -2352,10 +2416,10 @@ mod tests {
             PageProtection::PAGE_READWRITE,
             WindowsPlaceholderState::None,
         );
-        let copy_protect = PageProtection::PAGE_WRITECOPY | PageProtection::PAGE_NOCACHE;
+        let nocache_protect = PageProtection::PAGE_READONLY | PageProtection::PAGE_NOCACHE;
         let mut areas = RangeMap::new();
         for (pages, state) in [
-            (0..2, PageState::Committed(copy_protect)),
+            (0..2, PageState::Committed(nocache_protect)),
             (2..3, PageState::Committed(PageProtection::PAGE_READWRITE)),
             (3..5, PageState::Reserved),
             (5..6, PageState::Committed(PageProtection::PAGE_NOACCESS)),
@@ -2369,8 +2433,8 @@ mod tests {
             );
         }
         for (offset, count, state, protect) in [
-            (0, 2, MemoryState::MEM_COMMIT, copy_protect.bits()),
-            (1, 1, MemoryState::MEM_COMMIT, copy_protect.bits()),
+            (0, 2, MemoryState::MEM_COMMIT, nocache_protect.bits()),
+            (1, 1, MemoryState::MEM_COMMIT, nocache_protect.bits()),
             (
                 2,
                 1,
@@ -2592,8 +2656,9 @@ mod tests {
                     task.global
                         .page_manager
                         .read_vmem()
-                        .area_containing(allocation_base)
-                        .map(|(_, area)| area.state),
+                        .areas()
+                        .get(&allocation_base)
+                        .map(|area| area.state),
                     Some(PageState::Committed(protect))
                 );
                 release_allocation(&task, allocation_base);
