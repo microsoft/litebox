@@ -1221,6 +1221,12 @@ impl<Platform: crate::ShimPlatform> PeImageMapper<'_, Platform> {
         }
         let (base, _) = self.reserved.ok_or(PeImageAccessError::MemoryAccess)?;
         let mut vmem = self.page_manager.write_vmem();
+        if vmem
+            .allocation_covering(start, len)
+            .is_none_or(|allocation| allocation.base != base)
+        {
+            return Err(PeImageAccessError::MemoryAccess);
+        }
         let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(start);
         // SAFETY: All protection changes happen during PE load, before the initial guest thread
         // starts, so there is no concurrent read/write/execute on these pages. The RWX case is
@@ -1228,16 +1234,7 @@ impl<Platform: crate::ShimPlatform> PeImageMapper<'_, Platform> {
         // copied into the section come from the attacker-controlled PE file and are not executed
         // until protections are set, so this is no looser than running the same PE under the
         // real Windows loader.
-        unsafe { vmem.protect_pages(ptr, len, loader_permissions(prot)) }?;
-        if vmem.allocation_at(base).is_none()
-            || !vmem.set_page_protections(
-                start,
-                len,
-                Some(page_protection_from_loader_protection(prot)),
-            )
-        {
-            return Err(PeImageAccessError::MemoryAccess);
-        }
+        unsafe { vmem.protect_pages(ptr, len, page_protection_from_loader_protection(prot)) }?;
         Ok(())
     }
 }
@@ -1267,16 +1264,16 @@ impl<Platform: crate::ShimPlatform> MapMemory for PeImageMapper<'_, Platform> {
             |_| Ok(0),
         )?;
         let base = ptr.as_usize();
-        self.page_manager
-            .write_vmem()
-            .insert_allocation(crate::WindowsVirtualAllocation::new(
+        self.page_manager.write_vmem().assign_allocation(
+            crate::WindowsVirtualAllocation::new(
                 base,
                 len,
                 MemoryType::MEM_IMAGE,
                 PageProtection::PAGE_EXECUTE_WRITECOPY,
                 crate::WindowsPlaceholderState::None,
-                Some(PageProtection::PAGE_NOACCESS),
-            ));
+            ),
+            Some(PageProtection::PAGE_NOACCESS),
+        );
         self.reserved = Some((base, len));
         Ok(base)
     }
@@ -1400,20 +1397,6 @@ fn make_pages_writable<Platform: crate::ShimPlatform>(
     // SAFETY: Loading happens before the initial guest thread is allowed to execute.
     unsafe { page_manager.make_pages_writable(ptr, len)? };
     Ok(())
-}
-
-fn loader_permissions(prot: Protection) -> MemoryRegionPermissions {
-    match (prot.read, prot.write, prot.execute) {
-        (_, true, true) => {
-            MemoryRegionPermissions::READ
-                | MemoryRegionPermissions::WRITE
-                | MemoryRegionPermissions::EXEC
-        }
-        (_, true, false) => MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-        (_, false, true) => MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
-        (true, false, false) => MemoryRegionPermissions::READ,
-        (false, false, false) => MemoryRegionPermissions::empty(),
-    }
 }
 
 fn page_range(address: usize, len: usize) -> Result<(usize, usize), PeImageAccessError> {

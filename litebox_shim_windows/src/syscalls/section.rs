@@ -594,8 +594,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // SAFETY: Section views are tracked only after this shim successfully creates the pages;
             // unmapping consumes the tracked view and removes the exact owned range.
             if unsafe { vmem.release_allocation(view_base, view.size) }.is_err() {
+                let retained = vmem.allocation_at(view_base).is_some();
                 drop(vmem);
-                self.process.section_views.write().insert(view_base, view);
+                if retained {
+                    self.process.section_views.write().insert(view_base, view);
+                }
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
         } else {
@@ -1959,9 +1962,7 @@ mod tests {
                 .global
                 .page_manager
                 .read_vmem()
-                .mappings()
-                .iter()
-                .any(|(range, _)| range.contains(&base))
+                .is_range_committed(&(base..base + PAGE_SIZE))
         );
 
         assert_eq!(
@@ -1979,9 +1980,7 @@ mod tests {
             task.global
                 .page_manager
                 .read_vmem()
-                .mappings()
-                .iter()
-                .any(|(range, _)| range.contains(&base))
+                .is_range_committed(&(base..base + PAGE_SIZE))
         );
         let mapped = MutPtr::<TestPlatform, u32>::from_usize(base);
         assert_eq!(mapped.read_at_offset(0), Some(0));

@@ -126,10 +126,8 @@ mod tests {
             let snapshot = || {
                 let vmem = task.global.page_manager.read_vmem();
                 (
-                    vmem.allocations_in(..)
-                        .cloned()
-                        .collect::<alloc::vec::Vec<_>>(),
-                    vmem.mappings().clone(),
+                    vmem.allocations_in(..).collect::<alloc::vec::Vec<_>>(),
+                    vmem.areas().clone(),
                 )
             };
             let before = snapshot();
