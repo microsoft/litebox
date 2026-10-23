@@ -29,7 +29,7 @@ impl RingBuffer {
         phys_addr: PhysAddr,
         requested_size: usize,
     ) -> Self {
-        let pa: usize = phys_addr.as_u64().trunc();
+        let pa: usize = phys_addr.as_u64().trunc(); //TODO: We should make these requirements
         let fast_path_eligible = requested_size > 0
             && requested_size.is_multiple_of(PAGE_SIZE)
             && pa.is_multiple_of(PAGE_SIZE);
