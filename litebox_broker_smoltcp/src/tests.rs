@@ -16,7 +16,6 @@ use core::time::Duration;
 use litebox_broker_core::BrokerCoreLimits;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket as core_socket;
-use litebox_broker_core::socket::SocketProvider as _;
 use litebox_broker_core::test_support::{
     FaultingBuffer, ManualTimerProvider, StreamData, TestBrokerCoreBuilder, receive_data,
     receive_data_from,
@@ -887,6 +886,33 @@ fn listener(
     (server, listener)
 }
 
+/// The connecting process of each guest connection queued at a listener.
+fn queued_connectors(test: &Test) -> Vec<Option<ProcessId>> {
+    let stack = test.provider.0.stack.lock();
+    stack
+        .entries
+        .values()
+        .flat_map(|entry| match &entry.kind {
+            Kind::Tcp(tcp) => tcp.queued().map(|queued| queued.process).collect(),
+            Kind::Udp(_) => Vec::new(),
+        })
+        .collect()
+}
+
+/// A new TCP socket in `process`, if the limits allow it.
+fn try_socket(test: &Test, process: &BrokerProcess) -> BrokerResult<ObjectHandle> {
+    core_socket::create(
+        process,
+        CreateSocketRequest {
+            address_family: AddressFamily::Ipv4,
+            socket_type: SocketType::Stream,
+            protocol: IpProtocol::Tcp,
+            flags: FileOpenFlags::NONE,
+        },
+        test.sink.clone(),
+    )
+}
+
 #[test]
 fn unaccepted_guest_connections_count_against_the_connecting_process() {
     let test = Test::with_limits(None, &BrokerCoreLimits::new_with_all_limits(4096, 0, 64, 4));
@@ -904,17 +930,7 @@ fn unaccepted_guest_connections_count_against_the_connecting_process() {
     }
     // As on the userland broker, they count when creating a socket too.
     assert_eq!(
-        core_socket::create(
-            &client,
-            CreateSocketRequest {
-                address_family: AddressFamily::Ipv4,
-                socket_type: SocketType::Stream,
-                protocol: IpProtocol::Tcp,
-                flags: FileOpenFlags::NONE,
-            },
-            test.sink.clone(),
-        )
-        .map(|_| ()),
+        try_socket(&test, &client).map(|_| ()),
         Err(BrokerError::ResourceExhausted)
     );
     // Accepted, they are the server's.
@@ -930,26 +946,69 @@ fn unaccepted_guest_connections_count_against_the_connecting_process() {
         core_socket::connect(&client, third, destination),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    // Its process ending discards it.
-    let queued = || -> Vec<ProcessId> {
-        let stack = test.provider.0.stack.lock();
-        stack
-            .entries
-            .values()
-            .flat_map(|entry| match &entry.kind {
-                Kind::Tcp(tcp) => tcp.queued().map(|queued| queued.process).collect(),
-                Kind::Udp(_) => Vec::new(),
-            })
-            .collect()
-    };
-    let processes = queued();
-    assert_eq!(processes.len(), 1);
-    test.provider.close_process(processes[0]);
-    assert_eq!(queued(), Vec::<ProcessId>::new());
+}
+
+#[test]
+fn an_unaccepted_guest_connection_outlives_its_connecting_process() {
+    let test = Test::new(None);
+    let (server, listener) = listener(&test, address([0, 0, 0, 0], 8080), 8);
+    let client = test.process();
+    let socket = test.socket(&client, SocketType::Stream);
     assert_eq!(
-        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).map(|_| ()),
-        Err(BrokerError::WouldBlock)
+        core_socket::connect(&client, socket, address([127, 0, 0, 1], 8080)),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
+    assert_eq!(
+        core_socket::send(&client, socket, b"data", SendFlags::NONE),
+        Ok(SocketOutcome::Completed(4))
+    );
+    assert_eq!(queued_connectors(&test), [Some(client.id())]);
+    // As on Linux (the userland broker discards it), it stays queued,
+    // charged to no process: the process's ID may be reused.
+    client.cleanup(true);
+    assert_eq!(queued_connectors(&test), [None]);
+    let SocketOutcome::Completed(accepted) =
+        core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).unwrap()
+    else {
+        panic!("accept failed");
+    };
+    assert_eq!(receive(&server, accepted.handle, 8), received(b"data"));
+    assert_eq!(receive(&server, accepted.handle, 8), END);
+}
+
+#[test]
+fn orphaned_guest_connections_count_until_their_listener_closes() {
+    let test = Test::with_limits(None, &BrokerCoreLimits::new_with_all_limits(4096, 0, 4, 64));
+    let (server, listener) = listener(&test, address([0, 0, 0, 0], 8080), 8);
+    for _ in 0..2 {
+        let client = test.process();
+        let socket = test.socket(&client, SocketType::Stream);
+        assert_eq!(
+            core_socket::connect(&client, socket, address([127, 0, 0, 1], 8080)),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+        );
+        assert_eq!(
+            core_socket::send(&client, socket, b"data", SendFlags::NONE),
+            Ok(SocketOutcome::Completed(4))
+        );
+        client.cleanup(true);
+    }
+    assert_eq!(queued_connectors(&test), [None, None]);
+    // With the listener, they leave room for one more socket of the four.
+    let other = test.process();
+    let _ = test.socket(&other, SocketType::Stream);
+    assert_eq!(
+        try_socket(&test, &other).map(|_| ()),
+        Err(BrokerError::ResourceExhausted)
+    );
+    // Closing the listener frees them, and what they held.
+    server.close_object_reference(listener).unwrap();
+    {
+        let stack = test.provider.0.stack.lock();
+        assert!(stack.sockets.pairs.is_empty());
+        assert_eq!(stack.sockets.queued, 0);
+    }
+    assert!(try_socket(&test, &other).is_ok());
 }
 
 #[test]
@@ -2243,6 +2302,45 @@ fn one_process_cannot_fill_a_guest_sockets_queue() {
         count += 1;
     }
     assert_eq!(count, 17);
+}
+
+#[test]
+fn a_guest_datagram_outlives_its_sending_process() {
+    let test = Test::new(None);
+    let receiver_process = test.process();
+    let receiver = test.socket(&receiver_process, SocketType::Datagram);
+    let bound = address([127, 0, 0, 1], 5000);
+    assert_eq!(
+        core_socket::bind(&receiver_process, receiver, bound),
+        Ok(SocketOutcome::Completed(bound))
+    );
+    let sender = test.process();
+    let socket = test.socket(&sender, SocketType::Datagram);
+    assert_eq!(
+        core_socket::send_to(&sender, socket, b"x", SendFlags::NONE, Some(bound)),
+        Ok(SocketOutcome::Completed(1))
+    );
+    let senders = || -> Vec<Option<ProcessId>> {
+        let stack = test.provider.0.stack.lock();
+        stack
+            .entries
+            .values()
+            .flat_map(|entry| match &entry.kind {
+                Kind::Udp(udp) => udp.senders().collect(),
+                Kind::Tcp(_) => Vec::new(),
+            })
+            .collect()
+    };
+    assert_eq!(senders(), [Some(sender.id())]);
+    // Charged to no process, as the sender's ID may be reused.
+    sender.cleanup(true);
+    assert_eq!(senders(), [None]);
+    let SocketOutcome::Completed(datagram) =
+        receive_data_from(&receiver_process, receiver, 8, ReceiveFromFlags::NONE).unwrap()
+    else {
+        panic!("receive failed");
+    };
+    assert_eq!(datagram.data, b"x");
 }
 
 #[test]

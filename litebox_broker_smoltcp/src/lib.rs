@@ -155,11 +155,13 @@ struct Shared {
 }
 
 impl SmoltcpSocketProvider {
-    /// The socket limits are the broker core's, as for
-    /// `LinuxSocketProvider`: guest connections not yet accepted count
-    /// against their connecting processes'. Time is `timers`' clock.
-    /// Sockets reach beyond the guest through `network`, if any. `seed`
-    /// (e.g., from a CSPRNG) randomizes, e.g., TCP initial sequence numbers.
+    /// The socket limits are the broker core's. As for
+    /// `LinuxSocketProvider`, guest connections not yet accepted count
+    /// against their connecting processes'; unlike there, one whose process
+    /// ended stays queued, as on Linux, counting only toward `max_sockets`
+    /// (see `Tcp::release_queued`). Time is `timers`' clock. Sockets reach
+    /// beyond the guest through `network`, if any. `seed` (e.g., from a
+    /// CSPRNG) randomizes, e.g., TCP initial sequence numbers.
     pub fn new(
         max_sockets: usize,
         max_sockets_per_process: usize,
@@ -673,7 +675,7 @@ impl Stack {
             if let Kind::Tcp(tcp) = &entry.kind {
                 for queued in tcp.queued() {
                     count += 1;
-                    if queued.process == process {
+                    if queued.process == Some(process) {
                         process_count += 1;
                     }
                 }
@@ -682,15 +684,15 @@ impl Stack {
         (process_count, count)
     }
 
-    /// Discards the guest connections `process` made that are not yet
-    /// accepted.
+    /// Charges nothing more to `process`, which ended: the guest connections
+    /// it made that are not yet accepted, and the guest datagrams it sent
+    /// that are not yet received, stay (see [`tcp::Tcp::release_queued`]
+    /// and [`udp::Udp::release_received`]).
     fn close_process(&mut self, process: ProcessId) {
-        let Self {
-            entries, sockets, ..
-        } = self;
-        for entry in entries.values_mut() {
-            if let Kind::Tcp(tcp) = &mut entry.kind {
-                tcp.discard_queued(sockets, |queued| queued.process == process);
+        for entry in self.entries.values_mut() {
+            match &mut entry.kind {
+                Kind::Tcp(tcp) => tcp.release_queued(process),
+                Kind::Udp(udp) => udp.release_received(process),
             }
         }
     }

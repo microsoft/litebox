@@ -5,8 +5,11 @@
 //! As on the userland broker, a listener keeps a queue of guest
 //! connections, up to its backlog, each a socket pair (see
 //! [`super::socket_pair`]) whose connector is connected at once; accepting
-//! one takes it, with the source lease its connector's connect brought. A connection beyond the guest is
-//! one smoltcp socket on the Ethernet interface.
+//! one takes it, with the source lease its connector's connect brought.
+//! Unlike there, a queued connection outlives its connecting process, as
+//! on Linux (see [`Tcp::release_queued`]); the userland broker discards it
+//! when the process ends. A connection beyond the guest is one smoltcp
+//! socket on the Ethernet interface.
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -120,8 +123,9 @@ struct Listener {
 /// A guest connection waiting at its listener.
 pub(super) struct Queued {
     pair: u64,
-    /// The connecting process, which it counts against until accepted.
-    pub(super) process: ProcessId,
+    /// The connecting process, which it counts against until accepted, or
+    /// until the process ends (see [`Tcp::release_queued`]).
+    pub(super) process: Option<ProcessId>,
     /// The destination it connected to: the accepted socket's address.
     local: SocketAddrV4,
     lease: GuestSourceLease,
@@ -255,18 +259,28 @@ impl Tcp {
         .flatten()
     }
 
-    /// For a listener: drops the queued connections `discard` picks (e.g.,
-    /// of a process that ended), without resetting their connectors.
-    pub(super) fn discard_queued(
-        &mut self,
-        sockets: &mut Sockets,
-        discard: impl Fn(&Queued) -> bool,
-    ) {
+    /// For a listener: keeps the queued connections that `process` (now
+    /// ended) made until accepted or the listener closes, as Linux does,
+    /// charged to no process since its ID may be reused. The listener's
+    /// backlog and the stack's socket limit still bound them.
+    pub(super) fn release_queued(&mut self, process: ProcessId) {
+        if let Phase::Listening(listener) = &mut self.phase {
+            for queued in &mut listener.queue {
+                if queued.process == Some(process) {
+                    queued.process = None;
+                }
+            }
+        }
+    }
+
+    /// For a listener: drops queued connection `pair`, which its connector
+    /// aborted, without resetting the connector.
+    pub(super) fn discard_queued(&mut self, sockets: &mut Sockets, pair: u64) {
         if let Phase::Listening(listener) = &mut self.phase {
             listener.queue.retain(|queued| {
-                let dropped = discard(queued);
+                let dropped = queued.pair == pair;
                 if dropped {
-                    sockets.close_pair(queued.pair, 1, false);
+                    sockets.close_pair(pair, 1, false);
                 }
                 !dropped
             });
@@ -761,7 +775,7 @@ impl Tcp {
                         ..
                     }) = stack.entries.get_mut(&listener)
                 {
-                    listener.discard_queued(&mut stack.sockets, |queued| queued.pair == id);
+                    listener.discard_queued(&mut stack.sockets, id);
                 }
                 stack.sockets.close_pair(id, end, reset);
             }
@@ -883,7 +897,7 @@ impl Stack {
         }
         queue.queue.push_back(Queued {
             pair,
-            process,
+            process: Some(process),
             local: destination,
             lease,
         });
@@ -939,7 +953,7 @@ impl Stack {
         // As on the userland broker: the accepted socket counts against the
         // listener's process, where the connection, if the process made it,
         // no longer counts as pending.
-        let own = usize::from(front.process == process);
+        let own = usize::from(front.process == Some(process));
         if process_sockets + 1 - own > max_sockets_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
