@@ -2221,6 +2221,23 @@ pub enum PrctlOption {
     SetFpMode = 45,
     GetFpMode = 46,
     CapAmbient = 47,
+    SveSetVl = 50,
+    SveGetVl = 51,
+}
+
+/// Vector-length mask for `PR_SVE_SET_VL` arguments.
+pub const PR_SVE_VL_LEN_MASK: usize = 0xffff;
+
+bitflags::bitflags! {
+    /// Flags of a `PR_SVE_SET_VL` argument, above [`PR_SVE_VL_LEN_MASK`].
+    /// LiteBox only validates them.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SveVlFlags: usize {
+        /// `PR_SVE_VL_INHERIT`: keep the vector length across `execve`.
+        const INHERIT = 1 << 17;
+        /// `PR_SVE_SET_VL_ONEXEC`: defer the change to the next `execve`.
+        const SET_VL_ONEXEC = 1 << 18;
+    }
 }
 
 #[non_exhaustive]
@@ -2233,6 +2250,10 @@ pub enum PrctlArg {
     SetChildSubreaper(usize),
     /// PR_GET_CHILD_SUBREAPER: read whether this process adopts orphaned descendants
     GetChildSubreaper(UserPtrMut<i32>),
+    /// PR_SVE_SET_VL: request an SVE vector length; returns the bare vector length
+    SveSetVl(usize),
+    /// PR_SVE_GET_VL: get the bare SVE vector length, without flags
+    SveGetVl,
 }
 
 #[repr(i32)]
@@ -3349,6 +3370,12 @@ impl SyscallRequest {
                         PrctlOption::GetChildSubreaper => SyscallRequest::Prctl {
                             args: PrctlArg::GetChildSubreaper(ctx.sys_req_ptr(1)),
                         },
+                        PrctlOption::SveSetVl => SyscallRequest::Prctl {
+                            args: PrctlArg::SveSetVl(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::SveGetVl => SyscallRequest::Prctl {
+                            args: PrctlArg::SveGetVl,
+                        },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
@@ -3762,6 +3789,153 @@ pub mod arch {
     #[must_use]
     pub fn is_valid_user_tls_base(base: usize) -> bool {
         base < litebox::arch::aarch64::USER_ADDR_END
+    }
+
+    bitflags::bitflags! {
+        /// The `AT_HWCAP` bits guests may see (`HWCAP_*` in
+        /// `arch/arm64/include/uapi/asm/hwcap.h`); [`guest_hwcaps`] says when.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct Hwcap: u64 {
+            const FP = 1 << 0;
+            const ASIMD = 1 << 1;
+            const AES = 1 << 3;
+            const PMULL = 1 << 4;
+            const SHA1 = 1 << 5;
+            const SHA2 = 1 << 6;
+            const FPHP = 1 << 9;
+            const ASIMDHP = 1 << 10;
+            const SHA3 = 1 << 17;
+            const SM3 = 1 << 18;
+            const SM4 = 1 << 19;
+            const SHA512 = 1 << 21;
+            const SVE = 1 << 22;
+            const SVE_F16MM = 1 << 37;
+            const SVE_ELTPERM = 1 << 38;
+            const SVE_AES2 = 1 << 39;
+            const SVE_BFSCALE = 1 << 40;
+            const SVE2P2 = 1 << 41;
+
+            /// Shown only when the host reports both.
+            const HALF_PRECISION = Self::FPHP.bits() | Self::ASIMDHP.bits();
+            /// Shown only with guest SVE state.
+            const SVE_FAMILY = Self::SVE.bits()
+                | Self::SVE_F16MM.bits()
+                | Self::SVE_ELTPERM.bits()
+                | Self::SVE_AES2.bits()
+                | Self::SVE_BFSCALE.bits()
+                | Self::SVE2P2.bits();
+            /// Base features implied by SVE crypto; shown only with guest SVE state.
+            const SVE_BASE_ISA = Self::AES.bits()
+                | Self::PMULL.bits()
+                | Self::SHA1.bits()
+                | Self::SHA2.bits()
+                | Self::SHA3.bits()
+                | Self::SHA512.bits()
+                | Self::SM3.bits()
+                | Self::SM4.bits();
+        }
+    }
+
+    bitflags::bitflags! {
+        /// The `AT_HWCAP2` bits guests may see (`HWCAP2_*`); [`guest_hwcaps`]
+        /// says when.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct Hwcap2: u64 {
+            const SVE2 = 1 << 1;
+            const SVEAES = 1 << 2;
+            const SVEPMULL = 1 << 3;
+            const SVEBITPERM = 1 << 4;
+            const SVESHA3 = 1 << 5;
+            const SVESM4 = 1 << 6;
+            const SVEI8MM = 1 << 9;
+            const SVEF32MM = 1 << 10;
+            const SVEF64MM = 1 << 11;
+            const SVEBF16 = 1 << 12;
+            const I8MM = 1 << 13;
+            const BF16 = 1 << 14;
+            const EBF16 = 1 << 32;
+            const SVE_EBF16 = 1 << 33;
+            const SVE2P1 = 1 << 36;
+            const SVE_B16B16 = 1 << 45;
+
+            /// Shown only with guest SVE state.
+            const SVE_FAMILY = Self::SVE2.bits()
+                | Self::SVEAES.bits()
+                | Self::SVEPMULL.bits()
+                | Self::SVEBITPERM.bits()
+                | Self::SVESHA3.bits()
+                | Self::SVESM4.bits()
+                | Self::SVEI8MM.bits()
+                | Self::SVEF32MM.bits()
+                | Self::SVEF64MM.bits()
+                | Self::SVEBF16.bits()
+                | Self::SVE_EBF16.bits()
+                | Self::SVE2P1.bits()
+                | Self::SVE_B16B16.bits();
+            /// Base features implied by SVE matrix/BFloat16; shown only with guest SVE state.
+            const SVE_BASE_ISA = Self::I8MM.bits() | Self::BF16.bits() | Self::EBF16.bits();
+        }
+    }
+
+    /// Filters `host` to [`Hwcap`]/[`Hwcap2`]; `sve` means guest SVE state is managed.
+    ///
+    /// FP/ASIMD are prerequisites for SVE detection (e.g. Rust's `std_detect`);
+    /// FPHP/ASIMDHP are paired because FPHP alone makes detectors reject ASIMD.
+    /// With `sve`, expose the SVE family and the state-free base features its
+    /// extensions imply (AES, PMULL, SHA*, SM3/4, I8MM, BF16, EBF16), so the
+    /// extensions are detectable and consistent as a kernel would report them.
+    ///
+    /// All other bits stay hidden: SME/MTE/GCS/POE/FPMR state is unmanaged,
+    /// SSBS/DIT are not preserved across syscalls, and other ISA extensions
+    /// remain outside the allowlist.
+    pub fn guest_hwcaps(host: litebox::platform::HostHwcaps, sve: bool) -> (Hwcap, Hwcap2) {
+        let mut hwcap = Hwcap::from_bits_truncate(host.hwcap);
+        let mut hwcap2 = Hwcap2::from_bits_truncate(host.hwcap2);
+        if !hwcap.contains(Hwcap::HALF_PRECISION) {
+            hwcap.remove(Hwcap::HALF_PRECISION);
+        }
+        if !sve {
+            hwcap.remove(Hwcap::SVE_FAMILY | Hwcap::SVE_BASE_ISA);
+            hwcap2.remove(Hwcap2::SVE_FAMILY | Hwcap2::SVE_BASE_ISA);
+        }
+        (hwcap, hwcap2)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use litebox::platform::HostHwcaps;
+
+        #[test]
+        fn guest_hwcaps_keep_allowlisted_groups_consistent() {
+            const HWCAP_CPUID: u64 = 1 << 11;
+            const HWCAP2_SME: u64 = 1 << 23;
+            let host = HostHwcaps {
+                hwcap: (Hwcap::FP | Hwcap::ASIMD | Hwcap::FPHP | Hwcap::SVE | Hwcap::AES).bits()
+                    | HWCAP_CPUID,
+                hwcap2: (Hwcap2::SVE2 | Hwcap2::SVEAES | Hwcap2::BF16 | Hwcap2::EBF16).bits()
+                    | HWCAP2_SME,
+            };
+            assert_eq!(
+                guest_hwcaps(host, true),
+                (
+                    Hwcap::FP | Hwcap::ASIMD | Hwcap::SVE | Hwcap::AES,
+                    Hwcap2::SVE2 | Hwcap2::SVEAES | Hwcap2::BF16 | Hwcap2::EBF16,
+                )
+            );
+            assert_eq!(
+                guest_hwcaps(host, false),
+                (Hwcap::FP | Hwcap::ASIMD, Hwcap2::empty())
+            );
+            let host = HostHwcaps {
+                hwcap: (Hwcap::FP | Hwcap::ASIMD | Hwcap::HALF_PRECISION).bits(),
+                hwcap2: 0,
+            };
+            assert_eq!(
+                guest_hwcaps(host, false).0,
+                Hwcap::FP | Hwcap::ASIMD | Hwcap::HALF_PRECISION
+            );
+        }
     }
 }
 

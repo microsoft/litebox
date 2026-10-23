@@ -6,6 +6,8 @@ license = "MIT"
 description = "Trampoline definitions shared by LiteBox rewriters and runtimes"
 
 [dependencies]
+disarm64 = { version = "0.2.0", default-features = false, features = ["full"] }
+disarm64_defn = { version = "0.2.0", default-features = false }
 thiserror = { version = "2.0.6", default-features = false }
 yaxpeax-arch = { version = "0.3.2", default-features = false }
 yaxpeax-arm = { version = "0.4.0", default-features = false }

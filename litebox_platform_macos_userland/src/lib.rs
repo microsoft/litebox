@@ -19,7 +19,8 @@ use litebox::platform::page_mgmt::{
 use litebox::platform::{ArchSpecificError, ArchSpecificRegister, RawConstPointer as _};
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
-use litebox_common_linux::{GuestVectorState, PtRegs};
+use litebox_common_linux::PtRegs;
+use litebox_common_linux::signal::aarch64::GuestVectorState;
 use litebox_common_macos::{KernReturn, MachClock, syscall::MachTimebaseInfo};
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
@@ -819,11 +820,13 @@ struct TlsBlock {
     active: usize,
     current_thread: usize,
     in_guest: usize,
-    vector_state: usize,
+    /// `vector_state`'s buffer, for transition assembly.
+    vector_buffer: usize,
     host_fp_state: usize,
     pending_host_signals: AtomicU32,
     wait_waker_addr: AtomicPtr<core::task::Waker>,
     page_recovery_lock: usize,
+    vector_state: GuestVectorState,
 }
 
 mod tls_offset {
@@ -834,7 +837,7 @@ mod tls_offset {
     pub const ACTIVE: usize = core::mem::offset_of!(TlsBlock, active);
     pub const CURRENT_THREAD: usize = core::mem::offset_of!(TlsBlock, current_thread);
     pub const IN_GUEST: usize = core::mem::offset_of!(TlsBlock, in_guest);
-    pub const VECTOR_STATE: usize = core::mem::offset_of!(TlsBlock, vector_state);
+    pub const VECTOR_BUFFER: usize = core::mem::offset_of!(TlsBlock, vector_buffer);
     pub const HOST_FP_STATE: usize = core::mem::offset_of!(TlsBlock, host_fp_state);
     pub const PENDING_HOST_SIGNALS: usize = core::mem::offset_of!(TlsBlock, pending_host_signals);
     pub const WAIT_WAKER_ADDR: usize = core::mem::offset_of!(TlsBlock, wait_waker_addr);
@@ -869,11 +872,7 @@ fn tls_key() -> libc::pthread_key_t {
 unsafe extern "C" fn drop_tls_block(value: *mut libc::c_void) {
     if !value.is_null() {
         // SAFETY: initialize_thread_tls stores an owned TlsBlock in this key.
-        let block = unsafe { Box::from_raw(value.cast::<TlsBlock>()) };
-        if block.vector_state != 0 {
-            // SAFETY: initialize_thread_tls gives the block ownership of this allocation.
-            unsafe { drop(Box::from_raw(block.vector_state as *mut GuestVectorState)) };
-        }
+        drop(unsafe { Box::from_raw(value.cast::<TlsBlock>()) });
     }
 }
 
@@ -992,18 +991,21 @@ fn initialize_thread_tls() {
     if !unsafe { libc::pthread_getspecific(key) }.is_null() {
         return;
     }
-    let vector = Box::into_raw(Box::new(GuestVectorState::default())) as usize;
+    // macOS gives user space no non-streaming SVE, so the FP/SIMD registers
+    // are the complete guest vector state.
+    let mut vector_state = GuestVectorState::new(None);
     let block = Box::new(TlsBlock {
         guest_thread_pointer: 0,
         guest_x18: 0,
         active: 0,
         current_thread: 0,
         in_guest: 0,
-        vector_state: vector,
+        vector_buffer: vector_state.as_mut_ptr() as usize,
         host_fp_state: 0,
         pending_host_signals: AtomicU32::new(0),
         wait_waker_addr: AtomicPtr::new(core::ptr::null_mut()),
         page_recovery_lock: 0,
+        vector_state,
     });
     let block = Box::into_raw(block);
     // SAFETY: block matches the key destructor's contract.
@@ -1242,8 +1244,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
             ThreadHandle::current().0.process.clone()
         };
         let ctx = ctx.clone();
-        let vector_state =
-            litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
+        let vector_state = get_guest_vector_state();
         // TODO: report child TLS setup failures synchronously. pthread_setspecific
         // can still fail after spawn_thread has returned success, causing the child
         // to exit before running its initialization callback.
@@ -1333,25 +1334,35 @@ unsafe fn record_pending_host_signal(signal: litebox_common_linux::signal::Signa
     // SAFETY: errno points to a live c_int for this thread.
     unsafe { errno.write(saved_errno) };
 }
+/// Returns this thread's guest vector state, or null before
+/// `initialize_thread_tls`.
+fn guest_vector_state_ptr() -> *mut GuestVectorState {
+    let block = tls_block_address();
+    if block == 0 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: a non-null key value is a live TlsBlock owned by this thread;
+    // this creates no reference.
+    unsafe { &raw mut (*(block as *mut TlsBlock)).vector_state }
+}
 pub(crate) fn get_guest_vector_state() -> GuestVectorState {
-    let state = read_tls(tls_offset::VECTOR_STATE) as *const GuestVectorState;
+    let state = guest_vector_state_ptr();
     assert!(!state.is_null(), "macOS TLS is not initialized");
-    // SAFETY: this thread owns the allocation; volatile matches transition
-    // assembly and signal-handler accesses hidden from the compiler.
-    unsafe { state.read_volatile() }
+    // SAFETY: this thread owns the state. Transition assembly and signal
+    // handlers write it only while the guest runs, when no reference is live.
+    unsafe { (*state).clone() }
 }
 pub(crate) fn set_guest_vector_state(state: &GuestVectorState) {
-    let saved = read_tls(tls_offset::VECTOR_STATE) as *mut GuestVectorState;
+    let saved = guest_vector_state_ptr();
     assert!(!saved.is_null(), "macOS TLS is not initialized");
-    // SAFETY: this thread owns the allocation; volatile matches transition
-    // assembly and signal-handler accesses hidden from the compiler.
-    unsafe { saved.write_volatile(state.clone()) };
+    // SAFETY: as in `get_guest_vector_state`.
+    unsafe { (*saved).copy_from(state) };
 }
 
 impl<const PAGE_SIZE: usize> litebox::platform::GuestVectorStateProvider
     for MacosUserlandWithPageSize<PAGE_SIZE>
 {
-    type GuestVectorState = litebox_common_linux::GuestVectorState;
+    type GuestVectorState = GuestVectorState;
     fn get_guest_vector_state(&self) -> Self::GuestVectorState {
         get_guest_vector_state()
     }
@@ -1473,7 +1484,7 @@ unsafe extern "C" fn syscall_callback() {
         // syscall_handler supplies the -ENOSYS entry value for Linux guests;
         // Darwin syscall dispatch reads the saved x0 argument.
         // Save guest vector state before entering host Rust code.
-        "ldr x0, [x16, #{vector_state}]",
+        "ldr x0, [x16, #{vector_buffer}]",
         "stp q0, q1, [x0, #0]",
         "stp q2, q3, [x0, #32]",
         "stp q4, q5, [x0, #64]",
@@ -1544,7 +1555,7 @@ unsafe extern "C" fn syscall_callback() {
         active = const tls_offset::ACTIVE,
         in_guest = const tls_offset::IN_GUEST,
         guest_x18 = const tls_offset::GUEST_X18,
-        vector_state = const tls_offset::VECTOR_STATE,
+        vector_buffer = const tls_offset::VECTOR_BUFFER,
         context = const core::mem::offset_of!(ThreadContext, ctx),
         host_sp = const core::mem::offset_of!(ThreadContext, host_sp),
         thread_svc_frame = const core::mem::offset_of!(ThreadContext, svc_frame),
@@ -1556,8 +1567,8 @@ unsafe extern "C" fn syscall_callback() {
         regs_pstate = const core::mem::offset_of!(PtRegs, pstate),
         regs_orig_x0 = const core::mem::offset_of!(PtRegs, orig_x0),
         regs_syscallno = const core::mem::offset_of!(PtRegs, syscallno),
-        vector_fpsr = const core::mem::offset_of!(GuestVectorState, fpsr),
-        vector_fpcr = const core::mem::offset_of!(GuestVectorState, fpcr),
+        vector_fpsr = const GuestVectorState::FPSR_OFFSET,
+        vector_fpcr = const GuestVectorState::FPCR_OFFSET,
         host_fp_state = const tls_offset::HOST_FP_STATE,
         thread_guest_abi = const core::mem::offset_of!(ThreadContext, guest_abi),
         frame_x16 = const SVC_FRAME_OFF_X16,
@@ -1631,7 +1642,7 @@ unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) ->
         "1:",
         "ldr x1, [x16, #{regs_x18}]",
         "str x1, [x17, #{guest_x18}]",
-        "ldr x1, [x17, #{vector_state}]",
+        "ldr x1, [x17, #{vector_buffer}]",
         "ldp q0, q1, [x1, #0]",
         "ldp q2, q3, [x1, #32]",
         "ldp q4, q5, [x1, #64]",
@@ -1681,7 +1692,7 @@ unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) ->
         context = const core::mem::offset_of!(ThreadContext, ctx),
         in_guest = const tls_offset::IN_GUEST,
         guest_x18 = const tls_offset::GUEST_X18,
-        vector_state = const tls_offset::VECTOR_STATE,
+        vector_buffer = const tls_offset::VECTOR_BUFFER,
         host_fp_state = const tls_offset::HOST_FP_STATE,
         interrupted = const core::mem::offset_of!(ThreadContext, interrupted),
         thread_svc_frame = const core::mem::offset_of!(ThreadContext, svc_frame),
@@ -1695,8 +1706,8 @@ unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) ->
         regs_x25 = const core::mem::offset_of!(PtRegs, regs) + 25 * size_of::<usize>(),
         regs_x27 = const core::mem::offset_of!(PtRegs, regs) + 27 * size_of::<usize>(),
         regs_x29 = const core::mem::offset_of!(PtRegs, regs) + 29 * size_of::<usize>(),
-        vector_fpsr = const core::mem::offset_of!(GuestVectorState, fpsr),
-        vector_fpcr = const core::mem::offset_of!(GuestVectorState, fpcr),
+        vector_fpsr = const GuestVectorState::FPSR_OFFSET,
+        vector_fpcr = const GuestVectorState::FPCR_OFFSET,
     );
 }
 
@@ -2021,17 +2032,14 @@ fn copy_signal_context(regs: &mut PtRegs, mc: &libc::__darwin_mcontext64) {
     regs.pstate = u64::from(mc.__ss.__cpsr) & litebox_common_linux::arch::SAFE_USER_PSTATE;
     regs.orig_x0 = regs.regs[0];
     regs.syscallno = litebox_common_linux::arch::NO_SYSCALL;
-    let state = read_tls(tls_offset::VECTOR_STATE) as *mut GuestVectorState;
-    if state.is_null() {
+    // SAFETY: signal handlers copy the context only of an interrupted guest,
+    // while no reference to this thread's state is live.
+    let Some(state) = (unsafe { guest_vector_state_ptr().as_mut() }) else {
         fatal_signal(b"guest vector state is not initialized", regs.pc);
-    }
-    let captured = GuestVectorState {
-        registers: mc.__ns.__v,
-        fpsr: mc.__ns.__fpsr,
-        fpcr: mc.__ns.__fpcr,
     };
-    // SAFETY: state is this thread's allocation; volatile matches transition assembly.
-    unsafe { state.write_volatile(captured) }
+    *state.v_registers_mut() = mc.__ns.__v;
+    state.set_fpsr(mc.__ns.__fpsr);
+    state.set_fpcr(mc.__ns.__fpcr);
 }
 fn restore_signal_context(regs: &PtRegs, mc: &mut libc::__darwin_mcontext64) {
     set_guest_x18(regs.regs[18]);
@@ -2045,15 +2053,14 @@ fn restore_signal_context(regs: &PtRegs, mc: &mut libc::__darwin_mcontext64) {
     mc.__ss.__sp = regs.sp as u64;
     mc.__ss.__pc = regs.pc as u64;
     mc.__ss.__cpsr = (regs.pstate & litebox_common_linux::arch::SAFE_USER_PSTATE).trunc();
-    let state = read_tls(tls_offset::VECTOR_STATE) as *const GuestVectorState;
-    if state.is_null() {
+    // SAFETY: this thread's state, written only by guest execution, which is
+    // stopped, and by this thread's host code, which holds no reference to it.
+    let Some(state) = (unsafe { guest_vector_state_ptr().as_ref() }) else {
         fatal_signal(b"guest vector state is not initialized", regs.pc);
-    }
-    // SAFETY: state is this thread's allocation; volatile matches transition assembly.
-    let state = unsafe { state.read_volatile() };
-    mc.__ns.__v = state.registers;
-    mc.__ns.__fpsr = state.fpsr;
-    mc.__ns.__fpcr = state.fpcr;
+    };
+    mc.__ns.__v = *state.v_registers();
+    mc.__ns.__fpsr = state.fpsr();
+    mc.__ns.__fpcr = state.fpcr();
 }
 
 fn fatal_signal(message: &[u8], pc: usize) -> ! {
@@ -3389,18 +3396,18 @@ mod tests {
             assert_eq!((regs.sp, regs.pc), (0x4000, 0x5000));
             assert_eq!(regs.pstate, bits);
             let saved_vector = get_guest_vector_state();
-            assert_eq!(saved_vector.registers, mc.__ns.__v);
-            assert_eq!((saved_vector.fpsr, saved_vector.fpcr), (0x7000, 0x8000));
+            assert_eq!(*saved_vector.v_registers(), mc.__ns.__v);
+            assert_eq!((saved_vector.fpsr(), saved_vector.fpcr()), (0x7000, 0x8000));
 
             regs.regs = core::array::from_fn(|index| 0x9000 + index);
             regs.sp = 0xa000;
             regs.pc = 0xb000;
             regs.pstate = bits | !SAFE_USER_PSTATE;
-            let restored_vector = GuestVectorState {
-                registers: core::array::from_fn(|index| 0xc000 + index as u128),
-                fpsr: 0xd000,
-                fpcr: 0xe000,
-            };
+            let mut restored_vector = GuestVectorState::default();
+            *restored_vector.v_registers_mut() =
+                core::array::from_fn(|index| 0xc000 + index as u128);
+            restored_vector.set_fpsr(0xd000);
+            restored_vector.set_fpcr(0xe000);
             set_guest_vector_state(&restored_vector);
             restore_signal_context(&regs, &mut mc);
             for (index, value) in mc.__ss.__x.iter().enumerate() {
@@ -3411,7 +3418,7 @@ mod tests {
             assert_eq!((mc.__ss.__fp, mc.__ss.__lr), (0x901d, 0x901e));
             assert_eq!((mc.__ss.__sp, mc.__ss.__pc), (0xa000, 0xb000));
             assert_eq!(u64::from(mc.__ss.__cpsr), bits);
-            assert_eq!(mc.__ns.__v, restored_vector.registers);
+            assert_eq!(mc.__ns.__v, *restored_vector.v_registers());
             assert_eq!((mc.__ns.__fpsr, mc.__ns.__fpcr), (0xd000, 0xe000));
         }
     }

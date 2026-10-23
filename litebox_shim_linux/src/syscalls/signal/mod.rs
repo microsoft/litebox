@@ -10,6 +10,8 @@ mod x86_64;
 
 #[cfg(target_arch = "aarch64")]
 use aarch64 as arch;
+#[cfg(target_arch = "aarch64")]
+pub(crate) use aarch64::guest_sve_vl;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
 #[cfg(target_arch = "x86_64")]
@@ -713,6 +715,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns the restored return register, or 0 after forcing `SIGSEGV` for a bad frame.
     pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> usize {
+        // Linux AArch64 delivers frames 16-byte aligned and rejects any other
+        // SP before installing the signal mask.
+        #[cfg(target_arch = "aarch64")]
+        if !arch::sp(ctx).is_multiple_of(16) {
+            return self.sigreturn_bad_frame();
+        }
         let uctx_addr = arch::uctx_addr(ctx);
         let uctx_ptr = UserPtr::<Ucontext>::from_usize(uctx_addr);
         let Some(uctx) = uctx_ptr.read_at_offset::<Platform>(0) else {

@@ -22,6 +22,8 @@ use zerocopy::{FromBytes, IntoBytes};
 use litebox_platform::sync::{RawMutexProvider, WaitWakerProvider};
 use litebox_platform::time::TimeProvider;
 
+#[cfg(target_arch = "aarch64")]
+pub use arch::HostHwcaps;
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
 pub use page_mgmt::PageManagementProvider;
 pub use vector::GuestVectorStateProvider;

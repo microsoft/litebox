@@ -152,8 +152,8 @@ fn child_inherits_vector_state_and_dispatches_on_host_stack() {
     let original = get_guest_vector_state();
     let _restore = litebox::utils::defer(|| set_guest_vector_state(&original));
     let mut vector_state = GuestVectorState::default();
-    vector_state.registers[0] = 0x1234;
-    vector_state.registers[31] = 0x5678;
+    vector_state.v_registers_mut()[0] = 0x1234;
+    vector_state.v_registers_mut()[31] = 0x5678;
     set_guest_vector_state(&vector_state);
     let mut ctx = PtRegs {
         pc: base,

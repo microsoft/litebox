@@ -1022,8 +1022,36 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
+            #[cfg(target_arch = "aarch64")]
+            PrctlArg::SveSetVl(arg) => self.sve_vl_prctl(Some(arg)),
+            #[cfg(target_arch = "aarch64")]
+            PrctlArg::SveGetVl => self.sve_vl_prctl(None),
+            #[cfg(not(target_arch = "aarch64"))]
+            PrctlArg::SveSetVl(_) | PrctlArg::SveGetVl => Err(Errno::EINVAL),
             _ => unimplemented!(),
         }
+    }
+
+    /// Handles `PR_SVE_SET_VL` (`Some(arg)`) or `PR_SVE_GET_VL` (`None`). The VL is fixed at the
+    /// host's, so `PR_SVE_VL_INHERIT` is accepted but not reported.
+    #[cfg(target_arch = "aarch64")]
+    fn sve_vl_prctl(&self, set: Option<usize>) -> Result<usize, Errno> {
+        use litebox_common_linux::{PR_SVE_VL_LEN_MASK, SveVlFlags};
+        // `SVE_VL_MAX`: Linux accepts requests up to this, beyond the
+        // architectural maximum, and clamps them to a supported length.
+        const SVE_VL_MAX: usize = 0x2000;
+
+        let vl =
+            crate::syscalls::signal::guest_sve_vl(self.global.platform).ok_or(Errno::EINVAL)?;
+        if let Some(arg) = set {
+            let requested = arg & PR_SVE_VL_LEN_MASK;
+            if SveVlFlags::from_bits(arg & !PR_SVE_VL_LEN_MASK).is_none()
+                || !(requested.is_multiple_of(16) && (16..=SVE_VL_MAX).contains(&requested))
+            {
+                return Err(Errno::EINVAL);
+            }
+        }
+        Ok(usize::from(vl.bytes()))
     }
 
     /// Handle syscall `arch_prctl`.

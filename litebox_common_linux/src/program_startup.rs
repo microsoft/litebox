@@ -735,20 +735,20 @@ fn read_u8(input: &mut &[u8]) -> Result<u8, LinuxProgramStartupError> {
     Ok(take_bytes(input, size_of::<u8>())?[0])
 }
 
-/// Appends `state`, the Q registers followed by FPSR and FPCR.
+/// Appends the Q registers, FPSR and FPCR; fork is a syscall, which discards SVE state.
 #[cfg(target_arch = "aarch64")]
 fn push_vector_state(output: &mut Vec<u8>, state: &GuestVectorState) {
-    for register in &state.registers {
+    for register in state.v_registers() {
         output.extend_from_slice(&register.to_le_bytes());
     }
-    push_u32(output, state.fpsr);
-    push_u32(output, state.fpcr);
+    push_u32(output, state.fpsr());
+    push_u32(output, state.fpcr());
 }
 
 #[cfg(target_arch = "aarch64")]
 fn read_vector_state(input: &mut &[u8]) -> Result<GuestVectorState, LinuxProgramStartupError> {
     let mut state = GuestVectorState::default();
-    for register in &mut state.registers {
+    for register in state.v_registers_mut() {
         let bytes = take_bytes(input, size_of::<u128>())?;
         *register = u128::from_le_bytes(
             bytes
@@ -756,8 +756,8 @@ fn read_vector_state(input: &mut &[u8]) -> Result<GuestVectorState, LinuxProgram
                 .map_err(|_| LinuxProgramStartupError::Malformed)?,
         );
     }
-    state.fpsr = read_u32(input)?;
-    state.fpcr = read_u32(input)?;
+    state.set_fpsr(read_u32(input)?);
+    state.set_fpcr(read_u32(input)?);
     Ok(state)
 }
 
@@ -933,11 +933,11 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn fork_vector_state() -> GuestVectorState {
         let mut state = GuestVectorState::default();
-        for (index, register) in state.registers.iter_mut().enumerate() {
+        for (index, register) in state.v_registers_mut().iter_mut().enumerate() {
             *register = u128::MAX / 3 - index as u128;
         }
-        state.fpsr = 0x0800_0010;
-        state.fpcr = 0x0300_0000;
+        state.set_fpsr(0x0800_0010);
+        state.set_fpcr(0x0300_0000);
         state
     }
 

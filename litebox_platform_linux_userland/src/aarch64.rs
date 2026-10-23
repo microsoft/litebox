@@ -9,7 +9,10 @@ pub(super) use litebox_trampoline::aarch64::recovery::GateInterruption;
 use litebox_trampoline::aarch64::recovery::{GateAbi, GateRuntimeState};
 pub(super) type Aarch64GateSignalResult =
     litebox_trampoline::aarch64::recovery::Aarch64GateSignalResult<litebox_common_linux::PtRegs>;
-use litebox_common_linux::signal::aarch64::GuestVectorState;
+use core::ptr::NonNull;
+use litebox_common_linux::signal::aarch64::{GuestVectorState, SveVectorLength};
+use std::cell::Cell;
+use std::sync::atomic::AtomicU16;
 
 /// Overwrites the destination with the TLS control-block address derived from
 /// the host anchor in `TPIDR_EL0`. Callbacks entered directly from a rewritten
@@ -82,10 +85,14 @@ struct TlsBlock {
     wait_waker_addr: usize,
     outbound_stub: usize,
     outbound_pc: usize,
-    resume_frame_initialized: u8,
+    /// Raw root of this thread's [`GuestThreadState`], from which every Rust
+    /// access derives. Null before the thread's first guest entry and after the
+    /// state is freed.
+    guest_thread_state: *mut GuestThreadState,
+    /// That state's vector buffer root ([`GuestVectorState::as_mut_ptr`]), for
+    /// transition assembly. Null exactly when `guest_thread_state` is.
+    guest_vector_buffer: *mut u8,
     host_fp_state: FpState,
-    guest_vector_state: GuestVectorState,
-    resume_frame: resume_frame::ResumeFrame,
 }
 
 /// Byte offsets of [`TlsBlock`]'s fields, for the transition assembly.
@@ -104,11 +111,9 @@ pub(super) mod tls_offset {
     pub(crate) const WAIT_WAKER_ADDR: usize = offset_of!(TlsBlock, wait_waker_addr);
     pub(crate) const OUTBOUND_STUB: usize = offset_of!(TlsBlock, outbound_stub);
     pub(crate) const OUTBOUND_PC: usize = offset_of!(TlsBlock, outbound_pc);
-    pub(crate) const RESUME_FRAME_INITIALIZED: usize =
-        offset_of!(TlsBlock, resume_frame_initialized);
+    pub(super) const GUEST_THREAD_STATE: usize = offset_of!(TlsBlock, guest_thread_state);
+    pub(super) const GUEST_VECTOR_BUFFER: usize = offset_of!(TlsBlock, guest_vector_buffer);
     pub(super) const HOST_FP_STATE: usize = offset_of!(TlsBlock, host_fp_state);
-    pub(super) const GUEST_VECTOR_STATE: usize = offset_of!(TlsBlock, guest_vector_state);
-    pub(crate) const RESUME_FRAME: usize = offset_of!(TlsBlock, resume_frame);
 }
 
 // Storage layout and alignment must exactly match `TlsBlock`.
@@ -143,19 +148,12 @@ pub(super) fn guest_thread_pointer_tp_offset() -> u16 {
         )
 }
 
-/// Verifies the resume-frame alignment and rewriter-gate reach invariants.
+/// Verifies the rewriter-gate reach invariants.
 ///
 /// # Panics
 ///
-/// Panics if either invariant is violated.
+/// Panics if an invariant is violated.
 pub(super) fn assert_tls_block_placement() {
-    let frame = tprel_offset!(litebox_tls_block) + tls_offset::RESUME_FRAME;
-    assert!(
-        frame.is_multiple_of(core::mem::align_of::<resume_frame::ResumeFrame>()),
-        "the resume frame is at thread-pointer offset {frame}, which `sys_rt_sigreturn` would \
-         reject, failing every guest resume through the generic path",
-    );
-
     let _ = guest_thread_pointer_tp_offset();
     let guest_tp = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_THREAD_POINTER;
     let guest_x18 = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_X18;
@@ -175,7 +173,6 @@ const _: () = assert!(
     tls_offset::GUEST_X18 - tls_offset::GUEST_THREAD_POINTER
         == litebox_trampoline::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP
 );
-const _: () = assert!(tls_offset::GUEST_VECTOR_STATE < (1 << 12));
 
 #[cfg(feature = "aarch64_virtualize_x18")]
 fn set_guest_x18(value: usize) {
@@ -547,7 +544,10 @@ syscall_callback_in_guest_cleared:
     mov  x0,  #-{ENOSYS}
     str  x0,  [x16]
 
-    add  x0, x17, #{GUEST_VECTOR_STATE}
+    // Syscalls discard Z bits above 127, P0-P15 and FFR; only FP/SIMD survives.
+    // The buffer was published before guest entry (`prepare_guest_vector_state`).
+    ldr  x0, [x17, #{GUEST_VECTOR_BUFFER}]
+    strb wzr, [x0, #{VECTOR_SVE_LIVE}]
     stp  q0,  q1,  [x0, #0]
     stp  q2,  q3,  [x0, #32]
     stp  q4,  q5,  [x0, #64]
@@ -566,7 +566,7 @@ syscall_callback_in_guest_cleared:
     stp  q30, q31, [x0, #480]
     mrs  x1, fpsr
     mrs  x2, fpcr
-    add  x0, x0, #512
+    add  x0, x0, #{VECTOR_FPSR}
     stp  w1, w2, [x0]
 
     // Restore host FP state after saving the guest's.
@@ -650,7 +650,9 @@ interrupt_callback:
     HOST_SP = const tls_offset::HOST_SP,
     HOST_FP_STATE = const tls_offset::HOST_FP_STATE,
     GUEST_CONTEXT_TOP = const tls_offset::GUEST_CONTEXT_TOP,
-    GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
+    GUEST_VECTOR_BUFFER = const tls_offset::GUEST_VECTOR_BUFFER,
+    VECTOR_SVE_LIVE = const GuestVectorState::SVE_LIVE_OFFSET,
+    VECTOR_FPSR = const GuestVectorState::FPSR_OFFSET,
     IN_GUEST = const tls_offset::IN_GUEST,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
@@ -683,47 +685,22 @@ const _: () = assert!(
 /// guest-stack frame. Returning through `rt_sigreturn` spends no register as a
 /// branch target, so guest `x16` survives.
 ///
-/// One instance per guest thread, in this crate's TLS rather than on the guest
-/// stack, which would have to be writable at resume time and lies at a
-/// guest-controlled address. Together with [`GuestVectorState`], costs
-/// about 5.2KiB of `.tbss` per thread.
+/// One per guest thread, in its heap-allocated [`GuestThreadState`] rather
+/// than on the guest stack, which would have to be writable at resume time and
+/// lies at a guest-controlled address.
 ///
-/// The required `fpsimd_context` record is populated from the platform-owned
-/// guest vector state before each resume.
+/// The records are populated from the platform-owned guest vector state before
+/// each resume.
 pub(super) mod resume_frame {
     use litebox_common_linux::PtRegs;
+    use litebox_common_linux::signal::aarch64::{
+        FpsimdContext, GuestVectorState, SignalRecords, UnknownRecords, parse_signal_records,
+    };
     use litebox_common_linux::signal::{Siginfo, Ucontext};
-    use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-    /// `FPSIMD_MAGIC` from `arch/arm64/include/uapi/asm/sigcontext.h`.
-    const FPSIMD_MAGIC: u32 = 0x4650_8001;
+    use zerocopy::FromBytes;
 
     /// `__NR_rt_sigreturn` on the asm-generic syscall table AArch64 uses.
     pub(crate) const NR_RT_SIGRETURN: u32 = syscalls::Sysno::rt_sigreturn as u32;
-
-    /// The kernel's `struct fpsimd_context`: a `struct _aarch64_ctx` header
-    /// followed by the FP/SIMD register file.
-    ///
-    /// `fpsr`/`fpcr` sit *between* the header and `vregs`; putting them after
-    /// `vregs` instead pads the record out past the size the kernel expects.
-    #[repr(C)]
-    #[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
-    struct FpsimdContext {
-        magic: u32,
-        size: u32,
-        fpsr: u32,
-        fpcr: u32,
-        vregs: [u128; 32],
-    }
-
-    /// The kernel's `struct _aarch64_ctx`, used on its own as the `END_MAGIC`
-    /// terminator that closes the `__reserved` record list.
-    #[repr(C)]
-    #[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
-    struct Aarch64Ctx {
-        magic: u32,
-        size: u32,
-    }
 
     /// The kernel's `struct rt_sigframe`.
     ///
@@ -760,82 +737,13 @@ pub(super) mod resume_frame {
                 == core::mem::offset_of!(KernelSigcontext, __reserved)
     );
 
-    /// Uses pre-aligned TLS storage to avoid lazy initialization on a path that
-    /// must not panic.
-    fn state() -> (*mut ResumeFrame, *mut u8, usize) {
-        let block: usize;
-        // SAFETY: materializes the base of this thread's own TLS control
-        // block from `TPIDR_EL0`, which always holds the host anchor. Reads no
-        // memory.
-        unsafe {
-            core::arch::asm!(
-                load_tls_block_base!("{block}"),
-                block = out(reg) block,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-        (
-            (block + super::tls_offset::RESUME_FRAME) as *mut ResumeFrame,
-            (block + super::tls_offset::RESUME_FRAME_INITIALIZED) as *mut u8,
-            block,
-        )
-    }
-
-    fn init(frame: &mut ResumeFrame) {
-        let mcontext = &mut frame.ucontext.mcontext;
-
-        let (fpsimd, rest) = FpsimdContext::mut_from_prefix(&mut mcontext.__reserved)
-            .expect("__reserved is larger than both records");
-        fpsimd.magic = FPSIMD_MAGIC;
-        fpsimd.size = u32::try_from(size_of::<FpsimdContext>()).expect("record size fits in u32");
-        let (end, _) =
-            Aarch64Ctx::mut_from_prefix(rest).expect("__reserved is larger than both records");
-        end.magic = 0;
-        end.size = 0;
-
-        // `uc_stack` is deliberately left zeroed. `sys_rt_sigreturn` passes it
-        // to `restore_altstack`, which squashes every error, and
-        // `{ss_sp: NULL, ss_flags: 0, ss_size: 0}` is rejected by
-        // `do_sigaltstack` (`ss_size < MINSIGSTKSZ` gives `-ENOMEM`) before it
-        // changes anything. So this thread's alternate signal stack — which
-        // `with_signal_alt_stack` installed and which every host signal
-        // handler runs on — is left exactly as it is. Note that zeroing is not
-        // the same as writing `SS_DISABLE`, which *would* tear it down.
-    }
-
-    /// Finds the FPSIMD record offset in a bounded context chain.
-    fn fpsimd_context_offset(records: &[u8]) -> Option<usize> {
-        let mut offset = 0;
-        loop {
-            let remaining = records.get(offset..)?;
-            let (header, _) = Aarch64Ctx::ref_from_prefix(remaining).ok()?;
-            if header.magic == 0 && header.size == 0 {
-                return None;
-            }
-            let size = usize::try_from(header.size).ok()?;
-            if size < size_of::<Aarch64Ctx>() || size > remaining.len() || !size.is_multiple_of(16)
-            {
-                return None;
-            }
-            if header.magic == FPSIMD_MAGIC {
-                return (size == size_of::<FpsimdContext>()).then_some(offset);
-            }
-            offset += size;
-        }
-    }
-
-    fn find_fpsimd_context(records: &[u8]) -> Option<&FpsimdContext> {
-        let offset = fpsimd_context_offset(records)?;
-        FpsimdContext::ref_from_prefix(&records[offset..])
-            .ok()
-            .map(|(context, _)| context)
-    }
-
-    fn find_fpsimd_context_mut(records: &mut [u8]) -> Option<&mut FpsimdContext> {
-        let offset = fpsimd_context_offset(records)?;
-        FpsimdContext::mut_from_prefix(&mut records[offset..])
-            .ok()
-            .map(|(context, _)| context)
+    /// Parses the records of a kernel-built signal frame. Records of extensions
+    /// LiteBox does not handle are skipped.
+    fn parse_host_frame(context: &libc::ucontext_t) -> Option<SignalRecords<'_>> {
+        // SAFETY: the module-level assertions pin this cast and `__reserved`.
+        let signal_context =
+            unsafe { &*core::ptr::from_ref(&context.uc_mcontext).cast::<KernelSigcontext>() };
+        parse_signal_records(&signal_context.__reserved, UnknownRecords::Skip).ok()
     }
 
     /// Installs host FP state in a redirected signal frame.
@@ -844,11 +752,17 @@ pub(super) mod resume_frame {
         status: u32,
         control: u32,
     ) -> bool {
+        let Some(offset) = parse_host_frame(context).map(|records| records.fpsimd_reserved_offset)
+        else {
+            return false;
+        };
         // SAFETY: the module-level assertions pin this cast and `__reserved`.
         let signal_context = unsafe {
             &mut *core::ptr::from_mut(&mut context.uc_mcontext).cast::<KernelSigcontext>()
         };
-        let Some(fpsimd) = find_fpsimd_context_mut(&mut signal_context.__reserved) else {
+        let Ok((fpsimd, _)) =
+            FpsimdContext::mut_from_prefix(&mut signal_context.__reserved[offset..])
+        else {
             return false;
         };
         fpsimd.fpsr = status;
@@ -856,109 +770,86 @@ pub(super) mod resume_frame {
         true
     }
 
-    /// Returns this thread's platform-owned guest vector state.
-    fn guest_vector_state(block: usize) -> &'static super::GuestVectorState {
-        // SAFETY: `block` is this thread's TLS base. Mutations happen only in
-        // transition assembly or a signal handler while guest execution is stopped.
-        unsafe { &*((block + super::tls_offset::GUEST_VECTOR_STATE) as *const _) }
+    /// Loads the guest vector state from a host signal frame into `state`.
+    /// Returns false for invalid records, streaming (SME) state, or SVE state
+    /// at a VL other than `state`'s. Allocates nothing and does not panic.
+    pub(super) fn capture_signal_vector_state(
+        context: &libc::ucontext_t,
+        state: &mut GuestVectorState,
+    ) -> bool {
+        parse_host_frame(context).is_some_and(|records| state.load_signal_records(&records).is_ok())
     }
 
-    /// Copies kernel-saved guest FP/SIMD state from a host signal context.
-    /// Returns false if the bounded extension-record chain has no valid record.
-    pub(super) fn capture_signal_vector_state(context: &libc::ucontext_t, block: usize) -> bool {
-        // SAFETY: the module-level assertions pin this cast and `__reserved`.
-        let signal_context =
-            unsafe { &*core::ptr::from_ref(&context.uc_mcontext).cast::<KernelSigcontext>() };
-        let Some(fpsimd) = find_fpsimd_context(&signal_context.__reserved) else {
-            return false;
-        };
-        // SAFETY: guest execution is stopped and this signal handler has sole
-        // write access to the current thread's TLS vector state.
-        let state = unsafe {
-            &mut *((block + super::tls_offset::GUEST_VECTOR_STATE) as *mut super::GuestVectorState)
-        };
-        state.registers = fpsimd.vregs;
-        state.fpsr = fpsimd.fpsr;
-        state.fpcr = fpsimd.fpcr;
-        true
-    }
+    impl ResumeFrame {
+        /// Fills this frame in from `ctx` and `state` and returns it, ready
+        /// for `rt_sigreturn`. The frame stays valid until `self` is next
+        /// used or dropped.
+        pub(super) fn prepare(&mut self, ctx: &PtRegs, state: &GuestVectorState) -> *mut Self {
+            // The kernel accepts the `sve_context` only at the host thread's VL,
+            // which the platform-owned state always has.
+            state
+                .write_signal_records(&mut self.ucontext.mcontext.__reserved)
+                .expect("the records of a valid VL fit in `__reserved`");
 
-    /// Fills this thread's frame in from `ctx` and returns it, ready for
-    /// `rt_sigreturn`.
-    pub(super) fn prepare(ctx: &PtRegs) -> *mut ResumeFrame {
-        let (frame, initialized, block) = state();
-        // SAFETY: own-thread [`super::tls_offset`] slot accesses. The `&mut` is
-        // exclusive: this is the only function that takes one, it cannot be
-        // reentered on this thread (it runs with `in_guest` clear, outside any
-        // signal handler, and calls nothing that re-enters the runtime), and
-        // it is dead before the frame is handed to the kernel.
-        let frame = unsafe { &mut *frame };
-        // SAFETY: as above. Volatile is not needed — nothing else writes this
-        // byte — but the read and the write are kept adjacent to the `init`
-        // they guard.
-        unsafe {
-            if *initialized == 0 {
-                init(frame);
-                *initialized = 1;
+            // `restore_sigframe` ends by installing this mask, so it decides the
+            // host mask after every resume through this frame and has to say "no change".
+            // Sampled per resume: this frame outlives a single guest lifetime, and
+            // nothing stops a host thread from running another one.
+            // SAFETY: `sigset_t` is a plain bit array, so all-zero is a valid value.
+            let mut set: libc::sigset_t = unsafe { core::mem::zeroed() };
+            // SAFETY: `set` is a live, correctly typed `sigset_t`; passing a null
+            // `set` argument makes this a pure query.
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_BLOCK, core::ptr::null(), &raw mut set);
             }
-        }
+            // SAFETY: `sigset_t` is at least 8 bytes on every Linux target and its
+            // first 8 bytes are the mask for signals 1..=64, which is exactly the
+            // kernel's `sigset_t`. Read unaligned because `sigset_t`'s alignment is
+            // not part of its public API.
+            let blocked = unsafe { core::ptr::read_unaligned((&raw const set).cast::<u64>()) };
+            self.ucontext.sigmask = litebox_common_linux::signal::SigSet::from_u64(blocked);
 
-        // `restore_sigframe` ends by installing this mask, so it decides the
-        // host mask after every resume through this frame and has to say "no change".
-        // Sampled per resume: this frame outlives a single guest lifetime, and
-        // nothing stops a host thread from running another one.
-        // SAFETY: `sigset_t` is a plain bit array, so all-zero is a valid value.
-        let mut set: libc::sigset_t = unsafe { core::mem::zeroed() };
-        // SAFETY: `set` is a live, correctly typed `sigset_t`; passing a null
-        // `set` argument makes this a pure query.
-        unsafe {
-            libc::pthread_sigmask(libc::SIG_BLOCK, core::ptr::null(), &raw mut set);
-        }
-        // SAFETY: `sigset_t` is at least 8 bytes on every Linux target and its
-        // first 8 bytes are the mask for signals 1..=64, which is exactly the
-        // kernel's `sigset_t`. Read unaligned because `sigset_t`'s alignment is
-        // not part of its public API.
-        let blocked = unsafe { core::ptr::read_unaligned((&raw const set).cast::<u64>()) };
-        frame.ucontext.sigmask = litebox_common_linux::signal::SigSet::from_u64(blocked);
+            // `uc_stack` is deliberately left zeroed. `sys_rt_sigreturn` passes it
+            // to `restore_altstack`, which squashes every error, and
+            // `{ss_sp: NULL, ss_flags: 0, ss_size: 0}` is rejected by
+            // `do_sigaltstack` (`ss_size < MINSIGSTKSZ` gives `-ENOMEM`) before it
+            // changes anything. So this thread's alternate signal stack — which
+            // `with_signal_alt_stack` installed and which every host signal
+            // handler runs on — is left exactly as it is. Note that zeroing is not
+            // the same as writing `SS_DISABLE`, which *would* tear it down.
 
-        let (fpsimd, _) = FpsimdContext::mut_from_prefix(&mut frame.ucontext.mcontext.__reserved)
-            .expect("__reserved is 4KiB");
-        let vector_state = guest_vector_state(block);
-        fpsimd.vregs = vector_state.registers;
-        fpsimd.fpsr = vector_state.fpsr;
-        fpsimd.fpcr = vector_state.fpcr;
+            let mcontext = &mut self.ucontext.mcontext;
+            for (dst, src) in mcontext.regs.iter_mut().zip(ctx.regs.iter()) {
+                *dst = *src as u64;
+            }
+            #[cfg(feature = "aarch64_virtualize_x18")]
+            // SAFETY: copies physical x18 into the kernel signal frame without
+            // touching memory outside `mcontext` or modifying machine state.
+            unsafe {
+                core::arch::asm!("mov {host_x18}, x18", host_x18 = out(reg) mcontext.regs[18], options(nomem, nostack, preserves_flags));
+            }
+            mcontext.sp = ctx.sp as u64;
+            mcontext.pc = ctx.pc as u64;
+            // `rt_sigreturn` hands the whole word to the kernel, and
+            // `valid_user_regs` rejects some values rather than trimming them, so
+            // mask before the kernel sees it.
+            mcontext.pstate = ctx.pstate & litebox_common_linux::arch::SAFE_USER_PSTATE;
 
-        let mcontext = &mut frame.ucontext.mcontext;
-        for (dst, src) in mcontext.regs.iter_mut().zip(ctx.regs.iter()) {
-            *dst = *src as u64;
+            &raw mut *self
         }
-        #[cfg(feature = "aarch64_virtualize_x18")]
-        // SAFETY: copies physical x18 into the kernel signal frame without
-        // touching memory outside `mcontext` or modifying machine state.
-        unsafe {
-            core::arch::asm!("mov {host_x18}, x18", host_x18 = out(reg) mcontext.regs[18], options(nomem, nostack, preserves_flags));
-        }
-        mcontext.sp = ctx.sp as u64;
-        mcontext.pc = ctx.pc as u64;
-        // `rt_sigreturn` hands the whole word to the kernel, and
-        // `valid_user_regs` rejects some values rather than trimming them, so
-        // mask before the kernel sees it.
-        mcontext.pstate = ctx.pstate & litebox_common_linux::arch::SAFE_USER_PSTATE;
-
-        &raw mut *frame
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{Aarch64Ctx, FpsimdContext, ResumeFrame};
+        use super::ResumeFrame;
         use core::mem::offset_of;
         use litebox::utils::TruncateExt;
         use litebox_common_linux::PtRegs;
+        use litebox_common_linux::signal::aarch64::{
+            FpsimdContext, GuestVectorState, SveContext, SveVectorLength,
+        };
         use litebox_common_linux::signal::{Siginfo, Ucontext, aarch64::Sigcontext};
-        use zerocopy::FromBytes as _;
-
-        #[repr(align(16))]
-        struct AlignedRecords([u8; 4096]);
+        use zerocopy::FromZeros as _;
 
         /// The layout `rt_sigreturn` expects, pinned against the kernel's
         /// `struct rt_sigframe`. This is the whole contract with the kernel:
@@ -985,51 +876,175 @@ pub(super) mod resume_frame {
             assert_eq!(offset_of!(Sigcontext, pstate), 272);
             assert_eq!(offset_of!(Sigcontext, __reserved), 288);
             assert_eq!(size_of::<Sigcontext>(), 4384);
+        }
 
-            // The two records written into `__reserved`, which the kernel
-            // walks by `size` from the start of the area.
-            assert_eq!(size_of::<FpsimdContext>(), 528);
-            // Size alone does not pin the field order: `fpsr` and `fpcr` are
-            // both `u32` and swapping them would install a guest-controlled
-            // exception word into `FPCR`, trap-enable bits and all.
-            assert_eq!(offset_of!(FpsimdContext, magic), 0);
-            assert_eq!(offset_of!(FpsimdContext, size), 4);
-            assert_eq!(offset_of!(FpsimdContext, fpsr), 8);
-            assert_eq!(offset_of!(FpsimdContext, fpcr), 12);
-            assert_eq!(offset_of!(FpsimdContext, vregs), 16);
-            assert_eq!(super::FPSIMD_MAGIC, 0x4650_8001);
-            assert_eq!(align_of::<FpsimdContext>(), 16);
-            assert_eq!(size_of::<Aarch64Ctx>(), 8);
-            assert!(size_of::<FpsimdContext>() + size_of::<Aarch64Ctx>() <= 4096);
+        /// State with patterned FP/SIMD registers and room for SVE at `sve_vl`.
+        fn fpsimd_pattern(sve_vl: Option<SveVectorLength>) -> GuestVectorState {
+            let mut state = GuestVectorState::new(sve_vl);
+            *state.v_registers_mut() =
+                core::array::from_fn(|n| 0x1122_3344_5566_7788 * (n as u128 + 1));
+            state.set_fpsr(0x0800_0010);
+            state.set_fpcr(0x0300_0000);
+            state
+        }
+
+        fn sve_pattern(vl: SveVectorLength) -> Vec<u8> {
+            (0..vl.registers_size())
+                .map(|i| u8::try_from((i * 11 + 5) % 256).unwrap())
+                .collect()
+        }
+
+        fn live_pattern(vl: SveVectorLength, registers: &[u8]) -> GuestVectorState {
+            let mut state = fpsimd_pattern(Some(vl));
+            state.set_sve_registers(registers).unwrap();
+            state
+        }
+
+        /// A kernel-style host signal frame with the records of `state`.
+        fn host_frame(state: &GuestVectorState) -> ResumeFrame {
+            let mut frame = ResumeFrame::new_zeroed();
+            state
+                .write_signal_records(&mut frame.ucontext.mcontext.__reserved)
+                .unwrap();
+            frame
+        }
+
+        fn context(frame: &ResumeFrame) -> &libc::ucontext_t {
+            // SAFETY: `ucontext` is the kernel's `struct ucontext`, which
+            // `libc::ucontext_t` matches, at a 16-byte-aligned offset.
+            unsafe { &*(&raw const frame.ucontext).cast() }
         }
 
         #[test]
-        fn signal_vector_state_parser_accepts_reordered_records_and_rejects_malformed_ones() {
-            const UNKNOWN_MAGIC: u32 = 0x1234_5678;
-            let expected = [0x1122_3344_5566_7788u128; 32];
-            let mut records = AlignedRecords([0; 4096]);
-            let (unknown, rest) = Aarch64Ctx::mut_from_prefix(&mut records.0).unwrap();
-            unknown.magic = UNKNOWN_MAGIC;
-            unknown.size = 16;
-            let (fpsimd, rest) = FpsimdContext::mut_from_prefix(&mut rest[8..]).unwrap();
-            fpsimd.magic = super::FPSIMD_MAGIC;
-            fpsimd.size = u32::try_from(size_of::<FpsimdContext>()).unwrap();
-            fpsimd.vregs = expected;
-            let (end, _) = Aarch64Ctx::mut_from_prefix(rest).unwrap();
-            end.magic = 0;
-            end.size = 0;
+        fn capture_reads_sve_records() {
+            for bytes in [16, 96] {
+                let vl = SveVectorLength::new(bytes).unwrap();
+                let live = live_pattern(vl, &sve_pattern(vl));
+                let frame = host_frame(&live);
+                let mut state = GuestVectorState::new(Some(vl));
+                assert!(super::capture_signal_vector_state(
+                    context(&frame),
+                    &mut state
+                ));
+                assert!(state.sve_registers().is_some(), "VL {bytes}");
+                assert_eq!(state, live, "VL {bytes}");
 
-            let parsed = super::find_fpsimd_context(&records.0).unwrap();
-            assert_eq!(parsed.vregs, expected);
+                // A frame captured at a different VL must be rejected.
+                let other = SveVectorLength::new(112 - bytes).unwrap();
+                for mut state in [
+                    GuestVectorState::new(Some(other)),
+                    GuestVectorState::new(None),
+                ] {
+                    assert!(!super::capture_signal_vector_state(
+                        context(&frame),
+                        &mut state
+                    ));
+                }
 
-            records.0[4..8].copy_from_slice(&15u32.to_ne_bytes());
-            assert!(super::find_fpsimd_context(&records.0).is_none());
+                let inactive = host_frame(&fpsimd_pattern(Some(vl)));
+                let mut state = live.clone();
+                assert!(super::capture_signal_vector_state(
+                    context(&inactive),
+                    &mut state
+                ));
+                assert_eq!(state.sve_registers(), None, "VL {bytes}");
+                assert_eq!(state, fpsimd_pattern(Some(vl)), "VL {bytes}");
+            }
+        }
 
-            records.0.fill(0);
-            assert!(super::find_fpsimd_context(&records.0).is_none());
-            records.0[..4].copy_from_slice(&UNKNOWN_MAGIC.to_ne_bytes());
-            records.0[4..8].copy_from_slice(&4112u32.to_ne_bytes());
-            assert!(super::find_fpsimd_context(&records.0).is_none());
+        /// SME-only hosts have no SVE but write a header-only `sve_context`
+        /// with VL 0 for non-streaming state.
+        #[test]
+        fn capture_accepts_header_only_sve_records_without_host_sve() {
+            let mut frame = host_frame(&fpsimd_pattern(SveVectorLength::new(16)));
+            // The `sve_context` follows the 528-byte `fpsimd_context`.
+            let sve_vl = size_of::<FpsimdContext>() + offset_of!(SveContext, vl);
+            let reserved = &mut frame.ucontext.mcontext.__reserved;
+            assert_eq!(reserved[sve_vl..sve_vl + 2], 16u16.to_ne_bytes());
+            reserved[sve_vl..sve_vl + 2].copy_from_slice(&0u16.to_ne_bytes());
+
+            let mut state = GuestVectorState::new(None);
+            assert!(super::capture_signal_vector_state(
+                context(&frame),
+                &mut state
+            ));
+            assert_eq!(state, fpsimd_pattern(None));
+        }
+
+        /// Restores a prepared frame via host `rt_sigreturn` and stores P0-P15 and FFR
+        /// to `out` in `SVE_SIG_REGS` layout at the current VL.
+        ///
+        /// # Safety
+        ///
+        /// The CPU must implement SVE and `out` must hold 17 predicates.
+        unsafe fn resume_and_store_predicates(frame: *mut ResumeFrame, out: *mut u8) {
+            const MCONTEXT: usize =
+                offset_of!(ResumeFrame, ucontext) + offset_of!(Ucontext, mcontext);
+            const REGS: usize = MCONTEXT + offset_of!(Sigcontext, regs);
+            // SAFETY: as in `test_prepared_frame_round_trips_x16_through_the_kernel`,
+            // `rt_sigreturn` restores this function's own state from the frame
+            // and resumes at `99:`; `x21` and `x22` survive it as callee-saved
+            // registers saved to the frame.
+            unsafe {
+                core::arch::asm!(
+                    "add x17, x22, #{regs}",
+                    "stp x19, x20, [x17, #152]",
+                    "stp x21, x22, [x17, #168]",
+                    "stp x23, x24, [x17, #184]",
+                    "stp x25, x26, [x17, #200]",
+                    "stp x27, x28, [x17, #216]",
+                    "stp x29, x30, [x17, #232]",
+                    "mov x17, sp",
+                    "str x17, [x22, #{sp}]",
+                    "adr x17, 99f",
+                    "str x17, [x22, #{pc}]",
+                    "mov sp, x22",
+                    "mov x8, #{nr}",
+                    "svc #0",
+                    "brk #0",
+                    "99:",
+                    // Enabling SVE for the function instead would put FFR, which
+                    // LLVM reserves, in the `clobber_abi` list.
+                    ".arch_extension sve",
+                    ".irp n, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15",
+                    "str p\\n, [x21, #\\n, mul vl]",
+                    ".endr",
+                    "rdffr p0.b",
+                    "str p0, [x21, #16, mul vl]",
+                    in("x22") frame,
+                    in("x21") out,
+                    regs = const REGS,
+                    sp = const MCONTEXT + 256,
+                    pc = const MCONTEXT + 264,
+                    nr = const super::NR_RT_SIGRETURN,
+                    clobber_abi("C"),
+                );
+            }
+        }
+
+        /// The kernel must restore P0-P15 and FFR from a prepared live-SVE frame;
+        /// rejection kills the test process.
+        #[test]
+        fn test_prepared_frame_restores_live_sve_through_the_kernel() {
+            super::super::detect_host_sve();
+            let Some(vl) = super::super::host_sve_vector_length() else {
+                return;
+            };
+            let mut registers = sve_pattern(vl);
+            let predicates = 32 * usize::from(vl.bytes());
+            // WRFFR, which the kernel restores FFR with, needs a monotonic
+            // predicate.
+            let ffr = registers.len() - usize::from(vl.bytes()) / 8;
+            registers[ffr..].fill(0);
+            registers[ffr] = 0x07;
+            super::super::set_guest_vector_state(&live_pattern(vl, &registers));
+
+            let frame = super::super::prepare_resume_frame(&PtRegs::default());
+            let mut observed = vec![0u8; registers.len() - predicates];
+            // SAFETY: the CPU implements SVE, as detected, and `observed` holds
+            // 17 predicates.
+            unsafe { resume_and_store_predicates(frame, observed.as_mut_ptr()) };
+            assert_eq!(observed, registers[predicates..]);
         }
 
         #[test]
@@ -1046,7 +1061,7 @@ pub(super) mod resume_frame {
             ctx.sp = 0;
             ctx.pstate = u64::MAX;
 
-            let frame = super::prepare(&ctx);
+            let frame = super::super::prepare_resume_frame(&ctx);
 
             // SAFETY: `frame` is this thread's own frame, filled in above. The
             // block writes the live `sp`, `pc` and callee-saved registers into
@@ -1105,7 +1120,7 @@ pub(super) mod resume_frame {
         fn test_prepare_sanitizes_pstate() {
             let mut ctx: PtRegs = unsafe { core::mem::zeroed() };
             ctx.pstate = u64::MAX;
-            let frame = super::prepare(&ctx);
+            let frame = super::super::prepare_resume_frame(&ctx);
             // SAFETY: `frame` is this thread's own frame and no `&mut` to it
             // is live here.
             let pstate = unsafe { (*frame).ucontext.mcontext.pstate };
@@ -1131,7 +1146,7 @@ pub(super) mod resume_frame {
 pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[cfg(feature = "aarch64_virtualize_x18")]
     set_guest_x18(ctx.regs[18]);
-    if outbound_stub_is_current(ctx) {
+    if resumes_via_outbound_stub(ctx) {
         // SAFETY: the caller's contract, plus the stub's own: a stub is
         // recorded and `ctx.pc` is the PC it branches to, checked above.
         unsafe { switch_to_guest_via_outbound_stub(ctx) }
@@ -1139,6 +1154,18 @@ pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRe
         // SAFETY: inherited from this function's contract.
         unsafe { switch_to_guest_via_sigreturn(ctx) }
     }
+}
+
+/// Whether [`switch_to_guest`] can take the outbound stub, which restores only
+/// FP/SIMD registers, so not while SVE state is live.
+fn resumes_via_outbound_stub(ctx: &litebox_common_linux::PtRegs) -> bool {
+    let state = NonNull::new(published_guest_thread_state())
+        .expect("guest vector state is published before entry");
+    // SAFETY: a published root is this thread's live state; see
+    // [`GuestThreadState`]. This runs in host context between guest entries,
+    // so no other reference is live.
+    let sve_live = unsafe { state.as_ref() }.vector.sve_registers().is_some();
+    !sve_live && outbound_stub_is_current(ctx)
 }
 
 pub(super) fn outbound_stub_is_current(ctx: &litebox_common_linux::PtRegs) -> bool {
@@ -1247,29 +1274,42 @@ switch_to_guest_stage_x16_fixup:
     .long switch_to_guest_stage_x16_fixup - .
     .popsection
 
-    add  x17, x17, #{GUEST_VECTOR_STATE}
-    add  x17, x17, #512
-    ldp  w16, w4, [x17]
-    sub  x17, x17, #512
+    // x4 is scratch until the frame is recomputed below; x17 keeps the TLS
+    // base for the stub load. The buffer was published before guest entry
+    // (`prepare_guest_vector_state`).
+    ldr  x4,  [x17, #{GUEST_VECTOR_BUFFER}]
+    ldr  w16, [x4, #{VECTOR_FPSR}]
     msr  fpsr, x16
-    msr  fpcr, x4
-    ldp  q0,  q1,  [x17, #0]
-    ldp  q2,  q3,  [x17, #32]
-    ldp  q4,  q5,  [x17, #64]
-    ldp  q6,  q7,  [x17, #96]
-    ldp  q8,  q9,  [x17, #128]
-    ldp  q10, q11, [x17, #160]
-    ldp  q12, q13, [x17, #192]
-    ldp  q14, q15, [x17, #224]
-    ldp  q16, q17, [x17, #256]
-    ldp  q18, q19, [x17, #288]
-    ldp  q20, q21, [x17, #320]
-    ldp  q22, q23, [x17, #352]
-    ldp  q24, q25, [x17, #384]
-    ldp  q26, q27, [x17, #416]
-    ldp  q28, q29, [x17, #448]
-    ldp  q30, q31, [x17, #480]
-    sub  x17, x17, #{GUEST_VECTOR_STATE}
+    ldr  w16, [x4, #{VECTOR_FPCR}]
+    msr  fpcr, x16
+    ldp  q0,  q1,  [x4, #0]
+    ldp  q2,  q3,  [x4, #32]
+    ldp  q4,  q5,  [x4, #64]
+    ldp  q6,  q7,  [x4, #96]
+    ldp  q8,  q9,  [x4, #128]
+    ldp  q10, q11, [x4, #160]
+    ldp  q12, q13, [x4, #192]
+    ldp  q14, q15, [x4, #224]
+    ldp  q16, q17, [x4, #256]
+    ldp  q18, q19, [x4, #288]
+    ldp  q20, q21, [x4, #320]
+    ldp  q22, q23, [x4, #352]
+    ldp  q24, q25, [x4, #384]
+    ldp  q26, q27, [x4, #416]
+    ldp  q28, q29, [x4, #448]
+    ldp  q30, q31, [x4, #480]
+
+    // Linux zeroes P0-P15 and FFR on syscall return; the Q loads above already zeroed
+    // Z[VL-1:128]. `pfalse`/`wrffr` leave V/Z and NZCV intact but would trap without SVE.
+    adrp x16, {HOST_SVE_VECTOR_LENGTH}
+    ldrh w16, [x16, :lo12:{HOST_SVE_VECTOR_LENGTH}]
+    cbz  w16, 5f
+    .arch_extension sve
+    .irp n, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    pfalse p\\n\\().b
+    .endr
+    wrffr p0.b
+5:
 
     // x16 carries the stub. Recompute the frame after x4 was used as scratch;
     // SP starts below the frame because the stub pops it before returning.
@@ -1286,7 +1326,7 @@ switch_to_guest_stage_x16_fixup:
     // DIT therefore loses them across a syscall: both are hardening hints with
     // no architectural effect on results. (The generic `rt_sigreturn` path
     // does restore them for free by writing the whole SPSR; see
-    // `resume_frame::prepare`.)
+    // `resume_frame::ResumeFrame::prepare`.)
     //
     // TODO: restore SSBS/DIT for guests that set them, gated on a runtime
     // feature probe (HWCAP_SSBS / HWCAP2_DIT) so the hardware floor stays at
@@ -1320,11 +1360,14 @@ switch_to_guest_via_outbound_stub_end:
     IN_GUEST = const tls_offset::IN_GUEST,
     INTERRUPT = const tls_offset::INTERRUPT,
     HOST_FP_STATE = const tls_offset::HOST_FP_STATE,
-    GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
+    GUEST_VECTOR_BUFFER = const tls_offset::GUEST_VECTOR_BUFFER,
+    VECTOR_FPSR = const GuestVectorState::FPSR_OFFSET,
+    VECTOR_FPCR = const GuestVectorState::FPCR_OFFSET,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     SVC_FRAME_BYTES = const litebox_trampoline::aarch64::SVC_FRAME_BYTES,
     SVC_FRAME_OFF_X16 = const litebox_trampoline::aarch64::SVC_FRAME_OFF_X16,
     VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
+    HOST_SVE_VECTOR_LENGTH = sym HOST_SVE_VECTOR_LENGTH,
     resume_via_sigreturn = sym switch_to_guest_via_sigreturn,
     );
 }
@@ -1339,8 +1382,9 @@ switch_to_guest_via_outbound_stub_end:
 /// # Safety
 /// Inherits [`switch_to_guest`]'s contract; the caller must be in host state.
 unsafe extern "C" fn switch_to_guest_via_sigreturn(ctx: &litebox_common_linux::PtRegs) -> ! {
-    let frame = resume_frame::prepare(ctx);
-    // SAFETY: `prepare` returned a complete thread-local frame.
+    let frame = prepare_resume_frame(ctx);
+    // SAFETY: `prepare_resume_frame` returned a complete frame owned by this
+    // thread until it exits.
     unsafe { restore_guest_from_sigreturn_frame(frame) }
 }
 
@@ -1351,7 +1395,7 @@ unsafe extern "C" fn switch_to_guest_via_sigreturn(ctx: &litebox_common_linux::P
 ///
 /// # Safety
 /// As [`switch_to_guest`], and additionally: `frame` must point at a frame
-/// [`resume_frame::prepare`] has filled in from the context being resumed, and
+/// [`prepare_resume_frame`] has filled in from the context being resumed, and
 /// must stay valid until the guest is entered.
 ///
 /// The second range [`in_switch_to_guest`] tests; see
@@ -1427,6 +1471,17 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
             _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
     }
+
+    fn host_hwcaps(&self) -> Option<litebox::platform::HostHwcaps> {
+        // SAFETY: `getauxval` only reads the process's auxiliary vector.
+        let (hwcap, hwcap2) = unsafe {
+            (
+                libc::getauxval(libc::AT_HWCAP),
+                libc::getauxval(libc::AT_HWCAP2),
+            )
+        };
+        Some(litebox::platform::HostHwcaps { hwcap, hwcap2 })
+    }
 }
 
 impl litebox::platform::GuestVectorStateProvider for LinuxUserland {
@@ -1441,43 +1496,181 @@ impl litebox::platform::GuestVectorStateProvider for LinuxUserland {
     }
 }
 
-/// Returns a snapshot of the current thread's platform-owned guest vector state.
-pub(super) fn get_guest_vector_state() -> GuestVectorState {
+/// Host VL in bytes (0 without SVE), shared by all threads: neither LiteBox
+/// nor guests change it. Initialized before guest execution; signal handlers
+/// and [`switch_to_guest_via_outbound_stub`] only read it.
+static HOST_SVE_VECTOR_LENGTH: AtomicU16 = AtomicU16::new(0);
+
+/// Records the host SVE vector length.
+///
+/// # Panics
+///
+/// Panics if the host VL exceeds [`SveVectorLength::MAX`]: LiteBox writes
+/// signal frames without an `extra_context`, which larger VLs need.
+pub(super) fn detect_host_sve() {
+    /// # Safety
+    ///
+    /// The CPU must implement SVE.
+    #[target_feature(enable = "sve")]
+    unsafe fn read_vector_length() -> u64 {
+        let bytes: u64;
+        // SAFETY: reads the vector length; touches no memory or flags.
+        unsafe {
+            core::arch::asm!(
+                "rdvl {bytes}, #1",
+                bytes = out(reg) bytes,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        bytes
+    }
+
+    let bytes = if std::arch::is_aarch64_feature_detected!("sve") {
+        // SAFETY: the CPU implements SVE, checked above.
+        let bytes = unsafe { read_vector_length() };
+        let Some(vl) = u16::try_from(bytes).ok().and_then(SveVectorLength::new) else {
+            panic!(
+                "the host SVE vector length is {bytes} bytes, but LiteBox supports at most {} \
+                 bytes, whose signal frames need no `extra_context`",
+                SveVectorLength::MAX.bytes(),
+            );
+        };
+        vl.bytes()
+    } else {
+        0
+    };
+    HOST_SVE_VECTOR_LENGTH.store(bytes, Ordering::Relaxed);
+}
+
+fn host_sve_vector_length() -> Option<SveVectorLength> {
+    SveVectorLength::new(HOST_SVE_VECTOR_LENGTH.load(Ordering::Relaxed))
+}
+
+fn current_tls_block() -> usize {
     let block: usize;
-    // SAFETY: callers run on an initialized guest thread, whose TLS block owns
-    // this aligned slot. Volatile matches transition-assembly accesses.
+    // SAFETY: `TPIDR_EL0` anchors host TLS even in guest code. Reads no memory.
     unsafe {
         core::arch::asm!(
             load_tls_block_base!("{block}"),
             block = out(reg) block,
             options(nomem, nostack, preserves_flags)
         );
-        ((block + tls_offset::GUEST_VECTOR_STATE) as *const GuestVectorState).read_volatile()
     }
+    block
+}
+
+/// This thread's guest vector state, sized for the host VL, and resume frame,
+/// both updated in place.
+///
+/// Owned through the raw root published in [`TlsBlock`], from before the
+/// thread's first guest entry until [`GuestThreadStateOwner`] frees it at
+/// thread exit. Every Rust access, on the host or in a signal handler, derives
+/// a short-lived reference from that root, and transition assembly uses the
+/// vector state's buffer root, so no access invalidates another's pointer.
+/// Accesses never overlap: host code holds no reference while the guest
+/// runs, and signal handlers access the state only when they interrupt the
+/// guest.
+struct GuestThreadState {
+    vector: GuestVectorState,
+    resume_frame: resume_frame::ResumeFrame,
+}
+
+/// Frees this thread's [`GuestThreadState`] at thread exit.
+struct GuestThreadStateOwner(NonNull<GuestThreadState>);
+
+impl Drop for GuestThreadStateOwner {
+    fn drop(&mut self) {
+        publish_guest_thread_state(core::ptr::null_mut(), core::ptr::null_mut());
+        // SAFETY: the root came from `Box::leak` in `guest_thread_state`, is
+        // freed only here, and is no longer published, so nothing else uses it.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
+thread_local! {
+    /// Touched only from host context, when the state is allocated, so signal
+    /// handlers never access a `thread_local!`.
+    static GUEST_THREAD_STATE_OWNER: Cell<Option<GuestThreadStateOwner>> =
+        const { Cell::new(None) };
+}
+
+fn publish_guest_thread_state(state: *mut GuestThreadState, buffer: *mut u8) {
+    let block = current_tls_block();
+    // SAFETY: own-thread [`tls_offset`] slot accesses, from host context.
+    unsafe {
+        ((block + tls_offset::GUEST_THREAD_STATE) as *mut *mut GuestThreadState)
+            .write_volatile(state);
+        ((block + tls_offset::GUEST_VECTOR_BUFFER) as *mut *mut u8).write_volatile(buffer);
+    }
+}
+
+/// Returns this thread's published [`GuestThreadState`] root, or null if none
+/// is. Safe to call from a signal handler.
+fn published_guest_thread_state() -> *mut GuestThreadState {
+    let block = current_tls_block();
+    // SAFETY: an own-thread [`tls_offset`] slot access.
+    unsafe {
+        ((block + tls_offset::GUEST_THREAD_STATE) as *const *mut GuestThreadState).read_volatile()
+    }
+}
+
+/// Returns this thread's [`GuestThreadState`] root, allocating and publishing
+/// it on first use. Host context only.
+fn guest_thread_state() -> NonNull<GuestThreadState> {
+    if let Some(state) = NonNull::new(published_guest_thread_state()) {
+        return state;
+    }
+    let state = NonNull::from(Box::leak(Box::new(GuestThreadState {
+        vector: GuestVectorState::new(host_sve_vector_length()),
+        resume_frame: zerocopy::FromZeros::new_zeroed(),
+    })));
+    GUEST_THREAD_STATE_OWNER.set(Some(GuestThreadStateOwner(state)));
+    // SAFETY: a fresh root with no other user; the reference is short-lived.
+    let buffer = unsafe { (*state.as_ptr()).vector.as_mut_ptr() };
+    publish_guest_thread_state(state.as_ptr(), buffer);
+    state
+}
+
+/// Returns a snapshot of the current thread's platform-owned guest vector state.
+pub(super) fn get_guest_vector_state() -> GuestVectorState {
+    let state = published_guest_thread_state();
+    if state.is_null() {
+        return GuestVectorState::new(host_sve_vector_length());
+    }
+    // SAFETY: a published root is this thread's live state; see
+    // [`GuestThreadState`]. Host context, so no other reference is live.
+    unsafe { (*state).vector.clone() }
 }
 
 /// Prepares guest vector state for entry, optionally using inherited state.
 pub(super) fn prepare_guest_vector_state(inherited: Option<&GuestVectorState>) {
-    if let Some(state) = inherited {
-        set_guest_vector_state(state);
+    match inherited {
+        Some(state) => set_guest_vector_state(state),
+        // The state must be allocated and published before the thread's first
+        // guest entry.
+        None => {
+            guest_thread_state();
+        }
     }
 }
 
 /// Replaces the current thread's platform-owned guest vector state.
+///
+/// # Panics
+///
+/// Panics for live SVE at a non-host VL, which would make host `rt_sigreturn` fatal.
 fn set_guest_vector_state(state: &GuestVectorState) {
-    let block: usize;
-    // SAFETY: callers run on an initialized guest thread with guest execution
-    // stopped, giving exclusive access to this aligned TLS slot. Volatile
-    // matches transition-assembly accesses.
-    unsafe {
-        core::arch::asm!(
-            load_tls_block_base!("{block}"),
-            block = out(reg) block,
-            options(nomem, nostack, preserves_flags)
-        );
-        ((block + tls_offset::GUEST_VECTOR_STATE) as *mut GuestVectorState)
-            .write_volatile(state.clone());
-    }
+    let thread = guest_thread_state();
+    // SAFETY: as in `get_guest_vector_state`.
+    unsafe { (*thread.as_ptr()).vector.copy_from(state) };
+}
+
+/// Fills this thread's resume frame in from `ctx` and its guest vector state,
+/// and returns it, ready for `rt_sigreturn`.
+fn prepare_resume_frame(ctx: &litebox_common_linux::PtRegs) -> *mut resume_frame::ResumeFrame {
+    // SAFETY: as in `get_guest_vector_state`.
+    let state = unsafe { &mut *guest_thread_state().as_ptr() };
+    state.resume_frame.prepare(ctx, &state.vector)
 }
 
 unsafe extern "C" {
@@ -1786,17 +1979,20 @@ pub(super) fn signal_handler_take_guest() -> Option<*mut litebox_common_linux::P
 
 /// Captures kernel-saved guest vector state from the signal frame.
 /// Invalid required vector state terminates the process.
+///
+/// Only for a signal that interrupted the guest, i.e. with `in_guest` set:
+/// the state was published before guest entry, and no Rust borrow of it is
+/// live while the guest runs.
 pub(super) fn signal_handler_capture_guest_vector_state(context: &libc::ucontext_t) {
-    let block: usize;
-    // SAFETY: `TPIDR_EL0` anchors host TLS even in guest code. Reads no memory.
-    unsafe {
-        core::arch::asm!(
-            load_tls_block_base!("{block}"),
-            block = out(reg) block,
-            options(nostack, nomem, preserves_flags)
-        );
+    let state = published_guest_thread_state();
+    if state.is_null() {
+        fatal_aarch64_runtime_state();
     }
-    if !resume_frame::capture_signal_vector_state(context, block) {
+    // SAFETY: per this function's precondition, a published root is this
+    // thread's live state (see [`GuestThreadState`]) and no other reference
+    // to it is live.
+    let state = unsafe { &mut (*state).vector };
+    if !resume_frame::capture_signal_vector_state(context, state) {
         fatal_aarch64_runtime_state();
     }
 }
@@ -1924,11 +2120,15 @@ mod tests {
 
         let platform = LinuxUserland::new();
         let original = platform.get_guest_vector_state();
-        let expected = litebox_common_linux::GuestVectorState {
-            registers: core::array::from_fn(|index| index as u128 * 0x101),
-            fpsr: 0x1234,
-            fpcr: 0x5678,
-        };
+        let mut expected = GuestVectorState::new(original.sve_vl());
+        *expected.v_registers_mut() = core::array::from_fn(|index| index as u128 * 0x101);
+        expected.set_fpsr(0x1234);
+        expected.set_fpcr(0x5678);
+        if let Some(vl) = expected.sve_vl() {
+            expected
+                .set_sve_registers(&vec![0x5a; vl.registers_size()])
+                .unwrap();
+        }
         platform.set_guest_vector_state(&expected);
         let (send, receive) = std::sync::mpsc::channel();
         unsafe {
@@ -2087,17 +2287,83 @@ mod tests {
         assert_eq!(offset_of!(PtRegs, syscallno), 280);
     }
 
+    /// Live SVE must bypass the FP/SIMD-only outbound stub.
     #[test]
-    fn guest_vector_state_has_kernel_fpsimd_layout_and_zero_default() {
-        let state = GuestVectorState::default();
-        assert_eq!(core::mem::align_of::<GuestVectorState>(), 16);
-        assert_eq!(core::mem::size_of::<GuestVectorState>(), 528);
-        assert_eq!(core::mem::offset_of!(GuestVectorState, registers), 0);
-        assert_eq!(core::mem::offset_of!(GuestVectorState, fpsr), 512);
-        assert_eq!(core::mem::offset_of!(GuestVectorState, fpcr), 516);
-        assert!(state.registers.iter().all(|register| *register == 0));
-        assert_eq!(state.fpsr, 0);
-        assert_eq!(state.fpcr, 0);
+    fn live_sve_state_round_trips_and_disables_the_outbound_stub() {
+        LinuxUserland::new();
+        let Some(vl) = host_sve_vector_length() else {
+            return;
+        };
+        let block = current_tls_block();
+        let ctx = PtRegs {
+            pc: 0x1004,
+            ..PtRegs::default()
+        };
+        // SAFETY: this thread's own slots; no guest runs on this thread.
+        unsafe {
+            ((block + tls_offset::OUTBOUND_STUB) as *mut usize).write_volatile(0x4000);
+            ((block + tls_offset::OUTBOUND_PC) as *mut usize).write_volatile(ctx.pc);
+        }
+
+        let mut fpsimd = GuestVectorState::default();
+        *fpsimd.v_registers_mut() = core::array::from_fn(|index| u128::MAX / 37 * index as u128);
+        fpsimd.set_fpsr(0x10);
+        fpsimd.set_fpcr(0x0040_0000);
+        let registers: Vec<u8> = (0..vl.registers_size())
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let mut live = GuestVectorState::new(Some(vl));
+        live.copy_from(&fpsimd);
+        live.set_sve_registers(&registers).unwrap();
+        set_guest_vector_state(&live);
+        assert_eq!(get_guest_vector_state(), live);
+        assert!(!resumes_via_outbound_stub(&ctx));
+
+        // A syscall-time state, as fork decodes it, leaves SVE state inactive.
+        set_guest_vector_state(&fpsimd);
+        let mut inactive = GuestVectorState::new(Some(vl));
+        inactive.copy_from(&fpsimd);
+        assert_eq!(get_guest_vector_state(), inactive);
+        assert!(resumes_via_outbound_stub(&ctx));
+
+        // SAFETY: as above.
+        unsafe {
+            ((block + tls_offset::OUTBOUND_STUB) as *mut usize).write_volatile(0);
+            ((block + tls_offset::OUTBOUND_PC) as *mut usize).write_volatile(0);
+        }
+    }
+
+    /// The published pointers address this thread's state and its buffer, and
+    /// are cleared when the thread's state is freed.
+    #[test]
+    fn guest_vector_state_is_published_until_thread_exit() {
+        std::thread::spawn(|| {
+            let block = current_tls_block();
+            let buffer = || {
+                // SAFETY: an own-thread [`tls_offset`] slot access.
+                unsafe {
+                    ((block + tls_offset::GUEST_VECTOR_BUFFER) as *const *mut u8).read_volatile()
+                }
+            };
+            assert!(published_guest_thread_state().is_null());
+            assert_eq!(
+                get_guest_vector_state(),
+                GuestVectorState::new(host_sve_vector_length())
+            );
+            assert!(published_guest_thread_state().is_null());
+
+            prepare_guest_vector_state(None);
+            let state = published_guest_thread_state();
+            assert!(!state.is_null());
+            // SAFETY: the published root of this thread's live state.
+            assert_eq!(buffer(), unsafe { (*state).vector.as_mut_ptr() });
+
+            drop(GUEST_THREAD_STATE_OWNER.take());
+            assert!(published_guest_thread_state().is_null());
+            assert!(buffer().is_null());
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

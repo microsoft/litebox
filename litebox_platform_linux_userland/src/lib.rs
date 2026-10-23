@@ -43,7 +43,7 @@ pub mod process;
 #[cfg(target_arch = "aarch64")]
 use arch::{
     Aarch64GateSignalResult, GateInterruption, assert_tls_block_placement,
-    canonicalize_runtime_aarch64_gate_signal_context, fatal_aarch64_runtime_state,
+    canonicalize_runtime_aarch64_gate_signal_context, detect_host_sve, fatal_aarch64_runtime_state,
     guest_thread_pointer_tp_offset, signal_handler_capture_guest_vector_state,
     signal_handler_set_interrupt, signal_handler_take_guest, sync_instruction_stream,
 };
@@ -119,7 +119,10 @@ impl LinuxUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
     pub fn new() -> &'static Self {
         #[cfg(target_arch = "aarch64")]
-        assert_tls_block_placement();
+        {
+            assert_tls_block_placement();
+            detect_host_sve();
+        }
 
         register_exception_handlers();
 

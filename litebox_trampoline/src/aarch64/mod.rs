@@ -33,6 +33,8 @@
 //! x18 scratch frames need writable memory below SP; writeback pairs may spill as
 //! deep as `align_up(16 + max(0, -writeback), 16)`. Recovery distinguishes faults
 //! in these runtime spills from faults in the guest instruction.
+//! Ordinary x18 gates run at the original SP and spill scratches into `[SP-16, SP)`,
+//! so the gated instruction must not store there; AAPCS64 forbids such stores.
 //!
 //! # SVC return protocol
 //!
@@ -69,6 +71,8 @@ pub mod recovery;
 use crate::{Error, Result, TargetHost};
 use alloc::format;
 use alloc::vec::Vec;
+use disarm64::InsnOpcode as _;
+use disarm64_defn::{InsnBitField, InsnOperandClass, InsnOperandKind};
 use yaxpeax_arch::{Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::{
     InstDecoder, Instruction as DecodedInstruction, Opcode as DecodedOpcode, Operand,
@@ -836,16 +840,98 @@ fn x18_fixed_gate_can_execute(instruction: &DecodedInstruction) -> bool {
 }
 
 fn has_possible_x18_field(word: u32) -> bool {
-    // Exclude vector-only SVE ADD, but retain scalar SVE x18 detection.
-    if word & 0xFF20_FC00 == 0x0420_0000 {
-        return false;
-    }
     [0, 5, 10, 16]
         .into_iter()
         .any(|shift| (word >> shift) & REG_MASK == u32::from(X18))
         || [0, 16]
             .into_iter()
             .any(|shift| (word >> shift) & REG_MASK == u32::from(X18 - 1))
+}
+
+/// SVE op0 (bits 28:25) = `0b0010`; unsupported by yaxpeax-arm 0.4.0.
+const SVE_ENCODING_MASK: u32 = 0x1E00_0000;
+const SVE_ENCODING_BITS: u32 = 0x0400_0000;
+
+/// Returns `None` for non-SVE words, decode failures or unknown scalar fields,
+/// leaving the conservative field scan to decide.
+///
+/// Known disarm64 0.2.0 SVE `INT_REG`/`ADDRESS` fields:
+/// - `Rd`@0, `Rn`@5, `Rm`@16, `SVE_Rn`@16 and `SVE_Rm`@5 (5 bits) name X/W
+///   registers, with 31 meaning XZR or SP depending on the operand kind;
+/// - `SVE_Zn`, `SVE_Zm_16` (vector base/offset) and `SVE_xs_14`/`SVE_xs_22`
+///   (offset extend) are the remaining `ADDRESS` components.
+///
+/// Operand classes distinguish GPRs from `SIMD_REG` uses of `Rd` (e.g. `Vd`);
+/// no other class holds a 5-bit GPR (`psel`'s 2-bit `SME_Rm` selects W12-W15).
+/// Only `Rd_SP` (ADDVL/ADDPL/ADDSVL/ADDSPL) can write SP; SVE has no writeback.
+fn classify_sve_x18(word: u32) -> Option<X18Classification> {
+    if word & SVE_ENCODING_MASK != SVE_ENCODING_BITS {
+        return None;
+    }
+    let definition = disarm64::decoder::decode(word)?.definition();
+    let mut used = [false; 32];
+    // Bit `n` set: the 5-bit register field at bit `n` holds 18.
+    let mut x18_field_lsbs = 0u32;
+    let mut writes_sp = false;
+    for operand in definition.operands {
+        if !matches!(
+            operand.class,
+            InsnOperandClass::INT_REG | InsnOperandClass::ADDRESS
+        ) {
+            continue;
+        }
+        for field in operand.bit_fields {
+            match field.bitfield {
+                InsnBitField::Rd
+                | InsnBitField::Rn
+                | InsnBitField::Rm
+                | InsnBitField::SVE_Rn
+                | InsnBitField::SVE_Rm
+                    if field.width == 5 => {}
+                InsnBitField::SVE_Zn
+                | InsnBitField::SVE_Zm_16
+                | InsnBitField::SVE_xs_14
+                | InsnBitField::SVE_xs_22 => continue,
+                _ => return None,
+            }
+            let register = (word >> field.lsb) & REG_MASK;
+            used[register as usize] = true;
+            if register == u32::from(X18) {
+                x18_field_lsbs |= 1 << field.lsb;
+            }
+            writes_sp |= operand.kind == InsnOperandKind::Rd_SP && register == u32::from(SP);
+        }
+    }
+    if x18_field_lsbs == 0 {
+        return Some(X18Classification::None);
+    }
+    let unsupported = X18Classification::X18(X18TransformResult::Unsupported(
+        X18Unsupported::EncodingLayout,
+    ));
+    if writes_sp {
+        return Some(unsupported);
+    }
+    let mut available = (7u8..=17)
+        .rev()
+        .filter(|register| !used[usize::from(*register)]);
+    let (Some(scratch), Some(anchor_scratch)) = (available.next(), available.next()) else {
+        return Some(unsupported);
+    };
+    // Multiplying the lsb mask places a register number in every x18 field.
+    let substituted = (word & !(x18_field_lsbs * REG_MASK)) | (x18_field_lsbs * u32::from(scratch));
+    // Same definition with only x18 fields changed means the same operation on scratch.
+    let redecoded = disarm64::decoder::decode(substituted);
+    if !redecoded.is_some_and(|insn| core::ptr::eq(insn.definition(), definition)) {
+        return Some(unsupported);
+    }
+    Some(X18Classification::X18(X18TransformResult::Supported(
+        X18Substitution {
+            word: substituted,
+            scratch,
+            anchor_scratch,
+            pc_relative: None,
+        },
+    )))
 }
 
 fn is_control_flow(opcode: DecodedOpcode) -> bool {
@@ -1001,6 +1087,9 @@ pub fn classify_x18(word: u32) -> X18Classification {
         ));
     }
     let Some(instruction) = decode_instruction(word) else {
+        if let Some(classification) = classify_sve_x18(word) {
+            return classification;
+        }
         return if has_possible_x18_field(word) {
             X18Classification::X18(X18TransformResult::Unsupported(
                 X18Unsupported::DecodeFailure,
@@ -2481,18 +2570,89 @@ mod tests {
                 )),
             ),
             (0xffff_ffff, X18Classification::None),
-            (0x0420_e3e7, X18Classification::None), // SVE cntb
-            (0x2522_1ce1, X18Classification::None), // SVE whilelo
-            (0x04e1_0012, X18Classification::None), // SVE add z18.d, z0.d, z1.d
-            (0x0432_0252, X18Classification::None), // SVE add z18.b, z18.b, z18.b
-            (0x0472_0252, X18Classification::None), // SVE add z18.h, z18.h, z18.h
-            (0x04b2_0252, X18Classification::None), // SVE add z18.s, z18.s, z18.s
-            (0x04f2_0252, X18Classification::None), // SVE add z18.d, z18.d, z18.d
-            (0xa400_a020, X18Classification::None), // SVE ld1b
-            (0xe400_e060, X18Classification::None), // SVE st1b
         ] {
             assert_eq!(classify_x18(word), expected, "word {word:#010x}");
         }
+    }
+    // Encodings from `llvm-mc -triple=aarch64 -mattr=+sve,+sve2 --show-encoding`.
+    #[test]
+    fn sve_fields_that_only_resemble_x18_are_not_x18_uses() {
+        for word in [
+            0x8580_4822, // ldr z2, [x1, #2, mul vl]
+            0x8580_4012, // ldr z18, [x0]
+            0x85bf_5c11, // ldr z17, [x0, #-1, mul vl]
+            0xe582_4852, // str z18, [x2, #18, mul vl]
+            0xa5f1_4032, // ld1d {z18.d}, p0/z, [x1, x17, lsl #3]
+            0x65b2_0a32, // fmla z18.s, p2/m, z17.s, z18.s
+            0x25f1_1c02, // whilelo p2.d, x0, x17
+            0x2502_4842, // mov p2.b, p2/z, p2.b
+            0x04f2_4240, // index z0.d, #-14, #-14
+            0x0432_0252, // add z18.b, z18.b, z18.b
+        ] {
+            assert!(has_possible_x18_field(word), "word {word:#010x}");
+            assert_eq!(
+                classify_x18(word),
+                X18Classification::None,
+                "word {word:#010x}"
+            );
+        }
+    }
+    #[test]
+    fn sve_x18_register_fields_are_substituted() {
+        for (word, expected, scratch) in [
+            (0xa5e1_4240, 0xa5e1_4220, 17), // ld1d {z0.d}, p0/z, [x18, x1, lsl #3]
+            (0xa5f2_4000, 0xa5f1_4000, 17), // ld1d {z0.d}, p0/z, [x0, x18, lsl #3]
+            (0xa5e1_a240, 0xa5e1_a220, 17), // ld1d {z0.d}, p0/z, [x18, #1, mul vl]
+            (0x8580_4a40, 0x8580_4a20, 17), // ldr z0, [x18, #2, mul vl]
+            (0xc5e1_c240, 0xc5e1_c220, 17), // ld1d {z0.d}, p0/z, [x18, z1.d, lsl #3]
+            (0xc592_c020, 0xc591_c020, 17), // ldnt1d {z0.d}, p0/z, [z1.d, x18]
+            (0x8581_c240, 0x8581_c220, 17), // prfd pldl1keep, p0, [x18, x1, lsl #3]
+            (0x25e1_1e40, 0x25e1_1e20, 17), // whilelo p0.d, x18, x1
+            (0x25b2_0420, 0x25b1_0420, 17), // whilelt p0.s, w1, w18
+            (0x04e0_e3f2, 0x04e0_e3f1, 17), // cntd x18
+            (0x04f1_e3f2, 0x04f1_e3f1, 17), // incd x18, all, mul #2
+            (0x04a0_fbf2, 0x04a0_fbf1, 17), // sqdecw x18, w18
+            (0x25ec_8812, 0x25ec_8811, 17), // incp x18, p0.d
+            (0x0432_5032, 0x0431_5031, 17), // addvl x18, x18, #1
+            (0x0472_5040, 0x0471_5040, 17), // addpl x0, x18, #2
+            (0x043f_5032, 0x043f_5031, 17), // addvl x18, sp, #1
+            (0x04bf_5032, 0x04bf_5031, 17), // rdvl x18, #1
+            (0x05e1_a012, 0x05e1_a011, 17), // lastb x18, p0, z0.d
+            (0x05f0_a012, 0x05f0_a011, 17), // clasta x18, p0, x18, z0.d
+            (0x05e0_3a40, 0x05e0_3a20, 17), // mov z0.d, x18 (dup)
+            (0x05e8_a240, 0x05e8_a220, 17), // mov z0.d, p0/m, x18 (cpy)
+            (0x05e4_3a40, 0x05e4_3a20, 17), // insr z0.d, x18
+            (0x04e1_4640, 0x04e1_4620, 17), // index z0.d, x18, #1
+            (0x25e1_2240, 0x25e1_2220, 17), // ctermeq x18, x1
+            (0xa5f2_4240, 0xa5f1_4220, 17), // ld1d {z0.d}, p0/z, [x18, x18, lsl #3]
+            (0x25f2_1e40, 0x25f1_1e20, 17), // whilelo p0.d, x18, x18
+            (0xa5f2_4220, 0xa5f0_4220, 16), // ld1d {z0.d}, p0/z, [x17, x18, lsl #3]
+            (0xa5e1_4252, 0xa5e1_4232, 17), // ld1d {z18.d}, p0/z, [x18, x1, lsl #3]
+            (0xa5f2_43e0, 0xa5f1_43e0, 17), // ld1d {z0.d}, p0/z, [sp, x18, lsl #3]
+        ] {
+            let X18Classification::X18(X18TransformResult::Supported(substitution)) =
+                classify_x18(word)
+            else {
+                panic!("word {word:#010x} was not supported");
+            };
+            assert_eq!(
+                (substitution.word, substitution.scratch),
+                (expected, scratch),
+                "word {word:#010x}"
+            );
+            assert_ne!(substitution.anchor_scratch, scratch);
+            assert!((7..=17).contains(&substitution.anchor_scratch));
+            assert_eq!(substitution.pc_relative, None);
+        }
+    }
+    #[test]
+    fn sve_x18_sp_destination_is_unsupported() {
+        assert_eq!(
+            classify_x18(0x0432_503f), // addvl sp, x18, #1
+            X18Classification::X18(X18TransformResult::Unsupported(
+                X18Unsupported::EncodingLayout
+            ))
+        );
     }
     #[test]
     fn decoder_fallback_does_not_treat_mov_immediate_as_x18() {

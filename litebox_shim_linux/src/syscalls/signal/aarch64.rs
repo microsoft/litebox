@@ -15,73 +15,27 @@ use litebox_common_linux::{
     MapFlags, ProtFlags, PtRegs,
     signal::{
         SaFlags, SigAction, Siginfo, Ucontext,
-        aarch64::{GuestVectorState, Sigcontext},
+        aarch64::{
+            GuestVectorState, RESERVED_SIZE, Sigcontext, SveVectorLength, UnknownRecords,
+            parse_signal_records,
+        },
     },
 };
 use litebox_trampoline::{
     aarch64::RT_SIGRETURN_TRAMPOLINE_BYTES, aarch64::emit_rt_sigreturn_trampoline,
 };
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, IntoBytes};
 
-const FPSIMD_MAGIC: u32 = 0x4650_8001;
-
-#[repr(C)]
-#[derive(Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
-struct FpsimdContext {
-    magic: u32,
-    size: u32,
-    fpsr: u32,
-    fpcr: u32,
-    vregs: [u128; 32],
-}
-
-#[repr(C)]
-#[derive(Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
-struct Aarch64Ctx {
-    magic: u32,
-    size: u32,
-}
-
-#[repr(align(16))]
-struct AlignedContextRecords([u8; 4096]);
-
-fn write_vector_state(records: &mut [u8; 4096], state: &GuestVectorState) {
-    let (fpsimd, rest) = FpsimdContext::mut_from_prefix(records).unwrap();
-    fpsimd.magic = FPSIMD_MAGIC;
-    fpsimd.size = u32::try_from(size_of::<FpsimdContext>()).unwrap();
-    fpsimd.fpsr = state.fpsr;
-    fpsimd.fpcr = state.fpcr;
-    fpsimd.vregs = state.registers;
-    let (end, _) = Aarch64Ctx::mut_from_prefix(rest).unwrap();
-    end.magic = 0;
-    end.size = 0;
-}
-
-fn read_vector_state(records: &[u8; 4096]) -> Option<GuestVectorState> {
-    let mut records = records.as_slice();
-    let mut state = None;
-    loop {
-        let (header, _) = Aarch64Ctx::ref_from_prefix(records).ok()?;
-        if header.magic == 0 && header.size == 0 {
-            return state;
-        }
-        let size = usize::try_from(header.size).ok()?;
-        if size < size_of::<Aarch64Ctx>() || size > records.len() || !size.is_multiple_of(16) {
-            return None;
-        }
-        if header.magic == FPSIMD_MAGIC {
-            if state.is_some() || size != size_of::<FpsimdContext>() {
-                return None;
-            }
-            let (fpsimd, _) = FpsimdContext::ref_from_prefix(&records[..size]).ok()?;
-            state = Some(GuestVectorState {
-                registers: fpsimd.vregs,
-                fpsr: fpsimd.fpsr,
-                fpcr: fpsimd.fpcr,
-            });
-        }
-        records = &records[size..];
-    }
+/// Reads vector state from the guest's `__reserved`, validating SVE against
+/// `host_vl`; returns `None` for invalid records.
+fn read_vector_state(
+    reserved: &[u8; RESERVED_SIZE],
+    host_vl: Option<SveVectorLength>,
+) -> Option<GuestVectorState> {
+    let records = parse_signal_records(reserved, UnknownRecords::Reject).ok()?;
+    let mut state = GuestVectorState::new(host_vl);
+    state.load_signal_records(&records).ok()?;
+    Some(state)
 }
 
 /// Linux `rt_sigframe` followed by an unwind-link frame record. Dynamic extra
@@ -124,6 +78,12 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> Option<usize> 
     let frame_addr = sp.checked_sub(core::mem::size_of::<SignalFrame>())?;
     // Linux AArch64 signal entry requires a 16-byte-aligned stack pointer.
     Some(frame_addr & !15)
+}
+
+/// Returns the SVE vector length of guest vector state, which is the host's,
+/// or `None` when the platform does not manage guest SVE state.
+pub(crate) fn guest_sve_vl<Platform: ShimPlatform>(platform: &Platform) -> Option<SveVectorLength> {
+    platform.get_guest_vector_state().sve_vl()
 }
 
 fn requested_restorer(action: &SigAction) -> Option<usize> {
@@ -187,6 +147,7 @@ pub(super) fn sigreturn_trampoline<Platform: ShimPlatform>(
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
+    /// Like Linux, handlers retain the interrupted vector state, including live SVE.
     pub(super) fn write_signal_frame(
         &self,
         platform: &Platform,
@@ -203,8 +164,11 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             *dst = *src as u64;
         }
 
-        let mut reserved = AlignedContextRecords([0; 4096]);
-        write_vector_state(&mut reserved.0, &platform.get_guest_vector_state());
+        let mut reserved = [0; RESERVED_SIZE];
+        platform
+            .get_guest_vector_state()
+            .write_signal_records(&mut reserved)
+            .ok_or(DeliverFault)?;
         let frame = SignalFrame {
             siginfo: siginfo.clone(),
             ucontext: Ucontext {
@@ -221,7 +185,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                     pc: ctx.pc as u64,
                     pstate: ctx.pstate,
                     __reserved_pad: [0; _],
-                    __reserved: reserved.0,
+                    __reserved: reserved,
                 },
             },
             next_frame_fp: ctx.regs[29],
@@ -252,13 +216,13 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     }
 }
 
+/// Restores scalar state before validating vector records, as Linux does;
+/// returns restored X0, or `None` with vector state unchanged for invalid records.
 pub(super) fn restore_sigcontext<Platform: ShimPlatform>(
     platform: &Platform,
     ctx: &mut PtRegs,
     sigctx: &Sigcontext,
 ) -> Option<usize> {
-    let vector_state = read_vector_state(&sigctx.__reserved)?;
-    platform.set_guest_vector_state(&vector_state);
     let Sigcontext {
         fault_address: _,
         regs,
@@ -278,13 +242,21 @@ pub(super) fn restore_sigcontext<Platform: ShimPlatform>(
     ctx.pstate = *pstate & litebox_common_linux::arch::SAFE_USER_PSTATE;
     ctx.syscallno = litebox_common_linux::arch::NO_SYSCALL;
 
+    let vector_state = read_vector_state(&sigctx.__reserved, guest_sve_vl(platform))?;
+    platform.set_guest_vector_state(&vector_state);
     Some(ctx.regs[0])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_common_linux::signal::{SaFlags, SigSet};
+    use crate::UserPtr;
+    use crate::syscalls::signal::siginfo_kill;
+    use crate::syscalls::tests::{TestPlatform, init_platform, test_platform};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use litebox::platform::GuestVectorStateProvider as _;
+    use litebox_common_linux::signal::{SaFlags, SigSet, Signal};
 
     fn action(flags: SaFlags, restorer: usize) -> SigAction {
         SigAction {
@@ -320,23 +292,140 @@ mod tests {
         );
     }
 
-    #[test]
-    fn vector_state_round_trips_through_signal_records() {
-        let expected = GuestVectorState {
-            registers: core::array::from_fn(|index| index as u128 * 0x101),
-            fpsr: 0x1234,
-            fpcr: 0x5678,
+    /// State with patterned FP/SIMD registers and room for SVE at `sve_vl`.
+    fn fpsimd_state(sve_vl: Option<SveVectorLength>) -> GuestVectorState {
+        let mut state = GuestVectorState::new(sve_vl);
+        *state.v_registers_mut() = core::array::from_fn(|index| index as u128 * 0x101);
+        state.set_fpsr(0x1234);
+        state.set_fpcr(0x5678);
+        state
+    }
+
+    fn live_state(vl: SveVectorLength) -> GuestVectorState {
+        let registers: Vec<u8> = (0..vl.registers_size())
+            .map(|i| u8::try_from(i % 253).unwrap())
+            .collect();
+        let mut state = fpsimd_state(Some(vl));
+        state.set_sve_registers(&registers).unwrap();
+        state
+    }
+
+    fn records(state: &GuestVectorState) -> [u8; RESERVED_SIZE] {
+        let mut records = [0; RESERVED_SIZE];
+        state.write_signal_records(&mut records).unwrap();
+        records
+    }
+
+    /// Delivers a signal at the end of `stack` with `state` as the platform's
+    /// guest vector state.
+    fn deliver(stack: &mut [u128], state: &GuestVectorState) -> PtRegs {
+        let platform = test_platform();
+        platform.set_guest_vector_state(state);
+        let signals = SignalState::<TestPlatform>::new_process();
+        let action = action(SaFlags::SIGINFO, 0);
+        let mut regs = [0; 31];
+        regs[29] = 0x2929;
+        regs[30] = 0x3030;
+        let sp = stack.as_mut_ptr_range().end.addr();
+        let mut ctx = PtRegs {
+            regs,
+            sp,
+            pc: 0x4000,
+            ..PtRegs::default()
         };
-        let mut records = [0; 4096];
-        write_vector_state(&mut records, &expected);
-        assert_eq!(read_vector_state(&records), Some(expected.clone()));
+        let frame = get_signal_frame(sp, &action).unwrap();
+        assert!(frame >= stack.as_ptr().addr());
+        let siginfo = siginfo_kill(Signal::SIGUSR1);
+        let written =
+            signals.write_signal_frame(platform, frame, &siginfo, &action, &mut ctx, 0x7000);
+        assert!(written.is_ok());
+        ctx
+    }
 
-        records[4..8].copy_from_slice(&15u32.to_ne_bytes());
-        assert_eq!(read_vector_state(&records), None);
+    fn read_ucontext(ctx: &PtRegs) -> Ucontext {
+        UserPtr::<Ucontext>::from_usize(uctx_addr(ctx))
+            .read_at_offset::<TestPlatform>(0)
+            .unwrap()
+    }
 
-        write_vector_state(&mut records, &expected);
-        let terminator = size_of::<FpsimdContext>();
-        records[terminator..terminator + 8].fill(0xff);
-        assert_eq!(read_vector_state(&records), None);
+    #[test]
+    fn signal_frames_round_trip_vector_state() {
+        let host_vl = guest_sve_vl(test_platform());
+        let mut stack = vec![0u128; 1024];
+        for state in core::iter::once(fpsimd_state(host_vl)).chain(host_vl.map(live_state)) {
+            let ctx = deliver(&mut stack, &state);
+            let reserved = read_ucontext(&ctx).mcontext.__reserved;
+            assert_eq!(read_vector_state(&reserved, host_vl), Some(state));
+        }
+    }
+
+    #[test]
+    fn rt_sigreturn_rejects_sve_records_the_host_cannot_restore() {
+        let host = SveVectorLength::new(16).unwrap();
+        let other = SveVectorLength::MAX;
+        let live = records(&live_state(other));
+        assert_eq!(read_vector_state(&live, Some(host)), None, "VL mismatch");
+        assert_eq!(read_vector_state(&live, None), None, "no SVE on the host");
+
+        // Linux checks the VL of header-only records too.
+        let header_only = records(&fpsimd_state(Some(other)));
+        assert_eq!(
+            read_vector_state(&header_only, Some(host)),
+            None,
+            "header-only VL mismatch"
+        );
+
+        // Records without an SVE record leave SVE state inactive.
+        assert_eq!(
+            read_vector_state(&records(&fpsimd_state(None)), Some(host)),
+            Some(fpsimd_state(Some(host)))
+        );
+    }
+
+    /// Like Linux, a frame with invalid records still restores the scalar
+    /// context, which the forced `SIGSEGV` then reports.
+    #[test]
+    fn rt_sigreturn_restores_scalar_context_before_rejecting_records() {
+        let platform = test_platform();
+        let host_vl = guest_sve_vl(platform);
+        let mut stack = vec![0u128; 1024];
+        let sp = stack.as_mut_ptr_range().end.addr();
+        let mut ctx = deliver(&mut stack, &fpsimd_state(host_vl));
+        let before = GuestVectorState::new(host_vl);
+        platform.set_guest_vector_state(&before);
+        let mut ucontext = read_ucontext(&ctx);
+        // An FP/SIMD record of the wrong size is invalid.
+        ucontext.mcontext.__reserved[4..8].copy_from_slice(&16u32.to_ne_bytes());
+        ctx.pc = 0x7000;
+        ctx.syscallno = 139;
+
+        assert_eq!(
+            restore_sigcontext(platform, &mut ctx, &ucontext.mcontext),
+            None
+        );
+        assert_eq!((ctx.pc, ctx.sp), (0x4000, sp));
+        assert_eq!((ctx.regs[29], ctx.regs[30]), (0x2929, 0x3030));
+        assert_eq!(ctx.syscallno, litebox_common_linux::arch::NO_SYSCALL);
+        assert_eq!(platform.get_guest_vector_state(), before);
+    }
+
+    /// Like Linux, `rt_sigreturn` rejects an unaligned SP before it installs
+    /// the frame's signal mask.
+    #[test]
+    fn rt_sigreturn_rejects_an_unaligned_sp_before_installing_the_mask() {
+        let task = init_platform();
+        let mut stack = vec![0u128; 512];
+        let mut ctx = PtRegs {
+            sp: stack.as_mut_ptr().addr() + 8,
+            ..PtRegs::default()
+        };
+        // Read from this SP, the frame would block every signal.
+        UserPtrMut::<SigSet>::from_usize(uctx_addr(&ctx) + offset_of!(Ucontext, sigmask))
+            .write_at_offset::<TestPlatform>(0, SigSet::from_u64(u64::MAX))
+            .unwrap();
+        let blocked = task.signals.blocked.get();
+        assert_eq!(task.sys_rt_sigreturn(&mut ctx), 0);
+        assert_eq!(task.signals.blocked.get(), blocked);
+        assert!(task.pending_signal_set().contains(Signal::SIGSEGV));
     }
 }

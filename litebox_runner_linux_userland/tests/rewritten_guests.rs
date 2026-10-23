@@ -65,6 +65,66 @@ fn test_guest_simd_survives_signal_delivery() {
     run_rewritten_fixture("./tests/sigreturn_simd.c", "sigreturn_simd_rewriter");
 }
 
+/// Interrupted SVE state (Z, P and FFR) survives a guest signal whose `sve_context`
+/// carries it, and the handler's edits to the record take effect.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_guest_sve_survives_asynchronous_signals() {
+    if !std::arch::is_aarch64_feature_detected!("sve") {
+        return;
+    }
+    let output = run_rewritten_fixture("./tests/sve_signal.c", "sve_signal_rewriter");
+    assert!(
+        String::from_utf8_lossy(&output).contains("sve signal ok"),
+        "guest did not report preserved SVE state: {}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+/// The guest-visible SVE syscall ABI (hwcaps, P/FFR zeroing, `PR_SVE_*`); see `sve_syscall_abi.c`.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_guest_sve_syscall_abi() {
+    let unique_name = "sve_syscall_abi_rewriter";
+    let target = common::compile("./tests/sve_syscall_abi.c", unique_name, true, false);
+    // SAFETY: `getauxval` only reads this process's auxiliary vector.
+    let host = unsafe {
+        litebox::platform::HostHwcaps {
+            hwcap: libc::getauxval(libc::AT_HWCAP),
+            hwcap2: libc::getauxval(libc::AT_HWCAP2),
+        }
+    };
+    // The platform manages guest SVE state exactly when the host has SVE.
+    let (hwcap, hwcap2) = litebox_common_linux::arch::guest_hwcaps(
+        host,
+        std::arch::is_aarch64_feature_detected!("sve"),
+    );
+    let output = Runner::new(&target, unique_name)
+        .args([hwcap.bits().to_string(), hwcap2.bits().to_string()])
+        .output();
+    assert!(
+        String::from_utf8_lossy(&output).contains("sve syscall abi ok"),
+        "guest SVE syscall ABI checks failed: {}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+/// SVE x18 operands use guest state; with `aarch64_virtualize_x18`, gates are
+/// required because physical x18 never holds the guest value.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_guest_sve_uses_guest_x18() {
+    if !std::arch::is_aarch64_feature_detected!("sve") {
+        return;
+    }
+    let output = run_rewritten_fixture("./tests/sve_x18.c", "sve_x18_rewriter");
+    assert!(
+        String::from_utf8_lossy(&output).contains("sve x18 ok"),
+        "guest SVE x18 uses failed: {}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
 /// Semantic stress only: sampling cannot prove a signal PC landed inside a
 /// short gate; synthetic tests cover each gate instruction boundary.
 #[test]

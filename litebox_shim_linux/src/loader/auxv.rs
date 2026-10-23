@@ -91,6 +91,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             AuxKey::AT_MINSIGSTKSZ,
             crate::syscalls::signal::max_signal_frame_size(),
         );
+        #[cfg(target_arch = "aarch64")]
+        if let Some(host) = self.global.platform.host_hwcaps() {
+            let sve = crate::syscalls::signal::guest_sve_vl(self.global.platform).is_some();
+            let (hwcap, hwcap2) = litebox_common_linux::arch::guest_hwcaps(host, sve);
+            for (key, bits) in [
+                (AuxKey::AT_HWCAP, hwcap.bits()),
+                (AuxKey::AT_HWCAP2, hwcap2.bits()),
+            ] {
+                aux.insert(key, usize::try_from(bits).expect("AArch64 Linux is LP64"));
+            }
+        }
 
         aux
     }

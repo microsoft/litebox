@@ -34,7 +34,7 @@ fn ratchet_transmutes() -> Result<()> {
 fn ratchet_pub_uses() -> Result<()> {
     ratchet(
         &[
-            ("litebox/", 9),
+            ("litebox/", 10),
             ("litebox_broker_core/", 6),
             ("litebox_broker_host/", 1),
             ("litebox_broker_local/", 1),
@@ -77,7 +77,7 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_hal/", 1),
             ("litebox_platform/", 2),
             ("litebox_platform_linux_kernel/", 5),
-            ("litebox_platform_linux_userland/", 7),
+            ("litebox_platform_linux_userland/", 9),
             ("litebox_platform_macos_userland/", 7),
             ("litebox_platform_lvbs/", 24),
             ("litebox_platform_vm_kernel/", 7),

@@ -422,6 +422,20 @@ impl PatchKind {
     }
 }
 
+/// `MOVPRFX Zd, Zn` (unpredicated).
+const MOVPRFX_UNPREDICATED_MASK: u32 = 0xFFFF_FC00;
+const MOVPRFX_UNPREDICATED_BITS: u32 = 0x0420_BC00;
+/// `MOVPRFX Zd.T, Pg/<Z|M>, Zn.T` (predicated).
+const MOVPRFX_PREDICATED_MASK: u32 = 0xFF3E_E000;
+const MOVPRFX_PREDICATED_BITS: u32 = 0x0410_2000;
+
+/// Replacing `MOVPRFX`'s required compatible destructive SVE successor with
+/// `B gate` makes the pair constrained-unpredictable.
+fn is_movprfx(word: u32) -> bool {
+    word & MOVPRFX_UNPREDICATED_MASK == MOVPRFX_UNPREDICATED_BITS
+        || word & MOVPRFX_PREDICATED_MASK == MOVPRFX_PREDICATED_BITS
+}
+
 /// Scans executable sections for Linux syscall/thread-pointer gates and, when
 /// configured, x18 gates. Linux-specific sites are still rejected for Windows;
 /// x18 sites inside lexical exclusive sequences are rejected. AArch64
@@ -567,6 +581,16 @@ fn find_patch_sites_with_code_ranges(
                     match classify_x18(insn) {
                         X18Classification::None => continue,
                         X18Classification::Branch(branch) => PatchKind::X18Branch(branch),
+                        X18Classification::X18(X18TransformResult::Supported(_))
+                            if i >= INSN_BYTES
+                                && is_movprfx(u32::from_le_bytes(
+                                    section_data[i - INSN_BYTES..i].try_into().unwrap(),
+                                )) =>
+                        {
+                            PatchKind::X18(X18TransformResult::Unsupported(
+                                X18Unsupported::EncodingLayout,
+                            ))
+                        }
                         X18Classification::X18(result) => PatchKind::X18(result),
                     }
                 }
@@ -1259,35 +1283,75 @@ mod tests {
         assert_eq!(sites[0].vaddr, 0x1008);
     }
     #[test]
-    fn sve_scalar_x18_operands_are_trapped() {
+    fn sve_scalar_x18_operands_use_the_ordinary_x18_gate() {
         for word in [
             0x0420_e3f2, // cntb x18
             0x04f2_e3f2, // incd x18, all, mul #3
-            0x25e1_1e40, // whilelo p0.d, x18, x1
             0x25f2_1c00, // whilelo p0.d, x0, x18
             0xa5e0_a240, // ld1d { z0.d }, p0/z, [x18]
             0xe5e0_e240, // st1d { z0.d }, p0, [x18]
-            0xa5f2_4000, // ld1d { z0.d }, p0/z, [x0, x18, lsl #3]
         ] {
-            assert_eq!(
-                classify_x18(word),
-                X18Classification::X18(X18TransformResult::Unsupported(
-                    X18Unsupported::DecodeFailure,
-                )),
-                "word {word:#010x}"
+            let X18Classification::X18(X18TransformResult::Supported(substitution)) =
+                classify_x18(word)
+            else {
+                panic!("word {word:#010x} was not supported");
+            };
+            let (patched, outcome) = hook_words_opt_with_config(
+                &[word],
+                0x1000,
+                0x400000,
+                x18_config(TargetHost::Linux),
             );
-            let (patched, outcome) =
-                hook_words_opt_with_config(&[word], 0x1000, 0x2000, x18_config(TargetHost::Linux));
+            let outcome = outcome.unwrap();
+            assert_eq!(outcome.trapped_sites, [], "word {word:#010x}");
+            assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
+            let gate = &outcome.trampoline[GATES_START_OFFSET..];
             assert_eq!(
-                word_at(&patched, 0),
-                Insn::Brk(TRAP_BRK_IMM).encode().unwrap(),
-                "word {word:#010x}"
+                word_at(gate, gate.len() - GATE_METADATA_BYTES),
+                EncodedGateMetadata::encode(GateMetadata::X18 {
+                    scratch: substitution.scratch
+                })
+                .unwrap()
+                .0
             );
-            assert_eq!(outcome.unwrap().trapped_sites, vec![0x1000]);
+            // The relocated guest instruction is the gate's sixth word.
+            assert_eq!(word_at(gate, 20), substitution.word, "word {word:#010x}");
 
             let (native, outcome) = hook_words_opt(&[word], 0x1000, 0x2000);
             assert_eq!(word_at(&native, 0), word);
             assert!(outcome.is_none());
+        }
+    }
+    #[test]
+    fn sve_x18_site_after_movprfx_is_unsupported() {
+        const CPY_Z0_X18: u32 = 0x05e8_a240; // mov z0.d, p0/m, x18
+        const INSR_Z0_X18: u32 = 0x05e4_3a40; // insr z0.d, x18
+        let words = [
+            0x0420_bc20, // movprfx z0, z1
+            CPY_Z0_X18,
+            0x0420_bc20, // movprfx z0, z1
+            INSR_Z0_X18,
+            0x04d1_2020, // movprfx z0.d, p0/m, z1.d
+            CPY_Z0_X18,
+            0x04d0_2020, // movprfx z0.d, p0/z, z1.d
+            CPY_Z0_X18,
+            NOP,
+            CPY_Z0_X18,
+            INSR_Z0_X18,
+        ];
+        let (patched, outcome) =
+            hook_words_opt_with_config(&words, 0x1000, 0x400000, x18_config(TargetHost::Linux));
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.trapped_sites, [0x1004, 0x100c, 0x1014, 0x101c]);
+        let trap = Insn::Brk(TRAP_BRK_IMM).encode().unwrap();
+        for offset in [0x4, 0xc, 0x14, 0x1c] {
+            assert_eq!(word_at(&patched, offset), trap);
+        }
+        for offset in [0x24, 0x28] {
+            assert_eq!(
+                word_at(&patched, offset) & OPCODE_TOP6_MASK,
+                Opcode::B.bits()
+            );
         }
     }
     use alloc::vec;

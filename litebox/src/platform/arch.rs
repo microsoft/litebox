@@ -31,6 +31,21 @@ pub trait ArchSpecificProvider {
         reg: &ArchSpecificRegister,
         val: usize,
     ) -> Result<(), ArchSpecificError>;
+
+    /// Raw host AArch64 hwcaps, to be filtered by shims before guest exposure.
+    /// Defaults to `None` when the platform cannot report them.
+    #[cfg(target_arch = "aarch64")]
+    fn host_hwcaps(&self) -> Option<HostHwcaps> {
+        None
+    }
+}
+
+/// The host's raw AArch64 `AT_HWCAP` and `AT_HWCAP2` auxiliary vector words.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostHwcaps {
+    pub hwcap: u64,
+    pub hwcap2: u64,
 }
 
 /// Architecture-specific registers.
