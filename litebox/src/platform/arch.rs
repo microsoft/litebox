@@ -31,6 +31,15 @@ pub trait ArchSpecificProvider {
         reg: &ArchSpecificRegister,
         val: usize,
     ) -> Result<(), ArchSpecificError>;
+
+    /// AArch64 CPU features that guests may use: only those the host supports and whose
+    /// architectural state (registers, PSTATE bits, and PAC keys) the platform preserves across
+    /// syscalls, exceptions and signals, interrupts, and native fork. Shims must drop features
+    /// their own mechanisms do not preserve (e.g., pointer authentication under copy-based fork).
+    #[cfg(target_arch = "aarch64")]
+    fn get_guest_cpu_features(&self) -> crate::arch::aarch64::CpuFeatures {
+        crate::arch::aarch64::CpuFeatures::empty()
+    }
 }
 
 /// Architecture-specific registers.

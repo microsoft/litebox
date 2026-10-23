@@ -5,6 +5,7 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use std::cell::Cell;
+use std::ffi::CStr;
 use std::ops::Range;
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock, Weak,
@@ -12,6 +13,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use litebox::arch::aarch64::CpuFeatures;
 use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
     PermissionUpdateError,
@@ -82,6 +84,7 @@ pub const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000;
 /// `MacosUserland4K` (requires `subpage_compat`) for 4 KiB guests.
 pub struct MacosUserlandWithPageSize<const PAGE_SIZE: usize> {
     pages: Mutex<PageTable>,
+    host_cpu_features: CpuFeatures,
 }
 
 /// Page-management backend, chosen once from the guest page size.
@@ -184,6 +187,7 @@ impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
         let pages = PageTable::Native(native::Pages::default());
         Box::leak(Box::new(Self {
             pages: Mutex::new(pages),
+            host_cpu_features: detect_host_cpu_features(),
         }))
     }
 }
@@ -1119,6 +1123,75 @@ fn set_guest_x18(value: usize) {
     write_tls(tls_offset::GUEST_X18, value);
 }
 
+/// Documented `hw.optional` sysctls for host CPU features. WFXT, ECV, and MOPS stay unmapped
+/// because their EL0 usability under XNU is not established.
+const HOST_CPU_FEATURE_SYSCTLS: &[(&CStr, CpuFeatures)] = &[
+    (c"hw.optional.floatingpoint", CpuFeatures::FP),
+    // The canonical `hw.optional.arm.*` names exist from macOS 15.4; the legacy names cover
+    // earlier releases (`hw.optional.AdvSIMD` existed only in 12.0-15.3). Either name suffices.
+    (c"hw.optional.arm.AdvSIMD", CpuFeatures::ASIMD),
+    (c"hw.optional.neon", CpuFeatures::ASIMD),
+    (c"hw.optional.arm.FEAT_CRC32", CpuFeatures::CRC32),
+    (c"hw.optional.armv8_crc32", CpuFeatures::CRC32),
+    (c"hw.optional.arm.FEAT_AES", CpuFeatures::AES),
+    (c"hw.optional.arm.FEAT_PMULL", CpuFeatures::PMULL),
+    (c"hw.optional.arm.FEAT_SHA1", CpuFeatures::SHA1),
+    (c"hw.optional.arm.FEAT_SHA256", CpuFeatures::SHA256),
+    (c"hw.optional.arm.FEAT_LSE", CpuFeatures::LSE),
+    (c"hw.optional.arm.FEAT_FP16", CpuFeatures::FP16),
+    (c"hw.optional.arm.FEAT_RDM", CpuFeatures::RDM),
+    (c"hw.optional.arm.FEAT_JSCVT", CpuFeatures::JSCVT),
+    (c"hw.optional.arm.FEAT_FCMA", CpuFeatures::FCMA),
+    (c"hw.optional.arm.FEAT_LRCPC", CpuFeatures::LRCPC),
+    (c"hw.optional.arm.FEAT_DPB", CpuFeatures::DPB),
+    (c"hw.optional.arm.FEAT_SHA3", CpuFeatures::SHA3),
+    (c"hw.optional.arm.FEAT_DotProd", CpuFeatures::DOTPROD),
+    (c"hw.optional.arm.FEAT_SHA512", CpuFeatures::SHA512),
+    (c"hw.optional.arm.FEAT_FHM", CpuFeatures::FHM),
+    (c"hw.optional.arm.FEAT_LSE2", CpuFeatures::LSE2),
+    (c"hw.optional.arm.FEAT_LRCPC2", CpuFeatures::LRCPC2),
+    (c"hw.optional.arm.FEAT_FlagM", CpuFeatures::FLAGM),
+    (c"hw.optional.arm.FEAT_SB", CpuFeatures::SB),
+    (c"hw.optional.arm.FEAT_DPB2", CpuFeatures::DPB2),
+    (c"hw.optional.arm.FEAT_FlagM2", CpuFeatures::FLAGM2),
+    (c"hw.optional.arm.FEAT_FRINTTS", CpuFeatures::FRINTTS),
+    (c"hw.optional.arm.FEAT_I8MM", CpuFeatures::I8MM),
+    (c"hw.optional.arm.FEAT_BF16", CpuFeatures::BF16),
+    (c"hw.optional.arm.FEAT_AFP", CpuFeatures::AFP),
+    (c"hw.optional.arm.FEAT_RPRES", CpuFeatures::RPRES),
+    (c"hw.optional.arm.FEAT_EBF16", CpuFeatures::EBF16),
+    (c"hw.optional.arm.FEAT_CSSC", CpuFeatures::CSSC),
+    (c"hw.optional.arm.FEAT_HBC", CpuFeatures::HBC),
+    (c"hw.optional.arm.FEAT_DIT", CpuFeatures::DIT),
+    (c"hw.optional.arm.FEAT_SSBS", CpuFeatures::SSBS),
+    (c"hw.optional.arm.FEAT_PAuth", CpuFeatures::PAUTH),
+    (c"hw.optional.arm.FEAT_BTI", CpuFeatures::BTI),
+    (c"hw.optional.arm.FEAT_SME", CpuFeatures::SME),
+];
+
+fn detect_host_cpu_features() -> CpuFeatures {
+    HOST_CPU_FEATURE_SYSCTLS
+        .iter()
+        .filter(|(name, _)| {
+            let mut value: libc::c_int = 0;
+            let mut size = size_of_val(&value);
+            // SAFETY: `name` is NUL-terminated, `value` is writable output storage of `size`
+            // bytes, and no new value is written.
+            let result = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    (&raw mut value).cast(),
+                    &raw mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            result == 0 && size == size_of_val(&value) && value != 0
+        })
+        .map(|&(_, feature)| feature)
+        .collect()
+}
+
 impl<const PAGE_SIZE: usize> litebox::platform::ArchSpecificProvider
     for MacosUserlandWithPageSize<PAGE_SIZE>
 {
@@ -1147,6 +1220,16 @@ impl<const PAGE_SIZE: usize> litebox::platform::ArchSpecificProvider
             }
             _ => Err(ArchSpecificError::RegisterUnsupported),
         }
+    }
+    fn get_guest_cpu_features(&self) -> CpuFeatures {
+        // Excluded:
+        // - PAUTH: it is not established that XNU enables PAC keys for arm64 (non-arm64e)
+        //   processes.
+        // - DIT and SSBS: the syscall path saves and restores only NZCV.
+        // - SME and BTI: they need architectural state or kernel ABI this platform lacks.
+        // Assumes XNU keeps the whole FPCR across exceptions and sigreturn (its ARM_NEON_STATE64
+        // set-state path stores it unmasked), so FP16/AFP/EBF16 FPCR controls need nothing more.
+        self.host_cpu_features & CpuFeatures::BASE_STATE_ONLY
     }
 }
 
@@ -1444,6 +1527,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::GuestVectorStateProvider
         set_guest_vector_state(state);
     }
 }
+
 impl<const PAGE_SIZE: usize> litebox::platform::SystemInfoProvider
     for MacosUserlandWithPageSize<PAGE_SIZE>
 {
@@ -3448,6 +3532,16 @@ mod tests {
             unsafe { run_thread(PanickingShim, &mut ctx) };
         });
         assert!(result.is_err(), "the panic must propagate to the caller");
+    }
+
+    #[test]
+    fn detect_host_cpu_features_reports_mandatory_features() {
+        // Every Apple silicon Mac has these; a miss means a sysctl name is wrong.
+        let features = detect_host_cpu_features();
+        assert!(
+            features.contains(CpuFeatures::FP | CpuFeatures::ASIMD | CpuFeatures::CRC32),
+            "{features:?}"
+        );
     }
 
     #[test]

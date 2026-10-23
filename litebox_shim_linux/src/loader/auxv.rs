@@ -92,6 +92,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
             crate::syscalls::signal::max_signal_frame_size(),
         );
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            use litebox::arch::aarch64::CpuFeatures;
+            use litebox::utils::TruncateExt as _;
+
+            // Excluded: SVE and SME need SVE/ZA signal-frame records and PR_SVE_*/PR_SME_* prctls;
+            // BTI and MTE need PROT_BTI/PROT_MTE and tagged-address prctls.
+            //
+            // PAUTH caveat: PR_PAC_* prctls fail with EINVAL, as on Linux without pointer
+            // authentication. Key resets and sets must never reach the host: the guest and
+            // LiteBox share one set of PAC keys.
+            let mut supported = CpuFeatures::BASE_STATE_ONLY
+                | CpuFeatures::DIT
+                | CpuFeatures::SSBS
+                | CpuFeatures::PAUTH;
+            // Copy-based fork requires runners to disable the PAC address keys, and its child
+            // gets a different generic key.
+            if crate::syscalls::process::COPY_BASED_FORK {
+                supported.remove(CpuFeatures::PAUTH);
+            }
+            let hwcaps = litebox_common_linux::hwcap::LinuxHwcaps::from_cpu_features(
+                self.global.platform.get_guest_cpu_features() & supported,
+            );
+            // Linux always provides both, even when zero.
+            aux.insert(AuxKey::AT_HWCAP, hwcaps.hwcap.trunc());
+            aux.insert(AuxKey::AT_HWCAP2, hwcaps.hwcap2.trunc());
+        }
+
         aux
     }
 }
