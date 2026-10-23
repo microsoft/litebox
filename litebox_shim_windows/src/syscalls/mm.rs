@@ -722,6 +722,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let end = base.checked_add(size).ok_or(NtStatus::INVALID_PARAMETER)?;
         let mut vmem = self.global.page_manager.write_vmem();
         if free_type == coalesce {
+            if vmem.allocation_at(base).is_none() {
+                return Err(NtStatus::CONFLICTING_ADDRESSES);
+            }
             let mut covered_until = base;
             let mut count = 0;
             for allocation in vmem.allocations_in(base..end) {
@@ -1712,15 +1715,10 @@ mod tests {
             let (base, _) = allocate_committed_rw(&task, PAGE_SIZE * 4);
             let end = base + PAGE_SIZE * 4;
             let mut vmem = task.global.page_manager.write_vmem();
+            let protect_ptr = MutPtr::<TestPlatform, u8>::from_usize(base + PAGE_SIZE);
             // SAFETY: The test owns the allocation and does not access its pages.
-            unsafe {
-                vmem.protect_pages(
-                    MutPtr::<TestPlatform, u8>::from_usize(base + PAGE_SIZE),
-                    PAGE_SIZE,
-                    PageProtection::PAGE_READONLY,
-                )
-            }
-            .unwrap();
+            unsafe { vmem.protect_pages(protect_ptr, PAGE_SIZE, PageProtection::PAGE_READONLY) }
+                .unwrap();
 
             let allocation = vmem.allocation_at(base).unwrap();
             vmem.split_allocation_around(allocation, base + PAGE_SIZE * 2, PAGE_SIZE);
@@ -2372,37 +2370,46 @@ mod tests {
                 } else {
                     CreatePagesFlags::empty()
                 };
+                let address = address.and_then(NonZeroAddress::new);
+                let len = NonZeroPageSize::new(len).unwrap();
                 // SAFETY: The manager reserves fresh address space without replacement.
                 unsafe {
-                    manager.create_reserved_pages(
-                        address.and_then(NonZeroAddress::new),
-                        NonZeroPageSize::new(len).unwrap(),
-                        ALLOCATION_GRANULARITY,
-                        flags,
-                    )
+                    manager.create_reserved_pages(address, len, ALLOCATION_GRANULARITY, flags)
                 }
                 .unwrap()
             };
             // Find a free span for two reservations, then reserve its halves separately.
             let span = reserve(None, ALLOCATION_GRANULARITY * 2);
             let base = span.as_usize();
+            let span_len = ALLOCATION_GRANULARITY * 2;
             // SAFETY: The test owns the reservation and never accesses it.
-            unsafe { manager.remove_pages(span, ALLOCATION_GRANULARITY * 2) }.unwrap();
+            unsafe { manager.remove_pages(span, span_len) }.unwrap();
             let first = reserve(Some(base), ALLOCATION_GRANULARITY);
             let second = reserve(Some(base + ALLOCATION_GRANULARITY), ALLOCATION_GRANULARITY);
 
-            let info = query_basic_information(&task, base + PAGE_SIZE);
-            assert_eq!(info.allocation_base, base);
-            assert_eq!(info.region_size, ALLOCATION_GRANULARITY - PAGE_SIZE);
-            assert_eq!(info.state, MemoryState::MEM_RESERVE.bits());
-            let info = query_basic_information(&task, base + ALLOCATION_GRANULARITY);
-            assert_eq!(info.allocation_base, base + ALLOCATION_GRANULARITY);
-            assert_eq!(info.region_size, ALLOCATION_GRANULARITY);
+            assert!(
+                !manager
+                    .read_vmem()
+                    .is_range_committed(&(base + PAGE_SIZE..base + PAGE_SIZE))
+            );
+            let first_info = query_basic_information(&task, base + PAGE_SIZE);
+            assert_eq!(first_info.allocation_base, base);
+            assert_eq!(first_info.region_size, ALLOCATION_GRANULARITY - PAGE_SIZE);
+            assert_eq!(first_info.state, MemoryState::MEM_RESERVE.bits());
+            let second_info = query_basic_information(&task, base + ALLOCATION_GRANULARITY);
+            assert_eq!(second_info.allocation_base, base + ALLOCATION_GRANULARITY);
+            assert_eq!(second_info.region_size, ALLOCATION_GRANULARITY);
 
             for ptr in [first, second] {
                 // SAFETY: The test owns the reservation and never accesses it.
                 unsafe { manager.remove_pages(ptr, ALLOCATION_GRANULARITY) }.unwrap();
             }
+
+            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+            host_fidelity::assert_adjacent_reservation_queries_match_host([
+                first_info,
+                second_info,
+            ]);
         });
     }
 
@@ -3474,6 +3481,69 @@ mod tests {
 
         fn host_status(status: i32) -> NtStatus {
             NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
+        }
+
+        pub(super) fn assert_adjacent_reservation_queries_match_host(
+            expected: [MemoryBasicInformation; 2],
+        ) {
+            let mut reservations = [core::ptr::null_mut::<c_void>(); 2];
+            for (reservation, info) in reservations.iter_mut().zip(&expected) {
+                *reservation = info.allocation_base as *mut c_void;
+                let mut size = ALLOCATION_GRANULARITY;
+                // SAFETY: ntdll reserves without replacement at a previously released address;
+                // both output pointers are valid locals and no pages are accessed.
+                let status = unsafe {
+                    NtAllocateVirtualMemory(
+                        current_process(),
+                        reservation,
+                        0,
+                        &raw mut size,
+                        AllocationType::MEM_RESERVE.bits(),
+                        PageProtection::PAGE_NOACCESS.bits(),
+                    )
+                };
+                assert_eq!(host_status(status), NtStatus::SUCCESS);
+                assert_eq!(*reservation as usize, info.allocation_base);
+            }
+            for info in expected {
+                let mut host_info = MemoryBasicInformation::default();
+                let mut return_length = 0;
+                let address = info.base_address as *const c_void;
+                // SAFETY: Both reservations are live, and the synchronous query writes only
+                // the valid output buffer and return-length local.
+                let status = unsafe {
+                    NtQueryVirtualMemory(
+                        current_process(),
+                        address,
+                        MemoryInformationClass::Basic as u32,
+                        (&raw mut host_info).cast(),
+                        size_of::<MemoryBasicInformation>(),
+                        &raw mut return_length,
+                    )
+                };
+                assert_eq!(host_status(status), NtStatus::SUCCESS);
+                assert_eq!(return_length, size_of::<MemoryBasicInformation>());
+                assert_eq!(info.base_address, host_info.base_address);
+                assert_eq!(info.allocation_base, host_info.allocation_base);
+                assert_eq!(info.region_size, host_info.region_size);
+                assert_eq!(info.state, host_info.state);
+                assert_eq!(info.protect, host_info.protect);
+                assert_eq!(info.type_, host_info.type_);
+            }
+            for mut reservation in reservations {
+                let mut size = 0;
+                // SAFETY: Each reservation was created above, is still live, and is released
+                // once without any outstanding access to its pages.
+                let status = unsafe {
+                    NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut reservation,
+                        &raw mut size,
+                        FreeType::MEM_RELEASE.bits(),
+                    )
+                };
+                assert_eq!(host_status(status), NtStatus::SUCCESS);
+            }
         }
 
         #[test]

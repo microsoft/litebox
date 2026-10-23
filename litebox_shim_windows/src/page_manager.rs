@@ -98,7 +98,10 @@ where
             };
             let clipped = area_range.start.max(cursor)..area_range.end.min(range.end);
             cursor = clipped.end;
-            self.areas.insert(clipped, update(area));
+            let updated = update(area);
+            if updated != area {
+                self.areas.insert(clipped, updated);
+            }
         }
     }
 
@@ -261,12 +264,17 @@ where
 
     /// Returns whether every page of `range` is owned and committed.
     pub(crate) fn is_range_committed(&self, range: &Range<usize>) -> bool {
-        range.start <= range.end
-            && self.areas.gaps(range).next().is_none()
-            && self
-                .areas
-                .overlapping(range.clone())
-                .all(|(_, area)| matches!(area.state, PageState::Committed(_)))
+        if range.start > range.end {
+            return false;
+        }
+        let mut cursor = range.start;
+        for (area_range, area) in self.areas.overlapping(range.clone()) {
+            if area_range.start > cursor || !matches!(area.state, PageState::Committed(_)) {
+                return false;
+            }
+            cursor = area_range.end.min(range.end);
+        }
+        cursor == range.end
     }
 
     unsafe fn create_private_pages(
@@ -641,8 +649,8 @@ where
     /// Releases the pages of the allocation recorded at `base` together with its record, so
     /// no other thread can observe one without the other.
     ///
-    /// The range stays tracked only if `len` is unaligned or the range is not within one owned
-    /// reservation; once native release starts, the range is untracked even if it fails.
+    /// Range-validation failures leave tracking unchanged; once native release starts, the
+    /// range is untracked even if release fails.
     ///
     /// # Safety
     /// Same contract as [`Self::remove_pages`].
