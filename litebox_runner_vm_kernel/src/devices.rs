@@ -20,14 +20,16 @@
 //!
 //! Each CPU has its own local APIC, so its own timer; devices interrupt the
 //! boot CPU. The interrupt handler only ends the interrupt, noting a
-//! device's; the broker looks at the devices when it next runs, which, if
-//! the interrupt stopped a process, the shim has it do at once (see
-//! `litebox_platform_vm_kernel`). A wake IPI only ends a halt.
+//! device's for every CPU, waking the other idle ones, and interrupting those
+//! whose workers are suspended; the broker looks at the devices when it next
+//! runs, which, if the interrupt stopped a process, the shim has it do at
+//! once (see `litebox_platform_vm_kernel`). A wake IPI only ends a halt, or
+//! has a CPU running a process enter the kernel.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::stdio::StdioOutputStream;
 use litebox_broker_smoltcp::Network;
@@ -38,8 +40,8 @@ use litebox_hal::clock::Clock;
 use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice};
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_platform::time::{Instant as _, TimeProvider as _};
-use litebox_platform_vm_kernel::cpu::{self, InterruptController, Ipi, MAX_CPUS};
-use litebox_platform_vm_kernel::{Instant, VmKernel};
+use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
+use litebox_platform_vm_kernel::{Instant, VmKernel, worker};
 use litebox_shim_vm_kernel::ProcessTimer;
 use spin::Mutex;
 
@@ -50,7 +52,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 /// How long a share's server may take to answer a request before the share
 /// fails.
 const SHARE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How often a share that does not interrupt is polled.
+/// How often a share waiting for its server is polled, whether or not it
+/// interrupts (see [`ShareTransport`]).
 const SHARE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// The local APIC's timer.
@@ -59,7 +62,7 @@ const TIMER_VECTOR: u8 = 0x30;
 /// Shared by every device: the broker looks at all of them when it runs.
 const DEVICE_VECTOR: u8 = 0x31;
 
-/// Ends a halt ([`Ipi::Wake`]).
+/// Ends a halt, or interrupts a process ([`Ipi::Wake`]).
 const WAKE_VECTOR: u8 = 0x32;
 
 // So `send_fixed_ipi` cannot panic (it runs in interrupt handlers).
@@ -89,8 +92,10 @@ pub struct Devices {
     /// (see [`armed`]), so it can skip rewriting it: under KVM each write is
     /// a VM exit, and it rearms before every resume of a process.
     armed: [AtomicU64; MAX_CPUS],
-    /// See [`Events::take_device_interrupt`].
-    device_interrupted: AtomicBool,
+    /// Bit `i`: a device interrupted since CPU `i`'s last
+    /// [`Events::take_device_interrupt`], so that each CPU's suspended worker
+    /// sees each interrupt.
+    device_interrupted: AtomicU64,
 }
 
 /// [`Devices::armed`]'s value for `deadline`: zero for none (the instant zero,
@@ -131,7 +136,7 @@ impl Devices {
             network_interrupts: network.as_ref().is_some_and(NetworkDevice::interrupts),
             network: network.map(Mutex::new),
             armed: [const { AtomicU64::new(ARMED_UNKNOWN) }; MAX_CPUS],
-            device_interrupted: AtomicBool::new(false),
+            device_interrupted: AtomicU64::new(0),
             console: Mutex::new(console),
         }));
         litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|vector| {
@@ -206,7 +211,15 @@ impl Devices {
                     armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
                 }
             }
-            DEVICE_VECTOR => self.device_interrupted.store(true, Ordering::Relaxed),
+            // For whichever CPU's worker waits for it: the other idle CPUs
+            // step again, and the busy ones whose workers are suspended enter
+            // the kernel, to resume them (this one, the boot CPU, is already
+            // in, and needs no mark: see the shim's `Inner::worker_due`).
+            DEVICE_VECTOR => {
+                self.device_interrupted.store(u64::MAX, Ordering::SeqCst);
+                cpu::wake_idle(CpuId::BOOT);
+                worker::interrupt_suspended(CpuId::BOOT);
+            }
             WAKE_VECTOR => {}
             _ => return false,
         }
@@ -222,16 +235,26 @@ impl Devices {
     /// For drivers: waits until a device may have changed (an interrupt) or
     /// `deadline` (to poll one that does not interrupt); then look again. On
     /// the worker (serving broker requests), suspends it, and processes run
-    /// meanwhile; elsewhere, halts. Hold no lock the kernel may take meanwhile
-    /// (see `litebox_platform_vm_kernel::worker`).
+    /// meanwhile; elsewhere, halts. Hold no lock the kernel or another CPU
+    /// may take meanwhile (see `litebox_platform_vm_kernel::worker`).
     pub fn block(&self, deadline: Option<Instant>) {
         if !litebox_platform_vm_kernel::worker::suspend(deadline) {
             self.halt(deadline);
         }
     }
 
-    /// Halts the calling CPU until an interrupt, or until `deadline`.
+    /// Halts the calling CPU until an interrupt, or until `deadline`; while
+    /// the CPU has a wakeup to acknowledge (see
+    /// `litebox_platform_vm_kernel::cpu`), only takes the pending interrupts
+    /// ([`cpu::relax`]), without arming the timer (a VM exit under KVM), as
+    /// the caller polls meanwhile: until the scheduler acknowledges it, a
+    /// driver's waits (e.g., a 9P round trip's) busy-poll, which costs only
+    /// CPU time.
     fn halt(&self, deadline: Option<Instant>) {
+        if cpu::marked() {
+            cpu::relax();
+            return;
+        }
         if let Some(deadline) = deadline {
             self.apic
                 .arm_timer(self.clock.ticks_at(deadline.as_nanos()));
@@ -273,7 +296,12 @@ impl Events for Devices {
     }
 
     fn take_device_interrupt(&self) -> bool {
-        self.device_interrupted.swap(false, Ordering::Relaxed)
+        let bit = 1 << cpu::current().index();
+        // Sequentially consistent, as the handler's store, then load of the
+        // suspended works, and this CPU's noting its own suspended before:
+        // so either this sees the store, or the handler interrupts this CPU.
+        self.device_interrupted.load(Ordering::SeqCst) & bit != 0
+            && self.device_interrupted.fetch_and(!bit, Ordering::SeqCst) & bit != 0
     }
 }
 
@@ -368,7 +396,11 @@ impl Network for Devices {
 /// in [`Devices::halt`], not [`Devices::block`]: the 9P client holds its lock
 /// across the round trip, and while the worker is suspended, the kernel may
 /// take it (e.g., ending another process's association closes its files),
-/// which on one CPU nothing would release.
+/// which nothing on that CPU would release. Polled even if it interrupts:
+/// its interrupt goes to the boot CPU, which wakes this one for it (see
+/// [`Devices::on_interrupt`]) only as it takes interrupts, which it may not
+/// for a while, running kernel code (e.g., creating or freeing a process's
+/// address space, or spinning for a spin lock).
 struct ShareTransport {
     devices: &'static Devices,
     device: NinePDevice,
@@ -404,9 +436,11 @@ impl Transport for ShareTransport {
                 self.failed = true;
                 return Err(TransportError);
             }
-            // Until the device returns the request; nothing else runs meanwhile.
+            // Until the device returns the request; nothing else runs on this
+            // CPU meanwhile (and, while the CPU has a wakeup to acknowledge,
+            // this polls).
             let wake = match now.checked_add(SHARE_POLL_INTERVAL) {
-                Some(poll) if !self.device.interrupts() && poll < deadline => poll,
+                Some(poll) if poll < deadline => poll,
                 _ => deadline,
             };
             self.devices.halt(Some(wake));

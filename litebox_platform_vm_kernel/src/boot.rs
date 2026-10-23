@@ -162,6 +162,11 @@ struct Start {
 
 static START: spin::Once<Start> = spin::Once::new();
 
+/// The platform, once [`VmKernel::start_cpus`] was called.
+pub(crate) fn started() -> Option<&'static VmKernel> {
+    START.get().map(|start| start.platform)
+}
+
 impl VmKernel {
     /// Starts the CPUs with local APIC IDs `apic_ids` but the calling boot
     /// CPU's, in order, until `limit` CPUs are online in all (at most
@@ -423,10 +428,10 @@ unsafe extern "C" fn cpu_entry(pcv: u64) -> ! {
     init_cpu(None);
     cpu::controller().expect("set by `start_cpus`").init_cpu();
     // A check of the wake IPI, only it ending the halt (see `start_cpu`).
-    // Earlier marks (e.g., every CPU's, as a device interrupted before) would
-    // end it at once: acknowledged, each time before the handshake is read,
-    // so that the boot CPU's is not. (A wakeup from elsewhere just as it
-    // halts may still end it.)
+    // Earlier marks (e.g., as a device interrupted before) would end it at
+    // once: acknowledged, each time before the handshake is read, so that the
+    // boot CPU's is not. (A wakeup from elsewhere just as it halts may still
+    // end it.)
     loop {
         cpu::acknowledge();
         match handshake.load(Ordering::SeqCst) {

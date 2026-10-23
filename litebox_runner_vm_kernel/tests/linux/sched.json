@@ -1,17 +1,10 @@
 [
   {
     "concurrent": [
-      { "argv": ["/sched", "spin", "300", "5", "1000"] },
-      { "argv": ["/sched", "spin", "300", "5", "1000"] },
-      { "argv": ["/sched-pie", "spin", "300", "5", "1000"] }
-    ]
-  },
-  {
-    "concurrent": [
       { "argv": ["/alarm", "default"], "expect_signal": 14 },
       { "argv": ["/timerfd"] },
-      { "argv": ["/sched", "sleep", "200", "3"] },
-      { "argv": ["/sched", "spin", "1000", "5", "150"] }
+      { "argv": ["/sched", "sleep", "200", "3", "150"] },
+      { "argv": ["/sched", "spin", "1000", "0", "150"] }
     ]
   },
   {
@@ -25,6 +18,12 @@
     "concurrent": [
       { "argv": ["/sched", "calls", "100", "500"] },
       { "argv": ["/sched", "spin", "2000", "0", "2000"] }
+    ]
+  },
+  {
+    "concurrent": [
+      { "argv": ["/sched", "calls", "100", "1500", "1"] },
+      { "argv": ["/sched", "spin", "3000", "0", "3000"] }
     ]
   }
 ]

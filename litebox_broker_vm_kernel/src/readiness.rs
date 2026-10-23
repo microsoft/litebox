@@ -5,8 +5,7 @@
 //! at once, whichever process is current. What a full ring cannot take
 //! stays pending until the next [`KernelReadiness::flush`].
 
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{BrokerError, Result};
 use litebox_broker_host::readiness::{
@@ -20,6 +19,7 @@ use litebox_broker_transport::channel::HostNotificationChannel;
 use litebox_broker_transport::control_ring::{
     ControlRingError, ControlRingProducer, ControlRingWriteStatus,
 };
+use litebox_platform_vm_kernel::cpu;
 use spin::mutex::SpinMutex;
 
 use crate::memory::PinnedControlRing;
@@ -35,28 +35,30 @@ pub(crate) struct KernelReadiness {
     /// A notification was written since [`Self::take_published`].
     published: AtomicBool,
     /// A thread of the process blocks in a wait that a notification would
-    /// end (see `Association::set_notification_waiter`).
+    /// end (see `Association::set_notification_waiter`): a change to its ring
+    /// notifies every CPU ([`cpu::notify_all`]).
     waiting: AtomicBool,
-    /// The broker's: set when a waiting process's ring changes.
-    woken: Arc<AtomicBool>,
 }
 
 impl KernelReadiness {
-    pub(crate) fn new(woken: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             publisher: ReadinessPublisher::default(),
             notifications: SpinMutex::new(None),
             failed: AtomicBool::new(false),
             published: AtomicBool::new(false),
             waiting: AtomicBool::new(false),
-            woken,
         }
     }
 
     /// Whether a thread of the process blocks in a wait that a notification
-    /// would end, for a write to its ring to set the broker's `woken`.
+    /// would end, for a write to its ring to notify every CPU. Ordered before
+    /// the caller's reads of the ring (its poll of the wait), as
+    /// [`Self::flush`] orders its writes before reading this: either the poll
+    /// sees a write, or the write sees the waiter.
     pub(crate) fn set_waiting(&self, waiting: bool) {
-        self.waiting.store(waiting, Ordering::Relaxed);
+        self.waiting.store(waiting, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
     }
 
     /// Starts publishing to the ring, including what is already pending.
@@ -87,10 +89,15 @@ impl KernelReadiness {
         if ring.written {
             self.published.store(true, Ordering::Relaxed);
         }
+        // See `set_waiting`.
+        fence(Ordering::SeqCst);
+        // For the CPUs to poll the waits again, wherever they run. (A process
+        // with none, running on another CPU, sees `published` at its next
+        // kernel entry.)
         if (ring.written || matches!(result, Err(RingError::Ring(_))))
-            && self.waiting.load(Ordering::Relaxed)
+            && self.waiting.load(Ordering::SeqCst)
         {
-            self.woken.store(true, Ordering::Relaxed);
+            cpu::notify_all();
         }
         match result {
             Ok(()) | Err(RingError::Full) => {}

@@ -9,18 +9,26 @@
 //   between consecutive clock reads, while other programs ran, is in
 //   [MIN_GAP_MS, MAX_GAP_MS], and unless the computation and the rounding
 //   mode survived the switches. With DELAY_MS, sleeps that long first.
-// - "sleep MS COUNT": sleeps COUNT times for MS milliseconds; fails if one
-//   is too short.
-// - "calls COUNT MAX_MS": makes COUNT broker calls (one-byte reads of a
-//   file); fails if they took longer than MAX_MS, e.g., if each one gave up
-//   the CPU to other programs.
+// - "sleep MS COUNT [MAX_LATE_MS]": sleeps COUNT times for MS milliseconds;
+//   fails if one is too short, or, with MAX_LATE_MS, later than that (e.g.,
+//   if a program that kept the CPU was not preempted for it).
+// - "calls COUNT MAX_MS [SPINNERS]": makes COUNT broker calls (one-byte reads
+//   of a file); fails if they took longer than MAX_MS, e.g., if each one gave
+//   up the CPU to other programs. With SPINNERS, that many threads of its own
+//   busy-wait meanwhile: the calls must still be served, wherever the
+//   program runs.
 // - "input MAX_MS": prints `ready`, for the host to send console input (see
 //   sched.input.txt), then waits for it with no timeout; fails if it took
 //   longer than MAX_MS, e.g., while other programs ran.
-// See sched.json.
+// See preempt.json, which asserts preemption (MIN_GAP_MS): it runs 8
+// CPU-bound programs, at least twice as many as there are CPUs (at most 4,
+// which dev_tools/run_linux_on_vm_userland.sh checks), so that each still
+// waits for others; in sched.json, one may have a CPU to itself.
 
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,11 +80,33 @@ static int spin_mode(long long ms, long long min_gap_ms, long long max_gap_ms) {
     return 0;
 }
 
-static int calls_mode(int count, long long max_ms) {
+// At most this many SPINNERS for "calls".
+#define MAX_SPINNERS 8
+
+static atomic_int calls_done;
+
+static void *busy_wait(void *arg) {
+    (void)arg;
+    while (!atomic_load(&calls_done)) {
+    }
+    return NULL;
+}
+
+static int calls_mode(int count, long long max_ms, int spinners) {
+    pthread_t threads[MAX_SPINNERS];
+    if (spinners < 0 || spinners > MAX_SPINNERS) {
+        return 2;
+    }
     int fd = open("/sched", O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "calls: open failed\n");
         return 1;
+    }
+    for (int i = 0; i < spinners; i++) {
+        if (pthread_create(&threads[i], NULL, busy_wait, NULL) != 0) {
+            fprintf(stderr, "calls: pthread_create failed\n");
+            return 1;
+        }
     }
     char byte;
     long long start = now_us();
@@ -87,6 +117,10 @@ static int calls_mode(int count, long long max_ms) {
         }
     }
     long long took = now_us() - start;
+    atomic_store(&calls_done, 1);
+    for (int i = 0; i < spinners; i++) {
+        pthread_join(threads[i], NULL);
+    }
     close(fd);
     if (took > max_ms * 1000) {
         fprintf(stderr, "calls: %d took %lld us\n", count, took);
@@ -118,11 +152,20 @@ static int sleep_ms(long long ms) {
     return nanosleep(&duration, NULL);
 }
 
-static int sleep_mode(long long ms, int count) {
+static int sleep_mode(long long ms, int count, long long max_late_ms) {
     for (int i = 0; i < count; i++) {
         long long start = now_us();
-        if (sleep_ms(ms) != 0 || now_us() - start < ms * 1000) {
+        if (sleep_ms(ms) != 0) {
+            fprintf(stderr, "sleep: %d failed\n", i);
+            return 1;
+        }
+        long long took = now_us() - start;
+        if (took < ms * 1000) {
             fprintf(stderr, "sleep: %d too short\n", i);
+            return 1;
+        }
+        if (max_late_ms >= 0 && took > (ms + max_late_ms) * 1000) {
+            fprintf(stderr, "sleep: %d took %lld us\n", i, took);
             return 1;
         }
     }
@@ -136,15 +179,15 @@ int main(int argc, char *argv[]) {
         }
         return spin_mode(atoll(argv[2]), atoll(argv[3]), atoll(argv[4]));
     }
-    if (argc == 4 && strcmp(argv[1], "sleep") == 0) {
-        return sleep_mode(atoll(argv[2]), atoi(argv[3]));
+    if ((argc == 4 || argc == 5) && strcmp(argv[1], "sleep") == 0) {
+        return sleep_mode(atoll(argv[2]), atoi(argv[3]), argc == 5 ? atoll(argv[4]) : -1);
     }
-    if (argc == 4 && strcmp(argv[1], "calls") == 0) {
-        return calls_mode(atoi(argv[2]), atoll(argv[3]));
+    if ((argc == 4 || argc == 5) && strcmp(argv[1], "calls") == 0) {
+        return calls_mode(atoi(argv[2]), atoll(argv[3]), argc == 5 ? atoi(argv[4]) : 0);
     }
     if (argc == 3 && strcmp(argv[1], "input") == 0) {
         return input_mode(atoll(argv[2]));
     }
-    fprintf(stderr, "usage: sched spin MS MIN_GAP_MS MAX_GAP_MS [DELAY_MS] | sleep MS COUNT | calls COUNT MAX_MS | input MAX_MS\n");
+    fprintf(stderr, "usage: sched spin MS MIN_GAP_MS MAX_GAP_MS [DELAY_MS] | sleep MS COUNT | calls COUNT MAX_MS [SPINNERS] | input MAX_MS\n");
     return 2;
 }

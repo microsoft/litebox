@@ -32,7 +32,7 @@
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
 #   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
 #   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1)
-#   TIMEOUT       per-run timeout in seconds (default: 120)
+#   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners (and the rewriter unless
 #                 -u), run in their directories (default: "cargo build"; CI uses

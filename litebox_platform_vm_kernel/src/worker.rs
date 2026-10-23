@@ -1,17 +1,33 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The CPU's worker: kernel work on a second kernel stack, which can
+//! Each CPU's worker: kernel work on a second kernel stack, which can
 //! [`suspend`] partway (e.g., to wait for a device) while the kernel runs
-//! user threads, and be resumed later.
+//! user threads, and be resumed later, by the same CPU. These functions use
+//! the calling CPU's.
 //!
 //! Cooperative: the work runs, with interrupts disabled, until it finishes or
 //! suspends. While suspended, it keeps its kernel-fault handling (see
 //! [`crate::with_user_faults`]); its resumer restores its address space.
-//! It must not suspend holding a lock the kernel may take meanwhile: on one
-//! CPU, nothing would release it.
+//!
+//! It must not suspend holding a lock that anything but work may take: its
+//! CPU, spinning for it, would never resume it. The broker holds some across
+//! a suspension (e.g., an open file's, across a console write), which only
+//! requests take (closing a file takes none). So a CPU spinning for one
+//! ([`crate::RawMutex`]) runs its own work, not suspended; and a work must not
+//! wait for one while holding a lock that anything but work takes (the
+//! holder's CPU, spinning for that, would never resume it), and works on
+//! several CPUs must take such locks in one order, as a resumed work may take
+//! another holding one (broker rules). Only a CPU waiting for a process's
+//! claim (in the shim), which a work spinning for one may hold, must resume
+//! its own work meanwhile.
+//!
+//! A device's interrupt may be for a suspended work: [`interrupt_suspended`]
+//! has the CPUs whose work suspended enter the kernel, to resume it; but not
+//! one whose new work has yet to suspend.
 
 use crate::Instant;
+use crate::cpu::{self, CpuId};
 use crate::per_cpu::with_per_cpu_variables;
 use alloc::boxed::Box;
 use core::cell::Cell;
@@ -71,6 +87,17 @@ impl Worker {
 /// The worker's state.
 pub fn state() -> State {
     with_per_cpu_variables(|pcv| pcv.worker.state.get())
+}
+
+/// Sends the wake IPI ([`cpu::Ipi::Wake`]) to the CPUs whose work suspended,
+/// from its first suspension until it finishes (also while resumed), busy or
+/// idle, but `except` (e.g., the one a device interrupts, which needs none):
+/// one running a thread enters the kernel, which may then resume its worker
+/// (e.g., for what a device's interrupt changed). Not those whose new work
+/// has yet to suspend. No locks, no per-CPU data: usable in interrupt
+/// handlers.
+pub fn interrupt_suspended(except: CpuId) {
+    cpu::interrupt(cpu::suspended_mask() & !except.bit());
 }
 
 /// Runs `work` on the worker until it finishes or [`suspend`]s.
@@ -182,11 +209,13 @@ fn switch_to_work() -> Ran {
     // Safety: `rsp` is the work's: initial, or saved by `switch` in
     // `suspend`, on its allocated stack.
     unsafe { switch(resumer_rsp, rsp) };
-    match state() {
+    let ran = match state() {
         State::Idle => Ran::Finished,
         State::Suspended { .. } => Ran::Suspended,
         State::Running => unreachable!("the work switched back while running"),
-    }
+    };
+    cpu::set_suspended(ran == Ran::Suspended);
+    ran
 }
 
 /// The worker stack's initial frame, for `switch` to pop: callee-saved

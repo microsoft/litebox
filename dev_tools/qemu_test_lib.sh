@@ -14,8 +14,9 @@ if [[ -z ${QEMU_ACCEL:-} ]]; then
 fi
 case $QEMU_ACCEL in
     # invtsc (not migratable) lets QEMU publish the TSC frequency to the guest.
-    kvm) CPU=${QEMU_CPU:-host,+invtsc} ;;
-    tcg) CPU=${QEMU_CPU:-max} ;;
+    kvm) CPU=${QEMU_CPU:-host,+invtsc}; TIMEOUT=${TIMEOUT:-120} ;;
+    # Emulation is slow: e.g., the sched test takes minutes.
+    tcg) CPU=${QEMU_CPU:-max}; TIMEOUT=${TIMEOUT:-600} ;;
     *) echo "error: unknown QEMU_ACCEL '$QEMU_ACCEL'" >&2; exit 2 ;;
 esac
 # The kernel uses only RAM below 4 GiB. q35 keeps all of RAM there if it is
@@ -23,7 +24,6 @@ esac
 # 4 GiB): e.g., 2560M gives the kernel 2.5 GiB, but 3G only 2 GiB.
 QEMU_MEM=${QEMU_MEM:-2G}
 QEMU_SMP=${QEMU_SMP:-1}
-TIMEOUT=${TIMEOUT:-120}
 CARGO_BUILD=${CARGO_BUILD:-cargo build}
 
 # Cargo runs in crate directories, but a relative CARGO_TARGET_DIR is meant
@@ -58,6 +58,8 @@ trap 'rm -rf "$WORK"' EXIT
 pass=0
 fail=0
 failed=()
+# Tests a script did not run (e.g., unsupported where it runs).
+skipped=0
 
 # run_vm NAME KERNEL PAYLOAD [QEMU_ARG]...: boots KERNEL with PAYLOAD as its
 # initrd and records the outcome; with $verbose set, prints passing logs too.
@@ -98,7 +100,9 @@ run_vm() {
 }
 
 summary() {
+    local skips=
+    [[ $skipped -eq 0 ]] || skips=", $skipped skipped"
     echo
-    echo "[*] $pass passed, $fail failed"
+    echo "[*] $pass passed, $fail failed$skips"
     [[ $fail -eq 0 ]] || { printf '    %s\n' "${failed[@]}"; exit 1; }
 }

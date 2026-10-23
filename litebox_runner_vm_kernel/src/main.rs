@@ -16,7 +16,8 @@
 //! the host directories of virtio-9p devices, read-only, at their mount tags
 //! ([`devices`]).
 //!
-//! The boot CPU runs everything; the other CPUs, once online, only idle
+//! Every CPU runs the processes ([`litebox_shim_vm_kernel::sched`]); the boot
+//! CPU also runs the client and service, the others only the processes
 //! ([`cpu_main`]).
 
 #![cfg(target_arch = "x86_64")]
@@ -35,16 +36,22 @@ use core::panic::PanicInfo;
 use litebox_bootloader::Kernel;
 use litebox_hal::{power, serial, serial_println};
 use litebox_platform_vm_kernel::VmKernel;
-use litebox_platform_vm_kernel::cpu::{self, CpuId};
+use litebox_platform_vm_kernel::cpu::CpuId;
 use litebox_platform_vm_kernel::providers::set_platform_root_key;
+use litebox_shim_vm_kernel::sched::Scheduler;
 
 litebox_bootloader::entry!(kernel_main, &SerialLogger);
+
+/// The kernel's one scheduler, which every runner process runs in, on every
+/// CPU; published before the other CPUs start.
+static SCHEDULER: spin::Once<Scheduler> = spin::Once::new();
 
 fn kernel_main(kernel: Kernel) -> ! {
     set_platform_root_key(&litebox_hal::prk::development());
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
+    let scheduler = SCHEDULER.call_once(|| Scheduler::new(devices));
     kernel.start_cpus(devices, cpu_main);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
     let broker = |console, shares, allow_process_duplication| {
@@ -58,13 +65,11 @@ fn kernel_main(kernel: Kernel) -> ! {
             allow_process_duplication,
         })
     };
-    // The kernel's one scheduler, which every runner process runs in.
-    let scheduler = litebox_shim_vm_kernel::sched::Scheduler::default();
     if let Some(programs) = payload.file("programs.json") {
         let stdio: &'static client::program::Stdio =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(client::program::Stdio::new(devices)));
         let mut service = service::program::Programs::new(
-            scheduler,
+            scheduler.clone(),
             kernel.platform,
             kernel.clock,
             wall_clock,
@@ -76,7 +81,7 @@ fn kernel_main(kernel: Kernel) -> ! {
         client::program::run(programs, &mut service, stdio);
     } else {
         let mut service = service::optee::Optee::new(
-            scheduler,
+            scheduler.clone(),
             kernel.platform,
             kernel.clock,
             wall_clock,
@@ -88,17 +93,18 @@ fn kernel_main(kernel: Kernel) -> ! {
         );
         client::script::run(&payload, &mut service);
     }
+    // Whatever the log level, for the test scripts.
+    serial_println!("[litebox] slices run per CPU: {:?}", scheduler.slices());
     serial_println!("[litebox] ALL TESTS PASSED");
     power::exit(true)
 }
 
-/// Each other CPU's kernel, once online: it idles.
-fn cpu_main(platform: &'static VmKernel, _cpu: CpuId) -> ! {
-    loop {
-        // A wakeup left from its start would end every halt at once.
-        cpu::acknowledge();
-        platform.halt_until_interrupt();
-    }
+/// Each other CPU's kernel, once online: it runs the processes.
+fn cpu_main(_platform: &'static VmKernel, _cpu: CpuId) -> ! {
+    SCHEDULER
+        .get()
+        .expect("the scheduler is published before the CPUs start")
+        .run()
 }
 
 struct SerialLogger;

@@ -631,7 +631,6 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             | PageTableFlags::DIRTY;
         let mut src = self.inner.lock();
         let mut dst = dst.inner.lock();
-        let mut shared = shared_frames();
         let mut result = Ok(());
         for_each_user_leaf::<M>(src.level_4_table_mut(), |page, entry| {
             let addr: usize = page.start_address().as_u64().trunc();
@@ -643,6 +642,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
             let frame = PhysFrame::containing_address(entry.addr());
             let flags = (entry.flags() | COW) - PageTableFlags::WRITABLE;
+            // Per leaf, not across the walk: other CPUs' page faults, unmaps
+            // and teardowns take it too, spinning. From `reserve` to
+            // `add_leaf`, which adds the block `reserve` may make.
+            let mut shared = shared_frames();
             // Room to count it below, before `dst` maps it.
             let room = match shared.reserve(frame) {
                 Ok(room) => room,
@@ -666,7 +669,6 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             entry.set_flags(flags);
             shared.add_leaf(frame, room);
         });
-        drop(shared);
         drop(dst);
         drop(src);
         // The leaves made read-only may be cached writable.

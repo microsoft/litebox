@@ -12,14 +12,21 @@
 //! handshake before it runs, so that the broker's worker, suspended in the
 //! start, never waits for the clone. A process has at most one clone to adopt,
 //! its latest, which ends once the process makes another, or exits.
+//!
+//! The scheduler adds the clone as the slice that made it ends, and forgets it
+//! once dead, but neither claims nor runs it until it is adopted (see
+//! `claim`). Until then, only its parent's holder touches it, to make, adopt,
+//! or end it, through the clone's claim once made: so on one CPU at a time,
+//! where alone its address space is current, while it is made or adopted.
 
+use crate::claim::{Claim, Owned};
 use crate::memory::copy_to_user;
 use crate::thread::{self, Thread};
 use crate::{
-    Dead, Inner, Running, SpawnError, State, Suspended, layout, pin_control_ring, region_range,
-    release_address_space,
+    Dead, Inner, Running, SpawnError, State, Suspended, layout, new_thread, pin_control_ring,
+    region_range, release_address_space,
 };
-use alloc::rc::{Rc, Weak};
+use alloc::sync::{Arc, Weak};
 use core::cell::{Cell, RefCell};
 use litebox::shim::ContinueOperation;
 use litebox_broker_core::BrokerError;
@@ -28,6 +35,7 @@ use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::{
     CloneReply, CloneRequest, NewThread, Placement, Populate, Prot, Status,
 };
+use litebox_platform_vm_kernel::AddressSpaceId;
 use zerocopy::IntoBytes as _;
 
 impl Inner {
@@ -53,18 +61,26 @@ impl Inner {
     }
 
     /// The process clone `thread` asked for, made once the thread's run
-    /// ended, so that its state is saved; `None` if it cannot be made, and the
-    /// call then fails. Leaves another address space current.
-    pub(crate) fn fork(&self, thread: &Thread, slot: u64) -> Option<Rc<Self>> {
+    /// ended, so that its state is saved, as `own` owns it, for the scheduler
+    /// to add; `None` if it cannot be made, and the call then fails. Only
+    /// under the process's claim. Leaves the clone's address space not
+    /// current, so it can be published (see `Inner::spawn`).
+    pub(crate) fn fork(
+        &self,
+        thread: &Thread,
+        slot: u64,
+        own: impl FnOnce(Self) -> Arc<Owned>,
+    ) -> Option<Arc<Owned>> {
         match self.clone_process(thread, slot) {
             Ok(clone) => {
+                let clone = own(clone);
                 let id = self.next_clone.get();
                 self.next_clone.set(id + 1);
                 log::debug!("process clone {id} made");
                 // Only once made: a call making none leaves the pending clone.
                 end_pending(
                     self.pending_clone
-                        .replace(Some((id, Rc::downgrade(&clone)))),
+                        .replace(Some((id, Arc::downgrade(&clone)))),
                 );
                 thread.suspended.set(Suspended::Cloned { slot, thread: id });
                 Some(clone)
@@ -78,9 +94,12 @@ impl Inner {
     }
 
     /// A copy of the process, with fresh broker memory, and of `thread` (see
-    /// [`Thread::cloned`]).
-    fn clone_process(&self, thread: &Thread, slot: u64) -> Result<Rc<Self>, Status> {
+    /// [`Thread::cloned`]). Leaves the kernel's address space current if it
+    /// makes one.
+    fn clone_process(&self, thread: &Thread, slot: u64) -> Result<Self, Status> {
         let platform = self.platform;
+        // Under the process's claim, so its address space is current on no
+        // other CPU, as cloning it requires.
         let address_space = platform
             .clone_address_space(self.address_space)
             .map_err(|_| Status::NoMemory)?;
@@ -115,7 +134,11 @@ impl Inner {
                 // ran.
                 unsafe { release_address_space(platform, address_space) };
             })?;
-        Ok(Rc::new(Self {
+        // For the clone to be published, as `Inner::spawn` does.
+        // Safety: the kernel holds no references into user memory.
+        unsafe { platform.switch_address_space(AddressSpaceId::KERNEL) }
+            .expect("the kernel address space always exists");
+        Ok(Self {
             platform,
             address_space,
             identity: self.identity,
@@ -135,13 +158,19 @@ impl Inner {
             armed_deadline: Cell::new(None),
             notified: Cell::new(false),
             slice_end: Cell::new(None),
-            threads: RefCell::new(alloc::vec![Rc::new(Thread::cloned(thread, slot))]),
+            threads: RefCell::new(alloc::vec![new_thread(Thread::cloned(thread, slot))]),
             next_thread: Cell::new(thread::MAIN + 1),
             broker_requester: Cell::new(thread::MAIN),
-            broker_busy: Cell::new(false),
+            worker: Cell::new(None),
             pending_clone: RefCell::new(None),
             next_clone: Cell::new(1),
-        }))
+        })
+    }
+
+    /// A process clone not adopted yet (see the module docs), which runs
+    /// nothing.
+    pub(crate) fn is_cloned(&self) -> bool {
+        matches!(*self.state.borrow(), State::Cloned { .. })
     }
 
     /// Resumes `thread` from its `Clone` of a process clone, which returns
@@ -167,57 +196,74 @@ impl Inner {
     /// started with it, or fails `launch`. Makes the clone's broker handshake
     /// (see [`Association::adopt`](litebox_broker_vm_kernel::Association::adopt)),
     /// so that the start does not wait for the clone to run; a clone whose
-    /// handshake fails ends without running. Leaves another address space
-    /// current.
+    /// handshake fails ends without running. Either way, `launch` is done
+    /// with, which wakes the CPU whose worker waits for it (see
+    /// `PendingRunnerAssociation`'s `Drop`). Only under the process's claim.
+    /// Leaves the kernel's address space current if it adopts the clone, or
+    /// tries to.
     pub(crate) fn adopt(&self, id: u64, launch: PendingRunnerAssociation) {
         let pending = self
             .pending_clone
             .borrow_mut()
             .take_if(|(pending, _)| *pending == id);
         // Not if it ended.
-        let adoptable = pending.and_then(|(_, clone)| {
-            let clone = clone.upgrade()?;
-            let upcall_entry = match *clone.state.borrow() {
+        let clone = pending.and_then(|(_, clone)| clone.upgrade());
+        let adoptable = clone.as_ref().map(claim_clone).and_then(|claim| {
+            let upcall_entry = match *claim.state.borrow() {
                 State::Cloned { upcall_entry } => Some(upcall_entry),
                 _ => None,
             }?;
-            Some((clone, upcall_entry))
+            Some((claim, upcall_entry))
         });
-        let Some((clone, upcall_entry)) = adoptable else {
+        let Some((claim, upcall_entry)) = adoptable else {
             log::warn!("a process started a child with a process clone it has not");
             launch.fail(BrokerError::PolicyDenied);
             return;
         };
         // The handshake writes the startup data into the clone's shared
         // buffers.
-        clone.activate();
-        let main = clone.main_thread();
+        claim.activate();
+        let main = claim.main_thread();
         let running = Running {
-            inner: &clone,
+            inner: &claim,
             thread: &main,
         };
         let adopted =
-            litebox_platform_vm_kernel::with_user_faults(&running, || clone.broker.adopt(launch));
+            litebox_platform_vm_kernel::with_user_faults(&running, || claim.broker.adopt(launch));
         if let Err(error) = adopted {
             log::warn!("failed to adopt process clone {id}: {error:?}");
-            end(&clone);
+            end(&claim);
             return;
         }
-        *clone.state.borrow_mut() = State::Serving { upcall_entry };
+        *claim.state.borrow_mut() = State::Serving { upcall_entry };
         log::debug!("process clone {id} adopted");
+        // Runnable: for any CPU to take, once released.
+        claim.share();
     }
 }
 
-/// Ends the clone taken from a process's `pending_clone`, if any.
-pub(crate) fn end_pending(pending: Option<(u64, Weak<Inner>)>) {
+/// The claim of a process clone not adopted yet, for its parent's holder,
+/// the caller: free, as only that one takes it (see `claim`).
+fn claim_clone(clone: &Arc<Owned>) -> Claim<'_> {
+    clone
+        .try_claim()
+        .expect("only its parent claims a process clone not adopted yet")
+}
+
+/// Ends the clone taken from a process's `pending_clone`, if any, under the
+/// process's claim. Releasing the clone's claim leaves the kernel's address
+/// space current (see `claim`): callers stop the process's run, or are
+/// between runs. The upgraded reference may be the clone's last, if another
+/// CPU forgot the dead clone meanwhile (see `sched`): freeing it here is then
+/// as safe as between runs, as the kernel's address space is current, and
+/// freeing takes no claim.
+pub(crate) fn end_pending(pending: Option<(u64, Weak<Owned>)>) {
     if let Some(clone) = pending.and_then(|(_, clone)| clone.upgrade()) {
-        end(&clone);
+        end(&claim_clone(&clone));
     }
 }
 
-/// Ends `clone`, which was not adopted. The caller's reference, upgraded from
-/// the parent's `pending_clone`, is never the last: the scheduler keeps every
-/// clone until it is dead and drops it only between runs.
+/// Ends `clone`, which was not adopted, under its claim.
 fn end(clone: &Inner) {
     if !clone.is_dead() {
         log::debug!("ending a process clone that was not adopted");

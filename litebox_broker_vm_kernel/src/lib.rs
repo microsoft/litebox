@@ -66,7 +66,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, OnceCell, RefCell};
 use core::convert::Infallible;
-use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
@@ -88,7 +87,7 @@ use litebox_broker_transport::control_ring::{
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool};
 use litebox_common_vm_abi::{Status, UserRange, WireFrame};
 use litebox_platform::time::TimeProvider as _;
-use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel};
+use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel, cpu};
 
 use litebox_broker_smoltcp::{Network, SmoltcpSocketProvider};
 
@@ -106,12 +105,13 @@ pub const CONTROL_RING_SIZE: usize = CONTROL_RING_MEMORY_SIZE;
 /// What the broker waits for: the runner's event sources (e.g., device
 /// interrupts and a timer).
 pub trait Events: Sync {
-    /// Halts until an event may have happened, or until `deadline` passes.
-    /// Without a deadline, false if no event could ever end the halt (and it
-    /// does not halt).
+    /// Halts the calling CPU until an event may have happened, another CPU
+    /// wakes it (see [`cpu::halt`]), or `deadline` passes. Without a
+    /// deadline, false if no device could ever end the halt (and it does not
+    /// halt).
     fn wait(&self, deadline: Option<Instant>) -> bool;
 
-    /// Whether a device interrupted since the last call.
+    /// Whether a device interrupted since the calling CPU's last call.
     fn take_device_interrupt(&self) -> bool;
 }
 
@@ -143,8 +143,6 @@ pub struct Broker {
     events: &'static dyn Events,
     stdio: Arc<ConsoleStdio>,
     timers: Arc<KernelTimers>,
-    /// See [`Association::take_woken`].
-    woken: Arc<AtomicBool>,
     sockets: Arc<SmoltcpSocketProvider>,
     /// The virtual init, with [`Config::allow_process_duplication`].
     init: Option<Arc<BrokerProcess>>,
@@ -197,7 +195,6 @@ impl Broker {
             events: config.events,
             stdio,
             timers,
-            woken: Arc::new(AtomicBool::new(false)),
             sockets,
             init,
         }
@@ -279,7 +276,7 @@ impl Broker {
         Association {
             broker: self.clone(),
             shared_memory,
-            readiness: Arc::new(KernelReadiness::new(self.woken.clone())),
+            readiness: Arc::new(KernelReadiness::new()),
             launched,
             process: launch
                 .as_ref()
@@ -441,7 +438,7 @@ pub enum Entered {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitState {
     Ended(Result<(), EnterError>),
-    /// Until an event, or `wake`, if any (see [`Association::halt`]).
+    /// Until an event, or `wake`, if any (see [`Events::wait`]).
     Blocked {
         wake: Option<Instant>,
     },
@@ -642,14 +639,15 @@ impl Association {
     /// Serves the published requests, unless the response ring fills up.
     /// Needs the process's address space, for the shared buffers.
     ///
-    /// Must run on the kernel's worker
+    /// Must run on a CPU's worker
     /// ([`litebox_platform_vm_kernel::worker`]), as a request may suspend it:
     /// one waiting for a device, or one starting a child process, which waits
-    /// until the child's handshake or failure. While the worker is suspended,
-    /// the caller must keep creating what [`Self::take_pending_associations`]
-    /// returns, running the processes, and resuming the worker, or the request
-    /// never completes. Elsewhere, a request waiting for a device halts the
-    /// CPU, and one starting a child process panics.
+    /// until the child's handshake or failure (on any CPU). While the worker
+    /// is suspended, the caller must keep creating what
+    /// [`Self::take_pending_associations`] returns, running the processes, and
+    /// resuming the worker, or the request never completes. Elsewhere, a
+    /// request waiting for a device halts the CPU, and one starting a child
+    /// process panics.
     ///
     /// # Errors
     ///
@@ -810,23 +808,14 @@ impl Association {
 
     /// Whether a thread of the process blocks in a wait that a notification
     /// would end (on the notification epoch, or another the caller ends for
-    /// them, e.g., a futex wait), for a notification to set
-    /// [`Self::take_woken`]. The caller's to keep current: before polling
-    /// waits, since polling may publish.
+    /// them, e.g., a futex wait), for a notification to notify every CPU
+    /// ([`cpu::notify_all`], see [`cpu::take_notified`]): poll the waits
+    /// again. The caller's to keep current: before polling waits, since
+    /// polling may publish; ordered before the polls' reads, so that a
+    /// notification another CPU publishes meanwhile is either seen by the
+    /// poll or notified.
     pub fn set_notification_waiter(&self, waiting: bool) {
         self.readiness.set_waiting(waiting);
-    }
-
-    /// Whether a notification reached a process with a thread blocked in a
-    /// wait that it would end (see [`Self::set_notification_waiter`]), since
-    /// the last call (any process's): poll the waits again.
-    pub fn take_woken(&self) -> bool {
-        self.broker.woken.swap(false, Ordering::Relaxed)
-    }
-
-    /// [`Events::wait`]: for when no process can run.
-    pub fn halt(&self, wake: Option<Instant>) -> bool {
-        self.broker.events.wait(wake)
     }
 
     /// Runs `f` on the active association, ending it if `f` fails it.
@@ -995,7 +984,8 @@ impl PendingRunnerAssociation {
 
 impl Drop for PendingRunnerAssociation {
     /// Retires the process unless it started; `fail_start` keeps an earlier
-    /// failure's error.
+    /// failure's error. Either way, its start is over: the worker waiting for
+    /// it, on whichever CPU, looks again (see `KernelProcessLauncher`).
     fn drop(&mut self) {
         if !matches!(self.process.startup_result(), Some(Ok(()))) {
             let _ = self
@@ -1003,6 +993,7 @@ impl Drop for PendingRunnerAssociation {
                 .fail_start(BrokerError::PeerClosed, false, true);
             self.process.retire(true);
         }
+        cpu::notify_all();
     }
 }
 
@@ -1015,8 +1006,9 @@ struct KernelProcessLauncher {
 
 impl KernelProcessLauncher {
     /// Queues `launch`, and suspends the worker until its process started or
-    /// failed: meanwhile, the kernel creates its runner process, or adopts the
-    /// process clone it names as its runner.
+    /// failed, which notifies every CPU (see `PendingRunnerAssociation`'s
+    /// `Drop`): meanwhile, the kernel creates its runner process, or adopts
+    /// the process clone it names as its runner.
     fn start(&self, launch: PendingRunnerAssociation) -> Result<(), BrokerError> {
         let process = launch.process.clone();
         self.pending.lock().push(launch);

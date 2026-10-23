@@ -5,7 +5,6 @@
 //! output streams share it. Standard-input files are woken when input starts
 //! to be pending.
 
-use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_core::BrokerError;
 use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessWatchers};
 use litebox_broker_core::stdio::{
@@ -32,29 +31,35 @@ pub trait Console: Sync {
 
 pub(crate) struct ConsoleStdio {
     console: &'static dyn Console,
+    stdin: Mutex<Stdin>,
+}
+
+/// Locked as a whole, so that CPUs polling at once see input start to be
+/// pending in turn (and one publishes it).
+#[derive(Default)]
+struct Stdin {
     /// Standard-input files, to wake when input arrives.
-    watchers: Mutex<ReadinessWatchers>,
+    watchers: ReadinessWatchers,
     /// Whether input was pending when last looked at.
-    readable: AtomicBool,
+    readable: bool,
 }
 
 impl ConsoleStdio {
     pub(crate) fn new(console: &'static dyn Console) -> Self {
         Self {
             console,
-            watchers: Mutex::new(ReadinessWatchers::default()),
-            readable: AtomicBool::new(false),
+            stdin: Mutex::new(Stdin::default()),
         }
     }
 
     /// Wakes standard-input watchers if input started to be pending.
     pub(crate) fn poll(&self) {
+        let mut stdin = self.stdin.lock();
         let readable = self.console.has_input();
-        if readable && !self.readable.swap(true, Ordering::Relaxed) {
-            self.watchers.lock().publish(ReadinessFlags::READ);
-        } else if !readable {
-            self.readable.store(false, Ordering::Relaxed);
+        if readable && !stdin.readable {
+            stdin.watchers.publish(ReadinessFlags::READ);
         }
+        stdin.readable = readable;
     }
 }
 
@@ -98,7 +103,7 @@ impl StdioProvider for ConsoleStdio {
         registration: &ReadinessRegistration,
     ) -> litebox_broker_core::Result<()> {
         if stream == StdioStream::Stdin {
-            self.watchers.lock().watch(registration)?;
+            self.stdin.lock().watchers.watch(registration)?;
             if self.console.has_input() {
                 registration.publish(ReadinessFlags::READ);
             }
