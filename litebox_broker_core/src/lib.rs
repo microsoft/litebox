@@ -32,6 +32,7 @@ mod quota;
 pub mod random;
 pub mod readiness;
 pub mod readiness_queue;
+pub mod shared_memory;
 pub mod signal;
 pub mod socket;
 pub mod stdio;

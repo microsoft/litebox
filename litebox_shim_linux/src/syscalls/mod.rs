@@ -12,6 +12,7 @@ pub(crate) mod mm;
 pub(crate) mod net;
 pub(crate) mod pipe;
 pub mod process;
+pub(crate) mod shared_memory;
 pub(crate) mod timerfd;
 pub(crate) mod unix;
 

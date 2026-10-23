@@ -299,6 +299,34 @@ impl PendingChild {
             .collect())
     }
 
+    /// Gives this pending child process its own references to `memories`, returning the
+    /// child's handles in the same order.
+    ///
+    /// Each child reference shares its memory's futexes. The child adopts each handle with
+    /// [`LiteBox::adopt_inherited_shared_memory`] and releases its references when it
+    /// terminates. If this fails, the child receives none of them; a caller that then discards
+    /// the pending child also releases those [`Self::inherit`] gave it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a different number of handles than were duplicated.
+    pub fn inherit_shared_memory<Platform: RawSyncPrimitivesProvider + TimeProvider>(
+        &self,
+        memories: &[&crate::shared_memory::SharedMemory<Platform>],
+    ) -> Result<Vec<ObjectHandle>, ProcessError> {
+        // `memories` keeps the handles open until the child has its own.
+        let handles: Vec<ObjectHandle> = memories.iter().map(|memory| memory.handle()).collect();
+        let inherited = self
+            .broker
+            .duplicate_objects_to_child(self.identity.process_id, &handles)?;
+        assert_eq!(
+            inherited.len(),
+            handles.len(),
+            "broker returned a handle for every shared memory"
+        );
+        Ok(inherited)
+    }
+
     /// Writes `data` at `offset` of this pending child process's memory image,
     /// which the child's runner receives when the child starts.
     ///

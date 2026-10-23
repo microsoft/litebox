@@ -26,8 +26,8 @@ use thiserror::Error;
 
 /// A manager of all available futexes.
 ///
-/// Note: currently, this only supports "private" futexes, since it assumes only a single process.
-/// In the future, this may be expanded to support multi-process futexes.
+/// This only supports futexes private to one process, keyed by address. Futexes in memory shared
+/// with other processes use [`SharedMemory`](crate::shared_memory::SharedMemory) instead.
 pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
     /// Chaining hash table to map from futex address to waiter lists.
     table: alloc::boxed::Box<[LoanList<Platform, FutexEntry<Platform>>; HASH_TABLE_ENTRIES]>,
@@ -179,6 +179,13 @@ pub enum FutexError {
     WaitError(WaitError),
     #[error("fault reading futex word")]
     Fault,
+    /// The broker backing a futex in shared memory ran out of objects or memory.
+    #[error("futex backing resources exhausted")]
+    ResourceExhausted,
+    /// The broker backing a futex in shared memory failed, or its association with this
+    /// process did.
+    #[error("futex backing broker failed")]
+    Io,
 }
 
 #[cfg(test)]
@@ -351,7 +358,12 @@ mod tests {
                 | Err(
                     FutexError::WaitError(_) | FutexError::ImmediatelyWokenBecauseValueMismatch,
                 ) => {}
-                Err(FutexError::NotAligned | FutexError::Fault) => {
+                Err(
+                    FutexError::NotAligned
+                    | FutexError::Fault
+                    | FutexError::ResourceExhausted
+                    | FutexError::Io,
+                ) => {
                     unreachable!()
                 }
             }

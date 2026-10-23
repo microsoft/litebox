@@ -32,6 +32,10 @@ use crate::readiness_queue::{
     ReadinessQueueError, RemoveReadinessQueueEntryRequest, TakeReadyRequest, TakeReadyResponse,
 };
 use crate::shared_buffer::SharedBufferSequence;
+use crate::shared_memory::{
+    CreateFutexWaiterResponse, CreateSharedMemoryRequest, CreateSharedMemoryResponse,
+    FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse, FutexWakeRequest, FutexWakeResponse,
+};
 use crate::signal::{OpenSignalsResponse, SendSignalRequest, SignalEvent, TakeSignalRequest};
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
@@ -100,6 +104,8 @@ pub enum BrokerOperation {
     UnixSocket(UnixSocketRequest),
     /// Readiness queue request family.
     ReadinessQueue(ReadinessQueueRequest),
+    /// Shared memory and futex request family.
+    SharedMemory(SharedMemoryRequest),
 }
 
 impl BrokerOperation {
@@ -171,6 +177,7 @@ impl BrokerOperation {
             | Self::ProcessGroup(_)
             | Self::Timer(_)
             | Self::Signal(_)
+            | Self::SharedMemory(_)
             | Self::Process(
                 ProcessRequest::AllocateChild
                 | ProcessRequest::ExitChild(_)
@@ -303,6 +310,21 @@ pub enum ReadinessQueueRequest {
     Remove(RemoveReadinessQueueEntryRequest),
     /// Take ready events without waiting.
     TakeReady(TakeReadyRequest),
+}
+
+/// Broker-owned shared memory and futex request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedMemoryRequest {
+    /// Create a shared memory object.
+    Create(CreateSharedMemoryRequest),
+    /// Create an idle futex waiter for the calling thread.
+    CreateFutexWaiter,
+    /// Arm a futex waiter on a futex word.
+    FutexArm(FutexArmRequest),
+    /// Wake waiters on a futex word.
+    FutexWake(FutexWakeRequest),
+    /// Disarm a futex waiter, reporting whether it was woken.
+    FutexDisarm(FutexDisarmRequest),
 }
 
 /// Request about the caller's threads.
@@ -509,6 +531,8 @@ pub enum BrokerResult {
     UnixSocket(UnixSocketResponse),
     /// Readiness queue response family.
     ReadinessQueue(ReadinessQueueResponse),
+    /// Shared memory and futex response family.
+    SharedMemory(SharedMemoryResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -544,6 +568,21 @@ pub enum TimerResponse {
     Get(GetTimerResponse),
     /// Read operation response.
     Read(ReadTimerResponse),
+}
+
+/// Broker-owned shared memory and futex response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedMemoryResponse {
+    /// Create operation response.
+    Create(CreateSharedMemoryResponse),
+    /// Futex waiter create operation response.
+    CreateFutexWaiter(CreateFutexWaiterResponse),
+    /// Futex arm operation completed.
+    FutexArm,
+    /// Futex wake operation response.
+    FutexWake(FutexWakeResponse),
+    /// Futex disarm operation response.
+    FutexDisarm(FutexDisarmResponse),
 }
 
 /// Broker-owned readiness queue response.

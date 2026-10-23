@@ -34,6 +34,7 @@ mod primitive;
 mod process;
 mod process_group;
 mod readiness_queue;
+mod shared_memory;
 mod signal;
 mod socket;
 mod terminal;
@@ -58,6 +59,7 @@ const REQUEST_TAG_SIGNAL: u8 = 13;
 const REQUEST_TAG_PROCESS_GROUP: u8 = 14;
 const REQUEST_TAG_UNIX_SOCKET: u8 = 15;
 const REQUEST_TAG_READINESS_QUEUE: u8 = 16;
+const REQUEST_TAG_SHARED_MEMORY: u8 = 17;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -77,6 +79,7 @@ const RESPONSE_TAG_SIGNAL: u8 = 13;
 const RESPONSE_TAG_PROCESS_GROUP: u8 = 14;
 const RESPONSE_TAG_UNIX_SOCKET: u8 = 15;
 const RESPONSE_TAG_READINESS_QUEUE: u8 = 16;
+const RESPONSE_TAG_SHARED_MEMORY: u8 = 17;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -141,7 +144,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_SIGNAL
         | REQUEST_TAG_PROCESS_GROUP
         | REQUEST_TAG_UNIX_SOCKET
-        | REQUEST_TAG_READINESS_QUEUE => {
+        | REQUEST_TAG_READINESS_QUEUE
+        | REQUEST_TAG_SHARED_MEMORY => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -241,6 +245,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             readiness_queue::encode_readiness_queue_request(&mut encoder, request);
         }
+        BrokerOperation::SharedMemory(request) => {
+            encoder.u8(REQUEST_TAG_SHARED_MEMORY);
+            encoder.request_id(request_id);
+            shared_memory::encode_shared_memory_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -266,7 +275,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_SIGNAL
         | REQUEST_TAG_PROCESS_GROUP
         | REQUEST_TAG_UNIX_SOCKET
-        | REQUEST_TAG_READINESS_QUEUE => {}
+        | REQUEST_TAG_READINESS_QUEUE
+        | REQUEST_TAG_SHARED_MEMORY => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -296,6 +306,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         }
         REQUEST_TAG_READINESS_QUEUE => BrokerOperation::ReadinessQueue(
             readiness_queue::decode_readiness_queue_request(&mut decoder)?,
+        ),
+        REQUEST_TAG_SHARED_MEMORY => BrokerOperation::SharedMemory(
+            shared_memory::decode_shared_memory_request(&mut decoder)?,
         ),
         _ => unreachable!("active request tag was validated"),
     };
@@ -378,7 +391,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_SIGNAL
         | RESPONSE_TAG_PROCESS_GROUP
         | RESPONSE_TAG_UNIX_SOCKET
-        | RESPONSE_TAG_READINESS_QUEUE => {
+        | RESPONSE_TAG_READINESS_QUEUE
+        | RESPONSE_TAG_SHARED_MEMORY => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -478,6 +492,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             readiness_queue::encode_readiness_queue_response(&mut encoder, response);
         }
+        BrokerResult::SharedMemory(response) => {
+            encoder.u8(RESPONSE_TAG_SHARED_MEMORY);
+            encoder.request_id(request_id);
+            shared_memory::encode_shared_memory_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -511,7 +530,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_SIGNAL
         | RESPONSE_TAG_PROCESS_GROUP
         | RESPONSE_TAG_UNIX_SOCKET
-        | RESPONSE_TAG_READINESS_QUEUE => {}
+        | RESPONSE_TAG_READINESS_QUEUE
+        | RESPONSE_TAG_SHARED_MEMORY => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -543,6 +563,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_READINESS_QUEUE => BrokerResult::ReadinessQueue(
             readiness_queue::decode_readiness_queue_response(&mut decoder)?,
         ),
+        RESPONSE_TAG_SHARED_MEMORY => {
+            BrokerResult::SharedMemory(shared_memory::decode_shared_memory_response(&mut decoder)?)
+        }
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -637,9 +660,9 @@ mod tests {
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
         ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
-        ReadinessQueueRequest, ReadinessQueueResponse, SignalRequest, SignalResponse,
-        SocketRequest, SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse,
-        UnixSocketRequest, UnixSocketResponse,
+        ReadinessQueueRequest, ReadinessQueueResponse, SharedMemoryRequest, SharedMemoryResponse,
+        SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest,
+        ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -660,6 +683,11 @@ mod tests {
     use crate::shared_buffer::{
         MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
         SharedBufferSlotIndex,
+    };
+    use crate::shared_memory::{
+        CreateFutexWaiterResponse, CreateSharedMemoryRequest, CreateSharedMemoryResponse,
+        FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse, FutexWakeRequest,
+        FutexWakeResponse,
     };
     use crate::signal::{
         OpenSignalsResponse, PendingSignal, SendSignalRequest, SignalEvent, SignalTarget,
@@ -865,6 +893,25 @@ mod tests {
             BrokerOperation::ReadinessQueue(ReadinessQueueRequest::TakeReady(TakeReadyRequest {
                 queue: handle,
                 buffer: sequence(4, 48),
+            })),
+            BrokerOperation::SharedMemory(SharedMemoryRequest::Create(CreateSharedMemoryRequest {
+                length: u64::MAX,
+            })),
+            BrokerOperation::SharedMemory(SharedMemoryRequest::CreateFutexWaiter),
+            BrokerOperation::SharedMemory(SharedMemoryRequest::FutexArm(FutexArmRequest {
+                memory: handle,
+                offset: u64::MAX,
+                bitset: u32::MAX,
+                waiter: ObjectHandle(1),
+            })),
+            BrokerOperation::SharedMemory(SharedMemoryRequest::FutexWake(FutexWakeRequest {
+                memory: handle,
+                offset: 4,
+                count: u32::MAX,
+                bitset: 1,
+            })),
+            BrokerOperation::SharedMemory(SharedMemoryRequest::FutexDisarm(FutexDisarmRequest {
+                waiter: handle,
             })),
             BrokerOperation::Signal(SignalRequest::Open),
             BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
@@ -1546,6 +1593,22 @@ mod tests {
             BrokerResult::ReadinessQueue(ReadinessQueueResponse::Create(
                 CreateReadinessQueueResponse { handle },
             )),
+            BrokerResult::SharedMemory(SharedMemoryResponse::Create(CreateSharedMemoryResponse {
+                handle,
+            })),
+            BrokerResult::SharedMemory(SharedMemoryResponse::CreateFutexWaiter(
+                CreateFutexWaiterResponse { handle },
+            )),
+            BrokerResult::SharedMemory(SharedMemoryResponse::FutexArm),
+            BrokerResult::SharedMemory(SharedMemoryResponse::FutexWake(FutexWakeResponse {
+                woken: u32::MAX,
+            })),
+            BrokerResult::SharedMemory(SharedMemoryResponse::FutexDisarm(FutexDisarmResponse {
+                woken: true,
+            })),
+            BrokerResult::SharedMemory(SharedMemoryResponse::FutexDisarm(FutexDisarmResponse {
+                woken: false,
+            })),
             BrokerResult::ReadinessQueue(ReadinessQueueResponse::Add),
             BrokerResult::ReadinessQueue(ReadinessQueueResponse::Modify),
             BrokerResult::ReadinessQueue(ReadinessQueueResponse::Remove),

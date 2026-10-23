@@ -1129,9 +1129,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
             // Cast from *i32 to *u32
             let clear_child_tid = UserPtrMut::from_usize(clear_child_tid.as_usize());
+            // Linux wakes the word as a shared futex, which reaches waiters in other processes
+            // if it is in shared memory.
             let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
                 addr: clear_child_tid,
-                flags: litebox_common_linux::FutexFlags::PRIVATE,
+                flags: litebox_common_linux::FutexFlags::empty(),
                 count: 1,
             });
         }
@@ -1359,7 +1361,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             program_break: 0,
             regions: Vec::new(),
             fds,
+            shared_memory: Vec::new(),
         };
+        // Only a native child, which shares the mappings, inherits their shared memory.
+        let inherited_shared_memory = shares_memory.then(|| self.shared_mappings_for_fork());
+        if let Some(inherited) = &inherited_shared_memory {
+            startup.shared_memory = inherited.records(&[]);
+        }
         // The child keeps the references it inherits until it exits, so check the size first.
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
@@ -1374,6 +1382,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let handles = child.inherit(&objects).map_err(Errno::from)?;
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
+        }
+        if let Some(inherited) = &inherited_shared_memory
+            && !inherited.memories.is_empty()
+        {
+            let memories: Vec<_> = inherited.memories.iter().map(AsRef::as_ref).collect();
+            let handles = child
+                .inherit_shared_memory(&memories)
+                .map_err(Errno::from)?;
+            startup.shared_memory = inherited.records(&handles);
         }
         if let Some(launcher) = &self.global.fork_launcher {
             let payload = startup
@@ -1823,6 +1840,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         global: self.global.clone(),
                         litebox_thread: Cell::new(None),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
+                        shared_futex_waiter: core::cell::OnceCell::new(),
                         thread,
                         vfork: core::cell::RefCell::new(None),
                         pid: self.pid,
@@ -2651,26 +2669,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `futex`
+    ///
+    /// A futex without `FUTEX_PRIVATE_FLAG` in a shared anonymous mapping
+    /// spans every process that shares the mapping; every other futex is private to this
+    /// process, as Linux keys a shared futex in private memory by its address.
     pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
-        /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
-        /// It should be fine to treat shared futexes as private for now.
-        macro_rules! warn_shared_futex {
-            ($flag:ident) => {
-                if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    log_unsupported!("shared futex");
-                }
-            };
-        }
-
         let res = match arg {
             FutexArgs::Wake { addr, flags, count } => {
-                warn_shared_futex!(flags);
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
-                self.global
-                    .futex_manager
-                    .wake(addr.to_platform_ptr::<Platform>(), count, None)? as usize
+                if let Some((memory, offset)) = self.shared_futex_for(addr, &flags) {
+                    memory.wake(offset, count, None)? as usize
+                } else {
+                    self.global.futex_manager.wake(
+                        addr.to_platform_ptr::<Platform>(),
+                        count,
+                        None,
+                    )? as usize
+                }
             }
             FutexArgs::Wait {
                 addr,
@@ -2678,17 +2695,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 val,
                 timeout,
             } => {
-                warn_shared_futex!(flags);
                 let timeout = timeout.read::<Platform>()?;
-                self.global
-                    .futex_manager
-                    .wait(
-                        &self.wait_cx().with_timeout(timeout),
-                        addr.to_platform_ptr::<Platform>(),
-                        val,
-                        None,
-                    )
-                    .map_err(|error| wait_errno(timeout, error))?;
+                self.futex_wait(
+                    &self.wait_cx().with_timeout(timeout),
+                    addr,
+                    &flags,
+                    val,
+                    None,
+                )
+                .map_err(|error| wait_errno(timeout, error))?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
@@ -2698,7 +2713,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 timeout,
                 bitmask,
             } => {
-                warn_shared_futex!(flags);
                 let timeout = timeout.read::<Platform>()?;
                 let deadline = if let Some(timeout) = timeout {
                     let clock_id =
@@ -2711,20 +2725,71 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 };
-                self.global
-                    .futex_manager
-                    .wait(
-                        &self.wait_cx().with_deadline(deadline),
-                        addr.to_platform_ptr::<Platform>(),
-                        val,
-                        core::num::NonZeroU32::new(bitmask),
-                    )
-                    .map_err(|error| wait_errno(timeout, error))?;
+                self.futex_wait(
+                    &self.wait_cx().with_deadline(deadline),
+                    addr,
+                    &flags,
+                    val,
+                    core::num::NonZeroU32::new(bitmask),
+                )
+                .map_err(|error| wait_errno(timeout, error))?;
                 0
             }
             _ => unimplemented!("Unsupported futex operation"),
         };
         Ok(res)
+    }
+
+    /// Returns the broker shared memory holding the futex word at `addr`, and the word's offset
+    /// in it, if a futex operation with `flags` on it spans processes.
+    fn shared_futex_for(
+        &self,
+        addr: UserPtrMut<u32>,
+        flags: &litebox_common_linux::FutexFlags,
+    ) -> Option<(
+        alloc::sync::Arc<litebox::shared_memory::SharedMemory<Platform>>,
+        u64,
+    )> {
+        if flags.contains(litebox_common_linux::FutexFlags::PRIVATE) {
+            None
+        } else {
+            self.shared_futex(addr.as_usize())
+        }
+    }
+
+    /// Waits on the futex word at `addr` with the shared or private futexes `flags` selects.
+    fn futex_wait(
+        &self,
+        cx: &litebox::event::wait::WaitContext<'_, Platform>,
+        addr: UserPtrMut<u32>,
+        flags: &litebox_common_linux::FutexFlags,
+        val: u32,
+        bitset: Option<core::num::NonZeroU32>,
+    ) -> Result<(), Errno> {
+        let addr_ptr = addr.to_platform_ptr::<Platform>();
+        if let Some((memory, offset)) = self.shared_futex_for(addr, flags) {
+            self.get_or_create_shared_futex_waiter()?
+                .wait(cx, &memory, offset, addr_ptr, val, bitset)?;
+        } else {
+            self.global.futex_manager.wait(cx, addr_ptr, val, bitset)?;
+        }
+        Ok(())
+    }
+
+    /// Returns this thread's waiter for futexes in shared memory, creating it in the broker on
+    /// first use.
+    fn get_or_create_shared_futex_waiter(
+        &self,
+    ) -> Result<&litebox::shared_memory::SharedFutexWaiter<Platform>, Errno> {
+        if let Some(waiter) = self.shared_futex_waiter.get() {
+            return Ok(waiter);
+        }
+        let waiter = litebox::shared_memory::SharedFutexWaiter::new(
+            &self.global.litebox,
+            self.wait_cx().waker(),
+        )
+        .map_err(Errno::from)?;
+        Ok(self.shared_futex_waiter.get_or_init(|| waiter))
     }
 }
 
@@ -2956,6 +3021,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         unsafe { self.global.mm.release_memory() }.expect("failed to release memory mappings");
+        let forgotten = self.global.shared_mappings.lock().forget_all();
+        drop(forgotten);
 
         // AArch64 patch state contains addresses from the discarded image.
         // TODO: clear x86-64 patch state here too; it also contains addresses
@@ -3254,10 +3321,11 @@ mod tests {
                 .mm
                 .restore_program_break(program_break.0, program_break.1);
             assert_eq!(task.global.mm.has_shared_mappings(), shared);
+            // Only a launcher may share memory, on platforms that support shared pages.
+            let shares_backed_memory = shared && !matches!(mode, ForkLauncherMode::Default);
 
             let result = task.sys_fork(&PtRegs::default());
-            // Only a native child, which shares the pages, may inherit shared memory.
-            if shared && matches!(mode, ForkLauncherMode::Native) {
+            if shared && shares_backed_memory && matches!(mode, ForkLauncherMode::Native) {
                 result.unwrap();
             } else if shared {
                 assert_eq!(result, Err(Errno::EAGAIN));
@@ -3274,8 +3342,15 @@ mod tests {
                 );
             }
             let requests = requests.lock().unwrap();
-            // Without a launcher, shared memory is refused before a child exists.
-            if shared && matches!(mode, ForkLauncherMode::Default) {
+            if shares_backed_memory {
+                // The child inherits the mapping's shared memory before the launcher runs.
+                assert!(
+                    requests.iter().any(|request| matches!(
+                        request,
+                        ProcessRequest::DuplicateObjectsToChild(_)
+                    ))
+                );
+            } else if shared {
                 assert_eq!(*requests, []);
             }
             let writes = requests
@@ -3315,12 +3390,12 @@ mod tests {
     }
 
     #[test]
-    fn fork_launcher_native_shares_shared_memory() {
+    fn fork_launcher_native_shares_backed_shared_memory() {
         check_fork_launcher_fallback(ForkLauncherMode::Native, true);
     }
 
     #[test]
-    fn fork_launcher_native_rejects_shared_file_mapping() {
+    fn fork_launcher_native_rejects_unbacked_shared_file_mapping() {
         use litebox::platform::ThreadProvider;
         use litebox_broker_protocol::fs::FileMode;
         use litebox_common_linux::{MapFlags, OFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};

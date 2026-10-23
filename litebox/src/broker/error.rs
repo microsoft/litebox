@@ -9,6 +9,8 @@ use crate::event::{
     counter::EventCounterError, polling::TryOpError, readiness_queue::ReadinessQueueError,
     timer::TimerError,
 };
+use crate::shared_memory::SharedMemoryError;
+use crate::sync::futex::FutexError;
 
 /// Error returned by the deployment-provided broker control path.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -163,6 +165,40 @@ impl From<BrokerObjectError> for TimerError {
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::PeerClosed
+            | BrokerObjectError::UnsupportedOperation
+            | BrokerObjectError::Fault => Self::Io,
+        }
+    }
+}
+
+impl From<BrokerObjectError> for SharedMemoryError {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::ResourceExhausted | BrokerObjectError::OutOfMemory => {
+                Self::ResourceExhausted
+            }
+            BrokerObjectError::PermissionDenied => Self::PermissionDenied,
+            BrokerObjectError::Control
+            | BrokerObjectError::InvalidObject
+            | BrokerObjectError::WouldBlock
+            | BrokerObjectError::PeerClosed
+            | BrokerObjectError::UnsupportedOperation
+            | BrokerObjectError::Fault => Self::Io,
+        }
+    }
+}
+
+impl From<BrokerObjectError> for FutexError {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::ResourceExhausted | BrokerObjectError::OutOfMemory => {
+                Self::ResourceExhausted
+            }
+            BrokerObjectError::Control
+            | BrokerObjectError::InvalidObject
+            | BrokerObjectError::WouldBlock
+            | BrokerObjectError::PeerClosed
+            | BrokerObjectError::PermissionDenied
             | BrokerObjectError::UnsupportedOperation
             | BrokerObjectError::Fault => Self::Io,
         }
