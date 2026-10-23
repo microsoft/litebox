@@ -16,6 +16,10 @@ pub(crate) const PROT_NONE: PageTableFlags = PageTableFlags::BIT_9;
 // other leaf maps it.
 pub(crate) const COW: PageTableFlags = PageTableFlags::BIT_10;
 
+// A user leaf of shared memory, which clones map writable too instead of copy-on-write (see
+// `SHARED_FRAMES`), as Linux `MAP_SHARED` memory.
+pub(crate) const SHARED: PageTableFlags = PageTableFlags::BIT_11;
+
 pub(crate) struct PageTableAllocator<M: super::MemoryProvider> {
     _provider: core::marker::PhantomData<M>,
 }

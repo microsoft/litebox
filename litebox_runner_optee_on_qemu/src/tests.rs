@@ -18,7 +18,9 @@ use serde::Deserialize;
 pub fn check_user_memory_protection(platform: &VmKernel) {
     use litebox::platform::{
         PageManagementProvider, RawMutPointer as _,
-        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions as Permissions},
+        page_mgmt::{
+            AllocationOptions, FixedAddressBehavior, MemoryRegionPermissions as Permissions,
+        },
     };
     use litebox_common_linux::PAGE_SIZE;
     use litebox_platform_vm_kernel::AddressSpaceId;
@@ -35,8 +37,7 @@ pub fn check_user_memory_protection(platform: &VmKernel) {
             core::iter::empty,
             range.clone(),
             writable,
-            false,
-            true,
+            AllocationOptions::POPULATE,
             FixedAddressBehavior::NoReplace,
         )
     }

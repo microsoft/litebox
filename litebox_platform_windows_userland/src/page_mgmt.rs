@@ -7,10 +7,27 @@ use super::{
     VirtualProtect, Win32_Memory, WindowsUserland, c_void,
 };
 use litebox::platform::common_providers::reservations::TrackedReservations;
-use litebox::platform::page_mgmt::{AllocationDirection, HintPlacementBehavior, PageReservation};
+use litebox::platform::page_mgmt::{
+    AllocationDirection, AllocationOptions, HintPlacementBehavior, PageReservation,
+};
 
 /// `MEM_COALESCE_PLACEHOLDERS`, which `windows-sys` does not define.
 const MEM_COALESCE_PLACEHOLDERS: Win32_Memory::VIRTUAL_FREE_TYPE = 0x1;
+
+/// Whether this process ever asked for [`AllocationOptions::SHARED`] pages, which are
+/// private here, so that native fork, which would copy them, declines instead.
+///
+/// TODO: back shared pages with views of a pagefile section, which `RtlCloneUserProcess` clones
+/// share. A view cannot be partly released or moved, so partial `munmap` needs a view per region
+/// it can split.
+pub(crate) static SHARED_PAGES_REQUESTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn note_shared_pages(options: AllocationOptions) {
+    if options.contains(AllocationOptions::SHARED) {
+        SHARED_PAGES_REQUESTED.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
 
 #[allow(
     clippy::match_same_arms,
@@ -295,13 +312,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         _replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<WindowsUserlandReservation<ALIGN>, litebox::platform::page_mgmt::AllocationError>
     where
         Reservations: Iterator<Item = WindowsUserlandReservation<ALIGN>>,
     {
+        note_shared_pages(options);
         debug_assert!(!suggested_range.is_empty());
         debug_assert!(
             suggested_range
@@ -318,14 +335,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         if fixed_address_behavior == FixedAddressBehavior::Replace {
             return Err(AllocationError::UnsupportedByPlatform);
         }
-        // TODO: For Windows, there is no MAP_GROWDOWN feature so far.
-        let _ = can_grow_down;
+        // TODO: For Windows, there is no MAP_GROWDOWN feature so far, so `GROWS_DOWN` is ignored.
         let reservation = Self::allocate_native_reservation(
             suggested_range,
             fixed_address_behavior,
             NativeReservation::Committed(permissions),
         )?;
-        if populate_pages_immediately {
+        if options.contains(AllocationOptions::POPULATE) {
             let extent = reservation.range();
             do_prefetch_on_range(extent.start, extent.len());
         }
@@ -434,12 +450,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         covering_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         permissions: MemoryRegionPermissions,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>
     where
         Reservations: Iterator<Item = &'reservation WindowsUserlandReservation<ALIGN>>,
         WindowsUserlandReservation<ALIGN>: 'reservation,
     {
+        note_shared_pages(options);
         debug_assert_alignment!(range, ALIGN);
         if !Self::commit_reservations(
             covering_reservations(),
@@ -448,7 +465,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         ) {
             return Err(AllocationError::OutOfMemory);
         }
-        if populate_pages_immediately {
+        if options.contains(AllocationOptions::POPULATE) {
             do_prefetch_on_range(range.start, range.len());
         }
         Ok(UserMutPtr::from_ptr(range.start as *mut u8))
@@ -599,8 +616,7 @@ mod tests {
                 core::iter::empty,
                 suggested..suggested + 0x2_0000,
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                false,
-                false,
+                AllocationOptions::empty(),
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
         }
@@ -698,7 +714,7 @@ mod tests {
                 || core::iter::once(&merged),
                 base..base + 3 * UNIT,
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                false,
+                AllocationOptions::empty(),
             )
         }
         .unwrap();
@@ -818,8 +834,7 @@ mod tests {
                 core::iter::empty,
                 suggested..suggested + PAGE_SIZE,
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                false,
-                false,
+                AllocationOptions::empty(),
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
         }
@@ -836,8 +851,7 @@ mod tests {
                 core::iter::empty,
                 range.clone(),
                 MemoryRegionPermissions::READ,
-                false,
-                false,
+                AllocationOptions::empty(),
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
         }
@@ -886,7 +900,7 @@ mod tests {
                 || core::iter::once(&reservation),
                 addr..addr + 0x1000,
                 MemoryRegionPermissions::WRITE,
-                true,
+                AllocationOptions::POPULATE,
             )
         }
         .unwrap();
@@ -913,7 +927,7 @@ mod tests {
                 || core::iter::once(&reservation),
                 (addr + 0x8000)..(addr + 0x1_0000),
                 MemoryRegionPermissions::WRITE,
-                true,
+                AllocationOptions::POPULATE,
             )
         }
         .unwrap()

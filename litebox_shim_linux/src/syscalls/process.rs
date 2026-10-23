@@ -1303,9 +1303,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `MADV_DONTFORK` regions are copied too. Like Linux, the child has a single thread, a copy
     /// of the calling one; the parent's other threads pause while the parent is copied.
     ///
-    /// Only a process outside a `vfork` window, with default resource-limit state, no shared
-    /// memory mappings, no ELF file mid-load, and only descriptors a fresh runner can inherit is
-    /// duplicated; otherwise this fails with `EAGAIN`.
+    /// Only a process outside a `vfork` window, with default resource-limit state, no ELF file
+    /// mid-load, and only descriptors a fresh runner can inherit is duplicated; otherwise this
+    /// fails with `EAGAIN`. Shared memory mappings need a native launcher, which the child shares
+    /// them through, and must not be file-backed.
     fn fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1316,9 +1317,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EAGAIN);
         }
         let pause = self.pause_other_threads()?;
+        // Copying would silently unshare shared memory, so only a native child, which shares
+        // shared pages, may inherit it.
+        let shares_memory = self.global.mm.has_shared_mappings();
         if !self.thread.process.limits.has_default_state()
             || !self.global.elf_patch_cache.lock().is_empty()
-            || self.global.mm.has_shared_mappings()
+            || (shares_memory
+                && (self.global.fork_launcher.is_none()
+                    || self.global.mm.has_unforkable_shared_mappings()))
         {
             return Err(Errno::EAGAIN);
         }
@@ -1377,6 +1383,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // calling thread and the stable process state.
             match unsafe { launcher.start(&child, &payload) } {
                 Ok(()) => return Ok(child_pid.cast_unsigned() as usize),
+                Err(litebox::platform::ForkError::Unsupported) if shares_memory => {
+                    return Err(Errno::EAGAIN);
+                }
                 Err(litebox::platform::ForkError::Unsupported) => {}
                 Err(litebox::platform::ForkError::Failed(error)) => {
                     return Err(Errno::from(error));
@@ -3247,7 +3256,10 @@ mod tests {
             assert_eq!(task.global.mm.has_shared_mappings(), shared);
 
             let result = task.sys_fork(&PtRegs::default());
-            if shared {
+            // Only a native child, which shares the pages, may inherit shared memory.
+            if shared && matches!(mode, ForkLauncherMode::Native) {
+                result.unwrap();
+            } else if shared {
                 assert_eq!(result, Err(Errno::EAGAIN));
             } else if matches!(mode, ForkLauncherMode::Native) {
                 result.unwrap();
@@ -3262,7 +3274,8 @@ mod tests {
                 );
             }
             let requests = requests.lock().unwrap();
-            if shared {
+            // Without a launcher, shared memory is refused before a child exists.
+            if shared && matches!(mode, ForkLauncherMode::Default) {
                 assert_eq!(*requests, []);
             }
             let writes = requests
@@ -3302,8 +3315,42 @@ mod tests {
     }
 
     #[test]
-    fn fork_launcher_native_rejects_shared_memory() {
+    fn fork_launcher_native_shares_shared_memory() {
         check_fork_launcher_fallback(ForkLauncherMode::Native, true);
+    }
+
+    #[test]
+    fn fork_launcher_native_rejects_shared_file_mapping() {
+        use litebox::platform::ThreadProvider;
+        use litebox_broker_protocol::fs::FileMode;
+        use litebox_common_linux::{MapFlags, OFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};
+
+        let platform = crate::syscalls::tests::test_platform();
+        crate::syscalls::tests::TestPlatform::run_test_thread(|| {
+            let (litebox, process_id) = super::super::test_broker::litebox(platform);
+            let shim = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
+                .with_fork_launcher(super::fork_tests::checking_native_launcher())
+                .build();
+            let task = shim.0.new_test_task();
+            crate::syscalls::tests::create_file(&task, "/shared.txt", b"shared");
+            let fd = task
+                .sys_open("/shared.txt", OFlags::RDONLY, FileMode::empty())
+                .unwrap();
+            let mapping = task
+                .sys_mmap(
+                    0,
+                    PAGE_SIZE,
+                    ProtFlags::PROT_READ,
+                    MapFlags::MAP_SHARED,
+                    i32::try_from(fd).unwrap(),
+                    0,
+                )
+                .unwrap();
+            // The file's pages are private copies a native child would not share.
+            assert!(task.global.mm.has_unforkable_shared_mappings());
+            assert_eq!(task.sys_fork(&PtRegs::default()), Err(Errno::EAGAIN));
+            task.sys_munmap(mapping, PAGE_SIZE).unwrap();
+        });
     }
 
     #[test]

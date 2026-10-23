@@ -30,7 +30,7 @@ use x86_64::{
 use crate::UserMutPtr;
 use crate::mm::{
     MemoryProvider,
-    pgtable::{COW, PROT_NONE, PageTableAllocator, PageTableImpl},
+    pgtable::{COW, PROT_NONE, PageTableAllocator, PageTableImpl, SHARED},
 };
 
 /// Above this many pages, a full TLB flush is cheaper than `invlpg` per page
@@ -128,8 +128,8 @@ fn for_each_user_leaf<'a, M: MemoryProvider>(
     }
 }
 
-/// The frames that more than one user leaf maps, each with [`COW`], and how
-/// many leaves map each. A frame it does not count belongs to its one leaf.
+/// The frames that more than one user leaf maps, each with [`COW`] or [`SHARED`], and how many
+/// leaves map each. A frame it does not count belongs to its one leaf.
 static SHARED_FRAMES: spin::Once<spin::Mutex<SharedFrames>> = spin::Once::new();
 
 /// [`SHARED_FRAMES`], locked.
@@ -271,7 +271,7 @@ impl SharedFrames {
 ///
 /// No access or stale translation through the leaf may remain.
 unsafe fn release_user_frame<M: MemoryProvider>(frame: PhysFrame, flags: PageTableFlags) {
-    if flags.contains(COW) && shared_frames().remove_leaf(frame) {
+    if flags.intersects(COW | SHARED) && shared_frames().remove_leaf(frame) {
         return;
     }
     // Safety: the leaf was the frame's only one, and the caller guarantees
@@ -325,6 +325,9 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
     }
     if !values.contains(VmFlags::VM_EXEC) {
         flags |= PageTableFlags::NO_EXECUTE;
+    }
+    if values.contains(VmFlags::VM_SHARED) {
+        flags |= SHARED;
     }
     flags
 }
@@ -610,8 +613,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// Maps every user leaf of `self` but those of pinned ranges (see
     /// [`Self::pin`]) in `dst`, which has none. Pinned ranges are the
     /// kernel's (e.g., a broker control ring), and `dst`'s owner maps its own.
-    /// Any other frame is shared: both leaves map it, [`COW`] (and so not
-    /// writable).
+    /// Any other frame is shared: both leaves map it, [`SHARED`] ones as they
+    /// are, and the rest [`COW`] (and so not writable).
     ///
     /// # Errors
     ///
@@ -640,7 +643,11 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 return;
             }
             let frame = PhysFrame::containing_address(entry.addr());
-            let flags = (entry.flags() | COW) - PageTableFlags::WRITABLE;
+            let flags = if entry.flags().contains(SHARED) {
+                entry.flags()
+            } else {
+                (entry.flags() | COW) - PageTableFlags::WRITABLE
+            };
             // Room to count it below, before `dst` maps it.
             let room = match shared.reserve(frame) {
                 Ok(room) => room,
@@ -649,8 +656,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     return;
                 }
             };
-            // Safety: `dst` has no user leaves, and the frame is shared as COW
-            // by both leaves.
+            // Safety: `dst` has no user leaves, and both leaves share the frame, as COW unless it
+            // is shared memory.
             match unsafe {
                 dst.map_to_with_table_flags(page, frame, flags, table_flags, &mut allocator)
             } {

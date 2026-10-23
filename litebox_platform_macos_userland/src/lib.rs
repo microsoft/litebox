@@ -13,8 +13,8 @@ use std::sync::{
 use std::time::Duration;
 
 use litebox::platform::page_mgmt::{
-    AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    PermissionUpdateError,
+    AllocationError, AllocationOptions, DeallocationError, FixedAddressBehavior,
+    MemoryRegionPermissions, PermissionUpdateError,
 };
 use litebox::platform::{ArchSpecificError, ArchSpecificRegister, RawConstPointer as _};
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
@@ -673,9 +673,6 @@ fn is_page_aligned<const PAGE_SIZE: usize>(range: &Range<usize>) -> bool {
         && range.end.is_multiple_of(PAGE_SIZE)
 }
 fn prot_flags(permissions: MemoryRegionPermissions) -> i32 {
-    if permissions.contains(MemoryRegionPermissions::SHARED) {
-        unimplemented!("shared macOS mappings are not supported")
-    }
     let mut flags = libc::PROT_NONE;
     if permissions.contains(MemoryRegionPermissions::READ) {
         flags |= libc::PROT_READ;
@@ -706,18 +703,19 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
         replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: Range<usize>,
         permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
         behavior: FixedAddressBehavior,
     ) -> Result<MacosUserlandReservation<PAGE_SIZE>, AllocationError>
     where
         Reservations: Iterator<Item = MacosUserlandReservation<PAGE_SIZE>>,
     {
-        // TODO: grow the mapping from the signal path. macOS has no
-        // MAP_GROWSDOWN equivalent, so the initial stack is currently fixed-size.
-        let _ = can_grow_down;
-        // Eager population is an optional performance hint.
-        let _ = populate_pages_immediately;
+        // `options` is ignored:
+        // - TODO: grow the mapping from the signal path for `GROWS_DOWN`. macOS has no
+        //   MAP_GROWSDOWN equivalent, so the initial stack is currently fixed-size.
+        // - `POPULATE` is an optional performance hint.
+        // - TODO: back `SHARED` pages with `mmap(MAP_SHARED | MAP_ANON)` once this platform
+        //   supports native fork, until which private pages behave the same.
+        let _ = options;
         if !is_page_aligned::<PAGE_SIZE>(&suggested_range) {
             return Err(AllocationError::Unaligned);
         }
@@ -748,13 +746,14 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
         _covering_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
         permissions: MemoryRegionPermissions,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>
     where
         Reservations: Iterator<Item = &'reservation MacosUserlandReservation<PAGE_SIZE>>,
         MacosUserlandReservation<PAGE_SIZE>: 'reservation,
     {
-        let _ = populate_pages_immediately;
+        // As in `reserve_and_commit_pages`.
+        let _ = options;
         self.pages
             .lock()
             .unwrap()
@@ -2695,8 +2694,7 @@ mod tests {
                 core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * HOST_PAGE_SIZE,
                 RW,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
         }
@@ -2719,8 +2717,7 @@ mod tests {
                         core::iter::empty,
                         range.clone(),
                         RW,
-                        false,
-                        true,
+                        AllocationOptions::POPULATE,
                         FixedAddressBehavior::Replace,
                     )
                 },
@@ -2754,8 +2751,7 @@ mod tests {
                 core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                 RW,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
         }
@@ -2765,8 +2761,7 @@ mod tests {
                 core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + 8192,
                 RW,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
         }
@@ -3463,8 +3458,7 @@ mod tests {
                 core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                 RW,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
         }
@@ -3541,8 +3535,7 @@ mod tests {
                     core::iter::empty,
                     end..end + HOST_PAGE_SIZE,
                     RW,
-                    false,
-                    true,
+                    AllocationOptions::POPULATE,
                     FixedAddressBehavior::NoReplace,
                 )
             } {
@@ -3602,8 +3595,7 @@ mod tests {
                 core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                 RW,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
         }
@@ -3649,8 +3641,7 @@ mod tests {
                     || core::iter::once(reservation),
                     range.clone(),
                     RW | MemoryRegionPermissions::EXEC,
-                    false,
-                    true,
+                    AllocationOptions::POPULATE,
                     FixedAddressBehavior::Replace,
                 )
             },
@@ -3667,8 +3658,7 @@ mod tests {
                 core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * HOST_PAGE_SIZE,
                 RW,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
         }
@@ -3690,8 +3680,7 @@ mod tests {
                     core::iter::empty,
                     base..base + HOST_PAGE_SIZE,
                     RW,
-                    false,
-                    true,
+                    AllocationOptions::POPULATE,
                     FixedAddressBehavior::NoReplace,
                 )
             },
@@ -3705,8 +3694,7 @@ mod tests {
                 || core::iter::once(replaced),
                 base..base + HOST_PAGE_SIZE,
                 RW,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::Replace,
             )
         }
@@ -3768,8 +3756,7 @@ mod tests {
                         core::iter::empty,
                         host as usize..host as usize + HOST_PAGE_SIZE,
                         RW,
-                        false,
-                        true,
+                        AllocationOptions::POPULATE,
                         behavior,
                     )
                 },

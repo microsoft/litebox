@@ -33,6 +33,10 @@ impl<const ALIGN: usize> ProcessProvider for crate::WindowsUserland<ALIGN> {
 
     unsafe fn fork_process()
     -> core::result::Result<ProviderForkResult<ClonedProcess>, ForkError<Error>> {
+        // A clone would copy the private pages that stand in for shared ones.
+        if crate::page_mgmt::SHARED_PAGES_REQUESTED.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(ForkError::Unsupported);
+        }
         // SAFETY: The caller guarantees quiescence and a clone-safe child bootstrap.
         match unsafe { fork_process() } {
             Ok(ForkResult::Parent { process, thread }) => {

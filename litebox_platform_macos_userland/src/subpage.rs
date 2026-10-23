@@ -623,7 +623,9 @@ mod tests {
     use super::*;
 
     use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
-    use litebox::platform::page_mgmt::{AllocationDirection, PageReservation as _};
+    use litebox::platform::page_mgmt::{
+        AllocationDirection, AllocationOptions, PageReservation as _,
+    };
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -1195,8 +1197,7 @@ mod tests {
                 core::iter::empty,
                 neighbor_range.clone(),
                 RW,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::NoReplace,
             )
         }

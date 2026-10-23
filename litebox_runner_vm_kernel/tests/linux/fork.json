@@ -12,7 +12,7 @@
   { "argv": ["/fork", "cow"], "expect_stdout": "cow: child 0 parent 1\n" },
   {
     "argv": ["/fork", "shared"],
-    "expect_stdout": "shared: EAGAIN\nafter unmap: 0\n"
+    "expect_stdout": "shared: child 0 parent sees 42\nafter unmap: 0\n"
   },
   { "argv": ["/fork", "spawned"], "expect_stdout": "chain: 3\nspawned: 0\n" },
   {

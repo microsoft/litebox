@@ -11,13 +11,15 @@
 
 use alloc::boxed::Box;
 use core::ops::Range;
-use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
+use litebox::platform::page_mgmt::{
+    AllocationOptions, FixedAddressBehavior, MemoryRegionPermissions,
+};
 use litebox::platform::{PageManagementProvider, RawConstPointer as _, RawMutPointer as _};
 use litebox_common_linux::{
     PAGE_SIZE,
     vmem::{VmFlags, VmemPageFaultHandler},
 };
-use litebox_common_vm_abi::{Placement, Populate, Prot, Status};
+use litebox_common_vm_abi::{Placement, Populate, Prot, Sharing, Status};
 use litebox_platform_vm_kernel::VmKernel;
 use rangemap::RangeMap;
 
@@ -72,6 +74,7 @@ pub(crate) trait Frames {
         prot: Prot,
         placement: Placement,
         populate: Populate,
+        sharing: Sharing,
     ) -> Result<(), Status>;
 
     /// # Safety
@@ -99,10 +102,18 @@ impl Frames for VmKernel {
         prot: Prot,
         placement: Placement,
         populate: Populate,
+        sharing: Sharing,
     ) -> Result<(), Status> {
         let behavior = match placement {
             Placement::NoReplace => FixedAddressBehavior::NoReplace,
             Placement::Replace => FixedAddressBehavior::Replace,
+        };
+        // Every page exists before a clone can share it, since a page each process populated
+        // later would be its own.
+        let options = match sharing {
+            Sharing::Private if populate == Populate::Now => AllocationOptions::POPULATE,
+            Sharing::Private => AllocationOptions::empty(),
+            Sharing::Shared => AllocationOptions::POPULATE | AllocationOptions::SHARED,
         };
         // Safety: Mappings supplies an aligned user range, excludes conflicting access during
         // replacement, and retains ownership through its range map.
@@ -112,8 +123,7 @@ impl Frames for VmKernel {
                 core::iter::empty,
                 range,
                 permissions(prot),
-                false,
-                populate == Populate::Now,
+                options,
                 behavior,
             )
         }
@@ -172,7 +182,7 @@ impl<F: Frames + 'static> Mappings<F> {
         }
     }
 
-    /// A failed [`Placement::Replace`] leaves the range unmapped.
+    /// Maps private pages; see [`Self::map_with_sharing`].
     pub(crate) fn map(
         &self,
         range: Range<usize>,
@@ -180,11 +190,23 @@ impl<F: Frames + 'static> Mappings<F> {
         placement: Placement,
         populate: Populate,
     ) -> Result<(), Status> {
+        self.map_with_sharing(range, prot, placement, populate, Sharing::Private)
+    }
+
+    /// A failed [`Placement::Replace`] leaves the range unmapped.
+    pub(crate) fn map_with_sharing(
+        &self,
+        range: Range<usize>,
+        prot: Prot,
+        placement: Placement,
+        populate: Populate,
+        sharing: Sharing,
+    ) -> Result<(), Status> {
         if placement == Placement::NoReplace && self.regions.borrow().overlaps(&range) {
             return Err(Status::Exists);
         }
         self.platform
-            .allocate(range.clone(), prot, placement, populate)
+            .allocate(range.clone(), prot, placement, populate, sharing)
             .inspect_err(|_| {
                 if placement == Placement::Replace {
                     // The old mapping may be partly gone.
@@ -277,7 +299,7 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum Call {
-        Allocate(Range<usize>, Prot, Placement),
+        Allocate(Range<usize>, Prot, Placement, Sharing),
         Release(Range<usize>),
         Protect(Range<usize>, Prot),
         Populate(usize),
@@ -296,10 +318,11 @@ mod tests {
             prot: Prot,
             placement: Placement,
             _: Populate,
+            sharing: Sharing,
         ) -> Result<(), Status> {
             self.calls
                 .borrow_mut()
-                .push(Call::Allocate(range, prot, placement));
+                .push(Call::Allocate(range, prot, placement, sharing));
             self.allocate_fails.get().map_or(Ok(()), Err)
         }
 
@@ -391,6 +414,37 @@ mod tests {
         drop(regions);
         m.unmap(0..4 * P).unwrap();
         assert!(m.regions.borrow().is_empty());
+    }
+
+    #[test]
+    fn shared_mappings_reach_the_platform_as_shared() {
+        let (m, mock) = mappings();
+        m.map_with_sharing(
+            P..2 * P,
+            Prot::ReadWrite,
+            Placement::NoReplace,
+            Populate::Lazy,
+            Sharing::Shared,
+        )
+        .unwrap();
+        map(&m, 2 * P..3 * P, Prot::ReadWrite, Placement::NoReplace).unwrap();
+        assert_eq!(
+            *mock.calls.borrow(),
+            [
+                Call::Allocate(
+                    P..2 * P,
+                    Prot::ReadWrite,
+                    Placement::NoReplace,
+                    Sharing::Shared
+                ),
+                Call::Allocate(
+                    2 * P..3 * P,
+                    Prot::ReadWrite,
+                    Placement::NoReplace,
+                    Sharing::Private
+                ),
+            ]
+        );
     }
 
     #[test]

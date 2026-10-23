@@ -4,9 +4,10 @@
 //! Implementation of generic TEE related syscalls
 
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
+use litebox::platform::RawConstPointer;
 use litebox::platform::RawMutPointer;
-use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox::utils::TruncateExt;
+use litebox_common_linux::vmem::VmFlags;
 use litebox_common_optee::{
     PAGE_SIZE, TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeTime,
     TeeTimeCategory, TeeUuid, UserTaPropType, UteeParams,
@@ -314,13 +315,13 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             .as_usize()
             .checked_add(aligned_len.as_usize())
             .ok_or(TeeResult::AccessConflict)?;
-        if let Some(perms) = self.global.mm.get_memory_permissions(start, aligned_len) {
+        if let Some(vm_flags) = self.global.mm.get_memory_flags(start, aligned_len) {
             if (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_READ)
-                && !perms.contains(MemoryRegionPermissions::READ))
+                && !vm_flags.contains(VmFlags::VM_READ))
                 || (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_WRITE)
-                    && !perms.contains(MemoryRegionPermissions::WRITE))
+                    && !vm_flags.contains(VmFlags::VM_WRITE))
                 || (!flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_ANY_OWNER)
-                    && perms.contains(MemoryRegionPermissions::SHARED))
+                    && vm_flags.contains(VmFlags::VM_SHARED))
             {
                 // TODO: currently, we don't consider the following flags:
                 // - `TEE_MEMORY_ACCESS_NONSECURE`: should be non-secure (VTL0) mapping

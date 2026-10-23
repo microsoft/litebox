@@ -17,6 +17,7 @@ use litebox::platform::RawConstPointer;
 use litebox::platform::RawMutPointer;
 use litebox::platform::page_mgmt::AllocationDirection;
 use litebox::platform::page_mgmt::AllocationError;
+use litebox::platform::page_mgmt::AllocationOptions;
 use litebox::platform::page_mgmt::CowAllocationError;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::page_mgmt::HintPlacementBehavior;
@@ -122,9 +123,6 @@ impl From<MemoryRegionPermissions> for VmFlags {
             VmFlags::VM_EXEC,
             value.contains(MemoryRegionPermissions::EXEC),
         );
-        if value.contains(MemoryRegionPermissions::SHARED) {
-            unimplemented!("SHARED permission is not supported yet");
-        }
         flags
     }
 }
@@ -143,10 +141,6 @@ impl From<VmFlags> for MemoryRegionPermissions {
         flags.set(
             MemoryRegionPermissions::EXEC,
             value.contains(VmFlags::VM_EXEC),
-        );
-        flags.set(
-            MemoryRegionPermissions::SHARED,
-            value.contains(VmFlags::VM_SHARED),
         );
         flags
     }
@@ -197,6 +191,12 @@ impl VmArea {
         self.is_file_backed
     }
 
+    /// Check if this area is shared anonymous memory, whose pages native fork children share.
+    #[inline]
+    pub fn is_shared_anonymous(self) -> bool {
+        self.flags.contains(VmFlags::VM_SHARED) && !self.is_file_backed
+    }
+
     /// Create a new [`VmArea`] with the given flags, adding [`VmFlags::VM_HAS_CONTENTS`] if the
     /// area is file-backed or has any access.
     #[inline]
@@ -229,6 +229,20 @@ pub struct MmapRequest {
     pub populate_pages_immediately: bool,
     /// Required fixed-address behavior.
     pub behavior: FixedAddressBehavior,
+}
+
+/// Returns the options to create `vma`'s pages with.
+fn mapping_options(vma: VmArea, populate_pages_immediately: bool) -> AllocationOptions {
+    let mut options = AllocationOptions::empty();
+    options.set(
+        AllocationOptions::GROWS_DOWN,
+        vma.flags.contains(VmFlags::VM_GROWSDOWN),
+    );
+    options.set(AllocationOptions::POPULATE, populate_pages_immediately);
+    // TODO: share the pages of shared file-backed mappings too, which are private copies until
+    // then, so that every `VM_SHARED` area is shared.
+    options.set(AllocationOptions::SHARED, vma.is_shared_anonymous());
+    options
 }
 
 fn insert_mapped_vma<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>(
@@ -330,16 +344,15 @@ where
             behavior,
         } = request;
         let length = range.len();
-        let permissions = (vma.flags & VmFlags::VM_ACCESS_FLAGS).into();
-        let can_grow_down = vma.flags.contains(VmFlags::VM_GROWSDOWN);
+        let permissions = MemoryRegionPermissions::from(vma.flags);
+        let options = mapping_options(vma, populate_pages_immediately);
         // SAFETY: The caller authorizes replacement and this handle-free store owns mapping ranges.
         let reservation = unsafe {
             platform.reserve_and_commit_pages(
                 core::iter::empty,
                 range,
                 permissions,
-                can_grow_down,
-                populate_pages_immediately,
+                options,
                 behavior,
             )
         }?;
@@ -395,8 +408,9 @@ where
             populate_pages_immediately,
             behavior,
         } = request;
-        let permissions = (vma.flags & VmFlags::VM_ACCESS_FLAGS).into();
-        let can_grow_down = vma.flags.contains(VmFlags::VM_GROWSDOWN);
+        let permissions = MemoryRegionPermissions::from(vma.flags);
+        let options = mapping_options(vma, populate_pages_immediately);
+        let can_grow_down = options.contains(AllocationOptions::GROWS_DOWN);
 
         if range.start.is_multiple_of(Platform::RESERVATION_ALIGNMENT)
             && range.end.is_multiple_of(Platform::RESERVATION_ALIGNMENT)
@@ -409,8 +423,7 @@ where
                     core::iter::empty,
                     range.clone(),
                     permissions,
-                    can_grow_down,
-                    populate_pages_immediately,
+                    options,
                     behavior,
                 )
             } {
@@ -459,7 +472,7 @@ where
                 || self.overlapping(range.clone()),
                 range.clone(),
                 permissions,
-                populate_pages_immediately,
+                options,
             )
         } {
             Ok(pointer) => {
@@ -667,6 +680,7 @@ where
     ///
     /// The current implementation effectively re-inserts the mapping with the same
     /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
+    /// However, shared anonymous areas are skipped to keep their contents.
     ///
     /// # Panics
     ///
@@ -693,6 +707,11 @@ where
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
         for (r, vma) in overlapping_ranges {
+            // Like Linux shared memory, shared anonymous pages keep their contents: other
+            // processes may still see them, so there is nothing to discard.
+            if vma.is_shared_anonymous() {
+                continue;
+            }
             if vma.is_file_backed() {
                 if anonymous_only {
                     return Err(VmemResetError::FileBacked);
@@ -927,7 +946,7 @@ where
     ///
     /// It fails if it resizes more than one mapping or needs to split the current mapping
     /// (due to enlarging). When enlarging, adjacent mappings that differ only in
-    /// [`VmFlags::VM_HAS_CONTENTS`] count as one.
+    /// [`VmFlags::VM_HAS_CONTENTS`] count as one. Shared anonymous mappings can only shrink.
     ///
     /// See <https://elixir.bootlin.com/linux/v5.19.17/source/mm/mremap.c#L886> for reference.
     ///
@@ -963,12 +982,22 @@ where
         }
 
         // grow
-        if self.merged_area(range.clone()).is_none() {
+        let Some(area) = self.merged_area(range.clone()) else {
             // we can't remap across vm area boundaries
             return Err(VmemResizeError::InvalidAddr {
                 range: cur_range,
                 addr: range.end,
             });
+        };
+        // TODO: grow shared anonymous areas as Linux does. It grows the area's view of its shared
+        // memory, whose size is fixed, so accesses beyond it raise `SIGBUS`, and growing back
+        // after shrinking finds the old pages again. That needs the area to know its memory.
+        if area.is_shared_anonymous() {
+            litebox_util_log::warn!(
+                range:? = range, new_size = new_size.as_usize();
+                "growing a shared anonymous mapping is unsupported"
+            );
+            return Err(VmemResizeError::Unsupported);
         }
         let new_end = new_end.ok_or(VmemResizeError::OutOfMemory)?;
         // `last_range` contains the last page of `range`
@@ -1071,8 +1100,21 @@ where
             .merged_area(old_range.into())
             .expect("VMEM: range not covered by one mapping");
 
+        // TODO: move shared anonymous mappings, which needs platforms that share pages with fork
+        // children to move them rather than leave copies, which would no longer be shared.
+        if vma.is_shared_anonymous() {
+            litebox_util_log::warn!(
+                range:? = Range::from(old_range), new_size = new_size.as_usize();
+                "moving a shared anonymous mapping is unsupported"
+            );
+            return Err(VmemMoveError::Unsupported);
+        }
         if vma.is_file_backed() {
-            unimplemented!("file-backed mapping move is not supported yet");
+            litebox_util_log::warn!(
+                range:? = Range::from(old_range), new_size = new_size.as_usize();
+                "moving a file-backed mapping is unsupported"
+            );
+            return Err(VmemMoveError::Unsupported);
         }
         let mut request = Self::build_unmapped_area_request(
             suggested_new_address,
@@ -1380,35 +1422,28 @@ where
     {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
+        let vma = VmArea::new(
+            VmFlags::from(perms)
+                | VmFlags::may_flags_for_mapping(shared, file_backed)
+                | if flags.contains(CreatePagesFlags::IS_STACK) {
+                    VmFlags::VM_GROWSDOWN
+                } else {
+                    VmFlags::empty()
+                },
+            file_backed,
+        );
+        // SAFETY: The caller authorizes any replacement `FIXED_ADDR` requests.
         unsafe {
-            self.create_mapping_in_range(
-                suggested_new_address,
-                length,
-                VmArea::new(
-                    VmFlags::from(perms)
-                        | VmFlags::may_flags_for_mapping(shared, file_backed)
-                        | if flags.contains(CreatePagesFlags::IS_STACK) {
-                            VmFlags::VM_GROWSDOWN
-                        } else {
-                            VmFlags::empty()
-                        },
-                    flags.contains(CreatePagesFlags::MAP_FILE),
-                ),
-                flags,
-                allowed_range,
-            )
+            self.create_mapping_in_range(suggested_new_address, length, vma, flags, allowed_range)
         }
         .map_err(MappingError::MapError)
     }
 
-    /// Get the memory permissions of a given address range.
+    /// Get the flags of the single area that covers a given address range.
     ///
-    /// `page_range` specifies the range of pages to check the memory permissions.
-    /// This function returns `MemoryRegionPermissions` only if the range is valid.
-    pub(super) fn get_memory_permissions(
-        &self,
-        page_range: PageRange<ALIGN>,
-    ) -> Option<MemoryRegionPermissions> {
+    /// `page_range` specifies the range of pages to check.
+    /// This function returns `VmFlags` only if the range is valid.
+    pub(super) fn get_memory_flags(&self, page_range: PageRange<ALIGN>) -> Option<VmFlags> {
         let (range_start, range_end) = (page_range.start(), page_range.end());
         let range: core::ops::Range<usize> = page_range.into();
         if let Some(iter) = self.overlapping(range).next() {
@@ -1417,8 +1452,7 @@ where
                 // consists of memory pages with different permissions.
                 return None;
             }
-            let vmflags = iter.1.flags();
-            Some(vmflags.into())
+            Some(iter.1.flags())
         } else {
             None
         }
@@ -1607,6 +1641,9 @@ pub(super) enum VmemResizeError {
     PermissionDenied,
     #[error("out of memory")]
     OutOfMemory,
+    /// Such as growing a shared anonymous mapping.
+    #[error("unsupported")]
+    Unsupported,
 }
 
 /// Error for moving mappings
@@ -1616,6 +1653,9 @@ pub enum VmemMoveError {
     UnAligned,
     #[error("out of memory")]
     OutOfMemory,
+    /// Such as moving a shared anonymous or file-backed mapping.
+    #[error("unsupported")]
+    Unsupported,
     #[error("remap failed: {0}")]
     RemapError(#[from] litebox::platform::page_mgmt::RemapError),
 }
@@ -1781,7 +1821,7 @@ mod tests {
             _covering_reservations: impl FnOnce() -> Reservations,
             range: Range<usize>,
             _permissions: MemoryRegionPermissions,
-            _populate_pages_immediately: bool,
+            _options: AllocationOptions,
         ) -> Result<TransparentMutPtr<u8>, AllocationError>
         where
             Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
@@ -1798,8 +1838,7 @@ mod tests {
             _replaced_reservations: impl FnOnce() -> Reservations,
             suggested_range: Range<usize>,
             initial_permissions: MemoryRegionPermissions,
-            can_grow_down: bool,
-            populate_pages_immediately: bool,
+            options: AllocationOptions,
             fixed_address_behavior: FixedAddressBehavior,
         ) -> Result<litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>, AllocationError>
         where
@@ -2060,6 +2099,71 @@ mod tests {
             assert!(matches!(result, Err(AllocationError::OutOfMemory)));
         }
         assert!(backend.calls.lock().is_empty());
+    }
+
+    #[test]
+    fn shared_anonymous_mappings_can_shrink_but_not_grow_or_move() {
+        let backend = dummy_backend::<true>(None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        let shared = VmArea::new(
+            VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_SHARED,
+            false,
+        );
+        let pages = |start: usize, count: usize| {
+            PageRange::<PAGE_SIZE>::new(start, start + count * PAGE_SIZE).unwrap()
+        };
+        let size = |count: usize| NonZeroPageSize::new(count * PAGE_SIZE).unwrap();
+        unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(start),
+                size(2),
+                shared,
+                CreatePagesFlags::FIXED_ADDR,
+            )
+        }
+        .unwrap();
+
+        // An invalid range fails as such first.
+        assert!(matches!(
+            unsafe { vmem.resize_mapping(pages(start, 3), size(4)) },
+            Err(VmemResizeError::InvalidAddr { .. })
+        ));
+        assert!(matches!(
+            unsafe { vmem.resize_mapping(pages(start, 2), size(3)) },
+            Err(VmemResizeError::Unsupported)
+        ));
+        for new_size in [size(2), size(3)] {
+            assert!(matches!(
+                unsafe { vmem.move_mappings(pages(start, 2), None, new_size) },
+                Err(VmemMoveError::Unsupported)
+            ));
+        }
+
+        unsafe { vmem.resize_mapping(pages(start, 2), size(1)) }.unwrap();
+        let (range, area) = vmem
+            .overlapping(start..start + 2 * PAGE_SIZE)
+            .next()
+            .unwrap();
+        assert_eq!(*range, start..start + PAGE_SIZE);
+        assert!(area.is_shared_anonymous());
+
+        // File-backed mappings cannot move.
+        let file = start + 4 * PAGE_SIZE;
+        unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(file),
+                size(1),
+                VmArea::new(VmFlags::VM_READ, true),
+                CreatePagesFlags::FIXED_ADDR,
+            )
+        }
+        .unwrap();
+        assert!(matches!(
+            unsafe { vmem.move_mappings(pages(file, 1), None, size(2)) },
+            Err(VmemMoveError::Unsupported)
+        ));
+        assert!(backend.remap_calls.lock().is_empty());
     }
 
     #[test]
@@ -2799,7 +2903,7 @@ mod tests {
     }
 
     #[test]
-    fn copying_remap_of_shared_mapping_passes_only_access_permissions() {
+    fn copying_remap_passes_only_access_permissions() {
         let backend: &'static DummyVmemBackend = Box::leak(Box::new(DummyVmemBackend {
             rejected_address: None,
             rejected_remap_address: Mutex::new(None),
@@ -2823,7 +2927,6 @@ mod tests {
         let start = pages.as_mut_ptr() as usize;
         let flags = VmFlags::VM_READ
             | VmFlags::VM_WRITE
-            | VmFlags::VM_SHARED
             | VmFlags::VM_MAYREAD
             | VmFlags::VM_MAYWRITE
             | VmFlags::VM_MAYSHARE;
@@ -2864,8 +2967,14 @@ mod tests {
         );
         let vmas = vmm
             .iter()
-            .map(|(range, vma)| (range.clone(), vma.flags().contains(VmFlags::VM_SHARED)))
+            .map(|(range, vma)| (range.clone(), vma.flags()))
             .collect::<Vec<_>>();
-        assert_eq!(vmas, [(destination..destination + 4 * PAGE_SIZE, true)]);
+        assert_eq!(
+            vmas,
+            [(
+                destination..destination + 4 * PAGE_SIZE,
+                flags | VmFlags::VM_HAS_CONTENTS
+            )]
+        );
     }
 }

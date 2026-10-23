@@ -10,8 +10,8 @@ use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::common_providers::reservations::TrackedReservations;
 use litebox::platform::page_mgmt::{
-    AllocationDirection, AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    PageReservation as _, ReleaseTargetOf, ReservationStore as _,
+    AllocationDirection, AllocationError, AllocationOptions, FixedAddressBehavior,
+    MemoryRegionPermissions, PageReservation as _, ReleaseTargetOf, ReservationStore as _,
 };
 use litebox::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use litebox_common_linux::vmem::{
@@ -367,15 +367,18 @@ where
         flags: CreatePagesFlags,
         permissions: MemoryRegionPermissions,
     ) -> Result<Platform::Reservation, MappingError> {
-        let populate = flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY);
+        let mut options = AllocationOptions::empty();
+        options.set(
+            AllocationOptions::POPULATE,
+            flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
+        );
         // SAFETY: The caller guarantees the range is unowned; replacement is disabled.
         match unsafe {
             self.platform.reserve_and_commit_pages(
                 core::iter::empty,
                 requested.clone(),
                 permissions,
-                false,
-                populate,
+                options,
                 FixedAddressBehavior::NoReplace,
             )
         } {
@@ -398,7 +401,7 @@ where
                         || core::iter::once(&reservation),
                         actual,
                         permissions,
-                        populate,
+                        options,
                     )
                 } {
                     // SAFETY: Failed commitment leaves this unpublished reservation unused.
@@ -432,7 +435,7 @@ where
                 || core::iter::once(reservation),
                 range.clone(),
                 permissions,
-                false,
+                AllocationOptions::empty(),
             )
         }
         .map_err(|_| VmemProtectError::UnsupportedProtection)?;
