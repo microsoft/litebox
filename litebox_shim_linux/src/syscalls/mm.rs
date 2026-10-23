@@ -165,9 +165,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         // MAP_SHARED is partially supported:
-        // - Anonymous shared mappings are fully supported (no backing file concerns).
-        //   Note: since fork is not yet supported, shared anonymous mappings behave
-        //   identically to private ones (no cross-process sharing occurs).
+        // - Anonymous shared mappings are fully supported. Where the platform supports shared
+        //   pages, a native fork child shares them; elsewhere `fork` fails with `EAGAIN` rather
+        //   than copying them.
         // - File-backed shared mappings are read-only: writable permission is rejected
         //   upfront and cannot be added later via mprotect, because writes cannot be
         //   propagated back to the underlying file.
@@ -695,8 +695,8 @@ mod tests {
             count += 1;
             let addr = {
                 use litebox::platform::page_mgmt::{
-                    AllocationDirection, FixedAddressBehavior, MemoryRegionPermissions,
-                    PageReservation as _,
+                    AllocationDirection, AllocationOptions, FixedAddressBehavior,
+                    MemoryRegionPermissions, PageReservation as _,
                 };
 
                 let task_addr_min = <Platform as PageManagementProvider<4096>>::TASK_ADDR_MIN;
@@ -710,8 +710,7 @@ mod tests {
                         core::iter::empty,
                         suggested_start..suggested_start + 0x1000,
                         MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                        false,
-                        false,
+                        AllocationOptions::empty(),
                         FixedAddressBehavior::Hint(AllocationDirection::TopDown),
                     )
                 }
@@ -932,5 +931,44 @@ mod tests {
         let ptr = UserPtrMut::<u8>::from_usize(0xdeadbeef);
         let result = ptr.read_at_offset::<Platform>(0);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn shared_anonymous_memory_survives_madvise_and_can_shrink_but_not_grow() {
+        const PAGE: usize = litebox_common_linux::PAGE_SIZE;
+        let task = init_platform();
+        let mapping = task
+            .sys_mmap(
+                0,
+                2 * PAGE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+            .unwrap();
+        mapping.write_at_offset::<Platform>(0, 42).unwrap();
+        task.sys_madvise(
+            mapping,
+            PAGE,
+            litebox_common_linux::MadviseBehavior::DontNeed,
+        )
+        .unwrap();
+        // Like Linux shared memory, the contents remain for every process sharing them.
+        assert_eq!(mapping.read_at_offset::<Platform>(0), Some(42));
+
+        // Unlike Linux, which grows shared anonymous mappings, LiteBox refuses.
+        for flags in [MRemapFlags::empty(), MRemapFlags::MREMAP_MAYMOVE] {
+            assert_eq!(
+                task.sys_mremap(mapping, 2 * PAGE, 4 * PAGE, flags, 0).err(),
+                Some(Errno::ENOMEM)
+            );
+        }
+        let shrunk = task
+            .sys_mremap(mapping, 2 * PAGE, PAGE, MRemapFlags::empty(), 0)
+            .unwrap();
+        assert_eq!(shrunk.as_usize(), mapping.as_usize());
+        assert_eq!(shrunk.read_at_offset::<Platform>(0), Some(42));
+        task.sys_munmap(mapping, PAGE).unwrap();
     }
 }

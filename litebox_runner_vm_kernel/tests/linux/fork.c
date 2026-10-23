@@ -15,8 +15,8 @@
 // - "signal": kills the child, which waits for signals.
 // - "alarm": with an alarm armed, which fires in the parent only.
 // - "cow": both write all of a large buffer, each seeing its own writes only.
-// - "shared": fails with a shared mapping, which a copy cannot keep shared,
-//   and works once it is unmapped.
+// - "shared": with a shared mapping, which the child shares, seeing the
+//   parent the child's write, and once it is unmapped.
 // - "spawned": in a child started with posix_spawn (a "chain 3").
 // - "orphan": the child outlives the parent, and then sees init as its
 //   parent.
@@ -244,11 +244,18 @@ static int shared(void) {
         perror("mmap");
         return 1;
     }
+    *(volatile int *)page = 1;
     pid_t child = fork_flushed();
     if (child == 0) {
+        *(volatile int *)page = 42;
         _exit(0);
     }
-    printf("shared: %s\n", child < 0 && errno == EAGAIN ? "EAGAIN" : "forked");
+    if (child < 0) {
+        printf("shared: %s\n", strerror(errno));
+    } else {
+        int code = wait_code(child);
+        printf("shared: child %d parent sees %d\n", code, *(volatile int *)page);
+    }
     munmap(page, 4096);
     child = fork_flushed();
     if (child == 0) {

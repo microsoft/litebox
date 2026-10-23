@@ -4,7 +4,8 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use litebox::platform::page_mgmt::{
-    AllocationDirection, FixedAddressBehavior, MemoryRegionPermissions as Permissions,
+    AllocationDirection, AllocationOptions, FixedAddressBehavior,
+    MemoryRegionPermissions as Permissions,
 };
 use litebox::platform::{
     PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _,
@@ -115,8 +116,7 @@ fn spawned_threads_use_configured_darwin_gates() {
                 core::iter::empty,
                 MacosUserland::TASK_ADDR_MIN..MacosUserland::TASK_ADDR_MIN + 3 * HOST_PAGE_SIZE,
                 Permissions::READ | Permissions::WRITE,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap()

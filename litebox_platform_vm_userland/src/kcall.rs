@@ -10,7 +10,7 @@ use litebox_common_vm_abi::{
     CallSet, CloneKind, CloneRequest, DeriveKeyReply, DeriveKeyRequest, ExitRequest,
     ExitThreadRequest, FutexRequest, InterruptThreadRequest, KernelCall, LogLevel, LogRequest,
     MAIN_THREAD, MapRequest, Message, NewThread, Placement, Populate, Prot, ProtSet,
-    ProtectRequest, ReadyRequest, RestrictRequest, SetTimerRequest, Status, UnmapRequest,
+    ProtectRequest, ReadyRequest, RestrictRequest, SetTimerRequest, Sharing, Status, UnmapRequest,
     UserRange,
 };
 use zerocopy::{FromZeros as _, IntoBytes as _};
@@ -189,12 +189,14 @@ pub fn map(
     prot: Prot,
     placement: Placement,
     populate: Populate,
+    sharing: Sharing,
 ) -> Result<usize, Status> {
     call(&MapRequest::new(
         range(addr, len),
         prot,
         placement,
         populate,
+        sharing,
     ))
     .map(|reply| usize::try_from(reply.addr).unwrap_or(usize::MAX))
 }

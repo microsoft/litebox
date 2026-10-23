@@ -125,8 +125,26 @@ bitflags::bitflags! {
         const WRITE = 1 << 1;
         /// Executable
         const EXEC = 1 << 2;
-        /// Sharable between processes
-        const SHARED = 1 << 3;
+    }
+}
+
+bitflags::bitflags! {
+    /// How [`PageManagementProvider::reserve_and_commit_pages`] and
+    /// [`PageManagementProvider::commit_pages`] back pages, beyond their permissions.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct AllocationOptions: u8 {
+        /// The region may grow downward (towards zero) upon a page fault. Only meaningful when
+        /// reserving.
+        const GROWS_DOWN = 1 << 0;
+        /// Populate the pages immediately rather than lazily.
+        const POPULATE = 1 << 1;
+        /// Processes duplicated by
+        /// [`ProcessProvider::fork_process`](crate::platform::ProcessProvider::fork_process)
+        /// share the pages rather than copy them, as Linux `MAP_SHARED | MAP_ANONYMOUS` memory,
+        /// also after later [`PageManagementProvider::protect_pages`] and
+        /// [`PageManagementProvider::release_pages`] calls on parts of them. A platform that
+        /// cannot share them must make `fork_process` decline while such pages exist.
+        const SHARED = 1 << 2;
     }
 }
 
@@ -231,8 +249,11 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
                 replaced_reservations,
                 suggested_range,
                 MemoryRegionPermissions::empty(),
-                can_grow_down,
-                false,
+                if can_grow_down {
+                    AllocationOptions::GROWS_DOWN
+                } else {
+                    AllocationOptions::empty()
+                },
                 fixed_address_behavior,
             )
         }
@@ -301,8 +322,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///   extents may extend beyond it.
     /// - `range`: The address range to commit.
     /// - `permissions`: The permissions to apply to the committed pages.
-    /// - `populate_pages_immediately`: If `true`, populate pages immediately; otherwise,
-    ///   populate them lazily.
+    /// - `options`: How to back newly committed pages; see [`AllocationOptions`].
     ///
     /// # Safety
     ///
@@ -313,7 +333,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         covering_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
         permissions: MemoryRegionPermissions,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>
     where
         Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
@@ -329,10 +349,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///   handle-free mappings may yield no handles. Ownership outside the replaced range remains
     ///   with the caller.
     /// - `initial_permissions`: The permissions to apply to the allocated memory region.
-    /// - `can_grow_down`: If `true`, the region is allowed to grow downward (towards zero) upon
-    ///   a page fault.
-    /// - `populate_pages_immediately`: If `true`, the pages are populated immediately; otherwise,
-    ///   they are populated lazily.
+    /// - `options`: How to back the pages; see [`AllocationOptions`].
     /// - `fixed_address_behavior`: Specifies the required semantics of `suggested_range`.
     ///
     /// # Returns
@@ -358,8 +375,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
     where

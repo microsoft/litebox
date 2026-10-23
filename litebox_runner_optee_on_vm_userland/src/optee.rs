@@ -728,7 +728,9 @@ impl Runner {
 /// (upcalls and fixups), and the kernel populates lazy pages.
 fn check_guest_memory_access() {
     use litebox::platform::RawMutPointer as _;
-    use litebox_common_vm_abi::{PAGE_SIZE, Placement, Populate, Prot, RUNNER_MANAGED_MIN};
+    use litebox_common_vm_abi::{
+        PAGE_SIZE, Placement, Populate, Prot, RUNNER_MANAGED_MIN, Sharing,
+    };
     use litebox_shim_optee::UserConstPtr;
     type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
@@ -737,7 +739,15 @@ fn check_guest_memory_access() {
     let read = || UserConstPtr::<Platform, u64>::from_usize(addr).read_at_offset(0);
     let write = |v| MutPtr::<u64>::from_usize(addr).write_at_offset(0, v);
     assert_eq!(read(), None, "read from unmapped guest memory");
-    kcall::map(addr, len, Prot::None, Placement::NoReplace, Populate::Lazy).unwrap();
+    kcall::map(
+        addr,
+        len,
+        Prot::None,
+        Placement::NoReplace,
+        Populate::Lazy,
+        Sharing::Private,
+    )
+    .unwrap();
     assert_eq!(read(), None, "read from inaccessible guest memory");
     kcall::protect(addr, len, Prot::Read).unwrap();
     assert_eq!(write(1), None, "write to read-only guest memory");

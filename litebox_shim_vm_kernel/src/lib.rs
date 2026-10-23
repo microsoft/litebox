@@ -1112,11 +1112,12 @@ impl Inner {
     // backs page tables.
     fn map(&self, r: &MapRequest) -> Result<MapReply, Status> {
         Self::check_wx(r.prot)?;
-        self.mappings.map(
+        self.mappings.map_with_sharing(
             Self::managed(r.range.start, r.range.len)?,
             r.prot,
             r.placement,
             r.populate,
+            r.sharing,
         )?;
         Ok(MapReply {
             addr: r.range.start,

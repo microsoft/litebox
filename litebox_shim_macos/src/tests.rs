@@ -5,7 +5,10 @@ extern crate std;
 
 use super::*;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
-use litebox::platform::{RawConstPointer as _, page_mgmt::MemoryRegionPermissions as Permissions};
+use litebox::platform::{
+    RawConstPointer as _,
+    page_mgmt::{AllocationOptions, MemoryRegionPermissions as Permissions},
+};
 use litebox_common_linux::vmem::{CreatePagesFlags, VmFlags};
 use litebox_platform_macos_userland::MacosUserland as Platform;
 
@@ -248,8 +251,7 @@ fn teardown_continues_after_unmap_failure_during_unwind() {
                 core::iter::empty,
                 second_page.clone(),
                 Permissions::READ,
-                false,
-                true,
+                AllocationOptions::POPULATE,
                 FixedAddressBehavior::NoReplace,
             )
             .unwrap()
