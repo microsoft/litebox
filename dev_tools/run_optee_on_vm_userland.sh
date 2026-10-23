@@ -31,6 +31,7 @@
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
 #   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
+#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1)
 #   TIMEOUT       per-run timeout in seconds (default: 120)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners (and the rewriter unless
@@ -86,7 +87,7 @@ for f in "${built[@]}"; do
 done
 echo "[*] kernel: $KERNEL"
 echo "[*] userland runner: $USERLAND"
-echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU"
+echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, -smp $QEMU_SMP"
 if [[ $rewrite -eq 1 ]]; then echo "[*] TAs: syscall-rewritten"; else echo "[*] TAs: unmodified"; fi
 
 # Copies a guest binary, syscall-rewritten unless -u. Sites the rewriter

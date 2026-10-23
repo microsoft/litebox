@@ -11,9 +11,12 @@
 //! `x86_64_kernel.ld`) except [`BootInfo::reserved`], while the boot stack
 //! and page tables are still in use: a front end keeps them, and anything
 //! else it still needs, below the image's end or lists them in `reserved`.
+//! What it keeps below the image unlisted must be dead once the kernel runs
+//! (e.g., the CPU trampoline may reuse it).
 
 use arrayvec::{ArrayString, ArrayVec};
 use core::ops::Range;
+use litebox_platform_vm_kernel::cpu::MAX_CPUS;
 use x86_64::PhysAddr;
 
 // Boot fails rather than dropping entries beyond these limits.
@@ -30,6 +33,9 @@ pub struct BootInfo {
     /// Boot modules, in order.
     pub modules: ArrayVec<Range<PhysAddr>, MAX_MODULES>,
     pub cmdline: ArrayString<MAX_CMDLINE>,
+    /// The ACPI RSDP, if the front end knows where; otherwise it is searched
+    /// for where the BIOS leaves it.
+    pub rsdp: Option<PhysAddr>,
     /// Physical memory below this is mapped read/write at `PA + KERNEL_OFFSET`
     /// on entry.
     pub mapped_limit: PhysAddr,
@@ -42,4 +48,80 @@ impl BootInfo {
                 .and_then(|rest| rest.strip_prefix('='))
         })
     }
+}
+
+/// The page size of the ranges below.
+pub(crate) const PAGE_SIZE: u64 = 4096;
+
+impl BootInfo {
+    /// The usable RAM in `window`, but the reserved ranges.
+    pub(crate) fn free_ranges(
+        &self,
+        window: Range<PhysAddr>,
+    ) -> ArrayVec<Range<PhysAddr>, { MAX_RAM_REGIONS + MAX_RESERVED }> {
+        // Each reserved range splits at most one free range in two.
+        let mut free = ArrayVec::new();
+        for r in &self.usable {
+            let start = r.start.max(window.start);
+            let end = r.end.min(window.end);
+            if start < end {
+                free.push(start..end);
+            }
+        }
+        for hole in &self.reserved {
+            subtract(&mut free, hole);
+        }
+        free
+    }
+
+    /// A page for the CPU trampoline: free RAM ([`Self::free_ranges`]) below
+    /// VGA memory (as startup IPIs' pages are: see
+    /// [`litebox_hal::interrupt::VGA_MEMORY`]) and below `image`, the kernel
+    /// image's start (so the heap, above it, never gets it), but page 0 (the
+    /// real-mode IVT and BIOS data); the highest.
+    pub(crate) fn trampoline_page(&self, image: PhysAddr) -> Option<PhysAddr> {
+        let end = image.min(PhysAddr::new(litebox_hal::interrupt::VGA_MEMORY.start));
+        self.free_ranges(PhysAddr::new(PAGE_SIZE)..end)
+            .iter()
+            .filter_map(|r| {
+                let end = r.end.align_down(PAGE_SIZE);
+                (r.start.align_up(PAGE_SIZE) < end).then(|| end - PAGE_SIZE)
+            })
+            .max()
+    }
+
+    /// How many CPUs to use at most: [`MAX_CPUS`], or `litebox.cpus` if
+    /// lower; `Err` with its value if that is not a positive number.
+    pub(crate) fn cpu_limit(&self) -> Result<usize, &str> {
+        let Some(value) = self.cmdline_value("litebox.cpus") else {
+            return Ok(MAX_CPUS);
+        };
+        match value.parse::<usize>() {
+            Ok(limit) if limit != 0 => Ok(limit.min(MAX_CPUS)),
+            _ => Err(value),
+        }
+    }
+}
+
+fn subtract<const N: usize>(ranges: &mut ArrayVec<Range<PhysAddr>, N>, hole: &Range<PhysAddr>) {
+    let mut out = ArrayVec::<Range<PhysAddr>, N>::new();
+    let mut keep = |r: Range<PhysAddr>| {
+        assert!(
+            out.try_push(r).is_ok(),
+            "free-memory list overflowed ({N} ranges)"
+        );
+    };
+    for r in ranges.iter() {
+        if hole.end <= r.start || hole.start >= r.end {
+            keep(r.clone());
+            continue;
+        }
+        if r.start < hole.start {
+            keep(r.start..hole.start);
+        }
+        if hole.end < r.end {
+            keep(hole.end..r.end);
+        }
+    }
+    *ranges = out;
 }

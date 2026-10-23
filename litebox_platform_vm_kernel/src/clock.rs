@@ -7,6 +7,7 @@
 /// a counter at `StartupInfo::clock_khz`: so the installed source must be
 /// that counter's, at that frequency (as [`litebox_hal::clock::Clock`] is),
 /// or the kernel and ring 3 silently disagree on every time and deadline.
+/// Every CPU reads it, and must read the same time (see [`crate::cpu`]).
 pub trait ClockSource: Sync {
     /// Nanoseconds since an arbitrary origin that is fixed for the kernel's
     /// lifetime. Never decreases.

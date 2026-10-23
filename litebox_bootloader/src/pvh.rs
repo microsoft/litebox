@@ -402,6 +402,9 @@ fn boot_info() -> BootInfo {
         reserved,
         modules,
         cmdline,
+        rsdp: PhysAddr::try_new(info.rsdp_paddr)
+            .ok()
+            .filter(|rsdp| !rsdp.is_null()),
         mapped_limit: PhysAddr::new(MAPPED_LIMIT),
     }
 }

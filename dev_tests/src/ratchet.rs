@@ -80,7 +80,7 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_linux_userland/", 9),
             ("litebox_platform_macos_userland/", 7),
             ("litebox_platform_lvbs/", 24),
-            ("litebox_platform_vm_kernel/", 7),
+            ("litebox_platform_vm_kernel/", 9),
             ("litebox_platform_vm_userland/", 4),
             ("litebox_platform_windows_userland/", 11),
             ("litebox_runner_lvbs/", 8),

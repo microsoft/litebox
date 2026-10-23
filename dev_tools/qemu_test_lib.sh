@@ -3,10 +3,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Shared by the dev_tools/run_optee_on_*.sh scripts; source it. Reads QEMU,
-# QEMU_ACCEL, QEMU_CPU, QEMU_MEM, TIMEOUT, LITEBOX_LOG and CARGO_BUILD (see
-# the scripts), makes a relative CARGO_TARGET_DIR absolute, and creates $WORK,
-# removed on exit.
+# Shared by the dev_tools/run_*_on_*.sh scripts; source it. Reads QEMU,
+# QEMU_ACCEL, QEMU_CPU, QEMU_MEM, QEMU_SMP, TIMEOUT, LITEBOX_LOG and
+# CARGO_BUILD (see the scripts), makes a relative CARGO_TARGET_DIR absolute,
+# and creates $WORK, removed on exit.
 
 QEMU=${QEMU:-qemu-system-x86_64}
 if [[ -z ${QEMU_ACCEL:-} ]]; then
@@ -22,6 +22,7 @@ esac
 # under 2816 MiB, but only 2 GiB if it is at least that (the rest goes above
 # 4 GiB): e.g., 2560M gives the kernel 2.5 GiB, but 3G only 2 GiB.
 QEMU_MEM=${QEMU_MEM:-2G}
+QEMU_SMP=${QEMU_SMP:-1}
 TIMEOUT=${TIMEOUT:-120}
 CARGO_BUILD=${CARGO_BUILD:-cargo build}
 
@@ -69,7 +70,7 @@ run_vm() {
     # shellcheck disable=SC2086 # QEMU is a command line
     timeout "$TIMEOUT" $QEMU \
         -machine q35 -accel "$QEMU_ACCEL" -cpu "$CPU" \
-        -m "$QEMU_MEM" -smp 1 -nic none \
+        -m "$QEMU_MEM" -smp "$QEMU_SMP" -nic none \
         -kernel "$kernel" -initrd "$payload" -append "litebox.log=${LITEBOX_LOG:-info}" \
         -serial stdio -display none -no-reboot \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
