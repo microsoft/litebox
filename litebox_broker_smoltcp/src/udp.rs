@@ -155,6 +155,23 @@ impl Udp {
             .is_some_and(|binding| binding.covers(destination))
     }
 
+    /// Keeps the datagrams that `process` (now ended) sent until received,
+    /// charged to no process since its ID may be reused (see
+    /// [`Udp::has_room`]).
+    pub(super) fn release_received(&mut self, process: ProcessId) {
+        for datagram in &mut self.received {
+            if datagram.process == Some(process) {
+                datagram.process = None;
+            }
+        }
+    }
+
+    /// The sending process of each datagram to receive, oldest first.
+    #[cfg(test)]
+    pub(super) fn senders(&self) -> impl Iterator<Item = Option<ProcessId>> + '_ {
+        self.received.iter().map(|datagram| datagram.process)
+    }
+
     /// Whether the socket has room for `len` more bytes from `process`.
     fn has_room(&self, len: usize, process: Option<ProcessId>) -> bool {
         let (from_process, bytes_from_process) = self

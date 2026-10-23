@@ -64,8 +64,10 @@ impl SocketProvider for SmoltcpSocketProvider {
         }))
     }
 
-    /// Discards the guest connections the process made that were not
-    /// accepted (its sockets are retired already).
+    /// Charges nothing more to the process: what it left queued at others'
+    /// sockets stays, as on Linux (unlike the userland broker, which
+    /// discards its unaccepted guest connections); its sockets are retired
+    /// already. See `Stack::close_process`.
     fn close_process(&self, process_authority: ProcessId) {
         self.0.run(|stack| stack.close_process(process_authority));
     }
