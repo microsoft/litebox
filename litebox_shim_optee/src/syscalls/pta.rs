@@ -642,7 +642,7 @@ impl DevicePta {
             .inner
             .read()
             .iter()
-            .map(|(uuid, info)| (*uuid, info.flags))
+            .map(|(uuid, info)| (*uuid, info.head.flags))
             .collect();
         let (size, data) = Self::device_list(rflags, tas, blen);
         out.write_at(platform, 0, &data)?;
