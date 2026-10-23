@@ -209,6 +209,58 @@ fn fp_registers_survive_syscalls() {
     not(feature = "test-broker"),
     ignore = "macOS runner requires broker support"
 )]
+fn hwcaps_expose_only_supported_host_features() {
+    let fixture = Fixture::new();
+    // Writes the auxiliary vector to stdout.
+    let code = [
+        0x910003e1, // mov x1, sp
+        0xf9400029, // ldr x9, [x1] (argc)
+        0x91000929, // add x9, x9, #2
+        0x8b090c21, // add x1, x1, x9, lsl #3 (envp)
+        0xf8408429, // ldr x9, [x1], #8
+        0xb5ffffe9, // cbnz x9, -4
+        0xaa0103e2, // mov x2, x1 (auxv)
+        0xf8410449, // ldr x9, [x2], #16
+        0xb5ffffe9, // cbnz x9, -4
+        0xd2800020, // mov x0, #1 (stdout)
+        0xcb010042, // sub x2, x2, x1
+        0xd2800808, // mov x8, #64 (write)
+        0xd4000001, // svc #0
+        0xd2800540, 0xd2800ba8, 0xd4000001, // exit(42)
+    ];
+    std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
+    let output = fixture.run(&[]);
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (words, _) = output.stdout.as_chunks::<8>();
+    let words: Vec<u64> = words.iter().map(|&word| u64::from_le_bytes(word)).collect();
+    let aux = |key: u64| {
+        words
+            .chunks(2)
+            .find(|pair| pair[0] == key)
+            .map_or_else(|| panic!("missing auxv key {key}"), |pair| pair[1])
+    };
+    let (hwcap, hwcap2) = (aux(16), aux(26));
+
+    // HWCAP_FP | HWCAP_ASIMD: every Apple silicon host has them.
+    assert_eq!(hwcap & 0b11, 0b11, "hwcap={hwcap:#x}");
+    // HWCAP_CPUID, HWCAP_DIT, HWCAP_SSBS, HWCAP_PACA, and HWCAP_PACG.
+    let never = 1 << 11 | 1 << 24 | 1 << 28 | 1 << 30 | 1 << 31;
+    assert_eq!(hwcap & never, 0, "hwcap={hwcap:#x}");
+    // HWCAP2_BTI, HWCAP2_MTE, and HWCAP2_SME.
+    let never2 = 1 << 17 | 1 << 18 | 1 << 23;
+    assert_eq!(hwcap2 & never2, 0, "hwcap2={hwcap2:#x}");
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-broker"),
+    ignore = "macOS runner requires broker support"
+)]
 fn rejects_fixed_address_and_incompatible_page_layouts() {
     let fixture = Fixture::new();
     let mut binary = elf(EXIT_42);

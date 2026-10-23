@@ -178,4 +178,16 @@ mod tests {
             CpuFeatures::empty()
         );
     }
+
+    #[test]
+    fn feature_hwcaps_match_linux_uapi() {
+        // Literal bit positions from Linux uapi `hwcap.h`, independent of the constants above.
+        let features = CpuFeatures::AES | CpuFeatures::FP16 | CpuFeatures::PAUTH | CpuFeatures::HBC;
+        let hwcaps = LinuxHwcaps {
+            hwcap: 1 << 3 | 1 << 9 | 1 << 10 | 1 << 30 | 1 << 31,
+            hwcap2: 1 << 44,
+        };
+        assert_eq!(LinuxHwcaps::from_cpu_features(features), hwcaps);
+        assert_eq!(hwcaps.to_cpu_features(), features);
+    }
 }
