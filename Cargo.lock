@@ -1833,6 +1833,7 @@ dependencies = [
  "litebox_util_log",
  "spin 0.10.0",
  "x86_64",
+ "zerocopy",
 ]
 
 [[package]]
