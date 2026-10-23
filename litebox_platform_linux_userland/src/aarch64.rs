@@ -1300,19 +1300,13 @@ switch_to_guest_stage_x16_fixup:
     sub  x4,  x4,  #{SVC_FRAME_BYTES}
     mov  sp,  x4
 
-    // `msr nzcv` writes only PSTATE 31:28. SSBS and DIT are carried in
-    // `PtRegs::pstate` (see `copy_signal_context`) but are knowingly NOT
-    // restored here: writing them needs `msr ssbs`/`msr dit`, which are
-    // ARMv8.0 optional / ARMv8.4 respectively, so unconditionally emitting
-    // them would raise this crate's hardware floor. A guest that sets SSBS or
-    // DIT therefore loses them across a syscall: both are hardening hints with
-    // no architectural effect on results. (The generic `rt_sigreturn` path
-    // does restore them for free by writing the whole SPSR; see
-    // `resume_frame::prepare`.)
+    // Syscall entry saves only NZCV into `PtRegs::pstate`, and this path restores only NZCV,
+    // so SSBS/DIT are not preserved across syscalls: a resume that rebuilds PSTATE from
+    // `PtRegs::pstate` (`resume_frame::prepare`) clears them. Saving and restoring them needs
+    // `mrs`/`msr` of SSBS and DIT (optional ARMv8.0 / ARMv8.4), which would raise this crate's
+    // hardware floor, so guests are not offered them (see `get_guest_cpu_features`).
     //
-    // TODO: restore SSBS/DIT for guests that set them, gated on a runtime
-    // feature probe (HWCAP_SSBS / HWCAP2_DIT) so the hardware floor stays at
-    // ARMv8.0. Only worth doing once a guest actually depends on them.
+    // TODO: save and restore SSBS/DIT on the syscall path, gated on HWCAP_SSBS/HWCAP_DIT.
     ldr  x1,  [x0, #264]
     msr  nzcv, x1
     ldr  x1,  [x0, #8]
@@ -1448,6 +1442,25 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
             litebox::platform::ArchSpecificRegister::TpidrEl0 => Ok(get_guest_thread_pointer()),
             _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
+    }
+    fn get_guest_cpu_features(&self) -> litebox::arch::aarch64::CpuFeatures {
+        use litebox::arch::aarch64::CpuFeatures;
+
+        // SAFETY: getauxval only reads this process's auxiliary vector. It makes no syscall, so
+        // it also works under the seccomp filter.
+        let (hwcap, hwcap2) = unsafe {
+            (
+                libc::getauxval(libc::AT_HWCAP),
+                libc::getauxval(libc::AT_HWCAP2),
+            )
+        };
+        let host = litebox_common_linux::hwcap::LinuxHwcaps { hwcap, hwcap2 }.to_cpu_features();
+        // PAUTH is kept: PAC keys are per host process and inherited by native fork. Excluded:
+        // - DIT and SSBS: the syscall path saves and restores only NZCV (see
+        //   `switch_to_guest_via_outbound_stub`).
+        // - SVE and SME: only FP/SIMD vector state is saved.
+        // - BTI and MTE: there is no PROT_BTI/PROT_MTE page-attribute support.
+        host & (CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH)
     }
 }
 

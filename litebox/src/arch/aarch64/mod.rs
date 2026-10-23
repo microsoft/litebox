@@ -17,3 +17,115 @@ pub const PSR_NZCV_MASK: u64 = 0b1111 << 28;
 pub const PSR_SSBS_BIT: u64 = 1 << 12;
 /// Data Independent Timing bit.
 pub const PSR_DIT_BIT: u64 = 1 << 24;
+
+bitflags::bitflags! {
+    /// AArch64 CPU features, named after Arm `FEAT_*` extensions.
+    ///
+    /// Bit positions are LiteBox's own and must not be relied on to match any ABI encoding.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CpuFeatures: u64 {
+        const FP = 1 << 0;
+        /// `FEAT_AdvSIMD`.
+        const ASIMD = 1 << 1;
+        const AES = 1 << 2;
+        const PMULL = 1 << 3;
+        const SHA1 = 1 << 4;
+        const SHA256 = 1 << 5;
+        const CRC32 = 1 << 6;
+        const LSE = 1 << 7;
+        /// Half-precision scalar and vector arithmetic.
+        const FP16 = 1 << 8;
+        const RDM = 1 << 9;
+        const JSCVT = 1 << 10;
+        const FCMA = 1 << 11;
+        const LRCPC = 1 << 12;
+        /// `DC CVAP`.
+        const DPB = 1 << 13;
+        const SHA3 = 1 << 14;
+        const SM3 = 1 << 15;
+        const SM4 = 1 << 16;
+        const DOTPROD = 1 << 17;
+        const SHA512 = 1 << 18;
+        const FHM = 1 << 19;
+        /// Relaxed alignment for single-copy atomic accesses.
+        const LSE2 = 1 << 20;
+        const LRCPC2 = 1 << 21;
+        const FLAGM = 1 << 22;
+        const SB = 1 << 23;
+        /// `DC CVADP`.
+        const DPB2 = 1 << 24;
+        /// `AXFLAG` and `XAFLAG`.
+        const FLAGM2 = 1 << 25;
+        const FRINTTS = 1 << 26;
+        const I8MM = 1 << 27;
+        const BF16 = 1 << 28;
+        const DGH = 1 << 29;
+        /// `RNDR` and `RNDRRS`.
+        const RNG = 1 << 30;
+        const ECV = 1 << 31;
+        const AFP = 1 << 32;
+        const RPRES = 1 << 33;
+        /// `WFET` and `WFIT`.
+        const WFXT = 1 << 34;
+        const EBF16 = 1 << 35;
+        const CSSC = 1 << 36;
+        const RPRFM = 1 << 37;
+        const MOPS = 1 << 38;
+        const HBC = 1 << 39;
+        /// Adds the `PSTATE.DIT` bit.
+        const DIT = 1 << 40;
+        /// Adds the `PSTATE.SSBS` bit.
+        const SSBS = 1 << 41;
+        /// Pointer authentication with both address and generic keys.
+        const PAUTH = 1 << 42;
+        const SVE = 1 << 43;
+        const SME = 1 << 44;
+        const BTI = 1 << 45;
+        const MTE = 1 << 46;
+    }
+}
+
+impl CpuFeatures {
+    /// Features that use only X0-X30, SP, PC, NZCV, V0-V31, FPCR, and FPSR, and need no kernel
+    /// ABI. A host that reports one has enabled it for EL0, so preserving that state suffices.
+    pub const BASE_STATE_ONLY: Self = Self::FP
+        .union(Self::ASIMD)
+        .union(Self::AES)
+        .union(Self::PMULL)
+        .union(Self::SHA1)
+        .union(Self::SHA256)
+        .union(Self::CRC32)
+        .union(Self::LSE)
+        .union(Self::FP16)
+        .union(Self::RDM)
+        .union(Self::JSCVT)
+        .union(Self::FCMA)
+        .union(Self::LRCPC)
+        .union(Self::DPB)
+        .union(Self::SHA3)
+        .union(Self::SM3)
+        .union(Self::SM4)
+        .union(Self::DOTPROD)
+        .union(Self::SHA512)
+        .union(Self::FHM)
+        .union(Self::LSE2)
+        .union(Self::LRCPC2)
+        .union(Self::FLAGM)
+        .union(Self::SB)
+        .union(Self::DPB2)
+        .union(Self::FLAGM2)
+        .union(Self::FRINTTS)
+        .union(Self::I8MM)
+        .union(Self::BF16)
+        .union(Self::DGH)
+        .union(Self::RNG)
+        .union(Self::ECV)
+        .union(Self::AFP)
+        .union(Self::RPRES)
+        .union(Self::WFXT)
+        .union(Self::EBF16)
+        .union(Self::CSSC)
+        .union(Self::RPRFM)
+        .union(Self::MOPS)
+        .union(Self::HBC);
+}

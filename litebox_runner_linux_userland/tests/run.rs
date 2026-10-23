@@ -58,6 +58,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 // Dedicated fixtures build static binaries concurrently; exclude them to avoid
 // colliding with this sweep's dynamic `<stem>_rewriter` outputs.
 const DEDICATED_C_TESTS: &[&str] = &[
+    "aarch64_hwcaps.c",
     "async_x16.c",
     "fork_chain_parent.c",
     "fork_parent.c",
@@ -1086,6 +1087,73 @@ fn fork_and_vfork_preserve_aarch64_state() {
     let signed_line = line("signed-fork ");
     assert_eq!(numeric_field(signed_line, "exited="), 1, "{signed_line}");
     assert_eq!(numeric_field(signed_line, "code="), 0, "{signed_line}");
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[test]
+fn aarch64_hwcaps_expose_only_supported_host_features() {
+    use litebox::arch::aarch64::CpuFeatures;
+    use litebox_common_linux::hwcap::LinuxHwcaps;
+
+    // Bits from Linux uapi `arch/arm64/include/uapi/asm/hwcap.h` that libc does not define.
+    const HWCAP2_BTI: u64 = 1 << 17;
+    const HWCAP2_MTE: u64 = 1 << 18;
+    const HWCAP2_SME: u64 = 1 << 23;
+
+    let program = common::compile("./tests/aarch64_hwcaps.c", "aarch64_hwcaps", true, false);
+    let output = String::from_utf8(Runner::new(&program, "aarch64_hwcaps").output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+    let hwcaps_line = line("hwcaps ");
+    let field = |name: &str| -> u64 {
+        hwcaps_line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(name)?.parse().ok())
+            .unwrap_or_else(|| panic!("missing {name} in {hwcaps_line:?}"))
+    };
+    let (hwcap, hwcap2) = (field("hwcap="), field("hwcap2="));
+    // SAFETY: getauxval only reads this process's auxiliary vector.
+    let (host_hwcap, host_hwcap2) = unsafe {
+        (
+            libc::getauxval(libc::AT_HWCAP),
+            libc::getauxval(libc::AT_HWCAP2),
+        )
+    };
+
+    // Mirrors the platform filter intersected with the shim filter, which drops PAUTH under
+    // copy-based fork.
+    let mut exposed = CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH;
+    if litebox_shim_linux::syscalls::process::COPY_BASED_FORK {
+        exposed.remove(CpuFeatures::PAUTH);
+    }
+    let host = LinuxHwcaps {
+        hwcap: host_hwcap,
+        hwcap2: host_hwcap2,
+    };
+    let expected = LinuxHwcaps::from_cpu_features(host.to_cpu_features() & exposed);
+    assert_eq!(
+        (hwcap, hwcap2),
+        (expected.hwcap, expected.hwcap2),
+        "{hwcaps_line}: host hwcap={host_hwcap:#x} hwcap2={host_hwcap2:#x}"
+    );
+    // These checks are independent of the allow-list and the hwcap mapping.
+    let required = libc::HWCAP_FP | libc::HWCAP_ASIMD;
+    assert_eq!(hwcap & required, required, "{hwcaps_line}");
+    // HWCAP_CPUID would tell glibc/compiler-rt to trust the host's unfiltered ID-register reads.
+    let never = libc::HWCAP_CPUID | libc::HWCAP_SVE | libc::HWCAP_DIT | libc::HWCAP_SSBS;
+    assert_eq!(hwcap & never, 0, "{hwcaps_line}");
+    let never2 = HWCAP2_BTI | HWCAP2_MTE | HWCAP2_SME;
+    assert_eq!(hwcap2 & never2, 0, "{hwcaps_line}");
+
+    // FPCR controls, including those of the offered FP16, AFP, and EBF16 features, survive
+    // syscalls and signals.
+    let fpcr_line = line("fpcr ");
+    assert_eq!(numeric_field(fpcr_line, "syscall="), 1, "{fpcr_line}");
+    assert_eq!(numeric_field(fpcr_line, "signal="), 1, "{fpcr_line}");
 }
 
 #[cfg(target_os = "linux")]
