@@ -44,9 +44,9 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
     ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
-    ReadinessQueueRequest, ReadinessQueueResponse, SignalRequest, SignalResponse, SocketRequest,
-    SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest,
-    UnixSocketResponse,
+    ReadinessQueueRequest, ReadinessQueueResponse, SharedMemoryRequest, SharedMemoryResponse,
+    SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse,
+    TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -551,6 +551,10 @@ fn handle_request<Memory: SharedMemory>(
         }
         BrokerOperation::ProcessGroup(request) => {
             handle_process_group_request(process, request).map(BrokerResult::ProcessGroup)
+        }
+        BrokerOperation::SharedMemory(request) => {
+            handle_shared_memory_request(process, request, readiness_sink)
+                .map(BrokerResult::SharedMemory)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -1792,6 +1796,36 @@ fn handle_event_request(
                 .map_err(RequestFailure::from)
         }
     }
+}
+
+fn handle_shared_memory_request(
+    process: &BrokerProcess,
+    request: SharedMemoryRequest,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<SharedMemoryResponse> {
+    use litebox_broker_core::shared_memory;
+    use litebox_broker_protocol::shared_memory::{
+        CreateFutexWaiterResponse, CreateSharedMemoryResponse, FutexDisarmResponse,
+        FutexWakeResponse,
+    };
+
+    let response = match request {
+        SharedMemoryRequest::Create(request) => shared_memory::create(process, request.length)
+            .map(|handle| SharedMemoryResponse::Create(CreateSharedMemoryResponse { handle })),
+        SharedMemoryRequest::CreateFutexWaiter => {
+            shared_memory::create_futex_waiter(process, readiness_sink).map(|handle| {
+                SharedMemoryResponse::CreateFutexWaiter(CreateFutexWaiterResponse { handle })
+            })
+        }
+        SharedMemoryRequest::FutexArm(request) => {
+            shared_memory::futex_arm(process, request).map(|()| SharedMemoryResponse::FutexArm)
+        }
+        SharedMemoryRequest::FutexWake(request) => shared_memory::futex_wake(process, request)
+            .map(|woken| SharedMemoryResponse::FutexWake(FutexWakeResponse { woken })),
+        SharedMemoryRequest::FutexDisarm(request) => shared_memory::futex_disarm(process, request)
+            .map(|woken| SharedMemoryResponse::FutexDisarm(FutexDisarmResponse { woken })),
+    };
+    response.map_err(RequestFailure::from)
 }
 
 fn handle_timer_request(

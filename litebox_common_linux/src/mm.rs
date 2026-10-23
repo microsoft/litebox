@@ -645,6 +645,19 @@ where
             .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
     }
 
+    /// Returns whether every page of `range` is in a shared anonymous mapping.
+    pub fn range_is_shared_anonymous(&self, range: Range<usize>) -> bool {
+        let vmem = self.vmem.read();
+        let mut next = range.start;
+        for (mapped, vma) in vmem.overlapping(range.clone()) {
+            if mapped.start > next || !vma.is_shared_anonymous() {
+                return false;
+            }
+            next = mapped.end;
+        }
+        next >= range.end
+    }
+
     /// Returns all mappings in a vector.
     pub fn mappings(&self) -> Vec<(Range<usize>, VmFlags)> {
         self.vmem

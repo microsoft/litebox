@@ -616,6 +616,31 @@ pub(crate) trait BrokerControl: Send + Sync {
         name: SocketOptionName,
     ) -> core::result::Result<SocketOptionValue, BrokerControlError>;
 
+    fn create_shared_memory(
+        &self,
+        length: u64,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn create_futex_waiter(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn futex_arm(
+        &self,
+        memory: ObjectHandle,
+        offset: u64,
+        bitset: u32,
+        waiter: ObjectHandle,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn futex_wake(
+        &self,
+        memory: ObjectHandle,
+        offset: u64,
+        count: u32,
+        bitset: u32,
+    ) -> core::result::Result<u32, BrokerControlError>;
+
+    fn futex_disarm(&self, waiter: ObjectHandle) -> core::result::Result<bool, BrokerControlError>;
+
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 
     fn fail_connection(&self);
@@ -1696,6 +1721,41 @@ where
         name: SocketOptionName,
     ) -> core::result::Result<SocketOptionValue, BrokerControlError> {
         self.request(|local| local.get_unix_socket_option(handle, name))
+    }
+
+    fn create_shared_memory(
+        &self,
+        length: u64,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_shared_memory(length))
+    }
+
+    fn create_futex_waiter(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(BrokerLocal::create_futex_waiter)
+    }
+
+    fn futex_arm(
+        &self,
+        memory: ObjectHandle,
+        offset: u64,
+        bitset: u32,
+        waiter: ObjectHandle,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.futex_arm(memory, offset, bitset, waiter))
+    }
+
+    fn futex_wake(
+        &self,
+        memory: ObjectHandle,
+        offset: u64,
+        count: u32,
+        bitset: u32,
+    ) -> core::result::Result<u32, BrokerControlError> {
+        self.request(|local| local.futex_wake(memory, offset, count, bitset))
+    }
+
+    fn futex_disarm(&self, waiter: ObjectHandle) -> core::result::Result<bool, BrokerControlError> {
+        self.request(|local| local.futex_disarm(waiter))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {

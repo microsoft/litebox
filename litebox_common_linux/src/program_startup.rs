@@ -35,6 +35,8 @@ const HEADER_SIZE: usize = size_of::<u8>()
 const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u8>();
 /// Size of a memory region's start, end, and flags.
 const FORK_REGION_SIZE: usize = size_of::<[u64; 2]>() + size_of::<u32>();
+/// Size of a shared memory record's start, end, offset, and handle.
+const FORK_SHARED_MEMORY_SIZE: usize = size_of::<[u64; 4]>();
 const FILE_TAG: u8 = 0;
 const PIPE_TAG: u8 = 1;
 const UNIX_SOCKET_TAG: u8 = 2;
@@ -222,6 +224,22 @@ pub struct LinuxForkStartup {
     pub regions: Vec<ForkMemoryRegion>,
     /// Descriptors the child inherits, in strictly ascending descriptor order.
     pub fds: Vec<ForkedFd>,
+    /// Shared memory behind the shared anonymous mappings a native fork child inherits, in
+    /// strictly ascending, non-overlapping address order.
+    pub shared_memory: Vec<ForkSharedMemory>,
+}
+
+/// Broker shared memory behind a shared anonymous mapping a native fork child inherits, which
+/// keys the futexes in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkSharedMemory {
+    /// Page-aligned addresses of the mapping, or of what remains of it.
+    pub range: Range<usize>,
+    /// Offset of `range.start` in the shared memory.
+    pub offset: u64,
+    /// The child's broker handle to the shared memory, as returned by
+    /// [`litebox::process::PendingChild::inherit_shared_memory`]. Records may share a handle.
+    pub handle: ObjectHandle,
 }
 
 /// A memory region of a process duplicated by `fork`.
@@ -451,7 +469,12 @@ impl LinuxForkStartup {
         ] {
             push_u64(&mut output, value as u64);
         }
-        for count in [self.cwd.len(), self.regions.len(), self.fds.len()] {
+        for count in [
+            self.cwd.len(),
+            self.regions.len(),
+            self.fds.len(),
+            self.shared_memory.len(),
+        ] {
             push_u32(
                 &mut output,
                 u32::try_from(count).map_err(|_| LinuxProgramStartupError::TooLarge)?,
@@ -466,6 +489,12 @@ impl LinuxForkStartup {
         for fd in &self.fds {
             fd.inherited.encode(&mut output);
             output.push(u8::from(fd.close_on_exec));
+        }
+        for shared in &self.shared_memory {
+            push_u64(&mut output, shared.range.start as u64);
+            push_u64(&mut output, shared.range.end as u64);
+            push_u64(&mut output, shared.offset);
+            push_u64(&mut output, shared.handle.0);
         }
         if output.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(LinuxProgramStartupError::TooLarge);
@@ -514,6 +543,8 @@ impl LinuxForkStartup {
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let fd_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
+        let shared_memory_count = usize::try_from(read_u32(&mut input)?)
+            .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let cwd = core::str::from_utf8(take_bytes(&mut input, cwd_length)?)
             .map_err(|_| LinuxProgramStartupError::InvalidWorkingDirectory)?
             .into();
@@ -541,6 +572,19 @@ impl LinuxForkStartup {
             fds.push(ForkedFd {
                 inherited,
                 close_on_exec,
+            });
+        }
+        if shared_memory_count > input.len() / FORK_SHARED_MEMORY_SIZE {
+            return Err(LinuxProgramStartupError::Malformed);
+        }
+        let mut shared_memory = Vec::with_capacity(shared_memory_count);
+        for _ in 0..shared_memory_count {
+            let start = read_usize(&mut input)?;
+            let end = read_usize(&mut input)?;
+            shared_memory.push(ForkSharedMemory {
+                range: start..end,
+                offset: read_u64(&mut input)?,
+                handle: ObjectHandle(read_u64(&mut input)?),
             });
         }
         if !input.is_empty() {
@@ -572,6 +616,7 @@ impl LinuxForkStartup {
             program_break,
             regions,
             fds,
+            shared_memory,
         };
         validate_fork(&startup)?;
         Ok(startup)
@@ -697,12 +742,8 @@ fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupEr
     if startup.umask & !0o777 != 0 {
         return Err(LinuxProgramStartupError::InvalidUmask);
     }
-    let mut previous_end = 0;
-    for region in &startup.regions {
-        if region.range.start < previous_end || region.range.start >= region.range.end {
-            return Err(LinuxProgramStartupError::Malformed);
-        }
-        previous_end = region.range.end;
+    if !ascending_disjoint(startup.regions.iter().map(|region| &region.range)) {
+        return Err(LinuxProgramStartupError::Malformed);
     }
     if startup
         .fds
@@ -711,7 +752,22 @@ fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupEr
     {
         return Err(LinuxProgramStartupError::Malformed);
     }
+    if !ascending_disjoint(startup.shared_memory.iter().map(|shared| &shared.range)) {
+        return Err(LinuxProgramStartupError::Malformed);
+    }
     Ok(())
+}
+
+/// Returns whether `ranges` are nonempty, disjoint, and in ascending order.
+fn ascending_disjoint<'a>(ranges: impl Iterator<Item = &'a Range<usize>>) -> bool {
+    let mut previous_end = 0;
+    for range in ranges {
+        if range.start < previous_end || range.start >= range.end {
+            return false;
+        }
+        previous_end = range.end;
+    }
+    true
 }
 
 fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStartupError> {
@@ -1119,6 +1175,18 @@ mod tests {
                     close_on_exec: false,
                 },
             ],
+            shared_memory: vec![
+                ForkSharedMemory {
+                    range: 0x7100_0000..0x7100_1000,
+                    offset: 0,
+                    handle: ObjectHandle(14),
+                },
+                ForkSharedMemory {
+                    range: 0x7100_2000..0x7100_3000,
+                    offset: 0x2000,
+                    handle: ObjectHandle(14),
+                },
+            ],
         }
     }
 
@@ -1131,6 +1199,7 @@ mod tests {
         };
         assert_eq!(decoded.regions, startup.regions);
         assert_eq!(decoded.fds, startup.fds);
+        assert_eq!(decoded.shared_memory, startup.shared_memory);
         assert_eq!(decoded.comm, startup.comm);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
         #[cfg(target_arch = "aarch64")]
@@ -1180,6 +1249,12 @@ mod tests {
         overlapping.regions[1].range = 0x40_1000..0x40_3000;
         assert!(matches!(
             overlapping.encode(),
+            Err(LinuxProgramStartupError::Malformed)
+        ));
+        let mut overlapping_shared = startup.clone();
+        overlapping_shared.shared_memory[1].range = 0x7100_0000..0x7100_3000;
+        assert!(matches!(
+            overlapping_shared.encode(),
             Err(LinuxProgramStartupError::Malformed)
         ));
         let mut unordered = startup;

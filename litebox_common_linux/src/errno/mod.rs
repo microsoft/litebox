@@ -699,6 +699,18 @@ impl From<litebox::event::timer::TimerError> for Errno {
     }
 }
 
+impl From<litebox::shared_memory::SharedMemoryError> for Errno {
+    fn from(value: litebox::shared_memory::SharedMemoryError) -> Self {
+        use litebox::shared_memory::SharedMemoryError;
+        match value {
+            SharedMemoryError::ResourceExhausted => Errno::ENOMEM,
+            SharedMemoryError::PermissionDenied => Errno::EACCES,
+            SharedMemoryError::Io | SharedMemoryError::Unavailable => Errno::EIO,
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::event::readiness_queue::ReadinessQueueError> for Errno {
     fn from(value: litebox::event::readiness_queue::ReadinessQueueError) -> Self {
         use litebox::event::readiness_queue::ReadinessQueueError;
@@ -737,6 +749,9 @@ impl From<litebox::sync::futex::FutexError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::sync::futex::FutexError::Fault => Errno::EFAULT,
+            litebox::sync::futex::FutexError::ResourceExhausted => Errno::ENOMEM,
+            // Linux futexes have no I/O errors; a failed broker leaves the process unusable.
+            litebox::sync::futex::FutexError::Io => Errno::EIO,
         }
     }
 }

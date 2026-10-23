@@ -69,6 +69,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_epoll_parent.c",
     "fork_event_parent.c",
     "fork_inet_parent.c",
+    "fork_shared_futex_parent.c",
     "fork_unix_parent.c",
     "gate_signals.c",
     "inherited_ignored_signals.c",
@@ -1269,6 +1270,35 @@ fn forked_children_share_eventfds_and_timerfds() {
         .find(|line| line.starts_with("event-fork "))
         .unwrap_or_else(|| panic!("missing event-fork output in {output:?}"));
     for field in ["blocked=", "semaphore=", "nonblock=", "timer="] {
+        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn forked_children_share_futexes_in_shared_memory() {
+    let parent = common::compile(
+        "./tests/fork_shared_futex_parent.c",
+        "fork_shared_futex_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "fork_shared_futex_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = output
+        .lines()
+        .find(|line| line.starts_with("shared-futex "))
+        .unwrap_or_else(|| panic!("missing shared-futex output in {output:?}"));
+    for field in [
+        "memory=",
+        "wake=",
+        "timeout=",
+        "private=",
+        "mutex=",
+        "semaphore=",
+    ] {
         assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
     }
 }

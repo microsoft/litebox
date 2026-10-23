@@ -457,6 +457,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform: self.platform,
             mm: self.memory_manager,
             futex_manager: FutexManager::new(),
+            shared_mappings: litebox::sync::Mutex::new(
+                syscalls::shared_memory::SharedMappings::new(),
+            ),
             boot_time: self.platform.now(),
             process_id: self.process_id,
             litebox,
@@ -538,6 +541,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 litebox_thread: Cell::new(None),
                 thread: syscalls::process::ThreadState::new_process(pid, Some(initial_thread)),
                 wait_state: wait::WaitState::new(self.0.platform),
+                shared_futex_waiter: core::cell::OnceCell::new(),
                 vfork: RefCell::new(None),
                 pid,
                 credentials,
@@ -647,6 +651,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             program_break,
             regions,
             fds,
+            shared_memory,
         } = startup;
         let pid = self.0.process_id;
         if syscall_entry_point != self.0.platform.get_syscall_entry_point() {
@@ -664,6 +669,20 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 .mm
                 .restore_program_break(initial_program_break, program_break);
         }
+
+        // Only native fork children, which share the parent's shared anonymous mappings, inherit
+        // shared memory.
+        if shared_memory
+            .iter()
+            .any(|shared| !self.0.mm.range_is_shared_anonymous(shared.range.clone()))
+        {
+            return Err(ForkRestoreError::InvalidStartup);
+        }
+        self.0
+            .shared_mappings
+            .lock()
+            .adopt_inherited(&self.0.litebox, &shared_memory)
+            .map_err(ForkRestoreError::SharedMemory)?;
 
         let files = syscalls::file::FilesState::new();
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
@@ -699,6 +718,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 litebox_thread: Cell::new(None),
                 thread,
                 wait_state: wait::WaitState::new(self.0.platform),
+                shared_futex_waiter: core::cell::OnceCell::new(),
                 vfork: RefCell::new(None),
                 pid,
                 credentials,
@@ -787,6 +807,9 @@ pub enum ForkRestoreError {
     /// The working directory could not be restored.
     #[error("failed to restore the working directory")]
     WorkingDirectory(#[source] Errno),
+    /// The inherited shared memory could not be adopted.
+    #[error("failed to adopt the inherited shared memory")]
+    SharedMemory(#[source] litebox::process::ProcessError),
 }
 
 /// A handle to a process loaded via [`LinuxShim::load_program`].
@@ -1655,6 +1678,9 @@ struct GlobalState<Platform: ShimPlatform> {
     mm: Arc<MemoryManager<Platform>>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
+    /// Broker shared memory behind guest shared anonymous mappings, which keys their futexes.
+    shared_mappings:
+        litebox::sync::Mutex<Platform, syscalls::shared_memory::SharedMappings<Platform>>,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.
@@ -1671,6 +1697,8 @@ struct Task<Platform: ShimPlatform> {
     /// thread ID is the process ID.
     litebox_thread: Cell<Option<litebox::thread::Thread>>,
     wait_state: wait::WaitState<Platform>,
+    /// This thread's waiter for futexes in shared memory, created on first use.
+    shared_futex_waiter: core::cell::OnceCell<litebox::shared_memory::SharedFutexWaiter<Platform>>,
     thread: syscalls::process::ThreadState<Platform>,
     vfork: RefCell<Option<VforkState<Platform>>>,
     /// Process ID
@@ -1750,6 +1778,7 @@ mod test_utils {
             files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
             Task {
                 wait_state: wait::WaitState::new(self.platform),
+                shared_futex_waiter: core::cell::OnceCell::new(),
                 litebox_thread: Cell::new(None),
                 thread: syscalls::process::ThreadState::new_process(pid, None),
                 vfork: RefCell::new(None),
@@ -1776,6 +1805,7 @@ mod test_utils {
             };
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
+                shared_futex_waiter: core::cell::OnceCell::new(),
                 global: self.global.clone(),
                 litebox_thread: Cell::new(Some(litebox_thread)),
                 thread,
