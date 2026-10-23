@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod errno;
 pub mod loader;
+pub mod shared_cache;
 pub mod syscall;
 
 pub use litebox::user_pointers;

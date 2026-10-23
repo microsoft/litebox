@@ -13,8 +13,8 @@ use std::sync::{
 use std::time::Duration;
 
 use litebox::platform::page_mgmt::{
-    AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    PermissionUpdateError,
+    AllocationError, CowAllocationError, DeallocationError, FixedAddressBehavior,
+    MemoryRegionPermissions, PermissionUpdateError,
 };
 use litebox::platform::{ArchSpecificError, ArchSpecificRegister, RawConstPointer as _};
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
@@ -122,6 +122,23 @@ impl PageTable {
             Self::Native(pages) => pages.decommit(range),
             #[cfg(feature = "subpage_compat")]
             Self::Subpage(pages) => pages.decommit(range),
+        }
+    }
+
+    fn allocate_copy_on_write(
+        &mut self,
+        start: usize,
+        source: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        behavior: FixedAddressBehavior,
+    ) -> Result<usize, CowAllocationError> {
+        match self {
+            Self::Native(pages) => {
+                pages.allocate_copy_on_write(start, source, permissions, behavior)
+            }
+            // A 4 KiB guest page cannot own a host page of the copy, so callers copy instead.
+            #[cfg(feature = "subpage_compat")]
+            Self::Subpage(_) => Err(CowAllocationError::UnsupportedByPlatform),
         }
     }
 
@@ -670,12 +687,11 @@ bitflags::bitflags! {
     struct MachVmFlags: i32 {
         /// Mach uses zero to request the supplied fixed address.
         const FIXED = 0;
-        #[cfg(feature = "subpage_compat")]
         const ANYWHERE = 0x0000_0001;
+        const OVERWRITE = 0x0000_4000;
     }
 }
 
-#[cfg(any(test, feature = "subpage_compat"))]
 bitflags::bitflags! {
     #[repr(transparent)]
     struct MachVmProtection: i32 {
@@ -686,23 +702,20 @@ bitflags::bitflags! {
     }
 }
 
-#[cfg(any(test, feature = "subpage_compat"))]
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 struct MachBoolean(i32);
 
-#[cfg(any(test, feature = "subpage_compat"))]
 impl MachBoolean {
-    #[cfg(feature = "subpage_compat")]
     const FALSE: Self = Self(0);
-    #[cfg(test)]
     const TRUE: Self = Self(1);
 }
 
-#[cfg(feature = "subpage_compat")]
 #[derive(Clone, Copy)]
 #[repr(u32)]
 enum MachVmInheritance {
+    Copy = 1,
+    #[cfg(feature = "subpage_compat")]
     None = 2,
 }
 
@@ -720,7 +733,6 @@ unsafe extern "C" {
         set_maximum: MachBoolean,
         protection: MachVmProtection,
     ) -> KernReturn;
-    #[cfg(feature = "subpage_compat")]
     fn mach_vm_remap(
         task: u32,
         target: *mut u64,
@@ -866,6 +878,35 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
             return Err(DeallocationError::Unaligned);
         }
         self.pages.lock().unwrap().deallocate(range)
+    }
+
+    /// Map a private copy-on-write copy of `source_data` with `mach_vm_remap`. Native instances,
+    /// fixed placement and non-executable permissions only: `source_data` must be host-page
+    /// aligned, and its host mappings must allow read, write and execute, as anonymous and
+    /// `MAP_PRIVATE` file memory do; others, such as a read-only `MAP_SHARED` file mapping, give
+    /// [`CowAllocationError::UnsupportedSourceRegion`].
+    unsafe fn try_allocate_cow_pages<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_start: usize,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<MacosUserlandReservation<PAGE_SIZE>, CowAllocationError>
+    where
+        Reservations: Iterator<Item = MacosUserlandReservation<PAGE_SIZE>>,
+    {
+        let base = self.pages.lock().unwrap().allocate_copy_on_write(
+            suggested_start,
+            source_data,
+            permissions,
+            fixed_address_behavior,
+        )?;
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            replaced_reservations().for_each(drop);
+        }
+        // SAFETY: Pages acquired exclusive ownership of this exact guest extent.
+        Ok(unsafe { MacosUserlandReservation::new(base..base + source_data.len()) })
     }
 
     unsafe fn protect_pages<'reservation, Reservations>(
@@ -4158,5 +4199,720 @@ mod tests {
         // SAFETY: the test-owned page is idle; its old code has returned.
         unsafe { p.protect_pages(core::iter::empty, range.clone(), RW) }.unwrap();
         assert_eq!(run(44), 44);
+    }
+
+    /// Leaked page-aligned anonymous host memory filled with `fill`, as a copy-on-write source.
+    fn cow_source(len: usize, fill: u8) -> &'static [u8] {
+        // SAFETY: a fresh anonymous mapping, leaked for the program lifetime.
+        let source = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(source, libc::MAP_FAILED);
+        // SAFETY: the test exclusively owns the fresh writable mapping, which is never unmapped
+        // and never written after the shared slice is created.
+        unsafe {
+            core::ptr::write_bytes(source.cast::<u8>(), fill, len);
+            core::slice::from_raw_parts(source.cast(), len)
+        }
+    }
+
+    fn native_owns_any<const PAGE_SIZE: usize>(
+        p: &MacosUserlandWithPageSize<PAGE_SIZE>,
+        range: &Range<usize>,
+    ) -> bool {
+        match &*p.pages.lock().unwrap() {
+            PageTable::Native(pages) => pages.owns_any(range),
+            #[cfg(feature = "subpage_compat")]
+            PageTable::Subpage(_) => unreachable!("native instance"),
+        }
+    }
+
+    #[repr(C, packed(4))]
+    #[derive(Default)]
+    struct VmRegionBasicInfo64 {
+        protection: i32,
+        max_protection: i32,
+        inheritance: u32,
+        shared: i32,
+        reserved: i32,
+        offset: u64,
+        behavior: i32,
+        user_wired_count: u16,
+    }
+
+    const VM_REGION_BASIC_INFO_64: i32 = 9;
+
+    unsafe extern "C" {
+        fn mach_vm_region(
+            task: u32,
+            address: *mut u64,
+            size: *mut u64,
+            flavor: i32,
+            info: *mut VmRegionBasicInfo64,
+            count: *mut u32,
+            object_name: *mut u32,
+        ) -> KernReturn;
+    }
+
+    /// The inheritance of the host mapping at `address`.
+    fn inheritance_at(address: usize) -> u32 {
+        let mut region = address as u64;
+        let mut size = 0;
+        let mut info = VmRegionBasicInfo64::default();
+        let mut count = u32::try_from(size_of::<VmRegionBasicInfo64>() / size_of::<i32>()).unwrap();
+        let mut object_name = 0;
+        // SAFETY: all outputs are valid; the basic flavor returns no object name right.
+        let result = unsafe {
+            mach_vm_region(
+                mach_task_self(),
+                &raw mut region,
+                &raw mut size,
+                VM_REGION_BASIC_INFO_64,
+                &raw mut info,
+                &raw mut count,
+                &raw mut object_name,
+            )
+        };
+        assert_eq!(result, KernReturn::SUCCESS);
+        assert!(region <= address as u64, "{address:#x} is unmapped");
+        info.inheritance
+    }
+
+    #[test]
+    fn copy_on_write_pages_are_private_and_downgrade() {
+        let p = MacosUserland::new();
+        let source = cow_source(2 * HOST_PAGE_SIZE, 0x11);
+        // Keep this copy apart from other tests' hinted pages.
+        let hint = TASK_ADDR_MIN + (4 << 40);
+        // SAFETY: Hint placement is refused before any side effect.
+        let hinted = unsafe {
+            p.try_allocate_cow_pages(
+                || -> core::iter::Empty<_> { unreachable!("Hint replaces nothing") },
+                0,
+                source,
+                RW,
+                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            )
+        };
+        assert!(matches!(
+            hinted,
+            Err(CowAllocationError::UnsupportedByPlatform)
+        ));
+        // SAFETY: NoReplace placement replaces nothing.
+        let copy = unsafe {
+            p.try_allocate_cow_pages(
+                || -> core::iter::Empty<_> { unreachable!("NoReplace replaces nothing") },
+                hint,
+                source,
+                RW,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        let range = copy.range();
+        assert_eq!(range, hint..hint + source.len());
+        let _unmap = litebox::utils::defer(|| {
+            // SAFETY: the test owns the copy and no longer accesses it.
+            unsafe { p.release_pages(range.clone()) }.unwrap();
+        });
+        // Guest copies inherit like mmap'd guest pages (VM_INHERIT_DEFAULT).
+        assert_eq!(inheritance_at(range.start), MachVmInheritance::Copy as u32);
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                range.start,
+            );
+        assert_eq!(ptr.read_at_offset(0), Some(0x11));
+        for offset in [0, HOST_PAGE_SIZE] {
+            assert_eq!(ptr.write_at_offset(offset.cast_signed(), 0x22), Some(()));
+            assert_eq!(source[offset], 0x11, "writes never reach the source");
+        }
+        // SAFETY: the test owns the idle copy.
+        unsafe {
+            p.protect_pages(
+                || core::iter::once(&copy),
+                range.clone(),
+                MemoryRegionPermissions::READ,
+            )
+        }
+        .unwrap();
+        for offset in [0, HOST_PAGE_SIZE - 1, HOST_PAGE_SIZE] {
+            assert_eq!(ptr.write_at_offset(offset.cast_signed(), 0x33), None);
+        }
+        assert_eq!(ptr.read_at_offset(0), Some(0x22));
+        assert_eq!(ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed()), Some(0x22));
+        // Unaligned sources and W+X are refused before any side effect, here on free pages.
+        for (source, permissions, unaligned) in [
+            (
+                &source[1..=HOST_PAGE_SIZE],
+                MemoryRegionPermissions::READ,
+                true,
+            ),
+            (
+                &source[..HOST_PAGE_SIZE - 1],
+                MemoryRegionPermissions::READ,
+                true,
+            ),
+            (source, RW | MemoryRegionPermissions::EXEC, false),
+        ] {
+            // SAFETY: NoReplace placement replaces nothing.
+            let result = unsafe {
+                p.try_allocate_cow_pages(
+                    || -> core::iter::Empty<_> { unreachable!("NoReplace replaces nothing") },
+                    range.end,
+                    source,
+                    permissions,
+                    FixedAddressBehavior::NoReplace,
+                )
+            };
+            if unaligned {
+                assert!(matches!(result, Err(CowAllocationError::Unaligned)));
+            } else {
+                assert!(matches!(result, Err(CowAllocationError::InternalFailure)));
+            }
+        }
+    }
+
+    #[test]
+    fn released_copy_on_write_pages_leave_the_owned_set() {
+        let p = MacosUserland::new();
+        // Keep these pages apart from other tests' hinted pages: the test frees them.
+        let hint = TASK_ADDR_MIN + (5 << 40);
+        // SAFETY: Hint allocation chooses fresh pages that this test exclusively owns.
+        let reservation = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                hint..hint + 2 * HOST_PAGE_SIZE,
+                MemoryRegionPermissions::empty(),
+                false,
+                false,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let range = reservation.range();
+        let source = cow_source(range.len(), 0x11);
+        // SAFETY: the test-owned reservation is idle.
+        let copy = unsafe {
+            p.try_allocate_cow_pages(
+                || core::iter::once(reservation),
+                range.start,
+                source,
+                MemoryRegionPermissions::READ,
+                FixedAddressBehavior::Replace,
+            )
+        }
+        .unwrap();
+        assert_eq!(copy.range(), range);
+        assert!(native_owns_any(p, &range));
+        assert_eq!(inheritance_at(range.start), MachVmInheritance::Copy as u32);
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                range.start,
+            );
+        assert_eq!(ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed()), Some(0x11));
+        assert_eq!(ptr.write_at_offset(0, 0x22), None);
+        // SAFETY: the test owns the idle copy; later probes use fallible accesses.
+        unsafe { p.release_pages(copy.range()) }.unwrap();
+        assert!(!native_owns_any(p, &range));
+        assert_eq!(ptr.read_at_offset(0), None);
+        // SAFETY: the pages this test just released are free.
+        let fresh = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                range.clone(),
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        assert_eq!(ptr.read_at_offset(0), Some(0));
+        // SAFETY: the test owns the idle pages.
+        unsafe { p.release_pages(fresh.range()) }.unwrap();
+    }
+
+    #[test]
+    fn failed_copy_on_write_replacement_keeps_the_target_mapping() {
+        let p = MacosUserland::new();
+        // SAFETY: Hint allocation chooses a fresh page that this test exclusively owns.
+        let reservation = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let target = reservation.range();
+        let _unmap = litebox::utils::defer(|| {
+            // SAFETY: the test owns the page and no longer accesses it.
+            unsafe { p.release_pages(target.clone()) }.unwrap();
+        });
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                target.start,
+            );
+        assert_eq!(ptr.write_at_offset(0, 0x5a), Some(()));
+        // A READ-only maximum fails the staged copy's protection check before the target is
+        // touched.
+        let source = cow_source(HOST_PAGE_SIZE, 0x11);
+        // SAFETY: the test exclusively owns the leaked source mapping.
+        let result = unsafe {
+            mach_vm_protect(
+                mach_task_self(),
+                source.as_ptr() as u64,
+                HOST_PAGE_SIZE as u64,
+                MachBoolean::TRUE,
+                MachVmProtection::READ,
+            )
+        };
+        assert_eq!(result, KernReturn::SUCCESS);
+        // SAFETY: the test-owned page is idle; a failed replacement must leave it intact.
+        let replaced = unsafe {
+            p.try_allocate_cow_pages(
+                || -> core::iter::Empty<_> { unreachable!("the replacement failed") },
+                target.start,
+                source,
+                RW,
+                FixedAddressBehavior::Replace,
+            )
+        };
+        assert!(matches!(
+            replaced,
+            Err(CowAllocationError::UnsupportedSourceRegion)
+        ));
+        assert!(native_owns_any(p, &target));
+        assert_eq!(ptr.read_at_offset(0), Some(0x5a));
+        assert_eq!(ptr.write_at_offset(1, 0x6b), Some(()));
+    }
+
+    #[test]
+    fn copy_on_write_never_replaces_unowned_memory() {
+        let p = MacosUserland::new();
+        // Keep these pages apart from other tests' hinted pages: the test frees one of them.
+        let hint = TASK_ADDR_MIN + (6 << 40);
+        // SAFETY: Hint allocation chooses fresh pages that this test exclusively owns.
+        let base = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                hint..hint + 3 * HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap()
+        .range()
+        .start;
+        let _unmap = litebox::utils::defer(|| {
+            // SAFETY: the test-owned pages are no longer accessed.
+            unsafe { p.release_pages(base..base + 3 * HOST_PAGE_SIZE) }.unwrap();
+        });
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                base,
+            );
+        let page = |index: usize| (index * HOST_PAGE_SIZE).cast_signed();
+        let span = |indices: Range<usize>| {
+            base + indices.start * HOST_PAGE_SIZE..base + indices.end * HOST_PAGE_SIZE
+        };
+        let markers = [0x10, 0x11];
+        for (index, marker) in markers.into_iter().enumerate() {
+            assert_eq!(ptr.write_at_offset(page(index), marker), Some(()));
+        }
+
+        // Layout: page0 owned | page1 free | page2 host.
+        // SAFETY: the test-owned page is idle; later probes use fallible accesses.
+        unsafe { p.release_pages(span(2..3)) }.unwrap();
+        let mut host = span(2..3).start as u64;
+        // SAFETY: a FIXED allocation without OVERWRITE fails instead of replacing a mapping.
+        let result = unsafe {
+            mach_vm_allocate(
+                mach_task_self(),
+                &raw mut host,
+                HOST_PAGE_SIZE as u64,
+                MachVmFlags::FIXED,
+            )
+        };
+        assert_eq!(result, KernReturn::SUCCESS);
+        let _unmap_host = litebox::utils::defer(|| {
+            // SAFETY: the test exclusively owns the host page, which is no longer accessed.
+            unsafe { libc::munmap(host as *mut _, HOST_PAGE_SIZE) };
+        });
+        let host_marker = 0x42;
+        assert_eq!(ptr.write_at_offset(page(2), host_marker), Some(()));
+        // SAFETY: the test-owned page is idle; later probes use fallible accesses.
+        unsafe { p.release_pages(span(1..2)) }.unwrap();
+
+        let source = cow_source(2 * HOST_PAGE_SIZE, 0x77);
+        for (start, behavior) in [
+            // NoReplace refuses owned pages. Over free page 1 and host page 2, the reservation of
+            // their single unowned gap fails without replacing the host page.
+            (span(0..1).start, FixedAddressBehavior::NoReplace),
+            (span(1..2).start, FixedAddressBehavior::NoReplace),
+            (span(1..2).start, FixedAddressBehavior::Replace),
+        ] {
+            // SAFETY: the test-owned pages are idle; the host page must be rejected.
+            let result = unsafe {
+                p.try_allocate_cow_pages(
+                    || -> core::iter::Empty<_> { unreachable!("the allocation failed") },
+                    start,
+                    source,
+                    MemoryRegionPermissions::READ,
+                    behavior,
+                )
+            };
+            assert!(matches!(result, Err(CowAllocationError::InternalFailure)));
+        }
+        assert_eq!(ptr.read_at_offset(page(0)), Some(markers[0]));
+        assert_eq!(ptr.read_at_offset(page(1)), None);
+        assert!(!native_owns_any(p, &span(1..3)));
+        assert_eq!(ptr.read_at_offset(page(2)), Some(host_marker));
+        assert_eq!(ptr.write_at_offset(page(2), host_marker), Some(()));
+    }
+
+    #[test]
+    fn failed_copy_on_write_replacement_releases_reserved_gaps() {
+        let p = MacosUserland::new();
+        // Keep these pages apart from other tests' hinted pages: the test frees one of them.
+        let hint = TASK_ADDR_MIN + (8 << 40);
+        // SAFETY: Hint allocation chooses fresh pages that this test exclusively owns.
+        let base = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                hint..hint + 2 * HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap()
+        .range()
+        .start;
+        let owned = base..base + HOST_PAGE_SIZE;
+        let free = owned.end..owned.end + HOST_PAGE_SIZE;
+        let _unmap = litebox::utils::defer(|| {
+            // SAFETY: the test-owned page is no longer accessed.
+            unsafe { p.release_pages(owned.clone()) }.unwrap();
+        });
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                base,
+            );
+        assert_eq!(ptr.write_at_offset(0, 0x5a), Some(()));
+        // SAFETY: the test-owned page is idle; later probes use fallible accesses.
+        unsafe { p.release_pages(free.clone()) }.unwrap();
+        // The call reserves the free page, then staging fails: the source's READ-only maximum
+        // protection fails the staged copy's protection check.
+        let source = cow_source(2 * HOST_PAGE_SIZE, 0x11);
+        // SAFETY: the test exclusively owns the leaked source mapping.
+        let result = unsafe {
+            mach_vm_protect(
+                mach_task_self(),
+                source.as_ptr() as u64,
+                source.len() as u64,
+                MachBoolean::TRUE,
+                MachVmProtection::READ,
+            )
+        };
+        assert_eq!(result, KernReturn::SUCCESS);
+        // SAFETY: the test-owned page is idle; a failed replacement must leave it intact.
+        let replaced = unsafe {
+            p.try_allocate_cow_pages(
+                || -> core::iter::Empty<_> { unreachable!("the replacement failed") },
+                base,
+                source,
+                RW,
+                FixedAddressBehavior::Replace,
+            )
+        };
+        assert!(matches!(
+            replaced,
+            Err(CowAllocationError::UnsupportedSourceRegion)
+        ));
+        assert!(!native_owns_any(p, &free));
+        assert_eq!(ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed()), None);
+        assert!(native_owns_any(p, &owned));
+        assert_eq!(ptr.read_at_offset(0), Some(0x5a));
+    }
+
+    #[test]
+    fn copy_on_write_cost_is_independent_of_size() {
+        const LEN: usize = 64 << 30;
+        let p = MacosUserland::new();
+        // Untouched anonymous memory has no pages to copy.
+        // SAFETY: a fresh readable anonymous mapping, leaked for the program lifetime and never
+        // written.
+        let source: &'static [u8] = unsafe {
+            let source = libc::mmap(
+                core::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(source, libc::MAP_FAILED);
+            core::slice::from_raw_parts(source.cast(), LEN)
+        };
+        // CPU time of this thread, kernel time included, so host load does not inflate it.
+        let cpu_time = || {
+            // SAFETY: zero is a valid timespec.
+            let mut time = unsafe { core::mem::zeroed::<libc::timespec>() };
+            // SAFETY: `time` is valid output storage.
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut time) },
+                0
+            );
+            Duration::new(
+                time.tv_sec.cast_unsigned(),
+                time.tv_nsec.try_into().unwrap(),
+            )
+        };
+        let started = cpu_time();
+        // SAFETY: Hint allocation chooses fresh pages that this test exclusively owns.
+        let reservation = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + LEN,
+                MemoryRegionPermissions::empty(),
+                false,
+                false,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let range = reservation.range();
+        // SAFETY: the test-owned reservation is idle.
+        let replaced = unsafe {
+            p.try_allocate_cow_pages(
+                || core::iter::once(reservation),
+                range.start,
+                source,
+                MemoryRegionPermissions::READ,
+                FixedAddressBehavior::Replace,
+            )
+        }
+        .unwrap();
+        // Keep this copy apart from other tests' hinted pages.
+        let free = TASK_ADDR_MIN + (9 << 40);
+        // SAFETY: NoReplace placement replaces nothing.
+        let reserved = unsafe {
+            p.try_allocate_cow_pages(
+                core::iter::empty,
+                free,
+                source,
+                MemoryRegionPermissions::empty(),
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        // SAFETY: the test owns both idle copies.
+        unsafe {
+            p.release_pages(replaced.range()).unwrap();
+            p.release_pages(reserved.range()).unwrap();
+        }
+        // A per-page implementation needs millions of system calls here, about 0.5 µs each.
+        let elapsed = cpu_time().checked_sub(started).unwrap();
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert!(!native_owns_any(p, &range));
+    }
+
+    /// A test-owned RW host range of `len` bytes holding `marker` at offset 0 of each host page,
+    /// released when the guard drops.
+    fn owned_marked_range(
+        p: &'static MacosUserland,
+        len: usize,
+        marker: u8,
+    ) -> (MacosUserlandReservation<HOST_PAGE_SIZE>, impl Drop + use<>) {
+        // SAFETY: Hint allocation chooses fresh pages that this test exclusively owns.
+        let reservation = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + len,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let range = reservation.range();
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                range.start,
+            );
+        for offset in (0..len).step_by(HOST_PAGE_SIZE) {
+            assert_eq!(ptr.write_at_offset(offset.cast_signed(), marker), Some(()));
+        }
+        let release = litebox::utils::defer(move || {
+            // SAFETY: the test owns the pages and no longer accesses them.
+            unsafe { p.release_pages(range) }.unwrap();
+        });
+        (reservation, release)
+    }
+
+    #[test]
+    fn executable_copy_on_write_pages_are_refused() {
+        let p = MacosUserland::new();
+        let (target, _release) = owned_marked_range(p, HOST_PAGE_SIZE, 0x5a);
+        let range = target.range();
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                range.start,
+            );
+        let source = cow_source(HOST_PAGE_SIZE, 0);
+        // SAFETY: the test-owned page is idle; a refused replacement must leave it intact.
+        let result = unsafe {
+            p.try_allocate_cow_pages(
+                || -> core::iter::Empty<_> { unreachable!("executable copies are refused") },
+                range.start,
+                source,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                FixedAddressBehavior::Replace,
+            )
+        };
+        assert!(matches!(
+            result,
+            Err(CowAllocationError::UnsupportedByPlatform)
+        ));
+        assert!(native_owns_any(p, &range));
+        assert_eq!(ptr.read_at_offset(0), Some(0x5a));
+        assert_eq!(ptr.write_at_offset(1, 0x6b), Some(()));
+    }
+
+    /// A leaked read-only file mapping filled with `fill` whose host page `i` is mapped with
+    /// `mmap` flags `page_flags[i]`. Callers in one process pass distinct `fill`.
+    fn file_source(page_flags: &[i32], fill: u8) -> &'static [u8] {
+        let len = page_flags.len() * HOST_PAGE_SIZE;
+        let path =
+            std::env::temp_dir().join(format!("litebox-cow-source-{}-{fill}", std::process::id()));
+        std::fs::write(&path, vec![fill; len]).unwrap();
+        let source_file = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&source_file);
+        // SAFETY: a fresh file mapping, leaked for the program lifetime and never written.
+        let base = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                page_flags[0],
+                fd,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        for (index, flags) in page_flags.iter().enumerate().skip(1) {
+            let offset = index * HOST_PAGE_SIZE;
+            // SAFETY: MAP_FIXED replaces a page of this call's own mapping, which has no users.
+            let page = unsafe {
+                libc::mmap(
+                    base.byte_add(offset),
+                    HOST_PAGE_SIZE,
+                    libc::PROT_READ,
+                    flags | libc::MAP_FIXED,
+                    fd,
+                    i64::try_from(offset).unwrap(),
+                )
+            };
+            assert_ne!(page, libc::MAP_FAILED);
+        }
+        // SAFETY: the mapping is readable for `len` bytes for the program lifetime.
+        unsafe { core::slice::from_raw_parts(base.cast(), len) }
+    }
+
+    #[test]
+    fn copy_on_write_sources_must_allow_read_write_and_execute() {
+        let p = MacosUserland::new();
+        let (target, _release) = owned_marked_range(p, 2 * HOST_PAGE_SIZE, 0x5a);
+        let range = target.range();
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                range.start,
+            );
+        // A read-only MAP_SHARED file mapping's maximum protection lacks WRITE. A source that
+        // spans it and a MAP_PRIVATE page gets the intersection of both maximums.
+        let shared = file_source(&[libc::MAP_SHARED], 0x11);
+        let mixed = file_source(&[libc::MAP_PRIVATE, libc::MAP_SHARED], 0x22);
+        for (source, permissions) in [
+            (shared, MemoryRegionPermissions::READ),
+            (shared, RW),
+            (mixed, MemoryRegionPermissions::READ),
+        ] {
+            // SAFETY: the test-owned pages are idle; a failed replacement must leave them intact.
+            let result = unsafe {
+                p.try_allocate_cow_pages(
+                    || -> core::iter::Empty<_> { unreachable!("the replacement failed") },
+                    range.start,
+                    source,
+                    permissions,
+                    FixedAddressBehavior::Replace,
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(CowAllocationError::UnsupportedSourceRegion)
+            ));
+            assert!(native_owns_any(p, &range));
+            for offset in [0, HOST_PAGE_SIZE.cast_signed()] {
+                assert_eq!(ptr.read_at_offset(offset), Some(0x5a));
+                assert_eq!(ptr.write_at_offset(offset + 1, 0x6b), Some(()));
+            }
+        }
+
+        // A MAP_PRIVATE file mapping allows read, write and execute; writes stay in the copy.
+        let private = file_source(&[libc::MAP_PRIVATE, libc::MAP_PRIVATE], 0x33);
+        // SAFETY: the test-owned pages are idle.
+        let copy = unsafe {
+            p.try_allocate_cow_pages(
+                || core::iter::once(target),
+                range.start,
+                private,
+                MemoryRegionPermissions::READ,
+                FixedAddressBehavior::Replace,
+            )
+        }
+        .unwrap();
+        assert_eq!(ptr.read_at_offset(0), Some(0x33));
+        // SAFETY: the test owns the idle copy.
+        unsafe { p.protect_pages(|| core::iter::once(&copy), range.clone(), RW) }.unwrap();
+        assert_eq!(ptr.write_at_offset(0, 0x44), Some(()));
+        assert_eq!(ptr.read_at_offset(0), Some(0x44));
+        assert_eq!(private[0], 0x33, "writes never reach the source");
+    }
+
+    #[test]
+    #[cfg(feature = "subpage_compat")]
+    fn subpage_instances_leave_copy_on_write_to_callers() {
+        let p = MacosUserland4K::new();
+        let source = cow_source(HOST_PAGE_SIZE, 0x11);
+        // SAFETY: an unsupported request has no side effects.
+        let result = unsafe {
+            p.try_allocate_cow_pages(
+                || -> core::iter::Empty<_> { unreachable!("unsupported") },
+                TASK_ADDR_MIN,
+                source,
+                MemoryRegionPermissions::READ,
+                FixedAddressBehavior::Replace,
+            )
+        };
+        assert!(matches!(
+            result,
+            Err(CowAllocationError::UnsupportedByPlatform)
+        ));
     }
 }
