@@ -23,6 +23,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod io_errors;
+// On Linux, file reads and writes transfer directly between the host file and a buffer's raw
+// bytes, such as a runner's shared memory. Buffers without raw bytes, and all buffers on other
+// hosts, are staged through a bounce buffer.
+#[cfg(target_os = "linux")]
+mod linux;
 
 #[cfg(unix)]
 use io_errors::chown_error;
@@ -649,6 +654,10 @@ impl Backend for LocalFs {
             .filter(|_| h.readable)
             .ok_or(ReadError::NotForReading)?;
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
+        #[cfg(target_os = "linux")]
+        if let Some(result) = linux::read_at(file, buf, offset) {
+            return result.map_err(|_| ReadError::Io);
+        }
         let mut staged = bounce_buffer(buf.len())?;
         let result = {
             #[cfg(unix)]
@@ -681,6 +690,10 @@ impl Backend for LocalFs {
             .filter(|_| h.writable)
             .ok_or(WriteError::NotForWriting)?;
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
+        #[cfg(target_os = "linux")]
+        if let Some(result) = linux::write_at(file, buf, offset) {
+            return result.map_err(|_| WriteError::Io);
+        }
         let mut staged = bounce_buffer(buf.len())?;
         buf.copy_to_slice_at(0, &mut staged)?;
         let result = {

@@ -556,8 +556,8 @@ where
 /// The workers serving one association's requests.
 ///
 /// The association's own thread is the first worker; [`ReceivingRole::pass`]
-/// starts others only when a request is about to wait while no worker is
-/// idle.
+/// starts others only when a request that may wait is about to run while no
+/// worker is idle.
 struct Workers<Memory: SharedMemory, RequestSource, ResponseSink, Shutdown> {
     association: Arc<BrokerHostAssociation<Memory>>,
     /// Locked only by the worker holding `role`.
@@ -574,7 +574,7 @@ struct Workers<Memory: SharedMemory, RequestSource, ResponseSink, Shutdown> {
 /// request it received, so the requests of a mostly sequential peer keep going
 /// to one worker with a warm cache instead of rotating through ones that have
 /// gone cold. A worker passes the role on only before executing a request that
-/// waits (see [`Workers::run`]), so a slow request does not hold up later ones.
+/// may wait (see [`may_wait`]), so a slow request does not hold up later ones.
 struct ReceivingRole {
     state: Mutex<Receivers>,
 }
@@ -684,6 +684,32 @@ impl ReceivingRole {
     }
 }
 
+/// Returns whether executing `operation` may wait, so its worker passes the
+/// receiving role on first.
+///
+/// Starting a child process waits for its runner's setup, file requests may
+/// wait for host storage, and status-flag requests may wait for a file request
+/// on the same file. Other requests wait at most briefly for broker threads
+/// such as the socket reactor, and never for the guest, which learns of
+/// readiness through notifications instead.
+///
+/// This classifies by request type rather than by the backend serving a file,
+/// so requests on in-memory, archive, and device files pass the role too,
+/// though they never wait for the host. The only cost is an extra hand-off:
+/// the association's next request goes to another worker, possibly a newly
+/// started one, instead of this one with a warm cache.
+fn may_wait(operation: &BrokerOperation) -> bool {
+    matches!(
+        operation,
+        BrokerOperation::File(_)
+            | BrokerOperation::GetStatusFlags(_)
+            | BrokerOperation::SetStatusFlags(_)
+            | BrokerOperation::Process(
+                ProcessRequest::StartChild(_) | ProcessRequest::StartChildWithExistingRunner(_)
+            )
+    )
+}
+
 impl<Memory, RequestSource, ResponseSink, Shutdown>
     Workers<Memory, RequestSource, ResponseSink, Shutdown>
 where
@@ -706,16 +732,7 @@ where
             let Some(request) = self.next_request() else {
                 return;
             };
-            // Starting a child process waits for its runner's setup, so another
-            // worker receives meanwhile. Other requests wait at most briefly for
-            // broker threads such as the socket reactor, and never for the
-            // guest, which learns of readiness through notifications instead.
-            holds_role = !matches!(
-                request.operation,
-                BrokerOperation::Process(
-                    ProcessRequest::StartChild(_) | ProcessRequest::StartChildWithExistingRunner(_)
-                )
-            );
+            holds_role = !may_wait(&request.operation);
             if !holds_role {
                 self.pass_role();
             }
@@ -740,7 +757,7 @@ where
         }
     }
 
-    /// Passes the receiving role on before executing a request that waits.
+    /// Passes the receiving role on before executing a request that may wait.
     ///
     /// See [`ReceivingRole::pass`] for which worker takes it.
     fn pass_role(self: &Arc<Self>) {
@@ -858,6 +875,20 @@ mod tests {
             map_host_error(BrokerHostError::<IoError>::SharedBufferLayoutMismatch).kind(),
             ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn file_requests_pass_the_receiving_role() {
+        use litebox_broker_protocol::ObjectHandle;
+        use litebox_broker_protocol::fs::HandleFileStatusRequest;
+        use litebox_broker_protocol::message::FileRequest;
+
+        const HANDLE: ObjectHandle = ObjectHandle(1);
+        assert!(may_wait(&BrokerOperation::File(FileRequest::HandleStatus(
+            HandleFileStatusRequest { handle: HANDLE }
+        ))));
+        assert!(may_wait(&BrokerOperation::GetStatusFlags(HANDLE)));
+        assert!(!may_wait(&BrokerOperation::CloseObject(HANDLE)));
     }
 
     /// One live host association: the endpoints teardown acts on, and the rest
