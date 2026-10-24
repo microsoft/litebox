@@ -789,6 +789,10 @@ where
         if len == 0 {
             return Ok(());
         }
+        // Like Linux, round the length up to a whole number of pages.
+        let len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::ENOMEM)?;
         if addr
             .as_usize()
             .checked_add(len)

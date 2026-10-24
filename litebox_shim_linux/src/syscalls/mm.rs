@@ -506,7 +506,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// becomes executable.
     fn maybe_patch_on_mprotect_exec(&self, addr: UserPtrMut<u8>, len: usize, syscall_entry: usize) {
         let mprotect_start = addr.as_usize();
-        let mprotect_end = mprotect_start.saturating_add(len);
+        // mprotect rejects an unaligned start with EINVAL, so nothing becomes executable.
+        if !mprotect_start.is_multiple_of(PAGE_SIZE) {
+            return;
+        }
+        // mprotect rounds `len` up to whole pages, and all of them become executable.
+        // If the rounded range overflows, mprotect fails with ENOMEM and nothing does.
+        let Some(mprotect_end) = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .and_then(|len| mprotect_start.checked_add(len))
+        else {
+            return;
+        };
 
         // Find unpatched file mappings that overlap this mprotect range.
         // We collect (descriptor identity, vaddr, seg_len) to avoid holding
@@ -1211,7 +1222,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 mod tests {
     use litebox::{
         fs::{Mode, OFlags},
-        platform::PageManagementProvider,
+        mm::page::{NonZeroAddress, NonZeroPageSize},
+        platform::{PageManagementProvider, page_mgmt::MemoryRegionPermissions},
     };
     use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
@@ -1636,6 +1648,102 @@ mod tests {
         assert_eq!(err, Errno::EACCES);
 
         task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_mprotect_rounds_len_up_to_pages() {
+        let task = init_platform(None);
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x3000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+        let page_perms = |page: usize| {
+            task.global.mm.get_memory_permissions(
+                NonZeroAddress::new(addr.as_usize() + page * 0x1000).unwrap(),
+                NonZeroPageSize::new(0x1000).unwrap(),
+            )
+        };
+
+        // Like Linux, the length is rounded up to cover whole pages.
+        task.sys_mprotect(addr, 0x1001, ProtFlags::PROT_READ)
+            .unwrap();
+        assert_eq!(page_perms(0), Some(MemoryRegionPermissions::READ));
+        assert_eq!(page_perms(1), Some(MemoryRegionPermissions::READ));
+        assert_eq!(
+            page_perms(2),
+            Some(MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE)
+        );
+
+        task.sys_munmap(addr, 0x3000).unwrap();
+    }
+
+    #[test]
+    fn test_mprotect_exec_patches_pages_it_makes_executable() {
+        const SYSCALL: [u8; 2] = [0x0f, 0x05];
+        let task = init_platform(None);
+
+        // A minimal ET_DYN ELF whose single PT_LOAD covers two pages: the header
+        // page, then a code page of NOPs with a `syscall` in its second half.
+        let mut elf = alloc::vec![0u8; 0x2000];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[0x10..0x12].copy_from_slice(&super::ET_DYN.to_le_bytes()); // e_type
+        elf[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        elf[64..68].copy_from_slice(&super::PT_LOAD.to_le_bytes()); // p_type
+        elf[104..112].copy_from_slice(&0x2000u64.to_le_bytes()); // p_memsz
+        elf[0x1000..].fill(0x90);
+        elf[0x1800..0x1802].copy_from_slice(&SYSCALL);
+
+        let fd = task
+            .sys_open("code.elf", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        assert_eq!(task.sys_write(fd, &elf, None).unwrap(), elf.len());
+        let addr = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .unwrap();
+        let code_page = UserPtrMut::<u8>::from_usize(addr.as_usize() + 0x1000);
+        let syscall_bytes = || {
+            let code = code_page.to_owned_slice::<Platform>(0x1000).unwrap();
+            [code[0x800], code[0x801]]
+        };
+
+        // Like Linux, an unaligned start fails with EINVAL and a length that
+        // overflows when rounded up fails with ENOMEM. Neither patches anything.
+        let unaligned = UserPtrMut::<u8>::from_usize(code_page.as_usize() + 1);
+        assert_eq!(
+            task.sys_mprotect(unaligned, 1, ProtFlags::PROT_READ_EXEC),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            task.sys_mprotect(code_page, usize::MAX, ProtFlags::PROT_READ_EXEC),
+            Err(Errno::ENOMEM)
+        );
+        assert_eq!(syscall_bytes(), SYSCALL);
+
+        // A 1-byte length makes the whole code page executable, so the whole
+        // page must be patched, including the `syscall` past the first byte.
+        task.sys_mprotect(code_page, 1, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        assert_ne!(syscall_bytes(), SYSCALL, "syscall was left unpatched");
+
+        task.sys_munmap(addr, 0x2000).unwrap();
         task.sys_close(fd).unwrap();
     }
 
