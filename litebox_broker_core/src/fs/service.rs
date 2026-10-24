@@ -33,7 +33,7 @@ type ServiceResult<T> = Result<FileResult<T>>;
 /// Behaviorless type-erasure envelope for one broker-owned [`ResolverEntry`].
 ///
 /// This does not introduce another open-file-description layer. The erased resolver entry remains
-/// the only per-open semantic state. The surrounding lock serializes shared position and append
+/// the only mutable per-open state. The surrounding lock serializes shared position and append
 /// updates across duplicated broker references, while operations that cannot update position use
 /// shared access so blocking device I/O does not prevent status and other stateless operations.
 #[derive(Clone)]
@@ -42,6 +42,10 @@ pub struct File {
     /// Readiness of a file whose reads or writes can fail with `WouldBlock`.
     readiness: Option<Arc<dyn ReadinessSource>>,
     terminal: Option<Arc<dyn crate::terminal::TerminalEndpoint>>,
+    /// Absolute path of the file, with symbolic links resolved, as of when it was opened.
+    ///
+    /// Later renames or removals of the file are not reflected.
+    path: Arc<str>,
 }
 
 impl File {
@@ -234,16 +238,18 @@ where
         mode: FileMode,
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
-        let entry = match Resolver::open(self, user, path, flags, mode & FileMode::SUPPORTED) {
-            Ok(entry) => entry,
-            Err(error) => return Ok(Err(file_open_error(error))),
-        };
+        let (entry, path) =
+            match Resolver::open_with_path(self, user, path, flags, mode & FileMode::SUPPORTED) {
+                Ok(opened) => opened,
+                Err(error) => return Ok(Err(file_open_error(error))),
+            };
         let readiness = Resolver::readiness_source(self, &entry);
         let terminal = Resolver::terminal(self, &entry);
         Ok(Ok(File {
             state: Arc::new(RwLock::<Platform, _>::new(entry)),
             readiness,
             terminal,
+            path: path.into(),
         }))
     }
 
@@ -620,6 +626,13 @@ pub fn handle_status(
 ) -> Result<FileResult<FileStatus>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     process.core.fs.handle_status(&file)
+}
+
+/// Returns the absolute path of a broker-owned open object, with symbolic links resolved, as of
+/// when it was opened.
+pub fn handle_path(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<String>> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    Ok(Ok(String::from(&*file.path)))
 }
 
 /// Returns whether a broker-owned open object refers to a terminal, which it does exactly when it

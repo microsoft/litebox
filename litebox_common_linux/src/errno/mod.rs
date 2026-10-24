@@ -422,6 +422,16 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::FilePathError> for Errno {
+    fn from(value: litebox::fs::errors::FilePathError) -> Self {
+        match value {
+            litebox::fs::errors::FilePathError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::FilePathError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::IsTerminalError> for Errno {
     fn from(value: litebox::fs::errors::IsTerminalError) -> Self {
         match value {

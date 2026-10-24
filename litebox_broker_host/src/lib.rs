@@ -33,12 +33,12 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
-    FilePathResponse, HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE,
-    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-    ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
-    SeekFileResponse, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
+    FilePathResponse, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
+    MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+    SeekFileRequest, SeekFileResponse, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -832,6 +832,17 @@ fn handle_file_request<Memory: SharedMemory>(
                 Ok(status) => Ok(FileResponse::HandleStatus(status)),
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
+        }
+        FileRequest::HandlePath(HandleFilePathRequest { handle, buffer }) => {
+            validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
+            let path = litebox_broker_core::fs::handle_path(process, handle)
+                .map_err(RequestFailure::from)?;
+            Ok(
+                match write_file_path_response(shared_buffers, buffer, path)? {
+                    Ok(response) => FileResponse::HandlePath(response),
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
         }
         FileRequest::IsTerminal(IsTerminalFileRequest { handle }) => {
             match litebox_broker_core::fs::is_terminal(process, handle)
@@ -2323,6 +2334,7 @@ mod tests {
         association_shared_buffer_sequence_stages_random_data(&broker);
         association_shared_buffer_sequences_stage_ready_events(&broker);
         active_request_queries_file_terminal(&broker);
+        active_request_reads_file_handle_path(&broker);
         active_requests_change_file_status_flags(&broker);
         association_shared_buffer_sequences_stage_file_data(&broker);
         shared_buffer_usage_rejects_invalid_sequences();
@@ -2714,6 +2726,56 @@ mod tests {
             is_terminal(b"/dev/null"),
             BrokerResult::File(FileResponse::IsTerminal(false))
         );
+    }
+
+    fn active_request_reads_file_handle_path(broker: &BrokerCore) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let path = b"/dev/./stdout";
+        shared_buffers
+            .write(SharedBufferSlotIndex(0), path)
+            .unwrap();
+        let BrokerResult::File(FileResponse::Open(opened)) = handle_test_request_with_buffers(
+            &process,
+            BrokerOperation::File(FileRequest::Open(OpenFileRequest {
+                path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
+                user: ROOT,
+                access: FileAccessMode::WriteOnly,
+                flags: FileOpenFlags::NONE,
+                mode: FileMode::default(),
+            })),
+            &shared_buffers,
+        ) else {
+            panic!("expected successful file open");
+        };
+        let handle_path = |length| {
+            handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::File(FileRequest::HandlePath(HandleFilePathRequest {
+                    handle: opened.handle,
+                    buffer: single_slot_sequence(1, length),
+                })),
+                &shared_buffers,
+            )
+        };
+
+        assert_eq!(
+            handle_path(64),
+            BrokerResult::File(FileResponse::HandlePath(FilePathResponse { length: 11 }))
+        );
+        let mut output = [0; 11];
+        shared_buffers
+            .read(SharedBufferSlotIndex(1), &mut output)
+            .unwrap();
+        assert_eq!(output, *b"/dev/stdout");
+        assert_eq!(
+            handle_path(4),
+            BrokerResult::File(FileResponse::Failed(FileError::Io))
+        );
+
+        process.close_object_reference(opened.handle).unwrap();
     }
 
     fn active_requests_change_file_status_flags(broker: &BrokerCore) {
