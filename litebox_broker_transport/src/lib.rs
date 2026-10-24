@@ -9,9 +9,10 @@
 //! shared-buffer pool built on them, and the portable shared control-ring state
 //! machines.
 //!
-//! Nothing here is tied to an operating system or to hosted userland. The crate
-//! is unconditionally `no_std`, so a kernel deployment can use the same
-//! interfaces and control rings. Concrete association bindings, such as the
+//! Nothing here is tied to an operating system or to hosted userland, except
+//! the local call-lane pool behind the opt-in `std` feature. The crate is
+//! `no_std` without it, so a kernel deployment can use the same interfaces and
+//! control rings. Concrete association bindings, such as the
 //! Unix-domain-socket and memfd endpoints in
 //! `litebox_broker_transport_linux_userland`, live in separate crates, and a
 //! deployment may implement the channel traits directly instead of using the
@@ -25,11 +26,12 @@
 
 extern crate alloc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "std"))]
 extern crate std;
 
+#[cfg(feature = "std")]
+pub mod call_lane_pool;
 pub mod channel;
 pub mod control_ring;
-pub mod pending_calls;
 pub mod setup_frame;
 pub mod shared_memory;

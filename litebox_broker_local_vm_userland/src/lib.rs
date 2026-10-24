@@ -40,10 +40,9 @@ use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::wire::{self, WireError};
 use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing,
-    ControlRingConsumer, ControlRingDirection, ControlRingError, ControlRingProducer,
-    ControlRingReadError, ControlRingReadStatus, ControlRingWriteStatus, LocalControlRingEndpoints,
-    MemoryAccessPolicy, WaitableSharedMemory,
+    CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing, ControlRingConsumer, ControlRingError,
+    ControlRingLayout, ControlRingProducer, ControlRingReadError, ControlRingReadStatus,
+    ControlRingWriteStatus, LocalControlRingEndpoints, WaitableSharedMemory,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use litebox_common_vm_abi::{
@@ -232,8 +231,10 @@ impl SharedMemory for KernelSharedMemory {
     }
 }
 
-/// The control ring at the start of its region. Accesses keep to
-/// [`MemoryAccessPolicy::ControlRing`].
+/// The layout of the control ring the kernel serves.
+const LAYOUT: ControlRingLayout = ControlRingLayout::SINGLE_LANE;
+
+/// The control ring at the start of its region. Accesses keep to [`LAYOUT`].
 struct KernelControlRing {
     start: usize,
 }
@@ -242,7 +243,7 @@ impl KernelControlRing {
     /// `None` if `region` cannot hold the ring.
     fn new(region: UserRange) -> Option<Self> {
         let start: usize = region.start.trunc();
-        (region.len >= CONTROL_RING_MEMORY_SIZE as u64 && start.is_multiple_of(size_of::<u64>()))
+        (region.len >= LAYOUT.memory_size() as u64 && start.is_multiple_of(size_of::<u64>()))
             .then_some(Self { start })
     }
 
@@ -257,18 +258,18 @@ impl KernelControlRing {
     }
 
     fn u32_at(&self, offset: usize) -> Result<*mut u32, SharedMemoryError> {
-        self.word(offset, MemoryAccessPolicy::ControlRing.permits_u32(offset))
+        self.word(offset, LAYOUT.permits_u32(offset))
     }
 
     fn u64_at(&self, offset: usize) -> Result<*mut u64, SharedMemoryError> {
-        self.word(offset, MemoryAccessPolicy::ControlRing.permits_u64(offset))
+        self.word(offset, LAYOUT.permits_u64(offset))
     }
 
     fn bytes_at(&self, offset: usize, len: usize) -> Result<usize, SharedMemoryError> {
-        if !MemoryAccessPolicy::ControlRing.permits_byte_range(offset, len) {
+        if !LAYOUT.permits_byte_range(offset, len) {
             return Err(SharedMemoryError::InvalidRange);
         }
-        checked(self.start, CONTROL_RING_MEMORY_SIZE, offset, len)
+        checked(self.start, LAYOUT.memory_size(), offset, len)
     }
 }
 
@@ -276,7 +277,7 @@ impl KernelControlRing {
 // process's lifetime and disjoint from private memory.
 impl SharedMemory for KernelControlRing {
     fn len(&self) -> usize {
-        CONTROL_RING_MEMORY_SIZE
+        LAYOUT.memory_size()
     }
 
     fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
@@ -395,12 +396,16 @@ pub fn connect(
                     .ok_or(ChannelError::Memory(SharedMemoryError::InvalidRange))
             };
             let LocalControlRingEndpoints {
-                request_producer,
-                response_consumer,
+                lanes,
+                lane_demand: _,
                 notification_consumer,
-            } = ControlRing::new(ring()?)
+            } = ControlRing::new(ring()?, LAYOUT)
                 .map_err(ChannelError::Ring)?
                 .into_local();
+            let [lane] = <[_; 1]>::try_from(lanes)
+                .unwrap_or_else(|_| unreachable!("a single-lane layout has one lane"));
+            let (request_producer, response_consumer) =
+                (lane.request_producer, lane.response_consumer);
             let notifications = Notifications {
                 consumer: notification_consumer,
                 words: ring()?,
@@ -442,7 +447,7 @@ impl Notifications {
             if received != 0 {
                 return Ok(received);
             }
-            let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
+            let epoch = LAYOUT.notifications().producer_epoch_offset();
             match broker_wait(self.words.start, epoch, wait_epoch, deadline) {
                 Ok(()) => {}
                 Err(Status::TimedOut) => return Ok(0),
@@ -661,7 +666,7 @@ fn futex(
 /// Has the kernel serve published broker requests: a wake on the requests'
 /// producer epoch of the control ring at `start`.
 fn broker_wake(start: usize) -> Result<(), Status> {
-    let offset = ControlRingDirection::Requests.producer_epoch_offset();
+    let offset = LAYOUT.requests(0).producer_epoch_offset();
     futex(start, |addr| FutexRequest::wake(addr, 1), offset)
 }
 
@@ -691,8 +696,8 @@ fn broker_wait(
 ///
 /// On a failed check.
 pub fn self_check(notifications: &Notifications, platform: &VmUserland) {
-    let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
-    let served = ControlRingDirection::Requests.consumer_epoch_offset();
+    let epoch = LAYOUT.notifications().producer_epoch_offset();
+    let served = LAYOUT.requests(0).consumer_epoch_offset();
     let now = || platform.now();
     let current = |offset| {
         notifications
@@ -745,19 +750,19 @@ mod tests {
     fn ring(memory: &mut [u64]) -> (Notifications, ControlRingProducer<KernelControlRing>) {
         let region = UserRange {
             start: memory.as_mut_ptr() as u64,
-            len: CONTROL_RING_MEMORY_SIZE as u64,
+            len: LAYOUT.memory_size() as u64,
         };
         let ring = || KernelControlRing::new(region).expect("room for the ring");
         let notifications = Notifications {
-            consumer: ControlRing::new(ring())
+            consumer: ControlRing::new(ring(), LAYOUT)
                 .expect("ring")
                 .into_local()
                 .notification_consumer,
             words: ring(),
         };
-        let producer = ControlRing::new(ring())
+        let producer = ControlRing::new(ring(), LAYOUT)
             .expect("ring")
-            .into_broker()
+            .into_host()
             .notification_producer;
         (notifications, producer)
     }
@@ -770,7 +775,7 @@ mod tests {
     }
 
     fn ring_memory() -> Vec<u64> {
-        alloc::vec![0u64; CONTROL_RING_MEMORY_SIZE / size_of::<u64>()]
+        alloc::vec![0u64; LAYOUT.memory_size() / size_of::<u64>()]
     }
 
     #[test]

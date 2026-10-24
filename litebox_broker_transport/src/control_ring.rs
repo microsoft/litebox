@@ -9,6 +9,7 @@
 //! rather than interpreting the same shared memory differently.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::mem::size_of;
 use core::ops::Range;
 use core::sync::atomic::{Ordering, fence};
@@ -17,9 +18,6 @@ use crate::shared_memory::{ControlRingMemory, SharedMemoryError};
 
 /// Size of one shared control-ring slot.
 pub const CONTROL_RING_SLOT_SIZE: usize = 128;
-
-/// Versioned token exchanged before endpoints activate this control-ring ABI.
-pub const CONTROL_RING_READY: &[u8] = b"litebox-control-ring-ready-v1";
 
 /// Size of the fixed metadata at the start of a control-ring slot.
 pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;
@@ -36,9 +34,6 @@ const _: () = assert!(
 );
 const _: () = assert!(CONTROL_RING_SLOT_SIZE.is_multiple_of(size_of::<u64>()));
 
-/// Number of slots in each request or response direction.
-pub const CONTROL_RING_SLOT_COUNT: u64 = 64;
-
 /// Number of slots in the broker-to-local notification direction.
 pub const CONTROL_RING_NOTIFICATION_SLOT_COUNT: u64 = 64;
 
@@ -47,21 +42,10 @@ pub const CONTROL_RING_NOTIFICATION_SLOT_COUNT: u64 = 64;
 /// yet is far shorter than a scheduler time slice.
 pub const CONTROL_RING_PARALLEL_SPIN_LIMIT: u32 = 4000;
 
-/// Exact shared-memory size required for all association control directions.
-pub const CONTROL_RING_MEMORY_SIZE: usize =
-    CONTROL_RING_DATA_SIZE + CONTROL_RING_SYNC_DIRECTION_SIZE * 3;
-
-// The fixed count is representable by `usize` on every supported target.
-#[allow(clippy::cast_possible_truncation)]
-const CONTROL_RING_DIRECTION_SIZE: usize =
-    CONTROL_RING_SLOT_SIZE * CONTROL_RING_SLOT_COUNT as usize;
 // The fixed count is representable by `usize` on every supported target.
 #[allow(clippy::cast_possible_truncation)]
 const CONTROL_RING_NOTIFICATION_DIRECTION_SIZE: usize =
     CONTROL_RING_SLOT_SIZE * CONTROL_RING_NOTIFICATION_SLOT_COUNT as usize;
-const CONTROL_RING_DATA_SIZE: usize =
-    CONTROL_RING_DIRECTION_SIZE * 2 + CONTROL_RING_NOTIFICATION_DIRECTION_SIZE;
-const CONTROL_RING_SYNC_DIRECTION_SIZE: usize = 24;
 const PRODUCER_EPOCH_OFFSET: usize = 0;
 const CONSUMER_EPOCH_OFFSET: usize = 4;
 const CONSUMER_HEAD_OFFSET: usize = 8;
@@ -69,7 +53,234 @@ const CONSUMER_HEAD_OFFSET: usize = 8;
 const CONSUMER_WAITING_OFFSET: usize = 16;
 /// Nonzero while the producer may block on the consumer epoch.
 const PRODUCER_WAITING_OFFSET: usize = 20;
-const _: () = assert!(CONTROL_RING_SYNC_DIRECTION_SIZE.is_multiple_of(size_of::<u64>()));
+/// Size of the synchronization words of one direction.
+const SYNC_WORDS_SIZE: usize = 24;
+/// Cache-line size assumed when separating words that different threads poll.
+const CACHE_LINE_SIZE: usize = 64;
+/// Number of lanes the local peer asks the broker to serve.
+const DEMANDED_LANE_COUNT_OFFSET: usize = 0;
+/// Incremented whenever the local peer raises its demanded lane count.
+const DEMAND_EPOCH_OFFSET: usize = 4;
+const DEMAND_WORDS_SIZE: usize = 8;
+
+/// Shape of a control-ring mapping: its call lanes and their capacity.
+///
+/// A mapping holds one or more *lanes*, each a request direction and a
+/// response direction of the same slot count, and one broker-to-local
+/// notification direction. Calls on different lanes never queue behind each
+/// other, so a deployment that serves each lane separately can run as many
+/// calls in parallel as it has lanes.
+///
+/// The mapping starts with the slots of every direction, in the order lane 0
+/// requests, lane 0 responses, lane 1 requests, and so on, then notifications.
+/// The synchronization words of each direction follow in the same order, one
+/// block of `sync_stride` bytes per direction. With more than one lane, the
+/// lane-demand words come last: the local peer raises the number of lanes it
+/// uses there, so the broker can start serving a lane only once it is needed.
+/// Lane 0 is always in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlRingLayout {
+    lane_count: usize,
+    call_slots: u64,
+    sync_stride: usize,
+    ready: &'static [u8],
+}
+
+const _: () = assert!(ControlRingLayout::SINGLE_LANE.memory_size() == 24_648);
+const _: () = assert!(ControlRingLayout::MULTI_LANE.memory_size() == 11_336);
+
+impl ControlRingLayout {
+    /// One lane of 64 slots per direction, served by one broker thread.
+    pub const SINGLE_LANE: Self = Self {
+        lane_count: 1,
+        call_slots: 64,
+        sync_stride: SYNC_WORDS_SIZE,
+        ready: b"litebox-control-ring-ready-v1",
+    };
+
+    /// Eight single-slot lanes, each carrying one call at a time.
+    ///
+    /// The synchronization words of each direction have a cache line to
+    /// themselves, so neither the two directions of a call nor lanes in use at
+    /// the same time contend for one.
+    pub const MULTI_LANE: Self = Self {
+        lane_count: 8,
+        call_slots: 1,
+        sync_stride: CACHE_LINE_SIZE,
+        ready: b"litebox-control-ring-lanes-ready-v1",
+    };
+
+    /// Returns the number of lanes.
+    pub const fn lane_count(self) -> usize {
+        self.lane_count
+    }
+
+    /// Returns the versioned token endpoints exchange before activating a
+    /// mapping with this layout.
+    pub const fn ready_token(self) -> &'static [u8] {
+        self.ready
+    }
+
+    /// Returns the exact size of a mapping with this layout.
+    pub const fn memory_size(self) -> usize {
+        if self.lane_count > 1 {
+            self.demand_offset() + DEMAND_WORDS_SIZE
+        } else {
+            self.demand_offset()
+        }
+    }
+
+    /// Returns the local-to-broker request direction of `lane`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `lane` is not less than [`Self::lane_count`].
+    pub const fn requests(self, lane: usize) -> ControlRingDirection {
+        assert!(lane < self.lane_count, "control-ring lane out of range");
+        self.direction(2 * lane)
+    }
+
+    /// Returns the broker-to-local response direction of `lane`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `lane` is not less than [`Self::lane_count`].
+    pub const fn responses(self, lane: usize) -> ControlRingDirection {
+        assert!(lane < self.lane_count, "control-ring lane out of range");
+        self.direction(2 * lane + 1)
+    }
+
+    /// Returns the broker-to-local notification direction.
+    pub const fn notifications(self) -> ControlRingDirection {
+        self.direction(2 * self.lane_count)
+    }
+
+    /// Returns whether this layout permits a byte-copy range.
+    ///
+    /// Concrete shared-memory implementations use this together with
+    /// [`Self::permits_u32`] and [`Self::permits_u64`] to keep their own byte
+    /// and typed-word accesses disjoint. A peer can bypass these checks through
+    /// its backing-resource alias, so implementations must remain memory-safe
+    /// under arbitrary peer writes.
+    pub const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
+        let Some(end) = offset.checked_add(length) else {
+            return false;
+        };
+        if end > self.memory_size() {
+            return false;
+        }
+        if length == 0 {
+            return true;
+        }
+        let slot_offset = offset % CONTROL_RING_SLOT_SIZE;
+        end <= self.data_size()
+            && slot_offset >= size_of::<u64>()
+            && slot_offset + length <= CONTROL_RING_SLOT_SIZE
+    }
+
+    /// Returns whether this layout permits a `u32` access at `offset`.
+    pub const fn permits_u32(self, offset: usize) -> bool {
+        let Some(relative) = offset.checked_sub(self.data_size()) else {
+            return false;
+        };
+        if relative < self.sync_size() {
+            return matches!(
+                relative % self.sync_stride,
+                PRODUCER_EPOCH_OFFSET
+                    | CONSUMER_EPOCH_OFFSET
+                    | CONSUMER_WAITING_OFFSET
+                    | PRODUCER_WAITING_OFFSET
+            );
+        }
+        self.lane_count > 1
+            && matches!(
+                relative - self.sync_size(),
+                DEMANDED_LANE_COUNT_OFFSET | DEMAND_EPOCH_OFFSET
+            )
+    }
+
+    /// Returns whether this layout permits a `u64` access at `offset`.
+    pub const fn permits_u64(self, offset: usize) -> bool {
+        if offset < self.data_size() {
+            return offset.is_multiple_of(CONTROL_RING_SLOT_SIZE);
+        }
+        let relative = offset - self.data_size();
+        relative < self.sync_size() && relative % self.sync_stride == CONSUMER_HEAD_OFFSET
+    }
+
+    /// Returns the number of `u32` words an endpoint may block on: the
+    /// producer and consumer epochs of every direction and, with more than one
+    /// lane, the lane-demand epoch.
+    pub const fn waitable_word_count(self) -> usize {
+        2 * self.direction_count() + if self.lane_count > 1 { 1 } else { 0 }
+    }
+
+    /// Returns the position of the waitable `u32` at `offset` among the
+    /// [`Self::waitable_word_count`] words, or `None` if no endpoint blocks
+    /// on it.
+    pub const fn waitable_word_index(self, offset: usize) -> Option<usize> {
+        let Some(relative) = offset.checked_sub(self.data_size()) else {
+            return None;
+        };
+        if relative < self.sync_size() {
+            let direction = relative / self.sync_stride;
+            return match relative % self.sync_stride {
+                PRODUCER_EPOCH_OFFSET => Some(2 * direction),
+                CONSUMER_EPOCH_OFFSET => Some(2 * direction + 1),
+                _ => None,
+            };
+        }
+        if self.lane_count > 1 && relative - self.sync_size() == DEMAND_EPOCH_OFFSET {
+            Some(2 * self.direction_count())
+        } else {
+            None
+        }
+    }
+
+    const fn direction_count(self) -> usize {
+        2 * self.lane_count + 1
+    }
+
+    // Layout slot counts are small constants representable by `usize`.
+    #[allow(clippy::cast_possible_truncation)]
+    const fn call_direction_size(self) -> usize {
+        CONTROL_RING_SLOT_SIZE * self.call_slots as usize
+    }
+
+    const fn data_size(self) -> usize {
+        2 * self.lane_count * self.call_direction_size() + CONTROL_RING_NOTIFICATION_DIRECTION_SIZE
+    }
+
+    const fn sync_size(self) -> usize {
+        self.direction_count() * self.sync_stride
+    }
+
+    const fn demand_offset(self) -> usize {
+        self.data_size() + self.sync_size()
+    }
+
+    /// Returns the direction at `index` in mapping order, the notification
+    /// direction coming after every lane's.
+    const fn direction(self, index: usize) -> ControlRingDirection {
+        ControlRingDirection {
+            data_offset: index * self.call_direction_size(),
+            slot_count: if index == 2 * self.lane_count {
+                CONTROL_RING_NOTIFICATION_SLOT_COUNT
+            } else {
+                self.call_slots
+            },
+            sync_offset: self.data_size() + index * self.sync_stride,
+        }
+    }
+}
+
+const _: () = assert!(SYNC_WORDS_SIZE.is_multiple_of(size_of::<u64>()));
+const _: () = assert!(CACHE_LINE_SIZE >= SYNC_WORDS_SIZE);
+const _: () = assert!(
+    ControlRingLayout::MULTI_LANE
+        .data_size()
+        .is_multiple_of(CACHE_LINE_SIZE)
+);
 
 /// Access model enforced by a concrete shared-memory mapping.
 ///
@@ -79,8 +290,9 @@ const _: () = assert!(CONTROL_RING_SYNC_DIRECTION_SIZE.is_multiple_of(size_of::<
 pub enum MemoryAccessPolicy {
     /// General shared memory supporting only byte copies.
     Bytes,
-    /// Control-ring memory supporting its ABI-defined byte and word accesses.
-    ControlRing,
+    /// Control-ring memory supporting the byte and word accesses its layout
+    /// defines.
+    ControlRing(ControlRingLayout),
 }
 
 impl MemoryAccessPolicy {
@@ -88,163 +300,72 @@ impl MemoryAccessPolicy {
     pub const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
         match self {
             Self::Bytes => true,
-            Self::ControlRing => memory_permits_byte_range(offset, length),
+            Self::ControlRing(layout) => layout.permits_byte_range(offset, length),
         }
     }
 
     /// Returns whether this policy permits a `u32` access at `offset`.
     pub const fn permits_u32(self, offset: usize) -> bool {
-        matches!(self, Self::ControlRing) && memory_permits_u32(offset)
+        match self {
+            Self::Bytes => false,
+            Self::ControlRing(layout) => layout.permits_u32(offset),
+        }
     }
 
     /// Returns whether this policy permits a `u64` access at `offset`.
     pub const fn permits_u64(self, offset: usize) -> bool {
-        matches!(self, Self::ControlRing) && memory_permits_u64(offset)
+        match self {
+            Self::Bytes => false,
+            Self::ControlRing(layout) => layout.permits_u64(offset),
+        }
     }
 }
 
-/// Returns whether the control-ring ABI permits a byte-copy range.
-///
-/// Concrete shared-memory implementations use this together with
-/// [`memory_permits_u32`] and [`memory_permits_u64`] to keep their own byte and
-/// typed-word accesses disjoint. A peer can bypass these checks through its
-/// backing-resource alias, so implementations must remain memory-safe under
-/// arbitrary peer writes.
-pub const fn memory_permits_byte_range(offset: usize, length: usize) -> bool {
-    let Some(end) = offset.checked_add(length) else {
-        return false;
-    };
-    if end > CONTROL_RING_MEMORY_SIZE {
-        return false;
-    }
-    if length == 0 {
-        return true;
-    }
-    direction_permits_byte_range(offset, length, 0, CONTROL_RING_SLOT_COUNT)
-        || direction_permits_byte_range(
-            offset,
-            length,
-            CONTROL_RING_DIRECTION_SIZE,
-            CONTROL_RING_SLOT_COUNT,
-        )
-        || direction_permits_byte_range(
-            offset,
-            length,
-            CONTROL_RING_DIRECTION_SIZE * 2,
-            CONTROL_RING_NOTIFICATION_SLOT_COUNT,
-        )
-}
-
-/// Returns whether the control-ring ABI permits a `u32` access at `offset`.
-pub const fn memory_permits_u32(offset: usize) -> bool {
-    let Some(relative) = offset.checked_sub(CONTROL_RING_DATA_SIZE) else {
-        return false;
-    };
-    relative < CONTROL_RING_SYNC_DIRECTION_SIZE * 3
-        && matches!(
-            relative % CONTROL_RING_SYNC_DIRECTION_SIZE,
-            PRODUCER_EPOCH_OFFSET
-                | CONSUMER_EPOCH_OFFSET
-                | CONSUMER_WAITING_OFFSET
-                | PRODUCER_WAITING_OFFSET
-        )
-}
-
-/// Returns whether the control-ring ABI permits a `u64` access at `offset`.
-pub const fn memory_permits_u64(offset: usize) -> bool {
-    if offset < CONTROL_RING_DATA_SIZE {
-        return offset.is_multiple_of(CONTROL_RING_SLOT_SIZE);
-    }
-    let relative = offset - CONTROL_RING_DATA_SIZE;
-    relative < CONTROL_RING_SYNC_DIRECTION_SIZE * 3
-        && relative % CONTROL_RING_SYNC_DIRECTION_SIZE == CONSUMER_HEAD_OFFSET
-}
-
-const fn direction_permits_byte_range(
-    offset: usize,
-    length: usize,
-    direction_start: usize,
-    slot_count: u64,
-) -> bool {
-    let Some(relative) = offset.checked_sub(direction_start) else {
-        return false;
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let direction_size = CONTROL_RING_SLOT_SIZE * slot_count as usize;
-    if relative >= direction_size {
-        return false;
-    }
-    let slot_offset = relative % CONTROL_RING_SLOT_SIZE;
-    let Some(slot_end) = slot_offset.checked_add(length) else {
-        return false;
-    };
-    slot_offset >= size_of::<u64>() && slot_end <= CONTROL_RING_SLOT_SIZE
-}
-
-/// One direction in the shared control-ring mapping.
+/// One direction in a control-ring mapping, as placed by its
+/// [`ControlRingLayout`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControlRingDirection {
-    /// Local-to-broker request ring.
-    Requests,
-    /// Broker-to-local response ring.
-    Responses,
-    /// Broker-to-local asynchronous notification ring.
-    Notifications,
+pub struct ControlRingDirection {
+    data_offset: usize,
+    slot_count: u64,
+    sync_offset: usize,
 }
 
 impl ControlRingDirection {
     fn slot_range(self, slot: u64) -> Range<usize> {
-        debug_assert!(slot < self.slot_count());
+        debug_assert!(slot < self.slot_count);
         let slot = usize::try_from(slot).expect("control-ring slot index is bounded");
-        let data_offset = match self {
-            Self::Requests => 0,
-            Self::Responses => CONTROL_RING_DIRECTION_SIZE,
-            Self::Notifications => CONTROL_RING_DIRECTION_SIZE * 2,
-        };
-        let start = data_offset + slot * CONTROL_RING_SLOT_SIZE;
+        let start = self.data_offset + slot * CONTROL_RING_SLOT_SIZE;
         start..start + CONTROL_RING_SLOT_SIZE
     }
 
     /// Returns the number of slots in this direction.
     pub const fn slot_count(self) -> u64 {
-        match self {
-            Self::Requests | Self::Responses => CONTROL_RING_SLOT_COUNT,
-            Self::Notifications => CONTROL_RING_NOTIFICATION_SLOT_COUNT,
-        }
+        self.slot_count
     }
 
     /// Returns the `u32` epoch incremented when the producer publishes work for
     /// this direction.
     pub const fn producer_epoch_offset(self) -> usize {
-        self.sync_offset() + PRODUCER_EPOCH_OFFSET
+        self.sync_offset + PRODUCER_EPOCH_OFFSET
     }
 
     /// Returns the `u32` epoch incremented when the consumer publishes progress
     /// for this direction.
     pub const fn consumer_epoch_offset(self) -> usize {
-        self.sync_offset() + CONSUMER_EPOCH_OFFSET
+        self.sync_offset + CONSUMER_EPOCH_OFFSET
     }
 
     /// Returns the `u64` consumer-head offset for this direction.
     pub const fn consumer_head_offset(self) -> usize {
-        self.sync_offset() + CONSUMER_HEAD_OFFSET
+        self.sync_offset + CONSUMER_HEAD_OFFSET
     }
 
     const fn consumer_waiting_offset(self) -> usize {
-        self.sync_offset() + CONSUMER_WAITING_OFFSET
+        self.sync_offset + CONSUMER_WAITING_OFFSET
     }
 
     const fn producer_waiting_offset(self) -> usize {
-        self.sync_offset() + PRODUCER_WAITING_OFFSET
-    }
-
-    const fn sync_offset(self) -> usize {
-        CONTROL_RING_DATA_SIZE
-            + match self {
-                Self::Requests => 0,
-                Self::Responses => CONTROL_RING_SYNC_DIRECTION_SIZE,
-                Self::Notifications => CONTROL_RING_SYNC_DIRECTION_SIZE * 2,
-            }
+        self.sync_offset + PRODUCER_WAITING_OFFSET
     }
 }
 
@@ -342,42 +463,95 @@ pub enum ControlRingReadError<DecodeError> {
     Decode(DecodeError),
 }
 
-/// Exact-size shared memory containing request, response, and notification rings.
+/// Exact-size shared memory holding the directions of a [`ControlRingLayout`].
 pub struct ControlRing<Memory: ControlRingMemory> {
     memory: Memory,
+    layout: ControlRingLayout,
 }
 
-/// Role-bound association ring endpoints owned by the local peer.
-pub struct LocalControlRingEndpoints<Memory: ControlRingMemory> {
+/// The local peer's ends of one call lane.
+pub struct LocalControlRingLane<Memory: ControlRingMemory> {
     /// Local-to-broker request producer.
     pub request_producer: ControlRingProducer<Memory>,
     /// Broker-to-local response consumer.
     pub response_consumer: ControlRingConsumer<Memory>,
+}
+
+/// The broker peer's ends of one call lane.
+pub struct HostControlRingLane<Memory: ControlRingMemory> {
+    /// Local-to-broker request consumer.
+    pub request_consumer: ControlRingConsumer<Memory>,
+    /// Broker-to-local response producer.
+    pub response_producer: ControlRingProducer<Memory>,
+}
+
+/// Role-bound association ring endpoints owned by the local peer.
+pub struct LocalControlRingEndpoints<Memory: ControlRingMemory> {
+    /// Call lanes, in lane order.
+    pub lanes: Vec<LocalControlRingLane<Memory>>,
+    /// Lane-demand publisher, present when the layout has more than one lane.
+    pub lane_demand: Option<LocalLaneDemand<Memory>>,
     /// Broker-to-local notification consumer.
     pub notification_consumer: ControlRingConsumer<Memory>,
 }
 
 /// Role-bound association ring endpoints owned by the broker peer.
-pub struct BrokerControlRingEndpoints<Memory: ControlRingMemory> {
-    /// Local-to-broker request consumer.
-    pub request_consumer: ControlRingConsumer<Memory>,
-    /// Broker-to-local response producer.
-    pub response_producer: ControlRingProducer<Memory>,
+pub struct HostControlRingEndpoints<Memory: ControlRingMemory> {
+    /// Call lanes, in lane order.
+    pub lanes: Vec<HostControlRingLane<Memory>>,
+    /// Lane-demand observer, present when the layout has more than one lane.
+    pub lane_demand: Option<HostLaneDemand<Memory>>,
     /// Broker-to-local notification producer.
     pub notification_producer: ControlRingProducer<Memory>,
 }
 
+impl<Memory: ControlRingMemory> LocalControlRingEndpoints<Memory> {
+    /// Returns handles that interrupt every wait these endpoints offer.
+    pub fn wake_handles(&self) -> Vec<ControlRingWakeHandle<Memory>> {
+        self.lanes
+            .iter()
+            .flat_map(|lane| {
+                [
+                    lane.request_producer.wake_handle(),
+                    lane.response_consumer.wake_handle(),
+                ]
+            })
+            .chain([self.notification_consumer.wake_handle()])
+            .collect()
+    }
+}
+
+impl<Memory: ControlRingMemory> HostControlRingEndpoints<Memory> {
+    /// Returns handles that interrupt every wait these endpoints offer.
+    pub fn wake_handles(&self) -> Vec<ControlRingWakeHandle<Memory>> {
+        self.lanes
+            .iter()
+            .flat_map(|lane| {
+                [
+                    lane.request_consumer.wake_handle(),
+                    lane.response_producer.wake_handle(),
+                ]
+            })
+            .chain([self.notification_producer.wake_handle()])
+            .chain(self.lane_demand.as_ref().map(HostLaneDemand::wake_handle))
+            .collect()
+    }
+}
+
 impl<Memory: ControlRingMemory> ControlRing<Memory> {
-    /// Attaches to an exact-size shared control-ring mapping.
-    pub fn new(memory: Memory) -> Result<Self, ControlRingError> {
+    /// Attaches to an exact-size shared control-ring mapping with `layout`.
+    pub fn new(memory: Memory, layout: ControlRingLayout) -> Result<Self, ControlRingError> {
         let actual = memory.len();
-        if actual != CONTROL_RING_MEMORY_SIZE {
-            return Err(ControlRingError::MemoryLengthMismatch {
-                expected: CONTROL_RING_MEMORY_SIZE,
-                actual,
-            });
+        let expected = layout.memory_size();
+        if actual != expected {
+            return Err(ControlRingError::MemoryLengthMismatch { expected, actual });
         }
-        Ok(Self { memory })
+        Ok(Self { memory, layout })
+    }
+
+    /// Returns the layout of this mapping.
+    pub const fn layout(&self) -> ControlRingLayout {
+        self.layout
     }
 
     /// Returns the copy-only shared-memory resource.
@@ -387,39 +561,50 @@ impl<Memory: ControlRingMemory> ControlRing<Memory> {
 
     /// Consumes the mapping into endpoints owned by the local peer.
     pub fn into_local(self) -> LocalControlRingEndpoints<Memory> {
+        let layout = self.layout;
         let ring = Arc::new(self);
         LocalControlRingEndpoints {
-            request_producer: ControlRingProducer::new(
-                Arc::clone(&ring),
-                ControlRingDirection::Requests,
-            ),
-            response_consumer: ControlRingConsumer::new(
-                Arc::clone(&ring),
-                ControlRingDirection::Responses,
-            ),
-            notification_consumer: ControlRingConsumer::new(
-                ring,
-                ControlRingDirection::Notifications,
-            ),
+            lanes: (0..layout.lane_count())
+                .map(|lane| LocalControlRingLane {
+                    request_producer: ControlRingProducer::new(
+                        Arc::clone(&ring),
+                        layout.requests(lane),
+                    ),
+                    response_consumer: ControlRingConsumer::new(
+                        Arc::clone(&ring),
+                        layout.responses(lane),
+                    ),
+                })
+                .collect(),
+            lane_demand: (layout.lane_count() > 1).then(|| LocalLaneDemand {
+                ring: Arc::clone(&ring),
+            }),
+            notification_consumer: ControlRingConsumer::new(ring, layout.notifications()),
         }
     }
 
     /// Consumes the mapping into endpoints owned by the broker peer.
-    pub fn into_broker(self) -> BrokerControlRingEndpoints<Memory> {
+    pub fn into_host(self) -> HostControlRingEndpoints<Memory> {
+        let layout = self.layout;
         let ring = Arc::new(self);
-        BrokerControlRingEndpoints {
-            request_consumer: ControlRingConsumer::new(
-                Arc::clone(&ring),
-                ControlRingDirection::Requests,
-            ),
-            response_producer: ControlRingProducer::new(
-                Arc::clone(&ring),
-                ControlRingDirection::Responses,
-            ),
-            notification_producer: ControlRingProducer::new(
-                ring,
-                ControlRingDirection::Notifications,
-            ),
+        HostControlRingEndpoints {
+            lanes: (0..layout.lane_count())
+                .map(|lane| HostControlRingLane {
+                    request_consumer: ControlRingConsumer::new(
+                        Arc::clone(&ring),
+                        layout.requests(lane),
+                    ),
+                    response_producer: ControlRingProducer::new(
+                        Arc::clone(&ring),
+                        layout.responses(lane),
+                    ),
+                })
+                .collect(),
+            lane_demand: (layout.lane_count() > 1).then(|| HostLaneDemand {
+                ring: Arc::clone(&ring),
+                started_lane_count: 0,
+            }),
+            notification_producer: ControlRingProducer::new(ring, layout.notifications()),
         }
     }
 
@@ -506,6 +691,118 @@ impl<Memory: ControlRingMemory> ControlRing<Memory> {
     }
 }
 
+/// Local-peer end of the lane-demand words of a multi-lane control ring.
+///
+/// The local peer raises the number of lanes it uses before it first writes a
+/// request to a lane, and the broker starts serving a lane once it is
+/// demanded. Lane 0 is always demanded.
+pub struct LocalLaneDemand<Memory: ControlRingMemory> {
+    ring: Arc<ControlRing<Memory>>,
+}
+
+impl<Memory: ControlRingMemory> LocalLaneDemand<Memory> {
+    /// Publishes that the local peer uses the first `lanes` lanes.
+    ///
+    /// The count must not decrease within an association.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `lanes` exceeds the layout's lane count.
+    pub fn request(&self, lanes: usize) -> Result<(), ControlRingError> {
+        let layout = self.ring.layout;
+        assert!(lanes <= layout.lane_count(), "lane demand out of range");
+        let lanes = u32::try_from(lanes).expect("lane count is bounded by the layout");
+        let demand = layout.demand_offset();
+        self.ring
+            .memory
+            .store_u32_release(demand + DEMANDED_LANE_COUNT_OFFSET, lanes.to_le())?;
+        self.ring
+            .memory
+            .increment_u32_release(demand + DEMAND_EPOCH_OFFSET)?;
+        Ok(())
+    }
+}
+
+impl<Memory: WaitableSharedMemory> LocalLaneDemand<Memory> {
+    /// Wakes the broker after [`Self::request`].
+    ///
+    /// The wake is unconditional: demand rises at most once per lane, so
+    /// there is nothing to gain from an announcement word.
+    pub fn wake_broker(&self) -> Result<(), Memory::Error> {
+        self.ring
+            .memory
+            .wake_one(self.ring.layout.demand_offset() + DEMAND_EPOCH_OFFSET)
+    }
+}
+
+/// Result of polling a [`HostLaneDemand`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlRingDemandStatus {
+    /// The local peer demands this lane, which the broker has yet to serve.
+    Lane(usize),
+    /// The broker serves every demanded lane.
+    Satisfied {
+        /// Demand epoch sampled before the demand was read.
+        wait_epoch: u32,
+    },
+}
+
+/// Broker-peer end of the lane-demand words of a multi-lane control ring.
+///
+/// It hands out each lane, in lane order, once the local peer demands it.
+/// The local peer can publish any count; the broker clamps it to the layout's
+/// lanes and never takes a lane back.
+pub struct HostLaneDemand<Memory: ControlRingMemory> {
+    ring: Arc<ControlRing<Memory>>,
+    started_lane_count: usize,
+}
+
+impl<Memory: ControlRingMemory> HostLaneDemand<Memory> {
+    /// Returns the next demanded lane the broker has yet to serve, if any.
+    pub fn try_next_lane(&mut self) -> Result<ControlRingDemandStatus, ControlRingError> {
+        let layout = self.ring.layout;
+        let demand = layout.demand_offset();
+        let wait_epoch = self
+            .ring
+            .memory
+            .load_u32_acquire(demand + DEMAND_EPOCH_OFFSET)?;
+        let demanded_lane_count = u32::from_le(
+            self.ring
+                .memory
+                .load_u32_acquire(demand + DEMANDED_LANE_COUNT_OFFSET)?,
+        );
+        let demanded_lane_count = usize::try_from(demanded_lane_count)
+            .unwrap_or(usize::MAX)
+            .clamp(1, layout.lane_count());
+        if self.started_lane_count < demanded_lane_count {
+            let lane = self.started_lane_count;
+            self.started_lane_count += 1;
+            return Ok(ControlRingDemandStatus::Lane(lane));
+        }
+        Ok(ControlRingDemandStatus::Satisfied { wait_epoch })
+    }
+
+    /// Returns a handle that can interrupt [`Self::wait_for_demand`].
+    pub fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
+        ControlRingWakeHandle::new(
+            &self.ring,
+            self.ring.layout.demand_offset() + DEMAND_EPOCH_OFFSET,
+        )
+    }
+}
+
+impl<Memory: WaitableSharedMemory> HostLaneDemand<Memory> {
+    /// Waits for new demand after [`ControlRingDemandStatus::Satisfied`].
+    ///
+    /// The caller must poll again after this possibly spurious wakeup.
+    pub fn wait_for_demand(&mut self, wait_epoch: u32) -> Result<(), Memory::Error> {
+        self.ring.memory.wait_while_equal(
+            self.ring.layout.demand_offset() + DEMAND_EPOCH_OFFSET,
+            wait_epoch,
+        )
+    }
+}
+
 /// Trusted endpoint-local state for one control-ring producer.
 pub struct ControlRingProducer<Memory: ControlRingMemory> {
     ring: Arc<ControlRing<Memory>>,
@@ -524,7 +821,7 @@ pub struct ControlRingProducer<Memory: ControlRingMemory> {
 /// without gaining access to ring memory.
 pub struct ControlRingWakeHandle<Memory: ControlRingMemory> {
     ring: Arc<ControlRing<Memory>>,
-    wait_epoch: ControlRingWaitEpoch,
+    epoch_offset: usize,
 }
 
 /// Shared-memory wait and wake support for control-ring epoch words.
@@ -570,33 +867,25 @@ pub trait WaitableSharedMemory: ControlRingMemory {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ControlRingWaitEpoch {
-    Producer(ControlRingDirection),
-    Consumer(ControlRingDirection),
-}
-
-impl ControlRingWaitEpoch {
-    const fn offset(self) -> usize {
-        match self {
-            Self::Producer(direction) => direction.producer_epoch_offset(),
-            Self::Consumer(direction) => direction.consumer_epoch_offset(),
-        }
-    }
-}
-
 impl<Memory: ControlRingMemory> Clone for ControlRingWakeHandle<Memory> {
     fn clone(&self) -> Self {
         Self {
             ring: Arc::clone(&self.ring),
-            wait_epoch: self.wait_epoch,
+            epoch_offset: self.epoch_offset,
         }
     }
 }
 
 impl<Memory: ControlRingMemory> ControlRingWakeHandle<Memory> {
+    fn new(ring: &Arc<ControlRing<Memory>>, epoch_offset: usize) -> Self {
+        Self {
+            ring: Arc::clone(ring),
+            epoch_offset,
+        }
+    }
+
     pub(crate) const fn wait_epoch_offset(&self) -> usize {
-        self.wait_epoch.offset()
+        self.epoch_offset
     }
 
     pub(crate) fn memory(&self) -> &Memory {
@@ -694,10 +983,7 @@ impl<Memory: ControlRingMemory> ControlRingProducer<Memory> {
     /// Returns a handle that can interrupt a wait on this producer's ring
     /// direction.
     pub fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
-        ControlRingWakeHandle {
-            ring: Arc::clone(&self.ring),
-            wait_epoch: ControlRingWaitEpoch::Consumer(self.direction),
-        }
+        ControlRingWakeHandle::new(&self.ring, self.direction.consumer_epoch_offset())
     }
 
     #[cfg(test)]
@@ -810,10 +1096,7 @@ impl<Memory: ControlRingMemory> ControlRingConsumer<Memory> {
     /// Returns a handle that can interrupt a wait on this consumer's ring
     /// direction.
     pub fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
-        ControlRingWakeHandle {
-            ring: Arc::clone(&self.ring),
-            wait_epoch: ControlRingWaitEpoch::Producer(self.direction),
-        }
+        ControlRingWakeHandle::new(&self.ring, self.direction.producer_epoch_offset())
     }
 
     #[cfg(test)]
@@ -951,170 +1234,358 @@ mod tests {
     const SEQUENCE_RANGE: core::ops::Range<usize> = 0..8;
     const LENGTH_RANGE: core::ops::Range<usize> = 8..12;
     const RESERVED_RANGE: core::ops::Range<usize> = 12..16;
+    const LAYOUT: ControlRingLayout = ControlRingLayout::SINGLE_LANE;
+    const LAYOUTS: [ControlRingLayout; 2] = [
+        ControlRingLayout::SINGLE_LANE,
+        ControlRingLayout::MULTI_LANE,
+    ];
+    const MEMORY_SIZE: usize = LAYOUT.memory_size();
+    const REQUESTS: ControlRingDirection = LAYOUT.requests(0);
+    const RESPONSES: ControlRingDirection = LAYOUT.responses(0);
+    const NOTIFICATIONS: ControlRingDirection = LAYOUT.notifications();
+    const SLOT_COUNT: u64 = REQUESTS.slot_count();
 
     #[test]
     fn mapping_requires_the_exact_control_ring_size() {
-        assert_eq!(CONTROL_RING_MEMORY_SIZE, 24_648);
-        assert!(matches!(
-            ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE - 1)),
-            Err(ControlRingError::MemoryLengthMismatch {
-                expected: CONTROL_RING_MEMORY_SIZE,
-                actual
-            }) if actual == CONTROL_RING_MEMORY_SIZE - 1
-        ));
-        assert!(matches!(
-            ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE + 1)),
-            Err(ControlRingError::MemoryLengthMismatch {
-                expected: CONTROL_RING_MEMORY_SIZE,
-                actual
-            }) if actual == CONTROL_RING_MEMORY_SIZE + 1
-        ));
-        assert!(ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE)).is_ok());
+        assert_eq!(ControlRingLayout::SINGLE_LANE.memory_size(), 24_648);
+        for layout in LAYOUTS {
+            let size = layout.memory_size();
+            assert!(matches!(
+                ControlRing::new(TestMemory::new(size - 1), layout),
+                Err(ControlRingError::MemoryLengthMismatch { expected, actual })
+                    if expected == size && actual == size - 1
+            ));
+            assert!(matches!(
+                ControlRing::new(TestMemory::new(size + 1), layout),
+                Err(ControlRingError::MemoryLengthMismatch { expected, actual })
+                    if expected == size && actual == size + 1
+            ));
+            assert!(ControlRing::new(TestMemory::new(size), layout).is_ok());
+        }
     }
 
     #[test]
     fn memory_layout_separates_byte_and_word_regions() {
-        assert!(memory_permits_u64(0));
-        assert!(!memory_permits_u32(0));
-        assert!(!memory_permits_byte_range(0, 1));
-        assert!(memory_permits_byte_range(
-            size_of::<u64>(),
-            CONTROL_RING_SLOT_SIZE - size_of::<u64>()
-        ));
-        assert!(!memory_permits_byte_range(
-            size_of::<u64>(),
-            CONTROL_RING_SLOT_SIZE - size_of::<u64>() + 1
-        ));
+        for layout in LAYOUTS {
+            assert!(layout.permits_u64(0));
+            assert!(!layout.permits_u32(0));
+            assert!(!layout.permits_byte_range(0, 1));
+            assert!(
+                layout.permits_byte_range(
+                    size_of::<u64>(),
+                    CONTROL_RING_SLOT_SIZE - size_of::<u64>()
+                )
+            );
+            assert!(!layout.permits_byte_range(
+                size_of::<u64>(),
+                CONTROL_RING_SLOT_SIZE - size_of::<u64>() + 1
+            ));
 
-        let sync_start = CONTROL_RING_DATA_SIZE;
-        assert!(memory_permits_u32(sync_start + PRODUCER_EPOCH_OFFSET));
-        assert!(memory_permits_u32(sync_start + CONSUMER_EPOCH_OFFSET));
-        assert!(memory_permits_u64(sync_start + CONSUMER_HEAD_OFFSET));
-        assert!(memory_permits_u32(sync_start + CONSUMER_WAITING_OFFSET));
-        assert!(memory_permits_u32(sync_start + PRODUCER_WAITING_OFFSET));
-        assert!(!memory_permits_u64(sync_start + CONSUMER_WAITING_OFFSET));
-        assert!(!memory_permits_u32(sync_start + CONSUMER_HEAD_OFFSET));
-        assert!(!memory_permits_byte_range(sync_start, 1));
-        assert!(!memory_permits_u32(CONTROL_RING_MEMORY_SIZE));
-        assert!(!memory_permits_u64(CONTROL_RING_MEMORY_SIZE));
-        assert!(!memory_permits_byte_range(CONTROL_RING_MEMORY_SIZE, 1));
+            let sync_start = layout.data_size();
+            assert!(!layout.permits_byte_range(sync_start - 1, 2));
+            assert!(layout.permits_u32(sync_start + PRODUCER_EPOCH_OFFSET));
+            assert!(layout.permits_u32(sync_start + CONSUMER_EPOCH_OFFSET));
+            assert!(layout.permits_u64(sync_start + CONSUMER_HEAD_OFFSET));
+            assert!(layout.permits_u32(sync_start + CONSUMER_WAITING_OFFSET));
+            assert!(layout.permits_u32(sync_start + PRODUCER_WAITING_OFFSET));
+            assert!(!layout.permits_u64(sync_start + CONSUMER_WAITING_OFFSET));
+            assert!(!layout.permits_u32(sync_start + CONSUMER_HEAD_OFFSET));
+            assert!(!layout.permits_byte_range(sync_start, 1));
+            let size = layout.memory_size();
+            assert!(!layout.permits_u32(size));
+            assert!(!layout.permits_u64(size));
+            assert!(!layout.permits_byte_range(size, 1));
+            assert!(layout.permits_byte_range(size, 0));
+        }
+
+        let multi_lane = ControlRingLayout::MULTI_LANE;
+        let padding = multi_lane.data_size() + SYNC_WORDS_SIZE;
+        assert!(!multi_lane.permits_u32(padding));
+        assert!(!multi_lane.permits_u64(padding));
+        let demand = multi_lane.demand_offset();
+        assert!(multi_lane.permits_u32(demand + DEMANDED_LANE_COUNT_OFFSET));
+        assert!(multi_lane.permits_u32(demand + DEMAND_EPOCH_OFFSET));
+        assert!(!multi_lane.permits_u64(demand));
+        assert!(!multi_lane.permits_byte_range(demand, 1));
     }
 
     #[test]
     fn directions_occupy_disjoint_data_and_sync_ranges() {
-        let directions = [
-            ControlRingDirection::Requests,
-            ControlRingDirection::Responses,
-            ControlRingDirection::Notifications,
-        ];
-        let mut next_data_offset = 0;
-        for direction in directions {
-            let first = direction.slot_range(0);
-            let last = direction.slot_range(direction.slot_count() - 1);
-            assert_eq!(first.start, next_data_offset);
-            assert_eq!(
-                last.end - first.start,
-                usize::try_from(direction.slot_count()).unwrap() * CONTROL_RING_SLOT_SIZE
-            );
-            next_data_offset = last.end;
-        }
-        assert_eq!(next_data_offset, CONTROL_RING_DATA_SIZE);
+        for layout in LAYOUTS {
+            let directions: Vec<_> = (0..layout.lane_count())
+                .flat_map(|lane| [layout.requests(lane), layout.responses(lane)])
+                .chain([layout.notifications()])
+                .collect();
+            let mut next_data_offset = 0;
+            for direction in &directions {
+                let first = direction.slot_range(0);
+                let last = direction.slot_range(direction.slot_count() - 1);
+                assert_eq!(first.start, next_data_offset);
+                assert_eq!(
+                    last.end - first.start,
+                    usize::try_from(direction.slot_count()).unwrap() * CONTROL_RING_SLOT_SIZE
+                );
+                next_data_offset = last.end;
+            }
+            assert_eq!(next_data_offset, layout.data_size());
 
-        for (index, direction) in directions.into_iter().enumerate() {
+            for (index, direction) in directions.iter().enumerate() {
+                assert_eq!(
+                    direction.producer_epoch_offset(),
+                    layout.data_size() + index * layout.sync_stride
+                );
+                assert_eq!(
+                    direction.consumer_epoch_offset(),
+                    direction.producer_epoch_offset() + size_of::<u32>()
+                );
+                assert_eq!(
+                    direction.consumer_head_offset(),
+                    direction.producer_epoch_offset() + size_of::<u64>()
+                );
+                assert!(
+                    direction
+                        .consumer_head_offset()
+                        .is_multiple_of(align_of::<u64>())
+                );
+                assert_eq!(
+                    direction.consumer_waiting_offset(),
+                    direction.consumer_head_offset() + size_of::<u64>()
+                );
+                assert_eq!(
+                    direction.producer_waiting_offset(),
+                    direction.consumer_waiting_offset() + size_of::<u32>()
+                );
+            }
             assert_eq!(
-                direction.producer_epoch_offset(),
-                CONTROL_RING_DATA_SIZE + index * CONTROL_RING_SYNC_DIRECTION_SIZE
-            );
-            assert_eq!(
-                direction.consumer_epoch_offset(),
-                direction.producer_epoch_offset() + size_of::<u32>()
-            );
-            assert_eq!(
-                direction.consumer_head_offset(),
-                direction.producer_epoch_offset() + size_of::<u64>()
-            );
-            assert!(
-                direction
-                    .consumer_head_offset()
-                    .is_multiple_of(align_of::<u64>())
-            );
-            assert_eq!(
-                direction.consumer_waiting_offset(),
-                direction.consumer_head_offset() + size_of::<u64>()
-            );
-            assert_eq!(
-                direction.producer_waiting_offset(),
-                direction.consumer_waiting_offset() + size_of::<u32>()
+                layout.notifications().sync_offset + layout.sync_stride,
+                layout.demand_offset()
             );
         }
         assert_eq!(
-            ControlRingDirection::Notifications.producer_waiting_offset() + size_of::<u32>(),
-            CONTROL_RING_MEMORY_SIZE
+            ControlRingLayout::SINGLE_LANE.demand_offset(),
+            ControlRingLayout::SINGLE_LANE.memory_size()
+        );
+        assert_eq!(
+            ControlRingLayout::MULTI_LANE.demand_offset() + DEMAND_WORDS_SIZE,
+            ControlRingLayout::MULTI_LANE.memory_size()
         );
     }
 
     #[test]
+    fn waitable_words_are_indexed_densely() {
+        for layout in LAYOUTS {
+            let mut indices: Vec<_> = (0..layout.memory_size())
+                .filter_map(|offset| layout.waitable_word_index(offset))
+                .collect();
+            assert_eq!(indices.len(), layout.waitable_word_count());
+            indices.sort_unstable();
+            indices.dedup();
+            assert_eq!(indices.len(), layout.waitable_word_count());
+            assert!(
+                indices
+                    .iter()
+                    .all(|&index| index < layout.waitable_word_count())
+            );
+            for offset in 0..layout.memory_size() {
+                if layout.waitable_word_index(offset).is_some() {
+                    assert!(layout.permits_u32(offset));
+                }
+            }
+            let mut wait_offsets: Vec<_> = (0..layout.lane_count())
+                .flat_map(|lane| [layout.requests(lane), layout.responses(lane)])
+                .chain([layout.notifications()])
+                .flat_map(|direction| {
+                    [
+                        direction.producer_epoch_offset(),
+                        direction.consumer_epoch_offset(),
+                    ]
+                })
+                .collect();
+            if layout.lane_count() > 1 {
+                wait_offsets.push(layout.demand_offset() + DEMAND_EPOCH_OFFSET);
+            }
+            assert_eq!(wait_offsets.len(), layout.waitable_word_count());
+            for offset in wait_offsets {
+                assert!(layout.waitable_word_index(offset).is_some());
+            }
+        }
+        assert_eq!(ControlRingLayout::SINGLE_LANE.waitable_word_count(), 6);
+    }
+
+    #[test]
     fn endpoint_roles_bind_opposite_directions_to_one_mapping() {
-        let local = test_ring().into_local();
-        assert_eq!(
-            local.request_producer.direction(),
-            ControlRingDirection::Requests
+        for layout in LAYOUTS {
+            let local = test_ring_with(layout).into_local();
+            assert_eq!(local.lanes.len(), layout.lane_count());
+            assert_eq!(local.lane_demand.is_some(), layout.lane_count() > 1);
+            for (index, lane) in local.lanes.iter().enumerate() {
+                assert_eq!(lane.request_producer.direction(), layout.requests(index));
+                assert_eq!(lane.response_consumer.direction(), layout.responses(index));
+                assert!(Arc::ptr_eq(
+                    &lane.request_producer.ring,
+                    &local.notification_consumer.ring
+                ));
+                assert!(Arc::ptr_eq(
+                    &lane.response_consumer.ring,
+                    &local.notification_consumer.ring
+                ));
+            }
+            assert_eq!(
+                local.notification_consumer.direction(),
+                layout.notifications()
+            );
+            assert_eq!(local.wake_handles().len(), 2 * layout.lane_count() + 1);
+
+            let broker = test_ring_with(layout).into_host();
+            assert_eq!(broker.lanes.len(), layout.lane_count());
+            assert_eq!(broker.lane_demand.is_some(), layout.lane_count() > 1);
+            for (index, lane) in broker.lanes.iter().enumerate() {
+                assert_eq!(lane.request_consumer.direction(), layout.requests(index));
+                assert_eq!(lane.response_producer.direction(), layout.responses(index));
+                assert!(Arc::ptr_eq(
+                    &lane.request_consumer.ring,
+                    &broker.notification_producer.ring
+                ));
+                assert!(Arc::ptr_eq(
+                    &lane.response_producer.ring,
+                    &broker.notification_producer.ring
+                ));
+            }
+            assert_eq!(
+                broker.notification_producer.direction(),
+                layout.notifications()
+            );
+            assert_eq!(
+                broker.wake_handles().len(),
+                2 * layout.lane_count() + 1 + usize::from(layout.lane_count() > 1)
+            );
+        }
+    }
+
+    #[test]
+    fn single_slot_lanes_carry_one_call_at_a_time() {
+        let layout = ControlRingLayout::MULTI_LANE;
+        let ring = Arc::new(test_ring_with(layout));
+        let mut lanes: Vec<_> = (0..layout.lane_count())
+            .map(|lane| {
+                let local = LocalControlRingLane {
+                    request_producer: ControlRingProducer::new(
+                        Arc::clone(&ring),
+                        layout.requests(lane),
+                    ),
+                    response_consumer: ControlRingConsumer::new(
+                        Arc::clone(&ring),
+                        layout.responses(lane),
+                    ),
+                };
+                let broker = HostControlRingLane {
+                    request_consumer: ControlRingConsumer::new(
+                        Arc::clone(&ring),
+                        layout.requests(lane),
+                    ),
+                    response_producer: ControlRingProducer::new(
+                        Arc::clone(&ring),
+                        layout.responses(lane),
+                    ),
+                };
+                (local, broker)
+            })
+            .collect();
+        for round in 0..3_u8 {
+            for (index, (local, broker)) in lanes.iter_mut().enumerate() {
+                let request = [round, u8::try_from(index).unwrap()];
+                assert_eq!(
+                    local.request_producer.try_write(&request),
+                    Ok(ControlRingWriteStatus::Written)
+                );
+                assert!(matches!(
+                    local.request_producer.try_write(&request),
+                    Ok(ControlRingWriteStatus::Full { .. })
+                ));
+                assert_eq!(
+                    broker.request_consumer.try_read(owned_bytes),
+                    Ok(ControlRingReadStatus::Message(request.to_vec()))
+                );
+                assert!(matches!(
+                    broker.request_consumer.try_read(owned_bytes),
+                    Ok(ControlRingReadStatus::Empty { .. })
+                ));
+                broker.request_consumer.publish_head().unwrap();
+                let response = [round, u8::try_from(index).unwrap(), 0xff];
+                assert_eq!(
+                    broker.response_producer.try_write(&response),
+                    Ok(ControlRingWriteStatus::Written)
+                );
+                assert_eq!(
+                    local.response_consumer.try_read(owned_bytes),
+                    Ok(ControlRingReadStatus::Message(response.to_vec()))
+                );
+                local.response_consumer.publish_head().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn broker_hands_out_lanes_in_order_as_demand_rises() {
+        let ring = Arc::new(test_ring_with(ControlRingLayout::MULTI_LANE));
+        let local = LocalLaneDemand {
+            ring: Arc::clone(&ring),
+        };
+        let mut broker = HostLaneDemand {
+            ring: Arc::clone(&ring),
+            started_lane_count: 0,
+        };
+        assert_eq!(broker.try_next_lane(), Ok(ControlRingDemandStatus::Lane(0)));
+        let Ok(ControlRingDemandStatus::Satisfied { wait_epoch }) = broker.try_next_lane() else {
+            panic!("only lane 0 is demanded initially");
+        };
+        local.request(3).unwrap();
+        let epoch_offset = ring.layout.demand_offset() + DEMAND_EPOCH_OFFSET;
+        assert_ne!(
+            ring.memory.load_u32_acquire(epoch_offset).unwrap(),
+            wait_epoch
         );
-        assert_eq!(
-            local.response_consumer.direction(),
-            ControlRingDirection::Responses
-        );
-        assert_eq!(
-            local.notification_consumer.direction(),
-            ControlRingDirection::Notifications
-        );
-        assert!(Arc::ptr_eq(
-            &local.request_producer.ring,
-            &local.response_consumer.ring
-        ));
-        assert!(Arc::ptr_eq(
-            &local.request_producer.ring,
-            &local.notification_consumer.ring
+        assert_eq!(broker.try_next_lane(), Ok(ControlRingDemandStatus::Lane(1)));
+        assert_eq!(broker.try_next_lane(), Ok(ControlRingDemandStatus::Lane(2)));
+        assert!(matches!(
+            broker.try_next_lane(),
+            Ok(ControlRingDemandStatus::Satisfied { .. })
         ));
 
-        let broker = test_ring().into_broker();
-        assert_eq!(
-            broker.request_consumer.direction(),
-            ControlRingDirection::Requests
-        );
-        assert_eq!(
-            broker.response_producer.direction(),
-            ControlRingDirection::Responses
-        );
-        assert_eq!(
-            broker.notification_producer.direction(),
-            ControlRingDirection::Notifications
-        );
-        assert!(Arc::ptr_eq(
-            &broker.request_consumer.ring,
-            &broker.response_producer.ring
+        // A hostile peer can lower or overstate demand; the broker never
+        // takes back a lane and never exceeds the layout.
+        local.request(1).unwrap();
+        assert!(matches!(
+            broker.try_next_lane(),
+            Ok(ControlRingDemandStatus::Satisfied { .. })
         ));
-        assert!(Arc::ptr_eq(
-            &broker.request_consumer.ring,
-            &broker.notification_producer.ring
+        ring.memory
+            .store_u32_release(
+                ring.layout.demand_offset() + DEMANDED_LANE_COUNT_OFFSET,
+                u32::MAX.to_le(),
+            )
+            .unwrap();
+        for lane in 3..ControlRingLayout::MULTI_LANE.lane_count() {
+            assert_eq!(
+                broker.try_next_lane(),
+                Ok(ControlRingDemandStatus::Lane(lane))
+            );
+        }
+        assert!(matches!(
+            broker.try_next_lane(),
+            Ok(ControlRingDemandStatus::Satisfied { .. })
         ));
     }
 
     #[test]
     fn request_response_and_notification_rings_publish_independently() {
         let ring = Arc::new(test_ring());
-        let mut request_producer =
-            ControlRingProducer::new(Arc::clone(&ring), ControlRingDirection::Requests);
-        let mut request_consumer =
-            ControlRingConsumer::new(Arc::clone(&ring), ControlRingDirection::Requests);
-        let mut response_producer =
-            ControlRingProducer::new(Arc::clone(&ring), ControlRingDirection::Responses);
-        let mut response_consumer =
-            ControlRingConsumer::new(Arc::clone(&ring), ControlRingDirection::Responses);
-        let mut notification_producer =
-            ControlRingProducer::new(Arc::clone(&ring), ControlRingDirection::Notifications);
-        let mut notification_consumer =
-            ControlRingConsumer::new(ring, ControlRingDirection::Notifications);
+        let mut request_producer = ControlRingProducer::new(Arc::clone(&ring), REQUESTS);
+        let mut request_consumer = ControlRingConsumer::new(Arc::clone(&ring), REQUESTS);
+        let mut response_producer = ControlRingProducer::new(Arc::clone(&ring), RESPONSES);
+        let mut response_consumer = ControlRingConsumer::new(Arc::clone(&ring), RESPONSES);
+        let mut notification_producer = ControlRingProducer::new(Arc::clone(&ring), NOTIFICATIONS);
+        let mut notification_consumer = ControlRingConsumer::new(ring, NOTIFICATIONS);
 
         assert_eq!(
             request_producer.try_write(&[1, 2, 3]),
@@ -1181,11 +1652,7 @@ mod tests {
 
     #[test]
     fn each_direction_enforces_its_own_capacity() {
-        for direction in [
-            ControlRingDirection::Requests,
-            ControlRingDirection::Responses,
-            ControlRingDirection::Notifications,
-        ] {
+        for direction in [REQUESTS, RESPONSES, NOTIFICATIONS] {
             let (mut producer, mut consumer) = test_ring().into_endpoints(direction, direction);
             for value in 0..direction.slot_count() {
                 assert_eq!(
@@ -1232,10 +1699,7 @@ mod tests {
                     CONTROL_RING_SLOT_HEADER_SIZE - size_of::<u64>()
                 ),
                 (0, size_of::<u64>()),
-                (
-                    ControlRingDirection::Requests.producer_epoch_offset(),
-                    size_of::<u32>()
-                ),
+                (REQUESTS.producer_epoch_offset(), size_of::<u32>()),
             ]
         );
     }
@@ -1243,11 +1707,8 @@ mod tests {
     #[test]
     fn failed_payload_metadata_or_word_publication_does_not_publish_progress() {
         for failed_write in [1, 2, 3] {
-            let ring = ControlRing::new(FailingWriteMemory::new()).unwrap();
-            let (mut producer, mut consumer) = ring.into_endpoints(
-                ControlRingDirection::Requests,
-                ControlRingDirection::Requests,
-            );
+            let ring = ControlRing::new(FailingWriteMemory::new(), LAYOUT).unwrap();
+            let (mut producer, mut consumer) = ring.into_endpoints(REQUESTS, REQUESTS);
             producer.try_write(&[7]).unwrap();
             producer.memory().fail_after(failed_write);
             assert_eq!(
@@ -1282,14 +1743,14 @@ mod tests {
         let (mut producer, mut consumer) = test_endpoints();
 
         producer.try_write(&[7; 100]).unwrap();
-        for _ in 1..CONTROL_RING_SLOT_COUNT {
+        for _ in 1..SLOT_COUNT {
             producer.try_write(&[8]).unwrap();
         }
         assert_eq!(
             consumer.try_read(|payload| Ok::<_, ()>(payload.len())),
             Ok(ControlRingReadStatus::Message(100))
         );
-        for _ in 1..CONTROL_RING_SLOT_COUNT {
+        for _ in 1..SLOT_COUNT {
             consumer.try_read(owned_bytes).unwrap();
         }
         consumer.publish_head().unwrap();
@@ -1310,7 +1771,7 @@ mod tests {
     fn shared_epochs_publish_and_acknowledge_a_full_batch() {
         let (mut producer, mut consumer) = test_endpoints();
 
-        for value in 0..CONTROL_RING_SLOT_COUNT {
+        for value in 0..SLOT_COUNT {
             let value = u8::try_from(value).unwrap();
             assert_eq!(
                 producer.try_write(&[value]),
@@ -1322,7 +1783,7 @@ mod tests {
             Ok(ControlRingWriteStatus::Full { wait_epoch: 0 })
         );
 
-        for value in 0..CONTROL_RING_SLOT_COUNT {
+        for value in 0..SLOT_COUNT {
             let value = u8::try_from(value).unwrap();
             assert_eq!(
                 consumer.try_read(owned_bytes),
@@ -1332,7 +1793,7 @@ mod tests {
         assert_eq!(
             consumer.try_read(owned_bytes),
             Ok(ControlRingReadStatus::Empty {
-                wait_epoch: u32::try_from(CONTROL_RING_SLOT_COUNT).unwrap()
+                wait_epoch: u32::try_from(SLOT_COUNT).unwrap()
             })
         );
         assert_eq!(
@@ -1355,10 +1816,9 @@ mod tests {
     fn wakeup_epochs_wrap_without_controlling_ring_progress() {
         let (mut producer, mut consumer) = test_endpoints();
 
-        producer.memory().store_u32_for_test(
-            ControlRingDirection::Requests.producer_epoch_offset(),
-            u32::MAX,
-        );
+        producer
+            .memory()
+            .store_u32_for_test(REQUESTS.producer_epoch_offset(), u32::MAX);
         producer.try_write(&[7]).unwrap();
         assert_eq!(
             consumer.try_read(owned_bytes),
@@ -1369,15 +1829,14 @@ mod tests {
             Ok(ControlRingReadStatus::Empty { wait_epoch: 0 })
         );
 
-        consumer.memory().store_u32_for_test(
-            ControlRingDirection::Requests.consumer_epoch_offset(),
-            u32::MAX,
-        );
+        consumer
+            .memory()
+            .store_u32_for_test(REQUESTS.consumer_epoch_offset(), u32::MAX);
         consumer.publish_head().unwrap();
         assert_eq!(
             producer
                 .memory()
-                .load_u32_acquire(ControlRingDirection::Requests.consumer_epoch_offset()),
+                .load_u32_acquire(REQUESTS.consumer_epoch_offset()),
             Ok(0)
         );
         assert_eq!(producer.refresh_head(), Ok(()));
@@ -1390,7 +1849,7 @@ mod tests {
         assert_eq!(
             consumer
                 .memory()
-                .load_u32_acquire(ControlRingDirection::Requests.consumer_epoch_offset()),
+                .load_u32_acquire(REQUESTS.consumer_epoch_offset()),
             Ok(0)
         );
 
@@ -1401,7 +1860,7 @@ mod tests {
         assert_eq!(
             consumer
                 .memory()
-                .load_u32_acquire(ControlRingDirection::Requests.consumer_epoch_offset()),
+                .load_u32_acquire(REQUESTS.consumer_epoch_offset()),
             Ok(1)
         );
     }
@@ -1438,10 +1897,7 @@ mod tests {
         fn assert_rejected(image: &[u8; CONTROL_RING_SLOT_SIZE], expected: ControlRingError) {
             let ring = test_ring();
             install_slot(ring.memory(), image);
-            let (_, mut consumer) = ring.into_endpoints(
-                ControlRingDirection::Responses,
-                ControlRingDirection::Requests,
-            );
+            let (_, mut consumer) = ring.into_endpoints(RESPONSES, REQUESTS);
             assert_eq!(
                 consumer.try_read(owned_bytes),
                 Err(ControlRingReadError::Ring(expected))
@@ -1480,7 +1936,7 @@ mod tests {
             Ok(ControlRingReadStatus::Empty { wait_epoch: 0 })
         );
         install_slot(consumer.memory(), &raw_slot(1, 1, 0, &[7]));
-        consumer.head = CONTROL_RING_SLOT_COUNT;
+        consumer.head = SLOT_COUNT;
         assert_eq!(
             consumer.try_read(owned_bytes),
             Ok(ControlRingReadStatus::Empty { wait_epoch: 0 })
@@ -1557,11 +2013,8 @@ mod tests {
     #[test]
     fn torn_length_snapshot_is_rejected_before_payload_slicing() {
         let memory = TearingMemory::with_torn_length(&raw_slot(1, 1, 0, &[7]));
-        let ring = ControlRing::new(memory).unwrap();
-        let (_, mut consumer) = ring.into_endpoints(
-            ControlRingDirection::Responses,
-            ControlRingDirection::Requests,
-        );
+        let ring = ControlRing::new(memory, LAYOUT).unwrap();
+        let (_, mut consumer) = ring.into_endpoints(RESPONSES, REQUESTS);
 
         assert_eq!(
             consumer.try_read(owned_bytes),
@@ -1577,11 +2030,8 @@ mod tests {
     #[test]
     fn sequence_change_during_body_copy_is_rejected() {
         let memory = TearingMemory::with_changed_sequence(&raw_slot(1, 1, 0, &[7]));
-        let ring = ControlRing::new(memory).unwrap();
-        let (_, mut consumer) = ring.into_endpoints(
-            ControlRingDirection::Responses,
-            ControlRingDirection::Requests,
-        );
+        let ring = ControlRing::new(memory, LAYOUT).unwrap();
+        let (_, mut consumer) = ring.into_endpoints(RESPONSES, REQUESTS);
 
         assert_eq!(
             consumer.try_read(owned_bytes),
@@ -1630,17 +2080,18 @@ mod tests {
     }
 
     fn test_ring() -> ControlRing<TestMemory> {
-        ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE)).unwrap()
+        test_ring_with(LAYOUT)
+    }
+
+    fn test_ring_with(layout: ControlRingLayout) -> ControlRing<TestMemory> {
+        ControlRing::new(TestMemory::new(layout.memory_size()), layout).unwrap()
     }
 
     fn test_endpoints() -> (
         ControlRingProducer<TestMemory>,
         ControlRingConsumer<TestMemory>,
     ) {
-        test_ring().into_endpoints(
-            ControlRingDirection::Requests,
-            ControlRingDirection::Requests,
-        )
+        test_ring().into_endpoints(REQUESTS, REQUESTS)
     }
 
     fn owned_bytes(payload: &[u8]) -> Result<Vec<u8>, ()> {
@@ -1653,14 +2104,10 @@ mod tests {
 
     #[test]
     fn wakes_skip_peers_that_announce_no_wait() {
-        let (mut producer, mut consumer) =
-            ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE))
-                .unwrap()
-                .into_endpoints(
-                    ControlRingDirection::Requests,
-                    ControlRingDirection::Requests,
-                );
-        let direction = ControlRingDirection::Requests;
+        let (mut producer, mut consumer) = ControlRing::new(TestMemory::new(MEMORY_SIZE), LAYOUT)
+            .unwrap()
+            .into_endpoints(REQUESTS, REQUESTS);
+        let direction = REQUESTS;
         assert_eq!(
             producer.try_write(b"x"),
             Ok(ControlRingWriteStatus::Written)
@@ -1696,15 +2143,11 @@ mod tests {
 
     #[test]
     fn waits_announce_themselves_only_while_blocking() {
-        let (mut producer, mut consumer) =
-            ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE))
-                .unwrap()
-                .into_endpoints(
-                    ControlRingDirection::Responses,
-                    ControlRingDirection::Requests,
-                );
-        let requests = ControlRingDirection::Requests;
-        let responses = ControlRingDirection::Responses;
+        let (mut producer, mut consumer) = ControlRing::new(TestMemory::new(MEMORY_SIZE), LAYOUT)
+            .unwrap()
+            .into_endpoints(RESPONSES, REQUESTS);
+        let requests = REQUESTS;
+        let responses = RESPONSES;
         let Ok(ControlRingReadStatus::Empty { wait_epoch }) =
             consumer.try_read(|frame| Ok::<_, ()>(frame.to_vec()))
         else {
@@ -1763,10 +2206,7 @@ mod tests {
 
     fn store_test_consumer_head(memory: &TestMemory, head: u64) {
         memory
-            .store_u64_release(
-                ControlRingDirection::Requests.consumer_head_offset(),
-                head.to_le(),
-            )
+            .store_u64_release(REQUESTS.consumer_head_offset(), head.to_le())
             .unwrap();
     }
 
@@ -1937,7 +2377,7 @@ mod tests {
     impl FailingWriteMemory {
         fn new() -> Self {
             Self {
-                bytes: Mutex::new(vec![0; CONTROL_RING_MEMORY_SIZE]),
+                bytes: Mutex::new(vec![0; MEMORY_SIZE]),
                 write_count: AtomicUsize::new(0),
                 fail_on_write: AtomicUsize::new(usize::MAX),
             }
@@ -2054,7 +2494,7 @@ mod tests {
         }
 
         fn new(first_slot: &[u8; CONTROL_RING_SLOT_SIZE], tear: Tear) -> Self {
-            let mut bytes = vec![0; CONTROL_RING_MEMORY_SIZE];
+            let mut bytes = vec![0; MEMORY_SIZE];
             bytes[..CONTROL_RING_SLOT_SIZE].copy_from_slice(first_slot);
             Self {
                 bytes: Mutex::new(bytes),

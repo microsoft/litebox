@@ -11,8 +11,8 @@ use std::io::{Error, ErrorKind, Read, Result as IoResult};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,17 +30,17 @@ use litebox_broker_protocol::wire::{
     decode_handshake_response, decode_notification, decode_response, encode_handshake_request,
     encode_request,
 };
+use litebox_broker_transport::call_lane_pool::{LaneClaim, LocalCallLanePool};
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_READY, ControlRing, ControlRingConsumer, ControlRingProducer,
-    ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+    ControlRing, ControlRingConsumer, ControlRingLayout, ControlRingReadError,
+    ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+    LocalControlRingEndpoints, LocalControlRingLane, LocalLaneDemand,
 };
-pub use litebox_broker_transport::pending_calls::MAX_PENDING_CALLS;
 
 use crate::memfd::MemfdSharedMemory;
-use crate::pending_calls::{PendingCalls, pending_calls_error};
 use crate::setup::{
     copy_io_error, invalid_data, read_setup_frame, ring_error, shutdown_socket, wire_error,
     write_setup_frame,
@@ -66,22 +66,20 @@ pub struct UnixControlRingLocalShutdown {
     association: Arc<LocalRingAssociation>,
 }
 
+type LocalLane = LocalControlRingLane<MemfdSharedMemory>;
+
 /// State shared by every activated local endpoint of one association: the
-/// request producer, the response consumer read by whichever caller holds the
-/// pending-call reader role, the setup socket used for liveness and teardown,
-/// pending call tracking, and the wake handles of all three ring directions.
+/// call lanes and their demand, the setup socket used for liveness and
+/// teardown, and the wake handles of every ring wait.
 struct LocalRingAssociation {
-    request_producer: Mutex<ControlRingProducer<MemfdSharedMemory>>,
-    response_consumer: Mutex<ControlRingConsumer<MemfdSharedMemory>>,
+    lanes: LocalCallLanePool<LocalLane>,
+    lane_demand: LocalLaneDemand<MemfdSharedMemory>,
     control_stream: UnixStream,
-    pending_calls: Arc<PendingCalls>,
     /// Whether the call channel was dropped, which ends the association as a
     /// local close rather than a failure.
     closed: AtomicBool,
     on_failure: Arc<dyn Fn() + Send + Sync>,
-    request_wake: ControlRingWakeHandle<MemfdSharedMemory>,
-    response_wake: ControlRingWakeHandle<MemfdSharedMemory>,
-    notification_wake: ControlRingWakeHandle<MemfdSharedMemory>,
+    wakes: Vec<ControlRingWakeHandle<MemfdSharedMemory>>,
 }
 
 /// Local notification receiver for a shared-ring Unix broker association.
@@ -137,12 +135,14 @@ impl UnixStreamLocalSetupChannel {
         crate::memfd::receive_memfd(&mut self.stream, expected_len, deadline)
     }
 
-    /// Receives the control-ring memfd offered by the broker during setup.
+    /// Receives the control-ring memfd with `layout` offered by the broker
+    /// during setup.
     pub fn receive_control_ring(
         &mut self,
+        layout: ControlRingLayout,
         deadline: Option<Instant>,
     ) -> IoResult<MemfdSharedMemory> {
-        crate::memfd::receive_control_ring_memfd(&mut self.stream, deadline)
+        crate::memfd::receive_control_ring_memfd(&mut self.stream, layout, deadline)
     }
 
     /// Receives the optional process image offered by the broker during
@@ -159,7 +159,7 @@ impl UnixStreamLocalSetupChannel {
     /// monitor.
     ///
     /// The ring must be the control-ring memfd received during this
-    /// setup exchange.
+    /// setup exchange, with a layout of more than one lane.
     pub fn into_active(
         self,
         ring: ControlRing<MemfdSharedMemory>,
@@ -175,38 +175,42 @@ impl UnixStreamLocalSetupChannel {
             ));
         }
 
+        let ready_token = ring.layout().ready_token();
+        let endpoints = ring.into_local();
+        let wakes = endpoints.wake_handles();
+        let LocalControlRingEndpoints {
+            lanes,
+            lane_demand: Some(lane_demand),
+            notification_consumer,
+        } = endpoints
+        else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "broker control-ring layout has a single lane",
+            ));
+        };
         let mut setup_stream = self.stream;
-        write_setup_frame(&mut setup_stream, CONTROL_RING_READY, self.setup_deadline)?;
+        write_setup_frame(&mut setup_stream, ready_token, self.setup_deadline)?;
         let Some(ready) = read_setup_frame(&mut setup_stream, self.setup_deadline)? else {
             return Err(Error::new(
                 ErrorKind::UnexpectedEof,
                 "broker closed before control-ring setup acknowledgement",
             ));
         };
-        if ready != CONTROL_RING_READY {
+        if ready != ready_token {
             return Err(invalid_data(
                 "broker sent an invalid control-ring setup acknowledgement",
             ));
         }
 
         let shutdown_stream = setup_stream.try_clone()?;
-        let litebox_broker_transport::control_ring::LocalControlRingEndpoints {
-            request_producer,
-            response_consumer,
-            notification_consumer,
-        } = ring.into_local();
-        let pending_calls = Arc::new(PendingCalls::new());
-        let on_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(on_failure);
         let association = Arc::new(LocalRingAssociation {
-            request_wake: request_producer.wake_handle(),
-            request_producer: Mutex::new(request_producer),
+            lanes: LocalCallLanePool::new(lanes),
+            lane_demand,
             control_stream: shutdown_stream,
-            pending_calls: Arc::clone(&pending_calls),
             closed: AtomicBool::new(false),
-            on_failure,
-            response_wake: response_consumer.wake_handle(),
-            response_consumer: Mutex::new(response_consumer),
-            notification_wake: notification_consumer.wake_handle(),
+            on_failure: Arc::new(on_failure),
+            wakes,
         });
         let monitor_association = Arc::clone(&association);
         if let Err(error) = thread::Builder::new()
@@ -338,46 +342,25 @@ impl LocalCallChannel for UnixControlRingLocalCallChannel {
 
     fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
         let association = &self.association;
-        let request_id = request.request_id;
-        let pending_call = association
-            .pending_calls
-            .register(request_id)
-            .map_err(pending_calls_error)?;
-        let request_frame = encode_request(request);
-
-        let write_result = {
-            let mut producer = association
-                .request_producer
-                .lock()
-                .expect("broker request writer mutex poisoned");
-            loop {
-                let write_status = association
-                    .pending_calls
-                    .run_if_live(|| producer.try_write(&request_frame).map_err(ring_error))
-                    .map_err(pending_calls_error);
-                match write_status {
-                    Ok(ControlRingWriteStatus::Written) => {
-                        if let Err(error) = producer.wake_consumer() {
-                            break Err(error);
-                        }
-                        break Ok(());
-                    }
-                    Ok(ControlRingWriteStatus::Full { wait_epoch }) => {
-                        if let Err(error) = producer.wait_for_capacity(wait_epoch) {
-                            break Err(error);
-                        }
-                    }
-                    Err(error) => break Err(error),
-                }
+        let mut lane = match association
+            .lanes
+            .claim(|lanes| association.demand_lanes(lanes))
+        {
+            Ok(lane) => lane,
+            Err(error) => {
+                let result = Err(copy_io_error(&error));
+                let _ = association.fail(error);
+                return result;
             }
         };
-        if let Err(error) = write_result {
-            let _ = association.fail(error);
+        let result = association.call_on_lane(&mut lane, request);
+        // A failed call can leave its lane mid-exchange: fail the association
+        // before freeing the lane, so no other call uses it.
+        if let Err(error) = &result {
+            let _ = association.fail(copy_io_error(error));
         }
-
-        pending_call
-            .wait(|| association.read_response())
-            .map_err(|error| copy_io_error(&error))
+        drop(lane);
+        result
     }
 }
 
@@ -386,8 +369,8 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
 
     fn recv_notification(&mut self) -> IoResult<Option<BrokerNotification>> {
         loop {
-            if let Some(error) = self.association.pending_calls.current_failure() {
-                return self.association.end_notifications(&error);
+            if let Some(error) = self.association.lanes.current_failure() {
+                return self.association.end_notifications(error);
             }
             match self.consumer.try_read(decode_notification) {
                 Ok(ControlRingReadStatus::Message(notification)) => {
@@ -395,13 +378,13 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
                         .association
                         .acknowledge_notification(&mut self.consumer)
                     {
-                        return self.association.end_notifications(&error);
+                        return self.association.end_notifications(error);
                     }
                     return Ok(Some(notification));
                 }
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                    if let Some(error) = self.association.pending_calls.current_failure() {
-                        return self.association.end_notifications(&error);
+                    if let Some(error) = self.association.lanes.current_failure() {
+                        return self.association.end_notifications(error);
                     }
                     if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
                         let result = Err(copy_io_error(&error));
@@ -429,11 +412,11 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
 impl LocalRingAssociation {
     /// Ends notification receipt once the association has ended with
     /// `failure`: cleanly if the local side closed it.
-    fn end_notifications(&self, failure: &Error) -> IoResult<Option<BrokerNotification>> {
+    fn end_notifications(&self, failure: Error) -> IoResult<Option<BrokerNotification>> {
         if self.closed.load(Ordering::Acquire) {
             Ok(None)
         } else {
-            Err(copy_io_error(failure))
+            Err(failure)
         }
     }
 
@@ -441,15 +424,12 @@ impl LocalRingAssociation {
         &self,
         consumer: &mut ControlRingConsumer<MemfdSharedMemory>,
     ) -> IoResult<()> {
-        let result = self
-            .pending_calls
-            .run_if_live(|| {
-                consumer
-                    .publish_head()
-                    .map_err(ring_error)
-                    .and_then(|()| consumer.wake_producer())
-            })
-            .map_err(pending_calls_error);
+        let result = self.lanes.run_if_live(|| {
+            consumer
+                .publish_head()
+                .map_err(ring_error)
+                .and_then(|()| consumer.wake_producer())
+        });
         if let Err(error) = result {
             let result = Err(copy_io_error(&error));
             let _ = self.fail(error);
@@ -458,64 +438,74 @@ impl LocalRingAssociation {
         Ok(())
     }
 
-    /// Reads one response for the caller holding the pending-call reader
-    /// role, blocking until one arrives or the association fails.
-    fn read_response(&self) {
-        let mut consumer = self
-            .response_consumer
-            .lock()
-            .expect("broker response reader mutex poisoned");
+    /// Raises the lane demand to `lanes` and wakes the broker to serve them.
+    fn demand_lanes(&self, lanes: usize) -> IoResult<()> {
+        self.lane_demand.request(lanes).map_err(ring_error)?;
+        self.lane_demand.wake_broker()
+    }
+
+    /// Writes `request` to `lane` and reads the broker's response from it,
+    /// releasing the lane once the call succeeds.
+    fn call_on_lane(
+        &self,
+        lane: &mut LaneClaim<'_, LocalLane>,
+        request: BrokerRequest,
+    ) -> IoResult<BrokerResponse> {
+        let request_id = request.request_id;
+        let request_frame = encode_request(request);
+        let producer = &mut lane.request_producer;
         loop {
-            match consumer.try_read(decode_response) {
-                Ok(ControlRingReadStatus::Message(response)) => {
-                    if let Err(error) = consumer
-                        .publish_head()
-                        .map_err(ring_error)
-                        .and_then(|()| consumer.wake_producer())
-                        .and_then(|()| {
-                            self.pending_calls
-                                .complete(response)
-                                .map_err(pending_calls_error)
-                        })
-                    {
-                        let _ = self.fail(error);
-                    }
-                    return;
-                }
-                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                    if self.pending_calls.current_failure().is_some() {
-                        return;
-                    }
-                    if let Err(error) = consumer.wait_for_message(wait_epoch) {
-                        let _ = self.fail(error);
-                        return;
-                    }
-                }
-                Err(ControlRingReadError::Ring(error)) => {
-                    let _ = self.fail(ring_error(error));
-                    return;
-                }
-                Err(ControlRingReadError::Decode(error)) => {
-                    let _ = self.fail(wire_error(error));
-                    return;
+            let write_status = self
+                .lanes
+                .run_if_live(|| producer.try_write(&request_frame).map_err(ring_error))?;
+            match write_status {
+                ControlRingWriteStatus::Written => break,
+                ControlRingWriteStatus::Full { wait_epoch } => {
+                    producer.wait_for_capacity(wait_epoch)?;
                 }
             }
         }
+        producer.wake_consumer()?;
+
+        let consumer = &mut lane.response_consumer;
+        let response = loop {
+            match consumer.try_read(decode_response) {
+                Ok(ControlRingReadStatus::Message(response)) => break response,
+                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                    if let Some(error) = self.lanes.current_failure() {
+                        return Err(error);
+                    }
+                    consumer.wait_for_message(wait_epoch)?;
+                }
+                Err(ControlRingReadError::Ring(error)) => return Err(ring_error(error)),
+                Err(ControlRingReadError::Decode(error)) => return Err(wire_error(error)),
+            }
+        };
+        if response.request_id != request_id {
+            return Err(invalid_data("broker answered a different request"));
+        }
+        // Accepting the response with the lane's release excludes failure
+        // recording, so no call succeeds once the association has failed.
+        lane.release_if_live(|lane| {
+            let consumer = &mut lane.response_consumer;
+            consumer.publish_head().map_err(ring_error)?;
+            consumer.wake_producer()
+        })?;
+        Ok(response)
     }
 
     fn fail(&self, error: Error) -> IoResult<()> {
-        let first_failure = self.pending_calls.record_failure(Arc::new(error));
-        let request_wake = self.request_wake.interrupt_wait();
-        let response_wake = self.response_wake.interrupt_wait();
-        let notification_wake = self.notification_wake.interrupt_wait();
+        let first_failure = self.lanes.record_failure(error);
+        let wakes = self
+            .wakes
+            .iter()
+            .map(ControlRingWakeHandle::interrupt_wait)
+            .fold(Ok(()), IoResult::and);
         let shutdown_result = shutdown_socket(&self.control_stream);
         if first_failure {
             (self.on_failure)();
         }
-        request_wake
-            .and(response_wake)
-            .and(notification_wake)
-            .and(shutdown_result)
+        wakes.and(shutdown_result)
     }
 }
 
@@ -554,6 +544,9 @@ mod control_ring_tests {
     };
     use litebox_broker_protocol::{ObjectHandle, RequestId};
     use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_transport::control_ring::{
+        ControlRingDemandStatus, ControlRingProducer, HostControlRingEndpoints,
+    };
     use rustix::fs::{OFlags, fcntl_getfl};
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
@@ -564,6 +557,9 @@ mod control_ring_tests {
 
     type Producer = ControlRingProducer<MemfdSharedMemory>;
     type Consumer = ControlRingConsumer<MemfdSharedMemory>;
+    type Broker = HostControlRingEndpoints<MemfdSharedMemory>;
+
+    const LAYOUT: ControlRingLayout = ControlRingLayout::MULTI_LANE;
 
     struct TestSocketPath(PathBuf);
 
@@ -615,14 +611,15 @@ mod control_ring_tests {
         ControlRing<MemfdSharedMemory>,
         ControlRing<MemfdSharedMemory>,
     ) {
-        let first = MemfdSharedMemory::create_control_ring().unwrap();
+        let first = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
         let second = MemfdSharedMemory::control_ring_from_received_fd(
             first.as_fd().try_clone_to_owned().unwrap(),
+            LAYOUT,
         )
         .unwrap();
         (
-            ControlRing::new(first).unwrap(),
-            ControlRing::new(second).unwrap(),
+            ControlRing::new(first, LAYOUT).unwrap(),
+            ControlRing::new(second, LAYOUT).unwrap(),
         )
     }
 
@@ -640,8 +637,7 @@ mod control_ring_tests {
         UnixControlRingLocalCallChannel,
         UnixControlRingLocalNotificationChannel,
         UnixControlRingLocalShutdown,
-        Producer,
-        Consumer,
+        Broker,
         UnixStream,
     ) {
         let (local_stream, peer_stream) = UnixStream::pair().unwrap();
@@ -649,25 +645,19 @@ mod control_ring_tests {
         let acknowledgement = thread::spawn(move || {
             assert_eq!(
                 read_setup_frame(&mut ack_stream, None).unwrap().unwrap(),
-                CONTROL_RING_READY
+                LAYOUT.ready_token()
             );
-            write_setup_frame(&mut ack_stream, CONTROL_RING_READY, None).unwrap();
+            write_setup_frame(&mut ack_stream, LAYOUT.ready_token(), None).unwrap();
         });
         let (local_ring, broker_ring) = ring_pair();
         let setup = negotiated_local(local_stream);
         let (channel, notifications, shutdown) = setup.into_active(local_ring, on_failure).unwrap();
         acknowledgement.join().unwrap();
-        let litebox_broker_transport::control_ring::BrokerControlRingEndpoints {
-            request_consumer,
-            response_producer,
-            notification_producer: _,
-        } = broker_ring.into_broker();
         (
             channel,
             notifications,
             shutdown,
-            response_producer,
-            request_consumer,
+            broker_ring.into_host(),
             peer_stream,
         )
     }
@@ -759,9 +749,9 @@ mod control_ring_tests {
         let acknowledgement = thread::spawn(move || {
             assert_eq!(
                 read_setup_frame(&mut host_stream, None).unwrap().unwrap(),
-                CONTROL_RING_READY
+                LAYOUT.ready_token()
             );
-            write_setup_frame(&mut host_stream, CONTROL_RING_READY, None).unwrap();
+            write_setup_frame(&mut host_stream, LAYOUT.ready_token(), None).unwrap();
             host_stream
         });
         let (ring, _) = ring_pair();
@@ -777,9 +767,21 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn local_matches_out_of_order_ring_responses_without_socket_frames() {
-        let (channel, _notifications, _shutdown, mut responses, mut requests, mut peer) =
-            activate_local(|| {});
+    fn single_lane_layouts_are_rejected() {
+        let layout = ControlRingLayout::SINGLE_LANE;
+        let memory = MemfdSharedMemory::create_control_ring(layout).unwrap();
+        let (local_stream, _peer) = UnixStream::pair().unwrap();
+        let Err(error) = negotiated_local(local_stream)
+            .into_active(ControlRing::new(memory, layout).unwrap(), || {})
+        else {
+            panic!("a single-lane layout was activated");
+        };
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn concurrent_calls_use_separate_lanes_without_socket_frames() {
+        let (channel, _notifications, _shutdown, mut broker, mut peer) = activate_local(|| {});
         peer.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let channel = Arc::new(channel);
@@ -787,17 +789,38 @@ mod control_ring_tests {
             let channel = Arc::clone(&channel);
             thread::spawn(move || channel.call(request(id)))
         });
-        let first = read_request(&mut requests);
-        let second = read_request(&mut requests);
+        let demand = broker.lane_demand.as_mut().unwrap();
+        assert_eq!(demand.try_next_lane(), Ok(ControlRingDemandStatus::Lane(0)));
+        loop {
+            match demand.try_next_lane().unwrap() {
+                ControlRingDemandStatus::Lane(lane) => {
+                    assert_eq!(lane, 1);
+                    break;
+                }
+                ControlRingDemandStatus::Satisfied { wait_epoch } => {
+                    demand.wait_for_demand(wait_epoch).unwrap();
+                }
+            }
+        }
+        let first = read_request(&mut broker.lanes[0].request_consumer);
+        let second = read_request(&mut broker.lanes[1].request_consumer);
 
+        // The later lane answers first; neither call waits for the other.
         write_payload(
-            &mut responses,
+            &mut broker.lanes[1].response_producer,
             &encode_response(response(second.request_id)),
         );
-        write_payload(&mut responses, &encode_response(response(first.request_id)));
+        write_payload(
+            &mut broker.lanes[0].response_producer,
+            &encode_response(response(first.request_id)),
+        );
         for call in calls {
             assert!(call.join().unwrap().is_ok());
         }
+        assert!(matches!(
+            demand.try_next_lane(),
+            Ok(ControlRingDemandStatus::Satisfied { .. })
+        ));
         let mut byte = [0];
         assert!(matches!(
             peer.read(&mut byte).unwrap_err().kind(),
@@ -806,12 +829,38 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn unknown_duplicate_and_malformed_responses_fail_closed() {
+    fn sequential_calls_reuse_the_first_lane() {
+        let (channel, _notifications, _shutdown, mut broker, _peer) = activate_local(|| {});
+        let channel = Arc::new(channel);
+        for id in 1..=3 {
+            let caller = {
+                let channel = Arc::clone(&channel);
+                thread::spawn(move || channel.call(request(id)))
+            };
+            let lane = &mut broker.lanes[0];
+            let request = read_request(&mut lane.request_consumer);
+            assert_eq!(request.request_id, RequestId(id));
+            write_payload(
+                &mut lane.response_producer,
+                &encode_response(response(request.request_id)),
+            );
+            assert_eq!(caller.join().unwrap().unwrap().request_id, RequestId(id));
+        }
+        let demand = broker.lane_demand.as_mut().unwrap();
+        assert_eq!(demand.try_next_lane(), Ok(ControlRingDemandStatus::Lane(0)));
+        assert!(matches!(
+            demand.try_next_lane(),
+            Ok(ControlRingDemandStatus::Satisfied { .. })
+        ));
+    }
+
+    #[test]
+    fn mismatched_and_malformed_responses_fail_closed() {
         for payload_kind in 0..3 {
             let failures = Arc::new(AtomicUsize::new(0));
             let callback_failures = Arc::clone(&failures);
             let (failure_reported, wait_for_failure) = mpsc::channel();
-            let (channel, _notifications, _shutdown, mut responses, mut requests, _peer) =
+            let (channel, _notifications, _shutdown, mut broker, _peer) =
                 activate_local(move || {
                     callback_failures.fetch_add(1, Ordering::SeqCst);
                     failure_reported.send(()).unwrap();
@@ -821,22 +870,19 @@ mod control_ring_tests {
                 let channel = Arc::clone(&channel);
                 thread::spawn(move || channel.call(request(id)))
             });
-            read_request(&mut requests);
-            read_request(&mut requests);
+            read_request(&mut broker.lanes[0].request_consumer);
+            let other = read_request(&mut broker.lanes[1].request_consumer);
 
+            let producer = &mut broker.lanes[0].response_producer;
             match payload_kind {
-                0 => write_payload(&mut responses, &encode_response(response(RequestId(99)))),
-                1 => {
-                    let duplicate = encode_response(response(RequestId(1)));
-                    write_payload(&mut responses, &duplicate);
-                    write_payload(&mut responses, &duplicate);
-                }
-                _ => write_payload(&mut responses, &[u8::MAX]),
+                0 => write_payload(producer, &encode_response(response(RequestId(99)))),
+                1 => write_payload(producer, &encode_response(response(other.request_id))),
+                _ => write_payload(producer, &[u8::MAX]),
             }
 
-            let results = calls.map(|call| call.join().unwrap());
-            let error_count = results.iter().filter(|result| result.is_err()).count();
-            assert_eq!(error_count, if payload_kind == 1 { 1 } else { 2 });
+            for call in calls {
+                assert!(call.join().unwrap().is_err());
+            }
             wait_for_failure
                 .recv_timeout(Duration::from_secs(1))
                 .expect("failure callback was not invoked");
@@ -845,25 +891,36 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn local_socket_eof_and_shutdown_wake_pending_calls() {
+    fn local_socket_eof_and_shutdown_wake_waiting_calls() {
         for close_peer in [false, true] {
-            let (channel, _notifications, shutdown, _responses, mut requests, peer) =
-                activate_local(|| {});
-            let caller = thread::spawn(move || channel.call(request(1)));
-            read_request(&mut requests);
+            let (channel, _notifications, shutdown, mut broker, peer) = activate_local(|| {});
+            let channel = Arc::new(channel);
+            let call = |id| {
+                let channel = Arc::clone(&channel);
+                thread::spawn(move || channel.call(request(id)))
+            };
+            let callers: Vec<_> = (0..LAYOUT.lane_count() as u64).map(call).collect();
+            for lane in &mut broker.lanes {
+                read_request(&mut lane.request_consumer);
+            }
+            // Every lane is held, so this call waits to claim one.
+            let waiting = call(u64::MAX);
+            thread::sleep(Duration::from_millis(10));
             if close_peer {
                 drop(peer);
             } else {
                 shutdown.shutdown().unwrap();
             }
-            assert!(caller.join().unwrap().is_err());
+            for caller in callers {
+                assert!(caller.join().unwrap().is_err());
+            }
+            assert!(waiting.join().unwrap().is_err());
         }
     }
 
     #[test]
     fn dropping_the_call_channel_ends_notifications_cleanly() {
-        let (channel, mut notifications, _shutdown, _responses, _requests, _peer) =
-            activate_local(|| {});
+        let (channel, mut notifications, _shutdown, _broker, _peer) = activate_local(|| {});
         let receiver = thread::spawn(move || notifications.recv_notification());
         drop(channel);
         assert!(receiver.join().unwrap().unwrap().is_none());
@@ -974,36 +1031,8 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn completed_call_wins_over_later_failure_and_failure_wins_before_completion() {
-        let pending = PendingCalls::new();
-        let completed = pending.register(RequestId(1)).unwrap();
-        pending.complete(response(RequestId(1))).unwrap();
-        pending.record_failure(Arc::new(Error::new(
-            ErrorKind::ConnectionAborted,
-            "test failure",
-        )));
-        assert_eq!(
-            completed.wait(|| unreachable!()).unwrap().request_id,
-            RequestId(1)
-        );
-
-        let pending = PendingCalls::new();
-        let failed = pending.register(RequestId(2)).unwrap();
-        pending.record_failure(Arc::new(Error::new(
-            ErrorKind::ConnectionAborted,
-            "test failure",
-        )));
-        assert!(pending.complete(response(RequestId(2))).is_err());
-        assert_eq!(
-            failed.wait(|| unreachable!()).unwrap_err().kind(),
-            ErrorKind::ConnectionAborted
-        );
-    }
-
-    #[test]
     fn failure_recording_waits_for_in_progress_publication() {
-        let pending = Arc::new(PendingCalls::new());
-        let pending_call = pending.register(RequestId(1)).unwrap();
+        let pending = Arc::new(LocalCallLanePool::new(vec![()]));
         let publication_state = Arc::new(AtomicUsize::new(0));
         let (publication_started, wait_for_publication) = std::sync::mpsc::sync_channel(0);
         let (release_publication, publication_released) = std::sync::mpsc::sync_channel(0);
@@ -1028,10 +1057,8 @@ mod control_ring_tests {
         let failure_state = Arc::clone(&publication_state);
         let failure = thread::spawn(move || {
             failure_started.send(()).unwrap();
-            failure_pending.record_failure(Arc::new(Error::new(
-                ErrorKind::ConnectionAborted,
-                "test failure",
-            )));
+            failure_pending
+                .record_failure(Error::new(ErrorKind::ConnectionAborted, "test failure"));
             assert_eq!(failure_state.load(Ordering::Acquire), 2);
             failure_recorded.send(()).unwrap();
         });
@@ -1047,24 +1074,9 @@ mod control_ring_tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         failure.join().unwrap();
-        assert_eq!(
-            pending_call.wait(|| unreachable!()).unwrap_err().kind(),
-            ErrorKind::ConnectionAborted
-        );
-    }
-
-    #[test]
-    fn duplicate_pending_registration_preserves_original() {
-        let pending = PendingCalls::new();
-        let original = pending.register(RequestId(1)).unwrap();
-        let Err(error) = pending.register(RequestId(1)).map_err(pending_calls_error) else {
-            panic!("duplicate registration unexpectedly succeeded");
-        };
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
-        pending.complete(response(RequestId(1))).unwrap();
-        assert_eq!(
-            original.wait(|| unreachable!()).unwrap().request_id,
-            RequestId(1)
-        );
+        assert!(matches!(
+            pending.claim(|_| Ok(())),
+            Err(error) if error.kind() == ErrorKind::ConnectionAborted
+        ));
     }
 }

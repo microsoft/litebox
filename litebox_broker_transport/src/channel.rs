@@ -129,40 +129,52 @@ pub trait HostNotificationChannel {
     ///
     /// An error is terminal when this channel is part of an active
     /// association. Before returning it, the transport must terminate that
-    /// association and unblock its request, response, notification, and
-    /// shutdown endpoints. This lets the association runtime preserve a clean
-    /// peer close while relying on the request endpoint to report transport
-    /// failures.
+    /// association and unblock its call-lane, notification, and shutdown
+    /// endpoints. This lets the association runtime preserve a clean peer
+    /// close while relying on the call lanes to report transport failures.
     fn send_notification(&mut self, notification: &BrokerNotification) -> Result<(), Self::Error>;
 }
 
-/// Host-side endpoint that reads active broker requests from an association's
-/// peer.
+/// Host-side serving end of one call lane of an active association.
 ///
-/// This is the request-reading half of an active association's control
-/// transport. It is transport-neutral so a generic association runtime,
-/// such as the one in `litebox_broker_userland`, can dispatch requests without
-/// depending on a concrete transport crate.
-pub trait HostRequestSource {
+/// A lane carries one call at a time: the broker reads a request from it and
+/// answers that request on the same lane before reading the next. Calls on
+/// different lanes are independent, so a broker can serve each lane on its
+/// own thread. The trait is transport-neutral so a generic association
+/// runtime, such as the one in `litebox_broker_userland`, can serve calls
+/// without depending on a concrete transport crate.
+pub trait HostCallLane {
     /// Channel-specific error type.
     type Error;
 
-    /// Receives one active broker request.
+    /// Receives this lane's next broker request.
     fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
+
+    /// Serializes and sends the response to this lane's last request.
+    fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;
 }
 
-/// Host-side endpoint that publishes active broker responses to an
-/// association's peer.
+/// Host-side source of the call lanes of an active association.
 ///
-/// This is the response-writing half of an active association's control
-/// transport. Implementations are typically cheaply [`Clone`]able so
-/// concurrent request workers can each hold one.
-pub trait HostResponseSink {
+/// The local peer starts using lanes as its concurrent calls grow, and this
+/// source hands out each lane once the local peer starts using it, so a broker
+/// serves only lanes in use. The local peer always uses the first lane, so the
+/// first [`next_lane`](Self::next_lane) returns it without blocking unless the
+/// association has already ended.
+pub trait HostCallLaneSource {
     /// Channel-specific error type.
     type Error;
 
-    /// Serializes and sends one complete active broker response.
-    fn send_response(&self, response: &BrokerResponse) -> Result<(), Self::Error>;
+    /// Lane type handed out by this source.
+    type Lane: HostCallLane<Error = Self::Error>;
+
+    /// Blocks until the local peer starts using another lane and returns it.
+    ///
+    /// Once every lane is handed out, this blocks until the association ends.
+    /// Returns `Ok(None)` when the local peer closed the association cleanly.
+    /// An error is terminal: before returning it, the transport must terminate
+    /// the association and unblock every endpoint.
+    fn next_lane(&mut self) -> Result<Option<Self::Lane>, Self::Error>;
 }
 
 /// RAII-independent shutdown handle for an active broker association.

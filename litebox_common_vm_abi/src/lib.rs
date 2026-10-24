@@ -194,8 +194,8 @@
 //!   no further request.
 //! - A malformed ring or request kills the process. Before the handshake, a
 //!   futex operation on the control ring is [`Status::Denied`]; on the ring,
-//!   only the words that `litebox_broker_transport`'s
-//!   `MemoryAccessPolicy::ControlRing` lets a peer access as `u32` are valid.
+//!   only the words that `litebox_broker_transport`'s single-lane
+//!   `ControlRingLayout` lets a peer access as `u32` are valid.
 
 #![no_std]
 

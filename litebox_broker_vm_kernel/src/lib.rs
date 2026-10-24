@@ -80,9 +80,8 @@ use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER
 use litebox_broker_protocol::wire;
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::control_ring::{
-    BrokerControlRingEndpoints, CONTROL_RING_MEMORY_SIZE, ControlRing, ControlRingConsumer,
-    ControlRingDirection, ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus,
-    MemoryAccessPolicy,
+    ControlRing, ControlRingConsumer, ControlRingLayout, ControlRingProducer,
+    ControlRingReadStatus, ControlRingWriteStatus, HostControlRingEndpoints,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool};
 use litebox_common_vm_abi::{Status, UserRange, WireFrame};
@@ -99,8 +98,12 @@ use timers::KernelTimers;
 /// Size of a process's broker shared memory.
 pub const SHARED_MEMORY_SIZE: usize = SHARED_BUFFER_POOL_SIZE;
 
+/// Layout of a process's broker control ring: the kernel serves one call at a
+/// time, so a single lane.
+pub const CONTROL_RING_LAYOUT: ControlRingLayout = ControlRingLayout::SINGLE_LANE;
+
 /// Size of a process's broker control ring.
-pub const CONTROL_RING_SIZE: usize = CONTROL_RING_MEMORY_SIZE;
+pub const CONTROL_RING_SIZE: usize = CONTROL_RING_LAYOUT.memory_size();
 
 /// What the broker waits for: the runner's event sources (e.g., device
 /// interrupts and a timer).
@@ -272,7 +275,8 @@ impl Broker {
     ) -> Association {
         let memory =
             PinnedControlRing::new(control_ring_pages).expect("the pages hold the control ring");
-        let ring = ControlRing::new(memory).expect("a pinned control ring has the exact size");
+        let ring = ControlRing::new(memory, CONTROL_RING_LAYOUT)
+            .expect("a pinned control ring has the exact size");
         Association {
             broker: self.clone(),
             shared_memory,
@@ -568,16 +572,18 @@ impl Association {
                 return Err(Status::Denied);
             }
             let words = ring.memory().clone();
-            let BrokerControlRingEndpoints {
-                request_consumer,
-                response_producer,
+            let HostControlRingEndpoints {
+                lanes,
+                lane_demand: _,
                 notification_producer,
-            } = ring.into_broker();
+            } = ring.into_host();
+            let [lane] = <[_; 1]>::try_from(lanes)
+                .unwrap_or_else(|_| unreachable!("a single-lane layout has one lane"));
             self.readiness.activate(notification_producer);
             *state = State::Active(Box::new(Active {
                 association: host,
-                requests: request_consumer,
-                responses: response_producer,
+                requests: lane.request_consumer,
+                responses: lane.response_producer,
                 words,
                 overflow: None,
             }));
@@ -600,12 +606,12 @@ impl Association {
         if !matches!(*self.state.borrow(), State::Active(_)) {
             return Err(EnterError::Status(Status::Denied));
         }
-        if !MemoryAccessPolicy::ControlRing.permits_u32(offset) {
+        if !CONTROL_RING_LAYOUT.permits_u32(offset) {
             return Err(EnterError::Status(Status::InvalidArgument));
         }
         let wait = match op {
             RingFutex::Wake => {
-                if offset != ControlRingDirection::Requests.producer_epoch_offset() {
+                if offset != CONTROL_RING_LAYOUT.requests(0).producer_epoch_offset() {
                     // The broker waits on no other word.
                     return Ok(Entered::Done);
                 }
@@ -616,7 +622,7 @@ impl Association {
                 expected,
                 deadline,
                 notifications: offset
-                    == ControlRingDirection::Notifications.producer_epoch_offset(),
+                    == CONTROL_RING_LAYOUT.notifications().producer_epoch_offset(),
             }),
         };
         self.submitted.set(true);
@@ -1079,14 +1085,17 @@ impl ProcessLauncher for KernelProcessLauncher {
 
 #[cfg(test)]
 mod tests {
-    use litebox_broker_transport::control_ring::CONTROL_RING_READY;
+    use super::CONTROL_RING_LAYOUT;
 
     /// `ABI_VERSION` stands in for the userland broker's ring-layout token;
     /// change both together.
     #[test]
     fn ring_layout_change_needs_an_abi_version_change() {
         assert_eq!(
-            (CONTROL_RING_READY, litebox_common_vm_abi::ABI_VERSION),
+            (
+                CONTROL_RING_LAYOUT.ready_token(),
+                litebox_common_vm_abi::ABI_VERSION
+            ),
             (&b"litebox-control-ring-ready-v1"[..], 1)
         );
     }

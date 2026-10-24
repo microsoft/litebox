@@ -4,11 +4,11 @@
 //! The association's shared memory: the shared buffers in the process's lazy
 //! mapping, and the control ring in pinned pages.
 
+use crate::{CONTROL_RING_LAYOUT, CONTROL_RING_SIZE};
 use alloc::sync::Arc;
 use core::ops::Range;
 use litebox::mm::exception_table::memcpy_fallible;
 use litebox::platform::common_providers::userspace_pointers::ValidateAccess as _;
-use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, MemoryAccessPolicy};
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use litebox_common_vm_abi::UserRange;
 use litebox_platform::buffer::Fault;
@@ -71,14 +71,14 @@ impl SharedMemory for UserSharedMemory {
 }
 
 /// The control ring at the start of pinned pages, through the kernel's
-/// mapping. Accesses keep to [`MemoryAccessPolicy::ControlRing`].
+/// mapping. Accesses keep to [`CONTROL_RING_LAYOUT`].
 #[derive(Clone)]
 pub(crate) struct PinnedControlRing(Arc<PinnedUserPages>);
 
 impl PinnedControlRing {
     /// `None` if `pages` cannot hold the ring.
     pub(crate) fn new(pages: PinnedUserPages) -> Option<Self> {
-        (pages.len() >= CONTROL_RING_MEMORY_SIZE).then_some(Self(Arc::new(pages)))
+        (pages.len() >= CONTROL_RING_SIZE).then_some(Self(Arc::new(pages)))
     }
 
     fn word<T>(&self, offset: usize, permitted: bool) -> Result<*mut T, SharedMemoryError> {
@@ -97,11 +97,11 @@ impl PinnedControlRing {
     }
 
     fn u32_at(&self, offset: usize) -> Result<*mut u32, SharedMemoryError> {
-        self.word(offset, MemoryAccessPolicy::ControlRing.permits_u32(offset))
+        self.word(offset, CONTROL_RING_LAYOUT.permits_u32(offset))
     }
 
     fn u64_at(&self, offset: usize) -> Result<*mut u64, SharedMemoryError> {
-        self.word(offset, MemoryAccessPolicy::ControlRing.permits_u64(offset))
+        self.word(offset, CONTROL_RING_LAYOUT.permits_u64(offset))
     }
 
     /// Calls `copy` for each page's part of `offset..offset + len`, with that
@@ -112,7 +112,7 @@ impl PinnedControlRing {
         len: usize,
         mut copy: impl FnMut(*mut u8, Range<usize>),
     ) -> Result<(), SharedMemoryError> {
-        if !MemoryAccessPolicy::ControlRing.permits_byte_range(offset, len) {
+        if !CONTROL_RING_LAYOUT.permits_byte_range(offset, len) {
             return Err(SharedMemoryError::InvalidRange);
         }
         let mut done = 0;
@@ -133,7 +133,7 @@ impl PinnedControlRing {
 // (checked), and disjoint from private memory.
 impl SharedMemory for PinnedControlRing {
     fn len(&self) -> usize {
-        CONTROL_RING_MEMORY_SIZE
+        CONTROL_RING_SIZE
     }
 
     fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
