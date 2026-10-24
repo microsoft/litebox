@@ -386,6 +386,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
+        padding: Option<&[u8; 16]>,
     ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
         let litebox_common_linux::TaskParams {
             pid,
@@ -434,6 +435,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             loader::elf::ElfLoader::new(&entrypoints.task, &path)?,
             argv,
             envp,
+            padding,
         )?;
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
