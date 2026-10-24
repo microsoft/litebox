@@ -121,12 +121,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
         .init();
 
-    if !cli_args.insert_files.is_empty() {
-        unimplemented!(
-            "this should (hopefully soon) have a nicer interface to support loading in files"
-        )
-    }
-
     // When loading from tar, the program path is a guest-internal path and must
     // be absolute — LiteBox does not resolve programs via PATH.
     if cli_args.program_from_tar && !cli_args.program_and_arguments[0].starts_with('/') {
@@ -139,15 +133,53 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
 
+    #[allow(clippy::type_complexity)]
+    let mut in_memory_initial_fs_entries: Vec<(
+        Vec<(litebox::fs::Mode, u32)>,
+        alloc::borrow::Cow<'static, [u8]>,
+        PathBuf,
+    )> = vec![];
+
+    // Start building the list of files to go into the in-memory initial FS
+    // based on the files that the user requested be inserted.
+    for file_to_insert in cli_args.insert_files {
+        let prog = std::path::absolute(Path::new(&file_to_insert)).unwrap();
+        if !prog.exists() {
+            anyhow::bail!(format!(
+                "file not found on host filesystem: {}",
+                prog.display()
+            ));
+        }
+        let ancestors: Vec<_> = prog.ancestors().collect();
+        let modes: Vec<_> = ancestors
+            .into_iter()
+            .rev()
+            .skip(1)
+            .map(|path| {
+                let metadata = path.metadata().unwrap();
+                (
+                    litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
+                    metadata.st_uid(),
+                )
+            })
+            .collect();
+        let file = mmapped_file(&prog)?;
+        let data = if cli_args.rewrite_syscalls {
+            let rewritten = litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
+                .with_context(|| format!("failed to rewrite {}", prog.display()))?;
+            rewritten.into()
+        } else {
+            let data = file.data.into();
+            cow_eligible_regions.push(file);
+            data
+        };
+        in_memory_initial_fs_entries.push((modes, data, prog));
+    }
+
     // When --program-from-tar is set, the program binary is already in the tar file,
     // so we skip reading it from the host filesystem and skip extracting ancestor modes.
-    #[allow(clippy::type_complexity)]
-    let (ancestor_modes_and_users, prog_data): (
-        Vec<(litebox::fs::Mode, u32)>,
-        Option<alloc::borrow::Cow<'static, [u8]>>,
-    ) = if cli_args.program_from_tar {
-        (Vec::new(), None)
-    } else {
+    if !cli_args.program_from_tar {
+        // Add the program binary to the list of files to go into the in-memory initial FS.
         let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
         if !prog.exists() {
             let mut msg = format!("program not found on host filesystem: {}", prog.display());
@@ -182,8 +214,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             cow_eligible_regions.push(file);
             data
         };
-        (modes, Some(data))
-    };
+        in_memory_initial_fs_entries.push((modes, data, prog));
+    }
+
     let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
             anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
@@ -234,11 +267,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         };
         let mut entries: Vec<(String, litebox::fs::in_mem::InitialNode)> = Vec::new();
 
-        // When loading the program from the tar, we don't need to create ancestor
-        // directories or write the program binary into the in-memory FS -- the program
-        // is already in the tar layer.
-        if let Some(prog_data) = prog_data {
-            let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        // Create the initial in-memory FS from the list of entries built during initialization.
+        for (ancestor_modes_and_users, prog_data, prog) in in_memory_initial_fs_entries {
             let ancestors: Vec<_> = prog.ancestors().collect();
             let mut prev_user = 0;
             for (path, &mode_and_user) in ancestors
@@ -258,7 +288,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 prev_user = mode_and_user.1;
             }
             let last = ancestor_modes_and_users.last().ok_or_else(|| {
-                anyhow!("program path has no ancestor directories (is it the root path?)")
+                anyhow!("{} path has no ancestor directories (is it the root path?)", prog.display())
             })?;
             entries.push((
                 prog.to_str().unwrap().to_owned(),
@@ -293,6 +323,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 .map(|(path, node)| (path.to_owned(), node))
                 .chain(entries),
         );
+
         shim_builder.default_fs(in_mem, tar_data.into())
     };
 
