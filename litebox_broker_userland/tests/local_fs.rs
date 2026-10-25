@@ -12,6 +12,8 @@ use std::os::unix::{
 #[cfg(windows)]
 use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(unix)]
 use litebox_broker_core::fs::SeekWhence;
@@ -28,7 +30,14 @@ use litebox_broker_core::fs::errors::{OpenError, PathError, WalkError};
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::{Mode, OFlags, UserInfo};
+use litebox_broker_protocol::shared_buffer::{
+    SharedBufferLayout, SharedBufferSequence, SharedBufferSlotIndex,
+};
+use litebox_broker_transport::shared_memory::{
+    HeapSharedMemory, SharedBufferPool, SharedMemory, SharedMemoryError,
+};
 use litebox_broker_userland::fs::LocalFs;
+use litebox_platform::buffer::{RawBytes, ReadBuffer, WriteBuffer};
 
 const USER: UserInfo = UserInfo {
     user: 123,
@@ -84,6 +93,79 @@ fn canonical_root_live_io_and_open_file_handles() {
         local.status(HandleRef::File(&file)).unwrap().mode,
         Mode::RUSR
     );
+}
+
+/// Shared memory that counts the copies made through it and exposes its raw
+/// bytes only if `raw`.
+struct CountingMemory {
+    bytes: HeapSharedMemory,
+    raw: bool,
+    copies: AtomicUsize,
+}
+
+impl SharedMemory for CountingMemory {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
+        self.copies.fetch_add(1, Ordering::Relaxed);
+        self.bytes.read(offset, destination)
+    }
+
+    fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
+        self.copies.fetch_add(1, Ordering::Relaxed);
+        self.bytes.write(offset, source)
+    }
+
+    fn raw_bytes(&self) -> Option<RawBytes<'_>> {
+        self.bytes.raw_bytes().filter(|_| self.raw)
+    }
+}
+
+#[test]
+fn shared_buffer_io_is_direct_when_the_buffer_is_contiguous_raw_bytes() {
+    // In-order slots form one contiguous part; out-of-order slots form several.
+    for (raw, slots) in [(true, [1, 2, 3]), (true, [2, 0, 3]), (false, [1, 2, 3])] {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("file"), b"0123456789").unwrap();
+        let local = backend(temp.path());
+        let file = local
+            .open_file_at(local.root(), "file", OFlags::RDWR)
+            .unwrap()
+            .item;
+        let memory = Arc::new(CountingMemory {
+            bytes: HeapSharedMemory::new(16),
+            raw,
+            copies: AtomicUsize::new(0),
+        });
+        let layout = SharedBufferLayout::new(4, 4).unwrap();
+        let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
+        let mut buffer = pool
+            .buffer(
+                SharedBufferSequence::new(&slots.map(SharedBufferSlotIndex), 11).unwrap(),
+                11,
+            )
+            .unwrap();
+        buffer.copy_from_slice_at(0, b"abcdefghijk").unwrap();
+        let direct = raw && slots == [1, 2, 3] && cfg!(target_os = "linux");
+        memory.copies.store(0, Ordering::Relaxed);
+
+        assert_eq!(local.write(&file, &buffer, 3).unwrap(), 11);
+        let copies = memory.copies.swap(0, Ordering::Relaxed);
+        assert_eq!(copies == 0, direct, "write, raw: {raw}, slots: {slots:?}");
+        assert_eq!(
+            fs::read(temp.path().join("file")).unwrap(),
+            b"012abcdefghijk"
+        );
+        // A read past the end is short and leaves the rest of the buffer alone.
+        assert_eq!(local.read(&file, &mut buffer, 5).unwrap(), 9);
+        let copies = memory.copies.load(Ordering::Relaxed);
+        assert_eq!(copies == 0, direct, "read, raw: {raw}, slots: {slots:?}");
+        let mut contents = [0; 11];
+        buffer.copy_to_slice_at(0, &mut contents).unwrap();
+        assert_eq!(&contents, b"cdefghijkjk");
+    }
 }
 
 #[cfg(unix)]
