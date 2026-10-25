@@ -207,6 +207,26 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
         Some(address)
     }
 
+    /// Push a NULL memref (see [`ShmInfo::null`]) without reserving stack space.
+    fn push_param_null_memref(&mut self, param: &UteeParamOwned) -> Option<()> {
+        let param_type = match param {
+            UteeParamOwned::MemrefInput { .. } => TeeParamType::MemrefInput,
+            UteeParamOwned::MemrefOutput { .. } => TeeParamType::MemrefOutput,
+            UteeParamOwned::MemrefInout { .. } => TeeParamType::MemrefInout,
+            UteeParamOwned::None
+            | UteeParamOwned::ValueInput { .. }
+            | UteeParamOwned::ValueOutput
+            | UteeParamOwned::ValueInout { .. } => return None,
+        };
+        if self.num_params >= UteeParams::TEE_NUM_PARAMS {
+            return None;
+        }
+        self.params.set_values(self.num_params, 0, 0).ok()?;
+        self.params.set_type(self.num_params, param_type).ok()?;
+        self.num_params += 1;
+        Some(())
+    }
+
     fn push_param_memref_from_shm<const ALIGN: usize>(
         &mut self,
         platform: &Platform,
@@ -253,6 +273,11 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
 
         let mut memref_addresses = [None; UteeParams::TEE_NUM_PARAMS];
         for (index, param) in params.iter().enumerate() {
+            let shm = shm_info.get(index).and_then(Option::as_ref);
+            if shm.is_some_and(ShmInfo::is_null) {
+                self.push_param_null_memref(param)?;
+                continue;
+            }
             match param {
                 UteeParamOwned::ValueInput { value_a, value_b } => {
                     self.push_param_values(TeeParamType::ValueInput, Some((*value_a, *value_b)))?;
@@ -264,7 +289,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
                     self.push_param_values(TeeParamType::ValueInout, Some((*value_a, *value_b)))?;
                 }
                 UteeParamOwned::MemrefInput { data } => {
-                    if let Some(shm_info) = shm_info.get(index).and_then(Option::as_ref) {
+                    if let Some(shm_info) = shm {
                         let len = shm_info.len();
                         self.push_param_memref_from_shm(
                             platform,
@@ -278,21 +303,20 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
                     }
                 }
                 UteeParamOwned::MemrefInout { data, buffer_size } => {
-                    let address =
-                        if let Some(shm_info) = shm_info.get(index).and_then(Option::as_ref) {
-                            self.push_param_memref_from_shm(
-                                platform,
-                                TeeParamType::MemrefInout,
-                                shm_info,
-                                *buffer_size,
-                            )?
-                        } else {
-                            self.push_param_memref(
-                                TeeParamType::MemrefInout,
-                                Some(data.as_deref()?),
-                                *buffer_size,
-                            )?
-                        };
+                    let address = if let Some(shm_info) = shm {
+                        self.push_param_memref_from_shm(
+                            platform,
+                            TeeParamType::MemrefInout,
+                            shm_info,
+                            *buffer_size,
+                        )?
+                    } else {
+                        self.push_param_memref(
+                            TeeParamType::MemrefInout,
+                            Some(data.as_deref()?),
+                            *buffer_size,
+                        )?
+                    };
                     memref_addresses[index] = Some(address);
                 }
                 UteeParamOwned::MemrefOutput { buffer_size } => {
@@ -366,4 +390,59 @@ pub(crate) fn allocate_stack<Platform: crate::OpteeShimPlatform>(
     let stack = TaStack::new(sp, super::DEFAULT_STACK_SIZE)?;
 
     Some(stack)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox_common_optee::PAGE_SIZE;
+    use litebox_platform_linux_userland::LinuxUserland;
+
+    #[test]
+    fn null_memref_is_visible_as_null() {
+        let task = crate::syscalls::tests::init_platform();
+        let mut stack = allocate_stack(&task, None).unwrap();
+        let params = [
+            UteeParamOwned::MemrefInput { data: None },
+            UteeParamOwned::MemrefInout {
+                data: None,
+                buffer_size: 0,
+            },
+            UteeParamOwned::MemrefOutput { buffer_size: 0 },
+            UteeParamOwned::MemrefOutput { buffer_size: 0 },
+        ];
+        let empty = ShmInfo::<PAGE_SIZE>::new(alloc::boxed::Box::new([]), 0, 0).unwrap();
+        let shm_info = [
+            Some(ShmInfo::null()),
+            Some(ShmInfo::null()),
+            Some(ShmInfo::null()),
+            Some(empty),
+        ];
+
+        let memref_addresses = stack
+            .init(task.global.platform, &params, &shm_info)
+            .unwrap();
+
+        let utee_params = crate::UserConstPtr::<LinuxUserland, UteeParams>::from_usize(
+            stack.get_params_address(),
+        )
+        .read_at_offset(0)
+        .unwrap();
+        assert!(utee_params.has_types([
+            TeeParamType::MemrefInput,
+            TeeParamType::MemrefInout,
+            TeeParamType::MemrefOutput,
+            TeeParamType::MemrefOutput,
+        ]));
+        for index in 0..3 {
+            assert_eq!(utee_params.get_values(index).unwrap(), Some((0, 0)));
+        }
+        let (addr, len) = utee_params.get_values(3).unwrap().unwrap();
+        assert_ne!(addr, 0);
+        assert_eq!(len, 0);
+        assert_eq!(
+            memref_addresses,
+            [None, None, None, Some(usize::try_from(addr).unwrap())]
+        );
+    }
 }

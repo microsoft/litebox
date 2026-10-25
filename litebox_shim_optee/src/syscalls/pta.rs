@@ -140,17 +140,15 @@ impl ClientPta {
                 &ta_req_info.shm_info,
             )?,
         };
-        // Outputs are meaningful only on these results; a rejected NULL memref
-        // would otherwise fail the size check.
-        let outputs =
-            matches!(result, TeeResult::Success | TeeResult::ShortBuffer).then_some(&params);
-        // Memref outputs were written in place: no `memref_addresses`.
+        // Outputs are written back whatever the result, as OP-TEE
+        // `copy_out_param` does. Memref outputs were written in place: no
+        // `memref_addresses`.
         update_optee_msg_args(
             platform,
             result,
             TeeOrigin::TrustedApp,
             None,
-            outputs,
+            Some(&params),
             Some(ta_req_info),
             None,
             msg_args,
@@ -633,7 +631,7 @@ impl DevicePta {
             return Ok(TeeResult::BadParameters);
         };
         let blen = usize::try_from(blen).map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
-        // A NULL buffer has an empty `shm_info` regardless of `blen`.
+        // A NULL buffer has size 0 (`blen` is 0): a size query that writes nothing.
         let Some(out) = shm_info[0].as_ref().filter(|shm| shm.len() == blen) else {
             return Ok(TeeResult::BadParameters);
         };
