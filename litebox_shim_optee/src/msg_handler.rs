@@ -641,7 +641,7 @@ pub fn decode_ta_request<Platform: crate::OpteeShimPlatform>(
 /// the `OpteeMsgArgs` structure to return value-based outputs.
 /// `return_code` indicates the result of an OP-TEE request and `return_origin` indicates which component
 /// generated the return code. `session_id` can be provided if this is for an OpenSession request.
-/// `ta_params` is a reference to `UteeParams` structure that stores TA's output within its memory.
+/// `ta_params` holds the outputs and may come from TA memory; treat it as untrusted.
 /// `ta_req_info` refers to the decoded TA request information including the normal world
 /// shared memory addresses to write back output data.
 /// `memref_addresses` locates memref output data in TA memory; `None` means the
@@ -679,6 +679,21 @@ pub fn update_optee_msg_args<Platform: crate::OpteeShimPlatform>(
         let param_type = ta_params
             .get_type(index)
             .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+        if !matches!(
+            (param_type, &ta_req_info.params[index]),
+            (TeeParamType::ValueOutput, UteeParamOwned::ValueOutput)
+                | (TeeParamType::ValueInout, UteeParamOwned::ValueInout { .. })
+                | (
+                    TeeParamType::MemrefOutput,
+                    UteeParamOwned::MemrefOutput { .. }
+                )
+                | (
+                    TeeParamType::MemrefInout,
+                    UteeParamOwned::MemrefInout { .. }
+                )
+        ) {
+            continue;
+        }
         match param_type {
             TeeParamType::ValueOutput | TeeParamType::ValueInout => {
                 if let Ok(Some((value_a, value_b))) = ta_params.get_values(index) {
@@ -695,12 +710,6 @@ pub fn update_optee_msg_args<Platform: crate::OpteeShimPlatform>(
             TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
                 if let Ok(Some((_addr, len))) = ta_params.get_values(index) {
                     let len = checked_memref_size(len)?;
-                    if !matches!(
-                        &ta_req_info.params[index],
-                        UteeParamOwned::MemrefOutput { .. } | UteeParamOwned::MemrefInout { .. }
-                    ) {
-                        continue;
-                    }
                     let Some(shm_info) = &ta_req_info.shm_info[index] else {
                         continue;
                     };
