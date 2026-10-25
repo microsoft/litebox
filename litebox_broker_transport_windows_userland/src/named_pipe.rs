@@ -330,7 +330,7 @@ mod tests {
     fn demand_lanes(local: &Local, lanes: usize) {
         let demand = local.lane_demand.as_ref().unwrap();
         demand.request(lanes).unwrap();
-        demand.wake_broker().unwrap();
+        demand.wake_host().unwrap();
     }
 
     fn read_request(consumer: &mut Consumer) -> BrokerRequest {

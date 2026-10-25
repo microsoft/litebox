@@ -728,7 +728,7 @@ impl<Memory: WaitableSharedMemory> LocalLaneDemand<Memory> {
     ///
     /// The wake is unconditional: demand rises at most once per lane, so
     /// there is nothing to gain from an announcement word.
-    pub fn wake_broker(&self) -> Result<(), Memory::Error> {
+    pub fn wake_host(&self) -> Result<(), Memory::Error> {
         self.ring
             .memory
             .wake_one(self.ring.layout.demand_offset() + DEMAND_EPOCH_OFFSET)

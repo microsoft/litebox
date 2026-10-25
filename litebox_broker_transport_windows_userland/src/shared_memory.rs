@@ -754,7 +754,7 @@ mod tests {
         );
         let demander = std::thread::spawn(move || {
             local_demand.request(2).unwrap();
-            local_demand.wake_broker().unwrap();
+            local_demand.wake_host().unwrap();
         });
         loop {
             match broker_demand.try_next_lane().unwrap() {

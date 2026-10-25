@@ -441,7 +441,7 @@ impl LocalRingAssociation {
     /// Raises the lane demand to `lanes` and wakes the broker to serve them.
     fn demand_lanes(&self, lanes: usize) -> IoResult<()> {
         self.lane_demand.request(lanes).map_err(ring_error)?;
-        self.lane_demand.wake_broker()
+        self.lane_demand.wake_host()
     }
 
     /// Writes `request` to `lane` and reads the broker's response from it,
