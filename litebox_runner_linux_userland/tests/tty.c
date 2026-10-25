@@ -135,6 +135,8 @@ int main(int argc, char **argv) {
     // The controlling terminal is the one behind the standard streams.
     int tty = open("/dev/tty", O_RDWR);
     assert(tty >= 0 && isatty(tty));
+    const char *tty_name = ttyname(tty);
+    assert(tty_name != NULL && strcmp(tty_name, "/dev/tty") == 0);
     struct stat tty_status;
     assert(fstat(tty, &tty_status) == 0 && S_ISCHR(tty_status.st_mode));
     assert(major(tty_status.st_rdev) == 5 && minor(tty_status.st_rdev) == 0);

@@ -29,9 +29,9 @@ use crate::{LiteBox, sync};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, IsTerminalError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError, TerminalControlError,
-    TruncateError, UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, MkdirError, OpenError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError,
+    TerminalControlError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -421,6 +421,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(FileStatusError::from)
     }
 
+    /// Returns the absolute path of the file, with symbolic links resolved, as of when it was
+    /// opened.
+    ///
+    /// Later renames or removals of the file are not reflected.
+    pub fn path(&self) -> Result<String, FilePathError> {
+        self.broker
+            .handle_file_path(self.handle)?
+            .map_err(|_| FilePathError::Io)
+    }
+
     /// Determines whether the file is connected to a terminal.
     pub fn is_terminal(&self) -> Result<bool, IsTerminalError> {
         self.broker
@@ -632,6 +642,12 @@ impl From<BrokerControlError> for ReadDirError {
 }
 
 impl From<BrokerControlError> for FileStatusError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::Io, Self::Io)
+    }
+}
+
+impl From<BrokerControlError> for FilePathError {
     fn from(error: BrokerControlError) -> Self {
         broker_fd_error(error, Self::ClosedFd, Self::Io, Self::Io)
     }

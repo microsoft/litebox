@@ -148,6 +148,10 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
+        fn handle_path(&self, _file: &File) -> ServiceResult<String> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
         fn get_status_flags(&self, _file: &File) -> Result<FileStatusFlags> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -400,6 +404,13 @@ where
         Ok(Ok(status))
     }
 
+    fn handle_path(&self, file: &File) -> ServiceResult<String> {
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
+        Ok(Ok(String::from(entry.path())))
+    }
+
     fn get_status_flags(&self, file: &File) -> Result<FileStatusFlags> {
         let entry = file
             .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
@@ -620,6 +631,13 @@ pub fn handle_status(
 ) -> Result<FileResult<FileStatus>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     process.core.fs.handle_status(&file)
+}
+
+/// Returns the absolute path of a broker-owned open object, with symbolic links resolved, as of
+/// when it was opened.
+pub fn handle_path(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<String>> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    process.core.fs.handle_path(&file)
 }
 
 /// Returns whether a broker-owned open object refers to a terminal, which it does exactly when it

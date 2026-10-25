@@ -97,6 +97,16 @@ struct ResolvedPath {
 }
 
 impl ResolvedPath {
+    /// The path as an absolute string.
+    fn to_absolute(&self) -> String {
+        if self.components.is_empty() {
+            return String::from("/");
+        }
+        self.components
+            .iter()
+            .fold(String::new(), |path, component| path + "/" + component)
+    }
+
     fn parent_and_name(&self) -> Option<(Vec<&str>, &str)> {
         let (name, parent) = self.components.split_last()?;
         Some((parent.iter().map(String::as_str).collect(), name.as_str()))
@@ -130,14 +140,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         user: UserInfo,
         path: &str,
     ) -> Result<String, WalkError> {
-        let path = self.resolve_path(&Context::new(user), path, true, false)?;
-        if path.components.is_empty() {
-            return Ok(String::from("/"));
-        }
-        Ok(path
-            .components
-            .iter()
-            .fold(String::new(), |path, component| path + "/" + component))
+        Ok(self
+            .resolve_path(&Context::new(user), path, true, false)?
+            .to_absolute())
     }
 
     // XXX(jayb): callers rewalk the result, so this is non-atomic and walks twice; returning the
@@ -628,6 +633,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             nonblocking,
             path_only,
             seek_behavior,
+            path: path.to_absolute(),
         };
 
         if path.components.is_empty() {
@@ -1240,11 +1246,20 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     nonblocking: bool,
     path_only: bool,
     seek_behavior: SeekBehavior,
+    /// Absolute path of the opened object, with symbolic links resolved, as of when it was opened.
+    ///
+    /// Later renames or removals of the object are not reflected.
+    path: String,
 }
 
 impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     pub(crate) const fn is_path_only(&self) -> bool {
         self.path_only
+    }
+
+    /// Absolute path of the opened object, with symbolic links resolved, as of when it was opened.
+    pub(crate) fn path(&self) -> &str {
+        &self.path
     }
 
     pub(crate) const fn allows_read(&self) -> bool {
