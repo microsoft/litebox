@@ -2107,7 +2107,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     where
         T: TryFrom<FileStatus, Error = Errno> + From<FileStat>,
     {
-        // `/proc/self/fd/<fd>` is not backed by the file system; following it reaches the open
+        // The shim, not the file system, serves `/proc/self/fd/<fd>`; following it reaches the open
         // descriptor itself.
         if follow_symlink && let Some(fd) = self.proc_self_fd(pathname) {
             return self.do_stat(&fd?);
