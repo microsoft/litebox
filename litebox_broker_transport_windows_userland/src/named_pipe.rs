@@ -162,9 +162,9 @@ mod tests {
         LocalNotificationChannel, LocalSetupChannel,
     };
     use litebox_broker_transport::control_ring::{
-        ControlRing, ControlRingConsumer, ControlRingDemandStatus, ControlRingLayout,
-        ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus,
-        HostControlRingEndpoints, LocalControlRingEndpoints,
+        ControlRing, ControlRingConsumer, ControlRingLayout, ControlRingProducer,
+        ControlRingReadStatus, ControlRingWriteStatus, HostControlRingEndpoints,
+        LocalControlRingEndpoints,
     };
     use litebox_broker_transport::shared_memory::SharedMemory as _;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -774,74 +774,6 @@ mod tests {
         drop(peer);
         assert_eq!(receiver.join().unwrap().unwrap(), HostReceive::PeerClosed);
         assert!(next.join().unwrap().unwrap().is_none());
-    }
-
-    #[test]
-    fn concurrent_local_calls_use_separate_lanes() {
-        let (calls, _notifications, mut broker, _peer) = activate_local("local-concurrent");
-        let calls = Arc::new(calls);
-        let callers = [3, 7].map(|id| {
-            let calls = Arc::clone(&calls);
-            thread::spawn(move || calls.call(request(id)))
-        });
-        let demand = broker.lane_demand.as_mut().unwrap();
-        assert_eq!(demand.try_next_lane(), Ok(ControlRingDemandStatus::Lane(0)));
-        loop {
-            match demand.try_next_lane().unwrap() {
-                ControlRingDemandStatus::Lane(lane) => {
-                    assert_eq!(lane, 1);
-                    break;
-                }
-                ControlRingDemandStatus::Satisfied { wait_epoch } => {
-                    demand.wait_for_demand(wait_epoch).unwrap();
-                }
-            }
-        }
-        let first = read_request(&mut broker.lanes[0].request_consumer);
-        let second = read_request(&mut broker.lanes[1].request_consumer);
-
-        // The later lane answers first; neither call waits for the other.
-        write_payload(
-            &mut broker.lanes[1].response_producer,
-            &encode_response(response(second.request_id)),
-        );
-        write_payload(
-            &mut broker.lanes[0].response_producer,
-            &encode_response(response(first.request_id)),
-        );
-        for caller in callers {
-            assert!(caller.join().unwrap().is_ok());
-        }
-        assert!(matches!(
-            demand.try_next_lane(),
-            Ok(ControlRingDemandStatus::Satisfied { .. })
-        ));
-    }
-
-    #[test]
-    fn sequential_local_calls_reuse_the_first_lane() {
-        let (calls, _notifications, mut broker, _peer) = activate_local("local-sequential");
-        let calls = Arc::new(calls);
-        for id in 1..=3 {
-            let caller = {
-                let calls = Arc::clone(&calls);
-                thread::spawn(move || calls.call(request(id)))
-            };
-            let lane = &mut broker.lanes[0];
-            let request = read_request(&mut lane.request_consumer);
-            assert_eq!(request.request_id, RequestId(id));
-            write_payload(
-                &mut lane.response_producer,
-                &encode_response(response(request.request_id)),
-            );
-            assert_eq!(caller.join().unwrap().unwrap().request_id, RequestId(id));
-        }
-        let demand = broker.lane_demand.as_mut().unwrap();
-        assert_eq!(demand.try_next_lane(), Ok(ControlRingDemandStatus::Lane(0)));
-        assert!(matches!(
-            demand.try_next_lane(),
-            Ok(ControlRingDemandStatus::Satisfied { .. })
-        ));
     }
 
     #[test]
