@@ -1052,9 +1052,10 @@ pub(super) mod resume_frame {
             // block writes the live `sp`, `pc` and callee-saved registers into
             // it, so `rt_sigreturn` restores exactly the state this function
             // is running with, plus the sentinel in `x16`, and resumes at the
-            // `99:` label. `x8` and `x16`-`x18` are declared clobbered; every
-            // other caller-saved register is restored from the frame as zero,
-            // so they are declared clobbered too via `clobber_abi("C")`.
+            // `99:` label. The caller-saved registers, `x8`, `x16` and `x18`
+            // included, are restored from the frame and clobbered via
+            // `clobber_abi("C")`; `x17` is an explicit output so that it cannot
+            // share `{f}`'s register.
             let observed: u64;
             unsafe {
                 core::arch::asm!(
@@ -1078,6 +1079,7 @@ pub(super) mod resume_frame {
                     "99:",
                     "mov x20, x16",
                     f = in(reg) frame,
+                    out("x17") _,
                     lateout("x20") observed,
                     regs = const REGS,
                     sp = const MCONTEXT + 256,
