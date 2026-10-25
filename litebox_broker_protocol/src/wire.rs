@@ -1398,6 +1398,9 @@ mod tests {
             (FileError::InvalidTerminalControl, 24),
             (FileError::TooManySymlinks, 25),
             (FileError::NoSuchDevice, 26),
+            (FileError::NotControllingTerminal, 27),
+            (FileError::ProcessGroupNotInSession, 28),
+            (FileError::NoSuchProcessGroup, 29),
         ] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,

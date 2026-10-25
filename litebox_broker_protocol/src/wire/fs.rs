@@ -424,6 +424,9 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::InvalidTerminalControl => 24,
         FileError::TooManySymlinks => 25,
         FileError::NoSuchDevice => 26,
+        FileError::NotControllingTerminal => 27,
+        FileError::ProcessGroupNotInSession => 28,
+        FileError::NoSuchProcessGroup => 29,
     });
 }
 
@@ -455,6 +458,9 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         24 => Ok(FileError::InvalidTerminalControl),
         25 => Ok(FileError::TooManySymlinks),
         26 => Ok(FileError::NoSuchDevice),
+        27 => Ok(FileError::NotControllingTerminal),
+        28 => Ok(FileError::ProcessGroupNotInSession),
+        29 => Ok(FileError::NoSuchProcessGroup),
         _ => Err(WireError::InvalidTag),
     }
 }

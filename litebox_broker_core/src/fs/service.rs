@@ -653,6 +653,9 @@ pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<File
 /// stricter guest rules belong in the guest's shim. Reports [`FileError::PathOnly`] for a file
 /// opened only for path-based operations and [`FileError::NotTerminal`] for any other file that is
 /// not a terminal, so a caller can classify a handle with a single request.
+///
+/// Like a kernel's terminal layer, the broker answers foreground-group operations itself, on the
+/// caller's controlling terminal, and passes the rest to the terminal's endpoint.
 pub fn terminal_control(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -667,7 +670,17 @@ pub fn terminal_control(
             FileError::NotTerminal
         }));
     };
-    terminal.control(operation)
+    match operation {
+        TerminalOperation::GetForegroundGroup => {
+            Ok(crate::process_group::foreground_group(process, terminal)
+                .map(TerminalResponse::ForegroundGroup))
+        }
+        TerminalOperation::SetForegroundGroup(process_group) => Ok(
+            crate::process_group::set_foreground_group(process, terminal, process_group)
+                .map(|()| TerminalResponse::Done),
+        ),
+        _ => terminal.control(operation),
+    }
 }
 
 /// Returns the access mode and status flags of a broker-owned open file.

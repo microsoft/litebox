@@ -20,7 +20,6 @@ use litebox::{
     sync::Mutex,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
     FileStatusFlags, FileType, FileUser,
@@ -28,6 +27,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalOperation, TerminalResponse, TerminalSettings,
 };
+use litebox_broker_protocol::{ObjectHandle, ProcessGroupId};
 use litebox_common_linux::{
     AccessFlags, AtFlags, CloseRangeFlags, EfdFlags, EpollCreateFlags, FcntlArg,
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, PAGE_SIZE,
@@ -2488,6 +2488,14 @@ fn terminal_operation<Platform: ShimPlatform>(arg: &IoctlArg) -> Result<Terminal
             return Err(Errno::EOPNOTSUPP);
         }
         IoctlArg::TCSBRK(_) => TerminalOperation::Drain,
+        IoctlArg::TIOCGPGRP(_) | IoctlArg::TIOCGSID(_) => TerminalOperation::GetForegroundGroup,
+        IoctlArg::TIOCSPGRP(ptr) => {
+            let process_group = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+            if process_group < 0 {
+                return Err(Errno::EINVAL);
+            }
+            TerminalOperation::SetForegroundGroup(ProcessGroupId(process_group.cast_unsigned()))
+        }
         IoctlArg::TIOCGPTN(_) => return Err(Errno::ENOTTY),
         _ => unreachable!("non-terminal ioctl"),
     })
@@ -2609,6 +2617,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 ptr.write_at_offset::<Platform>(0, size.into())
                     .ok_or(Errno::EFAULT)?;
             }
+            (IoctlArg::TIOCGPGRP(ptr), TerminalResponse::ForegroundGroup(foreground)) => {
+                ptr.write_at_offset::<Platform>(0, foreground.process_group.0.cast_signed())
+                    .ok_or(Errno::EFAULT)?;
+            }
+            (IoctlArg::TIOCGSID(ptr), TerminalResponse::ForegroundGroup(foreground)) => {
+                ptr.write_at_offset::<Platform>(0, foreground.session.0.cast_signed())
+                    .ok_or(Errno::EFAULT)?;
+            }
             (_, TerminalResponse::Done) => {}
             _ => return Err(Errno::EIO),
         }
@@ -2698,6 +2714,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | IoctlArg::TCSBRK(..)
             | IoctlArg::TCFLSH(..)
             | IoctlArg::TIOCSWINSZ(..)
+            | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
+            | IoctlArg::TIOCGSID(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;

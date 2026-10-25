@@ -447,7 +447,10 @@ impl From<litebox::fs::errors::TerminalControlError> for Errno {
         match value {
             litebox::fs::errors::TerminalControlError::ClosedFd
             | litebox::fs::errors::TerminalControlError::PathOnly => Errno::EBADF,
-            litebox::fs::errors::TerminalControlError::NotATerminal => Errno::ENOTTY,
+            litebox::fs::errors::TerminalControlError::NotATerminal
+            | litebox::fs::errors::TerminalControlError::NotControllingTerminal => Errno::ENOTTY,
+            litebox::fs::errors::TerminalControlError::NoSuchProcessGroup => Errno::ESRCH,
+            litebox::fs::errors::TerminalControlError::ProcessGroupNotInSession => Errno::EPERM,
             litebox::fs::errors::TerminalControlError::InvalidControl => Errno::EINVAL,
             litebox::fs::errors::TerminalControlError::WouldBlock => Errno::EAGAIN,
             litebox::fs::errors::TerminalControlError::WaitError(e) => match e {

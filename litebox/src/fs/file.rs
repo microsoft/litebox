@@ -841,6 +841,9 @@ impl From<FileError> for TerminalControlError {
         match error {
             FileError::PathOnly => Self::PathOnly,
             FileError::NotTerminal => Self::NotATerminal,
+            FileError::NotControllingTerminal => Self::NotControllingTerminal,
+            FileError::NoSuchProcessGroup => Self::NoSuchProcessGroup,
+            FileError::ProcessGroupNotInSession => Self::ProcessGroupNotInSession,
             FileError::InvalidTerminalControl => Self::InvalidControl,
             _ => Self::Io,
         }

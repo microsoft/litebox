@@ -148,6 +148,12 @@ pub enum FileError {
     TooManySymlinks,
     #[error("no such device or address")]
     NoSuchDevice,
+    #[error("object is not the caller's controlling terminal")]
+    NotControllingTerminal,
+    #[error("no such process group")]
+    NoSuchProcessGroup,
+    #[error("process group is not in the caller's session")]
+    ProcessGroupNotInSession,
 }
 
 /// Seek origin.

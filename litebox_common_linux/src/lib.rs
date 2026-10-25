@@ -1132,9 +1132,12 @@ pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
 pub const TCSBRK: u32 = 0x5409;
 pub const TCFLSH: u32 = 0x540b;
+pub const TIOCGPGRP: u32 = 0x540f;
+pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
+pub const TIOCGSID: u32 = 0x5429;
 pub const TCGETS2: u32 = 0x802c542a;
 pub const TCSETS2: u32 = 0x402c542b;
 pub const TCSETSW2: u32 = 0x402c542c;
@@ -1170,6 +1173,12 @@ pub enum IoctlArg {
     TIOCGWINSZ(UserPtrMut<Winsize>),
     /// Set window size.
     TIOCSWINSZ(UserPtr<Winsize>),
+    /// Get the terminal's foreground process group.
+    TIOCGPGRP(UserPtrMut<i32>),
+    /// Set the terminal's foreground process group.
+    TIOCSPGRP(UserPtr<i32>),
+    /// Get the session the terminal controls.
+    TIOCGSID(UserPtrMut<i32>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(UserPtrMut<u32>),
@@ -3147,6 +3156,9 @@ impl SyscallRequest {
                         TCFLSH => IoctlArg::TCFLSH(ctx.sys_req_arg(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
+                        TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
+                        TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
+                        TIOCGSID => IoctlArg::TIOCGSID(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,

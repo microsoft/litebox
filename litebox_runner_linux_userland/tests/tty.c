@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -99,6 +100,45 @@ int main(int argc, char **argv) {
         int tty = open("/dev/tty", O_RDWR);
         assert(tty >= 0 && isatty(tty));
         assert(write(1, "DETACHED DONE\n", 14) == 14);
+        return 0;
+    }
+
+    if (strcmp(mode, "jobs") == 0) {
+        // The session moves the terminal's events to its foreground process group. Like a shell,
+        // ignore SIGTTOU, which Linux sends a background group that sets the foreground.
+        assert(signal(SIGTTOU, SIG_IGN) != SIG_ERR);
+        pid_t self = getpid();
+        assert(tcgetpgrp(0) == self && tcgetsid(0) == self);
+        assert(tcsetpgrp(0, INT_MAX) == -1 && errno == ESRCH);
+        int ready[2];
+        assert(pipe(ready) == 0);
+        assert(tcgetpgrp(ready[0]) == -1 && errno == ENOTTY);
+        int status;
+        pid_t outsider = fork();
+        assert(outsider >= 0);
+        if (outsider == 0) {
+            // A new session has no controlling terminal.
+            _exit(setsid() > 0 && tcgetpgrp(0) == -1 && errno == ENOTTY ? 0 : 1);
+        }
+        assert(waitpid(outsider, &status, 0) == outsider && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        pid_t job = fork();
+        assert(job >= 0);
+        if (job == 0) {
+            struct sigaction action = {.sa_handler = on_signal};
+            sigemptyset(&action.sa_mask);
+            assert(sigaction(SIGINT, &action, NULL) == 0);
+            assert(setpgid(0, 0) == 0);
+            assert(write(ready[1], "", 1) == 1);
+            await_signal(&interrupts);
+            _exit(0);
+        }
+        assert(read(ready[0], bytes, 1) == 1);
+        assert(tcsetpgrp(0, job) == 0 && tcgetpgrp(1) == job && tcgetsid(2) == self);
+        // The interrupt reaches only the job; it would kill this process.
+        puts("JOB READY");
+        assert(waitpid(job, &status, 0) == job && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        assert(tcsetpgrp(0, self) == 0 && tcgetpgrp(0) == self);
+        puts("JOBS DONE");
         return 0;
     }
 

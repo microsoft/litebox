@@ -268,6 +268,12 @@ pub enum TerminalControlError {
     PathOnly,
     #[error("file descriptor does not point to a terminal")]
     NotATerminal,
+    #[error("file descriptor does not point to the caller's controlling terminal")]
+    NotControllingTerminal,
+    #[error("no such process group")]
+    NoSuchProcessGroup,
+    #[error("process group is not in the caller's session")]
+    ProcessGroupNotInSession,
     #[error("terminal control is invalid or unsupported")]
     InvalidControl,
     #[error("terminal control would block")]

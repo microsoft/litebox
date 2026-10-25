@@ -21,7 +21,7 @@ use litebox_broker_core::{
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
     fs::{in_mem::InitialNode, resolver::Resolver},
     socket::HOST_GATEWAY_IPV4_ADDRESS,
-    stdio::StdioStream,
+    stdio::{StdioProvider as _, StdioStream},
     test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
 };
 use litebox_broker_host::{
@@ -150,7 +150,8 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
         let builder = builder.with_socket_provider(Arc::new(socket_provider));
         let core = builder
             .build()
-            .expect("a test process may build only one broker core");
+            .expect("a test process may build only one broker core")
+            .with_terminal(stdio.terminal().expect("the test terminal must exist"));
         TestBroker { core, stdio }
     })
 }

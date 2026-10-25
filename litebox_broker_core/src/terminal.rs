@@ -51,9 +51,13 @@ pub trait TerminalEndpoint: ReadinessSource {
 
     /// Controls the endpoint without blocking. Output-draining operations may
     /// return `WouldBlock` and later publish writable readiness.
+    ///
+    /// The broker answers foreground-group operations itself, so an endpoint
+    /// rejects them with [`FileError::InvalidTerminalControl`].
     fn control(&self, operation: TerminalOperation) -> crate::Result<FileResult<TerminalResponse>>;
 
-    /// Attaches the initial process group once, ignoring later attachments.
+    /// Attaches the sink for the terminal's events once, ignoring later
+    /// attachments.
     fn attach(&self, sink: Arc<dyn TerminalEventSink>);
 }
 
