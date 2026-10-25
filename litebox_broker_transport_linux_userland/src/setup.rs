@@ -101,8 +101,8 @@ pub(crate) fn wire_error(error: WireError) -> Error {
     )
 }
 
-/// Clones an error so one recorded terminal failure can be reported to every
-/// waiter of an association.
+/// Clones an error so the recorded failure that ended an association can be
+/// reported to every waiter of the association.
 pub(crate) fn copy_io_error(error: &Error) -> Error {
     match error.raw_os_error() {
         Some(code) => Error::from_raw_os_error(code),

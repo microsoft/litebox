@@ -17,6 +17,12 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 /// concurrent calls; callers beyond the lane count wait for a lane to free up.
 /// Lane 0 is always demanded; before a call first claims any higher lane, the
 /// claim raises the demand so the broker starts serving that lane.
+///
+/// The pool also records the failure that ended the association, since claims
+/// must check it and wait under the same lock. Other users of the association,
+/// such as its notification receiver, check that record through
+/// [`current_failure`](Self::current_failure) and
+/// [`run_if_live`](Self::run_if_live).
 pub struct LocalCallLanePool<Lane> {
     state: Mutex<LocalCallLanePoolInner<Lane>>,
     lane_freed: Condvar,
@@ -156,7 +162,8 @@ impl<Lane> LocalCallLanePool<Lane> {
         })
     }
 
-    /// Records the first terminal failure and wakes every waiting claim.
+    /// Records the first failure, which ends the association, and wakes every
+    /// waiting claim.
     ///
     /// Returns whether this call recorded the first failure.
     pub fn record_failure(&self, error: Error) -> bool {
@@ -169,7 +176,7 @@ impl<Lane> LocalCallLanePool<Lane> {
         true
     }
 
-    /// Returns a copy of the association's terminal failure, if one was
+    /// Returns a copy of the failure that ended the association, if one was
     /// recorded.
     pub fn current_failure(&self) -> Option<Error> {
         self.lock().failure.as_ref().map(copy_error)

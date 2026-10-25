@@ -72,6 +72,8 @@ type LocalLane = LocalControlRingLane<MemfdSharedMemory>;
 /// call lanes and their demand, the setup socket used for liveness and
 /// teardown, and the wake handles of every ring wait.
 struct LocalRingAssociation {
+    /// The call lanes, which also record the failure that ended the
+    /// association.
     lanes: LocalCallLanePool<LocalLane>,
     lane_demand: LocalLaneDemand<MemfdSharedMemory>,
     control_stream: UnixStream,

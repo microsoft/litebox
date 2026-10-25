@@ -67,6 +67,8 @@ type LocalLane = LocalControlRingLane<WindowsSharedMemory>;
 /// call lanes and their demand, the pipe liveness used for teardown, and the
 /// wake handles of every ring wait.
 struct LocalRingAssociation {
+    /// The call lanes, which also record the failure that ended the
+    /// association.
     lanes: LocalCallLanePool<LocalLane>,
     lane_demand: LocalLaneDemand<WindowsSharedMemory>,
     /// Whether the call channel was dropped, which ends the association as a
