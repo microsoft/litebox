@@ -8,11 +8,12 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use litebox_common_linux::{PAGE_SIZE, ProtFlags, errno::Errno};
+use litebox_syscall_rewriter::RewriteOptions;
 use litebox_syscall_rewriter::aarch64::{CodeScanRanges, ElfCodeMetadata};
 use zerocopy::FromZeros as _;
 
 use super::{ElfPatchState, read_file_exact_at};
-use crate::{ShimPlatform, Task, UserPtrMut, syscalls::file::File};
+use crate::{ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::file::File};
 
 /// Pre-patched AArch64 trampolines are populated (and their gates finalized)
 /// whenever a file mapping becomes executable, including through `mprotect`.
@@ -105,19 +106,10 @@ pub(super) fn finalize_trampoline(
 /// pre-scanned code ranges when they are known for the mapping.
 pub(super) struct CodeRewriter {
     ranges: Option<CodeScanRanges>,
+    options: RewriteOptions,
 }
 
 impl CodeRewriter {
-    pub(super) fn new(state: &ArchPatchState, file_offset: Option<usize>, len: usize) -> Self {
-        let ranges = file_offset.and_then(|file_offset| {
-            state
-                .code_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.ranges_for_mapping(file_offset as u64, len).ok())
-        });
-        Self { ranges }
-    }
-
     /// Patches `code` and returns the trampoline stubs plus addresses that
     /// could not be patched.
     pub(super) fn patch(
@@ -134,7 +126,7 @@ impl CodeRewriter {
                 ranges,
                 trampoline_vaddr,
                 syscall_entry,
-                crate::aarch64_rewrite_options(),
+                self.options,
             )
         } else {
             litebox_syscall_rewriter::patch_code_segment_with_options(
@@ -142,7 +134,7 @@ impl CodeRewriter {
                 code_vaddr,
                 trampoline_vaddr,
                 syscall_entry,
-                crate::aarch64_rewrite_options(),
+                self.options,
             )
         }
     }
@@ -158,19 +150,46 @@ impl CodeRewriter {
                 code,
                 code_vaddr,
                 ranges,
-                crate::aarch64_rewrite_options(),
+                self.options,
             )
         } else {
             litebox_syscall_rewriter::trap_all_syscalls_in_code_with_options(
                 code,
                 code_vaddr,
-                crate::aarch64_rewrite_options(),
+                self.options,
             )
         }
     }
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
+    /// Returns the rewriter of the `len` bytes of code at `code`, mapped from `file_offset`.
+    ///
+    /// The word right before `code`, if readable now, is passed to the rewriter, so that an x18
+    /// site at the start that a `MOVPRFX` there prefixes is trapped. A `MOVPRFX` mapped there
+    /// only after this rewrite is not re-checked.
+    pub(super) fn code_rewriter(
+        state: &ArchPatchState,
+        code: UserPtrMut<u8>,
+        file_offset: Option<usize>,
+        len: usize,
+    ) -> CodeRewriter {
+        let ranges = file_offset.and_then(|file_offset| {
+            state
+                .code_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.ranges_for_mapping(file_offset as u64, len).ok())
+        });
+        let preceding_word = code
+            .as_usize()
+            .checked_sub(size_of::<u32>())
+            .and_then(|address| UserPtr::<u32>::from_usize(address).read_at_offset::<Platform>(0));
+        CodeRewriter {
+            ranges,
+            options: crate::aarch64_rewrite_options().with_preceding_word(preceding_word),
+        }
+    }
+
     /// Pre-scans an unpatched file to size its runtime trampoline.
     ///
     /// Returns the arch state and the page-aligned trampoline capacity. Falls

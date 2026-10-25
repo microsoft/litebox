@@ -149,6 +149,7 @@ pub struct RewriteOptions {
     target_host: TargetHost,
     virtualize_x18: bool,
     unpatchable_syscalls: UnpatchableSyscalls,
+    preceding_word: Option<u32>,
 }
 
 impl RewriteOptions {
@@ -174,6 +175,7 @@ impl RewriteOptions {
             target_host,
             virtualize_x18: virtualize_x18 || !matches!(target_host, TargetHost::Linux),
             unpatchable_syscalls: UnpatchableSyscalls::Trap,
+            preceding_word: None,
         }
     }
 
@@ -197,6 +199,16 @@ impl RewriteOptions {
 
     pub const fn unpatchable_syscalls(self) -> UnpatchableSyscalls {
         self.unpatchable_syscalls
+    }
+
+    /// Sets the instruction word right before the code that runtime AArch64
+    /// rewriting scans, or `None` if it is unreadable. An x18 site at the
+    /// code's start that a `MOVPRFX` there prefixes is trapped rather than
+    /// gated, as in a scan covering both. Whole-binary rewriting ignores it.
+    #[must_use]
+    pub const fn with_preceding_word(mut self, word: Option<u32>) -> Self {
+        self.preceding_word = word;
+        self
     }
 }
 
@@ -1852,7 +1864,7 @@ pub fn patch_aarch64_code_segment_with_options_and_ranges(
         &identified,
         trampoline_write_vaddr,
         syscall_entry_addr,
-        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
+        aarch64::RewriteConfig::runtime(options, code_vaddr),
     )?
     else {
         return Ok((Vec::new(), Vec::new()));
@@ -1958,7 +1970,7 @@ pub fn trap_all_aarch64_patch_sites_with_options_and_ranges(
         code,
         &executable,
         &identified,
-        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
+        aarch64::RewriteConfig::runtime(options, code_vaddr),
     )
 }
 
@@ -3120,6 +3132,35 @@ mod tests {
             trampoline_vaddr + 16,
             "the B targets the first aligned gate slot"
         );
+    }
+
+    /// A runtime scan sees the word before its code: an x18 site there that a
+    /// `MOVPRFX` prefixes is trapped, since a gate branch must not follow
+    /// `MOVPRFX`, and is gated otherwise.
+    #[test]
+    fn aarch64_runtime_patch_traps_an_x18_site_after_a_preceding_movprfx() {
+        const CPY_X18: u32 = 0x05e8_a240; // mov z0.d, p0/m, x18
+        const MOVPRFX: u32 = 0x0420_bc20; // movprfx z0, z1
+        const NOP: u32 = 0xD503_201F;
+        let options = RewriteOptions::new(TargetHost::Linux, true);
+        for (preceding_word, trapped) in [(Some(MOVPRFX), true), (Some(NOP), false), (None, false)]
+        {
+            let mut code = CPY_X18.to_le_bytes().to_vec();
+            let (_, unredirected) = patch_aarch64_code_segment(
+                &mut code,
+                0x1000,
+                0x40_0000,
+                0x1234,
+                options.with_preceding_word(preceding_word),
+            )
+            .unwrap();
+            let site = u32::from_le_bytes(code[..4].try_into().unwrap());
+            assert_eq!(
+                (unredirected == [0x1000], site & 0xFC00_0000 == 0x1400_0000),
+                (trapped, !trapped),
+                "preceding word {preceding_word:x?}"
+            );
+        }
     }
 
     /// A region with no patch sites must not produce a trampoline: the caller

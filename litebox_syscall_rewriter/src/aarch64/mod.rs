@@ -47,7 +47,7 @@ use litebox_trampoline::aarch64::{
     TRAP_BRK_IMM, X18, X18Adr, X18Classification, X18CompareBranch, X18IndirectBranchKind,
     X18StackWriteback, X18TransformResult, X18Unsupported, XZR, classify_adr_x18,
     classify_pc_relative_x18, classify_x18, classify_x18_conditional_branch,
-    classify_x18_stack_writeback, emit_shared_prologue, exclusive_boundary, gate,
+    classify_x18_stack_writeback, emit_shared_prologue, exclusive_boundary, gate, sve,
 };
 use object::read::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
 use zerocopy::IntoBytes as _;
@@ -355,6 +355,9 @@ fn ranges_to_sections(
 pub(crate) struct RewriteConfig {
     host: TargetHost,
     virtualize_x18: bool,
+    /// The vaddr of the word that a `MOVPRFX` right before the scanned code
+    /// prefixes, if there is one.
+    movprfx_prefixed_vaddr: Option<u64>,
 }
 
 impl RewriteConfig {
@@ -362,6 +365,18 @@ impl RewriteConfig {
         Self {
             host: target,
             virtualize_x18,
+            movprfx_prefixed_vaddr: None,
+        }
+    }
+
+    /// The configuration of a runtime scan of the code at `code_vaddr`.
+    pub(crate) fn runtime(options: crate::RewriteOptions, code_vaddr: u64) -> Self {
+        Self {
+            movprfx_prefixed_vaddr: options
+                .preceding_word
+                .is_some_and(sve::is_movprfx)
+                .then_some(code_vaddr),
+            ..Self::new(options.target_host(), options.virtualizes_x18())
         }
     }
 }
@@ -424,8 +439,9 @@ impl PatchKind {
 
 /// Scans executable sections for Linux syscall/thread-pointer gates and, when
 /// configured, x18 gates. Linux-specific sites are still rejected for Windows;
-/// x18 sites inside lexical exclusive sequences are rejected. AArch64
-/// instructions are fixed-width, so sites are returned in ascending file order.
+/// x18 sites inside lexical exclusive sequences are rejected. Sections are
+/// scanned in virtual-address order, so sites are returned in ascending vaddr
+/// order.
 ///
 /// `MRS XZR, TPIDR_EL0` is a discarded read (register 31 as an `LDR` base would
 /// mean `SP`), so it is left native; every other `MRS Xd, TPIDR_EL0` is gated.
@@ -445,8 +461,22 @@ fn find_patch_sites_with_code_ranges(
     config: RewriteConfig,
 ) -> Result<Vec<PatchSite>> {
     let mut sites = Vec::new();
+    // Section headers need not be sorted; both lists are walked in vaddr order.
+    let mut executable_sections = executable_sections.to_vec();
+    executable_sections.sort_by_key(|section| section.vaddr);
+    let mut code_sections = code_sections.to_vec();
+    code_sections.sort_by_key(|section| section.vaddr);
+    // MOVPRFX prefixes the next word in execution order, so it carries into a
+    // section that starts at the previous section's end vaddr, and from the
+    // word before a runtime scan's code into its start.
+    let mut previous_end = config.movprfx_prefixed_vaddr;
+    let mut was_movprfx = previous_end.is_some();
 
-    for section in executable_sections {
+    for section in &executable_sections {
+        if previous_end != Some(section.vaddr) {
+            was_movprfx = false;
+        }
+        previous_end = Some(section.vaddr.saturating_add(section.size));
         let start = usize::try_from(section.file_offset)
             .map_err(|_| Error::ParseError("section file offset too large".into()))?;
         let size = usize::try_from(section.size)
@@ -510,6 +540,7 @@ fn find_patch_sites_with_code_ranges(
                 }
             }
             was_known_code = known_code;
+            let follows_movprfx = core::mem::replace(&mut was_movprfx, sve::is_movprfx(insn));
             let kind = if (insn & SVC_OPCODE_MASK) == SVC_OPCODE_BITS {
                 if config.host == TargetHost::Windows {
                     return Err(Error::UnsupportedExecutable(format!(
@@ -573,21 +604,27 @@ fn find_patch_sites_with_code_ranges(
             } else {
                 continue;
             };
-            if inside_exclusive_sequence
-                && matches!(
-                    kind,
-                    PatchKind::X18(_)
-                        | PatchKind::X18StackWriteback(_)
-                        | PatchKind::X18CompareBranch(_)
-                        | PatchKind::X18Adr(_)
-                        | PatchKind::X18Branch(_)
-                )
-            {
+            let x18_site = matches!(
+                kind,
+                PatchKind::X18(_)
+                    | PatchKind::X18StackWriteback(_)
+                    | PatchKind::X18CompareBranch(_)
+                    | PatchKind::X18Adr(_)
+                    | PatchKind::X18Branch(_)
+            );
+            if inside_exclusive_sequence && x18_site {
                 return Err(Error::UnsupportedExecutable(format!(
                     "AArch64 gate inside exclusive sequence at {:#x}",
                     checked_add_u64(section.vaddr, i as u64, "exclusive sequence gate")?
                 )));
             }
+            let kind = if follows_movprfx && x18_site {
+                PatchKind::X18(X18TransformResult::Unsupported(
+                    X18Unsupported::MovprfxSuccessor,
+                ))
+            } else {
+                kind
+            };
             sites.push(PatchSite {
                 file_offset: start + i,
                 vaddr,
@@ -1232,10 +1269,7 @@ mod tests {
                     size: bytes.len() as u64,
                 }],
                 &bytes,
-                RewriteConfig {
-                    host: TargetHost::Linux,
-                    virtualize_x18: true,
-                },
+                RewriteConfig::new(TargetHost::Linux, true),
             )
         };
 
@@ -1259,35 +1293,112 @@ mod tests {
         assert_eq!(sites[0].vaddr, 0x1008);
     }
     #[test]
-    fn sve_scalar_x18_operands_are_trapped() {
-        for word in [
-            0x0420_e3f2, // cntb x18
-            0x04f2_e3f2, // incd x18, all, mul #3
-            0x25e1_1e40, // whilelo p0.d, x18, x1
-            0x25f2_1c00, // whilelo p0.d, x0, x18
-            0xa5e0_a240, // ld1d { z0.d }, p0/z, [x18]
-            0xe5e0_e240, // st1d { z0.d }, p0, [x18]
-            0xa5f2_4000, // ld1d { z0.d }, p0/z, [x0, x18, lsl #3]
+    fn sve_x18_operands_use_the_ordinary_x18_gate() {
+        for (word, transformed) in [
+            (0x0420_e3f2, 0x0420_e3f1), // cntb x18
+            (0xa5f2_4000, 0xa5f1_4000), // ld1d { z0.d }, p0/z, [x0, x18, lsl #3]
         ] {
+            let (patched, outcome) = hook_words_opt_with_config(
+                &[word],
+                0x1000,
+                0x400000,
+                x18_config(TargetHost::Linux),
+            );
+            let outcome = outcome.unwrap();
+            assert_eq!(outcome.trapped_sites, [], "word {word:#010x}");
             assert_eq!(
-                classify_x18(word),
-                X18Classification::X18(X18TransformResult::Unsupported(
-                    X18Unsupported::DecodeFailure,
-                )),
+                word_at(&patched, 0) & OPCODE_TOP6_MASK,
+                Opcode::B.bits(),
                 "word {word:#010x}"
             );
-            let (patched, outcome) =
-                hook_words_opt_with_config(&[word], 0x1000, 0x2000, x18_config(TargetHost::Linux));
+            // The copied guest instruction.
             assert_eq!(
-                word_at(&patched, 0),
-                Insn::Brk(TRAP_BRK_IMM).encode().unwrap(),
+                word_at(&outcome.trampoline, GATES_START_OFFSET + 20),
+                transformed,
                 "word {word:#010x}"
             );
-            assert_eq!(outcome.unwrap().trapped_sites, vec![0x1000]);
 
-            let (native, outcome) = hook_words_opt(&[word], 0x1000, 0x2000);
+            let (native, outcome) = hook_words_opt(&[word], 0x1000, 0x400000);
             assert_eq!(word_at(&native, 0), word);
             assert!(outcome.is_none());
+        }
+    }
+    #[test]
+    fn x18_site_after_movprfx_is_unsupported() {
+        const CPY_X18: u32 = 0x05e8_a240; // mov z0.d, p0/m, x18
+        let scan_with_code_ranges =
+            |executable: &[TextSectionInfo], code: &[TextSectionInfo], words: &[u32]| {
+                let bytes = words
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect::<Vec<_>>();
+                find_patch_sites_with_code_ranges(
+                    executable,
+                    code,
+                    &bytes,
+                    x18_config(TargetHost::Linux),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|site| (site.vaddr, site.kind))
+                .collect::<Vec<_>>()
+            };
+        let scan = |sections: &[TextSectionInfo], words: &[u32]| {
+            scan_with_code_ranges(sections, sections, words)
+        };
+        let section = |vaddr: u64, file_offset: u64, words: u64| TextSectionInfo {
+            vaddr,
+            file_offset,
+            size: words * INSN_BYTES_U64,
+        };
+        let unsupported = PatchKind::X18(X18TransformResult::Unsupported(
+            X18Unsupported::MovprfxSuccessor,
+        ));
+        for movprfx in [
+            0x0420_bc20, // movprfx z0, z1
+            0x04d1_2020, // movprfx z0.d, p0/m, z1.d
+            0x04d0_2020, // movprfx z0.d, p0/z, z1.d
+        ] {
+            for sites in [
+                scan(&[section(0x1000, 0, 2)], &[movprfx, CPY_X18]),
+                scan(
+                    &[section(0x1000, 0, 1), section(0x1004, 4, 1)],
+                    &[movprfx, CPY_X18],
+                ),
+                scan(
+                    &[section(0x1004, 4, 1), section(0x1000, 0, 1)],
+                    &[movprfx, CPY_X18],
+                ),
+                // Contiguous in memory but not in the file.
+                scan(
+                    &[section(0x1000, 0, 1), section(0x1004, 8, 1)],
+                    &[movprfx, NOP, CPY_X18],
+                ),
+                // MOVPRFX outside the identified code ranges.
+                scan_with_code_ranges(
+                    &[section(0x1000, 0, 2)],
+                    &[section(0x1004, 4, 1)],
+                    &[movprfx, CPY_X18],
+                ),
+            ] {
+                assert_eq!(sites, [(0x1004, unsupported)], "movprfx {movprfx:#010x}");
+            }
+            for sites in [
+                scan(&[section(0x1000, 0, 3)], &[movprfx, NOP, CPY_X18]),
+                // Contiguous in the file but not in memory.
+                scan(
+                    &[section(0x1000, 0, 1), section(0x1008, 4, 1)],
+                    &[movprfx, CPY_X18],
+                ),
+            ] {
+                assert!(
+                    matches!(
+                        sites[..],
+                        [(_, PatchKind::X18(X18TransformResult::Supported(_)))]
+                    ),
+                    "movprfx {movprfx:#010x}: {sites:?}"
+                );
+            }
         }
     }
     use alloc::vec;
@@ -1299,10 +1410,7 @@ mod tests {
     const MSR_GATE_SIZE: usize = MSR_SLOT_BYTES;
     const MRS_GATE_SIZE: usize = MRS_SLOT_BYTES;
     fn x18_config(host: TargetHost) -> RewriteConfig {
-        RewriteConfig {
-            host,
-            virtualize_x18: true,
-        }
+        RewriteConfig::new(host, true)
     }
     fn word_at(data: &[u8], byte_off: usize) -> u32 {
         u32::from_le_bytes(data[byte_off..byte_off + 4].try_into().unwrap())
@@ -1379,10 +1487,7 @@ mod tests {
             &sections,
             tramp_base,
             callback,
-            RewriteConfig {
-                host: TargetHost::Linux,
-                virtualize_x18: false,
-            },
+            RewriteConfig::new(TargetHost::Linux, false),
         )
         .unwrap()
         .expect("expected a trampoline (input has patch sites)")
@@ -1395,10 +1500,7 @@ mod tests {
             words,
             base,
             tramp_base,
-            RewriteConfig {
-                host: TargetHost::Linux,
-                virtualize_x18: false,
-            },
+            RewriteConfig::new(TargetHost::Linux, false),
         )
     }
     fn hook_words_opt_with_config(
@@ -1430,10 +1532,7 @@ mod tests {
             &[original],
             0x1000,
             0x400000,
-            RewriteConfig {
-                host: TargetHost::Linux,
-                virtualize_x18: true,
-            },
+            RewriteConfig::new(TargetHost::Linux, true),
         );
         let mut outcome = outcome.unwrap();
         assert_eq!(outcome.trapped_sites, []);
@@ -1901,10 +2000,7 @@ mod tests {
             file_offset: 0,
             size: bytes.len() as u64,
         };
-        let enabled = RewriteConfig {
-            host: TargetHost::Linux,
-            virtualize_x18: true,
-        };
+        let enabled = RewriteConfig::new(TargetHost::Linux, true);
         let sites = find_patch_sites(&[section], &bytes, enabled).unwrap();
         assert!(sites.iter().all(|site| matches!(
             site.kind,
@@ -2646,10 +2742,7 @@ mod tests {
                 &[section],
                 0x400004,
                 0,
-                RewriteConfig {
-                    host: TargetHost::Linux,
-                    virtualize_x18: false,
-                },
+                RewriteConfig::new(TargetHost::Linux, false),
             ),
             Err(Error::AddressOverflow(_))
         ));
