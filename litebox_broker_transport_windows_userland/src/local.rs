@@ -7,8 +7,8 @@ use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::os::windows::fs::OpenOptionsExt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,19 +20,20 @@ use litebox_broker_protocol::wire::{
     decode_handshake_response, decode_notification, decode_response, encode_handshake_request,
     encode_request,
 };
+use litebox_broker_transport::call_lane_pool::{LaneClaim, LocalCallLanePool};
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_READY, ControlRing, ControlRingConsumer, ControlRingProducer,
-    ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+    ControlRing, ControlRingConsumer, ControlRingLayout, ControlRingReadError,
+    ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+    LocalControlRingEndpoints, LocalControlRingLane, LocalLaneDemand,
 };
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
 use crate::control_ring::PipeLiveness;
 use crate::named_pipe::{TRANSFER_FRAME_TAG, WindowsNamedPipeStream};
-use crate::pending_calls::{PendingCalls, pending_calls_error};
 use crate::process_image::WindowsReceivedProcessImage;
 use crate::setup::{
     copy_io_error, invalid_data, read_frame, read_pipe_until_cancelled, ring_error, wire_error,
@@ -60,18 +61,21 @@ pub struct WindowsControlRingLocalNotificationChannel {
     association: Arc<LocalRingAssociation>,
 }
 
+type LocalLane = LocalControlRingLane<WindowsSharedMemory>;
+
+/// State shared by every activated local endpoint of one association: the
+/// call lanes and their demand, the pipe liveness used for teardown, and the
+/// wake handles of every ring wait.
 struct LocalRingAssociation {
-    request_producer: Mutex<ControlRingProducer<WindowsSharedMemory>>,
-    /// Read by whichever caller holds the pending-call reader role.
-    response_consumer: Mutex<ControlRingConsumer<WindowsSharedMemory>>,
-    pending_calls: Arc<PendingCalls>,
+    /// The call lanes, which also record the failure that ended the
+    /// association.
+    lanes: LocalCallLanePool<LocalLane>,
+    lane_demand: LocalLaneDemand<WindowsSharedMemory>,
     /// Whether the call channel was dropped, which ends the association as a
     /// local close rather than a failure.
     closed: AtomicBool,
     liveness: PipeLiveness,
-    request_wake: ControlRingWakeHandle<WindowsSharedMemory>,
-    response_wake: ControlRingWakeHandle<WindowsSharedMemory>,
-    notification_wake: ControlRingWakeHandle<WindowsSharedMemory>,
+    wakes: Vec<ControlRingWakeHandle<WindowsSharedMemory>>,
 }
 
 impl WindowsNamedPipeLocalSetupChannel {
@@ -123,8 +127,12 @@ impl WindowsNamedPipeLocalSetupChannel {
         unsafe { WindowsSharedMemory::from_transferred(transfer) }
     }
 
-    /// Receives and maps the shared control ring duplicated into this process.
-    pub fn receive_control_ring(&mut self) -> IoResult<WindowsSharedMemory> {
+    /// Receives the shared control ring the broker duplicated into this process and maps it with
+    /// `layout`.
+    pub fn receive_control_ring(
+        &mut self,
+        layout: ControlRingLayout,
+    ) -> IoResult<WindowsSharedMemory> {
         let frame =
             read_frame(file_handle(&self.stream), self.setup_deadline)?.ok_or_else(|| {
                 Error::new(
@@ -135,7 +143,7 @@ impl WindowsNamedPipeLocalSetupChannel {
         let transfer = decode_transfer(&frame)?;
         // SAFETY: The authenticated broker duplicated these handles into this process and encoded
         // their target-process values in the setup frame.
-        unsafe { WindowsSharedMemory::control_ring_from_transferred(transfer) }
+        unsafe { WindowsSharedMemory::control_ring_from_transferred(transfer, layout) }
     }
 
     /// Receives and maps the optional process image the broker sent with
@@ -155,6 +163,8 @@ impl WindowsNamedPipeLocalSetupChannel {
     }
 
     /// Activates calls and notifications over the transferred shared control ring.
+    ///
+    /// The ring must have a layout of more than one lane.
     pub fn into_active(
         self,
         ring: ControlRing<WindowsSharedMemory>,
@@ -200,35 +210,40 @@ fn activate_local(
             "broker local setup channel activated before negotiation completed",
         ));
     }
-    write_frame(file_handle(&stream), CONTROL_RING_READY, setup_deadline)?;
+    let ready_token = ring.layout().ready_token();
+    let endpoints = ring.into_local();
+    let wakes = endpoints.wake_handles();
+    let LocalControlRingEndpoints {
+        lanes,
+        lane_demand: Some(lane_demand),
+        notification_consumer,
+    } = endpoints
+    else {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "broker control-ring layout has a single lane",
+        ));
+    };
+    write_frame(file_handle(&stream), ready_token, setup_deadline)?;
     let ready = read_frame(file_handle(&stream), setup_deadline)?.ok_or_else(|| {
         Error::new(
             ErrorKind::UnexpectedEof,
             "broker closed before control-ring setup acknowledgement",
         )
     })?;
-    if ready != CONTROL_RING_READY {
+    if ready != ready_token {
         return Err(invalid_data(
             "broker sent an invalid control-ring setup acknowledgement",
         ));
     }
 
-    let litebox_broker_transport::control_ring::LocalControlRingEndpoints {
-        request_producer,
-        response_consumer,
-        notification_consumer,
-    } = ring.into_local();
-    let pending_calls = Arc::new(PendingCalls::new());
     let stream = Arc::new(stream);
     let association = Arc::new(LocalRingAssociation {
-        liveness: PipeLiveness::new(Arc::clone(&stream), false)?,
-        request_wake: request_producer.wake_handle(),
-        request_producer: Mutex::new(request_producer),
-        response_wake: response_consumer.wake_handle(),
-        response_consumer: Mutex::new(response_consumer),
-        notification_wake: notification_consumer.wake_handle(),
-        pending_calls,
+        lanes: LocalCallLanePool::new(lanes),
+        lane_demand,
         closed: AtomicBool::new(false),
+        liveness: PipeLiveness::new(Arc::clone(&stream), false)?,
+        wakes,
     });
     let monitor_association = Arc::clone(&association);
     thread::Builder::new()
@@ -250,41 +265,25 @@ impl LocalCallChannel for WindowsControlRingLocalCallChannel {
 
     fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
         let association = &self.association;
-        let request_id = request.request_id;
-        let pending_call = association
-            .pending_calls
-            .register(request_id)
-            .map_err(pending_calls_error)?;
-        let frame = encode_request(request);
-        let write_result = {
-            let mut producer = association
-                .request_producer
-                .lock()
-                .map_err(|_| Error::other("broker request writer mutex poisoned"))?;
-            loop {
-                let status = association
-                    .pending_calls
-                    .run_if_live(|| producer.try_write(&frame).map_err(ring_error))
-                    .map_err(pending_calls_error);
-                match status {
-                    Ok(ControlRingWriteStatus::Written) => {
-                        break producer.wake_consumer();
-                    }
-                    Ok(ControlRingWriteStatus::Full { wait_epoch }) => {
-                        if let Err(error) = producer.wait_for_capacity(wait_epoch) {
-                            break Err(error);
-                        }
-                    }
-                    Err(error) => break Err(error),
-                }
+        let mut lane = match association
+            .lanes
+            .claim(|lanes| association.demand_lanes(lanes))
+        {
+            Ok(lane) => lane,
+            Err(error) => {
+                let result = Err(copy_io_error(&error));
+                let _ = association.fail(error);
+                return result;
             }
         };
-        if let Err(error) = write_result {
-            let _ = association.fail(error);
+        let result = association.call_on_lane(&mut lane, request);
+        // A failed call can leave its lane mid-exchange: fail the association
+        // before freeing the lane, so no other call uses it.
+        if let Err(error) = &result {
+            let _ = association.fail(copy_io_error(error));
         }
-        pending_call
-            .wait(|| association.read_response())
-            .map_err(|error| copy_io_error(&error))
+        drop(lane);
+        result
     }
 }
 
@@ -303,8 +302,8 @@ impl LocalNotificationChannel for WindowsControlRingLocalNotificationChannel {
 
     fn recv_notification(&mut self) -> IoResult<Option<BrokerNotification>> {
         loop {
-            if let Some(error) = self.association.pending_calls.current_failure() {
-                return self.association.end_notifications(&error);
+            if let Some(error) = self.association.lanes.current_failure() {
+                return self.association.end_notifications(error);
             }
             match self.consumer.try_read(decode_notification) {
                 Ok(ControlRingReadStatus::Message(notification)) => {
@@ -312,13 +311,13 @@ impl LocalNotificationChannel for WindowsControlRingLocalNotificationChannel {
                         .association
                         .acknowledge_notification(&mut self.consumer)
                     {
-                        return self.association.end_notifications(&error);
+                        return self.association.end_notifications(error);
                     }
                     return Ok(Some(notification));
                 }
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                    if let Some(error) = self.association.pending_calls.current_failure() {
-                        return self.association.end_notifications(&error);
+                    if let Some(error) = self.association.lanes.current_failure() {
+                        return self.association.end_notifications(error);
                     }
                     if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
                         let result = Err(copy_io_error(&error));
@@ -346,11 +345,11 @@ impl LocalNotificationChannel for WindowsControlRingLocalNotificationChannel {
 impl LocalRingAssociation {
     /// Ends notification receipt once the association has ended with
     /// `failure`: cleanly if the local side closed it.
-    fn end_notifications(&self, failure: &Error) -> IoResult<Option<BrokerNotification>> {
+    fn end_notifications(&self, failure: Error) -> IoResult<Option<BrokerNotification>> {
         if self.closed.load(Ordering::Acquire) {
             Ok(None)
         } else {
-            Err(copy_io_error(failure))
+            Err(failure)
         }
     }
 
@@ -358,15 +357,12 @@ impl LocalRingAssociation {
         &self,
         consumer: &mut ControlRingConsumer<WindowsSharedMemory>,
     ) -> IoResult<()> {
-        let result = self
-            .pending_calls
-            .run_if_live(|| {
-                consumer
-                    .publish_head()
-                    .map_err(ring_error)
-                    .and_then(|()| consumer.wake_producer())
-            })
-            .map_err(pending_calls_error);
+        let result = self.lanes.run_if_live(|| {
+            consumer
+                .publish_head()
+                .map_err(ring_error)
+                .and_then(|()| consumer.wake_producer())
+        });
         if let Err(error) = result {
             let result = Err(copy_io_error(&error));
             let _ = self.fail(error);
@@ -375,57 +371,68 @@ impl LocalRingAssociation {
         Ok(())
     }
 
-    /// Reads one response for the caller holding the pending-call reader
-    /// role, blocking until one arrives or the association fails.
-    fn read_response(&self) {
-        let Ok(mut consumer) = self.response_consumer.lock() else {
-            let _ = self.fail(Error::other("broker response reader mutex poisoned"));
-            return;
-        };
+    /// Raises the lane demand to `lanes` and wakes the broker to serve them.
+    fn demand_lanes(&self, lanes: usize) -> IoResult<()> {
+        self.lane_demand.request(lanes).map_err(ring_error)?;
+        self.lane_demand.wake_host()
+    }
+
+    /// Writes `request` to `lane` and reads the broker's response from it,
+    /// releasing the lane once the call succeeds.
+    fn call_on_lane(
+        &self,
+        lane: &mut LaneClaim<'_, LocalLane>,
+        request: BrokerRequest,
+    ) -> IoResult<BrokerResponse> {
+        let request_id = request.request_id;
+        let request_frame = encode_request(request);
+        let producer = &mut lane.request_producer;
         loop {
-            match consumer.try_read(decode_response) {
-                Ok(ControlRingReadStatus::Message(response)) => {
-                    if let Err(error) = consumer
-                        .publish_head()
-                        .map_err(ring_error)
-                        .and_then(|()| consumer.wake_producer())
-                        .and_then(|()| {
-                            self.pending_calls
-                                .complete(response)
-                                .map_err(pending_calls_error)
-                        })
-                    {
-                        let _ = self.fail(error);
-                    }
-                    return;
-                }
-                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                    if self.pending_calls.current_failure().is_some() {
-                        return;
-                    }
-                    if let Err(error) = consumer.wait_for_message(wait_epoch) {
-                        let _ = self.fail(error);
-                        return;
-                    }
-                }
-                Err(ControlRingReadError::Ring(error)) => {
-                    let _ = self.fail(ring_error(error));
-                    return;
-                }
-                Err(ControlRingReadError::Decode(error)) => {
-                    let _ = self.fail(wire_error(error));
-                    return;
+            let write_status = self
+                .lanes
+                .run_if_live(|| producer.try_write(&request_frame).map_err(ring_error))?;
+            match write_status {
+                ControlRingWriteStatus::Written => break,
+                ControlRingWriteStatus::Full { wait_epoch } => {
+                    producer.wait_for_capacity(wait_epoch)?;
                 }
             }
         }
+        producer.wake_consumer()?;
+
+        let consumer = &mut lane.response_consumer;
+        let response = loop {
+            match consumer.try_read(decode_response) {
+                Ok(ControlRingReadStatus::Message(response)) => break response,
+                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                    if let Some(error) = self.lanes.current_failure() {
+                        return Err(error);
+                    }
+                    consumer.wait_for_message(wait_epoch)?;
+                }
+                Err(ControlRingReadError::Ring(error)) => return Err(ring_error(error)),
+                Err(ControlRingReadError::Decode(error)) => return Err(wire_error(error)),
+            }
+        };
+        if response.request_id != request_id {
+            return Err(invalid_data("broker answered a different request"));
+        }
+        // Accepting the response with the lane's release excludes failure
+        // recording, so no call succeeds once the association has failed.
+        lane.release_if_live(|lane| {
+            let consumer = &mut lane.response_consumer;
+            consumer.publish_head().map_err(ring_error)?;
+            consumer.wake_producer()
+        })?;
+        Ok(response)
     }
 
     fn fail(&self, error: Error) -> IoResult<()> {
-        self.pending_calls.record_failure(Arc::new(error));
-        self.request_wake
-            .interrupt_wait()
-            .and(self.response_wake.interrupt_wait())
-            .and(self.notification_wake.interrupt_wait())
+        self.lanes.record_failure(error);
+        self.wakes
+            .iter()
+            .map(ControlRingWakeHandle::interrupt_wait)
+            .fold(Ok(()), IoResult::and)
             .and(self.liveness.shutdown())
     }
 }

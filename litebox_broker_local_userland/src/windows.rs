@@ -10,7 +10,7 @@ use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_transport::control_ring::ControlRing;
+use litebox_broker_transport::control_ring::{ControlRing, ControlRingLayout};
 use litebox_broker_transport_windows_userland::control_ring::{
     WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
 };
@@ -43,9 +43,10 @@ pub fn connect(control_pipe: &OsStr) -> Result<(BrokerConnection, Option<Process
     let (local, startup, (notifications, process_image)) =
         BrokerLocal::negotiate(setup, |mut setup| {
             let shared_memory = Arc::new(setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?);
-            let control_memory = setup.receive_control_ring()?;
+            let layout = ControlRingLayout::MULTI_LANE;
+            let control_memory = setup.receive_control_ring(layout)?;
             let process_image = setup.receive_process_image()?;
-            let control_ring = ControlRing::new(control_memory).map_err(|error| {
+            let control_ring = ControlRing::new(control_memory, layout).map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("invalid broker control ring: {error:?}"),

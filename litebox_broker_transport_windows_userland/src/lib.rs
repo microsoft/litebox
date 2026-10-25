@@ -13,7 +13,6 @@ pub mod existing_runner;
 mod host;
 mod local;
 pub mod named_pipe;
-mod pending_calls;
 pub mod process_image;
 mod setup;
 pub mod shared_memory;

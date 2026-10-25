@@ -41,12 +41,7 @@ use rustix::net::{
 };
 
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, CONTROL_RING_PARALLEL_SPIN_LIMIT, MemoryAccessPolicy,
-    WaitableSharedMemory,
-};
-#[cfg(test)]
-use litebox_broker_transport::control_ring::{
-    memory_permits_byte_range, memory_permits_u32, memory_permits_u64,
+    CONTROL_RING_PARALLEL_SPIN_LIMIT, ControlRingLayout, MemoryAccessPolicy, WaitableSharedMemory,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use litebox_platform::buffer::RawBytes;
@@ -207,9 +202,12 @@ impl MemfdSharedMemory {
         Self::create_with_policy(length, MemoryAccessPolicy::Bytes)
     }
 
-    /// Creates and maps a sealed memfd for one control ring.
-    pub fn create_control_ring() -> IoResult<Self> {
-        Self::create_with_policy(CONTROL_RING_MEMORY_SIZE, MemoryAccessPolicy::ControlRing)
+    /// Creates and maps a sealed memfd for one control ring with `layout`.
+    pub fn create_control_ring(layout: ControlRingLayout) -> IoResult<Self> {
+        Self::create_with_policy(
+            layout.memory_size(),
+            MemoryAccessPolicy::ControlRing(layout),
+        )
     }
 
     fn create_with_policy(length: usize, policy: MemoryAccessPolicy) -> IoResult<Self> {
@@ -238,12 +236,12 @@ impl MemfdSharedMemory {
         Self::from_received_fd_with_policy(fd, expected_length, MemoryAccessPolicy::Bytes)
     }
 
-    /// Maps a control-ring memfd received from the broker.
-    pub fn control_ring_from_received_fd(fd: OwnedFd) -> IoResult<Self> {
+    /// Maps a control-ring memfd with `layout` received from the broker.
+    pub fn control_ring_from_received_fd(fd: OwnedFd, layout: ControlRingLayout) -> IoResult<Self> {
         Self::from_received_fd_with_policy(
             fd,
-            CONTROL_RING_MEMORY_SIZE,
-            MemoryAccessPolicy::ControlRing,
+            layout.memory_size(),
+            MemoryAccessPolicy::ControlRing(layout),
         )
     }
 
@@ -288,7 +286,7 @@ impl MemfdSharedMemory {
         unsafe { madvise(address.as_ptr().cast(), length, Advice::LinuxDontFork) }?;
         let spin_limit = match policy {
             MemoryAccessPolicy::Bytes => 0,
-            MemoryAccessPolicy::ControlRing => parallel_spin_limit(),
+            MemoryAccessPolicy::ControlRing(_) => parallel_spin_limit(),
         };
         Ok(Self {
             fd,
@@ -470,13 +468,14 @@ pub fn receive_memfd(
     MemfdSharedMemory::from_received_fd(fd, expected_length)
 }
 
-/// Receives and maps one control-ring memfd from the broker.
+/// Receives and maps one control-ring memfd with `layout` from the broker.
 pub fn receive_control_ring_memfd(
     stream: &mut UnixStream,
+    layout: ControlRingLayout,
     deadline: Option<Instant>,
 ) -> IoResult<MemfdSharedMemory> {
     let fd = with_read_deadline(stream, deadline, receive_fd)?;
-    MemfdSharedMemory::control_ring_from_received_fd(fd)
+    MemfdSharedMemory::control_ring_from_received_fd(fd, layout)
 }
 
 /// Sparse memfd holding a process memory image for a runner being started.
@@ -734,8 +733,7 @@ mod tests {
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferSlotIndex,
     };
     use litebox_broker_transport::control_ring::{
-        CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRing, ControlRingReadStatus,
-        ControlRingWriteStatus,
+        ControlRing, ControlRingReadStatus, ControlRingWriteStatus,
     };
     use litebox_broker_transport::shared_memory::SharedBufferPool;
     use rustix::io::FdFlags;
@@ -743,6 +741,9 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
+
+    const LAYOUT: ControlRingLayout = ControlRingLayout::MULTI_LANE;
+    const MEMORY_SIZE: usize = LAYOUT.memory_size();
 
     #[test]
     fn mappings_share_bytes_and_validate_ranges() {
@@ -796,19 +797,20 @@ mod tests {
 
     #[test]
     fn mappings_enforce_control_ring_typed_access() {
-        let first = MemfdSharedMemory::create_control_ring().unwrap();
+        let first = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
         let second = MemfdSharedMemory::control_ring_from_received_fd(
             first.fd.as_fd().try_clone_to_owned().unwrap(),
+            LAYOUT,
         )
         .unwrap();
-        let sequence_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| memory_permits_u64(*offset))
+        let sequence_offset = (0..MEMORY_SIZE)
+            .find(|offset| LAYOUT.permits_u64(*offset))
             .unwrap();
-        let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| memory_permits_u32(*offset))
+        let epoch_offset = (0..MEMORY_SIZE)
+            .find(|offset| LAYOUT.permits_u32(*offset))
             .unwrap();
-        let body_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| memory_permits_byte_range(*offset, 1))
+        let body_offset = (0..MEMORY_SIZE)
+            .find(|offset| LAYOUT.permits_byte_range(*offset, 1))
             .unwrap();
 
         first
@@ -866,7 +868,7 @@ mod tests {
             Err(SharedMemoryError::InvalidRange)
         );
         assert_eq!(
-            second.load_u64_acquire(CONTROL_RING_MEMORY_SIZE),
+            second.load_u64_acquire(MEMORY_SIZE),
             Err(SharedMemoryError::InvalidRange)
         );
         assert_eq!(
@@ -884,9 +886,9 @@ mod tests {
 
     #[test]
     fn futex_wait_returns_without_peer_cooperation() {
-        let memory = MemfdSharedMemory::create_control_ring().unwrap();
-        let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| memory_permits_u32(*offset))
+        let memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
+        let epoch_offset = (0..MEMORY_SIZE)
+            .find(|offset| LAYOUT.permits_u32(*offset))
             .unwrap();
         let start = Instant::now();
 
@@ -897,13 +899,13 @@ mod tests {
 
     #[test]
     fn peer_descriptor_writes_are_read_as_untrusted_snapshots() {
-        let memory = MemfdSharedMemory::create_control_ring().unwrap();
+        let memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
         let peer_fd = memory.as_fd().try_clone_to_owned().unwrap();
-        let sequence_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| memory_permits_u64(*offset))
+        let sequence_offset = (0..MEMORY_SIZE)
+            .find(|offset| LAYOUT.permits_u64(*offset))
             .unwrap();
-        let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| memory_permits_u32(*offset))
+        let epoch_offset = (0..MEMORY_SIZE)
+            .find(|offset| LAYOUT.permits_u32(*offset))
             .unwrap();
 
         let mut expected_sequence = [0; size_of::<u64>()];
@@ -983,9 +985,10 @@ mod tests {
         let received_pool =
             MemfdSharedMemory::from_received_fd(pool.fd.as_fd().try_clone_to_owned().unwrap(), 64)
                 .unwrap();
-        let ring = MemfdSharedMemory::create_control_ring().unwrap();
+        let ring = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
         let received_ring = MemfdSharedMemory::control_ring_from_received_fd(
             ring.fd.as_fd().try_clone_to_owned().unwrap(),
+            LAYOUT,
         )
         .unwrap();
         for memory in [&pool, &received_pool, &ring, &received_ring] {
@@ -1052,13 +1055,13 @@ mod tests {
 
     #[test]
     fn transfers_exact_sealed_control_ring_mapping() {
-        let memory = MemfdSharedMemory::create_control_ring().unwrap();
-        let ring = ControlRing::new(memory).unwrap();
+        let memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
+        let ring = ControlRing::new(memory, LAYOUT).unwrap();
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
 
         send_memfd(&mut sender, ring.memory(), None).unwrap();
-        let mapped = receive_control_ring_memfd(&mut receiver, None).unwrap();
-        let mapped_ring = ControlRing::new(mapped).unwrap();
+        let mapped = receive_control_ring_memfd(&mut receiver, LAYOUT, None).unwrap();
+        let mapped_ring = ControlRing::new(mapped, LAYOUT).unwrap();
         ring.memory().write(13, &[1, 2, 3]).unwrap();
         let mut bytes = [0; 3];
         mapped_ring.memory().read(13, &mut bytes).unwrap();
@@ -1073,18 +1076,23 @@ mod tests {
 
     #[test]
     fn shared_futex_wakeup_prevents_missed_cross_mapping_work() {
-        let local_memory = MemfdSharedMemory::create_control_ring().unwrap();
+        let local_memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
         let broker_memory = MemfdSharedMemory::control_ring_from_received_fd(
             local_memory.fd.as_fd().try_clone_to_owned().unwrap(),
+            LAYOUT,
         )
         .unwrap();
-        let mut producer = ControlRing::new(local_memory)
+        let mut producer = ControlRing::new(local_memory, LAYOUT)
             .unwrap()
             .into_local()
+            .lanes
+            .swap_remove(0)
             .request_producer;
-        let mut consumer = ControlRing::new(broker_memory)
+        let mut consumer = ControlRing::new(broker_memory, LAYOUT)
             .unwrap()
-            .into_broker()
+            .into_host()
+            .lanes
+            .swap_remove(0)
             .request_consumer;
         let empty_checked = Arc::new(Barrier::new(2));
         let broker_empty_checked = Arc::clone(&empty_checked);
@@ -1100,7 +1108,7 @@ mod tests {
             };
             broker_empty_checked.wait();
             consumer.wait_for_message(producer_epoch).unwrap();
-            for expected in 0..CONTROL_RING_SLOT_COUNT {
+            for expected in 0..LAYOUT.requests(0).slot_count() {
                 let expected = u8::try_from(expected).unwrap();
                 loop {
                     match consumer
@@ -1136,7 +1144,7 @@ mod tests {
         });
 
         empty_checked.wait();
-        for value in 0..CONTROL_RING_SLOT_COUNT {
+        for value in 0..LAYOUT.requests(0).slot_count() {
             let value = u8::try_from(value).unwrap();
             assert_eq!(
                 producer.try_write(&[value]),
@@ -1250,7 +1258,7 @@ mod tests {
                 .kind(),
             ErrorKind::InvalidInput
         );
-        let control = MemfdSharedMemory::create_control_ring().unwrap();
+        let control = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
         assert_eq!(
             image
                 .write_from_shared(0, &control, 0..1)

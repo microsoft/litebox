@@ -17,7 +17,7 @@ use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_transport::control_ring::ControlRing;
+use litebox_broker_transport::control_ring::{ControlRing, ControlRingLayout};
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
     UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
@@ -84,13 +84,14 @@ fn negotiate(
         BrokerLocal::negotiate(setup_channel, |mut setup| {
             let shared_memory =
                 setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
-            let control_memory = setup.receive_control_ring(Some(setup_deadline))?;
+            let layout = ControlRingLayout::MULTI_LANE;
+            let control_memory = setup.receive_control_ring(layout, Some(setup_deadline))?;
             let process_image = setup.receive_process_image(Some(setup_deadline))?;
             let positional_io_fds = [
                 shared_memory.as_fd().as_raw_fd(),
                 control_memory.as_fd().as_raw_fd(),
             ];
-            let control_ring = ControlRing::new(control_memory).map_err(|error| {
+            let control_ring = ControlRing::new(control_memory, layout).map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("invalid broker control ring: {error:?}"),
@@ -268,8 +269,8 @@ mod tests {
     };
     use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
     use litebox_broker_transport_linux_userland::unix_socket::{
-        UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
-        UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
+        UnixControlRingHostCallLaneSource, UnixControlRingHostNotificationChannel,
+        UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
     };
     use litebox_broker_transport_linux_userland::unix_socket::{
         UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
@@ -318,18 +319,19 @@ mod tests {
         UnixControlRingLocalCallChannel,
         UnixControlRingLocalShutdown,
         UnixControlRingLocalNotificationChannel,
-        UnixControlRingHostRequestSource,
-        UnixControlRingHostResponseSink,
+        UnixControlRingHostCallLaneSource,
         UnixControlRingHostNotificationChannel,
         UnixControlRingHostShutdown,
     ) {
-        let local_memory = MemfdSharedMemory::create_control_ring().unwrap();
+        let layout = ControlRingLayout::MULTI_LANE;
+        let local_memory = MemfdSharedMemory::create_control_ring(layout).unwrap();
         let host_memory = MemfdSharedMemory::control_ring_from_received_fd(
             local_memory.as_fd().try_clone_to_owned().unwrap(),
+            layout,
         )
         .unwrap();
-        let local_ring = ControlRing::new(local_memory).unwrap();
-        let host_ring = ControlRing::new(host_memory).unwrap();
+        let local_ring = ControlRing::new(local_memory, layout).unwrap();
+        let host_ring = ControlRing::new(host_memory, layout).unwrap();
         let host_activation =
             std::thread::spawn(move || host_channel.into_active(host_ring).unwrap());
         let weak_association_coordinator = Arc::downgrade(association_coordinator);
@@ -340,14 +342,12 @@ mod tests {
                 }
             })
             .unwrap();
-        let (request_source, response_sink, host_notifications, host_shutdown) =
-            host_activation.join().unwrap();
+        let (host_lanes, host_notifications, host_shutdown) = host_activation.join().unwrap();
         (
             local_call,
             local_shutdown,
             local_notifications,
-            request_source,
-            response_sink,
+            host_lanes,
             host_notifications,
             host_shutdown,
         )
@@ -362,8 +362,7 @@ mod tests {
             active_channel,
             association_shutdown,
             notification_channel,
-            host_request_source,
-            host_response_sink,
+            host_lanes,
             _host_notifications,
             host_shutdown,
         ) = activate_control_channel(local_setup, host_control, &association_coordinator);
@@ -380,8 +379,7 @@ mod tests {
         .unwrap();
 
         host_shutdown.shutdown().unwrap();
-        drop(host_request_source);
-        drop(host_response_sink);
+        drop(host_lanes);
 
         failure_receiver
             .recv_timeout(Duration::from_secs(1))
@@ -401,8 +399,7 @@ mod tests {
             active_channel,
             association_shutdown,
             _notification_channel,
-            mut host_request_source,
-            _host_response_sink,
+            mut host_lanes,
             _host_notifications,
             _host_shutdown,
         ) = activate_control_channel(local_setup, host_control, &association_coordinator);
@@ -419,10 +416,9 @@ mod tests {
         let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
         association_coordinator.install_dispatch(move || failure_sender.send(()).unwrap());
         failure_receiver.try_recv().unwrap();
-        assert_eq!(
-            host_request_source.recv_request().unwrap(),
-            HostReceive::PeerClosed
-        );
+        // Lane 0 is always demanded, so the broker may hand it out before it
+        // sees the close.
+        while host_lanes.next_lane().unwrap().is_some() {}
         drop(active_channel);
     }
 
@@ -435,8 +431,7 @@ mod tests {
             active_channel,
             association_shutdown,
             notification_channel,
-            _host_request_source,
-            _host_response_sink,
+            _host_lanes,
             mut host_notifications,
             host_shutdown,
         ) = activate_control_channel(local_setup, host_control, &association_coordinator);
