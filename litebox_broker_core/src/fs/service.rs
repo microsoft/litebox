@@ -238,11 +238,16 @@ where
         mode: FileMode,
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
-        let (entry, path) =
-            match Resolver::open_with_path(self, user, path, flags, mode & FileMode::SUPPORTED) {
-                Ok(opened) => opened,
-                Err(error) => return Ok(Err(file_open_error(error))),
-            };
+        let (entry, path) = match Resolver::open_with_path_returned(
+            self,
+            user,
+            path,
+            flags,
+            mode & FileMode::SUPPORTED,
+        ) {
+            Ok(opened) => opened,
+            Err(error) => return Ok(Err(file_open_error(error))),
+        };
         let readiness = Resolver::readiness_source(self, &entry);
         let terminal = Resolver::terminal(self, &entry);
         Ok(Ok(File {

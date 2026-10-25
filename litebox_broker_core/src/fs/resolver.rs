@@ -582,13 +582,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         flags: OFlags,
         mode: Mode,
     ) -> Result<ResolverEntry<Backend>, OpenError> {
-        self.open_with_path(user, path, flags, mode)
+        self.open_with_path_returned(user, path, flags, mode)
             .map(|(entry, _)| entry)
     }
 
     /// Opens a file like [`Self::open`], also returning the absolute path of the opened object, with
     /// symbolic links resolved.
-    pub(crate) fn open_with_path(
+    pub(crate) fn open_with_path_returned(
         &self,
         user: UserInfo,
         path: &str,
