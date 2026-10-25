@@ -5,7 +5,7 @@
 //! host anchor; the guest thread pointer is virtualized in memory.
 
 use super::*;
-use litebox::arch::aarch64::vector::VectorArea;
+use litebox::arch::aarch64::vector::{SveVectorLength, VectorArea};
 pub(super) use litebox_trampoline::aarch64::recovery::GateInterruption;
 use litebox_trampoline::aarch64::recovery::{GateAbi, GateRuntimeState};
 pub(super) type Aarch64GateSignalResult =
@@ -88,6 +88,10 @@ struct TlsBlock {
     /// pointers, so [`publish_guest_vector_area`] re-derives and stores it after
     /// every such access.
     guest_vector_state: usize,
+    /// Nonzero iff the host has SVE (see [`host_has_sve`]), even if guests get
+    /// no vector length. Written once, when [`with_guest_vector_area`] creates
+    /// this thread's area.
+    host_has_sve: u8,
     host_fp_state: FpState,
     resume_frame: resume_frame::ResumeFrame,
 }
@@ -109,6 +113,7 @@ pub(super) mod tls_offset {
     pub(crate) const OUTBOUND_STUB: usize = offset_of!(TlsBlock, outbound_stub);
     pub(crate) const OUTBOUND_PC: usize = offset_of!(TlsBlock, outbound_pc);
     pub(super) const GUEST_VECTOR_STATE: usize = offset_of!(TlsBlock, guest_vector_state);
+    pub(super) const HOST_HAS_SVE: usize = offset_of!(TlsBlock, host_has_sve);
     pub(super) const HOST_FP_STATE: usize = offset_of!(TlsBlock, host_fp_state);
     pub(crate) const RESUME_FRAME: usize = offset_of!(TlsBlock, resume_frame);
 }
@@ -177,7 +182,8 @@ const _: () = assert!(
     tls_offset::GUEST_X18 - tls_offset::GUEST_THREAD_POINTER
         == litebox_trampoline::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP
 );
-const _: () = assert!(tls_offset::GUEST_VECTOR_STATE < (1 << 12));
+const _: () =
+    assert!(tls_offset::GUEST_VECTOR_STATE < (1 << 12) && tls_offset::HOST_HAS_SVE < (1 << 12));
 
 #[cfg(feature = "aarch64_virtualize_x18")]
 fn set_guest_x18(value: usize) {
@@ -549,7 +555,9 @@ syscall_callback_in_guest_cleared:
     mov  x0,  #-{ENOSYS}
     str  x0,  [x16]
 
+    // A syscall discards SVE state beyond V0-V31, as on Linux.
     ldr  x0, [x17, #{GUEST_VECTOR_STATE}]
+    strb wzr, [x0, #{VECTOR_SVE_LIVE}]
     stp  q0,  q1,  [x0, #0]
     stp  q2,  q3,  [x0, #32]
     stp  q4,  q5,  [x0, #64]
@@ -655,6 +663,7 @@ interrupt_callback:
     GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
     VECTOR_FPSR = const VectorArea::FPSR_OFFSET,
     VECTOR_FPCR = const VectorArea::FPCR_OFFSET,
+    VECTOR_SVE_LIVE = const VectorArea::SVE_LIVE_OFFSET,
     IN_GUEST = const tls_offset::IN_GUEST,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
@@ -682,10 +691,11 @@ const _: () = assert!(
 /// generic guest-resume path. It restores all 31 GPRs, `SP`, `PC`, `PSTATE`,
 /// and the vector state at once without depending on guest-stack contents.
 ///
-/// This path handles arbitrary resume PCs, including asynchronous resumes. It
-/// is also the fallback when the syscall-specific outbound stub cannot use its
-/// guest-stack frame. Returning through `rt_sigreturn` spends no register as a
-/// branch target, so guest `x16` survives.
+/// This path handles arbitrary resume PCs, including asynchronous resumes, and
+/// every resume with live SVE state. It is also the fallback when the
+/// syscall-specific outbound stub cannot use its guest-stack frame. Returning
+/// through `rt_sigreturn` spends no register as a branch target, so guest
+/// `x16` survives.
 ///
 /// One instance per guest thread, in this crate's TLS rather than on the guest
 /// stack, which would have to be writable at resume time and lies at a
@@ -843,6 +853,7 @@ pub(super) mod resume_frame {
         frame.ucontext.sigmask = litebox_common_linux::signal::SigSet::from_u64(blocked);
 
         let mcontext = &mut frame.ucontext.mcontext;
+        // `rt_sigreturn` checks an `sve_context` against the current VL.
         super::with_guest_vector_area(|area| write_vector_records(&mut mcontext.__reserved, area));
         for (dst, src) in mcontext.regs.iter_mut().zip(ctx.regs.iter()) {
             *dst = *src as u64;
@@ -870,7 +881,9 @@ pub(super) mod resume_frame {
         use litebox::arch::aarch64::vector::VectorArea;
         use litebox::utils::TruncateExt;
         use litebox_common_linux::PtRegs;
-        use litebox_common_linux::signal::aarch64::read_vector_records;
+        use litebox_common_linux::signal::aarch64::{
+            SveContext, live_sve_context_size, read_vector_records,
+        };
         use litebox_common_linux::signal::{Siginfo, Ucontext, aarch64::Sigcontext};
 
         /// The layout `rt_sigreturn` expects, pinned against the kernel's
@@ -902,15 +915,32 @@ pub(super) mod resume_frame {
 
         #[test]
         fn test_prepared_frame_carries_the_guest_vector_records() {
-            let state = super::super::tests::live_guest_vector_state();
-            super::super::set_guest_vector_state(&state);
-            let frame = super::prepare(&PtRegs::default());
-            // SAFETY: `frame` is this thread's own frame and no `&mut` to it
-            // is live here.
-            let reserved = unsafe { &(*frame).ucontext.mcontext.__reserved };
-            let mut read = VectorArea::default();
-            assert_eq!(read_vector_records(reserved, &mut read), Ok(()));
-            assert_eq!(read, state);
+            let live = super::super::tests::live_guest_vector_state();
+            let mut not_live = live.clone();
+            not_live.discard_sve();
+            // Live state first, so a stale payload left in the frame would show.
+            for state in [live.clone(), not_live, live] {
+                super::super::set_guest_vector_state(&state);
+                let frame = super::prepare(&PtRegs::default());
+                // SAFETY: `frame` is this thread's own frame and no `&mut` to it
+                // is live here.
+                let reserved = unsafe { &(*frame).ucontext.mcontext.__reserved };
+                let mut read = VectorArea::initial(state.sve_vl());
+                assert_eq!(read_vector_records(reserved, &mut read), Ok(()));
+                assert_eq!(read, state);
+                if let Some(vl) = state.sve_vl() {
+                    let size = u32::from_ne_bytes(reserved[532..536].try_into().unwrap());
+                    let expected = if state.sve_payload().is_some() {
+                        live_sve_context_size(vl)
+                    } else {
+                        size_of::<SveContext>()
+                    };
+                    assert_eq!(
+                        size as usize, expected,
+                        "sve_context follows fpsimd_context"
+                    );
+                }
+            }
         }
 
         #[test]
@@ -936,7 +966,9 @@ pub(super) mod resume_frame {
             // `99:` label. The caller-saved registers, `x8`, `x16` and `x18`
             // included, are restored from the frame and clobbered via
             // `clobber_abi("C")`; `x17` is an explicit output so that it cannot
-            // share `{f}`'s register.
+            // share `{f}`'s register. The vector registers, P0-P15 and FFR are
+            // restored from the guest vector area; `clobber_abi("C")` covers
+            // all of them on AArch64, `v8`-`v15` included.
             let observed: u64;
             unsafe {
                 core::arch::asm!(
@@ -1030,15 +1062,16 @@ pub(super) unsafe extern "C" fn switch_stack(
 ///
 /// The generic resume mechanism restores the complete context through
 /// `rt_sigreturn`. As an optimization, a resume at the most recent rewritten
-/// syscall site uses its recorded outbound stub while that stub's guest-stack
-/// frame remains usable. A fault while staging that frame returns to the
-/// generic mechanism.
+/// syscall site without live SVE state uses its recorded outbound stub while
+/// that stub's guest-stack frame remains usable. A fault while staging that
+/// frame returns to the generic mechanism.
 pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[cfg(feature = "aarch64_virtualize_x18")]
     set_guest_x18(ctx.regs[18]);
-    if outbound_stub_is_current(ctx) {
+    if can_resume_via_outbound_stub(ctx) {
         // SAFETY: the caller's contract, plus the stub's own: a stub is
-        // recorded and `ctx.pc` is the PC it branches to, checked above.
+        // recorded, `ctx.pc` is the PC it branches to, and SVE state is not
+        // live, checked above.
         unsafe { switch_to_guest_via_outbound_stub(ctx) }
     } else {
         // SAFETY: inherited from this function's contract.
@@ -1046,35 +1079,49 @@ pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRe
     }
 }
 
-pub(super) fn outbound_stub_is_current(ctx: &litebox_common_linux::PtRegs) -> bool {
+/// Returns whether `ctx` resumes at the most recent rewritten syscall site with
+/// SVE state not live, as [`switch_to_guest_via_outbound_stub`] requires.
+fn can_resume_via_outbound_stub(ctx: &litebox_common_linux::PtRegs) -> bool {
     let stub: usize;
     let pc: usize;
-    // SAFETY: own-thread [`tls_offset`] slot accesses. Read through `asm!`
-    // rather than plain loads because the transition assembly writes these
-    // slots behind the compiler's back.
+    let sve_live: u32;
+    // SAFETY: own-thread [`tls_offset`] slot accesses, and a read of the
+    // SVE-live flag through the pointer the transition assembly uses:
+    // `run_thread_inner` publishes this thread's vector area
+    // (`prepare_guest_vector_state`) before any `switch_to_guest`, and every
+    // Rust access to the area republishes it. Read through `asm!` rather than
+    // plain loads because the transition assembly writes these slots behind the
+    // compiler's back.
     unsafe {
         core::arch::asm!(
             load_tls_block_base!("{block}"),
             "ldr {stub}, [{block}, #{stub_off}]",
             "ldr {pc}, [{block}, #{pc_off}]",
+            "ldr {area}, [{block}, #{area_off}]",
+            "ldrb {live:w}, [{area}, #{live_off}]",
             block = out(reg) _,
+            area = out(reg) _,
             stub = out(reg) stub,
             pc = out(reg) pc,
+            live = out(reg) sve_live,
             stub_off = const tls_offset::OUTBOUND_STUB,
             pc_off = const tls_offset::OUTBOUND_PC,
+            area_off = const tls_offset::GUEST_VECTOR_STATE,
+            live_off = const VectorArea::SVE_LIVE_OFFSET,
             options(nostack, preserves_flags, readonly)
         );
     }
-    stub != 0 && pc == ctx.pc
+    stub != 0 && pc == ctx.pc && sve_live == 0
 }
 
 /// Re-enters the guest through the rewriter's per-site outbound stub, for a
-/// resume at the `SVC` site the guest left from.
+/// resume at the `SVC` site the guest left from. Restores FP/SIMD state and
+/// leaves SVE state beyond it zero, as after a Linux syscall.
 ///
 /// # Safety
 /// As [`switch_to_guest`], and additionally: a stub must be recorded in
-/// [`tls_offset::OUTBOUND_STUB`] and `ctx.pc` must be the PC it branches to.
-/// [`outbound_stub_is_current`] is the check.
+/// [`tls_offset::OUTBOUND_STUB`], `ctx.pc` must be the PC it branches to, and
+/// SVE state must not be live. [`can_resume_via_outbound_stub`] is the check.
 ///
 /// Stages `PtRegs::regs[16]` in the stub frame before restoring guest state.
 /// If that guest-stack access faults (for example, because the stack was
@@ -1174,6 +1221,35 @@ switch_to_guest_stage_x16_fixup:
     ldp  q28, q29, [x16, #448]
     ldp  q30, q31, [x16, #480]
 
+    // SVE state is not live on this path. The Q-register loads zeroed Z bits above 128, but
+    // P0-P15 and FFR still hold host values, also when guests get no vector length. Linux
+    // before 6.2 disables SVE on every syscall, and later kernels only on a syscall that
+    // context-switches, so this takes one SVE access trap on the first resume after such a
+    // host syscall.
+    ldrb w4,  [x17, #{HOST_HAS_SVE}]
+    cbz  w4,  5f
+    .arch_extension sve
+    pfalse p0.b
+    wrffr  p0.b
+    pfalse p1.b
+    pfalse p2.b
+    pfalse p3.b
+    pfalse p4.b
+    pfalse p5.b
+    pfalse p6.b
+    pfalse p7.b
+    pfalse p8.b
+    pfalse p9.b
+    pfalse p10.b
+    pfalse p11.b
+    pfalse p12.b
+    pfalse p13.b
+    pfalse p14.b
+    pfalse p15.b
+    // The directive would otherwise stay in effect for this crate's later naked asm.
+    .arch_extension nosve
+5:
+
     // x16 carries the stub. Recompute the frame after x4 was used as scratch;
     // SP starts below the frame because the stub pops it before returning.
     ldr  x16, [x17, #{OUTBOUND_STUB}]
@@ -1218,6 +1294,7 @@ switch_to_guest_via_outbound_stub_end:
     INTERRUPT = const tls_offset::INTERRUPT,
     HOST_FP_STATE = const tls_offset::HOST_FP_STATE,
     GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
+    HOST_HAS_SVE = const tls_offset::HOST_HAS_SVE,
     VECTOR_FPSR = const VectorArea::FPSR_OFFSET,
     VECTOR_FPCR = const VectorArea::FPCR_OFFSET,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
@@ -1338,12 +1415,17 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
             )
         };
         let host = litebox_common_linux::hwcap::LinuxHwcaps { hwcap, hwcap2 }.to_cpu_features();
-        // PAUTH is kept: PAC keys are per host process and inherited by native fork. Excluded:
+        // PAUTH is kept: PAC keys are per host process and inherited by native fork. SVE state
+        // is kept at `guest_sve_vl`, if any. Excluded:
         // - DIT and SSBS: the syscall path saves and restores only NZCV (see
         //   `switch_to_guest_via_outbound_stub`).
-        // - SVE and SME: only FP/SIMD vector state is saved.
+        // - SME: ZA and streaming-mode state are not saved.
         // - BTI and MTE: there is no PROT_BTI/PROT_MTE page-attribute support.
-        host & (CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH)
+        let mut offered = CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH;
+        if guest_sve_vl().is_some() {
+            offered |= CpuFeatures::SVE_STATE_ONLY;
+        }
+        host & offered
     }
 }
 
@@ -1351,6 +1433,49 @@ thread_local! {
     /// This thread's guest vector state. Its buffer address, published in
     /// [`tls_offset::GUEST_VECTOR_STATE`], stays fixed once installed.
     static GUEST_VECTOR_AREA: RefCell<Option<VectorArea>> = const { RefCell::new(None) };
+}
+
+/// Returns whether the host has SVE, from `AT_HWCAP`.
+fn host_has_sve() -> bool {
+    // SAFETY: getauxval only reads this process's auxiliary vector.
+    let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) };
+    hwcap & libc::HWCAP_SVE != 0
+}
+
+/// Returns the host's SVE vector length, or `None` if the host lacks SVE.
+///
+/// The VL is a Linux per-thread setting. LiteBox never changes it and threads
+/// inherit it, so every call returns the same length.
+fn host_sve_vl() -> Option<SveVectorLength> {
+    if !host_has_sve() {
+        return None;
+    }
+    let vl: u64;
+    // SAFETY: HWCAP_SVE means the kernel lets EL0 execute SVE instructions;
+    // RDVL only reads the vector length.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sve",
+            "rdvl {vl}, #1",
+            ".arch_extension nosve",
+            vl = out(reg) vl,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    u16::try_from(vl).ok().and_then(SveVectorLength::new)
+}
+
+/// Returns the SVE vector length of guest vector state, or `None` if guests
+/// get no SVE: the host lacks it, or its VL needs an `extra_context` signal
+/// record (see [`sve_context_fits_reserved`]).
+///
+/// On a host whose VL needs an `extra_context`, the CPU still executes guest
+/// SVE instructions. LiteBox drops their state beyond V0-V31 across resumes
+/// and raises no SIGILL.
+///
+/// [`sve_context_fits_reserved`]: litebox_common_linux::signal::aarch64::sve_context_fits_reserved
+fn guest_sve_vl() -> Option<SveVectorLength> {
+    host_sve_vl().filter(|&vl| litebox_common_linux::signal::aarch64::sve_context_fits_reserved(vl))
 }
 
 /// Publishes `area`'s buffer pointer to the transition assembly.
@@ -1369,11 +1494,25 @@ fn publish_guest_vector_area(area: &mut VectorArea) {
     }
 }
 
-/// Runs `f` on this thread's guest vector area, first creating it without SVE
-/// if needed, then publishes the area.
+/// Runs `f` on this thread's guest vector area, first creating it at
+/// [`guest_sve_vl`] and publishing whether the host has SVE if needed, then
+/// publishes the area.
 fn with_guest_vector_area<R>(f: impl FnOnce(&mut VectorArea) -> R) -> R {
     GUEST_VECTOR_AREA.with_borrow_mut(|area| {
-        let area = area.get_or_insert_with(VectorArea::default);
+        let area = area.get_or_insert_with(|| {
+            // SAFETY: a plain store to this thread's own TLS slot.
+            unsafe {
+                core::arch::asm!(
+                    load_tls_block_base!("{block}"),
+                    "strb {sve:w}, [{block}, #{sve_off}]",
+                    block = out(reg) _,
+                    sve = in(reg) u32::from(host_has_sve()),
+                    sve_off = const tls_offset::HOST_HAS_SVE,
+                    options(nostack, preserves_flags)
+                );
+            }
+            VectorArea::initial(guest_sve_vl())
+        });
         let result = f(area);
         publish_guest_vector_area(area);
         result
@@ -1390,6 +1529,10 @@ impl litebox::platform::GuestVectorStateProvider for LinuxUserland {
     fn set_guest_vector_state(&self, state: &VectorArea) {
         set_guest_vector_state(state);
     }
+
+    fn get_guest_sve_vl(&self) -> Option<SveVectorLength> {
+        guest_sve_vl()
+    }
 }
 
 /// Returns a snapshot of the current thread's guest vector state.
@@ -1397,7 +1540,8 @@ pub(super) fn get_guest_vector_state() -> VectorArea {
     with_guest_vector_area(|area| area.clone())
 }
 
-/// Copies `state` into the current thread's guest vector area.
+/// Copies `state` into the current thread's guest vector area, keeping
+/// [`guest_sve_vl`].
 ///
 /// # Panics
 /// Panics if `state` has live SVE state at another vector length.
@@ -1720,6 +1864,13 @@ pub(super) fn signal_handler_take_guest() -> Option<*mut litebox_common_linux::P
 
 /// Captures kernel-saved guest vector state from the signal frame of an
 /// interrupted guest. Invalid vector records terminate the process.
+///
+/// LiteBox offers guests no SME. A guest that enters streaming mode anyway
+/// cannot be resumed faithfully, so a streaming-mode `sve_context` is invalid
+/// and terminates the process. When guests get no vector length, every
+/// `sve_context`, streaming or not, is skipped. Otherwise, a frame with an
+/// `extra_context` but no `sve_context` in `__reserved` also terminates the
+/// process, since its SVE state could be behind the `extra_context`.
 pub(super) fn signal_handler_capture_guest_vector_state(context: &libc::ucontext_t) {
     if !resume_frame::capture_signal_vector_state(context) {
         fatal_aarch64_runtime_state();
@@ -2008,7 +2159,8 @@ mod tests {
         assert_eq!(offset_of!(PtRegs, syscallno), 280);
     }
 
-    /// Returns this thread's guest vector state with distinct FP/SIMD registers.
+    /// Returns this thread's guest vector state with distinct FP/SIMD registers
+    /// and, at a guest VL, live SVE state.
     pub(super) fn live_guest_vector_state() -> VectorArea {
         let mut state = get_guest_vector_state();
         state.set_fpsimd(
@@ -2016,6 +2168,16 @@ mod tests {
             0,
             0,
         );
+        if let Some(vl) = state.sve_vl() {
+            let mut payload: Vec<u8> = (0..vl.payload_size())
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+            // `WRFFR`, which restores FFR, needs a monotonic predicate.
+            let ffr = vl.payload_size() - usize::from(vl.bytes()) / 8;
+            payload[ffr..].fill(0);
+            payload[ffr] = 0b111;
+            assert!(state.set_sve_payload(&payload));
+        }
         state
     }
 
@@ -2073,6 +2235,7 @@ mod tests {
             control: EXPECTED_CONTROL,
         });
         let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+        // Host frames carry an `sve_context` too when the host has SVE.
         litebox_common_linux::signal::aarch64::write_vector_records(
             resume_frame::reserved_mut(&mut context),
             &live_guest_vector_state(),
@@ -3491,13 +3654,32 @@ mod tests {
     }
 
     #[test]
-    fn guest_vector_area_keeps_its_published_buffer() {
+    fn guest_vector_area_is_installed_at_the_guest_vector_length() {
+        const PR_SVE_GET_VL: libc::c_int = 51;
+        const PR_SVE_VL_LEN_MASK: libc::c_int = 0xffff;
+
+        // SAFETY: getauxval only reads this process's auxiliary vector.
+        let host_vl = if unsafe { libc::getauxval(libc::AT_HWCAP) } & libc::HWCAP_SVE == 0 {
+            None
+        } else {
+            // SAFETY: PR_SVE_GET_VL only reports this thread's vector length.
+            let status = unsafe { libc::prctl(PR_SVE_GET_VL) };
+            assert!(status > 0, "PR_SVE_GET_VL failed with SVE");
+            SveVectorLength::new(u16::try_from(status & PR_SVE_VL_LEN_MASK).unwrap())
+        };
+        assert_eq!(host_sve_vl(), host_vl);
+
         let buffer = with_guest_vector_area(VectorArea::as_mut_ptr);
         assert_eq!(
             read_tls_slot!(usize, tls_offset::GUEST_VECTOR_STATE),
             buffer.addr()
         );
+        assert_eq!(
+            read_tls_slot!(u8, tls_offset::HOST_HAS_SVE),
+            u8::from(host_vl.is_some())
+        );
         set_guest_vector_state(&VectorArea::default());
+        assert_eq!(get_guest_vector_state().sve_vl(), guest_sve_vl());
         assert_eq!(
             read_tls_slot!(usize, tls_offset::GUEST_VECTOR_STATE),
             buffer.addr(),

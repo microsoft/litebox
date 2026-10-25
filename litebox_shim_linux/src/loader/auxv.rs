@@ -85,8 +85,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
         }
 
-        // The XSAVE state in x86-64 signal frames makes their size host-dependent.
-        #[cfg(target_arch = "x86_64")]
+        // Linux always provides it. On x86-64, the XSAVE state in signal frames makes their size
+        // host-dependent.
         aux.insert(
             AuxKey::AT_MINSIGSTKSZ,
             crate::syscalls::signal::max_signal_frame_size(),
@@ -97,13 +97,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             use litebox::arch::aarch64::CpuFeatures;
             use litebox::utils::TruncateExt as _;
 
-            // Excluded: SVE and SME need SVE/ZA signal-frame records and PR_SVE_*/PR_SME_* prctls;
-            // BTI and MTE need PROT_BTI/PROT_MTE and tagged-address prctls.
+            // Excluded: SME needs ZA signal-frame records and PR_SME_* prctls; BTI and MTE need
+            // PROT_BTI/PROT_MTE and tagged-address prctls.
             //
             // PAUTH caveat: PR_PAC_* prctls fail with EINVAL, as on Linux without pointer
             // authentication. Key resets and sets must never reach the host: the guest and
             // LiteBox share one set of PAC keys.
             let mut supported = CpuFeatures::BASE_STATE_ONLY
+                | CpuFeatures::SVE_STATE_ONLY
                 | CpuFeatures::DIT
                 | CpuFeatures::SSBS
                 | CpuFeatures::PAUTH;

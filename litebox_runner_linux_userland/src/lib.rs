@@ -415,6 +415,8 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                 blocked_signals,
                 ignored_signals,
                 umask,
+                #[cfg(target_arch = "aarch64")]
+                sve_vl_inherit,
                 path,
                 cwd,
                 argv,
@@ -433,6 +435,8 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     inherited_fds: Some(inherited_fds),
                     cwd: Some(cwd),
                     umask: Some(umask),
+                    #[cfg(target_arch = "aarch64")]
+                    sve_vl_inherit,
                 },
                 path,
                 argv,
@@ -479,6 +483,8 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     inherited_fds: None,
                     cwd: None,
                     umask: None,
+                    #[cfg(target_arch = "aarch64")]
+                    sve_vl_inherit: false,
                 },
                 prog_path,
                 argv,

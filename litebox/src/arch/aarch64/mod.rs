@@ -84,6 +84,28 @@ bitflags::bitflags! {
         const SME = 1 << 44;
         const BTI = 1 << 45;
         const MTE = 1 << 46;
+        const SVE2 = 1 << 47;
+        /// `FEAT_SVE_AES`.
+        const SVE_AES = 1 << 48;
+        /// `FEAT_SVE_PMULL128`.
+        const SVE_PMULL = 1 << 49;
+        /// `FEAT_SVE_BitPerm`.
+        const SVE_BITPERM = 1 << 50;
+        const SVE_SHA3 = 1 << 51;
+        const SVE_SM4 = 1 << 52;
+        /// SVE `FEAT_I8MM`.
+        const SVE_I8MM = 1 << 53;
+        /// `FEAT_F32MM`.
+        const SVE_F32MM = 1 << 54;
+        /// `FEAT_F64MM`.
+        const SVE_F64MM = 1 << 55;
+        /// SVE `FEAT_BF16`.
+        const SVE_BF16 = 1 << 56;
+        /// SVE `FEAT_EBF16`.
+        const SVE_EBF16 = 1 << 57;
+        /// `FEAT_SVE2p1`.
+        const SVE2P1 = 1 << 58;
+        const SVE_B16B16 = 1 << 59;
     }
 }
 
@@ -130,4 +152,22 @@ impl CpuFeatures {
         .union(Self::RPRFM)
         .union(Self::MOPS)
         .union(Self::HBC);
+
+    /// Features that use only Z0-Z31, P0-P15 and FFR beyond [`Self::BASE_STATE_ONLY`] state, and
+    /// need no kernel ABI beyond SVE's. A host that reports one has enabled it for EL0, so
+    /// preserving SVE state suffices.
+    pub const SVE_STATE_ONLY: Self = Self::SVE
+        .union(Self::SVE2)
+        .union(Self::SVE_AES)
+        .union(Self::SVE_PMULL)
+        .union(Self::SVE_BITPERM)
+        .union(Self::SVE_SHA3)
+        .union(Self::SVE_SM4)
+        .union(Self::SVE_I8MM)
+        .union(Self::SVE_F32MM)
+        .union(Self::SVE_F64MM)
+        .union(Self::SVE_BF16)
+        .union(Self::SVE_EBF16)
+        .union(Self::SVE2P1)
+        .union(Self::SVE_B16B16);
 }

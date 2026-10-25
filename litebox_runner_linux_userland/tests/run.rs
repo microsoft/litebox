@@ -76,6 +76,10 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sigreturn.c",
     "sigreturn_simd.c",
     "svc_scratch_regs.c",
+    "sve_async.c",
+    "sve_signal.c",
+    "sve_syscall_abi.c",
+    "sve_x18.c",
     "tty.c",
     "vfork_fault_parent.c",
     "vfork_exec_child.c",
@@ -1127,6 +1131,9 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
     // Mirrors the platform filter intersected with the shim filter, which drops PAUTH under
     // copy-based fork.
     let mut exposed = CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH;
+    if common::guest_sve_vl().is_some() {
+        exposed |= CpuFeatures::SVE_STATE_ONLY;
+    }
     if litebox_shim_linux::syscalls::process::COPY_BASED_FORK {
         exposed.remove(CpuFeatures::PAUTH);
     }
@@ -1144,8 +1151,13 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
     let required = libc::HWCAP_FP | libc::HWCAP_ASIMD;
     assert_eq!(hwcap & required, required, "{hwcaps_line}");
     // HWCAP_CPUID would tell glibc/compiler-rt to trust the host's unfiltered ID-register reads.
-    let never = libc::HWCAP_CPUID | libc::HWCAP_SVE | libc::HWCAP_DIT | libc::HWCAP_SSBS;
+    let never = libc::HWCAP_CPUID | libc::HWCAP_DIT | libc::HWCAP_SSBS;
     assert_eq!(hwcap & never, 0, "{hwcaps_line}");
+    assert_eq!(
+        hwcap & libc::HWCAP_SVE != 0,
+        common::guest_sve_vl().is_some(),
+        "{hwcaps_line}"
+    );
     let never2 = HWCAP2_BTI | HWCAP2_MTE | HWCAP2_SME;
     assert_eq!(hwcap2 & never2, 0, "{hwcaps_line}");
 

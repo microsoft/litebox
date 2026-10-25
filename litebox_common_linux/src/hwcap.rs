@@ -38,8 +38,18 @@ const HWCAP_PACA: u64 = 1 << 30;
 const HWCAP_PACG: u64 = 1 << 31;
 
 const HWCAP2_DCPODP: u64 = 1 << 0;
+const HWCAP2_SVE2: u64 = 1 << 1;
+const HWCAP2_SVEAES: u64 = 1 << 2;
+const HWCAP2_SVEPMULL: u64 = 1 << 3;
+const HWCAP2_SVEBITPERM: u64 = 1 << 4;
+const HWCAP2_SVESHA3: u64 = 1 << 5;
+const HWCAP2_SVESM4: u64 = 1 << 6;
 const HWCAP2_FLAGM2: u64 = 1 << 7;
 const HWCAP2_FRINT: u64 = 1 << 8;
+const HWCAP2_SVEI8MM: u64 = 1 << 9;
+const HWCAP2_SVEF32MM: u64 = 1 << 10;
+const HWCAP2_SVEF64MM: u64 = 1 << 11;
+const HWCAP2_SVEBF16: u64 = 1 << 12;
 const HWCAP2_I8MM: u64 = 1 << 13;
 const HWCAP2_BF16: u64 = 1 << 14;
 const HWCAP2_DGH: u64 = 1 << 15;
@@ -52,14 +62,17 @@ const HWCAP2_RPRES: u64 = 1 << 21;
 const HWCAP2_SME: u64 = 1 << 23;
 const HWCAP2_WFXT: u64 = 1 << 31;
 const HWCAP2_EBF16: u64 = 1 << 32;
+const HWCAP2_SVE_EBF16: u64 = 1 << 33;
 const HWCAP2_CSSC: u64 = 1 << 34;
 const HWCAP2_RPRFM: u64 = 1 << 35;
+const HWCAP2_SVE2P1: u64 = 1 << 36;
 const HWCAP2_MOPS: u64 = 1 << 43;
 const HWCAP2_HBC: u64 = 1 << 44;
+const HWCAP2_SVE_B16B16: u64 = 1 << 45;
 
-/// A feature with several bits is present only if all of them are. Unmapped: `HWCAP_EVTSTRM` and
-/// `HWCAP_CPUID` are kernel services, not CPU features; SVE/SME sub-features and `HWCAP2_MTE3`
-/// have no [`CpuFeatures`] flag.
+/// A feature with several bits is present only if all of them are. `HWCAP_EVTSTRM` and
+/// `HWCAP_CPUID` are kernel services, not CPU features, and are unmapped. Bits without a
+/// [`CpuFeatures`] flag, e.g. SME sub-features and `HWCAP2_MTE3`, are never reported.
 const FEATURE_HWCAPS: &[(CpuFeatures, u64, u64)] = &[
     (CpuFeatures::FP, HWCAP_FP, 0),
     (CpuFeatures::ASIMD, HWCAP_ASIMD, 0),
@@ -108,6 +121,19 @@ const FEATURE_HWCAPS: &[(CpuFeatures, u64, u64)] = &[
     (CpuFeatures::RPRFM, 0, HWCAP2_RPRFM),
     (CpuFeatures::MOPS, 0, HWCAP2_MOPS),
     (CpuFeatures::HBC, 0, HWCAP2_HBC),
+    (CpuFeatures::SVE2, 0, HWCAP2_SVE2),
+    (CpuFeatures::SVE_AES, 0, HWCAP2_SVEAES),
+    (CpuFeatures::SVE_PMULL, 0, HWCAP2_SVEPMULL),
+    (CpuFeatures::SVE_BITPERM, 0, HWCAP2_SVEBITPERM),
+    (CpuFeatures::SVE_SHA3, 0, HWCAP2_SVESHA3),
+    (CpuFeatures::SVE_SM4, 0, HWCAP2_SVESM4),
+    (CpuFeatures::SVE_I8MM, 0, HWCAP2_SVEI8MM),
+    (CpuFeatures::SVE_F32MM, 0, HWCAP2_SVEF32MM),
+    (CpuFeatures::SVE_F64MM, 0, HWCAP2_SVEF64MM),
+    (CpuFeatures::SVE_BF16, 0, HWCAP2_SVEBF16),
+    (CpuFeatures::SVE_EBF16, 0, HWCAP2_SVE_EBF16),
+    (CpuFeatures::SVE2P1, 0, HWCAP2_SVE2P1),
+    (CpuFeatures::SVE_B16B16, 0, HWCAP2_SVE_B16B16),
 ];
 
 /// Linux `AT_HWCAP` and `AT_HWCAP2` auxiliary vector values.
@@ -182,10 +208,18 @@ mod tests {
     #[test]
     fn feature_hwcaps_match_linux_uapi() {
         // Literal bit positions from Linux uapi `hwcap.h`, independent of the constants above.
-        let features = CpuFeatures::AES | CpuFeatures::FP16 | CpuFeatures::PAUTH | CpuFeatures::HBC;
+        let features = CpuFeatures::AES
+            | CpuFeatures::FP16
+            | CpuFeatures::PAUTH
+            | CpuFeatures::HBC
+            | CpuFeatures::SVE_STATE_ONLY;
         let hwcaps = LinuxHwcaps {
-            hwcap: 1 << 3 | 1 << 9 | 1 << 10 | 1 << 30 | 1 << 31,
-            hwcap2: 1 << 44,
+            hwcap: 1 << 3 | 1 << 9 | 1 << 10 | 1 << 22 | 1 << 30 | 1 << 31,
+            hwcap2: 1 << 44
+                | (1..=6)
+                    .chain(9..=12)
+                    .chain([33, 36, 45])
+                    .fold(0, |bits, bit| bits | 1 << bit),
         };
         assert_eq!(LinuxHwcaps::from_cpu_features(features), hwcaps);
         assert_eq!(hwcaps.to_cpu_features(), features);

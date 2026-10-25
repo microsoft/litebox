@@ -23,7 +23,14 @@ use crate::{PtRegs, TASK_COMM_LEN};
 #[cfg(target_arch = "aarch64")]
 use litebox::arch::aarch64::vector::SveVectorLength;
 
-const HEADER_SIZE: usize = size_of::<u8>() + size_of::<[u32; 10]>() + size_of::<[u64; 2]>();
+const HEADER_SIZE: usize = size_of::<u8>()
+    + size_of::<[u32; 10]>()
+    + size_of::<[u64; 2]>()
+    + if cfg!(target_arch = "aarch64") {
+        size_of::<u8>()
+    } else {
+        0
+    };
 /// Size of an inherited descriptor's number, handle, and kind tag, which precede its kind's fields.
 const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u8>();
 /// Size of a memory region's start, end, and flags.
@@ -79,6 +86,9 @@ pub struct LinuxProgramStartup {
     pub ignored_signals: SigSet,
     /// File mode creation mask, with only permission bits set.
     pub umask: u32,
+    /// Whether the thread calling `execve` has `PR_SVE_VL_INHERIT` set, which the program keeps.
+    #[cfg(target_arch = "aarch64")]
+    pub sve_vl_inherit: bool,
     /// Absolute executable path.
     pub path: String,
     /// Absolute working directory.
@@ -190,6 +200,9 @@ pub struct LinuxForkStartup {
     pub registers: PtRegs,
     /// Floating-point and vector state at the `fork` system call.
     pub vector_state: GuestVectorState,
+    /// Whether the thread calling `fork` has `PR_SVE_VL_INHERIT` set, which the child copies.
+    #[cfg(target_arch = "aarch64")]
+    pub sve_vl_inherit: bool,
     /// Thread pointer, such as the FS base on x86-64 or `TPIDR_EL0` on AArch64.
     pub thread_pointer: usize,
     /// The parent's system call entry point, which the child's must match because the
@@ -279,6 +292,8 @@ impl LinuxProgramStartup {
         push_u64(&mut output, self.blocked_signals.as_u64());
         push_u64(&mut output, self.ignored_signals.as_u64());
         push_u32(&mut output, self.umask);
+        #[cfg(target_arch = "aarch64")]
+        output.push(u8::from(self.sve_vl_inherit));
         push_u32(
             &mut output,
             u32::try_from(self.path.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
@@ -333,6 +348,8 @@ impl LinuxProgramStartup {
         let blocked_signals = SigSet::from_u64(read_u64(&mut input)?);
         let ignored_signals = SigSet::from_u64(read_u64(&mut input)?);
         let umask = read_u32(&mut input)?;
+        #[cfg(target_arch = "aarch64")]
+        let sve_vl_inherit = read_bool(&mut input)?;
         let path_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let cwd_length = usize::try_from(read_u32(&mut input)?)
@@ -391,6 +408,8 @@ impl LinuxProgramStartup {
             blocked_signals,
             ignored_signals,
             umask,
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit,
             path,
             cwd,
             argv: values,
@@ -420,6 +439,8 @@ impl LinuxForkStartup {
         output.extend_from_slice(self.registers.as_bytes());
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         push_vector_state(&mut output, &self.vector_state);
+        #[cfg(target_arch = "aarch64")]
+        output.push(u8::from(self.sve_vl_inherit));
         for value in [
             self.thread_pointer,
             self.syscall_entry_point,
@@ -479,6 +500,8 @@ impl LinuxForkStartup {
         let registers = read_value(&mut input)?;
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let vector_state = read_vector_state(&mut input)?;
+        #[cfg(target_arch = "aarch64")]
+        let sve_vl_inherit = read_bool(&mut input)?;
         let thread_pointer = read_usize(&mut input)?;
         let syscall_entry_point = read_usize(&mut input)?;
         let set_child_tid = read_usize(&mut input)?;
@@ -514,11 +537,7 @@ impl LinuxForkStartup {
         let mut fds = Vec::with_capacity(fd_count);
         for _ in 0..fd_count {
             let inherited = InheritedFd::decode(&mut input)?;
-            let close_on_exec = match read_u8(&mut input)? {
-                0 => false,
-                1 => true,
-                _ => return Err(LinuxProgramStartupError::Malformed),
-            };
+            let close_on_exec = read_bool(&mut input)?;
             fds.push(ForkedFd {
                 inherited,
                 close_on_exec,
@@ -543,6 +562,8 @@ impl LinuxForkStartup {
             vector_state,
             #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             vector_state: (),
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit,
             thread_pointer,
             syscall_entry_point,
             set_child_tid,
@@ -633,11 +654,7 @@ impl InheritedFd {
                 },
             },
             EVENTFD_TAG => InheritedFdKind::Eventfd {
-                semaphore: match read_u8(input)? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(LinuxProgramStartupError::Malformed),
-                },
+                semaphore: read_bool(input)?,
             },
             TIMERFD_TAG => InheritedFdKind::Timerfd {
                 clock: match read_u8(input)? {
@@ -735,6 +752,14 @@ fn push_u64(output: &mut Vec<u8>, value: u64) {
 
 fn read_u8(input: &mut &[u8]) -> Result<u8, LinuxProgramStartupError> {
     Ok(take_bytes(input, size_of::<u8>())?[0])
+}
+
+fn read_bool(input: &mut &[u8]) -> Result<bool, LinuxProgramStartupError> {
+    match read_u8(input)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(LinuxProgramStartupError::Malformed),
+    }
 }
 
 /// Appends `state`'s SVE vector length (0 for none) and its length-delimited area bytes, without
@@ -854,6 +879,8 @@ mod tests {
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             ignored_signals: SigSet::empty().with(Signal::SIGPIPE),
             umask: 0o027,
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit: true,
             path: "/bin/child".into(),
             cwd: "/home/user".into(),
             argv: vec![
@@ -936,6 +963,8 @@ mod tests {
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
             umask: 0o022,
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit: false,
             path: "/child".into(),
             cwd: "/".into(),
             argv: vec![CString::new("").unwrap(); 1025],
@@ -1006,6 +1035,8 @@ mod tests {
             },
             registers: PtRegs::default(),
             vector_state: fork_vector_state(),
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit: true,
             thread_pointer: 0x7fff_0000,
             syscall_entry_point: 0x5555_0000,
             set_child_tid: 0x7fff_1000,
@@ -1105,6 +1136,7 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         {
             assert_eq!(decoded.vector_state, startup.vector_state);
+            assert!(decoded.sve_vl_inherit);
             // SVE that is not live, as at every `fork`, is encoded without its payload.
             let mut not_live = startup.clone();
             not_live.vector_state.discard_sve();
@@ -1198,6 +1230,8 @@ mod tests {
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
             umask: 0o022,
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit: false,
             path: "/child".into(),
             cwd: "/".into(),
             argv: vec![CString::new("child").unwrap()],

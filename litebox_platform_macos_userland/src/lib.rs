@@ -1544,6 +1544,11 @@ impl<const PAGE_SIZE: usize> litebox::platform::GuestVectorStateProvider
     fn set_guest_vector_state(&self, state: &Self::GuestVectorState) {
         set_guest_vector_state(state);
     }
+
+    fn get_guest_sve_vl(&self) -> Option<litebox::arch::aarch64::vector::SveVectorLength> {
+        // Guest vector areas are created without SVE, and installing state keeps their VL.
+        None
+    }
 }
 
 impl<const PAGE_SIZE: usize> litebox::platform::SystemInfoProvider

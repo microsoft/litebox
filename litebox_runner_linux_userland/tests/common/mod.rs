@@ -13,6 +13,27 @@ const MULTIARCH: &str = "x86_64-linux-gnu";
 #[cfg(target_arch = "aarch64")]
 const MULTIARCH: &str = "aarch64-linux-gnu";
 
+/// Returns the SVE vector length LiteBox offers guests on this host, if any:
+/// the host's, if its live `sve_context` fits a signal frame's `__reserved`
+/// area.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[allow(dead_code, reason = "not used by every test binary")]
+pub fn guest_sve_vl() -> Option<litebox::arch::aarch64::vector::SveVectorLength> {
+    use litebox::arch::aarch64::vector::SveVectorLength;
+    const PR_SVE_GET_VL: libc::c_int = 51;
+    const PR_SVE_VL_LEN_MASK: libc::c_int = 0xffff;
+
+    if !std::arch::is_aarch64_feature_detected!("sve") {
+        return None;
+    }
+    // SAFETY: PR_SVE_GET_VL only reports this thread's vector length.
+    let status = unsafe { libc::prctl(PR_SVE_GET_VL) };
+    u16::try_from(status & PR_SVE_VL_LEN_MASK)
+        .ok()
+        .and_then(SveVectorLength::new)
+        .filter(|&vl| litebox_common_linux::signal::aarch64::sve_context_fits_reserved(vl))
+}
+
 /// Find all dependencies of a given binary via `ldd`
 #[allow(dead_code, reason = "not used by loader.rs for x86")]
 pub fn find_dependencies(prog: &str) -> Vec<String> {
