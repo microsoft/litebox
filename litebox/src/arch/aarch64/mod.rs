@@ -3,6 +3,8 @@
 
 //! AArch64-specific helpers independent of host operating systems and guest ABIs.
 
+pub mod vector;
+
 /// Inclusive lower bound for user instruction and stack pointers, excluding the null guard.
 pub const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
 /// Exclusive upper bound for user addresses, reserving the final low-userspace page as a guard.

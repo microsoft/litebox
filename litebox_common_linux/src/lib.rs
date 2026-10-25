@@ -31,7 +31,7 @@ mod guest_vector_state {
         if #[cfg(target_arch = "x86_64")] {
             pub type Selected = litebox::arch::x86_64::xstate::XsaveArea;
         } else if #[cfg(target_arch = "aarch64")] {
-            pub type Selected = crate::signal::aarch64::GuestVectorState;
+            pub type Selected = litebox::arch::aarch64::vector::VectorArea;
         } else {
             pub type Selected = ();
         }
