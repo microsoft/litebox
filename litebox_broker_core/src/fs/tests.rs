@@ -965,9 +965,10 @@ mod in_mem {
             ("/dangling", symlink("dir/created")),
         ]));
         let path = |path: &str, flags: OFlags| -> String {
-            fs.open_with_path_returned(USER, path, flags, Mode::RWXU)
-                .unwrap_or_else(|error| panic!("open {path:?} failed: {error:?}"))
-                .1
+            let entry = fs
+                .open(USER, path, flags, Mode::RWXU)
+                .unwrap_or_else(|error| panic!("open {path:?} failed: {error:?}"));
+            String::from(entry.path())
         };
 
         assert_eq!(path("/", OFlags::RDONLY), "/");

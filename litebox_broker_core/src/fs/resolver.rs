@@ -579,22 +579,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         &self,
         user: UserInfo,
         path: &str,
-        flags: OFlags,
-        mode: Mode,
-    ) -> Result<ResolverEntry<Backend>, OpenError> {
-        self.open_with_path_returned(user, path, flags, mode)
-            .map(|(entry, _)| entry)
-    }
-
-    /// Opens a file like [`Self::open`], also returning the absolute path of the opened object, with
-    /// symbolic links resolved.
-    pub(crate) fn open_with_path_returned(
-        &self,
-        user: UserInfo,
-        path: &str,
         mut flags: OFlags,
         mode: Mode,
-    ) -> Result<(ResolverEntry<Backend>, String), OpenError> {
+    ) -> Result<ResolverEntry<Backend>, OpenError> {
         const CURRENTLY_SUPPORTED_OFLAGS: OFlags = OFlags::CREAT
             .union(OFlags::RDONLY)
             .union(OFlags::WRONLY)
@@ -636,20 +623,17 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
         let append_mode = flags.contains(OFlags::APPEND);
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let absolute_path = path.to_absolute();
-        let entry = |handle, seek_behavior| {
-            let entry = ResolverEntry {
-                handle,
-                _backend: core::marker::PhantomData,
-                read_allowed,
-                write_allowed,
-                position: 0,
-                append_mode,
-                nonblocking,
-                path_only,
-                seek_behavior,
-            };
-            (entry, absolute_path)
+        let entry = |handle, seek_behavior| ResolverEntry {
+            handle,
+            _backend: core::marker::PhantomData,
+            read_allowed,
+            write_allowed,
+            position: 0,
+            append_mode,
+            nonblocking,
+            path_only,
+            seek_behavior,
+            path: path.to_absolute(),
         };
 
         if path.components.is_empty() {
@@ -1262,11 +1246,20 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     nonblocking: bool,
     path_only: bool,
     seek_behavior: SeekBehavior,
+    /// Absolute path of the opened object, with symbolic links resolved, as of when it was opened.
+    ///
+    /// Later renames or removals of the object are not reflected.
+    path: String,
 }
 
 impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     pub(crate) const fn is_path_only(&self) -> bool {
         self.path_only
+    }
+
+    /// Absolute path of the opened object, with symbolic links resolved, as of when it was opened.
+    pub(crate) fn path(&self) -> &str {
+        &self.path
     }
 
     pub(crate) const fn allows_read(&self) -> bool {
