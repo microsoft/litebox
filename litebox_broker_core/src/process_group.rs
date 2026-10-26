@@ -161,7 +161,7 @@ struct TerminalSink {
 
 impl TerminalSink {
     /// Returns the foreground process group, in the terminal's session.
-    fn foreground(&self) -> ProcessGroupMembership {
+    fn get_foreground_group(&self) -> ProcessGroupMembership {
         ProcessGroupMembership {
             process_group: *self.foreground.lock(),
             session: self.session,
@@ -170,7 +170,7 @@ impl TerminalSink {
 
     /// Moves `process_group` to the foreground under the process tree lock,
     /// which `process` holds.
-    fn set_foreground(
+    fn set_foreground_group(
         &self,
         process: &BrokerProcess,
         process_group: ProcessGroupId,
@@ -204,7 +204,7 @@ impl TerminalEventSink for TerminalSink {
             let Some(processes) = self.processes.upgrade() else {
                 return;
             };
-            let foreground = self.foreground();
+            let foreground = self.get_foreground_group();
             let mut targets = crate::registered_processes(&processes);
             targets.retain(|target| target.membership() == foreground);
             targets
@@ -250,7 +250,7 @@ pub fn get_foreground_group(
 ) -> Result<ProcessGroupResult<ProcessGroupMembership>> {
     let terminal = crate::fs::handle_terminal(process, terminal)?;
     let _tree = process.core.process_tree_lock.lock();
-    Ok(controlling_terminal(process, terminal.as_ref()).map(TerminalSink::foreground))
+    Ok(controlling_terminal(process, terminal.as_ref()).map(TerminalSink::get_foreground_group))
 }
 
 /// Makes `process_group` the foreground group of the caller's controlling
@@ -269,7 +269,7 @@ pub fn set_foreground_group(
     let terminal = crate::fs::handle_terminal(process, terminal)?;
     let _tree = process.core.process_tree_lock.lock();
     Ok(controlling_terminal(process, terminal.as_ref())
-        .and_then(|sink| sink.set_foreground(process, process_group)))
+        .and_then(|sink| sink.set_foreground_group(process, process_group)))
 }
 
 #[cfg(test)]
