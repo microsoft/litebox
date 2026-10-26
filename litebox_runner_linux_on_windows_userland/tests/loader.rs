@@ -211,6 +211,30 @@ fn test_fork_with_threads_with_windows_broker() {
     assert_eq!(numeric_field(line, "slept="), 1);
 }
 
+/// Runs `fork_shared_futex_parent`, whose forked child shares `MAP_SHARED | MAP_ANONYMOUS`
+/// memory and the futexes, mutexes, and semaphores in it with the parent.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/fork_shared_futex_parent.c`.
+#[test]
+fn test_fork_shared_futex_with_windows_broker() {
+    let (broker, runner) = build_windows_broker();
+    let output =
+        run_progs_with_process_duplication(&broker, &runner, &["fork_shared_futex_parent"], &[]);
+
+    let line = output_line(&output, "shared-futex ");
+    for field in [
+        "memory=",
+        "wake=",
+        "timeout=",
+        "private=",
+        "mutex=",
+        "semaphore=",
+        "bitset=",
+    ] {
+        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
+    }
+}
+
 /// Runs `vfork_exec_parent`, whose child execs `vfork_exec_child` in a new runner.
 ///
 /// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/vfork_exec_*.c`.

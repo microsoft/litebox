@@ -249,11 +249,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
         let mut shared_mappings = self.global.shared_mappings.lock();
         let result = self.munmap_and_clear_file_mappings(addr, len);
-        let forgotten = result.is_ok().then(|| {
-            let end = addr
-                .as_usize()
-                .saturating_add(len.next_multiple_of(PAGE_SIZE));
-            shared_mappings.forget(addr.as_usize()..end)
+        let end = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .and_then(|length| addr.as_usize().checked_add(length));
+        let forgotten = end.map(|end| {
+            let range = addr.as_usize()..end;
+            if result.is_ok() {
+                alloc::vec![shared_mappings.forget(range)]
+            } else {
+                self.forget_unshared_mappings(&mut shared_mappings, range)
+            }
         });
         drop(shared_mappings);
         drop(forgotten);
@@ -270,6 +275,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
             self.clear_file_mappings_for_range(addr.as_usize(), len.next_multiple_of(PAGE_SIZE));
+        } else if let Some(end) = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .and_then(|length| addr.as_usize().checked_add(length))
+        {
+            let mut next = addr.as_usize();
+            for (mapped, _) in self.global.mm.overlapping(next..end) {
+                let start = mapped.start.max(next);
+                if next < start {
+                    self.clear_file_mappings_for_range(next, start - next);
+                }
+                next = mapped.end.min(end);
+            }
+            if next < end {
+                self.clear_file_mappings_for_range(next, end - next);
+            }
         }
         result
     }

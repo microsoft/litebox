@@ -1298,6 +1298,7 @@ fn forked_children_share_futexes_in_shared_memory() {
         "private=",
         "mutex=",
         "semaphore=",
+        "bitset=",
     ] {
         assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
     }

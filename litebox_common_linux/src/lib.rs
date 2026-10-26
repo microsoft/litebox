@@ -2320,6 +2320,7 @@ pub enum FutexOperation {
     Wait = 0,
     Wake = 1,
     WaitBitset = 9,
+    WakeBitset = 10,
 }
 
 bitflags::bitflags! {
@@ -2357,6 +2358,12 @@ pub enum FutexArgs {
         addr: UserPtrMut<u32>,
         flags: FutexFlags,
         count: u32,
+    },
+    WakeBitset {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        count: u32,
+        bitmask: u32,
     },
 }
 
@@ -3801,6 +3808,12 @@ impl SyscallRequest {
                 addr,
                 flags,
                 count: val,
+            },
+            FutexOperation::WakeBitset => FutexArgs::WakeBitset {
+                addr,
+                flags,
+                count: val,
+                bitmask: ctx.sys_req_arg(5),
             },
         };
         Ok(SyscallRequest::Futex { args })

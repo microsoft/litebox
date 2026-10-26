@@ -2761,19 +2761,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// process, as Linux keys a shared futex in private memory by its address.
     pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
         let res = match arg {
-            FutexArgs::Wake { addr, flags, count } => {
-                let Some(count) = core::num::NonZeroU32::new(count) else {
-                    return Ok(0);
-                };
-                if let Some((memory, offset)) = self.shared_futex_for(addr, &flags) {
-                    memory.wake(offset, count, None)? as usize
-                } else {
-                    self.global.futex_manager.wake(
-                        addr.to_platform_ptr::<Platform>(),
-                        count,
-                        None,
-                    )? as usize
-                }
+            FutexArgs::Wake { addr, flags, count } => self.futex_wake(addr, &flags, count, None)?,
+            FutexArgs::WakeBitset {
+                addr,
+                flags,
+                count,
+                bitmask,
+            } => {
+                // Like Linux, an empty mask fails even when there is nothing to wake.
+                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
+                self.futex_wake(addr, &flags, count, Some(bitmask))?
             }
             FutexArgs::Wait {
                 addr,
@@ -2811,12 +2808,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 };
+                // Like Linux, an empty mask fails rather than waiting for a wake that never comes.
+                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
                 self.futex_wait(
                     &self.wait_cx().with_deadline(deadline),
                     addr,
                     &flags,
                     val,
-                    core::num::NonZeroU32::new(bitmask),
+                    Some(bitmask),
                 )
                 .map_err(|error| wait_errno(timeout, error))?;
                 0
@@ -2841,6 +2840,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             self.shared_futex(addr.as_usize())
         }
+    }
+
+    /// Wakes up to `count` waiters on the futex word at `addr` whose masks intersect `bitset`, or
+    /// all masks if it is `None`, among the shared or private futexes `flags` selects.
+    fn futex_wake(
+        &self,
+        addr: UserPtrMut<u32>,
+        flags: &litebox_common_linux::FutexFlags,
+        count: u32,
+        bitset: Option<core::num::NonZeroU32>,
+    ) -> Result<usize, Errno> {
+        let Some(count) = core::num::NonZeroU32::new(count) else {
+            return Ok(0);
+        };
+        Ok(
+            if let Some((memory, offset)) = self.shared_futex_for(addr, flags) {
+                memory.wake(offset, count, bitset)? as usize
+            } else {
+                self.global
+                    .futex_manager
+                    .wake(addr.to_platform_ptr::<Platform>(), count, bitset)?
+                    as usize
+            },
+        )
     }
 
     /// Waits on the futex word at `addr` with the shared or private futexes `flags` selects.

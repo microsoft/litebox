@@ -123,26 +123,23 @@ pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<
             woken
                 .try_reserve(queue.len().min(request.count as usize))
                 .map_err(|_| BrokerError::OutOfMemory)?;
-            let mut index = 0;
-            while index < queue.len() && count < request.count {
-                if queue[index].bitset & request.bitset == 0 {
-                    index += 1;
-                    continue;
+            // One stable pass, so removing interleaved selections stays linear.
+            queue.retain(|queued| {
+                if count >= request.count || queued.bitset & request.bitset == 0 {
+                    return true;
                 }
-                let Some(selected) = queue.remove(index) else {
-                    break;
-                };
-                let Some(waiter) = selected.waiter.upgrade() else {
-                    continue;
-                };
-                let mut state = waiter.state.lock();
-                if matches!(*state, WaiterState::Armed { .. }) {
-                    *state = WaiterState::Woken;
-                    drop(state);
-                    woken.push(waiter);
-                    count += 1;
+                // Selected entries leave the queue even if their waiter is gone or disarmed.
+                if let Some(waiter) = queued.waiter.upgrade() {
+                    let mut state = waiter.state.lock();
+                    if matches!(*state, WaiterState::Armed { .. }) {
+                        *state = WaiterState::Woken;
+                        drop(state);
+                        woken.push(waiter);
+                        count += 1;
+                    }
                 }
-            }
+                false
+            });
             if queue.is_empty() {
                 queues.remove(&request.offset);
             }

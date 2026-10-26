@@ -39,10 +39,41 @@ static long futex(atomic_uint *word, int op, unsigned value, const struct timesp
     return syscall(SYS_futex, word, op, value, timeout, NULL, 0);
 }
 
+static long futex_bitset(atomic_uint *word, int op, unsigned value,
+                         const struct timespec *timeout, unsigned bitset) {
+    return syscall(SYS_futex, word, op, value, timeout, NULL, bitset);
+}
+
+// Returns the CLOCK_MONOTONIC time `ms` milliseconds from now, an absolute bitset-wait deadline.
+static struct timespec deadline_in_ms(long ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (ms % 1000) * 1000000;
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000;
+    }
+    return deadline;
+}
+
 static void sleep_ms(long ms) {
     struct timespec duration = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000};
     while (nanosleep(&duration, &duration) == -1 && errno == EINTR) {
     }
+}
+
+// Waits until `*word` holds `value`, returning whether it did before the timeout. Waits on
+// another process's stores are bounded, so memory that is not actually shared fails the check
+// instead of hanging.
+static int await_value(atomic_uint *word, unsigned value) {
+    for (int attempt = 0; attempt < TIMEOUT_SECONDS * 1000; attempt++) {
+        if (atomic_load(word) == value) {
+            return 1;
+        }
+        sleep_ms(1);
+    }
+    return atomic_load(word) == value;
 }
 
 // Returns the exit code of `child`, or -1 if it did not exit normally.
@@ -83,8 +114,10 @@ static int check_wake(struct shared *shared) {
         } while (result == -1 && errno == EINTR);
         _exit(result == 0 ? 0 : 1);
     }
-    while (atomic_load(&shared->ready) == 0) {
-        sleep_ms(1);
+    if (!await_value(&shared->ready, 1)) {
+        kill(child, SIGKILL);
+        reap(child);
+        return 0;
     }
     // The word stays zero, so the child returns only when a wake selects it.
     int code = -1;
@@ -130,8 +163,10 @@ static int check_private(struct shared *shared) {
         long result = futex(&shared->word, FUTEX_WAIT_PRIVATE, 0, &timeout);
         _exit(result == -1 && errno == ETIMEDOUT ? 0 : 1);
     }
-    while (atomic_load(&shared->ready) == 0) {
-        sleep_ms(1);
+    if (!await_value(&shared->ready, 1)) {
+        kill(child, SIGKILL);
+        reap(child);
+        return 0;
     }
     int ok = 1;
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -184,6 +219,58 @@ static int check_keyed(struct shared *shared, int wait_op, int wake_op, int othe
     }
     pthread_join(thread, NULL);
     return ok && woken == 1 && waiter.result == 0;
+}
+
+// Bitset operations on shared memory: a zero mask fails, a wait honors its absolute deadline, and
+// a wake selects only waiters whose masks intersect its own, including a forked child's.
+static int check_bitset(struct shared *shared) {
+    atomic_store(&shared->word, 0);
+    atomic_store(&shared->ready, 0);
+    struct timespec deadline = deadline_in_ms(50);
+    int ok = futex_bitset(&shared->word, FUTEX_WAIT_BITSET, 0, &deadline, 0) == -1 &&
+             errno == EINVAL;
+    ok &= futex_bitset(&shared->word, FUTEX_WAKE_BITSET, 1, NULL, 0) == -1 && errno == EINVAL;
+    ok &= futex_bitset(&shared->word, FUTEX_WAIT_BITSET, 0, &deadline, 1) == -1 &&
+          errno == ETIMEDOUT;
+    if (!ok) {
+        return 0;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        return 0;
+    }
+    if (child == 0) {
+        struct timespec child_deadline = deadline_in_ms(TIMEOUT_SECONDS * 1000);
+        atomic_store(&shared->ready, 1);
+        long result;
+        do {
+            result = futex_bitset(&shared->word, FUTEX_WAIT_BITSET, 0, &child_deadline, 0x1);
+        } while (result == -1 && errno == EINTR);
+        _exit(result == 0 ? 0 : 1);
+    }
+    if (!await_value(&shared->ready, 1)) {
+        kill(child, SIGKILL);
+        reap(child);
+        return 0;
+    }
+    // A wake whose mask misses the waiter's never selects it.
+    for (int attempt = 0; attempt < 10; attempt++) {
+        ok &= futex_bitset(&shared->word, FUTEX_WAKE_BITSET, 1, NULL, 0x2) == 0;
+        sleep_ms(5);
+    }
+    long woken = 0;
+    for (int attempt = 0; attempt < TIMEOUT_SECONDS * 100 && woken == 0; attempt++) {
+        woken = futex_bitset(&shared->word, FUTEX_WAKE_BITSET, 1, NULL, 0x3);
+        if (woken == 0) {
+            sleep_ms(10);
+        }
+    }
+    if (woken != 1) {
+        kill(child, SIGKILL);
+        reap(child);
+        return 0;
+    }
+    return reap(child) == 0 && ok;
 }
 
 // A parent and child take turns under a process-shared mutex and condition variable.
@@ -285,14 +372,14 @@ static int check_memory(struct shared *shared) {
         return 0;
     }
     if (child == 0) {
-        while (atomic_load(&shared->value) != 1) {
-            sleep_ms(1);
+        if (!await_value(&shared->value, 1)) {
+            _exit(1);
         }
         atomic_store(&shared->value, 2);
         _exit(0);
     }
     atomic_store(&shared->value, 1);
-    return reap(child) == 0 && atomic_load(&shared->value) == 2;
+    return reap(child) == 0 && await_value(&shared->value, 2);
 }
 
 int main(void) {
@@ -310,7 +397,9 @@ int main(void) {
                   check_keyed(shared, FUTEX_WAIT_PRIVATE, FUTEX_WAKE_PRIVATE, FUTEX_WAKE);
     int mutex = check_mutex(shared);
     int semaphore = check_semaphore(shared);
-    printf("shared-futex memory=%d wake=%d timeout=%d private=%d mutex=%d semaphore=%d\n",
-           memory, wake, timeout, private, mutex, semaphore);
-    return memory && wake && timeout && private && mutex && semaphore ? 0 : 1;
+    int bitset = check_bitset(shared);
+    printf("shared-futex memory=%d wake=%d timeout=%d private=%d mutex=%d semaphore=%d "
+           "bitset=%d\n",
+           memory, wake, timeout, private, mutex, semaphore, bitset);
+    return memory && wake && timeout && private && mutex && semaphore && bitset ? 0 : 1;
 }

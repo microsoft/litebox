@@ -240,13 +240,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(super) fn shared_mappings_for_fork(&self) -> InheritedSharedMappings<Platform> {
         let mappings = self.global.shared_mappings.lock();
         let mut memories: Vec<Arc<SharedMemory<Platform>>> = Vec::new();
+        let mut indices: BTreeMap<*const SharedMemory<Platform>, usize> = BTreeMap::new();
         let mut regions = Vec::new();
         for (&start, region) in &mappings.regions {
             // Regions split from one mapping share their memory, which the child inherits once.
-            let index = memories
-                .iter()
-                .position(|inherited| Arc::ptr_eq(inherited, &region.memory))
-                .unwrap_or_else(|| {
+            let index = *indices
+                .entry(Arc::as_ptr(&region.memory))
+                .or_insert_with(|| {
                     memories.push(Arc::clone(&region.memory));
                     memories.len() - 1
                 });
@@ -401,6 +401,47 @@ mod tests {
     }
 
     #[test]
+    fn bitset_wakes_select_intersecting_masks_and_reject_empty_ones() {
+        let task = init_platform();
+        let shared = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
+        let wake_bitset = |address: usize, bitmask: u32| {
+            task.sys_futex(FutexArgs::WakeBitset {
+                addr: word(address),
+                flags: FutexFlags::empty(),
+                count: u32::MAX,
+                bitmask,
+            })
+        };
+        for address in [shared, private] {
+            assert_eq!(wake_bitset(address, 0), Err(Errno::EINVAL));
+            assert_eq!(
+                task.sys_futex(FutexArgs::WaitBitset {
+                    addr: word(address),
+                    flags: FutexFlags::empty(),
+                    val: 0,
+                    timeout: TimeParam::None,
+                    bitmask: 0,
+                }),
+                Err(Errno::EINVAL)
+            );
+            let waiter = task.spawn_clone_for_test(move |task| {
+                task.sys_futex(FutexArgs::WaitBitset {
+                    addr: word(address),
+                    flags: FutexFlags::empty(),
+                    val: 0,
+                    timeout: TimeParam::None,
+                    bitmask: 0b01,
+                })
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(wake_bitset(address, 0b10), Ok(0));
+            assert_eq!(wake_bitset(address, 0b11), Ok(1));
+            assert_eq!(waiter.join().unwrap(), Ok(0));
+        }
+    }
+
+    #[test]
     fn unmapping_splits_shared_memory_and_keeps_offsets() {
         let task = init_platform();
         let mapping = map(&task, 3, MapFlags::MAP_SHARED);
@@ -413,7 +454,7 @@ mod tests {
         assert!(alloc::sync::Arc::ptr_eq(&memory, &tail_memory));
         assert_eq!(offset, 2 * PAGE_SIZE as u64 + 4);
 
-        // A mapping placed over part of the memory replaces it there.
+        task.sys_munmap(mapping, PAGE_SIZE).unwrap();
         let replaced = task
             .sys_mmap(
                 start,
@@ -497,6 +538,25 @@ mod tests {
         let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
         assert!(!mm.range_is_shared_anonymous(private..private + PAGE_SIZE));
         task.sys_munmap(mapping, 3 * PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn unmap_progress_preserves_shared_records_for_remaining_pages() {
+        let task = init_platform();
+        let first = map(&task, 2, MapFlags::MAP_SHARED).as_usize();
+        let second = map(&task, 2, MapFlags::MAP_SHARED).as_usize();
+        let (lower, upper) = (first.min(second), first.max(second));
+        task.sys_munmap(UserPtrMut::from_usize(lower), upper - lower + PAGE_SIZE)
+            .unwrap();
+        assert!(task.shared_futex(upper).is_none());
+        assert!(task.shared_futex(lower).is_none());
+        assert!(task.shared_futex(upper + PAGE_SIZE).is_some());
+        let mappings = task.global.shared_mappings.lock();
+        assert!(mappings.lookup(lower).is_none());
+        assert!(mappings.lookup(upper + PAGE_SIZE).is_some());
+        drop(mappings);
+        task.sys_munmap(UserPtrMut::from_usize(upper), 2 * PAGE_SIZE)
+            .unwrap();
     }
 
     #[test]
