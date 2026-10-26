@@ -1144,6 +1144,8 @@ pub const TCSETSW2: u32 = 0x402c542c;
 pub const TCSETSF2: u32 = 0x402c542d;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
+pub const TIOCSPTLCK: u32 = 0x40045431;
+pub const TIOCGPTLCK: u32 = 0x80045439;
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
@@ -1182,6 +1184,10 @@ pub enum IoctlArg {
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(UserPtrMut<u32>),
+    /// Lock (nonzero) or unlock (zero) the pseudo-terminal slave device.
+    TIOCSPTLCK(UserPtr<i32>),
+    /// Get whether the pseudo-terminal slave device is locked.
+    TIOCGPTLCK(UserPtrMut<i32>),
     /// Enables or disables non-blocking mode
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
@@ -3160,6 +3166,8 @@ impl SyscallRequest {
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         TIOCGSID => IoctlArg::TIOCGSID(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
+                        TIOCSPTLCK => IoctlArg::TIOCSPTLCK(ctx.sys_req_ptr(2)),
+                        TIOCGPTLCK => IoctlArg::TIOCGPTLCK(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
                         _ => IoctlArg::Raw {

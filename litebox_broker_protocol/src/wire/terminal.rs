@@ -103,6 +103,12 @@ pub(super) fn encode_operation(e: &mut Encoder, operation: TerminalOperation) {
             e.u8(u8::from(output));
         }
         TerminalOperation::Drain => e.u8(5),
+        TerminalOperation::GetSubsidiaryIndex => e.u8(6),
+        TerminalOperation::GetSubsidiaryLock => e.u8(7),
+        TerminalOperation::SetSubsidiaryLock(locked) => {
+            e.u8(8);
+            e.u8(u8::from(locked));
+        }
     }
 }
 
@@ -125,6 +131,9 @@ pub(super) fn decode_operation(d: &mut Decoder<'_>) -> Result<TerminalOperation,
             output: boolean(d)?,
         },
         5 => TerminalOperation::Drain,
+        6 => TerminalOperation::GetSubsidiaryIndex,
+        7 => TerminalOperation::GetSubsidiaryLock,
+        8 => TerminalOperation::SetSubsidiaryLock(boolean(d)?),
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -140,6 +149,14 @@ pub(super) fn encode_response(e: &mut Encoder, response: TerminalResponse) {
             encode_size(e, size);
         }
         TerminalResponse::Done => e.u8(2),
+        TerminalResponse::SubsidiaryIndex(index) => {
+            e.u8(3);
+            e.u32(index);
+        }
+        TerminalResponse::SubsidiaryLock(locked) => {
+            e.u8(4);
+            e.u8(u8::from(locked));
+        }
     }
 }
 
@@ -148,6 +165,8 @@ pub(super) fn decode_response(d: &mut Decoder<'_>) -> Result<TerminalResponse, W
         0 => TerminalResponse::Settings(decode_settings(d)?),
         1 => TerminalResponse::WindowSize(decode_size(d)?),
         2 => TerminalResponse::Done,
+        3 => TerminalResponse::SubsidiaryIndex(d.u32()?),
+        4 => TerminalResponse::SubsidiaryLock(boolean(d)?),
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -184,6 +203,10 @@ mod tests {
                 output: false,
             },
             TerminalOperation::Drain,
+            TerminalOperation::GetSubsidiaryIndex,
+            TerminalOperation::GetSubsidiaryLock,
+            TerminalOperation::SetSubsidiaryLock(false),
+            TerminalOperation::SetSubsidiaryLock(true),
         ] {
             let mut e = Encoder::default();
             encode_operation(&mut e, operation);
@@ -199,14 +222,30 @@ mod tests {
             TerminalResponse::Settings(TerminalSettings::default()),
             TerminalResponse::WindowSize(WindowSize::default()),
             TerminalResponse::Done,
+            TerminalResponse::SubsidiaryIndex(0x1234_5678),
+            TerminalResponse::SubsidiaryLock(false),
+            TerminalResponse::SubsidiaryLock(true),
         ] {
             let mut e = Encoder::default();
             encode_response(&mut e, response);
             let bytes = e.finish();
-            assert_eq!(decode_response(&mut Decoder::new(&bytes)), Ok(response));
+            let mut d = Decoder::new(&bytes);
+            assert_eq!(decode_response(&mut d), Ok(response));
+            assert_eq!(d.finish(), Ok(()));
+            for end in 0..bytes.len() {
+                assert!(decode_response(&mut Decoder::new(&bytes[..end])).is_err());
+            }
         }
         assert_eq!(
-            decode_response(&mut Decoder::new(&[3])),
+            decode_response(&mut Decoder::new(&[5])),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_response(&mut Decoder::new(&[4, 2])),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_operation(&mut Decoder::new(&[8, 2])),
             Err(WireError::InvalidTag)
         );
         assert_eq!(

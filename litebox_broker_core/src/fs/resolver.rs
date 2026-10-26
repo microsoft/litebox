@@ -1180,7 +1180,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
                 | OpenError::TruncateError(_)
-                | OpenError::NoSuchDevice => FileStatusError::Io,
+                | OpenError::NoSuchDevice
+                | OpenError::NoSpace => FileStatusError::Io,
             })?;
         self.handle_status(&entry)
     }

@@ -915,6 +915,7 @@ fn file_open_error(error: OpenError) -> FileError {
         OpenError::PathError(error) => file_path_error(error),
         OpenError::Io => FileError::Io,
         OpenError::NoSuchDevice => FileError::NoSuchDevice,
+        OpenError::NoSpace => FileError::NoSpace,
     }
 }
 

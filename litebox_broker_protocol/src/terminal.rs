@@ -179,6 +179,15 @@ pub enum TerminalOperation {
     },
     /// Wait for accepted output to reach the transport.
     Drain,
+    /// Read the index naming a pseudo-terminal's subsidiary. Only a
+    /// pseudo-terminal manager supports this.
+    GetSubsidiaryIndex,
+    /// Read whether a pseudo-terminal's subsidiary is locked against opening.
+    /// Only a pseudo-terminal manager supports this.
+    GetSubsidiaryLock,
+    /// Lock or unlock a pseudo-terminal's subsidiary against opening. Only a
+    /// pseudo-terminal manager supports this.
+    SetSubsidiaryLock(bool),
 }
 
 /// Result of a terminal control.
@@ -190,6 +199,10 @@ pub enum TerminalResponse {
     WindowSize(WindowSize),
     /// Mutation or drain completed.
     Done,
+    /// Index naming a pseudo-terminal's subsidiary.
+    SubsidiaryIndex(u32),
+    /// Whether a pseudo-terminal's subsidiary is locked against opening.
+    SubsidiaryLock(bool),
 }
 
 bitflags::bitflags! {

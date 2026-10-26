@@ -28,6 +28,7 @@ pub mod pipe;
 mod policy;
 mod process;
 pub mod process_group;
+mod pseudo_terminal;
 mod quota;
 pub mod random;
 pub mod readiness;

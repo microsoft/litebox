@@ -3,9 +3,11 @@
 
 //! Unix-y devices [`super::backend::Backend`].
 //!
-//! Provides `{stdin,stdout,tty,null,urandom,...}` entries, intended to be mounted at `/dev`.
+//! Provides `{stdin,stdout,tty,null,urandom,...}` entries, intended to be mounted at `/dev`, and
+//! pseudo-terminals: opening `ptmx` creates a pair and opens its manager, and `pts/<index>` names
+//! each pair's subsidiary.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -15,7 +17,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -23,6 +25,7 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use crate::pseudo_terminal::{ManagerFile, PseudoTerminal, PseudoTerminals, SubsidiaryFile};
 use crate::random::RandomProvider;
 use crate::readiness::{ReadinessRegistration, ReadinessSource};
 use crate::stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream};
@@ -70,6 +73,36 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     // major=1, minor=9
     rdev: core::num::NonZeroU64::new(0x109),
 };
+/// Node info for /dev/ptmx
+const PTMX_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 89,
+    // major=5, minor=2
+    rdev: core::num::NonZeroU64::new(0x502),
+};
+
+/// Name of the directory of pseudo-terminal subsidiaries.
+const PTS_DIR_NAME: &str = "pts";
+/// Major device number of pseudo-terminal subsidiaries, whose minors are their indices.
+const PTS_MAJOR: u64 = 136;
+/// Inode number of the subsidiary with index zero; later indices follow it.
+const FIRST_PTS_INODE: u64 = 3;
+
+/// The device number of the subsidiary with index `index`, encoded as `makedev` does.
+fn pts_rdev(index: u32) -> core::num::NonZeroU64 {
+    let minor = u64::from(index);
+    core::num::NonZeroU64::new((minor & 0xff) | (PTS_MAJOR << 8) | ((minor & !0xff) << 12))
+        .expect("the major number is nonzero")
+}
+
+/// The index that `name` spells in canonical decimal, if any.
+fn pts_index(name: &str) -> Option<u32> {
+    if !name.bytes().all(|byte| byte.is_ascii_digit()) || (name.len() > 1 && name.starts_with('0'))
+    {
+        return None;
+    }
+    name.parse().ok()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
@@ -79,6 +112,8 @@ enum Device {
     Tty,
     Null,
     URandom,
+    /// Creates a pseudo-terminal pair when opened, other than by path.
+    Ptmx,
 }
 
 impl Device {
@@ -89,6 +124,7 @@ impl Device {
         ("tty", Device::Tty),
         ("null", Device::Null),
         ("urandom", Device::URandom),
+        ("ptmx", Device::Ptmx),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -100,7 +136,7 @@ impl Device {
             Device::Stdin => Some(StdioStream::Stdin),
             Device::Stdout => Some(StdioStream::Stdout),
             Device::Stderr => Some(StdioStream::Stderr),
-            Device::Tty | Device::Null | Device::URandom => None,
+            Device::Tty | Device::Null | Device::URandom | Device::Ptmx => None,
         }
     }
 
@@ -138,6 +174,14 @@ impl Device {
                 node_info: URANDOM_NODE_INFO,
                 blksize: URANDOM_BLOCK_SIZE,
             },
+            Device::Ptmx => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: PTMX_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+            },
         }
     }
 }
@@ -146,11 +190,17 @@ impl Device {
 pub struct Devices {
     /// Stable inode info for this backend's root directory.
     root_inode: NodeInfo,
+    /// Stable inode info for the `pts` directory.
+    pts_inode: NodeInfo,
     /// Host standard streams behind `stdin`, `stdout`, and `stderr`, and the
     /// controlling terminal behind `tty`.
     stdio: Arc<dyn StdioProvider>,
     /// Randomness behind `urandom`.
     random: Arc<dyn RandomProvider>,
+    /// Pseudo-terminal pairs that `ptmx` created.
+    pseudo_terminals: PseudoTerminals,
+    /// Allocated the directories' inodes. It must allocate no more, since
+    /// subsidiaries' inode numbers start at [`FIRST_PTS_INODE`].
     _alloc: InodeAllocator,
 }
 
@@ -163,11 +213,35 @@ impl Devices {
         random: Arc<dyn RandomProvider>,
     ) -> Self {
         let root_inode = allocator.next();
+        let pts_inode = allocator.next();
+        debug_assert_eq!(pts_inode.ino + 1, FIRST_PTS_INODE);
         Self {
             root_inode,
+            pts_inode,
             stdio,
             random,
+            pseudo_terminals: PseudoTerminals::new(),
             _alloc: allocator,
+        }
+    }
+
+    /// The pair whose subsidiary `name` names, while its manager is open.
+    fn pseudo_terminal(&self, name: &str) -> Option<Arc<PseudoTerminal>> {
+        self.pseudo_terminals.get(pts_index(name)?)
+    }
+
+    fn subsidiary_status(&self, index: u32) -> FileStatus {
+        FileStatus {
+            file_type: FileType::CharacterDevice,
+            mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
+            size: 0,
+            owner: UserInfo::ROOT,
+            node_info: NodeInfo {
+                dev: self.pts_inode.dev,
+                ino: FIRST_PTS_INODE + u64::from(index),
+                rdev: Some(pts_rdev(index)),
+            },
+            blksize: STDIO_BLOCK_SIZE,
         }
     }
 
@@ -197,16 +271,44 @@ impl ReadinessSource for StdioReadiness {
 }
 
 /// Owned file handle; identifies which device backs this fd.
-#[derive(Debug, Clone, Copy)]
-pub struct DeviceFileHandle {
-    device: Device,
+#[derive(Clone)]
+pub struct DeviceFileHandle(DeviceFile);
+
+#[derive(Clone)]
+enum DeviceFile {
+    Device(Device),
+    /// The manager of a pair that opening `ptmx` created.
+    Manager(Arc<ManagerFile>),
+    /// The subsidiary named by `index`, open unless `file` is `None`, for a
+    /// path-only handle.
+    Subsidiary {
+        index: u32,
+        file: Option<Arc<SubsidiaryFile>>,
+    },
+}
+
+impl DeviceFile {
+    fn terminal(&self) -> Option<Arc<dyn TerminalEndpoint>> {
+        match self {
+            DeviceFile::Device(_) => None,
+            DeviceFile::Manager(file) => Some(file.endpoint().clone()),
+            DeviceFile::Subsidiary { file, .. } => file
+                .as_ref()
+                .map(|file| file.endpoint().clone() as Arc<dyn TerminalEndpoint>),
+        }
+    }
 }
 
 /// Directory handle
-// For devices, since no borrows are needed, we reuse this struct for both the walking handles as
+// For devices, since no borrows are needed, we reuse this type for both the walking handles as
 // well as the dir handles.
 #[derive(Debug, Clone, Copy)]
-pub struct DeviceDirHandle;
+pub enum DeviceDirHandle {
+    /// The backend's root.
+    Root,
+    /// The directory of pseudo-terminal subsidiaries.
+    Pts,
+}
 
 impl BackendHandles for Devices {
     type WalkingDirHandle<'a> = DeviceDirHandle;
@@ -216,11 +318,14 @@ impl BackendHandles for Devices {
 
 impl Backend for Devices {
     fn terminal(&self, h: &FileHandle) -> Option<Arc<dyn TerminalEndpoint>> {
-        self.endpoint(h.get_typed::<Self>().device)
+        match &h.get_typed::<Self>().0 {
+            DeviceFile::Device(device) => self.endpoint(*device),
+            file => file.terminal(),
+        }
     }
 
     fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(DeviceDirHandle)
+        WalkingDirHandle::from_typed::<Self>(DeviceDirHandle::Root)
     }
 
     fn walk_directories<'a>(
@@ -228,23 +333,35 @@ impl Backend for Devices {
         from: WalkingDirHandle<'a>,
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        let from = from.into_typed::<Self>();
-        // Device files are final path targets, so directory walking must stop before them.
-        if let Some(&component) = components.first() {
-            if Device::from_name(component).is_some() {
-                return Ok(WalkOutcome {
-                    components: vec![],
-                    last: WalkingDirHandle::from_typed::<Self>(from),
-                    stop_reason: WalkStopReason::StoppedAtNonDirectory {
-                        file_type: FileType::CharacterDevice,
-                    },
-                });
+        let mut dir = from.into_typed::<Self>();
+        let mut walked = vec![];
+        for &component in components {
+            let exists = match dir {
+                DeviceDirHandle::Root if component == PTS_DIR_NAME => {
+                    walked.push(WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    });
+                    dir = DeviceDirHandle::Pts;
+                    continue;
+                }
+                DeviceDirHandle::Root => Device::from_name(component).is_some(),
+                DeviceDirHandle::Pts => self.pseudo_terminal(component).is_some(),
+            };
+            if !exists {
+                return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
             }
-            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+            // Device files are final path targets, so directory walking must stop before them.
+            return Ok(WalkOutcome {
+                components: walked,
+                last: WalkingDirHandle::from_typed::<Self>(dir),
+                stop_reason: WalkStopReason::StoppedAtNonDirectory {
+                    file_type: FileType::CharacterDevice,
+                },
+            });
         }
         Ok(WalkOutcome {
-            components: vec![],
-            last: WalkingDirHandle::from_typed::<Self>(from),
+            components: walked,
+            last: WalkingDirHandle::from_typed::<Self>(dir),
             stop_reason: WalkStopReason::CompleteDirectory,
         })
     }
@@ -273,49 +390,82 @@ impl Backend for Devices {
         name: &str,
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
-        let _dir = dir.into_typed::<Self>();
-        let device = Device::from_name(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
-
-        if flags.contains(OFlags::DIRECTORY) {
-            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-        }
+        let not_found = || OpenError::PathError(PathError::NoSuchFileOrDirectory);
+        let path_only = flags.contains(OFlags::PATH);
+        let file = match dir.into_typed::<Self>() {
+            DeviceDirHandle::Root => {
+                let device = Device::from_name(name).ok_or_else(not_found)?;
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+                }
+                // Like Linux, opening `/dev/tty` for I/O needs a controlling terminal;
+                // `O_PATH` opens and `stat` do not.
+                if device == Device::Tty && !path_only && self.stdio.terminal().is_none() {
+                    return Err(OpenError::NoSuchDevice);
+                }
+                if device == Device::Ptmx && !path_only {
+                    DeviceFile::Manager(Arc::new(self.pseudo_terminals.open_manager()?))
+                } else {
+                    DeviceFile::Device(device)
+                }
+            }
+            DeviceDirHandle::Pts => {
+                let index = pts_index(name).ok_or_else(not_found)?;
+                let pair = self.pseudo_terminals.get(index).ok_or_else(not_found)?;
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+                }
+                let file = if path_only {
+                    None
+                } else {
+                    Some(Arc::new(pair.open_subsidiary()?))
+                };
+                DeviceFile::Subsidiary { index, file }
+            }
+        };
+        let item = FileHandle::from_typed::<Self>(DeviceFileHandle(file));
 
         if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
-            // instead, it is silently ignored if you attempt to truncate upon opening stdio.
+            // instead, it is silently ignored if you attempt to truncate upon opening a device.
             debug_assert!(matches!(
-                self.truncate(
-                    &FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
-                    0
-                ),
+                self.truncate(&item, 0),
                 Err(TruncateError::IsTerminalDevice)
             ));
         }
 
-        // Like Linux, opening `/dev/tty` for I/O needs a controlling terminal;
-        // `O_PATH` opens and `stat` do not.
-        if device == Device::Tty && !flags.contains(OFlags::PATH) && self.stdio.terminal().is_none()
-        {
-            return Err(OpenError::NoSuchDevice);
-        }
-
         Ok(Permissioned {
-            item: FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
+            item,
             permissions: PermissionCheck::ByBackend,
         })
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        let _handle = handle.into_typed::<Self>();
-        Ok(Device::ALL
-            .iter()
-            .map(|(n, d)| DirEntry {
-                name: String::from(*n),
-                file_type: FileType::CharacterDevice,
-                ino_info: Some(d.file_status().node_info),
-            })
-            .collect())
+        Ok(match handle.into_typed::<Self>() {
+            DeviceDirHandle::Root => Device::ALL
+                .iter()
+                .map(|(n, d)| DirEntry {
+                    name: String::from(*n),
+                    file_type: FileType::CharacterDevice,
+                    ino_info: Some(d.file_status().node_info),
+                })
+                .chain([DirEntry {
+                    name: String::from(PTS_DIR_NAME),
+                    file_type: FileType::Directory,
+                    ino_info: Some(self.pts_inode),
+                }])
+                .collect(),
+            DeviceDirHandle::Pts => self
+                .pseudo_terminals
+                .indices()
+                .into_iter()
+                .map(|index| DirEntry {
+                    name: index.to_string(),
+                    file_type: FileType::CharacterDevice,
+                    ino_info: Some(self.subsidiary_status(index).node_info),
+                })
+                .collect(),
+        })
     }
 
     fn read(
@@ -324,8 +474,13 @@ impl Backend for Devices {
         buf: &mut dyn ReadBuffer,
         _offset: usize,
     ) -> Result<usize, ReadError> {
-        let device = h.get_typed::<Self>().device;
+        let device = match &h.get_typed::<Self>().0 {
+            DeviceFile::Device(device) => *device,
+            file => return file.terminal().ok_or(ReadError::Io)?.read(buf),
+        };
         match device {
+            // Only path-only handles refer to `ptmx` itself.
+            Device::Ptmx => Err(ReadError::Io),
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
             Device::Stdin | Device::Tty if buf.is_empty() => Ok(0),
@@ -353,8 +508,12 @@ impl Backend for Devices {
         buf: &dyn WriteBuffer,
         _offset: usize,
     ) -> Result<usize, WriteError> {
-        let device = h.get_typed::<Self>().device;
+        let device = match &h.get_typed::<Self>().0 {
+            DeviceFile::Device(device) => *device,
+            file => return file.terminal().ok_or(WriteError::Io)?.write(buf),
+        };
         match device {
+            Device::Ptmx => return Err(WriteError::Io),
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Null | Device::URandom => return Ok(buf.len()),
             Device::Stdout | Device::Stderr | Device::Tty if buf.is_empty() => return Ok(0),
@@ -380,17 +539,25 @@ impl Backend for Devices {
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
-        let h = h.get_typed::<Self>();
-        match h.device {
-            Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty => {
-                SeekBehavior::NonSeekable
-            }
-            Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
+        match h.get_typed::<Self>().0 {
+            DeviceFile::Device(Device::Null | Device::URandom) => SeekBehavior::ZeroPosition,
+            DeviceFile::Device(
+                Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty | Device::Ptmx,
+            )
+            | DeviceFile::Manager(_)
+            | DeviceFile::Subsidiary { .. } => SeekBehavior::NonSeekable,
         }
     }
 
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
-        let device = h.get_typed::<Self>().device;
+        let device = match &h.get_typed::<Self>().0 {
+            DeviceFile::Device(device) => *device,
+            file => {
+                return file
+                    .terminal()
+                    .map(|terminal| terminal as Arc<dyn ReadinessSource>);
+            }
+        };
         if let Some(terminal) = self.endpoint(device) {
             return Some(terminal);
         }
@@ -403,18 +570,22 @@ impl Backend for Devices {
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
-            HandleRef::File(h) => Ok(h.get_typed::<Self>().device.file_status()),
-            HandleRef::Dir(h) => {
-                let _h = h.get_typed::<Self>();
-                Ok(FileStatus {
-                    file_type: FileType::Directory,
-                    mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                    size: super::DEFAULT_DIRECTORY_SIZE,
-                    owner: UserInfo::ROOT,
-                    node_info: self.root_inode,
-                    blksize: super::DEFAULT_DIRECTORY_SIZE,
-                })
-            }
+            HandleRef::File(h) => Ok(match &h.get_typed::<Self>().0 {
+                DeviceFile::Device(device) => device.file_status(),
+                DeviceFile::Manager(_) => Device::Ptmx.file_status(),
+                DeviceFile::Subsidiary { index, .. } => self.subsidiary_status(*index),
+            }),
+            HandleRef::Dir(h) => Ok(FileStatus {
+                file_type: FileType::Directory,
+                mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                size: super::DEFAULT_DIRECTORY_SIZE,
+                owner: UserInfo::ROOT,
+                node_info: match h.get_typed::<Self>() {
+                    DeviceDirHandle::Root => self.root_inode,
+                    DeviceDirHandle::Pts => self.pts_inode,
+                },
+                blksize: super::DEFAULT_DIRECTORY_SIZE,
+            }),
         }
     }
 

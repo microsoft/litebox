@@ -29,6 +29,10 @@ use crate::transfer::take_from_queue;
 pub const INPUT_CAPACITY: usize = 64 * 1024;
 /// Maximum editable canonical line, including its terminating newline.
 pub const LINE_CAPACITY: usize = 4096;
+/// Maximum queued output bytes per terminal, including echo.
+pub const OUTPUT_CAPACITY: usize = 64 * 1024;
+/// Largest write a terminal accepts whole or not at all.
+pub const ATOMIC_WRITE_SIZE: usize = 4096;
 
 /// Receives ABI-neutral terminal actions.
 pub trait TerminalEventSink: Send + Sync {

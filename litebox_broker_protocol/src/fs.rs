@@ -148,6 +148,8 @@ pub enum FileError {
     TooManySymlinks,
     #[error("no such device or address")]
     NoSuchDevice,
+    #[error("no space is left for a new object")]
+    NoSpace,
 }
 
 /// Seek origin.
