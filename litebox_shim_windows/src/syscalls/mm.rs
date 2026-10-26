@@ -649,7 +649,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if unsafe { vmem.remove_pages(ptr, aligned_len) }.is_err() {
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
-            vmem.split_allocation_around(allocation, aligned_base, aligned_len);
+            vmem.split_allocation_around(allocation, aligned_base, aligned_len, None);
         }
         drop(vmem);
         if !write_region_outputs::<Platform>(base_address, region_size, aligned_base, aligned_len) {
@@ -722,12 +722,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let end = base.checked_add(size).ok_or(NtStatus::INVALID_PARAMETER)?;
         let mut vmem = self.global.page_manager.write_vmem();
         if free_type == coalesce {
-            if vmem.allocation_at(base).is_none() {
-                return Err(NtStatus::CONFLICTING_ADDRESSES);
-            }
             let mut covered_until = base;
             let mut count = 0;
-            for allocation in vmem.allocations_in(base..end) {
+            for allocation in vmem.allocations_based_in(base..end) {
                 if allocation.base != covered_until
                     || allocation.placeholder_state != WindowsPlaceholderState::Reserved
                 {
@@ -783,16 +780,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             unsafe { vmem.decommit_pages(MutPtr::<Platform, u8>::from_usize(base), size) }
                 .map_err(|_| NtStatus::UNABLE_TO_FREE_VM)?;
         }
-        vmem.split_allocation_around(allocation, base, size);
-        vmem.assign_allocation(
-            WindowsVirtualAllocation::new(
+        vmem.split_allocation_around(
+            allocation,
+            base,
+            size,
+            Some(WindowsVirtualAllocation::new(
                 base,
                 size,
                 MemoryType::MEM_PRIVATE,
                 PageProtection::PAGE_NOACCESS,
                 WindowsPlaceholderState::Reserved,
-            ),
-            None,
+            )),
         );
         Ok((base, size))
     }
@@ -1432,19 +1430,7 @@ fn scan_protect_range<Platform: ShimPlatform>(
     if end > allocation_end {
         return Some(PageRangeScan::ContainsUncommitted);
     }
-    let mut covered_until = base;
-    let mut first_protect = None;
-    for (range, area) in vmem.areas().overlapping(base..end) {
-        let PageState::Committed(protect) = area.state else {
-            return Some(PageRangeScan::ContainsUncommitted);
-        };
-        if range.start > covered_until {
-            return Some(PageRangeScan::ContainsUncommitted);
-        }
-        first_protect.get_or_insert(protect);
-        covered_until = range.end;
-    }
-    let Some(first_protect) = first_protect.filter(|_| covered_until >= end) else {
+    let Some(first_protect) = vmem.first_committed_protect(&(base..end)) else {
         return Some(PageRangeScan::ContainsUncommitted);
     };
     Some(PageRangeScan::FullyCommitted {
@@ -1566,7 +1552,7 @@ fn update_permissions<Platform: ShimPlatform>(
 }
 
 /// Returns the `MEMORY_BASIC_INFORMATION` state and protection of `state`.
-fn page_state_query(state: PageState) -> (u32, u32) {
+fn basic_information_state_and_protect(state: PageState) -> (u32, u32) {
     match state {
         PageState::Reserved => (MemoryState::MEM_RESERVE.bits(), 0),
         PageState::Committed(protect) => (MemoryState::MEM_COMMIT.bits(), protect.bits()),
@@ -1591,11 +1577,16 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
         let reservation = vmem
             .reservation_containing(query_base)
             .unwrap_or_else(|| range.clone());
-        let (state, protect) = page_state_query(area.state);
+        let (state, protect) = basic_information_state_and_protect(area.state);
+        // LiteBox reserves its internal pages inaccessible before committing them.
+        let allocation_protect = match area.state {
+            PageState::Reserved => PageProtection::PAGE_NOACCESS.bits(),
+            PageState::Committed(_) => protect,
+        };
         return Some(MemoryBasicInformation {
             base_address: query_base,
             allocation_base: reservation.start,
-            allocation_protect: protect,
+            allocation_protect,
             partition_id: 0,
             _padding0: 0,
             region_size: range.end.min(reservation.end) - query_base,
@@ -1632,7 +1623,7 @@ fn query_allocation_basic_information(
 ) -> Option<MemoryBasicInformation> {
     let allocation_end = allocation.base.checked_add(allocation.size)?;
     let (range, area) = areas.get_key_value(&query_base)?;
-    let (state, protect) = page_state_query(area.state);
+    let (state, protect) = basic_information_state_and_protect(area.state);
     let region_end = range.end.min(allocation_end);
 
     Some(MemoryBasicInformation {
@@ -1721,9 +1712,9 @@ mod tests {
                 .unwrap();
 
             let allocation = vmem.allocation_at(base).unwrap();
-            vmem.split_allocation_around(allocation, base + PAGE_SIZE * 2, PAGE_SIZE);
+            vmem.split_allocation_around(allocation, base + PAGE_SIZE * 2, PAGE_SIZE, None);
             let pieces = vmem
-                .allocations_in(base..end)
+                .allocations_based_in(base..end)
                 .map(|allocation| (allocation.base, allocation.size))
                 .collect::<alloc::vec::Vec<_>>();
             assert_eq!(
@@ -1732,7 +1723,7 @@ mod tests {
             );
             // The head piece starts before the queried range, so only the tail is based in it.
             assert_eq!(
-                vmem.allocations_in(base + PAGE_SIZE..end)
+                vmem.allocations_based_in(base + PAGE_SIZE..end)
                     .map(|allocation| allocation.base)
                     .collect::<alloc::vec::Vec<_>>(),
                 [base + PAGE_SIZE * 3]
@@ -1756,7 +1747,7 @@ mod tests {
             vmem.coalesce_allocations(base, PAGE_SIZE * 4);
             let merged = vmem.allocation_covering(base, PAGE_SIZE * 4).unwrap();
             assert_eq!((merged.base, merged.size), (base, PAGE_SIZE * 4));
-            assert_eq!(vmem.allocations_in(base..end).count(), 1);
+            assert_eq!(vmem.allocations_based_in(base..end).count(), 1);
             drop(vmem);
             release_allocation(&task, base);
         });
@@ -2387,13 +2378,12 @@ mod tests {
             let first = reserve(Some(base), ALLOCATION_GRANULARITY);
             let second = reserve(Some(base + ALLOCATION_GRANULARITY), ALLOCATION_GRANULARITY);
 
-            assert!(
-                !manager
-                    .read_vmem()
-                    .is_range_committed(&(base + PAGE_SIZE..base + PAGE_SIZE))
-            );
             let first_info = query_basic_information(&task, base + PAGE_SIZE);
             assert_eq!(first_info.allocation_base, base);
+            assert_eq!(
+                first_info.allocation_protect,
+                PageProtection::PAGE_NOACCESS.bits()
+            );
             assert_eq!(first_info.region_size, ALLOCATION_GRANULARITY - PAGE_SIZE);
             assert_eq!(first_info.state, MemoryState::MEM_RESERVE.bits());
             let second_info = query_basic_information(&task, base + ALLOCATION_GRANULARITY);
@@ -3483,6 +3473,48 @@ mod tests {
             NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
         }
 
+        fn host_query(address: usize) -> MemoryBasicInformation {
+            let mut host_info = MemoryBasicInformation::default();
+            let mut return_length = 0;
+            // SAFETY: The synchronous query writes only the valid output buffer and
+            // return-length local.
+            let status = unsafe {
+                NtQueryVirtualMemory(
+                    current_process(),
+                    address as *const c_void,
+                    MemoryInformationClass::Basic as u32,
+                    (&raw mut host_info).cast(),
+                    size_of::<MemoryBasicInformation>(),
+                    &raw mut return_length,
+                )
+            };
+            assert_eq!(host_status(status), NtStatus::SUCCESS);
+            assert_eq!(return_length, size_of::<MemoryBasicInformation>());
+            host_info
+        }
+
+        /// Asserts that `guest` matches `host` once both are rebased from their allocation bases.
+        fn assert_query_matches_host(
+            guest: &MemoryBasicInformation,
+            guest_base: usize,
+            host: &MemoryBasicInformation,
+            host_base: usize,
+        ) {
+            assert_eq!(
+                guest.base_address - guest_base,
+                host.base_address - host_base
+            );
+            assert_eq!(
+                guest.allocation_base - guest_base,
+                host.allocation_base - host_base
+            );
+            assert_eq!(guest.region_size, host.region_size);
+            assert_eq!(guest.state, host.state);
+            assert_eq!(guest.protect, host.protect);
+            assert_eq!(guest.allocation_protect, host.allocation_protect);
+            assert_eq!(guest.type_, host.type_);
+        }
+
         pub(super) fn assert_adjacent_reservation_queries_match_host(
             expected: [MemoryBasicInformation; 2],
         ) {
@@ -3506,29 +3538,8 @@ mod tests {
                 assert_eq!(*reservation as usize, info.allocation_base);
             }
             for info in expected {
-                let mut host_info = MemoryBasicInformation::default();
-                let mut return_length = 0;
-                let address = info.base_address as *const c_void;
-                // SAFETY: Both reservations are live, and the synchronous query writes only
-                // the valid output buffer and return-length local.
-                let status = unsafe {
-                    NtQueryVirtualMemory(
-                        current_process(),
-                        address,
-                        MemoryInformationClass::Basic as u32,
-                        (&raw mut host_info).cast(),
-                        size_of::<MemoryBasicInformation>(),
-                        &raw mut return_length,
-                    )
-                };
-                assert_eq!(host_status(status), NtStatus::SUCCESS);
-                assert_eq!(return_length, size_of::<MemoryBasicInformation>());
-                assert_eq!(info.base_address, host_info.base_address);
-                assert_eq!(info.allocation_base, host_info.allocation_base);
-                assert_eq!(info.region_size, host_info.region_size);
-                assert_eq!(info.state, host_info.state);
-                assert_eq!(info.protect, host_info.protect);
-                assert_eq!(info.type_, host_info.type_);
+                let host_info = host_query(info.base_address);
+                assert_query_matches_host(&info, 0, &host_info, 0);
             }
             for mut reservation in reservations {
                 let mut size = 0;
@@ -3544,6 +3555,89 @@ mod tests {
                 };
                 assert_eq!(host_status(status), NtStatus::SUCCESS);
             }
+        }
+
+        #[test]
+        fn query_modifier_and_decommitted_regions_match_host_ntdll() {
+            run_with_test_platform_pointers(|| {
+                let protect = PageProtection::PAGE_READWRITE | PageProtection::PAGE_NOCACHE;
+                let mut host_base = core::ptr::null_mut::<c_void>();
+                let mut host_size = PAGE_SIZE * 3;
+                // SAFETY: The output pointers are valid locals and the current-process pseudo
+                // handle targets this process. The allocation is released before return.
+                let host_allocate_status = unsafe {
+                    host_status(NtAllocateVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        0,
+                        &raw mut host_size,
+                        (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                        protect.bits(),
+                    ))
+                };
+                assert_eq!(host_allocate_status, NtStatus::SUCCESS);
+                let mut host_middle = host_base.wrapping_byte_add(PAGE_SIZE);
+                let mut host_middle_size = PAGE_SIZE;
+                // SAFETY: Decommits a page of the live host allocation that is never accessed.
+                let host_decommit_status = unsafe {
+                    host_status(NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut host_middle,
+                        &raw mut host_middle_size,
+                        FreeType::MEM_DECOMMIT.bits(),
+                    ))
+                };
+                assert_eq!(host_decommit_status, NtStatus::SUCCESS);
+
+                let task = crate::tests::test_task();
+                let mut guest_base = 0usize;
+                let mut guest_size = PAGE_SIZE * 3;
+                assert_eq!(
+                    task.sys_nt_allocate_virtual_memory(
+                        ProcessHandle::CURRENT,
+                        mut_ptr(&mut guest_base),
+                        0,
+                        mut_ptr(&mut guest_size),
+                        (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                        protect.bits(),
+                    ),
+                    host_allocate_status
+                );
+                let mut guest_middle = guest_base + PAGE_SIZE;
+                let mut guest_middle_size = PAGE_SIZE;
+                assert_eq!(
+                    task.sys_nt_free_virtual_memory(
+                        ProcessHandle::CURRENT,
+                        mut_ptr(&mut guest_middle),
+                        mut_ptr(&mut guest_middle_size),
+                        FreeType::MEM_DECOMMIT.bits(),
+                    ),
+                    host_decommit_status
+                );
+
+                let host_base_address = host_base as usize;
+                for offset in 0..3 {
+                    assert_query_matches_host(
+                        &query_basic_information(&task, guest_base + offset * PAGE_SIZE),
+                        guest_base,
+                        &host_query(host_base_address + offset * PAGE_SIZE),
+                        host_base_address,
+                    );
+                }
+
+                release_allocation(&task, guest_base);
+                let mut host_release_size = 0usize;
+                // SAFETY: Releases the host allocation created by this test.
+                let host_free_status = unsafe {
+                    host_status(NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        &raw mut host_release_size,
+                        FreeType::MEM_RELEASE.bits(),
+                    ))
+                };
+                assert_eq!(host_free_status, NtStatus::SUCCESS);
+            });
         }
 
         #[test]

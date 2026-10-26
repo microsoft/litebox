@@ -7,10 +7,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use litebox::fs::errors::{FileStatusError, OpenError, PathError, ReadError};
 use litebox::mm::page::NonZeroPageSize;
-use litebox::platform::{
-    RawConstPointer as _, RawMutPointer as _, RawPointerProvider,
-    page_mgmt::MemoryRegionPermissions,
-};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags, FileType};
 use litebox_common_linux::vmem::{CreatePagesFlags, MappingError};
@@ -736,7 +733,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             page_len,
             crate::syscalls::mm::ALLOCATION_GRANULARITY,
             CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            MemoryRegionPermissions::READ,
+            PageProtection::PAGE_READONLY,
             |ptr| match Self::copy_nls_section_file(&section_file.fd, section_len, ptr) {
                 Ok(copied) => Ok(copied),
                 Err(status) => {

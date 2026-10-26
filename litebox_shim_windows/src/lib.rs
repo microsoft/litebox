@@ -488,7 +488,7 @@ fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
             length,
             crate::syscalls::mm::ALLOCATION_GRANULARITY,
             CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-            litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
+            syscalls::mm::PageProtection::PAGE_READONLY,
             |ptr| {
                 ptr.copy_from_slice(0, shared_data_bytes)
                     .ok_or(MappingError::OutOfMemory)?;

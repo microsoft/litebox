@@ -56,6 +56,7 @@ pub(crate) struct WindowsArea {
     pub(crate) state: PageState,
 }
 
+/// Windows guest address-space state: owned native reservations and the state of their pages.
 pub(crate) struct WindowsVmem<Platform>
 where
     Platform: crate::ShimPlatform,
@@ -83,8 +84,7 @@ where
         &self.areas
     }
 
-    /// Rewrites every area overlapping `range`, clipped to it. `update` must be idempotent,
-    /// because an updated piece may coalesce with the next area before that area is visited.
+    /// Rewrites every area overlapping `range`, clipped to it.
     fn update_areas(&mut self, range: Range<usize>, update: impl Fn(WindowsArea) -> WindowsArea) {
         let mut cursor = range.start;
         while cursor < range.end {
@@ -118,7 +118,7 @@ where
     }
 
     /// Iterates over the allocations based within `range`, in address order.
-    pub(crate) fn allocations_in(
+    pub(crate) fn allocations_based_in(
         &self,
         range: impl RangeBounds<usize>,
     ) -> impl Iterator<Item = WindowsVirtualAllocation> + '_ {
@@ -197,13 +197,14 @@ where
         Some(allocation)
     }
 
-    /// Detaches `base..base + size` from `allocation`, which covers it, leaving the pieces
-    /// before and after the range as separate allocations.
+    /// Reassigns `base..base + size` from `allocation`, which covers it, to `middle`, leaving
+    /// the pieces before and after the range as separate allocations.
     pub(crate) fn split_allocation_around(
         &mut self,
         allocation: WindowsVirtualAllocation,
         base: usize,
         size: usize,
+        middle: Option<WindowsVirtualAllocation>,
     ) {
         let (Some(end), Some(allocation_end)) = (
             base.checked_add(size),
@@ -218,7 +219,7 @@ where
             };
             self.set_allocation(allocation.base..base, Some(prefix));
         }
-        self.set_allocation(base..end, None);
+        self.set_allocation(base..end, middle);
         if end < allocation_end {
             let suffix = WindowsVirtualAllocation {
                 base: end,
@@ -262,19 +263,33 @@ where
         true
     }
 
-    /// Returns whether every page of `range` is owned and committed.
+    /// Returns whether every page of `range` is owned and committed; an empty range is.
     pub(crate) fn is_range_committed(&self, range: &Range<usize>) -> bool {
-        if range.start > range.end {
-            return false;
+        if range.start >= range.end {
+            return range.start == range.end;
+        }
+        self.first_committed_protect(range).is_some()
+    }
+
+    /// Returns the protection of the first page of `range` if `range` is non-empty and every
+    /// page of it is owned and committed.
+    pub(crate) fn first_committed_protect(&self, range: &Range<usize>) -> Option<PageProtection> {
+        if range.start >= range.end {
+            return None;
         }
         let mut cursor = range.start;
+        let mut first = None;
         for (area_range, area) in self.areas.overlapping(range.clone()) {
-            if area_range.start > cursor || !matches!(area.state, PageState::Committed(_)) {
-                return false;
+            let PageState::Committed(protect) = area.state else {
+                return None;
+            };
+            if area_range.start > cursor {
+                return None;
             }
-            cursor = area_range.end.min(range.end);
+            first.get_or_insert(protect);
+            cursor = area_range.end;
         }
-        cursor == range.end
+        first.filter(|_| cursor >= range.end)
     }
 
     unsafe fn create_private_pages(
@@ -477,6 +492,11 @@ where
         }
     }
 
+    /// Commits `len` bytes at `ptr` with `protect`; already committed pages take `protect`.
+    ///
+    /// # Safety
+    /// The range must lie in one owned reservation, and the caller must exclude accesses that
+    /// conflict with the commitment or permission change.
     pub(crate) unsafe fn commit_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
@@ -505,6 +525,10 @@ where
         Ok(())
     }
 
+    /// Decommits `len` bytes at `ptr`, discarding their contents but keeping them reserved.
+    ///
+    /// # Safety
+    /// The range must lie in one owned reservation, and the caller relinquishes its contents.
     pub(crate) unsafe fn decommit_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
@@ -595,6 +619,10 @@ where
         None
     }
 
+    /// Changes the protection of `len` committed bytes at `ptr` to `protect`.
+    ///
+    /// # Safety
+    /// The caller must exclude accesses that conflict with the permission change.
     pub(crate) unsafe fn protect_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
@@ -623,6 +651,10 @@ where
         Ok(())
     }
 
+    /// Releases `len` bytes at `ptr`, which must lie in one owned reservation, with their state.
+    ///
+    /// # Safety
+    /// The caller relinquishes the range and must exclude any remaining users of it.
     pub(crate) unsafe fn remove_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
@@ -758,7 +790,7 @@ where
         length: NonZeroPageSize<PAGE_SIZE>,
         alignment: usize,
         flags: CreatePagesFlags,
-        permissions: MemoryRegionPermissions,
+        protect: PageProtection,
         op: impl FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let writable = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
@@ -778,8 +810,7 @@ where
                 .expect("failed to release unpublished mapping");
             return Err(error);
         }
-        if permissions != writable {
-            let protect = permissions_to_page_protect(permissions);
+        if protect != PageProtection::PAGE_READWRITE {
             // SAFETY: The mapping is unpublished and exclusively owned during initialization.
             if unsafe { self.protect_pages(ptr, length.as_usize(), protect) }.is_err() {
                 // SAFETY: Protection failed before publication, so the mapping has no users.

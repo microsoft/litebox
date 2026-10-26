@@ -112,8 +112,7 @@ fn map_csr_server_shared_memory(
             length,
             crate::syscalls::mm::ALLOCATION_GRANULARITY,
             litebox_common_linux::vmem::CreatePagesFlags::empty(),
-            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
-                | litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE,
+            crate::syscalls::mm::PageProtection::PAGE_READWRITE,
             |_| Ok(0),
         )
         .map(|mapping| mapping.as_usize())

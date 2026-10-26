@@ -7,10 +7,7 @@ use core::{
     mem::{align_of, size_of},
 };
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
-use litebox::platform::{
-    RawConstPointer as _, RawMutPointer as _, RawPointerProvider,
-    page_mgmt::MemoryRegionPermissions,
-};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
 use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, VmemProtectError};
@@ -231,7 +228,7 @@ fn create_process_environment<Platform: crate::ShimPlatform>(
             length,
             ALLOCATION_GRANULARITY,
             CreatePagesFlags::empty(),
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            PageProtection::PAGE_READWRITE,
             |_| Ok(0),
         )?;
         Ok(ptr.as_usize())
@@ -419,7 +416,7 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
             length,
             ALLOCATION_GRANULARITY,
             CreatePagesFlags::IS_STACK,
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            PageProtection::PAGE_READWRITE,
             |_| Ok(0),
         )
         .map_err(PeImageAccessError::Mapping)?;
@@ -444,7 +441,7 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
             teb_length,
             ALLOCATION_GRANULARITY,
             CreatePagesFlags::empty(),
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            PageProtection::PAGE_READWRITE,
             |_| Ok(0),
         )
         .map_err(PeImageAccessError::Mapping)?
@@ -461,7 +458,7 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
             context_length,
             ALLOCATION_GRANULARITY,
             CreatePagesFlags::empty(),
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            PageProtection::PAGE_READWRITE,
             |_| Ok(0),
         )
         .map_err(PeImageAccessError::Mapping)?
@@ -1260,7 +1257,7 @@ impl<Platform: crate::ShimPlatform> MapMemory for PeImageMapper<'_, Platform> {
             length,
             ALLOCATION_GRANULARITY,
             CreatePagesFlags::empty(),
-            MemoryRegionPermissions::empty(),
+            PageProtection::PAGE_NOACCESS,
             |_| Ok(0),
         )?;
         let base = ptr.as_usize();
