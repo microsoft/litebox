@@ -4,39 +4,31 @@
 //! Host (broker-side) endpoints of a Unix-domain-socket broker association.
 //!
 //! The matching local endpoints live in the sibling `local` module, and both
-//! sides share the crate-private `setup` framing. Portable broker interfaces
-//! live in the no_std protocol, transport, local, core, and host crates.
+//! sides share the crate-private `setup` framing. Once negotiated, the
+//! association runs on the shared [`ring_association`] endpoints over a memfd
+//! control ring. Portable broker interfaces live in the no_std protocol,
+//! transport, local, core, and host crates.
 
-use std::io::{Error, ErrorKind, Read, Result as IoResult};
+use std::io::{Error, ErrorKind, Result as IoResult};
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Instant;
 
-use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-    BrokerResponse,
-};
+use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::wire::{
-    WireError, decode_handshake_request, decode_request, encode_handshake_response,
-    encode_notification, encode_response,
+    WireError, decode_handshake_request, encode_handshake_response,
 };
-use litebox_broker_transport::channel::{
-    HostAssociationShutdown, HostCallLane, HostCallLaneSource, HostNotificationChannel,
-    HostReceive, HostSetupChannel, PeerCredential,
-};
-use litebox_broker_transport::control_ring::{
-    ControlRing, ControlRingConsumer, ControlRingDemandStatus, ControlRingProducer,
-    ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
-    HostControlRingEndpoints, HostControlRingLane, HostLaneDemand,
+use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
+use litebox_broker_transport::control_ring::ControlRing;
+use litebox_broker_transport::ring_association::{
+    self, ControlRingHostCallLane, ControlRingHostCallLaneSource,
+    ControlRingHostNotificationChannel, ControlRingHostShutdown,
 };
 
 use crate::memfd::{MemfdProcessImage, MemfdSharedMemory};
 use crate::setup::{
-    copy_io_error, invalid_data, read_setup_frame, ring_error, shutdown_socket, wire_error,
-    write_setup_frame,
+    UnixAssociationStream, invalid_data, read_setup_frame, wire_error, write_setup_frame,
 };
 
 /// Validates that a connected Unix socket belongs to `expected_process_id`.
@@ -100,48 +92,19 @@ pub struct UnixStreamHostSetupChannel {
     negotiated: bool,
 }
 
-type BrokerLane = HostControlRingLane<MemfdSharedMemory>;
-
-/// Source of the call lanes of an active host control-ring association, which
+/// Source of the call lanes of an active host Unix-socket association, which
 /// hands out each lane once the runner starts using it.
-pub struct UnixControlRingHostCallLaneSource {
-    /// Each lane, or `None` once handed out.
-    lanes: Vec<Option<BrokerLane>>,
-    demand: HostLaneDemand<MemfdSharedMemory>,
-    association: Arc<HostRingAssociation>,
-}
+pub type UnixControlRingHostCallLaneSource = ControlRingHostCallLaneSource<MemfdSharedMemory>;
 
-/// One call lane of an active host control-ring association.
-pub struct UnixControlRingHostCallLane {
-    lane: BrokerLane,
-    association: Arc<HostRingAssociation>,
-}
+/// One call lane of an active host Unix-socket association.
+pub type UnixControlRingHostCallLane = ControlRingHostCallLane<MemfdSharedMemory>;
+
+/// Host notification sender of an active Unix-socket association.
+pub type UnixControlRingHostNotificationChannel =
+    ControlRingHostNotificationChannel<MemfdSharedMemory>;
 
 /// RAII guard that interrupts all active host ring I/O when dropped.
-pub struct UnixControlRingHostShutdown {
-    association: Arc<HostRingAssociation>,
-}
-
-/// State shared by every activated host endpoint of one association: the setup
-/// socket used for liveness and teardown, terminal status, and the wake handles
-/// of every ring wait.
-struct HostRingAssociation {
-    control_stream: UnixStream,
-    status: Mutex<HostAssociationStatus>,
-    wakes: Vec<ControlRingWakeHandle<MemfdSharedMemory>>,
-}
-
-enum HostAssociationStatus {
-    Live,
-    PeerClosed,
-    Failed(Arc<Error>),
-}
-
-/// Host notification sender for a shared-ring Unix broker association.
-pub struct UnixControlRingHostNotificationChannel {
-    producer: ControlRingProducer<MemfdSharedMemory>,
-    association: Arc<HostRingAssociation>,
-}
+pub type UnixControlRingHostShutdown = ControlRingHostShutdown<MemfdSharedMemory>;
 
 impl UnixStreamHostSetupChannel {
     /// Creates a host setup channel from an accepted Unix stream.
@@ -189,7 +152,7 @@ impl UnixStreamHostSetupChannel {
     ///
     /// The ring must have a layout of more than one lane.
     pub fn into_active(
-        mut self,
+        self,
         ring: ControlRing<MemfdSharedMemory>,
     ) -> IoResult<(
         UnixControlRingHostCallLaneSource,
@@ -201,82 +164,8 @@ impl UnixStreamHostSetupChannel {
                 "broker host setup channel activated before negotiation completed",
             ));
         }
-        let ready_token = ring.layout().ready_token();
-        let endpoints = ring.into_host();
-        let wakes = endpoints.wake_handles();
-        let HostControlRingEndpoints {
-            lanes,
-            lane_demand: Some(demand),
-            notification_producer,
-        } = endpoints
-        else {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "broker control-ring layout has a single lane",
-            ));
-        };
-        let Some(ready) = read_setup_frame(&mut self.stream, self.setup_deadline)? else {
-            return Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                "runner closed before control-ring setup acknowledgement",
-            ));
-        };
-        if ready != ready_token {
-            return Err(invalid_data(
-                "runner sent an invalid control-ring setup acknowledgement",
-            ));
-        }
-        write_setup_frame(&mut self.stream, ready_token, self.setup_deadline)?;
-
-        let shutdown_stream = self.stream.try_clone()?;
-        let association = Arc::new(HostRingAssociation {
-            control_stream: shutdown_stream,
-            status: Mutex::new(HostAssociationStatus::Live),
-            wakes,
-        });
-        let monitor_association = Arc::clone(&association);
-        thread::Builder::new()
-            .name("litebox-runner-liveness".to_owned())
-            .spawn(move || monitor_host_socket(&mut self.stream, &monitor_association))?;
-        Ok((
-            UnixControlRingHostCallLaneSource {
-                lanes: lanes.into_iter().map(Some).collect(),
-                demand,
-                association: Arc::clone(&association),
-            },
-            UnixControlRingHostNotificationChannel {
-                producer: notification_producer,
-                association: Arc::clone(&association),
-            },
-            UnixControlRingHostShutdown { association },
-        ))
-    }
-}
-
-impl UnixControlRingHostShutdown {
-    /// Shuts down the active association without waiting for a ring lock.
-    pub fn shutdown(&self) -> IoResult<()> {
-        self.association.fail(Error::new(
-            ErrorKind::ConnectionAborted,
-            "broker host association shut down",
-        ))
-    }
-}
-
-impl HostAssociationShutdown for UnixControlRingHostShutdown {
-    type Error = Error;
-
-    fn shutdown(&self) -> IoResult<()> {
-        Self::shutdown(self)
-    }
-}
-
-impl Drop for UnixControlRingHostShutdown {
-    fn drop(&mut self) {
-        let _ = self.association.fail(Error::new(
-            ErrorKind::ConnectionAborted,
-            "broker host association shutdown guard dropped",
-        ));
+        let stream = UnixAssociationStream::new(self.stream, self.setup_deadline)?;
+        ring_association::activate_host(ring, Box::new(stream))
     }
 }
 
@@ -309,303 +198,12 @@ impl HostSetupChannel for UnixStreamHostSetupChannel {
     }
 }
 
-impl UnixControlRingHostCallLaneSource {
-    /// Blocks until the runner starts using another lane and returns it.
-    ///
-    /// Once every lane is handed out, this blocks until the association ends.
-    /// Returns `Ok(None)` once the runner closed the association.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lane demand hands out a lane more than once.
-    pub fn next_lane(&mut self) -> IoResult<Option<UnixControlRingHostCallLane>> {
-        loop {
-            if let Some(ended) = self.association.ended() {
-                return ended.map(|()| None);
-            }
-            match self.demand.try_next_lane() {
-                Ok(ControlRingDemandStatus::Lane(index)) => {
-                    let lane = self.lanes[index]
-                        .take()
-                        .expect("lane demand hands out each lane once");
-                    return Ok(Some(UnixControlRingHostCallLane {
-                        lane,
-                        association: Arc::clone(&self.association),
-                    }));
-                }
-                Ok(ControlRingDemandStatus::Satisfied { wake_count }) => {
-                    if let Some(ended) = self.association.ended() {
-                        return ended.map(|()| None);
-                    }
-                    if let Err(error) = self.demand.wait_for_demand(wake_count) {
-                        let result = Err(copy_io_error(&error));
-                        let _ = self.association.fail(error);
-                        return result;
-                    }
-                }
-                Err(error) => {
-                    let error = ring_error(error);
-                    let result = Err(copy_io_error(&error));
-                    let _ = self.association.fail(error);
-                    return result;
-                }
-            }
-        }
-    }
-}
-
-impl HostCallLaneSource for UnixControlRingHostCallLaneSource {
-    type Error = Error;
-    type Lane = UnixControlRingHostCallLane;
-
-    fn next_lane(&mut self) -> IoResult<Option<UnixControlRingHostCallLane>> {
-        Self::next_lane(self)
-    }
-}
-
-impl UnixControlRingHostCallLane {
-    /// Receives this lane's next broker request.
-    pub fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
-        let consumer = &mut self.lane.request_consumer;
-        loop {
-            if let Some(error) = self.association.current_failure() {
-                return Err(error);
-            }
-            match consumer.try_read(decode_request) {
-                Ok(ControlRingReadStatus::Message(request)) => {
-                    self.association.acknowledge_request(consumer)?;
-                    return Ok(HostReceive::Message(request));
-                }
-                Ok(ControlRingReadStatus::Empty { wake_count }) => {
-                    if let Some(ended) = self.association.ended() {
-                        return ended.map(|()| HostReceive::PeerClosed);
-                    }
-                    if let Err(error) = consumer.wait_for_message(wake_count) {
-                        let result = Err(copy_io_error(&error));
-                        let _ = self.association.fail(error);
-                        return result;
-                    }
-                }
-                Err(ControlRingReadError::Decode(WireError::WrongMessagePhase)) => {
-                    return Ok(HostReceive::ProtocolViolation);
-                }
-                Err(ControlRingReadError::Decode(error)) => {
-                    let error = wire_error(error);
-                    let result = Err(copy_io_error(&error));
-                    let _ = self.association.fail(error);
-                    return result;
-                }
-                Err(ControlRingReadError::Ring(error)) => {
-                    let error = ring_error(error);
-                    let result = Err(copy_io_error(&error));
-                    let _ = self.association.fail(error);
-                    return result;
-                }
-            }
-        }
-    }
-
-    /// Serializes and sends the response to this lane's last request.
-    pub fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
-        let frame = encode_response(response.clone());
-        let producer = &mut self.lane.response_producer;
-        loop {
-            match self.association.try_publish(producer, &frame)? {
-                ControlRingWriteStatus::Written => return Ok(()),
-                ControlRingWriteStatus::Full { wake_count } => {
-                    if let Err(error) = producer.wait_for_capacity(wake_count) {
-                        let result = Err(copy_io_error(&error));
-                        let _ = self.association.fail(error);
-                        return result;
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl HostCallLane for UnixControlRingHostCallLane {
-    type Error = Error;
-
-    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
-        Self::recv_request(self)
-    }
-
-    fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
-        Self::send_response(self, response)
-    }
-}
-
-impl HostNotificationChannel for UnixControlRingHostNotificationChannel {
-    type Error = Error;
-
-    fn send_notification(&mut self, notification: &BrokerNotification) -> IoResult<()> {
-        let frame = encode_notification(notification.clone());
-        loop {
-            match self.association.try_publish(&mut self.producer, &frame)? {
-                ControlRingWriteStatus::Written => return Ok(()),
-                ControlRingWriteStatus::Full { wake_count } => {
-                    if let Err(error) = self.producer.wait_for_capacity(wake_count) {
-                        let result = Err(copy_io_error(&error));
-                        let _ = self.association.fail(error);
-                        return result;
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl HostRingAssociation {
-    fn acknowledge_request(
-        &self,
-        consumer: &mut ControlRingConsumer<MemfdSharedMemory>,
-    ) -> IoResult<()> {
-        let result = {
-            let status = self
-                .status
-                .lock()
-                .expect("broker host association mutex poisoned");
-            if let HostAssociationStatus::Failed(error) = &*status {
-                return Err(copy_io_error(error));
-            }
-            consumer
-                .publish_head()
-                .map_err(ring_error)
-                .and_then(|()| consumer.wake_producer())
-        };
-        if let Err(error) = result {
-            let result = Err(copy_io_error(&error));
-            let _ = self.fail(error);
-            return result;
-        }
-        Ok(())
-    }
-
-    fn fail(&self, error: Error) -> IoResult<()> {
-        {
-            let mut status = self
-                .status
-                .lock()
-                .expect("broker host association mutex poisoned");
-            if matches!(*status, HostAssociationStatus::Live) {
-                *status = HostAssociationStatus::Failed(Arc::new(error));
-            }
-        }
-        self.wakes
-            .iter()
-            .map(ControlRingWakeHandle::interrupt_wait)
-            .fold(Ok(()), IoResult::and)
-            .and(shutdown_socket(&self.control_stream))
-    }
-
-    fn peer_closed(&self) {
-        {
-            let mut status = self
-                .status
-                .lock()
-                .expect("broker host association mutex poisoned");
-            if matches!(*status, HostAssociationStatus::Live) {
-                *status = HostAssociationStatus::PeerClosed;
-            }
-        }
-        for wake in &self.wakes {
-            let _ = wake.interrupt_wait();
-        }
-    }
-
-    /// Returns how the association ended, if it has: `Ok` if the runner
-    /// closed it.
-    fn ended(&self) -> Option<IoResult<()>> {
-        match &*self
-            .status
-            .lock()
-            .expect("broker host association mutex poisoned")
-        {
-            HostAssociationStatus::Live => None,
-            HostAssociationStatus::PeerClosed => Some(Ok(())),
-            HostAssociationStatus::Failed(error) => Some(Err(copy_io_error(error))),
-        }
-    }
-
-    fn current_failure(&self) -> Option<Error> {
-        match &*self
-            .status
-            .lock()
-            .expect("broker host association mutex poisoned")
-        {
-            HostAssociationStatus::Failed(error) => Some(copy_io_error(error)),
-            HostAssociationStatus::Live | HostAssociationStatus::PeerClosed => None,
-        }
-    }
-
-    fn try_publish(
-        &self,
-        producer: &mut ControlRingProducer<MemfdSharedMemory>,
-        frame: &[u8],
-    ) -> IoResult<ControlRingWriteStatus> {
-        let result = {
-            let status = self
-                .status
-                .lock()
-                .expect("broker host association mutex poisoned");
-            match &*status {
-                HostAssociationStatus::Live => {}
-                HostAssociationStatus::PeerClosed => {
-                    return Err(Error::new(
-                        ErrorKind::BrokenPipe,
-                        "runner closed the active broker association",
-                    ));
-                }
-                HostAssociationStatus::Failed(error) => return Err(copy_io_error(error)),
-            }
-            producer
-                .try_write(frame)
-                .map_err(ring_error)
-                .and_then(|write_status| {
-                    if matches!(write_status, ControlRingWriteStatus::Written) {
-                        producer.wake_consumer()?;
-                    }
-                    Ok(write_status)
-                })
-        };
-        if let Err(error) = result {
-            let result = Err(copy_io_error(&error));
-            let _ = self.fail(error);
-            return result;
-        }
-        result
-    }
-}
-
-fn monitor_host_socket(stream: &mut UnixStream, association: &HostRingAssociation) {
-    let mut byte = [0];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => {
-                association.peer_closed();
-                return;
-            }
-            Ok(_) => {
-                let _ = association.fail(invalid_data(
-                    "runner sent unexpected active control-socket data",
-                ));
-                return;
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => {
-                let _ = association.fail(error);
-                return;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use litebox_broker_protocol::message::{
-        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
+        BrokerNotification, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
+        ReadinessNotification,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::wire::{
@@ -613,18 +211,21 @@ mod tests {
     };
     use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, RequestId};
     use litebox_broker_transport::channel::{
-        LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
+        HostNotificationChannel, LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
     };
     use litebox_broker_transport::control_ring::{
-        CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRingLayout, LocalControlRingEndpoints,
+        CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRingConsumer, ControlRingLayout,
+        ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus,
+        LocalControlRingEndpoints,
     };
 
     use crate::unix_socket::local::{
         UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
         UnixStreamLocalSetupChannel,
     };
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::fd::AsFd;
+    use std::thread;
     use std::time::Duration;
 
     type Producer = ControlRingProducer<MemfdSharedMemory>;
@@ -907,54 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn host_failure_preempts_queued_and_decoded_requests_but_peer_close_drains() {
-        let (mut lane, _shutdown, mut local, _peer) = activate_host_lane();
-        write_payload(
-            &mut local.lanes[0].request_producer,
-            &encode_request(request(1)),
-        );
-        lane.association
-            .fail(Error::new(ErrorKind::TimedOut, "test failure"))
-            .unwrap();
-        assert_eq!(lane.recv_request().unwrap_err().kind(), ErrorKind::TimedOut);
-
-        let (mut lane, _shutdown, mut local, _peer) = activate_host_lane();
-        write_payload(
-            &mut local.lanes[0].request_producer,
-            &encode_request(request(2)),
-        );
-        assert!(matches!(
-            lane.lane.request_consumer.try_read(decode_request).unwrap(),
-            ControlRingReadStatus::Message(_)
-        ));
-        lane.association
-            .fail(Error::new(ErrorKind::TimedOut, "test failure"))
-            .unwrap();
-        assert_eq!(
-            lane.association
-                .acknowledge_request(&mut lane.lane.request_consumer)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::TimedOut
-        );
-
-        let (mut lane, _shutdown, mut local, _peer) = activate_host_lane();
-        write_payload(
-            &mut local.lanes[0].request_producer,
-            &encode_request(request(3)),
-        );
-        lane.association.peer_closed();
-        assert!(matches!(
-            lane.recv_request().unwrap(),
-            HostReceive::Message(BrokerRequest {
-                request_id: RequestId(3),
-                ..
-            })
-        ));
-        assert_eq!(lane.recv_request().unwrap(), HostReceive::PeerClosed);
-    }
-
-    #[test]
     fn dropping_host_shutdown_guard_wakes_waits_and_closes_socket() {
         let (mut lanes, shutdown, _local, mut peer) = activate_host();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -1113,23 +666,5 @@ mod tests {
             receiver.join().unwrap().unwrap_err().kind(),
             ErrorKind::UnexpectedEof
         );
-    }
-
-    #[test]
-    fn malformed_notification_fails_the_association() {
-        let (control, mut local, mut host, _shutdown) = notification_channel_pair();
-        assert_eq!(
-            host.producer.try_write(&[0xff]).unwrap(),
-            ControlRingWriteStatus::Written
-        );
-        host.producer.wake_consumer().unwrap();
-
-        assert_eq!(
-            local.recv_notification().unwrap_err().kind(),
-            ErrorKind::InvalidData
-        );
-        // The local association is failed, so it refuses further calls without
-        // ever reaching the ring.
-        assert!(control.call(request(1)).is_err());
     }
 }

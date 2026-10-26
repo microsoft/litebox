@@ -5,7 +5,6 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use std::time::Instant;
 
 use litebox_broker_protocol::wire::WireError;
-use litebox_broker_transport::control_ring::ControlRingError;
 use litebox_broker_transport::setup_frame::{SetupFrameError, read_setup_frame, write_setup_frame};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_PIPE_NOT_CONNECTED,
@@ -293,19 +292,5 @@ pub(crate) fn wire_error(error: WireError) -> Error {
     Error::new(
         ErrorKind::InvalidData,
         format!("invalid broker wire message: {error}"),
-    )
-}
-
-pub(crate) fn copy_io_error(error: &Error) -> Error {
-    match error.raw_os_error() {
-        Some(code) => Error::from_raw_os_error(code),
-        None => Error::new(error.kind(), error.to_string()),
-    }
-}
-
-pub(crate) fn ring_error(error: ControlRingError) -> Error {
-    Error::new(
-        ErrorKind::InvalidData,
-        format!("invalid broker control ring: {error:?}"),
     )
 }

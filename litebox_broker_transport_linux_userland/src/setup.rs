@@ -14,10 +14,11 @@
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::time::Instant;
 
 use litebox_broker_protocol::wire::WireError;
-use litebox_broker_transport::control_ring::ControlRingError;
+use litebox_broker_transport::ring_association::AssociationStream;
 #[cfg(test)]
 use litebox_broker_transport::setup_frame::MAX_SETUP_FRAME_LEN;
 use litebox_broker_transport::setup_frame::{
@@ -81,10 +82,66 @@ fn frame_error(error: SetupFrameError<Error>) -> Error {
 
 /// Shuts down both directions of an association socket, tolerating a peer that
 /// already disconnected.
-pub(crate) fn shutdown_socket(stream: &UnixStream) -> IoResult<()> {
+fn shutdown_socket(stream: &UnixStream) -> IoResult<()> {
     match stream.shutdown(Shutdown::Both) {
         Err(error) if error.kind() == ErrorKind::NotConnected => Ok(()),
         result => result,
+    }
+}
+
+/// The setup socket of a negotiated association, which activation retains for
+/// liveness and teardown.
+pub(crate) struct UnixAssociationStream {
+    stream: UnixStream,
+    /// A duplicate of `stream` that teardown shuts down, so a sandbox can
+    /// permit shutting down only this descriptor.
+    shutdown_stream: Arc<UnixStream>,
+    setup_deadline: Option<Instant>,
+}
+
+impl UnixAssociationStream {
+    /// Wraps `stream`, bounding the remaining setup I/O by `setup_deadline`.
+    pub(crate) fn new(stream: UnixStream, setup_deadline: Option<Instant>) -> IoResult<Self> {
+        Ok(Self {
+            shutdown_stream: Arc::new(stream.try_clone()?),
+            stream,
+            setup_deadline,
+        })
+    }
+
+    /// Returns the descriptor that teardown shuts down.
+    pub(crate) fn shutdown_stream(&self) -> Arc<UnixStream> {
+        Arc::clone(&self.shutdown_stream)
+    }
+}
+
+impl AssociationStream for UnixAssociationStream {
+    fn read_frame(&mut self) -> IoResult<Option<Vec<u8>>> {
+        read_setup_frame(&mut self.stream, self.setup_deadline)
+    }
+
+    fn write_frame(&mut self, frame: &[u8]) -> IoResult<()> {
+        write_setup_frame(&mut self.stream, frame, self.setup_deadline)
+    }
+
+    fn wait_for_close(&self) -> IoResult<()> {
+        let mut byte = [0];
+        loop {
+            match (&self.stream).read(&mut byte) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {
+                    return Err(invalid_data(
+                        "peer sent unexpected active control-socket data",
+                    ));
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn shutdown(&self) -> IoResult<()> {
+        shutdown_socket(&self.shutdown_stream)
     }
 }
 
@@ -98,23 +155,6 @@ pub(crate) fn wire_error(error: WireError) -> Error {
     Error::new(
         ErrorKind::InvalidData,
         format!("invalid broker wire message: {error}"),
-    )
-}
-
-/// Clones an error so the recorded failure that ended an association can be
-/// reported to every waiter of the association.
-pub(crate) fn copy_io_error(error: &Error) -> Error {
-    match error.raw_os_error() {
-        Some(code) => Error::from_raw_os_error(code),
-        None => Error::new(error.kind(), error.to_string()),
-    }
-}
-
-/// Maps a control-ring failure to the fail-closed error both endpoints report.
-pub(crate) fn ring_error(error: ControlRingError) -> Error {
-    Error::new(
-        ErrorKind::InvalidData,
-        format!("invalid broker control ring: {error:?}"),
     )
 }
 
