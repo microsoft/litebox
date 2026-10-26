@@ -113,7 +113,6 @@ impl Pages {
         if permissions.contains(Perm::WRITE | Perm::EXEC) {
             return Err(AllocationError::PermissionDenied);
         }
-        // Panics on SHARED before any side effect, including on the fixed path.
         let prot = native_prot(permissions);
         // No icache maintenance: XNU keeps fresh zero-fill pages instruction-coherent (on arm64 it
         // syncs a page first mapped executable: `vm_fault_enter_set_mapped`, osfmk/vm/vm_fault.c);

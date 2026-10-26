@@ -181,19 +181,19 @@ pub struct VmArea {
 impl VmArea {
     /// Get the [flags](`VmFlags`) of this memory area.
     #[inline]
-    pub fn flags(self) -> VmFlags {
+    pub fn flags(&self) -> VmFlags {
         self.flags
     }
 
     /// Check if this area is backed by a file.
     #[inline]
-    pub fn is_file_backed(self) -> bool {
+    pub fn is_file_backed(&self) -> bool {
         self.is_file_backed
     }
 
     /// Check if this area is shared anonymous memory, whose pages native fork children share.
     #[inline]
-    pub fn is_shared_anonymous(self) -> bool {
+    pub fn is_shared_anonymous(&self) -> bool {
         self.flags.contains(VmFlags::VM_SHARED) && !self.is_file_backed
     }
 
@@ -225,8 +225,8 @@ pub struct MmapRequest {
     pub range: Range<usize>,
     /// Properties of the new virtual memory area.
     pub vma: VmArea,
-    /// Whether pages should be populated immediately.
-    pub populate_pages_immediately: bool,
+    /// Page allocation options.
+    pub options: AllocationOptions,
     /// Required fixed-address behavior.
     pub behavior: FixedAddressBehavior,
 }
@@ -263,10 +263,26 @@ pub trait LinuxReservationStore<Platform, const ALIGN: usize>:
 where
     Platform: PageManagementProvider<ALIGN, Reservations = Self>,
 {
+    /// Release all owned reservations and mappings.
+    ///
+    /// On failure, released extents have been removed from both stores, and the extents not
+    /// yet attempted remain available for retry.
+    ///
+    /// # Safety
+    ///
+    /// The caller must exclude all users of this address space.
+    unsafe fn release_all(
+        &mut self,
+        vmas: &mut RangeMap<usize, VmArea>,
+        platform: &Platform,
+    ) -> Result<(), DeallocationError>;
+
     /// Create a platform mapping, update reservation ownership, and insert its VMA.
     ///
     /// # Safety
     ///
+    /// Unless `request.behavior` is [`FixedAddressBehavior::Replace`], the requested range must
+    /// not overlap any existing VMA.
     /// When `request.behavior` is [`FixedAddressBehavior::Replace`], the caller must ensure that
     /// any replaced mappings are not in active use.
     unsafe fn mmap(
@@ -277,6 +293,9 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError>;
 
     /// Release a range's platform backing, update reservation ownership, and remove its VMAs.
+    ///
+    /// Tracked reservations with unaligned endpoints retain their address space until teardown,
+    /// even after their last VMA is removed, so future mappings can reuse it without reserving again.
     ///
     /// # Safety
     ///
@@ -331,6 +350,26 @@ where
     Platform: PageManagementProvider<ALIGN, Reservations = Self>,
     Reservation: PageReservation + Send + Sync,
 {
+    unsafe fn release_all(
+        &mut self,
+        vmas: &mut RangeMap<usize, VmArea>,
+        platform: &Platform,
+    ) -> Result<(), DeallocationError> {
+        let mut extents: Vec<Range<usize>> = Vec::new();
+        for (range, _) in vmas.iter() {
+            match extents.last_mut() {
+                Some(last) if last.end == range.start => last.end = range.end,
+                _ => extents.push(range.clone()),
+            }
+        }
+        for extent in extents {
+            // SAFETY: The caller relinquishes this provider-owned range without remaining users.
+            unsafe { platform.release_pages(extent.clone()) }?;
+            vmas.remove(extent);
+        }
+        Ok(())
+    }
+
     unsafe fn mmap(
         &mut self,
         platform: &Platform,
@@ -340,12 +379,11 @@ where
         let MmapRequest {
             range,
             vma,
-            populate_pages_immediately,
+            options,
             behavior,
         } = request;
         let length = range.len();
         let permissions = MemoryRegionPermissions::from(vma.flags);
-        let options = mapping_options(vma, populate_pages_immediately);
         // SAFETY: The caller authorizes replacement and this handle-free store owns mapping ranges.
         let reservation = unsafe {
             platform.reserve_and_commit_pages(
@@ -396,6 +434,20 @@ where
     Platform: PageManagementProvider<ALIGN, Reservations = Self>,
     Reservation: PageReservation + Send + Sync,
 {
+    unsafe fn release_all(
+        &mut self,
+        vmas: &mut RangeMap<usize, VmArea>,
+        platform: &Platform,
+    ) -> Result<(), DeallocationError> {
+        while let Some(reservation) = self.pop_first() {
+            let extent = reservation.range();
+            // SAFETY: The caller relinquishes this reservation without remaining users.
+            unsafe { platform.release_pages(reservation) }?;
+            vmas.remove(extent);
+        }
+        Ok(())
+    }
+
     unsafe fn mmap(
         &mut self,
         platform: &Platform,
@@ -405,12 +457,28 @@ where
         let MmapRequest {
             mut range,
             vma,
-            populate_pages_immediately,
-            behavior,
+            options,
+            mut behavior,
         } = request;
         let permissions = MemoryRegionPermissions::from(vma.flags);
-        let options = mapping_options(vma, populate_pages_immediately);
         let can_grow_down = options.contains(AllocationOptions::GROWS_DOWN);
+
+        // Replacement normally recommits pages in place, which cannot turn private pages into
+        // shared ones or shared pages into private ones. Detach such replaced pages first instead,
+        // as Linux unmaps replaced pages before mapping new ones.
+        if behavior == FixedAddressBehavior::Replace
+            && (vma.is_shared_anonymous()
+                || vmas
+                    .overlapping(range.clone())
+                    .any(|(_, replaced)| replaced.is_shared_anonymous()))
+        {
+            // SAFETY: Replacement covers only mapped, hence reserved, pages, and the caller
+            // excludes their users.
+            unsafe { platform.decommit_pages(|| self.overlapping(range.clone()), range.clone()) }
+                .expect("failed to detach replaced pages");
+            vmas.remove(range.clone());
+            behavior = FixedAddressBehavior::NoReplace;
+        }
 
         if range.start.is_multiple_of(Platform::RESERVATION_ALIGNMENT)
             && range.end.is_multiple_of(Platform::RESERVATION_ALIGNMENT)
@@ -466,7 +534,8 @@ where
             Err(error) => return Err(error),
         };
 
-        // SAFETY: The tracked reservations now completely cover the requested range.
+        // SAFETY: Reservations cover the range; new mappings target VMA gaps, and replacement
+        // is limited to private backing.
         match unsafe {
             platform.commit_pages(
                 || self.overlapping(range.clone()),
@@ -551,25 +620,39 @@ where
         vmas: &mut RangeMap<usize, VmArea>,
         range: Range<usize>,
     ) -> Result<(), DeallocationError> {
-        vmas.remove(range.clone());
-        let reservations = self.take_overlapping(range.clone());
-        let last = reservations.len().saturating_sub(1);
-        for (index, reservation) in reservations.into_iter().enumerate() {
-            if index == 0 || index == last {
-                let extent = reservation.range();
-                if vmas.overlaps(&extent) {
-                    let segment = extent.start.max(range.start)..extent.end.min(range.end);
-                    // SAFETY: The removed segment has no users and remains inside this reservation.
-                    unsafe { platform.decommit_pages(|| core::iter::once(&reservation), segment) }
-                        .expect("failed to decommit unmapped reservation backing");
-                    assert!(self.insert(extent.start, reservation).is_none());
-                    continue;
+        let alignment = Platform::RESERVATION_ALIGNMENT;
+        let mut reservations = self.take_overlapping(range.clone()).into_iter();
+        while let Some(reservation) = reservations.next() {
+            let extent = reservation.range();
+            // Only release the reservation if it is fully aligned and has no overlapping mappings outside the range.
+            let retained = !extent.start.is_multiple_of(alignment)
+                || !extent.end.is_multiple_of(alignment)
+                || vmas.overlapping(extent.clone()).any(|(mapped, _)| {
+                    mapped.start.max(extent.start) < range.start
+                        || mapped.end.min(extent.end) > range.end
+                });
+            if retained {
+                let segment = extent.start.max(range.start)..extent.end.min(range.end);
+                // SAFETY: The removed segment has no users and remains inside this reservation.
+                unsafe {
+                    platform.decommit_pages(|| core::iter::once(&reservation), segment.clone())
                 }
+                .expect("failed to decommit unmapped reservation backing");
+                vmas.remove(segment);
+                assert!(self.insert(extent.start, reservation).is_none());
+                continue;
             }
-            // SAFETY: No VMA uses this reservation after removing the requested range.
-            unsafe { platform.release_pages(reservation) }
-                .expect("failed to release unmapped reservation");
+
+            // SAFETY: This reservation has no surviving users or mappings outside the removed range.
+            if let Err(error) = unsafe { platform.release_pages(reservation) } {
+                for pending in reservations {
+                    assert!(self.insert(pending.range().start, pending).is_none());
+                }
+                return Err(error);
+            }
+            vmas.remove(extent);
         }
+        vmas.remove(range);
         Ok(())
     }
 
@@ -632,7 +715,8 @@ where
     /// Remove a range from its virtual address space, if all or any of it was present.
     ///
     /// If the range to be removed _partially_ overlaps any ranges, then those ranges will
-    /// be contracted to no longer cover the removed range.
+    /// be contracted to no longer cover the removed range. An error can leave earlier extents
+    /// unmapped.
     ///
     /// # Safety
     ///
@@ -662,12 +746,12 @@ where
     /// # Safety
     ///
     /// The caller must ensure that no mapped memory remains in use.
-    pub(super) unsafe fn release_all(&mut self) -> Result<(), DeallocationError> {
+    pub(super) unsafe fn release_all(&mut self) -> Result<(), DeallocationError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         // SAFETY: The caller relinquishes every owned extent without remaining users.
-        unsafe {
-            self.reservations
-                .release_all::<Platform, ALIGN, _>(&self.vmas, self.platform)
-        }?;
+        unsafe { self.reservations.release_all(&mut self.vmas, self.platform) }?;
         self.vmas.clear();
         Ok(())
     }
@@ -702,7 +786,7 @@ where
         // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
         // while still resetting all of the existing vmas in the range.
         let unmapped_error = self.vmas.gaps(&range).next().is_some();
-        let overlapping_ranges: Vec<(Range<usize>, VmArea)> = self
+        let overlapping_ranges: Vec<_> = self
             .overlapping(range.clone())
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
@@ -793,14 +877,15 @@ where
             }
         };
         // SAFETY: The caller authorizes replacement, and the checks above preserve external gaps.
+        // Other requests target VMA gaps selected by the caller.
         unsafe {
             self.reservations.mmap(
                 self.platform,
                 &mut self.vmas,
                 MmapRequest {
                     range: suggested_range.into(),
+                    options: mapping_options(vma, populate_pages_immediately),
                     vma,
-                    populate_pages_immediately,
                     behavior: platform_fixed_address_behavior,
                 },
             )
@@ -976,7 +1061,8 @@ where
             if new_end < range.end {
                 // shrink
                 let range = PageRange::new(new_end, range.end).unwrap();
-                unsafe { self.remove_mapping(range) }.unwrap();
+                // SAFETY: The caller excludes all users of the removed tail.
+                unsafe { self.remove_mapping(range) }.map_err(|_| VmemResizeError::Unsupported)?;
             }
             return Ok(());
         }
@@ -1298,10 +1384,10 @@ where
         // SAFETY: The range has complete VMA coverage and the caller excludes conflicting access.
         unsafe { self.reservations.protect(self.platform, range, permissions) }
             .map_err(VmemProtectError::ProtectError)?;
-        for (intersection, vma) in mappings_to_change {
+        for (intersection, mut vma) in mappings_to_change {
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-            self.vmas
-                .insert(intersection, VmArea::new(new_flags, vma.is_file_backed));
+            vma.flags = VmArea::new(new_flags, vma.is_file_backed).flags;
+            self.vmas.insert(intersection, vma);
         }
 
         Ok(())
@@ -1762,6 +1848,7 @@ mod tests {
         const TOP_DOWN: bool = false,
         Store = UntrackedDummyReservations,
         const LIMITED_PLACEMENT: bool = false,
+        const RESERVATION_ALIGN: usize = PAGE_SIZE,
     > {
         rejected_address: Option<usize>,
         rejected_remap_address: Mutex<Option<usize>>,
@@ -1770,27 +1857,31 @@ mod tests {
         rejected_commit: Option<usize>,
         calls: Mutex<Vec<AllocationCall>>,
         decommits: Mutex<Vec<Range<usize>>>,
+        shared_allocations: Mutex<Vec<Range<usize>>>,
         releases: Mutex<Vec<Range<usize>>>,
         permission_updates: Mutex<Vec<PermissionUpdate>>,
         store: core::marker::PhantomData<fn() -> Store>,
     }
 
-    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool>
+    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool, const RESERVATION_ALIGN: usize>
         litebox::platform::RawPointerProvider
-        for DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT>
+        for DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT, RESERVATION_ALIGN>
     {
         type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
         type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
     }
 
     #[expect(unused_variables, reason = "dummy/mock backend")]
-    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool>
-        PageManagementProvider<PAGE_SIZE> for DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT>
+    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool, const RESERVATION_ALIGN: usize>
+        PageManagementProvider<PAGE_SIZE>
+        for DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT, RESERVATION_ALIGN>
     where
         Store: ReservationStore<Reservation = DummyReservation<PAGE_SIZE>> + Default,
         Store::ReleaseTarget: Into<Range<usize>>,
     {
         type Reservations = Store;
+
+        const RESERVATION_ALIGNMENT: usize = RESERVATION_ALIGN;
 
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         const TASK_ADDR_MIN: usize = 0x1_0000;
@@ -1821,7 +1912,7 @@ mod tests {
             _covering_reservations: impl FnOnce() -> Reservations,
             range: Range<usize>,
             _permissions: MemoryRegionPermissions,
-            _options: AllocationOptions,
+            options: AllocationOptions,
         ) -> Result<TransparentMutPtr<u8>, AllocationError>
         where
             Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
@@ -1829,6 +1920,9 @@ mod tests {
         {
             if self.rejected_commit == Some(range.start) {
                 return Err(AllocationError::OutOfMemory);
+            }
+            if options.contains(AllocationOptions::SHARED) {
+                self.shared_allocations.lock().push(range.clone());
             }
             Ok(TransparentMutPtr::from_usize(range.start))
         }
@@ -1860,6 +1954,9 @@ mod tests {
             {
                 return Err(AllocationError::AddressInUse);
             }
+            if options.contains(AllocationOptions::SHARED) {
+                self.shared_allocations.lock().push(suggested_range.clone());
+            }
             // SAFETY: The mock models successful exclusive ownership of this exact range.
             Ok(unsafe { DummyReservation::new(suggested_range) })
         }
@@ -1880,7 +1977,7 @@ mod tests {
         unsafe fn release_pages(
             &self,
             target: litebox::platform::page_mgmt::ReleaseTargetOf<Self, PAGE_SIZE>,
-        ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+        ) -> Result<(), DeallocationError> {
             self.releases.lock().push(target.into());
             Ok(())
         }
@@ -1913,19 +2010,26 @@ mod tests {
 
         unsafe fn protect_pages<'reservation, Reservations>(
             &self,
-            _covering_reservations: impl FnOnce() -> Reservations,
+            covering_reservations: impl FnOnce() -> Reservations,
             range: Range<usize>,
             new_permissions: MemoryRegionPermissions,
         ) -> Result<(), PermissionUpdateError>
         where
-            Reservations: Iterator<
-                Item = &'reservation litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>,
-            >,
-            litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>: 'reservation,
+            Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
         {
-            self.permission_updates
-                .lock()
-                .push((range, new_permissions));
+            let mut reservations = covering_reservations().peekable();
+            let mut updates = self.permission_updates.lock();
+            if reservations.peek().is_none() {
+                updates.push((range, new_permissions));
+            } else {
+                for reservation in reservations {
+                    let extent = reservation.range();
+                    updates.push((
+                        range.start.max(extent.start)..range.end.min(extent.end),
+                        new_permissions,
+                    ));
+                }
+            }
             Ok(())
         }
     }
@@ -1946,6 +2050,21 @@ mod tests {
         rejected_address: Option<usize>,
         rejected_commit: Option<usize>,
     ) -> &'static DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT> {
+        new_dummy_backend_with_alignment::<TOP_DOWN, Store, LIMITED_PLACEMENT, PAGE_SIZE>(
+            rejected_address,
+            rejected_commit,
+        )
+    }
+
+    fn new_dummy_backend_with_alignment<
+        const TOP_DOWN: bool,
+        Store: 'static,
+        const LIMITED_PLACEMENT: bool,
+        const RESERVATION_ALIGN: usize,
+    >(
+        rejected_address: Option<usize>,
+        rejected_commit: Option<usize>,
+    ) -> &'static DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT, RESERVATION_ALIGN> {
         Box::leak(Box::new(DummyVmemBackend {
             rejected_address,
             rejected_remap_address: Mutex::new(None),
@@ -1954,6 +2073,7 @@ mod tests {
             rejected_commit,
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
+            shared_allocations: Mutex::new(Vec::new()),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,
@@ -2406,6 +2526,170 @@ mod tests {
     }
 
     #[test]
+    fn reservation_mmap_registers_vma_and_shares_anonymous_pages() {
+        fn check<Store>(platform: &'static DummyVmemBackend<false, Store>)
+        where
+            Store: LinuxReservationStore<DummyVmemBackend<false, Store>, PAGE_SIZE>
+                + ReservationStore<Reservation = DummyReservation<PAGE_SIZE>>
+                + Default
+                + 'static,
+            Store::ReleaseTarget: Into<Range<usize>>,
+        {
+            let base = 0x10_0000;
+            let range = base..base + 2 * PAGE_SIZE;
+            for (shared, file_backed) in [(false, false), (true, false), (true, true)] {
+                platform.shared_allocations.lock().clear();
+                let mut vmem = Vmem::<_, PAGE_SIZE>::new(platform);
+                let mut flags = VmFlags::VM_READ | VmFlags::VM_MAYREAD | VmFlags::VM_MAYEXEC;
+                flags.set(VmFlags::VM_SHARED, shared);
+                let vma = VmArea::new(flags, file_backed);
+                // SAFETY: The mock records mappings without accessing the simulated addresses.
+                let pointer = unsafe {
+                    vmem.insert_mapping(
+                        PageRange::new(range.start, range.end).unwrap(),
+                        vma,
+                        false,
+                        FixedAddressBehavior::NoReplace,
+                    )
+                }
+                .unwrap();
+                assert_eq!(pointer.as_usize(), base);
+                assert_eq!(vmem.vmas.iter().collect::<Vec<_>>(), [(&range, &vma)]);
+                // Shared file-backed mappings are still private copies.
+                let expected: &[Range<usize>] = if shared && !file_backed {
+                    core::slice::from_ref(&range)
+                } else {
+                    &[]
+                };
+                assert_eq!(*platform.shared_allocations.lock(), expected);
+                // SAFETY: The simulated mapping has no users.
+                unsafe { vmem.release_all() }.unwrap();
+            }
+        }
+
+        check(dummy_backend::<false>(None));
+        check(tracked_dummy_backend(None));
+    }
+
+    #[test]
+    fn tracked_shared_allocation_reserves_and_commits_together() {
+        let base = 0x10_0000;
+        let range = base..base + 2 * PAGE_SIZE;
+        let mut vmm = Vmem::new(tracked_dummy_backend(Some(base)));
+        let shared = VmArea::new(read_write_vma().flags() | VmFlags::VM_SHARED, false);
+        // SAFETY: The mock records mappings without accessing the simulated addresses.
+        let pointer = unsafe {
+            vmm.insert_mapping(
+                PageRange::new(range.start, range.end).unwrap(),
+                shared,
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        assert_eq!(pointer.as_usize(), base);
+        assert_eq!(collect_reservations(&vmm), vec![range.clone()]);
+        assert_eq!(collect_mappings(&vmm), vec![range.clone()]);
+        assert_eq!(*vmm.platform.shared_allocations.lock(), vec![range.clone()]);
+        assert_eq!(
+            *vmm.platform.calls.lock(),
+            vec![(range, FixedAddressBehavior::NoReplace)]
+        );
+    }
+
+    #[test]
+    fn tracked_unmap_retains_unaligned_reservations_until_teardown() {
+        let base = 0x10_0000;
+        let alignment = 0x1_0000;
+        let backend =
+            new_dummy_backend_with_alignment::<false, TrackedDummyReservations, false, 0x1_0000>(
+                None, None,
+            );
+        let mut vmm = Vmem::<_, PAGE_SIZE>::new(backend);
+        let extents = [
+            base..base + PAGE_SIZE,
+            base + PAGE_SIZE..base + 3 * PAGE_SIZE,
+            base + 3 * PAGE_SIZE..base + alignment,
+            base + alignment..base + 2 * alignment,
+        ];
+        for extent in &extents {
+            // SAFETY: The mock models disjoint, exclusively owned native reservation pieces.
+            let reservation = unsafe { DummyReservation::new(extent.clone()) };
+            vmm.reservations.insert(extent.start, reservation);
+        }
+        vmm.vmas
+            .insert(base..base + 2 * alignment, read_write_vma());
+        for extent in &extents {
+            // SAFETY: The simulated mappings have no active users.
+            unsafe { vmm.remove_mapping(PageRange::new(extent.start, extent.end).unwrap()) }
+                .unwrap();
+        }
+        assert!(vmm.vmas.is_empty());
+        assert_eq!(*backend.releases.lock(), [extents[3].clone()]);
+        assert_eq!(*backend.decommits.lock(), extents[..3]);
+        assert_eq!(
+            vmm.reservations
+                .iter()
+                .map(|(_, reservation)| reservation.range())
+                .collect::<Vec<_>>(),
+            extents[..3]
+        );
+        // SAFETY: All simulated pages are unused, including retained unmapped reservations.
+        unsafe { vmm.release_all() }.unwrap();
+        assert_eq!(
+            *backend.releases.lock(),
+            [
+                extents[3].clone(),
+                extents[0].clone(),
+                extents[1].clone(),
+                extents[2].clone()
+            ]
+        );
+        assert_eq!(vmm.reservations.iter().count(), 0);
+    }
+
+    #[test]
+    fn tracked_unmap_releases_middle_reservation_of_coalesced_vma() {
+        let base = 0x10_0000;
+        let page = |index: usize| base + index * PAGE_SIZE;
+        for edge_pages in [1, 2] {
+            let mut vmm = Vmem::new(tracked_dummy_backend(None));
+            for extent in [
+                page(0)..page(edge_pages),
+                page(edge_pages)..page(edge_pages + 1),
+                page(edge_pages + 1)..page(2 * edge_pages + 1),
+            ] {
+                // SAFETY: The mock models disjoint, exclusively owned reservations.
+                let reservation = unsafe { DummyReservation::new(extent.clone()) };
+                vmm.reservations.insert(extent.start, reservation);
+            }
+            vmm.vmas
+                .insert(page(0)..page(2 * edge_pages + 1), read_write_vma());
+            // SAFETY: No simulated page has active users, including partially unmapped edges.
+            unsafe { vmm.remove_mapping(PageRange::new(page(1), page(2 * edge_pages)).unwrap()) }
+                .unwrap();
+            assert_eq!(
+                *vmm.platform.releases.lock(),
+                core::slice::from_ref(&(page(edge_pages)..page(edge_pages + 1)))
+            );
+            assert_eq!(
+                collect_reservations(&vmm),
+                [
+                    page(0)..page(edge_pages),
+                    page(edge_pages + 1)..page(2 * edge_pages + 1),
+                ]
+            );
+            assert_eq!(
+                collect_mappings(&vmm),
+                [
+                    page(0)..page(1),
+                    page(2 * edge_pages)..page(2 * edge_pages + 1)
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn tracked_unmap_decommits_shared_reservations_and_releases_unused_ones() {
         let base = 0x10_0000;
         let mut vmm = Vmem::new(tracked_dummy_backend(None));
@@ -2494,6 +2778,64 @@ mod tests {
         assert_eq!(*vmm.platform.releases.lock(), vec![page(2)..page(3)]);
         assert_eq!(collect_reservations(&vmm), vec![page(0)..page(2)]);
         assert_eq!(collect_mappings(&vmm), vec![page(0)..page(1)]);
+    }
+
+    #[test]
+    fn tracked_replacement_involving_shared_pages_detaches_them_first() {
+        let base = 0x10_0000;
+        let target = base + PAGE_SIZE..base + 2 * PAGE_SIZE;
+        let private = read_write_vma();
+        let shared = VmArea::new(private.flags() | VmFlags::VM_SHARED, false);
+        for (previous, replacement) in [(private, shared), (shared, private), (shared, shared)] {
+            for commit_fails in [false, true] {
+                let backend = tracked_dummy_backend(commit_fails.then_some(target.start));
+                let mut vmm = Vmem::new(backend);
+                // SAFETY: The mock only records mappings; the fixture owns all simulated pages.
+                unsafe {
+                    vmm.insert_mapping(
+                        PageRange::new(base, target.end).unwrap(),
+                        previous,
+                        false,
+                        FixedAddressBehavior::NoReplace,
+                    )
+                }
+                .unwrap();
+                let original_calls = backend.calls.lock().clone();
+                backend.shared_allocations.lock().clear();
+                // SAFETY: The simulated replacement has no active users.
+                let result = unsafe {
+                    vmm.insert_mapping(
+                        PageRange::new(target.start, target.end).unwrap(),
+                        replacement,
+                        false,
+                        FixedAddressBehavior::Replace,
+                    )
+                };
+                // Like Linux, a failed replacement leaves the replaced pages unmapped.
+                let mut expected_mappings = RangeMap::new();
+                expected_mappings.insert(base..target.start, previous);
+                let mut expected_decommits = vec![target.clone()];
+                if commit_fails {
+                    assert!(matches!(result, Err(AllocationError::OutOfMemory)));
+                    expected_decommits.push(target.clone());
+                } else {
+                    assert_eq!(result.unwrap().as_usize(), target.start);
+                    expected_mappings.insert(target.clone(), replacement);
+                }
+                assert_eq!(vmm.vmas, expected_mappings);
+                assert_eq!(*backend.decommits.lock(), expected_decommits);
+                let expected_shared: &[Range<usize>] =
+                    if replacement.is_shared_anonymous() && !commit_fails {
+                        core::slice::from_ref(&target)
+                    } else {
+                        &[]
+                    };
+                assert_eq!(*backend.shared_allocations.lock(), expected_shared);
+                assert_eq!(*backend.calls.lock(), original_calls);
+                assert_eq!(collect_reservations(&vmm), vec![base..target.end]);
+                assert!(backend.releases.lock().is_empty());
+            }
+        }
     }
 
     #[test]
@@ -2912,6 +3254,7 @@ mod tests {
             rejected_commit: None,
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
+            shared_allocations: Mutex::new(Vec::new()),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,

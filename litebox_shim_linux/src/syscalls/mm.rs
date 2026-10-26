@@ -810,6 +810,8 @@ mod tests {
             .unwrap();
         addr.write_slice_at_offset::<Platform>(0, &[0xab; 0x10])
             .unwrap();
+        addr.write_slice_at_offset::<Platform>(0x1000, &[0xcd; 0x10])
+            .unwrap();
         assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xab_u8);
 
         // mprotect to read-only or read-exec should also succeed
@@ -818,7 +820,64 @@ mod tests {
         task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ_EXEC)
             .unwrap();
 
+        // Partially unmapping a shared mapping keeps the rest and its contents.
+        task.sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ)
+            .unwrap();
+        task.sys_munmap(addr, 0x1000).unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0x1000).unwrap(), 0xcd_u8);
         task.sys_munmap(addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    fn test_protect_private_shared_boundaries() {
+        let task = init_platform();
+        let writable = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let private = MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE;
+        let base = task.sys_mmap(0, 0x4000, writable, private, -1, 0).unwrap();
+        let middle = UserPtrMut::from_usize(base.as_usize() + 0x1000);
+        task.sys_munmap(middle, 0x2000).unwrap();
+        assert_eq!(
+            task.sys_mmap(
+                middle.as_usize(),
+                0x2000,
+                writable,
+                MapFlags::MAP_ANON | MapFlags::MAP_SHARED | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap()
+            .as_usize(),
+            middle.as_usize()
+        );
+        for detached in [false, true] {
+            if detached {
+                task.sys_munmap(middle, 0x2000).unwrap();
+                assert_eq!(
+                    task.sys_mmap(
+                        middle.as_usize(),
+                        0x2000,
+                        writable,
+                        private | MapFlags::MAP_FIXED_NOREPLACE,
+                        -1,
+                        0,
+                    )
+                    .unwrap()
+                    .as_usize(),
+                    middle.as_usize()
+                );
+            }
+            task.sys_mprotect(middle, 0x1000, ProtFlags::PROT_READ)
+                .unwrap();
+            task.sys_mprotect(base, 0x4000, ProtFlags::PROT_READ)
+                .unwrap();
+            task.sys_mprotect(base, 0x4000, writable).unwrap();
+            for offset in [0, 0x1000, 0x2000, 0x3000] {
+                base.write_slice_at_offset::<Platform>(offset, &[0x42])
+                    .unwrap();
+                assert_eq!(base.read_at_offset::<Platform>(offset).unwrap(), 0x42_u8);
+            }
+        }
+        task.sys_munmap(base, 0x4000).unwrap();
     }
 
     #[test]

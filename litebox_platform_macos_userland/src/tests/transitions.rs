@@ -63,7 +63,7 @@ fn prepare_code(
     // SAFETY: code and gates are initialized and have no users before RX publication.
     unsafe {
         platform.protect_pages(
-            || core::iter::once(&reservation),
+            core::iter::empty,
             base..base + HOST_PAGE_SIZE,
             MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
         )

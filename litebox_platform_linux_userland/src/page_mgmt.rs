@@ -77,6 +77,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Reservations: Iterator<Item = &'reservation LinuxUserlandReservation<ALIGN>>,
         LinuxUserlandReservation<ALIGN>: 'reservation,
     {
+        // Committing only changes the protection of the existing private mapping.
+        if options.contains(AllocationOptions::SHARED) {
+            return Err(litebox::platform::page_mgmt::AllocationError::UnsupportedByPlatform);
+        }
         // SAFETY: The caller owns the mapping and excludes conflicting access to these pages.
         unsafe {
             syscalls::syscall3(
@@ -193,28 +197,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Reservations: Iterator<Item = &'reservation LinuxUserlandReservation<ALIGN>>,
         LinuxUserlandReservation<ALIGN>: 'reservation,
     {
+        // Replacing the pages with a fresh private mapping discards private contents and detaches
+        // shared pages without discarding the contents that other sharers see. Recommitting then
+        // yields zeros either way.
         // SAFETY: The caller owns these pages and excludes all users of the decommitted range.
         unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::mprotect,
+            syscalls::syscall6(
+                syscalls::Sysno::mmap,
                 range.start,
                 range.len(),
                 ProtFlags::PROT_NONE.bits().reinterpret_as_unsigned() as usize,
+                (MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED)
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
+                usize::MAX,
+                0,
             )
         }
-        .expect("mprotect failed while decommitting pages");
-        // TODO: MADV_DONTNEED restores file contents for private file mappings instead of zeroing;
-        // decommit is currently only used by the Windows shim, which lacks native file mappings.
-        // SAFETY: The range is owned and inaccessible; discard its backing.
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::madvise,
-                range.start,
-                range.len(),
-                libc::MADV_DONTNEED as usize,
-            )
-        }
-        .expect("madvise failed while decommitting pages");
+        .expect("mmap failed while decommitting pages");
         Ok(())
     }
 

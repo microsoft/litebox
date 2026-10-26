@@ -10,6 +10,10 @@ use core::ops::Range;
 use thiserror::Error;
 
 /// Exclusive ownership of a reserved virtual-address extent.
+///
+/// Handles describe address ownership, not backing kind or native allocation boundaries.
+/// Splitting or joining ownership does not split or join native mappings, so providers must
+/// accept any set of handles that covers an operation's range.
 pub trait PageReservation: Into<Range<usize>> {
     /// Return the owned address range.
     fn range(&self) -> Range<usize>;
@@ -75,19 +79,6 @@ pub trait ReservationStore {
     /// Ownership representation consumed when this store releases pages.
     type ReleaseTarget;
 
-    /// Release every extent represented by this store.
-    ///
-    /// # Safety
-    ///
-    /// Every represented extent must belong to `platform` and have no remaining users.
-    unsafe fn release_all<Platform, const ALIGN: usize, V>(
-        &mut self,
-        vmas: &rangemap::RangeMap<usize, V>,
-        platform: &Platform,
-    ) -> Result<(), DeallocationError>
-    where
-        Platform: PageManagementProvider<ALIGN, Reservations = Self>;
-
     /// Insert a reservation at `base`.
     fn insert(&mut self, base: usize, reservation: Self::Reservation) -> Option<Self::Reservation>;
 
@@ -138,12 +129,18 @@ bitflags::bitflags! {
         const GROWS_DOWN = 1 << 0;
         /// Populate the pages immediately rather than lazily.
         const POPULATE = 1 << 1;
-        /// Processes duplicated by
+        /// Back the pages with fresh, zero-filled anonymous memory that processes duplicated by
         /// [`ProcessProvider::fork_process`](crate::platform::ProcessProvider::fork_process)
-        /// share the pages rather than copy them, as Linux `MAP_SHARED | MAP_ANONYMOUS` memory,
-        /// also after later [`PageManagementProvider::protect_pages`] and
-        /// [`PageManagementProvider::release_pages`] calls on parts of them. A platform that
-        /// cannot share them must make `fork_process` decline while such pages exist.
+        /// share rather than copy, as Linux `MAP_SHARED | MAP_ANONYMOUS` memory.
+        ///
+        /// Sharing survives later [`PageManagementProvider::protect_pages`],
+        /// [`PageManagementProvider::decommit_pages`], and
+        /// [`PageManagementProvider::release_pages`] calls on any page-aligned part of the pages;
+        /// decommitting detaches pages without discarding the contents that other sharers see.
+        /// With [`PageManagementProvider::commit_pages`], every page in the range must be
+        /// unbacked. A platform that cannot share pages must either reject this option with
+        /// [`AllocationError::UnsupportedByPlatform`] or make `fork_process` decline while such
+        /// pages exist.
         const SHARED = 1 << 2;
     }
 }
@@ -163,13 +160,17 @@ bitflags::bitflags! {
 ///
 /// [`Self::decommit_pages`] discards contents and makes pages inaccessible while retaining the
 /// reservation; recommitting decommitted pages yields zeros. [`Self::release_pages`] relinquishes
-/// the address space and any remaining backing, without requiring a prior decommit.
+/// the address space and any remaining backing, without requiring a prior decommit. These
+/// operations apply equally to pages committed with [`AllocationOptions::SHARED`].
 ///
 /// Acquiring an extent returns a [`PageReservation`] with exclusive ownership. The manager may
 /// retain reservations in [`Self::Reservations`] or use ranges for release, depending on the
 /// provider. Dropping a reservation does not release pages; ownership must be released explicitly
 /// once there are no remaining users. Replacement and remapping transfer ownership to the
 /// provider as specified by their respective methods.
+///
+/// Borrowed reservation suppliers are lazy so range-based providers can avoid reservation-store
+/// lookups entirely. Invoking these suppliers borrows ownership rather than transferring it.
 ///
 /// NOTE: Due to insufficient support for associated constants in current Stable Rust, we have
 /// `ALIGN` as a parameter. In the future, this may be changed to an associated constant, since each
@@ -328,6 +329,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// The supplied reservations must collectively cover `range`. The caller must exclude
     /// accesses to `range` that could conflict with changes to its backing or permissions.
+    /// Shared pages must not be recommitted; use protection to change their permissions.
     unsafe fn commit_pages<'reservation, Reservations>(
         &self,
         covering_reservations: impl FnOnce() -> Reservations,
@@ -401,18 +403,20 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
         ReservationOf<Self, ALIGN>: 'reservation;
 
-    /// Update permissions within live reservations.
+    /// Update permissions within live reservations, preserving their backing and contents.
     ///
     /// # Parameters
     ///
     /// - `covering_reservations`: Lazily supplies borrowed reservations covering `range`; their
-    ///   extents may extend beyond it.
+    ///   extents may extend beyond it. Handle-free providers may receive an empty iterator.
     /// - `range`: The address range whose permissions are updated.
     /// - `permissions`: The permissions to apply to the pages in `range`.
     ///
     /// # Safety
     ///
-    /// The reservations must cover `range`, and the caller must exclude conflicting accesses.
+    /// The nonempty range must be page-aligned, committed, and exclusively owned by the caller,
+    /// who must exclude conflicting accesses. The supplied reservations must collectively cover
+    /// it; handle-free providers instead rely on ownership of `range`.
     unsafe fn protect_pages<'reservation, Reservations>(
         &self,
         covering_reservations: impl FnOnce() -> Reservations,

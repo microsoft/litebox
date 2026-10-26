@@ -459,6 +459,10 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
         Reservations: Iterator<Item = &'reservation VmUserlandReservation<ALIGN>>,
         VmUserlandReservation<ALIGN>: 'reservation,
     {
+        // Committing only changes the protection of the existing private mapping.
+        if options.contains(AllocationOptions::SHARED) {
+            return Err(AllocationError::UnsupportedByPlatform);
+        }
         kcall::protect(range.start, range.len(), prot(permissions)).map_err(
             |status| match status {
                 Status::NoMemory => AllocationError::OutOfMemory,
@@ -467,9 +471,8 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
                 status => panic!("Protect while committing: unexpected {status:?}"),
             },
         )?;
-        // TODO: The VM ABI cannot eagerly populate or share an existing mapping without replacing
-        // its contents, so `options` is ignored.
-        let _ = options;
+        // TODO: The VM ABI cannot eagerly populate an existing mapping without replacing its
+        // contents, so `POPULATE` is ignored.
         Ok(UserMutPtr::from_ptr(range.start as *mut u8))
     }
 

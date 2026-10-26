@@ -88,6 +88,7 @@ static GUEST_TLS_MODE: AtomicU8 = AtomicU8::new(GUEST_TLS_MODE_UNCONFIGURED);
 /// traits.
 pub struct WindowsUserland<const ALIGN: usize = PAGE_SIZE> {
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
+    use_placeholders: bool,
 }
 
 impl<const ALIGN: usize> core::fmt::Debug for WindowsUserland<ALIGN> {
@@ -201,6 +202,16 @@ unsafe extern "system" fn vectored_exception_handler(
 unsafe extern "system" fn vectored_exception_handler_inner(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
+    // SAFETY: The system passes a valid exception record for the duration of the handler.
+    let exception_record = unsafe { &*(*exception_info).ExceptionRecord };
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && page_mgmt::retry_after_shared_view_split(
+            exception_record.ExceptionInformation[1],
+            exception_record.ExceptionInformation[0],
+        )
+    {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     let Some(tls) = get_tls_ptr() else {
         // TLS slot not initialized yet; cannot be in guest
         return EXCEPTION_CONTINUE_SEARCH;
@@ -343,6 +354,20 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
     ///
     /// Panics if Windows has not enabled user-mode FSGSBASE instructions.
     pub fn new() -> &'static Self {
+        Self::new_with_placeholders(true)
+    }
+
+    /// Create a platform with an immutable placeholder reservation policy.
+    ///
+    /// Enable placeholders to support shared pages. Disabling them reduces ordinary reservation
+    /// and committed allocation to one native allocation call and makes shared pages
+    /// unsupported. Mergeable reservations always use placeholders.
+    /// [`Self::new`] enables placeholders by default.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Windows has not enabled user-mode FSGSBASE instructions.
+    pub fn new_with_placeholders(use_placeholders: bool) -> &'static Self {
         assert!(
             // SAFETY: `IsProcessorFeaturePresent` accepts any feature identifier and has no
             // pointer or lifetime requirements.
@@ -372,6 +397,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
 
         let platform = Self {
             sys_info: std::sync::RwLock::new(sys_info),
+            use_placeholders,
         };
 
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
