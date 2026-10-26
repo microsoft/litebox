@@ -722,7 +722,7 @@ Serializer! {
     /// Readlink request
     #[derive(Clone, Debug)]
     pub(super) struct Treadlink {
-        fid: u32,
+        pub(super) fid: u32,
     }
 }
 
@@ -730,7 +730,7 @@ Serializer! {
     /// Readlink response
     #[derive(Clone, Debug)]
     pub(super) struct Rreadlink<'a> {
-        target: FcallStr<'a>,
+        pub(super) target: FcallStr<'a>,
     }
 }
 

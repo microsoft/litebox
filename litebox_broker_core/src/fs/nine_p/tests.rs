@@ -432,6 +432,64 @@ fn test_nine_p_host_files_visible() {
     );
 }
 
+#[test]
+fn test_nine_p_host_symlinks() {
+    let server = DiodServer::start();
+    let export = server.export_path();
+    std::fs::create_dir(export.join("dir")).unwrap();
+    std::fs::write(export.join("dir/file"), "target").unwrap();
+    std::os::unix::fs::symlink("file", export.join("dir/rel")).unwrap();
+    std::os::unix::fs::symlink("/dir", export.join("abs")).unwrap();
+    std::os::unix::fs::symlink("abs/rel", export.join("chain")).unwrap();
+    std::os::unix::fs::symlink("loop", export.join("loop")).unwrap();
+
+    let fs = connect_9p(&server);
+    let read = |path| {
+        let mut fd = fs
+            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .unwrap_or_else(|error| panic!("open {path}: {error:?}"));
+        let mut buf = alloc::vec![0u8; 16];
+        let n = fs.read(&mut fd, &mut buf, None).unwrap();
+        buf.truncate(n);
+        buf
+    };
+
+    // Relative targets resolve from the link's directory, absolute ones from the export root, and
+    // links are followed both as the final component and mid-path.
+    assert_eq!(read("/dir/rel"), b"target");
+    assert_eq!(read("/abs/file"), b"target");
+    assert_eq!(read("/abs/rel"), b"target");
+    assert_eq!(read("/chain"), b"target");
+
+    assert_eq!(fs.read_link(USER, "/abs").unwrap(), "/dir");
+    assert_eq!(fs.read_link(USER, "/abs/rel").unwrap(), "file");
+    assert!(fs.read_link(USER, "/dir/file").is_err());
+
+    let status = |path, follow| fs.file_status(USER, path, follow).unwrap().file_type;
+    assert_eq!(status("/chain", false), FileType::SymbolicLink);
+    assert_eq!(status("/chain", true), FileType::RegularFile);
+    assert_eq!(status("/abs", true), FileType::Directory);
+
+    assert!(matches!(
+        fs.open(USER, "/loop", OFlags::RDONLY, Mode::empty()),
+        Err(OpenError::PathError(
+            crate::fs::errors::PathError::TooManySymlinks
+        ))
+    ));
+
+    let fd = fs
+        .open(
+            USER,
+            "/dir",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap();
+    let entries = fs.read_dir(&fd).unwrap();
+    let rel = entries.iter().find(|entry| entry.name == "rel").unwrap();
+    assert_eq!(rel.file_type, FileType::SymbolicLink);
+}
+
 // ---------------------------------------------------------------------------
 // Broken-connection transport: wraps DiodTransport and breaks after N writes
 // ---------------------------------------------------------------------------
