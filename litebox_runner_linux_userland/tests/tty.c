@@ -105,8 +105,13 @@ int main(int argc, char **argv) {
 
     if (strcmp(mode, "jobs") == 0) {
         // The session moves the terminal's events to its foreground process group. Like a shell,
-        // ignore SIGTTOU, which Linux sends a background group that sets the foreground.
-        assert(signal(SIGTTOU, SIG_IGN) != SIG_ERR);
+        // ignore SIGTTOU, which Linux sends a background group that sets the foreground. An
+        // interrupt reaching this process must kill it, whatever it inherited.
+        assert(signal(SIGTTOU, SIG_IGN) != SIG_ERR && signal(SIGINT, SIG_DFL) != SIG_ERR);
+        sigset_t interrupt;
+        sigemptyset(&interrupt);
+        sigaddset(&interrupt, SIGINT);
+        assert(sigprocmask(SIG_UNBLOCK, &interrupt, NULL) == 0);
         pid_t self = getpid();
         assert(tcgetpgrp(0) == self && tcgetsid(0) == self);
         assert(tcsetpgrp(0, INT_MAX) == -1 && errno == ESRCH);
@@ -134,7 +139,7 @@ int main(int argc, char **argv) {
         }
         assert(read(ready[0], bytes, 1) == 1);
         assert(tcsetpgrp(0, job) == 0 && tcgetpgrp(1) == job && tcgetsid(2) == self);
-        // The interrupt reaches only the job; it would kill this process.
+        // The interrupt reaches only the job.
         puts("JOB READY");
         assert(waitpid(job, &status, 0) == job && WIFEXITED(status) && WEXITSTATUS(status) == 0);
         assert(tcsetpgrp(0, self) == 0 && tcgetpgrp(0) == self);

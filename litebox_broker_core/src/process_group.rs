@@ -120,21 +120,25 @@ impl ControllingTerminal {
     /// in the foreground, unless it already controls a session.
     pub(crate) fn attach(&self, process: &BrokerProcess) {
         self.sink.call_once(|| {
-            // The group's IDs cannot be released before they are retained.
-            let _tree = process.core.process_tree_lock.lock();
-            let membership = process.membership();
-            {
-                let mut ids = process.core.ids.lock();
-                ids.retain(membership.process_group.0);
-                ids.retain(membership.session.0);
-            }
-            let sink = Arc::new(TerminalSink {
-                processes: Arc::downgrade(&process.core.processes),
-                tree_lock: Arc::clone(&process.core.process_tree_lock),
-                ids: Arc::clone(&process.core.ids),
-                session: membership.session,
-                foreground: Mutex::new(membership.process_group),
-            });
+            let sink = {
+                // The group's IDs cannot be released before they are retained.
+                let _tree = process.core.process_tree_lock.lock();
+                let membership = process.membership();
+                {
+                    let mut ids = process.core.ids.lock();
+                    ids.retain(membership.process_group.0);
+                    ids.retain(membership.session.0);
+                }
+                Arc::new(TerminalSink {
+                    processes: Arc::downgrade(&process.core.processes),
+                    tree_lock: Arc::clone(&process.core.process_tree_lock),
+                    ids: Arc::clone(&process.core.ids),
+                    session: membership.session,
+                    foreground: Mutex::new(membership.process_group),
+                })
+            };
+            // Endpoints may post events while attaching, which takes the
+            // process tree lock.
             self.endpoint.attach(sink.clone());
             sink
         });
