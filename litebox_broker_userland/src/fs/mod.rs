@@ -456,15 +456,22 @@ impl Backend for LocalFs {
             Some(std::path::Component::Prefix(_) | std::path::Component::RootDir)
         ) {
             let inside = target.strip_prefix(&self.root);
-            // Canonical Windows roots are verbatim (`\\?\C:\...`), but host link targets usually
-            // spell the same location without that prefix.
-            #[cfg(windows)]
+            // The root is canonical, but targets may spell it differently (Windows verbatim or 8.3
+            // short prefixes, case, host symlinks in ancestors). Canonicalize the parent only, so
+            // the final component stays a name the resolver will itself follow.
+            let canonical_target =
+                target
+                    .parent()
+                    .zip(target.file_name())
+                    .and_then(|(parent, name)| {
+                        fs::canonicalize(parent)
+                            .ok()
+                            .map(|parent| parent.join(name))
+                    });
             let inside = inside.or_else(|error| {
-                self.root
-                    .to_str()
-                    .and_then(|root| root.strip_prefix(r"\\?\"))
-                    .filter(|root| !root.starts_with("UNC\\"))
-                    .map_or(Err(error), |root| target.strip_prefix(root))
+                canonical_target
+                    .as_deref()
+                    .map_or(Err(error), |target| target.strip_prefix(&self.root))
             });
             let (Ok(inside), Ok(depth)) = (inside, dir.canonical_path.strip_prefix(&self.root))
             else {
