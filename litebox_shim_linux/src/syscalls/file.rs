@@ -16,7 +16,7 @@ use litebox::{
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     fs::errors::OpenError,
-    process::InheritableFd,
+    process::{InheritableFd, ProcessError},
     sync::Mutex,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
@@ -2488,14 +2488,6 @@ fn terminal_operation<Platform: ShimPlatform>(arg: &IoctlArg) -> Result<Terminal
             return Err(Errno::EOPNOTSUPP);
         }
         IoctlArg::TCSBRK(_) => TerminalOperation::Drain,
-        IoctlArg::TIOCGPGRP(_) | IoctlArg::TIOCGSID(_) => TerminalOperation::GetForegroundGroup,
-        IoctlArg::TIOCSPGRP(ptr) => {
-            let process_group = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-            if process_group < 0 {
-                return Err(Errno::EINVAL);
-            }
-            TerminalOperation::SetForegroundGroup(ProcessGroupId(process_group.cast_unsigned()))
-        }
         IoctlArg::TIOCGPTN(_) => return Err(Errno::ENOTTY),
         _ => unreachable!("non-terminal ioctl"),
     })
@@ -2617,16 +2609,54 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 ptr.write_at_offset::<Platform>(0, size.into())
                     .ok_or(Errno::EFAULT)?;
             }
-            (IoctlArg::TIOCGPGRP(ptr), TerminalResponse::ForegroundGroup(foreground)) => {
-                ptr.write_at_offset::<Platform>(0, foreground.process_group.0.cast_signed())
-                    .ok_or(Errno::EFAULT)?;
-            }
-            (IoctlArg::TIOCGSID(ptr), TerminalResponse::ForegroundGroup(foreground)) => {
-                ptr.write_at_offset::<Platform>(0, foreground.session.0.cast_signed())
-                    .ok_or(Errno::EFAULT)?;
-            }
             (_, TerminalResponse::Done) => {}
             _ => return Err(Errno::EIO),
+        }
+        Ok(0)
+    }
+
+    /// Handles a job-control ioctl, which `file` must be the controlling terminal for.
+    fn job_control_ioctl(&self, file: &File<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
+        // Like Linux, rejects the descriptor (`EBADF` for `O_PATH`, `ENOTTY` for a non-terminal)
+        // before reporting `error`.
+        let reject = |error: Errno| {
+            file.terminal_control(TerminalOperation::GetSettings, None)
+                .err()
+                .unwrap_or(error)
+        };
+        let process_error = |error: ProcessError| match error {
+            ProcessError::NotControllingTerminal => reject(Errno::ENOTTY),
+            error => error.into(),
+        };
+        let litebox = &self.global.litebox;
+        match arg {
+            IoctlArg::TIOCGPGRP(ptr) | IoctlArg::TIOCGSID(ptr) => {
+                let foreground = litebox
+                    .get_foreground_group(file.file())
+                    .map_err(process_error)?;
+                let id = if matches!(arg, IoctlArg::TIOCGPGRP(_)) {
+                    foreground.process_group.0
+                } else {
+                    foreground.session.0
+                };
+                ptr.write_at_offset::<Platform>(0, id.cast_signed())
+                    .ok_or(Errno::EFAULT)?;
+            }
+            IoctlArg::TIOCSPGRP(ptr) => {
+                let process_group = ptr
+                    .read_at_offset::<Platform>(0)
+                    .ok_or_else(|| reject(Errno::EFAULT))?;
+                if process_group < 0 {
+                    return Err(reject(Errno::EINVAL));
+                }
+                litebox
+                    .set_foreground_group(
+                        file.file(),
+                        ProcessGroupId(process_group.cast_unsigned()),
+                    )
+                    .map_err(process_error)?;
+            }
+            _ => unreachable!("non-job-control ioctl"),
         }
         Ok(0)
     }
@@ -2714,15 +2744,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | IoctlArg::TCSBRK(..)
             | IoctlArg::TCFLSH(..)
             | IoctlArg::TIOCSWINSZ(..)
-            | IoctlArg::TIOCGPGRP(..)
-            | IoctlArg::TIOCSPGRP(..)
-            | IoctlArg::TIOCGSID(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.file_only(Errno::ENOTTY)?;
                 self.global
                     .with_file(fd, |file| self.terminal_ioctl(file, &arg))
+            }
+            IoctlArg::TIOCGPGRP(..) | IoctlArg::TIOCSPGRP(..) | IoctlArg::TIOCGSID(..) => {
+                let fd = files.typed_fd(fd)?;
+                let fd = fd.file_only(Errno::ENOTTY)?;
+                self.global
+                    .with_file(fd, |file| self.job_control_ioctl(file, &arg))
             }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);

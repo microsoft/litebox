@@ -16,16 +16,18 @@
 
 use alloc::sync::{Arc, Weak};
 
-use litebox_broker_protocol::fs::FileError;
-use litebox_broker_protocol::process_group::ProcessGroupMembership;
+use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::terminal::TerminalEvents;
-use litebox_broker_protocol::{ProcessGroupId, ProcessId, SessionId};
+use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId, SessionId};
 use spin::{Mutex, Once};
 
-use crate::fs::FileResult;
 use crate::id::IdAllocator;
 use crate::terminal::{TerminalEndpoint, TerminalEventSink};
 use crate::{BrokerError, BrokerProcess, ProcessRegistry, Result};
+
+/// Result of a process group operation that can fail in a way the guest ABI
+/// reports.
+pub type ProcessGroupResult<T> = core::result::Result<T, ProcessGroupError>;
 
 /// Moves the process `target` into `process_group`, creating the group if it
 /// is `target`'s ID.
@@ -153,6 +155,42 @@ struct TerminalSink {
     foreground: Mutex<ProcessGroupId>,
 }
 
+impl TerminalSink {
+    /// Returns the foreground process group, in the terminal's session.
+    fn foreground(&self) -> ProcessGroupMembership {
+        ProcessGroupMembership {
+            process_group: *self.foreground.lock(),
+            session: self.session,
+        }
+    }
+
+    /// Moves `process_group` to the foreground under the process tree lock,
+    /// which `process` holds.
+    fn set_foreground(
+        &self,
+        process: &BrokerProcess,
+        process_group: ProcessGroupId,
+    ) -> ProcessGroupResult<()> {
+        let session = process
+            .core
+            .registered_processes()
+            .iter()
+            .map(|member| member.membership())
+            .find(|membership| membership.process_group == process_group)
+            .ok_or(ProcessGroupError::NoSuchProcessGroup)?
+            .session;
+        if session != self.session {
+            return Err(ProcessGroupError::NotInSession);
+        }
+        let mut foreground = self.foreground.lock();
+        let mut ids = self.ids.lock();
+        ids.retain(process_group.0);
+        ids.release(foreground.0);
+        *foreground = process_group;
+        Ok(())
+    }
+}
+
 impl TerminalEventSink for TerminalSink {
     fn post(&self, events: TerminalEvents) {
         let targets = {
@@ -162,10 +200,7 @@ impl TerminalEventSink for TerminalSink {
             let Some(processes) = self.processes.upgrade() else {
                 return;
             };
-            let foreground = ProcessGroupMembership {
-                process_group: *self.foreground.lock(),
-                session: self.session,
-            };
+            let foreground = self.foreground();
             let mut targets = crate::registered_processes(&processes);
             targets.retain(|target| target.membership() == foreground);
             targets
@@ -187,8 +222,9 @@ impl Drop for TerminalSink {
 /// Returns the sink of `terminal` if it is the caller's controlling terminal.
 fn controlling_terminal<'a>(
     process: &'a BrokerProcess,
-    terminal: &Arc<dyn TerminalEndpoint>,
-) -> FileResult<&'a TerminalSink> {
+    terminal: Option<&Arc<dyn TerminalEndpoint>>,
+) -> ProcessGroupResult<&'a TerminalSink> {
+    let terminal = terminal.ok_or(ProcessGroupError::NotControllingTerminal)?;
     process
         .core
         .terminal
@@ -199,67 +235,61 @@ fn controlling_terminal<'a>(
         .and_then(|controlling| controlling.sink.get())
         .filter(|sink| process.membership().session == sink.session)
         .map(|sink| &**sink)
-        .ok_or(FileError::NotControllingTerminal)
+        .ok_or(ProcessGroupError::NotControllingTerminal)
 }
 
-/// Returns the foreground process group of `terminal`, which must be the
-/// caller's controlling terminal.
-pub(crate) fn foreground_group(
+/// Returns the foreground process group of the caller's controlling terminal,
+/// given an open handle `terminal` to it.
+pub fn get_foreground_group(
     process: &BrokerProcess,
-    terminal: &Arc<dyn TerminalEndpoint>,
-) -> FileResult<ProcessGroupMembership> {
+    terminal: ObjectHandle,
+) -> Result<ProcessGroupResult<ProcessGroupMembership>> {
+    let terminal = crate::fs::handle_terminal(process, terminal)?;
     let _tree = process.core.process_tree_lock.lock();
-    let sink = controlling_terminal(process, terminal)?;
-    Ok(ProcessGroupMembership {
-        process_group: *sink.foreground.lock(),
-        session: sink.session,
-    })
+    Ok(controlling_terminal(process, terminal.as_ref()).map(TerminalSink::foreground))
 }
 
-/// Makes `process_group`, an existing group in the caller's session, the
-/// foreground group of `terminal`, which must be the caller's controlling
-/// terminal.
-pub(crate) fn set_foreground_group(
+/// Makes `process_group` the foreground group of the caller's controlling
+/// terminal, given an open handle `terminal` to it.
+///
+/// Fails with [`ProcessGroupError::NotControllingTerminal`] if `terminal` does
+/// not refer to the caller's controlling terminal, then with
+/// [`ProcessGroupError::NoSuchProcessGroup`] if no process is in
+/// `process_group`, and then with [`ProcessGroupError::NotInSession`] if
+/// `process_group` is in another session.
+pub fn set_foreground_group(
     process: &BrokerProcess,
-    terminal: &Arc<dyn TerminalEndpoint>,
+    terminal: ObjectHandle,
     process_group: ProcessGroupId,
-) -> FileResult<()> {
+) -> Result<ProcessGroupResult<()>> {
+    let terminal = crate::fs::handle_terminal(process, terminal)?;
     let _tree = process.core.process_tree_lock.lock();
-    let sink = controlling_terminal(process, terminal)?;
-    let session = process
-        .core
-        .registered_processes()
-        .iter()
-        .map(|member| member.membership())
-        .find(|membership| membership.process_group == process_group)
-        .ok_or(FileError::NoSuchProcessGroup)?
-        .session;
-    if session != sink.session {
-        return Err(FileError::ProcessGroupNotInSession);
-    }
-    let mut current = sink.foreground.lock();
-    let mut ids = process.core.ids.lock();
-    ids.retain(process_group.0);
-    ids.release(current.0);
-    *current = process_group;
-    Ok(())
+    Ok(controlling_terminal(process, terminal.as_ref())
+        .and_then(|sink| sink.set_foreground(process, process_group)))
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
 
-    use litebox_broker_protocol::fs::FileError;
+    use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
     use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
-    use litebox_broker_protocol::process_group::ProcessGroupMembership;
+    use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
     use litebox_broker_protocol::terminal::TerminalEvents;
-    use litebox_broker_protocol::{ProcessGroupId, ProcessId};
+    use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 
+    use crate::fs::composer::Composer;
+    use crate::fs::devices::Devices;
+    use crate::fs::resolver::Resolver;
     use crate::id::IdAllocator;
+    use crate::random::TestRandomProvider;
+    use crate::readiness::ReadinessSink;
     use crate::readiness::tests::TestReadinessSink;
-    use crate::test_support::TestBrokerCoreBuilder;
+    use crate::stdio::StdioProvider as _;
+    use crate::test_platform::TestPlatform;
+    use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
         BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
         Result,
@@ -423,9 +453,6 @@ mod tests {
 
     #[test]
     fn terminal_events_reach_only_the_first_root_group_and_coalesce() {
-        use crate::stdio::StdioProvider as _;
-        use crate::test_support::TestStdioProvider;
-
         let stdio = TestStdioProvider::default().with_controlling_terminal();
         let broker = broker().with_terminal(stdio.terminal().unwrap());
         let root = process(&broker, None);
@@ -460,61 +487,102 @@ mod tests {
         }
     }
 
+    /// Returns a broker whose terminal is `/dev/tty`, while `/other/tty` is
+    /// another terminal, and the broker terminal's provider.
+    fn terminal_broker() -> (BrokerCore, Arc<TestStdioProvider>) {
+        let stdio = Arc::new(TestStdioProvider::default().with_controlling_terminal());
+        let devices = |stdio: Arc<TestStdioProvider>| {
+            move |allocator| Devices::new(allocator, stdio, Arc::new(TestRandomProvider))
+        };
+        let other = Arc::new(TestStdioProvider::default().with_controlling_terminal());
+        let fs = Composer::builder()
+            .mount("/dev", devices(Arc::clone(&stdio)))
+            .mount("/other", devices(other))
+            .build()
+            .unwrap();
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .build()
+        .unwrap()
+        .with_terminal(stdio.terminal().unwrap());
+        (broker, stdio)
+    }
+
+    fn open(process: &BrokerProcess, path: &str, flags: FileOpenFlags) -> ObjectHandle {
+        let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        crate::fs::open(
+            process,
+            path,
+            FileUser::ROOT,
+            FileAccessMode::ReadWrite,
+            flags,
+            FileMode::empty(),
+            &sink,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
     #[test]
     fn the_session_moves_terminal_events_to_its_foreground_group() {
-        use crate::stdio::StdioProvider as _;
-        use crate::test_support::TestStdioProvider;
-
-        let stdio = TestStdioProvider::default().with_controlling_terminal();
-        let terminal = stdio.terminal().unwrap();
-        let broker = broker().with_terminal(Arc::clone(&terminal));
+        let (broker, stdio) = terminal_broker();
         let root = process(&broker, None);
         let job = process(&broker, Some(&root));
         super::set(&root, job.id(), job.id().into()).unwrap();
         let detached = process(&broker, Some(&root));
         super::create_session(&detached, detached.id()).unwrap();
         let other_root = process(&broker, None);
-        let other_terminal = TestStdioProvider::default()
-            .with_controlling_terminal()
-            .terminal()
-            .unwrap();
+        let [root_tty, job_tty, detached_tty, other_root_tty] =
+            [&root, &job, &detached, &other_root]
+                .map(|process| open(process, "/dev/tty", FileOpenFlags::NONE));
 
         // The first root's group starts in the foreground.
         assert_eq!(
-            super::foreground_group(&job, &terminal),
-            Ok(membership(&root, &root))
+            super::get_foreground_group(&job, job_tty),
+            Ok(Ok(membership(&root, &root)))
         );
         // Only the broker's terminal is a controlling terminal, and only of
         // the first root's session.
         for (process, terminal) in [
-            (&detached, &terminal),
-            (&other_root, &terminal),
-            (&root, &other_terminal),
+            (&detached, detached_tty),
+            (&other_root, other_root_tty),
+            (&root, open(&root, "/other/tty", FileOpenFlags::NONE)),
+            (&root, open(&root, "/dev/stdout", FileOpenFlags::NONE)),
+            (&root, open(&root, "/dev/tty", FileOpenFlags::PATH)),
         ] {
             assert_eq!(
-                super::foreground_group(process, terminal),
-                Err(FileError::NotControllingTerminal)
+                super::get_foreground_group(process, terminal),
+                Ok(Err(ProcessGroupError::NotControllingTerminal))
             );
             assert_eq!(
                 super::set_foreground_group(process, terminal, root.id().into()),
-                Err(FileError::NotControllingTerminal)
+                Ok(Err(ProcessGroupError::NotControllingTerminal))
             );
         }
         // Only an existing group in the session can be in the foreground.
         for (process_group, error) in [
-            (detached.id().into(), FileError::ProcessGroupNotInSession),
-            (other_root.id().into(), FileError::ProcessGroupNotInSession),
-            (ProcessGroupId(u32::MAX), FileError::NoSuchProcessGroup),
+            (detached.id().into(), ProcessGroupError::NotInSession),
+            (other_root.id().into(), ProcessGroupError::NotInSession),
+            (
+                ProcessGroupId(u32::MAX),
+                ProcessGroupError::NoSuchProcessGroup,
+            ),
         ] {
             assert_eq!(
-                super::set_foreground_group(&root, &terminal, process_group),
-                Err(error)
+                super::set_foreground_group(&root, root_tty, process_group),
+                Ok(Err(error))
             );
         }
-        super::set_foreground_group(&job, &terminal, job.id().into()).unwrap();
         assert_eq!(
-            super::foreground_group(&root, &terminal),
-            Ok(membership(&job, &root))
+            super::set_foreground_group(&job, job_tty, job.id().into()),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            super::get_foreground_group(&root, root_tty),
+            Ok(Ok(membership(&job, &root)))
         );
 
         let handles = [&root, &job].map(|process| {
@@ -533,12 +601,7 @@ mod tests {
 
     #[test]
     fn the_foreground_group_keeps_its_id_while_in_the_foreground() {
-        use crate::stdio::StdioProvider as _;
-        use crate::test_support::TestStdioProvider;
-
-        let stdio = TestStdioProvider::default().with_controlling_terminal();
-        let terminal = stdio.terminal().unwrap();
-        let mut broker = broker().with_terminal(Arc::clone(&terminal));
+        let (mut broker, _stdio) = terminal_broker();
         broker.ids = Arc::new(spin::Mutex::new(IdAllocator::new(3).unwrap()));
         let allocate = |parent: Option<&BrokerProcess>| {
             broker.allocate_process(
@@ -549,11 +612,15 @@ mod tests {
         let root = allocate(None).unwrap();
         root.complete_start().unwrap();
         broker.terminal.as_ref().unwrap().attach(&root);
+        let tty = open(&root, "/dev/tty", FileOpenFlags::NONE);
         let job = allocate(Some(&root)).unwrap();
         job.complete_start().unwrap();
         let job_id = job.id();
         super::set(&root, job_id, job_id.into()).unwrap();
-        super::set_foreground_group(&root, &terminal, job_id.into()).unwrap();
+        assert_eq!(
+            super::set_foreground_group(&root, tty, job_id.into()),
+            Ok(Ok(()))
+        );
         job.retire(true);
         job.complete_exit(ProcessExitStatus::Exited { code: 0 })
             .unwrap();
@@ -568,7 +635,10 @@ mod tests {
             allocate(None).map(|process| process.id()),
             Err(BrokerError::ResourceExhausted)
         );
-        super::set_foreground_group(&root, &terminal, root.id().into()).unwrap();
+        assert_eq!(
+            super::set_foreground_group(&root, tty, root.id().into()),
+            Ok(Ok(()))
+        );
         assert_eq!(allocate(None).unwrap().id(), job_id);
         drop(other);
     }

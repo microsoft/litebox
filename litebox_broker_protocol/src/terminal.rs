@@ -3,9 +3,6 @@
 
 //! Guest-ABI-independent controls for shared terminal endpoints.
 
-use crate::ProcessGroupId;
-use crate::process_group::ProcessGroupMembership;
-
 bitflags::bitflags! {
     /// Transformations applied to incoming bytes.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -182,11 +179,6 @@ pub enum TerminalOperation {
     },
     /// Wait for accepted output to reach the transport.
     Drain,
-    /// Read the foreground process group of the caller's controlling terminal.
-    GetForegroundGroup,
-    /// Make a process group in the caller's session the foreground group of the caller's
-    /// controlling terminal.
-    SetForegroundGroup(ProcessGroupId),
 }
 
 /// Result of a terminal control.
@@ -198,8 +190,6 @@ pub enum TerminalResponse {
     WindowSize(WindowSize),
     /// Mutation or drain completed.
     Done,
-    /// The foreground process group, in the terminal's session.
-    ForegroundGroup(ProcessGroupMembership),
 }
 
 bitflags::bitflags! {

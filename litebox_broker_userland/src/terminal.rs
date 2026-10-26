@@ -515,9 +515,6 @@ impl TerminalEndpoint for HostTerminal {
                 TerminalResponse::Done
             }
             TerminalOperation::Drain => TerminalResponse::Done,
-            TerminalOperation::GetForegroundGroup | TerminalOperation::SetForegroundGroup(_) => {
-                return Ok(Err(FileError::InvalidTerminalControl));
-            }
         };
         state.publish();
         self.shared.changed.notify_all();

@@ -23,6 +23,7 @@ use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
     MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo, ThreadInfo,
 };
+use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::readiness_queue::{
@@ -160,6 +161,20 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<(), BrokerControlError>;
+
+    fn get_foreground_group(
+        &self,
+        terminal: ObjectHandle,
+    ) -> core::result::Result<
+        core::result::Result<ProcessGroupMembership, ProcessGroupError>,
+        BrokerControlError,
+    >;
+
+    fn set_foreground_group(
+        &self,
+        terminal: ObjectHandle,
+        process_group: litebox_broker_protocol::ProcessGroupId,
+    ) -> core::result::Result<core::result::Result<(), ProcessGroupError>, BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -928,6 +943,24 @@ where
         process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.create_session(process_id))
+    }
+
+    fn get_foreground_group(
+        &self,
+        terminal: ObjectHandle,
+    ) -> core::result::Result<
+        core::result::Result<ProcessGroupMembership, ProcessGroupError>,
+        BrokerControlError,
+    > {
+        self.request(|local| local.get_foreground_group(terminal))
+    }
+
+    fn set_foreground_group(
+        &self,
+        terminal: ObjectHandle,
+        process_group: litebox_broker_protocol::ProcessGroupId,
+    ) -> core::result::Result<core::result::Result<(), ProcessGroupError>, BrokerControlError> {
+        self.request(|local| local.set_foreground_group(terminal, process_group))
     }
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {

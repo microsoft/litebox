@@ -375,9 +375,6 @@ impl TerminalEndpoint for TestTerminal {
                 TerminalResponse::Done
             }
             TerminalOperation::Flush { .. } | TerminalOperation::Drain => TerminalResponse::Done,
-            TerminalOperation::GetForegroundGroup | TerminalOperation::SetForegroundGroup(_) => {
-                return Ok(Err(FileError::InvalidTerminalControl));
-            }
         }))
     }
 }

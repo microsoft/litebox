@@ -25,7 +25,9 @@ use crate::process::{
     StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
     WriteChildMemoryRequest,
 };
-use crate::process_group::SetProcessGroupRequest;
+use crate::process_group::{
+    ProcessGroupError, ProcessGroupMembership, SetForegroundGroupRequest, SetProcessGroupRequest,
+};
 use crate::readiness::ReadinessFlags;
 use crate::readiness_queue::{
     AddReadinessQueueEntryRequest, CreateReadinessQueueResponse, ModifyReadinessQueueEntryRequest,
@@ -380,6 +382,21 @@ pub enum ProcessGroupRequest {
     /// returns `UnknownObject`. The broker returns `PolicyDenied` if a process
     /// group already has the process's ID.
     CreateSession(ProcessId),
+    /// Read the foreground process group of the caller's controlling terminal,
+    /// given an open handle to it.
+    ///
+    /// Fails with [`ProcessGroupError::NotControllingTerminal`] if the handle
+    /// does not refer to the caller's controlling terminal.
+    GetForegroundGroup(ObjectHandle),
+    /// Make a process group the foreground group of the caller's controlling
+    /// terminal.
+    ///
+    /// Fails with [`ProcessGroupError::NotControllingTerminal`] if the handle
+    /// does not refer to the caller's controlling terminal, then with
+    /// [`ProcessGroupError::NoSuchProcessGroup`] if no process is in the group,
+    /// and then with [`ProcessGroupError::NotInSession`] if the group is in
+    /// another session.
+    SetForegroundGroup(SetForegroundGroupRequest),
 }
 
 /// Request about signals sent between broker processes.
@@ -615,6 +632,14 @@ pub enum ProcessGroupResponse {
     Set,
     /// The session was created.
     CreateSession,
+    /// The foreground process group, in the terminal's session.
+    GetForegroundGroup(ProcessGroupMembership),
+    /// The foreground process group changed.
+    SetForegroundGroup,
+    /// A foreground group operation failed in a way the guest ABI reports.
+    ///
+    /// Other failures use [`BrokerResult::Error`].
+    Failed(ProcessGroupError),
 }
 
 /// Response to a signal request.

@@ -650,7 +650,10 @@ mod tests {
         ProcessExitStatus, ProcessIdentity, ProcessInfo, StartChildProcessRequest,
         StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
     };
-    use crate::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
+    use crate::process_group::{
+        ProcessGroupError, ProcessGroupMembership, SetForegroundGroupRequest,
+        SetProcessGroupRequest,
+    };
     use crate::readiness_queue::{
         AddReadinessQueueEntryRequest, CreateReadinessQueueResponse,
         ModifyReadinessQueueEntryRequest, ReadinessQueueEntryFlags, ReadinessQueueError,
@@ -884,6 +887,13 @@ mod tests {
                 process_group: ProcessGroupId(u32::MAX),
             })),
             BrokerOperation::ProcessGroup(ProcessGroupRequest::CreateSession(process_id(5))),
+            BrokerOperation::ProcessGroup(ProcessGroupRequest::GetForegroundGroup(handle)),
+            BrokerOperation::ProcessGroup(ProcessGroupRequest::SetForegroundGroup(
+                SetForegroundGroupRequest {
+                    terminal: handle,
+                    process_group: ProcessGroupId(u32::MAX),
+                },
+            )),
             BrokerOperation::Signal(SignalRequest::Take(TakeSignalRequest { handle })),
             BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
                 capacity: 4096,
@@ -1398,9 +1408,6 @@ mod tests {
             (FileError::InvalidTerminalControl, 24),
             (FileError::TooManySymlinks, 25),
             (FileError::NoSuchDevice, 26),
-            (FileError::NotControllingTerminal, 27),
-            (FileError::ProcessGroupNotInSession, 28),
-            (FileError::NoSuchProcessGroup, 29),
         ] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,
@@ -1584,6 +1591,22 @@ mod tests {
             ))),
             BrokerResult::ProcessGroup(ProcessGroupResponse::Set),
             BrokerResult::ProcessGroup(ProcessGroupResponse::CreateSession),
+            BrokerResult::ProcessGroup(ProcessGroupResponse::GetForegroundGroup(
+                ProcessGroupMembership {
+                    process_group: ProcessGroupId(3),
+                    session: SessionId(u32::MAX),
+                },
+            )),
+            BrokerResult::ProcessGroup(ProcessGroupResponse::SetForegroundGroup),
+            BrokerResult::ProcessGroup(ProcessGroupResponse::Failed(
+                ProcessGroupError::NotControllingTerminal,
+            )),
+            BrokerResult::ProcessGroup(ProcessGroupResponse::Failed(
+                ProcessGroupError::NoSuchProcessGroup,
+            )),
+            BrokerResult::ProcessGroup(ProcessGroupResponse::Failed(
+                ProcessGroupError::NotInSession,
+            )),
             BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
                 read_handle: handle,
                 write_handle: ObjectHandle(14),
@@ -2378,6 +2401,23 @@ mod tests {
             frame[index] = 0xff;
             assert_eq!(decode_response(&frame), Err(WireError::InvalidTag));
         }
+
+        let process_group_error = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::ProcessGroup(ProcessGroupResponse::Failed(
+                ProcessGroupError::NotInSession,
+            )),
+        });
+        let mut unknown_process_group_error = process_group_error.clone();
+        *unknown_process_group_error.last_mut().unwrap() = 3;
+        assert_eq!(
+            decode_response(&unknown_process_group_error),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_response(&process_group_error[..process_group_error.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
 
         let socket_error = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,

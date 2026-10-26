@@ -148,7 +148,10 @@ impl From<litebox::process::ProcessError> for Errno {
             litebox::process::ProcessError::OutOfMemory => Errno::ENOMEM,
             litebox::process::ProcessError::ServiceFailed
             | litebox::process::ProcessError::InvalidChild => Errno::EIO,
-            litebox::process::ProcessError::NoSuchProcess => Errno::ESRCH,
+            litebox::process::ProcessError::NoSuchProcess
+            | litebox::process::ProcessError::NoSuchProcessGroup => Errno::ESRCH,
+            litebox::process::ProcessError::NotControllingTerminal => Errno::ENOTTY,
+            litebox::process::ProcessError::NotInSession => Errno::EPERM,
         }
     }
 }
@@ -447,10 +450,7 @@ impl From<litebox::fs::errors::TerminalControlError> for Errno {
         match value {
             litebox::fs::errors::TerminalControlError::ClosedFd
             | litebox::fs::errors::TerminalControlError::PathOnly => Errno::EBADF,
-            litebox::fs::errors::TerminalControlError::NotATerminal
-            | litebox::fs::errors::TerminalControlError::NotControllingTerminal => Errno::ENOTTY,
-            litebox::fs::errors::TerminalControlError::NoSuchProcessGroup => Errno::ESRCH,
-            litebox::fs::errors::TerminalControlError::ProcessGroupNotInSession => Errno::EPERM,
+            litebox::fs::errors::TerminalControlError::NotATerminal => Errno::ENOTTY,
             litebox::fs::errors::TerminalControlError::InvalidControl => Errno::EINVAL,
             litebox::fs::errors::TerminalControlError::WouldBlock => Errno::EAGAIN,
             litebox::fs::errors::TerminalControlError::WaitError(e) => match e {
@@ -877,6 +877,9 @@ mod tests {
             (ProcessError::ServiceFailed, Errno::EIO),
             (ProcessError::InvalidChild, Errno::EIO),
             (ProcessError::NoSuchProcess, Errno::ESRCH),
+            (ProcessError::NotControllingTerminal, Errno::ENOTTY),
+            (ProcessError::NoSuchProcessGroup, Errno::ESRCH),
+            (ProcessError::NotInSession, Errno::EPERM),
         ];
 
         for (error, expected) in cases {

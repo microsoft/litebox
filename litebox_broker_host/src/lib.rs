@@ -1924,6 +1924,28 @@ fn handle_process_group_request(
             litebox_broker_core::process_group::create_session(process, process_id)
                 .map(|()| ProcessGroupResponse::CreateSession)
         }
+        ProcessGroupRequest::GetForegroundGroup(terminal) => {
+            litebox_broker_core::process_group::get_foreground_group(process, terminal).map(
+                |result| {
+                    result.map_or_else(
+                        ProcessGroupResponse::Failed,
+                        ProcessGroupResponse::GetForegroundGroup,
+                    )
+                },
+            )
+        }
+        ProcessGroupRequest::SetForegroundGroup(request) => {
+            litebox_broker_core::process_group::set_foreground_group(
+                process,
+                request.terminal,
+                request.process_group,
+            )
+            .map(|result| {
+                result.map_or_else(ProcessGroupResponse::Failed, |()| {
+                    ProcessGroupResponse::SetForegroundGroup
+                })
+            })
+        }
     };
     response.map_err(RequestFailure::from)
 }
