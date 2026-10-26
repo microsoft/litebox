@@ -31,6 +31,7 @@ use litebox_broker_protocol::readiness_queue::{
     ReadyEvent,
 };
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
+use litebox_broker_protocol::shared_futex::SharedFutexKey;
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
@@ -616,25 +617,20 @@ pub(crate) trait BrokerControl: Send + Sync {
         name: SocketOptionName,
     ) -> core::result::Result<SocketOptionValue, BrokerControlError>;
 
-    fn create_shared_memory(
-        &self,
-        length: u64,
-    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
+    fn reserve_shared_memory_ids(&self) -> core::result::Result<u64, BrokerControlError>;
 
     fn create_futex_waiter(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn futex_arm(
         &self,
-        memory: ObjectHandle,
-        offset: u64,
+        key: SharedFutexKey,
         bitset: u32,
         waiter: ObjectHandle,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn futex_wake(
         &self,
-        memory: ObjectHandle,
-        offset: u64,
+        key: SharedFutexKey,
         count: u32,
         bitset: u32,
     ) -> core::result::Result<u32, BrokerControlError>;
@@ -1723,11 +1719,8 @@ where
         self.request(|local| local.get_unix_socket_option(handle, name))
     }
 
-    fn create_shared_memory(
-        &self,
-        length: u64,
-    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(|local| local.create_shared_memory(length))
+    fn reserve_shared_memory_ids(&self) -> core::result::Result<u64, BrokerControlError> {
+        self.request(BrokerLocal::reserve_shared_memory_ids)
     }
 
     fn create_futex_waiter(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
@@ -1736,22 +1729,20 @@ where
 
     fn futex_arm(
         &self,
-        memory: ObjectHandle,
-        offset: u64,
+        key: SharedFutexKey,
         bitset: u32,
         waiter: ObjectHandle,
     ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.futex_arm(memory, offset, bitset, waiter))
+        self.request(|local| local.futex_arm(key, bitset, waiter))
     }
 
     fn futex_wake(
         &self,
-        memory: ObjectHandle,
-        offset: u64,
+        key: SharedFutexKey,
         count: u32,
         bitset: u32,
     ) -> core::result::Result<u32, BrokerControlError> {
-        self.request(|local| local.futex_wake(memory, offset, count, bitset))
+        self.request(|local| local.futex_wake(key, count, bitset))
     }
 
     fn futex_disarm(&self, waiter: ObjectHandle) -> core::result::Result<bool, BrokerControlError> {

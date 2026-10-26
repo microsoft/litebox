@@ -9,7 +9,7 @@ use crate::event::{
     counter::EventCounterError, polling::TryOpError, readiness_queue::ReadinessQueueError,
     timer::TimerError,
 };
-use crate::shared_memory::SharedMemoryError;
+use crate::shared_futex::SharedFutexError;
 use crate::sync::futex::FutexError;
 
 /// Error returned by the deployment-provided broker control path.
@@ -171,7 +171,7 @@ impl From<BrokerObjectError> for TimerError {
     }
 }
 
-impl From<BrokerObjectError> for SharedMemoryError {
+impl From<BrokerObjectError> for SharedFutexError {
     fn from(error: BrokerObjectError) -> Self {
         match error {
             BrokerObjectError::ResourceExhausted | BrokerObjectError::OutOfMemory => {

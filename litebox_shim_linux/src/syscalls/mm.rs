@@ -11,7 +11,7 @@ use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
     IoReadVec, MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
-    mm::{MmapPlacement, RangePiece},
+    mm::MmapPlacement,
     vmem::{MappingError, VmemProtectError},
 };
 use litebox_platform::buffer::Buffer as _;
@@ -21,14 +21,6 @@ use crate::Task;
 use crate::UserPtrMut;
 use crate::guest_buffer::GuestReadBuffer;
 use crate::syscalls::file::AnyTypedFd;
-
-/// Returns the pages that `len` bytes at `addr` span, or `None` if their end overflows.
-fn page_range(addr: UserPtrMut<u8>, len: usize) -> Option<core::ops::Range<usize>> {
-    let end = addr
-        .as_usize()
-        .checked_add(len.checked_next_multiple_of(PAGE_SIZE)?)?;
-    Some(addr.as_usize()..end)
-}
 
 pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
     let mut prot = ProtFlags::PROT_NONE;
@@ -57,8 +49,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MapFlags,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
+        self.do_mmap_shared(suggested_addr, len, prot, flags, None, op)
+    }
+
+    /// Same as [`Self::do_mmap`], but names the shared memory a shared anonymous mapping maps,
+    /// which keys its futexes.
+    fn do_mmap_shared(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        shared_memory: Option<litebox::shared_futex::SharedMemoryId>,
+        op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
         let fixed_start = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED));
-        self.global.mm.do_mmap(
+        self.global.mm.do_mmap_shared(
             suggested_addr,
             len,
             prot,
@@ -67,6 +73,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
                 allowed_range: None,
             },
+            shared_memory,
             |pointer| {
                 if let Some(start) = fixed_start {
                     self.clear_file_mappings_for_range(start, len);
@@ -207,95 +214,32 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
-        let anonymous = flags.contains(MapFlags::MAP_ANONYMOUS);
-        let memory = if anonymous && flags.contains(MapFlags::MAP_SHARED) {
-            self.create_shared_memory_for_mapping(aligned_len)?
+        if flags.contains(MapFlags::MAP_ANONYMOUS) {
+            let shared_memory = if flags.contains(MapFlags::MAP_SHARED) {
+                self.new_shared_memory_id()?
+            } else {
+                None
+            };
+            self.do_mmap_shared(
+                suggested_addr,
+                aligned_len,
+                prot,
+                flags,
+                shared_memory,
+                |_| Ok(0),
+            )
+            .map_err(Errno::from)
         } else {
-            None
-        };
-        // File reads may block, so file mappings take the lock only once mapped; a futex lookup
-        // rechecks the memory manager's mapping in the meantime.
-        let (mut shared_mappings, mapped) = if anonymous {
-            let shared_mappings = self.global.shared_mappings.lock();
-            let mapped = self
-                .do_mmap(suggested_addr, aligned_len, prot, flags, |_| Ok(0))
-                .map_err(Errno::from);
-            (shared_mappings, mapped)
-        } else {
-            let mapped = self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset);
-            (self.global.shared_mappings.lock(), mapped)
-        };
-        let mapping = match mapped {
-            Ok(mapping) => mapping,
-            Err(errno) => {
-                // A failed fixed mapping may have replaced what was mapped before failing.
-                let forgotten = flags.contains(MapFlags::MAP_FIXED).then(|| {
-                    self.forget_unshared_mappings(
-                        &mut shared_mappings,
-                        addr..addr.saturating_add(aligned_len),
-                    )
-                });
-                drop(shared_mappings);
-                drop(forgotten);
-                drop(memory);
-                return Err(errno);
-            }
-        };
-        let range = mapping.as_usize()..mapping.as_usize() + aligned_len;
-        let forgotten = self.record_new_mapping(&mut shared_mappings, range, memory);
-        drop(shared_mappings);
-        drop(forgotten);
-        Ok(mapping)
+            self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
+        }
     }
 
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
-        let range = page_range(addr, len);
-        let mut shared_mappings = self.global.shared_mappings.lock();
-        let result = self.munmap_range_and_clear_file_mappings(addr, len, range.clone());
-        let forgotten = range.map(|range| {
-            if result.is_ok() {
-                shared_mappings.forget(range)
-            } else {
-                self.forget_unshared_mappings(&mut shared_mappings, range)
-            }
-        });
-        drop(shared_mappings);
-        drop(forgotten);
-        result
-    }
-
-    /// Unmaps a range with no shared memory to forget, such as a mapping just created, and
-    /// clears its file mappings, without taking the shared mappings lock.
-    pub(crate) fn munmap_unshared_and_clear_file_mappings(
-        &self,
-        addr: UserPtrMut<u8>,
-        len: usize,
-    ) -> Result<(), Errno> {
-        self.munmap_range_and_clear_file_mappings(addr, len, page_range(addr, len))
-    }
-
-    /// Unmaps `len` bytes at `addr`, whose page range is `range` unless it overflows, and clears
-    /// the file mappings of whatever it unmapped.
-    fn munmap_range_and_clear_file_mappings(
-        &self,
-        addr: UserPtrMut<u8>,
-        len: usize,
-        range: Option<core::ops::Range<usize>>,
-    ) -> Result<(), Errno> {
         let result = self.sys_munmap_raw(addr, len);
-        let Some(range) = range else {
-            return result;
-        };
         if result.is_ok() {
-            self.clear_file_mappings_for_range(range.start, range.len());
-        } else {
-            for (piece, kind) in self.global.mm.range_pieces(range) {
-                if kind == RangePiece::Unmapped {
-                    self.clear_file_mappings_for_range(piece.start, piece.len());
-                }
-            }
+            self.clear_file_mappings_for_range(addr.as_usize(), len.next_multiple_of(PAGE_SIZE));
         }
         result
     }
@@ -354,22 +298,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MRemapFlags,
         new_addr: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
-        let mut shared_mappings = self.global.shared_mappings.lock();
         let result = self
             .global
             .mm
             .sys_mremap(old_addr, old_size, new_size, flags, new_addr)?;
         let old_size = old_size.next_multiple_of(PAGE_SIZE);
         let new_size = new_size.next_multiple_of(PAGE_SIZE);
-        // Shared anonymous mappings can only shrink in place, so a moved mapping had no shared
-        // memory, and its destination was unmapped.
-        let forgotten = if result.as_usize() == old_addr.as_usize() {
-            shared_mappings.forget(old_addr.as_usize() + new_size..old_addr.as_usize() + old_size)
-        } else {
-            shared_mappings.forget(old_addr.as_usize()..old_addr.as_usize() + old_size)
-        };
-        drop(shared_mappings);
-        drop(forgotten);
         if result.as_usize() != old_addr.as_usize() {
             self.clear_file_mappings_for_range(old_addr.as_usize(), old_size);
             self.clear_file_mappings_for_range(result.as_usize(), new_size);
@@ -1083,5 +1017,44 @@ mod tests {
         let ptr = UserPtrMut::<u8>::from_usize(0xdeadbeef);
         let result = ptr.read_at_offset::<Platform>(0);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn shared_anonymous_memory_survives_madvise_and_can_shrink_but_not_grow() {
+        const PAGE: usize = litebox_common_linux::PAGE_SIZE;
+        let task = init_platform();
+        let mapping = task
+            .sys_mmap(
+                0,
+                2 * PAGE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+            .unwrap();
+        mapping.write_at_offset::<Platform>(0, 42).unwrap();
+        task.sys_madvise(
+            mapping,
+            PAGE,
+            litebox_common_linux::MadviseBehavior::DontNeed,
+        )
+        .unwrap();
+        // Like Linux shared memory, the contents remain for every process sharing them.
+        assert_eq!(mapping.read_at_offset::<Platform>(0), Some(42));
+
+        // Unlike Linux, which grows shared anonymous mappings, LiteBox refuses.
+        for flags in [MRemapFlags::empty(), MRemapFlags::MREMAP_MAYMOVE] {
+            assert_eq!(
+                task.sys_mremap(mapping, 2 * PAGE, 4 * PAGE, flags, 0).err(),
+                Some(Errno::ENOMEM)
+            );
+        }
+        let shrunk = task
+            .sys_mremap(mapping, 2 * PAGE, PAGE, MRemapFlags::empty(), 0)
+            .unwrap();
+        assert_eq!(shrunk.as_usize(), mapping.as_usize());
+        assert_eq!(shrunk.read_at_offset::<Platform>(0), Some(42));
+        task.sys_munmap(mapping, PAGE).unwrap();
     }
 }

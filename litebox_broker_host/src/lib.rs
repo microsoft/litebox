@@ -44,7 +44,7 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
     ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
-    ReadinessQueueRequest, ReadinessQueueResponse, SharedMemoryRequest, SharedMemoryResponse,
+    ReadinessQueueRequest, ReadinessQueueResponse, SharedFutexRequest, SharedFutexResponse,
     SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse,
     TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse,
 };
@@ -552,9 +552,9 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::ProcessGroup(request) => {
             handle_process_group_request(process, request).map(BrokerResult::ProcessGroup)
         }
-        BrokerOperation::SharedMemory(request) => {
-            handle_shared_memory_request(process, request, readiness_sink)
-                .map(BrokerResult::SharedMemory)
+        BrokerOperation::SharedFutex(request) => {
+            handle_shared_futex_request(process, request, readiness_sink)
+                .map(BrokerResult::SharedFutex)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -1798,36 +1798,37 @@ fn handle_event_request(
     }
 }
 
-fn handle_shared_memory_request(
+fn handle_shared_futex_request(
     process: &BrokerProcess,
-    request: SharedMemoryRequest,
+    request: SharedFutexRequest,
     readiness_sink: &Arc<dyn ReadinessSink>,
-) -> RequestResult<SharedMemoryResponse> {
-    use litebox_broker_core::shared_memory;
-    use litebox_broker_protocol::shared_memory::{
-        CreateFutexWaiterResponse, CreateSharedMemoryResponse, FutexDisarmResponse,
-        FutexWakeResponse,
+) -> RequestResult<SharedFutexResponse> {
+    use litebox_broker_core::shared_futex;
+    use litebox_broker_protocol::shared_futex::{
+        CreateFutexWaiterResponse, FutexDisarmResponse, FutexWakeResponse, ReserveMemoryIdsResponse,
     };
 
     let response = match request {
-        SharedMemoryRequest::Create(request) => shared_memory::create(process, request.length)
-            .map(|handle| SharedMemoryResponse::Create(CreateSharedMemoryResponse { handle })),
-        SharedMemoryRequest::CreateFutexWaiter => {
-            shared_memory::create_futex_waiter(process, readiness_sink).map(|handle| {
-                SharedMemoryResponse::CreateFutexWaiter(CreateFutexWaiterResponse { handle })
+        SharedFutexRequest::ReserveMemoryIds => {
+            shared_futex::reserve_memory_ids(process).map(|prefix| {
+                SharedFutexResponse::ReserveMemoryIds(ReserveMemoryIdsResponse { prefix })
             })
         }
-        SharedMemoryRequest::FutexArm(request) => {
-            shared_memory::futex_arm(process, request).map(|()| SharedMemoryResponse::FutexArm)
+        SharedFutexRequest::CreateWaiter => {
+            shared_futex::create_futex_waiter(process, readiness_sink).map(|handle| {
+                SharedFutexResponse::CreateWaiter(CreateFutexWaiterResponse { handle })
+            })
         }
-        SharedMemoryRequest::FutexWake(request) => shared_memory::futex_wake(process, request)
-            .map(|woken| SharedMemoryResponse::FutexWake(FutexWakeResponse { woken })),
-        SharedMemoryRequest::FutexDisarm(request) => shared_memory::futex_disarm(process, request)
-            .map(|woken| SharedMemoryResponse::FutexDisarm(FutexDisarmResponse { woken })),
+        SharedFutexRequest::Arm(request) => {
+            shared_futex::futex_arm(process, request).map(|()| SharedFutexResponse::Arm)
+        }
+        SharedFutexRequest::Wake(request) => shared_futex::futex_wake(process, request)
+            .map(|woken| SharedFutexResponse::Wake(FutexWakeResponse { woken })),
+        SharedFutexRequest::Disarm(request) => shared_futex::futex_disarm(process, request)
+            .map(|woken| SharedFutexResponse::Disarm(FutexDisarmResponse { woken })),
     };
     response.map_err(RequestFailure::from)
 }
-
 fn handle_timer_request(
     process: &BrokerProcess,
     request: TimerRequest,

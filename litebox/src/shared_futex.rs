@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Shared memory whose futexes span processes.
+//! Futexes in memory that several processes share.
 //!
-//! A [`SharedMemory`] names memory that this process and others map, such as a Linux
-//! `MAP_SHARED | MAP_ANONYMOUS` mapping a native fork child inherits. The broker keys futex wait
-//! queues by the memory and a byte offset in it, so a [`SharedMemory::wake`] in any process
-//! reaches the threads waiting with [`SharedFutexWaiter::wait`] in every process holding the
-//! memory.
+//! Processes that share memory, such as a Linux `MAP_SHARED | MAP_ANONYMOUS` mapping that native
+//! fork children inherit, name it by a [`SharedMemoryId`] that its creator draws from
+//! [`SharedMemoryIds`], and a futex word in it by a [`SharedFutexKey`]. The broker keys futex wait
+//! queues by that key, so [`LiteBox::wake_shared_futex`] in any process reaches the threads
+//! waiting with [`SharedFutexWaiter::wait`] in every process.
 //!
 //! Each waiting thread owns a [`SharedFutexWaiter`]. A wait arms it in the broker, re-checks the
 //! futex word, and sleeps until the broker publishes a wake for it or the wait times out or is
@@ -16,8 +16,10 @@
 
 use alloc::sync::Arc;
 use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use litebox_broker_protocol::ObjectHandle;
+pub use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 
@@ -31,117 +33,119 @@ use crate::event::{
     polling::{Pollee, PolleeObserver},
 };
 use crate::platform::{RawConstPointer as _, RawPointerProvider};
-use crate::process::ProcessError;
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::sync::futex::FutexError;
 
-/// Errors returned when creating shared memory or futex waiters.
+/// Errors returned when creating futex waiters or naming shared memory.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum SharedMemoryError {
+pub enum SharedFutexError {
     /// The broker ran out of objects or memory.
-    #[error("shared memory resource exhausted")]
+    #[error("shared futex resource exhausted")]
     ResourceExhausted,
     /// Broker policy forbids the caller from creating the object.
-    #[error("shared memory permission denied")]
+    #[error("shared futex permission denied")]
     PermissionDenied,
     /// The broker failed, or its association with this process did.
-    #[error("shared memory broker failed")]
+    #[error("shared futex broker failed")]
     Io,
     /// This process has no broker, so no other process can share its memory.
-    #[error("shared memory backing authority unavailable")]
+    #[error("shared futex authority unavailable")]
     Unavailable,
 }
 
-/// Shared memory whose futexes span every process holding it.
+/// Allocates the [`SharedMemoryId`]s of memory this process creates.
 ///
-/// Dropping it releases this process's reference; waiters already armed on it keep it alive in
-/// the broker until they are disarmed.
-pub struct SharedMemory<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    broker: Arc<dyn BrokerControl>,
-    handle: ObjectHandle,
-    _platform: core::marker::PhantomData<fn() -> Platform>,
+/// Each ID is a prefix that the broker reserves once per allocator, followed by a counter. A
+/// process that duplicates its memory, as native fork does, must give the duplicate a new
+/// allocator, so that the two use different prefixes.
+pub struct SharedMemoryIds {
+    /// The reserved prefix, plus one, or zero until it is reserved.
+    prefix: AtomicU64,
+    next: AtomicU64,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedMemory<Platform> {
-    /// Creates shared memory of `length` bytes, which bounds futex offsets.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker reports an unrecoverable error.
-    pub fn new(litebox: &LiteBox<Platform>, length: u64) -> Result<Self, SharedMemoryError> {
-        let broker = litebox
-            .broker_control()
-            .ok_or(SharedMemoryError::Unavailable)?;
-        let handle = broker
-            .create_shared_memory(length)
-            .map_err(BrokerObjectError::from)?;
-        Ok(Self::from_handle(broker, handle))
+impl Default for SharedMemoryIds {
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    fn from_handle(broker: Arc<dyn BrokerControl>, handle: ObjectHandle) -> Self {
+impl SharedMemoryIds {
+    /// Creates an allocator that reserves its prefix on first use.
+    pub const fn new() -> Self {
         Self {
-            broker,
-            handle,
-            _platform: core::marker::PhantomData,
+            prefix: AtomicU64::new(0),
+            next: AtomicU64::new(0),
         }
     }
 
-    /// The broker handle this memory owns.
-    pub(crate) fn handle(&self) -> ObjectHandle {
-        self.handle
-    }
-
-    /// Wakes up to `count` of the oldest waiters on the futex word at `offset` whose masks
-    /// intersect `bitset`, or all masks if it is `None`, returning how many it woke.
+    /// Returns an ID that no other shared memory uses.
     ///
-    /// Fails with [`FutexError::NotAligned`] if `offset` is not a multiple of four.
+    /// Fails with [`SharedFutexError::Unavailable`] without a broker, as then no other process
+    /// can share the memory either.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error.
-    pub fn wake(
+    pub fn allocate<Platform: RawSyncPrimitivesProvider>(
         &self,
-        offset: u64,
+        litebox: &LiteBox<Platform>,
+    ) -> Result<SharedMemoryId, SharedFutexError> {
+        let mut stored = self.prefix.load(Ordering::Acquire);
+        if stored == 0 {
+            let broker = litebox
+                .broker_control()
+                .ok_or(SharedFutexError::Unavailable)?;
+            let reserved = broker
+                .reserve_shared_memory_ids()
+                .map_err(BrokerObjectError::from)?;
+            // Concurrent first uses may each reserve a prefix; one is kept.
+            let candidate = reserved
+                .checked_add(1)
+                .ok_or(SharedFutexError::ResourceExhausted)?;
+            stored = match self.prefix.compare_exchange(
+                0,
+                candidate,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => candidate,
+                Err(raced) => raced,
+            };
+        }
+        let prefix = stored - 1;
+        let serial = self.next.fetch_add(1, Ordering::Relaxed);
+        Ok(SharedMemoryId(
+            u128::from(prefix) << 64 | u128::from(serial),
+        ))
+    }
+}
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
+    /// Wakes up to `count` of the oldest waiters on the futex word `key` whose masks intersect
+    /// `bitset`, or all masks if it is `None`, returning how many it woke.
+    ///
+    /// Fails with [`FutexError::NotAligned`] if the word's offset is not a multiple of four.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error.
+    pub fn wake_shared_futex(
+        &self,
+        key: SharedFutexKey,
         count: NonZeroU32,
         bitset: Option<NonZeroU32>,
     ) -> Result<u32, FutexError> {
-        if !offset.is_multiple_of(align_of::<u32>() as u64) {
+        if !key.offset.is_multiple_of(align_of::<u32>() as u64) {
             return Err(FutexError::NotAligned);
         }
-        Ok(self
-            .broker
-            .futex_wake(
-                self.handle,
-                offset,
-                count.get(),
-                bitset.map_or(u32::MAX, NonZeroU32::get),
-            )
+        let broker = self.broker_control().ok_or(FutexError::Io)?;
+        Ok(broker
+            .futex_wake(key, count.get(), bitset.map_or(u32::MAX, NonZeroU32::get))
             .map_err(BrokerObjectError::from)?)
     }
 }
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Returns the shared memory this process inherited from its parent as `handle` through
-    /// [`PendingChild::inherit_shared_memory`](crate::process::PendingChild::inherit_shared_memory).
-    ///
-    /// The memory owns `handle`, so callers adopt each handle once.
-    pub fn adopt_inherited_shared_memory(
-        &self,
-        handle: ObjectHandle,
-    ) -> Result<SharedMemory<Platform>, ProcessError> {
-        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(SharedMemory::from_handle(broker, handle))
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for SharedMemory<Platform> {
-    fn drop(&mut self) {
-        let _ = self.broker.close_object(self.handle);
-    }
-}
-
-/// One thread's waiter for futexes in [`SharedMemory`].
+/// One thread's waiter for futexes in shared memory.
 pub struct SharedFutexWaiter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
@@ -162,10 +166,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
     pub fn new(
         litebox: &LiteBox<Platform>,
         waker: &Waker<Platform>,
-    ) -> Result<Self, SharedMemoryError> {
+    ) -> Result<Self, SharedFutexError> {
         let broker = litebox
             .broker_control()
-            .ok_or(SharedMemoryError::Unavailable)?;
+            .ok_or(SharedFutexError::Unavailable)?;
         let handle = broker
             .create_futex_waiter()
             .map_err(BrokerObjectError::from)?;
@@ -186,8 +190,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
         })
     }
 
-    /// Waits on the futex word at `futex_addr`, which is at `offset` of `memory`, until a
-    /// [`SharedMemory::wake`] whose mask intersects `bitset` selects this waiter, or the wait
+    /// Waits on the futex word at `futex_addr`, which `key` names, until a
+    /// [`LiteBox::wake_shared_futex`] whose mask intersects `bitset` selects this waiter, or the wait
     /// times out or is interrupted.
     ///
     /// Returns [`FutexError::ImmediatelyWokenBecauseValueMismatch`] if the word does not hold
@@ -201,8 +205,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
     pub fn wait(
         &self,
         cx: &WaitContext<'_, Platform>,
-        memory: &SharedMemory<Platform>,
-        offset: u64,
+        key: SharedFutexKey,
         futex_addr: <Platform as RawPointerProvider>::RawMutPointer<u32>,
         expected_value: u32,
         bitset: Option<NonZeroU32>,
@@ -211,7 +214,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
         Platform: RawPointerProvider,
     {
         if !futex_addr.as_usize().is_multiple_of(align_of::<u32>())
-            || !offset.is_multiple_of(align_of::<u32>() as u64)
+            || !key.offset.is_multiple_of(align_of::<u32>() as u64)
         {
             return Err(FutexError::NotAligned);
         }
@@ -227,7 +230,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
             // spuriously, which disarming detects.
             self.latch.reset();
             self.broker
-                .futex_arm(memory.handle(), offset, bitset, self.handle)
+                .futex_arm(key, bitset, self.handle)
                 .map_err(BrokerObjectError::from)?;
             // A waker changes the word before waking, so either this sees the change or the
             // wake sees this waiter.

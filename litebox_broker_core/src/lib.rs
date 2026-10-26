@@ -33,7 +33,7 @@ mod quota;
 pub mod random;
 pub mod readiness;
 pub mod readiness_queue;
-pub mod shared_memory;
+pub mod shared_futex;
 pub mod signal;
 pub mod socket;
 pub mod stdio;
@@ -342,6 +342,8 @@ pub struct BrokerCore {
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
     pub(crate) readiness_queue_entries: Arc<AtomicUsize>,
     pub(crate) unix_sockets: Arc<unix_socket::UnixSockets>,
+    /// Futex wait queues in shared memory, across every process.
+    pub(crate) shared_futexes: Arc<shared_futex::SharedFutexes>,
     /// Bytes of child memory images held by the broker.
     pub(crate) reserved_child_image_size: Arc<AtomicU64>,
     pub(crate) random_provider: Arc<dyn RandomProvider>,
@@ -413,6 +415,7 @@ impl BrokerCore {
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             unix_sockets: Arc::new(unix_socket::UnixSockets::new(&limits)),
+            shared_futexes: Arc::default(),
             reserved_child_image_size: Arc::new(AtomicU64::new(0)),
             random_provider,
             socket_provider,

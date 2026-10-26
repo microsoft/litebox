@@ -42,6 +42,10 @@ impl Encoder {
         self.bytes.extend_from_slice(bytes);
     }
 
+    pub(super) fn u128(&mut self, value: u128) {
+        self.bytes(&value.to_le_bytes());
+    }
+
     pub(super) fn protocol_version(&mut self, version: ProtocolVersion) {
         self.u16(version.0);
     }
@@ -124,6 +128,10 @@ impl<'a> Decoder<'a> {
         let mut bytes = [0; N];
         bytes.copy_from_slice(self.take(N)?);
         Ok(bytes)
+    }
+
+    pub(super) fn u128(&mut self) -> Result<u128, WireError> {
+        Ok(u128::from_le_bytes(self.bytes()?))
     }
 
     pub(super) fn protocol_version(&mut self) -> Result<ProtocolVersion, WireError> {

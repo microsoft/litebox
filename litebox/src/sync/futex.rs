@@ -27,7 +27,7 @@ use thiserror::Error;
 /// A manager of all available futexes.
 ///
 /// This only supports futexes private to one process, keyed by address. Futexes in memory shared
-/// with other processes use [`SharedMemory`](crate::shared_memory::SharedMemory) instead.
+/// with other processes use [`crate::shared_futex`] instead.
 pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
     /// Chaining hash table to map from futex address to waiter lists.
     table: alloc::boxed::Box<[LoanList<Platform, FutexEntry<Platform>>; HASH_TABLE_ENTRIES]>,
@@ -169,7 +169,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
 }
 
 /// Errors from futex operations, whether private ([`FutexManager`]) or in shared memory
-/// ([`SharedMemory`](crate::shared_memory::SharedMemory)).
+/// ([`crate::shared_futex`]).
 #[derive(Debug, Error)]
 pub enum FutexError {
     #[error("address not correctly aligned to 4-bytes")]

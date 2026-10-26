@@ -28,7 +28,7 @@ mod process;
 mod process_group;
 mod random;
 mod readiness_queue;
-mod shared_memory;
+mod shared_futex;
 mod signal;
 mod socket;
 mod thread;

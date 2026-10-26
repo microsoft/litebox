@@ -460,11 +460,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if pending.inserted && pending.reservation.is_some() {
                 self.global.elf_patch_cache.lock().remove(&pending.key);
             }
-            // A fresh file mapping has no shared memory to forget; `sys_mmap` forgets any it
-            // replaced.
-            if let Err(error) =
-                self.munmap_unshared_and_clear_file_mappings(mapped, pending.allocation_len())
-            {
+            if let Err(error) = self.sys_munmap(mapped, pending.allocation_len()) {
                 litebox_util_log::warn!(
                     error:? = error;
                     "failed to release a failed file mapping"

@@ -15,7 +15,7 @@ use crate::fs::File;
 use crate::pipe::PipeObject;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::readiness_queue::ReadinessQueueObject;
-use crate::shared_memory::{FutexWaiterObject, SharedMemoryObject};
+use crate::shared_futex::FutexWaiterObject;
 use crate::signal::SignalsObject;
 use crate::socket::SocketObject;
 use crate::timer::TimerObject;
@@ -56,7 +56,6 @@ pub(crate) enum ObjectEntry {
     Signals(SignalsObject),
     Timer(TimerObject),
     ReadinessQueue(ReadinessQueueObject),
-    SharedMemory(SharedMemoryObject),
     FutexWaiter(FutexWaiterObject),
 }
 
@@ -77,8 +76,7 @@ impl ObjectEntry {
             | Self::Pipe(_)
             | Self::Socket(_)
             | Self::Timer(_)
-            | Self::ReadinessQueue(_)
-            | Self::SharedMemory(_) => true,
+            | Self::ReadinessQueue(_) => true,
             // A waiter belongs to the thread that waits with it.
             Self::Signals(_) | Self::FutexWaiter(_) => false,
         }
@@ -105,9 +103,8 @@ impl ObjectEntry {
             Self::Socket(socket) => watch(&|registration| socket.watch(registration)),
             Self::Timer(timer) => watch(&|registration| timer.watch(registration)),
             Self::ReadinessQueue(queue) => watch(&|registration| queue.watch(registration)),
-            // Shared memory has no readiness to publish, and a futex waiter publishes through
-            // the registration it was created with.
-            Self::Signals(_) | Self::SharedMemory(_) | Self::FutexWaiter(_) => Ok(None),
+            // A futex waiter publishes through the registration it was created with.
+            Self::Signals(_) | Self::FutexWaiter(_) => Ok(None),
         }
     }
 
@@ -116,7 +113,7 @@ impl ObjectEntry {
     /// a readiness queue entry watching it.
     ///
     /// Fails with `UnsupportedOperation` if other registrations cannot watch the
-    /// object, as for signals, shared memory, futex waiters, and readiness queues.
+    /// object, as for signals, futex waiters, and readiness queues.
     pub(crate) fn add_watcher(&self, registration: &ReadinessRegistration) -> Result<()> {
         match self {
             Self::Event(event) => event.watch(registration),
@@ -125,10 +122,9 @@ impl ObjectEntry {
             Self::Pipe(pipe) => pipe.watch(registration),
             Self::Socket(socket) => socket.watch(registration),
             Self::Timer(timer) => timer.watch(registration),
-            Self::Signals(_)
-            | Self::ReadinessQueue(_)
-            | Self::SharedMemory(_)
-            | Self::FutexWaiter(_) => Err(BrokerError::UnsupportedOperation),
+            Self::Signals(_) | Self::ReadinessQueue(_) | Self::FutexWaiter(_) => {
+                Err(BrokerError::UnsupportedOperation)
+            }
         }
     }
 }
@@ -201,8 +197,6 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
             ObjectEntry::Signals(signals) => return Ok(signals.readiness()),
             ObjectEntry::Timer(timer) => return Ok(timer.readiness()),
             ObjectEntry::ReadinessQueue(queue) => return Ok(queue.readiness()),
-            // Shared memory has no readiness of its own.
-            ObjectEntry::SharedMemory(_) => return Ok(ReadinessFlags::default()),
             ObjectEntry::FutexWaiter(waiter) => return Ok(waiter.readiness()),
             ObjectEntry::Socket(socket) => socket.resource(),
         }
@@ -223,7 +217,7 @@ pub(crate) fn get_status_flags(
         ObjectEntry::Timer(timer) => return Ok(timer.get_status_flags()),
         ObjectEntry::ReadinessQueue(queue) => return Ok(queue.get_status_flags()),
         ObjectEntry::Socket(socket) => return Ok(socket.get_status_flags()),
-        ObjectEntry::Signals(_) | ObjectEntry::SharedMemory(_) | ObjectEntry::FutexWaiter(_) => {
+        ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
             return Err(BrokerError::InvalidRights);
         }
     };
@@ -263,7 +257,7 @@ pub(crate) fn set_status_flags(
             socket.set_status_flags(mask, flags);
             return Ok(());
         }
-        ObjectEntry::Signals(_) | ObjectEntry::SharedMemory(_) | ObjectEntry::FutexWaiter(_) => {
+        ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
             return Err(BrokerError::InvalidRights);
         }
     };

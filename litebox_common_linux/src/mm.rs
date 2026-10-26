@@ -9,6 +9,7 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
+use litebox::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
@@ -38,18 +39,6 @@ pub struct MmapPlacement {
     pub direction: AllocationDirection,
     /// Optional bounds for the entire mapping.
     pub allowed_range: Option<Range<usize>>,
-}
-
-/// A piece of an address range, as split by [`VmemManager::range_pieces`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RangePiece {
-    /// No mapping covers the piece.
-    Unmapped,
-    /// One mapping covers the piece.
-    Mapped {
-        /// Whether the mapping is shared anonymous memory.
-        shared_anonymous: bool,
-    },
 }
 
 /// A page manager to support `mmap`, `munmap`, and etc.
@@ -145,11 +134,45 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
+        // SAFETY: The caller supplies the same guarantees as this method.
+        unsafe {
+            self.create_shared_pages(
+                suggested_address,
+                length,
+                flags,
+                permissions,
+                allowed_range,
+                None,
+                op,
+            )
+        }
+    }
+
+    /// Same as [`Self::create_pages`], but names the shared memory that shared anonymous pages
+    /// map, if `shared_memory` is given.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::create_pages`].
+    #[expect(clippy::too_many_arguments, reason = "mirrors `create_pages`")]
+    unsafe fn create_shared_pages<F>(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        permissions: (MemoryRegionPermissions, MemoryRegionPermissions),
+        allowed_range: Option<Range<usize>>,
+        shared_memory: Option<SharedMemoryId>,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
         let (before_perms, after_perms) = permissions;
         let addr = {
             let mut vmem = self.vmem.write();
             // SAFETY: The caller authorizes any replacements.
-            unsafe {
+            let addr = unsafe {
                 vmem.create_pages(
                     suggested_address,
                     length,
@@ -157,7 +180,14 @@ where
                     before_perms,
                     allowed_range,
                 )
-            }?
+            }?;
+            if let Some(memory) = shared_memory {
+                vmem.name_shared_memory(
+                    addr.as_usize()..addr.as_usize() + length.as_usize(),
+                    memory,
+                );
+            }
+            addr
         };
         let range = PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize())
             .expect("successful mapping must return an aligned, non-empty range");
@@ -657,42 +687,16 @@ where
             .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
     }
 
-    /// Returns whether every page of `range` is in a shared anonymous mapping.
-    pub fn range_is_shared_anonymous(&self, range: Range<usize>) -> bool {
+    /// Returns the key of the futex word at `address` if a mapping of named shared memory, which
+    /// other processes may map, holds all of it.
+    pub fn shared_futex_key(&self, address: usize) -> Option<SharedFutexKey> {
+        let end = address.checked_add(size_of::<u32>())?;
         let vmem = self.vmem.read();
-        let mut next = range.start;
-        for (mapped, vma) in vmem.overlapping(range.clone()) {
-            if mapped.start > next || !vma.is_shared_anonymous() {
-                return false;
-            }
-            next = mapped.end;
+        let (range, vma) = vmem.overlapping(address..end).next()?;
+        if range.start > address || range.end < end {
+            return None;
         }
-        next >= range.end
-    }
-
-    /// Splits `range` into its unmapped gaps and its parts within each mapping, in address order.
-    pub fn range_pieces(&self, range: Range<usize>) -> Vec<(Range<usize>, RangePiece)> {
-        let vmem = self.vmem.read();
-        let mut pieces = Vec::new();
-        let mut next = range.start;
-        for (mapped, vma) in vmem.overlapping(range.clone()) {
-            let start = mapped.start.max(next);
-            let end = mapped.end.min(range.end);
-            if next < start {
-                pieces.push((next..start, RangePiece::Unmapped));
-            }
-            pieces.push((
-                start..end,
-                RangePiece::Mapped {
-                    shared_anonymous: vma.is_shared_anonymous(),
-                },
-            ));
-            next = end;
-        }
-        if next < range.end {
-            pieces.push((next..range.end, RangePiece::Unmapped));
-        }
-        pieces
+        vma.shared_futex_key(address)
     }
 
     /// Returns all mappings in a vector.
@@ -954,6 +958,22 @@ where
         placement: MmapPlacement,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
+        self.do_mmap_shared(suggested_addr, len, prot, flags, placement, None, op)
+    }
+
+    /// Same as [`Self::do_mmap`], but names `shared_memory` as the memory a shared anonymous
+    /// mapping maps from its start, so that [`Self::shared_futex_key`] keys its futexes by it.
+    #[expect(clippy::too_many_arguments, reason = "mirrors `do_mmap`")]
+    pub fn do_mmap_shared(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        placement: MmapPlacement,
+        shared_memory: Option<SharedMemoryId>,
+        op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
         let mut flags = CreatePagesFlags::from(flags);
         flags.set(
             CreatePagesFlags::TOP_DOWN,
@@ -988,12 +1008,13 @@ where
         };
         // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the mapping.
         unsafe {
-            self.create_pages(
+            self.create_shared_pages(
                 suggested_addr,
                 length,
                 flags,
                 (before, permissions),
                 placement.allowed_range,
+                shared_memory,
                 op,
             )
         }

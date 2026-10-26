@@ -1,12 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-owned shared memory and the futexes on it.
+//! Futexes in memory that several processes share.
 //!
-//! A shared memory object names memory that several processes map, such as a Linux
-//! `MAP_SHARED | MAP_ANONYMOUS` mapping a native fork child inherits. The broker does not hold
-//! the memory's contents; it only keys futex wait queues by object and byte offset, so a wake in
-//! one process reaches waiters in every process that holds a reference to the object.
+//! Memory that several processes map, such as a Linux `MAP_SHARED | MAP_ANONYMOUS` mapping that
+//! native fork children inherit, is named by a [`SharedMemoryId`] that its creator picks from a
+//! range the broker reserved for it. The broker keeps no record of the memory: it keys futex wait
+//! queues by [`SharedFutexKey`], so a wake in one process reaches waiters in every process that
+//! names the same futex word.
 //!
 //! Each waiting thread owns a futex waiter object. A wait arms it on a futex, a wake marks the
 //! armed waiters it selects woken and publishes [`FUTEX_WAITER_WOKEN`] readiness for them, and
@@ -19,18 +20,28 @@ use crate::readiness::ReadinessFlags;
 /// Readiness of a futex waiter that a wake selected and that has not been disarmed since.
 pub const FUTEX_WAITER_WOKEN: ReadinessFlags = ReadinessFlags::READ;
 
-/// Request to create a broker-owned shared memory object.
+/// Names memory shared by several processes.
+///
+/// The creator of the memory picks an ID that no other shared memory uses: one starting with a
+/// prefix that the broker reserved for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SharedMemoryId(pub u128);
+
+/// Response to a request to reserve shared memory IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateSharedMemoryRequest {
-    /// Length of the memory in bytes, which bounds futex offsets.
-    pub length: u64,
+pub struct ReserveMemoryIdsResponse {
+    /// Prefix that no other reservation returns, which reserves the IDs whose upper 64 bits it
+    /// is.
+    pub prefix: u64,
 }
 
-/// Response to a shared memory create request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateSharedMemoryResponse {
-    /// Created shared memory handle.
-    pub handle: ObjectHandle,
+/// A futex word in shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SharedFutexKey {
+    /// Memory holding the futex word.
+    pub memory: SharedMemoryId,
+    /// Byte offset of the futex word in the memory, a multiple of four.
+    pub offset: u64,
 }
 
 /// Response to a futex waiter create request.
@@ -46,10 +57,8 @@ pub struct CreateFutexWaiterResponse {
 /// waiter if the word no longer holds the expected value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FutexArmRequest {
-    /// Shared memory holding the futex word.
-    pub memory: ObjectHandle,
-    /// Byte offset of the futex word in the memory, a multiple of four.
-    pub offset: u64,
+    /// Futex word to wait on.
+    pub key: SharedFutexKey,
     /// Nonzero mask a wake's mask must intersect to select the waiter.
     pub bitset: u32,
     /// Idle futex waiter to arm.
@@ -59,10 +68,8 @@ pub struct FutexArmRequest {
 /// Request to wake waiters on a futex word in shared memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FutexWakeRequest {
-    /// Shared memory holding the futex word.
-    pub memory: ObjectHandle,
-    /// Byte offset of the futex word in the memory, a multiple of four.
-    pub offset: u64,
+    /// Futex word whose waiters to wake.
+    pub key: SharedFutexKey,
     /// Maximum number of waiters to wake.
     pub count: u32,
     /// Nonzero mask selecting the waiters whose masks intersect it.

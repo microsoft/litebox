@@ -699,13 +699,13 @@ impl From<litebox::event::timer::TimerError> for Errno {
     }
 }
 
-impl From<litebox::shared_memory::SharedMemoryError> for Errno {
-    fn from(value: litebox::shared_memory::SharedMemoryError) -> Self {
-        use litebox::shared_memory::SharedMemoryError;
+impl From<litebox::shared_futex::SharedFutexError> for Errno {
+    fn from(value: litebox::shared_futex::SharedFutexError) -> Self {
+        use litebox::shared_futex::SharedFutexError;
         match value {
-            SharedMemoryError::ResourceExhausted => Errno::ENOMEM,
-            SharedMemoryError::PermissionDenied => Errno::EACCES,
-            SharedMemoryError::Io | SharedMemoryError::Unavailable => Errno::EIO,
+            SharedFutexError::ResourceExhausted => Errno::ENOMEM,
+            SharedFutexError::PermissionDenied => Errno::EACCES,
+            SharedFutexError::Io | SharedFutexError::Unavailable => Errno::EIO,
             _ => Errno::EIO,
         }
     }
