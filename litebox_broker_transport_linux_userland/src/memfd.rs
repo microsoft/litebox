@@ -806,7 +806,7 @@ mod tests {
         let sequence_offset = (0..MEMORY_SIZE)
             .find(|offset| LAYOUT.permits_u64(*offset))
             .unwrap();
-        let epoch_offset = (0..MEMORY_SIZE)
+        let wake_offset = (0..MEMORY_SIZE)
             .find(|offset| LAYOUT.permits_u32(*offset))
             .unwrap();
         let body_offset = (0..MEMORY_SIZE)
@@ -820,13 +820,13 @@ mod tests {
             second.load_u64_acquire(sequence_offset),
             Ok(0x0102_0304_0506_0708)
         );
-        assert_eq!(first.increment_u32_release(epoch_offset), Ok(()));
-        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(1));
+        assert_eq!(first.increment_u32_release(wake_offset), Ok(()));
+        assert_eq!(second.load_u32_acquire(wake_offset), Ok(1));
         assert_eq!(
             first.store_u64_and_increment_u32_release(
                 sequence_offset,
                 0x1112_1314_1516_1718,
-                epoch_offset,
+                wake_offset,
             ),
             Ok(())
         );
@@ -834,9 +834,9 @@ mod tests {
             second.load_u64_acquire(sequence_offset),
             Ok(0x1112_1314_1516_1718)
         );
-        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(2));
-        assert_eq!(first.store_u32_release(epoch_offset, 0x0102_0304), Ok(()));
-        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(0x0102_0304));
+        assert_eq!(second.load_u32_acquire(wake_offset), Ok(2));
+        assert_eq!(first.store_u32_release(wake_offset, 0x0102_0304), Ok(()));
+        assert_eq!(second.load_u32_acquire(wake_offset), Ok(0x0102_0304));
         assert_eq!(
             first.store_u32_release(sequence_offset, 0),
             Err(SharedMemoryError::InvalidRange)
@@ -851,7 +851,7 @@ mod tests {
             Err(SharedMemoryError::InvalidRange)
         );
         assert_eq!(
-            second.write(epoch_offset, &[0]),
+            second.write(wake_offset, &[0]),
             Err(SharedMemoryError::InvalidRange)
         );
         assert_eq!(
@@ -862,7 +862,7 @@ mod tests {
             second.load_u64_acquire(body_offset),
             Err(SharedMemoryError::InvalidRange)
         );
-        second.wait_while_equal(epoch_offset, 0).unwrap();
+        second.wait_while_equal(wake_offset, 0).unwrap();
         assert_eq!(
             second.store_u64_and_increment_u32_release(sequence_offset, 0, sequence_offset),
             Err(SharedMemoryError::InvalidRange)
@@ -887,12 +887,12 @@ mod tests {
     #[test]
     fn futex_wait_returns_without_peer_cooperation() {
         let memory = MemfdSharedMemory::create_control_ring(LAYOUT).unwrap();
-        let epoch_offset = (0..MEMORY_SIZE)
+        let wake_offset = (0..MEMORY_SIZE)
             .find(|offset| LAYOUT.permits_u32(*offset))
             .unwrap();
         let start = Instant::now();
 
-        memory.wait_while_equal(epoch_offset, 0).unwrap();
+        memory.wait_while_equal(wake_offset, 0).unwrap();
 
         assert!(start.elapsed() < Duration::from_secs(1));
     }
@@ -904,7 +904,7 @@ mod tests {
         let sequence_offset = (0..MEMORY_SIZE)
             .find(|offset| LAYOUT.permits_u64(*offset))
             .unwrap();
-        let epoch_offset = (0..MEMORY_SIZE)
+        let wake_offset = (0..MEMORY_SIZE)
             .find(|offset| LAYOUT.permits_u32(*offset))
             .unwrap();
 
@@ -927,12 +927,12 @@ mod tests {
             rustix::io::pwrite(
                 &peer_fd,
                 &u32::MAX.to_ne_bytes(),
-                u64::try_from(epoch_offset).unwrap(),
+                u64::try_from(wake_offset).unwrap(),
             ),
             Ok(size_of::<u32>())
         );
-        memory.increment_u32_release(epoch_offset).unwrap();
-        assert_eq!(memory.load_u32_acquire(epoch_offset), Ok(0));
+        memory.increment_u32_release(wake_offset).unwrap();
+        assert_eq!(memory.load_u32_acquire(wake_offset), Ok(0));
     }
 
     /// Returns whether `[address, address + length)` is still mapped in a forked child.
@@ -1099,7 +1099,7 @@ mod tests {
 
         let broker = thread::spawn(move || {
             let ControlRingReadStatus::Empty {
-                wait_epoch: producer_epoch,
+                wake_count: producer_wake,
             } = consumer
                 .try_read(|payload| Ok::<_, ()>(payload[0]))
                 .unwrap()
@@ -1107,7 +1107,7 @@ mod tests {
                 panic!("request ring should initially be empty");
             };
             broker_empty_checked.wait();
-            consumer.wait_for_message(producer_epoch).unwrap();
+            consumer.wait_for_message(producer_wake).unwrap();
             for expected in 0..LAYOUT.requests(0).slot_count() {
                 let expected = u8::try_from(expected).unwrap();
                 loop {
@@ -1119,8 +1119,8 @@ mod tests {
                             assert_eq!(value, expected);
                             break;
                         }
-                        ControlRingReadStatus::Empty { wait_epoch } => {
-                            consumer.wait_for_message(wait_epoch).unwrap();
+                        ControlRingReadStatus::Empty { wake_count } => {
+                            consumer.wait_for_message(wake_count).unwrap();
                         }
                     }
                 }
@@ -1132,8 +1132,8 @@ mod tests {
                 .try_read(|payload| Ok::<_, ()>(payload[0]))
                 .unwrap()
             {
-                ControlRingReadStatus::Empty { wait_epoch } => {
-                    consumer.wait_for_message(wait_epoch).unwrap();
+                ControlRingReadStatus::Empty { wake_count } => {
+                    consumer.wait_for_message(wake_count).unwrap();
                     assert_eq!(
                         consumer.try_read(|payload| Ok::<_, ()>(payload[0])),
                         Ok(ControlRingReadStatus::Message(0xff))
@@ -1152,14 +1152,14 @@ mod tests {
             );
         }
         let ControlRingWriteStatus::Full {
-            wait_epoch: consumer_epoch,
+            wake_count: consumer_wake,
         } = producer.try_write(&[0xff]).unwrap()
         else {
             panic!("request ring should be full");
         };
         producer.wake_consumer().unwrap();
 
-        producer.wait_for_capacity(consumer_epoch).unwrap();
+        producer.wait_for_capacity(consumer_wake).unwrap();
         assert_eq!(
             producer.try_write(&[0xff]),
             Ok(ControlRingWriteStatus::Written)

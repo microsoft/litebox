@@ -402,12 +402,13 @@ pub struct Wait {
     offset: usize,
     expected: u32,
     deadline: Option<Instant>,
-    /// On the notification epoch, which the broker changes on its own.
+    /// On the notification wake counter, which the broker changes on its own.
     notifications: bool,
 }
 
 impl Wait {
-    /// Whether it is on the notification epoch, which a notification ends.
+    /// Whether it is on the notification wake counter, which a notification
+    /// ends.
     pub fn is_for_notifications(&self) -> bool {
         self.notifications
     }
@@ -417,8 +418,8 @@ impl Wait {
 /// `litebox_common_vm_abi`, Broker).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingFutex {
-    /// On the requests' producer epoch, has the broker serve them; on other
-    /// words, nothing.
+    /// On the requests' producer wake counter, has the broker serve them; on
+    /// other words, nothing.
     Wake,
     /// Until the word differs from `expected`, or `deadline` passes.
     Wait {
@@ -431,8 +432,8 @@ pub enum RingFutex {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entered {
     Done,
-    /// [`RingFutex::Wake`] on the requests' producer epoch: serve before the
-    /// call returns.
+    /// [`RingFutex::Wake`] on the requests' producer wake counter: serve
+    /// before the call returns.
     Woke,
     /// Poll it with [`Association::poll_wait`].
     Wait(Wait),
@@ -611,7 +612,7 @@ impl Association {
         }
         let wait = match op {
             RingFutex::Wake => {
-                if offset != CONTROL_RING_LAYOUT.requests(0).producer_epoch_offset() {
+                if offset != CONTROL_RING_LAYOUT.requests(0).producer_wake_offset() {
                     // The broker waits on no other word.
                     return Ok(Entered::Done);
                 }
@@ -621,8 +622,7 @@ impl Association {
                 offset,
                 expected,
                 deadline,
-                notifications: offset
-                    == CONTROL_RING_LAYOUT.notifications().producer_epoch_offset(),
+                notifications: offset == CONTROL_RING_LAYOUT.notifications().producer_wake_offset(),
             }),
         };
         self.submitted.set(true);
@@ -764,8 +764,9 @@ impl Association {
     }
 
     /// Where `wait` stands, after firing due timers and publishing readiness.
-    /// Without a deadline, a wait on a word other than the notification epoch
-    /// is [`Status::Stalled`] once [`Self::serve`] has nothing left to serve.
+    /// Without a deadline, a wait on a word other than the notification wake
+    /// counter is [`Status::Stalled`] once [`Self::serve`] has nothing left to
+    /// serve.
     pub fn poll_wait(&self, wait: &Wait) -> WaitState {
         self.with_active(|active| {
             self.poll()?;
@@ -813,8 +814,8 @@ impl Association {
     }
 
     /// Whether a thread of the process blocks in a wait that a notification
-    /// would end (on the notification epoch, or another the caller ends for
-    /// them, e.g., a futex wait), for a notification to notify every CPU
+    /// would end (on the notification wake counter, or another the caller ends
+    /// for them, e.g., a futex wait), for a notification to notify every CPU
     /// ([`cpu::notify_all`], see [`cpu::take_notified`]): poll the waits
     /// again. The caller's to keep current: before polling waits, since
     /// polling may publish; ordered before the polls' reads, so that a

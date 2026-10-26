@@ -341,8 +341,8 @@ mod tests {
                     consumer.wake_producer().unwrap();
                     return request;
                 }
-                ControlRingReadStatus::Empty { wait_epoch } => {
-                    consumer.wait_for_message(wait_epoch).unwrap();
+                ControlRingReadStatus::Empty { wake_count } => {
+                    consumer.wait_for_message(wake_count).unwrap();
                 }
             }
         }
@@ -356,8 +356,8 @@ mod tests {
                     consumer.wake_producer().unwrap();
                     return response;
                 }
-                ControlRingReadStatus::Empty { wait_epoch } => {
-                    consumer.wait_for_message(wait_epoch).unwrap();
+                ControlRingReadStatus::Empty { wake_count } => {
+                    consumer.wait_for_message(wake_count).unwrap();
                 }
             }
         }
@@ -370,8 +370,8 @@ mod tests {
                     producer.wake_consumer().unwrap();
                     return;
                 }
-                ControlRingWriteStatus::Full { wait_epoch } => {
-                    producer.wait_for_capacity(wait_epoch).unwrap();
+                ControlRingWriteStatus::Full { wake_count } => {
+                    producer.wait_for_capacity(wake_count).unwrap();
                 }
             }
         }

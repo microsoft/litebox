@@ -709,8 +709,8 @@ mod tests {
             .pop()
             .unwrap();
 
-        let wait_epoch = match broker.request_consumer.try_read(|_| Ok::<_, ()>(())) {
-            Ok(ControlRingReadStatus::Empty { wait_epoch }) => wait_epoch,
+        let wake_count = match broker.request_consumer.try_read(|_| Ok::<_, ()>(())) {
+            Ok(ControlRingReadStatus::Empty { wake_count }) => wake_count,
             result => panic!("expected an empty request ring, got {result:?}"),
         };
         let writer = std::thread::spawn(move || {
@@ -722,7 +722,7 @@ mod tests {
         });
         broker
             .request_consumer
-            .wait_for_message(wait_epoch)
+            .wait_for_message(wake_count)
             .unwrap();
         assert_eq!(
             broker
@@ -762,8 +762,8 @@ mod tests {
                     assert_eq!(lane, 1);
                     break;
                 }
-                ControlRingDemandStatus::Satisfied { wait_epoch } => {
-                    broker_demand.wait_for_demand(wait_epoch).unwrap();
+                ControlRingDemandStatus::Satisfied { wake_count } => {
+                    broker_demand.wait_for_demand(wake_count).unwrap();
                 }
             }
         }
@@ -790,10 +790,10 @@ mod tests {
     #[test]
     fn event_wait_returns_without_peer_cooperation() {
         let memory = WindowsSharedMemory::create_control_ring(LAYOUT).unwrap();
-        let epoch_offset = LAYOUT.requests(0).producer_epoch_offset();
+        let wake_offset = LAYOUT.requests(0).producer_wake_offset();
         let start = std::time::Instant::now();
 
-        memory.wait_while_equal(epoch_offset, 0).unwrap();
+        memory.wait_while_equal(wake_offset, 0).unwrap();
 
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
@@ -801,10 +801,10 @@ mod tests {
     #[test]
     fn byte_memory_does_not_infer_control_ring_from_length() {
         let memory = WindowsSharedMemory::create(LAYOUT.memory_size()).unwrap();
-        let epoch_offset = LAYOUT.requests(0).producer_epoch_offset();
+        let wake_offset = LAYOUT.requests(0).producer_wake_offset();
 
         assert_eq!(
-            memory.wake_one(epoch_offset).unwrap_err().kind(),
+            memory.wake_one(wake_offset).unwrap_err().kind(),
             ErrorKind::InvalidInput
         );
         let transfer = memory
