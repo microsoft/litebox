@@ -4,7 +4,6 @@
 use core::mem::{offset_of, size_of};
 
 use litebox::mm::page::NonZeroPageSize;
-use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_linux::vmem::{CreatePagesFlags, MappingError};
 use litebox_common_windows::loader::PAGE_SIZE;
@@ -50,7 +49,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             length,
             ALLOCATION_GRANULARITY,
             CreatePagesFlags::empty(),
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            PageProtection::PAGE_READWRITE,
             initialize_gdi_shared_table::<Platform>,
         );
         let Ok(mapping) = mapping else {
@@ -126,10 +125,9 @@ mod tests {
             let snapshot = || {
                 let vmem = task.global.page_manager.read_vmem();
                 (
-                    vmem.allocations_in(..)
-                        .cloned()
+                    vmem.allocations_based_in(..)
                         .collect::<alloc::vec::Vec<_>>(),
-                    vmem.mappings().clone(),
+                    vmem.areas().clone(),
                 )
             };
             let before = snapshot();

@@ -220,7 +220,8 @@ pub(crate) enum WindowsPlaceholderState {
     Replaced,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A guest-visible allocation, stored on every page-manager area it spans.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {
     pub(crate) base: usize,
     pub(crate) size: usize,
@@ -228,20 +229,16 @@ pub(crate) struct WindowsVirtualAllocation {
     pub(crate) type_: syscalls::mm::MemoryType,
     /// Tracks both placeholders and private allocations that may be restored to placeholders.
     pub(crate) placeholder_state: WindowsPlaceholderState,
-    /// Exact Windows protections; commitment is determined by the page manager.
-    pub(crate) page_protections: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
 }
 
 impl WindowsVirtualAllocation {
-    /// Creates an allocation record whose pages are either all committed with
-    /// `committed_protect`, or, when it is `None`, all reserved.
+    /// Describes the allocation spanning `base..base + size`.
     pub(crate) fn new(
         base: usize,
         size: usize,
         type_: syscalls::mm::MemoryType,
         allocation_protect: syscalls::mm::PageProtection,
         placeholder_state: WindowsPlaceholderState,
-        committed_protect: Option<syscalls::mm::PageProtection>,
     ) -> Self {
         Self {
             base,
@@ -249,10 +246,12 @@ impl WindowsVirtualAllocation {
             allocation_protect,
             type_,
             placeholder_state,
-            page_protections: committed_protect.map_or_else(rangemap::RangeMap::new, |protect| {
-                syscalls::mm::initial_page_protections(base, size, protect)
-            }),
         }
+    }
+
+    /// Returns the exclusive end address, or `None` if it overflows.
+    pub(crate) fn end(&self) -> Option<usize> {
+        self.base.checked_add(self.size)
     }
 }
 
@@ -494,7 +493,7 @@ fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
             length,
             crate::syscalls::mm::ALLOCATION_GRANULARITY,
             CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-            litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
+            syscalls::mm::PageProtection::PAGE_READONLY,
             |ptr| {
                 ptr.copy_from_slice(0, shared_data_bytes)
                     .ok_or(MappingError::OutOfMemory)?;

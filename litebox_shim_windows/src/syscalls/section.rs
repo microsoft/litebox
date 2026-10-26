@@ -10,7 +10,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::mm::page::NonZeroPageSize;
-use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_linux::vmem::CreatePagesFlags;
 use litebox_common_windows::nt_status::NtStatus;
@@ -526,9 +525,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return NtStatus::INVALID_PARAMETER;
         }
-        let Some((page_protection, permissions)) =
-            mm::parse_page_protection(request.page_protection)
-        else {
+        let Some((page_protection, _)) = mm::parse_page_protection(request.page_protection) else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
         let entry = match self.typed_handle_entry_with_access::<SectionSubsystem<Platform>>(
@@ -546,7 +543,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 requested_view_size,
                 section_offset,
                 page_protection,
-                permissions,
             ),
             SectionBacking::CsrSharedSection { base } => self.map_csr_shared_section(
                 request,
@@ -594,8 +590,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // SAFETY: Section views are tracked only after this shim successfully creates the pages;
             // unmapping consumes the tracked view and removes the exact owned range.
             if unsafe { vmem.release_allocation(view_base, view.size) }.is_err() {
+                let retained = vmem.allocation_at(view_base).is_some();
                 drop(vmem);
-                self.process.section_views.write().insert(view_base, view);
+                if retained {
+                    self.process.section_views.write().insert(view_base, view);
+                }
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
         } else {
@@ -636,14 +635,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         requested_view_size: usize,
         section_offset: usize,
         page_protection: PageProtection,
-        permissions: MemoryRegionPermissions,
     ) -> NtStatus {
         let mapped_view = match self.map_pagefile_section_view(
             section,
             requested_view_size,
             section_offset,
             page_protection,
-            permissions,
         ) {
             Ok(mapped_view) => mapped_view,
             Err(status) => return status,
@@ -674,16 +671,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         )?;
         let section = entry.with_entry(|entry| Arc::clone(&entry.section));
         let page_protection = PageProtection::PAGE_READWRITE;
-        let Some((_, permissions)) = mm::parse_page_protection(page_protection.bits()) else {
-            return Err(NtStatus::INVALID_PAGE_PROTECTION);
-        };
-        self.map_pagefile_section_view(
-            &section,
-            requested_view_size,
-            0,
-            page_protection,
-            permissions,
-        )
+        self.map_pagefile_section_view(&section, requested_view_size, 0, page_protection)
     }
 
     fn map_pagefile_section_view(
@@ -692,7 +680,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         requested_view_size: usize,
         section_offset: usize,
         page_protection: PageProtection,
-        permissions: MemoryRegionPermissions,
     ) -> Result<MappedPagefileSectionView, NtStatus> {
         let remaining = section
             .size
@@ -756,7 +743,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 length,
                 super::mm::ALLOCATION_GRANULARITY,
                 CreatePagesFlags::empty(),
-                permissions,
+                page_protection,
                 |_| Ok(0),
             )
         }
@@ -1737,7 +1724,7 @@ mod tests {
             task.global
                 .page_manager
                 .read_vmem()
-                .allocations_in(..)
+                .allocations_based_in(..)
                 .filter(|allocation| allocation.type_ == MemoryType::MEM_IMAGE)
                 .count()
         };
@@ -1959,9 +1946,7 @@ mod tests {
                 .global
                 .page_manager
                 .read_vmem()
-                .mappings()
-                .iter()
-                .any(|(range, _)| range.contains(&base))
+                .is_range_committed(&(base..base + PAGE_SIZE))
         );
 
         assert_eq!(
@@ -1979,9 +1964,7 @@ mod tests {
             task.global
                 .page_manager
                 .read_vmem()
-                .mappings()
-                .iter()
-                .any(|(range, _)| range.contains(&base))
+                .is_range_committed(&(base..base + PAGE_SIZE))
         );
         let mapped = MutPtr::<TestPlatform, u32>::from_usize(base);
         assert_eq!(mapped.read_at_offset(0), Some(0));

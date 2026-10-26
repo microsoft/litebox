@@ -3,8 +3,7 @@
 
 //! Windows-style explicit reservation, commitment, decommitment, and release.
 
-use alloc::collections::BTreeMap;
-use core::ops::Range;
+use core::ops::{Bound, Range, RangeBounds};
 
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::RawConstPointer as _;
@@ -15,13 +14,14 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use litebox_common_linux::vmem::{
-    CreatePagesFlags, MappingError, VmFlags, VmemProtectError, VmemUnmapError,
+    CreatePagesFlags, MappingError, VmemProtectError, VmemUnmapError,
 };
 use rangemap::RangeMap;
 
-use crate::PAGE_SIZE;
-use crate::WindowsVirtualAllocation;
-use crate::syscalls::mm::PageProtection;
+use crate::syscalls::mm::{
+    PageProtection, page_protect_to_permissions, permissions_to_page_protect,
+};
+use crate::{PAGE_SIZE, WindowsPlaceholderState, WindowsVirtualAllocation};
 
 type Reservations<Platform> = TrackedReservations<<Platform as crate::ShimPlatform>::Reservation>;
 
@@ -37,16 +37,34 @@ pub(crate) enum PrivatePages {
     Committed(MemoryRegionPermissions),
 }
 
+/// Commitment of an owned page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PageState {
+    /// Reserved address space with no backing storage.
+    Reserved,
+    /// Committed with this guest-visible protection, which may differ from the native
+    /// permissions of pages LiteBox initialized itself.
+    Committed(PageProtection),
+}
+
+/// State of a run of owned pages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsArea {
+    /// The guest allocation assigned to these pages, if any.
+    pub(crate) allocation: Option<WindowsVirtualAllocation>,
+    /// Whether the pages are committed, and with which protection.
+    pub(crate) state: PageState,
+}
+
+/// Windows guest address-space state: owned native reservations and the state of their pages.
 pub(crate) struct WindowsVmem<Platform>
 where
     Platform: crate::ShimPlatform,
 {
     platform: &'static Platform,
     reservations: Reservations<Platform>,
-    mappings: RangeMap<usize, VmFlags>,
-    /// Guest-visible Windows allocations, kept under the same lock as the page state they
-    /// describe so no lock ordering is needed between them.
-    allocations: BTreeMap<usize, crate::WindowsVirtualAllocation>,
+    /// The only record of page state and guest allocations; every reserved page has an area.
+    areas: RangeMap<usize, WindowsArea>,
 }
 
 impl<Platform> WindowsVmem<Platform>
@@ -57,171 +75,217 @@ where
         Self {
             platform,
             reservations: TrackedReservations::<Platform::Reservation>::default(),
-            mappings: RangeMap::new(),
-            allocations: BTreeMap::new(),
+            areas: RangeMap::new(),
         }
     }
 
-    /// Iterates over the allocation records starting within `range`, in address order.
-    pub(crate) fn allocations_in(
-        &self,
-        range: impl core::ops::RangeBounds<usize>,
-    ) -> impl Iterator<Item = &WindowsVirtualAllocation> + '_ {
-        self.allocations
-            .range(range)
-            .map(|(_, allocation)| allocation)
+    /// Returns every owned page run with its state and owning allocation.
+    pub(crate) fn areas(&self) -> &RangeMap<usize, WindowsArea> {
+        &self.areas
     }
 
-    /// Returns the allocation record whose base is exactly `base`.
-    pub(crate) fn allocation_at(&self, base: usize) -> Option<&WindowsVirtualAllocation> {
-        self.allocations.get(&base)
+    /// Rewrites every area overlapping `range`, clipped to it.
+    fn update_areas(&mut self, range: Range<usize>, update: impl Fn(WindowsArea) -> WindowsArea) {
+        let mut cursor = range.start;
+        while cursor < range.end {
+            let Some((area_range, area)) = self
+                .areas
+                .overlapping(cursor..range.end)
+                .next()
+                .map(|(area_range, area)| (area_range.clone(), *area))
+            else {
+                break;
+            };
+            let clipped = area_range.start.max(cursor)..area_range.end.min(range.end);
+            cursor = clipped.end;
+            let updated = update(area);
+            if updated != area {
+                self.areas.insert(clipped, updated);
+            }
+        }
     }
 
-    #[cfg(test)]
-    pub(crate) fn allocation_at_mut(
+    fn set_state(&mut self, range: Range<usize>, state: PageState) {
+        self.update_areas(range, |area| WindowsArea { state, ..area });
+    }
+
+    fn set_allocation(
         &mut self,
-        base: usize,
-    ) -> Option<&mut WindowsVirtualAllocation> {
-        self.allocations.get_mut(&base)
+        range: Range<usize>,
+        allocation: Option<WindowsVirtualAllocation>,
+    ) {
+        self.update_areas(range, |area| WindowsArea { allocation, ..area });
     }
 
-    /// Returns the allocation record that fully covers `base..base + size`.
+    /// Iterates over the allocations based within `range`, in address order.
+    pub(crate) fn allocations_based_in(
+        &self,
+        range: impl RangeBounds<usize>,
+    ) -> impl Iterator<Item = WindowsVirtualAllocation> + '_ {
+        let start = match range.start_bound() {
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start.saturating_add(1),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&end) => end.saturating_add(1),
+            Bound::Excluded(&end) => end,
+            Bound::Unbounded => usize::MAX,
+        };
+        self.areas
+            .overlapping(start..end.max(start))
+            .filter_map(move |(area_range, area)| {
+                let allocation = area.allocation?;
+                (area_range.start == allocation.base && allocation.base >= start)
+                    .then_some(allocation)
+            })
+    }
+
+    /// Returns the allocation whose base is exactly `base`.
+    pub(crate) fn allocation_at(&self, base: usize) -> Option<WindowsVirtualAllocation> {
+        self.allocation_containing(base)
+            .filter(|allocation| allocation.base == base)
+    }
+
+    /// Returns the allocation that fully covers `base..base + size`.
     pub(crate) fn allocation_covering(
         &self,
         base: usize,
         size: usize,
-    ) -> Option<&WindowsVirtualAllocation> {
+    ) -> Option<WindowsVirtualAllocation> {
         let end = base.checked_add(size)?;
-        self.allocations
-            .range(..=base)
-            .next_back()
-            .map(|(_, allocation)| allocation)
-            .filter(|allocation| {
-                allocation
-                    .base
-                    .checked_add(allocation.size)
-                    .is_some_and(|allocation_end| end <= allocation_end)
-            })
+        self.allocation_containing(base).filter(|allocation| {
+            allocation
+                .end()
+                .is_some_and(|allocation_end| end <= allocation_end)
+        })
     }
 
-    /// Returns the allocation record containing `address`.
-    pub(crate) fn allocation_containing(
-        &self,
-        address: usize,
-    ) -> Option<&WindowsVirtualAllocation> {
-        self.allocation_covering(address, 1)
+    /// Returns the allocation containing `address`.
+    pub(crate) fn allocation_containing(&self, address: usize) -> Option<WindowsVirtualAllocation> {
+        self.areas.get(&address)?.allocation
     }
 
-    /// Records `allocation`, replacing any record with the same base.
-    pub(crate) fn insert_allocation(&mut self, allocation: WindowsVirtualAllocation) {
-        self.allocations.insert(allocation.base, allocation);
-    }
-
-    /// Removes the allocation record based at `base` without touching its pages.
-    pub(crate) fn remove_allocation(&mut self, base: usize) -> Option<WindowsVirtualAllocation> {
-        self.allocations.remove(&base)
-    }
-
-    /// Sets (or, for `None`, clears) the Windows page protections of `base..base + size`
-    /// within the allocation covering it. Returns `false` if no allocation covers the range.
-    pub(crate) fn set_page_protections(
+    /// Assigns the existing pages of `allocation` to it, setting its committed pages to
+    /// `committed_protect` when given.
+    pub(crate) fn assign_allocation(
         &mut self,
+        allocation: WindowsVirtualAllocation,
+        committed_protect: Option<PageProtection>,
+    ) {
+        let Some(end) = allocation.end() else {
+            return;
+        };
+        debug_assert!(
+            self.areas.gaps(&(allocation.base..end)).next().is_none(),
+            "allocation pages must exist"
+        );
+        self.update_areas(allocation.base..end, |area| WindowsArea {
+            allocation: Some(allocation),
+            state: match (area.state, committed_protect) {
+                (PageState::Committed(_), Some(protect)) => PageState::Committed(protect),
+                (state, _) => state,
+            },
+        });
+    }
+
+    /// Detaches the allocation based at `base` from its pages without touching them.
+    pub(crate) fn remove_allocation(&mut self, base: usize) -> Option<WindowsVirtualAllocation> {
+        let allocation = self.allocation_at(base)?;
+        self.set_allocation(base..allocation.end()?, None);
+        Some(allocation)
+    }
+
+    /// Reassigns `base..base + size` from `allocation`, which covers it, to `middle`, leaving
+    /// the pieces before and after the range as separate allocations.
+    pub(crate) fn split_allocation_around(
+        &mut self,
+        allocation: WindowsVirtualAllocation,
         base: usize,
         size: usize,
-        protect: Option<PageProtection>,
-    ) -> bool {
-        let Some(end) = base.checked_add(size) else {
-            return false;
+        middle: Option<WindowsVirtualAllocation>,
+    ) {
+        let (Some(end), Some(allocation_end)) = (base.checked_add(size), allocation.end()) else {
+            return;
         };
-        let Some((_, allocation)) = self.allocations.range_mut(..=base).next_back() else {
-            return false;
-        };
-        if allocation
-            .base
-            .checked_add(allocation.size)
-            .is_none_or(|allocation_end| end > allocation_end)
-        {
-            return false;
+        if allocation.base < base {
+            let prefix = WindowsVirtualAllocation {
+                size: base - allocation.base,
+                ..allocation
+            };
+            self.set_allocation(allocation.base..base, Some(prefix));
         }
-        match protect {
-            Some(protect) => allocation.page_protections.insert(base..end, protect),
-            None => allocation.page_protections.remove(base..end),
-        }
-        true
-    }
-
-    /// Splits the allocation containing `base` around the released `base..base + size`,
-    /// keeping the surrounding pieces and their page protections.
-    pub(crate) fn split_allocation_around(&mut self, base: usize, size: usize) {
-        let Some(released_end) = base.checked_add(size) else {
-            return;
-        };
-        let Some((&allocation_key, allocation)) = self.allocations.range(..=base).next_back()
-        else {
-            return;
-        };
-        let Some(allocation_end) = allocation.base.checked_add(allocation.size) else {
-            return;
-        };
-        let Some(allocation) = self.allocations.remove(&allocation_key) else {
-            return;
-        };
-
-        for (start, end) in [(allocation.base, base), (released_end, allocation_end)] {
-            if start >= end {
-                continue;
-            }
-            let mut pages = RangeMap::new();
-            for (range, protect) in allocation.page_protections.overlapping(start..end) {
-                pages.insert(range.start.max(start)..range.end.min(end), *protect);
-            }
-            self.allocations.insert(
-                start,
-                WindowsVirtualAllocation {
-                    base: start,
-                    size: end - start,
-                    allocation_protect: allocation.allocation_protect,
-                    type_: allocation.type_,
-                    placeholder_state: allocation.placeholder_state,
-                    page_protections: pages,
-                },
-            );
+        self.set_allocation(base..end, middle);
+        if end < allocation_end {
+            let suffix = WindowsVirtualAllocation {
+                base: end,
+                size: allocation_end - end,
+                ..allocation
+            };
+            self.set_allocation(end..allocation_end, Some(suffix));
         }
     }
 
-    /// Joins the allocation records tiling `base..base + size` into the one based at `base`.
+    /// Joins the allocations tiling `base..base + size` into the one based at `base`.
     pub(crate) fn coalesce_allocations(&mut self, base: usize, size: usize) {
         let Some(end) = base.checked_add(size) else {
             return;
         };
-        for _ in self.allocations.extract_if(base + 1..end, |_, _| true) {}
-        if let Some(allocation) = self.allocations.get_mut(&base) {
-            allocation.size = size;
-        }
+        let Some(first) = self.allocation_at(base) else {
+            return;
+        };
+        self.set_allocation(base..end, Some(WindowsVirtualAllocation { size, ..first }));
     }
 
-    /// Marks the reserved placeholder based at `base` as replaced with `protect`, recording its
-    /// pages as committed when `committed` is set. Returns `false` if no record is based there.
+    /// Marks the reserved placeholder based at `base` as replaced with `protect`. Returns
+    /// `false` if no allocation is based there.
     pub(crate) fn mark_placeholder_replaced(
         &mut self,
         base: usize,
         protect: PageProtection,
-        committed: bool,
     ) -> bool {
-        let Some(allocation) = self.allocations.get_mut(&base) else {
+        let Some(allocation) = self.allocation_at(base) else {
             return false;
         };
-        if committed {
-            allocation.page_protections =
-                crate::syscalls::mm::initial_page_protections(base, allocation.size, protect);
-        }
-        allocation.placeholder_state = crate::WindowsPlaceholderState::Replaced;
-        allocation.allocation_protect = protect;
+        let Some(end) = allocation.end() else {
+            return false;
+        };
+        let replaced = WindowsVirtualAllocation {
+            placeholder_state: WindowsPlaceholderState::Replaced,
+            allocation_protect: protect,
+            ..allocation
+        };
+        self.set_allocation(base..end, Some(replaced));
         true
     }
 
-    pub(crate) fn is_range_mapped(&self, range: &Range<usize>) -> bool {
-        range.start <= range.end && self.mappings.gaps(range).next().is_none()
+    /// Returns whether every page of `range` is owned and committed; an empty range is.
+    pub(crate) fn is_range_committed(&self, range: &Range<usize>) -> bool {
+        if range.start >= range.end {
+            return range.start == range.end;
+        }
+        self.first_committed_protect(range).is_some()
+    }
+
+    /// Returns the protection of the first page of `range` if `range` is non-empty and every
+    /// page of it is owned and committed.
+    pub(crate) fn first_committed_protect(&self, range: &Range<usize>) -> Option<PageProtection> {
+        if range.start >= range.end {
+            return None;
+        }
+        let mut cursor = range.start;
+        let mut first = None;
+        for (area_range, area) in self.areas.overlapping(range.clone()) {
+            let PageState::Committed(protect) = area.state else {
+                return None;
+            };
+            if area_range.start > cursor {
+                return None;
+            }
+            first.get_or_insert(protect);
+            cursor = area_range.end;
+        }
+        first.filter(|_| cursor >= range.end)
     }
 
     unsafe fn create_private_pages(
@@ -346,12 +410,19 @@ where
         let range = reservation.range();
         assert_eq!(range, requested);
         let ptr = Platform::RawMutPointer::<u8>::from_usize(range.start);
-        if let PrivatePages::Committed(permissions) = pages {
-            self.mappings.insert(
-                range.clone(),
-                VmFlags::VM_MAY_ACCESS_FLAGS | VmFlags::from(permissions),
-            );
-        }
+        let state = match pages {
+            PrivatePages::Committed(permissions) => {
+                PageState::Committed(permissions_to_page_protect(permissions))
+            }
+            PrivatePages::Reserved | PrivatePages::Mergeable => PageState::Reserved,
+        };
+        self.areas.insert(
+            range.clone(),
+            WindowsArea {
+                allocation: None,
+                state,
+            },
+        );
         assert!(self.reservations.insert(range.start, reservation).is_none());
         Ok(ptr)
     }
@@ -417,13 +488,20 @@ where
         }
     }
 
+    /// Commits `len` bytes at `ptr` with `protect`; already committed pages take `protect`.
+    ///
+    /// # Safety
+    /// The range must lie in one owned reservation, and the caller must exclude accesses that
+    /// conflict with the commitment or permission change.
     pub(crate) unsafe fn commit_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
-        permissions: MemoryRegionPermissions,
+        protect: PageProtection,
     ) -> Result<(), VmemProtectError> {
         let range = protect_page_range(ptr.as_usize(), len)?;
+        let permissions =
+            page_protect_to_permissions(protect).ok_or(VmemProtectError::UnsupportedProtection)?;
         let Some(reservation) = containing_reservation::<Platform>(&self.reservations, &range)
         else {
             return Err(VmemProtectError::InvalidRange(range));
@@ -439,13 +517,14 @@ where
             )
         }
         .map_err(|_| VmemProtectError::UnsupportedProtection)?;
-        self.mappings.insert(
-            range,
-            VmFlags::VM_MAY_ACCESS_FLAGS | VmFlags::from(permissions),
-        );
+        self.set_state(range, PageState::Committed(protect));
         Ok(())
     }
 
+    /// Decommits `len` bytes at `ptr`, discarding their contents but keeping them reserved.
+    ///
+    /// # Safety
+    /// The range must lie in one owned reservation, and the caller relinquishes its contents.
     pub(crate) unsafe fn decommit_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
@@ -462,7 +541,7 @@ where
                 .decommit_pages(|| core::iter::once(reservation), range.clone())
         }
         .map_err(|_| VmemProtectError::InvalidRange(range.clone()))?;
-        self.mappings.remove(range);
+        self.set_state(range, PageState::Reserved);
         Ok(())
     }
 
@@ -478,7 +557,10 @@ where
         len: usize,
     ) -> Result<(), VmemProtectError> {
         let range = protect_page_range(ptr.as_usize(), len)?;
-        if self.mappings.overlapping(range.clone()).next().is_some()
+        if self
+            .areas
+            .overlapping(range.clone())
+            .any(|(_, area)| matches!(area.state, PageState::Committed(_)))
             || self.reservations.gaps(range.clone()).next().is_some()
         {
             return Err(VmemProtectError::InvalidRange(range));
@@ -488,7 +570,7 @@ where
         }
         let pieces = self.reservations.take_replaced(range.clone());
         // SAFETY: The pieces are contiguous, ascending, mergeable per the caller contract, and
-        // uncommitted because no mapping overlaps `range`.
+        // uncommitted because no committed area overlaps `range`.
         let merged = unsafe { self.platform.merge_reservations(pieces) };
         assert_eq!(merged.range(), range);
         assert!(self.reservations.insert(range.start, merged).is_none());
@@ -504,50 +586,22 @@ where
             .map(litebox::platform::page_mgmt::PageReservation::range)
     }
 
-    /// Returns the start of the first reservation beginning above `address` and below `limit`.
-    pub(crate) fn next_reservation_start(&self, address: usize, limit: usize) -> Option<usize> {
-        self.reservations
-            .overlapping(address..limit)
-            .map(litebox::platform::page_mgmt::PageReservation::range)
-            .find(|range| range.start > address)
-            .map(|range| range.start)
-    }
-
-    pub(crate) fn get_memory_permissions(
-        &self,
-        ptr: NonZeroAddress<PAGE_SIZE>,
-        len: NonZeroPageSize<PAGE_SIZE>,
-    ) -> Option<MemoryRegionPermissions> {
-        let range = ptr.as_usize()..ptr.as_usize().checked_add(len.as_usize())?;
-        let mut covered_until = range.start;
-        let mut permissions = None;
-        for (mapped, flags) in self.mappings.overlapping(range.clone()) {
-            if mapped.start > covered_until {
-                return None;
-            }
-            let current = MemoryRegionPermissions::from(*flags);
-            if permissions.is_some_and(|permissions| permissions != current) {
-                return None;
-            }
-            permissions = Some(current);
-            covered_until = covered_until.max(mapped.end);
-            if covered_until >= range.end {
-                return permissions;
-            }
-        }
-        None
-    }
-
+    /// Changes the protection of `len` committed bytes at `ptr` to `protect`.
+    ///
+    /// # Safety
+    /// The caller must exclude accesses that conflict with the permission change.
     pub(crate) unsafe fn protect_pages(
         &mut self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
-        permissions: MemoryRegionPermissions,
+        protect: PageProtection,
     ) -> Result<(), VmemProtectError> {
         let range = protect_page_range(ptr.as_usize(), len)?;
-        if !self.is_range_mapped(&range) {
+        if !self.is_range_committed(&range) {
             return Err(VmemProtectError::InvalidRange(range));
         }
+        let permissions =
+            page_protect_to_permissions(protect).ok_or(VmemProtectError::UnsupportedProtection)?;
         if containing_reservation::<Platform>(&self.reservations, &range).is_none() {
             return Err(VmemProtectError::InvalidRange(range));
         }
@@ -560,55 +614,37 @@ where
                 permissions,
             )
         }?;
-        self.mappings.insert(
-            range,
-            VmFlags::VM_MAY_ACCESS_FLAGS | VmFlags::from(permissions),
-        );
+        self.set_state(range, PageState::Committed(protect));
         Ok(())
     }
 
-    pub(crate) unsafe fn remove_pages(
-        &mut self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-    ) -> Result<(), VmemUnmapError> {
-        let start = ptr.as_usize();
-        let range = page_range(start, len).ok_or(VmemUnmapError::UnAligned)?;
-        if containing_reservation::<Platform>(&self.reservations, &range).is_none() {
-            return Err(litebox::platform::page_mgmt::DeallocationError::AlreadyUnallocated.into());
-        }
-        let reservations = self.reservations.take_replaced(range);
-        for reservation in reservations {
-            let extent = reservation.range();
-            // SAFETY: The caller relinquishes this owned range and excludes remaining users.
-            unsafe {
-                self.platform
-                    .release_pages(into_release_target::<Platform>(reservation))
-            }?;
-            self.mappings.remove(extent);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn mappings(&self) -> &RangeMap<usize, VmFlags> {
-        &self.mappings
-    }
-
-    /// Releases the pages of the allocation recorded at `base` together with its record, so
-    /// no other thread can observe one without the other.
+    /// Releases `len` bytes at `base`, which must lie in one owned reservation, with their
+    /// page state and allocation records.
     ///
-    /// On failure the record is retained.
+    /// Range-validation failures leave tracking unchanged; once native release starts, the
+    /// range is untracked even if release fails.
     ///
     /// # Safety
-    /// Same contract as [`Self::remove_pages`].
+    /// The caller relinquishes the range and must exclude any remaining users of it.
     pub(crate) unsafe fn release_allocation(
         &mut self,
         base: usize,
         len: usize,
     ) -> Result<(), VmemUnmapError> {
-        // SAFETY: Forwarded caller contract.
-        unsafe { self.remove_pages(Platform::RawMutPointer::<u8>::from_usize(base), len) }?;
-        self.allocations.remove(&base);
+        let range = page_range(base, len).ok_or(VmemUnmapError::UnAligned)?;
+        if containing_reservation::<Platform>(&self.reservations, &range).is_none() {
+            return Err(litebox::platform::page_mgmt::DeallocationError::AlreadyUnallocated.into());
+        }
+        let reservations = self.reservations.take_replaced(range);
+        for reservation in reservations {
+            // The reservation is consumed even if release fails, so its pages are untracked first.
+            self.areas.remove(reservation.range());
+            // SAFETY: The caller relinquishes this owned range and excludes remaining users.
+            unsafe {
+                self.platform
+                    .release_pages(into_release_target::<Platform>(reservation))
+            }?;
+        }
         Ok(())
     }
 }
@@ -707,7 +743,7 @@ where
         length: NonZeroPageSize<PAGE_SIZE>,
         alignment: usize,
         flags: CreatePagesFlags,
-        permissions: MemoryRegionPermissions,
+        protect: PageProtection,
         op: impl FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let writable = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
@@ -727,9 +763,9 @@ where
                 .expect("failed to release unpublished mapping");
             return Err(error);
         }
-        if permissions != writable {
+        if protect != PageProtection::PAGE_READWRITE {
             // SAFETY: The mapping is unpublished and exclusively owned during initialization.
-            if unsafe { self.protect_pages(ptr, length.as_usize(), permissions) }.is_err() {
+            if unsafe { self.protect_pages(ptr, length.as_usize(), protect) }.is_err() {
                 // SAFETY: Protection failed before publication, so the mapping has no users.
                 unsafe { self.remove_pages(ptr, length.as_usize()) }
                     .expect("failed to release unpublished mapping");
@@ -752,11 +788,11 @@ where
         &self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
-        permissions: MemoryRegionPermissions,
+        protect: PageProtection,
     ) -> Result<(), VmemProtectError> {
         let mut vmem = self.vmem.write();
         // SAFETY: The write guard provides exclusive state access and forwards the caller contract.
-        unsafe { vmem.protect_pages(ptr, len, permissions) }
+        unsafe { vmem.protect_pages(ptr, len, protect) }
     }
 
     pub(crate) unsafe fn make_pages_writable(
@@ -765,13 +801,7 @@ where
         len: usize,
     ) -> Result<(), VmemProtectError> {
         // SAFETY: Forwarded caller contract.
-        unsafe {
-            self.protect_pages(
-                ptr,
-                len,
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-            )
-        }
+        unsafe { self.protect_pages(ptr, len, PageProtection::PAGE_READWRITE) }
     }
 
     pub(crate) unsafe fn remove_pages(
@@ -781,7 +811,7 @@ where
     ) -> Result<(), VmemUnmapError> {
         let mut vmem = self.vmem.write();
         // SAFETY: The write guard provides exclusive state access and forwards the caller contract.
-        unsafe { vmem.remove_pages(ptr, len) }
+        unsafe { vmem.release_allocation(ptr.as_usize(), len) }
     }
 }
 
