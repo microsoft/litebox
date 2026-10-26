@@ -148,7 +148,12 @@ fn shared_buffer_io_is_direct_when_the_buffer_is_contiguous_raw_bytes() {
             )
             .unwrap();
         buffer.copy_from_slice_at(0, b"abcdefghijk").unwrap();
-        let direct = raw && slots == [1, 2, 3] && cfg!(target_os = "linux");
+        let direct = raw
+            && slots == [1, 2, 3]
+            && cfg!(any(
+                target_os = "linux",
+                all(windows, target_arch = "x86_64")
+            ));
         memory.copies.store(0, Ordering::Relaxed);
 
         assert_eq!(local.write(&file, &buffer, 3).unwrap(), 11);
@@ -165,6 +170,8 @@ fn shared_buffer_io_is_direct_when_the_buffer_is_contiguous_raw_bytes() {
         let mut contents = [0; 11];
         buffer.copy_to_slice_at(0, &mut contents).unwrap();
         assert_eq!(&contents, b"cdefghijkjk");
+        // A read that starts past the end reads nothing.
+        assert_eq!(local.read(&file, &mut buffer, 20).unwrap(), 0);
     }
 }
 
