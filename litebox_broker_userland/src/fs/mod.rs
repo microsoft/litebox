@@ -23,11 +23,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod io_errors;
-// On Linux, file reads and writes transfer directly between the host file and a buffer that is one
-// contiguous part of raw bytes, such as a run of a runner's shared memory. Other buffers, and all
-// buffers on other hosts, are staged through a bounce buffer.
+// On Linux and x86-64 Windows hosts, file reads and writes transfer directly between the host file
+// and a buffer that is one contiguous part of raw bytes, such as a run of a runner's shared memory.
+// Other buffers, and all buffers on other hosts, are staged through a bounce buffer.
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod windows;
 
 #[cfg(unix)]
 use io_errors::chown_error;
@@ -658,6 +660,10 @@ impl Backend for LocalFs {
         if let Some(result) = linux::read_at(file, buf, offset) {
             return result.map_err(|_| ReadError::Io);
         }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(result) = windows::read_at(file, buf, offset) {
+            return result.map_err(|_| ReadError::Io);
+        }
         let mut staged = bounce_buffer(buf.len())?;
         let result = {
             #[cfg(unix)]
@@ -692,6 +698,10 @@ impl Backend for LocalFs {
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         #[cfg(target_os = "linux")]
         if let Some(result) = linux::write_at(file, buf, offset) {
+            return result.map_err(|_| WriteError::Io);
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(result) = windows::write_at(file, buf, offset) {
             return result.map_err(|_| WriteError::Io);
         }
         let mut staged = bounce_buffer(buf.len())?;
