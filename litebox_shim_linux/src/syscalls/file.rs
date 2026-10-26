@@ -16,11 +16,10 @@ use litebox::{
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     fs::errors::OpenError,
-    process::InheritableFd,
+    process::{InheritableFd, ProcessError},
     sync::Mutex,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
     FileStatusFlags, FileType, FileUser,
@@ -28,6 +27,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalOperation, TerminalResponse, TerminalSettings,
 };
+use litebox_broker_protocol::{ObjectHandle, ProcessGroupId};
 use litebox_common_linux::{
     AccessFlags, AtFlags, CloseRangeFlags, EfdFlags, EpollCreateFlags, FcntlArg,
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, PAGE_SIZE,
@@ -2615,6 +2615,52 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(0)
     }
 
+    /// Handles a job-control ioctl, which `file` must be the controlling terminal for.
+    fn job_control_ioctl(&self, file: &File<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
+        // Like Linux, rejects the descriptor (`EBADF` for `O_PATH`, `ENOTTY` for a non-terminal)
+        // before reporting `error`.
+        let reject = |error: Errno| {
+            file.terminal_control(TerminalOperation::GetSettings, None)
+                .err()
+                .unwrap_or(error)
+        };
+        let process_error = |error: ProcessError| match error {
+            ProcessError::NotControllingTerminal => reject(Errno::ENOTTY),
+            error => error.into(),
+        };
+        let litebox = &self.global.litebox;
+        match arg {
+            IoctlArg::TIOCGPGRP(ptr) | IoctlArg::TIOCGSID(ptr) => {
+                let foreground = litebox
+                    .get_foreground_group(file.file())
+                    .map_err(process_error)?;
+                let id = if matches!(arg, IoctlArg::TIOCGPGRP(_)) {
+                    foreground.process_group.0
+                } else {
+                    foreground.session.0
+                };
+                ptr.write_at_offset::<Platform>(0, id.cast_signed())
+                    .ok_or(Errno::EFAULT)?;
+            }
+            IoctlArg::TIOCSPGRP(ptr) => {
+                let process_group = ptr
+                    .read_at_offset::<Platform>(0)
+                    .ok_or_else(|| reject(Errno::EFAULT))?;
+                if process_group < 0 {
+                    return Err(reject(Errno::EINVAL));
+                }
+                litebox
+                    .set_foreground_group(
+                        file.file(),
+                        ProcessGroupId(process_group.cast_unsigned()),
+                    )
+                    .map_err(process_error)?;
+            }
+            _ => unreachable!("non-job-control ioctl"),
+        }
+        Ok(0)
+    }
+
     /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let files = self.files.borrow();
@@ -2704,6 +2750,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let fd = fd.file_only(Errno::ENOTTY)?;
                 self.global
                     .with_file(fd, |file| self.terminal_ioctl(file, &arg))
+            }
+            IoctlArg::TIOCGPGRP(..) | IoctlArg::TIOCSPGRP(..) | IoctlArg::TIOCGSID(..) => {
+                let fd = files.typed_fd(fd)?;
+                let fd = fd.file_only(Errno::ENOTTY)?;
+                self.global
+                    .with_file(fd, |file| self.job_control_ioctl(file, &arg))
             }
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);

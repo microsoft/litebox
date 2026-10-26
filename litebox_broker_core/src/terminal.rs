@@ -53,7 +53,8 @@ pub trait TerminalEndpoint: ReadinessSource {
     /// return `WouldBlock` and later publish writable readiness.
     fn control(&self, operation: TerminalOperation) -> crate::Result<FileResult<TerminalResponse>>;
 
-    /// Attaches the initial process group once, ignoring later attachments.
+    /// Attaches the sink for the terminal's events once, ignoring later
+    /// attachments.
     fn attach(&self, sink: Arc<dyn TerminalEventSink>);
 }
 

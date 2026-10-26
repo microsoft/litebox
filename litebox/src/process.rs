@@ -13,6 +13,7 @@ use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ThreadInfo,
 };
+use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId, ThreadId};
 use litebox_platform::time::TimeProvider;
@@ -58,6 +59,15 @@ pub enum ProcessError {
     /// No process has the target process ID.
     #[error("no such process")]
     NoSuchProcess,
+    /// The file is not this process's controlling terminal.
+    #[error("not the controlling terminal")]
+    NotControllingTerminal,
+    /// No process group has the target process group ID.
+    #[error("no such process group")]
+    NoSuchProcessGroup,
+    /// The target process group is in another session than this process.
+    #[error("process group is in another session")]
+    NotInSession,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -173,6 +183,37 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn create_session(&self, process_id: ProcessId) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         broker.create_session(process_id).map_err(no_such_process)
+    }
+
+    /// Returns the foreground process group of this process's session and the
+    /// session, given its controlling terminal `terminal`.
+    ///
+    /// Returns [`ProcessError::NotControllingTerminal`] if `terminal` is not
+    /// this process's controlling terminal.
+    pub fn get_foreground_group(
+        &self,
+        terminal: &File<Platform>,
+    ) -> Result<ProcessGroupMembership, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.get_foreground_group(terminal.handle())??)
+    }
+
+    /// Moves `process_group` into the foreground of this process's controlling
+    /// terminal `terminal`, so the terminal's events go to its members.
+    ///
+    /// Returns, in order of precedence,
+    /// [`ProcessError::NotControllingTerminal`] if `terminal` is not this
+    /// process's controlling terminal, [`ProcessError::NoSuchProcessGroup`] if
+    /// no process group has the ID `process_group`, and
+    /// [`ProcessError::NotInSession`] if the process group is in another
+    /// session.
+    pub fn set_foreground_group(
+        &self,
+        terminal: &File<Platform>,
+        process_group: ProcessGroupId,
+    ) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.set_foreground_group(terminal.handle(), process_group)??)
     }
 
     /// Opens the signals other processes send to this process and the exits
@@ -402,6 +443,17 @@ fn no_such_process(error: BrokerControlError) -> ProcessError {
     match error {
         BrokerControlError::Broker(ErrorCode::UnknownObject) => ProcessError::NoSuchProcess,
         error => error.into(),
+    }
+}
+
+impl From<ProcessGroupError> for ProcessError {
+    fn from(error: ProcessGroupError) -> Self {
+        match error {
+            ProcessGroupError::NotControllingTerminal => Self::NotControllingTerminal,
+            ProcessGroupError::NoSuchProcessGroup => Self::NoSuchProcessGroup,
+            ProcessGroupError::NotInSession => Self::NotInSession,
+            _ => Self::ServiceFailed,
+        }
     }
 }
 

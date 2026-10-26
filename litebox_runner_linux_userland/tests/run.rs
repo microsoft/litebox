@@ -2943,6 +2943,29 @@ fn check_broker_tty_line_discipline(alias: bool) {
     );
 }
 
+/// The session moves the terminal's events to its foreground process group.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_runner_broker_tty_job_control() {
+    let target = common::compile("./tests/tty.c", "tty_jobs", true, false);
+    let mut runner = Runner::new(&target, "tty_jobs");
+    runner.allow_process_duplication().arg("jobs");
+    let mut pty = common::pty::Pty::open();
+    let (stdin, stdout, stderr) = pty.slave_stdio();
+    let mut child =
+        runner.spawn_with_controlling_terminal(pty.slave(), stdin, stdout, stderr, false);
+    let mut output = Vec::new();
+    pty.wait_for_output(&mut output, b"JOB READY");
+    pty.write_all(b"\x03");
+    let status = pty.wait_for_child_exit(&mut child, &mut output);
+    assert!(
+        status.success(),
+        "job-control TTY fixture failed with {status}:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(output.windows(9).any(|bytes| bytes == b"JOBS DONE"));
+}
+
 /// A piped standard stream leaves the terminal to the host: the guest has none.
 #[cfg(target_os = "linux")]
 #[test]

@@ -346,8 +346,8 @@ pub struct BrokerCore {
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) fs: Arc<dyn FileService>,
-    /// Guest terminal whose events reach the first root process's group.
-    pub(crate) terminal: Option<Arc<dyn terminal::TerminalEndpoint>>,
+    /// Guest terminal, controlling the first root process's session.
+    pub(crate) terminal: Option<Arc<process_group::ControllingTerminal>>,
     pub(crate) socket_ports: BrokerSocketPorts,
     pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
 }
@@ -421,10 +421,11 @@ impl BrokerCore {
 
     /// Makes `terminal`, which the file service serves as `/dev/tty`, the
     /// controlling terminal of the first root process's session: the terminal
-    /// then signals that process's group. Set it before sharing the core.
+    /// then signals that session's foreground process group, initially that
+    /// process's group. Set it before sharing the core.
     #[must_use]
     pub fn with_terminal(mut self, terminal: Arc<dyn terminal::TerminalEndpoint>) -> Self {
-        self.terminal = Some(terminal);
+        self.terminal = Some(Arc::new(process_group::ControllingTerminal::new(terminal)));
         self
     }
 
@@ -548,8 +549,8 @@ impl BrokerCore {
     /// Creates one process and its initial thread.
     ///
     /// If initial-thread creation fails, the process is discarded before the
-    /// error is returned. A root process's group receives the events of the
-    /// [terminal](Self::with_terminal) unless an earlier root's does.
+    /// error is returned. The first root process's session gets the
+    /// [terminal](Self::with_terminal).
     ///
     /// # Panics
     ///
@@ -564,7 +565,7 @@ impl BrokerCore {
         match process.create_initial_thread() {
             Ok(()) => {
                 if let (None, Some(terminal)) = (parent_id, &self.terminal) {
-                    terminal.attach(process_group::terminal_sink(&process));
+                    terminal.attach(&process);
                 }
                 Ok(process)
             }

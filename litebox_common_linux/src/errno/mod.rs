@@ -148,7 +148,10 @@ impl From<litebox::process::ProcessError> for Errno {
             litebox::process::ProcessError::OutOfMemory => Errno::ENOMEM,
             litebox::process::ProcessError::ServiceFailed
             | litebox::process::ProcessError::InvalidChild => Errno::EIO,
-            litebox::process::ProcessError::NoSuchProcess => Errno::ESRCH,
+            litebox::process::ProcessError::NoSuchProcess
+            | litebox::process::ProcessError::NoSuchProcessGroup => Errno::ESRCH,
+            litebox::process::ProcessError::NotControllingTerminal => Errno::ENOTTY,
+            litebox::process::ProcessError::NotInSession => Errno::EPERM,
         }
     }
 }
@@ -874,6 +877,9 @@ mod tests {
             (ProcessError::ServiceFailed, Errno::EIO),
             (ProcessError::InvalidChild, Errno::EIO),
             (ProcessError::NoSuchProcess, Errno::ESRCH),
+            (ProcessError::NotControllingTerminal, Errno::ENOTTY),
+            (ProcessError::NoSuchProcessGroup, Errno::ESRCH),
+            (ProcessError::NotInSession, Errno::EPERM),
         ];
 
         for (error, expected) in cases {

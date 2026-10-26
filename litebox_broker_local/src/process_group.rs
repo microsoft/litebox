@@ -4,11 +4,15 @@
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessGroupRequest, ProcessGroupResponse,
 };
-use litebox_broker_protocol::process_group::SetProcessGroupRequest;
-use litebox_broker_protocol::{ProcessGroupId, ProcessId};
+use litebox_broker_protocol::process_group::{
+    ProcessGroupError, ProcessGroupMembership, SetForegroundGroupRequest, SetProcessGroupRequest,
+};
+use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
+
+type ProcessGroupResult<T> = core::result::Result<T, ProcessGroupError>;
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Moves process `process_id` into `process_group`.
@@ -27,9 +31,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             process_group,
         }))? {
             ProcessGroupResponse::Set => Ok(()),
-            response @ ProcessGroupResponse::CreateSession => {
-                panic!("broker returned unexpected process group response: {response:?}")
-            }
+            response => panic!("broker returned unexpected process group response: {response:?}"),
         }
     }
 
@@ -43,9 +45,48 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn create_session(&self, process_id: ProcessId) -> Result<(), Channel::Error> {
         match self.request_process_group(ProcessGroupRequest::CreateSession(process_id))? {
             ProcessGroupResponse::CreateSession => Ok(()),
-            response @ ProcessGroupResponse::Set => {
-                panic!("broker returned unexpected process group response: {response:?}")
-            }
+            response => panic!("broker returned unexpected process group response: {response:?}"),
+        }
+    }
+
+    /// Returns the foreground process group of the caller's session and the
+    /// session, given its controlling terminal `terminal`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a protocol
+    /// response that does not match the issued process group request.
+    pub fn get_foreground_group(
+        &self,
+        terminal: ObjectHandle,
+    ) -> Result<ProcessGroupResult<ProcessGroupMembership>, Channel::Error> {
+        match self.request_process_group(ProcessGroupRequest::GetForegroundGroup(terminal))? {
+            ProcessGroupResponse::GetForegroundGroup(membership) => Ok(Ok(membership)),
+            ProcessGroupResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected process group response: {response:?}"),
+        }
+    }
+
+    /// Moves `process_group` of the caller's session into the foreground of
+    /// its controlling terminal `terminal`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a protocol
+    /// response that does not match the issued process group request.
+    pub fn set_foreground_group(
+        &self,
+        terminal: ObjectHandle,
+        process_group: ProcessGroupId,
+    ) -> Result<ProcessGroupResult<()>, Channel::Error> {
+        let request = ProcessGroupRequest::SetForegroundGroup(SetForegroundGroupRequest {
+            terminal,
+            process_group,
+        });
+        match self.request_process_group(request)? {
+            ProcessGroupResponse::SetForegroundGroup => Ok(Ok(())),
+            ProcessGroupResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected process group response: {response:?}"),
         }
     }
 

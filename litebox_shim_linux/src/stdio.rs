@@ -363,6 +363,68 @@ mod tests {
     }
 
     #[test]
+    fn test_job_control_uses_the_controlling_terminal() {
+        let task = init_platform();
+        let pid = task.sys_getpid();
+        let tty = i32::try_from(
+            task.sys_open("/dev/tty", OFlags::RDWR, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        // The first process's group starts in the foreground of its session's terminal.
+        for fd in [1, tty] {
+            for request in [IoctlArg::TIOCGPGRP, IoctlArg::TIOCGSID] {
+                let mut id = 0;
+                assert_eq!(
+                    task.sys_ioctl(fd, request(UserPtrMut::from_ptr(&raw mut id))),
+                    Ok(0)
+                );
+                assert_eq!(id, pid);
+            }
+        }
+        // Only an existing group in the session can move to the foreground.
+        for (process_group, expected) in [
+            (pid, Ok(0)),
+            (i32::MAX, Err(Errno::ESRCH)),
+            (-1, Err(Errno::EINVAL)),
+        ] {
+            assert_eq!(
+                task.sys_ioctl(
+                    tty,
+                    IoctlArg::TIOCSPGRP(UserPtr::from_ptr(&raw const process_group))
+                ),
+                expected
+            );
+        }
+        // Like Linux, the descriptor is checked before the request.
+        let (pipe, _writer) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let path = i32::try_from(
+            task.sys_open("/dev/stdout", OFlags::PATH, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        let invalid = -1;
+        for (fd, expected) in [
+            (0, Errno::ENOTTY),
+            (i32::try_from(pipe).unwrap(), Errno::ENOTTY),
+            (path, Errno::EBADF),
+        ] {
+            let mut id = 0;
+            assert_eq!(
+                task.sys_ioctl(fd, IoctlArg::TIOCGPGRP(UserPtrMut::from_ptr(&raw mut id))),
+                Err(expected)
+            );
+            assert_eq!(
+                task.sys_ioctl(
+                    fd,
+                    IoctlArg::TIOCSPGRP(UserPtr::from_ptr(&raw const invalid))
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
     fn test_unknown_ioctl_fails_with_enotty() {
         let task = init_platform();
         let mut byte = 0u8;

@@ -647,6 +647,15 @@ pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<File
     Ok(Ok(file.terminal.is_some()))
 }
 
+/// Returns the terminal that a broker-owned open object refers to, if any.
+pub(crate) fn handle_terminal(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<Option<Arc<dyn crate::terminal::TerminalEndpoint>>> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    Ok(file.terminal)
+}
+
 /// Controls a shared terminal through any open file handle that refers to it.
 ///
 /// Like Linux, every operation only requires an open handle, not a particular access mode;

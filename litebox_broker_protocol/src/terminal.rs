@@ -193,11 +193,11 @@ pub enum TerminalResponse {
 }
 
 bitflags::bitflags! {
-    /// Terminal actions delivered to the initially attached process group.
+    /// Terminal actions delivered to the terminal's foreground process group.
     ///
-    /// Repeated actions coalesce. These are not guest signal numbers.
-    /// Foreground-group switching and stop/continue are deliberately outside
-    /// this initial terminal interface.
+    /// Repeated actions coalesce. These are not guest signal numbers. Stopping
+    /// and continuing jobs, and restricting background groups' access to the
+    /// terminal, are outside this interface.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct TerminalEvents: u8 {
         /// The interrupt character was received with action generation enabled.
