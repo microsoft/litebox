@@ -108,6 +108,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         })
     }
 
+    /// The fid of the directory `handle` names, and whether it is the backend's shared root.
+    fn walked_dir(
+        &self,
+        handle: NinePWalkingDirHandle<Platform, T>,
+    ) -> Result<(Arc<OwnedFid<Platform, T>>, bool), Error> {
+        match handle.inner {
+            NinePWalkingDirHandleInner::Dir {
+                fid,
+                is_backend_root,
+            } => Ok((fid, is_backend_root)),
+            NinePWalkingDirHandleInner::StoppedAtNonDir {
+                from,
+                from_is_backend_root,
+                prefix,
+                ..
+            } => {
+                if prefix.is_empty() {
+                    return Ok((from, from_is_backend_root));
+                }
+                let fid = self.client.walk(&from.fid, &prefix)?.into_complete_fid()?;
+                Ok((self.own(fid), false))
+            }
+        }
+    }
+
     /// Remove `name` from `dir`, via `Tunlinkat` where the server supports it.
     fn remove_at(
         &self,
@@ -181,17 +206,16 @@ enum NinePWalkingDirHandleInner<
     },
     /// The walk stopped because `name` is not a directory.
     ///
-    /// No fid on the parent directory is held: 9P walks into files just fine, so the walk already
-    /// ended up with a fid on `name` itself, which is the only thing the resolver asks for here
-    /// (see [`Backend::open_file_at`](super::backend::Backend::open_file_at)).
+    /// The parent directory is kept as the walk's starting fid plus the components walked from it,
+    /// rather than a fid of its own, so it costs a walk only when actually needed (e.g. to follow a
+    /// relative symlink target).
     ///
-    /// `child` is `None` when the path continued *through* the non-directory, as a short walk
-    /// establishes no fid; the resolver turns that into `ComponentNotADirectory` without ever
-    /// using this handle.
-    // XXX: anything this handle is asked for other than `name` itself (a different child via
-    // `open_file_at`, or the directory via `into_dir`) needs a walk to the parent first; both paths
-    // are `unimplemented!()` today.
+    /// `child` is the walk's fid on `name` itself, or `None` when the path continued *through* the
+    /// non-directory, as a short walk establishes no fid.
     StoppedAtNonDir {
+        from: Arc<OwnedFid<Platform, T>>,
+        from_is_backend_root: bool,
+        prefix: Vec<String>,
         name: String,
         child: Option<Arc<OwnedFid<Platform, T>>>,
     },
@@ -202,26 +226,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 {
     fn from(inner: NinePWalkingDirHandleInner<Platform, T>) -> Self {
         Self { inner }
-    }
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    NinePWalkingDirHandle<Platform, T>
-{
-    /// The fid of the directory this handle names, and whether it is the backend's shared root.
-    fn into_dir(self) -> (Arc<OwnedFid<Platform, T>>, bool) {
-        match self.inner {
-            NinePWalkingDirHandleInner::Dir {
-                fid,
-                is_backend_root,
-            } => (fid, is_backend_root),
-            // XXX: reaching the parent directory of a walk that stopped at a non-directory would
-            // need a second walk (from the fid the walk started at, back down the prefix); nothing
-            // currently needs it, as the resolver only ever opens the child.
-            NinePWalkingDirHandleInner::StoppedAtNonDir { .. } => {
-                unimplemented!()
-            }
-        }
     }
 }
 
@@ -290,7 +294,7 @@ where
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
         assert_ne!(components, [] as [&str; 0]);
-        let (from, _) = from.into_typed::<Self>().into_dir();
+        let (from, from_is_backend_root) = self.walked_dir(from.into_typed::<Self>())?;
         // 9P walks happily into files, so the qids have to be inspected to find where this walk
         // must stop for the resolver's purposes.
         let result = self.client.walk(&from.fid, components)?;
@@ -335,6 +339,12 @@ where
             components: backend_checked_components(stopped_at),
             last: WalkingDirHandle::from_typed::<Self>(
                 NinePWalkingDirHandleInner::StoppedAtNonDir {
+                    from,
+                    from_is_backend_root,
+                    prefix: components[..stopped_at]
+                        .iter()
+                        .map(|&part| String::from(part))
+                        .collect(),
                     name: String::from(components[stopped_at]),
                     child,
                 }
@@ -346,10 +356,28 @@ where
         })
     }
 
-    fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
-        // TODO: support `Treadlink` once `qid_type_to_file_type` reports symlinks.
-        litebox_util_log::debug!(name:? = name; "9P symlink targets are not yet readable");
-        Err(PathError::InvalidPathname.into())
+    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
+        let walked;
+        let fid = match &dir.as_typed::<Self>().inner {
+            NinePWalkingDirHandleInner::StoppedAtNonDir {
+                name: stopped,
+                child: Some(child),
+                ..
+            } if stopped == name => child,
+            NinePWalkingDirHandleInner::StoppedAtNonDir { from, prefix, .. } => {
+                let path: Vec<&str> = prefix.iter().map(String::as_str).chain([name]).collect();
+                walked = self.own(self.client.walk(&from.fid, &path)?.into_complete_fid()?);
+                &walked
+            }
+            NinePWalkingDirHandleInner::Dir { fid, .. } => {
+                walked = self.own(self.client.walk(&fid.fid, &[name])?.into_complete_fid()?);
+                &walked
+            }
+        };
+        let target = self.client.readlink(&fid.fid)?;
+        // Targets are passed through unchanged: an absolute target resolves from the guest root,
+        // which is wherever this export is mounted.
+        String::from_utf8(target).map_err(|_| PathError::InvalidPathname.into())
     }
 
     fn owned_dir_at(
@@ -358,7 +386,7 @@ where
         flags: OFlags,
     ) -> Result<DirHandle, OpenError> {
         assert_supported_oflags(flags);
-        let (fid, is_backend_root) = dir.into_typed::<Self>().into_dir();
+        let (fid, is_backend_root) = self.walked_dir(dir.into_typed::<Self>())?;
         if flags.contains(OFlags::PATH) {
             // An `O_PATH` handle is never opened server-side, so the walked fid can be handed over
             // as-is, even when it is the shared root fid.
@@ -408,9 +436,10 @@ where
             NinePWalkingDirHandleInner::StoppedAtNonDir {
                 name: walked,
                 child: Some(child),
+                ..
             } if walked == name => child,
-            NinePWalkingDirHandleInner::StoppedAtNonDir { .. } => unimplemented!("{name}"),
-            NinePWalkingDirHandleInner::Dir { fid, .. } => {
+            inner => {
+                let (fid, _) = self.walked_dir(inner.into())?;
                 self.own(self.client.walk(&fid.fid, &[name])?.into_complete_fid()?)
             }
         };
@@ -702,11 +731,9 @@ fn oflags_to_lopen(flags: OFlags) -> fcall::LOpenFlags {
 fn qid_type_to_file_type(qid_type: fcall::QidType) -> super::FileType {
     if qid_type.contains(fcall::QidType::DIR) {
         super::FileType::Directory
+    } else if qid_type.contains(fcall::QidType::SYMLINK) {
+        super::FileType::SymbolicLink
     } else {
-        if qid_type.contains(fcall::QidType::SYMLINK) {
-            // TODO: report `SymbolicLink` once `read_link_at` supports `Treadlink`.
-            litebox_util_log::debug!("9P symlink treated as a regular file");
-        }
         super::FileType::RegularFile
     }
 }

@@ -646,6 +646,18 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
     }
 
+    /// Read the target of the symbolic link represented by fid.
+    pub(super) fn readlink(&self, fid: &Fid<Platform>) -> Result<Vec<u8>, Error> {
+        self.fcall(
+            Fcall::Treadlink(fcall::Treadlink { fid: fid.id() }),
+            |response| match response {
+                Fcall::Rreadlink(fcall::Rreadlink { target }) => Ok(target.into_owned()),
+                Fcall::Rlerror(e) => Err(Error::from(e)),
+                _ => Err(Error::InvalidResponse),
+            },
+        )
+    }
+
     /// Remove the file represented by fid and clunk the fid, even if the remove fails.
     pub(super) fn remove(&self, fid: Fid<Platform>) -> Result<(), Error> {
         self.fcall(
