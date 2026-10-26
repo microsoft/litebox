@@ -699,9 +699,9 @@ impl From<litebox::event::timer::TimerError> for Errno {
     }
 }
 
-impl From<litebox::shared_futex::SharedFutexError> for Errno {
-    fn from(value: litebox::shared_futex::SharedFutexError) -> Self {
-        use litebox::shared_futex::SharedFutexError;
+impl From<litebox::sync::futex::shared::SharedFutexError> for Errno {
+    fn from(value: litebox::sync::futex::shared::SharedFutexError) -> Self {
+        use litebox::sync::futex::shared::SharedFutexError;
         match value {
             SharedFutexError::ResourceExhausted => Errno::ENOMEM,
             SharedFutexError::PermissionDenied => Errno::EACCES,

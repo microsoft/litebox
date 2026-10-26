@@ -9,7 +9,6 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
-use litebox::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
@@ -20,6 +19,7 @@ use litebox::{
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
+use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 
 use crate::PAGE_SIZE;
 
@@ -113,6 +113,9 @@ where
     ///
     /// `allowed_range` optionally restricts placement of the entire mapping.
     ///
+    /// `shared_memory`, if given, names the memory that shared anonymous pages map from their
+    /// start.
+    ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
     /// # Safety
@@ -122,40 +125,11 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter configures the mapping"
+    )]
     unsafe fn create_pages<F>(
-        &self,
-        suggested_address: Option<NonZeroAddress<ALIGN>>,
-        length: NonZeroPageSize<ALIGN>,
-        flags: CreatePagesFlags,
-        permissions: (MemoryRegionPermissions, MemoryRegionPermissions),
-        allowed_range: Option<Range<usize>>,
-        op: F,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
-    where
-        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
-    {
-        // SAFETY: The caller supplies the same guarantees as this method.
-        unsafe {
-            self.create_shared_pages(
-                suggested_address,
-                length,
-                flags,
-                permissions,
-                allowed_range,
-                None,
-                op,
-            )
-        }
-    }
-
-    /// Same as [`Self::create_pages`], but names the shared memory that shared anonymous pages
-    /// map, if `shared_memory` is given.
-    ///
-    /// # Safety
-    ///
-    /// Same as [`Self::create_pages`].
-    #[expect(clippy::too_many_arguments, reason = "mirrors `create_pages`")]
-    unsafe fn create_shared_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
@@ -243,6 +217,7 @@ where
                     permissions,
                 ),
                 allowed_range,
+                None,
                 op,
             )
         }
@@ -285,6 +260,7 @@ where
                     MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
                 ),
                 None,
+                None,
                 op,
             )
         }
@@ -316,7 +292,17 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        unsafe { self.create_pages(suggested_address, length, flags, (perms, perms), None, op) }
+        unsafe {
+            self.create_pages(
+                suggested_address,
+                length,
+                flags,
+                (perms, perms),
+                None,
+                None,
+                op,
+            )
+        }
     }
 
     /// Create read-only pages.
@@ -355,6 +341,7 @@ where
                     // keep READ, turn off WRITE
                     MemoryRegionPermissions::READ,
                 ),
+                None,
                 None,
                 op,
             )
@@ -396,6 +383,7 @@ where
                     MemoryRegionPermissions::empty(),
                 ),
                 None,
+                None,
                 op,
             )
         }
@@ -428,6 +416,7 @@ where
                 length,
                 flags,
                 (perms, perms),
+                None,
                 None,
                 |_| Ok(0),
             )
@@ -946,26 +935,18 @@ where
     /// Creates an anonymous or file-backed mapping with Linux `mmap` semantics.
     ///
     /// `placement` controls the allocation direction and optional address bounds.
+    /// `shared_memory`, if given, names the memory a shared anonymous mapping maps from its
+    /// start, so that [`Self::shared_futex_key`] keys its futexes by it.
     /// `op` initializes the mapping while it is writable;
     /// its error removes the new mapping. A file-backed mapping is expected to be filled with the
     /// file's contents from its start, so the platform is hinted to back it with larger pages.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter configures the mapping"
+    )]
     pub fn do_mmap(
         &self,
-        suggested_addr: Option<usize>,
-        len: usize,
-        prot: ProtFlags,
-        flags: MapFlags,
-        placement: MmapPlacement,
-        op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
-    ) -> Result<UserPtrMut<u8>, MappingError> {
-        self.do_mmap_shared(suggested_addr, len, prot, flags, placement, None, op)
-    }
 
-    /// Same as [`Self::do_mmap`], but names `shared_memory` as the memory a shared anonymous
-    /// mapping maps from its start, so that [`Self::shared_futex_key`] keys its futexes by it.
-    #[expect(clippy::too_many_arguments, reason = "mirrors `do_mmap`")]
-    pub fn do_mmap_shared(
-        &self,
         suggested_addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
@@ -1008,7 +989,7 @@ where
         };
         // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the mapping.
         unsafe {
-            self.create_shared_pages(
+            self.create_pages(
                 suggested_addr,
                 length,
                 flags,

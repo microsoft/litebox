@@ -2816,7 +2816,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         addr: UserPtrMut<u32>,
         flags: &litebox_common_linux::FutexFlags,
-    ) -> Option<litebox::shared_futex::SharedFutexKey> {
+    ) -> Option<litebox_broker_protocol::shared_futex::SharedFutexKey> {
         if flags.contains(litebox_common_linux::FutexFlags::PRIVATE) {
             None
         } else {
@@ -2868,11 +2868,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// first use.
     fn get_or_create_shared_futex_waiter(
         &self,
-    ) -> Result<&litebox::shared_futex::SharedFutexWaiter<Platform>, Errno> {
+    ) -> Result<&litebox::sync::futex::shared::SharedFutexWaiter<Platform>, Errno> {
         if let Some(waiter) = self.shared_futex_waiter.get() {
             return Ok(waiter);
         }
-        let waiter = litebox::shared_futex::SharedFutexWaiter::new(
+        let waiter = litebox::sync::futex::shared::SharedFutexWaiter::new(
             &self.global.litebox,
             self.wait_cx().waker(),
         )

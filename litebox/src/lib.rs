@@ -26,7 +26,6 @@ pub mod pipes;
 pub mod platform;
 pub mod process;
 pub mod random;
-pub mod shared_futex;
 pub mod shim;
 pub mod sync;
 pub mod thread;

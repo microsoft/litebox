@@ -19,7 +19,7 @@ use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use litebox_broker_protocol::ObjectHandle;
-pub use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
+use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 

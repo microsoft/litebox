@@ -40,7 +40,8 @@ pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) 
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    #[inline]
+    /// Creates a mapping, naming the memory of a shared anonymous mapping, which keys its
+    /// futexes.
     pub(crate) fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
@@ -49,22 +50,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MapFlags,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
-        self.do_mmap_shared(suggested_addr, len, prot, flags, None, op)
-    }
-
-    /// Same as [`Self::do_mmap`], but names the shared memory a shared anonymous mapping maps,
-    /// which keys its futexes.
-    fn do_mmap_shared(
-        &self,
-        suggested_addr: Option<usize>,
-        len: usize,
-        prot: ProtFlags,
-        flags: MapFlags,
-        shared_memory: Option<litebox::shared_futex::SharedMemoryId>,
-        op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
-    ) -> Result<UserPtrMut<u8>, MappingError> {
+        let shared_memory = if flags.contains(MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS) {
+            self.new_shared_memory_id()?
+        } else {
+            None
+        };
         let fixed_start = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED));
-        self.global.mm.do_mmap_shared(
+        self.global.mm.do_mmap(
             suggested_addr,
             len,
             prot,
@@ -215,20 +207,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         if flags.contains(MapFlags::MAP_ANONYMOUS) {
-            let shared_memory = if flags.contains(MapFlags::MAP_SHARED) {
-                self.new_shared_memory_id()?
-            } else {
-                None
-            };
-            self.do_mmap_shared(
-                suggested_addr,
-                aligned_len,
-                prot,
-                flags,
-                shared_memory,
-                |_| Ok(0),
-            )
-            .map_err(Errno::from)
+            self.do_mmap(suggested_addr, aligned_len, prot, flags, |_| Ok(0))
+                .map_err(Errno::from)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }

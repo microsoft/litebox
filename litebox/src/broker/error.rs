@@ -9,8 +9,8 @@ use crate::event::{
     counter::EventCounterError, polling::TryOpError, readiness_queue::ReadinessQueueError,
     timer::TimerError,
 };
-use crate::shared_futex::SharedFutexError;
 use crate::sync::futex::FutexError;
+use crate::sync::futex::shared::SharedFutexError;
 
 /// Error returned by the deployment-provided broker control path.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]

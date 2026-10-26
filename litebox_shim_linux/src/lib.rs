@@ -457,7 +457,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform: self.platform,
             mm: self.memory_manager,
             futex_manager: FutexManager::new(),
-            shared_memory_ids: litebox::shared_futex::SharedMemoryIds::new(),
+            shared_memory_ids: litebox::sync::futex::shared::SharedMemoryIds::new(),
             boot_time: self.platform.now(),
             process_id: self.process_id,
             litebox,
@@ -1661,7 +1661,7 @@ struct GlobalState<Platform: ShimPlatform> {
     /// Names the shared memory behind guest shared anonymous mappings, which keys their futexes.
     ///
     /// A native fork child gets its own, while inheriting the names of the parent's mappings.
-    shared_memory_ids: litebox::shared_futex::SharedMemoryIds,
+    shared_memory_ids: litebox::sync::futex::shared::SharedMemoryIds,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.
@@ -1679,7 +1679,8 @@ struct Task<Platform: ShimPlatform> {
     litebox_thread: Cell<Option<litebox::thread::Thread>>,
     wait_state: wait::WaitState<Platform>,
     /// This thread's waiter for futexes in shared memory, created on first use.
-    shared_futex_waiter: core::cell::OnceCell<litebox::shared_futex::SharedFutexWaiter<Platform>>,
+    shared_futex_waiter:
+        core::cell::OnceCell<litebox::sync::futex::shared::SharedFutexWaiter<Platform>>,
     thread: syscalls::process::ThreadState<Platform>,
     vfork: RefCell<Option<VforkState<Platform>>>,
     /// Process ID

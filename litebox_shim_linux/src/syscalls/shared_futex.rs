@@ -10,8 +10,9 @@
 //! futex word's offset in the memory, as Linux keys shared futexes by their backing object.
 //! Every other futex stays in the process's private futex manager.
 
-use litebox::shared_futex::{SharedFutexError, SharedMemoryId};
-use litebox_common_linux::errno::Errno;
+use litebox::sync::futex::shared::SharedFutexError;
+use litebox_broker_protocol::shared_futex::SharedMemoryId;
+use litebox_common_linux::vmem::MappingError;
 
 use crate::{ShimPlatform, Task};
 
@@ -19,12 +20,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns a new name for the memory of a shared anonymous mapping, or `None` without a
     /// broker, as then no other process can share the memory either.
     ///
-    /// Fails with `ENOMEM`, as `mmap` reports any failure to back a mapping, if the broker fails.
-    pub(super) fn new_shared_memory_id(&self) -> Result<Option<SharedMemoryId>, Errno> {
+    /// Fails with [`MappingError::OutOfMemory`], as `mmap` reports any failure to back a mapping
+    /// with `ENOMEM`, if the broker fails.
+    pub(super) fn new_shared_memory_id(&self) -> Result<Option<SharedMemoryId>, MappingError> {
         match self.global.shared_memory_ids.allocate(&self.global.litebox) {
             Ok(id) => Ok(Some(id)),
             Err(SharedFutexError::Unavailable) => Ok(None),
-            Err(_) => Err(Errno::ENOMEM),
+            Err(_) => Err(MappingError::OutOfMemory),
         }
     }
 }
@@ -35,7 +37,7 @@ mod tests {
 
     use core::time::Duration;
 
-    use litebox::shared_futex::SharedFutexKey;
+    use litebox_broker_protocol::shared_futex::SharedFutexKey;
     use litebox_common_linux::errno::Errno;
     use litebox_common_linux::{
         FutexArgs, FutexFlags, MRemapFlags, MadviseBehavior, MapFlags, PAGE_SIZE, ProtFlags,

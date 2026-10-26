@@ -24,10 +24,12 @@ use crate::utils::TruncateExt as _;
 use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 
+pub mod shared;
+
 /// A manager of all available futexes.
 ///
 /// This only supports futexes private to one process, keyed by address. Futexes in memory shared
-/// with other processes use [`crate::shared_futex`] instead.
+/// with other processes use [`shared`] instead.
 pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
     /// Chaining hash table to map from futex address to waiter lists.
     table: alloc::boxed::Box<[LoanList<Platform, FutexEntry<Platform>>; HASH_TABLE_ENTRIES]>,
@@ -169,7 +171,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
 }
 
 /// Errors from futex operations, whether private ([`FutexManager`]) or in shared memory
-/// ([`crate::shared_futex`]).
+/// ([`shared`]).
 #[derive(Debug, Error)]
 pub enum FutexError {
     #[error("address not correctly aligned to 4-bytes")]

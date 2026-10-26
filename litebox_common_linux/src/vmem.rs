@@ -27,7 +27,7 @@ use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
     page_mgmt::{DeallocationError, PageReservation, PermissionUpdateError, ReservationStore},
 };
-use litebox::shared_futex::{SharedFutexKey, SharedMemoryId};
+use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 
 use crate::PAGE_SIZE;
 
