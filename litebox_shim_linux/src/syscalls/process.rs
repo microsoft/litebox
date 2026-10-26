@@ -4691,6 +4691,7 @@ mod fork_tests {
                 program_break: 0,
                 regions: Vec::new(),
                 fds: Vec::new(),
+                shared_memory: Vec::new(),
             };
             let shim = crate::LinuxShim(task.global.clone());
             let thread = task.global.litebox.create_thread().unwrap();
