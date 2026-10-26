@@ -31,7 +31,7 @@ mod guest_vector_state {
         if #[cfg(target_arch = "x86_64")] {
             pub type Selected = litebox::arch::x86_64::xstate::XsaveArea;
         } else if #[cfg(target_arch = "aarch64")] {
-            pub type Selected = crate::signal::aarch64::GuestVectorState;
+            pub type Selected = litebox::arch::aarch64::vector::VectorArea;
         } else {
             pub type Selected = ();
         }
@@ -1687,6 +1687,9 @@ pub struct TaskParams {
     pub cwd: Option<alloc::string::String>,
     /// The file mode creation mask inherited from the parent, or `None` to start with `0o022`.
     pub umask: Option<u32>,
+    /// Whether the initial thread starts with `PR_SVE_VL_INHERIT` set, as kept across `execve`.
+    #[cfg(target_arch = "aarch64")]
+    pub sve_vl_inherit: bool,
 }
 
 #[repr(C)]
@@ -2223,6 +2226,24 @@ pub enum PrctlOption {
     SetFpMode = 45,
     GetFpMode = 46,
     CapAmbient = 47,
+    /// PR_SVE_SET_VL
+    #[cfg(target_arch = "aarch64")]
+    SveSetVl = 50,
+    /// PR_SVE_GET_VL
+    #[cfg(target_arch = "aarch64")]
+    SveGetVl = 51,
+}
+
+#[cfg(target_arch = "aarch64")]
+bitflags::bitflags! {
+    /// Flags of `prctl(PR_SVE_SET_VL)` alongside the vector length in bits 0-15.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SveSetVlFlags: usize {
+        /// `PR_SVE_VL_INHERIT`: keep the vector length across `execve`.
+        const INHERIT = 1 << 17;
+        /// `PR_SVE_SET_VL_ONEXEC`: defer the change until the next `execve`.
+        const ONEXEC = 1 << 18;
+    }
 }
 
 #[non_exhaustive]
@@ -2235,6 +2256,15 @@ pub enum PrctlArg {
     SetChildSubreaper(usize),
     /// PR_GET_CHILD_SUBREAPER: read whether this process adopts orphaned descendants
     GetChildSubreaper(UserPtrMut<i32>),
+    /// PR_SVE_SET_VL: request vector length `vl` in bytes
+    #[cfg(target_arch = "aarch64")]
+    SveSetVl {
+        vl: u16,
+        flags: SveSetVlFlags,
+    },
+    /// PR_SVE_GET_VL
+    #[cfg(target_arch = "aarch64")]
+    SveGetVl,
 }
 
 #[repr(i32)]
@@ -3350,6 +3380,20 @@ impl SyscallRequest {
                         },
                         PrctlOption::GetChildSubreaper => SyscallRequest::Prctl {
                             args: PrctlArg::GetChildSubreaper(ctx.sys_req_ptr(1)),
+                        },
+                        #[cfg(target_arch = "aarch64")]
+                        PrctlOption::SveSetVl => {
+                            let arg: usize = ctx.sys_req_arg(1);
+                            let vl: u16 = arg.trunc();
+                            let flags = SveSetVlFlags::from_bits(arg & !usize::from(u16::MAX))
+                                .ok_or(errno::Errno::EINVAL)?;
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SveSetVl { vl, flags },
+                            }
+                        }
+                        #[cfg(target_arch = "aarch64")]
+                        PrctlOption::SveGetVl => SyscallRequest::Prctl {
+                            args: PrctlArg::SveGetVl,
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));

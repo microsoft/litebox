@@ -66,6 +66,7 @@
 
 pub mod gate;
 pub mod recovery;
+pub mod sve;
 use crate::{Error, Result, TargetHost};
 use alloc::format;
 use alloc::vec::Vec;
@@ -712,6 +713,11 @@ pub enum X18Unsupported {
     ExclusiveAtomic,
     EncodingLayout,
     DecodeFailure,
+    /// The instruction follows a `MOVPRFX`, which must immediately precede it.
+    /// The trap that replaces such a site also follows the `MOVPRFX`, so the
+    /// CPU may raise an Undefined Instruction exception (SIGILL) instead of the
+    /// breakpoint. Either way, the x18 instruction does not run.
+    MovprfxSuccessor,
 }
 
 /// Decodes the deliberately narrow pair family supported by the
@@ -809,6 +815,10 @@ fn select_x18_scratches(instruction: &DecodedInstruction) -> Option<(u8, u8)> {
     for operand in &instruction.operands {
         mark_operand_registers(operand, &mut used);
     }
+    unused_x18_scratches(&used)
+}
+
+fn unused_x18_scratches(used: &[bool; 32]) -> Option<(u8, u8)> {
     let mut available = (7u8..=17)
         .rev()
         .filter(|register| !used[usize::from(*register)]);
@@ -836,10 +846,6 @@ fn x18_fixed_gate_can_execute(instruction: &DecodedInstruction) -> bool {
 }
 
 fn has_possible_x18_field(word: u32) -> bool {
-    // Exclude vector-only SVE ADD, but retain scalar SVE x18 detection.
-    if word & 0xFF20_FC00 == 0x0420_0000 {
-        return false;
-    }
     [0, 5, 10, 16]
         .into_iter()
         .any(|shift| (word >> shift) & REG_MASK == u32::from(X18))
@@ -1001,6 +1007,9 @@ pub fn classify_x18(word: u32) -> X18Classification {
         ));
     }
     let Some(instruction) = decode_instruction(word) else {
+        if let Some(fields) = sve::gpr_fields(word) {
+            return classify_sve_x18(word, fields);
+        }
         return if has_possible_x18_field(word) {
             X18Classification::X18(X18TransformResult::Unsupported(
                 X18Unsupported::DecodeFailure,
@@ -1037,6 +1046,46 @@ pub fn classify_x18(word: u32) -> X18Classification {
             X18TransformResult::Unsupported(X18Unsupported::EncodingLayout),
         ),
     }
+}
+
+fn classify_sve_x18(word: u32, fields: &'static [sve::GprField]) -> X18Classification {
+    let unsupported = X18Classification::X18(X18TransformResult::Unsupported(
+        X18Unsupported::EncodingLayout,
+    ));
+    if fields
+        .iter()
+        .all(|field| field.register(word) != X18_ENCODED)
+    {
+        return X18Classification::None;
+    }
+    // The gate cannot restore its frame after an SP write.
+    if fields.iter().any(|field| {
+        field.register31 == sve::Register31::StackPointerDestination && field.register(word) == SP
+    }) {
+        return unsupported;
+    }
+    let mut used = [false; 32];
+    for field in fields {
+        used[usize::from(field.register(word))] = true;
+    }
+    let Some((scratch, anchor_scratch)) = unused_x18_scratches(&used) else {
+        return unsupported;
+    };
+    let substituted = fields
+        .iter()
+        .filter(|field| field.register(word) == X18_ENCODED)
+        .fold(word, |substituted, field| {
+            substituted & !(REG_MASK << field.shift) | u32::from(scratch) << field.shift
+        });
+    if sve::gpr_fields(substituted) != Some(fields) {
+        return unsupported;
+    }
+    X18Classification::X18(X18TransformResult::Supported(X18Substitution {
+        word: substituted,
+        scratch,
+        anchor_scratch,
+        pc_relative: None,
+    }))
 }
 
 pub fn classify_x18_conditional_branch(word: u32, vaddr: u64) -> Option<X18CompareBranch> {
@@ -2473,26 +2522,133 @@ mod tests {
     }
     #[test]
     fn x18_decoder_failure_fallback_table() {
+        let decode_failure = X18Classification::X18(X18TransformResult::Unsupported(
+            X18Unsupported::DecodeFailure,
+        ));
         for (word, expected) in [
-            (
-                0xffff_fff2,
-                X18Classification::X18(X18TransformResult::Unsupported(
-                    X18Unsupported::DecodeFailure,
-                )),
-            ),
+            (0xffff_fff2, decode_failure),
             (0xffff_ffff, X18Classification::None),
-            (0x0420_e3e7, X18Classification::None), // SVE cntb
-            (0x2522_1ce1, X18Classification::None), // SVE whilelo
-            (0x04e1_0012, X18Classification::None), // SVE add z18.d, z0.d, z1.d
-            (0x0432_0252, X18Classification::None), // SVE add z18.b, z18.b, z18.b
-            (0x0472_0252, X18Classification::None), // SVE add z18.h, z18.h, z18.h
-            (0x04b2_0252, X18Classification::None), // SVE add z18.s, z18.s, z18.s
-            (0x04f2_0252, X18Classification::None), // SVE add z18.d, z18.d, z18.d
-            (0xa400_a020, X18Classification::None), // SVE ld1b
-            (0xe400_e060, X18Classification::None), // SVE st1b
+            // SME-only encodings in the SVE space.
+            (0x0432_5832, decode_failure), // addsvl x18, x18, #1
+            (0x0472_5820, decode_failure), // addspl x0, x18, #1
+            (0x04bf_5832, decode_failure), // rdsvl x18, #1
+            (0x04bf_5820, X18Classification::None), // rdsvl x0, #1
         ] {
             assert_eq!(classify_x18(word), expected, "word {word:#010x}");
         }
+    }
+    #[test]
+    fn sve_x18_substitution_table() {
+        let default_scratches = [
+            (0x04e1_4640, 0x04e1_4620), // index z0.d, x18, #1
+            (0x04f2_4820, 0x04f1_4820), // index z0.d, #1, x18
+            (0x04f2_4e40, 0x04f1_4e20), // index z0.d, x18, x18
+            (0x0432_5052, 0x0431_5051), // addvl x18, x18, #2
+            (0x047f_5032, 0x047f_5031), // addpl x18, sp, #1
+            (0x04bf_5032, 0x04bf_5031), // rdvl x18, #1
+            (0x04e2_e3f2, 0x04e2_e3f1), // cntd x18, all, mul #3
+            (0x0430_e492, 0x0430_e491), // decb x18, vl4
+            (0x0420_f3f2, 0x0420_f3f1), // sqincb x18, w18
+            (0x0460_fff2, 0x0460_fff1), // uqdech w18
+            (0x05e0_3a40, 0x05e0_3a20), // mov z0.d, x18
+            (0x05e8_a240, 0x05e8_a220), // mov z0.d, p0/m, x18
+            (0x05e4_3a40, 0x05e4_3a20), // insr z0.d, x18
+            (0x05e0_a012, 0x05e0_a011), // lasta x18, p0, z0.d
+            (0x05f0_a012, 0x05f0_a011), // clasta x18, p0, x18, z0.d
+            (0x25b2_0400, 0x25b1_0400), // whilelt p0.s, w0, w18
+            (0x2532_3010, 0x2531_3010), // whilerw p0.b, x0, x18
+            (0x2520_4e50, 0x2520_4e30), // whilelo pn8.b, x18, x0, vlx2
+            (0x2520_5e50, 0x2520_5e30), // whilelo { p0.b, p1.b }, x18, x0
+            (0x25e0_2240, 0x25e0_2220), // ctermeq x18, x0
+            (0x2520_8032, 0x2520_8031), // cntp x18, p0, p1.b
+            (0x2520_8312, 0x2520_8311), // cntp x18, pn8.b, vlx2
+            (0x252c_8812, 0x252c_8811), // incp x18, p0.b
+            (0x2528_8812, 0x2528_8811), // sqincp x18, p0.b, w18
+            (0x8541_c240, 0x8541_c220), // ld1rw { z0.s }, p0/z, [x18, #4]
+            (0x8580_4640, 0x8580_4620), // ldr z0, [x18, #1, mul vl]
+            (0x8521_4240, 0x8521_4220), // ld1w { z0.s }, p0/z, [x18, z1.s, uxtw #2]
+            (0x8412_c000, 0x8411_c000), // prfb pldl1keep, p0, [x0, x18]
+            (0x8512_a020, 0x8511_a020), // ldnt1w { z0.s }, p0/z, [z1.s, x18]
+            (0xa5e0_4240, 0xa5e0_4220), // ld1d { z0.d }, p0/z, [x18, x0, lsl #3]
+            (0xa401_2240, 0xa401_2220), // ld1rqb { z0.b }, p0/z, [x18, #16]
+            (0xa5a1_e240, 0xa5a1_e220), // ld2d { z0.d, z1.d }, p0/z, [x18, #2, mul vl]
+            (0xa5f2_43e0, 0xa5f1_43e0), // ld1d { z0.d }, p0/z, [sp, x18, lsl #3]
+            (0xc5e1_c240, 0xc5e1_c220), // ld1d { z0.d }, p0/z, [x18, z1.d, lsl #3]
+            (0xc592_c020, 0xc591_c020), // ldnt1d { z0.d }, p0/z, [z1.d, x18]
+            (0xe580_0640, 0xe580_0620), // str p0, [x18, #1, mul vl]
+            (0xe460_0240, 0xe460_0220), // st2q { z0.q, z1.q }, p0, [x18, x0, lsl #4]
+            (0xe592_2020, 0xe591_2020), // stnt1d { z0.d }, p0, [z1.d, x18]
+            (0xe5f2_4000, 0xe5f1_4000), // st1d { z0.d }, p0, [x0, x18, lsl #3]
+            (0xe5a1_a240, 0xe5a1_a220), // st1d { z0.d }, p0, [x18, z1.d, lsl #3]
+            (0xe5e1_e240, 0xe5e1_e220), // st1d { z0.d }, p0, [x18, #1, mul vl]
+            (0xa040_6240, 0xa040_6220), // ld1d { z0.d, z1.d }, pn8/z, [x18]
+            (0xa012_6000, 0xa011_6000), // ld1d { z0.d, z1.d }, pn8/z, [x0, x18, lsl #3]
+            (0xa061_6240, 0xa061_6220), // st1d { z0.d, z1.d }, pn8, [x18, #2, mul vl]
+            (0xa140_6240, 0xa140_6220), // ld1d { z0.d, z8.d }, pn8/z, [x18]
+            (0xa032_8241, 0xa031_8221), // stnt1b { z0.b - z3.b }, pn8, [x18, x18]
+        ]
+        .map(|(word, transformed)| (word, transformed, 17, 16));
+        // Scratches avoid the instruction's other registers.
+        let avoided_scratches = [
+            (0x25f2_1e20, 0x25f0_1e20, 16, 15), // whilelo p0.d, x17, x18
+            (0xe5f2_4200, 0xe5f1_4200, 17, 15), // st1d { z0.d }, p0, [x16, x18, lsl #3]
+        ];
+        for (word, transformed, scratch, anchor_scratch) in
+            default_scratches.into_iter().chain(avoided_scratches)
+        {
+            assert_eq!(
+                classify_x18(word),
+                X18Classification::X18(X18TransformResult::Supported(X18Substitution {
+                    word: transformed,
+                    scratch,
+                    anchor_scratch,
+                    pc_relative: None,
+                })),
+                "word {word:#010x}"
+            );
+        }
+    }
+    #[test]
+    fn sve_x18_lookalike_fields_are_not_x18() {
+        for word in [
+            0x8580_4802, // ldr z2, [x0, #2, mul vl]
+            0x8580_4812, // ldr z18, [x0, #2, mul vl]
+            0xe580_4872, // str z18, [x3, #2, mul vl]
+            0x04e1_0012, // add z18.d, z0.d, z1.d
+            0x0432_0252, // add z18.b, z18.b, z18.b
+            0x04f2_0252, // add z18.d, z18.d, z18.d
+            0x25f8_c252, // mov z18.d, #18
+            0x8400_e240, // prfb pldl1keep, p0, [z18.s]
+            0xc5b2_ca52, // ld1d { z18.d }, p2/z, [z18.d, #144]
+            0xe5c1_a240, // st1d { z0.d }, p0, [z18.d, #8]
+            0x0420_bc32, // movprfx z18, z1
+            0x0420_e3e7, // cntb x7
+            0x2522_1ce1, // whilelo p1.b, x7, x2
+            0xa400_a020, // ld1b { z0.b }, p0/z, [x1]
+            0xa040_6012, // ld1d { z18.d, z19.d }, pn8/z, [x0]
+        ] {
+            assert_eq!(
+                classify_x18(word),
+                X18Classification::None,
+                "word {word:#010x}"
+            );
+        }
+    }
+    #[test]
+    fn sve_x18_sp_destination_is_unsupported() {
+        for word in [
+            0x0432_503f, // addvl sp, x18, #1
+            0x0472_503f, // addpl sp, x18, #1
+        ] {
+            assert_eq!(
+                classify_x18(word),
+                X18Classification::X18(X18TransformResult::Unsupported(
+                    X18Unsupported::EncodingLayout
+                )),
+                "word {word:#010x}"
+            );
+        }
+        assert_eq!(classify_x18(0x043f_503f), X18Classification::None); // addvl sp, sp, #1
     }
     #[test]
     fn decoder_fallback_does_not_treat_mov_immediate_as_x18() {

@@ -495,6 +495,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             inherited_fds,
             cwd,
             umask,
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit,
         } = task;
         if pid != self.0.process_id {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
@@ -545,6 +547,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 signals: syscalls::signal::SignalState::inherited(blocked_signals, ignored_signals),
             },
         };
+        #[cfg(target_arch = "aarch64")]
+        entrypoints.task.thread.sve_vl_inherit.set(sve_vl_inherit);
         // A program started by `execve` keeps an ignored `SIGCHLD`, while the broker starts
         // each process without child reaping.
         if entrypoints.task.signals.reaps_children() {
@@ -633,6 +637,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             alternate_signal_stack,
             registers,
             vector_state,
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit,
             thread_pointer,
             syscall_entry_point,
             set_child_tid,
@@ -645,6 +651,11 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         let pid = self.0.process_id;
         if syscall_entry_point != self.0.platform.get_syscall_entry_point() {
             return Err(ForkRestoreError::IncompatibleRunner);
+        }
+        // Restoring keeps this runner's VL, but the duplicated guest code runs at the parent's.
+        #[cfg(target_arch = "aarch64")]
+        if vector_state.sve_vl() != self.0.platform.get_guest_sve_vl() {
+            return Err(ForkRestoreError::SveVectorLengthMismatch);
         }
 
         restore_memory(&self.0.mm, &regions)?;
@@ -672,6 +683,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         fs_state.set_umask(umask);
 
         let thread = syscalls::process::ThreadState::new_process(pid, Some(initial_thread));
+        #[cfg(target_arch = "aarch64")]
+        thread.sve_vl_inherit.set(sve_vl_inherit);
         thread.set_forked_init_state(
             registers,
             vector_state,
@@ -758,6 +771,10 @@ pub enum ForkRestoreError {
     /// The runner's code addresses differ from the parent's runner.
     #[error("the runner's address layout differs from the parent's")]
     IncompatibleRunner,
+    /// The runner's SVE vector length differs from the parent's.
+    #[cfg(target_arch = "aarch64")]
+    #[error("the runner's SVE vector length differs from the parent's")]
+    SveVectorLengthMismatch,
     /// A memory region could not be restored at its address.
     #[error("failed to restore the memory region at {0:#x}")]
     Memory(usize, #[source] MappingError),

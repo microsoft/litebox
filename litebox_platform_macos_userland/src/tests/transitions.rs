@@ -151,9 +151,11 @@ fn child_inherits_vector_state_and_dispatches_on_host_stack() {
     let base = reservation.range().start;
     let original = get_guest_vector_state();
     let _restore = litebox::utils::defer(|| set_guest_vector_state(&original));
+    let mut vregs = [0; 32];
+    vregs[0] = 0x1234;
+    vregs[31] = 0x5678;
     let mut vector_state = GuestVectorState::default();
-    vector_state.registers[0] = 0x1234;
-    vector_state.registers[31] = 0x5678;
+    vector_state.set_fpsimd(&vregs, 0, 0);
     set_guest_vector_state(&vector_state);
     let mut ctx = PtRegs {
         pc: base,

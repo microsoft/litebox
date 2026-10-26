@@ -65,6 +65,68 @@ fn test_guest_simd_survives_signal_delivery() {
     run_rewritten_fixture("./tests/sigreturn_simd.c", "sigreturn_simd_rewriter");
 }
 
+/// Asserts that an SVE fixture printed the vector length LiteBox offers and
+/// then `success`, or that it found no SVE exactly when LiteBox offers none.
+#[cfg(target_arch = "aarch64")]
+fn assert_sve_fixture_output(output: &[u8], success: &str) {
+    let output = String::from_utf8_lossy(output);
+    let expected = match common::guest_sve_vl() {
+        Some(vl) => format!("sve vl {}\n{success}\n", vl.bytes()),
+        None => "sve unavailable\n".to_owned(),
+    };
+    assert!(
+        output.contains(&expected),
+        "expected {expected:?} from the guest: {output}"
+    );
+}
+
+/// Live SVE state reaches a synchronous signal's `sve_context`, and the
+/// handler's edits to the record, FFR included, take effect on return. A
+/// second live state in the handler survives a nested synchronous signal whose
+/// handler moves its `sve_context` behind an `extra_context`.
+/// `AT_MINSIGSTKSZ` is nonzero; see `sve_signal.c`.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_guest_sve_survives_synchronous_signal() {
+    let output = run_rewritten_fixture("./tests/sve_signal.c", "sve_signal_rewriter");
+    assert_sve_fixture_output(&output, "sve signal ok");
+}
+
+/// Live SVE state survives asynchronous interruptions and the guest signal
+/// handlers they trigger in two threads that hold different live states at
+/// once, each interrupted by a process-directed signal only it unblocks.
+/// Each signal also interrupts the threads that block it, among them a third
+/// thread with a live state, which resumes without a handler, often at the
+/// PC right after its last syscall; see `sve_async.c`.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_guest_sve_survives_asynchronous_interruptions() {
+    let output = run_rewritten_fixture("./tests/sve_async.c", "sve_async_rewriter");
+    assert_sve_fixture_output(&output, "sve async ok");
+}
+
+/// Syscalls keep V0-V31 and discard the rest of the SVE state, also one that
+/// LiteBox answers without a host syscall, in both processes of a fork, and
+/// across a blocking read that an `SA_RESTART` handler interrupts at its `svc`
+/// before it restarts. `PR_SVE_GET_VL` and `PR_SVE_SET_VL` with every valid
+/// flag report the vector length, and `PR_SVE_VL_INHERIT` while set, also in a
+/// fork child, and `PR_SVE_SET_VL` rejects unknown flag bits; see
+/// `sve_syscall_abi.c`.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_guest_sve_syscall_abi() {
+    let target = common::compile(
+        "./tests/sve_syscall_abi.c",
+        "sve_syscall_abi_rewriter",
+        true,
+        false,
+    );
+    let output = Runner::new(&target, "sve_syscall_abi_rewriter")
+        .allow_process_duplication()
+        .output();
+    assert_sve_fixture_output(&output, "sve syscall abi ok");
+}
+
 /// Semantic stress only: sampling cannot prove a signal PC landed inside a
 /// short gate; synthetic tests cover each gate instruction boundary.
 #[test]
@@ -88,4 +150,13 @@ fn test_x18_virtualization() {
         true,
     );
     Runner::new(&target, "x18_virtualization_rewriter").run();
+}
+
+/// SVE instructions with x18 operands keep their native results, faults and
+/// signal behavior through x18 gates; see `sve_x18.c`.
+#[test]
+#[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+fn test_x18_virtualization_with_sve() {
+    let output = run_rewritten_fixture("./tests/sve_x18.c", "sve_x18_rewriter");
+    assert_sve_fixture_output(&output, "sve x18 ok");
 }

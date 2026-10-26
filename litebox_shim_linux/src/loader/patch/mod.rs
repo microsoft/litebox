@@ -1104,7 +1104,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         file_offset: Option<usize>,
         restore_protections: &[ProtectionRange],
     ) -> Result<(), Errno> {
-        let rewriter = arch::CodeRewriter::new(&state.arch, file_offset, len);
+        let rewriter = Self::code_rewriter(&state.arch, mapped_addr, file_offset, len);
         let code = mapped_addr.as_usize()..mapped_addr.as_usize().saturating_add(len);
         if !self.ensure_runtime_trampoline(state, code, syscall_entry) {
             return self.apply_trap_fallback(

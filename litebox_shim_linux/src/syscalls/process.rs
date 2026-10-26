@@ -14,6 +14,8 @@ use core::cell::Cell;
 use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+#[cfg(target_arch = "aarch64")]
+use litebox::arch::aarch64::vector::SveVectorLength;
 use litebox::event::observer::Observer;
 use litebox::event::polling::{Pollee, TryOpError};
 use litebox::event::wait::WaitError;
@@ -32,6 +34,8 @@ use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::SignalEvent;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId, ThreadId};
 use litebox_common_linux::ProtFlags;
+#[cfg(target_arch = "aarch64")]
+use litebox_common_linux::SveSetVlFlags;
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
@@ -224,6 +228,10 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
     /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
     robust_list: Cell<Option<UserPtr<litebox_common_linux::RobustListHead>>>,
+    /// Linux `TIF_SVE_VL_INHERIT`: whether the last `PR_SVE_SET_VL` set `PR_SVE_VL_INHERIT`.
+    /// Threads and processes created by this thread start with a copy, and `execve` keeps it.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) sve_vl_inherit: Cell<bool>,
 }
 
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
@@ -241,6 +249,8 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit: Cell::new(false),
         }
     }
 
@@ -253,6 +263,8 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             tid: Cell::new(Some(tid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit: Cell::new(self.sve_vl_inherit.get()),
         })
     }
 
@@ -1034,8 +1046,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
+            #[cfg(target_arch = "aarch64")]
+            PrctlArg::SveGetVl => {
+                let flags = if self.thread.sve_vl_inherit.get() {
+                    SveSetVlFlags::INHERIT
+                } else {
+                    SveSetVlFlags::empty()
+                };
+                Ok(sve_vl_status(self.guest_sve_vl()?, flags))
+            }
+            #[cfg(target_arch = "aarch64")]
+            PrctlArg::SveSetVl { vl, flags } => {
+                let status = sve_set_vl_status(self.guest_sve_vl()?, vl, flags)?;
+                self.thread
+                    .sve_vl_inherit
+                    .set(flags.contains(SveSetVlFlags::INHERIT));
+                Ok(status)
+            }
             _ => unimplemented!(),
         }
+    }
+
+    /// Returns the guest's SVE vector length, or `EINVAL` if the guest has no SVE.
+    #[cfg(target_arch = "aarch64")]
+    fn guest_sve_vl(&self) -> Result<SveVectorLength, Errno> {
+        self.global.platform.get_guest_sve_vl().ok_or(Errno::EINVAL)
     }
 
     /// Handle syscall `arch_prctl`.
@@ -1063,6 +1098,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
             _ => unimplemented!(),
         }
     }
+}
+
+/// Returns Linux `vec_prctl_status` for a thread at `vl` with `flags`: the VL, with
+/// `PR_SVE_VL_INHERIT` if `flags` has it.
+#[cfg(target_arch = "aarch64")]
+fn sve_vl_status(vl: SveVectorLength, flags: SveSetVlFlags) -> usize {
+    usize::from(vl.bytes()) | (flags & SveSetVlFlags::INHERIT).bits()
+}
+
+/// Returns the result of `PR_SVE_SET_VL` requesting `requested` bytes with `flags` from a thread
+/// at the fixed VL `current`.
+///
+/// For `sve_vl_valid` requests, Linux picks the largest supported VL that does not exceed the
+/// request, and raises a request below the smallest supported VL to that VL. LiteBox cannot
+/// change the VL, so a request below `current` fails with `EINVAL`, and any other returns
+/// `current`, with or without `ONEXEC`: the VL after `execve` also stays `current`. Linux could
+/// pick a larger VL than `current` on a CPU that supports one.
+#[cfg(target_arch = "aarch64")]
+fn sve_set_vl_status(
+    current: SveVectorLength,
+    requested: u16,
+    flags: SveSetVlFlags,
+) -> Result<usize, Errno> {
+    let valid = requested.is_multiple_of(16) && (16..=8192).contains(&requested);
+    if !valid || requested < current.bytes() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(sve_vl_status(current, flags))
 }
 
 const ROBUST_LIST_LIMIT: isize = 2048;
@@ -1355,6 +1418,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             alternate_signal_stack,
             registers: ctx.clone(),
             vector_state: self.global.platform.get_guest_vector_state(),
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit: self.thread.sve_vl_inherit.get(),
             thread_pointer: self
                 .global
                 .platform
@@ -2842,6 +2907,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             blocked_signals: self.signals.blocked(),
             ignored_signals: self.signals.ignored(),
             umask,
+            #[cfg(target_arch = "aarch64")]
+            sve_vl_inherit: self.thread.sve_vl_inherit.get(),
             path,
             cwd,
             argv,
@@ -3730,6 +3797,51 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_prctl_sve_vector_length() {
+        use litebox::platform::GuestVectorStateProvider as _;
+        use litebox_common_linux::{PrctlArg, SveSetVlFlags, errno::Errno};
+
+        let task = crate::syscalls::tests::init_platform();
+        let set = |vl, flags| task.sys_prctl(PrctlArg::SveSetVl { vl, flags });
+        let Some(vl) = task.global.platform.get_guest_sve_vl() else {
+            assert_eq!(task.sys_prctl(PrctlArg::SveGetVl), Err(Errno::EINVAL));
+            assert_eq!(set(16, SveSetVlFlags::empty()), Err(Errno::EINVAL));
+            return;
+        };
+        let get = || task.sys_prctl(PrctlArg::SveGetVl);
+        let current = usize::from(vl.bytes());
+        let inherit = current | SveSetVlFlags::INHERIT.bits();
+        assert_eq!(get(), Ok(current));
+        // `PR_SVE_VL_INHERIT` is recorded, reported, and copied to new threads.
+        assert_eq!(set(8192, SveSetVlFlags::all()), Ok(inherit));
+        assert_eq!(get(), Ok(inherit));
+        assert!(task.clone_for_test().unwrap().thread.sve_vl_inherit.get());
+        // An invalid request keeps it; a valid one without it clears it.
+        assert_eq!(set(0, SveSetVlFlags::empty()), Err(Errno::EINVAL));
+        assert_eq!(get(), Ok(inherit));
+        assert_eq!(set(8192, SveSetVlFlags::ONEXEC), Ok(current));
+        assert_eq!(get(), Ok(current));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sve_set_vl_never_returns_more_than_requested() {
+        use super::sve_set_vl_status;
+        use litebox::arch::aarch64::vector::SveVectorLength;
+        use litebox_common_linux::{SveSetVlFlags, errno::Errno};
+
+        let vl = SveVectorLength::new(32).unwrap();
+        let set = |requested| sve_set_vl_status(vl, requested, SveSetVlFlags::empty());
+        assert_eq!(set(16), Err(Errno::EINVAL));
+        assert_eq!(set(32), Ok(32));
+        assert_eq!(set(8192), Ok(32));
+        for invalid in [0, 33, 8192 + 16] {
+            assert_eq!(set(invalid), Err(Errno::EINVAL), "vl {invalid}");
+        }
+    }
+
     /// Installing a custom handler for SIGINT: a background OS thread sends
     /// a real SIGINT via `libc::kill`, which should interrupt a blocking sleep
     /// with `EINTR`.
@@ -4394,6 +4506,55 @@ mod fork_tests {
                 .unwrap();
             assert_eq!(child.0.mm.mappings(), vec![]);
         });
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn fork_restore_rejects_another_sve_vector_length() {
+        use litebox::arch::aarch64::vector::{SveVectorLength, VectorArea};
+        use litebox::platform::{GuestVectorStateProvider as _, SystemInfoProvider as _};
+
+        let task = crate::syscalls::tests::init_platform();
+        let platform = task.global.platform;
+        let runner_vl = platform.get_guest_sve_vl();
+        let (blocked_signals, signal_actions, alternate_signal_stack) = task.signals.fork_state();
+        for parent_vl in [None, SveVectorLength::new(16), SveVectorLength::new(32)] {
+            if parent_vl == runner_vl {
+                continue;
+            }
+            let startup = LinuxForkStartup {
+                uid: 0,
+                euid: 0,
+                gid: 0,
+                egid: 0,
+                umask: 0o022,
+                cwd: "/".into(),
+                comm: [0; litebox_common_linux::TASK_COMM_LEN],
+                blocked_signals,
+                signal_actions,
+                alternate_signal_stack,
+                registers: litebox_common_linux::PtRegs::default(),
+                vector_state: VectorArea::initial(parent_vl),
+                sve_vl_inherit: false,
+                thread_pointer: 0,
+                syscall_entry_point: platform.get_syscall_entry_point(),
+                set_child_tid: 0,
+                clear_child_tid: 0,
+                initial_program_break: 0,
+                program_break: 0,
+                regions: Vec::new(),
+                fds: Vec::new(),
+            };
+            let shim = crate::LinuxShim(task.global.clone());
+            let thread = task.global.litebox.create_thread().unwrap();
+            assert!(
+                matches!(
+                    shim.restore_fork(startup, thread, |_, _| unreachable!()),
+                    Err(crate::ForkRestoreError::SveVectorLengthMismatch)
+                ),
+                "parent {parent_vl:?}, runner {runner_vl:?}"
+            );
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

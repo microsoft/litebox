@@ -50,10 +50,6 @@ pub(super) fn finalize_trampoline(
 pub(super) struct CodeRewriter;
 
 impl CodeRewriter {
-    pub(super) fn new(_state: &ArchPatchState, _file_offset: Option<usize>, _len: usize) -> Self {
-        Self
-    }
-
     /// Patches `code` and returns the trampoline stubs plus addresses that
     /// could not be patched.
     #[expect(clippy::unused_self, reason = "shared interface with AArch64")]
@@ -87,6 +83,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the arch state and capacity of an unpatched file's runtime trampoline.
     pub(super) fn plan_runtime_trampoline(_file: &File<Platform>) -> (ArchPatchState, usize) {
         (ArchPatchState {}, RUNTIME_TRAMPOLINE_SIZE)
+    }
+
+    /// Returns the rewriter of a mapped code segment; x86-64 keeps no per-mapping state.
+    pub(super) fn code_rewriter(
+        _state: &ArchPatchState,
+        _code: UserPtrMut<u8>,
+        _file_offset: Option<usize>,
+        _len: usize,
+    ) -> CodeRewriter {
+        CodeRewriter
     }
 
     /// Applies `prot` to the whole request; x86-64 never excludes trampolines.
