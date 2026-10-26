@@ -353,7 +353,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         _covering_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
-        populate_pages_immediately: bool,
+        options: litebox::platform::page_mgmt::AllocationOptions,
     ) -> Result<UserMutPtr<u8>, litebox::platform::page_mgmt::AllocationError>
     where
         Reservations: Iterator<Item = &'reservation LinuxKernelReservation<ALIGN>>,
@@ -365,8 +365,11 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             litebox_common_linux::vmem::VmFlags::from_bits(permissions.bits().into()).unwrap();
         unsafe { self.page_table.mprotect_pages(range, flags) }
             .expect("failed to protect committed pages");
-        self.page_table
-            .map_pages(range, flags, populate_pages_immediately)
+        self.page_table.map_pages(
+            range,
+            flags,
+            options.contains(litebox::platform::page_mgmt::AllocationOptions::POPULATE),
+        )
     }
 
     unsafe fn reserve_and_commit_pages<Reservations>(
@@ -374,8 +377,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
-        can_grow_down: bool,
-        populate_pages_immediately: bool,
+        options: litebox::platform::page_mgmt::AllocationOptions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<
         litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
@@ -408,14 +410,17 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             }
         }
         let flags = u32::from(initial_permissions.bits())
-            | if can_grow_down {
+            | if options.contains(litebox::platform::page_mgmt::AllocationOptions::GROWS_DOWN) {
                 litebox_common_linux::vmem::VmFlags::VM_GROWSDOWN.bits()
             } else {
                 0
             };
         let flags = litebox_common_linux::vmem::VmFlags::from_bits(flags).unwrap();
-        self.page_table
-            .map_pages(range, flags, populate_pages_immediately)?;
+        self.page_table.map_pages(
+            range,
+            flags,
+            options.contains(litebox::platform::page_mgmt::AllocationOptions::POPULATE),
+        )?;
         // SAFETY: The page table now exclusively owns this exact aligned extent.
         Ok(unsafe { LinuxKernelReservation::new(suggested_range) })
     }

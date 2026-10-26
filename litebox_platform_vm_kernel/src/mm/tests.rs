@@ -21,7 +21,7 @@ use x86_64::{PhysAddr, VirtAddr};
 
 use super::{
     MemoryProvider,
-    pgtable::{COW, PageTableImpl},
+    pgtable::{COW, PageTableImpl, SHARED},
 };
 use crate::arch::mm::paging::{UnmapOptions, X64PageTable, shared_frames, vmflags_to_pteflags};
 use crate::boot::TrampolineTable;
@@ -577,6 +577,50 @@ fn shared_frames_outlive_all_but_their_last_leaf() {
     assert_eq!(mapped_frame(&grandchild, start), shared);
     drop(grandchild);
     assert_eq!(live_frames(), allocated - 2 * TABLE_FRAMES - 1);
+    drop(parent);
+    assert_eq!(live_frames(), before);
+}
+
+#[test]
+fn clones_share_shared_memory_writable_and_free_it_with_its_last_leaf() {
+    let _sharing = sharing();
+    let before = live_frames();
+    let start = 0x1_0000;
+    let shared_rw = RW | VmFlags::VM_SHARED;
+    let parent = new_table();
+    // Safety: a fresh table; the range is unmapped user space.
+    unsafe { parent.map_pages(range(start, 1), shared_rw, true) }.unwrap();
+    let frame = mapped_frame(&parent, start);
+    let child = clone(&parent);
+    let grandchild = clone(&child);
+    let pte = vmflags_to_pteflags(shared_rw);
+    assert!(pte.contains(SHARED | PageTableFlags::WRITABLE));
+    for pgtable in [&parent, &child, &grandchild] {
+        check_mapped(pgtable, start, pte);
+        assert_eq!(mapped_frame(pgtable, start), frame);
+    }
+    // Every process writes the one frame, without faulting.
+    write(frame, 7);
+    assert_eq!(read(mapped_frame(&grandchild, start)), 7);
+
+    // Protection changes keep the leaf shared.
+    // Safety: nothing uses the page.
+    unsafe { child.mprotect_pages(range(start, 1), VmFlags::VM_READ | VmFlags::VM_SHARED) }
+        .unwrap();
+    check_mapped(
+        &child,
+        start,
+        vmflags_to_pteflags(VmFlags::VM_READ | VmFlags::VM_SHARED),
+    );
+    assert_eq!(mapped_frame(&child, start), frame);
+
+    // The frame outlives every leaf but its last.
+    // Safety: nothing uses the page.
+    unsafe { parent.unmap_pages(range(start, 1), UnmapOptions::RELEASE) }.unwrap();
+    drop(child);
+    assert_eq!(read(mapped_frame(&grandchild, start)), 7);
+    assert!(shared_frames().is_empty());
+    drop(grandchild);
     drop(parent);
     assert_eq!(live_frames(), before);
 }

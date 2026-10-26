@@ -20,7 +20,7 @@ use elf::abi::{
 use elf::dynamic::DynamicTable;
 use elf::endian::LittleEndian;
 use elf::relocation::RelaIterator;
-use litebox_common_vm_abi::{GATE_SECTION, PAGE_SIZE, Placement, Populate, Prot};
+use litebox_common_vm_abi::{GATE_SECTION, PAGE_SIZE, Placement, Populate, Prot, Sharing};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -93,6 +93,7 @@ pub(crate) fn load(image: &[u8], mappings: &Mappings) -> Result<LoadedRunner, Lo
                 Prot::ReadWrite,
                 Placement::NoReplace,
                 Populate::Now,
+                Sharing::Private,
             )
             .map_err(LoadError::Map)?;
         copy_to_user(BASE + segment.vaddr.start, segment.data).map_err(LoadError::Map)?;

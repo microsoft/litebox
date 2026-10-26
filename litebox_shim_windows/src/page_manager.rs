@@ -10,8 +10,8 @@ use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::common_providers::reservations::TrackedReservations;
 use litebox::platform::page_mgmt::{
-    AllocationDirection, AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    PageReservation as _, ReleaseTargetOf, ReservationStore as _,
+    AllocationDirection, AllocationError, AllocationOptions, FixedAddressBehavior,
+    MemoryRegionPermissions, PageReservation as _, ReleaseTargetOf, ReservationStore as _,
 };
 use litebox::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use litebox_common_linux::vmem::{
@@ -367,15 +367,18 @@ where
         flags: CreatePagesFlags,
         permissions: MemoryRegionPermissions,
     ) -> Result<Platform::Reservation, MappingError> {
-        let populate = flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY);
+        let mut options = AllocationOptions::empty();
+        options.set(
+            AllocationOptions::POPULATE,
+            flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
+        );
         // SAFETY: The caller guarantees the range is unowned; replacement is disabled.
         match unsafe {
             self.platform.reserve_and_commit_pages(
                 core::iter::empty,
                 requested.clone(),
                 permissions,
-                false,
-                populate,
+                options,
                 FixedAddressBehavior::NoReplace,
             )
         } {
@@ -398,7 +401,7 @@ where
                         || core::iter::once(&reservation),
                         actual,
                         permissions,
-                        populate,
+                        options,
                     )
                 } {
                     // SAFETY: Failed commitment leaves this unpublished reservation unused.
@@ -432,7 +435,7 @@ where
                 || core::iter::once(reservation),
                 range.clone(),
                 permissions,
-                false,
+                AllocationOptions::empty(),
             )
         }
         .map_err(|_| VmemProtectError::UnsupportedProtection)?;
@@ -492,13 +495,6 @@ where
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn reservation_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
-        self.reservations
-            .iter()
-            .map(|(_, reservation)| reservation.range())
-    }
-
     /// Returns the range of the reservation containing `address`, if any.
     pub(crate) fn reservation_containing(&self, address: usize) -> Option<Range<usize>> {
         let end = address.checked_add(1)?;
@@ -552,15 +548,14 @@ where
         if !self.is_range_mapped(&range) {
             return Err(VmemProtectError::InvalidRange(range));
         }
-        let Some(reservation) = containing_reservation::<Platform>(&self.reservations, &range)
-        else {
+        if containing_reservation::<Platform>(&self.reservations, &range).is_none() {
             return Err(VmemProtectError::InvalidRange(range));
-        };
+        }
         // SAFETY: The range is committed and covered by the retained reservation; the caller
         // excludes accesses that conflict with the permission change.
         unsafe {
             self.platform.protect_pages(
-                || core::iter::once(reservation),
+                || self.reservations.overlapping(range.clone()),
                 range.clone(),
                 permissions,
             )
@@ -582,14 +577,15 @@ where
         if containing_reservation::<Platform>(&self.reservations, &range).is_none() {
             return Err(litebox::platform::page_mgmt::DeallocationError::AlreadyUnallocated.into());
         }
-        self.mappings.remove(range.clone());
         let reservations = self.reservations.take_replaced(range);
         for reservation in reservations {
+            let extent = reservation.range();
             // SAFETY: The caller relinquishes this owned range and excludes remaining users.
             unsafe {
                 self.platform
                     .release_pages(into_release_target::<Platform>(reservation))
             }?;
+            self.mappings.remove(extent);
         }
         Ok(())
     }
@@ -906,4 +902,17 @@ where
     <Platform::PlatformReservations as litebox::platform::page_mgmt::ReservationStore>::ReleaseTarget::from(
         reservation,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl<Platform: crate::ShimPlatform> WindowsVmem<Platform> {
+        pub(crate) fn reservation_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+            self.reservations
+                .iter()
+                .map(|(_, reservation)| reservation.range())
+        }
+    }
 }

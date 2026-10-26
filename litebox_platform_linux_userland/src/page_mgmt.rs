@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use super::*;
-use litebox::platform::page_mgmt::{AllocationDirection, HintPlacementBehavior};
+use litebox::platform::page_mgmt::{AllocationDirection, AllocationOptions, HintPlacementBehavior};
 
 fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     let mut res = ProtFlags::PROT_NONE;
@@ -18,9 +18,6 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
         ProtFlags::PROT_EXEC,
         flags.contains(MemoryRegionPermissions::EXEC),
     );
-    if flags.contains(MemoryRegionPermissions::SHARED) {
-        unimplemented!()
-    }
     res
 }
 
@@ -74,12 +71,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         _covering_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         permissions: MemoryRegionPermissions,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError>
     where
         Reservations: Iterator<Item = &'reservation LinuxUserlandReservation<ALIGN>>,
         LinuxUserlandReservation<ALIGN>: 'reservation,
     {
+        // Committing only changes the protection of the existing private mapping.
+        if options.contains(AllocationOptions::SHARED) {
+            return Err(litebox::platform::page_mgmt::AllocationError::UnsupportedByPlatform);
+        }
         // SAFETY: The caller owns the mapping and excludes conflicting access to these pages.
         unsafe {
             syscalls::syscall3(
@@ -90,7 +91,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         }
         .expect("mprotect failed while committing pages");
-        if populate_pages_immediately {
+        if options.contains(AllocationOptions::POPULATE) {
             // TODO: MADV_WILLNEED only reads ahead file or swap pages; anonymous pages still fault lazily.
             // SAFETY: This advice covers the live owned mapping and does not change its contents.
             let _ = unsafe {
@@ -110,8 +111,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<
         litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
@@ -135,19 +135,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             fixed_address_behavior,
             FixedAddressBehavior::Hint(AllocationDirection::BottomUp)
         ));
-        let flags = MapFlags::MAP_PRIVATE
+        let sharing = if options.contains(AllocationOptions::SHARED) {
+            MapFlags::MAP_SHARED
+        } else {
+            MapFlags::MAP_PRIVATE
+        };
+        let flags = sharing
             | MapFlags::MAP_ANONYMOUS
             | match fixed_address_behavior {
                 FixedAddressBehavior::Hint(_) => MapFlags::empty(),
                 FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
                 FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
             }
-            | if can_grow_down {
+            | if options.contains(AllocationOptions::GROWS_DOWN) {
                 MapFlags::MAP_GROWSDOWN
             } else {
                 MapFlags::empty()
             }
-            | if populate_pages_immediately {
+            | if options.contains(AllocationOptions::POPULATE) {
                 MapFlags::MAP_POPULATE
             } else {
                 MapFlags::empty()
@@ -192,28 +197,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Reservations: Iterator<Item = &'reservation LinuxUserlandReservation<ALIGN>>,
         LinuxUserlandReservation<ALIGN>: 'reservation,
     {
+        // Replacing the pages with a fresh private mapping discards private contents and detaches
+        // shared pages without discarding the contents that other sharers see. Recommitting then
+        // yields zeros either way.
         // SAFETY: The caller owns these pages and excludes all users of the decommitted range.
         unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::mprotect,
+            syscalls::syscall6(
+                syscalls::Sysno::mmap,
                 range.start,
                 range.len(),
                 ProtFlags::PROT_NONE.bits().reinterpret_as_unsigned() as usize,
+                (MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED)
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
+                usize::MAX,
+                0,
             )
         }
-        .expect("mprotect failed while decommitting pages");
-        // TODO: MADV_DONTNEED restores file contents for private file mappings instead of zeroing;
-        // decommit is currently only used by the Windows shim, which lacks native file mappings.
-        // SAFETY: The range is owned and inaccessible; discard its backing.
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::madvise,
-                range.start,
-                range.len(),
-                libc::MADV_DONTNEED as usize,
-            )
-        }
-        .expect("madvise failed while decommitting pages");
+        .expect("mmap failed while decommitting pages");
         Ok(())
     }
 
@@ -253,10 +254,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                     self,
                     core::iter::empty,
                     new_range.clone(),
-                    // Shared anonymous memory is private on the host, as in `allocate_pages`.
-                    permissions - MemoryRegionPermissions::SHARED,
-                    false,
-                    false,
+                    permissions,
+                    AllocationOptions::empty(),
                     FixedAddressBehavior::NoReplace,
                 )
             }
@@ -543,5 +542,60 @@ mod tests {
             assert_eq!(libc::munmap(new as *mut libc::c_void, 2 * PAGE), 0);
             assert_eq!(libc::close(fd), 0);
         }
+    }
+
+    #[test]
+    fn shared_pages_stay_shared_with_forked_children_after_protection_changes() {
+        const PAGE: usize = 4096;
+        let platform = LinuxUserland::new();
+        // SAFETY: A hint at no particular address replaces nothing.
+        let reservation = unsafe {
+            <LinuxUserland as litebox::platform::PageManagementProvider<PAGE>>::reserve_and_commit_pages(
+                platform,
+                core::iter::empty,
+                0..2 * PAGE,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                AllocationOptions::SHARED,
+                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            )
+        }
+        .unwrap();
+        let pages: core::ops::Range<usize> = reservation.into();
+        let start = pages.start;
+        // Protecting part of the pages must not unshare the rest.
+        // SAFETY: Nothing accesses the first page while it is read-only.
+        unsafe {
+            <LinuxUserland as litebox::platform::PageManagementProvider<PAGE>>::protect_pages(
+                platform,
+                core::iter::empty,
+                start..start + PAGE,
+                MemoryRegionPermissions::READ,
+            )
+        }
+        .unwrap();
+
+        let second = (start + PAGE) as *mut u8;
+        // SAFETY: The forked child only stores to the shared page, which is writable, and exits
+        // without returning, which are async-signal-safe.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // SAFETY: See above.
+            unsafe {
+                second.write_volatile(42);
+                libc::_exit(0);
+            }
+        }
+        let mut status = 0;
+        // SAFETY: `status` is a valid output for the child's status.
+        assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        // SAFETY: The page is mapped readable, and the child has exited.
+        assert_eq!(unsafe { second.read_volatile() }, 42);
+        // SAFETY: Nothing uses the pages anymore.
+        assert_eq!(
+            unsafe { libc::munmap(start as *mut libc::c_void, 2 * PAGE) },
+            0
+        );
     }
 }

@@ -193,6 +193,7 @@ impl ProcessHandle for ClonedProcess {
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_PROCESS_CLONED: i32 = 0x0000_0129;
 const RTL_CLONE_PROCESS_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
+const RTL_CLONE_PROCESS_FLAGS_INHERIT_HANDLES: u32 = 0x0000_0002;
 
 /// Result returned by [`fork_process`].
 pub enum ForkResult {
@@ -230,7 +231,8 @@ unsafe extern "system" {
 }
 
 /// Clones the calling process with copy-on-write memory, one suspended thread, and no inherited
-/// handles.
+/// handles other than the sections of shared pages, which the child needs to manage the views of
+/// them it shares.
 ///
 /// The caller must ensure every other thread is quiescent and that the child immediately enters
 /// a clone-safe bootstrap path. This uses an undocumented NT interface and can fail on Windows
@@ -250,18 +252,32 @@ pub unsafe fn fork_process() -> Result<ForkResult> {
         client_id: [0; 2],
         image_information: [0; 8],
     };
+    // Holding the lock keeps every shared view whole and recorded while the child copies them.
+    let shared_views = crate::page_mgmt::SharedViews::lock();
+    // Only the sections of shared views are inheritable, and only while cloning; without shared
+    // views, nothing needs to be inherited.
+    let mut flags = RTL_CLONE_PROCESS_FLAGS_CREATE_SUSPENDED;
+    if !shared_views.is_empty() {
+        shared_views.set_inheritable(true);
+        flags |= RTL_CLONE_PROCESS_FLAGS_INHERIT_HANDLES;
+    }
     // SAFETY: `information` has the x64 RTL_USER_PROCESS_INFORMATION layout and is writable.
     // Optional inputs are null. The runtime synchronizes its internal locks before cloning
     // and repairs them in the child; the caller guarantees a clone-safe bootstrap.
     let status = unsafe {
         RtlCloneUserProcess(
-            RTL_CLONE_PROCESS_FLAGS_CREATE_SUSPENDED,
+            flags,
             null_mut(),
             null_mut(),
             null_mut(),
             &raw mut information,
         )
     };
+    // The parent and the child each restore their own handles.
+    if !shared_views.is_empty() {
+        shared_views.set_inheritable(false);
+    }
+    drop(shared_views);
     match status {
         STATUS_SUCCESS => {
             if information.process.is_null() || information.thread.is_null() {

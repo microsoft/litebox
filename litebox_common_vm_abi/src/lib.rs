@@ -110,7 +110,8 @@
 //!   [`StartupInfo::upcall_stack`]).
 //! - [`CloneKind::Process`]: a *process clone*, as Linux's `fork`: a process
 //!   with a copy-on-write copy of the calling process's whole address space
-//!   (but see [Broker](crate#broker)), mappings, identity, upcall entry,
+//!   (but see [Broker](crate#broker)), sharing the pages of
+//!   [`Sharing::Shared`] mappings instead, and with its mappings, identity, upcall entry,
 //!   lockdown, and ability to start child processes, and one thread, a copy
 //!   of the calling one (registers, FS and GS bases, and extended state),
 //!   which, as its main thread, has the main thread's upcall stack and
@@ -645,6 +646,17 @@ pub enum Populate {
     Now = 1,
 }
 
+/// Whether a process clone ([`CloneKind::Process`]) shares a mapping's pages or copies them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(u32)]
+pub enum Sharing {
+    /// Copied, copy-on-write.
+    Private = 0,
+    /// Shared, as Linux `MAP_SHARED | MAP_ANONYMOUS` memory. The kernel populates the pages
+    /// before the call returns, whatever [`Populate`] says, so that clones share every page.
+    Shared = 1,
+}
+
 /// Maps exactly `range`: nonempty, page-aligned, within the runner-managed
 /// area.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -654,7 +666,7 @@ pub struct MapRequest {
     pub prot: Prot,
     pub placement: Placement,
     pub populate: Populate,
-    reserved: Reserved,
+    pub sharing: Sharing,
 }
 
 impl MapRequest {
@@ -663,13 +675,14 @@ impl MapRequest {
         prot: Prot,
         placement: Placement,
         populate: Populate,
+        sharing: Sharing,
     ) -> Self {
         Self {
             range,
             prot,
             placement,
             populate,
-            reserved: Reserved::Zero,
+            sharing,
         }
     }
 }
@@ -1124,7 +1137,7 @@ mod tests {
             prot: Prot::ReadWrite,
             placement: Placement::NoReplace,
             populate: Populate::Lazy,
-            reserved: Reserved::Zero,
+            sharing: Sharing::Private,
         };
         assert!(matches!(
             Request::decode(CallId::Map, request.as_bytes()),
@@ -1138,7 +1151,7 @@ mod tests {
             Status::InvalidArgument
         );
         bytes.copy_from_slice(request.as_bytes());
-        bytes[28] = 1; // `reserved`
+        bytes[28] = 2; // `sharing` out of range
         assert_eq!(
             Request::decode(CallId::Map, &bytes).unwrap_err(),
             Status::InvalidArgument

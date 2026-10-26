@@ -65,7 +65,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         anyhow::bail!("unsupported child Windows process startup");
     }
 
-    let platform = Platform::new();
+    let platform = Platform::new_with_placeholders(false);
     Platform::set_guest_tls_mode(GuestTlsMode::Windows);
     let broker::BrokerConnection {
         local,

@@ -40,8 +40,8 @@ use litebox::mm::vmap::{
     NoopPhysPageMapInfo, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
 use litebox::platform::page_mgmt::{
-    AllocationError, DeallocationError, FixedAddressBehavior, HintPlacementBehavior,
-    MemoryRegionPermissions, PermissionUpdateError,
+    AllocationError, AllocationOptions, DeallocationError, FixedAddressBehavior,
+    HintPlacementBehavior, MemoryRegionPermissions, PermissionUpdateError,
 };
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
@@ -53,8 +53,8 @@ use litebox_common_linux::{
     vmem::{PageFaultError, VmFlags, VmemPageFaultHandler},
 };
 use litebox_common_vm_abi::{
-    LogLevel, Placement, Populate, Prot, RUNNER_MANAGED_MAX, RUNNER_MANAGED_MIN, StartupInfo,
-    Status, WallClock,
+    LogLevel, Placement, Populate, Prot, RUNNER_MANAGED_MAX, RUNNER_MANAGED_MIN, Sharing,
+    StartupInfo, Status, WallClock,
 };
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
@@ -453,12 +453,16 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
         _covering_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         permissions: MemoryRegionPermissions,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
     ) -> Result<UserMutPtr<u8>, AllocationError>
     where
         Reservations: Iterator<Item = &'reservation VmUserlandReservation<ALIGN>>,
         VmUserlandReservation<ALIGN>: 'reservation,
     {
+        // Committing only changes the protection of the existing private mapping.
+        if options.contains(AllocationOptions::SHARED) {
+            return Err(AllocationError::UnsupportedByPlatform);
+        }
         kcall::protect(range.start, range.len(), prot(permissions)).map_err(
             |status| match status {
                 Status::NoMemory => AllocationError::OutOfMemory,
@@ -467,8 +471,8 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
                 status => panic!("Protect while committing: unexpected {status:?}"),
             },
         )?;
-        // TODO: The VM ABI cannot eagerly populate an existing mapping without replacing its contents.
-        let _ = populate_pages_immediately;
+        // TODO: The VM ABI cannot eagerly populate an existing mapping without replacing its
+        // contents, so `POPULATE` is ignored.
         Ok(UserMutPtr::from_ptr(range.start as *mut u8))
     }
 
@@ -477,8 +481,7 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
         replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<VmUserlandReservation<ALIGN>, AllocationError>
     where
@@ -489,13 +492,12 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
         {
             return Err(AllocationError::UnsupportedByPlatform);
         }
-        // The kernel never grows mappings; growth is the shim's bookkeeping.
-        let _ = can_grow_down;
+        // The kernel never grows mappings, so `GROWS_DOWN` is the shim's bookkeeping.
         let placement = match fixed_address_behavior {
             FixedAddressBehavior::Replace => Placement::Replace,
             FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => Placement::NoReplace,
         };
-        let populate = if populate_pages_immediately {
+        let populate = if options.contains(AllocationOptions::POPULATE) {
             Populate::Now
         } else {
             Populate::Lazy
@@ -507,12 +509,19 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
             return Err(AllocationError::AboveMaxAddress);
         }
         let len = suggested_range.end.saturating_sub(suggested_range.start);
+        // A process clone shares, rather than copies, the pages of a shared mapping.
+        let sharing = if options.contains(AllocationOptions::SHARED) {
+            Sharing::Shared
+        } else {
+            Sharing::Private
+        };
         let address = kcall::map(
             suggested_range.start,
             len,
             prot(initial_permissions),
             placement,
             populate,
+            sharing,
         )
         .map_err(|status| match status {
             Status::NoMemory => AllocationError::OutOfMemory,
@@ -544,6 +553,7 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
             Prot::None,
             Placement::Replace,
             Populate::Lazy,
+            Sharing::Private,
         )
         .map(|_| ())
         .map_err(|status| match status {
@@ -590,9 +600,9 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
 }
 
 /// The kernel resolves faults on pages it has mapped. One that reaches the shim
-/// is an access violation, or on a page the shim mapped only after the fault
-/// (stack growth): that page is populated here, so the retry cannot fault
-/// again.
+/// is an access violation, or on a page whose mapping or protection the shim
+/// changed only after the fault (stack growth, or a racing `mprotect`): the
+/// kernel's record then allows the access, so the retry succeeds.
 impl VmemPageFaultHandler for VmUserland {
     unsafe fn handle_page_fault(
         &self,
@@ -603,16 +613,19 @@ impl VmemPageFaultHandler for VmUserland {
         if error_code & PF_PRESENT != 0 {
             return Err(PageFaultError::AccessError("not resolvable by the kernel"));
         }
-        // A not-present page holds no data to replace.
-        kcall::map(
+        // A not-present page may still hold data, such as an inaccessible one, so map only where
+        // the kernel maps nothing, and otherwise retry under its now current record.
+        match kcall::map(
             fault_addr,
             PAGE_SIZE,
             prot(flags.into()),
-            Placement::Replace,
+            Placement::NoReplace,
             Populate::Now,
-        )
-        .map(|_| ())
-        .map_err(|_| PageFaultError::AllocationFailed)
+            Sharing::Private,
+        ) {
+            Ok(_) | Err(Status::Exists) => Ok(()),
+            Err(_) => Err(PageFaultError::AllocationFailed),
+        }
     }
 
     fn access_error(error_code: u64, flags: VmFlags) -> bool {

@@ -412,6 +412,8 @@ where
     /// `may_move` indicates whether the memory block can be moved to a new address if there is not sufficient
     /// space to expand the old memory block at its current location.
     ///
+    /// Shared anonymous areas can only shrink for now.
+    ///
     /// ## Returns
     ///
     /// If the operation is successful, it returns the new address of the memory block.
@@ -453,7 +455,9 @@ where
                     )
                 } {
                     Ok(new_addr) => Ok(new_addr),
-                    Err(vmem::VmemMoveError::OutOfMemory) => Err(RemapError::OutOfMemory),
+                    Err(vmem::VmemMoveError::OutOfMemory | vmem::VmemMoveError::Unsupported) => {
+                        Err(RemapError::OutOfMemory)
+                    }
                     Err(vmem::VmemMoveError::UnAligned) => Err(RemapError::Unaligned),
                     Err(vmem::VmemMoveError::RemapError(err)) => Err(err),
                 }
@@ -461,6 +465,7 @@ where
             Err(vmem::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
             Err(vmem::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
             Err(vmem::VmemResizeError::PermissionDenied) => Err(RemapError::PermissionDenied),
+            Err(vmem::VmemResizeError::Unsupported) => Err(RemapError::OutOfMemory),
         }
     }
 
@@ -629,6 +634,17 @@ where
             .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED))
     }
 
+    /// Returns whether any mapping has shared-memory semantics that a native fork child would
+    /// not share: a shared file mapping, whose pages are private copies.
+    pub fn has_unforkable_shared_mappings(&self) -> bool {
+        // TODO: share the pages of shared file mappings, so that every shared mapping can be
+        // forked.
+        self.vmem
+            .read()
+            .iter()
+            .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
+    }
+
     /// Returns all mappings in a vector.
     pub fn mappings(&self) -> Vec<(Range<usize>, VmFlags)> {
         self.vmem
@@ -717,11 +733,21 @@ where
         ptr: NonZeroAddress<ALIGN>,
         len: NonZeroPageSize<ALIGN>,
     ) -> Option<MemoryRegionPermissions> {
+        self.get_memory_flags(ptr, len).map(Into::into)
+    }
+
+    /// Get the flags of a given address range, which is valid under the same conditions as for
+    /// [`Self::get_memory_permissions`].
+    pub fn get_memory_flags(
+        &self,
+        ptr: NonZeroAddress<ALIGN>,
+        len: NonZeroPageSize<ALIGN>,
+    ) -> Option<VmFlags> {
         let vmem = self.vmem.read();
         let start = ptr.as_usize();
         let end = start + len.as_usize();
         let page_range = PageRange::<ALIGN>::new(start, end)?;
-        vmem.get_memory_permissions(page_range)
+        vmem.get_memory_flags(page_range)
     }
 }
 
@@ -1047,7 +1073,9 @@ where
     /// Applies the supported Linux `madvise` behaviors to a mapped range.
     ///
     /// `Normal`, `DontFork`, and `DoFork` are currently no-ops. `DontNeed` discards any mapping
-    /// contents, while `Free` only discards anonymous contents. Unsupported advice values panic.
+    /// contents, while `Free` only discards anonymous contents; neither discards the contents of
+    /// shared anonymous memory, which other processes may still see.
+    /// Unsupported advice values panic.
     pub fn sys_madvise(
         &self,
         addr: UserPtrMut<u8>,
@@ -1085,7 +1113,8 @@ where
                 // from the up-to-date contents of the underlying mapped file (for shared file mappings, shared anonymous mappings,
                 // and shmem-based techniques such as System V shared memory segments) or zero-fill-on-demand pages for anonymous private mappings.
                 //
-                // Note we do not support shared memory yet, so this is just to discard the pages without removing the mapping.
+                // Shared anonymous pages keep their contents; others are discarded without
+                // removing the mapping.
                 unsafe { self.reset_pages(addr, aligned_len, false) }.map_err(Errno::from)
             }
             crate::MadviseBehavior::Free => {

@@ -75,19 +75,6 @@ pub trait ReservationStore {
     /// Ownership representation consumed when this store releases pages.
     type ReleaseTarget;
 
-    /// Release every extent represented by this store.
-    ///
-    /// # Safety
-    ///
-    /// Every represented extent must belong to `platform` and have no remaining users.
-    unsafe fn release_all<Platform, const ALIGN: usize, V>(
-        &mut self,
-        vmas: &rangemap::RangeMap<usize, V>,
-        platform: &Platform,
-    ) -> Result<(), DeallocationError>
-    where
-        Platform: PageManagementProvider<ALIGN, Reservations = Self>;
-
     /// Insert a reservation at `base`.
     fn insert(&mut self, base: usize, reservation: Self::Reservation) -> Option<Self::Reservation>;
 
@@ -125,8 +112,20 @@ bitflags::bitflags! {
         const WRITE = 1 << 1;
         /// Executable
         const EXEC = 1 << 2;
-        /// Sharable between processes
-        const SHARED = 1 << 3;
+    }
+}
+
+bitflags::bitflags! {
+    /// How page allocations back pages, beyond their permissions.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct AllocationOptions: u8 {
+        /// The region may grow downward (towards zero) upon a page fault.
+        const GROWS_DOWN = 1 << 0;
+        /// Populate the pages immediately rather than lazily.
+        const POPULATE = 1 << 1;
+        /// Back the pages with fresh, zero-filled memory that could be shared
+        /// across processes rather than copied, as Linux `MAP_SHARED` memory.
+        const SHARED = 1 << 2;
     }
 }
 
@@ -231,8 +230,11 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
                 replaced_reservations,
                 suggested_range,
                 MemoryRegionPermissions::empty(),
-                can_grow_down,
-                false,
+                if can_grow_down {
+                    AllocationOptions::GROWS_DOWN
+                } else {
+                    AllocationOptions::empty()
+                },
                 fixed_address_behavior,
             )
         }
@@ -301,19 +303,19 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///   extents may extend beyond it.
     /// - `range`: The address range to commit.
     /// - `permissions`: The permissions to apply to the committed pages.
-    /// - `populate_pages_immediately`: If `true`, populate pages immediately; otherwise,
-    ///   populate them lazily.
+    /// - `options`: How to back newly committed pages; see [`AllocationOptions`].
     ///
     /// # Safety
     ///
     /// The supplied reservations must collectively cover `range`. The caller must exclude
     /// accesses to `range` that could conflict with changes to its backing or permissions.
+    /// Shared pages must not be recommitted; use protection to change their permissions.
     unsafe fn commit_pages<'reservation, Reservations>(
         &self,
         covering_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
         permissions: MemoryRegionPermissions,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>
     where
         Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
@@ -329,10 +331,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///   handle-free mappings may yield no handles. Ownership outside the replaced range remains
     ///   with the caller.
     /// - `initial_permissions`: The permissions to apply to the allocated memory region.
-    /// - `can_grow_down`: If `true`, the region is allowed to grow downward (towards zero) upon
-    ///   a page fault.
-    /// - `populate_pages_immediately`: If `true`, the pages are populated immediately; otherwise,
-    ///   they are populated lazily.
+    /// - `options`: How to back the pages; see [`AllocationOptions`].
     /// - `fixed_address_behavior`: Specifies the required semantics of `suggested_range`.
     ///
     /// # Returns
@@ -358,8 +357,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: Range<usize>,
         initial_permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
-        populate_pages_immediately: bool,
+        options: AllocationOptions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
     where

@@ -25,8 +25,7 @@ fn prepare_code(
             core::iter::empty,
             TASK_ADDR_MIN..TASK_ADDR_MIN + pages * HOST_PAGE_SIZE,
             RW,
-            false,
-            true,
+            AllocationOptions::POPULATE,
             FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
         )
     }
@@ -64,7 +63,7 @@ fn prepare_code(
     // SAFETY: code and gates are initialized and have no users before RX publication.
     unsafe {
         platform.protect_pages(
-            || core::iter::once(&reservation),
+            core::iter::empty,
             base..base + HOST_PAGE_SIZE,
             MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
         )

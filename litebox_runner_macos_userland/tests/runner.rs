@@ -452,7 +452,9 @@ fn incompatible_aot_gate_is_rejected_before_execution() {
 #[test]
 fn loader_teardown_and_argument_limit() {
     use litebox::platform::PageManagementProvider as _;
-    use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions as Perm};
+    use litebox::platform::page_mgmt::{
+        AllocationOptions, FixedAddressBehavior, MemoryRegionPermissions as Perm,
+    };
     use litebox_common_macos::PAGE_SIZE;
     use litebox_platform_macos_userland::{GuestAbi, MacosUserland, set_guest_abi};
     use litebox_shim_macos::MacosShimBuilder;
@@ -483,8 +485,7 @@ fn loader_teardown_and_argument_limit() {
                     core::iter::empty,
                     page..page + PAGE_SIZE,
                     Perm::READ,
-                    false,
-                    true,
+                    AllocationOptions::POPULATE,
                     FixedAddressBehavior::NoReplace,
                 )
                 .unwrap()
