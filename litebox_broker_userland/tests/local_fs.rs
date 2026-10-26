@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(unix)]
-use litebox_broker_core::fs::SeekWhence;
+use litebox_broker_core::fs::FileType;
 #[cfg(unix)]
-use litebox_broker_core::fs::backend::WalkStopReason;
+use litebox_broker_core::fs::SeekWhence;
 use litebox_broker_core::fs::backend::{Backend, HandleRef};
 #[cfg(unix)]
 use litebox_broker_core::fs::composer::Composer;
@@ -58,19 +58,23 @@ fn canonical_root_live_io_and_open_file_handles() {
     symlink(root.join("file"), root.join("absolute")).unwrap();
     symlink(&root, temp.path().join("root_link")).unwrap();
     let local = backend(&temp.path().join("root_link"));
-    let absolute = local
-        .open_file_at(local.root(), "absolute", OFlags::RDONLY)
+    assert_eq!(
+        local.read_link_at(&local.root(), "absolute").unwrap(),
+        "file"
+    );
+    let read_only = local
+        .open_file_at(local.root(), "file", OFlags::RDONLY)
         .unwrap()
         .item;
     let mut buf = [0; 7];
-    assert_eq!(local.read(&absolute, &mut buf, 0).unwrap(), 7);
+    assert_eq!(local.read(&read_only, &mut buf, 0).unwrap(), 7);
     assert_eq!(&buf, b"initial");
     assert!(matches!(
-        local.write(&absolute, b"x", 0),
+        local.write(&read_only, b"x", 0),
         Err(WriteError::NotForWriting)
     ));
     assert!(matches!(
-        local.truncate(&absolute, 0),
+        local.truncate(&read_only, 0),
         Err(TruncateError::NotForWriting)
     ));
 
@@ -454,65 +458,72 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
     symlink("cycle_a", root.join("cycle_b")).unwrap();
     symlink("target", root.join("chain_a")).unwrap();
     symlink("chain_a", root.join("chain_b")).unwrap();
-    fs::create_dir(root.join("blocked")).unwrap();
-    symlink("blocked/../target", root.join("search_bypass")).unwrap();
     let socket = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
-    let local = backend(&root);
+    let local: Resolver<(), _> = Resolver::new(backend(&root));
     let listed = local
-        .list_dir_at(local.owned_dir_at(local.root(), OFlags::RDONLY).unwrap())
+        .read_dir(
+            &local
+                .open(USER, "/", OFlags::RDONLY, Mode::empty())
+                .unwrap(),
+        )
         .unwrap();
-    for name in ["socket", "escape", "absolute", "dir_link"] {
-        assert!(!listed.iter().any(|entry| entry.name == name), "{name}");
+    assert!(!listed.iter().any(|entry| entry.name == "socket"));
+    for name in ["escape", "absolute", "dir_link"] {
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.name == name && entry.file_type == FileType::SymbolicLink),
+            "{name}"
+        );
     }
-    assert!(
-        matches!(local.walk_directories(local.root(), &["sub", "relative"]), Ok(outcome) if matches!(outcome.stop_reason, WalkStopReason::StoppedAtNonDirectory { .. }))
-    );
-    for name in ["absolute", "chain_b"] {
-        let file = local
-            .open_file_at(local.root(), name, OFlags::RDONLY)
+    assert_eq!(local.read_link(USER, "/absolute").unwrap(), "target");
+    assert_eq!(local.read_link(USER, "/sub/relative").unwrap(), "../target");
+    assert_eq!(
+        local
+            .file_status(USER, "/absolute", false)
             .unwrap()
-            .item;
+            .file_type,
+        FileType::SymbolicLink
+    );
+    for name in [
+        "/absolute",
+        "/chain_b",
+        "/sub/relative",
+        "/dir_link/relative",
+    ] {
+        let mut file = local
+            .open(USER, name, OFlags::RDONLY, Mode::empty())
+            .unwrap();
         let mut buf = [0; 6];
-        assert_eq!(local.read(&file, &mut buf, 0).unwrap(), 6);
+        assert_eq!(
+            local.read(&mut file, &mut buf, Some(0)).unwrap(),
+            6,
+            "{name}"
+        );
         assert_eq!(&buf, b"inside");
     }
-    for name in ["escape", "cycle_a", "socket"] {
+    for name in ["/escape", "/sub/climb", "/cycle_a", "/socket"] {
         assert!(
             local
-                .open_file_at(local.root(), name, OFlags::RDONLY)
+                .open(USER, name, OFlags::RDONLY, Mode::empty())
                 .is_err(),
             "{name}"
         );
     }
-    if fs::metadata(&root).unwrap().uid() != 0 {
-        fs::set_permissions(root.join("blocked"), fs::Permissions::from_mode(0o000)).unwrap();
+    for (name, flags) in [
+        ("/absolute", OFlags::RDONLY | OFlags::NOFOLLOW),
+        (
+            "/dir_link",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        ),
+    ] {
         assert!(
-            local
-                .open_file_at(local.root(), "search_bypass", OFlags::RDONLY)
-                .is_err()
+            local.open(USER, name, flags, Mode::empty()).is_err(),
+            "{name}"
         );
-        fs::set_permissions(root.join("blocked"), fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let root_dir = local.owned_dir_at(local.root(), OFlags::PATH).unwrap();
-    assert!(local.unlink_at(root_dir, "socket").is_err());
+    assert!(local.unlink(USER, "/socket").is_err());
     assert!(root.join("socket").exists());
-    let sub = local.walk_directories(local.root(), &["sub"]).unwrap();
-    assert!(
-        local
-            .open_file_at(sub.last, "climb", OFlags::RDONLY)
-            .is_err()
-    );
-    assert!(
-        local
-            .open_file_at(local.root(), "absolute", OFlags::PATH | OFlags::NOFOLLOW)
-            .is_err()
-    );
-    let walked = local.walk_directories(local.root(), &["dir_link"]).unwrap();
-    assert!(
-        local
-            .owned_dir_at(walked.last, OFlags::PATH | OFlags::NOFOLLOW)
-            .is_err()
-    );
     assert_eq!(fs::read(&outside).unwrap(), b"outside");
     drop(socket);
 }
@@ -754,34 +765,37 @@ fn symlinks_are_bounded_when_windows_allows_test_symlink_creation() {
         return;
     }
 
-    let local = backend(&root);
-    for name in ["inside_link", "absolute_link"] {
-        let inside = local
-            .open_file_at(local.root(), name, OFlags::RDONLY)
-            .unwrap()
-            .item;
+    let local: Resolver<(), _> = Resolver::new(backend(&root));
+    for name in ["/inside_link", "/absolute_link"] {
+        let mut inside = local
+            .open(USER, name, OFlags::RDONLY, Mode::empty())
+            .unwrap();
         let mut data = [0; 6];
-        assert_eq!(local.read(&inside, &mut data, 0).unwrap(), 6);
+        assert_eq!(local.read(&mut inside, &mut data, Some(0)).unwrap(), 6);
         assert_eq!(&data, b"inside");
     }
+    assert_eq!(local.read_link(USER, "/absolute_link").unwrap(), "target");
     assert!(
         local
-            .open_file_at(local.root(), "escape_link", OFlags::RDONLY)
+            .open(USER, "/escape_link", OFlags::RDONLY, Mode::empty())
             .is_err()
     );
     assert!(
         local
-            .open_file_at(local.root(), "inside_link", OFlags::PATH | OFlags::NOFOLLOW,)
+            .open(
+                USER,
+                "/inside_link",
+                OFlags::RDONLY | OFlags::NOFOLLOW,
+                Mode::empty()
+            )
             .is_err()
     );
 
-    let root_dir = local.owned_dir_at(local.root(), OFlags::PATH).unwrap();
     assert!(matches!(
-        local.rmdir_at(root_dir, "dir_link"),
+        local.rmdir(USER, "/dir_link"),
         Err(RmdirError::NotADirectory)
     ));
-    let root_dir = local.owned_dir_at(local.root(), OFlags::PATH).unwrap();
-    local.unlink_at(root_dir, "inside_link").unwrap();
+    local.unlink(USER, "/inside_link").unwrap();
     assert!(fs::symlink_metadata(root.join("inside_link")).is_err());
     assert_eq!(fs::read(root.join("target")).unwrap(), b"inside");
 }

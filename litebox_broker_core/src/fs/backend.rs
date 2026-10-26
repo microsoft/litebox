@@ -318,7 +318,11 @@ impl<'a> WalkingDirHandle<'a> {
     }
 
     /// Borrowing version of [`Self::into_typed`].
-    pub(super) fn as_typed<B: BackendHandles + 'static>(&self) -> &B::WalkingDirHandle<'a> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `B` is not the backend type used to create this handle.
+    pub fn as_typed<B: BackendHandles + 'static>(&self) -> &B::WalkingDirHandle<'a> {
         assert_eq!(
             self.backend_type,
             TypeId::of::<B>(),

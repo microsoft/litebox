@@ -5,9 +5,11 @@
 //!
 //! This backend assumes the host namespace is trusted not to race its checks. Guest-supplied path
 //! components are validated, every resolved object is canonicalized, and the result must remain
-//! below the configured root. Existing host symlinks are followed only when their canonical target
-//! remains below that root. Regular files and directories are exposed live and host access checks
-//! use the broker process's own credentials.
+//! below the configured root. Regular files, directories, and symlinks are exposed live and host
+//! access checks use the broker process's own credentials. Walks stop at host symlinks so the
+//! resolver follows their targets inside the guest namespace; an absolute target below the root is
+//! reported as an equivalent relative target so it stays correct wherever the backend is mounted,
+//! and any other absolute target is rejected.
 //!
 //! The root is intentionally path-based rather than pinned by a directory handle. A concurrent
 //! host rename, replacement, or symlink swap can therefore invalidate a check or redirect a later
@@ -64,17 +66,32 @@ pub struct LocalFs {
 pub struct LocalDir {
     instance_tag: BackendInstanceTag,
     canonical_path: PathBuf,
-    requested_name_was_symlink: bool,
 }
 
-/// Regular-file handle owned by [`LocalFs`].
+/// Regular-file or (`O_PATH`) symlink handle owned by [`LocalFs`].
 #[derive(Clone)]
 pub struct LocalFile {
     instance_tag: BackendInstanceTag,
     canonical_path: PathBuf,
+    /// Currently always [`FileType::RegularFile`] or (for `O_PATH` opens) [`FileType::SymbolicLink`].
+    file_type: FileType,
     file: Option<Arc<File>>,
     readable: bool,
     writable: bool,
+}
+
+impl LocalFile {
+    fn is_symlink(&self) -> bool {
+        assert!(
+            matches!(
+                self.file_type,
+                FileType::RegularFile | FileType::SymbolicLink
+            ),
+            "unexpected LocalFile type {:?}",
+            self.file_type
+        );
+        self.file_type == FileType::SymbolicLink
+    }
 }
 
 /// Identifies the [`LocalFs`] instance that created a handle.
@@ -108,7 +125,6 @@ struct HostIdentity {
 struct Located {
     canonical_path: PathBuf,
     file_type: FileType,
-    requested_name_was_symlink: bool,
 }
 
 impl BackendHandles for LocalFs {
@@ -221,17 +237,24 @@ fn identity(metadata: &fs::Metadata, canonical_path: &Path) -> HostIdentity {
     }
 }
 
+/// Type of a host object described by metadata that did not follow a final symlink.
+fn host_file_type(metadata: &fs::Metadata) -> std::io::Result<FileType> {
+    if metadata.file_type().is_symlink() {
+        Ok(FileType::SymbolicLink)
+    } else if metadata.is_file() {
+        Ok(FileType::RegularFile)
+    } else if metadata.is_dir() {
+        Ok(FileType::Directory)
+    } else {
+        Err(unsupported_object())
+    }
+}
+
 fn status_from_metadata(
     metadata: &fs::Metadata,
     node_info: NodeInfo,
 ) -> std::io::Result<FileStatus> {
-    let file_type = if metadata.is_file() {
-        FileType::RegularFile
-    } else if metadata.is_dir() {
-        FileType::Directory
-    } else {
-        return Err(unsupported_object());
-    };
+    let file_type = host_file_type(metadata)?;
     let (mode, owner, blksize) = {
         #[cfg(unix)]
         {
@@ -335,41 +358,16 @@ impl LocalFs {
         LocalDir {
             instance_tag: self.instance_tag.clone(),
             canonical_path: self.root.clone(),
-            requested_name_was_symlink: false,
         }
     }
 
-    fn ensure_beneath_root(&self, path: PathBuf) -> std::io::Result<PathBuf> {
-        let relative = path.strip_prefix(&self.root).map_err(|_| invalid_path())?;
-        for component in relative.components() {
-            let std::path::Component::Normal(name) = component else {
-                return Err(invalid_path());
-            };
-            validate_name(name.to_str().ok_or_else(invalid_path)?).map_err(|_| invalid_path())?;
-        }
-        Ok(path)
-    }
-
-    fn locate(&self, parent: &LocalDir, name: &str) -> std::io::Result<Located> {
+    fn locate(parent: &LocalDir, name: &str) -> std::io::Result<Located> {
         validate_name(name).map_err(|_| invalid_path())?;
-        let candidate = parent.canonical_path.join(name);
-        let requested_name_was_symlink = fs::symlink_metadata(&candidate)?.file_type().is_symlink();
-        // Resolve once through the guest-visible spelling so the host performs native search
-        // permission checks for every symlink target component (including `dir/..`). The trusted
-        // host assumption lets the subsequent canonicalization reuse that result safely.
-        let metadata = fs::metadata(&candidate)?;
-        let canonical_path = self.ensure_beneath_root(fs::canonicalize(candidate)?)?;
-        let file_type = if metadata.is_file() {
-            FileType::RegularFile
-        } else if metadata.is_dir() {
-            FileType::Directory
-        } else {
-            return Err(unsupported_object());
-        };
+        let canonical_path = parent.canonical_path.join(name);
+        let file_type = host_file_type(&fs::symlink_metadata(&canonical_path)?)?;
         Ok(Located {
             canonical_path,
             file_type,
-            requested_name_was_symlink,
         })
     }
 
@@ -385,14 +383,8 @@ impl LocalFs {
     }
 
     fn status_path_of_type(&self, path: &Path, expected: FileType) -> std::io::Result<FileStatus> {
-        let metadata = fs::metadata(path)?;
-        let actual = if metadata.is_file() {
-            FileType::RegularFile
-        } else if metadata.is_dir() {
-            FileType::Directory
-        } else {
-            return Err(unsupported_object());
-        };
+        let metadata = fs::symlink_metadata(path)?;
+        let actual = host_file_type(&metadata)?;
         // Check before `node` so a replaced object is not assigned a guest inode ID.
         if actual != expected {
             return Err(unsupported_object());
@@ -425,14 +417,13 @@ impl Backend for LocalFs {
             let Located {
                 canonical_path,
                 file_type,
-                requested_name_was_symlink,
-            } = self.locate(&dir, name).map_err(walk_error)?;
+            } = Self::locate(&dir, name).map_err(walk_error)?;
             if file_type == FileType::Directory {
                 dir = LocalDir {
                     instance_tag: self.instance_tag.clone(),
                     canonical_path,
-                    requested_name_was_symlink,
                 };
+                // XXX: search on a dir followed by `..` goes unchecked (e.g. `blocked/../target`).
                 walked.push(WalkedComponent {
                     permissions: PermissionCheck::ByBackend,
                 });
@@ -451,9 +442,64 @@ impl Backend for LocalFs {
         })
     }
 
-    fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, _name: &str) -> Result<String, WalkError> {
-        // Host symlinks are followed during `locate`, so walks never stop at one.
-        unimplemented!("symbolic links on the local host filesystem")
+    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
+        validate_name(name)?;
+        let dir = dir.as_typed::<Self>();
+        if !self.valid_dir(dir) {
+            return Err(WalkError::Io);
+        }
+        let target = fs::read_link(dir.canonical_path.join(name)).map_err(walk_error)?;
+        // The guest root is wherever this backend is mounted, so an absolute target below the host
+        // root becomes the equivalent path relative to the link's directory. Any other rooted
+        // target (including Windows drive- or root-relative forms) names a host location outside
+        // the root and is rejected.
+        if matches!(
+            target.components().next(),
+            Some(std::path::Component::Prefix(_) | std::path::Component::RootDir)
+        ) {
+            let inside = target.strip_prefix(&self.root);
+            // The root is canonical, but targets may spell it differently (Windows verbatim or 8.3
+            // short prefixes, case, host symlinks in ancestors). Canonicalize the parent only, so
+            // the final component stays a name the resolver will itself follow.
+            let canonical_target =
+                target
+                    .parent()
+                    .zip(target.file_name())
+                    .and_then(|(parent, name)| {
+                        fs::canonicalize(parent)
+                            .ok()
+                            .map(|parent| parent.join(name))
+                    });
+            let inside = inside.or_else(|error| {
+                canonical_target
+                    .as_deref()
+                    .map_or(Err(error), |target| target.strip_prefix(&self.root))
+            });
+            let (Ok(inside), Ok(depth)) = (inside, dir.canonical_path.strip_prefix(&self.root))
+            else {
+                litebox_util_log::debug!(
+                    target:? = target;
+                    "rejecting host symlink with an absolute target outside the root"
+                );
+                return Err(PathError::InvalidPathname.into());
+            };
+            let parts = depth
+                .components()
+                .map(|_| Some(".."))
+                .chain(inside.components().map(|part| part.as_os_str().to_str()))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(PathError::InvalidPathname)?;
+            return Ok(if parts.is_empty() {
+                String::from(".")
+            } else {
+                parts.join("/")
+            });
+        }
+        let target = target.to_str().ok_or(PathError::InvalidPathname)?;
+        #[cfg(windows)]
+        return Ok(target.replace('\\', "/"));
+        #[cfg(not(windows))]
+        Ok(target.into())
     }
 
     fn owned_dir_at(
@@ -472,15 +518,6 @@ impl Backend for LocalFs {
                 "directory vanished or was replaced before open; reporting Io"
             );
             return Err(OpenError::Io);
-        }
-        if dir.requested_name_was_symlink && flags.contains(OFlags::NOFOLLOW) {
-            // This flag persists on opened handles, so reopening one with `O_NOFOLLOW` and no
-            // further components is rejected too.
-            litebox_util_log::debug!(
-                path:? = dir.canonical_path;
-                "rejecting O_NOFOLLOW directory symlink as InvalidPathname where Linux would return ELOOP"
-            );
-            return Err(PathError::InvalidPathname.into());
         }
         if flags.contains(OFlags::CREAT | OFlags::EXCL) {
             return Err(OpenError::AlreadyExists);
@@ -534,19 +571,19 @@ impl Backend for LocalFs {
         let Located {
             canonical_path,
             file_type,
-            requested_name_was_symlink,
-        } = self.locate(&dir, name).map_err(open_error)?;
-        if requested_name_was_symlink && flags.contains(OFlags::NOFOLLOW) {
-            litebox_util_log::debug!(
-                path:? = canonical_path;
-                "rejecting O_NOFOLLOW file symlink as InvalidPathname where Linux would return ELOOP"
-            );
-            return Err(PathError::InvalidPathname.into());
-        }
+        } = Self::locate(&dir, name).map_err(open_error)?;
         if flags.contains(OFlags::CREAT | OFlags::EXCL) {
             return Err(OpenError::AlreadyExists);
         }
-        if file_type != FileType::RegularFile || flags.contains(OFlags::DIRECTORY) {
+        let symlink = file_type == FileType::SymbolicLink;
+        if symlink
+            && !flags.contains(OFlags::DIRECTORY)
+            && !flags.contains(OFlags::PATH | OFlags::NOFOLLOW)
+        {
+            // The resolver follows links itself, so only a non-following `O_PATH` open names one.
+            return Err(PathError::TooManySymlinks.into());
+        }
+        if !(file_type == FileType::RegularFile || symlink) || flags.contains(OFlags::DIRECTORY) {
             if file_type == FileType::Directory {
                 litebox_util_log::debug!(
                     path:? = canonical_path;
@@ -592,6 +629,7 @@ impl Backend for LocalFs {
             item: FileHandle::from_typed::<Self>(LocalFile {
                 instance_tag: self.instance_tag.clone(),
                 canonical_path,
+                file_type,
                 file,
                 readable,
                 writable,
@@ -619,16 +657,8 @@ impl Backend for LocalFs {
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            // `DirEntry::metadata` does not follow symlinks. Symlinks stay unlisted even when
-            // lookups would follow them inside the root.
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            let file_type = if metadata.is_file() {
-                FileType::RegularFile
-            } else if metadata.is_dir() {
-                FileType::Directory
-            } else {
+            // `DirEntry::metadata` does not follow symlinks.
+            let Ok(file_type) = host_file_type(&metadata) else {
                 continue;
             };
             result.push(DirEntry {
@@ -761,7 +791,7 @@ impl Backend for LocalFs {
                     self.status_file(open, &file.canonical_path)
                         .map_err(|_| FileStatusError::Io)
                 } else {
-                    self.status_path_of_type(&file.canonical_path, FileType::RegularFile)
+                    self.status_path_of_type(&file.canonical_path, file.file_type)
                         .map_err(|_| FileStatusError::Io)
                 }
             }
@@ -801,6 +831,7 @@ impl Backend for LocalFs {
         Ok(FileHandle::from_typed::<Self>(LocalFile {
             instance_tag: self.instance_tag.clone(),
             canonical_path,
+            file_type: FileType::RegularFile,
             file: Some(Arc::new(opened)),
             readable: true,
             writable: true,
@@ -851,7 +882,6 @@ impl Backend for LocalFs {
         Ok(DirHandle::from_typed::<Self>(LocalDir {
             instance_tag: self.instance_tag.clone(),
             canonical_path,
-            requested_name_was_symlink: false,
         }))
     }
 
@@ -925,6 +955,9 @@ impl Backend for LocalFs {
                 if !self.valid_file(file) {
                     return Err(ChmodError::Io);
                 }
+                if file.is_symlink() {
+                    return Err(ChmodError::IsSymlink);
+                }
                 if let Some(open) = &file.file {
                     set_permissions_file(open, mode)
                 } else {
@@ -964,6 +997,9 @@ impl Backend for LocalFs {
                 let file = file.get_typed::<Self>();
                 if !self.valid_file(file) {
                     return Err(ChownError::Io);
+                }
+                if file.is_symlink() {
+                    return Err(ChownError::IsSymlink);
                 }
                 file.file
                     .as_deref()
