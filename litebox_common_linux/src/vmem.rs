@@ -265,8 +265,8 @@ where
 {
     /// Release all owned reservations and mappings.
     ///
-    /// On failure, released extents have been removed from both stores, and the extents not
-    /// yet attempted remain available for retry.
+    /// On failure, extents not yet attempted remain available for retry. Tracked stores also
+    /// remove mappings for reservations consumed by a failed release.
     ///
     /// # Safety
     ///
@@ -293,6 +293,9 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError>;
 
     /// Release a range's platform backing, update reservation ownership, and remove its VMAs.
+    ///
+    /// A failed release that consumes a reservation also removes its VMAs; unattempted
+    /// reservations and their VMAs remain tracked.
     ///
     /// # Safety
     ///
@@ -439,9 +442,10 @@ where
     ) -> Result<(), DeallocationError> {
         while let Some(reservation) = self.pop_first() {
             let extent = reservation.range();
+            // Release consumes reservation ownership even on failure.
+            vmas.remove(extent);
             // SAFETY: The caller relinquishes this reservation without remaining users.
             unsafe { platform.release_pages(reservation) }?;
-            vmas.remove(extent);
         }
         Ok(())
     }
@@ -641,6 +645,8 @@ where
                 continue;
             }
 
+            // Release consumes reservation ownership even on failure.
+            vmas.remove(extent);
             // SAFETY: This reservation has no surviving users or mappings outside the removed range.
             if let Err(error) = unsafe { platform.release_pages(reservation) } {
                 for pending in reservations {
@@ -648,7 +654,6 @@ where
                 }
                 return Err(error);
             }
-            vmas.remove(extent);
         }
         vmas.remove(range);
         Ok(())
@@ -1856,6 +1861,7 @@ mod tests {
         calls: Mutex<Vec<AllocationCall>>,
         decommits: Mutex<Vec<Range<usize>>>,
         shared_allocations: Mutex<Vec<Range<usize>>>,
+        rejected_release: Mutex<Option<usize>>,
         releases: Mutex<Vec<Range<usize>>>,
         permission_updates: Mutex<Vec<PermissionUpdate>>,
         store: core::marker::PhantomData<fn() -> Store>,
@@ -1976,7 +1982,12 @@ mod tests {
             &self,
             target: litebox::platform::page_mgmt::ReleaseTargetOf<Self, PAGE_SIZE>,
         ) -> Result<(), DeallocationError> {
-            self.releases.lock().push(target.into());
+            let range = target.into();
+            let rejected = *self.rejected_release.lock() == Some(range.start);
+            self.releases.lock().push(range);
+            if rejected {
+                return Err(DeallocationError::AlreadyUnallocated);
+            }
             Ok(())
         }
 
@@ -2072,6 +2083,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
+            rejected_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,
@@ -2567,6 +2579,54 @@ mod tests {
 
         check(dummy_backend::<false>(None));
         check(tracked_dummy_backend(None));
+    }
+
+    #[test]
+    fn tracked_release_failure_untracks_consumed_reservations_and_preserves_pending() {
+        let base = 0x10_0000;
+        let page = |index: usize| base + index * PAGE_SIZE;
+        let extents = [page(0)..page(1), page(1)..page(2), page(2)..page(3)];
+        for unmap in [false, true] {
+            for failed in 0..extents.len() {
+                let backend = tracked_dummy_backend(None);
+                *backend.rejected_release.lock() = Some(extents[failed].start);
+                let mut vmm = Vmem::<_, PAGE_SIZE>::new(backend);
+                for extent in &extents {
+                    // SAFETY: The mock models disjoint, exclusively owned reservation pieces.
+                    let reservation = unsafe { DummyReservation::new(extent.clone()) };
+                    vmm.reservations.insert(extent.start, reservation);
+                }
+                vmm.vmas.insert(page(0)..page(3), read_write_vma());
+
+                let result = if unmap {
+                    // SAFETY: These simulated mappings have no active users.
+                    unsafe {
+                        vmm.reservations
+                            .unmap(backend, &mut vmm.vmas, page(0)..page(3))
+                    }
+                } else {
+                    // SAFETY: These simulated mappings have no active users.
+                    unsafe { vmm.release_all() }
+                };
+                assert!(matches!(result, Err(DeallocationError::AlreadyUnallocated)));
+                assert_eq!(*backend.releases.lock(), extents[..=failed]);
+                assert_eq!(collect_reservations(&vmm), extents[failed + 1..]);
+                let pending_range = page(failed + 1)..page(3);
+                let pending: &[Range<usize>] = if pending_range.is_empty() {
+                    &[]
+                } else {
+                    core::slice::from_ref(&pending_range)
+                };
+                assert_eq!(collect_mappings(&vmm), pending);
+
+                *backend.rejected_release.lock() = None;
+                // SAFETY: The remaining simulated mappings still have no active users.
+                unsafe { vmm.release_all() }.unwrap();
+                assert_eq!(*backend.releases.lock(), extents);
+                assert_eq!(collect_reservations(&vmm), []);
+                assert_eq!(collect_mappings(&vmm), []);
+            }
+        }
     }
 
     #[test]
@@ -3227,6 +3287,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
+            rejected_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,

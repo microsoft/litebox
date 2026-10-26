@@ -646,7 +646,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             // SAFETY: The range is page-aligned and belongs to an allocation tracked for this
             // process. The guest requested release, so the pages must not be used after success.
-            if unsafe { vmem.remove_pages(ptr, aligned_len) }.is_err() {
+            if unsafe { vmem.release_allocation(aligned_base, aligned_len) }.is_err() {
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
             vmem.split_allocation_around(allocation, aligned_base, aligned_len, None);
@@ -1442,7 +1442,7 @@ pub(super) fn parse_page_protection(
     Some((protect - PageProtection::PAGE_TARGETS_INVALID, permissions))
 }
 
-/// Returns the native permissions enforcing `protect`, or `None` if it is not a valid protection.
+/// Converts valid Windows protection to native R/W/X permissions; modifiers are not represented.
 pub(crate) fn page_protect_to_permissions(
     protect: PageProtection,
 ) -> Option<MemoryRegionPermissions> {
@@ -1572,7 +1572,7 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
             .reservation_containing(query_base)
             .unwrap_or_else(|| range.clone());
         let (state, protect) = basic_information_state_and_protect(area.state);
-        // LiteBox reserves its internal pages inaccessible before committing them.
+        // Internal allocations have no saved allocation protection; report their current protection.
         let allocation_protect = match area.state {
             PageState::Reserved => PageProtection::PAGE_NOACCESS.bits(),
             PageState::Committed(_) => protect,
@@ -3561,27 +3561,29 @@ mod tests {
                 // SAFETY: The output pointers are valid locals and the current-process pseudo
                 // handle targets this process. The allocation is released before return.
                 let host_allocate_status = unsafe {
-                    host_status(NtAllocateVirtualMemory(
+                    NtAllocateVirtualMemory(
                         current_process(),
                         &raw mut host_base,
                         0,
                         &raw mut host_size,
                         (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
                         protect.bits(),
-                    ))
+                    )
                 };
+                let host_allocate_status = host_status(host_allocate_status);
                 assert_eq!(host_allocate_status, NtStatus::SUCCESS);
                 let mut host_middle = host_base.wrapping_byte_add(PAGE_SIZE);
                 let mut host_middle_size = PAGE_SIZE;
                 // SAFETY: Decommits a page of the live host allocation that is never accessed.
                 let host_decommit_status = unsafe {
-                    host_status(NtFreeVirtualMemory(
+                    NtFreeVirtualMemory(
                         current_process(),
                         &raw mut host_middle,
                         &raw mut host_middle_size,
                         FreeType::MEM_DECOMMIT.bits(),
-                    ))
+                    )
                 };
+                let host_decommit_status = host_status(host_decommit_status);
                 assert_eq!(host_decommit_status, NtStatus::SUCCESS);
 
                 let task = crate::tests::test_task();
@@ -3623,14 +3625,15 @@ mod tests {
                     // SAFETY: Reprotects a committed page of the live host allocation that is
                     // never accessed; all output pointers are valid locals.
                     let host_protect_status = unsafe {
-                        host_status(NtProtectVirtualMemory(
+                        NtProtectVirtualMemory(
                             current_process(),
                             &raw mut host_page,
                             &raw mut host_page_size,
                             new_protect.bits(),
                             &raw mut host_old_protect,
-                        ))
+                        )
                     };
+                    let host_protect_status = host_status(host_protect_status);
                     let mut guest_page = guest_base + page * PAGE_SIZE;
                     let mut guest_page_size = PAGE_SIZE;
                     let mut guest_old_protect = 0u32;
@@ -3661,13 +3664,14 @@ mod tests {
                 let mut host_release_size = 0usize;
                 // SAFETY: Releases the host allocation created by this test.
                 let host_free_status = unsafe {
-                    host_status(NtFreeVirtualMemory(
+                    NtFreeVirtualMemory(
                         current_process(),
                         &raw mut host_base,
                         &raw mut host_release_size,
                         FreeType::MEM_RELEASE.bits(),
-                    ))
+                    )
                 };
+                let host_free_status = host_status(host_free_status);
                 assert_eq!(host_free_status, NtStatus::SUCCESS);
             });
         }
@@ -3998,32 +4002,19 @@ mod tests {
                 // SAFETY: The output pointers are valid locals and the current-process pseudo
                 // handle targets this process. The allocation is released before return.
                 let host_allocate_status = unsafe {
-                    host_status(NtAllocateVirtualMemory(
+                    NtAllocateVirtualMemory(
                         current_process(),
                         &raw mut host_base,
                         0,
                         &raw mut host_region_size,
                         AllocationType::MEM_COMMIT.bits(),
                         PageProtection::PAGE_NOACCESS.bits(),
-                    ))
+                    )
                 };
+                let host_allocate_status = host_status(host_allocate_status);
                 assert_eq!(host_allocate_status, NtStatus::SUCCESS);
 
-                let mut host_info = MemoryBasicInformation::default();
-                let mut host_return_length = 0usize;
-                // SAFETY: The host allocation is live, and the output buffer and return length are
-                // valid locals that ntdll writes synchronously.
-                let host_query_status = unsafe {
-                    host_status(NtQueryVirtualMemory(
-                        current_process(),
-                        host_base,
-                        MemoryInformationClass::Basic as u32,
-                        (&raw mut host_info).cast(),
-                        size_of::<MemoryBasicInformation>(),
-                        &raw mut host_return_length,
-                    ))
-                };
-                assert_eq!(host_query_status, NtStatus::SUCCESS);
+                let host_info = host_query(host_base as usize);
 
                 let task = crate::tests::test_task();
                 let mut guest_base = 0usize;
@@ -4044,11 +4035,7 @@ mod tests {
                 assert_eq!(host_info.base_address, host_base as usize);
                 assert_eq!(guest_info.allocation_base, guest_base);
                 assert_eq!(host_info.allocation_base, host_base as usize);
-                assert_eq!(guest_info.allocation_protect, host_info.allocation_protect);
-                assert_eq!(guest_info.region_size, host_info.region_size);
-                assert_eq!(guest_info.state, host_info.state);
-                assert_eq!(guest_info.protect, host_info.protect);
-                assert_eq!(guest_info.type_, host_info.type_);
+                assert_query_matches_host(&guest_info, guest_base, &host_info, host_base as usize);
 
                 let mut guest_release_base = guest_base;
                 let mut guest_release_size = 0usize;
@@ -4061,13 +4048,14 @@ mod tests {
                 let mut host_release_size = 0usize;
                 // SAFETY: Releases the host allocation created by this test.
                 let host_free_status = unsafe {
-                    host_status(NtFreeVirtualMemory(
+                    NtFreeVirtualMemory(
                         current_process(),
                         &raw mut host_base,
                         &raw mut host_release_size,
                         FreeType::MEM_RELEASE.bits(),
-                    ))
+                    )
                 };
+                let host_free_status = host_status(host_free_status);
                 assert_eq!(guest_free_status, host_free_status);
                 assert_eq!(guest_release_size, host_release_size);
             });

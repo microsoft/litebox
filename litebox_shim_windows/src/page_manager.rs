@@ -50,7 +50,7 @@ pub(crate) enum PageState {
 /// State of a run of owned pages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsArea {
-    /// The owning guest allocation, or `None` for LiteBox-internal pages.
+    /// The guest allocation assigned to these pages, if any.
     pub(crate) allocation: Option<WindowsVirtualAllocation>,
     /// Whether the pages are committed, and with which protection.
     pub(crate) state: PageState,
@@ -618,17 +618,20 @@ where
         Ok(())
     }
 
-    /// Releases `len` bytes at `ptr`, which must lie in one owned reservation, with their state.
+    /// Releases `len` bytes at `base`, which must lie in one owned reservation, with their
+    /// page state and allocation records.
+    ///
+    /// Range-validation failures leave tracking unchanged; once native release starts, the
+    /// range is untracked even if release fails.
     ///
     /// # Safety
     /// The caller relinquishes the range and must exclude any remaining users of it.
-    pub(crate) unsafe fn remove_pages(
+    pub(crate) unsafe fn release_allocation(
         &mut self,
-        ptr: Platform::RawMutPointer<u8>,
+        base: usize,
         len: usize,
     ) -> Result<(), VmemUnmapError> {
-        let start = ptr.as_usize();
-        let range = page_range(start, len).ok_or(VmemUnmapError::UnAligned)?;
+        let range = page_range(base, len).ok_or(VmemUnmapError::UnAligned)?;
         if containing_reservation::<Platform>(&self.reservations, &range).is_none() {
             return Err(litebox::platform::page_mgmt::DeallocationError::AlreadyUnallocated.into());
         }
@@ -643,23 +646,6 @@ where
             }?;
         }
         Ok(())
-    }
-
-    /// Releases the pages of the allocation recorded at `base` together with its record, so
-    /// no other thread can observe one without the other.
-    ///
-    /// Range-validation failures leave tracking unchanged; once native release starts, the
-    /// range is untracked even if release fails.
-    ///
-    /// # Safety
-    /// Same contract as [`Self::remove_pages`].
-    pub(crate) unsafe fn release_allocation(
-        &mut self,
-        base: usize,
-        len: usize,
-    ) -> Result<(), VmemUnmapError> {
-        // SAFETY: Forwarded caller contract.
-        unsafe { self.remove_pages(Platform::RawMutPointer::<u8>::from_usize(base), len) }
     }
 }
 
@@ -825,7 +811,7 @@ where
     ) -> Result<(), VmemUnmapError> {
         let mut vmem = self.vmem.write();
         // SAFETY: The write guard provides exclusive state access and forwards the caller contract.
-        unsafe { vmem.remove_pages(ptr, len) }
+        unsafe { vmem.release_allocation(ptr.as_usize(), len) }
     }
 }
 
