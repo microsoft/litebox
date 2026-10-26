@@ -173,19 +173,19 @@
 //!   host's futex. The kernel's broker changes the ring words, and serves the
 //!   published requests apart from the call, as the userland broker's
 //!   workers do; so on a word of the control ring:
-//!   - [`FutexOp::Wake`] on the requests' producer epoch has the kernel serve
-//!     them (before the call returns, unless a request waits, e.g., for a
-//!     device); on other words, it wakes nothing.
+//!   - [`FutexOp::Wake`] on the requests' producer wake counter has the kernel
+//!     serve them (before the call returns, unless a request waits, e.g., for
+//!     a device); on other words, it wakes nothing.
 //!   - [`FutexOp::Wait`] needs no wake: it returns once the word differs from
 //!     `expected`, the kernel serving the published requests meanwhile. It
 //!     is not interrupted ([`Status::Interrupted`]); a thread interrupted
 //!     meanwhile takes the interrupt once it resumes. Without a deadline, a
-//!     word other than the notification epoch is [`Status::Stalled`] once the
-//!     kernel has served every published request.
+//!     word other than the notification wake counter is [`Status::Stalled`]
+//!     once the kernel has served every published request.
 //! - The ring's notification direction carries readiness of broker objects
 //!   (e.g., standard input) from the kernel, published as it changes; the
 //!   runner consumes them and waits for them on the direction's producer
-//!   epoch.
+//!   wake counter.
 //! - The kernel pins the control ring and accesses it through its own mapping.
 //!   The shared buffers stay lazily populated and are touched only while
 //!   executing a request that names them, or by a launched process's

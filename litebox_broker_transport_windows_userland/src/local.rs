@@ -315,11 +315,11 @@ impl LocalNotificationChannel for WindowsControlRingLocalNotificationChannel {
                     }
                     return Ok(Some(notification));
                 }
-                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                Ok(ControlRingReadStatus::Empty { wake_count }) => {
                     if let Some(error) = self.association.lanes.current_failure() {
                         return self.association.end_notifications(error);
                     }
-                    if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
+                    if let Err(error) = self.consumer.wait_for_message(wake_count) {
                         let result = Err(copy_io_error(&error));
                         let _ = self.association.fail(error);
                         return result;
@@ -393,8 +393,8 @@ impl LocalRingAssociation {
                 .run_if_live(|| producer.try_write(&request_frame).map_err(ring_error))?;
             match write_status {
                 ControlRingWriteStatus::Written => break,
-                ControlRingWriteStatus::Full { wait_epoch } => {
-                    producer.wait_for_capacity(wait_epoch)?;
+                ControlRingWriteStatus::Full { wake_count } => {
+                    producer.wait_for_capacity(wake_count)?;
                 }
             }
         }
@@ -404,11 +404,11 @@ impl LocalRingAssociation {
         let response = loop {
             match consumer.try_read(decode_response) {
                 Ok(ControlRingReadStatus::Message(response)) => break response,
-                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                Ok(ControlRingReadStatus::Empty { wake_count }) => {
                     if let Some(error) = self.lanes.current_failure() {
                         return Err(error);
                     }
-                    consumer.wait_for_message(wait_epoch)?;
+                    consumer.wait_for_message(wake_count)?;
                 }
                 Err(ControlRingReadError::Ring(error)) => return Err(ring_error(error)),
                 Err(ControlRingReadError::Decode(error)) => return Err(wire_error(error)),

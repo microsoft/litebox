@@ -333,11 +333,11 @@ impl UnixControlRingHostCallLaneSource {
                         association: Arc::clone(&self.association),
                     }));
                 }
-                Ok(ControlRingDemandStatus::Satisfied { wait_epoch }) => {
+                Ok(ControlRingDemandStatus::Satisfied { wake_count }) => {
                     if let Some(ended) = self.association.ended() {
                         return ended.map(|()| None);
                     }
-                    if let Err(error) = self.demand.wait_for_demand(wait_epoch) {
+                    if let Err(error) = self.demand.wait_for_demand(wake_count) {
                         let result = Err(copy_io_error(&error));
                         let _ = self.association.fail(error);
                         return result;
@@ -376,11 +376,11 @@ impl UnixControlRingHostCallLane {
                     self.association.acknowledge_request(consumer)?;
                     return Ok(HostReceive::Message(request));
                 }
-                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                Ok(ControlRingReadStatus::Empty { wake_count }) => {
                     if let Some(ended) = self.association.ended() {
                         return ended.map(|()| HostReceive::PeerClosed);
                     }
-                    if let Err(error) = consumer.wait_for_message(wait_epoch) {
+                    if let Err(error) = consumer.wait_for_message(wake_count) {
                         let result = Err(copy_io_error(&error));
                         let _ = self.association.fail(error);
                         return result;
@@ -412,8 +412,8 @@ impl UnixControlRingHostCallLane {
         loop {
             match self.association.try_publish(producer, &frame)? {
                 ControlRingWriteStatus::Written => return Ok(()),
-                ControlRingWriteStatus::Full { wait_epoch } => {
-                    if let Err(error) = producer.wait_for_capacity(wait_epoch) {
+                ControlRingWriteStatus::Full { wake_count } => {
+                    if let Err(error) = producer.wait_for_capacity(wake_count) {
                         let result = Err(copy_io_error(&error));
                         let _ = self.association.fail(error);
                         return result;
@@ -444,8 +444,8 @@ impl HostNotificationChannel for UnixControlRingHostNotificationChannel {
         loop {
             match self.association.try_publish(&mut self.producer, &frame)? {
                 ControlRingWriteStatus::Written => return Ok(()),
-                ControlRingWriteStatus::Full { wait_epoch } => {
-                    if let Err(error) = self.producer.wait_for_capacity(wait_epoch) {
+                ControlRingWriteStatus::Full { wake_count } => {
+                    if let Err(error) = self.producer.wait_for_capacity(wake_count) {
                         let result = Err(copy_io_error(&error));
                         let _ = self.association.fail(error);
                         return result;
@@ -760,8 +760,8 @@ mod tests {
                     consumer.wake_producer().unwrap();
                     return response;
                 }
-                ControlRingReadStatus::Empty { wait_epoch } => {
-                    consumer.wait_for_message(wait_epoch).unwrap();
+                ControlRingReadStatus::Empty { wake_count } => {
+                    consumer.wait_for_message(wake_count).unwrap();
                 }
             }
         }
@@ -774,8 +774,8 @@ mod tests {
                     producer.wake_consumer().unwrap();
                     return;
                 }
-                ControlRingWriteStatus::Full { wait_epoch } => {
-                    producer.wait_for_capacity(wait_epoch).unwrap();
+                ControlRingWriteStatus::Full { wake_count } => {
+                    producer.wait_for_capacity(wake_count).unwrap();
                 }
             }
         }

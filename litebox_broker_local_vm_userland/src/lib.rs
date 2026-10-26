@@ -8,9 +8,9 @@
 //!
 //! Where the userland transport uses the host's futex, this one uses the
 //! kernel's (`Futex`), on the same ring words. The kernel serves the ring
-//! apart from it, so a call takes a Wake (on the requests' producer epoch)
-//! and, unless the response is already there, a Wait. Shared memory is
-//! accessed only through `peer_memory`.
+//! apart from it, so a call takes a Wake (on the requests' producer wake
+//! counter) and, unless the response is already there, a Wait. Shared memory
+//! is accessed only through `peer_memory`.
 //!
 //! Notifications (readiness of broker objects, e.g., standard input) have no
 //! receiver thread: the runner receives them with [`Notifications::receive`],
@@ -131,8 +131,8 @@ impl Rings {
                 .map_err(ChannelError::Ring)?
             {
                 ControlRingWriteStatus::Written => break,
-                ControlRingWriteStatus::Full { wait_epoch } => {
-                    self.requests.wait_for_capacity(wait_epoch)?;
+                ControlRingWriteStatus::Full { wake_count } => {
+                    self.requests.wait_for_capacity(wake_count)?;
                 }
             }
         }
@@ -141,8 +141,8 @@ impl Rings {
         let response = loop {
             match self.responses.try_read(wire::decode_response) {
                 Ok(ControlRingReadStatus::Message(response)) => break response,
-                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                    self.responses.wait_for_message(wait_epoch)?;
+                Ok(ControlRingReadStatus::Empty { wake_count }) => {
+                    self.responses.wait_for_message(wake_count)?;
                 }
                 Err(ControlRingReadError::Ring(error)) => return Err(ChannelError::Ring(error)),
                 Err(ControlRingReadError::Decode(error)) => return Err(ChannelError::Wire(error)),
@@ -442,13 +442,13 @@ impl Notifications {
     ) -> Result<usize, ChannelError> {
         loop {
             let start = self.words.start;
-            let (received, wait_epoch) =
+            let (received, wake_count) =
                 self.read_published(&mut dispatch, || broker_wake(start))?;
             if received != 0 {
                 return Ok(received);
             }
-            let epoch = LAYOUT.notifications().producer_epoch_offset();
-            match broker_wait(self.words.start, epoch, wait_epoch, deadline) {
+            let notified = LAYOUT.notifications().producer_wake_offset();
+            match broker_wait(self.words.start, notified, wake_count, deadline) {
                 Ok(()) => {}
                 Err(Status::TimedOut) => return Ok(0),
                 Err(status) => return Err(ChannelError::Kernel(status)),
@@ -471,9 +471,10 @@ impl Notifications {
         Ok(self.read_published(&mut dispatch, || broker_wake(start))?.0)
     }
 
-    /// As [`Self::try_receive`], also returning the producer epoch to wait on
-    /// while the ring stays empty; `publish_rest` (e.g., [`broker_wake`]) has
-    /// the kernel publish what did not fit in a full ring.
+    /// As [`Self::try_receive`], also returning the producer wake count to
+    /// wait on while the ring stays empty; `publish_rest` (e.g.,
+    /// [`broker_wake`]) has the kernel publish what did not fit in a full
+    /// ring.
     ///
     /// Reads what is published, publishes its progress, and only then
     /// dispatches it, until a read finds nothing: dispatching may take long
@@ -488,15 +489,15 @@ impl Notifications {
         let mut received = 0;
         loop {
             let mut batch = Vec::new();
-            let wait_epoch = loop {
+            let wake_count = loop {
                 match self.consumer.try_read(wire::decode_notification) {
                     Ok(ControlRingReadStatus::Message(notification)) => batch.push(notification),
-                    Ok(ControlRingReadStatus::Empty { wait_epoch }) => break wait_epoch,
+                    Ok(ControlRingReadStatus::Empty { wake_count }) => break wake_count,
                     Err(error) => return Err(read_error(error)),
                 }
             };
             if batch.is_empty() {
-                return Ok((received, wait_epoch));
+                return Ok((received, wake_count));
             }
             // The kernel sees the freed slots when it next publishes.
             self.consumer.publish_head().map_err(ChannelError::Ring)?;
@@ -664,9 +665,9 @@ fn futex(
 }
 
 /// Has the kernel serve published broker requests: a wake on the requests'
-/// producer epoch of the control ring at `start`.
+/// producer wake counter of the control ring at `start`.
 fn broker_wake(start: usize) -> Result<(), Status> {
-    let offset = LAYOUT.requests(0).producer_epoch_offset();
+    let offset = LAYOUT.requests(0).producer_wake_offset();
     futex(start, |addr| FutexRequest::wake(addr, 1), offset)
 }
 
@@ -689,15 +690,15 @@ fn broker_wait(
 }
 
 /// Self-check (debug builds): the broker's futex operations, on the
-/// notification ring's producer epoch and on the request ring's consumer
-/// epoch, which only the kernel's serving changes.
+/// notification ring's producer wake counter and on the request ring's
+/// consumer wake counter, which only the kernel's serving changes.
 ///
 /// # Panics
 ///
 /// On a failed check.
 pub fn self_check(notifications: &Notifications, platform: &VmUserland) {
-    let epoch = LAYOUT.notifications().producer_epoch_offset();
-    let served = LAYOUT.requests(0).consumer_epoch_offset();
+    let notified = LAYOUT.notifications().producer_wake_offset();
+    let served = LAYOUT.requests(0).consumer_wake_offset();
     let now = || platform.now();
     let current = |offset| {
         notifications
@@ -709,12 +710,12 @@ pub fn self_check(notifications: &Notifications, platform: &VmUserland) {
     broker_wake(start).expect("waking an idle broker");
     // The broker waits on no other word.
     assert_eq!(
-        futex(start, |addr| FutexRequest::wake(addr, 1), epoch),
+        futex(start, |addr| FutexRequest::wake(addr, 1), notified),
         Ok(())
     );
-    let notified = current(epoch);
+    let wake_count = current(notified);
     assert_eq!(
-        broker_wait(start, epoch, notified.wrapping_add(1), None),
+        broker_wait(start, notified, wake_count.wrapping_add(1), None),
         Ok(()),
         "word differs"
     );

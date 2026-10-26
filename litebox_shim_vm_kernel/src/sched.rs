@@ -852,8 +852,8 @@ fn work(claim: &Claim<'_>, resume: bool) -> Ran {
 }
 
 /// Whether a notification may end `thread`'s wait: a futex wait (see
-/// [`Inner::poll_futex`]), or a broker wait on the notification epoch. Its
-/// process is then a notification waiter (see
+/// [`Inner::poll_futex`]), or a broker wait on the notification wake counter.
+/// Its process is then a notification waiter (see
 /// [`Inner::mark_notification_waiter`]).
 fn waits_for_notifications(thread: &Thread) -> bool {
     match thread.suspended.get() {
