@@ -1277,6 +1277,12 @@ fn forked_children_share_eventfds_and_timerfds() {
 #[cfg(target_os = "linux")]
 #[test]
 fn forked_children_share_futexes_in_shared_memory() {
+    // Copy-based fork cannot share pages, so it refuses to fork with shared anonymous mappings.
+    assert!(
+        std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none()
+            && litebox_platform_linux_userland::process::native_fork_supported(),
+        "shared futexes across fork require native fork support"
+    );
     let parent = common::compile(
         "./tests/fork_shared_futex_parent.c",
         "fork_shared_futex_parent",

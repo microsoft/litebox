@@ -242,11 +242,11 @@ jobs:
           ./.github/tools/github_actions_run_cargo build -p litebox_broker_userland --features litebox_broker_userland/aarch64_virtualize_x18
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_virtualize_x18 -E 'binary(run) or binary(rewritten_guests)'
       - name: Test AArch64 copy-based fork
-        # Forces copy-based fork; the deep fork-chain tests need native fork.
+        # Forces copy-based fork; the deep fork-chain and shared-futex tests need native fork.
         env:
           LITEBOX_DISABLE_NATIVE_FORK: "1"
         run: |
-          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_copy_based_fork -E '(binary(run) and test(/fork|hwcaps/) and not test(/^deep_fork/)) or (binary(rewritten_guests) and test(sve))'
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_copy_based_fork -E '(binary(run) and test(/fork|hwcaps/) and not test(/^deep_fork|^forked_children_share_futexes/)) or (binary(rewritten_guests) and test(sve))'
       # Nextest does not run doctests.
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc $AARCH64_CRATES
