@@ -19,11 +19,17 @@
 #include <termios.h>
 #include <unistd.h>
 
+// Linux may split a message across reads, as its line discipline queues
+// output and echo in pieces.
 static void expect_read(int fd, const char *expected) {
     char buffer[64];
-    size_t length = strlen(expected);
-    ssize_t size = read(fd, buffer, sizeof(buffer));
-    assert(size == (ssize_t)length && memcmp(buffer, expected, length) == 0);
+    size_t length = strlen(expected), received = 0;
+    while (received < length) {
+        ssize_t size = read(fd, buffer + received, sizeof(buffer) - received);
+        assert(size > 0);
+        received += (size_t)size;
+    }
+    assert(received == length && memcmp(buffer, expected, length) == 0);
 }
 
 static void expect_write(int fd, const char *bytes) {
