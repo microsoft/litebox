@@ -40,6 +40,18 @@ pub struct MmapPlacement {
     pub allowed_range: Option<Range<usize>>,
 }
 
+/// A piece of an address range, as split by [`VmemManager::range_pieces`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangePiece {
+    /// No mapping covers the piece.
+    Unmapped,
+    /// One mapping covers the piece.
+    Mapped {
+        /// Whether the mapping is shared anonymous memory.
+        shared_anonymous: bool,
+    },
+}
+
 /// A page manager to support `mmap`, `munmap`, and etc.
 pub struct VmemManager<Platform, const ALIGN: usize>
 where
@@ -656,6 +668,31 @@ where
             next = mapped.end;
         }
         next >= range.end
+    }
+
+    /// Splits `range` into its unmapped gaps and its parts within each mapping, in address order.
+    pub fn range_pieces(&self, range: Range<usize>) -> Vec<(Range<usize>, RangePiece)> {
+        let vmem = self.vmem.read();
+        let mut pieces = Vec::new();
+        let mut next = range.start;
+        for (mapped, vma) in vmem.overlapping(range.clone()) {
+            let start = mapped.start.max(next);
+            let end = mapped.end.min(range.end);
+            if next < start {
+                pieces.push((next..start, RangePiece::Unmapped));
+            }
+            pieces.push((
+                start..end,
+                RangePiece::Mapped {
+                    shared_anonymous: vma.is_shared_anonymous(),
+                },
+            ));
+            next = end;
+        }
+        if next < range.end {
+            pieces.push((next..range.end, RangePiece::Unmapped));
+        }
+        pieces
     }
 
     /// Returns all mappings in a vector.

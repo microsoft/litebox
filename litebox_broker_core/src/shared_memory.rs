@@ -156,7 +156,7 @@ pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<
 ///
 /// Disarming an idle waiter returns `false`.
 pub fn futex_disarm(process: &BrokerProcess, request: FutexDisarmRequest) -> Result<bool> {
-    Ok(futex_waiter(process, request.waiter)?.disarm())
+    Ok(futex_waiter(process, request.waiter)?.disarm_and_take_woken())
 }
 
 /// Returns the caller's futex waiter `handle`.
@@ -243,7 +243,7 @@ impl FutexWaiterObject {
 
 impl Drop for FutexWaiterObject {
     fn drop(&mut self) {
-        self.0.disarm();
+        self.0.disarm_and_take_woken();
     }
 }
 
@@ -264,8 +264,8 @@ enum WaiterState {
 }
 
 impl FutexWaiter {
-    /// Disarms the waiter, returning whether it was woken.
-    fn disarm(&self) -> bool {
+    /// Disarms the waiter, returning whether it was woken and resetting a woken waiter to idle.
+    fn disarm_and_take_woken(&self) -> bool {
         let armed = match &*self.state.lock() {
             WaiterState::Armed { memory, offset } => Some((Arc::clone(memory), *offset)),
             WaiterState::Idle | WaiterState::Woken => None,

@@ -460,9 +460,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if pending.inserted && pending.reservation.is_some() {
                 self.global.elf_patch_cache.lock().remove(&pending.key);
             }
-            // Callers may hold the shared mappings lock.
+            // A fresh file mapping has no shared memory to forget; `sys_mmap` forgets any it
+            // replaced.
             if let Err(error) =
-                self.munmap_and_clear_file_mappings(mapped, pending.allocation_len())
+                self.munmap_unshared_and_clear_file_mappings(mapped, pending.allocation_len())
             {
                 litebox_util_log::warn!(
                     error:? = error;

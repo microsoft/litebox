@@ -2825,9 +2825,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(res)
     }
 
-    /// Returns the broker shared memory holding the futex word at `addr`, and the word's offset
-    /// in it, if a futex operation with `flags` on it spans processes.
-    fn shared_futex_for(
+    /// Returns the key of the futex word at `addr` if a futex operation with `flags` on it spans
+    /// processes: the broker shared memory holding the word and the word's offset in it.
+    fn shared_futex_key_for(
         &self,
         addr: UserPtrMut<u32>,
         flags: &litebox_common_linux::FutexFlags,
@@ -2838,7 +2838,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if flags.contains(litebox_common_linux::FutexFlags::PRIVATE) {
             None
         } else {
-            self.shared_futex(addr.as_usize())
+            self.shared_futex_key(addr.as_usize())
         }
     }
 
@@ -2855,7 +2855,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Ok(0);
         };
         Ok(
-            if let Some((memory, offset)) = self.shared_futex_for(addr, flags) {
+            if let Some((memory, offset)) = self.shared_futex_key_for(addr, flags) {
                 memory.wake(offset, count, bitset)? as usize
             } else {
                 self.global
@@ -2876,7 +2876,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         bitset: Option<core::num::NonZeroU32>,
     ) -> Result<(), Errno> {
         let addr_ptr = addr.to_platform_ptr::<Platform>();
-        if let Some((memory, offset)) = self.shared_futex_for(addr, flags) {
+        if let Some((memory, offset)) = self.shared_futex_key_for(addr, flags) {
             self.get_or_create_shared_futex_waiter()?
                 .wait(cx, &memory, offset, addr_ptr, val, bitset)?;
         } else {

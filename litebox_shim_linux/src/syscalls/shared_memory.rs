@@ -10,9 +10,10 @@
 //! memory and the futex word's offset in it, as Linux keys shared futexes by their backing
 //! object. Every other futex stays in the process's private futex manager.
 //!
-//! Guest calls that change mappings hold the [`SharedMappings`] lock across the change, so the
-//! recorded regions stay in step with the memory manager's. A futex lookup also checks that the
-//! memory manager still maps the word as shared anonymous memory.
+//! Guest calls that change mappings update the recorded regions while holding the
+//! [`SharedMappings`] lock, and anonymous mappings hold it across the change itself. Because file
+//! mappings and `execve` change the memory manager outside the lock, a futex lookup also checks
+//! that the memory manager still maps the word as shared anonymous memory.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -22,6 +23,7 @@ use core::ops::Range;
 use litebox::shared_memory::{SharedMemory, SharedMemoryError};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_common_linux::errno::Errno;
+use litebox_common_linux::mm::RangePiece;
 use litebox_common_linux::program_startup::ForkSharedMemory;
 
 use crate::{ShimPlatform, Task};
@@ -32,10 +34,22 @@ pub(crate) struct SharedMappings<Platform: ShimPlatform> {
     regions: BTreeMap<usize, SharedRegion<Platform>>,
 }
 
-/// Regions removed from [`SharedMappings`], whose memory references must be released only after
-/// its lock is, since releasing one calls the broker.
+/// Memory references removed from [`SharedMappings`], which must be released only after its lock
+/// is, since releasing one calls the broker.
 #[must_use]
-pub(super) struct ForgottenRegions<Platform: ShimPlatform>(Vec<SharedRegion<Platform>>);
+pub(super) struct ForgottenMemory<Platform: ShimPlatform>(Vec<Arc<SharedMemory<Platform>>>);
+
+impl<Platform: ShimPlatform> Default for ForgottenMemory<Platform> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<Platform: ShimPlatform> ForgottenMemory<Platform> {
+    fn append(&mut self, mut other: Self) {
+        self.0.append(&mut other.0);
+    }
+}
 
 struct SharedRegion<Platform: ShimPlatform> {
     end: usize,
@@ -52,10 +66,10 @@ impl<Platform: ShimPlatform> SharedMappings<Platform> {
     }
 
     /// Forgets the parts of regions within `range`, as when they are unmapped or replaced.
-    pub(super) fn forget(&mut self, range: Range<usize>) -> ForgottenRegions<Platform> {
+    pub(super) fn forget(&mut self, range: Range<usize>) -> ForgottenMemory<Platform> {
         let mut forgotten = Vec::new();
         if range.is_empty() {
-            return ForgottenRegions(forgotten);
+            return ForgottenMemory(forgotten);
         }
         let overlapping: Vec<usize> = self
             .regions
@@ -86,14 +100,19 @@ impl<Platform: ShimPlatform> SharedMappings<Platform> {
                     },
                 );
             }
-            forgotten.push(region);
+            forgotten.push(region.memory);
         }
-        ForgottenRegions(forgotten)
+        ForgottenMemory(forgotten)
     }
 
     /// Forgets every region, as `execve` replaces every mapping.
-    pub(super) fn forget_all(&mut self) -> ForgottenRegions<Platform> {
-        ForgottenRegions(core::mem::take(&mut self.regions).into_values().collect())
+    pub(super) fn forget_all(&mut self) -> ForgottenMemory<Platform> {
+        ForgottenMemory(
+            core::mem::take(&mut self.regions)
+                .into_values()
+                .map(|region| region.memory)
+                .collect(),
+        )
     }
 
     fn insert(
@@ -101,7 +120,7 @@ impl<Platform: ShimPlatform> SharedMappings<Platform> {
         range: Range<usize>,
         memory: Arc<SharedMemory<Platform>>,
         offset: u64,
-    ) -> ForgottenRegions<Platform> {
+    ) -> ForgottenMemory<Platform> {
         let forgotten = self.forget(range.clone());
         self.regions.insert(
             range.start,
@@ -173,31 +192,40 @@ impl<Platform: ShimPlatform> InheritedSharedMappings<Platform> {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    /// Records a guest mapping of `range` that just replaced whatever was mapped there, giving it
-    /// broker shared memory if it is shared anonymous memory.
+    /// Creates the broker shared memory for a new shared anonymous mapping of `len` bytes, before
+    /// the mapping and its [`SharedMappings`] lock, since creating it calls the broker.
     ///
-    /// Fails with `ENOMEM` if the broker cannot create the memory, leaving `range` unrecorded.
+    /// Returns `None` without a broker, as then no other process can share the memory either.
+    /// Fails with `ENOMEM`, as `mmap` reports any failure to back a mapping, if the broker fails.
+    pub(super) fn create_shared_memory_for_mapping(
+        &self,
+        len: usize,
+    ) -> Result<Option<Arc<SharedMemory<Platform>>>, Errno> {
+        match SharedMemory::new(&self.global.litebox, len as u64) {
+            Ok(memory) => Ok(Some(Arc::new(memory))),
+            Err(SharedMemoryError::Unavailable) => Ok(None),
+            Err(_) => Err(Errno::ENOMEM),
+        }
+    }
+
+    /// Records a guest mapping of `range` that just replaced whatever was mapped there, backed by
+    /// `memory` if it is shared anonymous memory.
     pub(super) fn record_new_mapping(
         &self,
         mappings: &mut SharedMappings<Platform>,
         range: Range<usize>,
-        shared_anonymous: bool,
-    ) -> Result<ForgottenRegions<Platform>, (ForgottenRegions<Platform>, Errno)> {
-        let forgotten = mappings.forget(range.clone());
-        if !shared_anonymous || !self.global.mm.range_is_shared_anonymous(range.clone()) {
-            return Ok(forgotten);
+        memory: Option<Arc<SharedMemory<Platform>>>,
+    ) -> ForgottenMemory<Platform> {
+        let mut forgotten = mappings.forget(range.clone());
+        if let Some(memory) = memory {
+            if self.global.mm.range_is_shared_anonymous(range.clone()) {
+                let replaced = mappings.insert(range, memory, 0);
+                debug_assert!(replaced.0.is_empty());
+            } else {
+                forgotten.0.push(memory);
+            }
         }
-        let memory = match SharedMemory::new(&self.global.litebox, range.len() as u64) {
-            Ok(memory) => memory,
-            // Without a broker, no other process can share the memory either.
-            Err(SharedMemoryError::Unavailable) => return Ok(forgotten),
-            // A broker that fails would leave the mapping without futexes other processes share.
-            // `mmap` reports any failure to back a mapping as `ENOMEM`.
-            Err(_) => return Err((forgotten, Errno::ENOMEM)),
-        };
-        let replaced = mappings.insert(range, Arc::new(memory), 0);
-        debug_assert!(replaced.0.is_empty());
-        Ok(forgotten)
+        forgotten
     }
 
     /// Forgets the shared memory of the parts of `range` that are no longer shared anonymous
@@ -206,25 +234,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         mappings: &mut SharedMappings<Platform>,
         range: Range<usize>,
-    ) -> Vec<ForgottenRegions<Platform>> {
-        let mut forgotten = Vec::new();
-        let mut next = range.start;
-        for (mapped, _) in self.global.mm.overlapping(range.clone()) {
-            let start = mapped.start.max(range.start);
-            let end = mapped.end.min(range.end);
-            forgotten.push(mappings.forget(next..start));
-            if !self.global.mm.range_is_shared_anonymous(start..end) {
-                forgotten.push(mappings.forget(start..end));
+    ) -> ForgottenMemory<Platform> {
+        let mut forgotten = ForgottenMemory::default();
+        for (piece, kind) in self.global.mm.range_pieces(range) {
+            if kind
+                != (RangePiece::Mapped {
+                    shared_anonymous: true,
+                })
+            {
+                forgotten.append(mappings.forget(piece));
             }
-            next = end;
         }
-        forgotten.push(mappings.forget(next..range.end));
         forgotten
     }
 
     /// Returns the broker shared memory holding the futex word at `address`, and the word's
     /// offset in it, if the word is in a shared anonymous mapping.
-    pub(super) fn shared_futex(
+    ///
+    /// Takes the [`SharedMappings`] lock, so its caller must not hold it.
+    pub(super) fn shared_futex_key(
         &self,
         address: usize,
     ) -> Option<(Arc<SharedMemory<Platform>>, u64)> {
@@ -334,14 +362,14 @@ mod tests {
         let task = init_platform();
         let mapping = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
         let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
-        assert!(task.shared_futex(private).is_none());
-        assert!(task.shared_futex(private + 4).is_none());
-        let (memory, offset) = task.shared_futex(mapping + 8).unwrap();
+        assert!(task.shared_futex_key(private).is_none());
+        assert!(task.shared_futex_key(private + 4).is_none());
+        let (memory, offset) = task.shared_futex_key(mapping + 8).unwrap();
         assert_eq!(offset, 8);
         // A word must lie entirely within the mapping.
         assert!(
-            task.shared_futex(mapping + PAGE_SIZE - 4).is_some()
-                && task.shared_futex(mapping + PAGE_SIZE - 2).is_none()
+            task.shared_futex_key(mapping + PAGE_SIZE - 4).is_some()
+                && task.shared_futex_key(mapping + PAGE_SIZE - 2).is_none()
         );
         drop(memory);
 
@@ -446,11 +474,11 @@ mod tests {
         let task = init_platform();
         let mapping = map(&task, 3, MapFlags::MAP_SHARED);
         let start = mapping.as_usize();
-        let (memory, _) = task.shared_futex(start).unwrap();
+        let (memory, _) = task.shared_futex_key(start).unwrap();
         task.sys_munmap(UserPtrMut::from_usize(start + PAGE_SIZE), PAGE_SIZE)
             .unwrap();
-        assert!(task.shared_futex(start + PAGE_SIZE).is_none());
-        let (tail_memory, offset) = task.shared_futex(start + 2 * PAGE_SIZE + 4).unwrap();
+        assert!(task.shared_futex_key(start + PAGE_SIZE).is_none());
+        let (tail_memory, offset) = task.shared_futex_key(start + 2 * PAGE_SIZE + 4).unwrap();
         assert!(alloc::sync::Arc::ptr_eq(&memory, &tail_memory));
         assert_eq!(offset, 2 * PAGE_SIZE as u64 + 4);
 
@@ -466,10 +494,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replaced.as_usize(), start);
-        assert!(task.shared_futex(start).is_none());
+        assert!(task.shared_futex_key(start).is_none());
 
         task.sys_munmap(mapping, 3 * PAGE_SIZE).unwrap();
-        assert!(task.shared_futex(start + 2 * PAGE_SIZE).is_none());
+        assert!(task.shared_futex_key(start + 2 * PAGE_SIZE).is_none());
     }
 
     #[test]
@@ -485,11 +513,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_memory_can_shrink_but_not_grow() {
+    fn shared_memory_can_shrink_but_unlike_linux_cannot_grow() {
         let task = init_platform();
         let mapping = map(&task, 2, MapFlags::MAP_SHARED);
         let start = mapping.as_usize();
-        // Unlike Linux, which grows shared anonymous mappings, LiteBox refuses.
+        // Known limitation: Linux grows shared anonymous mappings (mremap(2)), but LiteBox cannot
+        // grow their broker shared memory, so it refuses.
         for flags in [MRemapFlags::empty(), MRemapFlags::MREMAP_MAYMOVE] {
             assert_eq!(
                 task.sys_mremap(mapping, 2 * PAGE_SIZE, 4 * PAGE_SIZE, flags, 0)
@@ -501,8 +530,8 @@ mod tests {
             .sys_mremap(mapping, 2 * PAGE_SIZE, PAGE_SIZE, MRemapFlags::empty(), 0)
             .unwrap();
         assert_eq!(shrunk.as_usize(), start);
-        assert!(task.shared_futex(start).is_some());
-        assert!(task.shared_futex(start + PAGE_SIZE).is_none());
+        assert!(task.shared_futex_key(start).is_some());
+        assert!(task.shared_futex_key(start + PAGE_SIZE).is_none());
         task.sys_munmap(mapping, PAGE_SIZE).unwrap();
     }
 
@@ -513,7 +542,7 @@ mod tests {
         let forgotten = task.global.shared_mappings.lock().forget_all();
         assert_eq!(forgotten.0.len(), 1);
         drop(forgotten);
-        assert!(task.shared_futex(start).is_none());
+        assert!(task.shared_futex_key(start).is_none());
     }
 
     #[test]
@@ -548,9 +577,9 @@ mod tests {
         let (lower, upper) = (first.min(second), first.max(second));
         task.sys_munmap(UserPtrMut::from_usize(lower), upper - lower + PAGE_SIZE)
             .unwrap();
-        assert!(task.shared_futex(upper).is_none());
-        assert!(task.shared_futex(lower).is_none());
-        assert!(task.shared_futex(upper + PAGE_SIZE).is_some());
+        assert!(task.shared_futex_key(upper).is_none());
+        assert!(task.shared_futex_key(lower).is_none());
+        assert!(task.shared_futex_key(upper + PAGE_SIZE).is_some());
         let mappings = task.global.shared_mappings.lock();
         assert!(mappings.lookup(lower).is_none());
         assert!(mappings.lookup(upper + PAGE_SIZE).is_some());
@@ -587,7 +616,7 @@ mod tests {
         drop((first, second));
         let forgotten = mappings.forget_all();
         assert_eq!(forgotten.0.len(), 2);
-        assert!(Arc::ptr_eq(&forgotten.0[0].memory, &forgotten.0[1].memory));
+        assert!(Arc::ptr_eq(&forgotten.0[0], &forgotten.0[1]));
     }
 
     #[test]
@@ -607,13 +636,34 @@ mod tests {
         let forgotten =
             task.forget_unshared_mappings(&mut task.global.shared_mappings.lock(), range.clone());
         drop(forgotten);
-        assert!(task.shared_futex(shared).is_some());
+        assert!(task.shared_futex_key(shared).is_some());
 
         task.sys_munmap(UserPtrMut::from_usize(shared), PAGE_SIZE)
             .unwrap();
         // Unmapping already forgot the memory; forgetting again finds nothing.
         let forgotten =
             task.forget_unshared_mappings(&mut task.global.shared_mappings.lock(), range);
-        assert!(forgotten.iter().all(|forgotten| forgotten.0.is_empty()));
+        assert!(forgotten.0.is_empty());
+    }
+
+    #[test]
+    fn misaligned_shared_futex_fails_with_einval() {
+        let task = init_platform();
+        let mapping = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        // The word lies within the mapping, so only its alignment is wrong.
+        let misaligned = mapping + 2;
+        assert!(task.shared_futex_key(misaligned).is_some());
+        assert_eq!(
+            task.sys_futex(FutexArgs::Wake {
+                addr: word(misaligned),
+                flags: FutexFlags::empty(),
+                count: 1,
+            }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            wait(&task, misaligned, 0, FutexFlags::empty(), Some(10)),
+            Err(Errno::EINVAL)
+        );
     }
 }

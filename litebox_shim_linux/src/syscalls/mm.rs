@@ -11,7 +11,7 @@ use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
     IoReadVec, MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
-    mm::MmapPlacement,
+    mm::{MmapPlacement, RangePiece},
     vmem::{MappingError, VmemProtectError},
 };
 use litebox_platform::buffer::Buffer as _;
@@ -21,6 +21,14 @@ use crate::Task;
 use crate::UserPtrMut;
 use crate::guest_buffer::GuestReadBuffer;
 use crate::syscalls::file::AnyTypedFd;
+
+/// Returns the pages that `len` bytes at `addr` span, or `None` if their end overflows.
+fn page_range(addr: UserPtrMut<u8>, len: usize) -> Option<core::ops::Range<usize>> {
+    let end = addr
+        .as_usize()
+        .checked_add(len.checked_next_multiple_of(PAGE_SIZE)?)?;
+    Some(addr.as_usize()..end)
+}
 
 pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
     let mut prot = ProtFlags::PROT_NONE;
@@ -200,6 +208,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         let anonymous = flags.contains(MapFlags::MAP_ANONYMOUS);
+        let memory = if anonymous && flags.contains(MapFlags::MAP_SHARED) {
+            self.create_shared_memory_for_mapping(aligned_len)?
+        } else {
+            None
+        };
         // File reads may block, so file mappings take the lock only once mapped; a futex lookup
         // rechecks the memory manager's mapping in the meantime.
         let (mut shared_mappings, mapped) = if anonymous {
@@ -224,38 +237,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 });
                 drop(shared_mappings);
                 drop(forgotten);
+                drop(memory);
                 return Err(errno);
             }
         };
         let range = mapping.as_usize()..mapping.as_usize() + aligned_len;
-        let recorded = self.record_new_mapping(
-            &mut shared_mappings,
-            range,
-            anonymous && flags.contains(MapFlags::MAP_SHARED),
-        );
+        let forgotten = self.record_new_mapping(&mut shared_mappings, range, memory);
         drop(shared_mappings);
-        match recorded {
-            Ok(_forgotten) => Ok(mapping),
-            Err((_forgotten, errno)) => {
-                // Undo the mapping the broker could not back.
-                let _ = self.sys_munmap(mapping, aligned_len);
-                Err(errno)
-            }
-        }
+        drop(forgotten);
+        Ok(mapping)
     }
 
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
+        let range = page_range(addr, len);
         let mut shared_mappings = self.global.shared_mappings.lock();
-        let result = self.munmap_and_clear_file_mappings(addr, len);
-        let end = len
-            .checked_next_multiple_of(PAGE_SIZE)
-            .and_then(|length| addr.as_usize().checked_add(length));
-        let forgotten = end.map(|end| {
-            let range = addr.as_usize()..end;
+        let result = self.munmap_range_and_clear_file_mappings(addr, len, range.clone());
+        let forgotten = range.map(|range| {
             if result.is_ok() {
-                alloc::vec![shared_mappings.forget(range)]
+                shared_mappings.forget(range)
             } else {
                 self.forget_unshared_mappings(&mut shared_mappings, range)
             }
@@ -266,29 +267,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Unmaps a range with no shared memory to forget, such as a mapping just created, and
-    /// clears its file mappings, without taking the shared mappings lock its caller may hold.
-    pub(crate) fn munmap_and_clear_file_mappings(
+    /// clears its file mappings, without taking the shared mappings lock.
+    pub(crate) fn munmap_unshared_and_clear_file_mappings(
         &self,
         addr: UserPtrMut<u8>,
         len: usize,
     ) -> Result<(), Errno> {
+        self.munmap_range_and_clear_file_mappings(addr, len, page_range(addr, len))
+    }
+
+    /// Unmaps `len` bytes at `addr`, whose page range is `range` unless it overflows, and clears
+    /// the file mappings of whatever it unmapped.
+    fn munmap_range_and_clear_file_mappings(
+        &self,
+        addr: UserPtrMut<u8>,
+        len: usize,
+        range: Option<core::ops::Range<usize>>,
+    ) -> Result<(), Errno> {
         let result = self.sys_munmap_raw(addr, len);
+        let Some(range) = range else {
+            return result;
+        };
         if result.is_ok() {
-            self.clear_file_mappings_for_range(addr.as_usize(), len.next_multiple_of(PAGE_SIZE));
-        } else if let Some(end) = len
-            .checked_next_multiple_of(PAGE_SIZE)
-            .and_then(|length| addr.as_usize().checked_add(length))
-        {
-            let mut next = addr.as_usize();
-            for (mapped, _) in self.global.mm.overlapping(next..end) {
-                let start = mapped.start.max(next);
-                if next < start {
-                    self.clear_file_mappings_for_range(next, start - next);
+            self.clear_file_mappings_for_range(range.start, range.len());
+        } else {
+            for (piece, kind) in self.global.mm.range_pieces(range) {
+                if kind == RangePiece::Unmapped {
+                    self.clear_file_mappings_for_range(piece.start, piece.len());
                 }
-                next = mapped.end.min(end);
-            }
-            if next < end {
-                self.clear_file_mappings_for_range(next, end - next);
             }
         }
         result

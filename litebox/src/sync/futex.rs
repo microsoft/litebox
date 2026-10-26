@@ -168,7 +168,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     }
 }
 
-/// Potential errors that can be returned by [`FutexManager`]'s operations.
+/// Errors from futex operations, whether private ([`FutexManager`]) or in shared memory
+/// ([`SharedMemory`](crate::shared_memory::SharedMemory)).
 #[derive(Debug, Error)]
 pub enum FutexError {
     #[error("address not correctly aligned to 4-bytes")]

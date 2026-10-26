@@ -234,7 +234,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
             match matches() {
                 Ok(true) => {}
                 mismatch_or_fault => {
-                    if self.disarm()? {
+                    if self.disarm_and_take_woken()? {
                         return Ok(());
                     }
                     mismatch_or_fault?;
@@ -242,7 +242,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
                 }
             }
             let waited = cx.wait_until(|| self.latch.is_ready());
-            if self.disarm()? {
+            if self.disarm_and_take_woken()? {
                 return Ok(());
             }
             waited.map_err(FutexError::WaitError)?;
@@ -250,7 +250,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
     }
 
     /// Disarms the waiter, returning whether a wake selected it.
-    fn disarm(&self) -> Result<bool, FutexError> {
+    fn disarm_and_take_woken(&self) -> Result<bool, FutexError> {
         Ok(self
             .broker
             .futex_disarm(self.handle)
