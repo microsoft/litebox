@@ -156,8 +156,7 @@ where
         let end = base.checked_add(size)?;
         self.allocation_containing(base).filter(|allocation| {
             allocation
-                .base
-                .checked_add(allocation.size)
+                .end()
                 .is_some_and(|allocation_end| end <= allocation_end)
         })
     }
@@ -174,7 +173,7 @@ where
         allocation: WindowsVirtualAllocation,
         committed_protect: Option<PageProtection>,
     ) {
-        let Some(end) = allocation.base.checked_add(allocation.size) else {
+        let Some(end) = allocation.end() else {
             return;
         };
         debug_assert!(
@@ -193,7 +192,7 @@ where
     /// Detaches the allocation based at `base` from its pages without touching them.
     pub(crate) fn remove_allocation(&mut self, base: usize) -> Option<WindowsVirtualAllocation> {
         let allocation = self.allocation_at(base)?;
-        self.set_allocation(base..base.checked_add(allocation.size)?, None);
+        self.set_allocation(base..allocation.end()?, None);
         Some(allocation)
     }
 
@@ -206,10 +205,7 @@ where
         size: usize,
         middle: Option<WindowsVirtualAllocation>,
     ) {
-        let (Some(end), Some(allocation_end)) = (
-            base.checked_add(size),
-            allocation.base.checked_add(allocation.size),
-        ) else {
+        let (Some(end), Some(allocation_end)) = (base.checked_add(size), allocation.end()) else {
             return;
         };
         if allocation.base < base {
@@ -251,7 +247,7 @@ where
         let Some(allocation) = self.allocation_at(base) else {
             return false;
         };
-        let Some(end) = base.checked_add(allocation.size) else {
+        let Some(end) = allocation.end() else {
             return false;
         };
         let replaced = WindowsVirtualAllocation {
@@ -590,35 +586,6 @@ where
             .map(litebox::platform::page_mgmt::PageReservation::range)
     }
 
-    #[cfg(test)]
-    pub(crate) fn get_memory_permissions(
-        &self,
-        ptr: NonZeroAddress<PAGE_SIZE>,
-        len: NonZeroPageSize<PAGE_SIZE>,
-    ) -> Option<MemoryRegionPermissions> {
-        let range = ptr.as_usize()..ptr.as_usize().checked_add(len.as_usize())?;
-        let mut covered_until = range.start;
-        let mut permissions = None;
-        for (mapped, area) in self.areas.overlapping(range.clone()) {
-            if mapped.start > covered_until {
-                return None;
-            }
-            let PageState::Committed(protect) = area.state else {
-                return None;
-            };
-            let current = page_protect_to_permissions(protect)?;
-            if permissions.is_some_and(|permissions| permissions != current) {
-                return None;
-            }
-            permissions = Some(current);
-            covered_until = covered_until.max(mapped.end);
-            if covered_until >= range.end {
-                return permissions;
-            }
-        }
-        None
-    }
-
     /// Changes the protection of `len` committed bytes at `ptr` to `protect`.
     ///
     /// # Safety
@@ -667,13 +634,13 @@ where
         }
         let reservations = self.reservations.take_replaced(range);
         for reservation in reservations {
-            let extent = reservation.range();
+            // The reservation is consumed even if release fails, so its pages are untracked first.
+            self.areas.remove(reservation.range());
             // SAFETY: The caller relinquishes this owned range and excludes remaining users.
             unsafe {
                 self.platform
                     .release_pages(into_release_target::<Platform>(reservation))
             }?;
-            self.areas.remove(extent);
         }
         Ok(())
     }

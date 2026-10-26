@@ -730,10 +730,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     return Err(NtStatus::CONFLICTING_ADDRESSES);
                 }
-                covered_until = allocation
-                    .base
-                    .checked_add(allocation.size)
-                    .ok_or(NtStatus::CONFLICTING_ADDRESSES)?;
+                covered_until = allocation.end().ok_or(NtStatus::CONFLICTING_ADDRESSES)?;
                 count += 1;
             }
             if covered_until != end || count < 2 {
@@ -757,10 +754,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(NtStatus::CONFLICTING_ADDRESSES);
         }
         let placeholder_state = allocation.placeholder_state;
-        let allocation_end = allocation
-            .base
-            .checked_add(allocation.size)
-            .ok_or(NtStatus::CONFLICTING_ADDRESSES)?;
+        let allocation_end = allocation.end().ok_or(NtStatus::CONFLICTING_ADDRESSES)?;
         // Like Windows, a replaced allocation may restore any page-aligned sub-range; the
         // remaining pieces stay replaced and keep their contents.
         if end > allocation_end {
@@ -1426,7 +1420,7 @@ fn scan_protect_range<Platform: ShimPlatform>(
 ) -> Option<PageRangeScan> {
     let allocation = vmem.allocation_containing(base)?;
     let end = base.checked_add(size)?;
-    let allocation_end = allocation.base.checked_add(allocation.size)?;
+    let allocation_end = allocation.end()?;
     if end > allocation_end {
         return Some(PageRangeScan::ContainsUncommitted);
     }
@@ -1621,7 +1615,7 @@ fn query_allocation_basic_information(
     query_base: usize,
     areas: &RangeMap<usize, WindowsArea>,
 ) -> Option<MemoryBasicInformation> {
-    let allocation_end = allocation.base.checked_add(allocation.size)?;
+    let allocation_end = allocation.end()?;
     let (range, area) = areas.get_key_value(&query_base)?;
     let (state, protect) = basic_information_state_and_protect(area.state);
     let region_end = range.end.min(allocation_end);
@@ -2284,12 +2278,13 @@ mod tests {
                     assert_eq!(guest.as_usize(), middle.as_usize());
                     assert_eq!(guest.as_usize() % alignment, 0);
                     assert_eq!(
-                        guest_manager.read_vmem().get_memory_permissions(
-                            NonZeroAddress::new(guest.as_usize()).unwrap(),
-                            length,
+                        guest_manager.read_vmem().first_committed_protect(
+                            &(guest.as_usize()..guest.as_usize() + length.as_usize())
                         ),
                         match pages {
-                            PrivatePages::Committed(permissions) => Some(permissions),
+                            PrivatePages::Committed(permissions) => {
+                                Some(permissions_to_page_protect(permissions))
+                            }
                             PrivatePages::Reserved | PrivatePages::Mergeable => None,
                         },
                     );
@@ -3562,7 +3557,7 @@ mod tests {
             run_with_test_platform_pointers(|| {
                 let protect = PageProtection::PAGE_READWRITE | PageProtection::PAGE_NOCACHE;
                 let mut host_base = core::ptr::null_mut::<c_void>();
-                let mut host_size = PAGE_SIZE * 3;
+                let mut host_size = PAGE_SIZE * 4;
                 // SAFETY: The output pointers are valid locals and the current-process pseudo
                 // handle targets this process. The allocation is released before return.
                 let host_allocate_status = unsafe {
@@ -3591,7 +3586,7 @@ mod tests {
 
                 let task = crate::tests::test_task();
                 let mut guest_base = 0usize;
-                let mut guest_size = PAGE_SIZE * 3;
+                let mut guest_size = PAGE_SIZE * 4;
                 assert_eq!(
                     task.sys_nt_allocate_virtual_memory(
                         ProcessHandle::CURRENT,
@@ -3615,8 +3610,45 @@ mod tests {
                     host_decommit_status
                 );
 
+                for (page, new_protect) in [
+                    (
+                        2,
+                        PageProtection::PAGE_READONLY | PageProtection::PAGE_NOCACHE,
+                    ),
+                    (3, PageProtection::PAGE_NOACCESS),
+                ] {
+                    let mut host_page = host_base.wrapping_byte_add(page * PAGE_SIZE);
+                    let mut host_page_size = PAGE_SIZE;
+                    let mut host_old_protect = 0u32;
+                    // SAFETY: Reprotects a committed page of the live host allocation that is
+                    // never accessed; all output pointers are valid locals.
+                    let host_protect_status = unsafe {
+                        host_status(NtProtectVirtualMemory(
+                            current_process(),
+                            &raw mut host_page,
+                            &raw mut host_page_size,
+                            new_protect.bits(),
+                            &raw mut host_old_protect,
+                        ))
+                    };
+                    let mut guest_page = guest_base + page * PAGE_SIZE;
+                    let mut guest_page_size = PAGE_SIZE;
+                    let mut guest_old_protect = 0u32;
+                    assert_eq!(
+                        task.sys_nt_protect_virtual_memory(
+                            ProcessHandle::CURRENT,
+                            mut_ptr(&mut guest_page),
+                            mut_ptr(&mut guest_page_size),
+                            new_protect.bits(),
+                            mut_ptr(&mut guest_old_protect),
+                        ),
+                        host_protect_status
+                    );
+                    assert_eq!(guest_old_protect, host_old_protect);
+                }
+
                 let host_base_address = host_base as usize;
-                for offset in 0..3 {
+                for offset in 0..4 {
                     assert_query_matches_host(
                         &query_basic_information(&task, guest_base + offset * PAGE_SIZE),
                         guest_base,

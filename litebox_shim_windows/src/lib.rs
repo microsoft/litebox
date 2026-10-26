@@ -248,6 +248,11 @@ impl WindowsVirtualAllocation {
             placeholder_state,
         }
     }
+
+    /// Returns the exclusive end address, or `None` if it overflows.
+    pub(crate) fn end(&self) -> Option<usize> {
+        self.base.checked_add(self.size)
+    }
 }
 
 pub(crate) struct WindowsSectionView<Platform: ShimPlatform> {
