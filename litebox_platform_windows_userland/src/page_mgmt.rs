@@ -107,16 +107,25 @@ struct SharedView {
     offset: usize,
 }
 
-/// Every shared view in this process, by start address.
+/// Every shared view in this process.
 ///
 /// Windows unmaps only whole views, so detaching part of one briefly unmaps the rest before
-/// mapping it again. Holding this lock spans that window: the exception handler waits on it to
+/// mapping it again. Holding the lock spans that window: the exception handler waits on it to
 /// retry accesses that raced with a split, which is why the table is process-wide.
-static SHARED_VIEWS: Mutex<BTreeMap<usize, SharedView>> = Mutex::new(BTreeMap::new());
-/// Thread ID of the [`SHARED_VIEWS`] holder, or zero, so that its own faults never wait on it.
-static SHARED_VIEWS_OWNER: AtomicU32 = AtomicU32::new(0);
-/// Whether any shared view has been mapped, letting the exception handler skip the lock otherwise.
-static SHARED_VIEWS_USED: AtomicBool = AtomicBool::new(false);
+struct SharedViewTable {
+    /// Views by start address.
+    views: Mutex<BTreeMap<usize, SharedView>>,
+    /// Thread ID of the lock holder, or zero, so that its own faults never wait on the lock.
+    owner: AtomicU32,
+    /// Whether any shared view has been mapped, letting the exception handler skip the lock otherwise.
+    used: AtomicBool,
+}
+
+static SHARED_VIEWS: SharedViewTable = SharedViewTable {
+    views: Mutex::new(BTreeMap::new()),
+    owner: AtomicU32::new(0),
+    used: AtomicBool::new(false),
+};
 
 /// Exclusive access to [`SHARED_VIEWS`], which excludes view splits until dropped.
 pub(crate) struct SharedViews {
@@ -126,15 +135,20 @@ pub(crate) struct SharedViews {
 impl Drop for SharedViews {
     fn drop(&mut self) {
         // The lock is released after this, when `views` drops.
-        SHARED_VIEWS_OWNER.store(0, Ordering::Release);
+        SHARED_VIEWS.owner.store(0, Ordering::Release);
     }
 }
 
 impl SharedViews {
     pub(crate) fn lock() -> Self {
-        let views = SHARED_VIEWS.lock().unwrap_or_else(PoisonError::into_inner);
+        let views = SHARED_VIEWS
+            .views
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: GetCurrentThreadId has no preconditions.
-        SHARED_VIEWS_OWNER.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        SHARED_VIEWS
+            .owner
+            .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
         Self { views }
     }
 
@@ -255,9 +269,9 @@ impl SharedViews {
 ///
 /// `access` is the violation's access type: 0 for reads, 1 for writes, and 8 for execution.
 pub(crate) fn retry_after_shared_view_split(address: usize, access: usize) -> bool {
-    if !SHARED_VIEWS_USED.load(Ordering::Acquire)
+    if !SHARED_VIEWS.used.load(Ordering::Acquire)
         // SAFETY: GetCurrentThreadId has no preconditions.
-        || SHARED_VIEWS_OWNER.load(Ordering::Acquire) == unsafe { GetCurrentThreadId() }
+        || SHARED_VIEWS.owner.load(Ordering::Acquire) == unsafe { GetCurrentThreadId() }
     {
         return false;
     }
@@ -630,7 +644,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         let section = Arc::new(shared_section(range.len())?);
         let flags = prot_flags(permissions);
         let mut views = SharedViews::lock();
-        SHARED_VIEWS_USED.store(true, Ordering::Release);
+        SHARED_VIEWS.used.store(true, Ordering::Release);
         for allocation in allocations(range.clone()) {
             // Windows only allows mapping views of a section into reserved memory that is currently a placeholder.
             make_placeholder(allocation.clone());

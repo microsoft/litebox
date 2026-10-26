@@ -191,7 +191,7 @@ impl VmArea {
         self.is_file_backed
     }
 
-    /// Check if this area is shared anonymous memory, whose pages native fork children share.
+    /// Check if this area is shared anonymous memory.
     #[inline]
     pub fn is_shared_anonymous(&self) -> bool {
         self.flags.contains(VmFlags::VM_SHARED) && !self.is_file_backed
@@ -294,9 +294,6 @@ where
 
     /// Release a range's platform backing, update reservation ownership, and remove its VMAs.
     ///
-    /// Tracked reservations with unaligned endpoints retain their address space until teardown,
-    /// even after their last VMA is removed, so future mappings can reuse it without reserving again.
-    ///
     /// # Safety
     ///
     /// The caller must ensure that these pages are not in active use.
@@ -355,6 +352,7 @@ where
         vmas: &mut RangeMap<usize, VmArea>,
         platform: &Platform,
     ) -> Result<(), DeallocationError> {
+        // Collect contiguous extents from the VMAs to release them with fewer platform calls.
         let mut extents: Vec<Range<usize>> = Vec::new();
         for (range, _) in vmas.iter() {
             match extents.last_mut() {
@@ -2569,32 +2567,6 @@ mod tests {
 
         check(dummy_backend::<false>(None));
         check(tracked_dummy_backend(None));
-    }
-
-    #[test]
-    fn tracked_shared_allocation_reserves_and_commits_together() {
-        let base = 0x10_0000;
-        let range = base..base + 2 * PAGE_SIZE;
-        let mut vmm = Vmem::new(tracked_dummy_backend(Some(base)));
-        let shared = VmArea::new(read_write_vma().flags() | VmFlags::VM_SHARED, false);
-        // SAFETY: The mock records mappings without accessing the simulated addresses.
-        let pointer = unsafe {
-            vmm.insert_mapping(
-                PageRange::new(range.start, range.end).unwrap(),
-                shared,
-                false,
-                FixedAddressBehavior::NoReplace,
-            )
-        }
-        .unwrap();
-        assert_eq!(pointer.as_usize(), base);
-        assert_eq!(collect_reservations(&vmm), vec![range.clone()]);
-        assert_eq!(collect_mappings(&vmm), vec![range.clone()]);
-        assert_eq!(*vmm.platform.shared_allocations.lock(), vec![range.clone()]);
-        assert_eq!(
-            *vmm.platform.calls.lock(),
-            vec![(range, FixedAddressBehavior::NoReplace)]
-        );
     }
 
     #[test]

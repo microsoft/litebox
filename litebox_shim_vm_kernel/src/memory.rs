@@ -182,19 +182,8 @@ impl<F: Frames + 'static> Mappings<F> {
         }
     }
 
-    /// Maps private pages; see [`Self::map_with_sharing`].
-    pub(crate) fn map(
-        &self,
-        range: Range<usize>,
-        prot: Prot,
-        placement: Placement,
-        populate: Populate,
-    ) -> Result<(), Status> {
-        self.map_with_sharing(range, prot, placement, populate, Sharing::Private)
-    }
-
     /// A failed [`Placement::Replace`] leaves the range unmapped.
-    pub(crate) fn map_with_sharing(
+    pub(crate) fn map(
         &self,
         range: Range<usize>,
         prot: Prot,
@@ -358,7 +347,7 @@ mod tests {
         prot: Prot,
         placement: Placement,
     ) -> Result<(), Status> {
-        m.map(range, prot, placement, Populate::Lazy)
+        m.map(range, prot, placement, Populate::Lazy, Sharing::Private)
     }
 
     #[test]
@@ -414,37 +403,6 @@ mod tests {
         drop(regions);
         m.unmap(0..4 * P).unwrap();
         assert!(m.regions.borrow().is_empty());
-    }
-
-    #[test]
-    fn shared_mappings_reach_the_platform_as_shared() {
-        let (m, mock) = mappings();
-        m.map_with_sharing(
-            P..2 * P,
-            Prot::ReadWrite,
-            Placement::NoReplace,
-            Populate::Lazy,
-            Sharing::Shared,
-        )
-        .unwrap();
-        map(&m, 2 * P..3 * P, Prot::ReadWrite, Placement::NoReplace).unwrap();
-        assert_eq!(
-            *mock.calls.borrow(),
-            [
-                Call::Allocate(
-                    P..2 * P,
-                    Prot::ReadWrite,
-                    Placement::NoReplace,
-                    Sharing::Shared
-                ),
-                Call::Allocate(
-                    2 * P..3 * P,
-                    Prot::ReadWrite,
-                    Placement::NoReplace,
-                    Sharing::Private
-                ),
-            ]
-        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ use litebox_broker_core::BrokerError;
 use litebox_broker_vm_kernel::PendingRunnerAssociation;
 use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::{
-    CloneReply, CloneRequest, NewThread, Placement, Populate, Prot, Status,
+    CloneReply, CloneRequest, NewThread, Placement, Populate, Prot, Sharing, Status,
 };
 use litebox_platform_vm_kernel::AddressSpaceId;
 use zerocopy::IntoBytes as _;
@@ -113,6 +113,7 @@ impl Inner {
                 Prot::ReadWrite,
                 Placement::Replace,
                 Populate::Lazy,
+                Sharing::Private,
             )
             .and_then(|()| {
                 // `Replace`: the duplicated record lists the ring, which the

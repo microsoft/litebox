@@ -66,8 +66,8 @@ use litebox_common_vm_abi::{
     IDENTITY_LEN, Image, KernelCall, LogLevel, LogRequest, MAX_IMAGES, MAX_KDF_CONTEXT_LEN,
     MAX_LOG_LEN, MapReply, MapRequest, Message, PAGE_SIZE, Placement, Populate, Prot,
     ProtectRequest, RUNNER_MANAGED_MAX, RUNNER_MANAGED_MIN, Registers, Request, RestrictRequest,
-    SetTimerRequest, StartupInfo, Status, UnmapRequest, UpcallFrame, UpcallKind, UserRange,
-    WallClock,
+    SetTimerRequest, Sharing, StartupInfo, Status, UnmapRequest, UpcallFrame, UpcallKind,
+    UserRange, WallClock,
 };
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 #[cfg(doc)]
@@ -485,6 +485,7 @@ impl Inner {
                     Prot::ReadWrite,
                     Placement::NoReplace,
                     Populate::Lazy,
+                    Sharing::Private,
                 )
                 .map_err(SpawnError::Map)
         };
@@ -681,7 +682,13 @@ fn pin_control_ring(
 ) -> Result<PinnedUserPages, SpawnError> {
     let range = region_range(layout::BROKER_CONTROL_RING);
     mappings
-        .map(range.clone(), Prot::ReadWrite, placement, Populate::Now)
+        .map(
+            range.clone(),
+            Prot::ReadWrite,
+            placement,
+            Populate::Now,
+            Sharing::Private,
+        )
         .map_err(SpawnError::Map)?;
     // Safety: see above; unregistering the address space frees nothing while
     // pinned.
@@ -721,6 +728,7 @@ fn map_read_only(mappings: &Mappings, region: UserRange, bytes: &[u8]) -> Result
             Prot::ReadWrite,
             Placement::NoReplace,
             Populate::Now,
+            Sharing::Private,
         )
         .map_err(SpawnError::Map)?;
     copy_to_user(region.start, bytes).map_err(SpawnError::Map)?;
@@ -1112,7 +1120,7 @@ impl Inner {
     // backs page tables.
     fn map(&self, r: &MapRequest) -> Result<MapReply, Status> {
         Self::check_wx(r.prot)?;
-        self.mappings.map_with_sharing(
+        self.mappings.map(
             Self::managed(r.range.start, r.range.len)?,
             r.prot,
             r.placement,
