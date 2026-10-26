@@ -71,10 +71,25 @@ pub struct LocalDir {
 pub struct LocalFile {
     instance_tag: BackendInstanceTag,
     canonical_path: PathBuf,
-    symlink: bool,
+    /// Currently always [`FileType::RegularFile`] or (for `O_PATH` opens) [`FileType::SymbolicLink`].
+    file_type: FileType,
     file: Option<Arc<File>>,
     readable: bool,
     writable: bool,
+}
+
+impl LocalFile {
+    fn is_symlink(&self) -> bool {
+        assert!(
+            matches!(
+                self.file_type,
+                FileType::RegularFile | FileType::SymbolicLink
+            ),
+            "unexpected LocalFile type {:?}",
+            self.file_type
+        );
+        self.file_type == FileType::SymbolicLink
+    }
 }
 
 /// Identifies the [`LocalFs`] instance that created a handle.
@@ -605,7 +620,7 @@ impl Backend for LocalFs {
             item: FileHandle::from_typed::<Self>(LocalFile {
                 instance_tag: self.instance_tag.clone(),
                 canonical_path,
-                symlink,
+                file_type,
                 file,
                 readable,
                 writable,
@@ -759,12 +774,7 @@ impl Backend for LocalFs {
                     self.status_file(open, &file.canonical_path)
                         .map_err(|_| FileStatusError::Io)
                 } else {
-                    let expected = if file.symlink {
-                        FileType::SymbolicLink
-                    } else {
-                        FileType::RegularFile
-                    };
-                    self.status_path_of_type(&file.canonical_path, expected)
+                    self.status_path_of_type(&file.canonical_path, file.file_type)
                         .map_err(|_| FileStatusError::Io)
                 }
             }
@@ -804,7 +814,7 @@ impl Backend for LocalFs {
         Ok(FileHandle::from_typed::<Self>(LocalFile {
             instance_tag: self.instance_tag.clone(),
             canonical_path,
-            symlink: false,
+            file_type: FileType::RegularFile,
             file: Some(Arc::new(opened)),
             readable: true,
             writable: true,
@@ -928,7 +938,7 @@ impl Backend for LocalFs {
                 if !self.valid_file(file) {
                     return Err(ChmodError::Io);
                 }
-                if file.symlink {
+                if file.is_symlink() {
                     return Err(ChmodError::IsSymlink);
                 }
                 if let Some(open) = &file.file {
@@ -971,7 +981,7 @@ impl Backend for LocalFs {
                 if !self.valid_file(file) {
                     return Err(ChownError::Io);
                 }
-                if file.symlink {
+                if file.is_symlink() {
                     return Err(ChownError::IsSymlink);
                 }
                 file.file
