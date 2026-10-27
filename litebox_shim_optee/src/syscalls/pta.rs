@@ -630,7 +630,7 @@ impl DevicePta {
             return Ok(TeeResult::BadParameters);
         };
         let blen = usize::try_from(blen).map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
-        // A NULL buffer has an empty `shm_info` regardless of `blen`.
+        // A NULL buffer has size 0, making the call a size query.
         let Some(out) = shm_info[0].as_ref().filter(|shm| shm.len() == blen) else {
             return Ok(TeeResult::BadParameters);
         };

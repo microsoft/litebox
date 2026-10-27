@@ -207,6 +207,19 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
         Some(address)
     }
 
+    fn push_param_null_memref(&mut self, param: &UteeParamOwned) -> Option<()> {
+        let param_type = match param {
+            UteeParamOwned::MemrefInput { .. } => TeeParamType::MemrefInput,
+            UteeParamOwned::MemrefOutput { .. } => TeeParamType::MemrefOutput,
+            UteeParamOwned::MemrefInout { .. } => TeeParamType::MemrefInout,
+            _ => return None,
+        };
+        self.params.set_values(self.num_params, 0, 0).ok()?;
+        self.params.set_type(self.num_params, param_type).ok()?;
+        self.num_params += 1;
+        Some(())
+    }
+
     fn push_param_memref_from_shm<const ALIGN: usize>(
         &mut self,
         platform: &Platform,
@@ -252,6 +265,10 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
 
         let mut memref_buffers = [None; UteeParams::TEE_NUM_PARAMS];
         for (index, param) in params.iter().enumerate() {
+            if matches!(shm_info.get(index), Some(Some(shm)) if shm.is_null()) {
+                self.push_param_null_memref(param)?;
+                continue;
+            }
             match param {
                 UteeParamOwned::ValueInput { value_a, value_b } => {
                     self.push_param_values(TeeParamType::ValueInput, Some((*value_a, *value_b)))?;

@@ -604,44 +604,36 @@ pub fn decode_ta_request<Platform: crate::OpteeShimPlatform>(
             }
             OpteeMsgAttrType::TmemInput => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
-                let data_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
-                if data_size != shm_info.len() {
-                    return Err(OpteeSmcReturnCode::EBadAddr);
-                }
                 ta_req_info.shm_info[i] = Some(shm_info);
                 UteeParamOwned::MemrefInput { data: None }
             }
             OpteeMsgAttrType::RmemInput => {
                 let rmem = param.get_param_rmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
-                let data_size = checked_memref_size(rmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
-                if data_size != shm_info.len() {
-                    return Err(OpteeSmcReturnCode::EBadAddr);
-                }
                 ta_req_info.shm_info[i] = Some(shm_info);
                 UteeParamOwned::MemrefInput { data: None }
             }
             OpteeMsgAttrType::TmemOutput => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
-                let buffer_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
+                let buffer_size = shm_info.len();
 
                 ta_req_info.shm_info[i] = Some(shm_info);
                 UteeParamOwned::MemrefOutput { buffer_size }
             }
             OpteeMsgAttrType::RmemOutput => {
                 let rmem = param.get_param_rmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
-                let buffer_size = checked_memref_size(rmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
+                let buffer_size = shm_info.len();
 
                 ta_req_info.shm_info[i] = Some(shm_info);
                 UteeParamOwned::MemrefOutput { buffer_size }
             }
             OpteeMsgAttrType::TmemInout => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
-                let buffer_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
+                let buffer_size = shm_info.len();
 
                 ta_req_info.shm_info[i] = Some(shm_info);
                 UteeParamOwned::MemrefInout {
@@ -651,8 +643,8 @@ pub fn decode_ta_request<Platform: crate::OpteeShimPlatform>(
             }
             OpteeMsgAttrType::RmemInout => {
                 let rmem = param.get_param_rmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
-                let buffer_size = checked_memref_size(rmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
+                let buffer_size = shm_info.len();
 
                 ta_req_info.shm_info[i] = Some(shm_info);
                 UteeParamOwned::MemrefInout {
@@ -694,7 +686,8 @@ struct MemrefCopy<'a> {
 /// Update the OP-TEE message arguments for returning from the secure world to the normal world.
 ///
 /// Like OP-TEE `copy_out_param`, outputs follow the request's param types for every
-/// result, except that `TargetDead` writes back only the result.
+/// result, except that `TargetDead` writes back only the result. A NULL memref has
+/// neither data nor a buffer to bound, so its size is reported as is.
 ///
 /// # Errors
 ///
@@ -801,7 +794,9 @@ fn stage_outputs<'a, Platform: crate::OpteeShimPlatform>(
                 let fitting_len = usize::try_from(value_b)
                     .ok()
                     .filter(|&len| len <= dst.len());
-                if let Some(len) = fitting_len {
+                if dst.is_null() {
+                    // Nothing to copy, and no buffer for the size to bound.
+                } else if let Some(len) = fitting_len {
                     if let Some(layout) = layout {
                         // The recorded buffer bounds the read even if `request.params` changed.
                         let (src, _) = layout.memref_buffers[index]
@@ -826,7 +821,7 @@ fn stage_outputs<'a, Platform: crate::OpteeShimPlatform>(
 /// Build `UteeParams` for a client PTA from a decoded request.
 ///
 /// Memref addresses are 0: the buffer is `ta_req_info.shm_info[i]`, whose
-/// length equals the memref size except for NULL buffers (length 0).
+/// length equals the memref size.
 pub(crate) fn client_pta_params(ta_req_info: &TaRequestInfo<PAGE_SIZE>) -> UteeParams {
     let mut params = UteeParams::new();
     for (index, param) in ta_req_info.params.iter().enumerate() {
@@ -879,11 +874,14 @@ impl ShmRefPagesData {
 /// `page_offset` indicates the page offset of the first page (i.e., `pages[0]`) which should be
 /// smaller than `ALIGN`.
 /// `len` is the byte length of the shared memory view starting at `page_offset`.
+/// `null` marks a NULL memref (`OPTEE_SMC_SEC_CAP_MEMREF_NULL`). Being empty, it rejects any
+/// non-empty access even where `null` is unchecked.
 #[derive(Clone)]
 pub struct ShmInfo<const ALIGN: usize> {
     page_addrs: Box<[PhysPageAddr<ALIGN>]>,
     page_offset: usize,
     len: usize,
+    null: bool,
 }
 
 impl<const ALIGN: usize> ShmInfo<ALIGN> {
@@ -908,7 +906,12 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
             page_addrs,
             page_offset,
             len,
+            null: false,
         })
+    }
+
+    pub(crate) fn is_null(&self) -> bool {
+        self.null
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1180,12 +1183,17 @@ fn get_shm_info_from_optee_msg_param_tmem(
     tmem: OpteeMsgParamTmem,
 ) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturnCode> {
     if tmem.buf_ptr == 0 {
-        // NULL buffer - create empty ShmInfo
-        return ShmInfo::new(Box::new([]), 0, 0);
+        // The client's size is ignored, like OP-TEE OS `set_tmem_param()`.
+        return Ok(ShmInfo {
+            page_addrs: Box::new([]),
+            page_offset: 0,
+            len: 0,
+            null: true,
+        });
     }
 
     let phys_addr = tmem.buf_ptr;
-    let size: usize = tmem.size.trunc();
+    let size = checked_memref_size(tmem.size)?;
 
     // Calculate page-aligned address and offset
     let phys_addr_usize: usize = phys_addr.trunc();
@@ -1220,25 +1228,26 @@ fn get_shm_info_from_optee_msg_param_tmem(
 fn get_shm_info_from_optee_msg_param_rmem(
     rmem: OpteeMsgParamRmem,
 ) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturnCode> {
+    let size = checked_memref_size(rmem.size)?;
     let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
         return Err(OpteeSmcReturnCode::ENotAvail);
     };
     let page_offset = shm_info.page_offset;
     let rmem_offs: usize = rmem.offs.trunc();
     let view_end = rmem_offs
-        .checked_add(rmem.size.trunc())
+        .checked_add(size)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
     if view_end > shm_info.len() {
         return Err(OpteeSmcReturnCode::EBadAddr);
     }
-    if rmem.size == 0 {
+    if size == 0 {
         return ShmInfo::new(Box::new([]), 0, 0);
     }
     let start = page_offset
         .checked_add(rmem_offs)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
     let end = start
-        .checked_add(rmem.size.trunc())
+        .checked_add(size)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
     let start_page_index = start / PAGE_SIZE;
     let end_page_index = end.div_ceil(PAGE_SIZE);
@@ -1247,11 +1256,7 @@ fn get_shm_info_from_optee_msg_param_rmem(
     }
     let mut page_addrs = Vec::with_capacity(end_page_index - start_page_index);
     page_addrs.extend_from_slice(&shm_info.page_addrs[start_page_index..end_page_index]);
-    ShmInfo::new(
-        page_addrs.into_boxed_slice(),
-        start % PAGE_SIZE,
-        rmem.size.trunc(),
-    )
+    ShmInfo::new(page_addrs.into_boxed_slice(), start % PAGE_SIZE, size)
 }
 
 #[cfg(test)]
@@ -1293,8 +1298,8 @@ mod tests {
         blob
     }
 
-    /// Mirrors `TaStack::init`: records a placement where only memref output/inout
-    /// params get a buffer, `(memref_address, buffer_size)`.
+    /// Mirrors `TaStack::init` for non-NULL memrefs: records a placement where only
+    /// memref output/inout params get a buffer, `(memref_address, buffer_size)`.
     fn record_placement(
         request: &mut TaRequestInfo<PAGE_SIZE>,
         params_address: usize,
@@ -1415,5 +1420,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(to_bytes(&msg_args), to_bytes(&expected));
+    }
+
+    /// NULL TMEMs of any size reach the TA as NULL buffers of size 0, unlike a
+    /// zero-sized TMEM with a buffer. Their output sizes are returned as is, even
+    /// on `Success`, without a TA buffer.
+    #[test]
+    fn null_tmem() {
+        let task = crate::syscalls::tests::init_platform();
+        let platform = task.global.platform;
+        let original = msg_args(
+            OpteeMessageCommand::InvokeCommand,
+            &[
+                wire(OpteeMsgAttrType::TmemInput, [0, u64::MAX, 0]),
+                wire(OpteeMsgAttrType::TmemOutput, [0, u64::MAX, 0]),
+                wire(OpteeMsgAttrType::TmemInout, [0, u64::MAX, 0]),
+                wire(OpteeMsgAttrType::TmemInput, [PAGE_SIZE as u64, 0, 0]),
+            ],
+        );
+        let mut request = decode_ta_request(platform, &original).unwrap();
+
+        let mut stack = crate::loader::ta_stack::allocate_stack(&task, None).unwrap();
+        let layout = stack
+            .init(platform, &request.params, &request.shm_info)
+            .unwrap();
+        let ptr = crate::UserMutPtr::<Platform, UteeParams>::from_usize(layout.params_address);
+        let mut params = ptr.read_at_offset(0).unwrap();
+        assert!(params.has_types([
+            TeeParamType::MemrefInput,
+            TeeParamType::MemrefOutput,
+            TeeParamType::MemrefInout,
+            TeeParamType::MemrefInput,
+        ]));
+        for index in 0..3 {
+            assert_eq!(params.get_values(index), Ok(Some((0, 0))));
+        }
+        let (address, len) = params.get_values(3).unwrap().unwrap();
+        assert_ne!(address, 0, "a zero-sized TMEM with a buffer is not NULL");
+        assert_eq!(len, 0);
+        assert_eq!(layout.memref_buffers, [None; UteeParams::TEE_NUM_PARAMS]);
+
+        // The TA leaves the output size at 0 and reports an oversized inout size.
+        let size = MAX_SHM_MEMREF_SIZE as u64 + 1;
+        params.set_values(2, 0, size).unwrap();
+        ptr.write_at_offset(0, params).unwrap();
+        request.ta_layout = Some(layout);
+        let mut msg_args = original;
+        update_optee_msg_args(
+            platform,
+            TeeResult::Success,
+            TeeOrigin::TrustedApp,
+            None,
+            Some(&request),
+            &mut msg_args,
+        )
+        .unwrap();
+        assert_eq!(msg_args.get_param_tmem(1).unwrap().size, 0);
+        assert_eq!(msg_args.get_param_tmem(2).unwrap().size, size);
     }
 }
