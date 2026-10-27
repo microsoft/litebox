@@ -17,6 +17,7 @@ use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
 use litebox::{
     LiteBox,
+    event::wait::WaitState,
     platform::{RawConstPointer as _, RawMutPointer as _},
     shim::ContinueOperation,
     utils::TruncateExt,
@@ -172,11 +173,11 @@ impl<Platform: OpteeShimPlatform> litebox::shim::EnterShim for OpteeShimEntrypoi
         ContinueOperation::Terminate
     }
 
+    /// Resumes: OP-TEE has no signals, so an interrupt is for what the
+    /// platform handles itself, before this (e.g., broker notifications, which
+    /// it dispatches).
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        #[cfg(debug_assertions)]
-        todo!("OP-TEE shim doesn't support interrupt");
-        #[cfg(not(debug_assertions))]
-        ContinueOperation::Terminate
+        ContinueOperation::Resume
     }
 }
 
@@ -235,7 +236,8 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
 
     /// Where TA and ldelf messages (`utee_log`) go, as written, instead of
     /// the log: a file of [`Self::litebox`], such as the broker's
-    /// `/dev/stdout`. Messages the file does not take are logged.
+    /// `/dev/stdout`. A message waits while the file has no room, as a write to
+    /// a Linux terminal does; one the file fails to take is logged.
     #[must_use]
     pub fn with_log_file(mut self, log_file: litebox::fs::File<Platform>) -> Self {
         self.log_file = Some(log_file);
@@ -438,6 +440,7 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
             task: Task {
                 global: self.0.clone(),
                 thread: ThreadState::new(),
+                wait_state: WaitState::new(self.0.platform),
                 ta_app_id: ta_uuid,
                 ta_svn,
                 ta_digest,
@@ -1782,6 +1785,9 @@ fn verify_shdr_signature(
 struct Task<Platform: OpteeShimPlatform> {
     global: Arc<GlobalState<Platform>>,
     thread: ThreadState,
+    /// For the waits of the TA's thread, its only one (e.g., a log message's,
+    /// for room in the log file).
+    wait_state: WaitState<Platform>,
     /// TA UUID
     ta_app_id: TeeUuid,
     /// TA security version number
@@ -1959,6 +1965,7 @@ mod test_utils {
             Task {
                 global: self.clone(),
                 thread: ThreadState::new(),
+                wait_state: WaitState::new(self.platform),
                 ta_app_id: TeeUuid::default(),
                 ta_svn: 0,
                 ta_digest: [0; TA_DIGEST_LEN],

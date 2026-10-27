@@ -157,6 +157,9 @@ pub fn serve(info: &StartupInfo) -> ! {
     if cfg!(debug_assertions) {
         check_stdin(platform, builder.litebox(), &mut notifications);
     }
+    // The receiver's, made before the shim takes the LiteBox.
+    let dispatch = builder.litebox().broker_notification_dispatcher();
+    let dispatch_failure = builder.litebox().broker_failure_dispatcher();
     let shim = builder.build();
 
     // Safety: mapped read-only for the process's lifetime; nothing writes
@@ -193,6 +196,12 @@ pub fn serve(info: &StartupInfo) -> ! {
         check_lockdown_validation();
         litebox_broker_local_vm_userland::self_check(&notifications, platform);
     }
+    // As in the Linux runner: the platform's waits and interrupts dispatch
+    // broker notifications, which end waits (e.g., a TA log message's, for
+    // room in standard output).
+    platform.set_notification_receiver(Box::leak(Box::new(
+        notifications.into_receiver(dispatch, dispatch_failure),
+    )));
     loop {
         let reply = runner.serve(request);
         request =
@@ -761,13 +770,13 @@ fn check_guest_memory_access() {
 
 /// Self-check (debug builds): standard input through the broker, which TAs
 /// never read. Waits briefly for input (on broker notifications), and echoes
-/// what arrived to standard output.
+/// what arrived to standard output, waiting for room as it needs.
 fn check_stdin(
     platform: &Platform,
     litebox: &litebox::LiteBox<Platform>,
     notifications: &mut litebox_broker_local_vm_userland::Notifications,
 ) {
-    use litebox::fs::errors::ReadError;
+    use litebox::fs::errors::{ReadError, WriteError};
     const WAIT_MS: u64 = 20;
 
     let context = litebox::fs::Context::new();
@@ -809,9 +818,19 @@ fn check_stdin(
     }
     let stdout = open("/dev/stdout", FileAccessMode::WriteOnly);
     for bytes in [&b"[stdin] "[..], &input[..len]] {
-        stdout
-            .write(bytes, None, None)
-            .expect("writing standard output");
+        let mut written = 0;
+        while written < bytes.len() {
+            match stdout.write(&bytes[written..], None, None) {
+                Ok(count) => written += count,
+                Err(WriteError::WouldBlock) => {
+                    let dispatch = litebox.broker_notification_dispatcher();
+                    if let Err(error) = notifications.receive(None, dispatch) {
+                        panic!("waiting for room in standard output: {error}");
+                    }
+                }
+                Err(error) => panic!("writing standard output: {error:?}"),
+            }
+        }
     }
     drop(stdout);
     log::info!("stdin check: echoed {len} bytes");
