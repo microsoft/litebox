@@ -3,6 +3,7 @@
 
 //! Path management, permission checks, and open-state operations above [`super::backend`].
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -18,12 +19,13 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        CreationMetadata, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
-        Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+        CreationMetadata, DirHandle, FileTerminal, Handle, HandleRef, PermissionCheck,
+        PermissionInfo, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
     },
 };
 use super::{SeekWhence, UserInfo};
 use crate::readiness::ReadinessSource;
+use crate::terminal::TerminalEndpoint;
 
 /// Maximum number of symbolic links followed while resolving a single path; following more fails
 /// with [`PathError::TooManySymlinks`].
@@ -574,8 +576,54 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
     /// Opens a file
     ///
-    /// The `mode` is only significant when creating a file
+    /// The `mode` is only significant when creating a file. Opening a file
+    /// that refers to the opener's controlling terminal for I/O fails with
+    /// [`OpenError::NoSuchDevice`], as if the opener had none (see
+    /// [`open_with_controlling_terminal`](Self::open_with_controlling_terminal)).
     pub fn open(
+        &self,
+        user: UserInfo,
+        path: &str,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<ResolverEntry<Backend>, OpenError> {
+        self.open_with_controlling_terminal(user, path, flags, mode, &|| None)
+    }
+
+    /// Opens a file like [`open`](Self::open), binding a file that refers to
+    /// the opener's controlling terminal to `controlling_terminal()`, which it
+    /// holds open (see [`TerminalEndpoint::reopen`]) and through which its I/O
+    /// then goes.
+    ///
+    /// Like Linux, opening such a file for I/O fails with
+    /// [`OpenError::NoSuchDevice`] if the opener has no controlling terminal,
+    /// while opening it only for path-based operations does not.
+    pub fn open_with_controlling_terminal(
+        &self,
+        user: UserInfo,
+        path: &str,
+        flags: OFlags,
+        mode: Mode,
+        controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
+    ) -> Result<ResolverEntry<Backend>, OpenError> {
+        let mut entry = self.open_entry(user, path, flags, mode)?;
+        if let Handle::File(file) = &entry.handle
+            && !entry.path_only
+            && matches!(
+                self.backend.terminal(file),
+                Some(FileTerminal::OpenersControlling)
+            )
+        {
+            let terminal = controlling_terminal().ok_or(OpenError::NoSuchDevice)?;
+            entry.controlling_terminal = Some(ReopenedTerminal {
+                _file: Arc::clone(&terminal).reopen()?,
+                terminal,
+            });
+        }
+        Ok(entry)
+    }
+
+    fn open_entry(
         &self,
         user: UserInfo,
         path: &str,
@@ -634,6 +682,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             path_only,
             seek_behavior,
             path: path.to_absolute(),
+            controlling_terminal: None,
         };
 
         if path.components.is_empty() {
@@ -770,6 +819,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if !entry.read_allowed {
             return Err(ReadError::NotForReading);
         }
+        if let Some(controlling) = &entry.controlling_terminal {
+            return Ok((controlling.terminal.read(buf)?, 0));
+        }
 
         let read_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
@@ -817,6 +869,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let seek_behavior = entry.seek_behavior;
         if !entry.write_allowed {
             return Err(WriteError::NotForWriting);
+        }
+        if let Some(controlling) = &entry.controlling_terminal {
+            return Ok((controlling.terminal.write(buf)?, 0));
         }
 
         let write_offset = match seek_behavior {
@@ -1195,12 +1250,15 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 
     /// Shared terminal backing a non-path-only entry.
-    pub fn terminal(
-        &self,
-        entry: &ResolverEntry<Backend>,
-    ) -> Option<Arc<dyn crate::terminal::TerminalEndpoint>> {
+    pub fn terminal(&self, entry: &ResolverEntry<Backend>) -> Option<Arc<dyn TerminalEndpoint>> {
         match &entry.handle {
-            Handle::File(file) if !entry.path_only => self.backend.terminal(file),
+            Handle::File(file) if !entry.path_only => match self.backend.terminal(file)? {
+                FileTerminal::Fixed(terminal) => Some(terminal),
+                FileTerminal::OpenersControlling => entry
+                    .controlling_terminal
+                    .as_ref()
+                    .map(|controlling| Arc::clone(&controlling.terminal)),
+            },
             Handle::File(_) | Handle::Dir(_) => None,
         }
     }
@@ -1211,6 +1269,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         &self,
         entry: &ResolverEntry<Backend>,
     ) -> Option<Arc<dyn ReadinessSource>> {
+        if let Some(controlling) = &entry.controlling_terminal {
+            return Some(Arc::clone(&controlling.terminal) as Arc<dyn ReadinessSource>);
+        }
         match &entry.handle {
             Handle::File(file) if !entry.path_only => self.backend.readiness_source(file),
             Handle::File(_) | Handle::Dir(_) => None,
@@ -1251,6 +1312,16 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     ///
     /// Later renames or removals of the object are not reflected.
     path: String,
+    /// The controlling terminal that the file referred to when it was opened,
+    /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
+    controlling_terminal: Option<ReopenedTerminal>,
+}
+
+/// A terminal reopened by [`TerminalEndpoint::reopen`], which stays open
+/// until this drops.
+struct ReopenedTerminal {
+    terminal: Arc<dyn TerminalEndpoint>,
+    _file: Box<dyn Send + Sync>,
 }
 
 impl<Backend: super::backend::Backend> ResolverEntry<Backend> {

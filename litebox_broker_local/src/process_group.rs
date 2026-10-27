@@ -5,7 +5,8 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessGroupRequest, ProcessGroupResponse,
 };
 use litebox_broker_protocol::process_group::{
-    ProcessGroupError, ProcessGroupMembership, SetForegroundGroupRequest, SetProcessGroupRequest,
+    ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
+    SetForegroundGroupRequest, SetProcessGroupRequest,
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 use litebox_broker_transport::channel::LocalCallChannel;
@@ -49,8 +50,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Returns the foreground process group of the caller's session and the
-    /// session, given its controlling terminal `terminal`.
+    /// Returns the foreground process group of the session that `terminal`
+    /// controls and the session, given the caller's controlling terminal or a
+    /// pseudo-terminal manager.
     ///
     /// # Panics
     ///
@@ -85,6 +87,30 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         });
         match self.request_process_group(request)? {
             ProcessGroupResponse::SetForegroundGroup => Ok(Ok(())),
+            ProcessGroupResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected process group response: {response:?}"),
+        }
+    }
+
+    /// Makes `terminal`, or the subsidiary of pseudo-terminal manager
+    /// `terminal`, the controlling terminal of the session that process
+    /// `process_id` leads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a protocol
+    /// response that does not match the issued process group request.
+    pub fn set_controlling_terminal(
+        &self,
+        process_id: ProcessId,
+        terminal: ObjectHandle,
+    ) -> Result<ProcessGroupResult<()>, Channel::Error> {
+        let request = ProcessGroupRequest::SetControllingTerminal(SetControllingTerminalRequest {
+            process_id,
+            terminal,
+        });
+        match self.request_process_group(request)? {
+            ProcessGroupResponse::SetControllingTerminal => Ok(Ok(())),
             ProcessGroupResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected process group response: {response:?}"),
         }

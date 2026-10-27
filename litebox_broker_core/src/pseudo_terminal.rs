@@ -15,6 +15,7 @@
 //! prepare it first. Closing the manager hangs up the subsidiary and retires
 //! its name. The index becomes free once nothing refers to the pair.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -158,10 +159,15 @@ impl PseudoTerminal {
     }
 
     fn attach(&self, sink: Arc<dyn TerminalEventSink>) {
-        let mut state = self.lock();
-        if state.sink.is_none() {
-            state.sink = Some(sink);
-        }
+        let sink = {
+            let mut state = self.lock();
+            let sink = Arc::clone(state.sink.get_or_insert(sink));
+            if state.manager_open {
+                return;
+            }
+            sink
+        };
+        sink.hang_up();
     }
 
     fn manager_read(&self, output: &mut dyn ReadBuffer) -> Result<usize, ReadError> {
@@ -333,6 +339,14 @@ impl TerminalEndpoint for PseudoTerminal {
     fn attach(&self, sink: Arc<dyn TerminalEventSink>) {
         PseudoTerminal::attach(self, sink);
     }
+
+    fn reopen(self: Arc<Self>) -> Result<Box<dyn Send + Sync>, OpenError> {
+        // Like Linux, a subsidiary that is hung up or locked fails to reopen
+        // with `Io`, even though its path is gone once hung up.
+        self.open_subsidiary()
+            .map(|file| Box::new(file) as Box<dyn Send + Sync>)
+            .map_err(|_| OpenError::Io)
+    }
 }
 
 /// A pseudo-terminal pair's manager endpoint.
@@ -364,6 +378,10 @@ impl TerminalEndpoint for PseudoTerminalManager {
     fn attach(&self, sink: Arc<dyn TerminalEventSink>) {
         self.0.attach(sink);
     }
+
+    fn subsidiary(&self) -> Option<Arc<dyn TerminalEndpoint>> {
+        Some(self.0.clone())
+    }
 }
 
 /// The open manager of a pseudo-terminal pair. Dropping it closes the
@@ -379,12 +397,18 @@ impl ManagerFile {
 
 impl Drop for ManagerFile {
     fn drop(&mut self) {
-        let mut state = self.0.0.lock();
-        state.manager_open = false;
-        // A hung-up subsidiary reads nothing, and nothing reads its output.
-        state.output = VecDeque::new();
-        state.engine.flush_input();
-        state.publish();
+        let sink = {
+            let mut state = self.0.0.lock();
+            state.manager_open = false;
+            // A hung-up subsidiary reads nothing, and nothing reads its output.
+            state.output = VecDeque::new();
+            state.engine.flush_input();
+            state.publish();
+            state.sink.clone()
+        };
+        if let Some(sink) = sink {
+            sink.hang_up();
+        }
     }
 }
 
@@ -475,6 +499,11 @@ mod tests {
     impl TerminalEventSink for TestEventSink {
         fn post(&self, events: TerminalEvents) {
             self.0.lock().unwrap().push(events);
+        }
+
+        /// Records a hang-up as [`TerminalEvents::HANGUP`].
+        fn hang_up(&self) {
+            self.0.lock().unwrap().push(TerminalEvents::HANGUP);
         }
     }
 
@@ -648,6 +677,8 @@ mod tests {
     fn closing_the_manager_hangs_up_the_subsidiary() {
         let terminals = PseudoTerminals::new();
         let (manager, subsidiary) = open_pair(&terminals);
+        let events = Arc::new(TestEventSink::default());
+        manager.endpoint().attach(events.clone());
         write(manager.endpoint().as_ref(), b"line\r").unwrap();
         let sink = Arc::new(TestReadinessSink::default());
         let registration = ReadinessRegistration::new(ObjectHandle(1), sink.clone());
@@ -655,6 +686,7 @@ mod tests {
         subsidiary.watch(&registration).unwrap();
 
         drop(manager);
+        assert_eq!(*events.0.lock().unwrap(), [TerminalEvents::HANGUP]);
         let hung_up = R | W | ReadinessFlags::ERROR | ReadinessFlags::CLOSED;
         assert_eq!(
             sink.republished.lock().unwrap().as_slice(),

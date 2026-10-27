@@ -21,7 +21,7 @@ use litebox_broker_protocol::terminal::{
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use crate::fs::FileResult;
-use crate::fs::errors::{ReadError, WriteError};
+use crate::fs::errors::{OpenError, ReadError, WriteError};
 use crate::readiness::ReadinessSource;
 use crate::transfer::take_from_queue;
 
@@ -38,6 +38,10 @@ pub const ATOMIC_WRITE_SIZE: usize = 4096;
 pub trait TerminalEventSink: Send + Sync {
     /// Posts actions without blocking on guest execution.
     fn post(&self, events: TerminalEvents);
+
+    /// Reports that the terminal hung up, so it stops controlling any session.
+    /// Endpoints call this outside their own locks.
+    fn hang_up(&self);
 }
 
 /// A shared terminal endpoint implemented over a platform transport.
@@ -58,8 +62,24 @@ pub trait TerminalEndpoint: ReadinessSource {
     fn control(&self, operation: TerminalOperation) -> crate::Result<FileResult<TerminalResponse>>;
 
     /// Attaches the sink for the terminal's events once, ignoring later
-    /// attachments.
+    /// attachments. Every attachment reports a past hang-up to the attached
+    /// sink, so a terminal that starts controlling a session after hanging up
+    /// stops controlling it.
     fn attach(&self, sink: Arc<dyn TerminalEventSink>);
+
+    /// Opens another file on the terminal, as opening `/dev/tty` does, which
+    /// stays open until the returned value drops.
+    fn reopen(self: Arc<Self>) -> Result<Box<dyn Send + Sync>, OpenError> {
+        Ok(Box::new(()))
+    }
+
+    /// The terminal that this endpoint is the manager of, if it is a
+    /// pseudo-terminal manager. Process group operations through a manager
+    /// apply to that terminal, and opening a manager never makes it a
+    /// controlling terminal.
+    fn subsidiary(&self) -> Option<Arc<dyn TerminalEndpoint>> {
+        None
+    }
 }
 
 /// Why a host terminal transport operation did not complete.

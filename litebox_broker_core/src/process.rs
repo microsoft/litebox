@@ -833,6 +833,15 @@ impl BrokerProcess {
             && matches!(state.retirement, ProcessRetirement::Active { .. })
     }
 
+    /// Returns whether this process exited or failed to start, after which it
+    /// no longer leads its session (see [`crate::process_group`]).
+    pub(crate) fn has_left(&self) -> bool {
+        matches!(
+            self.state.lock().status,
+            ProcessStatus::Exited(_) | ProcessStatus::Failed(_)
+        )
+    }
+
     /// Returns the completed startup outcome, or `None` while startup is pending.
     pub fn startup_result(&self) -> Option<Result<()>> {
         match self.state.lock().status {
@@ -928,6 +937,7 @@ impl BrokerProcess {
                 .lock()
                 .status
                 .transition(ProcessStatus::Exited(exit_status))?;
+            crate::process_group::leader_left(self);
             let (parent, children) = {
                 let mut node = self.tree_node.lock();
                 node.exit_status = Some(exit_status);
@@ -1103,6 +1113,7 @@ impl BrokerProcess {
                 }
                 state.shutdown.clone()
             };
+            crate::process_group::leader_left(self);
             self.release_unstarted();
             shutdown
         };
@@ -1148,6 +1159,9 @@ impl BrokerProcess {
             children.retain(|child| {
                 let (failed, shutdown) = child.handle_parent_death();
                 shutdowns.extend(shutdown);
+                if failed {
+                    crate::process_group::leader_left(child);
+                }
                 !failed
             });
             let changed = children.len() != count;
@@ -1789,6 +1803,8 @@ impl BrokerProcess {
         if self.core.processes.write().remove(&self.id).is_none() {
             invariant_fault = true;
         }
+        // Before this process's ID, which names its session, can be reused.
+        crate::process_group::leader_cleaned_up(self);
         let release_ids = release_ids && !invariant_fault;
         self.release_threads(release_ids);
         if release_ids {
@@ -3875,6 +3891,7 @@ mod tests {
                 FileAccessMode::WriteOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),
+                &|| None,
             )
             .unwrap()
             .unwrap();
@@ -3891,6 +3908,7 @@ mod tests {
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),
+                &|| None,
             )
             .unwrap()
             .unwrap();

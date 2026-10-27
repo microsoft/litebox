@@ -26,7 +26,8 @@ use crate::process::{
     WriteChildMemoryRequest,
 };
 use crate::process_group::{
-    ProcessGroupError, ProcessGroupMembership, SetForegroundGroupRequest, SetProcessGroupRequest,
+    ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
+    SetForegroundGroupRequest, SetProcessGroupRequest,
 };
 use crate::readiness::ReadinessFlags;
 use crate::readiness_queue::{
@@ -383,10 +384,11 @@ pub enum ProcessGroupRequest {
     /// group already has the process's ID.
     CreateSession(ProcessId),
     /// Read the foreground process group of the caller's controlling terminal,
-    /// given an open handle to it.
+    /// given an open handle to it, or of any session's controlling terminal,
+    /// given an open handle to its pseudo-terminal manager.
     ///
     /// Fails with [`ProcessGroupError::NotControllingTerminal`] if the handle
-    /// does not refer to the caller's controlling terminal.
+    /// refers to no such terminal.
     GetForegroundGroup(ObjectHandle),
     /// Make a process group the foreground group of the caller's controlling
     /// terminal.
@@ -397,6 +399,9 @@ pub enum ProcessGroupRequest {
     /// and then with [`ProcessGroupError::NotInSession`] if the group is in
     /// another session.
     SetForegroundGroup(SetForegroundGroupRequest),
+    /// Make a terminal the controlling terminal of the session that a process
+    /// leads.
+    SetControllingTerminal(SetControllingTerminalRequest),
 }
 
 /// Request about signals sent between broker processes.
@@ -636,7 +641,9 @@ pub enum ProcessGroupResponse {
     GetForegroundGroup(ProcessGroupMembership),
     /// The foreground process group changed.
     SetForegroundGroup,
-    /// A foreground group operation failed in a way the guest ABI reports.
+    /// The terminal controls the process's session.
+    SetControllingTerminal,
+    /// A terminal operation failed in a way the guest ABI reports.
     ///
     /// Other failures use [`BrokerResult::Error`].
     Failed(ProcessGroupError),

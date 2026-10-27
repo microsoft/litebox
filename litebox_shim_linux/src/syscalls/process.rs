@@ -723,6 +723,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         (TerminalEvents::INTERRUPT, Signal::SIGINT),
                         (TerminalEvents::QUIT, Signal::SIGQUIT),
                         (TerminalEvents::RESIZE, Signal::SIGWINCH),
+                        (TerminalEvents::HANGUP, Signal::SIGHUP),
                     ] {
                         if events.contains(event) {
                             let mut info = siginfo_kill_from(signal, 0, 0);
@@ -2862,7 +2863,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let full_path = self.resolve_path(&path)?;
             let file = self.do_open(
                 &full_path,
-                litebox_common_linux::OFlags::RDONLY,
+                litebox_common_linux::OFlags::RDONLY | litebox_common_linux::OFlags::NOCTTY,
                 litebox_broker_protocol::fs::FileMode::empty(),
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];

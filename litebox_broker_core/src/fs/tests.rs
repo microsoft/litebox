@@ -1871,7 +1871,7 @@ mod devices {
     use crate::fs::devices::Devices;
     use crate::fs::errors::{OpenError, PathError};
     use crate::random::TestRandomProvider;
-    use crate::stdio::{StdioOutputStream, StdioStream};
+    use crate::stdio::{StdioOutputStream, StdioProvider, StdioStream};
     use crate::test_support::TestStdioProvider;
     use alloc::string::String;
     use alloc::sync::Arc;
@@ -1932,8 +1932,9 @@ mod devices {
         }
     }
 
-    /// `/dev/tty` and the standard streams referring to the guest terminal
-    /// share its endpoint's I/O; other streams go to the host streams.
+    /// `/dev/tty`, bound to the guest terminal as the opener's controlling
+    /// terminal, and the standard streams referring to the guest terminal share
+    /// its endpoint's I/O; other streams go to the host streams.
     #[test]
     fn terminal_devices_use_the_terminal_endpoint() {
         let provider = Arc::new(
@@ -1944,7 +1945,9 @@ mod devices {
         let fs = devices_fs(provider.clone());
 
         let mut tty = fs
-            .open(USER, "/dev/tty", OFlags::RDWR, Mode::empty())
+            .open_with_controlling_terminal(USER, "/dev/tty", OFlags::RDWR, Mode::empty(), &|| {
+                provider.terminal()
+            })
             .expect("Failed to open /dev/tty");
         let mut stdin = fs
             .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
@@ -1984,7 +1987,7 @@ mod devices {
         assert_eq!(&buffer, b"ne");
     }
 
-    /// The guest terminal stays reachable through `/dev/tty` when no standard
+    /// `/dev/tty` reaches the opener's controlling terminal when no standard
     /// stream refers to it.
     #[test]
     fn tty_without_terminal_streams() {
@@ -1992,7 +1995,13 @@ mod devices {
         let fs = devices_fs(provider.clone());
 
         let mut tty = fs
-            .open(USER, "/dev/tty", OFlags::WRONLY, Mode::empty())
+            .open_with_controlling_terminal(
+                USER,
+                "/dev/tty",
+                OFlags::WRONLY,
+                Mode::empty(),
+                &|| provider.terminal(),
+            )
             .expect("Failed to open /dev/tty");
         assert!(fs.terminal(&tty).is_some());
         assert!(matches!(fs.write(&mut tty, b"tty", None), Ok(3)));
@@ -2003,10 +2012,13 @@ mod devices {
         assert_eq!(provider.terminal_writes(), vec![b"tty".to_vec()]);
     }
 
-    /// Without a terminal, `/dev/tty` exists but cannot be opened for I/O.
+    /// Without a controlling terminal, `/dev/tty` exists but cannot be opened
+    /// for I/O, even if the guest has a terminal.
     #[test]
     fn tty_without_terminal() {
-        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
+        let fs = devices_fs(Arc::new(
+            TestStdioProvider::default().with_controlling_terminal(),
+        ));
 
         assert!(matches!(
             fs.open(USER, "/dev/tty", OFlags::RDWR, Mode::empty()),

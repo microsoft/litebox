@@ -176,6 +176,12 @@ pub(crate) trait BrokerControl: Send + Sync {
         process_group: litebox_broker_protocol::ProcessGroupId,
     ) -> core::result::Result<core::result::Result<(), ProcessGroupError>, BrokerControlError>;
 
+    fn set_controlling_terminal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        terminal: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<(), ProcessGroupError>, BrokerControlError>;
+
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
     fn exit_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
@@ -961,6 +967,14 @@ where
         process_group: litebox_broker_protocol::ProcessGroupId,
     ) -> core::result::Result<core::result::Result<(), ProcessGroupError>, BrokerControlError> {
         self.request(|local| local.set_foreground_group(terminal, process_group))
+    }
+
+    fn set_controlling_terminal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        terminal: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<(), ProcessGroupError>, BrokerControlError> {
+        self.request(|local| local.set_controlling_terminal(process_id, terminal))
     }
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {

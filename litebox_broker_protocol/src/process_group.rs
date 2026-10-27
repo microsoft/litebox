@@ -9,7 +9,9 @@
 //! session, while a root process, which has no creator, leads its own.
 //!
 //! A session may have a controlling terminal, whose events go to the session's
-//! foreground process group.
+//! foreground process group, and a terminal controls at most one session. A
+//! pseudo-terminal manager's handle refers to its subsidiary terminal in
+//! process group requests.
 
 use thiserror::Error;
 
@@ -38,11 +40,30 @@ pub struct SetProcessGroupRequest {
     pub process_group: ProcessGroupId,
 }
 
+/// Request to make a terminal the controlling terminal of the session that a
+/// process leads, with the process's group in the foreground.
+///
+/// The target must be the caller or its pending child, or the broker returns
+/// `UnknownObject`. Does nothing if the terminal already controls the target's
+/// session. Otherwise the broker returns `PolicyDenied` if the target leads no
+/// session, its session already has a controlling terminal, the terminal
+/// controls another session, or the handle is not open for reading. Fails with
+/// [`ProcessGroupError::NotControllingTerminal`] if the handle does not refer
+/// to a terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetControllingTerminalRequest {
+    /// Process whose session acquires the terminal.
+    pub process_id: ProcessId,
+    /// Open handle to the terminal or to its pseudo-terminal manager.
+    pub terminal: ObjectHandle,
+}
+
 /// Request to make a process group the foreground group of the caller's
 /// controlling terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetForegroundGroupRequest {
-    /// Open handle to the caller's controlling terminal.
+    /// Open handle to the caller's controlling terminal or to its
+    /// pseudo-terminal manager.
     pub terminal: ObjectHandle,
     /// Group to move to the foreground, which must be in the caller's session.
     pub process_group: ProcessGroupId,

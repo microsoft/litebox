@@ -1946,6 +1946,18 @@ fn handle_process_group_request(
                 })
             })
         }
+        ProcessGroupRequest::SetControllingTerminal(request) => {
+            litebox_broker_core::process_group::set_controlling_terminal(
+                process,
+                request.process_id,
+                request.terminal,
+            )
+            .map(|result| {
+                result.map_or_else(ProcessGroupResponse::Failed, |()| {
+                    ProcessGroupResponse::SetControllingTerminal
+                })
+            })
+        }
     };
     response.map_err(RequestFailure::from)
 }

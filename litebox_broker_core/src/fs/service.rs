@@ -24,6 +24,7 @@ use super::errors::{
 use super::resolver::{Resolver, ResolverEntry};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
+use crate::terminal::TerminalEndpoint;
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a broker file operation.
@@ -41,7 +42,7 @@ pub struct File {
     state: Arc<dyn Any + Send + Sync>,
     /// Readiness of a file whose reads or writes can fail with `WouldBlock`.
     readiness: Option<Arc<dyn ReadinessSource>>,
-    terminal: Option<Arc<dyn crate::terminal::TerminalEndpoint>>,
+    terminal: Option<Arc<dyn TerminalEndpoint>>,
 }
 
 impl File {
@@ -97,12 +98,14 @@ impl ObjectEntry {
 
 mod private {
     use super::{
-        BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
+        Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
         FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result, ServiceResult,
-        String, Vec, WriteBuffer,
+        String, TerminalEndpoint, Vec, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
+        /// Opens `path`, binding a file that refers to the opener's controlling terminal to
+        /// `controlling_terminal()`.
         fn open(
             &self,
             _path: &str,
@@ -110,6 +113,7 @@ mod private {
             _access: FileAccessMode,
             _flags: FileOpenFlags,
             _mode: FileMode,
+            _controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
         ) -> ServiceResult<File> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -236,9 +240,17 @@ where
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
+        controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
-        let entry = match Resolver::open(self, user, path, flags, mode & FileMode::SUPPORTED) {
+        let entry = match Resolver::open_with_controlling_terminal(
+            self,
+            user,
+            path,
+            flags,
+            mode & FileMode::SUPPORTED,
+            controlling_terminal,
+        ) {
             Ok(entry) => entry,
             Err(error) => return Ok(Err(file_open_error(error))),
         };
@@ -506,7 +518,11 @@ where
 /// Opens an absolute path and installs its broker-owned open state in `process`.
 ///
 /// If reads or writes of the file can fail with [`BrokerError::WouldBlock`], the new reference
-/// publishes the file's readiness through `readiness_sink`.
+/// publishes the file's readiness through `readiness_sink`. A file that refers to the opener's
+/// controlling terminal refers to the controlling terminal of `process`'s session. Unless `flags`
+/// contain [`FileOpenFlags::NO_CONTROLLING_TERMINAL`], opening a terminal for reading makes it the
+/// controlling terminal of the session that `process` leads, if that session has none and the
+/// terminal controls no other session.
 pub fn open(
     process: &BrokerProcess,
     path: &str,
@@ -521,14 +537,26 @@ pub fn open(
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let file = match process.core.fs.open(path, user, access, flags, mode)? {
+    let file = match process.core.fs.open(path, user, access, flags, mode, &|| {
+        crate::process_group::controlling_terminal(process)
+    })? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
     let readiness = file.watch(reference.handle(), readiness_sink)?;
-    reference
-        .commit_with_readiness(ObjectEntry::File(file), readiness)
-        .map(Ok)
+    let terminal = file
+        .terminal
+        .clone()
+        .filter(|_| !flags.contains(FileOpenFlags::NO_CONTROLLING_TERMINAL) && readable(access));
+    let handle = reference.commit_with_readiness(ObjectEntry::File(file), readiness)?;
+    if let Some(terminal) = terminal {
+        crate::process_group::acquire(process, &terminal);
+    }
+    Ok(Ok(handle))
+}
+
+fn readable(access: FileAccessMode) -> bool {
+    matches!(access, FileAccessMode::ReadOnly | FileAccessMode::ReadWrite)
 }
 
 /// Opens `path` for broker-internal use, returning the open file and its
@@ -548,7 +576,9 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    let file = match process.core.fs.open(path, user, access, flags, mode)? {
+    let file = match process.core.fs.open(path, user, access, flags, mode, &|| {
+        crate::process_group::controlling_terminal(process)
+    })? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -651,9 +681,24 @@ pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<File
 pub(crate) fn handle_terminal(
     process: &BrokerProcess,
     handle: ObjectHandle,
-) -> Result<Option<Arc<dyn crate::terminal::TerminalEndpoint>>> {
+) -> Result<Option<Arc<dyn TerminalEndpoint>>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     Ok(file.terminal)
+}
+
+/// Returns the terminal that a broker-owned open object refers to, if any, and whether the object
+/// is open for reading.
+pub(crate) fn handle_terminal_access(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<Option<(Arc<dyn TerminalEndpoint>, bool)>> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let Some(terminal) = file.terminal.clone() else {
+        return Ok(None);
+    };
+    let readable = readable(process.core.fs.get_status_flags(&file)?.access);
+    drop(file);
+    Ok(Some((terminal, readable)))
 }
 
 /// Controls a shared terminal through any open file handle that refers to it.

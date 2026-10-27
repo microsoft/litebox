@@ -27,7 +27,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalOperation, TerminalResponse, TerminalSettings,
 };
-use litebox_broker_protocol::{ObjectHandle, ProcessGroupId};
+use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 use litebox_common_linux::{
     AccessFlags, AtFlags, CloseRangeFlags, EfdFlags, EpollCreateFlags, FcntlArg,
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, PAGE_SIZE,
@@ -1008,6 +1008,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mode = mode & !self.get_umask();
         let fs = self.fs.borrow();
         let context = fs.context.read();
+        // The broker opens on behalf of a `vfork` child's parent, so the open must not give the
+        // parent's session a controlling terminal. The child can still acquire one with
+        // `TIOCSCTTY`.
+        let flags = if self.vfork.borrow().is_some() {
+            flags | OFlags::NOCTTY
+        } else {
+            flags
+        };
         let (access, open_flags) =
             file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
         let file = self
@@ -2688,6 +2696,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     )
                     .map_err(process_error)?;
             }
+            // Stealing a terminal from another session is unsupported, so the argument only
+            // matters when the broker denies the request anyway.
+            IoctlArg::TIOCSCTTY(_) => {
+                litebox
+                    .set_controlling_terminal(
+                        ProcessId(self.sys_getpid().cast_unsigned()),
+                        file.file(),
+                    )
+                    .map_err(process_error)?;
+            }
             _ => unreachable!("non-job-control ioctl"),
         }
         Ok(0)
@@ -2785,7 +2803,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.global
                     .with_file(fd, |file| self.terminal_ioctl(file, &arg))
             }
-            IoctlArg::TIOCGPGRP(..) | IoctlArg::TIOCSPGRP(..) | IoctlArg::TIOCGSID(..) => {
+            IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
+            | IoctlArg::TIOCGSID(..)
+            | IoctlArg::TIOCSCTTY(..) => {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.file_only(Errno::ENOTTY)?;
                 self.global

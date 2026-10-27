@@ -206,7 +206,8 @@ pub enum TerminalResponse {
 }
 
 bitflags::bitflags! {
-    /// Terminal actions delivered to the terminal's foreground process group.
+    /// Terminal actions delivered to processes in the session that a terminal
+    /// controls, by default to its foreground process group.
     ///
     /// Repeated actions coalesce. These are not guest signal numbers. Stopping
     /// and continuing jobs, and restricting background groups' access to the
@@ -219,5 +220,9 @@ bitflags::bitflags! {
         const QUIT = 1 << 1;
         /// Transport geometry changed.
         const RESIZE = 1 << 2;
+        /// The terminal stopped controlling the session: delivered to the
+        /// session leader when the terminal hangs up, and to the foreground
+        /// group when the session leader exits.
+        const HANGUP = 1 << 3;
     }
 }

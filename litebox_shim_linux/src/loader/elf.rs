@@ -36,7 +36,7 @@ struct ElfFile<'a, Platform: ShimPlatform> {
 impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
     fn new(task: &'a Task<Platform>, path: &str) -> Result<Self, Errno> {
         let fd = task
-            .sys_open(path, OFlags::RDONLY, Mode::empty())?
+            .sys_open(path, OFlags::RDONLY | OFlags::NOCTTY, Mode::empty())?
             .reinterpret_as_signed();
         #[cfg(target_arch = "aarch64")]
         let Ok(crate::syscalls::file::AnyTypedFd::File(file_fd)) = task.typed_fd(fd) else {

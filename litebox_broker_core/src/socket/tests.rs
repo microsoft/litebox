@@ -1513,7 +1513,8 @@ fn test_broker_with_policy(
         socket_provider,
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
         fs: Arc::new(crate::fs::UnsupportedFileService),
-        terminal: None,
+        terminal: Arc::default(),
+        controlling_terminals: Arc::default(),
         socket_ports: BrokerSocketPorts::default(),
         process_lifecycle_sink: Arc::new(crate::NoopProcessLifecycleSink),
     }

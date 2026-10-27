@@ -33,7 +33,7 @@ use litebox::{
 };
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
-    FcntlArg, IoReadVec, IoWriteVec, PAGE_SIZE, SyscallRequest,
+    FcntlArg, IoReadVec, IoWriteVec, IoctlArg, PAGE_SIZE, SyscallRequest,
     errno::Errno,
     mm::VmemManager,
     vmem::{CreatePagesFlags, MappingError, VmemUnmapError},
@@ -948,8 +948,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
         // The constrained vfork child may only inspect its temporary identity and resource limits,
-        // manage its own process group and session, signal state, descriptors, working directory,
-        // and umask, open and write files, exit, or attempt execve. Any other syscall terminates
+        // manage its own process group, session, and controlling terminal, signal state,
+        // descriptors, working directory, and umask, open and write files, exit, or attempt
+        // execve. Any other syscall terminates
         // the shared runner.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
@@ -966,6 +967,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Getpgrp
                     | SyscallRequest::Setsid
                     | SyscallRequest::Getsid { .. }
+                    | SyscallRequest::Ioctl {
+                        arg: IoctlArg::TIOCSCTTY(_),
+                        ..
+                    }
                     | SyscallRequest::Prlimit {
                         pid: 0,
                         new_limit: None,

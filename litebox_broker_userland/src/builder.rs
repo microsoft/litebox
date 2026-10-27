@@ -109,8 +109,8 @@ impl BrokerCoreBuilder {
         self
     }
 
-    /// Installs the guest terminal, if any, that the file service serves as
-    /// `/dev/tty`; see [`BrokerCore::with_terminal`].
+    /// Installs the guest terminal, if any, as the first root process's
+    /// controlling terminal; see [`BrokerCore::with_terminal`].
     #[must_use]
     pub fn with_terminal(mut self, terminal: Option<Arc<dyn TerminalEndpoint>>) -> Self {
         self.terminal = terminal;

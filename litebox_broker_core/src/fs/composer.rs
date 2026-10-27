@@ -741,7 +741,7 @@ impl Backend for Composer {
         }
     }
 
-    fn terminal(&self, h: &FileHandle) -> Option<Arc<dyn crate::terminal::TerminalEndpoint>> {
+    fn terminal(&self, h: &FileHandle) -> Option<super::backend::FileTerminal> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index].backend.terminal(&h.handle)
     }

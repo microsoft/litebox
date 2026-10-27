@@ -185,11 +185,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         broker.create_session(process_id).map_err(no_such_process)
     }
 
-    /// Returns the foreground process group of this process's session and the
-    /// session, given its controlling terminal `terminal`.
+    /// Returns the foreground process group of the session that `terminal`
+    /// controls and the session, given this process's controlling terminal or
+    /// a pseudo-terminal manager.
     ///
-    /// Returns [`ProcessError::NotControllingTerminal`] if `terminal` is not
-    /// this process's controlling terminal.
+    /// Returns [`ProcessError::NotControllingTerminal`] if `terminal` is
+    /// neither this process's controlling terminal nor the manager of a
+    /// session's controlling terminal.
     pub fn get_foreground_group(
         &self,
         terminal: &File<Platform>,
@@ -214,6 +216,29 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     ) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.set_foreground_group(terminal.handle(), process_group)??)
+    }
+
+    /// Makes `terminal`, or the subsidiary of pseudo-terminal manager
+    /// `terminal`, the controlling terminal of the session that process
+    /// `process_id` leads, with the leader's group in the foreground.
+    /// `process_id` must be this process or its pending child.
+    ///
+    /// Does nothing if the terminal already controls the session. Otherwise
+    /// returns [`ProcessError::PolicyDenied`] if the process leads no session,
+    /// the session already has a controlling terminal, the terminal controls
+    /// another session, or `terminal` is not open for reading. Returns
+    /// [`ProcessError::NotControllingTerminal`] if `terminal` is not a
+    /// terminal, and [`ProcessError::NoSuchProcess`] if `process_id` names
+    /// neither this process nor its pending child.
+    pub fn set_controlling_terminal(
+        &self,
+        process_id: ProcessId,
+        terminal: &File<Platform>,
+    ) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker
+            .set_controlling_terminal(process_id, terminal.handle())
+            .map_err(no_such_process)??)
     }
 
     /// Opens the signals other processes send to this process and the exits

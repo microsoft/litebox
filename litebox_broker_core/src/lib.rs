@@ -347,8 +347,11 @@ pub struct BrokerCore {
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) fs: Arc<dyn FileService>,
-    /// Guest terminal, controlling the first root process's session.
-    pub(crate) terminal: Option<Arc<process_group::ControllingTerminal>>,
+    /// Terminal that the first root process's session acquires when that
+    /// process starts.
+    pub(crate) terminal: Arc<Mutex<Option<Arc<dyn terminal::TerminalEndpoint>>>>,
+    /// Which terminal controls which session.
+    pub(crate) controlling_terminals: Arc<process_group::ControllingTerminals>,
     pub(crate) socket_ports: BrokerSocketPorts,
     pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
 }
@@ -414,19 +417,20 @@ impl BrokerCore {
             socket_provider,
             timer_provider,
             fs,
-            terminal: None,
+            terminal: Arc::new(Mutex::new(None)),
+            controlling_terminals: Arc::default(),
             socket_ports: BrokerSocketPorts::default(),
             process_lifecycle_sink: Arc::new(NoopProcessLifecycleSink),
         })
     }
 
-    /// Makes `terminal`, which the file service serves as `/dev/tty`, the
-    /// controlling terminal of the first root process's session: the terminal
-    /// then signals that session's foreground process group, initially that
-    /// process's group. Set it before sharing the core.
+    /// Makes `terminal` the controlling terminal of the first root process's
+    /// session: the terminal then signals that session's foreground process
+    /// group, initially that process's group, and its members open it as
+    /// `/dev/tty`. Set it before sharing the core.
     #[must_use]
-    pub fn with_terminal(mut self, terminal: Arc<dyn terminal::TerminalEndpoint>) -> Self {
-        self.terminal = Some(Arc::new(process_group::ControllingTerminal::new(terminal)));
+    pub fn with_terminal(self, terminal: Arc<dyn terminal::TerminalEndpoint>) -> Self {
+        *self.terminal.lock() = Some(terminal);
         self
     }
 
@@ -565,8 +569,11 @@ impl BrokerCore {
         let process = self.allocate_process(caller_credential, parent_id)?;
         match process.create_initial_thread() {
             Ok(()) => {
-                if let (None, Some(terminal)) = (parent_id, &self.terminal) {
-                    terminal.attach(&process);
+                if parent_id.is_none() {
+                    let terminal = self.terminal.lock().take();
+                    if let Some(terminal) = terminal {
+                        process_group::acquire(&process, &terminal);
+                    }
                 }
                 Ok(process)
             }
