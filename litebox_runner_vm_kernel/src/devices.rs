@@ -54,11 +54,6 @@ use litebox_platform_vm_kernel::{Handled, Instant, VmKernel, worker};
 use litebox_shim_vm_kernel::ProcessTimer;
 use spin::Mutex;
 
-/// How long a console write may wait for the device to take output before
-/// it returns what the device took: a short write, or none, which the writer
-/// tries again (see `ConsoleStdio`).
-const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
-
 /// How long a share's server may take to answer a request before the share
 /// fails.
 const SHARE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -291,17 +286,6 @@ impl Devices {
         &self.armed[cpu::current().index()]
     }
 
-    /// For drivers: waits until a device may have changed (an interrupt) or
-    /// `deadline` (to poll one that does not interrupt); then look again. On
-    /// the worker (serving broker requests), suspends it, and processes run
-    /// meanwhile; elsewhere, halts. Hold no lock the kernel or another CPU
-    /// may take meanwhile (see `litebox_platform_vm_kernel::worker`).
-    pub fn block(&self, deadline: Option<Instant>) {
-        if !litebox_platform_vm_kernel::worker::suspend(deadline) {
-            self.halt(deadline);
-        }
-    }
-
     /// Halts the calling CPU until an interrupt, or until `deadline`; while
     /// the CPU has a wakeup to acknowledge (see
     /// `litebox_platform_vm_kernel::cpu`), only takes the pending interrupts
@@ -414,23 +398,17 @@ impl Console for Devices {
         !console.receives() || console.has_input()
     }
 
-    /// Waits (bounded) for the device to take all of `input`; both streams
-    /// share it.
+    /// One attempt; both streams share the device.
     fn write(&self, _stream: StdioOutputStream, input: &[u8]) -> usize {
-        let deadline = self
-            .platform
-            .now()
-            .checked_add(WRITE_TIMEOUT)
-            .expect("the clock is far from overflowing");
-        let mut written = 0;
-        loop {
-            written += self.console.lock().write(&input[written..]);
-            if written == input.len() || self.platform.now() >= deadline {
-                return written;
-            }
-            // Until the device takes more output.
-            self.block(Some(deadline));
-        }
+        self.console.lock().write(input)
+    }
+
+    fn can_write(&self) -> bool {
+        self.console.lock().can_write()
+    }
+
+    fn interrupts(&self) -> bool {
+        self.console_interrupts
     }
 }
 
@@ -556,9 +534,9 @@ fn broker_id(id: hal::ConnectionId) -> ConnectionId {
 }
 
 /// A share's virtio-9p device: a request at a time, waiting for its response
-/// in [`Devices::halt`], not [`Devices::block`]: the 9P client holds its lock
-/// across the round trip, and while the worker is suspended, the kernel may
-/// take it (e.g., ending another process's association closes its files),
+/// in [`Devices::halt`], not suspending the worker: the 9P client holds its
+/// lock across the round trip, and while the worker is suspended, the kernel
+/// may take it (e.g., ending another process's association closes its files),
 /// which nothing on that CPU would release. Polled even if it interrupts:
 /// its interrupt goes to the boot CPU, which wakes this one for it (see
 /// [`Devices::on_interrupt`]) only as it takes interrupts, which it may not

@@ -16,6 +16,11 @@
 //! - `expect_exit_code` (default 0), or `expect_signal` for a signal death.
 //! - `expect_stdout`, `expect_stderr`: the exact output, if given; output
 //!   beyond what is recorded fails the check.
+//! - `expect_stdout_records`: `[writers, records]`, if given: standard output
+//!   is records of 256 bytes, each `w<writer> <seq>` padded with spaces and
+//!   ended by a newline, and nothing else: each writer's (numbered from 0)
+//!   `records` records (numbered from 0), whole and in order; writers' records
+//!   may interleave.
 //! - `min_reflected_syscalls`: default 0; guest syscalls the runner did not
 //!   take directly, so the kernel reflected them.
 //! - `replay`: default false; in debug builds, the run's process gives up on
@@ -27,8 +32,8 @@
 //!   does if one has it. Release builds ignore it.
 //!
 //! In a group, runs share standard input and output, so they take no
-//! `stdin`, `expect_stdout`, or `expect_stderr`, and at most one takes
-//! `console_stdin`.
+//! `stdin`, `expect_stdout`, `expect_stderr`, or `expect_stdout_records`, and
+//! at most one takes `console_stdin`.
 //!
 //! Debug builds also check that each entry's processes, once they all ended,
 //! left nothing behind in the kernel (see [`Programs::check_released`]).
@@ -73,6 +78,7 @@ struct Run {
     expect_signal: Option<u32>,
     expect_stdout: Option<String>,
     expect_stderr: Option<String>,
+    expect_stdout_records: Option<[usize; 2]>,
     #[serde(default)]
     min_reflected_syscalls: u64,
     #[serde(default)]
@@ -84,7 +90,10 @@ struct Run {
 }
 
 /// Keeps at most this much of each stream per run; the console gets all.
-const MAX_RECORDED: usize = 64 * 1024;
+const MAX_RECORDED: usize = 1024 * 1024;
+
+/// See `expect_stdout_records` in the [module](self) docs.
+const RECORD_SIZE: usize = 256;
 
 /// What a stream wrote, up to [`MAX_RECORDED`] bytes.
 #[derive(Default)]
@@ -166,6 +175,14 @@ impl Console for Stdio {
         recorded.truncated |= kept < written;
         written
     }
+
+    fn can_write(&self) -> bool {
+        self.device.can_write()
+    }
+
+    fn interrupts(&self) -> bool {
+        self.device.interrupts()
+    }
 }
 
 /// # Panics
@@ -185,11 +202,12 @@ pub fn run(json: &[u8], service: &mut Programs, stdio: &Stdio) {
                 assert!(
                     concurrent.iter().all(|run| run.stdin.is_empty()
                         && run.expect_stdout.is_none()
-                        && run.expect_stderr.is_none())
+                        && run.expect_stderr.is_none()
+                        && run.expect_stdout_records.is_none())
                         && concurrent.iter().filter(|run| run.console_stdin).count() <= 1,
                     "runs {index}..: concurrent runs share standard streams, so they take no \
-                     `stdin`, `expect_stdout`, or `expect_stderr`, and at most one \
-                     `console_stdin`"
+                     `stdin`, `expect_stdout`, `expect_stderr`, or `expect_stdout_records`, and \
+                     at most one `console_stdin`"
                 );
                 let len = concurrent.len();
                 run_group(index, concurrent, service, stdio);
@@ -279,6 +297,9 @@ fn check(index: usize, run: Run, reply: Reply, output: &[Recorded; 2]) {
             );
         }
     }
+    if let Some(expected) = run.expect_stdout_records {
+        check_records(index, path, &output[0], expected);
+    }
     assert!(
         reply.reflected_syscalls >= run.min_reflected_syscalls,
         "run {index} ({path}): {} reflected syscalls, expected at least {}",
@@ -298,5 +319,32 @@ fn check(index: usize, run: Run, reply: Reply, output: &[Recorded; 2]) {
         status:? = status,
         reflected_syscalls:% = reply.reflected_syscalls;
         "run passed"
+    );
+}
+
+/// Checks that `stdout` is `writers` writers' `records` records each (see
+/// `expect_stdout_records` in the [module](self) docs).
+fn check_records(index: usize, path: &str, stdout: &Recorded, [writers, records]: [usize; 2]) {
+    assert!(
+        !stdout.truncated,
+        "run {index} ({path}): stdout exceeded the {MAX_RECORDED} bytes recorded, so its \
+         records cannot be checked"
+    );
+    let mut next = alloc::vec![0; writers];
+    for (at, record) in stdout.bytes.chunks(RECORD_SIZE).enumerate() {
+        let Some(writer) = (0..writers).find(|&writer| {
+            let expected = alloc::format!("w{writer} {}", next[writer]);
+            record == alloc::format!("{expected:<width$}\n", width = RECORD_SIZE - 1).as_bytes()
+        }) else {
+            panic!(
+                "run {index} ({path}): stdout's record {at} was {:?}, no writer's next",
+                String::from_utf8_lossy(record)
+            );
+        };
+        next[writer] += 1;
+    }
+    assert!(
+        next.iter().all(|&written| written == records),
+        "run {index} ({path}): stdout had {next:?} records per writer, expected {records}"
     );
 }

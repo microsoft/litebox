@@ -23,8 +23,8 @@
 //! Each CPU's worker serves one process's requests at a time, on its own stack
 //! ([`litebox_platform_vm_kernel::worker`]), charged to the thread that made
 //! the last broker call (see `Inner::broker_requester`). A request that waits
-//! (e.g., for a device) suspends it: threads run meanwhile, on any CPU, but
-//! their broker calls wait for it, and only its CPU resumes it (see
+//! (to start a child process) suspends it: threads run meanwhile, on any CPU,
+//! but their broker calls wait for it, and only its CPU resumes it (see
 //! `Inner::worker`). A CPU runs its worker holding no claim but that of the
 //! process it serves (see `serve`), and outside the threads' runs.
 //!
@@ -514,7 +514,7 @@ impl Shared {
             };
             match thread.suspended.get() {
                 // Served at once, it keeps the rest of its slice, unless the
-                // request waits (e.g., for a device).
+                // request waits (to start a child process).
                 Suspended::Yielded if !serving => {
                     if work(&claim, false) == Ran::Suspended {
                         claim.worker.set(Some(cpu));

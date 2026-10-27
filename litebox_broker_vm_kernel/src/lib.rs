@@ -58,6 +58,7 @@ extern crate alloc;
 mod memory;
 mod providers;
 mod readiness;
+mod serving;
 pub mod share;
 pub mod stdio;
 mod timers;
@@ -343,7 +344,7 @@ impl Broker {
         }
     }
 
-    /// Looks at what changes outside requests: standard input, timers, the
+    /// Looks at what changes outside requests: standard streams, timers, the
     /// network, and the socket device.
     fn poll_sources(&self) {
         self.stdio.poll();
@@ -512,17 +513,23 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 
 impl Association {
     /// When, on the kernel clock, [`Self::poll_events`] next has something
-    /// to do: the earliest armed broker timer's deadline, or the network
-    /// stack's (e.g., to retransmit), or the vsock sockets'.
+    /// to do: the earliest armed broker timer's deadline, the network stack's
+    /// (e.g., to retransmit), the vsock sockets', or, while output waits for
+    /// a console that does not interrupt, its next poll.
     pub fn next_timer_deadline(&self) -> Option<Instant> {
-        timers::earliest(
-            self.broker.timers.next_deadline(),
-            self.broker.next_sources_deadline(),
-        )
+        let broker = &self.broker;
+        [
+            broker.timers.next_deadline(),
+            broker.next_sources_deadline(),
+            broker.stdio.next_deadline(broker.platform.now()),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
-    /// Looks at the devices (standard input, the network, vsock) and fires the
-    /// broker timers that are due, publishing readiness, as
+    /// Looks at the devices (standard streams, the network, vsock) and fires
+    /// the broker timers that are due, publishing readiness, as
     /// [`RingFutex::Wait`] would; for a process that is running instead
     /// (e.g., an interrupt stopped it). A notification ring this corrupts
     /// fails the association, which its next [`Self::futex`] reports.
@@ -691,13 +698,11 @@ impl Association {
     ///
     /// Must run on a CPU's worker
     /// ([`litebox_platform_vm_kernel::worker`]), as a request may suspend it:
-    /// one waiting for a device, or one starting a child process, which waits
-    /// until the child's handshake or failure (on any CPU). While the worker
-    /// is suspended, the caller must keep creating what
-    /// [`Self::take_pending_associations`] returns, running the processes, and
-    /// resuming the worker, or the request never completes. Elsewhere, a
-    /// request waiting for a device halts the CPU, and one starting a child
-    /// process panics.
+    /// one starting a child process, which waits until the child's handshake
+    /// or failure (on any CPU). While the worker is suspended, the caller must
+    /// keep creating what [`Self::take_pending_associations`] returns, running
+    /// the processes, and resuming the worker, or the request never completes.
+    /// Elsewhere, such a request panics.
     ///
     /// # Errors
     ///
@@ -705,8 +710,7 @@ impl Association {
     pub fn serve(&self) -> Result<(), EnterError> {
         self.submitted.set(false);
         self.with_active(|active| {
-            active
-                .serve(&self.launcher)
+            serving::serve(&self.readiness, || active.serve(&self.launcher))
                 .map_err(|Failed| EnterError::Failed)?;
             self.flush_readiness()
         })
@@ -830,14 +834,15 @@ impl Association {
             if wait.deadline.is_none() && !wait.notifications && !self.submitted.get() {
                 return Err(EnterError::Status(Status::Stalled));
             }
-            // Only notifications see timers; the network stack and the vsock
-            // sockets run at their deadlines, whatever the wait.
+            // Only notifications see timers and output's polls; the network
+            // stack and the vsock sockets run at their deadlines, whatever the
+            // wait.
             let wake = if wait.notifications {
-                timers::earliest(wait.deadline, self.broker.timers.next_deadline())
+                self.next_timer_deadline()
             } else {
-                wait.deadline
+                self.broker.next_sources_deadline()
             };
-            let wake = timers::earliest(wake, self.broker.next_sources_deadline());
+            let wake = timers::earliest(wait.deadline, wake);
             Ok(WaitState::Blocked { wake })
         })
         .unwrap_or_else(|error| WaitState::Ended(Err(error)))

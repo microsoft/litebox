@@ -13,16 +13,15 @@
 //! whichever address space is current, and its resumer need restore none.
 //!
 //! It must not suspend holding a lock that anything but work may take: its
-//! CPU, spinning for it, would never resume it. The broker holds some across
-//! a suspension (e.g., an open file's, across a console write), which only
-//! requests take (closing a file takes none). So a CPU spinning for one
-//! ([`crate::RawMutex`]) runs its own work, not suspended; and a work must not
-//! wait for one while holding a lock that anything but work takes (the
-//! holder's CPU, spinning for that, would never resume it), and works on
-//! several CPUs must take such locks in one order, as a resumed work may take
-//! another holding one (broker rules). Only a CPU waiting for a process's
-//! claim (in the shim), which a work spinning for one may hold, must resume
-//! its own work meanwhile.
+//! CPU, spinning for it, would never resume it. It may hold one that only
+//! requests take (e.g., an open file's: closing a file takes none). So a CPU
+//! spinning for one ([`crate::RawMutex`]) runs its own work, not suspended;
+//! and a work must not wait for one while holding a lock that anything but
+//! work takes (the holder's CPU, spinning for that, would never resume it),
+//! and works on several CPUs must take such locks in one order, as a resumed
+//! work may take another holding one (broker rules). Only a CPU waiting for a
+//! process's claim (in the shim), which a work spinning for one may hold, must
+//! resume its own work meanwhile.
 //!
 //! A device's interrupt may be for a suspended work: [`interrupt_suspended`]
 //! has the CPUs whose work suspended enter the kernel, to resume it; but not
