@@ -245,3 +245,311 @@ pub mod linux {
         }
     }
 }
+
+/// Temporary-file-backed shared file memory for Windows.
+///
+/// Pagefile-backed sections cannot grow, but sections of a file can be created at any size the
+/// file has, so a mapped file's contents live in a temporary file that is deleted when the broker
+/// closes it. Every runner mapping the file gets its own section of it, sized to the file when
+/// mapped, and all sections of one file share the file's pages.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod windows {
+    use std::any::Any;
+    use std::fs::File;
+    use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+    use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::{AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle};
+    use std::sync::Arc;
+
+    use litebox_broker_core::fs::shared_memory::{
+        SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
+    };
+    use windows_sys::Win32::Foundation::{
+        DUPLICATE_CLOSE_SOURCE, DuplicateHandle, ERROR_DISK_FULL, ERROR_FILE_INVALID,
+        ERROR_HANDLE_DISK_FULL, ERROR_HANDLE_EOF, ERROR_USER_MAPPED_FILE, GENERIC_EXECUTE,
+        GENERIC_READ, GENERIC_WRITE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
+    };
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, SECTION_MAP_EXECUTE,
+        SECTION_MAP_READ, SECTION_MAP_WRITE, SECTION_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, PROCESS_DUP_HANDLE};
+
+    use super::SharedObjectDelivery;
+
+    /// A file's contents in a temporary file, whose size is the file's.
+    ///
+    /// Runners only ever receive sections of it, which cannot change its size, and Windows keeps
+    /// file I/O coherent with every view of those sections.
+    pub struct TempFileMemory {
+        file: File,
+    }
+
+    fn memory_error(error: &IoError) -> SharedFileMemoryError {
+        match error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok())
+        {
+            Some(ERROR_USER_MAPPED_FILE) => SharedFileMemoryError::Busy,
+            Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL) => SharedFileMemoryError::NoMemory,
+            _ => SharedFileMemoryError::Io,
+        }
+    }
+
+    impl SharedFileMemory for TempFileMemory {
+        fn read_at(
+            &self,
+            offset: usize,
+            buffer: &mut [u8],
+        ) -> Result<usize, SharedFileMemoryError> {
+            let mut read = 0;
+            while read < buffer.len() {
+                match self
+                    .file
+                    .seek_read(&mut buffer[read..], (offset + read) as u64)
+                {
+                    Ok(0) => break,
+                    Ok(count) => read += count,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    // Reading at or past the end of the file is the end of the memory.
+                    Err(error) if error.raw_os_error() == i32::try_from(ERROR_HANDLE_EOF).ok() => {
+                        break;
+                    }
+                    Err(error) => return Err(memory_error(&error)),
+                }
+            }
+            Ok(read)
+        }
+
+        fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), SharedFileMemoryError> {
+            let mut written = 0;
+            while written < data.len() {
+                match self
+                    .file
+                    .seek_write(&data[written..], (offset + written) as u64)
+                {
+                    Ok(0) => return Err(SharedFileMemoryError::Io),
+                    Ok(count) => written += count,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(memory_error(&error)),
+                }
+            }
+            Ok(())
+        }
+
+        fn set_len(&self, length: usize) -> Result<(), SharedFileMemoryError> {
+            // Windows refuses to shrink a file while any section of it is mapped.
+            self.file
+                .set_len(length as u64)
+                .map_err(|error| memory_error(&error))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Creates [`TempFileMemory`] in the host's temporary directory.
+    pub struct TempFileMemoryProvider;
+
+    impl SharedFileMemoryProvider for TempFileMemoryProvider {
+        fn create(
+            &self,
+            contents: &[u8],
+        ) -> Result<Arc<dyn SharedFileMemory>, SharedFileMemoryError> {
+            let directory = std::env::temp_dir();
+            let file = loop {
+                let mut nonce = [0u8; 8];
+                getrandom::fill(&mut nonce).map_err(|_| SharedFileMemoryError::Io)?;
+                let path = directory.join(format!(
+                    "litebox-shared-file-{}-{:016x}",
+                    std::process::id(),
+                    u64::from_le_bytes(nonce),
+                ));
+                // Sections need execute access to the file for runners to map it executable, as
+                // Linux allows for a shared file mapping. No other process may open the file, and
+                // it is deleted when the broker closes it.
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .access_mode(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE)
+                    .share_mode(0)
+                    .attributes(FILE_ATTRIBUTE_TEMPORARY)
+                    .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                    .open(path)
+                {
+                    Ok(file) => break file,
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(memory_error(&error)),
+                }
+            };
+            let memory = TempFileMemory { file };
+            memory.set_len(contents.len())?;
+            memory.write_at(0, contents)?;
+            Ok(Arc::new(memory))
+        }
+    }
+
+    /// Delivers [`TempFileMemory`] to a runner process as a section handle in its handle table.
+    pub struct SectionDelivery {
+        process: OwnedHandle,
+    }
+
+    impl SectionDelivery {
+        /// Delivers sections into `process`, which must allow duplicating handles into it.
+        pub fn new(process: BorrowedHandle<'_>) -> IoResult<Self> {
+            let mut duplicate = std::ptr::null_mut();
+            // SAFETY: `process` is a live process handle, and the output is writable.
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    process.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &raw mut duplicate,
+                    PROCESS_DUP_HANDLE,
+                    0,
+                    0,
+                )
+            } == 0
+            {
+                return Err(IoError::last_os_error());
+            }
+            // SAFETY: DuplicateHandle returned a new handle that this process owns.
+            let process = unsafe { OwnedHandle::from_raw_handle(duplicate) };
+            Ok(Self { process })
+        }
+    }
+
+    impl SharedObjectDelivery for SectionDelivery {
+        fn deliver(&self, memory: &dyn SharedFileMemory, writable: bool) -> IoResult<u64> {
+            let memory = memory
+                .as_any()
+                .downcast_ref::<TempFileMemory>()
+                .ok_or_else(|| IoError::other("shared memory is not a temporary file"))?;
+            // A runner that may only read the file gets a read-only section, which no handle
+            // rights can map writable.
+            let (protection, access) = if writable {
+                (PAGE_EXECUTE_READWRITE, SECTION_MAP_WRITE)
+            } else {
+                (PAGE_EXECUTE_READ, 0)
+            };
+            // SAFETY: The file handle is live. Zero sizes make the section the file's size, and
+            // the section is unnamed with default security.
+            let section = unsafe {
+                CreateFileMappingW(
+                    memory.file.as_raw_handle(),
+                    std::ptr::null(),
+                    protection,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if section.is_null() {
+                let error = IoError::last_os_error();
+                // An empty file has no section; the runner leaves all its pages inaccessible.
+                if error.raw_os_error() == i32::try_from(ERROR_FILE_INVALID).ok() {
+                    return Ok(0);
+                }
+                return Err(error);
+            }
+            let mut delivered = std::ptr::null_mut();
+            // SAFETY: `section` is a new handle that this process owns, which the call closes
+            // whether or not it succeeds, and `self.process` allows duplicating handles into it.
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    section,
+                    self.process.as_raw_handle(),
+                    &raw mut delivered,
+                    SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_EXECUTE | access,
+                    0,
+                    DUPLICATE_CLOSE_SOURCE,
+                )
+            } == 0
+            {
+                return Err(IoError::last_os_error());
+            }
+            Ok(delivered as u64)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::Memory::{
+            FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+
+        #[test]
+        fn temp_file_memory_reads_writes_and_resizes() {
+            let memory = TempFileMemoryProvider.create(b"hello").unwrap();
+            let mut bytes = [0; 8];
+            assert_eq!(memory.read_at(0, &mut bytes).unwrap(), 5);
+            assert_eq!(&bytes[..5], b"hello");
+            memory.set_len(8).unwrap();
+            memory.write_at(6, b"!!").unwrap();
+            assert_eq!(memory.read_at(0, &mut bytes).unwrap(), 8);
+            assert_eq!(&bytes, b"hello\0!!");
+            memory.set_len(2).unwrap();
+            assert_eq!(memory.read_at(1, &mut bytes).unwrap(), 1);
+            assert_eq!(memory.read_at(4, &mut bytes).unwrap(), 0);
+        }
+
+        #[test]
+        fn delivered_sections_share_pages_and_keep_read_only_rights() {
+            // SAFETY: The pseudo-handle names this process and is always valid.
+            let process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
+            let delivery = SectionDelivery::new(process).unwrap();
+            let memory = TempFileMemoryProvider.create(&[0; 4096]).unwrap();
+            let take = |writable| {
+                let token = delivery.deliver(&*memory, writable).unwrap();
+                // SAFETY: The token is a section handle that `deliver` duplicated into this
+                // process for this caller alone.
+                unsafe { OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE) }
+            };
+            let map = |section: &OwnedHandle, access| {
+                // SAFETY: Maps a fresh view of a live section.
+                let view = unsafe { MapViewOfFile(section.as_raw_handle(), access, 0, 0, 4096) };
+                (!view.Value.is_null()).then_some(view)
+            };
+            let unmap = |view: MEMORY_MAPPED_VIEW_ADDRESS| {
+                // SAFETY: Unmaps a view mapped above that nothing else uses.
+                assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+            };
+
+            let read_only = take(false);
+            assert!(map(&read_only, FILE_MAP_READ | FILE_MAP_WRITE).is_none());
+            let writable = take(true);
+            let view = map(&writable, FILE_MAP_READ | FILE_MAP_WRITE).unwrap();
+            let reader = map(&read_only, FILE_MAP_READ).unwrap();
+
+            // Stores through one view are what file reads and other views see, and the reverse.
+            // SAFETY: The views are live and at least a page long.
+            unsafe { view.Value.cast::<u8>().write(42) };
+            let mut byte = [0];
+            memory.read_at(0, &mut byte).unwrap();
+            assert_eq!(byte, [42]);
+            memory.write_at(1, &[7]).unwrap();
+            // SAFETY: As above.
+            assert_eq!(unsafe { reader.Value.cast::<u8>().add(1).read() }, 7);
+
+            // The file cannot shrink while it is mapped, but can grow.
+            assert_eq!(memory.set_len(0), Err(SharedFileMemoryError::Busy));
+            memory.set_len(8192).unwrap();
+            unmap(view);
+            unmap(reader);
+            drop((read_only, writable));
+            memory.set_len(0).unwrap();
+
+            // An empty file has no section.
+            assert_eq!(delivery.deliver(&*memory, true).unwrap(), 0);
+        }
+    }
+}

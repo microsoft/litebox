@@ -584,11 +584,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         let mut file = h.get_typed::<Self>().file.write();
         if let Some(shared) = &mut file.shared {
             // Shrinking discards the pages past the end, so runners fault on them, as Linux
-            // raises `SIGBUS` past the end of a mapped file.
-            shared
-                .memory
-                .set_len(length)
-                .map_err(|_| TruncateError::Io)?;
+            // raises `SIGBUS` past the end of a mapped file. Hosts that cannot shrink mapped
+            // memory refuse instead.
+            shared.memory.set_len(length).map_err(|error| match error {
+                SharedFileMemoryError::Busy => TruncateError::Busy,
+                SharedFileMemoryError::NoMemory | SharedFileMemoryError::Io => TruncateError::Io,
+            })?;
             shared.len = length;
             return Ok(());
         }
@@ -928,7 +929,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
         let memory = provider.create(&file.data).map_err(|error| match error {
             SharedFileMemoryError::NoMemory => MapSharedError::NoMemory,
-            SharedFileMemoryError::Io => MapSharedError::Io,
+            SharedFileMemoryError::Io | SharedFileMemoryError::Busy => MapSharedError::Io,
         })?;
         let len = file.data.len();
         file.data = alloc::borrow::Cow::Borrowed(&[]);

@@ -109,6 +109,8 @@ pub enum TruncateError {
     NotOpenForWriting,
     #[error("file descriptor points to a terminal device")]
     IsTerminalDevice,
+    #[error("the file cannot shrink while it is mapped")]
+    Busy,
     #[error("I/O error")]
     Io,
 }

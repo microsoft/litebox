@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use litebox::platform::common_providers::reservations::TrackedReservations;
 use litebox::platform::page_mgmt::{
     AllocationDirection, AllocationOptions, HintPlacementBehavior, PageReservation,
+    SharedObjectToken,
 };
 use std::collections::BTreeMap;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -97,12 +98,23 @@ enum NativeReservation {
     Committed(MemoryRegionPermissions),
 }
 
-/// A mapped view of an anonymous section, which native fork children share.
+/// A section that shared views map: an anonymous section backing shared anonymous memory, or a
+/// section of a file that the broker delivered.
+struct Section {
+    handle: OwnedHandle,
+    /// Size of the section in bytes. Views cannot extend past it.
+    size: usize,
+    /// The protection views are mapped with: every access the section allows, which bounds later
+    /// protection changes.
+    protection: Win32_Memory::PAGE_PROTECTION_FLAGS,
+}
+
+/// A mapped view of a section, which native fork children share.
 struct SharedView {
     /// Exclusive end of the view. [`SHARED_VIEWS`] keys views by their start.
     end: usize,
     /// The section, shared by every view split from one allocation.
-    section: Arc<OwnedHandle>,
+    section: Arc<Section>,
     /// Offset in `section` of the view's start.
     offset: usize,
 }
@@ -172,7 +184,7 @@ impl SharedViews {
             // SAFETY: The section handle is owned by the view and remains open.
             let updated = unsafe {
                 Win32_Foundation::SetHandleInformation(
-                    view.section.as_raw_handle(),
+                    view.section.handle.as_raw_handle(),
                     Win32_Foundation::HANDLE_FLAG_INHERIT,
                     flags,
                 )
@@ -337,6 +349,110 @@ fn shared_section(size: usize) -> Result<OwnedHandle, AllocationError> {
     Ok(unsafe { OwnedHandle::from_raw_handle(section) })
 }
 
+/// A file section that the broker delivered into this process to map a shared file.
+struct DeliveredSection {
+    section: OwnedHandle,
+    /// The section's size, which is the file's size when the broker created it.
+    size: usize,
+    /// Whether the handle allows writable views.
+    writable: bool,
+}
+
+/// Takes ownership of the section the broker delivered under `token`, which is the section's
+/// handle value in this process, or zero for an empty file, which has no section.
+///
+/// A token that does not name a section is left alone, since this process does not own it.
+fn take_delivered_section(
+    token: SharedObjectToken,
+) -> Result<Option<DeliveredSection>, AllocationError> {
+    #[repr(C)]
+    struct SectionBasicInformation {
+        base_address: *mut c_void,
+        allocation_attributes: u32,
+        maximum_size: i64,
+    }
+    #[repr(C)]
+    struct ObjectBasicInformation {
+        attributes: u32,
+        granted_access: u32,
+        handle_count: u32,
+        pointer_count: u32,
+        reserved: [u32; 10],
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQuerySection(
+            section: Win32_Foundation::HANDLE,
+            class: i32,
+            information: *mut c_void,
+            length: usize,
+            returned: *mut usize,
+        ) -> i32;
+        fn NtQueryObject(
+            handle: Win32_Foundation::HANDLE,
+            class: i32,
+            information: *mut c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    const SECTION_BASIC_INFORMATION: i32 = 0;
+    const OBJECT_BASIC_INFORMATION: i32 = 0;
+
+    if token.0 == 0 {
+        return Ok(None);
+    }
+    let handle = usize::try_from(token.0).map_err(|_| AllocationError::OutOfMemory)?
+        as Win32_Foundation::HANDLE;
+    let mut section = SectionBasicInformation {
+        base_address: core::ptr::null_mut(),
+        allocation_attributes: 0,
+        maximum_size: 0,
+    };
+    // SAFETY: The output buffer is valid and sized for the class; the call fails for anything
+    // but a section handle.
+    let status = unsafe {
+        NtQuerySection(
+            handle,
+            SECTION_BASIC_INFORMATION,
+            (&raw mut section).cast(),
+            size_of::<SectionBasicInformation>(),
+            core::ptr::null_mut(),
+        )
+    };
+    if status < 0 {
+        return Err(AllocationError::OutOfMemory);
+    }
+    // SAFETY: `handle` names a section, which the broker duplicated into this process for this
+    // caller alone.
+    let section_handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let mut object = ObjectBasicInformation {
+        attributes: 0,
+        granted_access: 0,
+        handle_count: 0,
+        pointer_count: 0,
+        reserved: [0; 10],
+    };
+    // SAFETY: The handle is live, and the output buffer is valid and sized for the class.
+    let status = unsafe {
+        NtQueryObject(
+            section_handle.as_raw_handle(),
+            OBJECT_BASIC_INFORMATION,
+            (&raw mut object).cast(),
+            u32::try_from(size_of::<ObjectBasicInformation>()).unwrap(),
+            core::ptr::null_mut(),
+        )
+    };
+    if status < 0 {
+        return Err(AllocationError::OutOfMemory);
+    }
+    Ok(Some(DeliveredSection {
+        section: section_handle,
+        size: usize::try_from(section.maximum_size).map_err(|_| AllocationError::OutOfMemory)?,
+        writable: object.granted_access & Win32_Memory::SECTION_MAP_WRITE != 0,
+    }))
+}
+
 fn query(address: usize) -> Option<Win32_Memory::MEMORY_BASIC_INFORMATION> {
     let mut information = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
     // SAFETY: VirtualQuery only inspects the address and writes the provided output.
@@ -430,18 +546,21 @@ fn replace_placeholder(extent: &Range<usize>, kind: NativeReservation) -> bool {
 
 /// Replaces the placeholder at exactly `range` with a view of `section` starting at `offset`.
 ///
-/// The view allows every access, so that protection can later grant any of them.
-fn map_view(range: &Range<usize>, section: &OwnedHandle, offset: usize) -> bool {
-    // SAFETY: The caller owns this placeholder; the section covers the page-aligned window.
+/// The view is mapped with every access the section allows, so that protection can later grant
+/// any of them. A view ending past the section maps only up to its end, which Windows rounds up
+/// to a page.
+fn map_view(range: &Range<usize>, section: &Section, offset: usize) -> bool {
+    let length = range.len().min(section.size.saturating_sub(offset));
+    // SAFETY: The caller owns this placeholder; the section covers the requested window.
     let view = unsafe {
         Win32_Memory::MapViewOfFile3(
-            section.as_raw_handle(),
+            section.handle.as_raw_handle(),
             GetCurrentProcess(),
             range.start as *mut c_void,
             offset as u64,
-            range.len(),
+            length,
             Win32_Memory::MEM_REPLACE_PLACEHOLDER,
-            Win32_Memory::PAGE_EXECUTE_READWRITE,
+            section.protection,
             core::ptr::null_mut(),
             0,
         )
@@ -641,44 +760,60 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         if !self.use_placeholders {
             return Err(AllocationError::UnsupportedByPlatform);
         }
-        let section = Arc::new(shared_section(range.len())?);
-        let flags = prot_flags(permissions);
-        let mut views = SharedViews::lock();
-        SHARED_VIEWS.used.store(true, Ordering::Release);
-        for allocation in allocations(range.clone()) {
-            // Windows only allows mapping views of a section into reserved memory that is currently a placeholder.
-            make_placeholder(allocation.clone());
-            let offset = allocation.start - range.start;
-            if !map_view(&allocation, &section, offset) {
-                assert!(
-                    replace_placeholder(&allocation, NativeReservation::Reserved),
-                    "failed to restore reservation after shared mapping failure"
-                );
-                if range.start < allocation.start {
-                    views.detach(range.start..allocation.start);
-                }
-                return Err(AllocationError::OutOfMemory);
-            }
-            views.views.insert(
-                allocation.start,
-                SharedView {
-                    end: allocation.end,
-                    section: Arc::clone(&section),
-                    offset,
-                },
-            );
-            // Views are mapped with full access, which also bounds later protection changes, so
-            // narrow it to the requested protection separately.
-            if flags != Win32_Memory::PAGE_EXECUTE_READWRITE {
-                assert!(
-                    protect(&allocation, flags),
-                    "failed to protect shared view: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-        Ok(())
+        let section = Arc::new(Section {
+            handle: shared_section(range.len())?,
+            size: range.len(),
+            protection: Win32_Memory::PAGE_EXECUTE_READWRITE,
+        });
+        map_section(range, &section, 0, permissions)
     }
+}
+
+/// Backs the reserved but unbacked `range` with views of `section` from its byte `offset`, one
+/// per native allocation, protected with `permissions`. On failure, `range` remains reserved and
+/// unbacked.
+fn map_section(
+    range: Range<usize>,
+    section: &Arc<Section>,
+    offset: usize,
+    permissions: MemoryRegionPermissions,
+) -> Result<(), AllocationError> {
+    let flags = prot_flags(permissions);
+    let mut views = SharedViews::lock();
+    SHARED_VIEWS.used.store(true, Ordering::Release);
+    for allocation in allocations(range.clone()) {
+        // Windows only allows mapping views of a section into reserved memory that is currently a placeholder.
+        make_placeholder(allocation.clone());
+        let view_offset = offset + (allocation.start - range.start);
+        if !map_view(&allocation, section, view_offset) {
+            assert!(
+                replace_placeholder(&allocation, NativeReservation::Reserved),
+                "failed to restore reservation after shared mapping failure"
+            );
+            if range.start < allocation.start {
+                views.detach(range.start..allocation.start);
+            }
+            return Err(AllocationError::OutOfMemory);
+        }
+        views.views.insert(
+            allocation.start,
+            SharedView {
+                end: allocation.end,
+                section: Arc::clone(section),
+                offset: view_offset,
+            },
+        );
+        // Views are mapped with the section's full access, which also bounds later protection
+        // changes, so narrow it to the requested protection separately.
+        if flags != section.protection {
+            assert!(
+                protect(&allocation, flags),
+                "failed to protect shared view: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    Ok(())
 }
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
@@ -916,11 +1051,74 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         debug_assert_alignment!(range, ALIGN);
         let flags = prot_flags(permissions);
         for allocation in allocations(range) {
-            if !protect(&allocation, flags) {
-                return Err(litebox::platform::page_mgmt::PermissionUpdateError::PlatformFailure);
+            if protect(&allocation, flags) {
+                continue;
+            }
+            // Pages of a shared file mapping past the end of the file stay reserved, so that
+            // accessing them faults; protection only applies to the committed pages around them.
+            for (region, information) in regions(allocation) {
+                if information.State != Win32_Memory::MEM_RESERVE && !protect(&region, flags) {
+                    return Err(
+                        litebox::platform::page_mgmt::PermissionUpdateError::PlatformFailure,
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    fn supports_shared_objects(&self) -> bool {
+        // Views of delivered sections replace placeholders.
+        self.use_placeholders
+    }
+
+    unsafe fn commit_shared_object<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: Range<usize>,
+        token: SharedObjectToken,
+        offset: u64,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), AllocationError>
+    where
+        Reservations: Iterator<Item = &'reservation WindowsUserlandReservation<ALIGN>>,
+        WindowsUserlandReservation<ALIGN>: 'reservation,
+    {
+        debug_assert_alignment!(range, ALIGN);
+        let section = take_delivered_section(token)?;
+        if !self.use_placeholders {
+            return Err(AllocationError::UnsupportedByPlatform);
+        }
+        // An empty file has no section, and all its pages are past its end.
+        let Some(section) = section else {
+            return Ok(());
+        };
+        if permissions.contains(MemoryRegionPermissions::WRITE) && !section.writable {
+            return Err(AllocationError::PermissionDenied);
+        }
+        let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
+        // A view cannot extend past its section, so pages past the end of the file stay reserved
+        // and inaccessible, as Linux raises `SIGBUS` for them.
+        let available = section.size.saturating_sub(offset).next_multiple_of(ALIGN);
+        let mapped = range.start..range.start + range.len().min(available);
+        if mapped.is_empty() {
+            return Ok(());
+        }
+        let view_protection = if section.writable {
+            Win32_Memory::PAGE_EXECUTE_READWRITE
+        } else {
+            Win32_Memory::PAGE_EXECUTE_READ
+        };
+        let section = Arc::new(Section {
+            handle: section.section,
+            size: section.size,
+            protection: view_protection,
+        });
+        map_section(mapped, &section, offset, permissions)
+    }
+
+    fn release_shared_object(&self, token: SharedObjectToken) {
+        drop(take_delivered_section(token));
     }
 }
 
@@ -1886,5 +2084,211 @@ mod tests {
             )
         }
         .unwrap();
+    }
+
+    /// Creates a file section over a temporary file holding `contents`, readable, writable, and
+    /// executable, and returns the file and the section as a broker would deliver it, restricted
+    /// to `access`.
+    fn file_section(contents: &[u8], access: u32) -> (std::fs::File, SharedObjectToken) {
+        use std::io::Write as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        // A fresh name per call: the address of `contents` differs between live calls.
+        let path = std::env::temp_dir().join(format!(
+            "litebox-platform-section-{}-{:x}-{:x}",
+            std::process::id(),
+            contents.as_ptr() as usize,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(
+                Win32_Foundation::GENERIC_READ
+                    | Win32_Foundation::GENERIC_WRITE
+                    | Win32_Foundation::GENERIC_EXECUTE,
+            )
+            // FILE_FLAG_DELETE_ON_CLOSE
+            .custom_flags(0x0400_0000)
+            .open(path)
+            .unwrap();
+        file.write_all(contents).unwrap();
+        let mut section = core::ptr::null_mut();
+        // SAFETY: The file handle is live; a null size makes the section the file's size.
+        let status = unsafe {
+            NtCreateSection(
+                &raw mut section,
+                Win32_Memory::SECTION_ALL_ACCESS,
+                core::ptr::null(),
+                core::ptr::null(),
+                Win32_Memory::PAGE_EXECUTE_READWRITE,
+                Win32_Memory::SEC_COMMIT,
+                file.as_raw_handle(),
+            )
+        };
+        assert!(status >= 0, "NtCreateSection failed: {status:#x}");
+        let mut delivered = core::ptr::null_mut();
+        // SAFETY: Both handles are live in this process; the source is closed by the call.
+        let duplicated = unsafe {
+            Win32_Foundation::DuplicateHandle(
+                GetCurrentProcess(),
+                section,
+                GetCurrentProcess(),
+                &raw mut delivered,
+                access,
+                0,
+                Win32_Foundation::DUPLICATE_CLOSE_SOURCE,
+            )
+        };
+        assert_ne!(duplicated, 0, "{}", std::io::Error::last_os_error());
+        (file, SharedObjectToken(delivered as u64))
+    }
+
+    #[test]
+    fn delivered_file_sections_map_up_to_the_end_of_the_file() {
+        use std::os::windows::fs::FileExt as _;
+
+        let platform = WindowsUserland::<PAGE_SIZE>::new();
+        let read = MemoryRegionPermissions::READ;
+        let writable = read | MemoryRegionPermissions::WRITE;
+        let page = |base: usize, index: usize| base + index * PAGE_SIZE;
+        let map_access = Win32_Memory::SECTION_QUERY
+            | Win32_Memory::SECTION_MAP_READ
+            | Win32_Memory::SECTION_MAP_EXECUTE;
+        assert!(
+            <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::supports_shared_objects(
+                platform
+            )
+        );
+
+        // A file of one and a half pages, mapped over three pages from its start.
+        let mut contents = vec![0u8; PAGE_SIZE + PAGE_SIZE / 2];
+        contents[PAGE_SIZE] = 7;
+        let (file, token) = file_section(&contents, map_access | Win32_Memory::SECTION_MAP_WRITE);
+        // SAFETY: The fixture exclusively owns the fresh reservation and every page in it.
+        unsafe {
+            let reservation = platform
+                .reserve_pages(
+                    core::iter::empty,
+                    0..4 * PAGE_SIZE,
+                    false,
+                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                )
+                .unwrap();
+            let base = reservation.range().start;
+            platform
+                .commit_shared_object(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 3),
+                    token,
+                    0,
+                    writable,
+                )
+                .unwrap();
+            assert_eq!(query_region(page(base, 1)).Type, Win32_Memory::MEM_MAPPED);
+            assert_eq!((page(base, 1) as *const u8).read(), 7);
+            // The page past the end of the file stays reserved, so accessing it faults.
+            assert_eq!(query_region(page(base, 2)).State, Win32_Memory::MEM_RESERVE);
+
+            // Stores through the view are the file's contents, and the reverse.
+            (page(base, 0) as *mut u8).write(42);
+            let mut byte = [0];
+            file.seek_read(&mut byte, 0).unwrap();
+            assert_eq!(byte, [42]);
+            file.seek_write(&[9], PAGE_SIZE as u64 + 1).unwrap();
+            assert_eq!((page(base, 1) as *const u8).add(1).read(), 9);
+
+            // Protection skips the reserved page, and a split view keeps the rest of the file.
+            platform
+                .protect_pages(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 3),
+                    read,
+                )
+                .unwrap();
+            assert_eq!(
+                query_region(page(base, 1)).Protect,
+                Win32_Memory::PAGE_READONLY
+            );
+            platform
+                .decommit_pages(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 1),
+                )
+                .unwrap();
+            assert_eq!((page(base, 1) as *const u8).read(), 7);
+            let survivor = page(base, 1)..page(base, 2);
+            assert_eq!(shared_views_within(reservation.range()), [survivor]);
+            platform.release_pages(reservation).unwrap();
+        }
+
+        // A read-only section cannot back writable pages, but backs readable ones, which split
+        // with their view's protection.
+        let (_file, token) = file_section(&[1; 2 * PAGE_SIZE], map_access);
+        let (_file, rejected) = file_section(&[1; PAGE_SIZE], map_access);
+        // SAFETY: As above.
+        unsafe {
+            let reservation = platform
+                .reserve_pages(
+                    core::iter::empty,
+                    0..2 * PAGE_SIZE,
+                    false,
+                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                )
+                .unwrap();
+            let base = reservation.range().start;
+            assert!(matches!(
+                platform.commit_shared_object(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 2),
+                    rejected,
+                    0,
+                    writable,
+                ),
+                Err(AllocationError::PermissionDenied)
+            ));
+            platform
+                .commit_shared_object(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 2),
+                    token,
+                    0,
+                    read,
+                )
+                .unwrap();
+            assert!(
+                platform
+                    .protect_pages(
+                        || core::iter::once(&reservation),
+                        page(base, 0)..page(base, 1),
+                        writable,
+                    )
+                    .is_err()
+            );
+            platform
+                .decommit_pages(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 1),
+                )
+                .unwrap();
+            assert_eq!((page(base, 1) as *const u8).read(), 1);
+
+            // An empty file has no section, so every page stays reserved.
+            platform
+                .commit_shared_object(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 1),
+                    SharedObjectToken(0),
+                    0,
+                    writable,
+                )
+                .unwrap();
+            assert_eq!(query_region(page(base, 0)).State, Win32_Memory::MEM_RESERVE);
+            platform.release_pages(reservation).unwrap();
+        }
     }
 }
