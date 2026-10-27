@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use crate::control_ring::PipeAssociationStream;
 use crate::named_pipe::{TRANSFER_FRAME_TAG, WindowsNamedPipeStream};
 use crate::process_image::WindowsProcessImage;
-use crate::setup::{invalid_data, read_frame, wire_error, write_frame};
+use crate::setup::{invalid_data, wire_error};
 use crate::shared_memory::{TransferredSharedMemory, WindowsSharedMemory};
 
 /// Host-side broker setup channel over a Windows named pipe.
@@ -69,11 +69,8 @@ impl WindowsNamedPipeHostSetupChannel {
         runner_process: HANDLE,
     ) -> IoResult<()> {
         let transfer = memory.duplicate_to_process(runner_process)?;
-        write_frame(
-            file_handle(&self.stream),
-            &encode_transfer(&transfer)?,
-            self.setup_deadline,
-        )
+        self.stream
+            .write_frame(&encode_transfer(&transfer)?, self.setup_deadline)
     }
 
     /// Duplicates one shared-memory object into this process and sends its handle values.
@@ -104,11 +101,8 @@ impl WindowsNamedPipeHostSetupChannel {
                 handles: Vec::new(),
             },
         };
-        write_frame(
-            file_handle(&self.stream),
-            &encode_transfer(&transfer)?,
-            self.setup_deadline,
-        )
+        self.stream
+            .write_frame(&encode_transfer(&transfer)?, self.setup_deadline)
     }
 
     /// Activates host call-lane, notification, and shutdown control-ring endpoints.
@@ -140,7 +134,7 @@ impl HostSetupChannel for WindowsNamedPipeHostSetupChannel {
     }
 
     fn recv_handshake_request(&mut self) -> IoResult<HostReceive<BrokerHandshakeRequest>> {
-        let Some(frame) = read_frame(file_handle(&self.stream), self.setup_deadline)? else {
+        let Some(frame) = self.stream.read_frame(self.setup_deadline)? else {
             return Ok(HostReceive::PeerClosed);
         };
         match decode_handshake_request(&frame) {
@@ -151,8 +145,7 @@ impl HostSetupChannel for WindowsNamedPipeHostSetupChannel {
     }
 
     fn send_handshake_response(&mut self, response: &BrokerHandshakeResponse) -> IoResult<()> {
-        write_frame(
-            file_handle(&self.stream),
+        self.stream.write_frame(
             &encode_handshake_response(response.clone()),
             self.setup_deadline,
         )?;
@@ -168,7 +161,7 @@ pub fn validate_client_process(
 ) -> IoResult<()> {
     let mut process_id = 0;
     // SAFETY: `stream` is a connected named pipe and `process_id` is writable.
-    if unsafe { GetNamedPipeClientProcessId(file_handle(stream), &raw mut process_id) } == 0 {
+    if unsafe { GetNamedPipeClientProcessId(stream.handle(), &raw mut process_id) } == 0 {
         return Err(Error::last_os_error());
     }
     if process_id != expected_process_id {
@@ -201,8 +194,4 @@ fn encode_transfer(transfer: &TransferredSharedMemory) -> IoResult<Vec<u8>> {
         );
     }
     Ok(frame)
-}
-
-fn file_handle(stream: &WindowsNamedPipeStream) -> HANDLE {
-    stream.handle()
 }

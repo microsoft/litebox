@@ -16,13 +16,12 @@ use litebox_broker_transport::control_ring::{ControlRing, ControlRingLayout};
 use litebox_broker_transport::ring_association::{
     self, ControlRingLocalCallChannel, ControlRingLocalNotificationChannel,
 };
-use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
 use crate::control_ring::PipeAssociationStream;
 use crate::named_pipe::{TRANSFER_FRAME_TAG, WindowsNamedPipeStream};
 use crate::process_image::WindowsReceivedProcessImage;
-use crate::setup::{invalid_data, read_frame, wire_error, write_frame};
+use crate::setup::{invalid_data, wire_error};
 use crate::shared_memory::{TransferredSharedMemory, WindowsSharedMemory};
 
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -74,8 +73,10 @@ impl WindowsNamedPipeLocalSetupChannel {
         &mut self,
         expected_length: usize,
     ) -> IoResult<WindowsSharedMemory> {
-        let frame =
-            read_frame(file_handle(&self.stream), self.setup_deadline)?.ok_or_else(|| {
+        let frame = self
+            .stream
+            .read_frame(self.setup_deadline)?
+            .ok_or_else(|| {
                 Error::new(
                     ErrorKind::UnexpectedEof,
                     "broker closed before transferring shared memory",
@@ -96,8 +97,10 @@ impl WindowsNamedPipeLocalSetupChannel {
         &mut self,
         layout: ControlRingLayout,
     ) -> IoResult<WindowsSharedMemory> {
-        let frame =
-            read_frame(file_handle(&self.stream), self.setup_deadline)?.ok_or_else(|| {
+        let frame = self
+            .stream
+            .read_frame(self.setup_deadline)?
+            .ok_or_else(|| {
                 Error::new(
                     ErrorKind::UnexpectedEof,
                     "broker closed before transferring control-ring memory",
@@ -112,8 +115,10 @@ impl WindowsNamedPipeLocalSetupChannel {
     /// Receives and maps the optional process image the broker sent with
     /// [`WindowsNamedPipeHostSetupChannel::send_process_image`](crate::named_pipe::WindowsNamedPipeHostSetupChannel::send_process_image).
     pub fn receive_process_image(&mut self) -> IoResult<Option<WindowsReceivedProcessImage>> {
-        let frame =
-            read_frame(file_handle(&self.stream), self.setup_deadline)?.ok_or_else(|| {
+        let frame = self
+            .stream
+            .read_frame(self.setup_deadline)?
+            .ok_or_else(|| {
                 Error::new(
                     ErrorKind::UnexpectedEof,
                     "broker closed before transferring the process image",
@@ -151,15 +156,16 @@ impl LocalSetupChannel for WindowsNamedPipeLocalSetupChannel {
     type Error = Error;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
-        write_frame(
-            file_handle(&self.stream),
+        self.stream.write_frame(
             &encode_handshake_request(request.clone()),
             self.setup_deadline,
         )
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
-        let response = read_frame(file_handle(&self.stream), self.setup_deadline)?
+        let response = self
+            .stream
+            .read_frame(self.setup_deadline)?
             .map(|frame| decode_handshake_response(&frame).map_err(wire_error))
             .transpose()?;
         self.negotiated = matches!(response, Some(BrokerHandshakeResponse::Negotiated { .. }));
@@ -193,8 +199,4 @@ fn decode_transfer(frame: &[u8]) -> IoResult<TransferredSharedMemory> {
         })
         .collect::<IoResult<Vec<_>>>()?;
     Ok(TransferredSharedMemory { length, handles })
-}
-
-fn file_handle(stream: &WindowsNamedPipeStream) -> HANDLE {
-    stream.handle()
 }

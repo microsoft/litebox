@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use litebox_broker_transport::ring_association::AssociationStream;
-use windows_sys::Win32::Foundation::{ERROR_PIPE_NOT_CONNECTED, HANDLE};
+use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
 use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
 
 use crate::named_pipe::WindowsNamedPipeStream;
-use crate::setup::{self, OwnedEvent, invalid_data, read_pipe_until_cancelled};
+use crate::setup::{OwnedEvent, invalid_data};
 
 /// The setup pipe of a negotiated association, which activation retains for
 /// liveness and teardown.
@@ -51,13 +51,12 @@ impl PipeAssociationStream {
         })
     }
 
-    /// Returns the pipe handle for setup I/O.
-    fn setup_handle(&mut self) -> IoResult<HANDLE> {
+    /// Returns the pipe for setup I/O.
+    fn setup_stream(&mut self) -> IoResult<&WindowsNamedPipeStream> {
         self.stream
             .get_mut()
             .expect("broker association pipe mutex poisoned")
-            .as_ref()
-            .map(|stream| stream.handle())
+            .as_deref()
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::NotConnected,
@@ -75,13 +74,13 @@ impl PipeAssociationStream {
 
 impl AssociationStream for PipeAssociationStream {
     fn read_frame(&mut self) -> IoResult<Option<Vec<u8>>> {
-        let handle = self.setup_handle()?;
-        setup::read_frame(handle, self.setup_deadline)
+        let deadline = self.setup_deadline;
+        self.setup_stream()?.read_frame(deadline)
     }
 
     fn write_frame(&mut self, frame: &[u8]) -> IoResult<()> {
-        let handle = self.setup_handle()?;
-        setup::write_frame(handle, frame, self.setup_deadline)
+        let deadline = self.setup_deadline;
+        self.setup_stream()?.write_frame(frame, deadline)
     }
 
     fn wait_for_close(&self) -> IoResult<()> {
@@ -89,7 +88,7 @@ impl AssociationStream for PipeAssociationStream {
             return Ok(());
         };
         let mut byte = [0];
-        match read_pipe_until_cancelled(stream.handle(), &mut byte, self.shutdown_event.handle()) {
+        match stream.read_until_cancelled(&mut byte, &self.shutdown_event) {
             Ok(0) => {
                 // The peer closed the pipe, so shutdown needs no disconnect.
                 self.stream().take();
