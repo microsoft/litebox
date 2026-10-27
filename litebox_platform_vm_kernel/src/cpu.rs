@@ -77,6 +77,10 @@ pub enum Ipi {
     Startup { page: u8 },
     /// The runner's wake vector, whose handler only ends the interrupt.
     Wake,
+    /// The runner's TLB-flush vector, whose handler only ends the interrupt,
+    /// a doorbell ([`crate::Handled::Doorbell`]): the platform handles the
+    /// flushes before calling it.
+    FlushTlb,
 }
 
 /// The runner's interrupt controller (e.g., the local APICs), for starting
@@ -106,7 +110,7 @@ pub unsafe trait InterruptController: Sync {
     /// starts, running nothing anything still needs, and, for the latter,
     /// the page must hold the code it is to run in real mode, with its data,
     /// from then on (see [`VmKernel::start_cpus`]: for good). [`Ipi::Wake`]
-    /// needs nothing.
+    /// and [`Ipi::FlushTlb`] need nothing.
     unsafe fn send_ipi(&self, apic_id: u32, ipi: Ipi) -> bool;
 }
 
@@ -297,17 +301,45 @@ fn signal(set: &AtomicU64, cpus: u64) {
 /// Sends the wake IPI to `cpus` (bit `i`: CPU `i`), busy or idle, marking
 /// none: e.g., for those in user mode to enter the kernel. Nothing before
 /// [`VmKernel::start_cpus`].
-pub(crate) fn interrupt(mut cpus: u64) {
+pub fn interrupt(cpus: u64) {
+    // Harmless if unsent: before `start_cpus`, no other CPU runs, and it
+    // never starts one the controller cannot address.
+    send(cpus, Ipi::Wake);
+}
+
+/// Sends [`Ipi::FlushTlb`] to `cpus` (bit `i`: CPU `i`), for
+/// [`crate::tlb`], which then waits for each to answer.
+///
+/// # Panics
+///
+/// If it cannot send one (e.g., with no controller): that CPU would never
+/// answer, and the caller must not go on without it (e.g., to free frames).
+pub(crate) fn request_tlb_flush(cpus: u64) {
+    let unsent = send(cpus, Ipi::FlushTlb);
+    assert!(
+        unsent == 0,
+        "TLB-flush IPIs not sent to CPUs {unsent:#x} (bit `i`: CPU `i`)"
+    );
+}
+
+/// Sends `ipi`, one that needs nothing (see
+/// [`InterruptController::send_ipi`]), to `cpus`; returns those it could not
+/// send it to: all before [`VmKernel::start_cpus`] sets the controller.
+fn send(mut cpus: u64, ipi: Ipi) -> u64 {
     let Some(controller) = controller() else {
-        return;
+        return cpus;
     };
+    let mut unsent = 0;
     while cpus != 0 {
         let index = cpus.trailing_zeros() as usize;
         cpus &= cpus - 1;
         let apic_id = CPUS.apic_ids[index].load(Ordering::Relaxed);
-        // Safety: a wake IPI.
-        unsafe { controller.send_ipi(apic_id, Ipi::Wake) };
+        // Safety: a wake or TLB-flush IPI (see the callers).
+        if !unsafe { controller.send_ipi(apic_id, ipi) } {
+            unsent |= 1 << index;
+        }
     }
+    unsent
 }
 
 /// Whether `cpu` is in [`halt`].

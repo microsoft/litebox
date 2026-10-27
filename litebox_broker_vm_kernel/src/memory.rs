@@ -1,72 +1,80 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The association's shared memory: the shared buffers in the process's lazy
-//! mapping, and the control ring in pinned pages.
+//! The association's shared memory, in pinned pages, through the kernel's
+//! mapping: the shared buffers, populated as they are accessed, and the
+//! control ring. The runner may write either at any time, from other CPUs.
 
 use crate::{CONTROL_RING_LAYOUT, CONTROL_RING_SIZE};
 use alloc::sync::Arc;
 use core::ops::Range;
-use litebox::mm::exception_table::memcpy_fallible;
-use litebox::platform::common_providers::userspace_pointers::ValidateAccess as _;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
-use litebox_common_vm_abi::UserRange;
-use litebox_platform::buffer::Fault;
 use litebox_platform::peer_memory;
-use litebox_platform_vm_kernel::{PinnedUserPages, VmValidateAccess};
+use litebox_platform_vm_kernel::PinnedUserPages;
 
-/// The shared buffers, through the process's mapping: valid only while its
-/// address space is current.
-pub(crate) struct UserSharedMemory {
-    region: UserRange,
+/// Calls `copy` for each page's part of `offset..offset + len` of `pages`,
+/// with that part's range within `0..len`.
+fn for_each_page_part(
+    pages: &PinnedUserPages,
+    offset: usize,
+    len: usize,
+    mut copy: impl FnMut(*mut u8, Range<usize>),
+) -> Result<(), SharedMemoryError> {
+    let mut done = 0;
+    while done < len {
+        let (address, available) = pages
+            .kernel_address(offset + done)
+            .map_err(|_| SharedMemoryError::AccessFailed)?;
+        let part = available.min(len - done);
+        copy(address, done..done + part);
+        done += part;
+    }
+    Ok(())
 }
+
+/// The shared buffers, pinned lazily (see
+/// `VmKernel::pin_user_pages_lazily`).
+pub(crate) struct UserSharedMemory(PinnedUserPages);
 
 impl UserSharedMemory {
-    pub(crate) const fn new(region: UserRange) -> Self {
-        Self { region }
+    pub(crate) const fn new(pages: PinnedUserPages) -> Self {
+        Self(pages)
     }
 
-    /// The user address of `offset..offset + len`, validated.
-    fn user(&self, offset: usize, len: usize) -> Result<*mut u8, SharedMemoryError> {
-        let end = offset
-            .checked_add(len)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        if end > self.len() {
+    /// [`for_each_page_part`] of the shared buffers, once the whole range is
+    /// checked.
+    fn for_each_part(
+        &self,
+        offset: usize,
+        len: usize,
+        copy: impl FnMut(*mut u8, Range<usize>),
+    ) -> Result<(), SharedMemoryError> {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
             return Err(SharedMemoryError::InvalidRange);
         }
-        let start =
-            usize::try_from(self.region.start).map_err(|_| SharedMemoryError::InvalidRange)?;
-        VmValidateAccess::validate_slice(core::ptr::slice_from_raw_parts_mut(
-            (start + offset) as *mut u8,
-            len,
-        ))
-        .ok_or(SharedMemoryError::InvalidRange)
+        for_each_page_part(&self.0, offset, len, copy)
     }
 }
 
-/// Runs a fallible copy with user memory access open.
-fn copy_fallible(copy: impl FnOnce() -> Result<(), Fault>) -> Result<(), SharedMemoryError> {
-    VmValidateAccess::with_user_memory_access(copy).map_err(|_| SharedMemoryError::AccessFailed)
-}
-
+// Safety (below): pinned for `self`'s lifetime, in bounds (checked), and
+// disjoint from private memory.
 impl SharedMemory for UserSharedMemory {
     fn len(&self) -> usize {
-        usize::try_from(self.region.len).unwrap_or(0)
+        self.0.len()
     }
 
     fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-        let source = self.user(offset, destination.len())?;
-        // Safety: `destination` is private; `source` is validated user memory,
-        // whose faults are recovered.
-        copy_fallible(|| unsafe {
-            memcpy_fallible(destination.as_mut_ptr(), source, destination.len())
+        self.for_each_part(offset, destination.len(), |source, part| {
+            // Safety: see above.
+            unsafe { peer_memory::copy_from_peer(source, &mut destination[part]) };
         })
     }
 
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-        let destination = self.user(offset, source.len())?;
-        // Safety: as in `read`.
-        copy_fallible(|| unsafe { memcpy_fallible(destination, source.as_ptr(), source.len()) })
+        self.for_each_part(offset, source.len(), |destination, part| {
+            // Safety: see above.
+            unsafe { peer_memory::copy_to_peer(&source[part], destination) };
+        })
     }
 }
 
@@ -92,7 +100,7 @@ impl PinnedControlRing {
         let (address, _) = self
             .0
             .kernel_address(offset)
-            .ok_or(SharedMemoryError::InvalidRange)?;
+            .map_err(|_| SharedMemoryError::InvalidRange)?;
         Ok(address.cast())
     }
 
@@ -110,22 +118,12 @@ impl PinnedControlRing {
         &self,
         offset: usize,
         len: usize,
-        mut copy: impl FnMut(*mut u8, Range<usize>),
+        copy: impl FnMut(*mut u8, Range<usize>),
     ) -> Result<(), SharedMemoryError> {
         if !CONTROL_RING_LAYOUT.permits_byte_range(offset, len) {
             return Err(SharedMemoryError::InvalidRange);
         }
-        let mut done = 0;
-        while done < len {
-            let (address, available) = self
-                .0
-                .kernel_address(offset + done)
-                .ok_or(SharedMemoryError::InvalidRange)?;
-            let part = available.min(len - done);
-            copy(address, done..done + part);
-            done += part;
-        }
-        Ok(())
+        for_each_page_part(&self.0, offset, len, copy)
     }
 }
 

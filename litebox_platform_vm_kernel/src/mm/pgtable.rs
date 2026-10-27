@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::sync::atomic::{Ordering, compiler_fence};
 use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::vmem::PageFaultError;
 
@@ -43,6 +44,11 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
             // Safety: `PageAllocator`'s contract makes this a valid, page-aligned,
             // exclusively owned page in the kernel mapping.
             unsafe { core::slice::from_raw_parts_mut(addr, PAGE_SIZE).fill(0) };
+            // The zeroes before the entry that links the frame into a live
+            // table, which any CPU's page walk (or user access) may then
+            // follow at once: x86 keeps stores in order, the compiler must
+            // too.
+            compiler_fence(Ordering::Release);
             PhysFrame::from_start_address(M::va_to_pa(VirtAddr::new(addr as u64))).unwrap()
         })
     }

@@ -95,6 +95,7 @@ fn kernel_main(kernel: Kernel) -> ! {
     }
     // Whatever the log level, for the test scripts.
     serial_println!("[litebox] slices run per CPU: {:?}", scheduler.slices());
+    serial_println!("[litebox] threads parked per CPU: {:?}", scheduler.parks());
     serial_println!("[litebox] ALL TESTS PASSED");
     power::exit(true)
 }

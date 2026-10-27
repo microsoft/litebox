@@ -153,9 +153,10 @@ isr_ignore:
  * so no SWAPGS. The kernel runs with SSE disabled, so only the caller-saved
  * GPRs need saving.
  *
- * One that interrupted user mode then also reaches the shim: with an
- * `errcode`/`vector` pair pushed, as the CPU exception stubs do for
- * `exception_callback`, it jumps to `interrupt_callback`, its counterpart.
+ * One that interrupted user mode then also reaches the shim, unless the
+ * handler says otherwise (e.g., for a doorbell): with an `errcode`/`vector`
+ * pair pushed, as the CPU exception stubs do for `exception_callback`, it
+ * jumps to `interrupt_callback`, its counterpart.
  */
 .balign 8
 .global isr_external_stubs
@@ -189,6 +190,8 @@ isr_external:
     mov     rdx, [rbp + 96]     /* interrupted CS */
     and     rsp, -16
     call    external_interrupt_handler_impl
+    /* Its `Then`, kept across the restores in the stub return address's slot */
+    mov     byte ptr [rbp + 80], al
     mov     rsp, rbp
     pop     rbp
     pop     r11
@@ -200,10 +203,10 @@ isr_external:
     pop     rdx
     pop     rcx
     pop     rax
-    add     rsp, 8              /* stub return address */
-    /* All GPRs hold their interrupted values; [rsp] RIP, [rsp+8] CS. */
-    test    qword ptr [rsp + 8], 0x3
-    jnz     .Lisr_external_user
+    /* All GPRs hold their interrupted values; [rsp] `Then`, [rsp+8] RIP. */
+    cmp     byte ptr [rsp], 0   /* `Then::Return` */
+    lea     rsp, [rsp + 8]      /* keeps the flags */
+    jne     .Lisr_external_user
     iretq
 .Lisr_external_user:
     push    0                   /* error code, unused */

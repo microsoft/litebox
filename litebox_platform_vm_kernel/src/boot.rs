@@ -19,7 +19,7 @@ use crate::arch::mm::paging::{UnmapOptions, X64PageTable};
 use crate::arch::trampoline::{Args, Trampoline};
 use crate::cpu::{self, CpuEntry, CpuId, InterruptController, Ipi};
 use crate::mm::MemoryProvider;
-use crate::{BootConfig, VmKernel, arch, clock::ClockSource, mm, per_cpu, syscall_entry};
+use crate::{BootConfig, VmKernel, arch, clock::ClockSource, mm, per_cpu, syscall_entry, tlb};
 
 struct BootState {
     ram: Vec<Range<PhysAddr>>,
@@ -178,9 +178,9 @@ impl VmKernel {
     ///
     /// `controller` becomes the one [`cpu`] wakes CPUs with, the boot CPU
     /// too, and the runner's interrupt handler must already handle
-    /// [`Ipi::Wake`]: so call it even with no other CPU (no wake IPI is sent
-    /// before). Its IPIs start the CPUs (see [`InterruptController`]'s
-    /// safety contract).
+    /// [`Ipi::Wake`] and [`Ipi::FlushTlb`]: so call it even with no other CPU
+    /// (no IPI is sent before). Its IPIs start the CPUs (see
+    /// [`InterruptController`]'s safety contract).
     ///
     /// A CPU that the controller cannot address alone is skipped. One not
     /// online a second after its first startup IPI is abandoned, and none
@@ -229,6 +229,11 @@ impl VmKernel {
         }
         let online: Vec<u32> = cpu::online().map(cpu::apic_id).collect();
         litebox_util_log::info!(count:% = online.len(), apic_ids:? = online; "CPUs online");
+        #[cfg(debug_assertions)]
+        tlb::clone_check::finish(self);
+        if cfg!(debug_assertions) {
+            tlb::self_check(self.page_table_manager.base_page_table.physical_frame());
+        }
     }
 
     /// See [`Self::start_cpus`]: starts at most `count` of `apic_ids`.
@@ -280,6 +285,12 @@ impl VmKernel {
                     "the interrupt controller cannot address a CPU: not started"
                 );
             }
+        }
+        // The clone check, only with a CPU to start, and before CPU 1 may
+        // claim it (see `cpu_entry`).
+        #[cfg(debug_assertions)]
+        if !starting.is_empty() {
+            tlb::clone_check::prepare(self);
         }
         self.spin_until(self.deadline(INIT_DELAY), || false);
         for (index, &apic_id) in starting.iter().enumerate() {
@@ -449,6 +460,10 @@ unsafe extern "C" fn cpu_entry(pcv: u64) -> ! {
     // The boot CPU puts it online at once (see `start_cpu`).
     while handshake.load(Ordering::SeqCst) != ONLINE {
         core::hint::spin_loop();
+    }
+    #[cfg(debug_assertions)]
+    if pcv.cpu.index() == tlb::clone_check::WRITER {
+        tlb::clone_check::write(start.platform);
     }
     (start.entry)(start.platform, pcv.cpu)
 }

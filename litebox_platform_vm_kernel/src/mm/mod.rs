@@ -3,7 +3,8 @@
 
 //! Memory management
 
-use crate::arch::{PhysAddr, VirtAddr};
+use crate::arch::{PhysAddr, PhysFrame, Size4KiB, VirtAddr};
+use x86_64::structures::paging::page::PageRange;
 
 pub(crate) mod pgtable;
 
@@ -47,8 +48,8 @@ fn page_allocator() -> &'static dyn PageAllocator {
         .expect("page allocation before VmKernel::boot")
 }
 
-/// Physical memory for page tables and the VA/PA translation of the kernel
-/// mapping (`VA = PA + KERNEL_OFFSET`).
+/// Physical memory for page tables, the VA/PA translation of the kernel
+/// mapping (`VA = PA + KERNEL_OFFSET`), and TLB flushes.
 pub(crate) trait MemoryProvider {
     /// Allocate `1 << order` virtually and physically contiguous pages.
     fn mem_allocate_pages(order: u32) -> Option<*mut u8>;
@@ -67,6 +68,11 @@ pub(crate) trait MemoryProvider {
     fn pa_to_va(pa: PhysAddr) -> VirtAddr {
         VirtAddr::new_truncate(pa.as_u64() + crate::KERNEL_OFFSET)
     }
+
+    /// Flushes `pages` of the table whose P4 frame is `root` on the calling
+    /// CPU and on `cpus`, which may cache it; the caller meets
+    /// [`crate::tlb::shootdown`]'s requirements.
+    fn flush_tlb(cpus: &crate::tlb::Cpus, root: PhysFrame, pages: PageRange<Size4KiB>);
 }
 
 impl MemoryProvider for crate::VmKernel {
@@ -77,6 +83,10 @@ impl MemoryProvider for crate::VmKernel {
     unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
         // Safety: forwarded to the caller.
         unsafe { page_allocator().free_pages(ptr, order) }
+    }
+
+    fn flush_tlb(cpus: &crate::tlb::Cpus, root: PhysFrame, pages: PageRange<Size4KiB>) {
+        crate::tlb::shootdown(cpus, root, pages);
     }
 }
 

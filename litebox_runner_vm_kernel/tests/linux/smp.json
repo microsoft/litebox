@@ -1,0 +1,18 @@
+[
+  { "argv": ["/smp", "parallel"], "expect_stdout": "parallel: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp-dyn", "parallel"], "expect_stdout": "parallel: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp", "mprotect"], "expect_stdout": "mprotect: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp-pie", "mprotect"], "expect_stdout": "mprotect: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp", "munmap"], "expect_stdout": "munmap: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp-dyn", "munmap"], "expect_stdout": "munmap: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp", "upgrade"], "expect_stdout": "upgrade: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp-pie", "upgrade"], "expect_stdout": "upgrade: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp", "remap"], "expect_stdout": "remap: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp-dyn", "remap"], "expect_stdout": "remap: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp", "fork"], "expect_stdout": "fork: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp-pie", "fork"], "expect_stdout": "fork: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp", "cow"], "expect_stdout": "cow: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp-dyn", "cow"], "expect_stdout": "cow: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp", "stress"], "expect_stdout": "stress: ok\n", "expect_stderr": "" },
+  { "argv": ["/smp-dyn", "stress"], "expect_stdout": "stress: ok\n", "expect_stderr": "" }
+]

@@ -2,20 +2,26 @@
 // Licensed under the MIT license.
 
 //! Page-table tests. [`HostMemory`] backs frames with host allocations
-//! (PA == VA) and tracks live blocks to catch wrong and double frees.
-//! [`TestHeap`] is the kernel heap's stand-in, which a test can exhaust.
+//! (PA == VA), tracks live blocks to catch wrong and double frees, and
+//! records the TLB flushes it is asked for. [`TestHeap`] is the kernel
+//! heap's stand-in, which a test can exhaust.
 
 extern crate std;
 
 use core::cell::RefCell;
 use litebox::mm::page::PageRange;
-use litebox_common_linux::{PAGE_SIZE, vmem::VmFlags};
+use litebox_common_linux::{
+    PAGE_SIZE,
+    vmem::{PageFaultError, VmFlags},
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
+use std::vec::Vec;
 use x86_64::structures::idt::PageFaultErrorCode;
 use x86_64::structures::paging::{
     Page, PageTableFlags, PhysFrame, Size4KiB,
     mapper::{MappedFrame, TranslateResult},
+    page::PageRange as Pages,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -35,6 +41,12 @@ struct HostState {
     /// The thread's heap allocations left before they fail (see
     /// [`TestHeap`]; `None`: no limit).
     heap_budget: Option<usize>,
+    /// The flushes asked for since [`take_flushes`]: the table's P4 frame,
+    /// the pages, and how many frames were live then (see [`live_frames`]):
+    /// the change must not have freed its old frames yet.
+    flushes: Vec<(PhysFrame, Pages, usize)>,
+    /// See [`at_next_flush`].
+    at_flush: Option<std::boxed::Box<dyn FnOnce()>>,
 }
 
 std::thread_local! {
@@ -150,6 +162,32 @@ impl MemoryProvider for HostMemory {
     fn pa_to_va(pa: PhysAddr) -> VirtAddr {
         VirtAddr::new(pa.as_u64())
     }
+
+    fn flush_tlb(_cpus: &crate::tlb::Cpus, root: PhysFrame, pages: Pages) {
+        if let Some(change) = HOST.with(|host| host.borrow_mut().at_flush.take()) {
+            change();
+        }
+        let live = live_frames();
+        HOST.with(|host| host.borrow_mut().flushes.push((root, pages, live)));
+    }
+}
+
+/// Makes `change` at the next TLB flush, before it is recorded, as another
+/// CPU may as the flush waits.
+fn at_next_flush(change: impl FnOnce() + 'static) {
+    HOST.with(|host| host.borrow_mut().at_flush = Some(std::boxed::Box::new(change)));
+}
+
+/// The TLB flushes asked for since the last call, in order (see
+/// [`HostState::flushes`]).
+fn take_flushes() -> Vec<(PhysFrame, Pages, usize)> {
+    HOST.with(|host| core::mem::take(&mut host.borrow_mut().flushes))
+}
+
+/// `pages` pages from `start`, as flushed.
+fn span(start: usize, pages: u64) -> Pages {
+    let start = Page::containing_address(VirtAddr::new(start as u64));
+    Page::range(start, start + pages)
 }
 
 type TestPageTable = X64PageTable<'static, HostMemory, PAGE_SIZE>;
@@ -245,6 +283,7 @@ fn populate_failure_unmaps_populated_pages() {
     unsafe { pgtable.map_pages(range(start, 1), flags, true) }.unwrap();
     let rest = range(start + PAGE_SIZE, 4);
     let before = live_frames();
+    take_flushes();
 
     set_alloc_budget(Some(2));
     // Safety: as above; nothing is mapped in `rest`.
@@ -259,6 +298,11 @@ fn populate_failure_unmaps_populated_pages() {
         check_unmapped(&pgtable, page);
     }
     assert_eq!(live_frames(), before);
+    // Others may have used the two populated meanwhile: flushed, then freed.
+    assert_eq!(
+        take_flushes(),
+        [(pgtable.physical_frame(), span(rest.start(), 2), before + 2)]
+    );
 }
 
 #[test]
@@ -773,4 +817,250 @@ fn trampoline_table_leaves_the_trampoline() {
     assert!(live_frames() > before);
     drop(table);
     assert_eq!(live_frames(), before);
+}
+
+#[test]
+fn unmaps_flush_only_their_present_leaves() {
+    let pgtable = new_table();
+    let root = pgtable.physical_frame();
+    let start = 0x1_0000;
+    // Never populated: nothing to flush.
+    // Safety: a fresh table, which is never loaded; unmapped user space.
+    unsafe { pgtable.map_pages(range(start, 8), RW, false) }.unwrap();
+    // Safety: nothing uses the pages.
+    unsafe { pgtable.unmap_pages(range(start, 8), UnmapOptions::RELEASE) }.unwrap();
+    assert_eq!(take_flushes(), []);
+
+    // Present at 2, 3 and 5; at 7, PROT_NONE, which is not present.
+    for page in [2, 3, 5, 7] {
+        // Safety: unmapped user space.
+        unsafe { pgtable.map_pages(range(start + page * PAGE_SIZE, 1), RW, true) }.unwrap();
+    }
+    // Safety: nothing uses the page.
+    unsafe { pgtable.mprotect_pages(range(start + 7 * PAGE_SIZE, 1), VmFlags::empty()) }.unwrap();
+    take_flushes();
+    let before = live_frames();
+    // Safety: nothing uses the pages.
+    unsafe { pgtable.unmap_pages(range(start, 8), UnmapOptions::RELEASE) }.unwrap();
+    assert_eq!(
+        take_flushes(),
+        [(root, span(start + 2 * PAGE_SIZE, 4), before)]
+    );
+    assert_eq!(live_frames(), before - 4);
+
+    // One flush for more than a batch of leaves, before any is freed.
+    // Safety: unmapped user space.
+    unsafe { pgtable.map_pages(range(start, 600), RW, true) }.unwrap();
+    assert_eq!(take_flushes(), [], "new leaves need no flush");
+    let mapped = live_frames();
+    // Safety: nothing uses the pages.
+    unsafe { pgtable.unmap_pages(range(start, 600), UnmapOptions::RELEASE) }.unwrap();
+    assert_eq!(take_flushes(), [(root, span(start, 600), mapped)]);
+    assert_eq!(live_frames(), mapped - 600);
+}
+
+#[test]
+fn huge_sparse_ranges_skip_absent_tables() {
+    let pgtable = new_table();
+    let root = pgtable.physical_frame();
+    // Under different P2, P3 and P4 entries.
+    let pages = [0x20_3000, 0x4000_5000, 0x80_00e0_1000, 0x7e00_0000_0000];
+    for page in pages {
+        // Safety: a fresh table, which is never loaded; unmapped user space.
+        unsafe { pgtable.map_pages(range(page, 1), RW, true) }.unwrap();
+    }
+    take_flushes();
+    let before = live_frames();
+    // About 2^35 pages, which would take minutes to walk one by one.
+    let all = PageRange::new(0x1_0000, 0x7f00_0000_0000).unwrap();
+
+    // Safety: nothing uses the pages.
+    unsafe { pgtable.mprotect_pages(all, VmFlags::VM_READ) }.unwrap();
+    let read_only_pte = vmflags_to_pteflags(VmFlags::VM_READ) | PageTableFlags::PRESENT;
+    for page in pages {
+        check_mapped(&pgtable, page, read_only_pte);
+    }
+    let last = ((pages[3] - pages[0]) / PAGE_SIZE) as u64;
+    assert_eq!(take_flushes(), [(root, span(pages[0], last + 1), before)]);
+
+    // Safety: nothing uses the pages.
+    unsafe { pgtable.unmap_pages(all, UnmapOptions::RELEASE) }.unwrap();
+    for page in pages {
+        check_unmapped(&pgtable, page);
+    }
+    assert_eq!(take_flushes(), [(root, span(pages[0], last + 1), before)]);
+    assert_eq!(live_frames(), before - pages.len());
+}
+
+#[test]
+fn protections_flush_unless_only_gaining_write() {
+    let pgtable = new_table();
+    let root = pgtable.physical_frame();
+    let start = 0x1_0000;
+    let page = range(start, 1);
+    // Safety: a fresh table, which is never loaded; unmapped user space.
+    unsafe { pgtable.map_pages(page, RW, true) }.unwrap();
+    let live = live_frames();
+    let rx = VmFlags::VM_READ | VmFlags::VM_EXEC;
+    // From RW, each to the next, and whether it flushes.
+    for (flags, flushes) in [
+        (VmFlags::VM_READ, true),
+        (VmFlags::VM_READ, false),
+        (RW, false),
+        (VmFlags::empty(), true),
+        (VmFlags::VM_READ, false),
+        (rx, true),
+        (VmFlags::VM_READ, true),
+    ] {
+        // Safety: nothing uses the page.
+        unsafe { pgtable.mprotect_pages(page, flags) }.unwrap();
+        let expected = flushes.then_some((root, span(start, 1), live));
+        assert_eq!(take_flushes(), expected.as_slice(), "to {flags:?}");
+    }
+
+    // Read-only at 0, writable at 1 and 2, not populated at 3: only the span
+    // of those that lose a permission.
+    // Safety: unmapped user space.
+    unsafe { pgtable.map_pages(range(start + PAGE_SIZE, 2), RW, true) }.unwrap();
+    let live = live_frames();
+    // Safety: nothing uses the pages.
+    unsafe { pgtable.mprotect_pages(range(start, 4), VmFlags::VM_READ) }.unwrap();
+    assert_eq!(take_flushes(), [(root, span(start + PAGE_SIZE, 2), live)]);
+}
+
+#[test]
+fn upgrades_and_spurious_write_faults_flush_nothing() {
+    let start = 0x1_0000;
+    let pgtable = populated_table(start, 1);
+    let frame = mapped_frame(&pgtable, start);
+    // Safety: nothing uses the page.
+    unsafe { pgtable.mprotect_pages(range(start, 1), VmFlags::VM_READ) }.unwrap();
+    take_flushes();
+    let live = live_frames();
+    // Safety: as above.
+    unsafe { pgtable.mprotect_pages(range(start, 1), RW) }.unwrap();
+    // A write through a stale read-only translation faults, and finds the
+    // leaf writable already.
+    write_fault(&pgtable, start, RW);
+    check_mapped(&pgtable, start, vmflags_to_pteflags(RW));
+    assert_eq!(mapped_frame(&pgtable, start), frame);
+    assert_eq!(live_frames(), live);
+    assert_eq!(take_flushes(), []);
+}
+
+#[test]
+fn cow_copies_flush_their_page_and_take_overs_none() {
+    let _sharing = sharing();
+    let start = 0x1_0000;
+    let parent = populated_table(start, 1);
+    let child = clone(&parent);
+    take_flushes();
+    let allocated = live_frames();
+    // Other CPUs may still read the shared frame through the child's leaf:
+    // flushed with the copy mapped, before the leaf's frame is released.
+    write_fault(&child, start, RW);
+    assert_eq!(
+        take_flushes(),
+        [(child.physical_frame(), span(start, 1), allocated + 1)]
+    );
+    // Only gains WRITABLE.
+    write_fault(&parent, start, RW);
+    assert_eq!(take_flushes(), []);
+    drop((parent, child));
+    assert!(shared_frames().is_empty());
+}
+
+#[test]
+fn cow_copies_free_the_shared_frame_only_once_flushed() {
+    // A table mapping one page has a P4, P3, P2, and P1.
+    const TABLE_FRAMES: usize = 4;
+    let _sharing = sharing();
+    let start = 0x1_0000;
+    let parent = populated_table(start, 1);
+    let child = clone(&parent);
+    take_flushes();
+    let allocated = live_frames();
+    // The parent's leaf goes as the child's copy is flushed (e.g., its
+    // process exits on another CPU), so that the child's release frees the
+    // frame: only after the flush.
+    at_next_flush(move || drop(parent));
+    write_fault(&child, start, RW);
+    assert_eq!(
+        take_flushes(),
+        [(
+            child.physical_frame(),
+            span(start, 1),
+            allocated + 1 - TABLE_FRAMES
+        )]
+    );
+    assert_eq!(live_frames(), allocated - TABLE_FRAMES);
+    drop(child);
+    assert!(shared_frames().is_empty());
+}
+
+#[test]
+fn clones_flush_only_the_leaves_they_make_read_only() {
+    let _sharing = sharing();
+    let start = 0x1_0000;
+    // Read-only at 0, writable at 1 and 2, PROT_NONE at 3, and shared memory,
+    // writable, at 4.
+    let parent = populated_table(start, 4);
+    // Safety: nothing uses the pages.
+    unsafe { parent.mprotect_pages(range(start, 1), VmFlags::VM_READ) }.unwrap();
+    // Safety: as above.
+    unsafe { parent.mprotect_pages(range(start + 3 * PAGE_SIZE, 1), VmFlags::empty()) }.unwrap();
+    let shared_rw = RW | VmFlags::VM_SHARED;
+    // Safety: unmapped user space.
+    unsafe { parent.map_pages(range(start + 4 * PAGE_SIZE, 1), shared_rw, true) }.unwrap();
+    take_flushes();
+    let child = clone(&parent);
+    assert_eq!(
+        take_flushes(),
+        [(
+            parent.physical_frame(),
+            span(start + PAGE_SIZE, 2),
+            live_frames()
+        )]
+    );
+    // The parent's leaves are all read-only but shared memory's, which stays
+    // writable, so none loses WRITABLE.
+    let grandchild = clone(&parent);
+    assert_eq!(take_flushes(), []);
+    drop((parent, child, grandchild));
+    assert!(shared_frames().is_empty());
+}
+
+#[test]
+fn lazily_pinned_pages_are_populated_as_found() {
+    let _sharing = sharing();
+    let start = 0x1_0000;
+    let pgtable = new_table();
+    let pages = range(start, 2);
+    let page = |index: u64| Page::containing_address(VirtAddr::new(start as u64)) + index;
+    // Safety: nothing unmaps or remaps `pages` while pinned, and the test,
+    // their owner, may map them read-write.
+    unsafe { pgtable.pin_lazily(pages) };
+    let frame = pgtable.pinned_frame(page(0)).unwrap();
+    check_mapped(&pgtable, start, vmflags_to_pteflags(RW));
+    assert_eq!(pgtable.pinned_frame(page(0)).unwrap(), frame);
+    assert_eq!(mapped_frame(&pgtable, start), frame);
+    check_unmapped(&pgtable, start + PAGE_SIZE);
+    assert_eq!(take_flushes(), [], "new leaves need no flush");
+
+    set_alloc_budget(Some(0));
+    let result = pgtable.pinned_frame(page(1));
+    set_alloc_budget(None);
+    assert!(matches!(result, Err(PageFaultError::AllocationFailed)));
+
+    // Pinned: never shared.
+    let child = clone(&pgtable);
+    check_unmapped(&child, start);
+    // Protected since it was pinned: refused.
+    // Safety: nothing uses the page.
+    unsafe { pgtable.mprotect_pages(range(start, 1), VmFlags::VM_READ) }.unwrap();
+    assert!(matches!(
+        pgtable.pinned_frame(page(0)),
+        Err(PageFaultError::AccessError(_))
+    ));
+    pgtable.unpin(pages);
 }

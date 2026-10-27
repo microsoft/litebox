@@ -4,9 +4,9 @@
 //! The LiteBox VM kernel's broker, like `litebox_broker_userland` for hosted
 //! runners: [`Broker`] is the kernel's, and each runner process has an
 //! [`Association`] with it (see `litebox_common_vm_abi`, Broker). Requests and
-//! responses are in the control ring, pinned and accessed through the
-//! kernel's mapping; payloads are in the process's lazily populated shared
-//! buffers.
+//! responses are in the control ring, payloads in the shared buffers: both
+//! pinned (the shared buffers populated as they are accessed), and accessed
+//! through the kernel's mapping, from any CPU, in any address space.
 //!
 //! Files are the devices under `/dev`, with standard streams on the
 //! runner's [`stdio::Console`], those of an optional read-only root
@@ -84,7 +84,7 @@ use litebox_broker_transport::control_ring::{
     ControlRingReadStatus, ControlRingWriteStatus, HostControlRingEndpoints,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool};
-use litebox_common_vm_abi::{Status, UserRange, WireFrame};
+use litebox_common_vm_abi::{Status, WireFrame};
 use litebox_platform::time::TimeProvider as _;
 use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel, cpu};
 
@@ -203,12 +203,13 @@ impl Broker {
         }
     }
 
-    /// A process's association, before its handshake. `shared_memory` is in
-    /// the process's user mapping; `control_ring` is at the start of
-    /// `control_ring_pages`. With `launch`, the process is a launched one,
-    /// and its handshake attaches it to `launch`'s broker process. Otherwise,
-    /// it is a root; under the virtual init, its broker process is created
-    /// here (see the [crate] docs).
+    /// A process's association, before its handshake. The shared buffers are
+    /// `shared_memory` (see [`SHARED_MEMORY_SIZE`]), which may be pinned
+    /// lazily; the control ring is at the start of `control_ring_pages`. With
+    /// `launch`, the process is a launched one, and its handshake attaches it
+    /// to `launch`'s broker process. Otherwise, it is a root; under the
+    /// virtual init, its broker process is created here (see the [crate]
+    /// docs).
     ///
     /// # Errors
     ///
@@ -220,7 +221,7 @@ impl Broker {
     /// If `control_ring_pages` cannot hold [`CONTROL_RING_SIZE`].
     pub fn associate(
         &self,
-        shared_memory: UserRange,
+        shared_memory: PinnedUserPages,
         control_ring_pages: PinnedUserPages,
         launch: Option<PendingRunnerAssociation>,
     ) -> Result<Association, BrokerError> {
@@ -257,7 +258,7 @@ impl Broker {
     /// If `control_ring_pages` cannot hold [`CONTROL_RING_SIZE`].
     pub fn associate_clone(
         &self,
-        shared_memory: UserRange,
+        shared_memory: PinnedUserPages,
         control_ring_pages: PinnedUserPages,
     ) -> Association {
         self.association(shared_memory, control_ring_pages, true, None)
@@ -268,7 +269,7 @@ impl Broker {
     /// If `control_ring_pages` cannot hold [`CONTROL_RING_SIZE`].
     fn association(
         &self,
-        shared_memory: UserRange,
+        shared_memory: PinnedUserPages,
         control_ring_pages: PinnedUserPages,
         launched: bool,
         launch: Option<PendingRunnerAssociation>,
@@ -279,7 +280,6 @@ impl Broker {
             .expect("a pinned control ring has the exact size");
         Association {
             broker: self.clone(),
-            shared_memory,
             readiness: Arc::new(KernelReadiness::new()),
             launched,
             process: launch
@@ -288,7 +288,11 @@ impl Broker {
                 .unwrap_or_default(),
             exit_status: Cell::new(None),
             launcher: Arc::new(KernelProcessLauncher::default()),
-            state: RefCell::new(State::New(ring, launch)),
+            state: RefCell::new(State::New(
+                ring,
+                UserSharedMemory::new(shared_memory),
+                launch,
+            )),
             adoption_response: Cell::new(None),
             submitted: Cell::new(false),
         }
@@ -347,11 +351,12 @@ impl HostSetupChannel for KernelHostSetup {
 }
 
 enum State {
-    /// Before the handshake, with the ring it would activate, and the pending
-    /// association, if the broker process already exists (see
-    /// [`Broker::associate`]).
+    /// Before the handshake, with the ring and shared buffers it would
+    /// activate, and the pending association, if the broker process already
+    /// exists (see [`Broker::associate`]).
     New(
         ControlRing<PinnedControlRing>,
+        UserSharedMemory,
         Option<PendingRunnerAssociation>,
     ),
     Active(Box<Active>),
@@ -376,7 +381,6 @@ struct Active {
 /// handshake touch the shared buffers.
 pub struct Association {
     broker: Broker,
-    shared_memory: UserRange,
     readiness: Arc<KernelReadiness>,
     /// See [`Broker::associate`].
     launched: bool,
@@ -492,10 +496,8 @@ impl Association {
 
     /// [`BrokerHandshake`](litebox_common_vm_abi::CallId::BrokerHandshake):
     /// one attempt, successful or not; success activates the control ring.
-    /// Needs the process's address space, as a launched process's handshake
-    /// writes its startup data into its shared buffers. For an adopted process
-    /// clone, it returns the response of the handshake that [`Self::adopt`]
-    /// made, if `request` is the one runners make.
+    /// For an adopted process clone, it returns the response of the handshake
+    /// that [`Self::adopt`] made, if `request` is the one runners make.
     ///
     /// # Errors
     ///
@@ -528,8 +530,9 @@ impl Association {
         request: Result<BrokerHandshakeRequest, Status>,
     ) -> Result<WireFrame, Status> {
         let mut state = self.state.borrow_mut();
-        let (ring, mut launch) = match core::mem::replace(&mut *state, State::Ended) {
-            State::New(ring, launch) => (ring, launch),
+        let (ring, shared_memory, mut launch) = match core::mem::replace(&mut *state, State::Ended)
+        {
+            State::New(ring, shared_memory, launch) => (ring, shared_memory, launch),
             // Left as it was (e.g., active, on a repeated handshake).
             other => {
                 *state = other;
@@ -543,11 +546,8 @@ impl Association {
         // `launch` lives until the end, so a failed handshake fails the start
         // (see `PendingRunnerAssociation`'s `Drop`).
         let request = request?;
-        let shared_buffers = SharedBufferPool::new(
-            UserSharedMemory::new(self.shared_memory),
-            SHARED_BUFFER_LAYOUT,
-        )
-        .map_err(|_| Status::Unsupported)?;
+        let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
+            .map_err(|_| Status::Unsupported)?;
         let mut setup = KernelHostSetup {
             request: Some(request),
             response: None,
@@ -643,7 +643,6 @@ impl Association {
     }
 
     /// Serves the published requests, unless the response ring fills up.
-    /// Needs the process's address space, for the shared buffers.
     ///
     /// Must run on a CPU's worker
     /// ([`litebox_platform_vm_kernel::worker`]), as a request may suspend it:
@@ -693,10 +692,7 @@ impl Association {
     /// [`Broker::associate_clone`]) as the runner of `launch`'s process
     /// (`StartChildWithExistingRunner`): makes the clone's handshake as its
     /// runner would, which completes the start before the clone runs; the
-    /// clone's own [`Self::handshake`] then returns the response. Needs the
-    /// clone's address space current, with the kernel's faults on its user
-    /// memory handled (see `litebox_platform_vm_kernel::with_user_faults`), as
-    /// the handshake writes the startup data into its shared buffers.
+    /// clone's own [`Self::handshake`] then returns the response.
     ///
     /// # Errors
     ///
@@ -708,7 +704,7 @@ impl Association {
             self.launched && self.process.get().is_none() && self.exit_status.get().is_none();
         if adoptable
             && let Ok(mut state) = self.state.try_borrow_mut()
-            && let State::New(_, pending @ None) = &mut *state
+            && let State::New(_, _, pending @ None) = &mut *state
         {
             let _ = self.process.set(launch.process.clone());
             *pending = Some(launch);

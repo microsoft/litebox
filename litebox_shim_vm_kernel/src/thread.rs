@@ -6,9 +6,12 @@
 //!
 //! Every thread shares its process's [`Inner`]; only its registers, FS base,
 //! platform state (extended state and GS base), upcall stack, and how it
-//! stopped are its own. The main thread serves the process's requests.
+//! stopped are its own. The main thread serves the process's requests. The
+//! threads of a process run in parallel, each on at most one CPU at a time
+//! (see `sched`).
 
 use crate::memory::{checked_range, copy_from_user, copy_to_user};
+use crate::sched::Parked;
 use crate::{Inner, State, Suspended, layout, new_thread, sched};
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
@@ -20,7 +23,9 @@ use litebox_common_vm_abi::{
     RUNNER_MANAGED_MIN, Registers, Status, USER_END, UserRange,
 };
 use litebox_platform::time::TimeProvider as _;
+use litebox_platform_vm_kernel::cpu::{self, CpuId};
 use litebox_platform_vm_kernel::{Instant, UserThreadState};
+use spin::mutex::SpinMutex;
 
 pub(crate) use litebox_common_vm_abi::MAIN_THREAD as MAIN;
 
@@ -36,6 +41,20 @@ pub(crate) struct Thread {
     pub(crate) fs_base: Cell<usize>,
     /// Borrowed only by the thread's run.
     pub(crate) user_state: RefCell<UserThreadState>,
+    /// The CPU running it, which alone touches `ctx` and `user_state`
+    /// meanwhile, without the claim; set under the claim that hands it the
+    /// thread, and cleared under the one that ends its run, or that finishes
+    /// it parked (see `sched`): a parked thread keeps it, though that CPU
+    /// moved on.
+    pub(crate) running: Cell<Option<CpuId>>,
+    /// The rest of its run, if that ended without the claim (see
+    /// `sched::Parked`): left by its CPU, holding no claim, for the claim's
+    /// next holder. Locked briefly: to move it, or to see whether it is there
+    /// ([`Self::cpu_to_interrupt`]).
+    pub(crate) parked: SpinMutex<Option<Parked>>,
+    /// While it runs, when its slice ends (see `sched`); `None` if nothing
+    /// else needs its CPU.
+    pub(crate) slice_end: Cell<Option<Instant>>,
     pub(crate) upcall_stack: UserRange,
     pub(crate) suspended: Cell<Suspended>,
     /// [`CallId::InterruptThread`](litebox_common_vm_abi::CallId::InterruptThread):
@@ -87,6 +106,9 @@ impl Thread {
             ctx: RefCell::new(ctx),
             fs_base: Cell::new(thread.fs_base.trunc()),
             user_state: RefCell::new(user_state),
+            running: Cell::new(None),
+            parked: SpinMutex::new(None),
+            slice_end: Cell::new(None),
             upcall_stack: thread.upcall_stack,
             suspended: Cell::new(Suspended::No),
             kicked: Cell::new(false),
@@ -97,6 +119,14 @@ impl Thread {
 
     pub(crate) fn is_main(&self) -> bool {
         self.id == MAIN
+    }
+
+    /// The CPU to interrupt for the thread to enter the kernel: the one
+    /// running it, unless parked there. Under the claim, so only its CPU
+    /// parking it races this, harmlessly: then that CPU, moved on, takes the
+    /// interrupt needlessly.
+    pub(crate) fn cpu_to_interrupt(&self) -> Option<CpuId> {
+        self.running.get().filter(|_| self.parked.lock().is_none())
     }
 
     /// Adds the time elapsed since `start` (its run, or a worker job for
@@ -445,13 +475,18 @@ impl Inner {
             .ok_or(Status::InvalidArgument)?;
         // Delivered as it next runs (see `Inner::rearm_timer`), even if this
         // ends its wait: the runner may be waiting in its own code, which it
-        // returns to.
+        // returns to. At once on another CPU, which it interrupts.
         thread.kicked.set(true);
         if let Suspended::Futex(_) = thread.suspended.get() {
             thread
                 .suspended
                 .set(Suspended::Woken(Err(Status::Interrupted)));
             self.share_cpu();
+        }
+        if let Some(cpu) = thread.cpu_to_interrupt()
+            && cpu != cpu::current()
+        {
+            cpu::interrupt(crate::sched::bit(cpu));
         }
         Ok(())
     }
