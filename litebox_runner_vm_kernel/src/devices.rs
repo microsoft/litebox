@@ -299,7 +299,7 @@ impl Devices {
     }
 
     /// The calling CPU's [`Self::armed`].
-    fn armed(&self) -> &AtomicU64 {
+    pub(crate) fn armed(&self) -> &AtomicU64 {
         &self.armed[cpu::current().index()]
     }
 
@@ -383,6 +383,18 @@ impl ProcessTimer for Devices {
                 .arm_timer(self.clock.ticks_at(deadline.as_nanos())),
             None => self.apic.disarm_timer(),
         }
+    }
+
+    /// `armed(None)` and [`ARMED_UNKNOWN`] both mean that none is armed.
+    fn arm_if_earlier(&self, deadline: Instant) {
+        let armed_now = self.armed().load(Ordering::Relaxed);
+        if armed_now != armed(None)
+            && armed_now != ARMED_UNKNOWN
+            && armed_now <= armed(Some(deadline))
+        {
+            return;
+        }
+        self.arm(Some(deadline));
     }
 }
 

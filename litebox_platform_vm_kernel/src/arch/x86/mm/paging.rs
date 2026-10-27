@@ -909,6 +909,36 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
+    /// Maps the direct map's `page` to its frame again, RW/NX, after an unmap
+    /// that kept its tables: writes only its leaf, under the table's lock, and
+    /// needs no flush, as no CPU caches an absent translation.
+    ///
+    /// # Safety
+    ///
+    /// `page` is a page of the direct map (`PA + KERNEL_OFFSET`).
+    pub(crate) unsafe fn remap_direct(&self, page: Page<Size4KiB>) {
+        let frame = PhysFrame::containing_address(M::va_to_pa(page.start_address()));
+        let mut inner = self.inner.lock();
+        let Walk::Leaf(entry) = leaf_entry::<M>(inner.level_4_table_mut(), page) else {
+            panic!("the tables of {page:?} are gone");
+        };
+        assert!(entry.is_unused(), "{page:?} is mapped");
+        entry.set_frame(
+            frame,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+        );
+    }
+
+    /// Debug builds: whether `page` has a present leaf.
+    #[cfg(debug_assertions)]
+    pub(crate) fn is_present(&self, page: Page<Size4KiB>) -> bool {
+        let mut inner = self.inner.lock();
+        matches!(
+            leaf_entry::<M>(inner.level_4_table_mut(), page),
+            Walk::Leaf(entry) if entry.flags().contains(PageTableFlags::PRESENT)
+        )
+    }
+
     /// Gives the kernel PML4 slot holding `va` its P3 table now, as Linux
     /// preallocates its vmalloc area's: task tables share the kernel's slots
     /// as they are at creation, so they see later mappings in it.
