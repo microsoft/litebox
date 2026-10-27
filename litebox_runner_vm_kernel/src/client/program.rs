@@ -18,6 +18,13 @@
 //!   beyond what is recorded fails the check.
 //! - `min_reflected_syscalls`: default 0; guest syscalls the runner did not
 //!   take directly, so the kernel reflected them.
+//! - `replay`: default false; in debug builds, the run's process gives up on
+//!   its claim at its first kernel entry of each kind, as if another CPU held
+//!   it, and each must then be handled once, by its replay (see
+//!   `litebox_shim_vm_kernel::ProcessConfig::give_up_once`): so the program
+//!   must also make a syscall that the kernel reflects, raise an exception,
+//!   and take an interrupt (e.g., a timer's). In a group, every run's process
+//!   does if one has it. Release builds ignore it.
 //!
 //! In a group, runs share standard input and output, so they take no
 //! `stdin`, `expect_stdout`, or `expect_stderr`, and at most one takes
@@ -68,6 +75,12 @@ struct Run {
     expect_stderr: Option<String>,
     #[serde(default)]
     min_reflected_syscalls: u64,
+    #[serde(default)]
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(dead_code, reason = "release builds ignore it")
+    )]
+    replay: bool,
 }
 
 /// Keeps at most this much of each stream per run; the console gets all.
@@ -219,6 +232,10 @@ fn run_group(first: usize, runs: Vec<Run>, service: &mut Programs, stdio: &Stdio
     } else {
         Input::Given(runs.iter().flat_map(|run| run.stdin.bytes()).collect())
     };
+    #[cfg(debug_assertions)]
+    if runs.iter().any(|run| run.replay) {
+        service.give_up_once();
+    }
     let replies = service.run_concurrently(&programs);
     let output = stdio.take();
     for ((index, run), reply) in (first..).zip(runs).zip(replies) {
@@ -268,6 +285,14 @@ fn check(index: usize, run: Run, reply: Reply, output: &[Recorded; 2]) {
         reply.reflected_syscalls,
         run.min_reflected_syscalls
     );
+    #[cfg(debug_assertions)]
+    if run.replay {
+        assert_eq!(
+            reply.replay_counts, [1; 5],
+            "run {index} ({path}): how many times its first kernel call, reflected syscall, page \
+             fault, other exception, and interrupt, which gave up on its claim, were handled"
+        );
+    }
     litebox_util_log::info!(
         index:% = index,
         status:? = status,

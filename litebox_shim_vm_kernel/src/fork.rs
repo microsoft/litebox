@@ -13,11 +13,12 @@
 //! start, never waits for the clone. A process has at most one clone to adopt,
 //! its latest, which ends once the process makes another, or exits.
 //!
-//! The scheduler adds the clone as the slice that made it ends, and forgets it
-//! once dead, but neither claims nor runs it until it is adopted (see
-//! `claim`). Until then, only its parent's holder touches it, to make, adopt,
-//! or end it, through the clone's claim once made: so on one CPU at a time,
-//! where alone its address space is current, while it is made or adopted.
+//! The scheduler adds the clone once it is made, as another CPU may adopt it
+//! while the thread that made it runs on, and forgets it once dead, but
+//! neither claims nor runs it until it is adopted (see `claim`). Until then,
+//! only its parent's holder touches it, to make, adopt, or end it, through
+//! the clone's claim once made: so on one CPU at a time, where alone its
+//! address space is current while it is made.
 
 use crate::claim::{Claim, Owned};
 use crate::memory::copy_to_user;
@@ -60,8 +61,10 @@ impl Inner {
     /// The process clone `thread` asked for, made once the thread's run
     /// ended, so that its state is saved, as `own` owns it, for the scheduler
     /// to add; `None` if it cannot be made, and the call then fails. Only
-    /// under the process's claim. Leaves the clone's address space not
-    /// current, so it can be published (see `Inner::spawn`).
+    /// under the process's claim; its other threads may run meanwhile, on
+    /// other CPUs, whose writable translations, but shared memory's, the copy
+    /// shoots down (see
+    /// [`VmKernel::clone_address_space`](litebox_platform_vm_kernel::VmKernel::clone_address_space)).
     pub(crate) fn fork(
         &self,
         thread: &Thread,
@@ -92,11 +95,9 @@ impl Inner {
 
     /// A copy of the process, with fresh broker memory, and of `thread` (see
     /// [`Thread::cloned`]). Leaves the kernel's address space current if it
-    /// makes one.
+    /// makes one (see the crate docs).
     fn clone_process(&self, thread: &Thread, slot: u64) -> Result<Self, Status> {
         let platform = self.platform;
-        // Under the process's claim, so its address space is current on no
-        // other CPU, as cloning it requires.
         let address_space = platform
             .clone_address_space(self.address_space)
             .map_err(|_| Status::NoMemory)?;
@@ -121,7 +122,6 @@ impl Inner {
                 // ran.
                 unsafe { release_address_space(platform, address_space) };
             })?;
-        // For the clone to be published, as `Inner::spawn` does.
         // Safety: the kernel holds no references into user memory.
         unsafe { platform.switch_address_space(AddressSpaceId::KERNEL) }
             .expect("the kernel address space always exists");
@@ -144,13 +144,15 @@ impl Inner {
             reflected: Cell::new(0),
             armed_deadline: Cell::new(None),
             notified: Cell::new(false),
-            slice_end: Cell::new(None),
+            shared: Cell::new(false),
             threads: RefCell::new(alloc::vec![new_thread(Thread::cloned(thread, slot))]),
             next_thread: Cell::new(thread::MAIN + 1),
             broker_requester: Cell::new(thread::MAIN),
             worker: Cell::new(None),
             pending_clone: RefCell::new(None),
             next_clone: Cell::new(1),
+            #[cfg(debug_assertions)]
+            give_ups: Default::default(),
         })
     }
 
@@ -226,12 +228,11 @@ fn claim_clone(clone: &Arc<Owned>) -> Claim<'_> {
 }
 
 /// Ends the clone taken from a process's `pending_clone`, if any, under the
-/// process's claim. Releasing the clone's claim leaves the kernel's address
-/// space current (see `claim`): callers stop the process's run, or are
-/// between runs. The upgraded reference may be the clone's last, if another
-/// CPU forgot the dead clone meanwhile (see `sched`): freeing it here is then
-/// as safe as between runs, as the kernel's address space is current, and
-/// freeing takes no claim.
+/// process's claim. The upgraded reference may be the clone's last, if
+/// another CPU forgot the dead clone meanwhile (see `sched`): freeing it here
+/// then leaves the kernel's address space current (see
+/// `release_address_space`), so callers stop the process's run, or are
+/// between runs; and freeing takes no claim.
 pub(crate) fn end_pending(pending: Option<(u64, Weak<Owned>)>) {
     if let Some(clone) = pending.and_then(|(_, clone)| clone.upgrade()) {
         end(&claim_clone(&clone));

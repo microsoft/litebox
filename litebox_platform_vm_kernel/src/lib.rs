@@ -38,6 +38,7 @@
 use crate::arch::mm::paging::UnmapOptions;
 use crate::per_cpu::{PerCpuVariablesAsm, with_per_cpu_variables};
 use alloc::sync::Arc;
+use core::cell::Cell;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use litebox::mm::page::PageRange;
@@ -1268,19 +1269,32 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for VmKernel {
     }
 }
 
+/// How a thread's run ended (see [`run_thread_ref`]).
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// The shim ended it ([`ContinueOperation::Terminate`]).
+    Terminated,
+    /// The thread's context cannot return to user mode (its instruction or
+    /// stack pointer is outside user memory): at a `syscall`, before the shim
+    /// sees it, or once the shim resumes the thread.
+    InvalidContext,
+}
+
 /// Run a user thread until it terminates or returns to the kernel. The shim's
 /// `init` fills `ctx`, which is sanitized before user mode. Resets `state`.
+/// Returns how the run ended.
 ///
 /// # Safety
 ///
 /// The platform must be set up (see the crate docs), and no other
 /// `run_thread_ref`/`reenter_thread_ref` call may be in progress on the
 /// calling CPU.
-pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
+pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState) -> RunEnd
 where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
-    run_thread_inner(shim, ctx, false, state, true);
+    run_thread_inner(shim, ctx, false, state, true)
 }
 
 /// Re-enter a thread, e.g., after `load_ta_context`. The shim's `reenter`
@@ -1289,11 +1303,15 @@ where
 /// # Safety
 ///
 /// As for [`run_thread_ref`].
-pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
+pub unsafe fn reenter_thread_ref<T>(
+    shim: &T,
+    ctx: &mut PtRegs,
+    state: &mut UserThreadState,
+) -> RunEnd
 where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
-    run_thread_inner(shim, ctx, true, state, true);
+    run_thread_inner(shim, ctx, true, state, true)
 }
 
 /// As [`reenter_thread_ref`], but keeps `state`, for a thread suspended
@@ -1302,7 +1320,11 @@ where
 /// # Safety
 ///
 /// As for [`run_thread_ref`].
-pub unsafe fn resume_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
+pub unsafe fn resume_thread_ref<T>(
+    shim: &T,
+    ctx: &mut PtRegs,
+    state: &mut UserThreadState,
+) -> RunEnd
 where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
@@ -1367,6 +1389,9 @@ impl UserThreadState {
 struct ThreadContext<'a> {
     shim: &'a dyn EnterShim<ExecutionContext = PtRegs>,
     ctx: *mut PtRegs,
+    /// How the run ends: [`RunEnd::Terminated`] unless a user-entry handler
+    /// found the context invalid.
+    end: Cell<RunEnd>,
 }
 
 fn run_thread_inner(
@@ -1375,7 +1400,7 @@ fn run_thread_inner(
     reenter: bool,
     state: &mut UserThreadState,
     reset: bool,
-) {
+) -> RunEnd {
     // SWAPGS exposes KernelGsBase to user code.
     if reset {
         state.gs_base = VirtAddr::zero();
@@ -1389,7 +1414,11 @@ fn run_thread_inner(
         }
     });
     let ctx = core::ptr::from_mut(ctx);
-    let thread_ctx = ThreadContext { shim, ctx };
+    let thread_ctx = ThreadContext {
+        shim,
+        ctx,
+        end: Cell::new(RunEnd::Terminated),
+    };
     // `ctx` is passed again so the assembly need not know `ThreadContext`'s layout.
     // Safety: `ctx` is valid and otherwise unused for the duration of the call,
     // and `run_thread_arch` returns exactly once.
@@ -1399,6 +1428,7 @@ fn run_thread_inner(
     // Not left installed: the thread's area may be freed before the next run.
     state.xsaved = with_per_cpu_variables(|pcv| pcv.asm.uninstall_user_xsave());
     state.gs_base = crate::arch::read_kernel_gsbase_msr();
+    thread_ctx.end.get()
 }
 
 macro_rules! SAVE_CALLEE_SAVED_REGISTERS_ASM {
@@ -1761,7 +1791,7 @@ unsafe extern "C" fn init_handler(thread_ctx: &ThreadContext) {
     // Safety: entered from user-mode setup; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     if let ContinueOperation::Resume = thread_ctx.shim.init(ctx) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
@@ -1769,7 +1799,7 @@ unsafe extern "C" fn reenter_handler(thread_ctx: &ThreadContext) {
     // Safety: entered from user-mode setup; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     if let ContinueOperation::Resume = thread_ctx.shim.reenter(ctx) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
@@ -1777,10 +1807,11 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &ThreadContext) {
     // Safety: entered from user mode; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     if !ctx.has_user_return_addresses() {
+        thread_ctx.end.set(RunEnd::InvalidContext);
         return;
     }
     if let ContinueOperation::Resume = thread_ctx.shim.syscall(ctx) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
@@ -1794,7 +1825,7 @@ unsafe extern "C" fn exception_handler(thread_ctx: &ThreadContext, cr2: usize) {
         kernel_mode: false,
     };
     if let ContinueOperation::Resume = thread_ctx.shim.exception(ctx, &info) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
@@ -1807,16 +1838,18 @@ unsafe extern "C" fn interrupt_handler(thread_ctx: &ThreadContext) {
     // Safety: entered from user mode; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     if let ContinueOperation::Resume = thread_ctx.shim.interrupt(ctx) {
-        resume_user(ctx);
+        resume_user(thread_ctx, ctx);
     }
 }
 
-fn resume_user(ctx: &mut PtRegs) {
+/// Returns only if `ctx` cannot return to user mode, which ends the run.
+fn resume_user(thread_ctx: &ThreadContext, ctx: &mut PtRegs) {
     if ctx.sanitize_for_user_return() {
         // Safety: sanitized for user mode.
         unsafe { switch_to_user(ctx) }
     }
     litebox_util_log::warn!("terminating thread with invalid user return context");
+    thread_ctx.end.set(RunEnd::InvalidContext);
 }
 
 /// A kernel page fault outside `run_thread_arch`, where the shim cannot be

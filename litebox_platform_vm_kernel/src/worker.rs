@@ -96,7 +96,7 @@ pub fn state() -> State {
 /// has yet to suspend. No locks, no per-CPU data: usable in interrupt
 /// handlers.
 pub fn interrupt_suspended(except: CpuId) {
-    cpu::interrupt(cpu::suspended_mask() & !except.bit());
+    cpu::interrupt_mask(cpu::suspended_mask() & !except.bit());
 }
 
 /// Runs `work` on the worker until it finishes or [`suspend`]s.

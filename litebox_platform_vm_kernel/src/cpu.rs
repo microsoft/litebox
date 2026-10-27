@@ -303,13 +303,19 @@ pub fn notify_all() {
 /// Marks `cpus` in `set`, then sends the wake IPI to those idle.
 fn signal(set: &AtomicU64, cpus: u64) {
     set.fetch_or(cpus, Ordering::SeqCst);
-    interrupt(CPUS.idle.load(Ordering::SeqCst) & cpus);
+    interrupt_mask(CPUS.idle.load(Ordering::SeqCst) & cpus);
 }
 
-/// Sends the wake IPI to `cpus` (bit `i`: CPU `i`), busy or idle, marking
+/// Sends the wake IPI to each of `cpus`, busy or idle, marking
 /// none: e.g., for those in user mode to enter the kernel. Nothing before
 /// [`VmKernel::start_cpus`].
-pub(crate) fn interrupt(mut cpus: u64) {
+pub fn interrupt(cpus: impl IntoIterator<Item = CpuId>) {
+    interrupt_mask(cpus.into_iter().fold(0, |cpus, cpu| cpus | cpu.bit()));
+}
+
+/// [`interrupt`], of the CPUs in the mask `cpus` (bit `i`: CPU `i`), for
+/// callers that have one (e.g., in interrupt handlers).
+pub(crate) fn interrupt_mask(cpus: u64) {
     // Harmless if unsent: before `start_cpus`, no other CPU runs, and it
     // never starts one the controller cannot address.
     send(cpus, Ipi::Wake);

@@ -6,12 +6,15 @@
 //!
 //! Every thread shares its process's [`Inner`]; only its registers, FS base,
 //! platform state (extended state and GS base), upcall stack, and how it
-//! stopped are its own. The main thread serves the process's requests.
+//! stopped are its own. The main thread serves the process's requests. The
+//! threads of a process run in parallel, each on at most one CPU at a time
+//! (see `sched`).
 
 use crate::memory::{checked_range, copy_from_user, copy_to_user};
+use crate::sched::Parked;
 use crate::{Inner, State, Suspended, layout, new_thread, sched};
 use alloc::sync::Arc;
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, RefCell, RefMut};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_vm_kernel::{EnterError, Entered, RingFutex};
 use litebox_common_linux::PtRegs;
@@ -20,7 +23,9 @@ use litebox_common_vm_abi::{
     RUNNER_MANAGED_MIN, Registers, Status, USER_END, UserRange,
 };
 use litebox_platform::time::TimeProvider as _;
+use litebox_platform_vm_kernel::cpu::{self, CpuId};
 use litebox_platform_vm_kernel::{Instant, UserThreadState};
+use spin::mutex::SpinMutex;
 
 pub(crate) use litebox_common_vm_abi::MAIN_THREAD as MAIN;
 
@@ -31,11 +36,25 @@ const MAX_THREADS: usize = 256;
 pub(crate) struct Thread {
     pub(crate) id: u64,
     /// Borrowed only by the thread's run.
-    pub(crate) ctx: RefCell<PtRegs>,
+    ctx: RefCell<PtRegs>,
     /// Saved while it does not run.
     pub(crate) fs_base: Cell<usize>,
     /// Borrowed only by the thread's run.
-    pub(crate) user_state: RefCell<UserThreadState>,
+    user_state: RefCell<UserThreadState>,
+    /// The CPU running it, which alone touches `ctx` and `user_state`
+    /// meanwhile, without the claim; set under the claim that hands it the
+    /// thread, and cleared under the one that ends its run, or that finishes
+    /// it parked (see `sched`): a parked thread keeps it, though that CPU
+    /// moved on.
+    pub(crate) running: Cell<Option<CpuId>>,
+    /// The rest of its run, if that ended without the claim (see
+    /// `sched::Parked`): left by its CPU, holding no claim, for the claim's
+    /// next holder. Locked briefly: to move it, or to see whether it is there
+    /// ([`Self::cpu_to_interrupt`]).
+    pub(crate) parked: SpinMutex<Option<Parked>>,
+    /// While it runs, when its slice ends (see `sched`); `None` if nothing
+    /// else needs its CPU.
+    pub(crate) slice_end: Cell<Option<Instant>>,
     pub(crate) upcall_stack: UserRange,
     pub(crate) suspended: Cell<Suspended>,
     /// [`CallId::InterruptThread`](litebox_common_vm_abi::CallId::InterruptThread):
@@ -67,8 +86,8 @@ impl Thread {
     pub(crate) fn cloned(thread: &Self, slot: u64) -> Self {
         let clone = Self::new(
             MAIN,
-            thread.ctx.borrow().clone(),
-            thread.user_state.borrow().duplicate(),
+            thread.ctx_mut().clone(),
+            thread.user_state_mut().duplicate(),
             &NewThread {
                 fs_base: thread.fs_base.get() as u64,
                 upcall_stack: layout::UPCALL_STACK,
@@ -87,6 +106,9 @@ impl Thread {
             ctx: RefCell::new(ctx),
             fs_base: Cell::new(thread.fs_base.trunc()),
             user_state: RefCell::new(user_state),
+            running: Cell::new(None),
+            parked: SpinMutex::new(None),
+            slice_end: Cell::new(None),
             upcall_stack: thread.upcall_stack,
             suspended: Cell::new(Suspended::No),
             kicked: Cell::new(false),
@@ -99,11 +121,46 @@ impl Thread {
         self.id == MAIN
     }
 
+    /// Its registers, for the CPU running it, which alone touches them
+    /// meanwhile, without the claim (see [`Self::running`]), or, while none
+    /// does, for the claim's holder.
+    ///
+    /// # Panics
+    ///
+    /// If another CPU runs it, even in release builds: the borrow would race
+    /// that CPU's, as a `RefCell`'s borrow flag is not atomic.
+    pub(crate) fn ctx_mut(&self) -> RefMut<'_, PtRegs> {
+        self.assert_not_run_elsewhere();
+        self.ctx.borrow_mut()
+    }
+
+    /// Its platform state, as [`Self::ctx_mut`] its registers.
+    pub(crate) fn user_state_mut(&self) -> RefMut<'_, UserThreadState> {
+        self.assert_not_run_elsewhere();
+        self.user_state.borrow_mut()
+    }
+
+    /// See [`Self::ctx_mut`]'s panics.
+    fn assert_not_run_elsewhere(&self) {
+        assert!(
+            self.running.get().is_none_or(|cpu| cpu == cpu::current()),
+            "another CPU runs thread {}",
+            self.id
+        );
+    }
+
+    /// The CPU to interrupt for the thread to enter the kernel: the one
+    /// running it, unless parked there. Under the claim, so only its CPU
+    /// parking it races this, harmlessly: then that CPU, moved on, takes the
+    /// interrupt needlessly.
+    pub(crate) fn cpu_to_interrupt(&self) -> Option<CpuId> {
+        self.running.get().filter(|_| self.parked.lock().is_none())
+    }
+
     /// Adds the time elapsed since `start` (its run, or a worker job for
     /// it) to its CPU time, capped at one slice (see `sched::charged`).
     pub(crate) fn charge(&self, platform: &litebox_platform_vm_kernel::VmKernel, start: Instant) {
-        let used = platform.now().as_nanos().saturating_sub(start.as_nanos());
-        let used = sched::charged(used);
+        let used = sched::charged_since(platform, start);
         self.cpu_time.set(self.cpu_time.get().saturating_add(used));
     }
 }
@@ -255,13 +312,15 @@ impl Inner {
     ///
     /// The thread may have taken an interrupt for notifications in the
     /// runner's own code, which left them to its next guest entry, which
-    /// never comes: another thread is interrupted for them (a waiting one
-    /// sees them anyway, see `Inner::take_interrupt`).
+    /// never comes: another thread is interrupted for them, at once if it
+    /// runs on another CPU, else as it next resumes (a waiting one sees them
+    /// anyway, see `Inner::take_interrupt`).
     pub(crate) fn exit_thread(&self, thread: &Thread, clear: u64) {
         thread.exited.set(true);
         thread.suspended.set(Suspended::No);
         if self.broker.has_notifications() {
             self.notified.set(true);
+            self.interrupt_running();
         }
         if clear != 0 && clear.is_multiple_of(4) && copy_to_user(clear, &0u32.to_ne_bytes()).is_ok()
         {
@@ -445,13 +504,18 @@ impl Inner {
             .ok_or(Status::InvalidArgument)?;
         // Delivered as it next runs (see `Inner::rearm_timer`), even if this
         // ends its wait: the runner may be waiting in its own code, which it
-        // returns to.
+        // returns to. At once on another CPU, which it interrupts.
         thread.kicked.set(true);
         if let Suspended::Futex(_) = thread.suspended.get() {
             thread
                 .suspended
                 .set(Suspended::Woken(Err(Status::Interrupted)));
             self.share_cpu();
+        }
+        if let Some(cpu) = thread.cpu_to_interrupt()
+            && cpu != cpu::current()
+        {
+            cpu::interrupt([cpu]);
         }
         Ok(())
     }

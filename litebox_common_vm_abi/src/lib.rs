@@ -33,6 +33,9 @@
 //!   can gain a meaning later. Their type, `Reserved`, decodes only zero.
 //! - Only a `syscall` in the runner's [`GATE_SECTION`] is a call; any other,
 //!   the guest's or a stray one in the runner, becomes an upcall.
+//! - A thread the kernel cannot return to, with `rip` or `rsp` outside
+//!   [`RUNNER_MANAGED_MIN`]..[`USER_END`] (e.g., at a `syscall`), kills the
+//!   process.
 //!
 //! # Clock
 //!
@@ -123,7 +126,8 @@
 //!   first request) only once it is the only thread: like `exec`, a request
 //!   starts with one thread.
 //! - The kernel schedules threads, preempting them as processes, and keeps
-//!   the FS and GS bases per thread.
+//!   the FS and GS bases per thread. A process's threads may run at once, on
+//!   different CPUs.
 //! - [`CallId::Futex`] is a private futex on `u32` words of the process. A
 //!   wait also ends, with [`Status::Interrupted`], for what interrupts the
 //!   thread (see [Upcalls](crate#upcalls)), for the runner to handle it: the
