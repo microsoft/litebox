@@ -170,8 +170,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     }
 }
 
-/// Errors from futex operations, whether private ([`FutexManager`]) or in shared memory
-/// ([`shared`]).
+/// Potential errors that can be returned by [`FutexManager`]'s operations
+/// and [`SharedFutexWaiter`](shared::SharedFutexWaiter) operations.
 #[derive(Debug, Error)]
 pub enum FutexError {
     #[error("address not correctly aligned to 4-bytes")]
@@ -182,11 +182,8 @@ pub enum FutexError {
     WaitError(WaitError),
     #[error("fault reading futex word")]
     Fault,
-    /// The broker backing a futex in shared memory ran out of objects or memory.
     #[error("futex backing resources exhausted")]
     ResourceExhausted,
-    /// The broker backing a futex in shared memory failed, or its association with this
-    /// process did.
     #[error("futex backing broker failed")]
     Io,
 }

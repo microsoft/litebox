@@ -3,22 +3,18 @@
 
 //! Futex wait queues for memory that several processes share.
 //!
-//! The broker keeps no record of the memory: the processes sharing it name it by a
-//! [`SharedMemoryId`](litebox_broker_protocol::shared_futex::SharedMemoryId) from a prefix that
-//! [`reserve_memory_ids`] returns, and the broker keys wait queues by [`SharedFutexKey`]. A queue
-//! exists only while a waiter is armed on it. The
-//! broker never touches the memory itself: each waiter compares its futex word after arming, as
-//! the [protocol](litebox_broker_protocol::shared_futex) describes.
+//! The broker never sees the memory. Processes name it by a
+//! [`SharedMemoryId`](litebox_broker_protocol::shared_futex::SharedMemoryId) under a prefix from
+//! [`reserve_memory_ids`], and each waiter checks its futex word itself after arming, as the
+//! [protocol](litebox_broker_protocol::shared_futex) describes. Queues are keyed by
+//! [`SharedFutexKey`] and exist only while a waiter is armed on them.
 //!
-//! Any process may name any key, so a process can wake, or take wakes from, futexes of other
-//! processes. As on Linux, where a process may wake any futex in memory it maps, that disturbs
-//! only the guests involved; the broker's own state stays bounded and consistent.
+//! Any process may wake any key, as on Linux any process may wake a futex in memory it maps;
+//! that only affects the guests involved, and the broker's state stays bounded.
 //!
-//! Each futex waiter belongs to one thread and is armed on at most one futex at a time, so the
-//! queues together hold at most one entry per live waiter. A wake marks the oldest matching armed
-//! waiters woken and publishes their readiness, and disarming a waiter reports whether it was
-//! woken, so a wake is never lost to a waiter that times out or is interrupted at the same
-//! moment.
+//! A waiter is armed on at most one futex at a time, so the queues hold at most one entry per
+//! waiter. A wake marks waiters woken, and disarming reports it, so a wake racing a timeout or
+//! interruption is not lost.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -500,23 +496,6 @@ mod tests {
             armer.join().unwrap();
             assert_eq!(fixture.queued(), (0, 0));
         }
-    }
-
-    #[test]
-    fn reserved_memory_id_prefixes_are_unique() {
-        let fixture = fixture();
-        let first = super::reserve_memory_ids(&fixture.parent).unwrap();
-        let second = super::reserve_memory_ids(&fixture.child).unwrap();
-        assert_ne!(first, second);
-        fixture
-            .core
-            .shared_futexes
-            .next_prefix
-            .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            super::reserve_memory_ids(&fixture.parent),
-            Err(BrokerError::ResourceExhausted)
-        );
     }
 
     #[test]

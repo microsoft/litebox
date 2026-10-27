@@ -148,8 +148,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     }
 }
 
-/// Observer that latches any notification and wakes a waiting thread, as
-/// [`WaitContext::wait_on_events`] uses.
+/// Observer that records any notification and wakes the waiting thread.
 pub(crate) struct PolleeObserver<Platform: RawSyncPrimitivesProvider> {
     ready: AtomicBool,
     waker: super::wait::Waker<Platform>,

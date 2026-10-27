@@ -1,0 +1,426 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Implementation of the `futex` syscall.
+
+use core::num::NonZeroU32;
+
+use litebox::event::wait::WaitContext;
+use litebox::sync::futex::shared::{SharedFutexError, SharedFutexWaiter};
+use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
+use litebox_common_linux::errno::Errno;
+use litebox_common_linux::vmem::MappingError;
+use litebox_common_linux::{ClockId, FutexArgs, FutexFlags};
+
+use crate::wait::wait_errno;
+use crate::{ShimPlatform, Task, UserPtrMut};
+
+impl<Platform: ShimPlatform> Task<Platform> {
+    /// Handle syscall `futex`
+    pub(crate) fn sys_futex(&self, arg: FutexArgs) -> Result<usize, Errno> {
+        let res = match arg {
+            FutexArgs::Wake { addr, flags, count } => self.futex_wake(addr, &flags, count, None)?,
+            FutexArgs::WakeBitset {
+                addr,
+                flags,
+                count,
+                bitmask,
+            } => {
+                // Like Linux, an empty mask fails even when there is nothing to wake.
+                let bitmask = NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
+                self.futex_wake(addr, &flags, count, Some(bitmask))?
+            }
+            FutexArgs::Wait {
+                addr,
+                flags,
+                val,
+                timeout,
+            } => {
+                let timeout = timeout.read::<Platform>()?;
+                self.futex_wait(
+                    &self.wait_cx().with_timeout(timeout),
+                    addr,
+                    &flags,
+                    val,
+                    None,
+                )
+                .map_err(|error| wait_errno(timeout, error))?;
+                0
+            }
+            FutexArgs::WaitBitset {
+                addr,
+                flags,
+                val,
+                timeout,
+                bitmask,
+            } => {
+                let timeout = timeout.read::<Platform>()?;
+                let deadline = if let Some(timeout) = timeout {
+                    let clock_id = if flags.contains(FutexFlags::CLOCK_REALTIME) {
+                        ClockId::RealTime
+                    } else {
+                        ClockId::Monotonic
+                    };
+                    self.duration_since_epoch_to_deadline(clock_id, timeout)?
+                } else {
+                    None
+                };
+                // Like Linux, an empty mask fails rather than waiting for a wake that never comes.
+                let bitmask = NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
+                self.futex_wait(
+                    &self.wait_cx().with_deadline(deadline),
+                    addr,
+                    &flags,
+                    val,
+                    Some(bitmask),
+                )
+                .map_err(|error| wait_errno(timeout, error))?;
+                0
+            }
+            _ => unimplemented!("Unsupported futex operation"),
+        };
+        Ok(res)
+    }
+
+    /// Returns a new name for the memory of a shared anonymous mapping, or `None` without a
+    /// broker, as then no other process can share the memory either.
+    ///
+    /// Fails with [`MappingError::OutOfMemory`], as `mmap` reports any failure to back a mapping
+    /// with `ENOMEM`, if the broker fails.
+    pub(super) fn new_shared_memory_id(&self) -> Result<Option<SharedMemoryId>, MappingError> {
+        match self.global.shared_memory_ids.allocate(&self.global.litebox) {
+            Ok(id) => Ok(Some(id)),
+            Err(SharedFutexError::Unavailable) => Ok(None),
+            Err(_) => Err(MappingError::OutOfMemory),
+        }
+    }
+
+    /// Returns the key of the futex word at `addr` if a futex operation with `flags` on it spans
+    /// the processes that share the word's memory.
+    fn shared_futex_key_for(
+        &self,
+        addr: UserPtrMut<u32>,
+        flags: &FutexFlags,
+    ) -> Option<SharedFutexKey> {
+        if flags.contains(FutexFlags::PRIVATE) {
+            None
+        } else {
+            self.global.mm.shared_futex_key(addr.as_usize())
+        }
+    }
+
+    /// Wakes up to `count` waiters on the futex word at `addr` whose masks intersect `bitset`, or
+    /// all masks if it is `None`, among the shared or private futexes `flags` selects.
+    fn futex_wake(
+        &self,
+        addr: UserPtrMut<u32>,
+        flags: &FutexFlags,
+        count: u32,
+        bitset: Option<NonZeroU32>,
+    ) -> Result<usize, Errno> {
+        let Some(count) = NonZeroU32::new(count) else {
+            return Ok(0);
+        };
+        Ok(if let Some(key) = self.shared_futex_key_for(addr, flags) {
+            self.global.litebox.wake_shared_futex(key, count, bitset)? as usize
+        } else {
+            self.global
+                .futex_manager
+                .wake(addr.to_platform_ptr::<Platform>(), count, bitset)? as usize
+        })
+    }
+
+    /// Waits on the futex word at `addr` with the shared or private futexes `flags` selects.
+    fn futex_wait(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        addr: UserPtrMut<u32>,
+        flags: &FutexFlags,
+        val: u32,
+        bitset: Option<NonZeroU32>,
+    ) -> Result<(), Errno> {
+        let addr_ptr = addr.to_platform_ptr::<Platform>();
+        if let Some(key) = self.shared_futex_key_for(addr, flags) {
+            self.get_or_create_shared_futex_waiter()?
+                .wait(cx, key, addr_ptr, val, bitset)?;
+        } else {
+            self.global.futex_manager.wait(cx, addr_ptr, val, bitset)?;
+        }
+        Ok(())
+    }
+
+    /// Returns this thread's waiter for futexes in shared memory, creating it in the broker on
+    /// first use.
+    fn get_or_create_shared_futex_waiter(&self) -> Result<&SharedFutexWaiter<Platform>, Errno> {
+        if let Some(waiter) = self.shared_futex_waiter.get() {
+            return Ok(waiter);
+        }
+        let waiter = SharedFutexWaiter::new(&self.global.litebox).map_err(Errno::from)?;
+        Ok(self.shared_futex_waiter.get_or_init(|| waiter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::time::Duration;
+
+    use litebox_broker_protocol::shared_futex::SharedFutexKey;
+    use litebox_common_linux::errno::Errno;
+    use litebox_common_linux::{FutexArgs, FutexFlags, MapFlags, PAGE_SIZE, ProtFlags, TimeParam};
+
+    use crate::syscalls::tests::{TestPlatform, init_platform};
+    use crate::{Task, UserPtrMut};
+
+    fn map(task: &Task<TestPlatform>, pages: usize, flags: MapFlags) -> UserPtrMut<u8> {
+        task.sys_mmap(
+            0,
+            pages * PAGE_SIZE,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            flags | MapFlags::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn key(task: &Task<TestPlatform>, address: usize) -> Option<SharedFutexKey> {
+        task.global.mm.shared_futex_key(address)
+    }
+
+    fn word(address: usize) -> UserPtrMut<u32> {
+        UserPtrMut::from_usize(address)
+    }
+
+    fn wake(task: &Task<TestPlatform>, address: usize, flags: FutexFlags) -> usize {
+        task.sys_futex(FutexArgs::Wake {
+            addr: word(address),
+            flags,
+            count: u32::MAX,
+        })
+        .unwrap()
+    }
+
+    fn wait(
+        task: &Task<TestPlatform>,
+        address: usize,
+        val: u32,
+        flags: FutexFlags,
+        timeout_ms: Option<i32>,
+    ) -> Result<usize, Errno> {
+        task.sys_futex(FutexArgs::Wait {
+            addr: word(address),
+            flags,
+            val,
+            timeout: timeout_ms.map_or(TimeParam::None, TimeParam::Milliseconds),
+        })
+    }
+
+    /// Spawns a thread of `task`'s process that waits on the word at `address` with `flags`
+    /// until it is woken, and gives it time to arm its waiter.
+    fn spawn_waiter(
+        task: &Task<TestPlatform>,
+        address: usize,
+        flags: FutexFlags,
+    ) -> std::thread::JoinHandle<Result<usize, Errno>> {
+        let waiter = task.spawn_clone_for_test(move |task| wait(&task, address, 0, flags, None));
+        // The waiter cannot report when it sleeps, so give it time to.
+        std::thread::sleep(Duration::from_millis(100));
+        waiter
+    }
+
+    #[test]
+    fn shared_futex_in_shared_mapping_goes_through_broker() {
+        let task = init_platform();
+        let mapping = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
+        assert!(key(&task, private).is_none());
+        assert!(key(&task, private + 4).is_none());
+        let start = key(&task, mapping).unwrap();
+        assert_eq!(start.offset, 0);
+        assert_eq!(
+            key(&task, mapping + 8),
+            Some(SharedFutexKey {
+                memory: start.memory,
+                offset: 8
+            })
+        );
+        // A word must lie entirely within the mapping.
+        assert!(
+            key(&task, mapping + PAGE_SIZE - 4).is_some()
+                && key(&task, mapping + PAGE_SIZE - 2).is_none()
+        );
+
+        // Linux keys a private futex by address space and a shared one in shared memory by its
+        // backing object, so neither kind of wake reaches the other kind of waiter.
+        let waiter = spawn_waiter(&task, mapping + 8, FutexFlags::empty());
+        assert_eq!(wake(&task, mapping + 8, FutexFlags::PRIVATE), 0);
+        assert_eq!(wake(&task, mapping + 12, FutexFlags::empty()), 0);
+        assert_eq!(wake(&task, mapping + 8, FutexFlags::empty()), 1);
+        assert_eq!(waiter.join().unwrap(), Ok(0));
+
+        // A private waiter is woken only by a private wake.
+        let waiter = spawn_waiter(&task, mapping + 8, FutexFlags::PRIVATE);
+        assert_eq!(wake(&task, mapping + 8, FutexFlags::empty()), 0);
+        assert_eq!(wake(&task, mapping + 8, FutexFlags::PRIVATE), 1);
+        assert_eq!(waiter.join().unwrap(), Ok(0));
+    }
+
+    #[test]
+    fn each_shared_mapping_names_distinct_memory() {
+        let task = init_platform();
+        let first = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let second = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let (first, second) = (key(&task, first).unwrap(), key(&task, second).unwrap());
+        assert_ne!(first.memory, second.memory);
+        // Even when adjacent, distinct mappings stay distinct memory, each from offset zero.
+        assert_eq!((first.offset, second.offset), (0, 0));
+    }
+
+    #[test]
+    fn shared_futex_wait_checks_value_and_times_out() {
+        let task = init_platform();
+        let mapping = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        word(mapping).write_at_offset::<TestPlatform>(0, 1).unwrap();
+        assert_eq!(
+            wait(&task, mapping, 0, FutexFlags::empty(), None),
+            Err(Errno::EAGAIN)
+        );
+        assert_eq!(
+            wait(&task, mapping, 1, FutexFlags::empty(), Some(50)),
+            Err(Errno::ETIMEDOUT)
+        );
+        // The timed-out waiter left the queue, and the thread's waiter can be reused.
+        assert_eq!(wake(&task, mapping, FutexFlags::empty()), 0);
+        assert_eq!(
+            wait(&task, mapping, 1, FutexFlags::empty(), Some(10)),
+            Err(Errno::ETIMEDOUT)
+        );
+    }
+
+    #[test]
+    fn bitset_wakes_select_intersecting_masks_and_reject_empty_ones() {
+        let task = init_platform();
+        let shared = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
+        let wake_bitset = |address: usize, bitmask: u32| {
+            task.sys_futex(FutexArgs::WakeBitset {
+                addr: word(address),
+                flags: FutexFlags::empty(),
+                count: u32::MAX,
+                bitmask,
+            })
+        };
+        for address in [shared, private] {
+            assert_eq!(wake_bitset(address, 0), Err(Errno::EINVAL));
+            assert_eq!(
+                task.sys_futex(FutexArgs::WaitBitset {
+                    addr: word(address),
+                    flags: FutexFlags::empty(),
+                    val: 0,
+                    timeout: TimeParam::None,
+                    bitmask: 0,
+                }),
+                Err(Errno::EINVAL)
+            );
+            let waiter = task.spawn_clone_for_test(move |task| {
+                task.sys_futex(FutexArgs::WaitBitset {
+                    addr: word(address),
+                    flags: FutexFlags::empty(),
+                    val: 0,
+                    timeout: TimeParam::None,
+                    bitmask: 0b01,
+                })
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(wake_bitset(address, 0b10), Ok(0));
+            assert_eq!(wake_bitset(address, 0b11), Ok(1));
+            assert_eq!(waiter.join().unwrap(), Ok(0));
+        }
+    }
+
+    #[test]
+    fn splitting_a_mapping_keeps_its_futex_keys() {
+        let task = init_platform();
+        let mapping = map(&task, 3, MapFlags::MAP_SHARED);
+        let start = mapping.as_usize();
+        let memory = key(&task, start).unwrap().memory;
+        let tail = SharedFutexKey {
+            memory,
+            offset: 2 * PAGE_SIZE as u64 + 4,
+        };
+
+        // Changing the protection of the middle page splits the mapping, and changing it back
+        // joins it again.
+        let middle = UserPtrMut::from_usize(start + PAGE_SIZE);
+        task.sys_mprotect(middle, PAGE_SIZE, ProtFlags::PROT_READ)
+            .unwrap();
+        assert_eq!(key(&task, start + 2 * PAGE_SIZE + 4), Some(tail));
+        task.sys_mprotect(
+            middle,
+            PAGE_SIZE,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+        )
+        .unwrap();
+        assert_eq!(key(&task, start + 2 * PAGE_SIZE + 4), Some(tail));
+
+        task.sys_munmap(middle, PAGE_SIZE).unwrap();
+        assert!(key(&task, start + PAGE_SIZE).is_none());
+        assert_eq!(key(&task, start + 2 * PAGE_SIZE + 4), Some(tail));
+        task.sys_munmap(mapping, 3 * PAGE_SIZE).unwrap();
+        assert!(key(&task, start + 2 * PAGE_SIZE).is_none());
+    }
+
+    #[test]
+    fn replacing_a_mapping_replaces_its_memory() {
+        let task = init_platform();
+        let start = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let memory = key(&task, start).unwrap().memory;
+        let remap = |flags: MapFlags| {
+            task.sys_mmap(
+                start,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                flags | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED,
+                -1,
+                0,
+            )
+            .unwrap()
+        };
+        assert_eq!(remap(MapFlags::MAP_SHARED).as_usize(), start);
+        assert_ne!(key(&task, start).unwrap().memory, memory);
+        assert_eq!(remap(MapFlags::MAP_PRIVATE).as_usize(), start);
+        assert!(key(&task, start).is_none());
+    }
+
+    #[test]
+    fn broker_failure_wakes_shared_futex_waiter_with_error() {
+        let task = init_platform();
+        let mapping = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let waiter = spawn_waiter(&task, mapping, FutexFlags::empty());
+        task.global.litebox.broker_failure_dispatcher()();
+        assert_eq!(waiter.join().unwrap(), Err(Errno::EIO));
+    }
+
+    #[test]
+    fn misaligned_shared_futex_fails_with_einval() {
+        let task = init_platform();
+        let mapping = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        // The word lies within the mapping, so only its alignment is wrong.
+        let misaligned = mapping + 2;
+        assert!(key(&task, misaligned).is_some());
+        assert_eq!(
+            task.sys_futex(FutexArgs::Wake {
+                addr: word(misaligned),
+                flags: FutexFlags::empty(),
+                count: 1,
+            }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            wait(&task, misaligned, 0, FutexFlags::empty(), Some(10)),
+            Err(Errno::EINVAL)
+        );
+    }
+}

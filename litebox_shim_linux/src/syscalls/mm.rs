@@ -40,8 +40,6 @@ pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) 
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    /// Creates a mapping, naming the memory of a shared anonymous mapping, which keys its
-    /// futexes.
     pub(crate) fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
@@ -56,7 +54,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             None
         };
         let fixed_start = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED));
-        self.global.mm.do_mmap(
+        let addr = self.global.mm.do_mmap(
             suggested_addr,
             len,
             prot,
@@ -65,14 +63,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
                 allowed_range: None,
             },
-            shared_memory,
             |pointer| {
                 if let Some(start) = fixed_start {
                     self.clear_file_mappings_for_range(start, len);
                 }
                 op(pointer)
             },
-        )
+        )?;
+        if let Some(memory) = shared_memory {
+            self.global
+                .mm
+                .set_shared_memory(addr.as_usize()..addr.as_usize() + len, memory);
+        }
+        Ok(addr)
     }
 
     /// Map a file, applying runtime ELF syscall patching to the new mapping.

@@ -113,9 +113,6 @@ where
     ///
     /// `allowed_range` optionally restricts placement of the entire mapping.
     ///
-    /// `shared_memory`, if given, names the memory that shared anonymous pages map from their
-    /// start.
-    ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
     /// # Safety
@@ -125,10 +122,6 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each parameter configures the mapping"
-    )]
     unsafe fn create_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -136,33 +129,22 @@ where
         flags: CreatePagesFlags,
         permissions: (MemoryRegionPermissions, MemoryRegionPermissions),
         allowed_range: Option<Range<usize>>,
-        shared_memory: Option<SharedMemoryId>,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let (before_perms, after_perms) = permissions;
-        let addr = {
-            let mut vmem = self.vmem.write();
-            // SAFETY: The caller authorizes any replacements.
-            let addr = unsafe {
-                vmem.create_pages(
-                    suggested_address,
-                    length,
-                    flags,
-                    before_perms,
-                    allowed_range,
-                )
-            }?;
-            if let Some(memory) = shared_memory {
-                vmem.name_shared_memory(
-                    addr.as_usize()..addr.as_usize() + length.as_usize(),
-                    memory,
-                );
-            }
-            addr
-        };
+        // SAFETY: The caller authorizes any replacements.
+        let addr = unsafe {
+            self.vmem.write().create_pages(
+                suggested_address,
+                length,
+                flags,
+                before_perms,
+                allowed_range,
+            )
+        }?;
         let range = PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize())
             .expect("successful mapping must return an aligned, non-empty range");
         // call the user function with the pages
@@ -217,7 +199,6 @@ where
                     permissions,
                 ),
                 allowed_range,
-                None,
                 op,
             )
         }
@@ -260,7 +241,6 @@ where
                     MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
                 ),
                 None,
-                None,
                 op,
             )
         }
@@ -292,17 +272,7 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        unsafe {
-            self.create_pages(
-                suggested_address,
-                length,
-                flags,
-                (perms, perms),
-                None,
-                None,
-                op,
-            )
-        }
+        unsafe { self.create_pages(suggested_address, length, flags, (perms, perms), None, op) }
     }
 
     /// Create read-only pages.
@@ -341,7 +311,6 @@ where
                     // keep READ, turn off WRITE
                     MemoryRegionPermissions::READ,
                 ),
-                None,
                 None,
                 op,
             )
@@ -383,7 +352,6 @@ where
                     MemoryRegionPermissions::empty(),
                 ),
                 None,
-                None,
                 op,
             )
         }
@@ -416,7 +384,6 @@ where
                 length,
                 flags,
                 (perms, perms),
-                None,
                 None,
                 |_| Ok(0),
             )
@@ -674,6 +641,12 @@ where
             .read()
             .iter()
             .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
+    }
+
+    /// Records that the shared anonymous mapping just created at `range` maps `memory` from its
+    /// start, so that [`Self::shared_futex_key`] keys its futexes by it.
+    pub fn set_shared_memory(&self, range: Range<usize>, memory: SharedMemoryId) {
+        self.vmem.write().set_shared_memory(range, memory);
     }
 
     /// Returns the key of the futex word at `address` if a mapping of named shared memory, which
@@ -935,24 +908,16 @@ where
     /// Creates an anonymous or file-backed mapping with Linux `mmap` semantics.
     ///
     /// `placement` controls the allocation direction and optional address bounds.
-    /// `shared_memory`, if given, names the memory a shared anonymous mapping maps from its
-    /// start, so that [`Self::shared_futex_key`] keys its futexes by it.
     /// `op` initializes the mapping while it is writable;
     /// its error removes the new mapping. A file-backed mapping is expected to be filled with the
     /// file's contents from its start, so the platform is hinted to back it with larger pages.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each parameter configures the mapping"
-    )]
     pub fn do_mmap(
         &self,
-
         suggested_addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
         placement: MmapPlacement,
-        shared_memory: Option<SharedMemoryId>,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let mut flags = CreatePagesFlags::from(flags);
@@ -995,7 +960,6 @@ where
                 flags,
                 (before, permissions),
                 placement.allowed_range,
-                shared_memory,
                 op,
             )
         }

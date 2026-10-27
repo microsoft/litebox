@@ -728,13 +728,15 @@ where
         self.vmas.iter()
     }
 
-    /// Names the shared memory that the shared anonymous mapping just created at `range` maps
-    /// from its start.
-    pub(super) fn name_shared_memory(&mut self, range: Range<usize>, memory: SharedMemoryId) {
-        let Some(&vma) = self.vmas.get(&range.start) else {
+    /// Records that the shared anonymous mapping just created at `range` maps `memory` from its
+    /// start, unless another mapping has since replaced any of it.
+    pub(super) fn set_shared_memory(&mut self, range: Range<usize>, memory: SharedMemoryId) {
+        let Some((mapped, &vma)) = self.vmas.get_key_value(&range.start) else {
             return;
         };
-        debug_assert!(vma.is_shared_anonymous());
+        if mapped.end < range.end || !vma.is_shared_anonymous() || vma.shared_memory.is_some() {
+            return;
+        }
         self.vmas.insert(
             range.clone(),
             VmArea {

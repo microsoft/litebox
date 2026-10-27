@@ -5,7 +5,7 @@
 //!
 //! Processes that share memory, such as a Linux `MAP_SHARED | MAP_ANONYMOUS` mapping that native
 //! fork children inherit, name it by a [`SharedMemoryId`] that its creator draws from
-//! [`SharedMemoryIds`], and a futex word in it by a [`SharedFutexKey`]. The broker keys futex wait
+//! [`SharedMemoryIdAllocator`], and a futex word in it by a [`SharedFutexKey`]. The broker keys futex wait
 //! queues by that key, so [`LiteBox::wake_shared_futex`] in any process reaches the threads
 //! waiting with [`SharedFutexWaiter::wait`] in every process.
 //!
@@ -26,7 +26,7 @@ use thiserror::Error;
 use crate::LiteBox;
 use crate::broker::error::BrokerObjectError;
 use crate::broker::{BrokerControl, BrokerPollableRegistry};
-use crate::event::wait::{WaitContext, Waker};
+use crate::event::wait::WaitContext;
 use crate::event::{
     Events,
     observer::Observer,
@@ -59,19 +59,19 @@ pub enum SharedFutexError {
 /// Each ID is a prefix that the broker reserves once per allocator, followed by a counter. A
 /// process that duplicates its memory, as native fork does, must give the duplicate a new
 /// allocator, so that the two use different prefixes.
-pub struct SharedMemoryIds {
+pub struct SharedMemoryIdAllocator {
     /// The reserved prefix, plus one, or zero until it is reserved.
     prefix: AtomicU64,
     next: AtomicU64,
 }
 
-impl Default for SharedMemoryIds {
+impl Default for SharedMemoryIdAllocator {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedMemoryIds {
+impl SharedMemoryIdAllocator {
     /// Creates an allocator that reserves its prefix on first use.
     pub const fn new() -> Self {
         Self {
@@ -151,22 +151,16 @@ pub struct SharedFutexWaiter<Platform: RawSyncPrimitivesProvider + TimeProvider>
     handle: ObjectHandle,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     /// Kept alive for the pollable registry, which holds it weakly.
-    _pollee: Arc<Pollee<Platform>>,
-    /// Records wake notifications, including those that arrive before the thread sleeps.
-    latch: Arc<PolleeObserver<Platform>>,
+    pollee: Arc<Pollee<Platform>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platform> {
-    /// Creates a waiter for the thread that `waker` wakes, which must be the only thread that
-    /// waits with it.
+    /// Creates a waiter, with which only one thread may wait at a time.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error.
-    pub fn new(
-        litebox: &LiteBox<Platform>,
-        waker: &Waker<Platform>,
-    ) -> Result<Self, SharedFutexError> {
+    pub fn new(litebox: &LiteBox<Platform>) -> Result<Self, SharedFutexError> {
         let broker = litebox
             .broker_control()
             .ok_or(SharedFutexError::Unavailable)?;
@@ -175,18 +169,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
             .map_err(BrokerObjectError::from)?;
         let pollable_registry = litebox.broker_pollable_registry();
         let pollee = Arc::new(Pollee::new());
-        let latch = Arc::new(PolleeObserver::new(waker.clone()));
-        pollee.register_observer(
-            Arc::downgrade(&latch) as alloc::sync::Weak<dyn Observer<Events>>,
-            Events::all(),
-        );
         pollable_registry.register_pollable(handle, &pollee);
         Ok(Self {
             broker,
             handle,
             pollable_registry,
-            _pollee: pollee,
-            latch,
+            pollee,
         })
     }
 
@@ -222,13 +210,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
         let matches = || -> Result<bool, FutexError> {
             Ok(futex_addr.read_at_offset(0).ok_or(FutexError::Fault)? == expected_value)
         };
+        // Records wake notifications, including those that arrive before the thread sleeps.
+        let observer = Arc::new(PolleeObserver::new(cx.waker().clone()));
+        self.pollee.register_observer(
+            Arc::downgrade(&observer) as alloc::sync::Weak<dyn Observer<Events>>,
+            Events::all(),
+        );
         loop {
             if !matches()? {
                 return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
             }
             // A notification from an earlier wait may still arrive and wake this one
             // spuriously, which disarming detects.
-            self.latch.reset();
+            observer.reset();
             self.broker
                 .futex_arm(key, bitset, self.handle)
                 .map_err(BrokerObjectError::from)?;
@@ -244,7 +238,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
                     return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
                 }
             }
-            let waited = cx.wait_until(|| self.latch.is_ready());
+            let waited = cx.wait_until(|| observer.is_ready());
             if self.disarm_and_take_woken()? {
                 return Ok(());
             }

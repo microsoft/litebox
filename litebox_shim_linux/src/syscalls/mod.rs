@@ -6,13 +6,13 @@
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub mod file;
+pub(crate) mod futex;
 pub(crate) mod inet;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
 pub(crate) mod pipe;
 pub mod process;
-pub(crate) mod shared_futex;
 pub(crate) mod timerfd;
 pub(crate) mod unix;
 

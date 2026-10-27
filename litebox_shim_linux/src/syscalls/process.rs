@@ -4,7 +4,6 @@
 //! Process/thread related syscalls.
 
 use crate::syscalls::signal::{child_termination, siginfo_child, siginfo_kill_from};
-use crate::wait::wait_errno;
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
@@ -40,8 +39,8 @@ use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
-    errno::Errno, program_startup::LinuxProgramStartup,
+    ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam, errno::Errno,
+    program_startup::LinuxProgramStartup,
 };
 use litebox_common_linux::{
     PAGE_SIZE,
@@ -2207,7 +2206,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// If the time is so far in the future that it cannot be represented as an
     /// `Instant`, returns `Ok(None)`. If the time occurs in the past, returns
     /// the current time.
-    fn duration_since_epoch_to_deadline(
+    pub(super) fn duration_since_epoch_to_deadline(
         &self,
         clock_id: litebox_common_linux::ClockId,
         duration: Duration,
@@ -2735,149 +2734,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
         cpuset.iter_mut().for_each(|mut b| *b = true);
         CpuSet { bits: cpuset }
-    }
-}
-
-impl<Platform: ShimPlatform> Task<Platform> {
-    /// Handle syscall `futex`
-    ///
-    /// A futex without `FUTEX_PRIVATE_FLAG` in a shared anonymous mapping
-    /// spans every process that shares the mapping; every other futex is private to this
-    /// process, as Linux keys a shared futex in private memory by its address.
-    pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
-        let res = match arg {
-            FutexArgs::Wake { addr, flags, count } => self.futex_wake(addr, &flags, count, None)?,
-            FutexArgs::WakeBitset {
-                addr,
-                flags,
-                count,
-                bitmask,
-            } => {
-                // Like Linux, an empty mask fails even when there is nothing to wake.
-                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
-                self.futex_wake(addr, &flags, count, Some(bitmask))?
-            }
-            FutexArgs::Wait {
-                addr,
-                flags,
-                val,
-                timeout,
-            } => {
-                let timeout = timeout.read::<Platform>()?;
-                self.futex_wait(
-                    &self.wait_cx().with_timeout(timeout),
-                    addr,
-                    &flags,
-                    val,
-                    None,
-                )
-                .map_err(|error| wait_errno(timeout, error))?;
-                0
-            }
-            litebox_common_linux::FutexArgs::WaitBitset {
-                addr,
-                flags,
-                val,
-                timeout,
-                bitmask,
-            } => {
-                let timeout = timeout.read::<Platform>()?;
-                let deadline = if let Some(timeout) = timeout {
-                    let clock_id =
-                        if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
-                            litebox_common_linux::ClockId::RealTime
-                        } else {
-                            litebox_common_linux::ClockId::Monotonic
-                        };
-                    self.duration_since_epoch_to_deadline(clock_id, timeout)?
-                } else {
-                    None
-                };
-                // Like Linux, an empty mask fails rather than waiting for a wake that never comes.
-                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
-                self.futex_wait(
-                    &self.wait_cx().with_deadline(deadline),
-                    addr,
-                    &flags,
-                    val,
-                    Some(bitmask),
-                )
-                .map_err(|error| wait_errno(timeout, error))?;
-                0
-            }
-            _ => unimplemented!("Unsupported futex operation"),
-        };
-        Ok(res)
-    }
-
-    /// Returns the key of the futex word at `addr` if a futex operation with `flags` on it spans
-    /// the processes that share the word's memory.
-    fn shared_futex_key_for(
-        &self,
-        addr: UserPtrMut<u32>,
-        flags: &litebox_common_linux::FutexFlags,
-    ) -> Option<litebox_broker_protocol::shared_futex::SharedFutexKey> {
-        if flags.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-            None
-        } else {
-            self.global.mm.shared_futex_key(addr.as_usize())
-        }
-    }
-
-    /// Wakes up to `count` waiters on the futex word at `addr` whose masks intersect `bitset`, or
-    /// all masks if it is `None`, among the shared or private futexes `flags` selects.
-    fn futex_wake(
-        &self,
-        addr: UserPtrMut<u32>,
-        flags: &litebox_common_linux::FutexFlags,
-        count: u32,
-        bitset: Option<core::num::NonZeroU32>,
-    ) -> Result<usize, Errno> {
-        let Some(count) = core::num::NonZeroU32::new(count) else {
-            return Ok(0);
-        };
-        Ok(if let Some(key) = self.shared_futex_key_for(addr, flags) {
-            self.global.litebox.wake_shared_futex(key, count, bitset)? as usize
-        } else {
-            self.global
-                .futex_manager
-                .wake(addr.to_platform_ptr::<Platform>(), count, bitset)? as usize
-        })
-    }
-
-    /// Waits on the futex word at `addr` with the shared or private futexes `flags` selects.
-    fn futex_wait(
-        &self,
-        cx: &litebox::event::wait::WaitContext<'_, Platform>,
-        addr: UserPtrMut<u32>,
-        flags: &litebox_common_linux::FutexFlags,
-        val: u32,
-        bitset: Option<core::num::NonZeroU32>,
-    ) -> Result<(), Errno> {
-        let addr_ptr = addr.to_platform_ptr::<Platform>();
-        if let Some(key) = self.shared_futex_key_for(addr, flags) {
-            self.get_or_create_shared_futex_waiter()?
-                .wait(cx, key, addr_ptr, val, bitset)?;
-        } else {
-            self.global.futex_manager.wait(cx, addr_ptr, val, bitset)?;
-        }
-        Ok(())
-    }
-
-    /// Returns this thread's waiter for futexes in shared memory, creating it in the broker on
-    /// first use.
-    fn get_or_create_shared_futex_waiter(
-        &self,
-    ) -> Result<&litebox::sync::futex::shared::SharedFutexWaiter<Platform>, Errno> {
-        if let Some(waiter) = self.shared_futex_waiter.get() {
-            return Ok(waiter);
-        }
-        let waiter = litebox::sync::futex::shared::SharedFutexWaiter::new(
-            &self.global.litebox,
-            self.wait_cx().waker(),
-        )
-        .map_err(Errno::from)?;
-        Ok(self.shared_futex_waiter.get_or_init(|| waiter))
     }
 }
 
