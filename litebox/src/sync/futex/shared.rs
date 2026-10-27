@@ -4,10 +4,10 @@
 //! Futexes in memory that several processes share.
 //!
 //! Processes that share memory, such as a Linux `MAP_SHARED | MAP_ANONYMOUS` mapping that native
-//! fork children inherit, name it by a [`SharedMemoryId`] that its creator draws from
-//! [`SharedMemoryIdAllocator`], and a futex word in it by a [`SharedFutexKey`]. The broker keys futex wait
-//! queues by that key, so [`LiteBox::wake_shared_futex`] in any process reaches the threads
-//! waiting with [`SharedFutexWaiter::wait`] in every process.
+//! fork children inherit, name it by a [`SharedMemoryId`] that its creator gets from
+//! [`LiteBox::allocate_shared_memory_id`], and a futex word in it by a [`SharedFutexKey`]. The
+//! broker keys futex wait queues by that key, so [`LiteBox::wake_shared_futex`] in any process
+//! reaches the threads waiting with [`SharedFutexWaiter::wait`] in every process.
 //!
 //! Each waiting thread owns a [`SharedFutexWaiter`]. A wait arms it in the broker, re-checks the
 //! futex word, and sleeps until the broker publishes a wake for it or the wait times out or is
@@ -40,7 +40,7 @@ use crate::event::{
     polling::{Pollee, PolleeObserver},
 };
 use crate::platform::{RawConstPointer as _, RawPointerProvider};
-use crate::sync::RawSyncPrimitivesProvider;
+use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 /// Errors from the broker behind futexes in shared memory.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -63,95 +63,66 @@ pub enum SharedFutexError {
 
 /// Allocates the [`SharedMemoryId`]s of memory this process creates.
 ///
-/// The IDs come from a block that the broker reserves on first use, and again after each
-/// [`Self::retire_block`]. The broker lets a process name the blocks it reserved, and those its
-/// creator had reserved when creating it. So a process must call [`Self::retire_block`] after
-/// creating another, so that memory it creates later takes its IDs from a block reserved after
-/// the new process was created, which the new process cannot name. A process that duplicates its
-/// memory, as native fork does, must give the duplicate a new allocator.
-pub struct SharedMemoryIdAllocator {
-    state: spin::Mutex<AllocatorState>,
+/// The IDs come from a block that the broker reserves on first use, and again after each process
+/// this process creates. The broker lets a process name the blocks it reserved, and those its
+/// creator could name when creating it, so memory created after a process must take its IDs from
+/// a block reserved after it, which that process cannot name. Each [`LiteBox`] has its own
+/// allocator, so a process that duplicates its memory, as native fork does, gives the duplicate a
+/// new one with its new [`LiteBox`].
+pub(crate) struct SharedMemoryIdAllocator<Platform: RawSyncPrimitivesProvider> {
+    /// The next ID to allocate, or `None` if the next allocation must reserve a block.
+    ///
+    /// Held while allocating and while creating a process, so that no ID is allocated from a
+    /// block that a process created meanwhile may name.
+    next: Mutex<Platform, Option<SharedMemoryId>>,
 }
 
-struct AllocatorState {
-    /// The first ID of the current block, and how many of its IDs were allocated, once reserved.
-    block: Option<(SharedMemoryId, u64)>,
-    /// How many times the block was retired.
-    retirements: u64,
-}
-
-impl Default for SharedMemoryIdAllocator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SharedMemoryIdAllocator {
+impl<Platform: RawSyncPrimitivesProvider> SharedMemoryIdAllocator<Platform> {
     /// Creates an allocator that reserves its block on first use.
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            state: spin::Mutex::new(AllocatorState {
-                block: None,
-                retirements: 0,
-            }),
+            next: Mutex::new(None),
         }
     }
 
-    /// Returns an ID that no other shared memory uses.
+    /// Returns an ID that no other shared memory uses, reserving a block with `broker` if
+    /// needed.
+    fn allocate(&self, broker: &dyn BrokerControl) -> Result<SharedMemoryId, SharedFutexError> {
+        let mut next = self.next.lock();
+        let id = match *next {
+            Some(id) => id,
+            None => broker
+                .reserve_shared_memory_ids()
+                .map_err(BrokerObjectError::from)?,
+        };
+        *next = id.next_in_block();
+        Ok(id)
+    }
+
+    /// Creates a process with `create`, after which IDs come from a block reserved afterwards.
+    pub(crate) fn create_process<T>(&self, create: impl FnOnce() -> T) -> T {
+        let mut next = self.next.lock();
+        let created = create();
+        *next = None;
+        created
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
+    /// Returns a name for memory this process creates, which no other shared memory uses, and
+    /// which this process and the processes it creates from now on may name.
     ///
     /// Fails with [`SharedFutexError::Unavailable`] without a broker, as then no other process
-    /// can share the memory either, and with [`SharedFutexError::ResourceExhausted`] once the
-    /// block is used up.
+    /// can share the memory either, and with [`SharedFutexError::ResourceExhausted`],
+    /// [`SharedFutexError::PermissionDenied`], or [`SharedFutexError::Io`] if the broker cannot
+    /// reserve a block of names.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error.
-    pub fn allocate<Platform: RawSyncPrimitivesProvider>(
-        &self,
-        litebox: &LiteBox<Platform>,
-    ) -> Result<SharedMemoryId, SharedFutexError> {
-        loop {
-            let retirements = {
-                let mut state = self.state.lock();
-                if let Some(block) = state.block.as_mut() {
-                    return Self::next_in_block(block);
-                }
-                state.retirements
-            };
-            let broker = litebox
-                .broker_control()
-                .ok_or(SharedFutexError::Unavailable)?;
-            // Reserved without holding the lock, so concurrent first uses may each reserve a
-            // block; one is kept.
-            let reserved = broker
-                .reserve_shared_memory_ids()
-                .map_err(BrokerObjectError::from)?;
-            let mut state = self.state.lock();
-            // A block reserved while the block was retired may be one that a process created
-            // meanwhile can name.
-            if state.retirements == retirements {
-                return Self::next_in_block(state.block.get_or_insert((reserved, 0)));
-            }
-        }
-    }
-
-    /// Makes later IDs come from a block reserved after this call, which the processes created
-    /// before it cannot name.
-    pub fn retire_block(&self) {
-        let mut state = self.state.lock();
-        state.block = None;
-        state.retirements = state.retirements.wrapping_add(1);
-    }
-
-    /// Allocates the next ID of the block whose first ID and number of allocated IDs are
-    /// `block`, failing with [`SharedFutexError::ResourceExhausted`] once it is used up.
-    fn next_in_block(
-        (first, allocated): &mut (SharedMemoryId, u64),
-    ) -> Result<SharedMemoryId, SharedFutexError> {
-        let next = allocated
-            .checked_add(1)
-            .ok_or(SharedFutexError::ResourceExhausted)?;
-        Ok(first.nth_in_block(core::mem::replace(allocated, next)))
+    pub fn allocate_shared_memory_id(&self) -> Result<SharedMemoryId, SharedFutexError> {
+        let broker = self.broker_control().ok_or(SharedFutexError::Unavailable)?;
+        self.x.shared_memory_ids.allocate(&*broker)
     }
 }
 

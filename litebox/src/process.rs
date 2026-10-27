@@ -72,9 +72,15 @@ pub enum ProcessError {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Allocates one pending child process.
+    ///
+    /// Memory this process creates from now on is named by shared memory IDs that the child may
+    /// not name, so the child cannot reach its futexes.
     pub fn allocate_child_process(&self) -> Result<PendingChild, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        let identity = broker.allocate_child_process()?;
+        let identity = self
+            .x
+            .shared_memory_ids
+            .create_process(|| broker.allocate_child_process())?;
         Ok(PendingChild {
             broker,
             identity,

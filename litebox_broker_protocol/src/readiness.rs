@@ -3,12 +3,18 @@
 
 /// ABI-neutral broker object readiness flags.
 ///
-/// Unknown bits are preserved so protocol peers can ignore readiness kinds they
-/// do not understand.
+/// Unknown bits below [`Self::PAYLOAD_SHIFT`] are preserved so protocol peers
+/// can ignore readiness kinds they do not understand. The bits from
+/// [`Self::PAYLOAD_SHIFT`] up are not flags: they carry a payload whose meaning
+/// depends on the kind of object, such as a futex waiter's arm generation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadinessFlags(pub u32);
 
 impl ReadinessFlags {
+    /// Position of the lowest bit of the object-specific payload, above every
+    /// flag.
+    pub const PAYLOAD_SHIFT: u32 = 8;
+
     /// Data can be read without blocking.
     pub const READ: Self = Self(1 << 0);
     /// Data can be written without blocking.
@@ -64,5 +70,15 @@ mod tests {
         assert!(readiness.contains(ReadinessFlags::WRITE));
         assert!(readiness.contains(ReadinessFlags::READ | ReadinessFlags::WRITE));
         assert!(!readiness.contains(ReadinessFlags::ERROR));
+    }
+
+    #[test]
+    fn flags_stay_below_the_payload() {
+        let flags = ReadinessFlags::READ
+            | ReadinessFlags::WRITE
+            | ReadinessFlags::HANGUP
+            | ReadinessFlags::ERROR
+            | ReadinessFlags::CLOSED;
+        assert_eq!(flags.0 >> ReadinessFlags::PAYLOAD_SHIFT, 0);
     }
 }

@@ -88,7 +88,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Fails with [`MappingError::OutOfMemory`] if the broker cannot provide a name, as `mmap`
     /// reports any failure to back a mapping with `ENOMEM`.
     pub(super) fn allocate_shared_memory_id(&self) -> Result<Option<SharedMemoryId>, MappingError> {
-        match self.global.shared_memory_ids.allocate(&self.global.litebox) {
+        match self.global.litebox.allocate_shared_memory_id() {
             Ok(id) => Ok(Some(id)),
             Err(SharedFutexError::Unavailable) => Ok(None),
             Err(_) => Err(MappingError::OutOfMemory),
@@ -612,5 +612,46 @@ mod tests {
         let other = task.spawn_clone_for_test(move |task| take_turns(&task, 1));
         assert_eq!(take_turns(&task, 0), Ok(()));
         assert_eq!(other.join().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn shared_futex_wakes_racing_timeouts_are_each_reported_once() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const WAITS: usize = 300;
+        let task = init_platform();
+        let address = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let done = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let done = Arc::clone(&done);
+            task.spawn_clone_for_test(move |task| {
+                let mut woken = 0;
+                for _ in 0..WAITS {
+                    match wait(&task, address, 0, FutexFlags::empty(), Some(1)) {
+                        Ok(_) => woken += 1,
+                        Err(Errno::ETIMEDOUT) => {}
+                        Err(error) => panic!("unexpected wait failure: {error:?}"),
+                    }
+                }
+                done.store(true, Ordering::Release);
+                woken
+            })
+        };
+        let mut woken = 0;
+        while !done.load(Ordering::Acquire) {
+            woken += task
+                .sys_futex(FutexArgs::Wake {
+                    addr: word(address),
+                    flags: FutexFlags::empty(),
+                    count: 1,
+                })
+                .unwrap();
+            // Waking a little less often than waits time out makes wakes land as waits time out.
+            std::thread::sleep(Duration::from_micros(1500));
+        }
+        // A wake that selects a timing-out waiter must make that wait succeed, and a wait only
+        // succeeds if a wake selected it.
+        assert_eq!(waiter.join().unwrap(), woken);
     }
 }

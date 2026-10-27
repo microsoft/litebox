@@ -457,7 +457,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform: self.platform,
             mm: self.memory_manager,
             futex_manager: FutexManager::new(),
-            shared_memory_ids: litebox::sync::futex::shared::SharedMemoryIdAllocator::new(),
             boot_time: self.platform.now(),
             process_id: self.process_id,
             litebox,
@@ -1658,10 +1657,6 @@ struct GlobalState<Platform: ShimPlatform> {
     mm: Arc<MemoryManager<Platform>>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
-    /// Names the shared memory behind guest shared anonymous mappings, which keys their futexes.
-    ///
-    /// A native fork child gets its own, while inheriting the names of the parent's mappings.
-    shared_memory_ids: litebox::sync::futex::shared::SharedMemoryIdAllocator,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.

@@ -1445,7 +1445,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
         // Dropping the pending child on failure discards it.
-        let child = self.allocate_child_process()?;
+        let child = self
+            .global
+            .litebox
+            .allocate_child_process()
+            .map_err(Errno::from)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let handles = child.inherit(&objects).map_err(Errno::from)?;
@@ -1489,18 +1493,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         drop(pause);
         child.start(&payload).map_err(Errno::from)?;
         Ok(child_pid.cast_unsigned() as usize)
-    }
-
-    /// Allocates a pending child process, then retires the block of shared memory IDs that the
-    /// child may name, so that the child cannot reach the futexes of memory created afterwards.
-    fn allocate_child_process(&self) -> Result<litebox::process::PendingChild, Errno> {
-        let child = self
-            .global
-            .litebox
-            .allocate_child_process()
-            .map_err(Errno::from)?;
-        self.global.shared_memory_ids.retire_block();
-        Ok(child)
     }
 
     /// Writes the contents of each of `regions` that has contents to the pending `child`'s
@@ -1651,7 +1643,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return Err(Errno::EAGAIN);
         }
-        let child = self.allocate_child_process()?;
+        let child = self
+            .global
+            .litebox
+            .allocate_child_process()
+            .map_err(Errno::from)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
@@ -4538,7 +4534,10 @@ mod fork_tests {
                 .unwrap()
                 .unwrap()
                 .memory;
-            assert_ne!(created.block(), parent_memory.block());
+            assert_ne!(
+                (created.reserver(), created.block()),
+                (parent_memory.reserver(), parent_memory.block())
+            );
         });
     }
 
@@ -4570,7 +4569,7 @@ mod fork_tests {
         assert_eq!(map_shared().block(), first.block());
         // The broker lets the child name the blocks this process reserved so far, so memory
         // created from now on must come from another.
-        let child = task.allocate_child_process().unwrap();
+        let child = task.global.litebox.allocate_child_process().unwrap();
         let after = map_shared();
         assert_ne!(after.block(), first.block());
         drop(child);

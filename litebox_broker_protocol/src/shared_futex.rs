@@ -29,17 +29,15 @@ use crate::readiness::ReadinessFlags;
 /// again since.
 const FUTEX_WAITER_WOKEN: ReadinessFlags = ReadinessFlags::READ;
 
-/// Number of distinct futex waiter arm generations, which wrap around.
-pub const FUTEX_WAITER_GENERATIONS: u32 = 1 << 24;
-
-/// Position of the arm generation in the readiness of a woken futex waiter.
-const FUTEX_WAITER_GENERATION_SHIFT: u32 = 8;
+/// Number of distinct futex waiter arm generations, which wrap around: as many as the readiness
+/// payload holds.
+pub const FUTEX_WAITER_GENERATIONS: u32 = 1 << (u32::BITS - ReadinessFlags::PAYLOAD_SHIFT);
 
 /// Returns the readiness of a futex waiter that a wake selected while it was armed with
 /// `generation`, which must be less than [`FUTEX_WAITER_GENERATIONS`].
 #[must_use]
 pub const fn futex_waiter_woken_readiness(generation: u32) -> ReadinessFlags {
-    ReadinessFlags(FUTEX_WAITER_WOKEN.0 | generation << FUTEX_WAITER_GENERATION_SHIFT)
+    ReadinessFlags(FUTEX_WAITER_WOKEN.0 | generation << ReadinessFlags::PAYLOAD_SHIFT)
 }
 
 /// Returns the generation of the arm in which a wake selected a futex waiter with `readiness`,
@@ -47,7 +45,7 @@ pub const fn futex_waiter_woken_readiness(generation: u32) -> ReadinessFlags {
 #[must_use]
 pub const fn woken_futex_waiter_generation(readiness: ReadinessFlags) -> Option<u32> {
     if readiness.contains(FUTEX_WAITER_WOKEN) {
-        Some(readiness.0 >> FUTEX_WAITER_GENERATION_SHIFT)
+        Some(readiness.0 >> ReadinessFlags::PAYLOAD_SHIFT)
     } else {
         None
     }
@@ -62,32 +60,52 @@ pub const FUTEX_WORD_SIZE: u64 = 4;
 /// broker reserved for it, as [`ReserveMemoryIdsResponse`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SharedMemoryId(
-    /// The ID's value: a block's upper 64 bits, then a position in the block.
+    /// The ID's value: from the most significant bits, the [reserver](Self::reserver) of its
+    /// block (64 bits), the [block](Self::block)'s index among the reserver's blocks (32 bits),
+    /// and the ID's position in the block (32 bits).
     pub u128,
 );
 
 impl SharedMemoryId {
-    /// Returns the block the ID belongs to: its upper 64 bits.
+    /// Mask of the ID's position in its block.
+    const POSITION: u128 = u32::MAX as u128;
+
+    /// Returns the first ID of the block with index `block` among those of `reserver`.
     #[must_use]
-    pub const fn block(self) -> u64 {
+    pub const fn first_in_block(reserver: u64, block: u32) -> Self {
+        Self((reserver as u128) << 64 | (block as u128) << 32)
+    }
+
+    /// Returns the ID of the process that reserved the ID's block, which no other process the
+    /// broker creates shares.
+    #[must_use]
+    pub const fn reserver(self) -> u64 {
         (self.0 >> 64) as u64
     }
 
-    /// Returns the ID `index` places after `self` in its block, wrapping within the block.
+    /// Returns the index of the ID's block among those its [reserver](Self::reserver) reserved,
+    /// in the order it reserved them.
     #[must_use]
-    pub fn nth_in_block(self, index: u64) -> Self {
-        let position_mask = u128::from(u64::MAX);
-        let position = self.0.wrapping_add(u128::from(index)) & position_mask;
-        Self((self.0 & !position_mask) | position)
+    pub const fn block(self) -> u32 {
+        ((self.0 >> 32) & Self::POSITION) as u32
+    }
+
+    /// Returns the ID after this one in its block, or `None` if this is the block's last.
+    #[must_use]
+    pub const fn next_in_block(self) -> Option<Self> {
+        if self.0 & Self::POSITION == Self::POSITION {
+            None
+        } else {
+            Some(Self(self.0 + 1))
+        }
     }
 }
 
 /// Response to a request to reserve shared memory IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReserveMemoryIdsResponse {
-    /// First ID of the reserved block: the 2^64 IDs that share its upper 64 bits, which no other
-    /// reservation shares, and which only the reserving process and the processes it later
-    /// creates may name.
+    /// First ID of the reserved block, which the reserving process and the processes it creates
+    /// from now on may name.
     pub first: SharedMemoryId,
 }
 
@@ -109,8 +127,7 @@ pub struct CreateFutexWaiterResponse {
 
 /// Request to arm a futex waiter on a futex word in shared memory.
 ///
-/// The caller compares the futex word itself, after this request completes, and disarms the
-/// waiter if the word no longer holds the expected value.
+/// The broker does not read the futex word; the caller compares it after arming.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FutexArmRequest {
     /// Futex word to wait on.
@@ -179,17 +196,14 @@ mod tests {
     }
 
     #[test]
-    fn ids_in_a_block_wrap_without_leaving_it() {
-        let first = SharedMemoryId(7 << 64 | u128::from(u64::MAX - 1));
-        assert_eq!(first.nth_in_block(0), first);
-        assert_eq!(
-            first.nth_in_block(1),
-            SharedMemoryId(7 << 64 | u128::from(u64::MAX))
-        );
-        assert_eq!(first.nth_in_block(2), SharedMemoryId(7 << 64));
-        assert_eq!(
-            first.nth_in_block(u64::MAX),
-            SharedMemoryId(7 << 64 | u128::from(u64::MAX - 2))
-        );
+    fn ids_name_their_reserver_and_block_and_stay_in_it() {
+        let first = SharedMemoryId::first_in_block(u64::MAX, u32::MAX);
+        assert_eq!((first.reserver(), first.block()), (u64::MAX, u32::MAX));
+        let second = first.next_in_block().unwrap();
+        assert_eq!((second.reserver(), second.block()), (u64::MAX, u32::MAX));
+        assert_ne!(second, first);
+        let last = SharedMemoryId(first.0 | u128::from(u32::MAX));
+        assert_eq!(last.block(), u32::MAX);
+        assert_eq!(last.next_in_block(), None);
     }
 }

@@ -420,6 +420,44 @@ static int check_timeout(struct shared *shared) {
            futex(&shared->word, FUTEX_WAIT, 0, &timeout) == -1 && errno == EAGAIN;
 }
 
+static void ignore_signal(int signal) {
+    (void)signal;
+}
+
+// Like Linux, a signal whose handler does not restart system calls interrupts a shared wait with
+// EINTR, and the interrupted waiter is no longer queued, so a later wake finds no waiter.
+static int check_interrupted(struct shared *shared) {
+    atomic_store(&shared->word, 0);
+    atomic_store(&shared->value, 0);
+    pid_t child = fork();
+    if (child < 0) {
+        return 0;
+    }
+    if (child == 0) {
+        struct sigaction action = {.sa_handler = ignore_signal};
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGUSR1, &action, NULL) != 0) {
+            _exit(1);
+        }
+        atomic_store(&shared->value, 1);
+        struct timespec timeout = {.tv_sec = TIMEOUT_SECONDS};
+        int interrupted = futex(&shared->word, FUTEX_WAIT, 0, &timeout) == -1 && errno == EINTR;
+        atomic_store(&shared->value, 2);
+        _exit(interrupted && await_value(&shared->value, 3) ? 0 : 1);
+    }
+    // Signal until the wait ends, as a signal that arrives before the child waits is handled
+    // without interrupting it.
+    int ok = await_value(&shared->value, 1);
+    for (int attempt = 0; ok && atomic_load(&shared->value) != 2 && attempt < TIMEOUT_SECONDS * 100;
+         attempt++) {
+        kill(child, SIGUSR1);
+        sleep_ms(10);
+    }
+    ok = ok && atomic_load(&shared->value) == 2 && futex(&shared->word, FUTEX_WAKE, 1, NULL) == 0;
+    atomic_store(&shared->value, 3);
+    return reap(child, ok) == 0 && ok;
+}
+
 // Like any futex operation, one on a misaligned word fails, whether shared or private, and even
 // a wake of no waiters.
 static int check_misaligned(struct shared *shared) {
@@ -586,6 +624,10 @@ static int check_inaccessible(struct shared *shared) {
                                FUTEX_BITSET_MATCH_ANY) == 0;
         }
     }
+    // A wait faults like a wake, and a misaligned word fails before its mapping is looked at.
+    struct timespec timeout = {.tv_nsec = 10 * 1000000};
+    ok &= futex(word, FUTEX_WAIT, 0, &timeout) == -1 && errno == EFAULT;
+    ok &= futex((atomic_uint *)((char *)word + 2), FUTEX_WAKE, 1, NULL) == -1 && errno == EINVAL;
     sleep_ms(50);
     ok = ok && poll_waiter(&waiter) == 0;
     // Once accessible again, a wake reaches the waiter the failed wakes left waiting.
@@ -714,6 +756,7 @@ int main(void) {
     int memory = check_memory(shared);
     int wake = check_wake(shared, other);
     int timeout = check_timeout(shared);
+    int interrupted = check_interrupted(shared);
     int private = check_private(shared) &&
                   check_keyed(shared, FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAKE_PRIVATE) &&
                   check_keyed(shared, FUTEX_WAIT_PRIVATE, FUTEX_WAKE_PRIVATE, FUTEX_WAKE);
@@ -725,12 +768,13 @@ int main(void) {
     int inaccessible = check_inaccessible(shared);
     int private_memory = check_private_memory(shared);
     int clear_tid = check_clear_tid(shared);
-    printf("shared-futex memory=%d wake=%d timeout=%d private=%d mutex=%d semaphore=%d "
-           "bitset=%d misaligned=%d count=%d inaccessible=%d private-memory=%d clear-tid=%d\n",
-           memory, wake, timeout, private, mutex, semaphore, bitset, misaligned, count,
-           inaccessible, private_memory, clear_tid);
-    return memory && wake && timeout && private && mutex && semaphore && bitset && misaligned &&
-                   count && inaccessible && private_memory && clear_tid
+    printf("shared-futex memory=%d wake=%d timeout=%d interrupted=%d private=%d mutex=%d "
+           "semaphore=%d bitset=%d misaligned=%d count=%d inaccessible=%d private-memory=%d "
+           "clear-tid=%d\n",
+           memory, wake, timeout, interrupted, private, mutex, semaphore, bitset, misaligned,
+           count, inaccessible, private_memory, clear_tid);
+    return memory && wake && timeout && interrupted && private && mutex && semaphore && bitset &&
+                   misaligned && count && inaccessible && private_memory && clear_tid
                ? 0
                : 1;
 }

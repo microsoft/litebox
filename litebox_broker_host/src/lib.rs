@@ -2395,6 +2395,7 @@ mod tests {
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
         active_requests_operate_timers(&broker, &timer_provider);
+        active_requests_operate_shared_futexes(&broker);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequences_stage_unix_socket_data(&broker);
@@ -3257,6 +3258,84 @@ mod tests {
                 BrokerOperation::CloseObject(ObjectHandle(handle.0 + 1))
             ),
             BrokerResult::Error(ErrorCode::UnknownObject)
+        );
+    }
+
+    fn active_requests_operate_shared_futexes(broker: &BrokerCore) {
+        use litebox_broker_protocol::shared_futex::{
+            CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
+            FutexWakeRequest, FutexWakeResponse, ReserveMemoryIdsResponse, SharedFutexKey,
+        };
+
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let request =
+            |request| handle_test_request(&process, BrokerOperation::SharedFutex(request));
+        let response = request(SharedFutexRequest::ReserveMemoryIds);
+        let BrokerResult::SharedFutex(SharedFutexResponse::ReserveMemoryIds(
+            ReserveMemoryIdsResponse { first },
+        )) = response
+        else {
+            panic!("unexpected reserve response: {response:?}");
+        };
+        let response = request(SharedFutexRequest::CreateWaiter);
+        let BrokerResult::SharedFutex(SharedFutexResponse::CreateWaiter(
+            CreateFutexWaiterResponse { handle: waiter },
+        )) = response
+        else {
+            panic!("unexpected create response: {response:?}");
+        };
+        let key = SharedFutexKey {
+            memory: first,
+            offset: 4,
+        };
+        let arm = |key| {
+            request(SharedFutexRequest::Arm(FutexArmRequest {
+                key,
+                bitset: u32::MAX,
+                waiter,
+                generation: 0,
+            }))
+        };
+
+        assert_eq!(
+            arm(key),
+            BrokerResult::SharedFutex(SharedFutexResponse::Arm)
+        );
+        assert_eq!(
+            arm(key),
+            BrokerResult::Error(ErrorCode::UnsupportedOperation)
+        );
+        assert_eq!(
+            request(SharedFutexRequest::Wake(FutexWakeRequest {
+                key,
+                count: 1,
+                bitset: u32::MAX,
+            })),
+            BrokerResult::SharedFutex(SharedFutexResponse::Wake(FutexWakeResponse { woken: 1 }))
+        );
+        assert_eq!(
+            request(SharedFutexRequest::Disarm(FutexDisarmRequest { waiter })),
+            BrokerResult::SharedFutex(SharedFutexResponse::Disarm(FutexDisarmResponse {
+                woken: true
+            }))
+        );
+        // The process may not name memory from a block it has yet to reserve.
+        let unreserved = SharedFutexKey {
+            memory: litebox_broker_protocol::shared_futex::SharedMemoryId::first_in_block(
+                first.reserver(),
+                first.block() + 1,
+            ),
+            offset: 0,
+        };
+        assert_eq!(
+            arm(unreserved),
+            BrokerResult::Error(ErrorCode::PolicyDenied)
+        );
+        assert_eq!(
+            handle_test_request(&process, BrokerOperation::CloseObject(waiter)),
+            BrokerResult::ObjectClosed
         );
     }
 

@@ -1277,8 +1277,8 @@ fn forked_children_share_eventfds_and_timerfds() {
 #[cfg(target_os = "linux")]
 #[test]
 fn forked_children_share_futexes_in_shared_memory() {
-    const EXPECTED: &str = "shared-futex memory=1 wake=1 timeout=1 private=1 mutex=1 \
-                            semaphore=1 bitset=1 misaligned=1 count=1 inaccessible=1 \
+    const EXPECTED: &str = "shared-futex memory=1 wake=1 timeout=1 interrupted=1 private=1 \
+                            mutex=1 semaphore=1 bitset=1 misaligned=1 count=1 inaccessible=1 \
                             private-memory=1 clear-tid=1";
     // Copy-based fork cannot share pages, so it refuses to fork with shared anonymous mappings.
     assert!(

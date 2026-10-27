@@ -50,7 +50,7 @@ where
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
     /// Whether any mapping was ever given a [`SharedMemoryId`], which lets futex operations skip
     /// looking up the mapping of their futex word while none was.
-    names_shared_memory: AtomicBool,
+    ever_named_shared_memory: AtomicBool,
 }
 
 impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
@@ -63,7 +63,7 @@ where
         let vmem = RwLock::new(Vmem::new(platform));
         Self {
             vmem,
-            names_shared_memory: AtomicBool::new(false),
+            ever_named_shared_memory: AtomicBool::new(false),
         }
     }
 
@@ -195,7 +195,7 @@ where
             if let Some(memory) = shared_memory {
                 let start = addr.as_usize();
                 vmem.set_shared_memory(start..start + length.as_usize(), memory);
-                self.names_shared_memory.store(true, Ordering::Release);
+                self.ever_named_shared_memory.store(true, Ordering::Release);
             }
             addr
         };
@@ -703,7 +703,7 @@ where
     /// Fails with [`Errno::EFAULT`] if that mapping has no access, as Linux faults resolving a
     /// shared futex in an inaccessible page before looking at its waiters.
     pub fn shared_futex_key(&self, address: usize) -> Result<Option<SharedFutexKey>, Errno> {
-        if !self.names_shared_memory.load(Ordering::Acquire) {
+        if !self.ever_named_shared_memory.load(Ordering::Acquire) {
             return Ok(None);
         }
         let Some(end) = address.checked_add(size_of::<u32>()) else {

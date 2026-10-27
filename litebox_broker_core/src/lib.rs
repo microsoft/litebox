@@ -70,7 +70,7 @@ pub use process::{
     ProcessLifecycleSink, ProcessShutdown,
 };
 use random::RandomProvider;
-use shared_futex::SharedMemoryBlocks;
+use shared_futex::SharedMemoryAuthority;
 use socket::{BrokerSocketPorts, SocketProvider};
 use timer::TimerProvider;
 
@@ -526,9 +526,9 @@ impl BrokerCore {
             processes
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
-            let shared_memory_blocks = parent.map_or_else(
-                || Ok(SharedMemoryBlocks::default()),
-                |parent| SharedMemoryBlocks::inherit(&parent.shared_memory_blocks),
+            let shared_memory = SharedMemoryAuthority::new(
+                &self.shared_futexes,
+                parent.map(|parent| &parent.shared_memory),
             )?;
             if let Some(parent) = parent {
                 parent.reserve_child()?;
@@ -540,7 +540,7 @@ impl BrokerCore {
                 id,
                 parent,
                 caller_credential,
-                shared_memory_blocks,
+                shared_memory,
             ));
             assert!(
                 processes.insert(id, Arc::downgrade(&process)).is_none(),

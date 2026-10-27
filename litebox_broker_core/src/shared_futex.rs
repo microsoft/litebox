@@ -9,9 +9,12 @@
 //! describes. Waiters are queued by [`SharedFutexKey`] in buckets chosen by hashing the key.
 //!
 //! The broker does not check that a process maps the memory whose futexes it names. Instead, each
-//! process may only name the IDs of [`SharedMemoryBlocks`] it reserved, or that its creator could
-//! name when creating it. Enforcement is by block, so a process cannot reach the futexes of
-//! memory whose IDs come from blocks reserved after it was created.
+//! process may only name the IDs of blocks it reserved, or that its creator could name when
+//! creating it. Enforcement is by block, so a process cannot reach the futexes of memory whose
+//! IDs come from blocks reserved after it was created. Each block is named by the process that
+//! reserved it and how many blocks that process reserved before, so what a process may name is,
+//! for itself and each of its ancestors, how many blocks that process had reserved by then, which
+//! takes no broker memory per block.
 //!
 //! A waiter is armed on at most one futex at a time, so the buckets hold at most one entry per
 //! waiter. A wake marks waiters woken and publishes it with the generation of their arm, and
@@ -21,7 +24,7 @@
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -35,8 +38,9 @@ use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerError, BrokerProcess, Result};
 
-/// Most blocks of shared memory IDs that one process may name, counting the ones it inherits.
-const MAX_SHARED_MEMORY_BLOCKS: usize = 1 << 16;
+/// Most ancestors that reserved blocks whose IDs a process may name, which bounds the broker
+/// memory each process needs to authorize them.
+const MAX_RESERVING_ANCESTORS: usize = 1 << 10;
 
 /// Base-two logarithm of the number of wait queue buckets.
 const BUCKET_BITS: u32 = 8;
@@ -49,15 +53,15 @@ type Bucket = Mutex<VecDeque<QueuedWaiter>>;
 pub(crate) struct SharedFutexes {
     /// Lock order: a bucket, then a waiter's state.
     buckets: [Bucket; BUCKETS],
-    /// The upper 64 bits of the next block of shared memory IDs to reserve.
-    next_block: AtomicU64,
+    /// The reserver ID of the next process created.
+    next_reserver: AtomicU64,
 }
 
 impl Default for SharedFutexes {
     fn default() -> Self {
         Self {
             buckets: core::array::from_fn(|_| Mutex::new(VecDeque::new())),
-            next_block: AtomicU64::new(0),
+            next_reserver: AtomicU64::new(0),
         }
     }
 }
@@ -76,53 +80,83 @@ impl SharedFutexes {
 /// Reserves a block of shared memory IDs that the caller, and the processes it creates from now
 /// on, may name, and returns its first ID.
 ///
-/// The block is the 2^64 IDs that share the first ID's upper 64 bits, which no other reservation
-/// returns.
-///
 /// Fails with `PolicyDenied` if the caller may not wait on objects, and with `ResourceExhausted`
-/// once the caller may name [`MAX_SHARED_MEMORY_BLOCKS`] blocks or every block is reserved.
+/// once the caller reserved `u32::MAX` blocks, or if it may name the blocks of 2^10 ancestors.
 pub fn reserve_memory_ids(process: &BrokerProcess) -> Result<SharedMemoryId> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    // Reserving under the lock keeps the caller's blocks in ascending order.
-    let mut blocks = process.shared_memory_blocks.0.lock();
-    if blocks.len() >= MAX_SHARED_MEMORY_BLOCKS {
+    let authority = &process.shared_memory;
+    // The processes it creates may name the blocks of one more ancestor than it may.
+    if authority.ancestors.len() >= MAX_RESERVING_ANCESTORS {
         return Err(BrokerError::ResourceExhausted);
     }
-    blocks
-        .try_reserve(1)
-        .map_err(|_| BrokerError::OutOfMemory)?;
-    let block = process
-        .core
-        .shared_futexes
-        .next_block
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |block| {
-            block.checked_add(1)
+    let block = authority
+        .reserved
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+            reserved.checked_add(1)
         })
         .map_err(|_| BrokerError::ResourceExhausted)?;
-    blocks.push(block);
-    Ok(SharedMemoryId(u128::from(block) << 64))
+    Ok(SharedMemoryId::first_in_block(authority.reserver, block))
 }
 
-/// The blocks of shared memory IDs that a process may name, in ascending order.
-#[derive(Default)]
-pub(crate) struct SharedMemoryBlocks(Mutex<Vec<u64>>);
+/// The blocks of shared memory IDs that a process may name.
+pub(crate) struct SharedMemoryAuthority {
+    /// The process's reserver ID, which names the blocks it reserves.
+    reserver: u64,
+    /// How many blocks the process reserved, whose indices are below it.
+    reserved: AtomicU32,
+    /// For each ancestor of the process, oldest first, the ancestor's reserver ID and how many
+    /// blocks it had reserved when it created the next process on the way to this one, omitting
+    /// those that had reserved none.
+    ancestors: Vec<(u64, u32)>,
+}
 
-impl SharedMemoryBlocks {
-    /// Returns the blocks of a process that `creator` creates: those `creator` may name now,
-    /// which include the memory the new process may share with it.
-    pub(crate) fn inherit(creator: &Self) -> Result<Self> {
-        let blocks = creator.0.lock();
-        let mut inherited = Vec::new();
-        inherited
-            .try_reserve_exact(blocks.len())
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        inherited.extend_from_slice(&blocks);
-        Ok(Self(Mutex::new(inherited)))
+impl SharedMemoryAuthority {
+    /// Returns the authority of a new process that `creator`, if any, creates: it may name its
+    /// own blocks and those `creator` may name now, which include the memory the new process
+    /// may share with it.
+    ///
+    /// Fails with `ResourceExhausted` once the broker created 2^64 processes.
+    pub(crate) fn new(futexes: &SharedFutexes, creator: Option<&Self>) -> Result<Self> {
+        let mut ancestors = Vec::new();
+        if let Some(creator) = creator {
+            // A reservation the creator completed before this is included, and any later one
+            // gets a larger index.
+            let reserved = creator.reserved.load(Ordering::Acquire);
+            let own = usize::from(reserved != 0);
+            ancestors
+                .try_reserve_exact(creator.ancestors.len() + own)
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            ancestors.extend_from_slice(&creator.ancestors);
+            if reserved != 0 {
+                // Creators are created before their processes, so reserver IDs stay ascending.
+                ancestors.push((creator.reserver, reserved));
+            }
+        }
+        let reserver = futexes
+            .next_reserver
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserver| {
+                reserver.checked_add(1)
+            })
+            .map_err(|_| BrokerError::ResourceExhausted)?;
+        Ok(Self {
+            reserver,
+            reserved: AtomicU32::new(0),
+            ancestors,
+        })
     }
 
     /// Fails with `PolicyDenied` unless the process may name `memory`.
     fn authorize(&self, memory: SharedMemoryId) -> Result<()> {
-        if self.0.lock().binary_search(&memory.block()).is_ok() {
+        let reserved = if memory.reserver() == self.reserver {
+            self.reserved.load(Ordering::Acquire)
+        } else {
+            self.ancestors
+                .binary_search_by_key(&memory.reserver(), |&(reserver, _)| reserver)
+                .ok()
+                .and_then(|index| self.ancestors.get(index))
+                .map_or(0, |&(_, reserved)| reserved)
+        };
+        if memory.block() < reserved {
             Ok(())
         } else {
             Err(BrokerError::PolicyDenied)
@@ -158,7 +192,7 @@ pub fn create_futex_waiter(
 /// the key's memory.
 pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()> {
     validate_key_and_bitset(request.key, request.bitset)?;
-    process.shared_memory_blocks.authorize(request.key.memory)?;
+    process.shared_memory.authorize(request.key.memory)?;
     if request.generation >= FUTEX_WAITER_GENERATIONS {
         return Err(BrokerError::UnsupportedOperation);
     }
@@ -197,20 +231,22 @@ pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()
 pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<u32> {
     validate_key_and_bitset(request.key, request.bitset)?;
     process.require_object_rights(ObjectRights::WAIT)?;
-    process.shared_memory_blocks.authorize(request.key.memory)?;
+    process.shared_memory.authorize(request.key.memory)?;
     let selects =
         |queued: &QueuedWaiter| queued.key == request.key && queued.bitset & request.bitset != 0;
     let mut woken = Vec::new();
     let mut count = 0;
     {
         let mut bucket = process.core.shared_futexes.bucket(request.key).lock();
-        let eligible = bucket.iter().filter(|queued| selects(queued)).count();
-        if eligible == 0 {
+        let most = bucket
+            .len()
+            .min(usize::try_from(request.count).unwrap_or(usize::MAX));
+        if most == 0 {
             return Ok(0);
         }
         // Reserve first: a waiter marked woken must have its wake published.
         woken
-            .try_reserve(eligible.min(request.count as usize))
+            .try_reserve(most)
             .map_err(|_| BrokerError::OutOfMemory)?;
         // One stable pass removes the selected entries in linear time, keeping the others oldest
         // first. Selected entries leave the queue even if their waiter is gone or disarmed.
@@ -365,9 +401,9 @@ mod tests {
     use crate::{BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights};
     use crate::{PolicyEngine, Result};
 
-    /// The first block the broker reserves, which the fixture's parent reserves before creating
-    /// its child.
-    const MEMORY: SharedMemoryId = SharedMemoryId(0);
+    /// The first block of the first process, the fixture's parent, which reserves it before
+    /// creating its child.
+    const MEMORY: SharedMemoryId = SharedMemoryId::first_in_block(0, 0);
 
     fn key(offset: u64) -> SharedFutexKey {
         SharedFutexKey {
@@ -515,7 +551,7 @@ mod tests {
         Fixture::arm(&fixture.parent, key(4), u32::MAX, other_offset).unwrap();
         let other_memory = fixture.waiter(&fixture.parent);
         let other_memory_key = SharedFutexKey {
-            memory: MEMORY.nth_in_block(1),
+            memory: MEMORY.next_in_block().unwrap(),
             offset: 0,
         };
         Fixture::arm(&fixture.parent, other_memory_key, u32::MAX, other_memory).unwrap();
@@ -743,6 +779,93 @@ mod tests {
             Fixture::wake(&fixture.parent, later_key, 1, u32::MAX),
             Ok(1)
         );
+    }
+
+    #[test]
+    fn descendants_name_the_blocks_each_ancestor_had_when_creating_their_line() {
+        let fixture = fixture();
+        let grandchild = fixture
+            .core
+            .create_process(CallerCredential::Unauthenticated, Some(fixture.child.id()))
+            .unwrap();
+        // The child reserves after creating the grandchild, so only the grandparent's block
+        // reaches the grandchild.
+        let child_block = super::reserve_memory_ids(&fixture.child).unwrap();
+        let great_grandchild = fixture
+            .core
+            .create_process(CallerCredential::Unauthenticated, Some(grandchild.id()))
+            .unwrap();
+        for process in [&grandchild, &great_grandchild] {
+            assert_eq!(Fixture::wake(process, key(0), 1, u32::MAX), Ok(0));
+            let key = SharedFutexKey {
+                memory: child_block,
+                offset: 0,
+            };
+            assert_eq!(
+                Fixture::wake(process, key, 1, u32::MAX),
+                Err(BrokerError::PolicyDenied)
+            );
+        }
+        // A process may not name the blocks it has yet to reserve.
+        let unreserved = SharedFutexKey {
+            memory: SharedMemoryId::first_in_block(child_block.reserver(), 1),
+            offset: 0,
+        };
+        assert_eq!(
+            Fixture::wake(&fixture.child, unreserved, 1, u32::MAX),
+            Err(BrokerError::PolicyDenied)
+        );
+    }
+
+    #[test]
+    fn many_reservations_take_no_memory_per_block() {
+        let fixture = fixture();
+        // Each fork in a loop of shared mappings and forks reserves a block.
+        for block in 1..100_000 {
+            assert_eq!(
+                super::reserve_memory_ids(&fixture.parent).map(SharedMemoryId::block),
+                Ok(block)
+            );
+        }
+        let child = fixture
+            .core
+            .create_process(CallerCredential::Unauthenticated, Some(fixture.parent.id()))
+            .unwrap();
+        assert_eq!(child.shared_memory.ancestors.len(), 1);
+        let last = SharedFutexKey {
+            memory: SharedMemoryId::first_in_block(MEMORY.reserver(), 99_999),
+            offset: 0,
+        };
+        assert_eq!(Fixture::wake(&child, last, 1, u32::MAX), Ok(0));
+    }
+
+    #[test]
+    fn wakes_racing_disarms_are_each_reported_once() {
+        let fixture = Arc::new(fixture());
+        let waiter = fixture.waiter(&fixture.child);
+        let done = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let waker = {
+            let fixture = Arc::clone(&fixture);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let mut woken = 0;
+                while !done.load(core::sync::atomic::Ordering::Acquire) {
+                    woken += Fixture::wake(&fixture.parent, key(0), 1, u32::MAX).unwrap();
+                }
+                woken
+            })
+        };
+        let mut reported = 0;
+        for generation in 0..5000 {
+            Fixture::arm_generation(&fixture.child, key(0), u32::MAX, waiter, generation).unwrap();
+            if Fixture::disarm(&fixture.child, waiter).unwrap() {
+                reported += 1;
+            }
+        }
+        done.store(true, core::sync::atomic::Ordering::Release);
+        // Every wake that selected the waiter is reported by exactly one disarm.
+        assert_eq!(waker.join().unwrap(), reported);
+        assert_eq!(fixture.queued(), (0, 0));
     }
 
     #[test]
