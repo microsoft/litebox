@@ -59,7 +59,6 @@ fn kernel_main(kernel: Kernel) -> ! {
         litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
             platform: kernel.platform,
             console,
-            events: devices,
             root: payload.file("rootfs.tar"),
             shares,
             network: devices.network(),

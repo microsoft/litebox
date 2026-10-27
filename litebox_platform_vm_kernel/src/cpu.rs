@@ -18,9 +18,9 @@
 //! check for work before halting, and again after.
 //!
 //! Takes no locks, and only [`current`] (so [`halt`], [`marked`],
-//! [`acknowledge`], [`take_notified`] and `set_suspended`), [`local`] and
-//! [`set_local`] touch per-CPU data: [`wake`], [`wake_idle`] and
-//! [`notify_all`] are usable in interrupt handlers.
+//! [`acknowledge`] and [`take_notified`]), [`local`] and [`set_local`] touch
+//! per-CPU data: [`wake`], [`wake_idle`] and [`notify_all`] are usable in
+//! interrupt handlers.
 //!
 //! The kernel clock ([`crate::clock`]) is the TSC of whichever CPU reads it:
 //! the CPUs' TSCs are assumed synchronized, unchecked (VMMs such as QEMU and
@@ -135,10 +135,6 @@ struct Cpus {
     notified: AtomicU64,
     /// Index to local APIC ID, set before the CPU is online.
     apic_ids: [AtomicU32; MAX_CPUS],
-    /// Bit `i`: CPU `i`'s work suspended: set once it first suspends, until
-    /// it finishes (also while resumed); see
-    /// [`crate::worker::interrupt_suspended`].
-    suspended: AtomicU64,
     /// Set by [`VmKernel::start_cpus`]; until then, no IPIs are sent.
     controller: spin::Once<&'static dyn InterruptController>,
 }
@@ -149,7 +145,6 @@ static CPUS: Cpus = Cpus {
     woken: AtomicU64::new(0),
     notified: AtomicU64::new(0),
     apic_ids: [const { AtomicU32::new(0) }; MAX_CPUS],
-    suspended: AtomicU64::new(0),
     controller: spin::Once::new(),
 };
 
@@ -330,9 +325,8 @@ pub fn interrupt(cpus: impl IntoIterator<Item = CpuId>) {
     interrupt_mask(cpus.into_iter().fold(0, |cpus, cpu| cpus | cpu.bit()));
 }
 
-/// [`interrupt`], of the CPUs in the mask `cpus` (bit `i`: CPU `i`), for
-/// callers that have one (e.g., in interrupt handlers).
-pub(crate) fn interrupt_mask(cpus: u64) {
+/// [`interrupt`], of the CPUs in the mask `cpus` (bit `i`: CPU `i`).
+fn interrupt_mask(cpus: u64) {
     // Harmless if unsent: before `start_cpus`, no other CPU runs, and it
     // never starts one the controller cannot address.
     send(cpus, Ipi::Wake);
@@ -373,20 +367,4 @@ fn send(cpus: u64, ipi: Ipi) -> u64 {
 /// Whether `cpu` is in [`halt`].
 pub(crate) fn is_idle(cpu: CpuId) -> bool {
     CPUS.idle.load(Ordering::SeqCst) & cpu.bit() != 0
-}
-
-/// Bit `i`: CPU `i`'s work suspended, and has not finished (see
-/// [`crate::worker::interrupt_suspended`]).
-pub(crate) fn suspended_mask() -> u64 {
-    CPUS.suspended.load(Ordering::SeqCst)
-}
-
-/// Sets the calling CPU's bit in [`suspended_mask`], or clears it.
-pub(crate) fn set_suspended(suspended: bool) {
-    let bit = current().bit();
-    if suspended {
-        CPUS.suspended.fetch_or(bit, Ordering::SeqCst);
-    } else {
-        CPUS.suspended.fetch_and(!bit, Ordering::SeqCst);
-    }
 }

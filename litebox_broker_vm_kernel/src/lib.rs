@@ -127,7 +127,6 @@ pub struct Config {
     pub platform: &'static VmKernel,
     /// Behind `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
     pub console: &'static dyn stdio::Console,
-    pub events: &'static dyn Events,
     /// A tar, read-only at `/`, e.g., a Linux program's files.
     pub root: Option<&'static [u8]>,
     /// Host directories, each mounted read-only at its path.
@@ -154,7 +153,6 @@ pub struct Broker {
     /// Their job.
     job: Arc<Job>,
     platform: &'static VmKernel,
-    events: &'static dyn Events,
     stdio: Arc<ConsoleStdio>,
     timers: Arc<KernelTimers>,
     sockets: Arc<SmoltcpSocketProvider>,
@@ -229,7 +227,6 @@ impl Broker {
             fs,
             job,
             platform: config.platform,
-            events: config.events,
             stdio,
             timers,
             sockets,
@@ -848,11 +845,6 @@ impl Association {
         .unwrap_or_else(|error| WaitState::Ended(Err(error)))
     }
 
-    /// See [`Events::take_device_interrupt`].
-    pub fn take_device_interrupt(&self) -> bool {
-        self.broker.events.take_device_interrupt()
-    }
-
     /// For a blocked wait that the caller ends itself (e.g., stalled, or the
     /// process killed).
     pub fn abandon_wait(&self) {
@@ -1070,7 +1062,7 @@ impl KernelProcessLauncher {
                 return result;
             }
             assert!(
-                litebox_platform_vm_kernel::worker::suspend(None),
+                litebox_platform_vm_kernel::worker::suspend(),
                 "requests are served on the worker"
             );
         }

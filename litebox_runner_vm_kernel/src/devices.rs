@@ -21,14 +21,13 @@
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
 //! Each CPU has its own local APIC, so its own timer; devices interrupt the
-//! boot CPU. The interrupt handler only ends the interrupt, noting a
-//! device's for every CPU, waking the other idle ones, and interrupting those
-//! whose workers are suspended; the broker looks at the devices when it next
-//! runs, which, if the interrupt stopped a process, the shim has it do at
-//! once (see `litebox_platform_vm_kernel`). A wake IPI only ends a halt, or
-//! has a CPU running a process enter the kernel. A TLB-flush IPI is only a
-//! doorbell: the platform flushes before the handler runs, and a process it
-//! interrupted resumes at once.
+//! boot CPU. The interrupt handler only ends the interrupt, noting a device's
+//! for every CPU and waking the other idle ones; the broker looks at the
+//! devices when it next runs, which, if the interrupt stopped a process, the
+//! shim has it do at once (see `litebox_platform_vm_kernel`). A wake IPI only
+//! ends a halt, or has a CPU running a process enter the kernel. A TLB-flush
+//! IPI is only a doorbell: the platform flushes before the handler runs, and a
+//! process it interrupted resumes at once.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -50,7 +49,7 @@ use litebox_hal::devices::{self as hal, ConsoleDevice, NetworkDevice, NinePDevic
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
-use litebox_platform_vm_kernel::{Handled, Instant, VmKernel, worker};
+use litebox_platform_vm_kernel::{Handled, Instant, VmKernel};
 use litebox_shim_vm_kernel::ProcessTimer;
 use spin::Mutex;
 
@@ -116,8 +115,7 @@ pub struct Devices {
     /// a VM exit, and it rearms before every resume of a process.
     armed: [AtomicU64; MAX_CPUS],
     /// Bit `i`: a device interrupted since CPU `i`'s last
-    /// [`Events::take_device_interrupt`], so that each CPU's suspended worker
-    /// sees each interrupt.
+    /// [`Events::take_device_interrupt`].
     device_interrupted: AtomicU64,
 }
 
@@ -261,14 +259,11 @@ impl Devices {
                     armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
                 }
             }
-            // For whichever CPU's worker waits for it: the other idle CPUs
-            // step again, and the busy ones whose workers are suspended enter
-            // the kernel, to resume them (this one, the boot CPU, is already
-            // in, and needs no mark: see the shim's `Inner::worker_due`).
+            // The other idle CPUs step again, to poll the devices (this one,
+            // the boot CPU, is already in).
             DEVICE_VECTOR => {
                 self.device_interrupted.store(u64::MAX, Ordering::SeqCst);
                 cpu::wake_idle(CpuId::BOOT);
-                worker::interrupt_suspended(CpuId::BOOT);
             }
             WAKE_VECTOR => {}
             FLUSH_VECTOR => {
@@ -345,9 +340,6 @@ impl Events for Devices {
 
     fn take_device_interrupt(&self) -> bool {
         let bit = 1 << cpu::current().index();
-        // Sequentially consistent, as the handler's store, then load of the
-        // suspended works, and this CPU's noting its own suspended before:
-        // so either this sees the store, or the handler interrupts this CPU.
         self.device_interrupted.load(Ordering::SeqCst) & bit != 0
             && self.device_interrupted.fetch_and(!bit, Ordering::SeqCst) & bit != 0
     }
