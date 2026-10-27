@@ -2498,15 +2498,6 @@ fn terminal_operation<Platform: ShimPlatform>(arg: &IoctlArg) -> Result<Terminal
     })
 }
 
-/// Whether `arg` requests an operation only pseudo-terminal managers support,
-/// which Linux fails with `ENOTTY` on other terminals.
-fn is_manager_ioctl(arg: &IoctlArg) -> bool {
-    matches!(
-        arg,
-        IoctlArg::TIOCGPTN(_) | IoctlArg::TIOCGPTLCK(_) | IoctlArg::TIOCSPTLCK(_)
-    )
-}
-
 /// Reads the settings a `TCSETS` or `TCSETS2` family `arg` requests through `ptr`.
 fn set_settings<Platform: ShimPlatform, T>(
     arg: &IoctlArg,
@@ -2595,7 +2586,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     fn terminal_ioctl(&self, file: &File<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
-        let manager_only = is_manager_ioctl(arg);
+        // Only pseudo-terminal managers support these, and Linux fails them with `ENOTTY` on
+        // other terminals.
+        let manager_only = matches!(
+            arg,
+            IoctlArg::TIOCGPTN(_) | IoctlArg::TIOCGPTLCK(_) | IoctlArg::TIOCSPTLCK(_)
+        );
         let control = |operation, cx| {
             file.terminal_control(operation, cx)
                 .map_err(|error| match error {

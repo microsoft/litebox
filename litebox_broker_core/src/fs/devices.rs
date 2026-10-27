@@ -479,7 +479,8 @@ impl Backend for Devices {
             file => return file.terminal().ok_or(ReadError::Io)?.read(buf),
         };
         match device {
-            // Only path-only handles refer to `ptmx` itself.
+            // Opening `ptmx` yields a manager, so only `O_PATH` handles, which the resolver bars
+            // from I/O, hold `Ptmx`.
             Device::Ptmx => Err(ReadError::Io),
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
@@ -513,6 +514,7 @@ impl Backend for Devices {
             file => return file.terminal().ok_or(WriteError::Io)?.write(buf),
         };
         match device {
+            // See `read`.
             Device::Ptmx => return Err(WriteError::Io),
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Null | Device::URandom => return Ok(buf.len()),
