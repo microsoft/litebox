@@ -99,7 +99,7 @@ use litebox_broker_smoltcp::{Network, SmoltcpSocketProvider};
 use memory::{PinnedControlRing, UserSharedMemory};
 use readiness::KernelReadiness;
 use stdio::ConsoleStdio;
-use timers::KernelTimers;
+use timers::{KernelTimers, PublishedDeadline};
 
 /// Size of a process's broker shared memory.
 pub const SHARED_MEMORY_SIZE: usize = SHARED_BUFFER_POOL_SIZE;
@@ -163,6 +163,8 @@ pub struct Broker {
     vsock: Option<Arc<VsockTransportProvider<Instant>>>,
     /// The virtual init, with [`Config::allow_process_duplication`].
     init: Option<Arc<BrokerProcess>>,
+    /// When it next has something to do (see [`Self::publish_deadline`]).
+    deadline: Arc<PublishedDeadline>,
 }
 
 impl Broker {
@@ -173,8 +175,9 @@ impl Broker {
     /// Without a hardware CSPRNG, on a second call, if a share cannot be
     /// mounted, or if the virtual init cannot be created as process 1.
     pub fn new(config: Config) -> Self {
+        let deadline = Arc::new(PublishedDeadline::new());
         let stdio = Arc::new(ConsoleStdio::new(config.console));
-        let timers = Arc::new(KernelTimers::new(config.platform));
+        let timers = Arc::new(KernelTimers::new(config.platform, deadline.clone()));
         let sockets = Arc::new(SmoltcpSocketProvider::new(
             providers::LIMITS.max_sockets,
             providers::LIMITS.max_sockets_per_process,
@@ -235,6 +238,7 @@ impl Broker {
             sockets,
             vsock,
             init,
+            deadline,
         }
     }
 
@@ -332,7 +336,7 @@ impl Broker {
     }
 
     /// Looks at what changes outside requests: standard streams, timers, the
-    /// network, and the socket device.
+    /// network, and the socket device; then publishes the next deadline.
     fn poll_sources(&self) {
         self.stdio.poll();
         self.timers.fire();
@@ -340,6 +344,26 @@ impl Broker {
         if let Some(vsock) = &self.vsock {
             vsock.poll();
         }
+        self.publish_deadline();
+    }
+
+    /// Publishes when [`Self::poll_sources`] next has something to do, for
+    /// the kernel (see [`Association::next_timer_deadline`]): the earliest
+    /// armed broker timer's deadline, the network stack's (e.g., to
+    /// retransmit), the vsock sockets', or, while output waits for a console
+    /// that does not interrupt, its next poll. After polls, serves and ends,
+    /// which may change them, and as an alarm is set (see `timers`).
+    fn publish_deadline(&self) {
+        self.deadline.publish(|| {
+            [
+                self.timers.next_deadline(),
+                self.next_sources_deadline(),
+                self.stdio.next_deadline(self.platform.now()),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+        });
     }
 
     /// When the network stack, or the vsock sockets, must next run, if ever.
@@ -502,19 +526,10 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 
 impl Association {
     /// When, on the kernel clock, [`Self::poll_events`] next has something
-    /// to do: the earliest armed broker timer's deadline, the network stack's
-    /// (e.g., to retransmit), the vsock sockets', or, while output waits for
-    /// a console that does not interrupt, its next poll.
+    /// to do, as the broker published it, without its locks (see
+    /// `Broker::publish_deadline`).
     pub fn next_timer_deadline(&self) -> Option<Instant> {
-        let broker = &self.broker;
-        [
-            broker.timers.next_deadline(),
-            broker.next_sources_deadline(),
-            broker.stdio.next_deadline(broker.platform.now()),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+        self.broker.deadline.get()
     }
 
     /// Looks at the devices (standard streams, the network, vsock) and fires
@@ -717,11 +732,14 @@ impl Association {
     /// [`EnterError::Failed`], which ended the association.
     pub fn serve(&self) -> Result<(), EnterError> {
         self.submitted.set(false);
-        self.with_active(|active| {
+        let served = self.with_active(|active| {
             serving::serve(&self.readiness, || active.serve(&self.launcher))
                 .map_err(|Failed| EnterError::Failed)?;
             self.flush_readiness()
-        })
+        });
+        // Requests may have changed the deadlines (e.g., set a timer).
+        self.broker.publish_deadline();
+        served
     }
 
     /// The child processes the process started since the last call, in order,
@@ -814,6 +832,9 @@ impl Association {
             // has none. This kernel does not measure its processes' CPU time.
             let _ = process.complete_exit(status, CpuTime::default());
         }
+        // Releasing the process's objects may have changed the deadlines
+        // (e.g., a closed socket's connection lingers).
+        self.broker.publish_deadline();
     }
 
     /// Where `wait` stands, after firing due timers and publishing readiness.
