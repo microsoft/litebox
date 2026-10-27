@@ -6,6 +6,7 @@
 //! optionally, a read-only root from a tar, read-only host directories
 //! ([`Share`]s) over 9P, and sockets.
 
+use crate::TaskWake;
 use crate::share::{Share, ShareFs};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -94,7 +95,7 @@ pub(crate) fn seed() -> u64 {
 /// Runner processes, which the kernel vouches for, may open and use files: the
 /// devices, `root`'s, if any, and the shares' (read-only); sockets (see
 /// [`socket_policy`]); and, if `allow_process_duplication`, start child
-/// processes.
+/// processes. Lifecycle changes wake the tasks ([`TaskWake`]).
 ///
 /// # Panics
 ///
@@ -121,4 +122,5 @@ pub(crate) fn core(
         file_service(root, shares, stdio, random),
     )
     .unwrap_or_else(|error| panic!("broker core: {error:?}"))
+    .with_process_lifecycle_sink(Arc::new(TaskWake))
 }

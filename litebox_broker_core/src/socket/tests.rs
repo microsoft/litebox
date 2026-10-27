@@ -1754,9 +1754,10 @@ fn duplicated_socket_shares_readiness_and_stays_charged_to_its_creator() {
     drop(failing);
 
     // The duplicate keeps the socket, and the creator's provider state and
-    // ID, after the creator releases its references.
+    // ID, after the creator's teardown releases its references.
     let retired_sockets = provider.state.retired_sockets.load(Ordering::Relaxed);
-    creator.cleanup(true);
+    creator.retire(true);
+    drop(creator);
     assert_eq!(*creator_sink.retired.lock().unwrap(), [socket]);
     assert!(
         !provider
@@ -1847,23 +1848,26 @@ fn socket_accepted_through_a_duplicate_is_charged_to_the_listener() {
     };
     assert_eq!(process_reserved_sockets(&owner), 2);
     assert_eq!(process_reserved_sockets(&sharer), 0);
-    let closed = |process: &BrokerProcess| {
+    let closed = |process_id| {
         provider
             .state
             .closed_processes
             .lock()
             .unwrap()
-            .contains(&process.id())
+            .contains(&process_id)
     };
+    let (owner_id, sharer_id) = (owner.id(), sharer.id());
 
-    owner.cleanup(true);
+    owner.retire(true);
+    drop(owner);
     sharer.close_object_reference(duplicate).unwrap();
-    assert!(!closed(&owner));
+    assert!(!closed(owner_id));
     sharer.close_object_reference(accepted.handle).unwrap();
-    assert!(closed(&owner));
-    assert!(!closed(&sharer));
-    sharer.cleanup(true);
-    assert!(closed(&sharer));
+    assert!(closed(owner_id));
+    assert!(!closed(sharer_id));
+    sharer.retire(true);
+    drop(sharer);
+    assert!(closed(sharer_id));
     connector_session.close_object_reference(connector).unwrap();
 }
 

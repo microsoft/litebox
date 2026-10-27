@@ -4,19 +4,21 @@
 //! Per-process ownership: a runner process's [`Inner`] belongs to at most one
 //! CPU at a time, the one holding its claim, so its `Cell`s and `RefCell`s
 //! need no other synchronization. Whoever polls its waits, delivers its
-//! requests, spawns its launched children, runs a worker for it, or hands
-//! one of its threads to a CPU's run holds the claim, as does each kernel
-//! entry of its running threads, which run in ring 3 without it, several at
-//! once (see `Running`). A process clone not adopted yet is claimed only by
-//! its parent's holder (see `fork`).
+//! requests, spawns its launched children, runs or resumes a batch of its
+//! broker's, or hands one of its threads to a CPU's run holds the claim, as
+//! does each kernel entry of its running threads, which run in ring 3 without
+//! it, several at once (see `Running`). A process clone not adopted yet is
+//! claimed only by its parent's holder (see `fork`).
 //!
 //! The scheduler only tries to claim ([`Owned::try_claim`]), but spins
-//! briefly, holding none, for the process its CPU's worker serves; and an
-//! entry spins for the claim only briefly ([`Owned::claim_briefly`]), else
-//! its CPU parks the thread (see `sched`). Only services wait for a claim
-//! ([`Owned::claim`]), holding none, so no two CPUs ever wait for each
-//! other's claims; meanwhile, they resume their own worker, which the holder
-//! may wait for, and take interrupts.
+//! briefly, holding none, for a process whose broker its CPU holds
+//! suspended; and an entry spins for the claim only briefly
+//! ([`Owned::claim_briefly`]), else its CPU parks the thread (see `sched`).
+//! Only services wait for a claim ([`Owned::claim`]), holding none, so no two
+//! CPUs ever wait for each other's claims; meanwhile, they take interrupts.
+//! No holder waits for a suspended broker: it is a step, an entry, a
+//! service, or a batch, which suspends rather than waits (see
+//! `litebox_platform_vm_kernel::worker`), releasing the claim.
 //!
 //! Each release leaves lock-free mirrors of the process's state (e.g.,
 //! [`Owned::is_stopped`]), and wakes the CPUs that may now have work: the
@@ -34,7 +36,7 @@ use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, MAX_CPUS};
 use litebox_platform_vm_kernel::{Instant, LOCK_WARNING, VmKernel};
 
-/// [`Owned::worker`] and [`Owned::holder`]: no CPU's.
+/// [`Owned::task_cpu`] and [`Owned::holder`]: no CPU's.
 const NO_CPU: u8 = u8::MAX;
 
 /// At most how long an entry spins for its process's claim
@@ -63,10 +65,9 @@ pub(crate) struct Owned {
     stopped: AtomicBool,
     quiescent: AtomicBool,
     dead: AtomicBool,
-    /// See [`Self::needs_serving`].
-    needs_serving: AtomicBool,
-    /// [`Inner::worker`]'s index, or [`NO_CPU`].
-    worker: AtomicU8,
+    /// The index of the CPU holding its broker's suspended batch (see
+    /// [`Inner::task`]), or [`NO_CPU`].
+    task_cpu: AtomicU8,
     /// See [`Self::runnable`].
     runnable: AtomicU64,
     inner: Inner,
@@ -79,7 +80,11 @@ pub(crate) struct Owned {
 // `user_state`, which only its CPU touches, without the claim, from the claim
 // that hands it the thread until its run ends (see `Thread::running`); a run
 // that ends without the claim leaves the rest to the claim's next holder
-// through `Thread::parked`, a lock, which orders the two. References to its
+// through `Thread::parked`, a lock, which orders the two. Its broker's task
+// (`Inner::task`) also runs only under the claim: a suspended batch, whose
+// stack may hold the process and values that are not `Send` (e.g., a lock's
+// guard), touches nothing until the CPU it suspended on, which alone may (see
+// `worker::Task::resume`), resumes it under the claim. References to its
 // threads held past a claim (in `sched`) only count references, atomically.
 // What other CPUs reach otherwise is thread-safe itself: the parts of
 // `inner` it shares with the broker (e.g., its readiness) and the platform,
@@ -102,8 +107,7 @@ impl Owned {
             stopped: AtomicBool::new(false),
             quiescent: AtomicBool::new(inner.is_cloned()),
             dead: AtomicBool::new(false),
-            needs_serving: AtomicBool::new(false),
-            worker: AtomicU8::new(NO_CPU),
+            task_cpu: AtomicU8::new(NO_CPU),
             runnable: AtomicU64::new(u64::MAX),
             inner,
         }
@@ -131,16 +135,15 @@ impl Owned {
         self.take()
     }
 
-    /// The claim, once another CPU releases it, calling `waiting` meanwhile,
-    /// now and then (see `sched::Scheduler::claim`), and taking interrupts
+    /// The claim, once another CPU releases it, meanwhile taking interrupts
     /// (see [`cpu::relax`]). Never while holding a claim. If the claim stays
     /// held for [`LOCK_WARNING`] from the last release seen, warns, once, as
     /// it may be a deadlock (e.g., the holder waits for what the calling CPU
-    /// holds), and waits on: a claim is held across a whole work (all its
-    /// round trips, and its waits for other CPUs' locks), and this wait also
-    /// counts its own worker's time (in `waiting`).
-    pub(crate) fn claim(self: &Arc<Self>, mut waiting: impl FnMut()) -> Claim<'_> {
-        /// Spins between calls of `waiting`.
+    /// holds), and waits on: a claim is held across a whole run of a batch
+    /// (until it finishes or suspends), whose requests' kernel work is not
+    /// bounded in time.
+    pub(crate) fn claim(self: &Arc<Self>) -> Claim<'_> {
+        /// Spins between looks at the clock.
         const SPINS: u32 = 1 << 10;
         let platform = self.inner.platform;
         let mut warned = false;
@@ -160,7 +163,6 @@ impl Owned {
                     );
                     warned = true;
                 }
-                waiting();
                 for _ in 0..SPINS {
                     if self.holder.load(Ordering::Relaxed) == NO_CPU {
                         break;
@@ -171,13 +173,13 @@ impl Owned {
         }
     }
 
-    /// For an entry of a running thread (see `Running`), or a step resuming
-    /// its CPU's worker (see `sched`), holding no claim: the claim, unless
-    /// this CPU cannot take it within [`ENTRY_SPIN`] (one budget, however
-    /// often the claim changes hands), meanwhile taking interrupts (see
-    /// [`cpu::relax`]). An entry cannot wait longer: the holder may wait for
-    /// this CPU's suspended worker, which the CPU resumes only outside the
-    /// thread's run (see `litebox_platform_vm_kernel::worker`).
+    /// For an entry of a running thread (see `Running`), or a step for a
+    /// broker its CPU holds suspended (see `sched`), holding no claim: the
+    /// claim, unless this CPU cannot take it within [`ENTRY_SPIN`] (one
+    /// budget, however often the claim changes hands), meanwhile taking
+    /// interrupts (see [`cpu::relax`]). An entry does not wait longer: the
+    /// holder may keep it long (e.g., a batch's run), while the CPU could run
+    /// something else.
     pub(crate) fn claim_briefly(self: &Arc<Self>) -> Option<Claim<'_>> {
         if let Some(claim) = self.take() {
             return Some(claim);
@@ -225,8 +227,8 @@ impl Owned {
     /// # Safety
     ///
     /// The calling CPU need not hold the claim; but if it gets the process, it
-    /// must keep the claim for as long as it uses it (e.g., the worker serving
-    /// the process, which runs only under it).
+    /// must keep the claim for as long as it uses it (e.g., a batch of its
+    /// broker's, which runs only under it).
     pub(crate) unsafe fn claimed(&self) -> Option<&Inner> {
         // Only the holder stores its index there, as it takes the claim, and
         // clears it to release it.
@@ -245,24 +247,17 @@ impl Owned {
     }
 
     /// Stopped, or a process clone not adopted yet, which runs nothing (see
-    /// `fork`), and nothing to do for it: no thread running, no worker
-    /// suspended serving it, and, unless dead, nothing submitted to serve.
-    /// Only a service's call (e.g., `Process::submit`), or, for a clone, its
-    /// adoption, changes that.
+    /// `fork`), and nothing to do for it: no thread running, no batch of its
+    /// broker's suspended, and no work for its broker (see
+    /// `Association::has_work`: requests to serve, or, once dead, its
+    /// association to end). Only a service's call (e.g., `Process::submit`),
+    /// or, for a clone, its adoption or its end, changes that.
     pub(crate) fn is_quiescent(&self) -> bool {
         self.quiescent.load(Ordering::SeqCst)
     }
 
     pub(crate) fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
-    }
-
-    /// Whether a worker may have to serve what the process submitted: it is
-    /// not dead, no worker is suspended serving it, and its threads' calls may
-    /// have published requests since it was last served (see `sched`). Only
-    /// its claim's holder changes that, and its release publishes it.
-    pub(crate) fn needs_serving(&self) -> bool {
-        self.needs_serving.load(Ordering::SeqCst)
     }
 
     /// Whether a CPU holds the claim.
@@ -276,12 +271,13 @@ impl Owned {
         self.running.load(Ordering::SeqCst) != 0
     }
 
-    /// [`Inner::worker`]: only that CPU resumes it.
-    pub(crate) fn worker(&self) -> Option<CpuId> {
-        CpuId::new(usize::from(self.worker.load(Ordering::SeqCst)))
+    /// The CPU holding its broker's suspended batch, if any (see
+    /// [`Inner::task`]): only that CPU resumes it.
+    pub(crate) fn task_cpu(&self) -> Option<CpuId> {
+        CpuId::new(usize::from(self.task_cpu.load(Ordering::SeqCst)))
     }
 
-    /// The least CPU time of its runnable threads (see `sched`) when last
+    /// The least CPU time of its runnable entities (see `sched`) when last
     /// polled, if any: a lower bound, as CPU time only grows.
     pub(crate) fn runnable(&self) -> Option<u64> {
         let cpu_time = self.runnable.load(Ordering::Relaxed);
@@ -354,17 +350,19 @@ impl Drop for Claim<'_> {
         let inner = &owned.inner;
         let stopped = inner.is_stopped();
         let dead = inner.is_dead();
-        let worker = inner.worker.get();
+        let task_cpu = inner.task.cpu();
         let quiescent = (stopped || inner.is_cloned())
-            && worker.is_none()
+            && task_cpu.is_none()
             && !owned.is_running()
-            && (dead || !inner.broker.has_submitted());
-        let needs_serving = !dead && worker.is_none() && inner.broker.has_submitted();
+            && !inner.broker.has_work();
         let was_stopped = owned.stopped.swap(stopped, Ordering::SeqCst);
-        owned.dead.store(dead, Ordering::SeqCst);
+        // Before `dead`, which `Shared::reap` reads first: once it sees the
+        // process dead, it sees whether it is quiescent since then, not before
+        // it died (death is final, and a dead process becomes quiescent once,
+        // for good, as its broker ended its association).
         owned.quiescent.store(quiescent, Ordering::SeqCst);
-        owned.needs_serving.store(needs_serving, Ordering::SeqCst);
-        owned.worker.store(index(worker), Ordering::SeqCst);
+        owned.dead.store(dead, Ordering::SeqCst);
+        owned.task_cpu.store(index(task_cpu), Ordering::SeqCst);
         let share = inner.shared.take();
         owned.holder.store(NO_CPU, Ordering::SeqCst);
         if share {

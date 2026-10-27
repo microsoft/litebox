@@ -1,0 +1,6 @@
+[
+  {
+    "argv": ["/brokers", "block", "4", "4", "1000"],
+    "expect_stdout": "busy first\nreaders: 3 exited, 1 killed\n"
+  }
+]

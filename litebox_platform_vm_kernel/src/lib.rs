@@ -11,13 +11,15 @@
 //! must precede execution that needs derived keys. The runner may then start
 //! the other CPUs ([`VmKernel::start_cpus`], [`cpu`]), which run its entry.
 //!
-//! Assumptions: no kernel threads (the runner may switch user threads);
-//! kernel mappings changed after boot only to add some or to unmap a stack's
-//! guard page, which only its CPU uses, so flushed locally; synchronized
-//! TSCs (see [`cpu`]); and not a confidential VM (no #VE/#VC/#HV). A task's
-//! address space may be current on several CPUs at once: a change to its
-//! mappings that may leave stale translations is shot down, by IPI, on those
-//! that may cache it (see `tlb`).
+//! Assumptions: no kernel threads (the runner may switch user threads), but
+//! cooperative tasks ([`worker`]); kernel mappings changed after boot only to
+//! add some, or to unmap a stack's guard page, flushed locally: a CPU's own
+//! stacks' only there, a cooperative task's where it is unmapped, then on
+//! each other CPU before it first runs on the stack (and mapped again as it
+//! was before the stack is freed); synchronized TSCs (see [`cpu`]); and not a
+//! confidential VM (no #VE/#VC/#HV). A task's address space may be current on
+//! several CPUs at once: a change to its mappings that may leave stale
+//! translations is shot down, by IPI, on those that may cache it (see `tlb`).
 //!
 //! Devices: [`VmKernel`] is the drivers' [`litebox_hal::dma::Hal`].
 //!
@@ -89,6 +91,7 @@ mod dma;
 pub mod mm;
 mod per_cpu;
 pub mod providers;
+mod reclaim;
 
 mod syscall_entry;
 mod tlb;
@@ -222,7 +225,12 @@ pub(crate) struct PageTableManager {
     /// Lives until reset; must never be dropped.
     base_page_table: mm::PageTable<PAGE_SIZE>,
     base_page_table_frame: PhysFrame<Size4KiB>,
-    task_page_tables: spin::RwLock<HashMap<AddressSpaceId, Arc<mm::PageTable<PAGE_SIZE>>>>,
+    /// Each table in the node that releases it once unregistered.
+    task_page_tables: spin::RwLock<
+        HashMap<AddressSpaceId, alloc::boxed::Box<reclaim::Node<Arc<mm::PageTable<PAGE_SIZE>>>>>,
+    >,
+    /// See [`Self::unregister_task_page_table`].
+    unregistered: reclaim::Reclaim<Arc<mm::PageTable<PAGE_SIZE>>>,
 }
 
 impl PageTableManager {
@@ -232,6 +240,7 @@ impl PageTableManager {
             base_page_table: base_pt,
             base_page_table_frame: base_frame,
             task_page_tables: spin::RwLock::new(HashMap::new()),
+            unregistered: reclaim::Reclaim::new(),
         }
     }
 
@@ -298,7 +307,7 @@ impl PageTableManager {
 
         let pt = {
             let task_pts = self.task_page_tables.read();
-            Arc::clone(task_pts.get(&task_pt_id).ok_or(Errno::ENOENT)?)
+            Arc::clone(task_pts.get(&task_pt_id).ok_or(Errno::ENOENT)?.item())
         };
 
         let previous = without_interrupts(|| {
@@ -347,9 +356,11 @@ impl PageTableManager {
 
         let pt = Arc::new(pt);
         let task_pt_id = AddressSpaceId(pt.physical_frame().start_address().as_u64().trunc());
+        // Its node now, so that unregistering it allocates nothing.
+        let node = reclaim::Node::new(pt);
 
         let mut task_pts = self.task_page_tables.write();
-        task_pts.insert(task_pt_id, pt);
+        task_pts.insert(task_pt_id, node);
 
         Ok(task_pt_id)
     }
@@ -366,12 +377,27 @@ impl PageTableManager {
             self.task_page_tables
                 .read()
                 .get(&source)
-                .ok_or(Errno::ENOENT)?,
+                .ok_or(Errno::ENOENT)?
+                .item(),
         );
         self.create_task_page_table(Some(&source))
     }
 
-    /// Unregisters a task table; retained handles keep it alive.
+    /// Unregisters a task table; retained handles keep it alive. The
+    /// registry's reference is released by one CPU at a time (see
+    /// `reclaim`), with no allocation: this one, which then also releases
+    /// those unregistered meanwhile, or one already doing so, which this
+    /// leaves it to. It is queued as it leaves the registry, under the
+    /// registry's lock, so that it is always registered or retiring (see
+    /// `VmKernel::retiring_address_spaces`). This call releases only once it
+    /// dropped that lock; a CPU already releasing may release this one
+    /// sooner, while this one still holds the lock (it drops items under no
+    /// lock of its own). If it is the last (as when a reaped process drops its
+    /// address space: no thread of it runs, and its broker unpinned its
+    /// pages), the releasing CPU destroys the table, freeing every frame it
+    /// maps, with no time bound. Otherwise the last handle (a CPU's current
+    /// table, or a pin) destroys it as it drops, on its CPU, unserialized, as a
+    /// creation that fails before registering its table does.
     ///
     /// # Safety
     ///
@@ -387,11 +413,14 @@ impl PageTableManager {
             return Err(Errno::EINVAL);
         }
 
-        let pt = {
+        let drain = {
             let mut task_pts = self.task_page_tables.write();
-            task_pts.remove(&task_pt_id).ok_or(Errno::ENOENT)?
+            let node = task_pts.remove(&task_pt_id).ok_or(Errno::ENOENT)?;
+            self.unregistered.enqueue(node)
         };
-        drop(pt);
+        if let Some(drain) = drain {
+            drain.run();
+        }
         Ok(())
     }
 }
@@ -580,9 +609,8 @@ impl VmKernel {
             ram_frame_ranges,
             ioremap_next: spin::Mutex::new(IOREMAP.start),
         }));
-        if cfg!(debug_assertions) {
-            worker::self_check(platform);
-        }
+        #[cfg(debug_assertions)]
+        worker::self_check(platform);
         platform
     }
 
@@ -593,23 +621,6 @@ impl VmKernel {
     /// after: none is missed.
     pub fn halt_until_interrupt(&self) {
         cpu::halt();
-    }
-
-    /// A kernel stack of `size` bytes (a multiple of the page size), with an
-    /// unmapped guard page below it; its top. Never freed.
-    fn allocate_worker_stack(&self, size: usize) -> usize {
-        use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
-        let layout = Layout::from_size_align(size + PAGE_SIZE, PAGE_SIZE)
-            .expect("a page-aligned stack size");
-        // Safety: nonzero size. Leaked: the guard stays unmapped.
-        let base = unsafe { alloc_zeroed(layout) };
-        if base.is_null() {
-            handle_alloc_error(layout);
-        }
-        // Safety: its first page, unused. Kernel mappings are shared by every
-        // page table.
-        unsafe { per_cpu::unmap_guard(&self.page_table_manager.base_page_table, base as usize) };
-        base as usize + PAGE_SIZE + size
     }
 
     /// Only valid for addresses in the kernel's direct mapping.
@@ -640,7 +651,14 @@ impl VmKernel {
             .expect("Failed to allocate a new page table frame")
     }
 
-    /// Unregisters a task table; retained handles keep it alive.
+    /// Unregisters a task table; retained handles keep it alive. The
+    /// registry's references are released by one CPU at a time: this one, or
+    /// one already releasing them, which this call does not wait for. A table
+    /// whose last reference is the registry's is destroyed, its frames freed,
+    /// as that is released; one that another handle keeps (e.g., a pin) is
+    /// destroyed as that drops, on its CPU, unserialized. If this one
+    /// releases, it also releases those that other CPUs unregister
+    /// meanwhile, with no time bound, holding what its caller holds.
     ///
     /// # Safety
     ///
@@ -762,7 +780,8 @@ impl VmKernel {
                 .task_page_tables
                 .read()
                 .get(&address_space)
-                .ok_or(Errno::ENOENT)?,
+                .ok_or(Errno::ENOENT)?
+                .item(),
         );
         Ok((page_table, range))
     }
@@ -787,6 +806,18 @@ impl VmKernel {
     /// [`Self::create_address_space`]).
     pub fn address_space_count(&self) -> usize {
         self.page_table_manager.task_page_tables.read().len()
+    }
+
+    /// Whether the registry's references to unregistered address spaces (see
+    /// [`Self::unregister_address_space`]) are still queued, or being
+    /// released: for debug checks that nothing is left to free. Read it after
+    /// [`Self::address_space_count`]: an address space is queued as it leaves
+    /// the registry, under the registry's lock, so one that the count no
+    /// longer includes shows here until released. Not the tables that other
+    /// handles keep (e.g., a CPU's current table, or a pin).
+    #[cfg(debug_assertions)]
+    pub fn retiring_address_spaces(&self) -> bool {
+        !self.page_table_manager.unregistered.is_idle()
     }
 
     /// How many frames address spaces share copy-on-write (see
@@ -871,14 +902,18 @@ impl RawMutexProvider for VmKernel {
 
 impl WaitWakerProvider for VmKernel {}
 
-/// No kernel thread blocks, so nothing wakes a waiter: it spins until
-/// another CPU changes the value (every wake follows a change), with
-/// [`cpu::relax`], taking interrupts meanwhile, as a halt does. That CPU may
-/// be holding the lock in its worker, suspended, until it resumes it (see
-/// [`worker`]). A spin that sees no change for [`LOCK_WARNING`] warns, once,
-/// and spins on: it may be a deadlock (e.g., the holder's CPU waits for the
+/// On a task ([`worker`]), a waiter suspends the task: a release, which
+/// changes the value, makes it due (see [`worker::Wait`]). Elsewhere, no
+/// kernel thread blocks, so nothing wakes a waiter: it spins until another
+/// CPU changes the value (every wake follows a change), with [`cpu::relax`],
+/// taking interrupts meanwhile, as a halt does. The holder may be a task
+/// suspended on its CPU, until that resumes it: so code that is not a task
+/// must not wait for a lock that a task may hold across a suspension (see
+/// [`worker`]); debug builds panic if it would spin with a task suspended on
+/// its CPU. A spin that sees no change for [`LOCK_WARNING`] warns, once, and
+/// spins on: it may be a deadlock (e.g., the holder's CPU waits for the
 /// spinning one; which CPU holds a lock is unknown), or a long hold. With no
-/// other CPU online, blocking would deadlock, and panics; timeouts are
+/// other CPU online, spinning would deadlock, and panics; timeouts are
 /// unsupported (no kernel code uses one), and panic.
 pub struct RawMutex {
     inner: AtomicU32,
@@ -894,6 +929,8 @@ impl RawMutexTrait for RawMutex {
     }
 
     fn wake_many(&self, _n: usize) -> usize {
+        // For the waiting tasks; the others spin.
+        worker::wake_blocked(cpu::current());
         0
     }
 
@@ -931,9 +968,25 @@ impl RawMutex {
             self.underlying_atomic()
                 .load(core::sync::atomic::Ordering::Relaxed)
         };
+        if timeout.is_none() && worker::on_task() {
+            // Before the last look (see `worker::Wait`).
+            let seen = worker::wakes();
+            if value() != val {
+                return Err(ImmediatelyWokenUp);
+            }
+            // Safety: `self` outlives the wait, which ends in this call.
+            worker::suspend(unsafe { worker::Wait::lock(&self.inner, val, seen) });
+            return Ok(UnblockedOrTimedOut::Unblocked);
+        }
         if value() != val {
             return Err(ImmediatelyWokenUp);
         }
+        debug_assert_eq!(
+            worker::live_here(),
+            0,
+            "code that is not a task waits for a lock, which a task suspended on its CPU may \
+             hold (see `worker`)"
+        );
         assert!(
             timeout.is_none() && cpu::online_count() > 1,
             "blocking in the VM guest kernel, with no other CPU to release the lock, or with a \

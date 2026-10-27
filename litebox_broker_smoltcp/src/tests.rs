@@ -965,7 +965,8 @@ fn an_unaccepted_guest_connection_outlives_its_connecting_process() {
     assert_eq!(queued_connectors(&test), [Some(client.id())]);
     // As on Linux (the userland broker discards it), it stays queued,
     // charged to no process: the process's ID may be reused.
-    client.cleanup(true);
+    client.retire(true);
+    drop(client);
     assert_eq!(queued_connectors(&test), [None]);
     let SocketOutcome::Completed(accepted) =
         core_socket::accept(&server, listener, FileOpenFlags::NONE, test.sink.clone()).unwrap()
@@ -991,7 +992,8 @@ fn orphaned_guest_connections_count_until_their_listener_closes() {
             core_socket::send(&client, socket, b"data", SendFlags::NONE),
             Ok(SocketOutcome::Completed(4))
         );
-        client.cleanup(true);
+        client.retire(true);
+        drop(client);
     }
     assert_eq!(queued_connectors(&test), [None, None]);
     // With the listener, they leave room for one more socket of the four.
@@ -2333,7 +2335,8 @@ fn a_guest_datagram_outlives_its_sending_process() {
     };
     assert_eq!(senders(), [Some(sender.id())]);
     // Charged to no process, as the sender's ID may be reused.
-    sender.cleanup(true);
+    sender.retire(true);
+    drop(sender);
     assert_eq!(senders(), [None]);
     let SocketOutcome::Completed(datagram) =
         receive_data_from(&receiver_process, receiver, 8, ReceiveFromFlags::NONE).unwrap()

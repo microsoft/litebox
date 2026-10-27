@@ -69,7 +69,7 @@ fn set_alloc_budget(budget: Option<usize>) {
 
 /// Makes the thread's heap allocations (see [`TestHeap`]) fail after
 /// `budget` more, or not (`None`); frames ([`HostMemory`]) still come.
-fn set_heap_budget(budget: Option<usize>) {
+pub(crate) fn set_heap_budget(budget: Option<usize>) {
     HOST.with(|host| host.borrow_mut().heap_budget = budget);
 }
 
@@ -440,6 +440,42 @@ fn kernel_image_permissions() {
         );
     }
     // HostMemory's identity mapping places these owned frames in private slots.
+    drop(pgtable);
+    assert_eq!(live_frames(), before);
+}
+
+#[test]
+fn stack_guards_are_mapped_again_as_they_were() {
+    let before = live_frames();
+    let pgtable = new_table();
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(
+        HostMemory::mem_allocate_pages(0).unwrap() as u64,
+    ));
+    let none = PhysAddr::zero()..PhysAddr::zero();
+    // As the kernel maps RAM, here at `PA + 0`.
+    pgtable
+        .map_kernel(PhysFrame::range(frame, frame + 1), 0, &none, &none)
+        .unwrap();
+    let guard = usize::try_from(frame.start_address().as_u64()).unwrap();
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    check_mapped(&pgtable, guard, flags);
+    let frames = live_frames();
+    take_flushes();
+    // Safety: host test; nothing uses the page, and the table is never loaded.
+    unsafe { crate::per_cpu::unmap_guard(&pgtable, guard) };
+    check_unmapped(&pgtable, guard);
+    assert_eq!(
+        take_flushes(),
+        [(pgtable.physical_frame(), span(guard, 1), frames)]
+    );
+    // Safety: as above; unmapped just now.
+    unsafe { crate::per_cpu::restore_guard(&pgtable, guard) };
+    check_mapped(&pgtable, guard, flags);
+    assert_eq!(mapped_frame(&pgtable, guard), frame);
+    // The leaf was absent: nothing to flush. No table allocated, no frame
+    // freed.
+    assert_eq!(take_flushes(), []);
+    assert_eq!(live_frames(), frames);
     drop(pgtable);
     assert_eq!(live_frames(), before);
 }

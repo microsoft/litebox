@@ -260,6 +260,9 @@ pub(crate) enum ProcessStatus {
     /// Exit is releasing the process's resources before its status becomes
     /// observable.
     Exiting,
+    /// Startup failed, and the one caller that failed it is releasing what
+    /// the process holds before the failure becomes observable.
+    Rejecting(BrokerError),
     /// Startup failed and host cleanup is still pending.
     Failed(BrokerError),
     /// The process exited and retains its exit status.
@@ -270,8 +273,9 @@ impl ProcessStatus {
     fn transition(&mut self, next: Self) -> Result<()> {
         let allowed = matches!(
             (*self, next),
-            (Self::Starting, Self::Running | Self::Failed(_))
+            (Self::Starting, Self::Running | Self::Rejecting(_))
                 | (Self::Starting | Self::Running, Self::Exiting)
+                | (Self::Rejecting(_), Self::Failed(_))
                 | (Self::Exiting, Self::Exited(_))
         );
         if !allowed {
@@ -286,7 +290,6 @@ impl ProcessStatus {
 enum ProcessRetirement {
     Active { abnormal: bool },
     Retired { release_ids: bool },
-    Cleaned,
 }
 
 impl ProcessRetirement {
@@ -294,7 +297,6 @@ impl ProcessRetirement {
         match self {
             Self::Active { abnormal } => *abnormal = true,
             Self::Retired { release_ids } => *release_ids = false,
-            Self::Cleaned => {}
         }
     }
 
@@ -304,7 +306,6 @@ impl ProcessRetirement {
             Self::Retired {
                 release_ids: current,
             } => current && release_ids,
-            Self::Cleaned => return,
         };
         *self = Self::Retired { release_ids };
     }
@@ -570,7 +571,7 @@ impl BrokerProcess {
         let release_thread_ids = {
             let mut state = child.state.lock();
             // Owner death fails the child if it takes the child lock first.
-            if let ProcessStatus::Failed(error) = state.status {
+            if let ProcessStatus::Rejecting(error) | ProcessStatus::Failed(error) = state.status {
                 return Err(error);
             }
             state.status.transition(ProcessStatus::Exiting)?;
@@ -833,19 +834,22 @@ impl BrokerProcess {
             && matches!(state.retirement, ProcessRetirement::Active { .. })
     }
 
-    /// Returns whether this process exited or failed to start, after which it
-    /// no longer leads its session (see [`crate::process_group`]).
+    /// Returns whether this process exited or failed to start (as soon as a
+    /// caller claimed the failure, see [`ProcessStatus::Rejecting`]), after
+    /// which it no longer leads its session (see [`crate::process_group`]).
     pub(crate) fn has_left(&self) -> bool {
         matches!(
             self.state.lock().status,
-            ProcessStatus::Exited(_) | ProcessStatus::Failed(_)
+            ProcessStatus::Exited(_) | ProcessStatus::Rejecting(_) | ProcessStatus::Failed(_)
         )
     }
 
-    /// Returns the completed startup outcome, or `None` while startup is pending.
+    /// Returns the completed startup outcome, or `None` while startup is
+    /// pending: a failed start completes once it released what the process
+    /// held (see [`Self::fail_start`]).
     pub fn startup_result(&self) -> Option<Result<()>> {
         match self.state.lock().status {
-            ProcessStatus::Starting => None,
+            ProcessStatus::Starting | ProcessStatus::Rejecting(_) => None,
             // A process exits only after it runs, possibly before starting its
             // own runner.
             ProcessStatus::Running | ProcessStatus::Exiting | ProcessStatus::Exited(_) => {
@@ -865,7 +869,9 @@ impl BrokerProcess {
             match state.status {
                 ProcessStatus::Starting => {}
                 ProcessStatus::Running => return Err(BrokerError::Internal),
-                ProcessStatus::Failed(error) => return Err(error),
+                ProcessStatus::Rejecting(error) | ProcessStatus::Failed(error) => {
+                    return Err(error);
+                }
                 ProcessStatus::Exiting | ProcessStatus::Exited(_) => {
                     return Err(BrokerError::PeerClosed);
                 }
@@ -895,7 +901,9 @@ impl BrokerProcess {
                 ProcessStatus::Running => {}
                 ProcessStatus::Exiting | ProcessStatus::Exited(_) => return Ok(()),
                 ProcessStatus::Starting => return Err(BrokerError::WouldBlock),
-                ProcessStatus::Failed(error) => return Err(error),
+                ProcessStatus::Rejecting(error) | ProcessStatus::Failed(error) => {
+                    return Err(error);
+                }
             }
             // Only the caller that claims the exit releases resources.
             state.status.transition(ProcessStatus::Exiting)?;
@@ -1083,6 +1091,11 @@ impl BrokerProcess {
     ///
     /// A process whose startup failed leaves the process tree, as if it had
     /// never been created, except that its parent learns it was removed.
+    /// Only the first caller to fail it (here or through its parent's owner
+    /// death) releases what it holds, before [`Self::startup_result`] reports
+    /// the failure and the process lifecycle sink is notified. A later caller
+    /// returns that failure's error at once, though the release may still be
+    /// under way.
     pub fn fail_start(
         &self,
         error: BrokerError,
@@ -1098,12 +1111,14 @@ impl BrokerProcess {
                     ProcessStatus::Running | ProcessStatus::Exiting | ProcessStatus::Exited(_) => {
                         return Ok(());
                     }
-                    ProcessStatus::Failed(error) => return Err(error),
+                    ProcessStatus::Rejecting(error) | ProcessStatus::Failed(error) => {
+                        return Err(error);
+                    }
                 }
                 if abnormal {
                     state.retirement.mark_abnormal();
                 }
-                state.status.transition(ProcessStatus::Failed(error))?;
+                state.status.transition(ProcessStatus::Rejecting(error))?;
                 if state.shutdown_request == ProcessShutdownRequest::None {
                     state.shutdown_request = if expected_shutdown {
                         ProcessShutdownRequest::Expected
@@ -1117,15 +1132,35 @@ impl BrokerProcess {
             self.release_unstarted();
             shutdown
         };
-        // Release the child's references before publishing the failure.
-        if self.release_references() {
-            self.state.lock().retirement.mark_abnormal();
-        }
-        self.core.process_lifecycle_sink.changed();
+        self.finish_rejection();
         if let Some(shutdown) = shutdown {
             shutdown();
         }
         Err(error)
+    }
+
+    /// Finishes the rejection of this process's start that the caller claimed
+    /// (see [`ProcessStatus::Rejecting`]): releases the process's references,
+    /// publishes the failure, then notifies the process lifecycle sink.
+    ///
+    /// Callers hold no lock, since dropping a reference may reach a provider
+    /// (e.g., a file's), which may block, but hold this process, so that its
+    /// final drop cannot release it meanwhile.
+    fn finish_rejection(&self) {
+        let fault = self.release_references();
+        let mut state = self.state.lock();
+        if fault {
+            state.retirement.mark_abnormal();
+        }
+        let ProcessStatus::Rejecting(error) = state.status else {
+            return;
+        };
+        state
+            .status
+            .transition(ProcessStatus::Failed(error))
+            .expect("rejecting start failure must be a valid transition");
+        drop(state);
+        self.core.process_lifecycle_sink.changed();
     }
 
     /// Returns whether the first runner shutdown request was expected.
@@ -1143,37 +1178,43 @@ impl BrokerProcess {
 
     /// Applies owner-death handling to every direct child process.
     ///
-    /// Children that are still starting fail.
+    /// Children that are still starting, including those taken for startup,
+    /// fail as with [`Self::fail_start`], one after another: each releases
+    /// what it holds, holding no lock, before its failure is published and
+    /// the process lifecycle sink notified.
     /// Calling this method more than once is harmless.
     pub fn handle_owner_death(&self) {
         self.cancellation.cancel();
         let pending_child_process = self.state.lock().pending_child_process.take();
         let mut shutdowns = Vec::new();
-        let changed = {
+        // Kept until their rejections finish: their last owners may drop them
+        // meanwhile, anywhere.
+        let rejected: Vec<Arc<Self>> = {
             // Child creation checks cancellation under the tree lock, so once
             // this lock is taken every child created for a live owner is
             // listed.
             let _tree = self.core.process_tree_lock.lock();
             let mut children = core::mem::take(&mut self.tree_node.lock().children);
-            let count = children.len();
-            children.retain(|child| {
-                let (failed, shutdown) = child.handle_parent_death();
-                shutdowns.extend(shutdown);
-                if failed {
-                    crate::process_group::leader_left(child);
-                }
-                !failed
-            });
-            let changed = children.len() != count;
+            let rejected = children
+                .extract_if(.., |child| {
+                    let (rejected, shutdown) = child.handle_parent_death();
+                    shutdowns.extend(shutdown);
+                    if rejected {
+                        crate::process_group::leader_left(child);
+                    }
+                    rejected
+                })
+                .collect();
             self.tree_node.lock().children = children;
-            changed
+            rejected
         };
-        if changed {
-            self.core.process_lifecycle_sink.changed();
+        for child in &rejected {
+            child.finish_rejection();
         }
         for shutdown in shutdowns {
             shutdown();
         }
+        drop(rejected);
         if let Some(PendingChild { process: child, .. }) = pending_child_process {
             child.discard();
         }
@@ -1218,11 +1259,13 @@ impl BrokerProcess {
             .is_some_and(|own_parent| core::ptr::eq(own_parent.as_ptr(), parent))
     }
 
-    /// Fails this child if it is still starting after its parent's owner
-    /// dies, returning whether it failed and the runner shutdown to run.
+    /// Claims the rejection of this child's start if it is still starting
+    /// after its parent's owner dies, returning whether it did and the runner
+    /// shutdown to run.
     ///
     /// A child whose startup failed leaves the process tree. Callers hold the
-    /// core's process tree lock and remove the child from its parent.
+    /// core's process tree lock and remove the child from its parent, then,
+    /// holding no lock, finish its rejection ([`Self::finish_rejection`]).
     fn handle_parent_death(&self) -> (bool, Option<ProcessShutdown>) {
         let mut state = self.state.lock();
         if state.status != ProcessStatus::Starting {
@@ -1230,7 +1273,7 @@ impl BrokerProcess {
         }
         state
             .status
-            .transition(ProcessStatus::Failed(BrokerError::PeerClosed))
+            .transition(ProcessStatus::Rejecting(BrokerError::PeerClosed))
             .expect("starting child rejection must be a valid transition");
         if state.shutdown_request == ProcessShutdownRequest::None {
             state.shutdown_request = ProcessShutdownRequest::Expected;
@@ -1778,27 +1821,12 @@ impl BrokerProcess {
         Ok(reference)
     }
 
-    /// Cleans up this process, optionally releasing its numeric IDs for reuse.
+    /// Cleans up this process as it finally drops, releasing its numeric IDs
+    /// for reuse if its teardown was fully accounted (`release_ids`).
     ///
-    /// Set `release_ids` only after fully accounted teardown. Final process
-    /// drop otherwise retains IDs after an unwind or uncertain retirement.
-    /// Calling this method more than once is harmless. It never takes the
-    /// core's process tree lock, so a process may drop while that lock is
-    /// held.
-    pub fn cleanup(&self, release_ids: bool) {
-        let release_ids = {
-            let mut state = self.state.lock();
-            let release_ids = match state.retirement {
-                ProcessRetirement::Active { abnormal } => release_ids && !abnormal,
-                ProcessRetirement::Retired {
-                    release_ids: decided,
-                } => release_ids && decided,
-                ProcessRetirement::Cleaned => return,
-            };
-            state.retirement = ProcessRetirement::Cleaned;
-            release_ids
-        };
-
+    /// It never takes the core's process tree lock, so a process may drop
+    /// while that lock is held.
+    fn cleanup(&mut self, release_ids: bool) {
         let mut invariant_fault = self.release_references();
         if self.core.processes.write().remove(&self.id).is_none() {
             invariant_fault = true;
@@ -1813,6 +1841,7 @@ impl BrokerProcess {
             ids.release(self.id.0);
             Self::release_membership_ids(&mut ids, membership);
         }
+        // Only once nothing is left to clean up, since a sink may unwind.
         self.core.process_lifecycle_sink.changed();
     }
 
@@ -2006,13 +2035,13 @@ fn release_pending_reference(
 
 impl Drop for BrokerProcess {
     fn drop(&mut self) {
-        let release_ids = {
-            let state = self.state.lock();
-            matches!(
-                state.retirement,
-                ProcessRetirement::Retired { release_ids: true }
-            )
-        };
+        let state = self.state.get_mut();
+        // A rejection still under way was abandoned by a claimant that
+        // unwound, so this releases what it left but keeps the process's IDs.
+        let release_ids = matches!(
+            state.retirement,
+            ProcessRetirement::Retired { release_ids: true }
+        ) && !matches!(state.status, ProcessStatus::Rejecting(_));
         self.cleanup(release_ids);
     }
 }
@@ -2021,15 +2050,17 @@ impl Drop for BrokerProcess {
 mod tests {
     use core::any::Any;
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::time::Duration;
 
     use super::{
         BrokerProcess, ProcessImage, ProcessLifecycleSink, ProcessReferences, ProcessStatus,
         Result, release_pending_reference,
     };
-    use crate::readiness::ReadinessSink;
-    use crate::stdio::StdioOutputStream;
+    use crate::readiness::{ReadinessSink, SharedReadinessWatchers};
+    use crate::stdio::{StdioOutputStream, StdioProvider as _};
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
+    use crate::timer::{Alarm, TimerProvider};
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -2045,7 +2076,12 @@ mod tests {
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
-    use std::{boxed::Box, sync::Arc, vec, vec::Vec};
+    use std::{
+        boxed::Box,
+        sync::{Arc, OnceLock, Weak, mpsc},
+        vec,
+        vec::Vec,
+    };
 
     const TEST_MAX_REFERENCES: usize = 4;
     const TEST_MAX_PIPE_CAPACITY: usize = 8;
@@ -2106,11 +2142,16 @@ mod tests {
     #[derive(Default)]
     struct TestProcessLifecycleSink {
         changes: AtomicUsize,
+        /// Runs on each change, once set.
+        on_change: OnceLock<Box<dyn Fn() + Send + Sync>>,
     }
 
     impl ProcessLifecycleSink for TestProcessLifecycleSink {
         fn changed(&self) {
             self.changes.fetch_add(1, Ordering::Relaxed);
+            if let Some(on_change) = self.on_change.get() {
+                on_change();
+            }
         }
     }
 
@@ -2124,13 +2165,14 @@ mod tests {
             .map(|parent| parent.id())
     }
 
-    fn process_statuses() -> [ProcessStatus; 5] {
+    fn process_statuses() -> [ProcessStatus; 6] {
         use ProcessStatus as State;
 
         [
             State::Starting,
             State::Running,
             State::Exiting,
+            State::Rejecting(BrokerError::PeerClosed),
             State::Failed(BrokerError::PeerClosed),
             State::Exited(EXITED),
         ]
@@ -2140,12 +2182,14 @@ mod tests {
     fn process_status_transition_matrix() {
         use ProcessStatus as State;
 
+        let rejecting = State::Rejecting(BrokerError::PeerClosed);
         let failed = State::Failed(BrokerError::PeerClosed);
         let states = process_statuses();
         let allowed = [
             (State::Starting, State::Running),
             (State::Starting, State::Exiting),
-            (State::Starting, failed),
+            (State::Starting, rejecting),
+            (rejecting, failed),
             (State::Running, State::Exiting),
             (State::Exiting, State::Exited(EXITED)),
         ];
@@ -3227,6 +3271,517 @@ mod tests {
     }
 
     #[test]
+    fn owner_death_releases_a_starting_childs_references_before_it_drops() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child_id = parent.allocate_child_process().unwrap().process_id;
+        let sink: Arc<dyn ReadinessSink> = readiness_sink();
+        let event = crate::event::create(&parent, 1, FileOpenFlags::NONE).unwrap();
+        parent
+            .duplicate_object_references_to_child(child_id, &[event], &sink)
+            .unwrap();
+        // Taken for startup, as a launch holds it until the start ends.
+        let child = parent.take_child_process(child_id).unwrap();
+        assert_eq!(child.references.lock().handles.len(), 1);
+
+        parent.handle_owner_death();
+
+        assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
+        assert_eq!(child.references.lock().handles, []);
+        assert!(child.is_released());
+        assert!(parent.tree_node.lock().children.is_empty());
+        // The launch's end then only retires it.
+        assert_eq!(
+            child.fail_start(BrokerError::PeerClosed, false, true),
+            Err(BrokerError::PeerClosed)
+        );
+        child.retire(true);
+        drop(child);
+        assert!(!broker.processes.read().contains_key(&child_id));
+        assert_eq!(
+            parent.check_readiness(event),
+            Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
+        );
+    }
+
+    /// The hook that [`HookedTimers`]' alarms run as they drop, once set.
+    type DropHook = Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>;
+
+    /// Timer provider whose alarm, which drops with its timer's last
+    /// reference, runs a hook as it drops, as a provider's destructor runs,
+    /// which may block.
+    struct HookedTimers(DropHook);
+
+    impl TimerProvider for HookedTimers {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn create_alarm(&self, _watchers: SharedReadinessWatchers) -> Result<Box<dyn Alarm>> {
+            Ok(Box::new(HookedAlarm(Arc::clone(&self.0))))
+        }
+    }
+
+    struct HookedAlarm(DropHook);
+
+    impl Alarm for HookedAlarm {
+        fn set(&self, _deadline: Option<Duration>) {}
+    }
+
+    impl Drop for HookedAlarm {
+        fn drop(&mut self) {
+            if let Some(hook) = self.0.get() {
+                hook();
+            }
+        }
+    }
+
+    /// Returns a broker whose timers' alarms run the returned hook as they
+    /// drop.
+    fn broker_with_hooked_timers() -> (BrokerCore, DropHook) {
+        let on_drop = DropHook::default();
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .with_timer_provider(Arc::new(HookedTimers(Arc::clone(&on_drop))))
+        .build()
+        .unwrap();
+        (broker, on_drop)
+    }
+
+    /// Allocates a pending child of `parent` that holds the only references
+    /// to two timers it inherited, so their alarms drop as the child releases
+    /// its references.
+    fn pending_child_with_timers(parent: &BrokerProcess) -> ProcessId {
+        let sink: Arc<dyn ReadinessSink> = readiness_sink();
+        let timers =
+            [(); 2].map(|()| crate::timer::create(parent, &sink, FileOpenFlags::NONE).unwrap());
+        let child = parent.allocate_child_process().unwrap().process_id;
+        parent
+            .duplicate_object_references_to_child(child, &timers, &sink)
+            .unwrap();
+        for timer in timers {
+            parent.close_object_reference(timer).unwrap();
+        }
+        child
+    }
+
+    /// Makes `on_drop` count its runs, the one numbered `blocked` (from 0) of
+    /// which reports to the returned receiver, then blocks until the returned
+    /// sender sends.
+    fn block_on_drop(
+        on_drop: &DropHook,
+        blocked: usize,
+    ) -> (Arc<AtomicUsize>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (entered, entered_receiver) = mpsc::channel();
+        let (release_sender, release) = mpsc::channel::<()>();
+        let release = std::sync::Mutex::new(release);
+        let counted = Arc::clone(&runs);
+        let hook = move || {
+            if counted.fetch_add(1, Ordering::Relaxed) == blocked {
+                entered.send(()).unwrap();
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        };
+        assert!(on_drop.set(Box::new(hook)).is_ok());
+        (runs, entered_receiver, release_sender)
+    }
+
+    /// Makes `on_drop` count its runs, the first of which fails, unwinding
+    /// its caller as a failing provider destructor would.
+    fn fail_first_drop(on_drop: &DropHook) -> Arc<AtomicUsize> {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let hook = move || {
+            assert_ne!(
+                counted.fetch_add(1, Ordering::Relaxed),
+                0,
+                "provider failure"
+            );
+        };
+        assert!(on_drop.set(Box::new(hook)).is_ok());
+        runs
+    }
+
+    #[test]
+    fn failing_start_completes_once_its_references_are_released() {
+        let lifecycle = Arc::new(TestProcessLifecycleSink::default());
+        let (broker, on_drop) = broker_with_hooked_timers();
+        let broker = broker.with_process_lifecycle_sink(lifecycle.clone());
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child_id = pending_child_with_timers(&parent);
+        // Taken for startup, as a launch holds it until the start ends.
+        let child = parent.take_child_process(child_id).unwrap();
+        let ids = [child_id.0, child.initial_thread_id().0];
+        let allocated = || ids.map(|id| broker.ids.lock().is_allocated(id));
+        let (destroyed, entered, release) = block_on_drop(&on_drop, 0);
+        let changes = lifecycle.changes.load(Ordering::Relaxed);
+
+        let failing = {
+            let child = Arc::clone(&child);
+            std::thread::spawn(move || child.fail_start(BrokerError::OutOfMemory, false, true))
+        };
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // While an inherited timer's provider blocks its destruction, the
+        // failing caller holds no broker lock, and nothing publishes the
+        // failure. The process already left the tree, and neither starts nor
+        // serves operations.
+        assert!(broker.process_tree_lock.try_lock().is_some());
+        assert!(child.state.try_lock().is_some());
+        assert_eq!(child.startup_result(), None);
+        assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes);
+        assert!(child.is_released());
+        assert_eq!(child.complete_start(), Err(BrokerError::OutOfMemory));
+        assert_eq!(
+            child.report_exit_status(EXITED),
+            Err(BrokerError::PeerClosed)
+        );
+        // Competitors neither release nor complete anything: a later failure
+        // returns the first one's error at once, and owner death no longer
+        // finds the child.
+        assert_eq!(
+            child.fail_start(BrokerError::PeerClosed, true, true),
+            Err(BrokerError::OutOfMemory)
+        );
+        parent.handle_owner_death();
+        assert_eq!(destroyed.load(Ordering::Relaxed), 1);
+        assert_eq!(child.startup_result(), None);
+        assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes);
+        assert_eq!(allocated(), [true; 2]);
+
+        release.send(()).unwrap();
+        assert_eq!(failing.join().unwrap(), Err(BrokerError::OutOfMemory));
+        assert_eq!(destroyed.load(Ordering::Relaxed), 2);
+        assert_eq!(child.references.lock().handles, []);
+        assert!(broker.references.read().is_empty());
+        assert_eq!(child.startup_result(), Some(Err(BrokerError::OutOfMemory)));
+        assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes + 1);
+        assert_eq!(
+            child.fail_start(BrokerError::PeerClosed, false, true),
+            Err(BrokerError::OutOfMemory)
+        );
+        // Its IDs stay in use until the launch's end retires it and its last
+        // owner drops it.
+        assert_eq!(allocated(), [true; 2]);
+        child.retire(true);
+        drop(child);
+        assert!(!broker.processes.read().contains_key(&child_id));
+        assert_eq!(allocated(), [false; 2]);
+    }
+
+    #[test]
+    fn owner_death_rejection_completes_once_references_are_released() {
+        let lifecycle = Arc::new(TestProcessLifecycleSink::default());
+        let (broker, on_drop) = broker_with_hooked_timers();
+        let broker = broker.with_process_lifecycle_sink(lifecycle.clone());
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child_id = pending_child_with_timers(&parent);
+        // Taken for startup, as a launch holds it until the start ends.
+        let child = parent.take_child_process(child_id).unwrap();
+        let ids = [child_id.0, child.initial_thread_id().0];
+        let allocated = || ids.map(|id| broker.ids.lock().is_allocated(id));
+        let (destroyed, entered, release) = block_on_drop(&on_drop, 0);
+        let changes = lifecycle.changes.load(Ordering::Relaxed);
+
+        let dying = {
+            let parent = Arc::clone(&parent);
+            std::thread::spawn(move || parent.handle_owner_death())
+        };
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // While an inherited timer's provider blocks its destruction, owner
+        // death holds no broker lock, and nothing publishes the failure. The
+        // child already left the tree, and neither starts nor serves
+        // operations.
+        assert!(broker.process_tree_lock.try_lock().is_some());
+        assert!(parent.state.try_lock().is_some());
+        assert!(child.state.try_lock().is_some());
+        assert_eq!(child.startup_result(), None);
+        assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes);
+        assert!(child.is_released());
+        assert!(parent.tree_node.lock().children.is_empty());
+        assert_eq!(child.complete_start(), Err(BrokerError::PeerClosed));
+        assert_eq!(
+            child.report_exit_status(EXITED),
+            Err(BrokerError::PeerClosed)
+        );
+        // The launch's end neither releases nor completes anything: its
+        // failure returns owner death's error at once.
+        assert_eq!(
+            child.fail_start(BrokerError::OutOfMemory, false, true),
+            Err(BrokerError::PeerClosed)
+        );
+        child.retire(true);
+        assert_eq!(destroyed.load(Ordering::Relaxed), 1);
+        assert_eq!(child.startup_result(), None);
+        assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes);
+        assert_eq!(allocated(), [true; 2]);
+
+        release.send(()).unwrap();
+        dying.join().unwrap();
+        assert_eq!(destroyed.load(Ordering::Relaxed), 2);
+        assert_eq!(child.references.lock().handles, []);
+        assert!(broker.references.read().is_empty());
+        assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
+        assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes + 1);
+        assert_eq!(child.complete_start(), Err(BrokerError::PeerClosed));
+        // Retired, it keeps its IDs only until its last owner drops it.
+        assert_eq!(allocated(), [true; 2]);
+        drop(child);
+        assert!(!broker.processes.read().contains_key(&child_id));
+        assert_eq!(allocated(), [false; 2]);
+    }
+
+    #[test]
+    fn rejected_starts_release_references_holding_no_broker_lock() {
+        let (broker, on_drop) = broker_with_hooked_timers();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let failed = parent
+            .take_child_process(pending_child_with_timers(&parent))
+            .unwrap();
+        let transferred = parent
+            .take_child_process(pending_child_with_timers(&parent))
+            .unwrap();
+        let pending_id = pending_child_with_timers(&parent);
+        let pending = parent.with_pending_child(pending_id, Arc::clone).unwrap();
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = {
+            let tree = Arc::clone(&broker.process_tree_lock);
+            let references = Arc::clone(&broker.references);
+            let processes = [&parent, &failed, &transferred, &pending].map(Arc::downgrade);
+            let held = Arc::clone(&held);
+            move || {
+                // No other thread runs, so a lock this one cannot take is one
+                // its callers hold.
+                let mut locked = vec![tree.try_lock().is_none(), references.try_write().is_none()];
+                for process in processes.iter().filter_map(Weak::upgrade) {
+                    locked.push(process.state.try_lock().is_none());
+                    locked.push(process.tree_node.try_lock().is_none());
+                    locked.push(process.references.try_lock().is_none());
+                }
+                held.lock().unwrap().push(locked.contains(&true));
+            }
+        };
+        assert!(on_drop.set(Box::new(hook)).is_ok());
+
+        assert_eq!(
+            failed.fail_start(BrokerError::OutOfMemory, false, true),
+            Err(BrokerError::OutOfMemory)
+        );
+        parent.handle_owner_death();
+
+        // Each inherited timer's provider destructor ran once, under no broker
+        // lock.
+        assert_eq!(*held.lock().unwrap(), [false; 6]);
+        for (child, error) in [
+            (&failed, BrokerError::OutOfMemory),
+            (&transferred, BrokerError::PeerClosed),
+            (&pending, BrokerError::PeerClosed),
+        ] {
+            assert_eq!(child.startup_result(), Some(Err(error)));
+            assert_eq!(child.references.lock().handles, []);
+            assert!(child.is_released());
+        }
+        assert!(broker.references.read().is_empty());
+        assert!(parent.tree_node.lock().children.is_empty());
+    }
+
+    #[test]
+    fn final_drop_finishes_an_abandoned_rejection_keeping_its_ids() {
+        let lifecycle = Arc::new(TestProcessLifecycleSink::default());
+        let (broker, on_drop) = broker_with_hooked_timers();
+        let broker = broker.with_process_lifecycle_sink(lifecycle.clone());
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child_id = pending_child_with_timers(&parent);
+        let child = parent.take_child_process(child_id).unwrap();
+        let ids = [child_id.0, child.initial_thread_id().0];
+        let destroyed = fail_first_drop(&on_drop);
+        // Whether the child was still registered at each notification.
+        let registered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = {
+            let registered = Arc::clone(&registered);
+            let processes = Arc::clone(&broker.processes);
+            move || {
+                let contained = processes.read().contains_key(&child_id);
+                registered.lock().unwrap().push(contained);
+            }
+        };
+        assert!(lifecycle.on_change.set(Box::new(hook)).is_ok());
+
+        let failing = {
+            let child = Arc::clone(&child);
+            std::thread::spawn(move || child.fail_start(BrokerError::OutOfMemory, false, true))
+        };
+        assert!(failing.join().is_err());
+
+        // The claimant unwound from its first provider destructor, leaving the
+        // start rejecting and the other inherited timer unreleased, to the
+        // final drop, which releases the timer but keeps the IDs, though the
+        // process was retired cleanly.
+        assert_eq!(child.startup_result(), None);
+        child.retire(true);
+        assert_eq!(destroyed.load(Ordering::Relaxed), 1);
+        assert!(broker.processes.read().contains_key(&child_id));
+        drop(child);
+        assert_eq!(destroyed.load(Ordering::Relaxed), 2);
+        assert!(!broker.processes.read().contains_key(&child_id));
+        assert_eq!(ids.map(|id| broker.ids.lock().is_allocated(id)), [true; 2]);
+        // Its one notification came once the child was unregistered, so a
+        // sink that unwinds cannot leave it taking a process slot.
+        let notified = registered.lock().unwrap().clone();
+        assert_eq!(notified, [false]);
+    }
+
+    #[test]
+    fn owner_death_notifies_each_rejection_before_releasing_the_next() {
+        let lifecycle = Arc::new(TestProcessLifecycleSink::default());
+        let (broker, on_drop) = broker_with_hooked_timers();
+        let broker = broker.with_process_lifecycle_sink(lifecycle.clone());
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let earlier = parent
+            .take_child_process(pending_child_with_timers(&parent))
+            .unwrap();
+        let later = parent
+            .take_child_process(pending_child_with_timers(&parent))
+            .unwrap();
+        // Owner death releases the earlier child's two timers, then the later
+        // child's: the third provider destructor blocks.
+        let (destroyed, entered, release) = block_on_drop(&on_drop, 2);
+        let notified = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook = {
+            let children = [&earlier, &later].map(Arc::downgrade);
+            let notified = Arc::clone(&notified);
+            // What each notification shows the children's startup waiters,
+            // read without waiting for a lock.
+            move || {
+                let statuses = children.each_ref().map(|child| {
+                    let child = child.upgrade()?;
+                    child.state.try_lock().map(|state| state.status)
+                });
+                notified.lock().unwrap().push(statuses);
+            }
+        };
+        assert!(lifecycle.on_change.set(Box::new(hook)).is_ok());
+
+        let dying = {
+            let parent = Arc::clone(&parent);
+            std::thread::spawn(move || parent.handle_owner_death())
+        };
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // While the later child's provider destructor blocks, holding no
+        // broker lock, the earlier child's failure is published, and was
+        // notified once published.
+        assert!(broker.process_tree_lock.try_lock().is_some());
+        for process in [&parent, &earlier, &later] {
+            assert!(process.state.try_lock().is_some());
+        }
+        assert_eq!(destroyed.load(Ordering::Relaxed), 3);
+        assert_eq!(earlier.startup_result(), Some(Err(BrokerError::PeerClosed)));
+        assert_eq!(later.startup_result(), None);
+        let failed = Some(ProcessStatus::Failed(BrokerError::PeerClosed));
+        let rejecting = Some(ProcessStatus::Rejecting(BrokerError::PeerClosed));
+        assert_eq!(*notified.lock().unwrap(), [[failed, rejecting]]);
+
+        release.send(()).unwrap();
+        dying.join().unwrap();
+        assert_eq!(destroyed.load(Ordering::Relaxed), 4);
+        assert_eq!(later.startup_result(), Some(Err(BrokerError::PeerClosed)));
+        assert_eq!(
+            *notified.lock().unwrap(),
+            [[failed, rejecting], [failed, failed]]
+        );
+    }
+
+    /// Checks that the session that a starting child leads loses its
+    /// terminal as `reject`, given the parent and the child, claims the
+    /// rejection of the child's start: before the child released what it
+    /// holds, and for good.
+    fn rejecting_ends_terminal_control(reject: fn(&BrokerProcess, &BrokerProcess)) {
+        let (broker, on_drop) = broker_with_hooked_timers();
+        let [parent, other] = [(); 2].map(|()| {
+            broker
+                .allocate_process(CallerCredential::Unauthenticated, None)
+                .unwrap()
+        });
+        parent.complete_start().unwrap();
+        let child_id = pending_child_with_timers(&parent);
+        // Taken for startup, as a launch holds it until the start ends,
+        // leading a session that a terminal controls.
+        let child = parent.take_child_process(child_id).unwrap();
+        crate::process_group::create_session(&child, child_id).unwrap();
+        let terminal = TestStdioProvider::default()
+            .with_controlling_terminal()
+            .terminal()
+            .unwrap();
+        crate::process_group::acquire(&child, &terminal);
+        assert!(crate::process_group::controlling_terminal(&child).is_some());
+        let (_, entered, release) = block_on_drop(&on_drop, 0);
+
+        let rejecting = {
+            let (parent, child) = (Arc::clone(&parent), Arc::clone(&child));
+            std::thread::spawn(move || reject(&parent, &child))
+        };
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // While the child's release blocks, before its failure is published,
+        // its session already lost the terminal, which it cannot acquire
+        // again, and which another session can.
+        assert_eq!(child.startup_result(), None);
+        assert!(crate::process_group::controlling_terminal(&child).is_none());
+        crate::process_group::acquire(&child, &terminal);
+        assert!(crate::process_group::controlling_terminal(&child).is_none());
+        crate::process_group::acquire(&other, &terminal);
+        assert!(crate::process_group::controlling_terminal(&other).is_some());
+
+        release.send(()).unwrap();
+        rejecting.join().unwrap();
+        assert!(child.startup_result().is_some_and(|result| result.is_err()));
+    }
+
+    #[test]
+    fn a_failing_start_ends_its_terminal_control_at_once() {
+        rejecting_ends_terminal_control(|_, child| {
+            let _ = child.fail_start(BrokerError::OutOfMemory, false, true);
+        });
+    }
+
+    #[test]
+    fn owner_death_ends_a_starting_childs_terminal_control_at_once() {
+        rejecting_ends_terminal_control(|parent, _| parent.handle_owner_death());
+    }
+
+    #[test]
     fn process_and_thread_ids_share_one_numeric_namespace() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
@@ -3536,7 +4091,8 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         ));
 
-        first.cleanup(true);
+        first.retire(true);
+        drop(first);
         assert!(
             broker
                 .allocate_process(CallerCredential::Unauthenticated, None)
@@ -3568,7 +4124,8 @@ mod tests {
         assert!(Arc::ptr_eq(&process, &registered));
         drop(registered);
 
-        process.cleanup(true);
+        process.retire(true);
+        drop(process);
         assert!(!broker.processes.read().contains_key(&process_id));
         assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
 

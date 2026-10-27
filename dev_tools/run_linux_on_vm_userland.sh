@@ -35,7 +35,9 @@
 # 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
 # A fresh host directory per test, with greeting.txt, is mounted read-only at
-# /mnt/host over virtio-9p (its mount tag).
+# /mnt/host over virtio-9p (its mount tag). For the brokers test, the server
+# reads files at most once a second, so that its readers wait in 9P round
+# trips (see brokers.c).
 #
 # With QEMU_SMP above 1, the CPUs but the boot CPU must have run programs too:
 # the kernel prints the slices each CPU ran, and the run fails if, over the
@@ -210,9 +212,11 @@ network_args() {
 
 # The virtio-9p share for test $1: see the header.
 share_args() {
+    local throttle=
+    [[ $1 != brokers ]] || throttle=,throttling.iops-read=1
     mkdir "$WORK/$1.share"
     echo "hello from the host" >"$WORK/$1.share/greeting.txt"
-    echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
+    echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none$throttle" \
         -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
 }
 

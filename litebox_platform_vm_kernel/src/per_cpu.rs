@@ -4,8 +4,12 @@
 //! Per-CPU kernel variables, each CPU's reached through its GSBASE.
 
 use crate::AddressSpaceId;
-use crate::arch::{gdt, mm::paging::UnmapOptions};
+use crate::arch::{
+    gdt,
+    mm::paging::{UnmapOptions, X64PageTable},
+};
 use crate::cpu::CpuId;
+use crate::mm::MemoryProvider;
 use alloc::{
     alloc::{alloc_zeroed, handle_alloc_error},
     boxed::Box,
@@ -16,8 +20,9 @@ use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
 use litebox::arch::x86_64::{rdgsbase, wrgsbase};
 use litebox_common_linux::PAGE_SIZE;
-use x86_64::VirtAddr;
 use x86_64::registers::model_specific::KernelGsBase;
+use x86_64::structures::paging::PhysFrame;
+use x86_64::{PhysAddr, VirtAddr};
 
 // Include guards in the power-of-two allocation to avoid buddy-allocator waste.
 const DOUBLE_FAULT_STACK_SIZE: usize = 4 * PAGE_SIZE;
@@ -35,7 +40,7 @@ pub(crate) struct PerCpuVariables {
     pub(crate) cpu: CpuId,
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<*mut ()>,
-    pub(crate) worker: crate::worker::Worker,
+    pub(crate) tasks: crate::worker::Tasks,
     /// Keeps the task page table in CR3 alive (`None`: the base table).
     active_page_table: UnsafeCell<Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
     stacks: PerCpuStacks,
@@ -390,7 +395,7 @@ pub(crate) fn allocate_per_cpu_variables(cpu: CpuId) -> &'static PerCpuVariables
         cpu,
         gdt: Cell::new(None),
         tls: Cell::new(core::ptr::null_mut()),
-        worker: crate::worker::Worker::new(),
+        tasks: crate::worker::Tasks::new(),
         active_page_table: UnsafeCell::new(None),
         stacks: PerCpuStacks::allocate(),
     }))
@@ -423,13 +428,44 @@ impl PerCpuVariables {
 ///
 /// # Safety
 ///
-/// `start` is an aligned, unused page of an allocation that is never freed.
-pub(crate) unsafe fn unmap_guard(page_table: &crate::mm::PageTable<PAGE_SIZE>, start: usize) {
+/// `start` is an aligned, unused page of an allocation that is never freed,
+/// or only once [`restore_guard`] mapped it again.
+pub(crate) unsafe fn unmap_guard<M: MemoryProvider>(
+    page_table: &X64PageTable<'_, M, PAGE_SIZE>,
+    start: usize,
+) {
     let range = litebox::mm::page::PageRange::new(start, start + PAGE_SIZE)
         .expect("stack guard page must be aligned and non-empty");
     // Safety: see the function's.
     unsafe { page_table.unmap_pages(range, UnmapOptions::KEEP_FRAMES) }
         .expect("failed to unmap a stack guard page");
+}
+
+/// Maps the stack guard page at `start` again, as the kernel's mapping of RAM
+/// has it (`VA = PA + offset`, RW/NX), before its allocation is freed. The
+/// same leaf as before [`unmap_guard`], and an absent one is never cached: no
+/// flush, on any CPU.
+///
+/// # Safety
+///
+/// `start` is a page that [`unmap_guard`] unmapped in `page_table`, of a
+/// stack nothing runs on anymore.
+pub(crate) unsafe fn restore_guard<M: MemoryProvider>(
+    page_table: &X64PageTable<'_, M, PAGE_SIZE>,
+    start: usize,
+) {
+    let page = VirtAddr::new(start as u64);
+    let frame = M::va_to_pa(page);
+    let none = PhysAddr::zero()..PhysAddr::zero();
+    let frame = PhysFrame::from_start_address(frame).expect("a stack guard page is aligned");
+    page_table
+        .map_kernel(
+            PhysFrame::range(frame, frame + 1),
+            page.as_u64() - frame.start_address().as_u64(),
+            &none,
+            &none,
+        )
+        .expect("a stack guard page has its tables");
 }
 
 /// Allocate the current core's kernel XSAVE area. Must run after [`install`]

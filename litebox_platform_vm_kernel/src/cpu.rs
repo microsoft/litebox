@@ -18,9 +18,9 @@
 //! check for work before halting, and again after.
 //!
 //! Takes no locks, and only [`current`] (so [`halt`], [`marked`],
-//! [`acknowledge`], [`take_notified`] and `set_suspended`) touches per-CPU
-//! data: [`wake`], [`wake_idle`] and [`notify_all`] are usable in interrupt
-//! handlers.
+//! [`acknowledge`], [`take_notified`] and `set_blocked`) touches per-CPU
+//! data: [`wake`], [`wake_idle`], [`notify_all`] and `kick` are usable in
+//! interrupt handlers.
 //!
 //! The kernel clock ([`crate::clock`]) is the TSC of whichever CPU reads it:
 //! the CPUs' TSCs are assumed synchronized, unchecked (VMMs such as QEMU and
@@ -135,10 +135,9 @@ struct Cpus {
     notified: AtomicU64,
     /// Index to local APIC ID, set before the CPU is online.
     apic_ids: [AtomicU32; MAX_CPUS],
-    /// Bit `i`: CPU `i`'s work suspended: set once it first suspends, until
-    /// it finishes (also while resumed); see
-    /// [`crate::worker::interrupt_suspended`].
-    suspended: AtomicU64,
+    /// Bit `i`: CPU `i` holds suspended tasks (see
+    /// [`crate::worker::wake_blocked`]); set and cleared by that CPU.
+    blocked: AtomicU64,
     /// Set by [`VmKernel::start_cpus`]; until then, no IPIs are sent.
     controller: spin::Once<&'static dyn InterruptController>,
 }
@@ -149,7 +148,7 @@ static CPUS: Cpus = Cpus {
     woken: AtomicU64::new(0),
     notified: AtomicU64::new(0),
     apic_ids: [const { AtomicU32::new(0) }; MAX_CPUS],
-    suspended: AtomicU64::new(0),
+    blocked: AtomicU64::new(0),
     controller: spin::Once::new(),
 };
 
@@ -298,6 +297,14 @@ fn signal(set: &AtomicU64, cpus: u64) {
     interrupt(CPUS.idle.load(Ordering::SeqCst) & cpus);
 }
 
+/// Marks `cpus` (bit `i`: CPU `i`) woken, as [`wake`] does, then sends them
+/// the wake IPI, busy or idle: one in user mode enters the kernel, one about
+/// to halt does not (see [`crate::worker::wake_blocked`]).
+pub(crate) fn kick(cpus: u64) {
+    CPUS.woken.fetch_or(cpus, Ordering::SeqCst);
+    interrupt(cpus);
+}
+
 /// Sends the wake IPI to `cpus` (bit `i`: CPU `i`), busy or idle, marking
 /// none: e.g., for those in user mode to enter the kernel. Nothing before
 /// [`VmKernel::start_cpus`].
@@ -347,18 +354,17 @@ pub(crate) fn is_idle(cpu: CpuId) -> bool {
     CPUS.idle.load(Ordering::SeqCst) & cpu.bit() != 0
 }
 
-/// Bit `i`: CPU `i`'s work suspended, and has not finished (see
-/// [`crate::worker::interrupt_suspended`]).
-pub(crate) fn suspended_mask() -> u64 {
-    CPUS.suspended.load(Ordering::SeqCst)
+/// Bit `i`: CPU `i` holds suspended tasks (see [`crate::worker`]).
+pub(crate) fn blocked_mask() -> u64 {
+    CPUS.blocked.load(Ordering::SeqCst)
 }
 
-/// Sets the calling CPU's bit in [`suspended_mask`], or clears it.
-pub(crate) fn set_suspended(suspended: bool) {
+/// Sets the calling CPU's bit in [`blocked_mask`], or clears it.
+pub(crate) fn set_blocked(blocked: bool) {
     let bit = current().bit();
-    if suspended {
-        CPUS.suspended.fetch_or(bit, Ordering::SeqCst);
+    if blocked {
+        CPUS.blocked.fetch_or(bit, Ordering::SeqCst);
     } else {
-        CPUS.suspended.fetch_and(!bit, Ordering::SeqCst);
+        CPUS.blocked.fetch_and(!bit, Ordering::SeqCst);
     }
 }

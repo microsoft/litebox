@@ -67,7 +67,7 @@ pub(crate) fn prepare(platform: &VmKernel) {
         return;
     }
     let source = platform.create_address_space();
-    let table = Arc::clone(&platform.page_table_manager.task_page_tables.read()[&source]);
+    let table = Arc::clone(platform.page_table_manager.task_page_tables.read()[&source].item());
     let page = PageRange::new(PAGE, PAGE + PAGE_SIZE).expect("an aligned page");
     // Safety: a user page, which the new table does not map yet.
     unsafe { table.map_pages(page, VmFlags::VM_READ | VmFlags::VM_WRITE, true) }

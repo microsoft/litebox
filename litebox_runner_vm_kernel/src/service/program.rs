@@ -10,12 +10,16 @@
 use super::Service;
 use crate::payload::Payload;
 use alloc::vec::Vec;
+#[cfg(debug_assertions)]
 use core::time::Duration;
 use litebox_common_vm_abi::WallClock;
 use litebox_common_vm_abi::program::{ExitStatus, Program};
 use litebox_hal::clock::Clock;
+#[cfg(debug_assertions)]
 use litebox_platform::time::{Instant as _, TimeProvider as _};
-use litebox_platform_vm_kernel::{VmKernel, cpu};
+use litebox_platform_vm_kernel::VmKernel;
+#[cfg(debug_assertions)]
+use litebox_platform_vm_kernel::{cpu, worker};
 use litebox_shim_vm_kernel::program::RunError;
 use litebox_shim_vm_kernel::sched::Scheduler;
 use litebox_shim_vm_kernel::{Process, ProcessConfig, ProcessTimer};
@@ -85,21 +89,30 @@ impl Programs {
     }
 
     /// Checks that the processes that ran, which all ended, left nothing
-    /// behind in the kernel: no address space, and no frame shared
-    /// copy-on-write (e.g., of a process clone never freed), once the other
-    /// CPUs released what they still held (see [`Scheduler::reap`]).
+    /// behind in the kernel: no address space, registered or retiring (see
+    /// [`VmKernel::retiring_address_spaces`]), no frame shared copy-on-write
+    /// (e.g., of a process clone never freed), and no broker task unfinished,
+    /// once the other CPUs released what they still held (see
+    /// [`Scheduler::reap`]).
     ///
     /// # Panics
     ///
     /// If they did.
+    #[cfg(debug_assertions)]
     pub fn check_released(&self) {
-        /// Ample for the other CPUs to release them, even under emulation.
-        const TIMEOUT: Duration = Duration::from_secs(5);
+        /// Ample for the other CPUs to release them, even under emulation: in
+        /// debug builds, freeing a runner's address space takes up to seconds,
+        /// and one CPU at a time frees those unregistered, one after another.
+        const TIMEOUT: Duration = Duration::from_mins(1);
         /// Between looks, which take locks that releasing them takes.
         const BACKOFF: Duration = Duration::from_micros(100);
         let released = || {
             self.scheduler.reap();
-            self.platform.address_space_count() == 0 && self.platform.shared_frame_count() == 0
+            // The count first (see `VmKernel::retiring_address_spaces`).
+            self.platform.address_space_count() == 0
+                && !self.platform.retiring_address_spaces()
+                && self.platform.shared_frame_count() == 0
+                && worker::stacks_in_use() == 0
         };
         let after = |duration| {
             self.platform
@@ -119,10 +132,21 @@ impl Programs {
             0,
             "ended processes left address spaces, after waiting {TIMEOUT:?} for the other CPUs"
         );
+        assert!(
+            !self.platform.retiring_address_spaces(),
+            "ended processes left address spaces unreleased, after waiting {TIMEOUT:?} for the \
+             CPU releasing them"
+        );
         assert_eq!(
             self.platform.shared_frame_count(),
             0,
             "ended processes left shared frames, after waiting {TIMEOUT:?} for the other CPUs"
+        );
+        assert_eq!(
+            worker::stacks_in_use(),
+            0,
+            "ended processes left broker tasks unfinished, after waiting {TIMEOUT:?} for the other \
+             CPUs"
         );
     }
 

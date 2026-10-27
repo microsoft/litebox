@@ -129,8 +129,9 @@ impl Thread {
         self.running.get().filter(|_| self.parked.lock().is_none())
     }
 
-    /// Adds the time elapsed since `start` (its run, or a worker job for
-    /// it) to its CPU time, capped at one slice (see `sched::charged`).
+    /// Adds the time elapsed since `start` (its run, or the step that chose
+    /// it: see `Shared::step`) to its CPU time, capped at one slice (see
+    /// `sched::charged`).
     pub(crate) fn charge(&self, platform: &litebox_platform_vm_kernel::VmKernel, start: Instant) {
         let used = platform.now().as_nanos().saturating_sub(start.as_nanos());
         let used = sched::charged(used);
@@ -198,29 +199,6 @@ fn pt_regs(regs: &Registers) -> PtRegs {
 }
 
 impl Inner {
-    /// The main thread, which every process has.
-    pub(crate) fn main_thread(&self) -> Arc<Thread> {
-        self.threads
-            .borrow()
-            .first()
-            .filter(|thread| thread.is_main())
-            .cloned()
-            .expect("the main thread is the first")
-    }
-
-    /// The thread the worker's serving is for (see `sched`): the last to
-    /// make a broker call, which may have published requests, else the main
-    /// thread.
-    pub(crate) fn broker_requester(&self) -> Arc<Thread> {
-        let id = self.broker_requester.get();
-        self.threads
-            .borrow()
-            .iter()
-            .find(|thread| thread.id == id && !thread.exited.get())
-            .cloned()
-            .unwrap_or_else(|| self.main_thread())
-    }
-
     /// The threads that have not exited.
     pub(crate) fn live_threads(&self) -> usize {
         self.threads
@@ -313,7 +291,7 @@ impl Inner {
         }
         let ring = layout::BROKER_CONTROL_RING;
         if ring.contains(r.addr) {
-            return self.ring_futex(thread, (r.addr - ring.start).trunc(), r);
+            return self.ring_futex((r.addr - ring.start).trunc(), r);
         }
         Ok(match r.op {
             FutexOp::Wait => self
@@ -326,18 +304,11 @@ impl Inner {
     }
 
     /// The broker's futex, on the word at `offset` into the control ring.
-    fn ring_futex(
-        &self,
-        thread: &Thread,
-        offset: usize,
-        r: &FutexRequest,
-    ) -> Result<FutexFlow, Status> {
+    fn ring_futex(&self, offset: usize, r: &FutexRequest) -> Result<FutexFlow, Status> {
         if self.broker_busy() {
-            // The worker is using the association (see `sched`).
+            // Its broker is using the association (see `sched`).
             return Ok(FutexFlow::Retry);
         }
-        // Either may have published requests.
-        self.broker_requester.set(thread.id);
         let op = match r.op {
             FutexOp::Wait => RingFutex::Wait {
                 expected: r.expected,
@@ -347,7 +318,7 @@ impl Inner {
         };
         match self.broker.futex(offset, op) {
             Ok(Entered::Done) => Ok(FutexFlow::Done(0)),
-            // The worker serves at once (see `sched`).
+            // Until its broker served them (see `sched`).
             Ok(Entered::Woke) => Ok(FutexFlow::Block(Suspended::Yielded)),
             Ok(Entered::Wait(wait)) => Ok(FutexFlow::Block(Suspended::Waiting(wait))),
             Err(EnterError::Status(status)) => Err(status),

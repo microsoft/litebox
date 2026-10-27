@@ -9,7 +9,7 @@
 //! ended, which saved the state to copy. The clone runs nothing until the
 //! kernel adopts it ([`Inner::adopt`]) as the runner of a child that the parent
 //! starts with it (`StartChildWithExistingRunner`), making the clone's broker
-//! handshake before it runs, so that the broker's worker, suspended in the
+//! handshake before it runs, so that the parent's broker, suspended in the
 //! start, never waits for the clone. A process has at most one clone to adopt,
 //! its latest, which ends once the process makes another, or exits.
 //!
@@ -33,7 +33,7 @@ use litebox_broker_core::BrokerError;
 use litebox_broker_vm_kernel::PendingRunnerAssociation;
 use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::{CloneReply, CloneRequest, NewThread, Placement, Status};
-use litebox_platform_vm_kernel::AddressSpaceId;
+use litebox_platform_vm_kernel::{AddressSpaceId, worker};
 use zerocopy::IntoBytes as _;
 
 impl Inner {
@@ -98,6 +98,9 @@ impl Inner {
     /// makes one (see the crate docs).
     fn clone_process(&self, thread: &Thread, slot: u64) -> Result<Self, Status> {
         let platform = self.platform;
+        // First: failing, it leaves the process as it was (e.g., its pages
+        // writable).
+        let task = worker::Task::try_new(platform).ok_or(Status::NoMemory)?;
         let address_space = platform
             .clone_address_space(self.address_space)
             .map_err(|_| Status::NoMemory)?;
@@ -147,8 +150,8 @@ impl Inner {
             shared: Cell::new(false),
             threads: RefCell::new(alloc::vec![new_thread(Thread::cloned(thread, slot))]),
             next_thread: Cell::new(thread::MAIN + 1),
-            broker_requester: Cell::new(thread::MAIN),
-            worker: Cell::new(None),
+            task,
+            broker_time: Cell::new(0),
             pending_clone: RefCell::new(None),
             next_clone: Cell::new(1),
         })
@@ -184,8 +187,9 @@ impl Inner {
     /// (see [`Association::adopt`](litebox_broker_vm_kernel::Association::adopt)),
     /// so that the start does not wait for the clone to run; a clone whose
     /// handshake fails ends without running. Either way, `launch` is done
-    /// with, which wakes the CPU whose worker waits for it (see
-    /// `PendingRunnerAssociation`'s `Drop`). Only under the process's claim.
+    /// with, which wakes the process's broker waiting for it, on whichever
+    /// CPU (see `PendingRunnerAssociation`'s `Drop`). Only under the process's
+    /// claim.
     pub(crate) fn adopt(&self, id: u64, launch: PendingRunnerAssociation) {
         let pending = self
             .pending_clone

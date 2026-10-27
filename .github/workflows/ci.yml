@@ -174,7 +174,7 @@ jobs:
         # https://github.com/microsoft/litebox/pull/1228 reproduces is fixed.
         run: |
           QEMU_SMP=4 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_linux_on_vm_userland.sh -r -t smp -t sched -t fork
+            ./dev_tools/run_linux_on_vm_userland.sh -r -t smp -t sched -t fork -t brokers -t brokers_progress
       - name: Run OP-TEE TAs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         run: |
           QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \

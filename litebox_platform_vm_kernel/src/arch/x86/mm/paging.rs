@@ -815,8 +815,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     }
 
     /// Maps `frame_range` at `PA + offset`: frames in `text` RX, in
-    /// `read_only` R/NX, the rest RW/NX. Requires an inactive table. Kernel
-    /// mappings must not demand-fault.
+    /// `read_only` R/NX, the rest RW/NX. Requires an inactive table, or leaves
+    /// that are absent, with their tables (e.g., a stack guard mapped again,
+    /// see `per_cpu::restore_guard`). Kernel mappings must not demand-fault.
     pub(crate) fn map_kernel(
         &self,
         frame_range: PhysFrameRange<Size4KiB>,

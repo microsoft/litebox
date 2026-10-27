@@ -9,7 +9,7 @@ use x86_64::structures::paging::page::PageRange;
 pub(crate) mod pgtable;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Kernel-supplied page source for [`crate::BootConfig`].
 ///

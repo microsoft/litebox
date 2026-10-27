@@ -7,8 +7,10 @@ use crate::{VmKernel, per_cpu::with_per_cpu_variables};
 
 pub const PRK_LEN: usize = 32;
 
-// Safety: the pointer is stored per CPU, and there is one thread per CPU. It
-// starts as null and is only changed by `replace_thread_local_storage`.
+// Safety: the pointer is stored per CPU, and there is one thread per CPU,
+// but for cooperative tasks, each of which has its own, switched in and out
+// with it (see `worker`). It starts as null and is only changed by
+// `replace_thread_local_storage`.
 unsafe impl litebox::platform::ThreadLocalStorageProvider for VmKernel {
     fn get_thread_local_storage() -> *mut () {
         with_per_cpu_variables(|pcv| pcv.tls.get())

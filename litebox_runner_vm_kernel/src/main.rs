@@ -55,15 +55,18 @@ fn kernel_main(kernel: Kernel) -> ! {
     kernel.start_cpus(devices, cpu_main);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
     let broker = |console, shares, allow_process_duplication| {
-        litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
+        let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
             platform: kernel.platform,
             console,
-            events: devices,
             root: payload.file("rootfs.tar"),
             shares,
             network: devices.network(),
             allow_process_duplication,
-        })
+        });
+        // The shares are mounted; processes, which need the broker, may run.
+        #[cfg(debug_assertions)]
+        devices.begin_runtime();
+        broker
     };
     if let Some(programs) = payload.file("programs.json") {
         let stdio: &'static client::program::Stdio =
@@ -79,6 +82,11 @@ fn kernel_main(kernel: Kernel) -> ! {
             broker(stdio, devices.shares(), true),
         );
         client::program::run(programs, &mut service, stdio);
+        // Kept as the kernel exits: dropping the broker here, off any task,
+        // would release its providers, e.g., close a share's root in a 9P
+        // round trip, which only tasks make once processes ran (see
+        // `Devices::begin_runtime`).
+        core::mem::forget(service);
     } else {
         let mut service = service::optee::Optee::new(
             scheduler.clone(),

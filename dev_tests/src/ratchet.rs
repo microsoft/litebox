@@ -81,7 +81,10 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_linux_userland/", 10),
             ("litebox_platform_macos_userland/", 7),
             ("litebox_platform_lvbs/", 24),
-            ("litebox_platform_vm_kernel/", 10),
+            // TLB shootdown requests and the task wake generation (`WAKES`),
+            // which interrupt handlers reach without per-CPU data, and, in
+            // debug builds, the task stacks in use on every CPU (`IN_USE`).
+            ("litebox_platform_vm_kernel/", 12),
             ("litebox_platform_vm_userland/", 4),
             ("litebox_platform_windows_userland/", 12),
             ("litebox_runner_lvbs/", 8),
