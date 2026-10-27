@@ -36,6 +36,8 @@ fn encode_settings(e: &mut Encoder, s: TerminalSettings) {
         c.word_erase,
         c.literal_next,
         c.reprint,
+        c.suspend,
+        c.discard,
         s.minimum_read,
     ] {
         e.u8(byte);
@@ -60,6 +62,8 @@ fn decode_settings(d: &mut Decoder<'_>) -> Result<TerminalSettings, WireError> {
             word_erase: d.u8()?,
             literal_next: d.u8()?,
             reprint: d.u8()?,
+            suspend: d.u8()?,
+            discard: d.u8()?,
         },
         minimum_read: d.u8()?,
     })

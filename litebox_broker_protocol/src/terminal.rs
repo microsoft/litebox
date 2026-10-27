@@ -74,6 +74,10 @@ pub struct ControlCharacters {
     pub literal_next: u8,
     /// Echo the current editable line again.
     pub reprint: u8,
+    /// Suspend character. Retained for readback; job control is not emulated.
+    pub suspend: u8,
+    /// Discard-output character. Retained for readback; Linux does not act on it either.
+    pub discard: u8,
 }
 
 /// Settings shared by every descriptor referring to one terminal.
@@ -124,6 +128,8 @@ impl Default for TerminalSettings {
                 word_erase: 23,
                 literal_next: 22,
                 reprint: 18,
+                suspend: 0,
+                discard: 0,
             },
             minimum_read: 1,
         }

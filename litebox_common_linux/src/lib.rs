@@ -950,10 +950,10 @@ impl From<TerminalSettings> for Termios {
                 0,
                 c.start,
                 c.stop,
-                0,
+                c.suspend,
                 c.end_of_line,
                 c.reprint,
-                0,
+                c.discard,
                 c.word_erase,
                 c.literal_next,
                 c.end_of_line2,
@@ -978,9 +978,7 @@ impl TryFrom<&Termios> for TerminalSettings {
         };
         if termios.c_line != 0
             || ![TERMIOS_CONTROL, TERMIOS_CONTROL | TERMIOS_INPUT_SPEED].contains(&termios.c_cflag)
-            || [5, 7, 10, 13, 17, 18]
-                .iter()
-                .any(|&index| termios.c_cc[index] != 0)
+            || [5, 7, 17, 18].iter().any(|&index| termios.c_cc[index] != 0)
             || termios.c_cc[6] > 1
         {
             return Err(errno::Errno::EINVAL);
@@ -998,8 +996,10 @@ impl TryFrom<&Termios> for TerminalSettings {
                 end_of_file: c[4],
                 start: c[8],
                 stop: c[9],
+                suspend: c[10],
                 end_of_line: c[11],
                 reprint: c[12],
+                discard: c[13],
                 word_erase: c[14],
                 literal_next: c[15],
                 end_of_line2: c[16],
@@ -1068,6 +1068,11 @@ mod termios_tests {
         raw.c_oflag = 0;
         raw.c_lflag = 0;
         assert!(TerminalSettings::try_from(&raw).is_ok());
+        // Suspend and discard characters are retained, though neither is acted on.
+        raw.c_cc[10] = 26;
+        raw.c_cc[13] = 15;
+        let kept = Termios::from(TerminalSettings::try_from(&raw).unwrap());
+        assert_eq!((kept.c_cc[10], kept.c_cc[13]), (26, 15));
     }
 
     #[test]
@@ -1082,7 +1087,7 @@ mod termios_tests {
 
     #[test]
     fn unsupported_modes_are_not_silently_accepted() {
-        for (index, value) in [(5, 1), (6, 2), (10, 26), (13, 15)] {
+        for (index, value) in [(5, 1), (6, 2), (7, 1)] {
             let mut settings = Termios::from(TerminalSettings::default());
             settings.c_cc[index] = value;
             assert_eq!(TerminalSettings::try_from(&settings), Err(Errno::EINVAL));
