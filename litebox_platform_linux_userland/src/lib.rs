@@ -39,6 +39,7 @@ extern crate alloc;
 mod arch;
 mod page_mgmt;
 pub mod process;
+mod shared_objects;
 
 #[cfg(target_arch = "aarch64")]
 use arch::{
@@ -80,6 +81,8 @@ pub struct LinuxUserland {
     /// is persistent across multiple process executions, however, it is ephemeral across true
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
+    /// Receives the host shared objects that the broker delivers, once the runner installs it.
+    shared_objects: std::sync::OnceLock<shared_objects::SharedObjectChannel>,
 }
 
 /// Determines how an x86-64 guest accesses its thread-local storage.
@@ -126,6 +129,7 @@ impl LinuxUserland {
         let platform = Self {
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
+            shared_objects: std::sync::OnceLock::new(),
         };
         Box::leak(Box::new(platform))
     }
@@ -143,7 +147,23 @@ impl LinuxUserland {
         Box::leak(Box::new(Self {
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
+            shared_objects: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Installs the socket over which the broker delivers host shared objects, such as the
+    /// memfds backing shared file mappings.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a socket was already installed.
+    pub fn set_shared_object_channel(&self, socket: std::os::fd::OwnedFd) {
+        assert!(
+            self.shared_objects
+                .set(shared_objects::SharedObjectChannel::new(socket))
+                .is_ok(),
+            "shared-object channel already installed"
+        );
     }
 
     /// Configures the process-wide guest TLS mode.
@@ -253,12 +273,15 @@ impl LinuxUserland {
     ///
     /// Broker transport exceptions are restricted to the supplied descriptors. If
     /// `native_fork_stream_fd` is given, the runner may natively clone itself, and the clone
-    /// negotiates its broker association over a socket it places at that descriptor number.
+    /// negotiates its broker association over a socket it places at that descriptor number. If
+    /// `shared_object_fd` is given, the runner may receive the host shared objects the broker
+    /// delivers over that socket (see [`Self::set_shared_object_channel`]).
     pub fn enable_seccomp_filter(
         positional_io_fds: &[std::os::fd::RawFd],
         shutdown_fds: &[std::os::fd::RawFd],
         scope: SeccompScope,
         native_fork_stream_fd: Option<std::os::fd::RawFd>,
+        shared_object_fd: Option<std::os::fd::RawFd>,
     ) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
@@ -489,8 +512,43 @@ impl LinuxUserland {
                 .collect();
             rules.push((libc::SYS_shutdown, shutdown_rules));
         }
-        let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
-            rules.into_iter().collect();
+        if let Some(fd) = shared_object_fd {
+            rules.push((
+                libc::SYS_recvmsg,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            0,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            u64::from(
+                                u32::try_from(fd).expect("shared-object descriptor must be valid"),
+                            ),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ));
+        }
+        // A syscall may have rules from more than one source, such as `recvmsg` on both the
+        // native fork socket and the shared-object socket; any of them allows it.
+        let mut rule_map = std::collections::BTreeMap::<i64, Vec<SeccompRule>>::new();
+        for (syscall, syscall_rules) in rules {
+            match rule_map.entry(syscall) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(syscall_rules);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // An empty rule list allows the syscall unconditionally.
+                    if !entry.get().is_empty() && !syscall_rules.is_empty() {
+                        entry.get_mut().extend(syscall_rules);
+                    } else {
+                        entry.get_mut().clear();
+                    }
+                }
+            }
+        }
         let filter = SeccompFilter::new(
             rule_map,
             // In debug builds, log violations instead of silently returning an error so that
@@ -2434,6 +2492,7 @@ mod tests {
             &[allowed.as_raw_fd()],
             &[allowed_shutdown.as_raw_fd()],
             super::SeccompScope::AllThreads,
+            None,
             None,
         );
         barrier.wait();

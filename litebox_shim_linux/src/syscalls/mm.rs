@@ -12,7 +12,7 @@ use litebox_common_linux::{
     IoReadVec, MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     mm::MmapPlacement,
-    vmem::{MappingError, VmemProtectError},
+    vmem::{MappingError, SharedObjectMapping, VmemProtectError},
 };
 use litebox_platform::buffer::Buffer as _;
 
@@ -21,6 +21,7 @@ use crate::Task;
 use crate::UserPtrMut;
 use crate::guest_buffer::GuestReadBuffer;
 use crate::syscalls::file::AnyTypedFd;
+use litebox_broker_protocol::fs::FileAccessMode;
 
 pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
     let mut prot = ProtFlags::PROT_NONE;
@@ -163,20 +164,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
 
-        // MAP_SHARED is partially supported:
-        // - Anonymous shared mappings are fully supported. Where the platform supports shared
-        //   pages, a native fork child shares them; elsewhere `fork` fails with `EAGAIN` rather
-        //   than copying them.
-        // - File-backed shared mappings are read-only: writable permission is rejected
-        //   upfront and cannot be added later via mprotect, because writes cannot be
-        //   propagated back to the underlying file.
-        if flags.contains(MapFlags::MAP_SHARED)
-            && prot.contains(ProtFlags::PROT_WRITE)
-            && !flags.contains(MapFlags::MAP_ANONYMOUS)
-        {
-            todo!("MAP_SHARED with PROT_WRITE on file-backed mappings is not supported");
-        }
-
         if flags.intersects(
             MapFlags::MAP_32BIT
                 | MapFlags::MAP_GROWSDOWN
@@ -197,13 +184,108 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EOVERFLOW);
         }
 
+        // MAP_SHARED is supported as follows:
+        // - Anonymous shared mappings are fully supported. Where the platform supports shared
+        //   pages, a native fork child shares them; elsewhere `fork` fails with `EAGAIN` rather
+        //   than copying them.
+        // - File-backed shared mappings map the host shared object holding the file's contents
+        //   where the platform and file system support it, as described in
+        //   `do_mmap_shared_file`.
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap(suggested_addr, aligned_len, prot, flags, |_| Ok(0))
                 .map_err(Errno::from)
+        } else if flags.contains(MapFlags::MAP_SHARED) {
+            self.do_mmap_shared_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
+    }
+
+    /// Maps a file `MAP_SHARED`.
+    ///
+    /// Where the platform and the file system support it, the mapping maps the host shared
+    /// object that holds the file's contents. Every mapping of the file, in this or any other
+    /// process, including native fork children, then shares its pages, and `read`, `write`, and
+    /// `ftruncate` on the file see and change the same bytes.
+    ///
+    /// Otherwise, as for files that never change, a mapping that can never become writable is a
+    /// private copy of the file, and a writable one fails with `ENODEV`. So is a mapping with
+    /// `PROT_EXEC` but not `PROT_WRITE`, which keeps runtime syscall patching for code.
+    fn do_mmap_shared_file(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, Errno> {
+        use litebox::fs::errors::MapSharedError;
+
+        let typed_fd = self.typed_fd(fd)?;
+        let AnyTypedFd::File(file_fd) = &typed_fd else {
+            return Err(Errno::ENODEV);
+        };
+        let access = self
+            .global
+            .with_file(file_fd, super::file::File::access_mode)?;
+        // As on Linux, a shared mapping needs a readable file, and a writable one, or one that
+        // `mprotect` may later make writable, needs a file open for writing too.
+        let may_write = match access {
+            FileAccessMode::ReadOnly => false,
+            FileAccessMode::ReadWrite => true,
+            _ => return Err(Errno::EACCES),
+        };
+        let writable = prot.contains(ProtFlags::PROT_WRITE);
+        if writable && !may_write {
+            return Err(Errno::EACCES);
+        }
+        let copy = || {
+            if writable {
+                Err(Errno::ENODEV)
+            } else {
+                self.do_mmap_file(suggested_addr, len, prot, flags, fd, offset)
+            }
+        };
+        if (prot.contains(ProtFlags::PROT_EXEC) && !writable)
+            || !self.global.platform.supports_shared_objects()
+        {
+            return copy();
+        }
+        let object = match self
+            .global
+            .with_file(file_fd, |file| Ok(file.map_shared(may_write)))?
+        {
+            Ok(object) => object,
+            Err(MapSharedError::Unsupported) => return copy(),
+            Err(MapSharedError::ClosedFd) => return Err(Errno::EBADF),
+            Err(MapSharedError::IsDirectory) => return Err(Errno::ENODEV),
+            Err(MapSharedError::NotForReading | MapSharedError::NotForWriting) => {
+                return Err(Errno::EACCES);
+            }
+            Err(MapSharedError::NoMemory | MapSharedError::Io) => return Err(Errno::ENOMEM),
+        };
+        let mapped = self.global.mm.do_mmap_shared_object(
+            suggested_addr,
+            len,
+            prot,
+            flags,
+            MmapPlacement {
+                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
+                allowed_range: None,
+            },
+            SharedObjectMapping {
+                id: object.identity,
+                token: object.token,
+                offset: offset as u64,
+                may_write,
+            },
+        )?;
+        if flags.contains(MapFlags::MAP_FIXED) {
+            self.clear_file_mappings_for_range(mapped.as_usize(), len);
+        }
+        Ok(mapped)
     }
 
     /// Handle syscall `munmap`
@@ -307,6 +389,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
         self.global.mm.sys_madvise(addr, len, advice)
+    }
+
+    /// Handle syscall `msync`
+    pub(crate) fn sys_msync(
+        &self,
+        addr: UserPtrMut<u8>,
+        len: usize,
+        flags: i32,
+    ) -> Result<(), Errno> {
+        self.global.mm.sys_msync(addr, len, flags)
     }
 }
 
@@ -934,6 +1026,101 @@ mod tests {
 
         task.sys_munmap(addr, 0x1000).unwrap();
         task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn shared_file_mappings_check_access_and_need_shared_objects_to_write() {
+        let task = init_platform();
+        create_file(&task, "/shared.txt", b"shared");
+        let open = |flags| {
+            i32::try_from(task.sys_open("/shared.txt", flags, Mode::empty()).unwrap()).unwrap()
+        };
+        let read_write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+
+        // As on Linux, a shared mapping needs a readable file, and a writable one a file that
+        // is open for writing too.
+        let read_only = open(OFlags::RDONLY);
+        assert_eq!(
+            task.sys_mmap(0, 0x1000, read_write, MapFlags::MAP_SHARED, read_only, 0)
+                .err(),
+            Some(Errno::EACCES)
+        );
+        let write_only = open(OFlags::WRONLY);
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                write_only,
+                0
+            )
+            .err(),
+            Some(Errno::EACCES)
+        );
+
+        // This platform has no channel for host shared objects, so a writable shared mapping
+        // cannot be coherent with the file and fails, while a read-only one is a copy.
+        let read_write_fd = open(OFlags::RDWR);
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x1000,
+                read_write,
+                MapFlags::MAP_SHARED,
+                read_write_fd,
+                0
+            )
+            .err(),
+            Some(Errno::ENODEV)
+        );
+        let copy = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                read_write_fd,
+                0,
+            )
+            .unwrap();
+        assert_eq!(copy.read_at_offset::<Platform>(0), Some(b's'));
+        assert!(!task.global.mm.has_shared_mappings());
+        task.sys_munmap(copy, 0x1000).unwrap();
+        for fd in [read_only, write_only, read_write_fd] {
+            task.sys_close(fd).unwrap();
+        }
+    }
+
+    #[test]
+    fn msync_validates_its_arguments() {
+        const MS_ASYNC: i32 = 1;
+        const MS_SYNC: i32 = 4;
+        let task = init_platform();
+        let mapping = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(task.sys_msync(mapping, 0x2000, MS_SYNC), Ok(()));
+        assert_eq!(task.sys_msync(mapping, 1, MS_ASYNC), Ok(()));
+        assert_eq!(
+            task.sys_msync(mapping, 0x1000, MS_SYNC | MS_ASYNC),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(task.sys_msync(mapping, 0x1000, 8), Err(Errno::EINVAL));
+        let unaligned = UserPtrMut::from_usize(mapping.as_usize() + 1);
+        assert_eq!(
+            task.sys_msync(unaligned, 0x1000, MS_SYNC),
+            Err(Errno::EINVAL)
+        );
+        task.sys_munmap(mapping, 0x2000).unwrap();
+        assert_eq!(task.sys_msync(mapping, 0x1000, MS_SYNC), Err(Errno::ENOMEM));
     }
 
     #[test]

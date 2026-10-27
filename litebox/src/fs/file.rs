@@ -29,10 +29,19 @@ use crate::{LiteBox, sync};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use super::errors::{
-    ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError,
-    TerminalControlError, TruncateError, UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, MapSharedError,
+    MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError, SeekError,
+    StatusFlagsError, TerminalControlError, TruncateError, UnlinkError, WalkError, WriteError,
 };
+
+/// A host shared object holding a file's contents, as returned by [`File::map_shared`].
+#[derive(Clone, Copy, Debug)]
+pub struct SharedFileObject {
+    /// Identity of the file, the same in every process that maps it.
+    pub identity: u128,
+    /// The token under which the broker delivered the object to this process.
+    pub token: crate::platform::page_mgmt::SharedObjectToken,
+}
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     // XXX: lexical normalization diverges from Linux once symlinks exist: `link/..` names the
@@ -407,6 +416,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(TruncateError::from)
     }
 
+    /// Asks the broker for the host shared object holding this file's contents, so that every
+    /// process mapping it `MAP_SHARED` shares its pages. The mapping may be made writable only if
+    /// `writable` is set, which requires the file to be open for writing.
+    ///
+    /// The broker delivers the object out of band, before this returns, under the returned
+    /// token, which the caller must pass to
+    /// [`PageManagementProvider::try_map_shared_object`](crate::platform::PageManagementProvider::try_map_shared_object).
+    /// Callers must first check
+    /// [`supports_shared_objects`](crate::platform::PageManagementProvider::supports_shared_objects).
+    pub fn map_shared(&self, writable: bool) -> Result<SharedFileObject, MapSharedError> {
+        let response = self.broker.map_file(self.handle, writable)??;
+        Ok(SharedFileObject {
+            identity: response.identity,
+            token: crate::platform::page_mgmt::SharedObjectToken(response.token),
+        })
+    }
+
     /// Reads the entries of the directory this file opens.
     pub fn read_directory(&self) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         self.broker
@@ -626,6 +652,25 @@ impl From<BrokerControlError> for WriteError {
 impl From<BrokerControlError> for TruncateError {
     fn from(error: BrokerControlError) -> Self {
         broker_fd_error(error, Self::ClosedFd, Self::NotForWriting, Self::Io)
+    }
+}
+
+impl From<BrokerControlError> for MapSharedError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::NotForReading, Self::Io)
+    }
+}
+
+impl From<FileError> for MapSharedError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::IsDirectory => Self::IsDirectory,
+            FileError::NotForReading | FileError::PathOnly => Self::NotForReading,
+            FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
+            FileError::NoSuchDevice => Self::Unsupported,
+            FileError::NoSpace => Self::NoMemory,
+            _ => Self::Io,
+        }
     }
 }
 

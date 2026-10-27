@@ -5,6 +5,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::fd::AsFd as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
@@ -19,10 +20,12 @@ use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
+use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 use litebox_broker_userland::builder::BrokerCoreBuilder;
+use litebox_broker_userland::shared_objects::linux::MemfdDelivery;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
 
 use super::{SETUP_TIMEOUT, configured_socket_policy};
@@ -239,6 +242,7 @@ fn serve_control_stream(
 ) -> IoResult<()> {
     let control_channel =
         UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
+    let (shared_objects, runner_shared_objects) = SharedObjectSender::pair()?;
     litebox_broker_userland::runtime::serve_in_process_runner_association(
         broker,
         control_channel,
@@ -247,8 +251,11 @@ fn serve_control_stream(
         |channel, shared_memory, control_memory| {
             channel.send_memfd(shared_memory, Some(setup_deadline))?;
             channel.send_memfd(control_memory, Some(setup_deadline))?;
+            channel
+                .send_shared_object_channel(runner_shared_objects.as_fd(), Some(setup_deadline))?;
             channel.send_process_image(None, Some(setup_deadline))
         },
         UnixStreamHostSetupChannel::into_active,
+        Some(Arc::new(MemfdDelivery(shared_objects))),
     )
 }

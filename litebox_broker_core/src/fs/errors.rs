@@ -118,6 +118,25 @@ pub enum TruncateError {
     Io,
 }
 
+/// Possible errors from [`super::resolver::Resolver::map_shared`]
+#[derive(Error, Debug)]
+pub enum MapSharedError {
+    #[error("file descriptor points to a directory")]
+    IsDirectory,
+    #[error("file is not opened for reading")]
+    NotForReading,
+    #[error("file is not opened for writing")]
+    NotForWriting,
+    #[error("file descriptor is not open for reading or writing")]
+    PathOnly,
+    #[error("the file system cannot share this file's pages")]
+    Unsupported,
+    #[error("out of host shared memory")]
+    NoMemory,
+    #[error("I/O error")]
+    Io,
+}
+
 /// Possible errors from [`super::resolver::Resolver::chmod`]
 #[derive(Error, Debug)]
 pub enum ChmodError {

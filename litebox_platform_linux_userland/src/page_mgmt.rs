@@ -461,6 +461,75 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             Err(_) => Err(CowAllocationError::InternalFailure),
         }
     }
+
+    fn supports_shared_objects(&self) -> bool {
+        self.shared_objects.get().is_some()
+    }
+
+    unsafe fn try_map_shared_object<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+        token: litebox::platform::page_mgmt::SharedObjectToken,
+        offset: u64,
+        permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
+        litebox::platform::page_mgmt::AllocationError,
+    >
+    where
+        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+    {
+        use litebox::platform::page_mgmt::AllocationError;
+        use std::os::fd::AsRawFd as _;
+
+        let channel = self
+            .shared_objects
+            .get()
+            .ok_or(AllocationError::UnsupportedByPlatform)?;
+        let object = channel
+            .take(token.0)
+            .map_err(|_| AllocationError::OutOfMemory)?;
+        let placement = match fixed_address_behavior {
+            FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
+            FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
+            FixedAddressBehavior::Hint(_) => {
+                unreachable!("shared objects are mapped at addresses vmem chose")
+            }
+        };
+        // SAFETY: The caller authorizes replacing `range`; otherwise the kernel refuses to
+        // replace anything. The mapping keeps the object alive after its descriptor closes.
+        let result = unsafe {
+            syscalls::syscall6(
+                syscalls::Sysno::mmap,
+                range.start,
+                range.len(),
+                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
+                (MapFlags::MAP_SHARED | placement)
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
+                usize::try_from(object.as_raw_fd()).unwrap(),
+                usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?,
+            )
+        };
+        drop(object);
+        match result {
+            Ok(address) => {
+                debug_assert_eq!(address, range.start);
+                if fixed_address_behavior == FixedAddressBehavior::Replace {
+                    replaced_reservations().for_each(drop);
+                }
+                // SAFETY: mmap returned exclusive ownership of exactly `range`.
+                Ok(unsafe { LinuxUserlandReservation::new(range) })
+            }
+            Err(syscalls::Errno::EEXIST) => Err(AllocationError::AddressInUse),
+            Err(syscalls::Errno::EACCES | syscalls::Errno::EPERM) => {
+                Err(AllocationError::PermissionDenied)
+            }
+            Err(_) => Err(AllocationError::OutOfMemory),
+        }
+    }
 }
 
 #[cfg(test)]

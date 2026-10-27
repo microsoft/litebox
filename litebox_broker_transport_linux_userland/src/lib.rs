@@ -23,7 +23,14 @@ mod setup;
 
 pub mod existing_runner;
 pub mod memfd;
+pub mod shared_objects;
 
 mod unix_io;
 
 pub mod unix_socket;
+
+/// Returns uninitialized space for the ancillary data of one message, `N` bytes as
+/// `rustix::cmsg_space!` computes.
+fn control_space<const N: usize>() -> [core::mem::MaybeUninit<u8>; N] {
+    [core::mem::MaybeUninit::uninit(); N]
+}
