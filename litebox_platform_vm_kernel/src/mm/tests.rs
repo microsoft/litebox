@@ -10,7 +10,11 @@ extern crate std;
 
 use core::cell::RefCell;
 use litebox::mm::page::PageRange;
-use litebox_common_linux::{PAGE_SIZE, vmem::VmFlags};
+use litebox_common_linux::{
+    PAGE_SIZE,
+    errno::Errno,
+    vmem::{PageFaultError, VmFlags},
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::vec::Vec;
@@ -1102,4 +1106,96 @@ fn clones_flush_only_the_leaves_they_make_read_only() {
     assert_eq!(take_flushes(), []);
     drop((parent, child, grandchild));
     assert!(shared_frames().is_empty());
+}
+
+#[test]
+fn lazily_pinned_pages_are_populated_as_found() {
+    let _sharing = sharing();
+    let start = 0x1_0000;
+    let pgtable = new_table();
+    let pages = range(start, 2);
+    let page = |index: u64| Page::containing_address(VirtAddr::new(start as u64)) + index;
+    // Safety: nothing unmaps or remaps `pages` while pinned, and the test,
+    // their owner, may map them read-write.
+    unsafe { pgtable.pin_lazily(pages) };
+    // Safety: pinned lazily until the end.
+    let pinned_frame = |index| unsafe { pgtable.pinned_frame(page(index)) };
+    let frame = pinned_frame(0).unwrap();
+    check_mapped(&pgtable, start, vmflags_to_pteflags(RW));
+    assert_eq!(pinned_frame(0).unwrap(), frame);
+    assert_eq!(mapped_frame(&pgtable, start), frame);
+    check_unmapped(&pgtable, start + PAGE_SIZE);
+    assert_eq!(take_flushes(), [], "new leaves need no flush");
+
+    set_alloc_budget(Some(0));
+    let result = pinned_frame(1);
+    set_alloc_budget(None);
+    assert!(matches!(result, Err(PageFaultError::AllocationFailed)));
+
+    // Pinned: never shared.
+    let child = clone(&pgtable);
+    check_unmapped(&child, start);
+    // Protected since it was pinned: refused.
+    // Safety: nothing uses the page.
+    unsafe { pgtable.mprotect_pages(range(start, 1), VmFlags::VM_READ) }.unwrap();
+    assert!(matches!(
+        pinned_frame(0),
+        Err(PageFaultError::AccessError(_))
+    ));
+    pgtable.unpin(pages);
+}
+
+/// A lazy pin's page addresses (see `crate::Pages`), over several blocks: each
+/// is found at the page's first access, then kept, unless finding it failed.
+#[test]
+fn lazily_pinned_addresses_are_found_once() {
+    use crate::BLOCK_PAGES;
+
+    let pages = crate::Pages::on_access(2 * BLOCK_PAGES + 1).unwrap();
+    let address = |index: usize| (index + 1) * PAGE_SIZE;
+    // Each block's first and last pages (the last block has one).
+    let ends = [
+        0,
+        BLOCK_PAGES - 1,
+        BLOCK_PAGES,
+        2 * BLOCK_PAGES - 1,
+        2 * BLOCK_PAGES,
+    ];
+    for index in ends {
+        assert_eq!(
+            pages.address(index, || Ok(address(index))),
+            Ok(address(index))
+        );
+    }
+    for index in ends {
+        let again = || panic!("page {index} found again");
+        assert_eq!(pages.address(index, again), Ok(address(index)));
+    }
+    assert_eq!(pages.address(1, || Err(Errno::ENOMEM)), Err(Errno::ENOMEM));
+    assert_eq!(pages.address(1, || Ok(address(1))), Ok(address(1)));
+
+    // Room for the first two blocks only.
+    set_heap_budget(Some(3));
+    let result = crate::Pages::on_access(2 * BLOCK_PAGES + 1);
+    set_heap_budget(None);
+    assert!(matches!(result, Err(Errno::ENOMEM)));
+}
+
+/// Two CPUs racing to a lazy pin's page's first access (see `crate::Pages`)
+/// both find it, and agree on its address if they find the same, as
+/// `PinnedUserPages::kernel_address`'s finds do (under the table's lock).
+#[test]
+fn racing_first_accesses_each_find() {
+    let pages = crate::Pages::on_access(1).unwrap();
+    let both = std::sync::Barrier::new(2);
+    let find = || {
+        both.wait();
+        Ok(PAGE_SIZE)
+    };
+    std::thread::scope(|scope| {
+        let racer = scope.spawn(|| pages.address(0, find));
+        assert_eq!(pages.address(0, find), Ok(PAGE_SIZE));
+        assert_eq!(racer.join().unwrap(), Ok(PAGE_SIZE));
+    });
+    assert_eq!(pages.address(0, || panic!("found again")), Ok(PAGE_SIZE));
 }

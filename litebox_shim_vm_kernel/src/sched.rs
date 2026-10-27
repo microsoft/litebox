@@ -838,13 +838,14 @@ fn resume_worker(process: &Arc<Owned>) -> Option<bool> {
 }
 
 /// Has this CPU's worker serve what the claimed process submitted, or
-/// `resume` serving it, in its address space, until done or suspended.
-/// Charged to the thread that made the last broker call (see
+/// `resume` serving it, until done or suspended. The work reaches the
+/// process's memory only through pinned pages (see
+/// `litebox_broker_vm_kernel`), so in no particular address space. Charged to
+/// the thread that made the last broker call (see
 /// [`Inner::broker_requester`]): the requests of several at once are charged
 /// to one.
 fn work(claim: &Claim<'_>, resume: bool) -> Ran {
     let start = claim.platform.now();
-    claim.activate();
     // The work looks at the devices itself.
     let _ = claim.broker.take_device_interrupt();
     let ran = if resume {
@@ -858,15 +859,7 @@ fn work(claim: &Claim<'_>, resume: bool) -> Ran {
                 // Safety: the work runs only in `work`, under the claim,
                 // which this CPU takes again to resume it.
                 let inner = unsafe { process.claimed() };
-                let main = inner.main_thread();
-                let running = Running {
-                    inner,
-                    thread: &main,
-                };
-                // Demand-pages the shared buffers, as in its kernel calls.
-                let result =
-                    litebox_platform_vm_kernel::with_user_faults(&running, || inner.broker.serve());
-                if result.is_err() {
+                if inner.broker.serve().is_err() {
                     inner.kill("broker association failed");
                 }
             }),

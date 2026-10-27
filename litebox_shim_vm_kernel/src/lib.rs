@@ -121,7 +121,7 @@ pub enum SpawnError {
     ImagesTooLarge,
     #[error("mapping failed: {0:?}")]
     Map(Status),
-    #[error("pinning the broker control ring failed: {0:?}")]
+    #[error("pinning the broker's memory failed: {0:?}")]
     Pin(litebox_common_linux::errno::Errno),
     #[error("creating the broker process failed: {0:?}")]
     Broker(BrokerError),
@@ -492,12 +492,11 @@ impl Inner {
         lazy(layout::UPCALL_STACK)?;
         lazy(layout::STACK)?;
         lazy(layout::MESSAGE_WINDOW)?;
-        lazy(layout::BROKER_SHARED_MEMORY)?;
         lazy(layout::HEAP)?;
-        let control_ring =
-            pin_control_ring(platform, address_space, &mappings, Placement::NoReplace)?;
+        let (shared_memory, control_ring) =
+            pin_broker_memory(platform, address_space, &mappings, Placement::NoReplace)?;
         let broker = broker
-            .associate(layout::BROKER_SHARED_MEMORY, control_ring, launch)
+            .associate(shared_memory, control_ring, launch)
             .map_err(SpawnError::Broker)?;
         let images = map_images(&mappings, config.images)?;
 
@@ -605,8 +604,7 @@ impl Inner {
     /// `spawned`, or adopts the process clone it was started with as its runner
     /// (see `fork`), and fails the start of those it cannot. Returns whether
     /// there were any: either way, the requests that started them can complete.
-    /// Leaves the kernel's address space current if it creates or adopts a
-    /// process.
+    /// Leaves the kernel's address space current if it creates a process.
     pub(crate) fn spawn_launched(&self, spawned: &mut Vec<Self>) -> bool {
         let broker = self.broker.broker();
         let launches = self.broker.take_pending_associations();
@@ -671,28 +669,46 @@ fn region_range(region: UserRange) -> Range<usize> {
     usize::try_from(region.start).unwrap()..usize::try_from(region.end()).unwrap()
 }
 
-/// Populated and pinned at creation, a process clone's too, as the clone does
-/// not map its parent's. Nothing unmaps or remaps it: the runner's calls are
-/// confined to the runner-managed area.
-fn pin_control_ring(
+/// The broker's memory, pinned at creation, a process clone's too, as the
+/// clone does not map its parent's: the shared buffers, populated as the
+/// broker accesses them, and the control ring, populated now. Nothing unmaps,
+/// remaps, or protects either: the runner's calls are confined to the
+/// runner-managed area, the kernel maps both only here, and a fork leaves
+/// pinned leaves as they are.
+fn pin_broker_memory(
     platform: &VmKernel,
     address_space: AddressSpaceId,
     mappings: &Mappings,
     placement: Placement,
-) -> Result<PinnedUserPages, SpawnError> {
-    let range = region_range(layout::BROKER_CONTROL_RING);
+) -> Result<(PinnedUserPages, PinnedUserPages), SpawnError> {
+    let shared_memory = region_range(layout::BROKER_SHARED_MEMORY);
+    let control_ring = region_range(layout::BROKER_CONTROL_RING);
     mappings
         .map(
-            range.clone(),
+            shared_memory.clone(),
+            Prot::ReadWrite,
+            placement,
+            Populate::Lazy,
+            Sharing::Private,
+        )
+        .map_err(SpawnError::Map)?;
+    mappings
+        .map(
+            control_ring.clone(),
             Prot::ReadWrite,
             placement,
             Populate::Now,
             Sharing::Private,
         )
         .map_err(SpawnError::Map)?;
-    // Safety: see above; unregistering the address space frees nothing while
-    // pinned.
-    unsafe { platform.pin_user_pages(address_space, range) }.map_err(SpawnError::Pin)
+    // Safety: see above, and it is mapped read-write; unregistering the
+    // address space frees nothing while pinned.
+    let shared_memory = unsafe { platform.pin_user_pages_lazily(address_space, shared_memory) }
+        .map_err(SpawnError::Pin)?;
+    // Safety: as for the shared buffers.
+    let control_ring =
+        unsafe { platform.pin_user_pages(address_space, control_ring) }.map_err(SpawnError::Pin)?;
+    Ok((shared_memory, control_ring))
 }
 
 /// Read-only, packed in [`layout::IMAGES`] with a guard page after each.

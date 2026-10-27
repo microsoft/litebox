@@ -38,7 +38,7 @@
 use crate::arch::mm::paging::UnmapOptions;
 use crate::per_cpu::{PerCpuVariablesAsm, with_per_cpu_variables};
 use alloc::sync::Arc;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use litebox::mm::page::PageRange;
 use litebox::mm::vmap::{
@@ -689,7 +689,7 @@ impl VmKernel {
     /// # Safety
     ///
     /// Nothing may unmap or remap `range` while the result lives. The result
-    /// keeps the page table, which owns the frames, alive.
+    /// keeps the whole address space alive (see [`PinnedUserPages`]).
     ///
     /// # Errors
     ///
@@ -701,6 +701,58 @@ impl VmKernel {
         address_space: AddressSpaceId,
         range: core::ops::Range<usize>,
     ) -> Result<PinnedUserPages, Errno> {
+        let (page_table, range) = self.pin_target(address_space, range)?;
+        let pages = page_table
+            .pin(range)
+            .ok_or(Errno::EFAULT)?
+            .iter()
+            .map(|frame| Self::pa_to_va(frame.start_address()).as_u64().trunc())
+            .collect();
+        Ok(PinnedUserPages {
+            page_table,
+            range,
+            pages: Pages::Found(pages),
+        })
+    }
+
+    /// As [`Self::pin_user_pages`], but the pages need not be present: each
+    /// is found as it is first accessed ([`PinnedUserPages::kernel_address`]),
+    /// on any CPU, without loading the address space, and populated writable
+    /// if not mapped. Its kernel address is then kept: a word per page.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::pin_user_pages`]; and `range` must stay mapped writable
+    /// (e.g., lazily) meanwhile: its pages are populated so, and each is found
+    /// only once, so a change of its permissions would go unseen.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` for an invalid range or [`AddressSpaceId::KERNEL`], `ENOENT`
+    /// for an unknown ID, and `ENOMEM` if the heap has no room for the pages'
+    /// addresses.
+    pub unsafe fn pin_user_pages_lazily(
+        &self,
+        address_space: AddressSpaceId,
+        range: core::ops::Range<usize>,
+    ) -> Result<PinnedUserPages, Errno> {
+        let (page_table, range) = self.pin_target(address_space, range)?;
+        let pages = Pages::on_access(range.len() / PAGE_SIZE)?;
+        // Safety: forwarded to the caller.
+        unsafe { page_table.pin_lazily(range) };
+        Ok(PinnedUserPages {
+            page_table,
+            range,
+            pages,
+        })
+    }
+
+    /// The table of `address_space`, and `range` as pages, for a pin.
+    fn pin_target(
+        &self,
+        address_space: AddressSpaceId,
+        range: core::ops::Range<usize>,
+    ) -> Result<(Arc<mm::PageTable<PAGE_SIZE>>, PageRange<PAGE_SIZE>), Errno> {
         let range = PageRange::<PAGE_SIZE>::new(range.start, range.end).ok_or(Errno::EINVAL)?;
         if range.is_empty() || range.start() < USER_ADDR_MIN || range.end() > USER_ADDR_MAX {
             return Err(Errno::EINVAL);
@@ -715,17 +767,7 @@ impl VmKernel {
                 .get(&address_space)
                 .ok_or(Errno::ENOENT)?,
         );
-        let pages = page_table
-            .pin(range)
-            .ok_or(Errno::EFAULT)?
-            .iter()
-            .map(|frame| Self::pa_to_va(frame.start_address()).as_u64().trunc())
-            .collect();
-        Ok(PinnedUserPages {
-            page_table,
-            range,
-            pages,
-        })
+        Ok((page_table, range))
     }
 
     /// A new address space with `source`'s user mappings, whose frames the
@@ -757,15 +799,81 @@ impl VmKernel {
     }
 }
 
-/// See [`VmKernel::pin_user_pages`]. The process may write these pages at any
-/// time: access them only with peer-safe operations, never through Rust
-/// references.
+/// See [`VmKernel::pin_user_pages`] and [`VmKernel::pin_user_pages_lazily`].
+/// The process may write these pages at any time: access them only with
+/// peer-safe operations, never through Rust references. Keeps the whole
+/// address space alive, every frame it maps, not only these, until dropped,
+/// even once unregistered.
 pub struct PinnedUserPages {
-    /// Keeps the frames alive.
+    /// Keeps the table, and every frame it owns, alive.
     page_table: Arc<mm::PageTable<PAGE_SIZE>>,
     range: PageRange<PAGE_SIZE>,
-    /// Kernel address of each page.
-    pages: alloc::boxed::Box<[usize]>,
+    pages: Pages,
+}
+
+/// How [`PinnedUserPages`] finds its pages' kernel addresses.
+enum Pages {
+    /// Each page's, found as it was pinned.
+    Found(alloc::boxed::Box<[usize]>),
+    /// Each page's, 0 until found, and populated if not mapped, at its first
+    /// access: its frame and permissions are fixed while pinned (see
+    /// [`VmKernel::pin_user_pages_lazily`]). In blocks of [`BLOCK_PAGES`].
+    OnAccess(alloc::boxed::Box<[alloc::boxed::Box<[AtomicUsize]>]>),
+}
+
+/// Pages per block of [`Pages::OnAccess`]: a page of addresses, which the
+/// kernel heap allocates as a frame, and frees back as one. It may have no
+/// larger free block, as page frames come from it too.
+const BLOCK_PAGES: usize = PAGE_SIZE / size_of::<AtomicUsize>();
+
+impl Pages {
+    /// [`Self::OnAccess`], for `pages` pages.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if the heap has no room for their addresses.
+    fn on_access(pages: usize) -> Result<Self, Errno> {
+        let count = pages.div_ceil(BLOCK_PAGES);
+        let mut blocks = alloc::vec::Vec::new();
+        blocks.try_reserve_exact(count).map_err(|_| Errno::ENOMEM)?;
+        for _ in 0..count {
+            let mut block = alloc::vec::Vec::new();
+            block
+                .try_reserve_exact(BLOCK_PAGES)
+                .map_err(|_| Errno::ENOMEM)?;
+            block.resize_with(BLOCK_PAGES, || AtomicUsize::new(0));
+            blocks.push(block.into_boxed_slice());
+        }
+        Ok(Self::OnAccess(blocks.into_boxed_slice()))
+    }
+
+    /// The kernel address of page `index`: for [`Self::OnAccess`], what
+    /// `find` finds at the page's first access, which is then kept. CPUs
+    /// racing to the first access each call `find`, which must find the same.
+    ///
+    /// # Errors
+    ///
+    /// `find`'s, which is not kept: the next access calls `find` again.
+    fn address(
+        &self,
+        index: usize,
+        find: impl FnOnce() -> Result<usize, Errno>,
+    ) -> Result<usize, Errno> {
+        match self {
+            Self::Found(pages) => Ok(pages[index]),
+            Self::OnAccess(blocks) => {
+                let entry = &blocks[index / BLOCK_PAGES][index % BLOCK_PAGES];
+                let mut page = entry.load(Ordering::Acquire);
+                if page == 0 {
+                    page = find()?;
+                    // Release: after `find`'s writes (e.g., zeroing a frame
+                    // it populated).
+                    entry.store(page, Ordering::Release);
+                }
+                Ok(page)
+            }
+        }
+    }
 }
 
 impl Drop for PinnedUserPages {
@@ -777,20 +885,42 @@ impl Drop for PinnedUserPages {
 impl PinnedUserPages {
     /// In bytes.
     pub fn len(&self) -> usize {
-        self.pages.len() * PAGE_SIZE
+        self.range.len()
     }
 
-    /// Never: [`VmKernel::pin_user_pages`] rejects empty ranges.
+    /// Never: pins reject empty ranges.
     pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
+        self.range.is_empty()
     }
 
-    /// The kernel address of byte `offset` and the bytes left in its page;
-    /// `None` past the end.
-    pub fn kernel_address(&self, offset: usize) -> Option<(*mut u8, usize)> {
-        let page = *self.pages.get(offset / PAGE_SIZE)?;
+    /// The kernel address of byte `offset` and the bytes left in its page.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` past the end; for a lazy pin, until the page is found,
+    /// `ENOMEM` if populating it runs out of frames, and `EFAULT` if it is
+    /// mapped but not writable.
+    pub fn kernel_address(&self, offset: usize) -> Result<(*mut u8, usize), Errno> {
+        if offset >= self.len() {
+            return Err(Errno::EINVAL);
+        }
+        let index = offset / PAGE_SIZE;
+        // Called only for a lazy pin's page not found yet. A CPU racing this
+        // one finds the same frame, under the table's lock.
+        let page = self.pages.address(index, || {
+            let user_page = x86_64::structures::paging::Page::containing_address(VirtAddr::new(
+                (self.range.start() + index * PAGE_SIZE) as u64,
+            ));
+            // Safety: in `self.range`, pinned lazily until `self` drops.
+            let found = unsafe { self.page_table.pinned_frame(user_page) };
+            let frame = found.map_err(|error| match error {
+                PageFaultError::AllocationFailed => Errno::ENOMEM,
+                PageFaultError::AccessError(_) | PageFaultError::HugePage => Errno::EFAULT,
+            })?;
+            Ok(VmKernel::pa_to_va(frame.start_address()).as_u64().trunc())
+        })?;
         let within = offset % PAGE_SIZE;
-        Some(((page + within) as *mut u8, PAGE_SIZE - within))
+        Ok(((page + within) as *mut u8, PAGE_SIZE - within))
     }
 }
 
@@ -1176,37 +1306,7 @@ pub unsafe fn resume_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserT
 where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
-    run_thread_inner(shim, ctx, true, state, false);
-}
-
-/// Runs `f` outside any thread's run, with `shim` handling kernel page faults
-/// as during one (e.g., demand paging its user memory), for the kernel to
-/// access a thread's memory between its runs. Its address space must be
-/// current.
-///
-/// # Panics
-///
-/// If called during a run, or nested.
-pub fn with_user_faults<R>(
-    shim: &dyn EnterShim<ExecutionContext = PtRegs>,
-    f: impl FnOnce() -> R,
-) -> R {
-    let thread_ctx = ThreadContext {
-        shim,
-        // Kernel-fault handlers do not touch it.
-        ctx: core::ptr::null_mut(),
-    };
-    with_per_cpu_variables(|pcv| {
-        assert!(
-            !pcv.asm.is_in_user() && pcv.fault_context.get().is_null(),
-            "user faults are already handled"
-        );
-        pcv.fault_context
-            .set(core::ptr::from_ref(&thread_ctx).cast());
-    });
-    let result = f();
-    with_per_cpu_variables(|pcv| pcv.fault_context.set(core::ptr::null()));
-    result
+    run_thread_inner(shim, ctx, true, state, false)
 }
 
 /// A user thread's state that the platform keeps across its runs, besides
@@ -1726,18 +1826,6 @@ unsafe extern "C" fn kernel_exception_handler_no_ctx(
     error_code: usize,
     faulting_rip: usize,
 ) -> usize {
-    let fault_context = with_per_cpu_variables(|pcv| pcv.fault_context.get());
-    if !fault_context.is_null() {
-        let regs = PtRegs {
-            orig_rax: error_code,
-            rip: faulting_rip,
-            ..PtRegs::default()
-        };
-        // Safety: `with_user_faults` keeps it alive while set.
-        return unsafe {
-            kernel_exception_handler(&*fault_context.cast::<ThreadContext>(), &regs, cr2)
-        };
-    }
     search_exception_tables(faulting_rip).unwrap_or_else(|| {
         panic!(
             "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\

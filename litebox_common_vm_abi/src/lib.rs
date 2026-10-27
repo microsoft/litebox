@@ -187,10 +187,10 @@
 //!   (e.g., standard input) from the kernel, published as it changes; the
 //!   runner consumes them and waits for them on the direction's producer
 //!   wake counter.
-//! - The kernel pins the control ring and accesses it through its own mapping.
-//!   The shared buffers stay lazily populated and are touched only while
-//!   executing a request that names them, or by a launched process's
-//!   handshake.
+//! - The kernel pins the control ring and the shared buffers, and accesses
+//!   them through its own mapping. The shared buffers stay lazily populated
+//!   and are touched only while executing a request that names them, or by a
+//!   launched process's handshake.
 //! - If the response ring is full, the kernel holds one response and consumes
 //!   no further request.
 //! - A malformed ring or request kills the process. Before the handshake, a

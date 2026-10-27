@@ -23,8 +23,7 @@ use crate::claim::{Claim, Owned};
 use crate::memory::copy_to_user;
 use crate::thread::{self, Thread};
 use crate::{
-    Dead, Inner, Running, SpawnError, State, Suspended, layout, new_thread, pin_control_ring,
-    region_range, release_address_space,
+    Dead, Inner, SpawnError, State, Suspended, new_thread, pin_broker_memory, release_address_space,
 };
 use alloc::sync::{Arc, Weak};
 use core::cell::{Cell, RefCell};
@@ -32,9 +31,7 @@ use litebox::shim::ContinueOperation;
 use litebox_broker_core::BrokerError;
 use litebox_broker_vm_kernel::PendingRunnerAssociation;
 use litebox_common_linux::PtRegs;
-use litebox_common_vm_abi::{
-    CloneReply, CloneRequest, NewThread, Placement, Populate, Prot, Sharing, Status,
-};
+use litebox_common_vm_abi::{CloneReply, CloneRequest, NewThread, Placement, Status};
 use litebox_platform_vm_kernel::AddressSpaceId;
 use zerocopy::IntoBytes as _;
 
@@ -107,28 +104,17 @@ impl Inner {
         unsafe { platform.switch_address_space(address_space) }
             .expect("a freshly cloned address space is registered");
         let mappings = self.mappings.duplicate();
-        let broker = mappings
-            .map(
-                region_range(layout::BROKER_SHARED_MEMORY),
-                Prot::ReadWrite,
-                Placement::Replace,
-                Populate::Lazy,
-                Sharing::Private,
-            )
-            .and_then(|()| {
-                // `Replace`: the duplicated record lists the ring, which the
-                // clone does not map.
-                pin_control_ring(platform, address_space, &mappings, Placement::Replace).map_err(
-                    |error| match error {
-                        SpawnError::Map(status) => status,
-                        _ => Status::NoMemory,
-                    },
-                )
+        // `Replace`: the duplicated record lists the broker's memory, which
+        // the clone does not map.
+        let broker = pin_broker_memory(platform, address_space, &mappings, Placement::Replace)
+            .map_err(|error| match error {
+                SpawnError::Map(status) => status,
+                _ => Status::NoMemory,
             })
-            .map(|control_ring| {
+            .map(|(shared_memory, control_ring)| {
                 self.broker
                     .broker()
-                    .associate_clone(layout::BROKER_SHARED_MEMORY, control_ring)
+                    .associate_clone(shared_memory, control_ring)
             })
             .inspect_err(|_| {
                 // Safety: nothing references the clone's memory, and it never
@@ -200,8 +186,6 @@ impl Inner {
     /// handshake fails ends without running. Either way, `launch` is done
     /// with, which wakes the CPU whose worker waits for it (see
     /// `PendingRunnerAssociation`'s `Drop`). Only under the process's claim.
-    /// Leaves the kernel's address space current if it adopts the clone, or
-    /// tries to.
     pub(crate) fn adopt(&self, id: u64, launch: PendingRunnerAssociation) {
         let pending = self
             .pending_clone
@@ -221,17 +205,7 @@ impl Inner {
             launch.fail(BrokerError::PolicyDenied);
             return;
         };
-        // The handshake writes the startup data into the clone's shared
-        // buffers.
-        claim.activate();
-        let main = claim.main_thread();
-        let running = Running {
-            inner: &claim,
-            thread: &main,
-        };
-        let adopted =
-            litebox_platform_vm_kernel::with_user_faults(&running, || claim.broker.adopt(launch));
-        if let Err(error) = adopted {
+        if let Err(error) = claim.broker.adopt(launch) {
             log::warn!("failed to adopt process clone {id}: {error:?}");
             end(&claim);
             return;

@@ -335,13 +335,56 @@ unsafe fn release_user_frame<M: MemoryProvider>(frame: PhysFrame, flags: PageTab
     unsafe { PageTableAllocator::<M>::new().deallocate_frame(frame) };
 }
 
+/// Maps `page`, which has no leaf, to a fresh, zeroed frame with `flags`;
+/// the frame.
+///
+/// # Safety
+///
+/// `page` must be user memory its owner may access as `flags` allow.
+unsafe fn map_fresh_frame<M: MemoryProvider>(
+    inner: &mut MappedPageTable<'_, FrameMapping<M>>,
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<PhysFrame, PageFaultError> {
+    let mut allocator = PageTableAllocator::<M>::new();
+    let frame =
+        PageTableAllocator::<M>::allocate_frame().ok_or(PageFaultError::AllocationFailed)?;
+    // ACCESSED and DIRTY are preset in parent entries, so the page walker
+    // never has to set them; it sets a leaf's (see `vmflags_to_pteflags`).
+    let table_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::ACCESSED
+        | PageTableFlags::DIRTY;
+    // Safety: `frame` is fresh and exclusively owned, and the caller may map
+    // `page` so.
+    match unsafe { inner.map_to_with_table_flags(page, frame, flags, table_flags, &mut allocator) }
+    {
+        // A newly present entry needs no flush.
+        Ok(flush) => {
+            flush.ignore();
+            Ok(frame)
+        }
+        Err(e) => {
+            // Safety: never mapped.
+            unsafe { allocator.deallocate_frame(frame) };
+            match e {
+                MapToError::PageAlreadyMapped(_) => unreachable!(),
+                MapToError::ParentEntryHugePage => Err(PageFaultError::HugePage),
+                MapToError::FrameAllocationFailed => Err(PageFaultError::AllocationFailed),
+            }
+        }
+    }
+}
+
 pub(crate) struct X64PageTable<'a, M: MemoryProvider, const ALIGN: usize> {
     inner: spin::mutex::SpinMutex<MappedPageTable<'a, FrameMapping<M>>>,
     /// For CR3 and shootdowns, without `inner`.
     p4: PhysFrame,
     /// See [`tlb::Cpus`]; never set for the base and trampoline tables.
     cpus: tlb::Cpus,
-    /// The ranges of [`Self::pin`]: their frames are never shared.
+    /// The ranges of [`Self::pin`] and [`Self::pin_lazily`]: their frames are
+    /// never shared.
     pinned: spin::Mutex<Vec<Range<usize>>>,
 }
 
@@ -678,6 +721,69 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             .position(|pin| *pin == (range.start()..range.end()))
             .expect("unpinning a pinned range");
         pinned.swap_remove(index);
+    }
+
+    /// Pins `range` as [`Self::pin`] does, but its pages need not be present:
+    /// [`Self::pinned_frame`] finds each, populating it if it has no leaf.
+    ///
+    /// # Safety
+    ///
+    /// Until [`Self::unpin`], nothing may unmap or remap `range`, and those of
+    /// its pages with no leaf must be ones their owner may map read-write
+    /// (e.g., in a lazy read-write mapping).
+    pub(crate) unsafe fn pin_lazily(&self, range: PageRange<ALIGN>) {
+        self.pinned.lock().push(range.start()..range.end());
+    }
+
+    /// The frame of `page`, if mapped writable, or, if it has no leaf,
+    /// populated so. Walks the table through the kernel mapping, so with
+    /// whichever table is current.
+    ///
+    /// # Safety
+    ///
+    /// `page` must be in a range [pinned lazily](Self::pin_lazily) until this
+    /// returns, so that, if it has no leaf, its owner may map it read-write
+    /// (asserted to be pinned in debug builds).
+    ///
+    /// # Errors
+    ///
+    /// `AllocationFailed` if populating runs out of frames, and `AccessError`
+    /// if the page is mapped but not writable (e.g., protected since it was
+    /// pinned).
+    pub(crate) unsafe fn pinned_frame(
+        &self,
+        page: Page<Size4KiB>,
+    ) -> Result<PhysFrame, PageFaultError> {
+        let address: usize = page.start_address().as_u64().trunc();
+        debug_assert!(
+            self.pinned
+                .lock()
+                .iter()
+                .any(|range| range.contains(&address)),
+            "page {address:#x} is not pinned"
+        );
+        let mut inner = self.inner.lock();
+        match inner.translate(page.start_address()) {
+            TranslateResult::Mapped {
+                frame: MappedFrame::Size4KiB(frame),
+                offset: _,
+                flags,
+            } if flags.contains(
+                PageTableFlags::PRESENT
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::WRITABLE,
+            ) =>
+            {
+                Ok(frame)
+            }
+            TranslateResult::NotMapped => {
+                let flags = vmflags_to_pteflags(VmFlags::VM_READ | VmFlags::VM_WRITE);
+                // Safety: the caller's page is pinned lazily and has no leaf,
+                // so its owner may map it read-write (see `pin_lazily`).
+                unsafe { map_fresh_frame(&mut inner, page, flags) }
+            }
+            _ => Err(PageFaultError::AccessError("pinned page not writable")),
+        }
     }
 
     /// Maps every user leaf of `self` but those of pinned ranges (see
@@ -1094,38 +1200,9 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 }
             }
             TranslateResult::NotMapped => {
-                let mut allocator = PageTableAllocator::<M>::new();
                 // TODO: if it is file-backed, we need to read the page from file
-                let frame = PageTableAllocator::<M>::allocate_frame()
-                    .ok_or(PageFaultError::AllocationFailed)?;
-                // ACCESSED and DIRTY are preset so the page walker never has to set them.
-                let table_flags = PageTableFlags::PRESENT
-                    | PageTableFlags::WRITABLE
-                    | PageTableFlags::USER_ACCESSIBLE
-                    | PageTableFlags::ACCESSED
-                    | PageTableFlags::DIRTY;
-                // Safety: `frame` is fresh and exclusively owned; the caller
-                // checked that the access is allowed.
-                match unsafe {
-                    inner.map_to_with_table_flags(page, frame, flags, table_flags, &mut allocator)
-                } {
-                    Ok(_fl) => {}
-                    Err(e) => {
-                        // Safety: never mapped.
-                        unsafe { allocator.deallocate_frame(frame) };
-                        match e {
-                            MapToError::PageAlreadyMapped(_) => {
-                                unreachable!()
-                            }
-                            MapToError::ParentEntryHugePage => {
-                                return Err(PageFaultError::HugePage);
-                            }
-                            MapToError::FrameAllocationFailed => {
-                                return Err(PageFaultError::AllocationFailed);
-                            }
-                        }
-                    }
-                }
+                // Safety: the caller checked that the access is allowed.
+                unsafe { map_fresh_frame(inner, page, flags) }?;
                 Ok(None)
             }
             TranslateResult::InvalidFrameAddress(pa) => {
