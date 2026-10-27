@@ -809,6 +809,7 @@ impl From<FileError> for TruncateError {
             FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
             FileError::PathOnly => Self::NotOpenForWriting,
             FileError::IsTerminalDevice => Self::IsTerminalDevice,
+            FileError::Busy => Self::Busy,
             _ => Self::Io,
         }
     }

@@ -256,6 +256,28 @@ fn test_vfork_exec_with_windows_broker() {
     assert!(child_line.contains("marker=from-vfork env=1"));
 }
 
+/// Runs `shared_file_mapping`, which shares `MAP_SHARED` file pages with a forked child and an
+/// exec'd process. Windows cannot shrink a mapped file, so the program reports `shrink=busy`.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/shared_file_mapping.c`.
+#[test]
+fn test_shared_file_mapping_with_windows_broker() {
+    let (broker, runner) = build_windows_broker();
+    let output = run_progs_with_process_duplication(
+        &broker,
+        &runner,
+        &["shared_file_mapping"],
+        &["/bin/shared_file_mapping.hooked"],
+    );
+
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "shared-file failures=0 shrink=busy"),
+        "{output}"
+    );
+}
+
 const DYNAMIC_LIBS: [(&str, &str); 2] = [
     ("libc.so.6", "/lib/x86_64-linux-gnu"),
     ("ld-linux-x86-64.so.2", "/lib64"),

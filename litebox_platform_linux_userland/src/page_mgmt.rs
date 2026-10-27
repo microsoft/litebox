@@ -391,6 +391,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         self.shared_objects.get().is_some()
     }
 
+    fn release_shared_object(&self, token: litebox::platform::page_mgmt::SharedObjectToken) {
+        if let Some(channel) = self.shared_objects.get() {
+            // The broker sent the descriptor before answering with its token, so this only
+            // drains it from the socket and closes it.
+            drop(channel.take(token.0));
+        }
+    }
+
     unsafe fn try_map_shared_object<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,

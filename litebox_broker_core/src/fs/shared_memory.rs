@@ -25,6 +25,10 @@ pub enum SharedFileMemoryError {
     /// The host failed to access the memory.
     #[error("host shared memory I/O failed")]
     Io,
+    /// The host cannot shrink the memory while it is mapped, as Windows refuses to truncate a
+    /// file with mapped views.
+    #[error("host shared memory is mapped")]
+    Busy,
 }
 
 /// Host memory that holds one file's contents.
