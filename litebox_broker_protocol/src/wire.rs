@@ -651,11 +651,11 @@ mod tests {
         ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
         FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileType,
         FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-        MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-        ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-        ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
-        SeekFileResponse, SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest,
-        UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+        MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+        PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+        ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+        SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, TerminalControlFileRequest,
+        TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
@@ -1064,6 +1064,10 @@ mod tests {
             BrokerOperation::File(FileRequest::HandlePath(HandleFilePathRequest {
                 handle,
                 buffer: sequence(13, 256),
+            })),
+            BrokerOperation::File(FileRequest::Map(MapFileRequest {
+                handle,
+                writable: true,
             })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
@@ -1821,6 +1825,10 @@ mod tests {
             BrokerResult::File(FileResponse::ReadLink(FilePathResponse { length: 31 })),
             BrokerResult::File(FileResponse::ResolvePath(FilePathResponse { length: 37 })),
             BrokerResult::File(FileResponse::HandlePath(FilePathResponse { length: 41 })),
+            BrokerResult::File(FileResponse::Map(MapFileResponse {
+                identity: (7 << 64) | 9,
+                token: 11,
+            })),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
                 process_id: process_id(19),

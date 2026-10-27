@@ -12,10 +12,12 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, RmdirError, SymlinkError, TruncateError, UnlinkError,
+    WriteError,
 };
 use super::inode_allocator::InodeAllocator;
+use super::shared_memory::{SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
@@ -32,6 +34,9 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
     // XXX(jayb): serializes directory moves so ancestry stays stable while rename chooses
     // ancestor-first locks; should be cleaned up as part of broader atomicity fixups.
     rename_lock: sync::Mutex<Platform, ()>,
+    /// Creates the host shared memory that a file's contents move to when a runner maps it, if
+    /// this deployment supports shared file mappings.
+    shared_memory: Option<Arc<dyn SharedFileMemoryProvider>>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
@@ -51,7 +56,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             root,
             inode_allocator,
             rename_lock: sync::Mutex::new(()),
+            shared_memory: None,
         }
+    }
+
+    /// Lets runners map this backend's regular files `MAP_SHARED`, keeping a mapped file's
+    /// contents in host shared memory from `provider`.
+    #[must_use]
+    pub fn with_shared_memory(mut self, provider: Arc<dyn SharedFileMemoryProvider>) -> Self {
+        self.shared_memory = Some(provider);
+        self
     }
 
     /// Construct an `InMem` backend pre-populated with `entries`.
@@ -146,6 +160,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     userinfo: owner,
                 };
                 existing.data = data;
+                existing.shared = None;
             }
             (
                 Some(Node::File(existing)),
@@ -189,6 +204,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     file_type: FileType::RegularFile,
                     data,
                     node_info: self.inode_allocator.next(),
+                    shared: None,
                 }));
                 dir.children.insert(name.into(), Node::File(child));
             }
@@ -208,6 +224,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     file_type: FileType::SymbolicLink,
                     data: target.into_bytes().into(),
                     node_info: self.inode_allocator.next(),
+                    shared: None,
                 }));
                 dir.children.insert(name.into(), Node::File(child));
             }
@@ -254,7 +271,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             "must only be used on regular files during initialization"
         );
         assert!(
-            file.data.is_empty(),
+            file.len() == 0 && file.shared.is_none(),
             "must only be used on empty files during initialization"
         );
         file.data = data;
@@ -510,10 +527,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         offset: usize,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
-        let start = offset.min(file.data.len());
-        let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
+        let start = offset.min(file.len());
+        let end = offset.checked_add(buf.len()).unwrap().min(file.len());
         debug_assert!(start <= end);
         let len = end - start;
+        if let Some(shared) = &file.shared {
+            let mut bytes = alloc::vec![0; len];
+            let read = shared
+                .memory
+                .read_at(start, &mut bytes)
+                .map_err(|_| ReadError::Io)?;
+            buf.copy_from_slice_at(0, &bytes[..read])?;
+            return Ok(read);
+        }
         buf.copy_from_slice_at(0, &file.data[start..end])?;
         Ok(len)
     }
@@ -525,6 +551,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         offset: usize,
     ) -> Result<usize, WriteError> {
         let mut file = h.get_typed::<Self>().file.write();
+        if let Some(shared) = &mut file.shared {
+            let end = offset.checked_add(buf.len()).unwrap();
+            let mut bytes = alloc::vec![0; buf.len()];
+            buf.copy_to_slice_at(0, &mut bytes)?;
+            if end > shared.len {
+                // Pads with 0s if the offset is past the end of the file.
+                shared.memory.set_len(end).map_err(|_| WriteError::Io)?;
+                shared.len = end;
+            }
+            shared
+                .memory
+                .write_at(offset, &bytes)
+                .map_err(|_| WriteError::Io)?;
+            return Ok(buf.len());
+        }
         let data = file.data.to_mut();
         let previous_len = data.len();
         let end = offset.checked_add(buf.len()).unwrap();
@@ -541,6 +582,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {
         let mut file = h.get_typed::<Self>().file.write();
+        if let Some(shared) = &mut file.shared {
+            // Shrinking discards the pages past the end, so runners fault on them, as Linux
+            // raises `SIGBUS` past the end of a mapped file.
+            shared
+                .memory
+                .set_len(length)
+                .map_err(|_| TruncateError::Io)?;
+            shared.len = length;
+            return Ok(());
+        }
         match length.cmp(&file.data.len()) {
             core::cmp::Ordering::Less => match &mut file.data {
                 alloc::borrow::Cow::Borrowed(d) => *d = &d[..length],
@@ -563,7 +614,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 Ok(FileStatus {
                     file_type: file.file_type,
                     mode: file.perms.mode,
-                    size: u64::try_from(file.data.len()).map_err(|_| FileStatusError::Io)?,
+                    size: u64::try_from(file.len()).map_err(|_| FileStatusError::Io)?,
                     owner: file.perms.userinfo,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
@@ -604,6 +655,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             file_type: FileType::RegularFile,
             data: Vec::new().into(),
             node_info: self.inode_allocator.next(),
+            shared: None,
         }));
         let old = parent
             .children
@@ -634,6 +686,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             file_type: FileType::SymbolicLink,
             data: target.as_bytes().to_vec().into(),
             node_info: self.inode_allocator.next(),
+            shared: None,
         }));
         parent.children.insert(name.into(), Node::File(file));
         Ok(())
@@ -849,13 +902,41 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn get_static_backing_data(&self, h: &super::backend::FileHandle) -> Option<&'static [u8]> {
         let file = h.get_typed::<Self>().file.read();
-        if file.file_type == FileType::SymbolicLink {
+        if file.file_type == FileType::SymbolicLink || file.shared.is_some() {
             return None;
         }
         match file.data {
             alloc::borrow::Cow::Borrowed(slice) => Some(slice),
             alloc::borrow::Cow::Owned(_) => None,
         }
+    }
+
+    fn map_shared(
+        &self,
+        h: &super::backend::FileHandle,
+    ) -> Result<Arc<dyn SharedFileMemory>, MapSharedError> {
+        let mut file = h.get_typed::<Self>().file.write();
+        if let Some(shared) = &file.shared {
+            return Ok(Arc::clone(&shared.memory));
+        }
+        let provider = self
+            .shared_memory
+            .as_ref()
+            .ok_or(MapSharedError::Unsupported)?;
+        if file.file_type != FileType::RegularFile {
+            return Err(MapSharedError::Unsupported);
+        }
+        let memory = provider.create(&file.data).map_err(|error| match error {
+            SharedFileMemoryError::NoMemory => MapSharedError::NoMemory,
+            SharedFileMemoryError::Io => MapSharedError::Io,
+        })?;
+        let len = file.data.len();
+        file.data = alloc::borrow::Cow::Borrowed(&[]);
+        file.shared = Some(SharedContents {
+            memory: Arc::clone(&memory),
+            len,
+        });
+        Ok(memory)
     }
 }
 
@@ -937,7 +1018,24 @@ struct FileData {
     file_type: FileType,
     /// The contents of a regular file, or the target of a symlink.
     data: alloc::borrow::Cow<'static, [u8]>,
+    /// Host shared memory that holds a regular file's contents instead of `data`, once a runner
+    /// has mapped the file.
+    shared: Option<SharedContents>,
     node_info: NodeInfo,
+}
+
+struct SharedContents {
+    memory: Arc<dyn SharedFileMemory>,
+    /// The file's size, which is also the memory's.
+    len: usize,
+}
+
+impl FileData {
+    fn len(&self) -> usize {
+        self.shared
+            .as_ref()
+            .map_or(self.data.len(), |shared| shared.len)
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -38,7 +38,8 @@ pub struct BrokerConnection {
     pub positional_io_fds: [RawFd; 2],
     /// Association-shutdown descriptor that a runner's syscall filter must permit.
     pub shutdown_fd: RawFd,
-    /// Socket over which the broker delivers host shared objects.
+    /// Socket over which the broker delivers host shared objects, which a runner's syscall
+    /// filter must permit receiving from.
     pub shared_object_channel: OwnedFd,
     /// Sealed memfd holding the memory image this process starts from, if
     /// its parent wrote one.

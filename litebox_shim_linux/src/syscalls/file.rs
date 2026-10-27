@@ -155,6 +155,20 @@ impl<Platform: ShimPlatform> File<Platform> {
         linux_status_flags(self.file.get_status_flags()?)
     }
 
+    /// Returns the access mode the open file description was opened with.
+    pub(crate) fn access_mode(&self) -> Result<FileAccessMode, Errno> {
+        Ok(self.file.get_status_flags()?.access)
+    }
+
+    /// Asks the broker for the host shared object holding this file's contents. See
+    /// [`litebox::fs::File::map_shared`].
+    pub(crate) fn map_shared(
+        &self,
+        writable: bool,
+    ) -> Result<litebox::fs::SharedFileObject, litebox::fs::errors::MapSharedError> {
+        self.file.map_shared(writable)
+    }
+
     /// Changes the status flags in `mask` of the open file description to their values in
     /// `flags`, ignoring flags other than `O_NONBLOCK` and `O_APPEND`.
     pub(crate) fn set_status_flags(&self, mask: OFlags, flags: OFlags) -> Result<(), Errno> {

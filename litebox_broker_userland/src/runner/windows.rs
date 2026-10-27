@@ -342,6 +342,7 @@ fn serve_association(
         },
         WindowsNamedPipeHostSetupChannel::into_active,
         launcher,
+        None,
     )
 }
 

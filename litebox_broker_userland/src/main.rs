@@ -222,6 +222,11 @@ where
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
     let in_mem = InMem::<Platform>::new_initialized(entries);
+    // Files that runners map `MAP_SHARED` move into memfds, which every mapping shares.
+    #[cfg(target_os = "linux")]
+    let in_mem = in_mem.with_shared_memory(Arc::new(
+        litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider,
+    ));
     let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
             Overlay::<Platform>::new(

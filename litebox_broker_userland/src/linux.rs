@@ -25,6 +25,7 @@ use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 use litebox_broker_userland::builder::BrokerCoreBuilder;
+use litebox_broker_userland::shared_objects::linux::MemfdDelivery;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
 
 use super::{SETUP_TIMEOUT, configured_socket_policy};
@@ -241,10 +242,7 @@ fn serve_control_stream(
 ) -> IoResult<()> {
     let control_channel =
         UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
-    // No process launcher serves an in-process association, so nothing is delivered through the
-    // broker's end. It stays open while the association is served so that the runner does not
-    // see its shared-object channel closed.
-    let (_shared_objects, runner_shared_objects) = SharedObjectSender::pair()?;
+    let (shared_objects, runner_shared_objects) = SharedObjectSender::pair()?;
     litebox_broker_userland::runtime::serve_in_process_runner_association(
         broker,
         control_channel,
@@ -258,5 +256,6 @@ fn serve_control_stream(
             channel.send_process_image(None, Some(setup_deadline))
         },
         UnixStreamHostSetupChannel::into_active,
+        Some(Arc::new(MemfdDelivery(Arc::new(shared_objects)))),
     )
 }

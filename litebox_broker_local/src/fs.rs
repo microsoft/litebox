@@ -10,11 +10,11 @@ use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FilePathResponse,
     FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
-    IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, try_decode_directory_entries,
+    IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MapFileRequest, MapFileResponse,
+    MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadFileRequest, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -163,6 +163,24 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Truncate => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file truncate response: {response:?}"),
+        }
+    }
+
+    /// Requests the host shared object holding an open file's contents, which the broker
+    /// delivers out of band under the returned token.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn map_file(
+        &self,
+        handle: ObjectHandle,
+        writable: bool,
+    ) -> Result<FileOperationResult<MapFileResponse>, Channel::Error> {
+        match self.request_file(FileRequest::Map(MapFileRequest { handle, writable }))? {
+            FileResponse::Map(response) => Ok(Ok(response)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file map response: {response:?}"),
         }
     }
 

@@ -8,12 +8,13 @@ use crate::event::{
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapFileRequest,
+    MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+    SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SymlinkFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -216,7 +217,8 @@ impl BrokerOperation {
                 | FileRequest::Truncate(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::IsTerminal(_)
-                | FileRequest::TerminalControl(_),
+                | FileRequest::TerminalControl(_)
+                | FileRequest::Map(_),
             )
             | Self::UnixSocket(
                 UnixSocketRequest::Create(_)
@@ -843,6 +845,8 @@ pub enum FileRequest {
     Symlink(SymlinkFileRequest),
     /// Rename a file or directory by path.
     Rename(RenameFileRequest),
+    /// Obtain the host shared object holding an open file's contents.
+    Map(MapFileRequest),
 }
 
 /// Broker-owned fs response.
@@ -866,6 +870,8 @@ pub enum FileResponse {
     HandleStatus(FileStatus),
     /// Handle-path response.
     HandlePath(FilePathResponse),
+    /// Map response.
+    Map(MapFileResponse),
     /// Terminal query response.
     IsTerminal(bool),
     /// Terminal-control response.

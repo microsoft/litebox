@@ -76,6 +76,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "inherited_ignored_signals.c",
     "process_group_parent.c",
     "process_tree_parent.c",
+    "shared_file_mapping.c",
     "sigreturn.c",
     "sigreturn_simd.c",
     "svc_scratch_regs.c",
@@ -1173,6 +1174,32 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
     let fpcr_line = line("fpcr ");
     assert_eq!(numeric_field(fpcr_line, "syscall="), 1, "{fpcr_line}");
     assert_eq!(numeric_field(fpcr_line, "signal="), 1, "{fpcr_line}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shared_file_mappings_are_shared_across_fork_and_processes() {
+    let program = common::compile(
+        "./tests/shared_file_mapping.c",
+        "shared_file_mapping",
+        true,
+        false,
+    );
+    let program_guest_path = std::path::absolute(&program).unwrap();
+    let mut runner = Runner::new(&program, "shared_file_mapping");
+    runner
+        .allow_process_duplication()
+        .arg(&program_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(program_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&program, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "shared-file failures=0"),
+        "{output}"
+    );
 }
 
 #[cfg(target_os = "linux")]

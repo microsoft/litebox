@@ -1435,8 +1435,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// memory mappings, no ELF file mid-load, and only descriptors a fresh runner can inherit is
     /// duplicated; otherwise this fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process
     /// that cannot fork natively is not duplicated either; this fails with `ENOSYS`.
-    /// Shared memory mappings need a native launcher, which the child shares
-    /// them through, and must not be file-backed.
+    /// Shared memory mappings, anonymous or of a file's host shared object, need a native
+    /// launcher, which the child shares them through. A read-only shared file mapping that is a
+    /// private copy of the file is copied like private memory.
     fn fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1452,9 +1453,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let shares_memory = self.global.mm.has_shared_mappings();
         if !self.thread.process.limits.has_default_state()
             || !self.global.elf_patch_cache.lock().is_empty()
-            || (shares_memory
-                && (self.global.fork_launcher.is_none()
-                    || self.global.mm.has_unforkable_shared_mappings()))
+            || (shares_memory && self.global.fork_launcher.is_none())
         {
             return Err(Errno::EAGAIN);
         }
@@ -3517,7 +3516,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_launcher_native_rejects_shared_file_mapping() {
+    fn fork_launcher_native_forks_read_only_shared_file_copy() {
         use litebox::platform::ThreadProvider;
         use litebox_broker_protocol::fs::FileMode;
         use litebox_common_linux::{MapFlags, OFlags, PAGE_SIZE, ProtFlags, PtRegs, errno::Errno};
@@ -3543,9 +3542,14 @@ mod tests {
                     0,
                 )
                 .unwrap();
-            // The file's pages are private copies a native child would not share.
-            assert!(task.global.mm.has_unforkable_shared_mappings());
-            assert_eq!(task.sys_fork(&PtRegs::default()), Err(Errno::EAGAIN));
+            // Without shared objects, the file's pages are a private copy that can never become
+            // writable, so a child's copy of them is as good as sharing them.
+            assert!(!task.global.mm.has_shared_mappings());
+            assert_eq!(
+                task.sys_mprotect(mapping, PAGE_SIZE, ProtFlags::PROT_READ_WRITE),
+                Err(Errno::EACCES)
+            );
+            task.sys_fork(&PtRegs::default()).unwrap();
             task.sys_munmap(mapping, PAGE_SIZE).unwrap();
         });
     }

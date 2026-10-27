@@ -13,9 +13,9 @@ use core::marker::PhantomData;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
-    WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, WalkError, WriteError,
 };
 use super::{
     FileType, Mode, OFlags,
@@ -1398,6 +1398,38 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             Handle::File(file) => self.backend.get_static_backing_data(file),
             Handle::Dir(_) => None,
         }
+    }
+
+    /// Returns the host shared memory holding an open file's contents, for a `MAP_SHARED`
+    /// mapping that may be made writable if `writable` is set.
+    ///
+    /// The file must be open for reading, and also for writing if `writable` is set. The
+    /// mapping's identity is the file's device and inode numbers, which every process that
+    /// opens the file sees.
+    pub fn map_shared(
+        &self,
+        entry: &ResolverEntry<Backend>,
+        writable: bool,
+    ) -> Result<super::shared_memory::SharedFileMapping, MapSharedError> {
+        let file = match &entry.handle {
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(MapSharedError::IsDirectory),
+        };
+        if entry.path_only {
+            return Err(MapSharedError::PathOnly);
+        }
+        if !entry.read_allowed {
+            return Err(MapSharedError::NotForReading);
+        }
+        if writable && !entry.write_allowed {
+            return Err(MapSharedError::NotForWriting);
+        }
+        let status = self.handle_status(entry).map_err(|_| MapSharedError::Io)?;
+        let memory = self.backend.map_shared(file)?;
+        Ok(super::shared_memory::SharedFileMapping {
+            identity: (u128::from(status.node_info.dev) << 64) | u128::from(status.node_info.ino),
+            memory,
+        })
     }
 }
 
