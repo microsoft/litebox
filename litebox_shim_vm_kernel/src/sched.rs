@@ -39,6 +39,10 @@
 //! CPU, once no other CPU runs anything.
 //!
 //! Known limitations:
+//! - A thread's run, or the worker's work for it, longer than a slice (e.g., in
+//!   long kernel work) counts as a slice (see `charged`), since the clock
+//!   cannot tell it from the host's not running the CPU: such a thread gets
+//!   more than its share of the CPU.
 //! - A notification to any waiting process shortens every busy CPU's slice.
 //! - A process running on another CPU, with no thread waiting for
 //!   notifications, sees one only at its next kernel entry, at the latest as
@@ -242,6 +246,25 @@ struct Found<'a> {
 /// Bit `i`: CPU `i`.
 pub(crate) fn bit(cpu: CpuId) -> u64 {
     1 << cpu.index()
+}
+
+/// The CPU time to count for a runnable thread that used `cpu_time`, as it is
+/// polled with the [`RunQueue::floor`] at `floor`: one back from waiting
+/// (e.g., for a device) is due at most a slice more than the others. Never
+/// less than it used, whatever the floor: it may stay put as threads run
+/// (e.g., held down by a process whose CPU the host stopped, see
+/// [`Found::held`]), and threads whose runs did not count would tie, left to
+/// the round-robin, which other CPUs move: one could starve.
+fn counted(cpu_time: u64, floor: u64) -> u64 {
+    cpu_time.max(floor.saturating_sub(QUANTUM_NANOS))
+}
+
+/// The CPU time to charge a thread for its run, or the worker's work for it,
+/// that took `elapsed` nanoseconds: a slice at most, as the clock cannot tell
+/// a longer one (e.g., in long kernel work) from one the host stopped the CPU
+/// in, after which the thread would wait for every other to catch up.
+pub(crate) fn charged(elapsed: u64) -> u64 {
+    elapsed.min(QUANTUM_NANOS)
 }
 
 impl Shared {
@@ -707,10 +730,8 @@ impl<'a> Found<'a> {
             match turn {
                 Turn::Runnable => {
                     runnable += 1;
-                    // A thread back from waiting (e.g., for a device) is due
-                    // at most a slice more than the others.
                     let cpu_time = &thread.cpu_time;
-                    cpu_time.set(cpu_time.get().max(floor.saturating_sub(QUANTUM_NANOS)));
+                    cpu_time.set(counted(cpu_time.get(), floor));
                     let id = (process.seq, thread.id);
                     let key = (cpu_time.get(), id <= last, id.0, id.1);
                     let other = match best {
@@ -1035,5 +1056,103 @@ impl Inner {
             self.kill("returned to the kernel without waiting");
         }
         clone
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polls_lift_threads_back_from_waiting_and_runs_count_a_slice_at_most() {
+        let slice = QUANTUM_NANOS;
+        let floor = 5 * slice;
+        // Back from waiting: due a slice more than the others at most.
+        assert_eq!(counted(0, floor), floor - slice);
+        assert_eq!(counted(floor - slice / 2, floor), floor - slice / 2);
+        // Ahead of the others: all it used counts.
+        assert_eq!(counted(floor + 7 * slice, floor), floor + 7 * slice);
+        assert_eq!(counted(0, 0), 0);
+        // A run counts what it took, a slice at most (e.g., one the host
+        // stopped the CPU in).
+        assert_eq!(charged(slice / 2), slice / 2);
+        assert_eq!(charged(8 * slice), slice);
+    }
+
+    /// A step of a CPU that claims process `seq` alone, whose threads, by ID,
+    /// used `cpu_time`, all runnable, as `Shared::step` and `Shared::run_best`
+    /// take it: the best runs, `elapsed` long, then the floor rises to the
+    /// least CPU time of those that could run, `held` being that of the
+    /// processes other CPUs hold. Returns the thread that ran.
+    fn take_step(
+        queue: &mut RunQueue,
+        seq: u64,
+        cpu_time: &mut [u64],
+        elapsed: u64,
+        held: Option<u64>,
+    ) -> u64 {
+        for time in &mut *cpu_time {
+            *time = counted(*time, queue.floor);
+        }
+        let (id, time) = (0..)
+            .zip(&mut *cpu_time)
+            .min_by_key(|(id, time)| -> Key { (**time, (seq, *id) <= queue.last, seq, *id) })
+            .expect("a runnable thread");
+        *time += charged(elapsed);
+        let runnable = cpu_time.iter().copied().chain(held).min();
+        queue.floor = queue.floor.max(runnable.expect("a thread"));
+        queue.last = (seq, id);
+        id
+    }
+
+    /// Asserts that, in the `order` that `count` threads ran in (by ID), none
+    /// waits more than two rounds: not an exact share of the CPU, but about
+    /// half of one at least.
+    fn assert_no_starvation(order: &[u64], count: usize) {
+        for thread in (0..).take(count) {
+            let wait = order
+                .split(|&ran| ran == thread)
+                .map(<[u64]>::len)
+                .max()
+                .unwrap_or_default();
+            assert!(
+                wait <= 2 * count,
+                "thread {thread} waited {wait} steps: {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thread_whose_run_the_host_stalled_runs_again_soon() {
+        let mut queue = RunQueue::default();
+        let mut cpu_time = [0; 8];
+        let mut order = Vec::new();
+        for step in 0..200 {
+            // The run at step 20 lasts 70 ms more, as one the host stopped the
+            // CPU that long in would, or one the kernel worked that long for.
+            let stall = if step == 20 { 70_000_000 } else { 0 };
+            let elapsed = QUANTUM_NANOS + stall;
+            order.push(take_step(&mut queue, 1, &mut cpu_time, elapsed, None));
+        }
+        // The one that stalled does not wait for the others to run 70 ms more.
+        assert_no_starvation(&order, 8);
+    }
+
+    #[test]
+    fn neither_sibling_starves_while_a_stalled_cpu_holds_the_floor_down() {
+        let mut queue = RunQueue::default();
+        // The host stopped a CPU holding process 1, whose least CPU time, as
+        // last polled, is 0: the floor stays there (see `Found::held`).
+        let held = Some(0);
+        // Process 2's two threads run on one CPU, and process 3's thread on
+        // another, in turn: the latter moves the round-robin past the former.
+        let (mut siblings, mut other) = ([0; 2], [0]);
+        let mut order = Vec::new();
+        for _ in 0..100 {
+            order.push(take_step(&mut queue, 2, &mut siblings, QUANTUM_NANOS, held));
+            take_step(&mut queue, 3, &mut other, QUANTUM_NANOS, held);
+        }
+        // Each run counts, so neither waits for the stopped CPU.
+        assert_no_starvation(&order, 2);
     }
 }

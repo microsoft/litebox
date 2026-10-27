@@ -9,7 +9,7 @@
 //! stopped are its own. The main thread serves the process's requests.
 
 use crate::memory::{checked_range, copy_from_user, copy_to_user};
-use crate::{Inner, State, Suspended, layout, new_thread};
+use crate::{Inner, State, Suspended, layout, new_thread, sched};
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::utils::TruncateExt as _;
@@ -99,9 +99,11 @@ impl Thread {
         self.id == MAIN
     }
 
-    /// Adds the CPU time since `start` (its run, or the worker's for it).
+    /// Adds the CPU time since `start` (its run, or the worker's for it), a
+    /// slice at most (see `sched::charged`).
     pub(crate) fn charge(&self, platform: &litebox_platform_vm_kernel::VmKernel, start: Instant) {
         let used = platform.now().as_nanos().saturating_sub(start.as_nanos());
+        let used = sched::charged(used);
         self.cpu_time.set(self.cpu_time.get().saturating_add(used));
     }
 }
