@@ -7,6 +7,8 @@
 //! expects a byte stream. Symlink targets are passed through unchanged: an
 //! absolute one resolves from the guest's root, not from the share's.
 
+#[cfg(debug_assertions)]
+use crate::gate::Gate;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -61,6 +63,9 @@ pub struct Share {
     /// devices.
     pub path: String,
     pub transport: Box<dyn Transport>,
+    /// Debug builds: holds reads (see [`Gate`]).
+    #[cfg(debug_assertions)]
+    pub gate: &'static Gate,
 }
 
 /// The 9P client writes a whole request, then reads its response; a request
@@ -136,7 +141,11 @@ impl Read for Stream {
 /// A [`Share`]'s directory, as `litebox_broker_userland`'s `--mount-ro` is a
 /// host directory: the 9P backend in a [`ReadOnly`] view, which refuses what
 /// would change it. Its files report no times.
-pub(crate) struct ShareFs(ReadOnly<NineP<VmKernel, Stream>>);
+pub(crate) struct ShareFs {
+    nine_p: ReadOnly<NineP<VmKernel, Stream>>,
+    #[cfg(debug_assertions)]
+    gate: &'static Gate,
+}
 
 /// Linux's defaults for the user and tree a 9P mount attaches as; servers
 /// such as QEMU's ignore them.
@@ -144,18 +153,19 @@ const USER: &str = "nobody";
 const TREE: &str = "";
 
 impl ShareFs {
-    /// Attaches to the 9P server at the other end of `transport`.
+    /// Attaches to the 9P server at the other end of `share`'s transport.
     ///
     /// # Errors
     ///
     /// Version negotiation or the attach failed.
-    pub(crate) fn new(
-        transport: Box<dyn Transport>,
-        allocator: InodeAllocator,
-    ) -> Result<Self, nine_p::Error> {
-        let stream = Stream::new(transport);
+    pub(crate) fn new(share: Share, allocator: InodeAllocator) -> Result<Self, nine_p::Error> {
+        let stream = Stream::new(share.transport);
         let msize = u32::try_from(stream.max_message_size()).unwrap_or(u32::MAX);
-        NineP::new(stream, msize, USER, TREE, allocator).map(|fs| Self(ReadOnly::new(fs)))
+        Ok(Self {
+            nine_p: ReadOnly::new(NineP::new(stream, msize, USER, TREE, allocator)?),
+            #[cfg(debug_assertions)]
+            gate: share.gate,
+        })
     }
 }
 
@@ -167,7 +177,7 @@ fn untimed(mut status: FileStatus) -> FileStatus {
 
 impl Backend for ShareFs {
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        self.0.root()
+        self.nine_p.root()
     }
 
     fn resolve<'a>(
@@ -176,31 +186,31 @@ impl Backend for ShareFs {
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError> {
-        self.0.resolve(from, components, authorize_dir_lookup)
+        self.nine_p.resolve(from, components, authorize_dir_lookup)
     }
 
     fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
-        self.0.read_link_at(dir, name)
+        self.nine_p.read_link_at(dir, name)
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
-        self.0.open_dir(dir, flags)
+        self.nine_p.open_dir(dir, flags)
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
-        self.0.walking_dir_at(dir)
+        self.nine_p.walking_dir_at(dir)
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
-        self.0.open_file(file, flags)
+        self.nine_p.open_file(file, flags)
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        self.0.list_dir_at(handle)
+        self.nine_p.list_dir_at(handle)
     }
 
     fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
-        self.0.lookup_at(dir, name)
+        self.nine_p.lookup_at(dir, name)
     }
 
     fn read(
@@ -209,15 +219,18 @@ impl Backend for ShareFs {
         buf: &mut dyn ReadBuffer,
         offset: usize,
     ) -> Result<usize, FsReadError> {
-        self.0.read(h, buf, offset)
+        let read = self.nine_p.read(h, buf, offset);
+        #[cfg(debug_assertions)]
+        self.gate.hold_at(crate::gate::Point::Read);
+        read
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
-        self.0.get_static_backing_data(h)
+        self.nine_p.get_static_backing_data(h)
     }
 
     fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
-        self.0.map_shared(h)
+        self.nine_p.map_shared(h)
     }
 
     fn write(
@@ -226,31 +239,31 @@ impl Backend for ShareFs {
         buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, FsWriteError> {
-        self.0.write(h, buf, offset)
+        self.nine_p.write(h, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
-        self.0.truncate(h, length)
+        self.nine_p.truncate(h, length)
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
-        self.0.seek_behavior(h)
+        self.nine_p.seek_behavior(h)
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
-        self.0.status(h).map(untimed)
+        self.nine_p.status(h).map(untimed)
     }
 
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
-        self.0.resolved_status(target).map(untimed)
+        self.nine_p.resolved_status(target).map(untimed)
     }
 
     fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
-        self.0.terminal(h)
+        self.nine_p.terminal(h)
     }
 
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
-        self.0.readiness_source(h)
+        self.nine_p.readiness_source(h)
     }
 
     fn create_file_at(
@@ -259,7 +272,7 @@ impl Backend for ShareFs {
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
-        self.0.create_file_at(dir, name, metadata)
+        self.nine_p.create_file_at(dir, name, metadata)
     }
 
     fn symlink_at(
@@ -269,7 +282,7 @@ impl Backend for ShareFs {
         target: &str,
         metadata: CreationMetadata,
     ) -> Result<(), SymlinkError> {
-        self.0.symlink_at(dir, name, target, metadata)
+        self.nine_p.symlink_at(dir, name, target, metadata)
     }
 
     fn mkdir_at(
@@ -278,15 +291,15 @@ impl Backend for ShareFs {
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
-        self.0.mkdir_at(dir, name, metadata)
+        self.nine_p.mkdir_at(dir, name, metadata)
     }
 
     fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
-        self.0.unlink_at(dir, name)
+        self.nine_p.unlink_at(dir, name)
     }
 
     fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
-        self.0.rmdir_at(dir, name)
+        self.nine_p.rmdir_at(dir, name)
     }
 
     fn rename_at(
@@ -296,7 +309,7 @@ impl Backend for ShareFs {
         new_dir: DirHandle,
         new_name: &str,
     ) -> Result<(), RenameError> {
-        self.0.rename_at(old_dir, old_name, new_dir, new_name)
+        self.nine_p.rename_at(old_dir, old_name, new_dir, new_name)
     }
 
     fn set_times(
@@ -304,11 +317,11 @@ impl Backend for ShareFs {
         target: ResolvedTarget<'_>,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
-        self.0.set_times(target, times)
+        self.nine_p.set_times(target, times)
     }
 
     fn chmod(&self, target: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
-        self.0.chmod(target, mode)
+        self.nine_p.chmod(target, mode)
     }
 
     fn chown(
@@ -317,6 +330,6 @@ impl Backend for ShareFs {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        self.0.chown(target, user, group)
+        self.nine_p.chown(target, user, group)
     }
 }

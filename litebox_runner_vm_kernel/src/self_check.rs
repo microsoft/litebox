@@ -43,7 +43,9 @@ pub(crate) fn kthreads(platform: &'static VmKernel, devices: &'static Devices) {
     cpu::acknowledge();
 }
 
-/// Once the other CPUs started: a shortened slice end is armed; due runs.
+/// Once the other CPUs started: a shortened slice end is armed; due runs; a
+/// thread's check at a device interrupt waits for the device waiters' lock,
+/// which another CPU holds.
 pub(crate) fn smp_kthreads(platform: &'static VmKernel, devices: &'static Devices) {
     if cpu::online_count() == 1 {
         return;
@@ -52,6 +54,7 @@ pub(crate) fn smp_kthreads(platform: &'static VmKernel, devices: &'static Device
     for safe_point in [false, true] {
         redone(|| due_stays_due(platform, devices, safe_point));
     }
+    redone(|| contended_check(platform, devices));
     devices.arm(None);
     cpu::acknowledge();
 }
@@ -63,7 +66,8 @@ fn kthread(work: impl FnOnce() + Send + 'static) -> Kthread {
     )
 }
 
-/// Runs `thread` with no slice end, as a step would.
+/// Runs `thread` with no slice end, which the kernel-thread API allows (a
+/// scheduler's step would give one).
 fn step(thread: Kthread) -> Ran {
     cpu::acknowledge();
     thread.run(None).0
@@ -308,9 +312,10 @@ fn expiry_in_a_guard(
 }
 
 /// A lone thread, its run's timer inherited (`inherited`: a slice end from
-/// now, if any): a notification arms no timer, and a wake ends its slice, so
-/// that the woken thread runs at its next safe point (`safe_point`) or at the
-/// grace, not at the inherited end.
+/// now, if any; the scheduler always gives one, but a kernel thread's run
+/// may have none): a notification arms no timer, and a wake ends its slice,
+/// so that the woken thread runs at its next safe point (`safe_point`) or at
+/// the grace, not at the inherited end.
 fn lone_wake(
     platform: &'static VmKernel,
     devices: &'static Devices,
@@ -495,5 +500,63 @@ fn shortened_end_is_armed(
         Some(slice_end),
         &stage,
         Stage::SPINNING,
+    )
+}
+
+/// A thread's check at a device interrupt wakes the threads that wait for a
+/// device while another CPU holds their queue's lock: it spins until released.
+/// A device's own interrupt (e.g., from the host's vsock traffic as the kernel
+/// boots) may come first, as the thread starts: that one's check then takes
+/// the devices' look, and waits instead, until the hold's bound ends it. The
+/// run is then inconclusive, as the hold ended before the thread's interrupt.
+fn contended_check(platform: &'static VmKernel, devices: &'static Devices) -> Result<(), String> {
+    let others = cpu::online_count() - 1;
+    let waiting = stopped(step(kthread(move || {
+        devices.waiters().prepare().sleep(None);
+    })));
+    devices.hold_waiters();
+    let held = Arc::new(AtomicBool::new(false));
+    let waited = Arc::new(AtomicBool::new(false));
+    let interrupter = kthread({
+        let (held, waited) = (held.clone(), waited.clone());
+        move || {
+            let release_at = {
+                let _service = NoPreempt::new();
+                held.store(devices.holds_waiters(), Ordering::SeqCst);
+                devices.interrupt_self();
+                let release_at = after(platform.now(), Duration::from_millis(2));
+                devices.release_waiters(release_at);
+                release_at
+            };
+            waited.store(platform.now() >= release_at, Ordering::SeqCst);
+        }
+    });
+    let mut ran = step(interrupter);
+    while let Ran::Slept(thread) | Ran::Preempted(thread) = ran {
+        ran = step(thread);
+    }
+    finished(ran);
+    // Another CPU's look, if it took the interrupt's, may still spin.
+    let start = platform.now();
+    while !waiting.is_due(platform.now()) {
+        assert!(
+            platform.now().duration_since(&start) < Duration::from_secs(1),
+            "the reschedule check's wake landed"
+        );
+        core::hint::spin_loop();
+    }
+    finished(step(waiting));
+    // With more than one, another CPU's look may take the interrupt's.
+    if others > 1 || waited.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    assert!(
+        !held.load(Ordering::SeqCst),
+        "the reschedule check waited for the lock"
+    );
+    Err(
+        "contended_check: the other CPU's hold of the device waiters' lock ended before the \
+         thread's interrupt"
+            .into(),
     )
 }

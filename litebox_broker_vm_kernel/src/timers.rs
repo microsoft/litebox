@@ -1,11 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker timers on the kernel clock. Alarms fire when the broker runs: on
-//! each futex operation on the control ring and each poll of a blocked wait,
-//! after the kernel halts until the earliest deadline
-//! ([`KernelTimers::next_deadline`]), and when that deadline interrupts a
-//! running process. A fired alarm publishes
+//! Broker timers on the kernel clock. Alarms fire as the broker looks at its
+//! sources: on the source thread, which sleeps until the earliest deadline,
+//! and after each serve. A fired alarm publishes
 //! its timer's readiness to its watchers (e.g., processes sharing the timer
 //! across fork), through their associations' notification rings.
 //!
@@ -23,6 +21,7 @@ use litebox_broker_core::readiness::SharedReadinessWatchers;
 use litebox_broker_core::timer::{Alarm, TimerProvider};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::time::TimeProvider as _;
+use litebox_platform_vm_kernel::kthread::{Prepared, WaitQueue};
 use litebox_platform_vm_kernel::{Instant, VmKernel};
 use spin::mutex::SpinMutex;
 
@@ -57,17 +56,20 @@ impl Alarm for AlarmHandle {
 
 /// When the broker must next run, as last published, for the kernel to read
 /// without the broker's locks ([`Self::get`]): the earliest of its sources'
-/// deadlines (see `Broker::publish_deadline`). Published anew where they may
-/// have changed (as polls, serves and associations end), and lowered as an
-/// alarm is set; a later publication may be too early (e.g., an alarm since
+/// deadlines (see `publish_deadline`). Published anew where they may have
+/// changed (as polls, serves and associations end), and lowered as an alarm
+/// is set; a later publication may be too early (e.g., an alarm since
 /// cancelled), which costs a poll, but never too late. Both under one lock,
 /// so that a publication computed before an alarm was set never replaces its
-/// lowering.
+/// lowering. The source thread sleeps until it, on its queue: a lowering
+/// wakes it.
 pub(crate) struct PublishedDeadline {
     /// In nanoseconds; `u64::MAX` for none.
     nanos: AtomicU64,
     /// Orders publications and lowerings.
     publishing: SpinMutex<()>,
+    /// The source thread's.
+    source: WaitQueue,
 }
 
 impl PublishedDeadline {
@@ -75,6 +77,7 @@ impl PublishedDeadline {
         Self {
             nanos: AtomicU64::new(u64::MAX),
             publishing: SpinMutex::new(()),
+            source: WaitQueue::new(),
         }
     }
 
@@ -84,17 +87,33 @@ impl PublishedDeadline {
         (nanos != u64::MAX).then(|| Instant::from_nanos(nanos))
     }
 
-    /// Publishes the deadline `next` computes, reading the sources.
-    pub(crate) fn publish(&self, next: impl FnOnce() -> Option<Instant>) {
+    /// Publishes the deadline `next` computes: whether it is earlier than before.
+    pub(crate) fn publish(&self, next: impl FnOnce() -> Option<Instant>) -> bool {
         let _publishing = self.publishing.lock();
         let nanos = next().map_or(u64::MAX, Instant::as_nanos);
-        self.nanos.store(nanos, Ordering::SeqCst);
+        self.nanos.swap(nanos, Ordering::SeqCst) > nanos
     }
 
-    /// Lowers the published deadline to `deadline`, if earlier.
+    /// Lowers the published deadline to `deadline`, if earlier, then waking
+    /// the source thread.
     fn lower(&self, deadline: Instant) {
-        let _publishing = self.publishing.lock();
-        self.nanos.fetch_min(deadline.as_nanos(), Ordering::SeqCst);
+        let lowered = {
+            let _publishing = self.publishing.lock();
+            self.nanos.fetch_min(deadline.as_nanos(), Ordering::SeqCst) > deadline.as_nanos()
+        };
+        if lowered {
+            self.wake_source();
+        }
+    }
+
+    /// For the source thread, to sleep until the published deadline.
+    pub(crate) fn prepare_source(&self) -> Prepared<'_> {
+        self.source.prepare()
+    }
+
+    /// Wakes the source thread.
+    pub(crate) fn wake_source(&self) {
+        self.source.wake(1);
     }
 }
 

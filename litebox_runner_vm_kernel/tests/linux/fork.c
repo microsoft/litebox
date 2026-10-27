@@ -23,6 +23,14 @@
 // - "abandon": the child, without the standard streams, waits for signals
 //   after the parent exited: so the guest service must kill it (kill(-1)) and
 //   reap it (waitpid(-1)) as the container ends.
+// - "nostack": starts a child with posix_spawn that runs "nofork", and exits
+//   with its code: "nofork" forks twice, and exits 0 only if the first fork
+//   failed (returned -1) and the second's child exited 0 (see the
+//   bthread_hold init tests in dev_tools/run_linux_on_vm_userland.sh, which
+//   fail the first's broker stack, or the start's). A start that fails ends
+//   this process with 127, whatever its error (e.g., ENOMEM): the Linux shim
+//   runs the child as a vfork child in this process's runner until it
+//   starts, and exits the runner if its start fails.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -281,6 +289,33 @@ static int spawned(void) {
     return 0;
 }
 
+static int nofork(void) {
+    int failed[2], worked[2];
+    for (int i = 0; i < 2; i++) {
+        pid_t child = fork_flushed();
+        if (child == 0) _exit(0);
+        failed[i] = child < 0;
+        // Reaps the child, the first's too if its fork did not fail.
+        worked[i] = !failed[i] && wait_code(child) == 0;
+        printf("fork %d: %s\n", i, failed[i] ? "failed" : worked[i] ? "worked" : "?");
+    }
+    return failed[0] && worked[1] ? 0 : 1;
+}
+
+static int nostack(void) {
+    char *nofork[] = {"/fork", "nofork", NULL};
+    pid_t child;
+    fflush(stdout);
+    int error = posix_spawn(&child, nofork[0], NULL, NULL, nofork, environ);
+    if (error != 0) {
+        printf("posix_spawn: %s\n", strerror(error));
+        return 1;
+    }
+    int code = wait_code(child);
+    printf("spawned: %d\n", code);
+    return code;
+}
+
 static int orphan(void) {
     pid_t parent = getpid();
     pid_t child = fork_flushed();
@@ -346,6 +381,12 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(mode, "abandon") == 0) {
         return abandon();
+    }
+    if (strcmp(mode, "nostack") == 0) {
+        return nostack();
+    }
+    if (strcmp(mode, "nofork") == 0) {
+        return nofork();
     }
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;

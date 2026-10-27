@@ -36,12 +36,26 @@
 # service's.
 #
 # An init test (INIT_TESTS) boots its program as litebox.init instead, and
-# passes if it exits 0. Only init tests get debug kernels' leak check, as the
+# passes if it exits 0, or ends with its INIT_STATUS, and the kernel then
+# completes its boot. Only init tests get debug kernels' leak check, as the
 # guest service never exits.
 #   pid1: process 1 adopts and reaps orphans.
 #   lifecycle: processes end in each way the other tests end theirs.
 #   writable_root: the root is writable.
-#   console_flood: the console keeps 4 writers' records (check_records).
+#   console_flood: the console keeps 4 writers' records (check_records, as
+#     for every init test of /console_flood).
+# Hooked init tests also give a debug kernel the keys of INIT_KARGS: init's
+# arguments, the broker's and scheduler's hooks, and a script of steps (see
+# litebox_runner_vm_kernel/src/test_hooks.rs), which its checks follow. Each
+# boots alone, named GROUP.CASE; -t GROUP runs a group's cases.
+#   bthread_unthreaded: runners that misbehave, which the kernel ends.
+#   bthread_retake: handoffs held before they retake the claim.
+#   bthread_hold: broker work held, then killed, or failing (stacks, adoption).
+#   bthread_shutdown: processes reaped, dropped past the broker's shutdown.
+#   bthread_stress: broker threads' slices of 50 us, with no grace (/share's
+#     console must be share.json's output).
+#   share_lost: a share's response lost, which fails the share.
+#   share_migrate: a broker thread holding a lock moves to another CPU.
 #
 # Runner processes' standard output and error go to a virtio console, backed
 # by a file.
@@ -56,16 +70,20 @@
 #
 # With QEMU_SMP above 4, the preempt test is skipped: it checks preemption
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
-# checks threads of a program running at once. Unless QEMU_MEM's size (its
-# first field, maybe after size=) is at least 4G, as an integer in MiB or
-# suffixed M or G (e.g., 6144, 6g, or size=6G,maxmem=8G), the highmem test is
-# skipped: it needs RAM above 4 GiB. A test given with -t that would be
+# checks threads of a program running at once; and so are share_migrate,
+# which moves a broker thread to another CPU, and bthread_retake's cases,
+# which have another CPU take a broker call on. Release builds skip the
+# hooked init tests: their kernels ignore the keys. Unless QEMU_MEM's size
+# (its first field, maybe after size=) is at least 4G, as an integer in MiB
+# or suffixed M or G (e.g., 6144, 6g, or size=6G,maxmem=8G), the highmem test
+# is skipped: it needs RAM above 4 GiB. A test given with -t that would be
 # skipped is an error instead. QEMU_SMP must give the CPU count as QEMU does:
 # cpus= (or a bare count), else maxcpus=, else the product of the topology's
 # counts (e.g., sockets=2,cores=2).
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
-#   -t   test to run, e.g. hello (repeatable; default: every test)
+#   -t   test to run, e.g. hello, or a group of init tests (repeatable;
+#        default: every test)
 #   -r   build and run the release kernel, runner and guest service
 #   -v   print the full guest log and console output for passing runs too
 #
@@ -153,15 +171,81 @@ counted_log=debug
 
 # Init tests (see the header): their init's path in the root.
 declare -A INIT_TESTS=([pid1]=/pid1 [writable_root]=/writable_root
-    [console_flood]=/console_flood [lifecycle]=/lifecycle)
+    [console_flood]=/console_flood [lifecycle]=/lifecycle
+    [bthread_unthreaded.fs_base]=/hello [bthread_unthreaded.wake_slot]=/hello
+    [bthread_retake.handshake]=/hello [bthread_retake.futex]=/hello
+    [bthread_retake.preempted_futex]=/hello [bthread_retake.preempted_futex_ran]=/hello
+    [bthread_hold.read_sleeper]=/share_contend [bthread_hold.kill_read]=/share_contend
+    [bthread_hold.kill_transmitted]=/share [bthread_hold.kill_handshake]=/hello
+    [bthread_hold.kill_adoption]=/fork [bthread_hold.kill_start]=/fork
+    [bthread_hold.fail_adoption]=/fork [bthread_hold.stack_root]=/hello
+    [bthread_hold.stack_clone]=/fork [bthread_hold.stack_spawn]=/fork
+    [bthread_hold.stack_association]=/fork [bthread_hold.post_as_finished]=/hello
+    [bthread_shutdown]=/fork
+    [bthread_stress.fork_chain]=/fork [bthread_stress.fork_many]=/fork
+    [bthread_stress.console_flood]=/console_flood [bthread_stress.net_loopback]=/net
+    [bthread_stress.net_external]=/net [bthread_stress.share]=/share
+    [share_lost]=/share [share_migrate]=/share_contend)
 
-# Why test $1 is skipped with these CPUs or this RAM (see the header), if it
-# is.
+# Hooked init tests' kernel keys (see the header).
+stress="litebox.hooks=broker_slice_us:50"
+held_kill="litebox.script=held,kill,release"
+declare -A INIT_KARGS=(
+    [bthread_unthreaded.fs_base]="litebox.hooks=misbehave:bad_fs_base"
+    [bthread_unthreaded.wake_slot]="litebox.hooks=misbehave:bad_wake_slot"
+    [bthread_retake.handshake]="litebox.hooks=hold_retake:handshake"
+    [bthread_retake.futex]="litebox.hooks=hold_retake:futex"
+    [bthread_retake.preempted_futex]="litebox.hooks=hold_retake:preempted_futex,slow_serves"
+    [bthread_retake.preempted_futex_ran]="litebox.hooks=hold_retake:preempted_futex_ran,slow_serves"
+    [bthread_hold.read_sleeper]="litebox.hooks=gate:read litebox.script=held,lock_sleeper,release"
+    [bthread_hold.kill_read]="litebox.hooks=gate:read $held_kill"
+    [bthread_hold.kill_transmitted]="litebox.hooks=gate:transmitted $held_kill"
+    [bthread_hold.kill_handshake]="litebox.hooks=gate:handshake $held_kill"
+    [bthread_hold.kill_adoption]="litebox.init.args=many,1 litebox.hooks=gate:adopt $held_kill"
+    [bthread_hold.kill_start]="litebox.init.args=many,1 litebox.hooks=hold_starts $held_kill"
+    [bthread_hold.fail_adoption]="litebox.init.args=many,1 litebox.hooks=fail_adoption"
+    [bthread_hold.stack_root]="litebox.hooks=stack_failure:root"
+    [bthread_hold.stack_clone]="litebox.init.args=nostack litebox.hooks=stack_failure:clone"
+    [bthread_hold.stack_spawn]="litebox.init.args=nostack litebox.hooks=stack_failure:spawn"
+    [bthread_hold.stack_association]="litebox.init.args=nostack litebox.hooks=stack_failure:after_association"
+    [bthread_hold.post_as_finished]="litebox.hooks=post_as_finished"
+    [bthread_shutdown]="litebox.init.args=many,3 litebox.hooks=keep_reaped"
+    [bthread_stress.fork_chain]="litebox.init.args=chain,48 $stress"
+    [bthread_stress.fork_many]="litebox.init.args=many,100 $stress"
+    [bthread_stress.console_flood]="$stress"
+    [bthread_stress.net_loopback]="litebox.init.args=loopback $stress"
+    [bthread_stress.net_external]="litebox.init.args=external,10.0.2.100,7 $stress"
+    [bthread_stress.share]="$stress"
+    [share_lost]="litebox.hooks=lose_share_response"
+    [share_migrate]="litebox.hooks=gate:read litebox.script=held,lock_sleeper,migrate,release"
+)
+
+# Init tests' expected exit status (see the header), if not "exited 0".
+killed='its runner died (Killed("killed by its test script"))'
+declare -A INIT_STATUS=(
+    [bthread_unthreaded.fs_base]='its runner died (Killed("invalid FS base"))'
+    [bthread_unthreaded.wake_slot]='its runner died (Exited(1))'
+    [bthread_hold.kill_read]=$killed [bthread_hold.kill_transmitted]=$killed
+    [bthread_hold.kill_handshake]=$killed [bthread_hold.kill_adoption]=$killed
+    [bthread_hold.kill_start]=$killed
+    [bthread_hold.fail_adoption]='exited 1'
+    [bthread_hold.stack_spawn]='exited 127' [bthread_hold.stack_association]='exited 127'
+    [share_lost]='exited 1'
+)
+
+# Why test $1 is skipped with these CPUs, this RAM, or this build profile
+# (see the header), if it is.
 skip_reason() {
+    if [[ -n ${INIT_KARGS[$1]:-} && $profile != debug ]]; then
+        echo "its kernel keys are debug builds' only"
+        return
+    fi
     case $1 in
         preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
         highmem) [[ $mem -ge 4096 ]] || echo "needs QEMU_MEM of at least 4G, as an integer in MiB or suffixed M or G" ;;
+        share_migrate) [[ $smp -ge 2 ]] || echo "needs another CPU to move a broker thread to" ;;
+        bthread_retake.*) [[ $smp -ge 2 ]] || echo "needs another CPU to take a broker call on" ;;
     esac
 }
 
@@ -171,6 +255,22 @@ if [[ ${#tests[@]} -eq 0 ]]; then
     done
     mapfile -t -O "${#tests[@]}" tests < <(printf '%s\n' "${!INIT_TESTS[@]}" | sort)
 else
+    # A group of init tests (see the header) is its cases.
+    given=("${tests[@]}")
+    tests=()
+    for t in "${given[@]}"; do
+        cases=()
+        if [[ ! -f "$TESTS_DIR/$t.json" && -z ${INIT_TESTS[$t]:-} ]]; then
+            for c in "${!INIT_TESTS[@]}"; do
+                [[ $c != "$t".* ]] || cases+=("$c")
+            done
+        fi
+        if [[ ${#cases[@]} -eq 0 ]]; then
+            tests+=("$t")
+        else
+            mapfile -t -O "${#tests[@]}" tests < <(printf '%s\n' "${cases[@]}" | sort)
+        fi
+    done
     for t in "${tests[@]}"; do
         why=$(skip_reason "$t")
         [[ -z $why ]] || {
@@ -369,14 +469,35 @@ check_records() {
         }' "$1"
 }
 
+# share.json's output, which share.c prints but does not check: the console
+# of a /share init test expected to exit 0.
+share_output='hello from the host
+link.txt -> greeting.txt
+hello from the host
+hello from the host
+abs.txt -> /mnt/host/greeting.txt
+hello from the host
+read-only
+'
+
 # Shows boot $1's output, and checks what only its kernel can (see the
-# header); for an init test, that init exited 0.
+# header); for an init test, how init ended, and that the boot completed.
 check_boot() {
     show_output "$1"
     if [[ -n ${INIT_TESTS[$1]:-} ]]; then
-        grep -qF '[litebox] init exit status: exited 0' "$WORK/$1.log" ||
-            { echo "no exit status 0 of init in the log"; return 1; }
-        [[ $1 != console_flood ]] || check_records "$WORK/$1.console" 4 512
+        local want=${INIT_STATUS[$1]:-exited 0} got
+        got=$(sed -n 's/.*\[litebox\] init exit status: //p' "$WORK/$1.log" | tr -d '\r' | tail -n 1)
+        [[ $got == "$want" ]] ||
+            { echo "init exit status \"$got\" in the log, expected \"$want\""; return 1; }
+        # Printed once init's checks, and a debug kernel's shutdown, passed.
+        grep -qF '[litebox] slices run per CPU' "$WORK/$1.log" ||
+            { echo "the kernel did not complete the boot after init"; return 1; }
+        if [[ ${INIT_TESTS[$1]} == /console_flood ]]; then
+            check_records "$WORK/$1.console" 4 512
+        elif [[ ${INIT_TESTS[$1]} == /share && -z ${INIT_STATUS[$1]:-} ]]; then
+            printf %s "$share_output" | cmp -s - "$WORK/$1.console" ||
+                { echo "the console is not share.json's output"; return 1; }
+        fi
         return
     fi
     # The container's end must end every guest process (e.g., fork.c's).
@@ -448,8 +569,12 @@ for test in "${tests[@]}"; do
                 -C "$WORK/$test/root" guest.txt
         fi
         pack_payload "$test" "$WORK/$test/rootfs.tar"
-        kernel_args="litebox.init=${INIT_TESTS[$test]}"
+        kernel_args="litebox.init=${INIT_TESTS[$test]}${INIT_KARGS[$test]:+ ${INIT_KARGS[$test]}}"
+        # A kernel whose init ends otherwise than exiting 0 reports a failure:
+        # the check then decides.
+        expect_guest_failure=${INIT_STATUS[$test]:+1}
         boot "$test" "$WORK/$test.tar"
+        expect_guest_failure=
         continue
     fi
     pack_payload "$test" "$WORK/rootfs.tar"

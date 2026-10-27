@@ -20,9 +20,8 @@
 //!
 //! Takes no locks, and only [`current`] (so [`halt`], [`marked`],
 //! [`acknowledge`], [`take_notified`], [`take_resched`] and
-//! [`wake_idle_or_resched`]), [`local`] and [`set_local`] touch per-CPU data:
-//! [`wake`], [`wake_idle`] and [`notify_all`] are usable in interrupt
-//! handlers.
+//! [`wake_idle_or_resched`]) touches per-CPU data: [`wake`], [`wake_idle`]
+//! and [`notify_all`] are usable in interrupt handlers.
 //!
 //! The kernel clock ([`crate::clock`]) is the TSC of whichever CPU reads it:
 //! the CPUs' TSCs are assumed synchronized, unchecked (VMMs such as QEMU and
@@ -160,23 +159,6 @@ static CPUS: Cpus = Cpus {
 /// The calling CPU. Not for interrupt handlers (it reads per-CPU data).
 pub fn current() -> CpuId {
     with_per_cpu_variables(|pcv| pcv.cpu)
-}
-
-/// The calling CPU's word, which the kernel broker keeps for code deeper in
-/// its call stack (see [`set_local`]); zero at boot. Not for interrupt
-/// handlers (per-CPU data).
-pub fn local() -> usize {
-    with_per_cpu_variables(|pcv| pcv.local.get())
-}
-
-/// Sets the calling CPU's word (see [`local`]).
-///
-/// # Safety
-///
-/// The word has one user, the kernel broker's `serving`, which dereferences
-/// what it holds: no other code may set it.
-pub unsafe fn set_local(word: usize) {
-    with_per_cpu_variables(|pcv| pcv.local.set(word));
 }
 
 /// Bit `i` for each online CPU `i`.

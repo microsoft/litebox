@@ -1,16 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! What the running broker work is doing, for the console, behind broker core,
-//! to look up: whose requests it serves, and whether it publishes the
-//! console's `WRITE` to its waiters alone (see `stdio::OutputWaiters`). In the
-//! CPU's word: broker work runs on its CPU without interruption, and a
-//! suspended worker serves nothing else, and resumes on its own CPU.
+//! What a broker thread is doing, for the console, behind broker core, to look
+//! up: whose requests it serves, and whether it publishes the console's
+//! `WRITE` to its waiters alone (see `stdio::OutputWaiters`). In the thread's
+//! word, which goes with it from CPU to CPU: a thread may be preempted
+//! anywhere in its work, and go on on another CPU.
 
 use crate::readiness::KernelReadiness;
 use alloc::sync::Arc;
 #[cfg(not(test))]
-use litebox_platform_vm_kernel::cpu::{local as word, set_local as set_word};
+use litebox_platform_vm_kernel::kthread::{local as word, set_local as set_word};
 
 /// Bit 0 of the word: publishing the console's `WRITE` to its waiters alone.
 /// The rest: the address of the served association's readiness `Arc`, or zero.
@@ -31,17 +31,16 @@ pub(crate) fn serve<T>(association: &Arc<KernelReadiness>, f: impl FnOnce() -> T
     result
 }
 
-/// The readiness of the association whose requests the running broker work
-/// serves, if any.
+/// The readiness of the association whose requests the calling broker
+/// thread serves, if any.
 pub(crate) fn served() -> Option<Arc<KernelReadiness>> {
     let address = word() & !PUBLISHING;
     if address == 0 {
         return None;
     }
     // Safety: only this module sets the word (`set_local`'s contract), so a
-    // nonzero address is that of the one `serve` on this CPU (its worker's,
-    // perhaps suspended), whose `association` outlives it: the work holds its
-    // process, and so the association.
+    // nonzero address is the `association` of the `serve` that the thread
+    // runs (only the thread reads its word), which outlives it.
     let association =
         unsafe { &*core::ptr::with_exposed_provenance::<Arc<KernelReadiness>>(address) };
     Some(association.clone())
@@ -59,13 +58,13 @@ pub(crate) fn publish_console<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
-/// Whether the running broker work publishes the console's `WRITE` to its
+/// Whether the calling broker thread publishes the console's `WRITE` to its
 /// waiters alone.
 pub(crate) fn publishing_console() -> bool {
     word() & PUBLISHING != 0
 }
 
-/// Host tests: no broker work runs, so none does any of the above.
+/// Host tests: no broker thread runs, so none does any of the above.
 #[cfg(test)]
 fn word() -> usize {
     0

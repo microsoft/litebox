@@ -32,6 +32,7 @@ mod payload;
 mod self_check;
 #[cfg(feature = "optee")]
 mod service;
+mod test_hooks;
 
 use core::panic::PanicInfo;
 use litebox_bootloader::Kernel;
@@ -76,6 +77,7 @@ fn kernel_main(kernel: Kernel) -> ! {
         .boot_info
         .cmdline_value(init::PATH_KEY)
         .unwrap_or(init::DEFAULT_PATH);
+    // Before any broker thread exists: e.g., a share's 9P connection halts.
     let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
         platform: kernel.platform,
         console: devices,
@@ -84,7 +86,15 @@ fn kernel_main(kernel: Kernel) -> ! {
         network: devices.network(),
         vsock: devices.vsock(),
         allow_process_duplication: true,
+        events: devices,
+        #[cfg(debug_assertions)]
+        gate: devices.gate(),
     });
+    scheduler.start_broker(&broker);
+    #[cfg(debug_assertions)]
+    let mut hooks = test_hooks::Boot::set(kernel.boot_info, scheduler, devices);
+    #[cfg(not(debug_assertions))]
+    test_hooks::warn_ignored(kernel.boot_info);
     let config = ProcessConfig {
         runner,
         images: &[],
@@ -95,8 +105,24 @@ fn kernel_main(kernel: Kernel) -> ! {
         started_runner: Some(runner),
         #[cfg(debug_assertions)]
         give_up_once: kernel.boot_info.cmdline_value(init::REPLAY_KEY) == Some("1"),
+        #[cfg(debug_assertions)]
+        hooks: hooks.process,
     };
-    let status = init::run(scheduler, kernel.platform, &broker, &config, path);
+    let status = init::run(
+        scheduler,
+        kernel.platform,
+        &broker.handle(),
+        &config,
+        path,
+        #[cfg(debug_assertions)]
+        &mut hooks,
+    );
+    // Init is gone; in debug builds, with every other process (see
+    // `init::run`), so the broker shuts down. Release builds power off
+    // without (as OP-TEE's, below, do not).
+    if cfg!(debug_assertions) {
+        scheduler.shut_down_broker(broker);
+    }
     print_slices(scheduler);
     devices.drain_console();
     power::exit(status == Ok(ExitStatus::Exited { code: 0 }))
@@ -111,6 +137,22 @@ fn run_optee(
     scheduler: &Scheduler,
     wall_clock: litebox_common_vm_abi::WallClock,
 ) -> ! {
+    // Before any broker thread exists.
+    let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
+        platform: kernel.platform,
+        console: devices,
+        root: None,
+        // No shares: TA storage (OP-TEE secure storage) needs a file
+        // system of its own, not provided yet.
+        shares: alloc::vec::Vec::new(),
+        network: devices.network(),
+        vsock: devices.vsock(),
+        allow_process_duplication: false,
+        events: devices,
+        #[cfg(debug_assertions)]
+        gate: devices.gate(),
+    });
+    scheduler.start_broker(&broker);
     let mut service = service::optee::Optee::new(
         scheduler.clone(),
         kernel.platform,
@@ -118,19 +160,12 @@ fn run_optee(
         wall_clock,
         devices,
         payload,
-        litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
-            platform: kernel.platform,
-            console: devices,
-            root: None,
-            // No shares: TA storage (OP-TEE secure storage) needs a file
-            // system of its own, not provided yet.
-            shares: alloc::vec::Vec::new(),
-            network: devices.network(),
-            vsock: devices.vsock(),
-            allow_process_duplication: false,
-        }),
+        broker.handle(),
     );
     client::script::run(payload, &mut service);
+    // With its processes, the keep-alive instances' too.
+    drop(service);
+    scheduler.shut_down_broker(broker);
     print_slices(scheduler);
     // Whatever the log level, for the test scripts.
     serial_println!("[litebox] ALL TESTS PASSED");
