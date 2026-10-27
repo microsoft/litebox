@@ -1,0 +1,53 @@
+[
+  {
+    "argv": ["/share_contend"],
+    "gate": "read",
+    "script": ["held", "lock_sleeper", "release"],
+    "expect_stdout": "read: ok\n"
+  },
+  {
+    "argv": ["/share_contend"],
+    "gate": "read",
+    "script": ["held", "kill", "release"],
+    "expect_killed": true
+  },
+  {
+    "argv": ["/share"],
+    "gate": "transmitted",
+    "script": ["held", "kill", "release"],
+    "expect_killed": true
+  },
+  {
+    "argv": ["/hello"],
+    "gate": "handshake",
+    "script": ["held", "kill", "release"],
+    "expect_killed": true
+  },
+  {
+    "argv": ["/fork", "many", "1"],
+    "gate": "adopt",
+    "script": ["held", "kill", "release"],
+    "expect_killed": true
+  },
+  {
+    "argv": ["/fork", "many", "1"],
+    "hold_starts": true,
+    "script": ["start_held", "kill", "release_starts"],
+    "expect_killed": true
+  },
+  {
+    "argv": ["/fork", "many", "1"],
+    "fail_adoption": true,
+    "expect_exit_code": 1,
+    "expect_stdout": "fork 0 failed\n"
+  },
+  { "argv": ["/hello"], "stack_failure": "root", "expect_stdout": "hello, world\n" },
+  {
+    "argv": ["/fork", "nostack"],
+    "stack_failure": "clone",
+    "expect_stdout": "fork 0: failed\nfork 1: worked\nspawned: 0\n"
+  },
+  { "argv": ["/fork", "nostack"], "stack_failure": "spawn", "expect_exit_code": 127 },
+  { "argv": ["/fork", "nostack"], "stack_failure": "after_association", "expect_exit_code": 127 },
+  { "argv": ["/hello"], "post_as_finished": true, "expect_stdout": "hello, world\n" }
+]

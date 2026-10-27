@@ -63,8 +63,9 @@ fn kernel_main(kernel: Kernel) -> ! {
     #[cfg(debug_assertions)]
     self_check::smp_kthreads(kernel.platform, devices);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
+    // Before any broker thread exists: e.g., a share's 9P connection halts.
     let broker = |console, shares, allow_process_duplication| {
-        litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
+        let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
             platform: kernel.platform,
             console,
             root: payload.file("rootfs.tar"),
@@ -72,11 +73,18 @@ fn kernel_main(kernel: Kernel) -> ! {
             network: devices.network(),
             vsock: devices.vsock(),
             allow_process_duplication,
-        })
+            events: devices,
+            #[cfg(debug_assertions)]
+            gate: devices.gate(),
+        });
+        scheduler.start_broker(&broker);
+        broker
     };
-    if let Some(programs) = payload.file("programs.json") {
+    let broker = if let Some(programs) = payload.file("programs.json") {
         let stdio: &'static client::program::Stdio =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(client::program::Stdio::new(devices)));
+        // Programs may start child processes.
+        let broker = broker(stdio, devices.shares(), true);
         let mut service = service::program::Programs::new(
             scheduler.clone(),
             kernel.platform,
@@ -84,11 +92,14 @@ fn kernel_main(kernel: Kernel) -> ! {
             wall_clock,
             devices,
             &payload,
-            // Programs may start child processes.
-            broker(stdio, devices.shares(), true),
+            broker.handle(),
         );
         client::program::run(programs, &mut service, stdio);
+        broker
     } else {
+        // No shares: TA storage (OP-TEE secure storage) needs a file system
+        // of its own, not provided yet.
+        let broker = broker(devices, alloc::vec::Vec::new(), false);
         let mut service = service::optee::Optee::new(
             scheduler.clone(),
             kernel.platform,
@@ -96,12 +107,13 @@ fn kernel_main(kernel: Kernel) -> ! {
             wall_clock,
             devices,
             &payload,
-            // No shares: TA storage (OP-TEE secure storage) needs a file
-            // system of its own, not provided yet.
-            broker(devices, alloc::vec::Vec::new(), false),
+            broker.handle(),
         );
         client::script::run(&payload, &mut service);
-    }
+        broker
+    };
+    // The services are gone, with their processes.
+    scheduler.shut_down_broker(broker);
     // Whatever the log level, for the test scripts.
     serial_println!("[litebox] slices run per CPU: {:?}", scheduler.slices());
     serial_println!("[litebox] threads parked per CPU: {:?}", scheduler.parks());

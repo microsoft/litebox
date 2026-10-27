@@ -9,9 +9,11 @@
 //   between consecutive clock reads, while other programs ran, is in
 //   [MIN_GAP_MS, MAX_GAP_MS], and unless the computation and the rounding
 //   mode survived the switches. With DELAY_MS, sleeps that long first.
-// - "sleep MS COUNT [MAX_LATE_MS]": sleeps COUNT times for MS milliseconds;
+// - "sleep MS COUNT [MAX_LATE_MS [WARMUP]]": sleeps COUNT times for MS milliseconds;
 //   fails if one is too short, or, with MAX_LATE_MS, later than that (e.g.,
-//   if a program that kept the CPU was not preempted for it).
+//   if a program that kept the CPU was not preempted for it). With WARMUP, it
+//   first sleeps that many times, untimed: at first, it may have used more CPU
+//   than another program, which fair share then runs first.
 // - "calls COUNT MAX_MS [SPINNERS]": makes COUNT broker calls (one-byte reads
 //   of a file); fails if they took longer than MAX_MS, e.g., if each one gave
 //   up the CPU to other programs. With SPINNERS, that many threads of its own
@@ -152,7 +154,13 @@ static int sleep_ms(long long ms) {
     return nanosleep(&duration, NULL);
 }
 
-static int sleep_mode(long long ms, int count, long long max_late_ms) {
+static int sleep_mode(long long ms, int count, long long max_late_ms, int warmup) {
+    for (int i = 0; i < warmup; i++) {
+        if (sleep_ms(ms) != 0) {
+            fprintf(stderr, "sleep: warm-up %d failed\n", i);
+            return 1;
+        }
+    }
     for (int i = 0; i < count; i++) {
         long long start = now_us();
         if (sleep_ms(ms) != 0) {
@@ -179,8 +187,9 @@ int main(int argc, char *argv[]) {
         }
         return spin_mode(atoll(argv[2]), atoll(argv[3]), atoll(argv[4]));
     }
-    if ((argc == 4 || argc == 5) && strcmp(argv[1], "sleep") == 0) {
-        return sleep_mode(atoll(argv[2]), atoi(argv[3]), argc == 5 ? atoll(argv[4]) : -1);
+    if (argc >= 4 && argc <= 6 && strcmp(argv[1], "sleep") == 0) {
+        return sleep_mode(atoll(argv[2]), atoi(argv[3]), argc >= 5 ? atoll(argv[4]) : -1,
+                          argc == 6 ? atoi(argv[5]) : 0);
     }
     if ((argc == 4 || argc == 5) && strcmp(argv[1], "calls") == 0) {
         return calls_mode(atoi(argv[2]), atoll(argv[3]), argc == 5 ? atoi(argv[4]) : 0);
@@ -188,6 +197,6 @@ int main(int argc, char *argv[]) {
     if (argc == 3 && strcmp(argv[1], "input") == 0) {
         return input_mode(atoll(argv[2]));
     }
-    fprintf(stderr, "usage: sched spin MS MIN_GAP_MS MAX_GAP_MS [DELAY_MS] | sleep MS COUNT | calls COUNT MAX_MS [SPINNERS] | input MAX_MS\n");
+    fprintf(stderr, "usage: sched spin MS MIN_GAP_MS MAX_GAP_MS [DELAY_MS] | sleep MS COUNT [MAX_LATE_MS [WARMUP]] | calls COUNT MAX_MS [SPINNERS] | input MAX_MS\n");
     return 2;
 }

@@ -41,7 +41,9 @@ pub(crate) fn kthreads(platform: &'static VmKernel, devices: &'static Devices) {
     cpu::acknowledge();
 }
 
-/// Once the other CPUs started: a shortened slice end is armed; due runs.
+/// Once the other CPUs started: a shortened slice end is armed; due runs; a
+/// thread's check at a device interrupt waits for the device waiters' lock,
+/// which another CPU holds.
 pub(crate) fn smp_kthreads(platform: &'static VmKernel, devices: &'static Devices) {
     if cpu::online_count() == 1 {
         return;
@@ -50,6 +52,7 @@ pub(crate) fn smp_kthreads(platform: &'static VmKernel, devices: &'static Device
     for safe_point in [false, true] {
         due_stays_due(platform, devices, safe_point);
     }
+    contended_check(platform, devices);
     devices.arm(None);
     cpu::acknowledge();
 }
@@ -343,4 +346,42 @@ fn shortened_end_is_armed(platform: &'static VmKernel, devices: &'static Devices
     let slice_end = after(platform.now(), 10 * QUANTUM);
     devices.arm(Some(after(slice_end, GRACE)));
     preempted_at(thread, Some(slice_end), &stage, Stage::SPINNING);
+}
+
+/// A thread's check at a device interrupt wakes the threads that wait for a
+/// device while another CPU holds their queue's lock: it spins until released.
+fn contended_check(platform: &'static VmKernel, devices: &'static Devices) {
+    let others = cpu::online_count() - 1;
+    let waiting = stopped(step(kthread(move || {
+        devices.waiters().prepare().sleep(None);
+    })));
+    devices.hold_waiters();
+    let interrupter = kthread(move || {
+        let release_at = {
+            let _service = NoPreempt::new();
+            devices.interrupt_self();
+            let release_at = after(platform.now(), Duration::from_millis(2));
+            devices.release_waiters(release_at);
+            release_at
+        };
+        assert!(
+            others > 1 || platform.now() >= release_at,
+            "the reschedule check waited for the lock"
+        );
+    });
+    let mut ran = step(interrupter);
+    while let Ran::Slept(thread) | Ran::Preempted(thread) = ran {
+        ran = step(thread);
+    }
+    finished(ran);
+    // Another CPU's look, if it took the interrupt's, may still spin.
+    let start = platform.now();
+    while !waiting.is_due(platform.now()) {
+        assert!(
+            platform.now().duration_since(&start) < Duration::from_secs(1),
+            "the reschedule check's wake landed"
+        );
+        core::hint::spin_loop();
+    }
+    finished(step(waiting));
 }

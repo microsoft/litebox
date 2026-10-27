@@ -1,0 +1,8 @@
+[
+  {
+    "argv": ["/share"],
+    "lose_share_response": true,
+    "expect_exit_code": 1,
+    "expect_stderr": "open greeting.txt: Input/output error\n"
+  }
+]

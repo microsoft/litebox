@@ -20,9 +20,10 @@ pub enum RunError {
 
 /// Runs each program in its process, all at once, in `scheduler`, and returns
 /// their exit statuses, in order, once every process waits for a request or
-/// is dead (e.g., their descendants exited too). Each process is
-/// [finished](Process::finish) as soon as it replies. A malformed reply kills
-/// the process.
+/// is dead (e.g., their descendants exited too), and, in debug builds,
+/// `between_steps`, called between the scheduler's steps, returned true. Each
+/// process is [finished](Process::finish) as soon as it replies. A malformed
+/// reply kills the process.
 ///
 /// # Panics
 ///
@@ -30,6 +31,7 @@ pub enum RunError {
 pub fn run_all(
     scheduler: &Scheduler,
     runs: &mut [(&mut Process, &Program)],
+    #[cfg(debug_assertions)] mut between_steps: impl FnMut(&mut [(&mut Process, &Program)]) -> bool,
 ) -> Vec<Result<ExitStatus, RunError>> {
     let mut replies: Vec<Option<Result<ExitStatus, RunError>>> = runs
         .iter_mut()
@@ -38,13 +40,17 @@ pub fn run_all(
     // One program per process: release what it holds (e.g., a pipe end) as
     // soon as it replies, as its children may wait on it.
     let mut collect = || {
+        #[cfg(debug_assertions)]
+        let done = between_steps(runs);
+        #[cfg(not(debug_assertions))]
+        let done = true;
         for ((process, _), reply) in runs.iter_mut().zip(&mut replies) {
             if reply.is_none() && process.is_stopped() {
                 *reply = Some(self::reply(process));
                 process.finish();
             }
         }
-        replies.iter().all(Option::is_some)
+        done && replies.iter().all(Option::is_some)
     };
     scheduler.run_until(&mut collect);
     // The last step may have stopped some (e.g., killed them).

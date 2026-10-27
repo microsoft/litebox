@@ -8,9 +8,9 @@
 //! the scheduler makes the clone ([`Inner::fork`]) only once the thread's run
 //! ended, which saved the state to copy. The clone runs nothing until the
 //! kernel adopts it ([`Inner::adopt`]) as the runner of a child that the parent
-//! starts with it (`StartChildWithExistingRunner`), making the clone's broker
-//! handshake before it runs, so that the broker's worker, suspended in the
-//! start, never waits for the clone. A process has at most one clone to adopt,
+//! starts with it (`StartChildWithExistingRunner`): the clone's broker thread
+//! makes its handshake, so that the start never waits for the clone to run.
+//! A process has at most one clone to adopt,
 //! its latest, which ends once the process makes another, or exits.
 //!
 //! The scheduler adds the clone once it is made, as another CPU may adopt it
@@ -105,6 +105,13 @@ impl Inner {
         unsafe { platform.switch_address_space(address_space) }
             .expect("a freshly cloned address space is registered");
         let mappings = self.mappings.duplicate();
+        #[cfg(debug_assertions)]
+        if self.hooks.stack_failure == Some(crate::StackFailure::Clone)
+            && self.broker.is_launched()
+            && !self.cloned_once.replace(true)
+        {
+            litebox_platform_vm_kernel::kthread::fail_next_stack();
+        }
         // `Replace`: the duplicated record lists the broker's memory, which
         // the clone does not map.
         let broker = pin_broker_memory(platform, address_space, &mappings, Placement::Replace)
@@ -112,10 +119,16 @@ impl Inner {
                 SpawnError::Map(status) => status,
                 _ => Status::NoMemory,
             })
-            .map(|(shared_memory, control_ring)| {
-                self.broker
+            .and_then(|(shared_memory, control_ring)| {
+                let broker = self
+                    .broker
                     .broker()
-                    .associate_clone(shared_memory, control_ring)
+                    .associate_clone(shared_memory, control_ring)?;
+                #[cfg(debug_assertions)]
+                if self.hooks.slow_serves {
+                    broker.slow_serves();
+                }
+                Ok(broker)
             })
             .inspect_err(|_| {
                 // Safety: nothing references the clone's memory, and it never
@@ -147,12 +160,16 @@ impl Inner {
             shared: Cell::new(false),
             threads: RefCell::new(alloc::vec![new_thread(Thread::cloned(thread, slot))]),
             next_thread: Cell::new(thread::MAIN + 1),
-            broker_requester: Cell::new(thread::MAIN),
-            worker: Cell::new(None),
             pending_clone: RefCell::new(None),
             next_clone: Cell::new(1),
             #[cfg(debug_assertions)]
             give_ups: Default::default(),
+            #[cfg(debug_assertions)]
+            hooks: self.hooks,
+            #[cfg(debug_assertions)]
+            launched_once: Cell::new(false),
+            #[cfg(debug_assertions)]
+            cloned_once: Cell::new(false),
         })
     }
 
@@ -182,12 +199,9 @@ impl Inner {
     }
 
     /// Has the process's clone `id` run as `launch`, a child the process
-    /// started with it, or fails `launch`. Makes the clone's broker handshake
+    /// started with it, or fails `launch`. Posts the clone's adoption
     /// (see [`Association::adopt`](litebox_broker_vm_kernel::Association::adopt)),
-    /// so that the start does not wait for the clone to run; a clone whose
-    /// handshake fails ends without running. Either way, `launch` is done
-    /// with, which wakes the CPU whose worker waits for it (see
-    /// `PendingRunnerAssociation`'s `Drop`). Only under the process's claim.
+    /// whose failure kills the clone. Only under the process's claim.
     pub(crate) fn adopt(&self, id: u64, launch: PendingRunnerAssociation) {
         let pending = self
             .pending_clone
@@ -207,11 +221,11 @@ impl Inner {
             launch.fail(BrokerError::PolicyDenied);
             return;
         };
-        if let Err(error) = claim.broker.adopt(launch) {
-            log::warn!("failed to adopt process clone {id}: {error:?}");
-            end(&claim);
-            return;
+        #[cfg(debug_assertions)]
+        if self.hooks.fail_adoption {
+            claim.broker.fail_adoption();
         }
+        claim.broker.adopt(launch);
         *claim.state.borrow_mut() = State::Serving { upcall_entry };
         log::debug!("process clone {id} adopted");
         // Runnable: for any CPU to take, once released.

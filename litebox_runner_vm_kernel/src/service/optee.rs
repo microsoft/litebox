@@ -45,7 +45,7 @@ impl Optee {
         wall_clock: WallClock,
         timer: &'static dyn ProcessTimer,
         payload: &Payload,
-        broker: litebox_broker_vm_kernel::Broker,
+        broker: litebox_broker_vm_kernel::BrokerHandle,
     ) -> Self {
         let file = |name| {
             payload
@@ -100,6 +100,8 @@ impl Optee {
                     started_runner: None,
                     #[cfg(debug_assertions)]
                     give_up_once: false,
+                    #[cfg(debug_assertions)]
+                    hooks: litebox_shim_vm_kernel::Hooks::default(),
                 },
             )
             .map_err(|error| {

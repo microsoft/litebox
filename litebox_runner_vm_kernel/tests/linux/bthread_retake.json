@@ -1,0 +1,16 @@
+[
+  { "argv": ["/hello"], "hold_retake": "handshake", "expect_stdout": "hello, world\n" },
+  { "argv": ["/hello"], "hold_retake": "futex", "expect_stdout": "hello, world\n" },
+  {
+    "argv": ["/hello"],
+    "hold_retake": "preempted_futex",
+    "slow_serves": true,
+    "expect_stdout": "hello, world\n"
+  },
+  {
+    "argv": ["/hello"],
+    "hold_retake": "preempted_futex_ran",
+    "slow_serves": true,
+    "expect_stdout": "hello, world\n"
+  }
+]

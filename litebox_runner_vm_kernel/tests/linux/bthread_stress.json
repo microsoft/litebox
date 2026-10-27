@@ -1,0 +1,24 @@
+[
+  { "argv": ["/fork", "chain", "48"], "broker_slice_us": 50, "expect_stdout": "chain: 48\n" },
+  {
+    "argv": ["/fork", "many", "100"],
+    "broker_slice_us": 50,
+    "expect_stdout": "forked 100 times\n"
+  },
+  { "argv": ["/console_flood"], "broker_slice_us": 50, "expect_stdout_records": [4, 512] },
+  {
+    "argv": ["/net", "loopback"],
+    "broker_slice_us": 50,
+    "expect_stdout": "tcp 127.0.0.1: ok\ntcp 10.0.2.15: ok\ntcp refused: ok\nudp: ok\n"
+  },
+  {
+    "argv": ["/net", "external", "10.0.2.100", "7"],
+    "broker_slice_us": 50,
+    "expect_stdout": "external 10.0.2.100:7: ok\n"
+  },
+  {
+    "argv": ["/share"],
+    "broker_slice_us": 50,
+    "expect_stdout": "hello from the host\nread-only\n"
+  }
+]

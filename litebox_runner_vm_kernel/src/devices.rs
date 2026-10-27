@@ -22,9 +22,8 @@
 //!
 //! Each CPU has its own local APIC, so its own timer; devices interrupt the
 //! boot CPU. The interrupt handler only ends the interrupt, noting a device's
-//! for every CPU and waking the other idle ones; the broker looks at the
-//! devices when it next runs, which, if the interrupt stopped a process, the
-//! shim has it do at once (see `litebox_platform_vm_kernel`). A wake IPI only
+//! and waking the other idle CPUs; the first CPU to look at the devices then
+//! ([`Events::poll`]) wakes the threads that wait for one. A wake IPI only
 //! ends a halt, or has a CPU running a process enter the kernel. A TLB-flush
 //! IPI is only a doorbell: the platform flushes before the handler runs, and a
 //! process it interrupted resumes at once.
@@ -33,7 +32,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::stdio::StdioOutputStream;
 use litebox_broker_core::vsock_socket::transport::{
@@ -42,13 +41,18 @@ use litebox_broker_core::vsock_socket::transport::{
 use litebox_broker_protocol::vsock_socket::VsockPort;
 use litebox_broker_smoltcp::Network;
 use litebox_broker_vm_kernel::Events;
+#[cfg(debug_assertions)]
+use litebox_broker_vm_kernel::gate::Gate;
 use litebox_broker_vm_kernel::share::{Share, Transport, TransportError};
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
-use litebox_hal::devices::{self as hal, ConsoleDevice, NetworkDevice, NinePDevice, VsockDevice};
+use litebox_hal::devices::{
+    self as hal, ConsoleDevice, NetworkDevice, NinePDevice, Polled, VsockDevice,
+};
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
+use litebox_platform_vm_kernel::kthread::{self, WaitQueue};
 use litebox_platform_vm_kernel::preempt::{KernelMutex, KernelMutexGuard};
 use litebox_platform_vm_kernel::{Handled, Instant, VmKernel};
 use litebox_shim_vm_kernel::ProcessTimer;
@@ -56,9 +60,11 @@ use litebox_shim_vm_kernel::ProcessTimer;
 /// How long a share's server may take to answer a request before the share
 /// fails.
 const SHARE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How often a share waiting for its server is polled, whether or not it
-/// interrupts (see [`ShareTransport`]).
+/// How often a share waiting for its server is polled (see [`ShareTransport`]).
 const SHARE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// How long a kernel thread polls a share for its response before it sleeps:
+/// longer than most of the server's round trips.
+const SHARE_SPIN: Duration = Duration::from_micros(250);
 
 /// The local APIC's timer.
 const TIMER_VECTOR: u8 = 0x30;
@@ -116,9 +122,29 @@ pub struct Devices {
     /// (see [`armed`]), so it can skip rewriting it: under KVM each write is
     /// a VM exit, and it rearms before every resume of a process.
     armed: [AtomicU64; MAX_CPUS],
-    /// Bit `i`: a device interrupted since CPU `i`'s last
-    /// [`Events::take_device_interrupt`].
-    device_interrupted: AtomicU64,
+    /// A device interrupted since the last [`Events::poll`].
+    device_interrupted: AtomicBool,
+    /// The kernel threads that wait for a device.
+    waiters: WaitQueue,
+    #[cfg(debug_assertions)]
+    hold_waiters: HoldWaiters,
+    #[cfg(debug_assertions)]
+    gate: Gate,
+    #[cfg(debug_assertions)]
+    lose_share_response: AtomicBool,
+    #[cfg(debug_assertions)]
+    share_timeouts: AtomicU64,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct HoldWaiters {
+    /// Until a CPU takes it.
+    requested: AtomicBool,
+    /// While the CPU that took it holds the lock.
+    holding: AtomicBool,
+    /// When it is to release it, in nanoseconds; zero until set.
+    release_at: AtomicU64,
 }
 
 /// [`Devices::armed`]'s value for `deadline`: zero for none (the instant zero,
@@ -172,8 +198,17 @@ impl Devices {
             vsock_interrupts: vsock.as_ref().is_some_and(VsockDevice::interrupts),
             vsock: vsock.map(KernelMutex::new),
             armed: [const { AtomicU64::new(ARMED_UNKNOWN) }; MAX_CPUS],
-            device_interrupted: AtomicU64::new(0),
+            device_interrupted: AtomicBool::new(false),
+            waiters: WaitQueue::new(),
             console: KernelMutex::new(console),
+            #[cfg(debug_assertions)]
+            hold_waiters: HoldWaiters::default(),
+            #[cfg(debug_assertions)]
+            gate: Gate::new(platform),
+            #[cfg(debug_assertions)]
+            lose_share_response: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            share_timeouts: AtomicU64::new(0),
         }));
         litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|vector| {
             devices.on_interrupt(vector)
@@ -244,13 +279,16 @@ impl Devices {
                     device,
                     failed: false,
                 }),
+                #[cfg(debug_assertions)]
+                gate: &self.gate,
             });
         }
         shares
     }
 
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
-    /// per-CPU data.
+    /// per-CPU data; but, in debug builds, a test's hold of the device
+    /// waiters' lock (see [`Self::hold_waiters`]).
     fn on_interrupt(&self, vector: u8) -> Handled {
         match vector {
             // Fired: arming the same deadline again (e.g., after an early
@@ -261,13 +299,15 @@ impl Devices {
                     armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
                 }
             }
-            // The other idle CPUs step again, to poll the devices (this one,
-            // the boot CPU, is already in).
+            // The other idle CPUs step again, to look at the devices.
             DEVICE_VECTOR => {
-                self.device_interrupted.store(u64::MAX, Ordering::SeqCst);
+                self.device_interrupted.store(true, Ordering::SeqCst);
                 cpu::wake_idle(CpuId::BOOT);
             }
-            WAKE_VECTOR => {}
+            WAKE_VECTOR => {
+                #[cfg(debug_assertions)]
+                self.hold_waiters_if_asked();
+            }
             FLUSH_VECTOR => {
                 self.apic.end_of_interrupt();
                 return Handled::Doorbell;
@@ -276,6 +316,90 @@ impl Devices {
         }
         self.apic.end_of_interrupt();
         Handled::Event
+    }
+
+    /// Debug builds: the broker's gate.
+    #[cfg(debug_assertions)]
+    pub fn gate(&'static self) -> &'static Gate {
+        &self.gate
+    }
+
+    /// The kernel threads that wait for a device (see [`Events::poll`]).
+    #[cfg(debug_assertions)]
+    pub(crate) fn waiters(&self) -> &WaitQueue {
+        &self.waiters
+    }
+
+    /// Debug builds: the next round trip in a kernel thread loses its response,
+    /// and times out, which fails its share.
+    #[cfg(debug_assertions)]
+    pub fn lose_share_response(&self) {
+        self.lose_share_response.store(true, Ordering::SeqCst);
+    }
+
+    /// Debug builds: how many sleeps for a share's response ended at their
+    /// deadline, for a device that interrupts: so the interrupt never came.
+    #[cfg(debug_assertions)]
+    pub fn share_timeouts(&self) -> u64 {
+        self.share_timeouts.load(Ordering::SeqCst)
+    }
+
+    /// Debug builds: has another CPU, as it takes a wake, hold
+    /// [`Self::waiters`]'s lock until [`Self::release_waiters`] sets when (or
+    /// for a second); panics if none took the request within a second.
+    #[cfg(debug_assertions)]
+    pub(crate) fn hold_waiters(&self) {
+        let start = self.platform.now();
+        let hold = &self.hold_waiters;
+        hold.release_at.store(0, Ordering::SeqCst);
+        hold.requested.store(true, Ordering::SeqCst);
+        while !hold.holding.load(Ordering::SeqCst) {
+            assert!(
+                self.platform.now().duration_since(&start) < Duration::from_secs(1),
+                "another CPU holds the device waiters' lock"
+            );
+            // Again, for a CPU that was not idle yet.
+            cpu::wake_idle(cpu::current());
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Debug builds: see [`Self::hold_waiters`].
+    #[cfg(debug_assertions)]
+    pub(crate) fn release_waiters(&self, at: Instant) {
+        self.hold_waiters
+            .release_at
+            .store(at.as_nanos().max(1), Ordering::SeqCst);
+    }
+
+    /// Debug builds: takes a request of [`Self::hold_waiters`], if any.
+    #[cfg(debug_assertions)]
+    fn hold_waiters_if_asked(&self) {
+        let hold = &self.hold_waiters;
+        // A load first: no write to the shared line on every wake.
+        if !hold.requested.load(Ordering::Relaxed) || !hold.requested.swap(false, Ordering::SeqCst)
+        {
+            return;
+        }
+        let start = self.platform.now();
+        self.waiters.hold_while(|| {
+            hold.holding.store(true, Ordering::SeqCst);
+            let now = self.platform.now();
+            let release_at = hold.release_at.load(Ordering::SeqCst);
+            (release_at == 0 || now.as_nanos() < release_at)
+                && now.duration_since(&start) < Duration::from_secs(1)
+        });
+        hold.holding.store(false, Ordering::SeqCst);
+    }
+
+    /// Debug builds: sends the calling CPU a device interrupt.
+    #[cfg(debug_assertions)]
+    pub(crate) fn interrupt_self(&self) {
+        assert!(
+            self.apic
+                .send_fixed_ipi(cpu::apic_id(cpu::current()), DEVICE_VECTOR),
+            "a device interrupt sent"
+        );
     }
 
     /// The calling CPU's [`Self::armed`].
@@ -340,10 +464,16 @@ impl Events for Devices {
         true
     }
 
-    fn take_device_interrupt(&self) -> bool {
-        let bit = 1 << cpu::current().index();
-        self.device_interrupted.load(Ordering::SeqCst) & bit != 0
-            && self.device_interrupted.fetch_and(!bit, Ordering::SeqCst) & bit != 0
+    /// After the device wrote what it interrupted for: so a thread that
+    /// registers after the wake, then looks, sees it.
+    fn poll(&self) -> bool {
+        // A load first: no write to the shared line on every look.
+        let interrupted = self.device_interrupted.load(Ordering::Relaxed)
+            && self.device_interrupted.swap(false, Ordering::SeqCst);
+        if interrupted {
+            self.waiters.wake(usize::MAX);
+        }
+        interrupted
     }
 }
 
@@ -539,15 +669,10 @@ fn broker_id(id: hal::ConnectionId) -> ConnectionId {
     }
 }
 
-/// A share's virtio-9p device: a request at a time, waiting for its response
-/// in [`Devices::halt`], not suspending the worker: the 9P client holds its
-/// lock across the round trip, and while the worker is suspended, the kernel
-/// may take it (e.g., ending another process's association closes its files),
-/// which nothing on that CPU would release. Polled even if it interrupts:
-/// its interrupt goes to the boot CPU, which wakes this one for it (see
-/// [`Devices::on_interrupt`]) only as it takes interrupts, which it may not
-/// for a while, running kernel code (e.g., creating or freeing a process's
-/// address space, or spinning for a spin lock).
+/// A share's virtio-9p device: a request at a time. In a kernel thread, it
+/// polls for the response for up to [`SHARE_SPIN`], then sleeps until the
+/// devices' interrupt, or its next poll. Otherwise (at boot or shutdown), it
+/// halts, polling every [`SHARE_POLL_INTERVAL`].
 struct ShareTransport {
     devices: &'static Devices,
     device: NinePDevice,
@@ -562,7 +687,93 @@ impl Transport for ShareTransport {
     }
 
     fn round_trip(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, TransportError> {
-        if self.failed || !self.device.transmit(request) {
+        if self.failed {
+            return Err(TransportError);
+        }
+        let received = if kthread::in_kthread() {
+            self.poll_then_sleep(request, response)
+        } else {
+            self.halt(request, response)
+        };
+        if received.is_err() {
+            litebox_util_log::warn!(device:% = self.device; "9P server did not answer; share failed");
+            self.failed = true;
+        }
+        received
+    }
+}
+
+impl ShareTransport {
+    /// [`Transport::round_trip`] in a kernel thread (see [`ShareTransport`]).
+    fn poll_then_sleep(
+        &mut self,
+        request: &[u8],
+        response: &mut [u8],
+    ) -> Result<usize, TransportError> {
+        let devices = self.devices;
+        let platform = devices.platform;
+        let start = platform.now();
+        let spin_end = start.checked_add(SHARE_SPIN);
+        #[cfg(debug_assertions)]
+        let lose = devices.lose_share_response.load(Ordering::Relaxed)
+            && devices.lose_share_response.swap(false, Ordering::SeqCst);
+        #[cfg(not(debug_assertions))]
+        let lose = false;
+        let timeout = if lose {
+            Duration::from_millis(100)
+        } else {
+            SHARE_TIMEOUT
+        };
+        let deadline = start
+            .checked_add(timeout)
+            .expect("the clock is far from overflowing");
+        #[cfg(debug_assertions)]
+        let mut transmitted = Some(&devices.gate);
+        let polled = self.device.transmit_polled(
+            request,
+            response,
+            || {
+                #[cfg(debug_assertions)]
+                if let Some(gate) = transmitted.take() {
+                    gate.hold_at(litebox_broker_vm_kernel::gate::Point::Transmitted);
+                }
+                spin_end.is_some_and(|spin_end| platform.now() < spin_end) && !kthread::yield_due()
+            },
+            || devices.waiters.prepare(),
+        );
+        let mut prepared = match polled.ok_or(TransportError)? {
+            Polled::Received(_) if lose => devices.waiters.prepare(),
+            Polled::Received(len) => return Ok(len),
+            Polled::Waiting(prepared) => prepared,
+        };
+        loop {
+            let now = platform.now();
+            if now >= deadline {
+                return Err(TransportError);
+            }
+            let interrupts = self.device.interrupts();
+            let wake = if interrupts {
+                deadline
+            } else {
+                poll_at(now, deadline)
+            };
+            prepared.sleep(Some(wake));
+            #[cfg(debug_assertions)]
+            if interrupts && platform.now() >= deadline {
+                devices.share_timeouts.fetch_add(1, Ordering::SeqCst);
+            }
+            // Before the look: an interrupt's wake after it ends the sleep.
+            prepared = devices.waiters.prepare();
+            match self.device.receive(response) {
+                Some(len) if !lose => return Ok(len),
+                _ => {}
+            }
+        }
+    }
+
+    /// [`Transport::round_trip`] outside kernel threads, halting.
+    fn halt(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, TransportError> {
+        if !self.device.transmit(request) {
             return Err(TransportError);
         }
         let platform = self.devices.platform;
@@ -576,22 +787,21 @@ impl Transport for ShareTransport {
             }
             let now = platform.now();
             if now >= deadline {
-                litebox_util_log::warn!(
-                    device:% = self.device;
-                    "9P server did not answer; share failed"
-                );
-                self.failed = true;
                 return Err(TransportError);
             }
             // Until the device returns the request; nothing else runs on this
             // CPU meanwhile (and, while the CPU has a wakeup to acknowledge,
             // this polls).
-            let wake = match now.checked_add(SHARE_POLL_INTERVAL) {
-                Some(poll) if poll < deadline => poll,
-                _ => deadline,
-            };
-            self.devices.halt(Some(wake));
+            self.devices.halt(Some(poll_at(now, deadline)));
         }
+    }
+}
+
+/// A share's next poll after `now`, unless `deadline` is earlier.
+fn poll_at(now: Instant, deadline: Instant) -> Instant {
+    match now.checked_add(SHARE_POLL_INTERVAL) {
+        Some(poll) if poll < deadline => poll,
+        _ => deadline,
     }
 }
 

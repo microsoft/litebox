@@ -489,6 +489,17 @@ impl WaitQueue {
         }
         woken
     }
+
+    /// Debug builds: holds the queue's lock, interrupts disabled, while
+    /// `holding` returns true.
+    #[cfg(debug_assertions)]
+    pub fn hold_while(&self, mut holding: impl FnMut() -> bool) {
+        let _no_preempt = NoPreempt::new();
+        let _queue = self.0.queue.lock();
+        while holding() {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// A thread's registration on a [`WaitQueue`], dropped before the thread

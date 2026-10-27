@@ -157,10 +157,12 @@ impl Rings {
     }
 }
 
+/// The request and response rings, `None` once a call has failed the
+/// association. A thread may be preempted, or wait in the kernel, holding them.
+type SharedRings = Arc<litebox_platform::sync::Mutex<VmUserland, Option<Rings>>>;
+
 pub struct KernelBrokerChannel {
-    /// `None` once a call has failed the association. A thread may be
-    /// preempted, or wait in the kernel, holding it.
-    rings: litebox_platform::sync::Mutex<VmUserland, Option<Rings>>,
+    rings: SharedRings,
 }
 
 impl LocalCallChannel for KernelBrokerChannel {
@@ -370,6 +372,7 @@ pub struct Notifications {
     consumer: ControlRingConsumer<KernelControlRing>,
     /// For [`self_check`].
     words: KernelControlRing,
+    rings: SharedRings,
 }
 
 /// Returns the broker's local endpoint, the startup data of a launched
@@ -406,17 +409,17 @@ pub fn connect(
                 .unwrap_or_else(|_| unreachable!("a single-lane layout has one lane"));
             let (request_producer, response_consumer) =
                 (lane.request_producer, lane.response_consumer);
+            let rings = Arc::new(litebox_platform::sync::Mutex::new(Some(Rings {
+                requests: request_producer,
+                responses: response_consumer,
+                words: ring()?,
+            })));
             let notifications = Notifications {
                 consumer: notification_consumer,
                 words: ring()?,
+                rings: rings.clone(),
             };
-            let channel = KernelBrokerChannel {
-                rings: litebox_platform::sync::Mutex::new(Some(Rings {
-                    requests: request_producer,
-                    responses: response_consumer,
-                    words: ring()?,
-                })),
-            };
+            let channel = KernelBrokerChannel { rings };
             let shared_memory: Arc<dyn SharedMemory> = Arc::new(KernelSharedMemory {
                 region: info.broker_shared_memory,
             });
@@ -691,7 +694,8 @@ fn broker_wait(
 
 /// Self-check (debug builds): the broker's futex operations, on the
 /// notification ring's producer wake counter and on the request ring's
-/// consumer wake counter, which only the kernel's serving changes.
+/// consumer wake counter, which only the kernel's serving changes; and a Wait
+/// with no Wake has more requests served than the response ring holds.
 ///
 /// # Panics
 ///
@@ -736,6 +740,66 @@ pub fn self_check(notifications: &Notifications, platform: &VmUserland) {
     wake.expected = 1;
     assert_eq!(kcall::call(&wake), Err(Status::InvalidArgument));
     broker_wake(start).expect("the association survives");
+    let mut rings = notifications.rings.lock();
+    let rings = rings.as_mut().expect("the association works");
+    // Twice what the response ring holds, in two batches, as the request ring
+    // holds half.
+    let slots = LAYOUT.responses(0).slot_count();
+    let responded = LAYOUT.responses(0).producer_wake_offset();
+    for batch in 0..2 {
+        for request_id in batch * slots..(batch + 1) * slots {
+            let request = wire::encode_request(BrokerRequest {
+                request_id: litebox_broker_protocol::RequestId(request_id),
+                operation: litebox_broker_protocol::message::BrokerOperation::CheckReadiness(
+                    litebox_broker_protocol::ObjectHandle(u64::MAX),
+                ),
+            });
+            assert!(
+                matches!(
+                    rings.requests.try_write(&request),
+                    Ok(ControlRingWriteStatus::Written)
+                ),
+                "room for a batch of requests"
+            );
+        }
+        let served = broker_wait(start, responded, current(responded), None);
+        let expected = if batch == 0 {
+            Ok(())
+        } else {
+            Err(Status::Stalled)
+        };
+        assert_eq!(served, expected, "a Wait has batch {batch} served");
+    }
+    let mut answered = 0;
+    while answered < 2 * slots {
+        answered = drain_responses(rings, answered);
+        if answered < 2 * slots {
+            assert_eq!(
+                broker_wait(start, responded, current(responded), None),
+                Ok(()),
+                "a Wait has the kernel serve on, once the responses are drained"
+            );
+        }
+    }
+}
+
+/// Consumes the responses published, which must answer the requests from
+/// `answered` on, in order; how many are answered then.
+fn drain_responses(rings: &mut Rings, mut answered: u64) -> u64 {
+    while let ControlRingReadStatus::Message(response) = rings
+        .responses
+        .try_read(wire::decode_response)
+        .expect("a well-formed response")
+    {
+        assert_eq!(
+            response.request_id,
+            litebox_broker_protocol::RequestId(answered),
+            "responses in order"
+        );
+        answered += 1;
+    }
+    rings.responses.publish_head().expect("a ring that works");
+    answered
 }
 
 #[cfg(test)]
@@ -760,6 +824,7 @@ mod tests {
                 .into_local()
                 .notification_consumer,
             words: ring(),
+            rings: Arc::new(litebox_platform::sync::Mutex::new(None)),
         };
         let producer = ControlRing::new(ring(), LAYOUT)
             .expect("ring")

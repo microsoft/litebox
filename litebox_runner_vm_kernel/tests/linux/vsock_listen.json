@@ -1,4 +1,5 @@
 [
   { "argv": ["/vsock_listen"], "expect_stdout": "vsock-listen ok\n" },
-  { "argv": ["/vsock_listen-dyn"], "expect_stdout": "vsock-listen ok\n" }
+  { "argv": ["/vsock_listen-dyn"], "expect_stdout": "vsock-listen ok\n" },
+  { "argv": ["/vsock_listen"], "broker_slice_us": 50, "expect_stdout": "vsock-listen ok\n" }
 ]

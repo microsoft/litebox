@@ -12,9 +12,12 @@
 
 use crate::memory::{checked_range, copy_from_user, copy_to_user};
 use crate::sched::Parked;
-use crate::{Inner, State, Suspended, layout, new_thread, sched};
+use crate::{BrokerCall, Inner, State, Suspended, layout, new_thread, sched};
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell, RefMut};
+#[cfg(debug_assertions)]
+use core::sync::atomic::AtomicU8;
+use core::sync::atomic::{AtomicU64, Ordering};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_vm_kernel::{EnterError, Entered, RingFutex};
 use litebox_common_linux::PtRegs;
@@ -65,6 +68,12 @@ pub(crate) struct Thread {
     pub(crate) exited: Cell<bool>,
     /// Nanoseconds, for `sched` to pick the thread that used the least.
     pub(crate) cpu_time: Cell<u64>,
+    /// Nanoseconds its broker calls' threads ran, added without the claim, for
+    /// the claim's holder to fold into `cpu_time`.
+    pub(crate) broker_time: Arc<AtomicU64>,
+    /// Debug builds: see `sched::RetakeHold`.
+    #[cfg(debug_assertions)]
+    pub(crate) retake_hold: AtomicU8,
 }
 
 impl Thread {
@@ -114,6 +123,9 @@ impl Thread {
             kicked: Cell::new(false),
             exited: Cell::new(false),
             cpu_time: Cell::new(0),
+            broker_time: Arc::default(),
+            #[cfg(debug_assertions)]
+            retake_hold: AtomicU8::new(0),
         }
     }
 
@@ -157,10 +169,16 @@ impl Thread {
         self.running.get().filter(|_| self.parked.lock().is_none())
     }
 
-    /// Adds the time elapsed since `start` (its run, or a worker job for
-    /// it) to its CPU time, capped at one slice (see `sched::charged`).
+    /// Adds the time elapsed since `start` (its run) to its CPU time, capped
+    /// at one slice (see `sched::charged`).
     pub(crate) fn charge(&self, platform: &litebox_platform_vm_kernel::VmKernel, start: Instant) {
         let used = sched::charged_since(platform, start);
+        self.cpu_time.set(self.cpu_time.get().saturating_add(used));
+    }
+
+    /// Folds [`Self::broker_time`] into its CPU time, under the claim.
+    pub(crate) fn fold_broker_time(&self) {
+        let used = self.broker_time.swap(0, Ordering::Relaxed);
         self.cpu_time.set(self.cpu_time.get().saturating_add(used));
     }
 }
@@ -179,8 +197,6 @@ pub(crate) enum FutexFlow {
     Done(u64),
     /// Suspend the thread so.
     Block(Suspended),
-    /// Make the call again later (see `Inner::retry`).
-    Retry,
     /// The broker association failed.
     Failed,
 }
@@ -225,29 +241,6 @@ fn pt_regs(regs: &Registers) -> PtRegs {
 }
 
 impl Inner {
-    /// The main thread, which every process has.
-    pub(crate) fn main_thread(&self) -> Arc<Thread> {
-        self.threads
-            .borrow()
-            .first()
-            .filter(|thread| thread.is_main())
-            .cloned()
-            .expect("the main thread is the first")
-    }
-
-    /// The thread the worker's serving is for (see `sched`): the last to
-    /// make a broker call, which may have published requests, else the main
-    /// thread.
-    pub(crate) fn broker_requester(&self) -> Arc<Thread> {
-        let id = self.broker_requester.get();
-        self.threads
-            .borrow()
-            .iter()
-            .find(|thread| thread.id == id && !thread.exited.get())
-            .cloned()
-            .unwrap_or_else(|| self.main_thread())
-    }
-
     /// The threads that have not exited.
     pub(crate) fn live_threads(&self) -> usize {
         self.threads
@@ -345,7 +338,7 @@ impl Inner {
         }
         let ring = layout::BROKER_CONTROL_RING;
         if ring.contains(r.addr) {
-            return self.ring_futex(thread, (r.addr - ring.start).trunc(), r);
+            return self.ring_futex((r.addr - ring.start).trunc(), r);
         }
         Ok(match r.op {
             FutexOp::Wait => self
@@ -358,18 +351,7 @@ impl Inner {
     }
 
     /// The broker's futex, on the word at `offset` into the control ring.
-    fn ring_futex(
-        &self,
-        thread: &Thread,
-        offset: usize,
-        r: &FutexRequest,
-    ) -> Result<FutexFlow, Status> {
-        if self.broker_busy() {
-            // The worker is using the association (see `sched`).
-            return Ok(FutexFlow::Retry);
-        }
-        // Either may have published requests.
-        self.broker_requester.set(thread.id);
+    fn ring_futex(&self, offset: usize, r: &FutexRequest) -> Result<FutexFlow, Status> {
         let op = match r.op {
             FutexOp::Wait => RingFutex::Wait {
                 expected: r.expected,
@@ -379,8 +361,13 @@ impl Inner {
         };
         match self.broker.futex(offset, op) {
             Ok(Entered::Done) => Ok(FutexFlow::Done(0)),
-            // The worker serves at once (see `sched`).
-            Ok(Entered::Woke) => Ok(FutexFlow::Block(Suspended::Yielded)),
+            Ok(Entered::Queued(result)) => result.map(|()| FutexFlow::Done(0)),
+            Ok(Entered::InBroker { binding, then }) => {
+                Ok(FutexFlow::Block(Suspended::InBroker(BrokerCall::Futex {
+                    binding,
+                    then,
+                })))
+            }
             Ok(Entered::Wait(wait)) => Ok(FutexFlow::Block(Suspended::Waiting(wait))),
             Err(EnterError::Status(status)) => Err(status),
             Err(EnterError::Failed) => Ok(FutexFlow::Failed),
@@ -402,8 +389,7 @@ impl Inner {
         }
     }
 
-    /// Where `wait` stands, after firing due timers and publishing
-    /// readiness.
+    /// Where `wait` stands, after publishing readiness.
     pub(crate) fn poll_futex(&self, thread: &Thread, wait: &FutexWait) -> FutexState {
         self.broker.poll_events();
         if self.take_interrupt(thread) {
@@ -413,14 +399,10 @@ impl Inner {
         if wait.deadline.is_some_and(|deadline| now >= deadline) {
             return FutexState::Ended(Err(Status::TimedOut));
         }
-        let wake = [
-            wait.deadline,
-            self.armed_deadline.get(),
-            self.broker.next_timer_deadline(),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
+        let wake = [wait.deadline, self.armed_deadline.get()]
+            .into_iter()
+            .flatten()
+            .min();
         FutexState::Blocked { wake }
     }
 

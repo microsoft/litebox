@@ -24,9 +24,9 @@ const DOUBLE_FAULT_STACK_SIZE: usize = 4 * PAGE_SIZE;
 const NMI_STACK_SIZE: usize = 4 * PAGE_SIZE;
 const EXCEPTION_STACK_SIZE: usize = 4 * PAGE_SIZE;
 #[cfg(debug_assertions)]
-pub(crate) const KERNEL_STACK_SIZE: usize = 111 * PAGE_SIZE;
+const KERNEL_STACK_SIZE: usize = 111 * PAGE_SIZE;
 #[cfg(not(debug_assertions))]
-pub(crate) const KERNEL_STACK_SIZE: usize = 47 * PAGE_SIZE;
+const KERNEL_STACK_SIZE: usize = 47 * PAGE_SIZE;
 
 #[repr(C)]
 pub(crate) struct PerCpuVariables {
@@ -35,9 +35,6 @@ pub(crate) struct PerCpuVariables {
     pub(crate) cpu: CpuId,
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<*mut ()>,
-    /// See [`crate::cpu::local`].
-    pub(crate) local: Cell<usize>,
-    pub(crate) worker: crate::worker::Worker,
     pub(crate) kthread: crate::kthread::KthreadCpu,
     /// Keeps the task page table in CR3 alive (`None`: the base table).
     active_page_table: UnsafeCell<Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
@@ -333,8 +330,6 @@ pub(crate) fn allocate_per_cpu_variables(cpu: CpuId) -> &'static PerCpuVariables
         cpu,
         gdt: Cell::new(None),
         tls: Cell::new(core::ptr::null_mut()),
-        local: Cell::new(0),
-        worker: crate::worker::Worker::new(),
         kthread: crate::kthread::KthreadCpu::new(),
         active_page_table: UnsafeCell::new(None),
         stacks: PerCpuStacks::allocate(),

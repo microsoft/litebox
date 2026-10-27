@@ -20,6 +20,12 @@
 // - "spawned": in a child started with posix_spawn (a "chain 3").
 // - "orphan": the child outlives the parent, and then sees init as its
 //   parent.
+// - "nostack": starts a child with posix_spawn that runs "nofork": forks,
+//   twice, reporting whether each worked (see bthread_hold.json, which fails
+//   the first, or the start). A start that fails ends this process with 127,
+//   whatever its error (e.g., ENOMEM): the Linux shim runs the child as a
+//   vfork child in this process's runner until it starts, and exits the
+//   runner if its start fails.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -278,6 +284,28 @@ static int spawned(void) {
     return 0;
 }
 
+static int nofork(void) {
+    for (int i = 0; i < 2; i++) {
+        pid_t child = fork_flushed();
+        if (child == 0) _exit(0);
+        printf("fork %d: %s\n", i, child < 0 ? "failed" : wait_code(child) == 0 ? "worked" : "?");
+    }
+    return 0;
+}
+
+static int nostack(void) {
+    char *nofork[] = {"/fork", "nofork", NULL};
+    pid_t child;
+    fflush(stdout);
+    int error = posix_spawn(&child, nofork[0], NULL, NULL, nofork, environ);
+    if (error != 0) {
+        printf("posix_spawn: %s\n", strerror(error));
+        return 1;
+    }
+    printf("spawned: %d\n", wait_code(child));
+    return 0;
+}
+
 static int orphan(void) {
     pid_t parent = getpid();
     pid_t child = fork_flushed();
@@ -325,6 +353,12 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(mode, "orphan") == 0) {
         return orphan();
+    }
+    if (strcmp(mode, "nostack") == 0) {
+        return nostack();
+    }
+    if (strcmp(mode, "nofork") == 0) {
+        return nofork();
     }
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;

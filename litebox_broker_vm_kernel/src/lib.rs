@@ -21,22 +21,24 @@
 //! or sockets) goes to the association's notification ring.
 //!
 //! As in the userland broker, requests are served apart from the runner's
-//! calls ([`Association::serve`]), and a wait blocks only its process: the
-//! kernel's scheduler polls it ([`Association::poll_wait`]).
+//! calls, on preemptible kernel threads, which may block (e.g., for a lock, a
+//! 9P response, or a child process's start): an association thread drains an
+//! association's inbox (see `inbox`), and the source thread looks at what
+//! changes outside requests. The kernel's scheduler runs them ([`ThreadWork`]).
+//!
+//! The kernel never takes the broker's locks, nor runs or drops broker state.
 //!
 //! A process can start a child process (`StartChild`). Its association queues a
 //! [`PendingRunnerAssociation`] ([`Association::take_pending_associations`]),
 //! for which the kernel creates a runner process and associates it
-//! ([`Broker::associate`]); the child's handshake returns its startup data.
-//! It can also start one with an existing runner
+//! ([`BrokerHandle::associate`]); the child's handshake returns its startup
+//! data. It can also start one with an existing runner
 //! (`StartChildWithExistingRunner`): a process clone it made (see
 //! `litebox_common_vm_abi`, `CloneKind::Process`), which the kernel associated
-//! as it made it ([`Broker::associate_clone`]). The child's queued association
-//! names the clone ([`PendingRunnerAssociation::clone_to_adopt`]), which the
-//! kernel adopts as the child's runner ([`Association::adopt`]), making the
-//! clone's handshake before it runs, so that the worker, suspended in the
-//! start, never waits for the clone. Memory images (`WriteChildMemory`) are not
-//! supported.
+//! as it made it ([`BrokerHandle::associate_clone`]). The child's queued
+//! association names the clone ([`PendingRunnerAssociation::clone_to_adopt`]),
+//! which the kernel adopts as the child's runner ([`Association::adopt`]).
+//! Memory images (`WriteChildMemory`) are not supported.
 //!
 //! When a process ends ([`Association::exited`]), its association ends and
 //! its broker process exits, releasing what it holds (e.g., pipe ends).
@@ -57,6 +59,9 @@
 
 extern crate alloc;
 
+#[cfg(debug_assertions)]
+pub mod gate;
+mod inbox;
 mod memory;
 mod providers;
 mod readiness;
@@ -65,11 +70,17 @@ pub mod share;
 pub mod stdio;
 mod timers;
 
+/// A binding of an association's inbox (see [`Association::has_ended`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Binding(u64);
+
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::cell::{Cell, OnceCell, RefCell};
+use core::cell::{Cell, OnceCell};
 use core::convert::Infallible;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use inbox::{Inbox, Op, Posted};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
@@ -90,6 +101,7 @@ use litebox_broker_transport::control_ring::{
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool};
 use litebox_common_vm_abi::{Status, WireFrame};
 use litebox_platform::time::TimeProvider as _;
+use litebox_platform_vm_kernel::kthread::{self, Kthread, Stack, WaitQueue};
 use litebox_platform_vm_kernel::preempt::KernelMutex;
 use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel, cpu};
 
@@ -111,7 +123,7 @@ pub const CONTROL_RING_LAYOUT: ControlRingLayout = ControlRingLayout::SINGLE_LAN
 /// Size of a process's broker control ring.
 pub const CONTROL_RING_SIZE: usize = CONTROL_RING_LAYOUT.memory_size();
 
-/// What the broker waits for: the runner's event sources (e.g., device
+/// What the kernel waits for: the runner's event sources (e.g., device
 /// interrupts and a timer).
 pub trait Events: Sync {
     /// Halts the calling CPU until an event may have happened, another CPU
@@ -120,8 +132,9 @@ pub trait Events: Sync {
     /// halt).
     fn wait(&self, deadline: Option<Instant>) -> bool;
 
-    /// Whether a device interrupted since the calling CPU's last call.
-    fn take_device_interrupt(&self) -> bool;
+    /// Whether a device interrupted since the last call, on any CPU; if so,
+    /// wakes the kernel threads that wait for a device. Lock-free if not.
+    fn poll(&self) -> bool;
 }
 
 /// The runner's sources for a [`Broker`].
@@ -143,11 +156,17 @@ pub struct Config {
     /// creates their runner processes (see [`PendingRunnerAssociation`]). Roots
     /// then run under a virtual init (see the [crate] docs).
     pub allow_process_duplication: bool,
+    /// The devices, whose interrupts the source thread looks at.
+    pub events: &'static dyn Events,
+    /// Debug builds: holds handshakes and adoptions (see [`gate::Gate`]).
+    #[cfg(debug_assertions)]
+    pub gate: &'static gate::Gate,
 }
 
-/// The kernel's broker; clones share it.
-#[derive(Clone)]
-pub struct Broker {
+/// The kernel's broker, whose state only broker threads use.
+pub struct Broker(Arc<BrokerState>);
+
+struct BrokerState {
     core: Arc<BrokerCore>,
     /// The PID namespace of the processes the kernel starts.
     pid_namespace: Arc<PidNamespace>,
@@ -163,12 +182,43 @@ pub struct Broker {
     vsock: Option<Arc<VsockTransportProvider<Instant>>>,
     /// The virtual init, with [`Config::allow_process_duplication`].
     init: Option<Arc<BrokerProcess>>,
-    /// When it next has something to do (see [`Self::publish_deadline`]).
+    runtime: Arc<Runtime>,
+    #[cfg(debug_assertions)]
+    gate: &'static gate::Gate,
+}
+
+/// What the kernel and broker threads share: lock-free, or kernel-grade.
+pub(crate) struct Runtime {
+    /// The inboxes bound with no thread yet.
+    queued: KernelMutex<Vec<Arc<Inbox>>>,
+    bound: AtomicUsize,
+    sides: AtomicUsize,
+    /// When the source thread next has something to do; lowering it wakes it.
     deadline: Arc<PublishedDeadline>,
+    events: &'static dyn Events,
+    platform: &'static VmKernel,
+    stopping: AtomicBool,
+}
+
+impl Runtime {
+    fn queue(&self, inbox: Arc<Inbox>) {
+        self.queued.lock().push(inbox);
+        cpu::wake_idle_or_resched();
+    }
+}
+
+/// The kernel's side of the [`Broker`]: it holds no broker state, so the
+/// kernel may hold and drop it anywhere. Clones share it.
+#[derive(Clone)]
+pub struct BrokerHandle {
+    runtime: Arc<Runtime>,
+    /// Gone once the broker is shut down.
+    state: Weak<BrokerState>,
 }
 
 impl Broker {
-    /// At most once: only one broker core may exist.
+    /// At most once: only one broker core may exist. Before any broker
+    /// thread exists, as it may block (e.g., mounting a share over 9P).
     ///
     /// # Panics
     ///
@@ -227,7 +277,7 @@ impl Broker {
                 .expect("a running process can change its place in the tree");
             init
         });
-        Self {
+        Self(Arc::new(BrokerState {
             core,
             pid_namespace,
             fs,
@@ -238,16 +288,65 @@ impl Broker {
             sockets,
             vsock,
             init,
-            deadline,
+            runtime: Arc::new(Runtime {
+                queued: KernelMutex::new(Vec::new()),
+                bound: AtomicUsize::new(0),
+                sides: AtomicUsize::new(0),
+                deadline,
+                events: config.events,
+                platform: config.platform,
+                stopping: AtomicBool::new(false),
+            }),
+            #[cfg(debug_assertions)]
+            gate: config.gate,
+        }))
+    }
+
+    /// The kernel's side.
+    pub fn handle(&self) -> BrokerHandle {
+        BrokerHandle {
+            runtime: self.0.runtime.clone(),
+            state: Arc::downgrade(&self.0),
         }
     }
 
+    /// The source thread's work, on `stack`, to start once.
+    pub fn source(&self, stack: Stack) -> ThreadWork {
+        ThreadWork {
+            state: self.0.clone(),
+            kind: Kind::Source(stack),
+        }
+    }
+
+    /// Has the source thread finish, at its next look.
+    pub fn stop_source(&self) {
+        self.0.runtime.stopping.store(true, Ordering::SeqCst);
+        self.0.runtime.deadline.wake_source();
+    }
+
+    /// How many associations' broker sides are alive: none, with no broker
+    /// thread left, before the broker drops.
+    pub fn sides(&self) -> usize {
+        self.0.runtime.sides.load(Ordering::SeqCst)
+    }
+
+    /// Whether no thread's work holds the broker's state.
+    pub fn is_unshared(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
+}
+
+impl BrokerHandle {
     /// A process's association, before its handshake. The shared buffers are
     /// `shared_memory` (see [`SHARED_MEMORY_SIZE`]), which may be pinned
     /// lazily; the control ring is at the start of `control_ring_pages`. With
     /// `launch`, the process is a launched one, and its handshake attaches it
     /// to `launch`'s broker process. Otherwise, it is a root, whose handshake
     /// creates its broker process (see the [crate] docs).
+    ///
+    /// # Errors
+    ///
+    /// [`Status::NoMemory`] if no stack is left; `launch`, if any, then fails.
     ///
     /// # Panics
     ///
@@ -257,32 +356,15 @@ impl Broker {
         shared_memory: PinnedUserPages,
         control_ring_pages: PinnedUserPages,
         launch: Option<PendingRunnerAssociation>,
-    ) -> Association {
-        let launched = launch.is_some();
-        self.association(shared_memory, control_ring_pages, launched, launch)
-    }
-
-    /// Creates a new root's broker process, at its handshake. With the virtual
-    /// init, the root is init's child and leads a new session; otherwise, it
-    /// has no parent.
-    fn create_root(&self) -> Result<Arc<BrokerProcess>, BrokerError> {
-        let Some(init) = &self.init else {
-            return self.core.create_process(
-                CallerCredential::HostGuaranteed,
-                &self.pid_namespace,
-                &self.fs,
-                &self.job,
-                None,
-            );
+    ) -> Result<Association, Status> {
+        let Some(stack) = Stack::allocate() else {
+            if let Some(launch) = launch {
+                launch.fail(BrokerError::OutOfMemory);
+            }
+            return Err(Status::NoMemory);
         };
-        let id = init.allocate_child_process(None, false)?.process_id;
-        // Its own session, as without init, so that, e.g., a root's
-        // `kill(0, ..)` reaches no other root.
-        process_group::create_session(init, id)
-            .and_then(|()| init.take_child_process(id))
-            .inspect_err(|_| {
-                let _ = init.cancel_child_process(id);
-            })
+        let launched = launch.is_some();
+        Ok(self.association(stack, shared_memory, control_ring_pages, launched, launch))
     }
 
     /// A process clone's association (see `litebox_common_vm_abi`,
@@ -291,6 +373,10 @@ impl Broker {
     /// [`Association::adopt`] gives it one. `control_ring_pages` must be
     /// zeroed, as a new process's are.
     ///
+    /// # Errors
+    ///
+    /// [`Status::NoMemory`] if no stack is left.
+    ///
     /// # Panics
     ///
     /// If `control_ring_pages` cannot hold [`CONTROL_RING_SIZE`].
@@ -298,8 +384,9 @@ impl Broker {
         &self,
         shared_memory: PinnedUserPages,
         control_ring_pages: PinnedUserPages,
-    ) -> Association {
-        self.association(shared_memory, control_ring_pages, true, None)
+    ) -> Result<Association, Status> {
+        let stack = Stack::allocate().ok_or(Status::NoMemory)?;
+        Ok(self.association(stack, shared_memory, control_ring_pages, true, None))
     }
 
     /// # Panics
@@ -307,6 +394,7 @@ impl Broker {
     /// If `control_ring_pages` cannot hold [`CONTROL_RING_SIZE`].
     fn association(
         &self,
+        stack: Stack,
         shared_memory: PinnedUserPages,
         control_ring_pages: PinnedUserPages,
         launched: bool,
@@ -314,64 +402,141 @@ impl Broker {
     ) -> Association {
         let memory =
             PinnedControlRing::new(control_ring_pages).expect("the pages hold the control ring");
+        let words = memory.clone();
         let ring = ControlRing::new(memory, CONTROL_RING_LAYOUT)
             .expect("a pinned control ring has the exact size");
-        Association {
-            broker: self.clone(),
-            readiness: Arc::new(KernelReadiness::new()),
+        let readiness = Arc::new(KernelReadiness::new());
+        let children = Arc::new(KernelProcessLauncher::default());
+        let inbox = Arc::new(Inbox::new(self.runtime.clone(), stack));
+        let process = launch
+            .as_ref()
+            .map_or_default(|launch| OnceCell::from(launch.process.clone()));
+        *inbox.side.lock() = Some(Side {
+            state: State::New(ring, UserSharedMemory::new(shared_memory), launch),
+            process,
             launched,
-            process: launch
-                .as_ref()
-                .map_or_default(|launch| OnceCell::from(launch.process.clone())),
-            exit_status: Cell::new(None),
-            launcher: Arc::new(KernelProcessLauncher::default()),
-            state: RefCell::new(State::New(
-                ring,
-                UserSharedMemory::new(shared_memory),
-                launch,
-            )),
-            adoption_response: Cell::new(None),
-            submitted: Cell::new(false),
-        }
-    }
-
-    /// Looks at what changes outside requests: standard streams, timers, the
-    /// network, and the socket device; then publishes the next deadline.
-    fn poll_sources(&self) {
-        self.stdio.poll();
-        self.timers.fire();
-        self.sockets.poll();
-        if let Some(vsock) = &self.vsock {
-            vsock.poll();
-        }
-        self.publish_deadline();
-    }
-
-    /// Publishes when [`Self::poll_sources`] next has something to do, for
-    /// the kernel (see [`Association::next_timer_deadline`]): the earliest
-    /// armed broker timer's deadline, the network stack's (e.g., to
-    /// retransmit), the vsock sockets', or, while output waits for a console
-    /// that does not interrupt, its next poll. After polls, serves and ends,
-    /// which may change them, and as an alarm is set (see `timers`).
-    fn publish_deadline(&self) {
-        self.deadline.publish(|| {
-            [
-                self.timers.next_deadline(),
-                self.next_sources_deadline(),
-                self.stdio.next_deadline(self.platform.now()),
-            ]
-            .into_iter()
-            .flatten()
-            .min()
+            launcher: children.clone(),
+            readiness: readiness.clone(),
+            adoption_response: None,
+            #[cfg(debug_assertions)]
+            fail_adoption: false,
+            #[cfg(debug_assertions)]
+            slow_serves: false,
         });
+        self.runtime.sides.fetch_add(1, Ordering::SeqCst);
+        Association {
+            inbox,
+            words,
+            readiness,
+            launcher: children,
+            handle: self.clone(),
+            launched,
+            unthreaded: Cell::new(false),
+            adoption_pending: Cell::new(false),
+        }
     }
 
-    /// When the network stack, or the vsock sockets, must next run, if ever.
-    fn next_sources_deadline(&self) -> Option<Instant> {
-        timers::earliest(
-            self.sockets.next_deadline().map(timers::instant),
-            self.vsock.as_ref().and_then(|vsock| vsock.next_deadline()),
-        )
+    /// The inboxes bound with no thread, to start a thread for each.
+    ///
+    /// # Panics
+    ///
+    /// Once the broker is shut down.
+    pub fn take_queued(&self) -> Vec<ThreadWork> {
+        let queued = core::mem::take(&mut *self.runtime.queued.lock());
+        queued
+            .into_iter()
+            .map(|inbox| ThreadWork {
+                state: self.state.upgrade().expect("the broker runs"),
+                kind: Kind::Association(inbox),
+            })
+            .collect()
+    }
+
+    /// Looks at the devices (see [`Events::poll`]), waking the source thread
+    /// if one interrupted: whether one did.
+    pub fn poll_devices(&self) -> bool {
+        let interrupted = self.runtime.events.poll();
+        if interrupted {
+            self.runtime.deadline.wake_source();
+        }
+        interrupted
+    }
+
+    /// Whether no inbox is bound or queued.
+    pub fn is_idle(&self) -> bool {
+        self.runtime.bound.load(Ordering::SeqCst) == 0
+    }
+
+    /// When the source thread next has something to do.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.runtime.deadline.get()
+    }
+}
+
+/// Broker work for a kernel thread: an association's, or the source's.
+pub struct ThreadWork {
+    state: Arc<BrokerState>,
+    kind: Kind,
+}
+
+enum Kind {
+    Association(Arc<Inbox>),
+    Source(Stack),
+}
+
+/// What the kernel keeps of a started [`ThreadWork`] until its thread
+/// finished ([`Self::finish`]).
+pub struct Started(Whose);
+
+enum Whose {
+    /// The kernel may then be the inbox's last owner.
+    Association(Arc<Inbox>),
+    Source,
+}
+
+impl ThreadWork {
+    /// Starts its thread, on its inbox's stack or its own.
+    pub fn start(self) -> (Kthread, Started) {
+        let state = self.state;
+        let (stack, inbox) = match self.kind {
+            Kind::Association(inbox) => (inbox.take_stack(), Some(inbox)),
+            Kind::Source(stack) => (stack, None),
+        };
+        let drained = inbox.clone();
+        let work: Box<dyn FnOnce() + Send> = Box::new(move || {
+            debug_assert!(kthread::in_kthread(), "kernel code reached broker code");
+            match drained {
+                Some(inbox) => state.drain(&inbox),
+                None => state.run_source(),
+            }
+        });
+        let whose = inbox.map_or(Whose::Source, Whose::Association);
+        (Kthread::new(stack, work), Started(whose))
+    }
+}
+
+impl Started {
+    /// Its thread finished, with `stack`, which the kernel, off that stack,
+    /// gives back to its inbox, or frees.
+    pub fn finish(self, stack: Stack) {
+        match self.0 {
+            Whose::Association(inbox) => {
+                if inbox.finished(stack) {
+                    inbox.runtime.clone().queue(inbox);
+                }
+            }
+            Whose::Source => drop(stack),
+        }
+    }
+
+    /// Debug builds: posts the requests' operation to its inbox, if any, as a
+    /// call would: whether it was taken.
+    #[cfg(debug_assertions)]
+    pub fn post_requests(&self) -> bool {
+        match &self.0 {
+            Whose::Association(inbox) => inbox.post(Op::Submitted) == Posted::Pending,
+            Whose::Source => false,
+        }
     }
 }
 
@@ -380,6 +545,9 @@ struct KernelHostSetup {
     request: Option<BrokerHandshakeRequest>,
     response: Option<BrokerHandshakeResponse>,
 }
+
+#[cfg(debug_assertions)]
+const SLOW_SERVE: core::time::Duration = core::time::Duration::from_millis(30);
 
 /// The handshake request a runner makes, which the kernel makes for a
 /// process clone (see [`Association::adopt`]).
@@ -416,8 +584,8 @@ impl HostSetupChannel for KernelHostSetup {
 enum State {
     /// Before the handshake, with the ring and shared buffers it would
     /// activate, and the pending association, if the broker process already
-    /// exists (see [`Broker::associate`]): a launched process's, or none for a
-    /// root, or for a process clone until adopted.
+    /// exists (see [`BrokerHandle::associate`]): a launched process's, or none
+    /// for a root, or for a process clone until adopted.
     New(
         ControlRing<PinnedControlRing>,
         UserSharedMemory,
@@ -429,41 +597,53 @@ enum State {
 }
 
 /// The broker's ends of the request and response rings; the notification
-/// ring's is in [`Association::readiness`].
+/// ring's is in [`Side::readiness`].
 struct Active {
     association: BrokerHostAssociation<UserSharedMemory>,
     requests: ControlRingConsumer<PinnedControlRing>,
     responses: ControlRingProducer<PinnedControlRing>,
-    /// For [`RingFutex::Wait`].
-    words: PinnedControlRing,
     /// A response the full ring could not take; no request is consumed while
     /// it waits.
     overflow: Option<Vec<u8>>,
 }
 
-/// A process's broker association. Only [`Association::serve`] and the
-/// handshake touch the shared buffers.
-pub struct Association {
-    broker: Broker,
-    readiness: Arc<KernelReadiness>,
-    /// See [`Broker::associate`].
-    launched: bool,
+/// An association's broker side, which its inbox's bound thread holds.
+pub(crate) struct Side {
+    state: State,
     /// The broker process: a launched process's from the start, a root's once
-    /// its handshake creates it (see [`Broker::associate`]), and a process
-    /// clone's once [`Self::adopt`] gives it one. The process's end completes
-    /// its exit.
+    /// its handshake creates it (see [`BrokerHandle::associate`]), and a
+    /// process clone's once [`Association::adopt`] gives it one.
     process: OnceCell<Arc<BrokerProcess>>,
-    /// Once the process ended (see [`Self::exited`]); the association ends
-    /// as soon as the worker is not using it.
-    exit_status: Cell<Option<ProcessExitStatus>>,
+    /// See [`BrokerHandle::associate`].
+    launched: bool,
     /// Queues the child processes the process starts, for the kernel.
     launcher: Arc<KernelProcessLauncher>,
-    state: RefCell<State>,
+    readiness: Arc<KernelReadiness>,
     /// The response of a process clone's handshake, which [`Self::adopt`]
-    /// made, until the clone's own [`Self::handshake`] takes it.
-    adoption_response: Cell<Option<WireFrame>>,
-    /// See [`Association::has_submitted`].
-    submitted: Cell<bool>,
+    /// made, until the clone's own handshake takes it.
+    adoption_response: Option<WireFrame>,
+    #[cfg(debug_assertions)]
+    fail_adoption: bool,
+    #[cfg(debug_assertions)]
+    slow_serves: bool,
+}
+
+/// A process's broker association's kernel side, which the process holds,
+/// under its claim; its drop ends the association, unless its end did.
+pub struct Association {
+    inbox: Arc<Inbox>,
+    /// The control ring's words, for [`RingFutex::Wait`].
+    words: PinnedControlRing,
+    readiness: Arc<KernelReadiness>,
+    /// Its queues only (kernel-grade).
+    launcher: Arc<KernelProcessLauncher>,
+    handle: BrokerHandle,
+    /// See [`BrokerHandle::associate`].
+    launched: bool,
+    /// A call bound the inbox, which has no thread yet (see [`Self::thread`]).
+    unthreaded: Cell<bool>,
+    /// See [`Self::adoption_pending`].
+    adoption_pending: Cell<bool>,
 }
 
 /// A [`RingFutex::Wait`] that did not end at once.
@@ -491,7 +671,8 @@ pub enum RingFutex {
     /// On the requests' producer wake counter, has the broker serve them; on
     /// other words, nothing.
     Wake,
-    /// Until the word differs from `expected`, or `deadline` passes.
+    /// Until the word differs from `expected`, or `deadline` passes; has the
+    /// broker serve the requests too.
     Wait {
         expected: u32,
         deadline: Option<Instant>,
@@ -501,12 +682,18 @@ pub enum RingFutex {
 /// What [`Association::futex`] leaves to the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entered {
+    /// The call returns.
     Done,
-    /// [`RingFutex::Wake`] on the requests' producer wake counter: serve
-    /// before the call returns.
-    Woke,
-    /// Poll it with [`Association::poll_wait`].
+    /// The call waits: poll it with [`Association::poll_wait`].
     Wait(Wait),
+    /// The call bound the inbox, for a thread to serve its requests: it waits
+    /// until `binding` ended, then for `then`, if any.
+    InBroker {
+        binding: Binding,
+        then: Option<Wait>,
+    },
+    /// A wait that ended at once, with this; its inbox's thread is queued.
+    Queued(Result<(), Status>),
 }
 
 /// See [`Association::poll_wait`].
@@ -525,27 +712,21 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 }
 
 impl Association {
-    /// When, on the kernel clock, [`Self::poll_events`] next has something
-    /// to do, as the broker published it, without its locks (see
-    /// `Broker::publish_deadline`).
+    /// See [`BrokerHandle::next_deadline`].
     pub fn next_timer_deadline(&self) -> Option<Instant> {
-        self.broker.deadline.get()
+        self.handle.next_deadline()
     }
 
-    /// Looks at the devices (standard streams, the network, vsock) and fires
-    /// the broker timers that are due, publishing readiness, as
-    /// [`RingFutex::Wait`] would; for a process that is running instead
-    /// (e.g., an interrupt stopped it). A notification ring this corrupts
-    /// fails the association, which its next [`Self::futex`] reports.
+    /// For a process that is running instead: looks at the devices, and
+    /// publishes the readiness pending for the process.
     pub fn poll_events(&self) {
-        self.broker.poll_sources();
-        let _ = self.flush_readiness();
+        self.handle.poll_devices();
+        self.readiness.flush();
     }
 
     /// Whether a notification was published since the last call (e.g., a
-    /// timer fired, or standard input arrived, as the broker served a request
-    /// or [`Self::poll_events`]): the process then has something to receive,
-    /// even while it runs.
+    /// timer fired, or standard input arrived): the process then has
+    /// something to receive, even while it runs.
     pub fn take_published(&self) -> bool {
         self.readiness.take_published()
     }
@@ -558,14 +739,461 @@ impl Association {
     }
 
     /// [`BrokerHandshake`](litebox_common_vm_abi::CallId::BrokerHandshake):
-    /// one attempt, successful or not; success activates the control ring.
-    /// For an adopted process clone, it returns the response of the handshake
-    /// that [`Self::adopt`] made, if `request` is the one runners make.
+    /// posts the process's one handshake, with `request`, for its thread to
+    /// make: the call waits for the response ([`Self::take_handshake_reply`]).
+    /// An adopted process clone's gets its adoption's response.
     ///
     /// # Errors
     ///
-    /// The status for the runner.
-    pub fn handshake(&self, request: &WireFrame) -> Result<WireFrame, Status> {
+    /// [`Status::Denied`] for a second handshake, or once the process ended.
+    pub fn handshake(&self, request: &WireFrame) -> Result<(), Status> {
+        if self.inbox.is_handshaken() {
+            return Err(Status::Denied);
+        }
+        self.inbox.mailbox.lock().handshake = Some(*request);
+        match self.inbox.post(Op::Handshake) {
+            Posted::Bound(_) => self.unthreaded.set(true),
+            Posted::Pending => {}
+            Posted::Refused => {
+                self.inbox.mailbox.lock().handshake = None;
+                return Err(Status::Denied);
+            }
+        }
+        Ok(())
+    }
+
+    /// The handshake's response, once its thread made it.
+    pub fn take_handshake_reply(&self) -> Option<Result<WireFrame, Status>> {
+        self.inbox.mailbox.lock().reply.take()
+    }
+
+    /// Whether the handshake's response is made.
+    pub fn has_handshake_reply(&self) -> bool {
+        self.inbox.mailbox.lock().reply.is_some()
+    }
+
+    /// Whether a process clone's adoption was posted, and the clone has not made
+    /// its handshake yet, which it may then make whatever its lockdown.
+    pub fn adoption_pending(&self) -> bool {
+        self.adoption_pending.get() && !self.inbox.is_handshaken()
+    }
+
+    /// [`Futex`](litebox_common_vm_abi::CallId::Futex) on the `u32` at
+    /// `offset` into the control ring (see [`RingFutex`] and [`Entered`]).
+    /// An invalid request has no effect. Before the handshake, any request is
+    /// [`Status::Denied`]. A corrupted notification ring fails the
+    /// association, as a corrupted request ring does. Once the process ended,
+    /// any request is denied too.
+    ///
+    /// # Errors
+    ///
+    /// See [`EnterError`].
+    pub fn futex(&self, offset: usize, op: RingFutex) -> Result<Entered, EnterError> {
+        if !self.inbox.active.load(Ordering::SeqCst) {
+            return Err(EnterError::Status(Status::Denied));
+        }
+        if self.inbox.failed.load(Ordering::SeqCst) {
+            return Err(EnterError::Failed);
+        }
+        if !CONTROL_RING_LAYOUT.permits_u32(offset) {
+            return Err(EnterError::Status(Status::InvalidArgument));
+        }
+        let then = match op {
+            RingFutex::Wake => {
+                if offset != CONTROL_RING_LAYOUT.requests(0).producer_wake_offset() {
+                    // The broker waits on no other word.
+                    return Ok(Entered::Done);
+                }
+                None
+            }
+            RingFutex::Wait { expected, deadline } => Some(Wait {
+                offset,
+                expected,
+                deadline,
+                notifications: offset == CONTROL_RING_LAYOUT.notifications().producer_wake_offset(),
+            }),
+        };
+        let binding = match self.inbox.post(Op::Submitted) {
+            Posted::Bound(binding) => binding,
+            Posted::Pending => {
+                return match then {
+                    None => Ok(Entered::Done),
+                    Some(wait) => match self.poll_wait(&wait) {
+                        WaitState::Ended(result) => result.map(|()| Entered::Done),
+                        WaitState::Blocked { .. } => Ok(Entered::Wait(wait)),
+                    },
+                };
+            }
+            Posted::Refused => return Err(EnterError::Status(Status::Denied)),
+        };
+        let Some(wait) = then else {
+            self.unthreaded.set(true);
+            return Ok(Entered::InBroker {
+                binding,
+                then: None,
+            });
+        };
+        match self.poll_wait(&wait) {
+            WaitState::Blocked { .. } => {
+                self.unthreaded.set(true);
+                Ok(Entered::InBroker {
+                    binding,
+                    then: Some(wait),
+                })
+            }
+            WaitState::Ended(result) => {
+                self.queue();
+                match result {
+                    Ok(()) => Ok(Entered::Queued(Ok(()))),
+                    Err(EnterError::Status(status)) => Ok(Entered::Queued(Err(status))),
+                    Err(EnterError::Failed) => Err(EnterError::Failed),
+                }
+            }
+        }
+    }
+
+    /// The thread to start for the inbox that a call of the process bound, if
+    /// it has none yet.
+    ///
+    /// # Panics
+    ///
+    /// Once the broker is shut down.
+    pub fn thread(&self) -> Option<ThreadWork> {
+        self.unthreaded.take().then(|| ThreadWork {
+            state: self.handle.state.upgrade().expect("the broker runs"),
+            kind: Kind::Association(self.inbox.clone()),
+        })
+    }
+
+    /// Whether `binding` (see [`Entered::InBroker`]) ended.
+    pub fn has_ended(&self, binding: Binding) -> bool {
+        self.inbox.has_ended(binding)
+    }
+
+    /// The child processes the process started since the last call, in order,
+    /// for the caller to create a runner process for each (see
+    /// [`BrokerHandle::associate`]), or adopt the process clone it names as its
+    /// runner ([`PendingRunnerAssociation::clone_to_adopt`]), or fail it
+    /// ([`PendingRunnerAssociation::fail`]).
+    pub fn take_pending_associations(&self) -> Vec<PendingRunnerAssociation> {
+        core::mem::take(&mut *self.launcher.pending.lock())
+    }
+
+    /// The broker's kernel side, e.g., to associate the process's children.
+    pub fn broker(&self) -> &BrokerHandle {
+        &self.handle
+    }
+
+    /// Whether the process is a launched one (see [`BrokerHandle::associate`]).
+    pub fn is_launched(&self) -> bool {
+        self.launched
+    }
+
+    /// Posts the adoption of the process clone this association is for as the
+    /// runner of `launch`'s process: its thread makes the clone's handshake,
+    /// whose failure fails the start and the association.
+    pub fn adopt(&self, launch: PendingRunnerAssociation) {
+        self.inbox.mailbox.lock().adopt = Some(launch);
+        match self.inbox.post(Op::Adopt) {
+            Posted::Bound(_) => self.queue(),
+            Posted::Pending => {}
+            Posted::Refused => {
+                let launch = self.inbox.mailbox.lock().adopt.take();
+                if let Some(launch) = launch {
+                    launch.fail(BrokerError::PeerClosed);
+                }
+                return;
+            }
+        }
+        self.adoption_pending.set(true);
+    }
+
+    /// The process ended (e.g., it exited, or the kernel killed it) with
+    /// `status`: posts the end, for its thread. Only the first call counts.
+    pub fn exited(&self, status: ProcessExitStatus) {
+        if self.inbox.is_ending() {
+            return;
+        }
+        self.inbox.mailbox.lock().exit = Some(status);
+        if let Posted::Bound(_) = self.inbox.post(Op::End) {
+            self.queue();
+        }
+    }
+
+    /// Whether serving, or the adoption, failed the association.
+    pub fn has_failed(&self) -> bool {
+        self.inbox.failed.load(Ordering::SeqCst)
+    }
+
+    /// Whether no broker work is in flight for the process. Lock-free.
+    pub fn is_idle(&self) -> bool {
+        self.inbox.is_idle()
+    }
+
+    /// Mirrors whether the process stopped, for the inbox's thread, which wakes
+    /// the boot CPU once done with a stopped process's work.
+    pub fn set_stopped(&self, stopped: bool) {
+        self.inbox.stopped.store(stopped, Ordering::SeqCst);
+    }
+
+    /// Where `wait` stands, after publishing readiness. Without a deadline, a
+    /// wait on a word other than the notification wake counter is
+    /// [`Status::Stalled`] once the inbox is idle.
+    pub fn poll_wait(&self, wait: &Wait) -> WaitState {
+        self.wait_state(wait)
+            .unwrap_or_else(|error| WaitState::Ended(Err(error)))
+    }
+
+    fn wait_state(&self, wait: &Wait) -> Result<WaitState, EnterError> {
+        if !self.inbox.active.load(Ordering::SeqCst) {
+            return Err(EnterError::Status(Status::Denied));
+        }
+        self.readiness.flush();
+        if self.readiness.failed() || self.inbox.failed.load(Ordering::SeqCst) {
+            return Err(EnterError::Failed);
+        }
+        // Before the word: the thread writes its responses before the kernel
+        // unbinds the inbox.
+        let idle = self.inbox.is_idle();
+        match self.words.load_u32_acquire(wait.offset) {
+            Ok(word) if word != wait.expected => {
+                if wait.notifications {
+                    // The runner receives them next, so need not also
+                    // be interrupted for them.
+                    self.readiness.take_published();
+                }
+                return Ok(WaitState::Ended(Ok(())));
+            }
+            Ok(_) => {}
+            Err(_) => return Err(EnterError::Status(Status::InvalidArgument)),
+        }
+        let now = self.handle.runtime.platform.now();
+        if wait.deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(EnterError::Status(Status::TimedOut));
+        }
+        if wait.deadline.is_none() && !wait.notifications && idle {
+            return Err(EnterError::Status(Status::Stalled));
+        }
+        Ok(WaitState::Blocked {
+            wake: wait.deadline,
+        })
+    }
+
+    /// For a blocked wait that the caller ends itself.
+    pub fn abandon_wait(&self) {
+        self.readiness.set_waiting(false);
+    }
+
+    /// Whether a thread of the process blocks in a wait that a notification
+    /// would end (on the notification wake counter, or another the caller ends
+    /// for them, e.g., a futex wait), for a notification to notify every CPU
+    /// ([`cpu::notify_all`], see [`cpu::take_notified`]): poll the waits
+    /// again. The caller's to keep current: before polling waits, since
+    /// polling may publish; ordered before the polls' reads, so that a
+    /// notification another CPU publishes meanwhile is either seen by the
+    /// poll or notified.
+    pub fn set_notification_waiter(&self, waiting: bool) {
+        self.readiness.set_waiting(waiting);
+    }
+
+    fn queue(&self) {
+        self.unthreaded.set(false);
+        self.handle.runtime.queue(self.inbox.clone());
+    }
+
+    /// Debug builds: before the handshake, has the adoption fail.
+    #[cfg(debug_assertions)]
+    pub fn fail_adoption(&self) {
+        if let Some(side) = &mut *self.inbox.side.lock() {
+            side.fail_adoption = true;
+        }
+    }
+
+    /// Debug builds: its broker thread spins for `SLOW_SERVE` after each serve.
+    #[cfg(debug_assertions)]
+    pub fn slow_serves(&self) {
+        if let Some(side) = &mut *self.inbox.side.lock() {
+            side.slow_serves = true;
+        }
+    }
+
+    /// Debug builds: whether [`Self::take_pending_associations`] has one.
+    #[cfg(debug_assertions)]
+    pub fn has_pending_associations(&self) -> bool {
+        !self.launcher.pending.lock().is_empty()
+    }
+}
+
+impl Drop for Association {
+    /// Ends the association if the process's end did not.
+    fn drop(&mut self) {
+        self.exited(ProcessExitStatus::Unknown);
+    }
+}
+
+impl BrokerState {
+    /// An association thread's work: takes `inbox`'s operations, with safe
+    /// points between them, until none is left.
+    fn drain(&self, inbox: &Arc<Inbox>) {
+        let mut side = inbox.side.lock().take();
+        let mut first = true;
+        while let Some(op) = inbox.take() {
+            // After the take, so that an operation posted as the last one ran
+            // has one before it too; none after the last.
+            if !core::mem::take(&mut first) {
+                kthread::safe_point();
+            }
+            match op {
+                Op::End => {
+                    // The operations not started: a pending start fails.
+                    let (exit, adopt) = {
+                        let mut mailbox = inbox.mailbox.lock();
+                        mailbox.handshake = None;
+                        (mailbox.exit.take(), mailbox.adopt.take())
+                    };
+                    drop(adopt);
+                    if let Some(side) = side.take() {
+                        side.end(exit.unwrap_or(ProcessExitStatus::Unknown));
+                        // Releasing the process's objects may have changed
+                        // the deadlines (e.g., a closed socket's connection
+                        // lingers).
+                        self.publish_deadline(true);
+                        self.runtime.sides.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                Op::Adopt => {
+                    #[cfg(debug_assertions)]
+                    self.gate.hold_at(gate::Point::Adopt);
+                    let launch = inbox.mailbox.lock().adopt.take();
+                    if let (Some(side), Some(launch)) = (&mut side, launch) {
+                        if side.adopt(self, launch).is_err() {
+                            inbox.failed.store(true, Ordering::SeqCst);
+                        }
+                        side.activate_inbox(inbox);
+                    }
+                }
+                Op::Handshake => {
+                    #[cfg(debug_assertions)]
+                    self.gate.hold_at(gate::Point::Handshake);
+                    let request = inbox.mailbox.lock().handshake.take();
+                    let reply = match (&mut side, request) {
+                        (Some(side), Some(request)) => {
+                            let reply = side.handshake(self, &request);
+                            side.activate_inbox(inbox);
+                            reply
+                        }
+                        _ => Err(Status::Denied),
+                    };
+                    inbox.mailbox.lock().reply = Some(reply);
+                }
+                Op::Submitted => {
+                    if let Some(side) = &mut side
+                        && side.serve().is_err()
+                    {
+                        inbox.failed.store(true, Ordering::SeqCst);
+                    }
+                    #[cfg(debug_assertions)]
+                    if side.as_ref().is_some_and(|side| side.slow_serves) {
+                        use litebox_platform::time::Instant as _;
+                        let start = self.platform.now();
+                        while self.platform.now().duration_since(&start) < SLOW_SERVE {
+                            core::hint::spin_loop();
+                        }
+                    }
+                    // What changed outside requests reaches the process soon.
+                    self.poll_sources(true);
+                    if let Some(side) = &side {
+                        side.readiness.flush();
+                    }
+                }
+            }
+        }
+        *inbox.side.lock() = side;
+    }
+
+    /// The source thread's work: polls the sources until stopped.
+    fn run_source(&self) {
+        let runtime = &self.runtime;
+        while !runtime.stopping.load(Ordering::SeqCst) {
+            let prepared = runtime.deadline.prepare_source();
+            self.poll_sources(false);
+            if runtime.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            prepared.sleep(runtime.deadline.get());
+        }
+    }
+
+    /// Looks at what changes outside requests, then publishes the next
+    /// deadline, waking the source thread for an earlier one if `wake`.
+    fn poll_sources(&self, wake: bool) {
+        self.stdio.poll();
+        self.timers.fire();
+        self.sockets.poll();
+        if let Some(vsock) = &self.vsock {
+            vsock.poll();
+        }
+        self.publish_deadline(wake);
+    }
+
+    /// Publishes when [`Self::poll_sources`] next has something to do; one
+    /// earlier than before wakes the source thread, if `wake`.
+    fn publish_deadline(&self, wake: bool) {
+        let earlier = self.runtime.deadline.publish(|| {
+            [
+                self.timers.next_deadline(),
+                self.next_sources_deadline(),
+                self.stdio.next_deadline(self.platform.now()),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+        });
+        if earlier && wake {
+            self.runtime.deadline.wake_source();
+        }
+    }
+
+    /// When the network stack, or the vsock sockets, must next run, if ever.
+    fn next_sources_deadline(&self) -> Option<Instant> {
+        timers::earliest(
+            self.sockets.next_deadline().map(timers::instant),
+            self.vsock.as_ref().and_then(|vsock| vsock.next_deadline()),
+        )
+    }
+
+    /// Creates a new root's broker process, at its handshake. With the virtual
+    /// init, the root is init's child and leads a new session; otherwise, it
+    /// has no parent.
+    fn create_root(&self) -> Result<Arc<BrokerProcess>, BrokerError> {
+        let Some(init) = &self.init else {
+            return self.core.create_process(
+                CallerCredential::HostGuaranteed,
+                &self.pid_namespace,
+                &self.fs,
+                &self.job,
+                None,
+            );
+        };
+        let id = init.allocate_child_process(None, false)?.process_id;
+        // Its own session, as without init, so that, e.g., a root's
+        // `kill(0, ..)` reaches no other root.
+        process_group::create_session(init, id)
+            .and_then(|()| init.take_child_process(id))
+            .inspect_err(|_| {
+                let _ = init.cancel_child_process(id);
+            })
+    }
+}
+
+impl Side {
+    fn activate_inbox(&self, inbox: &Inbox) {
+        if matches!(self.state, State::Active(_)) {
+            inbox.active.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn handshake(&mut self, state: &BrokerState, request: &WireFrame) -> Result<WireFrame, Status> {
         let request = request
             .as_slice()
             .and_then(|request| wire::decode_handshake_request(request).ok())
@@ -576,31 +1204,25 @@ impl Association {
                 _ => Err(Status::InvalidArgument),
             };
         }
-        self.connect(request)
-    }
-
-    /// Whether the association holds the response of the handshake that
-    /// [`Self::adopt`] made, which the process clone's [`Self::handshake`]
-    /// takes.
-    pub fn holds_adoption_response(&self) -> bool {
-        self.adoption_response.get().is_some()
+        self.connect(state, request)
     }
 
     /// Makes the association's one handshake, with `request` (or fails with
     /// its error), as [`Self::handshake`] does.
     fn connect(
-        &self,
+        &mut self,
+        broker: &BrokerState,
         request: Result<BrokerHandshakeRequest, Status>,
     ) -> Result<WireFrame, Status> {
-        let mut state = self.state.borrow_mut();
-        let (ring, shared_memory, launch) = match core::mem::replace(&mut *state, State::Ended) {
+        let (ring, shared_memory, launch) = match core::mem::replace(&mut self.state, State::Ended)
+        {
             State::New(ring, shared_memory, launch) if launch.is_some() || !self.launched => {
                 (ring, shared_memory, launch)
             }
             // Left as it was (e.g., active, on a repeated handshake, or a
             // process clone's that no start adopted).
             other => {
-                *state = other;
+                self.state = other;
                 return Err(Status::Denied);
             }
         };
@@ -608,13 +1230,14 @@ impl Association {
         let mut launch = match launch {
             Some(launch) => launch,
             // A root's.
-            None => match self.broker.create_root() {
+            None => match broker.create_root() {
                 Ok(process) => {
                     let _ = self.process.set(process.clone());
                     PendingRunnerAssociation {
                         process,
                         startup: None,
                         clone: None,
+                        launcher: Weak::new(),
                     }
                 }
                 Err(error) => {
@@ -647,7 +1270,6 @@ impl Association {
                 host.finish();
                 return Err(Status::Denied);
             }
-            let words = ring.memory().clone();
             let HostControlRingEndpoints {
                 lanes,
                 lane_demand: _,
@@ -656,11 +1278,10 @@ impl Association {
             let [lane] = <[_; 1]>::try_from(lanes)
                 .unwrap_or_else(|_| unreachable!("a single-lane layout has one lane"));
             self.readiness.activate(notification_producer);
-            *state = State::Active(Box::new(Active {
+            self.state = State::Active(Box::new(Active {
                 association: host,
                 requests: lane.request_consumer,
                 responses: lane.response_producer,
-                words,
                 overflow: None,
             }));
         }
@@ -668,128 +1289,31 @@ impl Association {
         frame(&wire::encode_handshake_response(response))
     }
 
-    /// [`Futex`](litebox_common_vm_abi::CallId::Futex) on the `u32` at
-    /// `offset` into the control ring: leaves published requests to
-    /// [`Self::serve`], and a wait that does not end at once to the caller.
-    /// An invalid request has no effect. Before the handshake, any request is
-    /// [`Status::Denied`]. A corrupted notification ring fails the
-    /// association, as a corrupted request ring does.
-    ///
-    /// # Errors
-    ///
-    /// See [`EnterError`].
-    pub fn futex(&self, offset: usize, op: RingFutex) -> Result<Entered, EnterError> {
-        if !matches!(*self.state.borrow(), State::Active(_)) {
-            return Err(EnterError::Status(Status::Denied));
-        }
-        if !CONTROL_RING_LAYOUT.permits_u32(offset) {
-            return Err(EnterError::Status(Status::InvalidArgument));
-        }
-        let wait = match op {
-            RingFutex::Wake => {
-                if offset != CONTROL_RING_LAYOUT.requests(0).producer_wake_offset() {
-                    // The broker waits on no other word.
-                    return Ok(Entered::Done);
-                }
-                None
-            }
-            RingFutex::Wait { expected, deadline } => Some(Wait {
-                offset,
-                expected,
-                deadline,
-                notifications: offset == CONTROL_RING_LAYOUT.notifications().producer_wake_offset(),
-            }),
-        };
-        self.submitted.set(true);
-        let Some(wait) = wait else {
-            self.with_active(|_| self.poll())?;
-            return Ok(Entered::Woke);
-        };
-        match self.poll_wait(&wait) {
-            WaitState::Ended(result) => result.map(|()| Entered::Done),
-            WaitState::Blocked { .. } => Ok(Entered::Wait(wait)),
-        }
-    }
-
-    /// Whether a call since the last [`Self::serve`] may have published
-    /// requests.
-    pub fn has_submitted(&self) -> bool {
-        self.submitted.get()
-    }
-
-    /// Serves the published requests, unless the response ring fills up.
-    ///
-    /// Must run on a CPU's worker
-    /// ([`litebox_platform_vm_kernel::worker`]), as a request may suspend it:
-    /// one starting a child process, which waits until the child's handshake
-    /// or failure (on any CPU). While the worker is suspended, the caller must
-    /// keep creating what [`Self::take_pending_associations`] returns, running
-    /// the processes, and resuming the worker, or the request never completes.
-    /// Elsewhere, such a request panics.
-    ///
-    /// # Errors
-    ///
-    /// [`EnterError::Failed`], which ended the association.
-    pub fn serve(&self) -> Result<(), EnterError> {
-        self.submitted.set(false);
-        let served = self.with_active(|active| {
-            serving::serve(&self.readiness, || active.serve(&self.launcher))
-                .map_err(|Failed| EnterError::Failed)?;
-            self.flush_readiness()
-        });
-        // Requests may have changed the deadlines (e.g., set a timer).
-        self.broker.publish_deadline();
-        served
-    }
-
-    /// The child processes the process started since the last call, in order,
-    /// for the caller to create a runner process for each (see
-    /// [`Broker::associate`]), or adopt the process clone it names as its
-    /// runner ([`PendingRunnerAssociation::clone_to_adopt`]), or fail it
-    /// ([`PendingRunnerAssociation::fail`]). The request that started one
-    /// keeps the worker suspended until the child starts or fails (see
-    /// [`Self::serve`]); dropping a pending association fails it too.
-    pub fn take_pending_associations(&self) -> Vec<PendingRunnerAssociation> {
-        core::mem::take(&mut *self.launcher.pending.lock())
-    }
-
-    /// The broker, e.g., to associate the process's children.
-    pub fn broker(&self) -> &Broker {
-        &self.broker
-    }
-
-    /// Whether the process is a launched one (see [`Broker::associate`]).
-    pub fn is_launched(&self) -> bool {
-        self.launched
-    }
-
-    /// Adopts the process clone this association is for (see
-    /// [`Broker::associate_clone`]) as the runner of `launch`'s process
-    /// (`StartChildWithExistingRunner`): makes the clone's handshake as its
-    /// runner would, which completes the start before the clone runs; the
-    /// clone's own [`Self::handshake`] then returns the response.
+    /// See [`Association::adopt`].
     ///
     /// # Errors
     ///
     /// [`BrokerError::PolicyDenied`] unless the association is a clone's that
-    /// no start adopted and that has not ended, or [`BrokerError::PeerClosed`]
-    /// if the handshake fails; either fails `launch`.
-    pub fn adopt(&self, launch: PendingRunnerAssociation) -> Result<(), BrokerError> {
-        let adoptable =
-            self.launched && self.process.get().is_none() && self.exit_status.get().is_none();
-        if adoptable
-            && let Ok(mut state) = self.state.try_borrow_mut()
-            && let State::New(_, _, pending @ None) = &mut *state
-        {
+    /// no start adopted, or [`BrokerError::PeerClosed`] if the handshake
+    /// fails; either fails `launch`.
+    fn adopt(
+        &mut self,
+        broker: &BrokerState,
+        launch: PendingRunnerAssociation,
+    ) -> Result<(), BrokerError> {
+        let adoptable = self.launched && self.process.get().is_none();
+        #[cfg(debug_assertions)]
+        let adoptable = adoptable && !self.fail_adoption;
+        if adoptable && let State::New(_, _, pending @ None) = &mut self.state {
             let _ = self.process.set(launch.process.clone());
             *pending = Some(launch);
         } else {
             launch.fail(BrokerError::PolicyDenied);
             return Err(BrokerError::PolicyDenied);
         }
-        match self.connect(Ok(RUNNER_HANDSHAKE)) {
-            Ok(response) if matches!(*self.state.borrow(), State::Active(_)) => {
-                self.adoption_response.set(Some(response));
+        match self.connect(broker, Ok(RUNNER_HANDSHAKE)) {
+            Ok(response) if matches!(self.state, State::Active(_)) => {
+                self.adoption_response = Some(response);
                 Ok(())
             }
             // Dropping `launch` failed the start.
@@ -797,34 +1321,37 @@ impl Association {
         }
     }
 
-    /// The process ended (e.g., it exited, or the kernel killed it) with
-    /// `status`, unless it reported its own: ends the association and
-    /// completes the broker process's exit, or fails its start if it never
-    /// started. If the worker is using the association (e.g., suspended in a
-    /// request), this happens once the worker is done. Only the first call
-    /// counts.
-    pub fn exited(&self, status: ProcessExitStatus) {
-        if self.exit_status.get().is_none() {
-            self.exit_status.set(Some(status));
+    /// Serves the published requests, unless the response ring fills up, and
+    /// publishes the readiness pending.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed`], which ended the association.
+    fn serve(&mut self) -> Result<(), Failed> {
+        let State::Active(active) = &mut self.state else {
+            return Ok(());
+        };
+        let served = serving::serve(&self.readiness, || active.serve(&self.launcher));
+        let served = served.and_then(|()| {
+            self.readiness.flush();
+            if self.readiness.failed() {
+                Err(Failed)
+            } else {
+                Ok(())
+            }
+        });
+        if served.is_err()
+            && let State::Active(active) = core::mem::replace(&mut self.state, State::Ended)
+        {
+            end(active.association, &self.readiness);
         }
-        self.end_if_ended();
+        served
     }
 
-    /// Does what [`Self::exited`] recorded, unless the worker is using the
-    /// association (its state is borrowed); [`Self::with_active`] then calls
-    /// this again.
-    fn end_if_ended(&self) {
-        let Some(status) = self.exit_status.get() else {
-            return;
-        };
-        let Ok(mut state) = self.state.try_borrow_mut() else {
-            return;
-        };
-        // A pending association that never started fails (see
-        // `PendingRunnerAssociation`'s `Drop`).
-        let previous = core::mem::replace(&mut *state, State::Ended);
-        drop(state);
-        if let State::Active(active) = previous {
+    /// Ends the association, and completes the broker process's exit, or fails
+    /// its start if it never started.
+    fn end(mut self, status: ProcessExitStatus) {
+        if let State::Active(active) = core::mem::replace(&mut self.state, State::Ended) {
             end(active.association, &self.readiness);
         }
         if let Some(process) = self.process.get() {
@@ -832,107 +1359,15 @@ impl Association {
             // has none. This kernel does not measure its processes' CPU time.
             let _ = process.complete_exit(status, CpuTime::default());
         }
-        // Releasing the process's objects may have changed the deadlines
-        // (e.g., a closed socket's connection lingers).
-        self.broker.publish_deadline();
     }
+}
 
-    /// Where `wait` stands, after firing due timers and publishing readiness.
-    /// Without a deadline, a wait on a word other than the notification wake
-    /// counter is [`Status::Stalled`] once [`Self::serve`] has nothing left to
-    /// serve.
-    pub fn poll_wait(&self, wait: &Wait) -> WaitState {
-        self.with_active(|active| {
-            self.poll()?;
-            match active.words.load_u32_acquire(wait.offset) {
-                Ok(word) if word != wait.expected => {
-                    if wait.notifications {
-                        // The runner receives them next, so need not also
-                        // be interrupted for them.
-                        self.readiness.take_published();
-                    }
-                    return Ok(WaitState::Ended(Ok(())));
-                }
-                Ok(_) => {}
-                Err(_) => return Err(EnterError::Status(Status::InvalidArgument)),
-            }
-            let now = self.broker.platform.now();
-            if wait.deadline.is_some_and(|deadline| now >= deadline) {
-                return Err(EnterError::Status(Status::TimedOut));
-            }
-            if wait.deadline.is_none() && !wait.notifications && !self.submitted.get() {
-                return Err(EnterError::Status(Status::Stalled));
-            }
-            // Only notifications see timers and output's polls; the network
-            // stack and the vsock sockets run at their deadlines, whatever the
-            // wait.
-            let wake = if wait.notifications {
-                self.next_timer_deadline()
-            } else {
-                self.broker.next_sources_deadline()
-            };
-            let wake = timers::earliest(wait.deadline, wake);
-            Ok(WaitState::Blocked { wake })
-        })
-        .unwrap_or_else(|error| WaitState::Ended(Err(error)))
-    }
-
-    /// For a blocked wait that the caller ends itself (e.g., stalled, or the
-    /// process killed).
-    pub fn abandon_wait(&self) {
-        self.readiness.set_waiting(false);
-    }
-
-    /// Whether a thread of the process blocks in a wait that a notification
-    /// would end (on the notification wake counter, or another the caller ends
-    /// for them, e.g., a futex wait), for a notification to notify every CPU
-    /// ([`cpu::notify_all`], see [`cpu::take_notified`]): poll the waits
-    /// again. The caller's to keep current: before polling waits, since
-    /// polling may publish; ordered before the polls' reads, so that a
-    /// notification another CPU publishes meanwhile is either seen by the
-    /// poll or notified.
-    pub fn set_notification_waiter(&self, waiting: bool) {
-        self.readiness.set_waiting(waiting);
-    }
-
-    /// Runs `f` on the active association, ending it if `f` fails it.
-    /// Then ends it if the process ended meanwhile (see [`Self::exited`]).
-    fn with_active<T>(
-        &self,
-        f: impl FnOnce(&mut Active) -> Result<T, EnterError>,
-    ) -> Result<T, EnterError> {
-        let result = {
-            let mut state = self.state.borrow_mut();
-            let State::Active(active) = &mut *state else {
-                return Err(EnterError::Status(Status::Denied));
-            };
-            let result = f(active);
-            if let Err(EnterError::Failed) = result
-                && let State::Active(active) = core::mem::replace(&mut *state, State::Ended)
-            {
-                end(active.association, &self.readiness);
-            }
-            result
-        };
-        self.end_if_ended();
-        result
-    }
-
-    /// Catches up with what changed outside requests (devices, timers),
-    /// publishing readiness.
-    fn poll(&self) -> Result<(), EnterError> {
-        self.broker.poll_sources();
-        self.flush_readiness()
-    }
-
-    /// Publishes pending readiness; a corrupted notification ring fails the
-    /// association.
-    fn flush_readiness(&self) -> Result<(), EnterError> {
-        self.readiness.flush();
-        if self.readiness.failed() {
-            return Err(EnterError::Failed);
-        }
-        Ok(())
+impl Drop for Side {
+    fn drop(&mut self) {
+        debug_assert!(
+            kthread::in_kthread(),
+            "an association's broker side drops on a broker thread"
+        );
     }
 }
 
@@ -1022,25 +1457,20 @@ fn end(association: BrokerHostAssociation<UserSharedMemory>, readiness: &KernelR
     association.finish();
 }
 
-impl Drop for Association {
-    /// Ends the association if the process's end did not (see
-    /// [`Self::exited`]).
-    fn drop(&mut self) {
-        self.exited(ProcessExitStatus::Unknown);
-    }
-}
-
 /// A child process to start (`StartChild`), for which the kernel creates a
 /// runner process (see [`Association::take_pending_associations`]), or adopts a
 /// process clone as its runner (`StartChildWithExistingRunner`), or a root
-/// (see [`Broker::associate`]). Dropping it before the process's handshake
-/// fails the start.
+/// (see [`BrokerHandle::associate`]). Dropping it before the process's
+/// handshake fails the start (in the kernel, through the request that waits
+/// for it, as failing it is broker work).
 pub struct PendingRunnerAssociation {
     process: Arc<BrokerProcess>,
     /// Until the handshake takes it; a root has none.
     startup: Option<ProcessStartupData>,
     /// See [`Self::clone_to_adopt`].
     clone: Option<u64>,
+    /// The launcher of the request that waits for the start; a root has none.
+    launcher: Weak<KernelProcessLauncher>,
 }
 
 impl PendingRunnerAssociation {
@@ -1052,59 +1482,104 @@ impl PendingRunnerAssociation {
         self.clone
     }
 
-    /// Fails to start the process, e.g., if its runner process cannot be
-    /// created.
-    pub fn fail(self, error: BrokerError) {
-        let _ = self.process.fail_start(error, false, true);
+    /// Fails to start the process with `error`, e.g., if its runner process
+    /// cannot be created.
+    pub fn fail(mut self, error: BrokerError) {
+        if !self.hand_back(error) {
+            let _ = self.process.fail_start(error, false, true);
+        }
+    }
+
+    /// In the kernel, hands the start back to the request that waits for it,
+    /// to fail with `error`: whether it did.
+    fn hand_back(&mut self, error: BrokerError) -> bool {
+        if kthread::in_kthread() {
+            return false;
+        }
+        let launcher = core::mem::take(&mut self.launcher)
+            .upgrade()
+            .expect("the request that started a child waits for its start");
+        let start = Self {
+            process: self.process.clone(),
+            startup: self.startup.take(),
+            clone: self.clone,
+            launcher: Weak::new(),
+        };
+        launcher.failed.lock().push((start, error));
+        launcher.started.wake(1);
+        true
     }
 }
 
 impl Drop for PendingRunnerAssociation {
     /// Retires the process unless it started; `fail_start` keeps an earlier
-    /// failure's error. Either way, its start is over: the worker waiting for
-    /// it, on whichever CPU, looks again (see `KernelProcessLauncher`).
+    /// failure's error. In the kernel, hands it back instead (see
+    /// [`Self::fail`]), unless handed back already.
     fn drop(&mut self) {
-        if !matches!(self.process.startup_result(), Some(Ok(()))) {
+        if self.launcher.strong_count() != 0 && self.hand_back(BrokerError::PeerClosed) {
+            return;
+        }
+        if kthread::in_kthread() && !matches!(self.process.startup_result(), Some(Ok(()))) {
             let _ = self
                 .process
                 .fail_start(BrokerError::PeerClosed, false, true);
             self.process.retire(true);
         }
-        cpu::notify_all();
+        if let Some(launcher) = self.launcher.upgrade() {
+            launcher.started.wake(1);
+        }
     }
 }
 
 /// An association's [`ProcessLauncher`]: queues each child process for the
-/// kernel, and suspends the worker until the child starts or fails.
+/// kernel, and sleeps until the child starts or fails.
 #[derive(Default)]
 struct KernelProcessLauncher {
     /// Kernel-grade: broker work queues, and the kernel takes.
     pending: KernelMutex<Vec<PendingRunnerAssociation>>,
+    /// The starts the kernel handed back, with why.
+    failed: KernelMutex<Vec<(PendingRunnerAssociation, BrokerError)>>,
+    /// The request that waits for a start: one thread serves the process.
+    started: WaitQueue,
 }
 
 impl KernelProcessLauncher {
-    /// Queues `launch`, and suspends the worker until its process started or
-    /// failed, which notifies every CPU (see `PendingRunnerAssociation`'s
-    /// `Drop`): meanwhile, the kernel creates its runner process, or adopts
-    /// the process clone it names as its runner.
-    fn start(&self, launch: PendingRunnerAssociation) -> Result<(), BrokerError> {
+    /// Queues `launch`, and sleeps until its process started or failed, or
+    /// the kernel handed it back, which this fails.
+    fn start(self: &Arc<Self>, mut launch: PendingRunnerAssociation) -> Result<(), BrokerError> {
         let process = launch.process.clone();
+        launch.launcher = Arc::downgrade(self);
         self.pending.lock().push(launch);
         loop {
+            // Before the registration: failing a start is broker work, which
+            // may sleep itself.
+            let failed = core::mem::take(&mut *self.failed.lock());
+            for (launch, error) in failed {
+                launch.fail(error);
+            }
+            let prepared = self.started.prepare();
             if let Some(result) = process.startup_result() {
                 return result;
             }
-            assert!(
-                litebox_platform_vm_kernel::worker::suspend(),
-                "requests are served on the worker"
-            );
+            if self.failed.lock().is_empty() {
+                prepared.sleep(None);
+            }
         }
+    }
+}
+
+impl Drop for KernelProcessLauncher {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.pending.lock().is_empty() && self.failed.lock().is_empty(),
+            "a launcher dropped with starts left"
+        );
     }
 }
 
 impl ProcessLauncher for KernelProcessLauncher {
     /// Never created: the kernel associates clones itself (see [`Self::launch_existing`]).
-    type ChildConnection = core::convert::Infallible;
+    type ChildConnection = Infallible;
 
     fn launch(
         self: Arc<Self>,
@@ -1118,6 +1593,7 @@ impl ProcessLauncher for KernelProcessLauncher {
                 process,
                 startup: Some(startup),
                 clone: None,
+                launcher: Weak::new(),
             }
             .fail(BrokerError::UnsupportedOperation);
             return Err(BrokerError::UnsupportedOperation);
@@ -1126,6 +1602,7 @@ impl ProcessLauncher for KernelProcessLauncher {
             process,
             startup: Some(startup),
             clone: None,
+            launcher: Weak::new(),
         })
     }
 
@@ -1138,13 +1615,14 @@ impl ProcessLauncher for KernelProcessLauncher {
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
         runner_descriptor: Vec<u8>,
-        _connection: Option<core::convert::Infallible>,
+        _connection: Option<Infallible>,
     ) -> Result<(), BrokerError> {
         let clone = litebox_common_vm_abi::decode_clone_descriptor(&runner_descriptor);
         let launch = PendingRunnerAssociation {
             process,
             startup: Some(startup),
             clone,
+            launcher: Weak::new(),
         };
         if clone.is_none() {
             log::warn!("rejected a runner descriptor that names no process clone");

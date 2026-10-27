@@ -55,7 +55,9 @@
 # for the other CPUs running nothing at all). With more than
 # 4, the preempt test is skipped: it checks preemption with 8 CPU-bound
 # programs. With fewer than 2, the smp test is skipped: it checks threads of
-# a program running at once. A test given with -t that would be skipped is
+# a program running at once; and so are share_migrate, which moves a broker
+# thread to another CPU, and bthread_retake, which has another CPU take a
+# broker call on. A test given with -t that would be skipped is
 # an error instead. QEMU_SMP must give the CPU count as QEMU does: cpus= (or
 # a bare count), else maxcpus=, else the product of the topology's counts
 # (e.g., sockets=2,cores=2).
@@ -158,6 +160,8 @@ skip_reason() {
     case $1 in
         preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
+        share_migrate) [[ $smp -ge 2 ]] || echo "needs another CPU to move a broker thread to" ;;
+        bthread_retake) [[ $smp -ge 2 ]] || echo "needs another CPU to take a broker call on" ;;
     esac
     if [[ ! -f "$TESTS_DIR/$1.host.py" ]]; then
         return

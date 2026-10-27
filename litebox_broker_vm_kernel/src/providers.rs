@@ -47,11 +47,10 @@ fn file_service(
     }
     composer = composer.mount("/dev", |allocator| Devices::new(allocator, stdio, random));
     for share in shares {
+        let path = share.path.clone();
         composer = composer
-            .try_mount(&share.path, |allocator| {
-                ShareFs::new(share.transport, allocator)
-            })
-            .unwrap_or_else(|error| panic!("mounting a share at {}: {error}", share.path));
+            .try_mount(&path, |allocator| ShareFs::new(share, allocator))
+            .unwrap_or_else(|error| panic!("mounting a share at {path}: {error}"));
     }
     let devices = composer
         .build()

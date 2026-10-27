@@ -1,0 +1,8 @@
+[
+  {
+    "argv": ["/share_contend"],
+    "gate": "read",
+    "script": ["held", "lock_sleeper", "migrate", "release"],
+    "expect_stdout": "read: ok\n"
+  }
+]

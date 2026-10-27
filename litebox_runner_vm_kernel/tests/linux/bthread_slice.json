@@ -1,0 +1,8 @@
+[
+  {
+    "concurrent": [
+      { "argv": ["/sched", "calls", "40", "60000"], "slow_serves": true },
+      { "argv": ["/sched", "sleep", "1", "200", "5", "5"] }
+    ]
+  }
+]
