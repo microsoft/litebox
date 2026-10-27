@@ -363,7 +363,7 @@ impl TerminalEndpoint for TestTerminal {
         Ok(Ok(match operation {
             TerminalOperation::GetSettings => TerminalResponse::Settings(state.settings),
             TerminalOperation::SetSettings { settings, .. } => {
-                if settings.minimum_read > 1 {
+                if !settings.is_supported() {
                     return Ok(Err(FileError::InvalidTerminalControl));
                 }
                 state.settings = settings;

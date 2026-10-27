@@ -6,8 +6,8 @@ use super::{
     primitive::{Decoder, Encoder},
 };
 use crate::terminal::{
-    ChangeTiming, ControlCharacters, InputFlags, LocalFlags, OutputFlags, TerminalOperation,
-    TerminalResponse, TerminalSettings, WindowSize,
+    ChangeTiming, ControlCharacters, GUEST_ATTRIBUTES_LEN, InputFlags, LocalFlags, OutputFlags,
+    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
 };
 
 fn boolean(decoder: &mut Decoder<'_>) -> Result<bool, WireError> {
@@ -40,6 +40,9 @@ fn encode_settings(e: &mut Encoder, s: TerminalSettings) {
     ] {
         e.u8(byte);
     }
+    for byte in s.guest_attributes {
+        e.u8(byte);
+    }
 }
 
 fn decode_settings(d: &mut Decoder<'_>) -> Result<TerminalSettings, WireError> {
@@ -62,6 +65,13 @@ fn decode_settings(d: &mut Decoder<'_>) -> Result<TerminalSettings, WireError> {
             reprint: d.u8()?,
         },
         minimum_read: d.u8()?,
+        guest_attributes: {
+            let mut attributes = [0; GUEST_ATTRIBUTES_LEN];
+            for byte in &mut attributes {
+                *byte = d.u8()?;
+            }
+            attributes
+        },
     })
 }
 
@@ -177,10 +187,17 @@ mod tests {
 
     #[test]
     fn controls_and_responses_round_trip_and_reject_bad_tags() {
+        let mut guest_attributes = [0; GUEST_ATTRIBUTES_LEN];
+        guest_attributes[0] = 0xa5;
+        guest_attributes[GUEST_ATTRIBUTES_LEN - 1] = 0x5a;
+        let attributed = TerminalSettings {
+            guest_attributes,
+            ..TerminalSettings::default()
+        };
         for operation in [
             TerminalOperation::GetSettings,
             TerminalOperation::SetSettings {
-                settings: TerminalSettings::default(),
+                settings: attributed,
                 timing: ChangeTiming::Now,
             },
             TerminalOperation::SetSettings {
@@ -219,7 +236,7 @@ mod tests {
             }
         }
         for response in [
-            TerminalResponse::Settings(TerminalSettings::default()),
+            TerminalResponse::Settings(attributed),
             TerminalResponse::WindowSize(WindowSize::default()),
             TerminalResponse::Done,
             TerminalResponse::SubsidiaryIndex(0x1234_5678),

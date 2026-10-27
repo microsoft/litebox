@@ -200,10 +200,10 @@ impl TerminalEngine {
 
     /// Changes settings without discarding buffered input.
     ///
-    /// Fails with [`FileError::InvalidTerminalControl`] if the settings need
-    /// more than one byte to satisfy a noncanonical read.
+    /// Fails with [`FileError::InvalidTerminalControl`] if the settings are not
+    /// [supported](TerminalSettings::is_supported).
     pub fn configure(&mut self, settings: TerminalSettings) -> FileResult<()> {
-        if settings.minimum_read > 1 {
+        if !settings.is_supported() {
             return Err(FileError::InvalidTerminalControl);
         }
         let was_canonical = self.settings.local.contains(L::CANONICAL);
@@ -951,6 +951,28 @@ mod tests {
         tty.receive(b"partial");
         tty.flush_input();
         assert_eq!(tty.read_slice(&mut bytes), None);
+    }
+
+    #[test]
+    fn only_noncanonical_reads_limit_the_minimum_and_attributes_are_kept() {
+        let mut tty = TerminalEngine::default();
+        let mut guest_attributes = [0; litebox_broker_protocol::terminal::GUEST_ATTRIBUTES_LEN];
+        guest_attributes[3] = 7;
+        let canonical = TerminalSettings {
+            minimum_read: 5,
+            guest_attributes,
+            ..tty.settings()
+        };
+        tty.configure(canonical).unwrap();
+        assert_eq!(tty.settings(), canonical);
+        assert_eq!(
+            tty.configure(TerminalSettings {
+                local: L::empty(),
+                ..canonical
+            }),
+            Err(FileError::InvalidTerminalControl)
+        );
+        assert_eq!(tty.settings(), canonical);
     }
 
     #[test]

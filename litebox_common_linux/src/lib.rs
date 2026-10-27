@@ -12,7 +12,8 @@ use int_enum::IntEnum;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_broker_protocol::fs::{FileMode, FileNodeInfo, FileStatus, FileType, FileUser};
 use litebox_broker_protocol::terminal::{
-    ControlCharacters, InputFlags, LocalFlags, OutputFlags, TerminalSettings, WindowSize,
+    ControlCharacters, GUEST_ATTRIBUTES_LEN, InputFlags, LocalFlags, OutputFlags, TerminalSettings,
+    WindowSize,
 };
 use syscalls::Sysno;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -833,7 +834,7 @@ type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 type speed_t = ::core::ffi::c_uint;
 #[repr(C)]
-#[derive(Debug, Clone, FromBytes, IntoBytes)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable)]
 pub struct Termios {
     pub c_iflag: tcflag_t,
     pub c_oflag: tcflag_t,
@@ -891,18 +892,108 @@ const TERMIOS_LOCAL: &[(u32, LocalFlags)] = &[
     (0x800, LocalFlags::ECHO_KILL_ERASE),
     (0x8000, LocalFlags::EXTENDED_EDITING),
 ];
-// The virtual endpoint transports eight-bit bytes, not a configurable UART:
-// CS8 | CREAD | B38400. Hardware configuration is deliberately unsupported.
-const TERMIOS_CONTROL: u32 = 0x30 | 0x80 | 0xf;
-// An input speed (CIBAUD) of B38400 equals the default B0, which means the
-// output speed; glibc 2.42 sets it explicitly.
-const TERMIOS_INPUT_SPEED: u32 = 0xf << 16;
-// The speed B38400 selects.
-const TERMIOS_SPEED: speed_t = 38400;
-// IGNBRK | BRKINT | IGNPAR | INPCK | IMAXBEL are accepted but not retained: the
-// virtual endpoint has no breaks or parity errors, and Linux ignores IMAXBEL.
-// POSIX lets `tcsetattr` succeed when only some changes take effect.
-const TERMIOS_INPUT_IGNORED: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x2000;
+// Modes a Linux pseudoterminal stores but never acts on, which the shared
+// terminal therefore keeps as `InertTermios`. Input: IGNBRK | BRKINT | IGNPAR |
+// INPCK only concern breaks and parity errors, which a pseudoterminal never
+// receives; IXOFF | IMAXBEL are ignored.
+const TERMIOS_INPUT_INERT: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x1000 | 0x2000;
+// OFILL | OFDEL and the NL, CR, BS, VT, and FF delays.
+const TERMIOS_OUTPUT_INERT: u32 = 0x40 | 0x80 | 0x100 | 0x600 | 0x2000 | 0x4000 | 0x8000;
+// The tab delay field: TAB3 expands tabs, but TAB1 and TAB2 are inert.
+const TERMIOS_TAB_DELAY: u32 = 0x1800;
+// XCASE | FLUSHO | PENDIN.
+const TERMIOS_LOCAL_INERT: u32 = 0x4 | 0x1000 | 0x4000;
+// VTIME, VSWTC, VSUSP, VDISCARD, and the two unnamed `c_cc` entries. VTIME is
+// inert only for canonical reads; timed noncanonical reads are rejected.
+const TERMIOS_INERT_CHARACTERS: [usize; 6] = [5, 7, 10, 13, 17, 18];
+const VTIME: usize = 5;
+// The output speed field (CBAUD). Its CBAUDEX bit selects the extended speeds,
+// except alone, as BOTHER, which selects `Termios2`'s arbitrary speed. The input
+// speed field (CIBAUD) is the same, shifted; zero there means the output speed.
+const TERMIOS_SPEED_FIELD: u32 = 0x100f;
+const TERMIOS_SPEED_EXTENDED: u32 = 0x1000;
+const TERMIOS_INPUT_SPEED_SHIFT: u32 = 16;
+// Like Linux, a pseudoterminal transports eight-bit bytes without parity: CSIZE
+// and PARENB are replaced with CS8 | CREAD, and ADDRB stays clear.
+const TERMIOS_CONTROL_FORCED: u32 = 0x30 | 0x80;
+const TERMIOS_CONTROL_CLEARED: u32 = 0x30 | 0x100 | 0x2000_0000;
+// The speeds of B0..=B38400 and then, with CBAUDEX (0x1000), B57600..=B4000000.
+const TERMIOS_SPEEDS: [speed_t; 31] = [
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
+    115_200, 230_400, 460_800, 500_000, 576_000, 921_600, 1_000_000, 1_152_000, 1_500_000,
+    2_000_000, 2_500_000, 3_000_000, 3_500_000, 4_000_000,
+];
+
+/// Termios state that a Linux pseudoterminal stores but never acts on, kept in
+/// [`TerminalSettings::guest_attributes`].
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
+struct InertTermios {
+    c_iflag: tcflag_t,
+    c_oflag: tcflag_t,
+    c_cflag: tcflag_t,
+    c_lflag: tcflag_t,
+    /// The `c_cc` entries at [`TERMIOS_INERT_CHARACTERS`].
+    c_cc: [cc_t; TERMIOS_INERT_CHARACTERS.len()],
+    c_line: cc_t,
+    _reserved: [u8; 9],
+}
+
+impl InertTermios {
+    /// A new Linux pseudoterminal's state: B38400 | CS8 | CREAD, VSUSP `^Z`, and
+    /// VDISCARD `^O`.
+    const DEFAULT: Self = Self {
+        c_iflag: 0,
+        c_oflag: 0,
+        c_cflag: 0xf | TERMIOS_CONTROL_FORCED,
+        c_lflag: 0,
+        c_cc: [0, 0, 0x1a, 0x0f, 0, 0],
+        c_line: 0,
+        _reserved: [0; 9],
+    };
+
+    /// Encodes as the difference from [`Self::DEFAULT`], so a new terminal's
+    /// zeroed attributes decode as Linux's defaults.
+    fn encode(&self) -> [u8; GUEST_ATTRIBUTES_LEN] {
+        let mut attributes = [0; GUEST_ATTRIBUTES_LEN];
+        for (attribute, (byte, default)) in attributes
+            .iter_mut()
+            .zip(self.as_bytes().iter().zip(Self::DEFAULT.as_bytes()))
+        {
+            *attribute = byte ^ default;
+        }
+        attributes
+    }
+
+    fn decode(attributes: &[u8; GUEST_ATTRIBUTES_LEN]) -> Self {
+        let mut inert = Self::DEFAULT;
+        for (byte, attribute) in inert.as_mut_bytes().iter_mut().zip(attributes) {
+            *byte ^= attribute;
+        }
+        inert
+    }
+}
+
+const _: () = assert!(size_of::<InertTermios>() == GUEST_ATTRIBUTES_LEN);
+
+/// The speed that a speed-field `code` other than BOTHER selects.
+fn termios_speed(code: u32) -> speed_t {
+    let index = if code & TERMIOS_SPEED_EXTENDED == 0 {
+        code
+    } else {
+        (code & !TERMIOS_SPEED_EXTENDED) + 15
+    };
+    TERMIOS_SPEEDS.get(index as usize).copied().unwrap_or(0)
+}
+
+/// The output and input speeds that `c_cflag` selects.
+fn termios_speeds(c_cflag: tcflag_t) -> (speed_t, speed_t) {
+    let output = termios_speed(c_cflag & TERMIOS_SPEED_FIELD);
+    match (c_cflag >> TERMIOS_INPUT_SPEED_SHIFT) & TERMIOS_SPEED_FIELD {
+        0 => (output, output),
+        input => (output, termios_speed(input)),
+    }
+}
 
 /// Maps termios mode bits through `table`, matching each entry's whole value;
 /// `None` if any bit is left unmatched.
@@ -920,46 +1011,54 @@ fn termios_flags<F: bitflags::Flags + Copy>(bits: u32, table: &[(u32, F)]) -> Op
 
 impl From<TerminalSettings> for Termios {
     fn from(settings: TerminalSettings) -> Self {
+        let inert = InertTermios::decode(&settings.guest_attributes);
         let c = settings.characters;
+        let mut c_cc = [
+            c.interrupt,
+            c.quit,
+            c.erase,
+            c.kill,
+            c.end_of_file,
+            0,
+            settings.minimum_read,
+            0,
+            c.start,
+            c.stop,
+            0,
+            c.end_of_line,
+            c.reprint,
+            0,
+            c.word_erase,
+            c.literal_next,
+            c.end_of_line2,
+            0,
+            0,
+        ];
+        for (index, value) in TERMIOS_INERT_CHARACTERS.into_iter().zip(inert.c_cc) {
+            c_cc[index] = value;
+        }
         Termios {
             c_iflag: TERMIOS_INPUT
                 .iter()
                 .filter(|(_, f)| settings.input.contains(*f))
                 .map(|(b, _)| *b)
-                .sum(),
+                .sum::<u32>()
+                | (inert.c_iflag & TERMIOS_INPUT_INERT),
             c_oflag: TERMIOS_OUTPUT
                 .iter()
                 .filter(|(_, f)| settings.output.contains(*f))
                 .map(|(b, _)| *b)
-                .sum(),
+                .sum::<u32>()
+                | (inert.c_oflag & (TERMIOS_OUTPUT_INERT | TERMIOS_TAB_DELAY)),
             c_lflag: TERMIOS_LOCAL
                 .iter()
                 .filter(|(_, f)| settings.local.contains(*f))
                 .map(|(b, _)| *b)
-                .sum(),
-            c_cflag: TERMIOS_CONTROL,
-            c_line: 0,
-            c_cc: [
-                c.interrupt,
-                c.quit,
-                c.erase,
-                c.kill,
-                c.end_of_file,
-                0,
-                settings.minimum_read,
-                0,
-                c.start,
-                c.stop,
-                0,
-                c.end_of_line,
-                c.reprint,
-                0,
-                c.word_erase,
-                c.literal_next,
-                c.end_of_line2,
-                0,
-                0,
-            ],
+                .sum::<u32>()
+                | (inert.c_lflag & TERMIOS_LOCAL_INERT),
+            c_cflag: inert.c_cflag,
+            c_line: inert.c_line,
+            c_cc,
         }
     }
 }
@@ -967,26 +1066,40 @@ impl From<TerminalSettings> for Termios {
 impl TryFrom<&Termios> for TerminalSettings {
     type Error = errno::Errno;
 
-    /// Fails with `EINVAL` for settings the shared terminal does not support.
+    /// Fails with `EINVAL` for settings that a Linux pseudoterminal acts on but
+    /// the shared terminal does not support.
     fn try_from(termios: &Termios) -> Result<Self, errno::Errno> {
+        let output_inert = if termios.c_oflag & TERMIOS_TAB_DELAY == TERMIOS_TAB_DELAY {
+            TERMIOS_OUTPUT_INERT
+        } else {
+            TERMIOS_OUTPUT_INERT | TERMIOS_TAB_DELAY
+        };
         let (Some(input), Some(output), Some(local)) = (
-            termios_flags(termios.c_iflag & !TERMIOS_INPUT_IGNORED, TERMIOS_INPUT),
-            termios_flags(termios.c_oflag, TERMIOS_OUTPUT),
-            termios_flags(termios.c_lflag, TERMIOS_LOCAL),
+            termios_flags(termios.c_iflag & !TERMIOS_INPUT_INERT, TERMIOS_INPUT),
+            termios_flags(termios.c_oflag & !output_inert, TERMIOS_OUTPUT),
+            termios_flags(termios.c_lflag & !TERMIOS_LOCAL_INERT, TERMIOS_LOCAL),
         ) else {
             return Err(errno::Errno::EINVAL);
         };
-        if termios.c_line != 0
-            || ![TERMIOS_CONTROL, TERMIOS_CONTROL | TERMIOS_INPUT_SPEED].contains(&termios.c_cflag)
-            || [5, 7, 10, 13, 17, 18]
-                .iter()
-                .any(|&index| termios.c_cc[index] != 0)
-            || termios.c_cc[6] > 1
+        let c = termios.c_cc;
+        // Arbitrary speeds are not stored, and timed reads are not emulated.
+        if [0, TERMIOS_INPUT_SPEED_SHIFT]
+            .into_iter()
+            .any(|shift| (termios.c_cflag >> shift) & TERMIOS_SPEED_FIELD == TERMIOS_SPEED_EXTENDED)
+            || (!local.contains(LocalFlags::CANONICAL) && c[VTIME] != 0)
         {
             return Err(errno::Errno::EINVAL);
         }
-        let c = termios.c_cc;
-        Ok(Self {
+        let inert = InertTermios {
+            c_iflag: termios.c_iflag & TERMIOS_INPUT_INERT,
+            c_oflag: termios.c_oflag & output_inert,
+            c_cflag: (termios.c_cflag & !TERMIOS_CONTROL_CLEARED) | TERMIOS_CONTROL_FORCED,
+            c_lflag: termios.c_lflag & TERMIOS_LOCAL_INERT,
+            c_cc: TERMIOS_INERT_CHARACTERS.map(|index| c[index]),
+            c_line: termios.c_line,
+            _reserved: [0; 9],
+        };
+        let settings = Self {
             input,
             output,
             local,
@@ -1005,16 +1118,23 @@ impl TryFrom<&Termios> for TerminalSettings {
                 end_of_line2: c[16],
             },
             minimum_read: c[6],
-        })
+            guest_attributes: inert.encode(),
+        };
+        if !settings.is_supported() {
+            return Err(errno::Errno::EINVAL);
+        }
+        Ok(settings)
     }
 }
 
 impl From<TerminalSettings> for Termios2 {
     fn from(settings: TerminalSettings) -> Self {
+        let termios = Termios::from(settings);
+        let (output, input) = termios_speeds(termios.c_cflag);
         Self {
-            termios: settings.into(),
-            c_ispeed: TERMIOS_SPEED,
-            c_ospeed: TERMIOS_SPEED,
+            termios,
+            c_ispeed: input,
+            c_ospeed: output,
         }
     }
 }
@@ -1056,71 +1176,118 @@ mod termios_tests {
     use super::*;
     use crate::errno::Errno;
 
+    fn round_trip(termios: &Termios) -> Result<Termios, Errno> {
+        TerminalSettings::try_from(termios).map(Termios::from)
+    }
+
     #[test]
-    fn supported_settings_round_trip() {
+    fn new_terminals_report_linux_defaults_and_settings_round_trip() {
         let settings = TerminalSettings::default();
-        assert_eq!(
-            TerminalSettings::try_from(&Termios::from(settings)),
-            Ok(settings)
-        );
-        let mut raw = Termios::from(settings);
+        let termios = Termios::from(settings);
+        assert_eq!(termios.c_cflag, 0xbf); // B38400 | CS8 | CREAD
+        assert_eq!((termios.c_cc[10], termios.c_cc[13]), (0x1a, 0x0f)); // VSUSP, VDISCARD
+        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
+        let mut raw = termios;
         raw.c_iflag = 0;
         raw.c_oflag = 0;
         raw.c_lflag = 0;
-        assert!(TerminalSettings::try_from(&raw).is_ok());
+        assert_eq!(round_trip(&raw).unwrap().as_bytes(), raw.as_bytes());
     }
 
     #[test]
-    fn inert_input_modes_are_accepted_but_not_retained() {
+    fn inert_modes_round_trip_without_changing_behavior() {
         let settings = TerminalSettings::default();
         let mut termios = Termios::from(settings);
-        termios.c_iflag |= TERMIOS_INPUT_IGNORED;
-        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
-        termios.c_iflag |= 0x8; // PARMRK changes how input is delivered.
-        assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
-    }
-
-    #[test]
-    fn unsupported_modes_are_not_silently_accepted() {
-        for (index, value) in [(5, 1), (6, 2), (10, 26), (13, 15)] {
-            let mut settings = Termios::from(TerminalSettings::default());
-            settings.c_cc[index] = value;
-            assert_eq!(TerminalSettings::try_from(&settings), Err(Errno::EINVAL));
+        termios.c_iflag |= TERMIOS_INPUT_INERT;
+        termios.c_oflag |= TERMIOS_OUTPUT_INERT;
+        termios.c_lflag |= TERMIOS_LOCAL_INERT;
+        termios.c_cflag = 0xd | 0x30 | 0x80 | 0x40 | 0x400 | 0x800 | (0xf << 16); // CSTOPB, HUPCL, CLOCAL
+        termios.c_line = 2;
+        for (value, index) in (1..).zip(TERMIOS_INERT_CHARACTERS) {
+            termios.c_cc[index] = value;
         }
-        let mut settings = Termios::from(TerminalSettings::default());
-        settings.c_lflag |= 0x100; // TOSTOP requires job control.
-        assert_eq!(TerminalSettings::try_from(&settings), Err(Errno::EINVAL));
+        let stored = TerminalSettings::try_from(&termios).unwrap();
+        assert_eq!(
+            TerminalSettings {
+                guest_attributes: settings.guest_attributes,
+                ..stored
+            },
+            settings
+        );
+        assert_eq!(Termios::from(stored).as_bytes(), termios.as_bytes());
     }
 
     #[test]
-    fn tab_expansion_round_trips_but_tab_delays_are_rejected() {
+    fn control_modes_are_normalized_like_linux() {
         let mut termios = Termios::from(TerminalSettings::default());
-        termios.c_oflag |= 0x1800; // TAB3
-        let settings = TerminalSettings::try_from(&termios).unwrap();
-        assert!(settings.output.contains(OutputFlags::EXPAND_TABS));
-        assert_eq!(Termios::from(settings).c_oflag, termios.c_oflag);
-        for delay in [0x800, 0x1000] {
-            termios.c_oflag = (termios.c_oflag & !0x1800) | delay;
+        termios.c_cflag = 0xf | 0x20 | 0x100 | 0x200 | 0x2000_0000; // CS7, PARENB, PARODD, ADDRB
+        assert_eq!(
+            round_trip(&termios).unwrap().c_cflag,
+            0xf | 0x30 | 0x80 | 0x200
+        );
+    }
+
+    #[test]
+    fn modes_linux_acts_on_are_rejected_unless_supported() {
+        let default = Termios::from(TerminalSettings::default());
+        for (iflag, oflag, lflag) in [
+            (0x8, 0, 0),       // PARMRK
+            (0x200, 0, 0),     // IUCLC
+            (0x10_0000, 0, 0), // undefined
+            (0, 0x2, 0),       // OLCUC
+            (0, 0, 0x100),     // TOSTOP
+            (0, 0, 0x400),     // ECHOPRT
+            (0, 0, 0x1_0000),  // EXTPROC
+        ] {
+            let mut termios = default.clone();
+            termios.c_iflag |= iflag;
+            termios.c_oflag |= oflag;
+            termios.c_lflag |= lflag;
+            assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
+        }
+        // Canonical reads ignore VTIME and VMIN; noncanonical reads support neither a timeout nor
+        // more than one byte.
+        for (index, value) in [(VTIME, 1), (6, 2)] {
+            let mut termios = default.clone();
+            termios.c_cc[index] = value;
+            assert_eq!(round_trip(&termios).unwrap().as_bytes(), termios.as_bytes());
+            termios.c_lflag &= !0x2;
             assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
         }
     }
 
     #[test]
-    fn termios2_reports_and_accepts_the_fixed_speed() {
+    fn tab_expansion_and_tab_delays_round_trip() {
+        let mut termios = Termios::from(TerminalSettings::default());
+        for (tab_delay, expands) in [(0x800, false), (0x1000, false), (0x1800, true)] {
+            termios.c_oflag = 1 | tab_delay;
+            let settings = TerminalSettings::try_from(&termios).unwrap();
+            assert_eq!(settings.output.contains(OutputFlags::EXPAND_TABS), expands);
+            assert_eq!(Termios::from(settings).c_oflag, termios.c_oflag);
+        }
+    }
+
+    #[test]
+    fn termios2_speeds_follow_the_control_modes() {
         assert_eq!(core::mem::size_of::<Termios2>(), 0x2c);
-        let settings = TerminalSettings::default();
-        let mut termios = Termios2::from(settings);
+        let mut termios = Termios2::from(TerminalSettings::default());
         assert_eq!((termios.c_ispeed, termios.c_ospeed), (38400, 38400));
-        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
-        // glibc 2.42 sets the input speed in `c_cflag` (CIBAUD) to match the output speed.
-        termios.termios.c_cflag |= 0xf << 16;
-        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
-        // Like Linux, `c_cflag` speeds other than BOTHER supersede the explicit ones.
-        termios.c_ispeed = 9600;
-        termios.c_ospeed = 9600;
-        assert_eq!(TerminalSettings::try_from(&termios), Ok(settings));
-        for input_speed in [0xd << 16, 0x1000 << 16] {
-            termios.termios.c_cflag = TERMIOS_CONTROL | input_speed; // B9600, BOTHER
+        // Like Linux, `c_cflag` speeds other than BOTHER supersede the explicit ones, and an input
+        // speed of B0 means the output speed.
+        for (c_cflag_speeds, input, output) in [
+            (0xd, 9600, 9600),                           // B9600
+            (0x1 | (0xf << 16), 38400, 50),              // B50, input B38400
+            (0x1001 | (0x100f << 16), 4_000_000, 57600), // B57600, input B4000000
+        ] {
+            termios.termios.c_cflag = c_cflag_speeds | 0x30 | 0x80;
+            termios.c_ispeed = 1;
+            termios.c_ospeed = 2;
+            let reported = Termios2::from(TerminalSettings::try_from(&termios).unwrap());
+            assert_eq!(reported.termios.c_cflag, termios.termios.c_cflag);
+            assert_eq!((reported.c_ispeed, reported.c_ospeed), (input, output));
+        }
+        for c_cflag_speeds in [0x1000, 0xf | (0x1000 << 16)] {
+            termios.termios.c_cflag = c_cflag_speeds | 0x30 | 0x80; // BOTHER
             assert_eq!(TerminalSettings::try_from(&termios), Err(Errno::EINVAL));
         }
     }

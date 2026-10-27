@@ -463,7 +463,7 @@ impl TerminalEndpoint for HostTerminal {
         let response = match operation {
             TerminalOperation::GetSettings => TerminalResponse::Settings(state.engine.settings()),
             TerminalOperation::SetSettings { settings, timing } => {
-                if settings.minimum_read > 1 {
+                if !settings.is_supported() {
                     return Ok(Err(FileError::InvalidTerminalControl));
                 }
                 if timing == ChangeTiming::AfterOutputAndFlushInput {

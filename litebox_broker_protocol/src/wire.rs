@@ -970,6 +970,13 @@ mod tests {
                 handle,
                 operation: crate::terminal::TerminalOperation::GetSettings,
             })),
+            BrokerOperation::File(FileRequest::TerminalControl(TerminalControlFileRequest {
+                handle,
+                operation: crate::terminal::TerminalOperation::SetSettings {
+                    settings: crate::terminal::TerminalSettings::default(),
+                    timing: crate::terminal::ChangeTiming::Now,
+                },
+            })),
             BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
                 path: sequence(6, 9),
                 user: FileUser { user: 2, group: 3 },
@@ -1816,7 +1823,7 @@ mod tests {
                 Err(WireError::WrongMessagePhase)
             );
         }
-        assert_eq!(maximum_encoded_size, 58);
+        assert_eq!(maximum_encoded_size, 62);
     }
 
     #[test]
