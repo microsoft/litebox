@@ -226,6 +226,10 @@ static int cow(void) {
     memset(buffer, 'a', BUFFER_SIZE);
     char byte = 'x';
     pid_t child = fork_flushed();
+    // Each side closes the ends it does not use, so that its read ends if the
+    // other dies first.
+    close(child == 0 ? to_parent[0] : to_parent[1]);
+    close(child == 0 ? to_child[1] : to_child[0]);
     if (child == 0) {
         int ok = all(buffer, 'a');
         memset(buffer, 'b', BUFFER_SIZE);
@@ -235,7 +239,7 @@ static int cow(void) {
     }
     int ok = child > 0 && read(to_parent[0], &byte, 1) == 1 && all(buffer, 'a');
     memset(buffer, 'c', BUFFER_SIZE);
-    ok &= write(to_child[1], &byte, 1) == 1;
+    ok = ok && write(to_child[1], &byte, 1) == 1;
     int code = child < 0 ? -1 : wait_code(child);
     printf("cow: child %d parent %d\n", code, ok && all(buffer, 'c'));
     return 0;
