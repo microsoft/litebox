@@ -48,8 +48,8 @@ use alloc::vec::Vec;
 use litebox_broker_core::stdio::StdioOutputStream;
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_common_vm_abi::program::{ExitStatus, Program};
+use litebox_platform_vm_kernel::preempt::KernelMutex;
 use serde::Deserialize;
-use spin::Mutex;
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -112,21 +112,22 @@ enum Input {
 }
 
 /// The runs' [`Console`]: serves each run's standard input, and records what
-/// each output stream wrote to `device`.
+/// each output stream wrote to `device`. Its locks are kernel-grade, as the
+/// devices' are (see [`Devices`](crate::devices::Devices)).
 pub struct Stdio {
     device: &'static dyn Console,
     /// The current run's.
-    input: Mutex<Input>,
+    input: KernelMutex<Input>,
     /// Standard output, then standard error.
-    recorded: Mutex<[Recorded; 2]>,
+    recorded: KernelMutex<[Recorded; 2]>,
 }
 
 impl Stdio {
     pub fn new(device: &'static dyn Console) -> Self {
         Self {
             device,
-            input: Mutex::new(Input::Given(VecDeque::new())),
-            recorded: Mutex::new(Default::default()),
+            input: KernelMutex::new(Input::Given(VecDeque::new())),
+            recorded: KernelMutex::new(Default::default()),
         }
     }
 

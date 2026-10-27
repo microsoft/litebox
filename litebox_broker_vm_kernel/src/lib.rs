@@ -88,6 +88,7 @@ use litebox_broker_transport::control_ring::{
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool};
 use litebox_common_vm_abi::{Status, WireFrame};
 use litebox_platform::time::TimeProvider as _;
+use litebox_platform_vm_kernel::preempt::KernelMutex;
 use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel, cpu};
 
 use litebox_broker_core::vsock_socket::transport::{VsockTransport, VsockTransportProvider};
@@ -1045,7 +1046,8 @@ impl Drop for PendingRunnerAssociation {
 /// kernel, and suspends the worker until the child starts or fails.
 #[derive(Default)]
 struct KernelProcessLauncher {
-    pending: spin::Mutex<Vec<PendingRunnerAssociation>>,
+    /// Kernel-grade: broker work queues, and the kernel takes.
+    pending: KernelMutex<Vec<PendingRunnerAssociation>>,
 }
 
 impl KernelProcessLauncher {

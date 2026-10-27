@@ -49,9 +49,9 @@ use litebox_hal::devices::{self as hal, ConsoleDevice, NetworkDevice, NinePDevic
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
+use litebox_platform_vm_kernel::preempt::{KernelMutex, KernelMutexGuard};
 use litebox_platform_vm_kernel::{Handled, Instant, VmKernel};
 use litebox_shim_vm_kernel::ProcessTimer;
-use spin::Mutex;
 
 /// How long a share's server may take to answer a request before the share
 /// fails.
@@ -101,13 +101,15 @@ pub struct Devices {
     platform: &'static VmKernel,
     apic: LocalApic,
     clock: Clock,
-    console: Mutex<ConsoleDevice>,
+    /// The devices' locks are kernel-grade: the broker drives them from code
+    /// that runs with interrupts enabled.
+    console: KernelMutex<ConsoleDevice>,
     /// Whether the console interrupts; else it is polled.
     console_interrupts: bool,
-    network: Option<Mutex<NetworkDevice>>,
+    network: Option<KernelMutex<NetworkDevice>>,
     /// Whether the network device interrupts; else it is polled.
     network_interrupts: bool,
-    vsock: Option<Mutex<VsockDevice>>,
+    vsock: Option<KernelMutex<VsockDevice>>,
     /// Whether the socket device interrupts; else it is polled.
     vsock_interrupts: bool,
     /// Per CPU, what [`ProcessTimer::arm`] last programmed into its timer
@@ -166,12 +168,12 @@ impl Devices {
             clock,
             console_interrupts: console.interrupts(),
             network_interrupts: network.as_ref().is_some_and(NetworkDevice::interrupts),
-            network: network.map(Mutex::new),
+            network: network.map(KernelMutex::new),
             vsock_interrupts: vsock.as_ref().is_some_and(VsockDevice::interrupts),
-            vsock: vsock.map(Mutex::new),
+            vsock: vsock.map(KernelMutex::new),
             armed: [const { AtomicU64::new(ARMED_UNKNOWN) }; MAX_CPUS],
             device_interrupted: AtomicU64::new(0),
-            console: Mutex::new(console),
+            console: KernelMutex::new(console),
         }));
         litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|vector| {
             devices.on_interrupt(vector)
@@ -184,7 +186,7 @@ impl Devices {
         self.network.is_some().then_some(self)
     }
 
-    fn network_device(&self) -> spin::MutexGuard<'_, NetworkDevice> {
+    fn network_device(&self) -> KernelMutexGuard<'_, NetworkDevice> {
         self.network
             .as_ref()
             .expect("the broker has a network only with a device")
@@ -198,7 +200,7 @@ impl Devices {
             .then(|| Arc::new(VmVsock(self)) as Arc<dyn VsockTransport>)
     }
 
-    fn vsock_device(&self) -> spin::MutexGuard<'_, VsockDevice> {
+    fn vsock_device(&self) -> KernelMutexGuard<'_, VsockDevice> {
         self.vsock
             .as_ref()
             .expect("the broker has vsock sockets only with a device")

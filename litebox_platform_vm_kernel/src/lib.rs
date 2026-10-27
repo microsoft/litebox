@@ -90,6 +90,7 @@ pub mod cpu;
 mod dma;
 pub mod mm;
 mod per_cpu;
+pub mod preempt;
 pub mod providers;
 
 mod syscall_entry;
@@ -711,7 +712,7 @@ impl VmKernel {
             .map(|frame| Self::pa_to_va(frame.start_address()).as_u64().trunc())
             .collect();
         Ok(PinnedUserPages {
-            page_table,
+            page_table: core::mem::ManuallyDrop::new(page_table),
             range,
             pages: Pages::Found(pages),
         })
@@ -743,7 +744,7 @@ impl VmKernel {
         // Safety: forwarded to the caller.
         unsafe { page_table.pin_lazily(range) };
         Ok(PinnedUserPages {
-            page_table,
+            page_table: core::mem::ManuallyDrop::new(page_table),
             range,
             pages,
         })
@@ -805,10 +806,13 @@ impl VmKernel {
 /// The process may write these pages at any time: access them only with
 /// peer-safe operations, never through Rust references. Keeps the whole
 /// address space alive, every frame it maps, not only these, until dropped,
-/// even once unregistered.
+/// even once unregistered. Broker work uses and drops them, with interrupts
+/// enabled: what takes the table's locks disables them (see
+/// [`preempt::NoPreempt`]).
 pub struct PinnedUserPages {
-    /// Keeps the table, and every frame it owns, alive.
-    page_table: Arc<mm::PageTable<PAGE_SIZE>>,
+    /// Keeps the table, and every frame it owns, alive; dropped with
+    /// interrupts disabled, as its last reference frees the table.
+    page_table: core::mem::ManuallyDrop<Arc<mm::PageTable<PAGE_SIZE>>>,
     range: PageRange<PAGE_SIZE>,
     pages: Pages,
 }
@@ -880,7 +884,10 @@ impl Pages {
 
 impl Drop for PinnedUserPages {
     fn drop(&mut self) {
+        let _no_preempt = preempt::NoPreempt::new();
         self.page_table.unpin(self.range);
+        // Safety: the field's last use.
+        unsafe { core::mem::ManuallyDrop::drop(&mut self.page_table) };
     }
 }
 
@@ -913,6 +920,7 @@ impl PinnedUserPages {
             let user_page = x86_64::structures::paging::Page::containing_address(VirtAddr::new(
                 (self.range.start() + index * PAGE_SIZE) as u64,
             ));
+            let _no_preempt = preempt::NoPreempt::new();
             // Safety: in `self.range`, pinned lazily until `self` drops.
             let found = unsafe { self.page_table.pinned_frame(user_page) };
             let frame = found.map_err(|error| match error {

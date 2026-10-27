@@ -4,6 +4,10 @@
 //! An association's readiness, published to its (pinned) notification ring
 //! at once, whichever process is current. What a full ring cannot take
 //! stays pending until the next [`KernelReadiness::flush`].
+//!
+//! Kernel-grade: broker work publishes, and the kernel reads and flushes, so
+//! every method that takes a lock (the ring's, or the publisher's) takes it
+//! with interrupts disabled (see [`NoPreempt`]).
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 use litebox_broker_core::readiness::ReadinessSink;
@@ -20,7 +24,7 @@ use litebox_broker_transport::control_ring::{
     ControlRingError, ControlRingProducer, ControlRingWriteStatus,
 };
 use litebox_platform_vm_kernel::cpu;
-use spin::mutex::SpinMutex;
+use litebox_platform_vm_kernel::preempt::{KernelMutex, NoPreempt};
 
 use crate::memory::PinnedControlRing;
 
@@ -29,7 +33,7 @@ type Producer = ControlRingProducer<PinnedControlRing>;
 pub(crate) struct KernelReadiness {
     publisher: ReadinessPublisher,
     /// Until the handshake and after the association ends: `None`.
-    notifications: SpinMutex<Option<Producer>>,
+    notifications: KernelMutex<Option<Producer>>,
     /// The process corrupted its notification ring.
     failed: AtomicBool,
     /// A notification was written since [`Self::take_published`].
@@ -47,7 +51,7 @@ impl KernelReadiness {
     pub(crate) fn new() -> Self {
         Self {
             publisher: ReadinessPublisher::default(),
-            notifications: SpinMutex::new(None),
+            notifications: KernelMutex::new(None),
             failed: AtomicBool::new(false),
             published: AtomicBool::new(false),
             waiting: AtomicBool::new(false),
@@ -95,8 +99,10 @@ impl KernelReadiness {
 
     /// Stops publishing, for good.
     pub(crate) fn close(&self) {
+        let _no_preempt = NoPreempt::new();
         self.publisher.close();
-        *self.notifications.lock() = None;
+        let producer = self.notifications.lock().take();
+        drop(producer);
     }
 
     /// Publishes what is pending, as far as the ring has room.
@@ -192,6 +198,7 @@ impl ReadinessSink for KernelReadiness {
     }
 
     fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+        let _no_preempt = NoPreempt::new();
         self.publisher
             .publish(handle, readiness)
             .map_err(|_| BrokerError::ResourceExhausted)?;
@@ -203,6 +210,7 @@ impl ReadinessSink for KernelReadiness {
         if self.skips(readiness, crate::serving::publishing_console) {
             return Ok(());
         }
+        let _no_preempt = NoPreempt::new();
         self.publisher
             .republish(handle, readiness)
             .map_err(|_| BrokerError::ResourceExhausted)?;
@@ -211,6 +219,7 @@ impl ReadinessSink for KernelReadiness {
     }
 
     fn retire(&self, handle: ObjectHandle) {
+        let _no_preempt = NoPreempt::new();
         self.publisher.retire(handle);
     }
 }
