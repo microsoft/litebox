@@ -259,7 +259,7 @@ impl PseudoTerminal {
         let response = match operation {
             TerminalOperation::GetSettings => TerminalResponse::Settings(state.engine.settings()),
             TerminalOperation::SetSettings { settings, timing } => {
-                if settings.minimum_read > 1 {
+                if !settings.is_supported() {
                     return Err(FileError::InvalidTerminalControl);
                 }
                 // The manager reads output directly, so none waits to drain.

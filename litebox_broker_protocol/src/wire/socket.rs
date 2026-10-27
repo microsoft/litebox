@@ -585,17 +585,12 @@ fn decode_socket_error(decoder: &mut Decoder<'_>) -> Result<SocketError, WireErr
 }
 
 fn encode_address(encoder: &mut Encoder, address: SocketAddrV4) {
-    for octet in address.ip().octets() {
-        encoder.u8(octet);
-    }
+    encoder.bytes(&address.ip().octets());
     encoder.u16(address.port());
 }
 
 fn decode_address(decoder: &mut Decoder<'_>) -> Result<SocketAddrV4, WireError> {
-    let mut octets = [0; 4];
-    for octet in &mut octets {
-        *octet = decoder.u8()?;
-    }
+    let octets: [u8; 4] = decoder.bytes()?;
     Ok(SocketAddrV4::new(Ipv4Addr::from(octets), decoder.u16()?))
 }
 

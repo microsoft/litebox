@@ -233,28 +233,66 @@ int main(int argc, char **argv) {
     assert(resizes == 2);
     assert(ioctl(2, TIOCGWINSZ, &size) == 0 && size.ws_row == 42 && size.ws_col == 110);
 
+    // Like a Linux pseudoterminal, canonical reads ignore VTIME and VMIN, but
+    // noncanonical reads here support neither a timeout nor more than one byte.
     attributes = original;
     attributes.c_cc[VTIME] = 1;
+    attributes.c_cc[VMIN] = 2;
+    assert(tcsetattr(0, TCSANOW, &attributes) == 0);
+    attributes.c_lflag &= ~ICANON;
+    attributes.c_cc[VMIN] = 1;
     assert(tcsetattr(0, TCSANOW, &attributes) == -1 && errno == EINVAL);
-    attributes = original;
+    attributes.c_cc[VTIME] = 0;
     attributes.c_cc[VMIN] = 2;
     assert(tcsetattr(0, TCSANOW, &attributes) == -1 && errno == EINVAL);
-    assert(tcgetattr(0, &attributes) == 0 && attributes.c_cc[VTIME] == 0 && attributes.c_cc[VMIN] == 1);
+    assert(tcgetattr(0, &attributes) == 0 && (attributes.c_lflag & ICANON));
+    assert(attributes.c_cc[VTIME] == 1 && attributes.c_cc[VMIN] == 2);
+    assert(tcsetattr(0, TCSANOW, &original) == 0);
+
+    // Like a Linux pseudoterminal, the terminal reports and keeps settings it
+    // never acts on, such as the line speed, parity checks, and delays.
+    assert(original.c_cc[VSUSP] == 032 && original.c_cc[VDISCARD] == 017);
+    assert(cfgetospeed(&original) == B38400 && (original.c_cflag & CSIZE) == CS8);
+    attributes = original;
+    attributes.c_iflag |= BRKINT | IGNPAR;
+    attributes.c_oflag |= NL1 | TAB1;
+    attributes.c_cflag |= CLOCAL;
+    attributes.c_lflag |= FLUSHO;
+    attributes.c_cc[VSUSP] = 0;
+    attributes.c_cc[VDISCARD] = 0;
+    assert(cfsetspeed(&attributes, B9600) == 0);
+    assert(tcsetattr(1, TCSANOW, &attributes) == 0);
+    struct termios reported;
+    assert(tcgetattr(0, &reported) == 0);
+    assert(reported.c_iflag == attributes.c_iflag && reported.c_oflag == attributes.c_oflag);
+    assert(reported.c_lflag == attributes.c_lflag);
+    assert((reported.c_cflag & ~(CBAUD | CIBAUD)) == (attributes.c_cflag & ~(CBAUD | CIBAUD)));
+    assert(cfgetospeed(&reported) == B9600 && cfgetispeed(&reported) == B9600);
+    assert(memcmp(reported.c_cc, attributes.c_cc, NCCS) == 0);
+    // Settings Linux acts on but the terminal does not support are rejected.
+    attributes = original;
+    attributes.c_iflag |= PARMRK;
+    assert(tcsetattr(0, TCSANOW, &attributes) == -1 && errno == EINVAL);
+    assert(tcsetattr(0, TCSANOW, &original) == 0);
 
     // Like glibc 2.42, use termios2 and set the input speed explicitly.
     struct kernel_termios2 attributes2;
     assert(ioctl(0, GET_TERMIOS2, &attributes2) == 0);
     assert(attributes2.c_ispeed == 38400 && attributes2.c_ospeed == 38400);
     assert(attributes2.c_iflag == original.c_iflag && attributes2.c_oflag == original.c_oflag);
-    // glibc 2.42's tcgetattr fills in the input speed (CIBAUD), which the terminal reports as 0.
+    // glibc 2.42's tcgetattr rewrites the input speed field (CIBAUD), so skip it.
     assert((attributes2.c_cflag & ~CIBAUD) == (original.c_cflag & ~CIBAUD));
     assert(attributes2.c_lflag == original.c_lflag);
     assert(memcmp(attributes2.c_cc, original.c_cc, sizeof(attributes2.c_cc)) == 0);
     // Copy the output speed's kernel code to CIBAUD; glibc 2.42 redefines B38400 as the plain rate.
     attributes2.c_cflag |= (attributes2.c_cflag & CBAUD) << 16;
     attributes2.c_lflag &= ~ECHO;
+    // Like Linux, a pseudoterminal transports eight-bit bytes without parity.
+    // (glibc's tcsetattr would report that change as EINVAL.)
+    attributes2.c_cflag = (attributes2.c_cflag & ~CSIZE) | CS7 | PARENB;
     assert(ioctl(1, SET_TERMIOS2_DRAIN, &attributes2) == 0);
     assert(tcgetattr(0, &attributes) == 0 && !(attributes.c_lflag & ECHO));
+    assert((attributes.c_cflag & (CSIZE | PARENB)) == CS8);
     assert(tcsetattr(0, TCSANOW, &original) == 0);
     // Like a Linux pseudoterminal, the terminal rejects requests it does not know with ENOTTY.
     assert(ioctl(1, TIOCGSERIAL, NULL) == -1 && errno == ENOTTY);

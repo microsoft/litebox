@@ -76,12 +76,14 @@ pub struct ControlCharacters {
     pub reprint: u8,
 }
 
+/// Size of [`TerminalSettings::guest_attributes`].
+pub const GUEST_ATTRIBUTES_LEN: usize = 32;
+
 /// Settings shared by every descriptor referring to one terminal.
 ///
-/// This initial interface supports canonical reads and immediate or one-byte
-/// noncanonical reads. Timed reads and serial-port configuration are not
-/// emulated; shims must reject those requests rather than silently accepting
-/// them.
+/// This interface supports canonical reads and immediate or one-byte
+/// noncanonical reads. Timed reads are not emulated; shims must reject
+/// requests that need them rather than silently accepting them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSettings {
     /// Incoming byte transformations and flow control.
@@ -92,8 +94,22 @@ pub struct TerminalSettings {
     pub local: LocalFlags,
     /// Named control characters, independent of guest array indices.
     pub characters: ControlCharacters,
-    /// Zero permits an empty noncanonical read; one waits for input.
+    /// Bytes a noncanonical read waits for: zero permits an empty read and one
+    /// waits for input. Canonical reads ignore it.
     pub minimum_read: u8,
+    /// Guest-defined state that the terminal stores and reports but never
+    /// interprets, such as settings with no effect on a virtual terminal. A new
+    /// terminal starts with zeros, so shims encode it relative to their defaults.
+    pub guest_attributes: [u8; GUEST_ATTRIBUTES_LEN],
+}
+
+impl TerminalSettings {
+    /// Whether a terminal can honor these settings: noncanonical reads wait for
+    /// at most one byte.
+    #[must_use]
+    pub fn is_supported(&self) -> bool {
+        self.local.contains(LocalFlags::CANONICAL) || self.minimum_read <= 1
+    }
 }
 
 impl Default for TerminalSettings {
@@ -126,6 +142,7 @@ impl Default for TerminalSettings {
                 reprint: 18,
             },
             minimum_read: 1,
+            guest_attributes: [0; GUEST_ATTRIBUTES_LEN],
         }
     }
 }

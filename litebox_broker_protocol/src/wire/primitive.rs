@@ -38,6 +38,10 @@ impl Encoder {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
+    pub(super) fn bytes(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
     pub(super) fn protocol_version(&mut self, version: ProtocolVersion) {
         self.u16(version.0);
     }
@@ -114,6 +118,12 @@ impl<'a> Decoder<'a> {
         Ok(u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
+    }
+
+    pub(super) fn bytes<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
+        let mut bytes = [0; N];
+        bytes.copy_from_slice(self.take(N)?);
+        Ok(bytes)
     }
 
     pub(super) fn protocol_version(&mut self) -> Result<ProtocolVersion, WireError> {

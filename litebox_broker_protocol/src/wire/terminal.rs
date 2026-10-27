@@ -40,6 +40,7 @@ fn encode_settings(e: &mut Encoder, s: TerminalSettings) {
     ] {
         e.u8(byte);
     }
+    e.bytes(&s.guest_attributes);
 }
 
 fn decode_settings(d: &mut Decoder<'_>) -> Result<TerminalSettings, WireError> {
@@ -62,6 +63,7 @@ fn decode_settings(d: &mut Decoder<'_>) -> Result<TerminalSettings, WireError> {
             reprint: d.u8()?,
         },
         minimum_read: d.u8()?,
+        guest_attributes: d.bytes()?,
     })
 }
 
@@ -174,13 +176,21 @@ pub(super) fn decode_response(d: &mut Decoder<'_>) -> Result<TerminalResponse, W
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::GUEST_ATTRIBUTES_LEN;
 
     #[test]
     fn controls_and_responses_round_trip_and_reject_bad_tags() {
+        let mut guest_attributes = [0; GUEST_ATTRIBUTES_LEN];
+        guest_attributes[0] = 0xa5;
+        guest_attributes[GUEST_ATTRIBUTES_LEN - 1] = 0x5a;
+        let attributed = TerminalSettings {
+            guest_attributes,
+            ..TerminalSettings::default()
+        };
         for operation in [
             TerminalOperation::GetSettings,
             TerminalOperation::SetSettings {
-                settings: TerminalSettings::default(),
+                settings: attributed,
                 timing: ChangeTiming::Now,
             },
             TerminalOperation::SetSettings {
@@ -219,7 +229,7 @@ mod tests {
             }
         }
         for response in [
-            TerminalResponse::Settings(TerminalSettings::default()),
+            TerminalResponse::Settings(attributed),
             TerminalResponse::WindowSize(WindowSize::default()),
             TerminalResponse::Done,
             TerminalResponse::SubsidiaryIndex(0x1234_5678),
