@@ -137,8 +137,6 @@ pub enum SpawnError {
     Map(Status),
     #[error("pinning the broker's memory failed: {0:?}")]
     Pin(litebox_common_linux::errno::Errno),
-    #[error("creating the broker process failed: {0:?}")]
-    Broker(BrokerError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -581,9 +579,7 @@ impl Inner {
         lazy(layout::HEAP)?;
         let (shared_memory, control_ring) =
             pin_broker_memory(platform, address_space, &mappings, Placement::NoReplace)?;
-        let broker = broker
-            .associate(shared_memory, control_ring, launch)
-            .map_err(SpawnError::Broker)?;
+        let broker = broker.associate(shared_memory, control_ring, launch);
         let images = map_images(&mappings, config.images)?;
 
         let info = StartupInfo {

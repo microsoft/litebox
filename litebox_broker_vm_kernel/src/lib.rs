@@ -47,7 +47,9 @@
 //! root) is init's child and leads its own session and process group. As on
 //! Linux, init adopts orphans; like `tini`, it reaps its children as they
 //! exit, keeping no exit statuses. Without child processes, there is no init,
-//! and a root has no parent, as in the userland broker.
+//! and a root has no parent, as in the userland broker. Either way, a root's
+//! handshake creates its broker process, and a root whose broker process cannot
+//! be created (e.g., too many processes) gets an error response.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -240,13 +242,8 @@ impl Broker {
     /// `shared_memory` (see [`SHARED_MEMORY_SIZE`]), which may be pinned
     /// lazily; the control ring is at the start of `control_ring_pages`. With
     /// `launch`, the process is a launched one, and its handshake attaches it
-    /// to `launch`'s broker process. Otherwise, it is a root, whose broker
-    /// process is created here (see the [crate] docs).
-    ///
-    /// # Errors
-    ///
-    /// If the root's broker process cannot be created (e.g., too many
-    /// processes).
+    /// to `launch`'s broker process. Otherwise, it is a root, whose handshake
+    /// creates its broker process (see the [crate] docs).
     ///
     /// # Panics
     ///
@@ -256,21 +253,14 @@ impl Broker {
         shared_memory: PinnedUserPages,
         control_ring_pages: PinnedUserPages,
         launch: Option<PendingRunnerAssociation>,
-    ) -> Result<Association, BrokerError> {
+    ) -> Association {
         let launched = launch.is_some();
-        let launch = match launch {
-            Some(launch) => launch,
-            None => PendingRunnerAssociation {
-                process: self.create_root()?,
-                startup: None,
-                clone: None,
-            },
-        };
-        Ok(self.association(shared_memory, control_ring_pages, launched, Some(launch)))
+        self.association(shared_memory, control_ring_pages, launched, launch)
     }
 
-    /// Creates a new root's broker process. With the virtual init, the root is
-    /// init's child and leads a new session; otherwise, it has no parent.
+    /// Creates a new root's broker process, at its handshake. With the virtual
+    /// init, the root is init's child and leads a new session; otherwise, it
+    /// has no parent.
     fn create_root(&self) -> Result<Arc<BrokerProcess>, BrokerError> {
         let Some(init) = &self.init else {
             return self.core.create_process(
@@ -402,7 +392,8 @@ impl HostSetupChannel for KernelHostSetup {
 enum State {
     /// Before the handshake, with the ring and shared buffers it would
     /// activate, and the pending association, if the broker process already
-    /// exists (see [`Broker::associate`]).
+    /// exists (see [`Broker::associate`]): a launched process's, or none for a
+    /// root, or for a process clone until adopted.
     New(
         ControlRing<PinnedControlRing>,
         UserSharedMemory,
@@ -433,9 +424,10 @@ pub struct Association {
     readiness: Arc<KernelReadiness>,
     /// See [`Broker::associate`].
     launched: bool,
-    /// The broker process: set from the start, except in a process clone's
-    /// association, which [`Self::adopt`] gives one. The process's end
-    /// completes its exit.
+    /// The broker process: a launched process's from the start, a root's once
+    /// its handshake creates it (see [`Broker::associate`]), and a process
+    /// clone's once [`Self::adopt`] gives it one. The process's end completes
+    /// its exit.
     process: OnceCell<Arc<BrokerProcess>>,
     /// Once the process ended (see [`Self::exited`]); the association ends
     /// as soon as the worker is not using it.
@@ -586,9 +578,10 @@ impl Association {
         request: Result<BrokerHandshakeRequest, Status>,
     ) -> Result<WireFrame, Status> {
         let mut state = self.state.borrow_mut();
-        let (ring, shared_memory, mut launch) = match core::mem::replace(&mut *state, State::Ended)
-        {
-            State::New(ring, shared_memory, Some(launch)) => (ring, shared_memory, launch),
+        let (ring, shared_memory, launch) = match core::mem::replace(&mut *state, State::Ended) {
+            State::New(ring, shared_memory, launch) if launch.is_some() || !self.launched => {
+                (ring, shared_memory, launch)
+            }
             // Left as it was (e.g., active, on a repeated handshake, or a
             // process clone's that no start adopted).
             other => {
@@ -596,10 +589,28 @@ impl Association {
                 return Err(Status::Denied);
             }
         };
+        let request = request?;
+        let mut launch = match launch {
+            Some(launch) => launch,
+            // A root's.
+            None => match self.broker.create_root() {
+                Ok(process) => {
+                    let _ = self.process.set(process.clone());
+                    PendingRunnerAssociation {
+                        process,
+                        startup: None,
+                        clone: None,
+                    }
+                }
+                Err(error) => {
+                    let response = BrokerHandshakeResponse::Error(error.into());
+                    return frame(&wire::encode_handshake_response(response));
+                }
+            },
+        };
         let startup = launch.startup.take();
         // `launch` lives until the end, so a failed handshake fails the start
         // (see `PendingRunnerAssociation`'s `Drop`).
-        let request = request?;
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
             .map_err(|_| Status::Unsupported)?;
         let mut setup = KernelHostSetup {
