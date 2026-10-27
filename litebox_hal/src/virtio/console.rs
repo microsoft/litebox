@@ -32,7 +32,11 @@ const TRANSMIT_QUEUE: u16 = 1;
 
 const RECEIVE_BUFFERS: u16 = 16;
 const RECEIVE_BUFFER_SIZE: usize = 256;
-const TRANSMIT_BUFFERS: u16 = 32;
+/// As many as QEMU's virtio-serial queues hold. `PciTransport::setup_queue`
+/// and `Buffers::new` cap them at the device's queue size, so
+/// [`TRANSMIT_CAPACITY`] is an upper bound. They set how much output a broker
+/// call can hand the device at once.
+const TRANSMIT_BUFFERS: u16 = 128;
 const TRANSMIT_BUFFER_SIZE: usize = 512;
 
 /// The most output the device holds at once, so the most one
