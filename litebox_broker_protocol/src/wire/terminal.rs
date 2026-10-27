@@ -6,8 +6,8 @@ use super::{
     primitive::{Decoder, Encoder},
 };
 use crate::terminal::{
-    ChangeTiming, ControlCharacters, GUEST_ATTRIBUTES_LEN, InputFlags, LocalFlags, OutputFlags,
-    TerminalOperation, TerminalResponse, TerminalSettings, WindowSize,
+    ChangeTiming, ControlCharacters, InputFlags, LocalFlags, OutputFlags, TerminalOperation,
+    TerminalResponse, TerminalSettings, WindowSize,
 };
 
 fn boolean(decoder: &mut Decoder<'_>) -> Result<bool, WireError> {
@@ -40,9 +40,7 @@ fn encode_settings(e: &mut Encoder, s: TerminalSettings) {
     ] {
         e.u8(byte);
     }
-    for byte in s.guest_attributes {
-        e.u8(byte);
-    }
+    e.bytes(&s.guest_attributes);
 }
 
 fn decode_settings(d: &mut Decoder<'_>) -> Result<TerminalSettings, WireError> {
@@ -65,13 +63,7 @@ fn decode_settings(d: &mut Decoder<'_>) -> Result<TerminalSettings, WireError> {
             reprint: d.u8()?,
         },
         minimum_read: d.u8()?,
-        guest_attributes: {
-            let mut attributes = [0; GUEST_ATTRIBUTES_LEN];
-            for byte in &mut attributes {
-                *byte = d.u8()?;
-            }
-            attributes
-        },
+        guest_attributes: d.bytes()?,
     })
 }
 
@@ -184,6 +176,7 @@ pub(super) fn decode_response(d: &mut Decoder<'_>) -> Result<TerminalResponse, W
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::GUEST_ATTRIBUTES_LEN;
 
     #[test]
     fn controls_and_responses_round_trip_and_reject_bad_tags() {
