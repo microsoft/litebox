@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# Local call-lane pool.
+# Local call-lane pool and active control-ring associations.
 std = []
 
 [dependencies]

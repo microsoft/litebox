@@ -11,83 +11,111 @@ pub use crate::local::{
     WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
 };
 
-use std::io::{Error, Result as IoResult};
-use std::sync::{Arc, Mutex};
+use std::io::{Error, ErrorKind, Result as IoResult};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
+
+use litebox_broker_transport::ring_association::AssociationStream;
 use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
 use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
 
 use crate::named_pipe::WindowsNamedPipeStream;
-use crate::setup::OwnedEvent;
+use crate::setup::{OwnedEvent, invalid_data};
 
-pub(crate) struct PipeLiveness {
+/// The setup pipe of a negotiated association, which activation retains for
+/// liveness and teardown.
+pub(crate) struct PipeAssociationStream {
+    /// Whether this end is the pipe server, which disconnects the pipe instance
+    /// on shutdown so the client observes it.
     server: bool,
+    setup_deadline: Option<Instant>,
+    /// Signaled on shutdown to cancel the liveness read.
     shutdown_event: OwnedEvent,
-    state: Mutex<PipeLivenessState>,
+    /// The pipe, or `None` once the association ended, so its handle closes
+    /// promptly.
+    stream: Mutex<Option<Arc<WindowsNamedPipeStream>>>,
 }
 
-struct PipeLivenessState {
-    stream: Option<Arc<WindowsNamedPipeStream>>,
-    shutdown: bool,
-}
-
-impl PipeLiveness {
-    pub(crate) fn new(stream: Arc<WindowsNamedPipeStream>, server: bool) -> IoResult<Self> {
+impl PipeAssociationStream {
+    /// Wraps `stream`, bounding the remaining setup I/O by `setup_deadline`.
+    pub(crate) fn new(
+        stream: WindowsNamedPipeStream,
+        server: bool,
+        setup_deadline: Option<Instant>,
+    ) -> IoResult<Self> {
         Ok(Self {
             server,
+            setup_deadline,
             shutdown_event: OwnedEvent::manual_reset()?,
-            state: Mutex::new(PipeLivenessState {
-                stream: Some(stream),
-                shutdown: false,
-            }),
+            stream: Mutex::new(Some(Arc::new(stream))),
         })
     }
 
-    pub(crate) fn shutdown(&self) -> IoResult<()> {
-        let stream = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| Error::other("broker pipe liveness mutex poisoned"))?;
-            if state.shutdown {
-                return Ok(());
-            }
-            state.shutdown = true;
-            state.stream.take()
-        };
-
-        let mut first_error = self.shutdown_event.set().err();
-        if self.server
-            && let Some(stream) = &stream
-        {
-            // SAFETY: This is a duplicated server handle for the active named-pipe instance.
-            if unsafe { DisconnectNamedPipe(file_handle(stream)) } == 0 {
-                let error = Error::last_os_error();
-                if error.raw_os_error() != Some(ERROR_PIPE_NOT_CONNECTED.cast_signed())
-                    && first_error.is_none()
-                {
-                    first_error = Some(error);
-                }
-            }
-        }
-        drop(stream);
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+    /// Returns the pipe for setup I/O.
+    fn setup_stream(&mut self) -> IoResult<&WindowsNamedPipeStream> {
+        self.stream
+            .get_mut()
+            .expect("broker association pipe mutex poisoned")
+            .as_deref()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotConnected,
+                    "broker association pipe was shut down",
+                )
+            })
     }
 
-    pub(crate) fn peer_closed(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.shutdown = true;
-            state.stream.take();
-        }
-    }
-
-    pub(crate) fn shutdown_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
-        self.shutdown_event.handle()
+    fn stream(&self) -> MutexGuard<'_, Option<Arc<WindowsNamedPipeStream>>> {
+        self.stream
+            .lock()
+            .expect("broker association pipe mutex poisoned")
     }
 }
 
-fn file_handle(stream: &WindowsNamedPipeStream) -> windows_sys::Win32::Foundation::HANDLE {
-    stream.handle()
+impl AssociationStream for PipeAssociationStream {
+    fn read_frame(&mut self) -> IoResult<Option<Vec<u8>>> {
+        let deadline = self.setup_deadline;
+        self.setup_stream()?.read_frame(deadline)
+    }
+
+    fn write_frame(&mut self, frame: &[u8]) -> IoResult<()> {
+        let deadline = self.setup_deadline;
+        self.setup_stream()?.write_frame(frame, deadline)
+    }
+
+    fn wait_for_close(&self) -> IoResult<()> {
+        let Some(stream) = self.stream().clone() else {
+            return Ok(());
+        };
+        let mut byte = [0];
+        match stream.read_until_cancelled(&mut byte, &self.shutdown_event) {
+            Ok(0) => {
+                // The peer closed the pipe, so shutdown needs no disconnect.
+                self.stream().take();
+                Ok(())
+            }
+            Ok(_) => Err(invalid_data(
+                "peer sent unexpected active control-pipe data",
+            )),
+            Err(error) if error.kind() == ErrorKind::ConnectionAborted => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn shutdown(&self) -> IoResult<()> {
+        let Some(stream) = self.stream().take() else {
+            return Ok(());
+        };
+        let mut first_error = self.shutdown_event.set().err();
+        // SAFETY: This is the server handle of the active named-pipe instance.
+        if self.server && unsafe { DisconnectNamedPipe(stream.handle()) } == 0 {
+            let error = Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_PIPE_NOT_CONNECTED.cast_signed())
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
 }

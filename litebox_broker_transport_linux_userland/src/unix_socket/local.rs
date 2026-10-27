@@ -4,15 +4,16 @@
 //! Local (guest-side) endpoints of a Unix-domain-socket broker association.
 //!
 //! The matching host endpoints live in the sibling `host` module, and both
-//! sides share the crate-private `setup` framing. Portable broker interfaces
-//! live in the no_std protocol, transport, local, core, and host crates.
+//! sides share the crate-private `setup` framing. Once negotiated, the
+//! association runs on the shared [`ring_association`] endpoints over a memfd
+//! control ring. Portable broker interfaces live in the no_std protocol,
+//! transport, local, core, and host crates.
 
-use std::io::{Error, ErrorKind, Read, Result as IoResult};
+use std::io::{Error, ErrorKind, Result as IoResult};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,28 +23,18 @@ use rustix::net::{
     AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with, sockopt,
 };
 
-use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-    BrokerResponse,
-};
-use litebox_broker_protocol::wire::{
-    decode_handshake_response, decode_notification, decode_response, encode_handshake_request,
-    encode_request,
-};
-use litebox_broker_transport::call_lane_pool::{LaneClaim, LocalCallLanePool};
-use litebox_broker_transport::channel::{
-    LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
-};
-use litebox_broker_transport::control_ring::{
-    ControlRing, ControlRingConsumer, ControlRingLayout, ControlRingReadError,
-    ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
-    LocalControlRingEndpoints, LocalControlRingLane, LocalLaneDemand,
+use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
+use litebox_broker_protocol::wire::{decode_handshake_response, encode_handshake_request};
+use litebox_broker_transport::channel::LocalSetupChannel;
+use litebox_broker_transport::control_ring::{ControlRing, ControlRingLayout};
+use litebox_broker_transport::ring_association::{
+    self, ControlRingLocalCallChannel, ControlRingLocalNotificationChannel,
+    ControlRingLocalShutdown,
 };
 
 use crate::memfd::MemfdSharedMemory;
 use crate::setup::{
-    copy_io_error, invalid_data, read_setup_frame, ring_error, shutdown_socket, wire_error,
-    write_setup_frame,
+    UnixAssociationStream, invalid_data, read_setup_frame, wire_error, write_setup_frame,
 };
 use crate::unix_io::io_timeout_for_deadline;
 
@@ -56,38 +47,18 @@ pub struct UnixStreamLocalSetupChannel {
     negotiated: bool,
 }
 
-/// Call-issuing endpoint of an active local control-ring association.
-pub struct UnixControlRingLocalCallChannel {
-    association: Arc<LocalRingAssociation>,
-}
+/// Call-issuing endpoint of an active local Unix-socket association.
+pub type UnixControlRingLocalCallChannel = ControlRingLocalCallChannel<MemfdSharedMemory>;
+
+/// Local notification receiver of an active Unix-socket association.
+pub type UnixControlRingLocalNotificationChannel =
+    ControlRingLocalNotificationChannel<MemfdSharedMemory>;
 
 /// Independently owned handle for interrupting all local active-ring I/O.
 pub struct UnixControlRingLocalShutdown {
-    association: Arc<LocalRingAssociation>,
-}
-
-type LocalLane = LocalControlRingLane<MemfdSharedMemory>;
-
-/// State shared by every activated local endpoint of one association: the
-/// call lanes and their demand, the setup socket used for liveness and
-/// teardown, and the wake handles of every ring wait.
-struct LocalRingAssociation {
-    /// The call lanes, which also record the failure that ended the
-    /// association.
-    lanes: LocalCallLanePool<LocalLane>,
-    lane_demand: LocalLaneDemand<MemfdSharedMemory>,
-    control_stream: UnixStream,
-    /// Whether the call channel was dropped, which ends the association as a
-    /// local close rather than a failure.
-    closed: AtomicBool,
-    on_failure: Arc<dyn Fn() + Send + Sync>,
-    wakes: Vec<ControlRingWakeHandle<MemfdSharedMemory>>,
-}
-
-/// Local notification receiver for a shared-ring Unix broker association.
-pub struct UnixControlRingLocalNotificationChannel {
-    consumer: ControlRingConsumer<MemfdSharedMemory>,
-    association: Arc<LocalRingAssociation>,
+    shutdown: ControlRingLocalShutdown<MemfdSharedMemory>,
+    /// The socket descriptor that shutting down the association shuts down.
+    stream: Arc<UnixStream>,
 }
 
 impl UnixStreamLocalSetupChannel {
@@ -176,64 +147,17 @@ impl UnixStreamLocalSetupChannel {
                 "broker local setup channel activated before negotiation completed",
             ));
         }
-
-        let ready_token = ring.layout().ready_token();
-        let endpoints = ring.into_local();
-        let wakes = endpoints.wake_handles();
-        let LocalControlRingEndpoints {
-            lanes,
-            lane_demand: Some(lane_demand),
-            notification_consumer,
-        } = endpoints
-        else {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "broker control-ring layout has a single lane",
-            ));
-        };
-        let mut setup_stream = self.stream;
-        write_setup_frame(&mut setup_stream, ready_token, self.setup_deadline)?;
-        let Some(ready) = read_setup_frame(&mut setup_stream, self.setup_deadline)? else {
-            return Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                "broker closed before control-ring setup acknowledgement",
-            ));
-        };
-        if ready != ready_token {
-            return Err(invalid_data(
-                "broker sent an invalid control-ring setup acknowledgement",
-            ));
-        }
-
-        let shutdown_stream = setup_stream.try_clone()?;
-        let association = Arc::new(LocalRingAssociation {
-            lanes: LocalCallLanePool::new(lanes),
-            lane_demand,
-            control_stream: shutdown_stream,
-            closed: AtomicBool::new(false),
-            on_failure: Arc::new(on_failure),
-            wakes,
-        });
-        let monitor_association = Arc::clone(&association);
-        if let Err(error) = thread::Builder::new()
-            .name("litebox-broker-liveness".to_owned())
-            .spawn(move || {
-                monitor_local_socket(&mut setup_stream, &monitor_association);
-            })
-        {
-            let _ = association.fail(error);
-            return Err(Error::other("failed to start broker liveness monitor"));
-        }
-
+        let stream = UnixAssociationStream::new(self.stream, self.setup_deadline)?;
+        let shutdown_stream = stream.shutdown_stream();
+        let (calls, notifications, shutdown) =
+            ring_association::activate_local(ring, Box::new(stream), on_failure)?;
         Ok((
-            UnixControlRingLocalCallChannel {
-                association: Arc::clone(&association),
+            calls,
+            notifications,
+            UnixControlRingLocalShutdown {
+                shutdown,
+                stream: shutdown_stream,
             },
-            UnixControlRingLocalNotificationChannel {
-                consumer: notification_consumer,
-                association: Arc::clone(&association),
-            },
-            UnixControlRingLocalShutdown { association },
         ))
     }
 }
@@ -295,26 +219,14 @@ fn wait_for_nonblocking_connect(socket: &OwnedFd, deadline: Instant) -> IoResult
 impl UnixControlRingLocalShutdown {
     /// Shuts down the active association, unblocking ring and socket waits.
     pub fn shutdown(&self) -> IoResult<()> {
-        self.association.fail(Error::new(
-            ErrorKind::ConnectionAborted,
-            "broker local association shut down",
-        ))
+        self.shutdown.shutdown()
     }
 }
 
+/// Exposes the socket descriptor that [`shutdown`](Self::shutdown) shuts down.
 impl AsFd for UnixControlRingLocalShutdown {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.association.control_stream.as_fd()
-    }
-}
-
-impl Drop for UnixControlRingLocalCallChannel {
-    fn drop(&mut self) {
-        self.association.closed.store(true, Ordering::Release);
-        let _ = self.association.fail(Error::new(
-            ErrorKind::ConnectionAborted,
-            "broker local call channel dropped",
-        ));
+        self.stream.as_fd()
     }
 }
 
@@ -339,202 +251,6 @@ impl LocalSetupChannel for UnixStreamLocalSetupChannel {
     }
 }
 
-impl LocalCallChannel for UnixControlRingLocalCallChannel {
-    type Error = Error;
-
-    fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
-        let association = &self.association;
-        let mut lane = match association
-            .lanes
-            .claim(|lanes| association.demand_lanes(lanes))
-        {
-            Ok(lane) => lane,
-            Err(error) => {
-                let result = Err(copy_io_error(&error));
-                let _ = association.fail(error);
-                return result;
-            }
-        };
-        let result = association.call_on_lane(&mut lane, request);
-        // A failed call can leave its lane mid-exchange: fail the association
-        // before freeing the lane, so no other call uses it.
-        if let Err(error) = &result {
-            let _ = association.fail(copy_io_error(error));
-        }
-        drop(lane);
-        result
-    }
-}
-
-impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
-    type Error = Error;
-
-    fn recv_notification(&mut self) -> IoResult<Option<BrokerNotification>> {
-        loop {
-            if let Some(error) = self.association.lanes.current_failure() {
-                return self.association.end_notifications(error);
-            }
-            match self.consumer.try_read(decode_notification) {
-                Ok(ControlRingReadStatus::Message(notification)) => {
-                    if let Err(error) = self
-                        .association
-                        .acknowledge_notification(&mut self.consumer)
-                    {
-                        return self.association.end_notifications(error);
-                    }
-                    return Ok(Some(notification));
-                }
-                Ok(ControlRingReadStatus::Empty { wake_count }) => {
-                    if let Some(error) = self.association.lanes.current_failure() {
-                        return self.association.end_notifications(error);
-                    }
-                    if let Err(error) = self.consumer.wait_for_message(wake_count) {
-                        let result = Err(copy_io_error(&error));
-                        let _ = self.association.fail(error);
-                        return result;
-                    }
-                }
-                Err(ControlRingReadError::Ring(error)) => {
-                    let error = ring_error(error);
-                    let result = Err(copy_io_error(&error));
-                    let _ = self.association.fail(error);
-                    return result;
-                }
-                Err(ControlRingReadError::Decode(error)) => {
-                    let error = wire_error(error);
-                    let result = Err(copy_io_error(&error));
-                    let _ = self.association.fail(error);
-                    return result;
-                }
-            }
-        }
-    }
-}
-
-impl LocalRingAssociation {
-    /// Ends notification receipt once the association has ended with
-    /// `failure`: cleanly if the local side closed it.
-    fn end_notifications(&self, failure: Error) -> IoResult<Option<BrokerNotification>> {
-        if self.closed.load(Ordering::Acquire) {
-            Ok(None)
-        } else {
-            Err(failure)
-        }
-    }
-
-    fn acknowledge_notification(
-        &self,
-        consumer: &mut ControlRingConsumer<MemfdSharedMemory>,
-    ) -> IoResult<()> {
-        let result = self.lanes.run_if_live(|| {
-            consumer
-                .publish_head()
-                .map_err(ring_error)
-                .and_then(|()| consumer.wake_producer())
-        });
-        if let Err(error) = result {
-            let result = Err(copy_io_error(&error));
-            let _ = self.fail(error);
-            return result;
-        }
-        Ok(())
-    }
-
-    /// Raises the lane demand to `lanes` and wakes the broker to serve them.
-    fn demand_lanes(&self, lanes: usize) -> IoResult<()> {
-        self.lane_demand.request(lanes).map_err(ring_error)?;
-        self.lane_demand.wake_host()
-    }
-
-    /// Writes `request` to `lane` and reads the broker's response from it,
-    /// releasing the lane once the call succeeds.
-    fn call_on_lane(
-        &self,
-        lane: &mut LaneClaim<'_, LocalLane>,
-        request: BrokerRequest,
-    ) -> IoResult<BrokerResponse> {
-        let request_id = request.request_id;
-        let request_frame = encode_request(request);
-        let producer = &mut lane.request_producer;
-        loop {
-            let write_status = self
-                .lanes
-                .run_if_live(|| producer.try_write(&request_frame).map_err(ring_error))?;
-            match write_status {
-                ControlRingWriteStatus::Written => break,
-                ControlRingWriteStatus::Full { wake_count } => {
-                    producer.wait_for_capacity(wake_count)?;
-                }
-            }
-        }
-        producer.wake_consumer()?;
-
-        let consumer = &mut lane.response_consumer;
-        let response = loop {
-            match consumer.try_read(decode_response) {
-                Ok(ControlRingReadStatus::Message(response)) => break response,
-                Ok(ControlRingReadStatus::Empty { wake_count }) => {
-                    if let Some(error) = self.lanes.current_failure() {
-                        return Err(error);
-                    }
-                    consumer.wait_for_message(wake_count)?;
-                }
-                Err(ControlRingReadError::Ring(error)) => return Err(ring_error(error)),
-                Err(ControlRingReadError::Decode(error)) => return Err(wire_error(error)),
-            }
-        };
-        if response.request_id != request_id {
-            return Err(invalid_data("broker answered a different request"));
-        }
-        // Accepting the response with the lane's release excludes failure
-        // recording, so no call succeeds once the association has failed.
-        lane.release_if_live(|lane| {
-            let consumer = &mut lane.response_consumer;
-            consumer.publish_head().map_err(ring_error)?;
-            consumer.wake_producer()
-        })?;
-        Ok(response)
-    }
-
-    fn fail(&self, error: Error) -> IoResult<()> {
-        let first_failure = self.lanes.record_failure(error);
-        let wakes = self
-            .wakes
-            .iter()
-            .map(ControlRingWakeHandle::interrupt_wait)
-            .fold(Ok(()), IoResult::and);
-        let shutdown_result = shutdown_socket(&self.control_stream);
-        if first_failure {
-            (self.on_failure)();
-        }
-        wakes.and(shutdown_result)
-    }
-}
-
-fn monitor_local_socket(stream: &mut UnixStream, association: &LocalRingAssociation) {
-    let error = wait_for_socket_termination(stream, "broker");
-    let _ = association.fail(error);
-}
-
-fn wait_for_socket_termination(stream: &mut UnixStream, peer: &'static str) -> Error {
-    let mut byte = [0];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => {
-                return Error::new(
-                    ErrorKind::UnexpectedEof,
-                    format!("{peer} closed the active broker association"),
-                );
-            }
-            Ok(_) => {
-                return invalid_data("peer sent unexpected active control-socket data");
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return error,
-        }
-    }
-}
-
 #[cfg(test)]
 mod control_ring_tests {
     use super::*;
@@ -545,9 +261,13 @@ mod control_ring_tests {
         decode_handshake_request, decode_request, encode_handshake_response, encode_response,
     };
     use litebox_broker_protocol::{ObjectHandle, RequestId};
-    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_transport::call_lane_pool::LocalCallLanePool;
+    use litebox_broker_transport::channel::{
+        LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
+    };
     use litebox_broker_transport::control_ring::{
-        ControlRingDemandStatus, ControlRingProducer, HostControlRingEndpoints,
+        ControlRingConsumer, ControlRingDemandStatus, ControlRingProducer, ControlRingReadStatus,
+        ControlRingWriteStatus, HostControlRingEndpoints,
     };
     use rustix::fs::{OFlags, fcntl_getfl};
     use std::io::{Read, Write};

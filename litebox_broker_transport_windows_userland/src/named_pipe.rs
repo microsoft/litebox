@@ -146,7 +146,7 @@ mod tests {
         WindowsControlRingHostCallLaneSource, WindowsControlRingHostShutdown,
         WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
     };
-    use crate::setup::{OwnedEvent, read_frame, read_pipe_until_cancelled, write_frame};
+    use crate::setup::OwnedEvent;
     use crate::shared_memory::WindowsSharedMemory;
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
@@ -281,10 +281,13 @@ mod tests {
     ) {
         let (local, host) = negotiated_pair(suffix);
         let (local_ring, host_ring) = control_rings();
-        write_frame(local.stream.handle(), LAYOUT.ready_token(), None).unwrap();
+        local
+            .stream
+            .write_frame(LAYOUT.ready_token(), None)
+            .unwrap();
         let (lanes, _notifications, shutdown) = host.into_active(host_ring).unwrap();
         assert_eq!(
-            read_frame(local.stream.handle(), None).unwrap().unwrap(),
+            local.stream.read_frame(None).unwrap().unwrap(),
             LAYOUT.ready_token()
         );
         (lanes, shutdown, local_ring.into_local(), local)
@@ -305,22 +308,18 @@ mod tests {
         let mut local = connect_local(&name);
         let host = accept_stream_guaranteed(listener);
         send_handshake_request(&mut local);
-        read_frame(host.handle(), None).unwrap().unwrap();
-        write_frame(
-            host.handle(),
-            &encode_handshake_response(negotiated()),
-            None,
-        )
-        .unwrap();
+        host.read_frame(None).unwrap().unwrap();
+        host.write_frame(&encode_handshake_response(negotiated()), None)
+            .unwrap();
         local.recv_handshake_response().unwrap().unwrap();
         let (local_ring, broker_ring) = control_rings();
         let (calls, notifications) = thread::scope(|scope| {
             scope.spawn(|| {
                 assert_eq!(
-                    read_frame(host.handle(), None).unwrap().unwrap(),
+                    host.read_frame(None).unwrap().unwrap(),
                     LAYOUT.ready_token()
                 );
-                write_frame(host.handle(), LAYOUT.ready_token(), None).unwrap();
+                host.write_frame(LAYOUT.ready_token(), None).unwrap();
             });
             local.into_active(local_ring).unwrap()
         });
@@ -443,7 +442,7 @@ mod tests {
         });
         let stream = accept_stream_guaranteed(listener);
         let local = client.join().unwrap();
-        write_frame(local.stream.handle(), b"ready", None).unwrap();
+        local.stream.write_frame(b"ready", None).unwrap();
         let mut host =
             WindowsNamedPipeHostSetupChannel::from_host_guaranteed(stream, Instant::now());
 
@@ -467,8 +466,9 @@ mod tests {
         let shutdown = OwnedEvent::manual_reset().unwrap();
         shutdown.set().unwrap();
 
-        let error =
-            read_pipe_until_cancelled(stream.handle(), &mut [0], shutdown.handle()).unwrap_err();
+        let error = stream
+            .read_until_cancelled(&mut [0], &shutdown)
+            .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
     }
 

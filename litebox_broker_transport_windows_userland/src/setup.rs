@@ -5,7 +5,6 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use std::time::Instant;
 
 use litebox_broker_protocol::wire::WireError;
-use litebox_broker_transport::control_ring::ControlRingError;
 use litebox_broker_transport::setup_frame::{SetupFrameError, read_setup_frame, write_setup_frame};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_PIPE_NOT_CONNECTED,
@@ -17,6 +16,8 @@ use windows_sys::Win32::System::Threading::{
     CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
 
+use crate::named_pipe::WindowsNamedPipeStream;
+
 pub(crate) struct OverlappedOperation {
     state: Box<OVERLAPPED>,
     event: OwnedEvent,
@@ -24,21 +25,37 @@ pub(crate) struct OverlappedOperation {
 
 pub(crate) struct OwnedEvent(HANDLE);
 
-pub(crate) fn read_frame(stream: HANDLE, deadline: Option<Instant>) -> IoResult<Option<Vec<u8>>> {
-    read_setup_frame(
-        |buffer| read_pipe(stream, buffer, deadline),
-        |error| error.kind() == ErrorKind::Interrupted,
-    )
-    .map_err(frame_error)
-}
+impl WindowsNamedPipeStream {
+    /// Reads one setup frame, bounded by `deadline`.
+    ///
+    /// Returns `Ok(None)` when the peer closed cleanly on a frame boundary.
+    pub(crate) fn read_frame(&self, deadline: Option<Instant>) -> IoResult<Option<Vec<u8>>> {
+        read_setup_frame(
+            |buffer| read_pipe(self.handle(), buffer, deadline, None),
+            |error| error.kind() == ErrorKind::Interrupted,
+        )
+        .map_err(frame_error)
+    }
 
-pub(crate) fn write_frame(stream: HANDLE, frame: &[u8], deadline: Option<Instant>) -> IoResult<()> {
-    write_setup_frame(
-        frame,
-        |buffer| write_pipe(stream, buffer, deadline),
-        |error| error.kind() == ErrorKind::Interrupted,
-    )
-    .map_err(frame_error)
+    /// Writes one setup frame, bounded by `deadline`.
+    pub(crate) fn write_frame(&self, frame: &[u8], deadline: Option<Instant>) -> IoResult<()> {
+        write_setup_frame(
+            frame,
+            |buffer| write_pipe(self.handle(), buffer, deadline),
+            |error| error.kind() == ErrorKind::Interrupted,
+        )
+        .map_err(frame_error)
+    }
+
+    /// Reads into `buffer` without a deadline, failing with
+    /// [`ErrorKind::ConnectionAborted`] once `cancellation` is signaled.
+    pub(crate) fn read_until_cancelled(
+        &self,
+        buffer: &mut [u8],
+        cancellation: &OwnedEvent,
+    ) -> IoResult<usize> {
+        read_pipe(self.handle(), buffer, None, Some(cancellation.handle()))
+    }
 }
 
 fn frame_error(error: SetupFrameError<Error>) -> Error {
@@ -54,23 +71,7 @@ fn frame_error(error: SetupFrameError<Error>) -> Error {
     }
 }
 
-pub(crate) fn read_pipe(
-    stream: HANDLE,
-    buffer: &mut [u8],
-    deadline: Option<Instant>,
-) -> IoResult<usize> {
-    read_pipe_inner(stream, buffer, deadline, None)
-}
-
-pub(crate) fn read_pipe_until_cancelled(
-    stream: HANDLE,
-    buffer: &mut [u8],
-    cancellation: HANDLE,
-) -> IoResult<usize> {
-    read_pipe_inner(stream, buffer, None, Some(cancellation))
-}
-
-fn read_pipe_inner(
+fn read_pipe(
     stream: HANDLE,
     buffer: &mut [u8],
     deadline: Option<Instant>,
@@ -94,11 +95,7 @@ fn read_pipe_inner(
     finish_io(stream, &operation, started, deadline, cancellation).or_else(pipe_read_eof)
 }
 
-pub(crate) fn write_pipe(
-    stream: HANDLE,
-    buffer: &[u8],
-    deadline: Option<Instant>,
-) -> IoResult<usize> {
+fn write_pipe(stream: HANDLE, buffer: &[u8], deadline: Option<Instant>) -> IoResult<usize> {
     reject_expired_deadline(deadline)?;
     let length = u32::try_from(buffer.len())
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "pipe write buffer is too large"))?;
@@ -293,19 +290,5 @@ pub(crate) fn wire_error(error: WireError) -> Error {
     Error::new(
         ErrorKind::InvalidData,
         format!("invalid broker wire message: {error}"),
-    )
-}
-
-pub(crate) fn copy_io_error(error: &Error) -> Error {
-    match error.raw_os_error() {
-        Some(code) => Error::from_raw_os_error(code),
-        None => Error::new(error.kind(), error.to_string()),
-    }
-}
-
-pub(crate) fn ring_error(error: ControlRingError) -> Error {
-    Error::new(
-        ErrorKind::InvalidData,
-        format!("invalid broker control ring: {error:?}"),
     )
 }

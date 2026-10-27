@@ -10,7 +10,8 @@
 //! machines.
 //!
 //! Nothing here is tied to an operating system or to hosted userland, except
-//! the local call-lane pool behind the opt-in `std` feature. The crate is
+//! the local call-lane pool and the active control-ring associations over a
+//! retained setup stream, both behind the opt-in `std` feature. The crate is
 //! `no_std` without it, so a kernel deployment can use the same interfaces and
 //! control rings. Concrete association bindings, such as the
 //! Unix-domain-socket and memfd endpoints in
@@ -33,5 +34,7 @@ extern crate std;
 pub mod call_lane_pool;
 pub mod channel;
 pub mod control_ring;
+#[cfg(feature = "std")]
+pub mod ring_association;
 pub mod setup_frame;
 pub mod shared_memory;

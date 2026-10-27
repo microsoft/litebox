@@ -204,7 +204,7 @@ impl<Lane> LocalCallLanePool<Lane> {
 }
 
 /// Copies `error`, since [`Error`] is not `Clone`.
-fn copy_error(error: &Error) -> Error {
+pub(crate) fn copy_error(error: &Error) -> Error {
     match error.raw_os_error() {
         Some(code) => Error::from_raw_os_error(code),
         None => Error::new(error.kind(), error.to_string()),
