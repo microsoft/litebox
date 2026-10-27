@@ -713,8 +713,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Some(frames)
     }
 
-    /// Ends one [`Self::pin`] of `range`.
+    /// Ends one [`Self::pin`] of `range`. With interrupts disabled, as every
+    /// use of the table's locks (see [`crate::preempt::NoPreempt`]).
     pub(crate) fn unpin(&self, range: PageRange<ALIGN>) {
+        crate::preempt::debug_assert_disabled();
         let mut pinned = self.pinned.lock();
         let index = pinned
             .iter()
@@ -737,7 +739,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
     /// The frame of `page`, if mapped writable, or, if it has no leaf,
     /// populated so. Walks the table through the kernel mapping, so with
-    /// whichever table is current.
+    /// whichever table is current. With interrupts disabled, as every use of
+    /// the table's locks (see [`crate::preempt::NoPreempt`]).
     ///
     /// # Safety
     ///
@@ -754,6 +757,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         page: Page<Size4KiB>,
     ) -> Result<PhysFrame, PageFaultError> {
+        crate::preempt::debug_assert_disabled();
         let address: usize = page.start_address().as_u64().trunc();
         debug_assert!(
             self.pinned
@@ -1019,8 +1023,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 }
 
 impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> {
-    /// Requires a prior non-PCID CR3 reload.
+    /// Requires a prior non-PCID CR3 reload, and interrupts disabled, as every
+    /// use of the table's locks (see [`crate::preempt::NoPreempt`]).
     fn drop(&mut self) {
+        crate::preempt::debug_assert_disabled();
         debug_assert!(self.cpus.is_empty(), "a page table dropped in use");
         let mut allocator = PageTableAllocator::<M>::new();
         let mut inner = self.inner.lock();

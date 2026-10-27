@@ -255,15 +255,22 @@ impl PerCpuVariablesAsm {
     }
 }
 
-/// Requires kernel GSBASE from [`install`].
+/// Requires kernel GSBASE from [`install`], and interrupts disabled, as
+/// kernel code runs: code that runs with them enabled may be preempted, and
+/// go on on another CPU (see [`crate::preempt::NoPreempt`]).
 ///
 /// # Panics
-/// Panics if GSBASE is not set or contains a non-canonical address.
+/// Panics if GSBASE is not set or contains a non-canonical address; in debug
+/// builds, if interrupts are enabled.
 pub(crate) fn with_per_cpu_variables<F, R>(f: F) -> R
 where
     F: FnOnce(&PerCpuVariables) -> R,
     R: 'static,
 {
+    debug_assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "per-CPU data accessed with interrupts enabled"
+    );
     let ptr = per_cpu_variables_ptr();
     // Safety: only this core accesses its per-CPU data.
     let pcv = unsafe { &*ptr };

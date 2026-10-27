@@ -93,6 +93,7 @@ impl ComPort {
     }
 }
 
+/// Locked with interrupts disabled (see [`with_com`]).
 static COM_ONCE: Once<Mutex<ComPort>> = Once::new();
 
 fn com() -> &'static Mutex<ComPort> {
@@ -110,18 +111,26 @@ impl fmt::Write for ComPort {
     }
 }
 
+/// Runs `f` on the port, holding its lock with interrupts disabled, so that no
+/// holder is ever preempted: code that runs with them enabled (e.g., a
+/// kernel's preemptible threads) logs too, as does code that spins for the
+/// lock with them disabled, which would never resume a preempted holder.
+fn with_com<R>(f: impl FnOnce(&mut ComPort) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| f(&mut com().lock()))
+}
+
 pub fn print(args: core::fmt::Arguments) {
     use core::fmt::Write;
-    let _ = com().lock().write_fmt(args);
+    let _ = with_com(|com| com.write_fmt(args));
 }
 
 pub fn print_str(s: &str) {
-    com().lock().write_string(s);
+    with_com(|com| com.write_string(s));
 }
 
 /// Non-printable bytes show as `0xfe`.
 pub fn print_bytes(bytes: &[u8]) {
-    com().lock().write_bytes(bytes);
+    with_com(|com| com.write_bytes(bytes));
 }
 
 /// Panic may interrupt a locked or initializing console. Never wait for it
