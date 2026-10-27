@@ -41,12 +41,12 @@ impl Clone for Box<dyn AnyCloneSendSync> {
 /// The terminal that an open file refers to.
 #[derive(Clone)]
 pub enum FileTerminal {
-    /// A terminal independent of the file's open file description.
-    Endpoint(Arc<dyn TerminalEndpoint>),
+    /// A terminal that the file refers to whoever opens it.
+    Fixed(Arc<dyn TerminalEndpoint>),
     /// The controlling terminal of the opener's session, which the resolver
     /// binds when the file is opened and through which the file's I/O then
     /// goes.
-    Controlling,
+    OpenersControlling,
 }
 
 /// How a backend file handle participates in seek.

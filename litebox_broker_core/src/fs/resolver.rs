@@ -609,10 +609,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let mut entry = self.open_entry(user, path, flags, mode)?;
         if let Handle::File(file) = &entry.handle
             && !entry.path_only
-            && matches!(self.backend.terminal(file), Some(FileTerminal::Controlling))
+            && matches!(
+                self.backend.terminal(file),
+                Some(FileTerminal::OpenersControlling)
+            )
         {
             let terminal = controlling_terminal().ok_or(OpenError::NoSuchDevice)?;
-            entry.controlling_terminal = Some(ControllingTerminalFile {
+            entry.controlling_terminal = Some(ReopenedTerminal {
                 _file: Arc::clone(&terminal).reopen()?,
                 terminal,
             });
@@ -1250,8 +1253,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn terminal(&self, entry: &ResolverEntry<Backend>) -> Option<Arc<dyn TerminalEndpoint>> {
         match &entry.handle {
             Handle::File(file) if !entry.path_only => match self.backend.terminal(file)? {
-                FileTerminal::Endpoint(terminal) => Some(terminal),
-                FileTerminal::Controlling => entry
+                FileTerminal::Fixed(terminal) => Some(terminal),
+                FileTerminal::OpenersControlling => entry
                     .controlling_terminal
                     .as_ref()
                     .map(|controlling| Arc::clone(&controlling.terminal)),
@@ -1310,14 +1313,14 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     /// Later renames or removals of the object are not reflected.
     path: String,
     /// The controlling terminal that the file referred to when it was opened,
-    /// if it refers to the opener's (see [`FileTerminal::Controlling`]).
-    controlling_terminal: Option<ControllingTerminalFile>,
+    /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
+    controlling_terminal: Option<ReopenedTerminal>,
 }
 
-/// A file open on a controlling terminal.
-struct ControllingTerminalFile {
+/// A terminal reopened by [`TerminalEndpoint::reopen`], which stays open
+/// until this drops.
+struct ReopenedTerminal {
     terminal: Arc<dyn TerminalEndpoint>,
-    /// Holds the file open (see [`TerminalEndpoint::reopen`]).
     _file: Box<dyn Send + Sync>,
 }
 

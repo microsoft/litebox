@@ -319,9 +319,9 @@ impl BackendHandles for Devices {
 impl Backend for Devices {
     fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
         match &h.get_typed::<Self>().0 {
-            DeviceFile::Device(Device::Tty) => Some(FileTerminal::Controlling),
-            DeviceFile::Device(device) => self.endpoint(*device).map(FileTerminal::Endpoint),
-            file => file.terminal().map(FileTerminal::Endpoint),
+            DeviceFile::Device(Device::Tty) => Some(FileTerminal::OpenersControlling),
+            DeviceFile::Device(device) => self.endpoint(*device).map(FileTerminal::Fixed),
+            file => file.terminal().map(FileTerminal::Fixed),
         }
     }
 

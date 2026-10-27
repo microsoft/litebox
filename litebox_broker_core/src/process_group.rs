@@ -1083,8 +1083,10 @@ mod tests {
         let (broker, _stdio) = terminal_broker();
         let root = process(&broker, None);
         let leader = process(&broker, Some(&root));
+        leader.complete_start().unwrap();
         super::create_session(&leader, leader.id()).unwrap();
         let job = process(&broker, Some(&leader));
+        job.complete_start().unwrap();
         super::set(&leader, job.id(), job.id().into()).unwrap();
         let manager = open(&root, "/dev/ptmx", FileOpenFlags::NONE);
         assert_eq!(
@@ -1160,6 +1162,14 @@ mod tests {
             ),
             Err(FileError::NoSuchDevice)
         );
+
+        // Like Linux, the session keeps its foreground group, which hears the
+        // leader leave.
+        leader.retire(true);
+        leader
+            .complete_exit(ProcessExitStatus::Exited { code: 0 })
+            .unwrap();
+        assert_signalled(&job, handles[1], TerminalEvents::HANGUP);
     }
 
     #[test]
@@ -1231,70 +1241,6 @@ mod tests {
     }
 
     #[test]
-    fn the_foreground_group_hears_its_session_leader_exit_after_a_hang_up() {
-        let (broker, _stdio) = terminal_broker();
-        let root = process(&broker, None);
-        let leader = process(&broker, None);
-        leader.complete_start().unwrap();
-        let member = process(&broker, Some(&leader));
-        member.complete_start().unwrap();
-        super::set(&leader, member.id(), member.id().into()).unwrap();
-        let manager = open(&root, "/dev/ptmx", FileOpenFlags::NONE);
-        assert_eq!(
-            crate::fs::terminal_control(
-                &root,
-                manager,
-                TerminalOperation::SetSubsidiaryLock(false)
-            ),
-            Ok(Ok(TerminalResponse::Done))
-        );
-        let subsidiary = open(&leader, "/dev/pts/0", FileOpenFlags::NONE);
-        assert_eq!(
-            super::set_foreground_group(&leader, subsidiary, member.id().into()),
-            Ok(Ok(()))
-        );
-        let handles = [&leader, &member].map(|process| signals(process));
-
-        root.close_object_reference(manager).unwrap();
-        assert_signalled(&leader, handles[0], TerminalEvents::HANGUP);
-        assert_not_signalled(&member, handles[1]);
-        leader.retire(true);
-        leader
-            .complete_exit(ProcessExitStatus::Exited { code: 0 })
-            .unwrap();
-        assert_signalled(&member, handles[1], TerminalEvents::HANGUP);
-    }
-
-    #[test]
-    fn a_session_leader_that_left_acquires_no_terminal() {
-        let (broker, _stdio) = terminal_broker();
-        let _root = process(&broker, None);
-        let leader = process(&broker, None);
-        leader.complete_start().unwrap();
-        let handle = open(
-            &leader,
-            "/other/stdout",
-            FileOpenFlags::NO_CONTROLLING_TERMINAL,
-        );
-        let terminal = crate::fs::handle_terminal(&leader, handle)
-            .unwrap()
-            .unwrap();
-        leader.retire(true);
-        leader
-            .complete_exit(ProcessExitStatus::Exited { code: 0 })
-            .unwrap();
-        // As when an open races the leader's exit.
-        super::acquire(&leader, &terminal);
-        let next = process(&broker, None);
-        open(&next, "/other/stdout", FileOpenFlags::NONE);
-        let tty = open(&next, "/dev/tty", FileOpenFlags::NONE);
-        assert_eq!(
-            super::get_foreground_group(&next, tty),
-            Ok(Ok(membership(&next, &next)))
-        );
-    }
-
-    #[test]
     fn a_root_dropped_before_starting_releases_its_terminal() {
         let (broker, _stdio, other) = terminal_broker_with_other();
         let broker = broker.with_terminal(other.terminal().unwrap());
@@ -1324,7 +1270,10 @@ mod tests {
         });
         super::set(&leader, background.id(), background.id().into()).unwrap();
         let member_terminal = open(&member, "/other/stdout", FileOpenFlags::NONE);
-        open(&leader, "/other/stdout", FileOpenFlags::NONE);
+        let leader_terminal = open(&leader, "/other/stdout", FileOpenFlags::NONE);
+        let terminal = crate::fs::handle_terminal(&leader, leader_terminal)
+            .unwrap()
+            .unwrap();
         let handles = [&member, &background].map(|process| signals(process));
 
         leader.retire(true);
@@ -1333,7 +1282,10 @@ mod tests {
             .unwrap();
         assert_signalled(&member, handles[0], TerminalEvents::HANGUP);
         assert_not_signalled(&background, handles[1]);
-        // The session lost its terminal, which another session can acquire.
+        // A leader that left cannot acquire it again, as when an open races
+        // its exit, so the session lost its terminal, which another session
+        // can acquire.
+        super::acquire(&leader, &terminal);
         assert_eq!(
             super::get_foreground_group(&member, member_terminal),
             Ok(Err(ProcessGroupError::NotControllingTerminal))
