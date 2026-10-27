@@ -6,12 +6,11 @@
 //! Instead, these tests use pre-defined JSON-formatted command sequences to test TAs.
 
 use litebox::platform::RawConstPointer;
-use litebox::utils::TruncateExt;
 use litebox_common_optee::{
-    TeeIdentity, TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
+    PAGE_SIZE, TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
 };
 use litebox_platform_linux_userland::LinuxUserland as Platform;
-use litebox_shim_optee::{LoadedProgram, UserConstPtr};
+use litebox_shim_optee::{LoadedProgram, UserConstPtr, msg_handler::TaRequestInfo};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -103,19 +102,13 @@ pub fn run_ta_with_test_commands(
             // `ta_info` is only `Some` after an OpenSession, which also sets
             // `session_id`, so this command runs on that established session.
             let session_id = session_id.expect("session id set by OpenSession");
-            let _ = info
-                .entrypoints
+            let mut request = TaRequestInfo::new(func_id, session_id, cmd.cmd_id);
+            request.params = params;
+            info.entrypoints
                 .as_ref()
                 .unwrap()
-                .load_ta_context(
-                    params.as_slice(),
-                    session_id,
-                    func_id as u32,
-                    Some(cmd.cmd_id),
-                )
-                .map_err(|_| {
-                    panic!("Failed to load TA context");
-                });
+                .load_ta_context(&mut request)
+                .expect("Failed to load TA context");
             let mut ctx = litebox_common_linux::PtRegs::default();
             unsafe {
                 litebox_platform_linux_userland::reenter_thread(
@@ -128,37 +121,38 @@ pub fn run_ta_with_test_commands(
                 "TA exits with error: return_code={:#x}",
                 ctx.rax
             );
-            // TA stores results in the `UteeParams` structure and/or buffers it refers to.
-            if let Some(params_address) = info.params_address {
-                let ptr = UserConstPtr::<Platform, UteeParams>::from_usize(params_address);
-                let params = ptr.read_at_offset(0).expect("Failed to read UteeParams");
-                handle_ta_command_output(&params);
-            }
+            handle_ta_command_output(&request);
         }
     }
 }
 
-/// A function to retrieve the results of the OP-TEE TA command execution.
-fn handle_ta_command_output(params: &UteeParams) {
-    for idx in 0..UteeParams::TEE_NUM_PARAMS {
-        let param_type = params.get_type(idx).expect("Failed to get parameter type");
-        match param_type {
-            TeeParamType::ValueOutput | TeeParamType::ValueInout => {
-                if let Ok(Some((value_a, value_b))) = params.get_values(idx) {
-                    litebox_util_log::info!(
-                        idx:% = idx,
-                        value_a:% = format_args!("{:#x}", value_a),
-                        value_b:% = format_args!("{:#x}", value_b);
-                        "output"
-                    );
-                    // TODO: return the outcome to VTL0
-                }
+/// Logs the TA's value and memref outputs.
+///
+/// Output kinds come from `request.params` and memref buffers from its recorded
+/// placement, not from the TA-writable `UteeParams`.
+fn handle_ta_command_output(request: &TaRequestInfo<PAGE_SIZE>) {
+    let params_address = request
+        .ta_params_address()
+        .expect("request is loaded into the TA");
+    let ta_params = UserConstPtr::<Platform, UteeParams>::from_usize(params_address)
+        .read_at_offset(0)
+        .expect("Failed to read UteeParams");
+    for (idx, param) in request.params.iter().enumerate() {
+        let (value_a, value_b) = (ta_params.vals[idx * 2], ta_params.vals[idx * 2 + 1]);
+        match param {
+            UteeParamOwned::ValueOutput | UteeParamOwned::ValueInout { .. } => {
+                litebox_util_log::info!(
+                    idx:% = idx,
+                    value_a:% = format_args!("{:#x}", value_a),
+                    value_b:% = format_args!("{:#x}", value_b);
+                    "output"
+                );
             }
-            TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
-                if let Ok(Some((addr, len))) = params.get_values(idx) {
-                    let len: usize = len.trunc();
-                    let ptr: UserConstPtr<Platform, u8> =
-                        UserConstPtr::<Platform, u8>::from_ptr(addr as *const u8);
+            UteeParamOwned::MemrefOutput { .. } | UteeParamOwned::MemrefInout { .. } => {
+                if let Some((addr, buffer_len)) = request.ta_memref_buffer(idx) {
+                    let len =
+                        usize::try_from(value_b).map_or(buffer_len, |len| len.min(buffer_len));
+                    let ptr = UserConstPtr::<Platform, u8>::from_usize(addr);
                     let slice = ptr.to_owned_slice(len).unwrap_or_default();
                     if slice.is_empty() {
                         litebox_util_log::info!(
@@ -182,7 +176,6 @@ fn handle_ta_command_output(params: &UteeParams) {
                             "output"
                         );
                     }
-                    // TODO: return the outcome to VTL0
                 }
             }
             _ => {}

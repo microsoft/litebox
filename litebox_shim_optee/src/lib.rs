@@ -342,7 +342,17 @@ type UserMutPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 pub type UserConstPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
-pub type TaMemrefAddresses = [Option<usize>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS];
+
+/// Where the shim placed a TA entry's `UteeParams` block and memref buffers.
+///
+/// The TA can rewrite the memory at these addresses, including the memref
+/// addresses in `UteeParams`, but not this record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TaParamLayout {
+    params_address: usize,
+    /// `(address, len)` of each memref output or inout parameter's TA buffer.
+    memref_buffers: [Option<(usize, usize)>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS],
+}
 
 type MutPtr<Platform, T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
@@ -432,21 +442,8 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         let mut elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin)?;
         let init_state = elf_loader.load_ldelf(&LdelfArg::new(ta_uuid))?;
         entrypoints.task.thread.init_state.set(init_state);
-        let params_address = if entrypoints.task.get_ta_stack_base_addr().is_some() {
-            let ta_stack = crate::loader::ta_stack::allocate_stack(
-                &entrypoints.task,
-                entrypoints.task.get_ta_stack_base_addr(),
-            )
-            .ok_or(loader::elf::ElfLoaderError::MappingError(
-                litebox_common_linux::vmem::MappingError::OutOfMemory,
-            ))?;
-            Some(ta_stack.get_params_address())
-        } else {
-            None
-        };
         Ok(LoadedProgram {
             entrypoints: Some(entrypoints),
-            params_address,
             ta_flags: ta.head.flags,
         })
     }
@@ -503,38 +500,33 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimEntrypoints<Platform> {
-    /// Load the CPU context to (re)enter the loaded TA.
+    /// Load the CPU context to (re)enter the loaded TA for `request`, in session
+    /// `request.session`.
+    ///
+    /// `request.cmd_id` is passed only to `InvokeCommand`. Records in `request` where its
+    /// `params` are placed in TA memory, for
+    /// [`update_optee_msg_args`](msg_handler::update_optee_msg_args); a failed load
+    /// leaves no placement.
     pub fn load_ta_context(
         &self,
-        params: &[litebox_common_optee::UteeParamOwned],
-        session_id: u32,
-        func_id: u32,
-        cmd_id: Option<u32>,
+        request: &mut msg_handler::TaRequestInfo<PAGE_SIZE>,
     ) -> Result<(), loader::elf::ElfLoaderError> {
-        self.load_ta_context_with_shm(params, &[], session_id, func_id, cmd_id)
-            .map(|_| ())
-    }
-
-    /// Load the TA context with shared-memory sources for its input buffers.
-    pub fn load_ta_context_with_shm(
-        &self,
-        params: &[litebox_common_optee::UteeParamOwned],
-        shm_info: &[Option<msg_handler::ShmInfo<PAGE_SIZE>>],
-        session_id: u32,
-        func_id: u32,
-        cmd_id: Option<u32>,
-    ) -> Result<TaMemrefAddresses, loader::elf::ElfLoaderError> {
-        let init_state = self
-            .task
-            .load_ta_context(params, shm_info, session_id, func_id, cmd_id)?;
-        let ThreadInitState::Ta {
-            memref_addresses, ..
-        } = init_state
-        else {
+        request.ta_layout = None;
+        let cmd_id = (request.entry_func == litebox_common_optee::UteeEntryFunc::InvokeCommand)
+            .then_some(request.cmd_id);
+        let init_state = self.task.load_ta_context(
+            &request.params,
+            &request.shm_info,
+            request.session,
+            request.entry_func as u32,
+            cmd_id,
+        )?;
+        let ThreadInitState::Ta { layout, .. } = init_state else {
             return Err(loader::elf::ElfLoaderError::InvalidStackAddr);
         };
         self.task.thread.init_state.set(init_state);
-        Ok(memref_addresses)
+        request.ta_layout = Some(layout);
+        Ok(())
     }
 }
 
@@ -542,17 +534,6 @@ impl<Platform: OpteeShimPlatform> OpteeShimEntrypoints<Platform> {
 pub struct LoadedProgram<Platform: OpteeShimPlatform> {
     /// The entrypoints for the TA (syscall handling, context loading, etc.)
     pub entrypoints: Option<OpteeShimEntrypoints<Platform>>,
-    /// Address where TA parameters (`UteeParams`) are stored on the stack.
-    ///
-    /// This address is constant for the lifetime of the TA instance because:
-    /// 1. The stack buffer is allocated once during initial loading (for ldelf)
-    /// 2. Subsequent TA invocations reuse the same stack buffer
-    /// 3. `UteeParams` is always placed at a fixed offset from the stack base
-    ///    (`stack_top + stack_len - sizeof(UteeParams)`)
-    ///
-    /// The stack contents (including `UteeParams` values) are reinitialized on each
-    /// `load_ta_context` call, but the address remains the same.
-    pub params_address: Option<usize>,
     /// TA flags parsed from the `.ta_head` section
     pub ta_flags: TaFlags,
 }
@@ -846,18 +827,17 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
             ThreadInitState::None | ThreadInitState::Ldelf { .. } => ContinueOperation::Terminate,
             ThreadInitState::Ta {
                 cmd_id,
-                params_address,
                 session_id,
                 func_id,
                 entry_point,
                 stack_top,
-                ..
+                layout,
             } => {
                 #[cfg(target_arch = "x86_64")]
                 {
                     ctx.rdi = func_id;
                     ctx.rsi = session_id;
-                    ctx.rdx = params_address;
+                    ctx.rdx = layout.params_address;
                     ctx.rcx = cmd_id;
                     ctx.rip = entry_point;
                     ctx.rsp = stack_top;
@@ -1013,18 +993,17 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
                 ElfLoaderError::MappingError(litebox_common_linux::vmem::MappingError::OutOfMemory),
             )?;
-        let memref_addresses = ta_stack
+        let layout = ta_stack
             .init(self.global.platform, params, shm_info)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ThreadInitState::Ta {
             cmd_id: cmd_id.unwrap_or(0) as usize,
-            params_address: ta_stack.get_params_address(),
             session_id: session_id as usize,
             func_id: func_id as usize,
             entry_point: self.get_ta_entry_point(),
             stack_top: ta_stack.get_cur_stack_top(),
-            memref_addresses,
+            layout,
         })
     }
 
@@ -1868,12 +1847,11 @@ pub(crate) enum ThreadInitState {
     },
     Ta {
         cmd_id: usize,
-        params_address: usize,
         session_id: usize,
         func_id: usize,
         entry_point: usize,
         stack_top: usize,
-        memref_addresses: TaMemrefAddresses,
+        layout: TaParamLayout,
     },
 }
 

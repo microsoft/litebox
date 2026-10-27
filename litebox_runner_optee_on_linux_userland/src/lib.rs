@@ -3,8 +3,9 @@
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
+use litebox_common_optee::UteeEntryFunc;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
+use litebox_shim_optee::msg_handler::TaRequestInfo;
 use litebox_shim_optee::session::SessionManager;
 use std::path::PathBuf;
 
@@ -117,8 +118,6 @@ fn run_ta_with_default_commands(
         .uuid;
     assert!(shim.store_embedded_ta_bin(ta_bin));
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
-        let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
-
         if func_id == UteeEntryFunc::OpenSession {
             let session_token = shim
                 .session_manager()
@@ -142,11 +141,10 @@ fn run_ta_with_default_commands(
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
-            let _ = entrypoints
-                .load_ta_context(params.as_slice(), session_id, func_id as u32, None)
-                .map_err(|_| {
-                    panic!("Failed to load TA context");
-                });
+            let mut request = TaRequestInfo::new(func_id, session_id, 0);
+            entrypoints
+                .load_ta_context(&mut request)
+                .expect("Failed to load TA context");
             unsafe {
                 litebox_platform_linux_userland::reenter_thread(
                     entrypoints,
