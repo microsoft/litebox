@@ -375,6 +375,11 @@ impl TerminalEndpoint for TestTerminal {
                 TerminalResponse::Done
             }
             TerminalOperation::Flush { .. } | TerminalOperation::Drain => TerminalResponse::Done,
+            TerminalOperation::GetSubsidiaryIndex
+            | TerminalOperation::GetSubsidiaryLock
+            | TerminalOperation::SetSubsidiaryLock(_) => {
+                return Ok(Err(FileError::InvalidTerminalControl));
+            }
         }))
     }
 }

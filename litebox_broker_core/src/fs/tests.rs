@@ -1873,9 +1873,11 @@ mod devices {
     use crate::random::TestRandomProvider;
     use crate::stdio::{StdioOutputStream, StdioStream};
     use crate::test_support::TestStdioProvider;
+    use alloc::string::String;
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
+    use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
     fn devices_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
         Resolver::new(
@@ -2046,6 +2048,154 @@ mod devices {
             fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
+    }
+
+    fn names(fs: &Resolver<TestPlatform, Composer>, path: &str) -> Vec<String> {
+        let dir = fs
+            .open(
+                USER,
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .expect("Failed to open directory");
+        let entries = fs.read_dir(&dir).expect("Failed to read directory");
+        entries.into_iter().map(|entry| entry.name).collect()
+    }
+
+    /// Opening `/dev/ptmx` creates a pair whose subsidiary `/dev/pts/<index>`
+    /// opens once unlocked, and the two ends exchange bytes.
+    #[test]
+    fn ptmx_opens_pseudo_terminal_pairs() {
+        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
+        let mut manager = fs
+            .open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .expect("Failed to open /dev/ptmx");
+        let endpoint = fs.terminal(&manager).expect("ptmx opens a terminal");
+        assert_eq!(
+            endpoint.control(TerminalOperation::GetSubsidiaryIndex),
+            Ok(Ok(TerminalResponse::SubsidiaryIndex(0)))
+        );
+        assert!(fs.readiness_source(&manager).is_some());
+        let status = fs.handle_status(&manager).unwrap();
+        assert_eq!(
+            status.node_info.rdev.map(core::num::NonZeroU64::get),
+            Some(0x502)
+        );
+
+        assert!(matches!(
+            fs.open(USER, "/dev/pts/0", OFlags::RDWR, Mode::empty()),
+            Err(OpenError::Io)
+        ));
+        assert_eq!(
+            endpoint.control(TerminalOperation::SetSubsidiaryLock(false)),
+            Ok(Ok(TerminalResponse::Done))
+        );
+        let mut subsidiary = fs
+            .open(USER, "/dev/pts/0", OFlags::RDWR, Mode::empty())
+            .expect("Failed to open /dev/pts/0");
+        assert!(fs.terminal(&subsidiary).is_some());
+        assert!(fs.readiness_source(&subsidiary).is_some());
+
+        let mut buffer = [0; 16];
+        assert!(matches!(fs.write(&mut manager, b"in\n", None), Ok(3)));
+        assert!(matches!(fs.read(&mut subsidiary, &mut buffer, None), Ok(3)));
+        assert_eq!(&buffer[..3], b"in\n");
+        // Echo reaches the manager ahead of the subsidiary's output.
+        assert!(matches!(fs.write(&mut subsidiary, b"out", None), Ok(3)));
+        assert!(matches!(fs.read(&mut manager, &mut buffer, None), Ok(7)));
+        assert_eq!(&buffer[..7], b"in\r\nout");
+    }
+
+    /// `/dev/pts` lists and names the subsidiaries of open managers, with
+    /// Linux's device numbers, without `stat` or `O_PATH` creating pairs.
+    #[test]
+    fn pts_names_open_pairs() {
+        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
+        let ptmx_path = fs
+            .open(USER, "/dev/ptmx", OFlags::PATH, Mode::empty())
+            .expect("Failed to open /dev/ptmx with O_PATH");
+        assert!(fs.terminal(&ptmx_path).is_none());
+        let ptmx = fs.file_status(USER, "/dev/ptmx", true).unwrap();
+        assert_eq!(ptmx.file_type, FileType::CharacterDevice);
+        assert_eq!(names(&fs, "/dev/pts"), [".", ".."]);
+        let pts = fs.file_status(USER, "/dev/pts", true).unwrap();
+        assert_eq!(pts.file_type, FileType::Directory);
+        let dev = names(&fs, "/dev");
+        assert!(dev.iter().any(|name| name == "ptmx"));
+        assert!(dev.iter().any(|name| name == "pts"));
+
+        let first = fs
+            .open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .unwrap();
+        let second = fs
+            .open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .unwrap();
+        assert_eq!(names(&fs, "/dev/pts"), [".", "..", "0", "1"]);
+        let status = fs.file_status(USER, "/dev/pts/1", true).unwrap();
+        assert_eq!(status.file_type, FileType::CharacterDevice);
+        assert_eq!(status.mode, Mode::RUSR | Mode::WUSR | Mode::WGRP);
+        assert_eq!(status.node_info.dev, pts.node_info.dev);
+        assert_eq!(status.node_info.ino, 4);
+        assert_eq!(
+            status.node_info.rdev.map(core::num::NonZeroU64::get),
+            Some((136 << 8) | 1)
+        );
+        // A path-only subsidiary describes itself without opening it.
+        let path = fs
+            .open(USER, "/dev/pts/1", OFlags::PATH, Mode::empty())
+            .unwrap();
+        assert!(fs.terminal(&path).is_none());
+        assert_eq!(fs.handle_status(&path).unwrap().node_info, status.node_info);
+
+        for missing in ["/dev/pts/2", "/dev/pts/01", "/dev/pts/+1", "/dev/pts/x"] {
+            assert!(
+                matches!(
+                    fs.open(USER, missing, OFlags::PATH, Mode::empty()),
+                    Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+                ),
+                "{missing}"
+            );
+        }
+        for not_directory in ["/dev/pts/0/", "/dev/pts/0/x", "/dev/ptmx/x"] {
+            assert!(
+                matches!(
+                    fs.open(USER, not_directory, OFlags::PATH, Mode::empty()),
+                    Err(OpenError::PathError(PathError::ComponentNotADirectory))
+                ),
+                "{not_directory}"
+            );
+        }
+        assert!(matches!(
+            fs.open(USER, "/dev/pts/0", OFlags::DIRECTORY, Mode::empty()),
+            Err(OpenError::PathError(PathError::ComponentNotADirectory))
+        ));
+
+        // A subsidiary's name goes away with its manager.
+        drop(first);
+        assert_eq!(names(&fs, "/dev/pts"), [".", "..", "1"]);
+        assert!(matches!(
+            fs.open(USER, "/dev/pts/0", OFlags::PATH, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        drop(second);
+    }
+
+    /// `/dev/ptmx` fails to open once every index is in use.
+    #[test]
+    fn ptmx_runs_out_of_space() {
+        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
+        let mut managers: Vec<_> =
+            core::iter::from_fn(|| fs.open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty()).ok())
+                .collect();
+        assert_eq!(managers.len(), 64);
+        assert!(matches!(
+            fs.open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty()),
+            Err(OpenError::NoSpace)
+        ));
+        managers.pop();
+        fs.open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .expect("A closed pair frees its index");
     }
 }
 

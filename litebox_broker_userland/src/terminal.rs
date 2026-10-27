@@ -18,7 +18,8 @@ use litebox_broker_core::fs::FileResult;
 use litebox_broker_core::fs::errors::{ReadError, WriteError};
 use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessSource, ReadinessWatchers};
 use litebox_broker_core::terminal::{
-    TerminalEndpoint, TerminalEngine, TerminalEventSink, TerminalTransport, TerminalTransportError,
+    ATOMIC_WRITE_SIZE, OUTPUT_CAPACITY, TerminalEndpoint, TerminalEngine, TerminalEventSink,
+    TerminalTransport, TerminalTransportError,
 };
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_protocol::fs::FileError;
@@ -32,9 +33,6 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 /// resizes; Linux, for one, signals them only to the terminal's foreground
 /// process group.
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-const OUTPUT_CAPACITY: usize = 64 * 1024;
-const ATOMIC_WRITE_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {
@@ -515,6 +513,11 @@ impl TerminalEndpoint for HostTerminal {
                 TerminalResponse::Done
             }
             TerminalOperation::Drain => TerminalResponse::Done,
+            TerminalOperation::GetSubsidiaryIndex
+            | TerminalOperation::GetSubsidiaryLock
+            | TerminalOperation::SetSubsidiaryLock(_) => {
+                return Ok(Err(FileError::InvalidTerminalControl));
+            }
         };
         state.publish();
         self.shared.changed.notify_all();

@@ -30,6 +30,8 @@ pub enum OpenError {
     PathError(#[from] PathError),
     #[error("no such device or address")]
     NoSuchDevice,
+    #[error("no space is left for a new object")]
+    NoSpace,
 }
 
 /// Possible errors from [`super::resolver::Resolver::read`]

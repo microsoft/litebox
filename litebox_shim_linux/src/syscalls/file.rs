@@ -2488,7 +2488,12 @@ fn terminal_operation<Platform: ShimPlatform>(arg: &IoctlArg) -> Result<Terminal
             return Err(Errno::EOPNOTSUPP);
         }
         IoctlArg::TCSBRK(_) => TerminalOperation::Drain,
-        IoctlArg::TIOCGPTN(_) => return Err(Errno::ENOTTY),
+        IoctlArg::TIOCGPTN(_) => TerminalOperation::GetSubsidiaryIndex,
+        IoctlArg::TIOCGPTLCK(_) => TerminalOperation::GetSubsidiaryLock,
+        IoctlArg::TIOCSPTLCK(ptr) => {
+            let lock = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+            TerminalOperation::SetSubsidiaryLock(lock != 0)
+        }
         _ => unreachable!("non-terminal ioctl"),
     })
 }
@@ -2581,16 +2586,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     fn terminal_ioctl(&self, file: &File<Platform>, arg: &IoctlArg) -> Result<u32, Errno> {
+        // Only pseudo-terminal managers support these, and Linux fails them with `ENOTTY` on
+        // other terminals.
+        let manager_only = matches!(
+            arg,
+            IoctlArg::TIOCGPTN(_) | IoctlArg::TIOCGPTLCK(_) | IoctlArg::TIOCSPTLCK(_)
+        );
+        let control = |operation, cx| {
+            file.terminal_control(operation, cx)
+                .map_err(|error| match error {
+                    Errno::EINVAL if manager_only => Errno::ENOTTY,
+                    error => error,
+                })
+        };
         let operation = match terminal_operation::<Platform>(arg) {
             Ok(operation) => operation,
             Err(error) => {
                 // Linux rejects the descriptor (`EBADF` for `O_PATH`, `ENOTTY` for a
-                // non-terminal) before the request's argument.
-                file.terminal_control(TerminalOperation::GetSettings, None)?;
+                // non-terminal, or for a manager-only request, a non-manager) before the
+                // request's argument.
+                let probe = if manager_only {
+                    TerminalOperation::GetSubsidiaryLock
+                } else {
+                    TerminalOperation::GetSettings
+                };
+                control(probe, None)?;
                 return Err(error);
             }
         };
-        let response = file.terminal_control(operation, Some(&self.wait_cx()))?;
+        let response = control(operation, Some(&self.wait_cx()))?;
         if matches!(operation, TerminalOperation::SetWindowSize(_)) {
             // Like Linux, a resize signals the terminal's process group, which may include this
             // process, before the ioctl returns.
@@ -2607,6 +2631,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             (IoctlArg::TIOCGWINSZ(ptr), TerminalResponse::WindowSize(size)) => {
                 ptr.write_at_offset::<Platform>(0, size.into())
+                    .ok_or(Errno::EFAULT)?;
+            }
+            (IoctlArg::TIOCGPTN(ptr), TerminalResponse::SubsidiaryIndex(index)) => {
+                ptr.write_at_offset::<Platform>(0, index)
+                    .ok_or(Errno::EFAULT)?;
+            }
+            (IoctlArg::TIOCGPTLCK(ptr), TerminalResponse::SubsidiaryLock(locked)) => {
+                ptr.write_at_offset::<Platform>(0, i32::from(locked))
                     .ok_or(Errno::EFAULT)?;
             }
             (_, TerminalResponse::Done) => {}
@@ -2745,6 +2777,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | IoctlArg::TCFLSH(..)
             | IoctlArg::TIOCSWINSZ(..)
             | IoctlArg::TIOCGPTN(..)
+            | IoctlArg::TIOCGPTLCK(..)
+            | IoctlArg::TIOCSPTLCK(..)
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.file_only(Errno::ENOTTY)?;
