@@ -7,9 +7,9 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use litebox_platform::sync::{Mutex, RawSyncPrimitivesProvider};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -31,18 +31,26 @@ const MAX_SYMLINKS: usize = 40;
 
 /// The broker-core filesystem resolver, generic over its synchronization platform and
 /// [`Backend`](super::backend::Backend).
-pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
+pub struct Resolver<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+{
     backend: Backend,
-    _sync: PhantomData<fn() -> Platform>,
+    /// Held by each append from finding the end of its file until its write lands there, because
+    /// separate opens of one file do not share an entry lock.
+    ///
+    /// Appends are atomic only with respect to each other: a concurrent non-append write or
+    /// truncate of the same file is not ordered against them.
+    append: Mutex<Platform, ()>,
 }
 
-impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    Resolver<Platform, Backend>
+{
     /// Construct a filesystem resolver over `backend`.
     #[must_use]
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
-            _sync: PhantomData,
+            append: Mutex::new(()),
         }
     }
 }
@@ -133,7 +141,9 @@ enum SearchScope {
     AndReadableTarget,
 }
 
-impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    Resolver<Platform, Backend>
+{
     /// Resolve an absolute path to its physical location, following symbolic links.
     pub fn resolve_following_symlinks(
         &self,
@@ -571,11 +581,33 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 }
 
-impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    Resolver<Platform, Backend>
+{
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
     pub fn open(
+        &self,
+        user: UserInfo,
+        path: &str,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<ResolverEntry<Backend>, OpenError> {
+        match self.open_once(user, path, flags, mode) {
+            // Without `EXCL`, this means another open created the file between this one's walk and
+            // its create, so open that file instead. Retry only once so a backend whose walk never
+            // sees a name its create rejects cannot loop forever.
+            Err(OpenError::AlreadyExists)
+                if flags.contains(OFlags::CREAT) && !flags.contains(OFlags::EXCL) =>
+            {
+                self.open_once(user, path, flags, mode)
+            }
+            result => result,
+        }
+    }
+
+    fn open_once(
         &self,
         user: UserInfo,
         path: &str,
@@ -819,17 +851,18 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             return Err(WriteError::NotForWriting);
         }
 
+        let appending =
+            seek_behavior == SeekBehavior::PositionBased && entry.append_mode && offset.is_none();
+        let _append = appending.then(|| self.append.lock());
         let write_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased if entry.append_mode && offset.is_none() => {
-                usize::try_from(
-                    self.backend
-                        .status(HandleRef::File(file))
-                        .map_err(|_| WriteError::Io)?
-                        .size,
-                )
-                .map_err(|_| WriteError::Io)?
-            }
+            SeekBehavior::PositionBased if appending => usize::try_from(
+                self.backend
+                    .status(HandleRef::File(file))
+                    .map_err(|_| WriteError::Io)?
+                    .size,
+            )
+            .map_err(|_| WriteError::Io)?,
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
         let written = self.backend.write(file, buf, write_offset)?;

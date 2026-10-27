@@ -935,6 +935,97 @@ mod in_mem {
     }
 
     #[test]
+    fn appends_through_separate_opens_never_overwrite() {
+        const WRITERS: u8 = 4;
+        const ROUNDS: usize = 200;
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
+        let path = "/log";
+        create_with_content(&fs, path, b"");
+
+        let fds: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                fs.open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+                    .expect("Failed to open file with O_APPEND")
+            })
+            .collect();
+        let round = std::sync::Barrier::new(usize::from(WRITERS));
+        let failures: Vec<_> = std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..WRITERS)
+                .zip(fds)
+                .map(|(writer, mut fd)| {
+                    let (fs, round) = (&fs, &round);
+                    // Meet every round even after a failure, so no writer is left waiting.
+                    scope.spawn(move || {
+                        (0..ROUNDS)
+                            .filter_map(|_| {
+                                round.wait();
+                                fs.write(&mut fd, &[writer], None).err()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            writers
+                .into_iter()
+                .flat_map(|writer| writer.join().unwrap())
+                .collect()
+        });
+        assert!(failures.is_empty(), "{failures:?}");
+
+        let mut fd = fs
+            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file for reading");
+        let mut contents = vec![0; usize::from(WRITERS) * ROUNDS + 1];
+        let read = fs
+            .read(&mut fd, &mut contents, None)
+            .expect("Failed to read from file");
+        contents.truncate(read);
+        contents.sort_unstable();
+        let every_append: Vec<u8> = (0..WRITERS)
+            .flat_map(|writer| core::iter::repeat_n(writer, ROUNDS))
+            .collect();
+        assert_eq!(contents, every_append);
+    }
+
+    #[test]
+    fn creators_without_excl_all_open_the_file() {
+        const OPENERS: usize = 4;
+        const FILES: usize = 200;
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
+
+        let round = std::sync::Barrier::new(OPENERS);
+        let failures: Vec<_> = std::thread::scope(|scope| {
+            let openers: Vec<_> = (0..OPENERS)
+                .map(|_| {
+                    let (fs, round) = (&fs, &round);
+                    // Meet every round even after a failure, so no opener is left waiting.
+                    scope.spawn(move || {
+                        (0..FILES)
+                            .filter_map(|file| {
+                                round.wait();
+                                fs.open(
+                                    USER,
+                                    &alloc::format!("/file{file}"),
+                                    OFlags::CREAT | OFlags::WRONLY,
+                                    Mode::RWXU,
+                                )
+                                .err()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            openers
+                .into_iter()
+                .flat_map(|opener| opener.join().unwrap())
+                .collect()
+        });
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
     fn open_returns_symlink_resolved_path() {
         use crate::fs::in_mem::InitialNode;
         use alloc::string::String;
