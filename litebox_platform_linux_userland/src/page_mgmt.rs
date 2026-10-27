@@ -23,7 +23,7 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
 
 #[cfg(target_arch = "aarch64")]
 fn cache_sync_permissions(permissions: MemoryRegionPermissions) -> MemoryRegionPermissions {
-    (permissions | MemoryRegionPermissions::READ) & !MemoryRegionPermissions::EXEC
+    permissions | MemoryRegionPermissions::READ
 }
 
 litebox::define_page_reservation!(LinuxUserlandReservation);
@@ -330,12 +330,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
         #[cfg(target_arch = "aarch64")]
         {
-            // Cache maintenance needs read permission. Keep execute disabled until
-            // the new instructions are visible to the fetch path.
+            // Cache maintenance needs read permission. Execute permission stays as requested:
+            // revoking it would fault threads already running this code, and like Linux,
+            // LiteBox does not promise new instructions to threads racing with this call.
             //
-            // TODO: only a W->X transition needs this; `update_permissions` is not
+            // TODO: only a W->X transition needs synchronization, but `protect_pages` is not
             // told the old permissions, so every transition to X pays for it.
-            // Revisit when the trait passes the old permissions.
             let syncing = new_permissions.contains(MemoryRegionPermissions::EXEC);
             let mapped_permissions = if syncing {
                 cache_sync_permissions(new_permissions)
@@ -469,13 +469,18 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn cache_sync_permissions_are_readable_and_non_executable() {
-        let final_permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC;
-        let sync_permissions = cache_sync_permissions(final_permissions);
+    fn cache_sync_permissions_add_read_and_keep_execute() {
+        use MemoryRegionPermissions as Perm;
 
-        assert!(sync_permissions.contains(MemoryRegionPermissions::READ));
-        assert!(!sync_permissions.contains(MemoryRegionPermissions::EXEC));
-        assert!(final_permissions.contains(MemoryRegionPermissions::EXEC));
+        assert_eq!(cache_sync_permissions(Perm::EXEC), Perm::READ | Perm::EXEC);
+        assert_eq!(
+            cache_sync_permissions(Perm::READ | Perm::EXEC),
+            Perm::READ | Perm::EXEC
+        );
+        assert_eq!(
+            cache_sync_permissions(Perm::READ | Perm::WRITE | Perm::EXEC),
+            Perm::READ | Perm::WRITE | Perm::EXEC
+        );
     }
     #[test]
     fn moving_growth_of_file_pages_adds_zeroed_pages() {
