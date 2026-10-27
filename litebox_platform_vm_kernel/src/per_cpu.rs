@@ -17,6 +17,7 @@ use core::mem::offset_of;
 use litebox::arch::x86_64::{rdgsbase, wrgsbase};
 use litebox_common_linux::PAGE_SIZE;
 use x86_64::VirtAddr;
+use x86_64::registers::model_specific::KernelGsBase;
 
 // Include guards in the power-of-two allocation to avoid buddy-allocator waste.
 const DOUBLE_FAULT_STACK_SIZE: usize = 4 * PAGE_SIZE;
@@ -345,6 +346,39 @@ fn per_cpu_variables_ptr() -> *mut PerCpuVariables {
         "GS contains a non-canonical address"
     );
     gsbase as *mut PerCpuVariables
+}
+
+/// The mode an external interrupt interrupted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Interrupted {
+    /// In [`crate::cpu::halt`] or [`crate::cpu::relax`], the only kernel code
+    /// that takes interrupts.
+    Kernel,
+    User,
+}
+
+/// The CPU an external interrupt arrived on, for its handler, without GS,
+/// which user mode may have changed: the kernel's GS base is GS's in
+/// kernel mode, and in `IA32_KERNEL_GS_BASE` in user mode (see
+/// `switch_to_user`).
+pub(crate) fn interrupted_cpu(interrupted: Interrupted) -> CpuId {
+    let mut base = match interrupted {
+        // Safety: FSGSBASE is enabled before interrupts are.
+        Interrupted::Kernel => (unsafe { rdgsbase() }) as u64,
+        // Safety: reads an MSR, which has no side effects.
+        Interrupted::User => unsafe { KernelGsBase::MSR.read() },
+    };
+    // No speculation past the choice with the other base, which user code
+    // may control (as after SWAPGS); through `base`, so that neither moves
+    // across it.
+    // Safety: a fence only.
+    unsafe {
+        core::arch::asm!("lfence /* {base} */", base = inout(reg) base, options(nostack, preserves_flags));
+    };
+    let pcv = base as *const PerCpuVariables;
+    // Safety: the CPU's variables (see above), which live for good; reads
+    // only `cpu`, which never changes.
+    unsafe { (&raw const (*pcv).cpu).read() }
 }
 
 /// `cpu`'s variables and stacks, for [`install`]; they live as long as the

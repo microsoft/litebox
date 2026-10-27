@@ -91,7 +91,8 @@ pub(crate) trait Frames {
     ///
     /// # Safety
     ///
-    /// For a page fault on a page mapped with `flags` that they allow.
+    /// For a page fault on a page mapped with `flags` that they allow,
+    /// serialized as [`VmemPageFaultHandler::handle_page_fault`] requires.
     unsafe fn populate(&self, addr: usize, flags: VmFlags, error_code: u64) -> bool;
 }
 
@@ -249,7 +250,8 @@ impl<F: Frames + 'static> Mappings<F> {
             return false;
         }
         // Safety: called for a page fault on a page the process mapped with
-        // `flags`, and the access is allowed.
+        // `flags`, and the access is allowed; under the process's claim, as
+        // are its other faults, and the changes and copies of its mappings.
         unsafe { self.platform.populate(addr, flags, error_code) }
     }
 }

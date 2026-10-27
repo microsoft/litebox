@@ -802,7 +802,9 @@ where
     ///
     /// # Safety
     ///
-    /// This should only be called from the kernel page fault handler.
+    /// This should only be called from the kernel page fault handler, serialized with any copy of
+    /// the address space (its lock serializes the faults and mapping changes made through it; see
+    /// [`VmemPageFaultHandler::handle_page_fault`]).
     pub unsafe fn handle_page_fault(
         &self,
         fault_addr: usize,

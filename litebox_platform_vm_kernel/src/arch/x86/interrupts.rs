@@ -5,10 +5,13 @@
 //! NMI entry cannot assume kernel GS or a completed syscall stack switch.
 //! CR4.MCE remains off; machine checks shut down the CPU.
 
-use crate::InterruptHandler;
+use crate::per_cpu::{self, Interrupted};
+use crate::{Handled, InterruptHandler};
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::PtRegs;
 use spin::Once;
-use x86_64::{VirtAddr, structures::idt::InterruptDescriptorTable};
+use x86_64::structures::{gdt::SegmentSelector, idt::InterruptDescriptorTable};
+use x86_64::{PrivilegeLevel, VirtAddr};
 
 core::arch::global_asm!(include_str!("interrupts.S"));
 
@@ -143,20 +146,44 @@ pub(crate) fn set_external_interrupt_handler(handler: &'static InterruptHandler)
     assert!(installed, "an interrupt handler is already set");
 }
 
+/// What `isr_external` does once [`external_interrupt_handler_impl`]
+/// returns; it reads the value as a byte.
+#[repr(u8)]
+enum Then {
+    /// Returns to the interrupted code.
+    Return = 0,
+    /// Enters the shim (`interrupt_callback`) from the interrupted user
+    /// mode.
+    EnterShim = 1,
+}
+
+const _: () = assert!(Then::Return as u8 == 0 && Then::EnterShim as u8 == 1);
+
 /// Runs with interrupts disabled and the interrupted context's GS (see
 /// `isr_external`), on the interrupted stack from kernel mode or on the
-/// `TSS.RSP0` stack from user mode.
+/// `TSS.RSP0` stack from user mode. Handles the CPU's TLB flushes first
+/// (see [`crate::tlb`]).
 #[unsafe(no_mangle)]
-extern "C" fn external_interrupt_handler_impl(vector: u64, rip: u64, cs: u64) {
-    if let (Some(interrupts), Ok(vector)) = (INTERRUPTS.get(), u8::try_from(vector))
-        && interrupts
+extern "C" fn external_interrupt_handler_impl(vector: u64, rip: u64, cs: u64) -> Then {
+    let interrupted = match SegmentSelector(cs.trunc()).rpl() {
+        PrivilegeLevel::Ring0 => Interrupted::Kernel,
+        _ => Interrupted::User,
+    };
+    crate::tlb::handle(per_cpu::interrupted_cpu(interrupted));
+    let handled = match (INTERRUPTS.get(), u8::try_from(vector)) {
+        (Some(interrupts), Ok(vector)) => interrupts
             .handler
             .get()
-            .is_some_and(|handler| handler(vector))
-    {
-        return;
+            .map_or(Handled::Unexpected, |handler| handler(vector)),
+        _ => Handled::Unexpected,
+    };
+    match (handled, interrupted) {
+        (Handled::Unexpected, _) => {
+            panic!("EXCEPTION: UNEXPECTED INTERRUPT (vector {vector:#x}, RIP {rip:#x}, CS {cs:#x})")
+        }
+        (Handled::Event, Interrupted::User) => Then::EnterShim,
+        (Handled::Event, Interrupted::Kernel) | (Handled::Doorbell, _) => Then::Return,
     }
-    panic!("EXCEPTION: UNEXPECTED INTERRUPT (vector {vector:#x}, RIP {rip:#x}, CS {cs:#x})");
 }
 
 #[unsafe(no_mangle)]

@@ -11,22 +11,25 @@
 //! must precede execution that needs derived keys. The runner may then start
 //! the other CPUs ([`VmKernel::start_cpus`], [`cpu`]), which run its entry.
 //!
-//! Assumptions: no kernel threads (the runner may switch user threads); a
-//! task's address space current on at most one CPU at a time, which alone
-//! changes its mappings, and kernel mappings changed after boot only to add
-//! some or to unmap a stack's guard page, which only its CPU uses: TLB
-//! flushes are local; synchronized TSCs (see [`cpu`]); and not a confidential
-//! VM (no #VE/#VC/#HV).
+//! Assumptions: no kernel threads (the runner may switch user threads);
+//! kernel mappings changed after boot only to add some or to unmap a stack's
+//! guard page, which only its CPU uses, so flushed locally; synchronized
+//! TSCs (see [`cpu`]); and not a confidential VM (no #VE/#VC/#HV). A task's
+//! address space may be current on several CPUs at once: a change to its
+//! mappings that may leave stale translations is shot down, by IPI, on those
+//! that may cache it (see `tlb`).
 //!
 //! Devices: [`VmKernel`] is the drivers' [`litebox_hal::dma::Hal`].
 //!
 //! Interrupts: the kernel runs with interrupts disabled, except while it
 //! halts ([`cpu::halt`]) or spins in [`cpu::relax`]; user code runs with them
-//! enabled. External interrupts, on any CPU, go to the handler the runner
-//! installs ([`set_interrupt_handler`]); one that interrupted user code then
-//! also enters the shim's `interrupt` (e.g., for the runner's one-shot timer,
-//! a device's input, or another CPU's wake IPI, see [`cpu`]); ending the run
-//! there lets the runner preempt the thread ([`resume_thread_ref`]).
+//! enabled. External interrupts, on any CPU, handle the TLB flushes other
+//! CPUs requested of it, then go to the handler the runner installs
+//! ([`set_interrupt_handler`]); one that interrupted user code then also
+//! enters the shim's `interrupt` (e.g., for the runner's one-shot timer, a
+//! device's input, or another CPU's wake IPI, see [`cpu`]), unless only a
+//! doorbell ([`Handled::Doorbell`]); ending the run there lets the runner
+//! preempt the thread ([`resume_thread_ref`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -88,6 +91,7 @@ mod per_cpu;
 pub mod providers;
 
 mod syscall_entry;
+mod tlb;
 pub mod worker;
 
 /// Inputs to the boot CPU's kernel handoff. The runner owns device setup and
@@ -112,20 +116,32 @@ pub struct BootConfig<'a> {
 }
 
 /// See [`set_interrupt_handler`].
-pub type InterruptHandler = dyn Fn(u8) -> bool + Sync;
+pub type InterruptHandler = dyn Fn(u8) -> Handled + Sync;
+
+/// What [`set_interrupt_handler`]'s handler made of an interrupt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handled {
+    /// Not a vector it handles: the kernel panics.
+    Unexpected,
+    /// Ended, for the kernel to look at: user code it interrupted enters the
+    /// shim's `interrupt`.
+    Event,
+    /// Ended, only a doorbell (e.g., [`cpu::Ipi::FlushTlb`]'s): user code it
+    /// interrupted resumes at once.
+    Doorbell,
+}
 
 /// Installs the handler for external interrupts (vectors 32 and up, except
-/// [`BootConfig::ignored_vectors`]), which returns whether it handled the
-/// vector; an unhandled one panics. Before this, every external interrupt
-/// panics.
+/// [`BootConfig::ignored_vectors`]), which says what it made of the vector
+/// ([`Handled`]). Before this, every external interrupt panics.
 ///
 /// The handler runs with interrupts disabled, on the interrupted context's GS
 /// (user mode, [`cpu::halt`], or a spin's [`cpu::relax`]), on any CPU: it
 /// must not touch per-CPU data, block, or take locks; it should only end the
 /// interrupt, maybe wake CPUs (e.g., [`cpu::wake_idle`]), and leave the work
 /// to the kernel after the halt. It also handles the wake IPI
-/// ([`cpu::Ipi::Wake`]), on every CPU, the boot CPU too, from
-/// [`VmKernel::start_cpus`] on.
+/// ([`cpu::Ipi::Wake`]) and the TLB-flush IPI ([`cpu::Ipi::FlushTlb`]), on
+/// every CPU, the boot CPU too, from [`VmKernel::start_cpus`] on.
 ///
 /// # Panics
 ///
@@ -255,7 +271,12 @@ impl PageTableManager {
             unsafe { self.base_page_table.load() };
             with_per_cpu_variables(|pcv| {
                 // Safety: CR3 now references the base page table and interrupts are disabled.
-                unsafe { pcv.replace_active_page_table(None) }
+                let previous = unsafe { pcv.replace_active_page_table(None) };
+                // Only now that CR3 points elsewhere (see `tlb`).
+                if let Some((_, table)) = &previous {
+                    table.cpus().leave(pcv.cpu);
+                }
+                previous
             })
         });
         // Last-owner reclamation runs outside the interrupt-free section.
@@ -281,12 +302,22 @@ impl PageTableManager {
         };
 
         let previous = without_interrupts(|| {
+            // Before CR3 points to it (see `tlb`).
+            pt.cpus().enter(cpu::current());
             // Replace the per-CPU owner only after CR3 stops referencing it.
             // Safety: task tables share the base table's kernel entries.
             unsafe { pt.load() };
             with_per_cpu_variables(|pcv| {
                 // Safety: CR3 now references `pt` and interrupts are disabled.
-                unsafe { pcv.replace_active_page_table(Some((task_pt_id, pt))) }
+                let previous = unsafe { pcv.replace_active_page_table(Some((task_pt_id, pt))) };
+                // Only now that CR3 points elsewhere, unless reloaded (see
+                // `tlb`).
+                if let Some((id, table)) = &previous
+                    && *id != task_pt_id
+                {
+                    table.cpus().leave(pcv.cpu);
+                }
+                previous
             })
         });
         // Last-owner reclamation runs outside the interrupt-free section.
@@ -700,9 +731,9 @@ impl VmKernel {
     /// A new address space with `source`'s user mappings, whose frames the
     /// two share copy-on-write: each gets its own copy of a page once either
     /// writes it. Pinned pages (see [`Self::pin_user_pages`]) are not cloned:
-    /// the new address space leaves them unmapped. `source` must be current on
-    /// no other CPU (see the crate docs): its leaves become read-only, which
-    /// only this CPU's TLB learns.
+    /// the new address space leaves them unmapped. `source`'s leaves, but
+    /// shared memory's and pinned ones, become read-only, which is shot down
+    /// on every CPU that may cache it.
     ///
     /// # Errors
     ///
@@ -991,8 +1022,9 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
         match fixed_address_behavior {
             FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
-                // Safety: the caller replaces this range, so nothing uses it.
-                // Unmapping fails only for an unaligned range.
+                // Safety: the caller replaces this range, so nothing uses it,
+                // and, owning it, changes it no other way meanwhile.
+                // Unmapping fails only for an unaligned range, or at a huge page (a bug).
                 unsafe { current_pt.unmap_pages(range, UnmapOptions::RELEASE) }
                     .map_err(|_| AllocationError::Unaligned)?;
                 replaced_reservations().for_each(drop);
@@ -1025,7 +1057,8 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
         range: core::ops::Range<usize>,
     ) -> Result<(), DeallocationError> {
         let range = PageRange::new(range.start, range.end).ok_or(DeallocationError::Unaligned)?;
-        // Safety: forwarded to the caller, who no longer uses `range`.
+        // Safety: forwarded to the caller, who no longer uses `range`, and,
+        // owning it, changes it no other way meanwhile.
         unsafe {
             self.page_table_manager
                 .current_page_table()
@@ -1062,7 +1095,8 @@ impl VmemPageFaultHandler for VmKernel {
         flags: VmFlags,
         error_code: u64,
     ) -> Result<(), PageFaultError> {
-        // Safety: forwarded to the caller (the page fault handler).
+        // Safety: forwarded to the caller (the page fault handler, serialized
+        // with the page's other faults, and changes and copies of its mapping).
         unsafe {
             self.page_table_manager
                 .current_page_table()

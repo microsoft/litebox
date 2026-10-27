@@ -14,7 +14,7 @@
 //! - [`Devices::shares`]: the VM's virtio-9p devices, each a host directory
 //!   mounted at its tag.
 //! - [`InterruptController`]: the local APICs, to start and wake the other
-//!   CPUs.
+//!   CPUs, and to have them flush their TLBs.
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
@@ -24,7 +24,9 @@
 //! whose workers are suspended; the broker looks at the devices when it next
 //! runs, which, if the interrupt stopped a process, the shim has it do at
 //! once (see `litebox_platform_vm_kernel`). A wake IPI only ends a halt, or
-//! has a CPU running a process enter the kernel.
+//! has a CPU running a process enter the kernel. A TLB-flush IPI is only a
+//! doorbell: the platform flushes before the handler runs, and a process it
+//! interrupted resumes at once.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -41,7 +43,7 @@ use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice};
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
-use litebox_platform_vm_kernel::{Instant, VmKernel, worker};
+use litebox_platform_vm_kernel::{Handled, Instant, VmKernel, worker};
 use litebox_shim_vm_kernel::ProcessTimer;
 use spin::Mutex;
 
@@ -66,12 +68,27 @@ const DEVICE_VECTOR: u8 = 0x31;
 /// Ends a halt, or interrupts a process ([`Ipi::Wake`]).
 const WAKE_VECTOR: u8 = 0x32;
 
-// So `send_fixed_ipi` cannot panic (it runs in interrupt handlers).
+/// Has a CPU flush its TLB ([`Ipi::FlushTlb`]): in the highest priority
+/// class, below the spurious vector.
+const FLUSH_VECTOR: u8 = 0xf0;
+
+// So `send_fixed_ipi` cannot panic (it runs in interrupt handlers), and each
+// vector is handled as one thing.
 const _: () = {
-    assert!(WAKE_VECTOR >= 32);
+    let vectors = [TIMER_VECTOR, DEVICE_VECTOR, WAKE_VECTOR, FLUSH_VECTOR];
+    assert!(WAKE_VECTOR >= 32 && FLUSH_VECTOR >= 32);
     let mut i = 0;
     while i < SPURIOUS_VECTORS.len() {
-        assert!(WAKE_VECTOR != SPURIOUS_VECTORS[i]);
+        assert!(WAKE_VECTOR != SPURIOUS_VECTORS[i] && FLUSH_VECTOR != SPURIOUS_VECTORS[i]);
+        i += 1;
+    }
+    let mut i = 0;
+    while i < vectors.len() {
+        let mut j = i + 1;
+        while j < vectors.len() {
+            assert!(vectors[i] != vectors[j]);
+            j += 1;
+        }
         i += 1;
     }
 };
@@ -202,7 +219,7 @@ impl Devices {
 
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
     /// per-CPU data.
-    fn on_interrupt(&self, vector: u8) -> bool {
+    fn on_interrupt(&self, vector: u8) -> Handled {
         match vector {
             // Fired: arming the same deadline again (e.g., after an early
             // fire) must reprogram it. Which CPU's timer it was is per-CPU
@@ -222,10 +239,14 @@ impl Devices {
                 worker::interrupt_suspended(CpuId::BOOT);
             }
             WAKE_VECTOR => {}
-            _ => return false,
+            FLUSH_VECTOR => {
+                self.apic.end_of_interrupt();
+                return Handled::Doorbell;
+            }
+            _ => return Handled::Unexpected,
         }
         self.apic.end_of_interrupt();
-        true
+        Handled::Event
     }
 
     /// The calling CPU's [`Self::armed`].
@@ -268,9 +289,9 @@ impl Devices {
     }
 }
 
-// Safety: `send_ipi` sends `Init` and `Startup` as the HAL's, and `Wake` as
-// a fixed interrupt, to the APIC ID it is given, or nothing (false); and
-// `init_cpu` sets up the calling CPU's local APIC only.
+// Safety: `send_ipi` sends `Init` and `Startup` as the HAL's, and `Wake` and
+// `FlushTlb` as fixed interrupts, to the APIC ID it is given, or nothing
+// (false); and `init_cpu` sets up the calling CPU's local APIC only.
 unsafe impl InterruptController for Devices {
     fn init_cpu(&self) {
         self.apic.init_cpu();
@@ -281,6 +302,7 @@ unsafe impl InterruptController for Devices {
             Ipi::Init => StartupIpi::Init,
             Ipi::Startup { page } => StartupIpi::Startup { page },
             Ipi::Wake => return self.apic.send_fixed_ipi(apic_id, WAKE_VECTOR),
+            Ipi::FlushTlb => return self.apic.send_fixed_ipi(apic_id, FLUSH_VECTOR),
         };
         // Safety: the caller's, as `send_ipi`'s.
         unsafe { self.apic.send_startup_ipi(apic_id, startup) }
