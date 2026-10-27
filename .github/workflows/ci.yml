@@ -168,6 +168,13 @@ jobs:
         run: |
           QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
+      - name: Run threaded Linux programs in a QEMU VM with stacked runners on 4 CPUs, release (KVM)
+        # TODO: The pthread test hangs here at times, with a process's threads
+        # running at once on 4 CPUs. It is left out until the lost wakeup that
+        # https://github.com/microsoft/litebox/pull/1228 reproduces is fixed.
+        run: |
+          QEMU_SMP=4 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_linux_on_vm_userland.sh -r -t smp -t sched -t fork
       - name: Run OP-TEE TAs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         run: |
           QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \

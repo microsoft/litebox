@@ -42,7 +42,11 @@
 # passing tests with concurrent runs, the other CPUs ran none (a smoke check,
 # for the other CPUs running nothing at all). With more than
 # 4, the preempt test is skipped: it checks preemption with 8 CPU-bound
-# programs. Both need QEMU_SMP to start with the CPU count, or to have cpus=.
+# programs. With fewer than 2, the smp test is skipped: it checks threads of
+# a program running at once. A test given with -t that would be skipped is
+# an error instead. QEMU_SMP must give the CPU count as QEMU does: cpus= (or
+# a bare count), else maxcpus=, else the product of the topology's counts
+# (e.g., sockets=2,cores=2).
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
@@ -87,8 +91,46 @@ while getopts "t:rvh" opt; do
         *) awk 'NR >= 6 { if (!/^#/) exit; print }' "$0"; exit 2 ;;
     esac
 done
+
+# The CPU count in QEMU_SMP $1 (see the header); fails for another form.
+smp_cpus() {
+    local field key value cpus='' maxcpus='' product=1
+    local -a fields
+    IFS=, read -r -a fields <<<"$1"
+    for field in "${fields[@]}"; do
+        key=cpus value=$field
+        [[ $field != *=* ]] || { key=${field%%=*}; value=${field#*=}; }
+        [[ $value =~ ^[1-9][0-9]*$ ]] || return 1
+        case $key in
+            cpus) cpus=$value ;;
+            maxcpus) maxcpus=$value ;;
+            drawers | books | sockets | dies | clusters | modules | cores | threads)
+                product=$((product * value)) ;;
+            *) return 1 ;;
+        esac
+    done
+    echo "${cpus:-${maxcpus:-$product}}"
+}
+smp=$(smp_cpus "$QEMU_SMP") || {
+    echo "error: no CPU count in QEMU_SMP=$QEMU_SMP (see the header)" >&2
+    exit 2
+}
+
+# Why test $1 is skipped with these CPUs (see the header), if it is.
+skip_reason() {
+    case $1 in
+        preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
+        smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
+    esac
+}
+
 if [[ ${#tests[@]} -eq 0 ]]; then
     for f in "$TESTS_DIR"/*.json; do tests+=("$(basename "$f" .json)"); done
+else
+    for t in "${tests[@]}"; do
+        why=$(skip_reason "$t")
+        [[ -z $why ]] || { echo "error: test $t is skipped with QEMU_SMP=$QEMU_SMP: $why" >&2; exit 2; }
+    done
 fi
 
 # The userland runner has its own target directory.
@@ -180,21 +222,6 @@ show_console() {
     fi
 }
 
-# The CPU count (see the header), if QEMU_SMP has it.
-case $QEMU_SMP in
-    [0-9]*) smp=${QEMU_SMP%%[!0-9]*} ;;
-    cpus=[0-9]* | *,cpus=[0-9]*)
-        smp=",$QEMU_SMP"
-        smp=${smp##*,cpus=}
-        smp=${smp%%[!0-9]*}
-        ;;
-    *) smp= ;;
-esac
-if [[ -z $smp ]]; then
-    echo "warning: no CPU count in QEMU_SMP=$QEMU_SMP: the other CPUs' slices are not checked," \
-        "and preempt runs" >&2
-fi
-
 # Per passing test with concurrent runs, a line with the slices the CPUs but
 # the boot CPU ran (see the header); `run_vm` runs checks in a subshell.
 : >"$WORK/other_slices"
@@ -202,7 +229,7 @@ fi
 # Shows test $1's console, and records its other CPUs' slices.
 check_test() {
     show_console "$1"
-    if [[ ${smp:-1} -gt 1 ]] && grep -q '"concurrent"' "$TESTS_DIR/$1.json"; then
+    if [[ $smp -gt 1 ]] && grep -q '"concurrent"' "$TESTS_DIR/$1.json"; then
         local line slices count sum=0
         # Each CPU's, the boot CPU's first, as the kernel prints them at the
         # end, whatever LITEBOX_LOG.
@@ -222,8 +249,9 @@ check=check_test
 
 for t in "${tests[@]}"; do
     [[ -f "$TESTS_DIR/$t.json" ]] || { echo "error: no test $TESTS_DIR/$t.json" >&2; exit 2; }
-    if [[ $t == preempt && ${smp:-1} -gt 4 ]]; then
-        echo "SKIP  $t  (more CPUs than its preemption checks allow: see the header)"
+    why=$(skip_reason "$t")
+    if [[ -n $why ]]; then
+        echo "SKIP  $t  ($why: see the header)"
         skipped=$((skipped + 1))
         continue
     fi
