@@ -422,6 +422,30 @@ pub struct TruncateFileRequest {
     pub reset_offset: bool,
 }
 
+/// Requests the host shared object holding an open regular file's contents, so that the caller
+/// can map it as a `MAP_SHARED` file mapping.
+///
+/// The file must be open for reading, and also for writing if `writable` is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapFileRequest {
+    /// Broker-owned file handle.
+    pub handle: ObjectHandle,
+    /// Whether the caller may map the object writable.
+    pub writable: bool,
+}
+
+/// Successful map response.
+///
+/// The broker delivers the object itself to the caller out of band, tagged with `token`, before
+/// it sends this response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapFileResponse {
+    /// Identity of the object, the same for every caller that maps the same file.
+    pub identity: u128,
+    /// Tag of the out-of-band delivery of the object.
+    pub token: u64,
+}
+
 /// Reads one bounded page of directory entries into a shared-buffer region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadDirectoryRequest {

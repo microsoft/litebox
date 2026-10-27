@@ -323,6 +323,8 @@ pub const ILL_ILLOPN: i32 = 2;
 
 pub const FPE_INTDIV: i32 = 1;
 
+pub const BUS_ADRERR: i32 = 2;
+
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 

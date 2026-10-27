@@ -13,8 +13,8 @@ use core::marker::PhantomData;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
+    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
@@ -144,6 +144,22 @@ pub trait Backend: Send + Sync + Any {
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
         None
+    }
+
+    /// Returns the host shared memory that holds the file's contents, moving them there first if
+    /// necessary, so that runners can map the file `MAP_SHARED`.
+    ///
+    /// After this succeeds, the backend must keep the file's contents in that memory, so that
+    /// every mapping and every read, write, and truncation see the same bytes. The `identity` of
+    /// the result is filled in by the caller.
+    ///
+    /// The default implementation returns [`MapSharedError::Unsupported`].
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn map_shared(
+        &self,
+        h: &FileHandle,
+    ) -> Result<alloc::sync::Arc<dyn super::shared_memory::SharedFileMemory>, MapSharedError> {
+        Err(MapSharedError::Unsupported)
     }
 
     /// Write `buf` into the file, based on `offset` (see [`crate::transfer`]), returning the number

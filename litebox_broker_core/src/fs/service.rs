@@ -18,11 +18,12 @@ use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
+    ReadDirError, ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+    WalkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
+use super::shared_memory::SharedFileMapping;
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
 use crate::terminal::TerminalEndpoint;
@@ -99,9 +100,9 @@ impl ObjectEntry {
 
 mod private {
     use super::{
-        Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
-        FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result, ServiceResult,
-        String, TerminalEndpoint, Vec, WriteBuffer,
+        Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileMode,
+        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer, Result,
+        ServiceResult, SharedFileMapping, String, TerminalEndpoint, Vec, WriteBuffer,
     };
 
     pub trait Service: Send + Sync {
@@ -143,6 +144,10 @@ mod private {
 
         fn truncate(&self, _file: &File, _length: u64, _reset_offset: bool) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn map_shared(&self, _file: &File, _writable: bool) -> ServiceResult<SharedFileMapping> {
+            Ok(Err(FileError::NoSuchDevice))
         }
 
         fn read_directory(&self, _file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
@@ -390,6 +395,13 @@ where
             self.truncate_without_position_update(&entry, length)
         };
         Ok(truncate.map_err(file_truncate_error))
+    }
+
+    fn map_shared(&self, file: &File, writable: bool) -> ServiceResult<SharedFileMapping> {
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
+        Ok(Resolver::map_shared(self, &entry, writable).map_err(file_map_shared_error))
     }
 
     fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
@@ -652,6 +664,19 @@ pub fn truncate(
 ) -> Result<FileResult<()>> {
     let file = file(process, handle, ObjectRights::WRITE)?;
     process.core.fs.truncate(&file, length, reset_offset)
+}
+
+/// Returns the host shared memory holding a broker-owned open file's contents, so that the
+/// caller can map the file `MAP_SHARED`, writable only if `writable` is set.
+///
+/// Fails with [`FileError::NoSuchDevice`] if the file system cannot share the file's pages.
+pub fn map_shared(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    writable: bool,
+) -> Result<FileResult<SharedFileMapping>> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    process.core.fs.map_shared(&file, writable)
 }
 
 /// Returns a fresh enumeration of a broker-owned open directory.
@@ -1012,6 +1037,18 @@ fn file_truncate_error(error: TruncateError) -> FileError {
         TruncateError::NotOpenForWriting => FileError::PathOnly,
         TruncateError::IsTerminalDevice => FileError::IsTerminalDevice,
         TruncateError::ClosedFd | TruncateError::Io => FileError::Io,
+    }
+}
+
+fn file_map_shared_error(error: MapSharedError) -> FileError {
+    match error {
+        MapSharedError::IsDirectory => FileError::IsDirectory,
+        MapSharedError::NotForReading => FileError::NotForReading,
+        MapSharedError::NotForWriting => FileError::NotForWriting,
+        MapSharedError::PathOnly => FileError::PathOnly,
+        MapSharedError::Unsupported => FileError::NoSuchDevice,
+        MapSharedError::NoMemory => FileError::NoSpace,
+        MapSharedError::Io => FileError::Io,
     }
 }
 

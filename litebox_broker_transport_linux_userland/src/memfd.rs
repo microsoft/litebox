@@ -612,6 +612,26 @@ pub fn receive_process_image(
     }
 }
 
+/// Sends the runner's end of its shared-object socket during setup. See
+/// [`crate::shared_objects`].
+pub fn send_shared_object_channel(
+    stream: &mut UnixStream,
+    socket: BorrowedFd<'_>,
+    deadline: Option<Instant>,
+) -> IoResult<()> {
+    with_write_deadline(stream, deadline, |stream, deadline| {
+        send_fd(stream, socket, deadline)
+    })
+}
+
+/// Receives the shared-object socket sent by [`send_shared_object_channel`].
+pub fn receive_shared_object_channel(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+) -> IoResult<OwnedFd> {
+    with_read_deadline(stream, deadline, receive_fd)
+}
+
 fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
     send_frame(stream, Some(fd), deadline)
 }
@@ -627,7 +647,7 @@ fn send_frame(
     let carrier = [u8::from(fd.is_some())];
     let io = [IoSlice::new(&carrier)];
     let fds = fd.as_slice();
-    let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control_space = crate::control_space::<{ rustix::cmsg_space!(ScmRights(1)) }>();
     let mut control = SendAncillaryBuffer::new(&mut control_space);
     if !fds.is_empty() {
         assert!(
@@ -668,7 +688,7 @@ fn receive_frame(
 ) -> IoResult<(u8, Option<OwnedFd>)> {
     let mut carrier = [0];
     let mut io = [IoSliceMut::new(&mut carrier)];
-    let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+    let mut control_space = crate::control_space::<{ rustix::cmsg_space!(ScmRights(4)) }>();
     let mut control = RecvAncillaryBuffer::new(&mut control_space);
     let received = loop {
         refresh_read_deadline(stream, deadline)?;
@@ -1317,8 +1337,7 @@ mod tests {
     fn send_test_fds(stream: &mut UnixStream, fds: &[BorrowedFd<'_>]) {
         let carrier = [0];
         let io = [IoSlice::new(&carrier)];
-        let mut control_space =
-            [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
+        let mut control_space = crate::control_space::<{ rustix::cmsg_space!(ScmRights(8)) }>();
         let mut control = SendAncillaryBuffer::new(&mut control_space);
         assert!(control.push(SendAncillaryMessage::ScmRights(fds)));
         assert_eq!(
