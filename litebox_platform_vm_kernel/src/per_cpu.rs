@@ -3,9 +3,9 @@
 
 //! Per-CPU kernel variables, each CPU's reached through its GSBASE.
 
-use crate::AddressSpaceId;
 use crate::arch::{gdt, mm::paging::UnmapOptions};
 use crate::cpu::CpuId;
+use crate::{AddressSpaceId, Instant};
 use alloc::{
     alloc::{alloc_zeroed, handle_alloc_error},
     boxed::Box,
@@ -17,7 +17,6 @@ use core::mem::offset_of;
 use litebox::arch::x86_64::{rdgsbase, wrgsbase};
 use litebox_common_linux::PAGE_SIZE;
 use x86_64::VirtAddr;
-use x86_64::registers::model_specific::KernelGsBase;
 
 // Include guards in the power-of-two allocation to avoid buddy-allocator waste.
 const DOUBLE_FAULT_STACK_SIZE: usize = 4 * PAGE_SIZE;
@@ -38,6 +37,7 @@ pub(crate) struct PerCpuVariables {
     /// See [`crate::cpu::local`].
     pub(crate) local: Cell<usize>,
     pub(crate) worker: crate::worker::Worker,
+    pub(crate) kthread: crate::kthread::KthreadCpu,
     /// Keeps the task page table in CR3 alive (`None`: the base table).
     active_page_table: UnsafeCell<Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
     stacks: PerCpuStacks,
@@ -134,6 +134,30 @@ impl PerCpuVariables {
         // Return the old owner so the caller can drop it outside that section.
         unsafe { core::mem::replace(&mut *self.active_page_table.get(), page_table) }
     }
+
+    /// Makes the kernel thread whose control block is at `control` this CPU's
+    /// running one, its slice ending at `slice_end`, until
+    /// [`Self::clear_kthread`]: this CPU, and the slot for its runner's stack
+    /// pointer.
+    ///
+    /// # Panics
+    ///
+    /// In a thread or a user thread's run.
+    pub(crate) fn set_kthread(
+        &self,
+        control: usize,
+        slice_end: Option<Instant>,
+    ) -> (CpuId, *mut usize) {
+        self.asm.set_kthread(control);
+        self.kthread.slice_end.set(slice_end);
+        (self.cpu, self.kthread.runner_rsp.as_ptr())
+    }
+
+    /// Ends [`Self::set_kthread`]: the run's slice end, as the run left it.
+    pub(crate) fn clear_kthread(&self) -> Option<Instant> {
+        self.asm.clear_kthread();
+        self.kthread.slice_end.take()
+    }
 }
 
 /// Tracks a user XSAVE area. XSAVEOPT is only valid after an XRSTOR of the
@@ -191,6 +215,9 @@ pub(crate) struct PerCpuVariablesAsm {
     /// 1 while inside `run_thread_arch`, i.e., while a valid thread context
     /// exists for kernel page faults to use.
     is_in_user: Cell<u8>,
+    /// The running kernel thread's control block, or zero (see `kthread`'s
+    /// `current`).
+    kthread: Cell<usize>,
 }
 
 impl PerCpuVariablesAsm {
@@ -253,17 +280,49 @@ impl PerCpuVariablesAsm {
     pub(crate) fn exception(&self) -> litebox::shim::Exception {
         litebox::shim::Exception(self.exception_trapno.get())
     }
+
+    /// Makes the kernel thread whose control block is at `control` the
+    /// running one, until [`Self::clear_kthread`].
+    ///
+    /// # Panics
+    ///
+    /// In a thread or a user thread's run.
+    fn set_kthread(&self, control: usize) {
+        assert!(
+            !self.is_in_user() && self.kthread.get() == 0,
+            "a thread runs outside other threads' runs"
+        );
+        self.kthread.set(control);
+    }
+
+    fn clear_kthread(&self) {
+        self.kthread.set(0);
+    }
+
+    pub(crate) const fn kthread_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, kthread)
+    }
 }
 
-/// Requires kernel GSBASE from [`install`].
+/// Requires kernel GSBASE from [`install`], and interrupts disabled, as
+/// kernel code runs: what the caller reads of its CPU holds only while it
+/// stays on it. A kernel thread, which runs with them enabled and may go on on
+/// another CPU, finds itself in one load (`kthread`'s `current`), and reads the
+/// rest only in its scheduler's sections, with them disabled (`kthread`'s
+/// `with_this_cpu`).
 ///
 /// # Panics
-/// Panics if GSBASE is not set or contains a non-canonical address.
+/// Panics if GSBASE is not set or contains a non-canonical address, or if
+/// interrupts are enabled (the caller could move to another CPU meanwhile).
 pub(crate) fn with_per_cpu_variables<F, R>(f: F) -> R
 where
     F: FnOnce(&PerCpuVariables) -> R,
     R: 'static,
 {
+    assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "per-CPU data accessed with interrupts enabled"
+    );
     let ptr = per_cpu_variables_ptr();
     // Safety: only this core accesses its per-CPU data.
     let pcv = unsafe { &*ptr };
@@ -284,34 +343,10 @@ fn per_cpu_variables_ptr() -> *mut PerCpuVariables {
 /// The mode an external interrupt interrupted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Interrupted {
-    /// In [`crate::cpu::halt`] or [`crate::cpu::relax`], the only kernel code
-    /// that takes interrupts.
+    /// In [`crate::cpu::halt`] or [`crate::cpu::relax`], or a kernel thread:
+    /// the only kernel code that takes interrupts.
     Kernel,
     User,
-}
-
-/// The CPU an external interrupt arrived on, for its handler, without GS,
-/// which user mode may have changed: the kernel's GS base is GS's in
-/// kernel mode, and in `IA32_KERNEL_GS_BASE` in user mode (see
-/// `switch_to_user`).
-pub(crate) fn interrupted_cpu(interrupted: Interrupted) -> CpuId {
-    let mut base = match interrupted {
-        // Safety: FSGSBASE is enabled before interrupts are.
-        Interrupted::Kernel => (unsafe { rdgsbase() }) as u64,
-        // Safety: reads an MSR, which has no side effects.
-        Interrupted::User => unsafe { KernelGsBase::MSR.read() },
-    };
-    // No speculation past the choice with the other base, which user code
-    // may control (as after SWAPGS); through `base`, so that neither moves
-    // across it.
-    // Safety: a fence only.
-    unsafe {
-        core::arch::asm!("lfence /* {base} */", base = inout(reg) base, options(nostack, preserves_flags));
-    };
-    let pcv = base as *const PerCpuVariables;
-    // Safety: the CPU's variables (see above), which live for good; reads
-    // only `cpu`, which never changes.
-    unsafe { (&raw const (*pcv).cpu).read() }
 }
 
 /// `cpu`'s variables and stacks, for [`install`]; they live as long as the
@@ -327,6 +362,7 @@ pub(crate) fn allocate_per_cpu_variables(cpu: CpuId) -> &'static PerCpuVariables
         tls: Cell::new(core::ptr::null_mut()),
         local: Cell::new(0),
         worker: crate::worker::Worker::new(),
+        kthread: crate::kthread::KthreadCpu::new(),
         active_page_table: UnsafeCell::new(None),
         stacks: PerCpuStacks::allocate(),
     }))
@@ -359,11 +395,24 @@ impl PerCpuVariables {
 ///
 /// # Safety
 ///
-/// `start` is an aligned, unused page of an allocation that is never freed.
+/// `start` is an aligned, unused page of an allocation that is not freed
+/// unless [`restore_guard`] maps the page back first.
 pub(crate) unsafe fn unmap_guard(page_table: &crate::mm::PageTable<PAGE_SIZE>, start: usize) {
     let range = litebox::mm::page::PageRange::new(start, start + PAGE_SIZE)
         .expect("stack guard page must be aligned and non-empty");
     // Safety: see the function's.
     unsafe { page_table.unmap_pages(range, UnmapOptions::KEEP_FRAMES) }
         .expect("failed to unmap a stack guard page");
+}
+
+/// Maps back the guard page at `start`.
+///
+/// # Safety
+///
+/// [`unmap_guard`] unmapped it from `page_table`; its allocation is not freed.
+pub(crate) unsafe fn restore_guard(page_table: &crate::mm::PageTable<PAGE_SIZE>, start: usize) {
+    let page = x86_64::structures::paging::Page::from_start_address(VirtAddr::new(start as u64))
+        .expect("stack guard page must be aligned");
+    // Safety: a page of the heap, so of the direct map, whose tables remain.
+    unsafe { page_table.remap_direct(page) };
 }

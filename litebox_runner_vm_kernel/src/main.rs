@@ -30,6 +30,8 @@ mod client;
 mod devices;
 mod init;
 mod payload;
+#[cfg(debug_assertions)]
+mod self_check;
 #[cfg(feature = "optee")]
 mod service;
 
@@ -56,7 +58,11 @@ fn kernel_main(kernel: Kernel) -> ! {
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
-    let scheduler = SCHEDULER.call_once(|| Scheduler::new(devices));
+    let scheduler = SCHEDULER.call_once(|| Scheduler::new(devices, devices, kernel.platform));
+    litebox_platform_vm_kernel::kthread::set_preemption(scheduler);
+    // Once interrupts and the timer are set up, before the other CPUs start.
+    #[cfg(debug_assertions)]
+    self_check::kthreads(devices);
     kernel.start_cpus(devices, cpu_main);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
     let Some(runner) = payload.file(init::RUNNER) else {
@@ -187,6 +193,11 @@ impl log::Log for SerialLogger {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // First, and through the power-off, so that nothing preempts a panicking
+    // kernel thread on its way out; not with a `NoPreempt`, as a panic may
+    // come on the user's GS (a double fault of user mode).
+    // Safety: only disables interrupts.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
     serial::panic_print(format_args!("[litebox] PANIC: {info}\n"));
     power::exit(false)
 }

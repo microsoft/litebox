@@ -7,16 +7,27 @@ use crate::{VmKernel, per_cpu::with_per_cpu_variables};
 
 pub const PRK_LEN: usize = 32;
 
-// Safety: the pointer is stored per CPU, and there is one thread per CPU. It
-// starts as null and is only changed by `replace_thread_local_storage`.
+// Safety: the pointer is stored per CPU, and there is one thread per CPU: a
+// kernel thread, which may go on on another CPU, has none (rejected in all
+// builds). It starts as null and is only changed by
+// `replace_thread_local_storage`.
 unsafe impl litebox::platform::ThreadLocalStorageProvider for VmKernel {
     fn get_thread_local_storage() -> *mut () {
+        assert_no_kthread();
         with_per_cpu_variables(|pcv| pcv.tls.get())
     }
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
+        assert_no_kthread();
         with_per_cpu_variables(|pcv| pcv.tls.replace(value))
     }
+}
+
+fn assert_no_kthread() {
+    assert!(
+        !crate::kthread::in_kthread(),
+        "a kernel thread has no thread-local storage"
+    );
 }
 
 static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();

@@ -60,7 +60,8 @@ pub fn init() {
     let tss = Box::leak(Box::new(AlignedTss(tss)));
 
     // STAR and user-return assembly require this order: CS=0x08, DS=0x10,
-    // TSS=0x18, user DS=0x2b, user CS=0x33.
+    // TSS=0x18, user DS=0x2b, user CS=0x33. The same on every CPU: a kernel
+    // thread may return from an interrupt on another.
     let mut gdt = GlobalDescriptorTable::new();
     let selectors = Selectors {
         kernel_code: gdt.append(Descriptor::kernel_code_segment()),

@@ -4,13 +4,15 @@
 //! An association's readiness, published to its (pinned) notification ring
 //! at once, whichever process is current. What a full ring cannot take
 //! stays pending until the next [`KernelReadiness::flush`].
+//!
+//! Kernel-grade: broker work publishes, and the kernel reads and flushes, so
+//! both locks are taken with interrupts disabled, by their types: the ring's
+//! is a [`KernelMutex`], and the publisher's is behind [`KernelPublisher`].
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{BrokerError, Result};
-use litebox_broker_host::readiness::{
-    MAX_TRACKED_READINESS_OBJECTS, ReadinessPublisher, publish_pending_readiness,
-};
+use litebox_broker_host::readiness::MAX_TRACKED_READINESS_OBJECTS;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -20,16 +22,17 @@ use litebox_broker_transport::control_ring::{
     ControlRingError, ControlRingProducer, ControlRingWriteStatus,
 };
 use litebox_platform_vm_kernel::cpu;
-use spin::mutex::SpinMutex;
+use litebox_platform_vm_kernel::preempt::KernelMutex;
 
 use crate::memory::PinnedControlRing;
+use publisher::KernelPublisher;
 
 type Producer = ControlRingProducer<PinnedControlRing>;
 
 pub(crate) struct KernelReadiness {
-    publisher: ReadinessPublisher,
+    publisher: KernelPublisher,
     /// Until the handshake and after the association ends: `None`.
-    notifications: SpinMutex<Option<Producer>>,
+    notifications: KernelMutex<Option<Producer>>,
     /// The process corrupted its notification ring.
     failed: AtomicBool,
     /// A notification was written since [`Self::take_published`].
@@ -46,8 +49,8 @@ pub(crate) struct KernelReadiness {
 impl KernelReadiness {
     pub(crate) fn new() -> Self {
         Self {
-            publisher: ReadinessPublisher::default(),
-            notifications: SpinMutex::new(None),
+            publisher: KernelPublisher::default(),
+            notifications: KernelMutex::new(None),
             failed: AtomicBool::new(false),
             published: AtomicBool::new(false),
             waiting: AtomicBool::new(false),
@@ -96,7 +99,9 @@ impl KernelReadiness {
     /// Stops publishing, for good.
     pub(crate) fn close(&self) {
         self.publisher.close();
-        *self.notifications.lock() = None;
+        // Dropped once unlocked.
+        let producer = self.notifications.lock().take();
+        drop(producer);
     }
 
     /// Publishes what is pending, as far as the ring has room.
@@ -111,7 +116,7 @@ impl KernelReadiness {
             producer,
             written: false,
         };
-        let result = publish_pending_readiness(&self.publisher, &mut ring);
+        let result = self.publisher.publish_pending(&mut ring);
         if ring.written {
             self.published.store(true, Ordering::Relaxed);
         }
@@ -212,6 +217,63 @@ impl ReadinessSink for KernelReadiness {
 
     fn retire(&self, handle: ObjectHandle) {
         self.publisher.retire(handle);
+    }
+}
+
+mod publisher {
+    use litebox_broker_host::readiness::{
+        PublishOutcome, ReadinessPublishError, ReadinessPublisher, publish_pending_readiness,
+    };
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::readiness::ReadinessFlags;
+    use litebox_broker_transport::channel::HostNotificationChannel;
+    use litebox_platform_vm_kernel::preempt::NoPreempt;
+
+    /// broker_host's publisher, whose lock broker work and the kernel share.
+    /// It is the userland broker's too, so its lock is not kernel-grade: each
+    /// method takes it with interrupts disabled, and nothing else reaches it.
+    #[derive(Default)]
+    pub(super) struct KernelPublisher(ReadinessPublisher);
+
+    impl KernelPublisher {
+        pub(super) fn publish(
+            &self,
+            handle: ObjectHandle,
+            readiness: ReadinessFlags,
+        ) -> Result<PublishOutcome, ReadinessPublishError> {
+            guarded(|| self.0.publish(handle, readiness))
+        }
+
+        pub(super) fn republish(
+            &self,
+            handle: ObjectHandle,
+            readiness: ReadinessFlags,
+        ) -> Result<PublishOutcome, ReadinessPublishError> {
+            guarded(|| self.0.republish(handle, readiness))
+        }
+
+        pub(super) fn retire(&self, handle: ObjectHandle) {
+            guarded(|| self.0.retire(handle));
+        }
+
+        pub(super) fn close(&self) {
+            guarded(|| self.0.close());
+        }
+
+        /// Publishes what is pending to `channel`, which must not block (see
+        /// [`publish_pending_readiness`]).
+        pub(super) fn publish_pending<C: HostNotificationChannel>(
+            &self,
+            channel: &mut C,
+        ) -> Result<(), C::Error> {
+            guarded(|| publish_pending_readiness(&self.0, channel))
+        }
+    }
+
+    /// The publisher's lock's one boundary.
+    fn guarded<R>(f: impl FnOnce() -> R) -> R {
+        let _no_preempt = NoPreempt::new();
+        f()
     }
 }
 

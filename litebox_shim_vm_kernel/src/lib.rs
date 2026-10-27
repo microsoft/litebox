@@ -121,8 +121,13 @@ pub struct ProcessConfig<'a> {
 pub trait ProcessTimer: Sync {
     /// Arms the calling CPU's timer, or with `None` disarms it, for a one-shot
     /// interrupt at `deadline`, which interrupts a process running then there
-    /// (see [`EnterShim::interrupt`]). Arming replaces an earlier deadline.
+    /// (see [`EnterShim::interrupt`]), or a kernel thread. Arming replaces an
+    /// earlier deadline.
     fn arm(&self, deadline: Option<Instant>);
+
+    /// As [`Self::arm`], unless armed for an earlier deadline, which stays. A
+    /// timer that fired, or is disarmed, is armed for none.
+    fn arm_if_earlier(&self, deadline: Instant);
 }
 
 #[derive(Debug, thiserror::Error)]

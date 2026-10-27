@@ -5,7 +5,7 @@
 //! NMI entry cannot assume kernel GS or a completed syscall stack switch.
 //! CR4.MCE remains off; machine checks shut down the CPU.
 
-use crate::per_cpu::{self, Interrupted};
+use crate::per_cpu::Interrupted;
 use crate::{Handled, InterruptHandler};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::PtRegs;
@@ -159,22 +159,23 @@ enum Then {
 
 const _: () = assert!(Then::Return as u8 == 0 && Then::EnterShim as u8 == 1);
 
-/// Runs with interrupts disabled and the interrupted context's GS (see
-/// `isr_external`), on the interrupted stack from kernel mode or on the
-/// `TSS.RSP0` stack from user mode. Handles the CPU's TLB flushes first
-/// (see [`crate::tlb`]).
+/// Runs with interrupts disabled and the kernel's GS (see `isr_external`), on
+/// the interrupted stack from kernel mode or on the `TSS.RSP0` stack from user
+/// mode. Handles the CPU's TLB flushes first (see [`crate::tlb`]); last,
+/// checks a kernel thread it interrupted.
 #[unsafe(no_mangle)]
 extern "C" fn external_interrupt_handler_impl(vector: u64, rip: u64, cs: u64) -> Then {
     let interrupted = match SegmentSelector(cs.trunc()).rpl() {
         PrivilegeLevel::Ring0 => Interrupted::Kernel,
         _ => Interrupted::User,
     };
-    crate::tlb::handle(per_cpu::interrupted_cpu(interrupted));
+    let cpu = crate::cpu::current();
+    crate::tlb::handle(cpu);
     let handled = match (INTERRUPTS.get(), u8::try_from(vector)) {
         (Some(interrupts), Ok(vector)) => interrupts
             .handler
             .get()
-            .map_or(Handled::Unexpected, |handler| handler(vector)),
+            .map_or(Handled::Unexpected, |handler| handler(cpu, vector)),
         _ => Handled::Unexpected,
     };
     match (handled, interrupted) {
@@ -182,7 +183,11 @@ extern "C" fn external_interrupt_handler_impl(vector: u64, rip: u64, cs: u64) ->
             panic!("EXCEPTION: UNEXPECTED INTERRUPT (vector {vector:#x}, RIP {rip:#x}, CS {cs:#x})")
         }
         (Handled::Event, Interrupted::User) => Then::EnterShim,
-        (Handled::Event, Interrupted::Kernel) | (Handled::Doorbell, _) => Then::Return,
+        (Handled::Doorbell, Interrupted::User) => Then::Return,
+        (_, Interrupted::Kernel) => {
+            crate::kthread::interrupted();
+            Then::Return
+        }
     }
 }
 
