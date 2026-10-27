@@ -6,12 +6,12 @@ use core::num::NonZeroU64;
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
     FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MapFileRequest,
+    MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
+    SeekFileResponse, SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -38,6 +38,7 @@ const REQUEST_TAG_TERMINAL_CONTROL: u8 = 14;
 const REQUEST_TAG_READ_LINK: u8 = 15;
 const REQUEST_TAG_RESOLVE_PATH: u8 = 16;
 const REQUEST_TAG_HANDLE_PATH: u8 = 17;
+const REQUEST_TAG_MAP: u8 = 18;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -57,6 +58,7 @@ const RESPONSE_TAG_TERMINAL_CONTROL: u8 = 14;
 const RESPONSE_TAG_READ_LINK: u8 = 15;
 const RESPONSE_TAG_RESOLVE_PATH: u8 = 16;
 const RESPONSE_TAG_HANDLE_PATH: u8 = 17;
+const RESPONSE_TAG_MAP: u8 = 18;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -77,6 +79,7 @@ const _: () = {
     assert!(REQUEST_TAG_READ_LINK == RESPONSE_TAG_READ_LINK);
     assert!(REQUEST_TAG_RESOLVE_PATH == RESPONSE_TAG_RESOLVE_PATH);
     assert!(REQUEST_TAG_HANDLE_PATH == RESPONSE_TAG_HANDLE_PATH);
+    assert!(REQUEST_TAG_MAP == RESPONSE_TAG_MAP);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -184,6 +187,11 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.buffer);
         }
+        FileRequest::Map(request) => {
+            encoder.u8(REQUEST_TAG_MAP);
+            encoder.handle(request.handle);
+            encoder.u8(u8::from(request.writable));
+        }
     }
 }
 
@@ -280,6 +288,10 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
         })),
+        REQUEST_TAG_MAP => Ok(FileRequest::Map(MapFileRequest {
+            handle: decoder.handle()?,
+            writable: decode_bool(decoder)?,
+        })),
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -341,6 +353,18 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_HANDLE_PATH);
             encoder.u32(length);
         }
+        FileResponse::Map(MapFileResponse { identity, token }) => {
+            encoder.u8(RESPONSE_TAG_MAP);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "splits the identity in halves"
+            )]
+            {
+                encoder.u64((identity >> 64) as u64);
+                encoder.u64(identity as u64);
+            }
+            encoder.u64(token);
+        }
         FileResponse::Failed(error) => {
             encoder.u8(RESPONSE_TAG_FAILED);
             encode_file_error(encoder, error);
@@ -390,6 +414,10 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         })),
         RESPONSE_TAG_HANDLE_PATH => Ok(FileResponse::HandlePath(FilePathResponse {
             length: decoder.u32()?,
+        })),
+        RESPONSE_TAG_MAP => Ok(FileResponse::Map(MapFileResponse {
+            identity: (u128::from(decoder.u64()?) << 64) | u128::from(decoder.u64()?),
+            token: decoder.u64()?,
         })),
         RESPONSE_TAG_FAILED => Ok(FileResponse::Failed(decode_file_error(decoder)?)),
         _ => Err(WireError::InvalidTag),

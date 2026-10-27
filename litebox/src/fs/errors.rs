@@ -113,6 +113,25 @@ pub enum TruncateError {
     Io,
 }
 
+/// Possible errors from [`super::File::map_shared`].
+#[derive(Error, Debug)]
+pub enum MapSharedError {
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("file descriptor points to a directory")]
+    IsDirectory,
+    #[error("file is not opened for reading")]
+    NotForReading,
+    #[error("file is not opened for writing")]
+    NotForWriting,
+    #[error("the file system cannot share this file's pages")]
+    Unsupported,
+    #[error("out of host shared memory")]
+    NoMemory,
+    #[error("I/O error")]
+    Io,
+}
+
 /// Possible errors from [`crate::LiteBox::chmod_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

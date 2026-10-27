@@ -26,8 +26,9 @@ use crate::{
     MRemapFlags, MapFlags, ProtFlags, UserPtrMut,
     errno::Errno,
     vmem::{
-        self, CreatePagesFlags, LinuxReservationStore, MappingError, PageFaultError, VmFlags, Vmem,
-        VmemPageFaultHandler, VmemProtectError, VmemResetError, VmemUnmapError,
+        self, CreatePagesFlags, LinuxReservationStore, MappingError, PageFaultError,
+        SharedObjectMapping, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError, VmemResetError,
+        VmemUnmapError,
     },
 };
 
@@ -626,23 +627,31 @@ where
         }
     }
 
-    /// Returns whether any mapping has shared-memory semantics.
+    /// Returns whether any mapping's pages are shared with other mappings: shared anonymous
+    /// memory, or a shared file mapping of a host shared object.
+    ///
+    /// A shared file mapping whose pages are a private copy of the file does not count: it can
+    /// never become writable, so a copy of it is indistinguishable from sharing it.
     pub fn has_shared_mappings(&self) -> bool {
         self.vmem
             .read()
             .iter()
-            .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED))
+            .any(|(_, vma)| vma.is_shared_anonymous() || vma.shared_object().is_some())
     }
 
-    /// Returns whether any mapping has shared-memory semantics that a native fork child would
-    /// not share: a shared file mapping, whose pages are private copies.
-    pub fn has_unforkable_shared_mappings(&self) -> bool {
-        // TODO: share the pages of shared file mappings, so that every shared mapping can be
-        // forked.
+    /// Returns whether a host fault at `address` must be past the end of a mapped file: it lies
+    /// in a shared file mapping of a host shared object that allows the access, which the host
+    /// would otherwise have served. Linux raises `SIGBUS` for such accesses.
+    pub fn is_fault_past_shared_file_end(&self, address: usize, write: bool) -> bool {
         self.vmem
             .read()
-            .iter()
-            .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
+            .overlapping(address..address.saturating_add(1))
+            .next()
+            .is_some_and(|(_, area)| {
+                area.shared_object().is_some()
+                    && area.flags().contains(VmFlags::VM_READ)
+                    && (!write || area.flags().contains(VmFlags::VM_WRITE))
+            })
     }
 
     /// Returns all mappings in a vector.
@@ -948,6 +957,75 @@ where
             )
         }
         .map(UserPtrMut::from_platform_ptr::<Platform>)
+    }
+
+    /// Maps a host shared object as a `MAP_SHARED` file mapping with Linux `mmap` semantics.
+    ///
+    /// Every mapping of the object, in this or any other process, shares its pages, so the
+    /// mapping needs no initialization.
+    pub fn do_mmap_shared_object(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        placement: MmapPlacement,
+        object: SharedObjectMapping,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        let mut flags = CreatePagesFlags::from(flags);
+        flags.set(
+            CreatePagesFlags::TOP_DOWN,
+            placement.direction == AllocationDirection::TopDown,
+        );
+        let suggested_addr = match suggested_addr {
+            Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
+            None => None,
+        };
+        let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
+        let permissions =
+            memory_region_permissions(prot).ok_or(MappingError::InvalidPermissions)?;
+        // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the mapping.
+        unsafe {
+            self.vmem.write().create_shared_object_mapping(
+                suggested_addr,
+                length,
+                flags,
+                permissions,
+                placement.allowed_range,
+                object,
+            )
+        }
+        .map(UserPtrMut::from_platform_ptr::<Platform>)
+        .map_err(MappingError::MapError)
+    }
+
+    /// Handle syscall `msync`.
+    ///
+    /// Every shared file mapping either maps the host shared object holding the file's contents,
+    /// which is the file itself, or is a read-only copy of the file. Neither holds changes to
+    /// write back, so this only validates its arguments, as Linux does.
+    pub fn sys_msync(&self, addr: UserPtrMut<u8>, len: usize, flags: i32) -> Result<(), Errno> {
+        const MS_ASYNC: i32 = 1;
+        const MS_INVALIDATE: i32 = 2;
+        const MS_SYNC: i32 = 4;
+        if addr.as_usize() & !PAGE_MASK != 0
+            || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+            || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
+        {
+            return Err(Errno::EINVAL);
+        }
+        let end = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .and_then(|len| addr.as_usize().checked_add(len))
+            .ok_or(Errno::ENOMEM)?;
+        let range = addr.as_usize()..end;
+        if range.is_empty() {
+            return Ok(());
+        }
+        if self.vmem.read().has_gaps(range) {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(())
     }
 
     /// Handle syscall `munmap`.

@@ -163,6 +163,8 @@ fn run_fake_runner(args: &[OsString]) {
                 ControlRingLayout::MULTI_LANE,
                 Some(Instant::now() + Duration::from_secs(5)),
             )?;
+            let _shared_objects = setup
+                .receive_shared_object_channel(Some(Instant::now() + Duration::from_secs(5)))?;
             let process_image =
                 setup.receive_process_image(Some(Instant::now() + Duration::from_secs(5)))?;
             (shared_memory, control_memory, process_image)

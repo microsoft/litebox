@@ -2272,3 +2272,135 @@ mod composed {
         );
     }
 }
+
+mod shared_mapping {
+    use super::{
+        InMem, InodeAllocator, Mode, OFlags, ROOT, Resolver, TEST_TAR_FILE, TestPlatform, USER,
+    };
+    use crate::fs::errors::MapSharedError;
+    use crate::fs::in_mem::InitialNode;
+    use crate::fs::shared_memory::test_memory::VecMemoryProvider;
+    use alloc::borrow::Cow;
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    fn shared_in_mem() -> InMem<TestPlatform> {
+        InMem::<TestPlatform>::new(InodeAllocator::standalone())
+            .with_shared_memory(Arc::new(VecMemoryProvider))
+    }
+
+    #[test]
+    fn mapped_file_contents_stay_coherent_with_file_io() {
+        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem());
+        let mut fd = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        fs.write(&mut fd, b"hello", None).unwrap();
+
+        let mapping = fs.map_shared(&fd, true).unwrap();
+        let status = fs.handle_status(&fd).unwrap();
+        assert_eq!(
+            mapping.identity,
+            (u128::from(status.node_info.dev) << 64) | u128::from(status.node_info.ino)
+        );
+        let mut bytes = [0; 8];
+        assert_eq!(mapping.memory.read_at(0, &mut bytes).unwrap(), 5);
+        assert_eq!(&bytes[..5], b"hello");
+
+        // Writes, including ones that extend the file, reach the shared memory...
+        fs.write(&mut fd, b"!!", Some(6)).unwrap();
+        assert_eq!(mapping.memory.read_at(0, &mut bytes).unwrap(), 8);
+        assert_eq!(&bytes, b"hello\0!!");
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 8);
+
+        // ...stores to the shared memory are what reads see...
+        mapping.memory.write_at(0, b"J").unwrap();
+        let mut read = vec![0; 8];
+        assert_eq!(fs.read(&mut fd, &mut read, Some(0)).unwrap(), 8);
+        assert_eq!(&read, b"Jello\0!!");
+
+        // ...and truncation resizes it.
+        fs.truncate(&mut fd, 2, false).unwrap();
+        assert_eq!(mapping.memory.read_at(0, &mut bytes).unwrap(), 2);
+        assert_eq!(fs.handle_status(&fd).unwrap().size, 2);
+
+        // Every mapping of the file shares the same memory.
+        let fd = fs
+            .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let again = fs.map_shared(&fd, false).unwrap();
+        assert!(Arc::ptr_eq(&again.memory, &mapping.memory));
+        assert_eq!(again.identity, mapping.identity);
+    }
+
+    #[test]
+    fn mapping_requires_matching_access_and_support() {
+        let fs = Resolver::<TestPlatform, _>::new(shared_in_mem());
+        drop(
+            fs.open(ROOT, "/file", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .unwrap(),
+        );
+        let read_only = fs
+            .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&read_only, true),
+            Err(MapSharedError::NotForWriting)
+        ));
+        let write_only = fs
+            .open(ROOT, "/file", OFlags::WRONLY, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&write_only, false),
+            Err(MapSharedError::NotForReading)
+        ));
+        let dir = fs.open(ROOT, "/", OFlags::RDONLY, Mode::empty()).unwrap();
+        assert!(matches!(
+            fs.map_shared(&dir, false),
+            Err(MapSharedError::IsDirectory)
+        ));
+
+        // Without a shared-memory provider, files stay in ordinary memory.
+        let fs = super::in_mem_fs();
+        let fd = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&fd, true),
+            Err(MapSharedError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn overlay_shares_only_upper_files() {
+        let upper = InMem::<TestPlatform>::new_initialized([(
+            "/",
+            InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: ROOT,
+            },
+        )])
+        .with_shared_memory(Arc::new(VecMemoryProvider));
+        let fs = super::overlay_fs(upper, Cow::Borrowed(TEST_TAR_FILE));
+        // A lower file opened for reading cannot change, so it is not shared.
+        let lower = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&lower, false),
+            Err(MapSharedError::Unsupported)
+        ));
+        // Opening it for writing copies it up, after which it is shared with its contents.
+        let upper = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
+        let mapping = fs.map_shared(&upper, true).unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(mapping.memory.read_at(0, &mut bytes).unwrap(), 8);
+        let mut read = vec![0; 8];
+        let lower = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let mut lower = lower;
+        assert_eq!(fs.read(&mut lower, &mut read, Some(0)).unwrap(), 8);
+        assert_eq!(read, bytes);
+    }
+}

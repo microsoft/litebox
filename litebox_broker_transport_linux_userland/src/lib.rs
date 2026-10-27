@@ -23,6 +23,7 @@ mod setup;
 
 pub mod existing_runner;
 pub mod memfd;
+pub mod shared_objects;
 
 mod unix_io;
 

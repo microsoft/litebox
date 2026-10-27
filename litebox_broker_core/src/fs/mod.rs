@@ -23,6 +23,7 @@ pub mod nine_p;
 pub mod overlay;
 pub mod resolver;
 mod service;
+pub mod shared_memory;
 pub mod tar_ro;
 #[cfg(test)]
 mod tests;
@@ -36,8 +37,8 @@ pub(crate) use service::{
 };
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chown, handle_path, handle_status,
-    is_terminal, mkdir, open, path_status, read, read_directory, read_link, resolve_path, rmdir,
-    seek, terminal_control, truncate, unlink, write,
+    is_terminal, map_shared, mkdir, open, path_status, read, read_directory, read_link,
+    resolve_path, rmdir, seek, terminal_control, truncate, unlink, write,
 };
 
 bitflags! {

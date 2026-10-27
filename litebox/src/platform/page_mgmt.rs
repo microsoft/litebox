@@ -508,7 +508,53 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     {
         Err(CowAllocationError::UnsupportedByPlatform)
     }
+
+    /// Returns whether [`Self::try_map_shared_object`] can map host shared objects that the
+    /// broker hands this process.
+    ///
+    /// Callers must check this before asking the broker for an object, since the broker
+    /// delivers each object only once. The default implementation returns `false`.
+    fn supports_shared_objects(&self) -> bool {
+        false
+    }
+
+    /// Maps the host shared object that the broker delivered under `token`, starting at its
+    /// byte `offset`, over exactly `range` with `permissions`.
+    ///
+    /// Every mapping of the same object, in this or any other process, shares its pages, and a
+    /// native fork child keeps sharing them. The platform takes the delivered object whether or
+    /// not the mapping succeeds; the caller must not map `token` again.
+    ///
+    /// `fixed_address_behavior` must be [`FixedAddressBehavior::Replace`] or
+    /// [`FixedAddressBehavior::NoReplace`]. On replacement, `replaced_reservations` lazily
+    /// transfers ownership of the reservations overlapping `range`; recoverable failure must leave
+    /// it uninvoked. On success, the returned reservation owns exactly `range`.
+    ///
+    /// # Safety
+    ///
+    /// Replacement ownership follows [`Self::reserve_pages`]. The caller must track the returned
+    /// reservation directly and must not construct duplicate ownership from its range.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    unsafe fn try_map_shared_object<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        range: Range<usize>,
+        token: SharedObjectToken,
+        offset: u64,
+        permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
+    where
+        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
+    {
+        Err(AllocationError::UnsupportedByPlatform)
+    }
 }
+
+/// Names a host shared object that the broker delivered to this process out of band, such as a
+/// memfd backing a shared file. See [`PageManagementProvider::try_map_shared_object`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedObjectToken(pub u64);
 
 /// Behavior when allocating pages at a fixed address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use std::any::Any;
 use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -19,6 +19,7 @@ use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_broker_transport_linux_userland::memfd::{MemfdProcessImage, MemfdSharedMemory};
+use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
@@ -28,6 +29,7 @@ use super::{
     UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
+use crate::shared_objects::linux::MemfdDelivery;
 
 /// Memory image passed to a runner as a sealed memfd.
 struct RunnerProcessImage(MemfdProcessImage);
@@ -298,6 +300,15 @@ fn serve_association(
             };
         }
     };
+    let (shared_objects, runner_shared_objects) = match SharedObjectSender::pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            return AssociationOutcome {
+                result: Err(error),
+                abnormal: true,
+            };
+        }
+    };
     crate::runtime::serve_out_of_process_runner_association(
         startup,
         broker,
@@ -309,6 +320,8 @@ fn serve_association(
         move |channel, shared_memory, control_memory| {
             channel.send_memfd(shared_memory, Some(setup_deadline))?;
             channel.send_memfd(control_memory, Some(setup_deadline))?;
+            channel
+                .send_shared_object_channel(runner_shared_objects.as_fd(), Some(setup_deadline))?;
             let image = image.as_ref().map(|image| {
                 &image
                     .image()
@@ -321,6 +334,7 @@ fn serve_association(
         },
         UnixStreamHostSetupChannel::into_active,
         launcher,
+        Some(Arc::new(MemfdDelivery(shared_objects))),
     )
 }
 

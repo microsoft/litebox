@@ -612,6 +612,26 @@ pub fn receive_process_image(
     }
 }
 
+/// Sends the runner's end of its shared-object socket during setup. See
+/// [`crate::shared_objects`].
+pub fn send_shared_object_channel(
+    stream: &mut UnixStream,
+    socket: BorrowedFd<'_>,
+    deadline: Option<Instant>,
+) -> IoResult<()> {
+    with_write_deadline(stream, deadline, |stream, deadline| {
+        send_fd(stream, socket, deadline)
+    })
+}
+
+/// Receives the shared-object socket sent by [`send_shared_object_channel`].
+pub fn receive_shared_object_channel(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+) -> IoResult<OwnedFd> {
+    with_read_deadline(stream, deadline, receive_fd)
+}
+
 fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
     send_frame(stream, Some(fd), deadline)
 }
