@@ -1085,7 +1085,7 @@ mod tests {
     use crate::dma::Mmio;
     use crate::virtio::pci::tests::{COMMON_LEN, DEVICE_STATUS, DRIVER_OK, FAILED};
     use crate::virtio::queue::Buffer;
-    use crate::virtio::queue::tests::{HeapHal, device_returns};
+    use crate::virtio::queue::testing::{HeapHal, device_returns};
     use alloc::boxed::Box;
     use core::ptr::NonNull;
 

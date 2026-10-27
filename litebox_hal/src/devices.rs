@@ -63,7 +63,9 @@ impl ConsoleDevice {
         }
     }
 
-    /// Whether [`Self::write`] would take output now.
+    /// Whether [`Self::write`] would take output now. If not, a device that
+    /// interrupts (see [`Self::interrupts`]) does so once room comes, unless
+    /// a later call finds it first.
     pub fn can_write(&mut self) -> bool {
         match &mut self.0 {
             Backend::Virtio(device) => device.can_write(),
@@ -72,6 +74,8 @@ impl ConsoleDevice {
     }
 
     /// Queues as much of `bytes` as the device takes now; returns how much.
+    /// After a short count, a device that interrupts (see [`Self::interrupts`])
+    /// does so once room comes, unless a later call finds it first.
     pub fn write(&mut self, bytes: &[u8]) -> usize {
         match &mut self.0 {
             Backend::Virtio(device) => device.write(bytes),
