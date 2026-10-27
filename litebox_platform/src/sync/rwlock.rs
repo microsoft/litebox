@@ -623,6 +623,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLock<Platform, T> {
     #[inline]
     #[track_caller]
     pub fn read(&self) -> RwLockReadGuard<'_, Platform, T> {
+        Platform::might_block();
+
         #[cfg(feature = "lock_tracing")]
         self.creation
             .ensure_registered(LockType::RwLock, || &raw const self.raw.state);
@@ -643,6 +645,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLock<Platform, T> {
     #[inline]
     #[track_caller]
     pub fn write(&self) -> RwLockWriteGuard<'_, Platform, T> {
+        Platform::might_block();
+
         #[cfg(feature = "lock_tracing")]
         self.creation
             .ensure_registered(LockType::RwLock, || &raw const self.raw.state);

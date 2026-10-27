@@ -60,7 +60,8 @@ pub fn init() {
     let tss = Box::leak(Box::new(AlignedTss(tss)));
 
     // STAR and user-return assembly require this order: CS=0x08, DS=0x10,
-    // TSS=0x18, user DS=0x2b, user CS=0x33.
+    // TSS=0x18, user DS=0x2b, user CS=0x33. The same on every CPU: a kernel
+    // thread may return from an interrupt on another.
     let mut gdt = GlobalDescriptorTable::new();
     let selectors = Selectors {
         kernel_code: gdt.append(Descriptor::kernel_code_segment()),
@@ -69,6 +70,18 @@ pub fn init() {
         user_data: gdt.append(Descriptor::user_data_segment()),
         user_code: gdt.append(Descriptor::user_code_segment()),
     };
+    assert_eq!(
+        [
+            selectors.kernel_code,
+            selectors.kernel_data,
+            selectors.tss,
+            selectors.user_data,
+            selectors.user_code,
+        ]
+        .map(|selector| selector.0),
+        [0x08, 0x10, 0x18, 0x2b, 0x33],
+        "the selectors are the same on every CPU"
+    );
     let gdt = Box::leak(Box::new(GdtWrapper { gdt, selectors }));
     gdt.gdt.load();
 

@@ -162,7 +162,7 @@ const _: () = assert!(Then::Return as u8 == 0 && Then::EnterShim as u8 == 1);
 /// Runs with interrupts disabled and the interrupted context's GS (see
 /// `isr_external`), on the interrupted stack from kernel mode or on the
 /// `TSS.RSP0` stack from user mode. Handles the CPU's TLB flushes first
-/// (see [`crate::tlb`]).
+/// (see [`crate::tlb`]); last, checks a kernel thread it interrupted.
 #[unsafe(no_mangle)]
 extern "C" fn external_interrupt_handler_impl(vector: u64, rip: u64, cs: u64) -> Then {
     let interrupted = match SegmentSelector(cs.trunc()).rpl() {
@@ -182,7 +182,11 @@ extern "C" fn external_interrupt_handler_impl(vector: u64, rip: u64, cs: u64) ->
             panic!("EXCEPTION: UNEXPECTED INTERRUPT (vector {vector:#x}, RIP {rip:#x}, CS {cs:#x})")
         }
         (Handled::Event, Interrupted::User) => Then::EnterShim,
-        (Handled::Event, Interrupted::Kernel) | (Handled::Doorbell, _) => Then::Return,
+        (Handled::Doorbell, Interrupted::User) => Then::Return,
+        (_, Interrupted::Kernel) => {
+            crate::kthread::interrupted();
+            Then::Return
+        }
     }
 }
 

@@ -148,11 +148,12 @@ isr_ignore:
  * vector lookup.
  *
  * They arrive from user mode, or from the kernel only while it halts, or
- * spins in `cpu::relax`, with IF=1. Entry does not depend on GS
+ * spins in `cpu::relax`, or runs a kernel thread, with IF=1. Entry does not depend on GS
  * (which may still be the user's): `external_interrupt_handler_impl` finds
  * its CPU without it (see `per_cpu::interrupted_cpu`), and the handler must
  * not touch per-CPU data, so no SWAPGS. The kernel runs with SSE disabled, so
- * only the caller-saved GPRs need saving.
+ * only the caller-saved GPRs need saving (a kernel thread's check that
+ * switches away saves the rest, and may return here on another CPU).
  *
  * One that interrupted user mode then also reaches the shim, unless the
  * handler says otherwise (e.g., for a doorbell): with an `errcode`/`vector`

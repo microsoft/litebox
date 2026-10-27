@@ -58,6 +58,7 @@
 //!   held, and no CPU is idle once it is released, the thread waits for a busy
 //!   CPU's next step, up to a slice later.
 
+use crate::ProcessTimer;
 use crate::claim::{Claim, Owned};
 use crate::thread::{FutexState, Thread};
 use crate::{Ended, Inner, Running, Suspended, Unclaimed};
@@ -69,7 +70,8 @@ use core::time::Duration;
 use litebox_broker_vm_kernel::{EnterError, Events, WaitState};
 use litebox_common_vm_abi::Status;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
-use litebox_platform_vm_kernel::cpu::{self, CpuId, MAX_CPUS};
+use litebox_platform_vm_kernel::cpu::{self, CpuId, MAX_CPUS, NOTIFIED};
+use litebox_platform_vm_kernel::kthread::{self, Check, Point};
 use litebox_platform_vm_kernel::worker::{self, Ran};
 use litebox_platform_vm_kernel::{Instant, VmKernel};
 use spin::mutex::SpinMutex;
@@ -77,11 +79,9 @@ use spin::mutex::SpinMutex;
 const QUANTUM_NANOS: u64 = 10_000_000;
 /// The length of a slice.
 pub const QUANTUM: Duration = Duration::from_nanos(QUANTUM_NANOS);
-/// With other CPUs online, at most how long a thread still runs once its CPU
-/// is notified (see `Inner::take_notified`; alone, it stops at once): a
-/// notification tells every CPU, and this is so that a stream of
-/// notifications does not stop every CPU's thread at once.
-const NOTIFIED: Duration = Duration::from_nanos(QUANTUM_NANOS / 10);
+/// How long a kernel thread's run goes on past its slice end without reaching
+/// a safe point: as long as a thread runs on once notified.
+pub const GRACE: Duration = NOTIFIED;
 
 /// The kernel's scheduler, which every runner process runs in from its
 /// creation until it dies, whether a service spawned it
@@ -106,6 +106,8 @@ struct Shared {
     boot_stepping: AtomicBool,
     /// To halt with.
     events: &'static dyn Events,
+    timer: &'static dyn ProcessTimer,
+    platform: &'static VmKernel,
     /// The next [`Owned::seq`].
     next_seq: AtomicU64,
 }
@@ -140,12 +142,18 @@ struct RunQueue {
 impl Scheduler {
     /// One that halts with the runner's `events` (see [`Events::wait`]) when
     /// no process can run.
-    pub fn new(events: &'static dyn Events) -> Self {
+    pub fn new(
+        events: &'static dyn Events,
+        timer: &'static dyn ProcessTimer,
+        platform: &'static VmKernel,
+    ) -> Self {
         Self(Arc::new(Shared {
             queue: SpinMutex::new(RunQueue::default()),
             counts: Arc::new(core::array::from_fn(|_| CpuCounts::default())),
             boot_stepping: AtomicBool::new(false),
             events,
+            timer,
+            platform,
             next_seq: AtomicU64::new(1),
         }))
     }
@@ -233,6 +241,90 @@ impl Scheduler {
     pub(crate) fn claim<'a>(&self, process: &'a Arc<Owned>) -> Claim<'a> {
         process.claim(|| self.0.resume_own_worker())
     }
+}
+
+/// Lazy, as a thread's run in the kernel is: see `check_run`.
+impl kthread::Preemption for Scheduler {
+    fn check(&self, point: Point, slice_end: Option<Instant>) -> Check {
+        let resched = cpu::take_resched();
+        let marks = Marks {
+            resched,
+            notified: !resched && cpu::take_notified(),
+            alone: cpu::online_count() == 1,
+        };
+        let now = self.0.platform.now();
+        let (check, arm) = check_run(point, now, slice_end, GRACE, marks);
+        if let Some(arm) = arm {
+            self.0.timer.arm_if_earlier(arm);
+        }
+        check
+    }
+
+    fn end_slice(&self, slice_end: Option<Instant>) -> Instant {
+        let end = end_by(slice_end, self.0.platform.now(), Duration::ZERO);
+        self.0.timer.arm_if_earlier(past_grace(end, GRACE));
+        end
+    }
+}
+
+/// The marks a check took from its CPU, and whether it is alone online.
+#[derive(Clone, Copy, Debug, Default)]
+struct Marks {
+    resched: bool,
+    notified: bool,
+    alone: bool,
+}
+
+/// The policy for a kernel thread's run, checked at `point` at `now`, its
+/// slice ending at `slice_end`. The `marks` shorten the end: to now to
+/// reschedule, or notified alone online; else within [`NOTIFIED`] if notified.
+/// The run ends at a safe point once past its end, where it holds nothing
+/// others wait for; at an interrupt only `grace` past it, as it may hold a
+/// spin lock there. Otherwise the timer is to be armed for the grace past an
+/// end the marks shortened, which stays the run's, or at an interrupt.
+fn check_run(
+    point: Point,
+    now: Instant,
+    slice_end: Option<Instant>,
+    grace: Duration,
+    marks: Marks,
+) -> (Check, Option<Instant>) {
+    let Marks {
+        resched,
+        notified,
+        alone,
+    } = marks;
+    let end = if resched || (notified && alone) {
+        Some(end_by(slice_end, now, Duration::ZERO))
+    } else if notified {
+        Some(end_by(slice_end, now, NOTIFIED))
+    } else {
+        slice_end
+    };
+    let limit = match point {
+        Point::SafePoint => end,
+        Point::Interrupt => end.map(|end| past_grace(end, grace)),
+    };
+    if limit.is_some_and(|limit| now >= limit) {
+        return (Check::Preempt, None);
+    }
+    let arm = end
+        .filter(|&end| point == Point::Interrupt || Some(end) != slice_end)
+        .map(|end| past_grace(end, grace));
+    (Check::Continue(end), arm)
+}
+
+fn past_grace(end: Instant, grace: Duration) -> Instant {
+    end.checked_add(grace)
+        .unwrap_or(Instant::from_nanos(u64::MAX))
+}
+
+/// `slice_end`, none being never, but `duration` from `now` at the latest.
+fn end_by(slice_end: Option<Instant>, now: Instant, duration: Duration) -> Instant {
+    let end = now
+        .checked_add(duration)
+        .unwrap_or(Instant::from_nanos(u64::MAX));
+    slice_end.map_or(end, |slice_end| slice_end.min(end))
 }
 
 /// Ordering of runnable threads, least first: by CPU time, then
@@ -988,15 +1080,7 @@ impl Inner {
 
     /// Ends `thread`'s slice `duration` from now, at the latest.
     fn end_slice_by(&self, thread: &Thread, duration: Duration) {
-        let end = self
-            .platform
-            .now()
-            .checked_add(duration)
-            .unwrap_or(Instant::from_nanos(u64::MAX));
-        let slice_end = thread
-            .slice_end
-            .get()
-            .map_or(end, |slice_end| slice_end.min(end));
+        let slice_end = end_by(thread.slice_end.get(), self.platform.now(), duration);
         thread.slice_end.set(Some(slice_end));
     }
 
@@ -1218,6 +1302,86 @@ mod tests {
             assert!(
                 wait <= 2 * count,
                 "thread {thread} waited {wait} steps: {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kernel_threads_run_ends_at_its_slice_end_or_for_its_cpus_marks() {
+        let at = Instant::from_nanos;
+        let notified_ns = u64::try_from(NOTIFIED.as_nanos()).unwrap();
+        let grace = u64::try_from(GRACE.as_nanos()).unwrap();
+        let (safe, interrupt) = (Point::SafePoint, Point::Interrupt);
+        let run_on =
+            |end: Option<u64>, arm: Option<u64>| (Check::Continue(end.map(at)), arm.map(at));
+        let marks = Marks::default();
+        let alone = Marks {
+            alone: true,
+            ..marks
+        };
+        let resched = Marks {
+            resched: true,
+            ..marks
+        };
+        let notified = Marks {
+            notified: true,
+            ..marks
+        };
+        let notified_alone = Marks {
+            alone: true,
+            ..notified
+        };
+        assert_eq!(
+            check_run(safe, at(100), Some(at(200)), GRACE, marks),
+            run_on(Some(200), None)
+        );
+        assert_eq!(
+            check_run(interrupt, at(100), Some(at(200)), GRACE, marks),
+            run_on(Some(200), Some(200 + grace))
+        );
+        assert_eq!(
+            check_run(safe, at(100), None, GRACE, alone),
+            run_on(None, None)
+        );
+        assert_eq!(
+            check_run(safe, at(200), Some(at(200)), GRACE, marks),
+            (Check::Preempt, None)
+        );
+        assert_eq!(
+            check_run(interrupt, at(200), Some(at(200)), GRACE, marks),
+            run_on(Some(200), Some(200 + grace))
+        );
+        assert_eq!(
+            check_run(interrupt, at(200 + grace), Some(at(200)), GRACE, marks),
+            (Check::Preempt, None)
+        );
+        assert_eq!(
+            check_run(safe, at(100), None, GRACE, resched),
+            (Check::Preempt, None)
+        );
+        assert_eq!(
+            check_run(interrupt, at(100), None, GRACE, resched),
+            run_on(Some(100), Some(100 + grace))
+        );
+        assert_eq!(
+            check_run(safe, at(100), None, GRACE, notified_alone),
+            (Check::Preempt, None)
+        );
+        for slice_end in [None, Some(at(100 + 100 * grace))] {
+            assert_eq!(
+                check_run(safe, at(100), slice_end, GRACE, notified),
+                run_on(Some(100 + notified_ns), Some(100 + notified_ns + grace))
+            );
+        }
+        assert_eq!(
+            check_run(safe, at(100), Some(at(150)), GRACE, notified),
+            run_on(Some(150), None)
+        );
+        for (slice_end, end) in [(None, 100), (Some(at(200)), 100), (Some(at(50)), 50)] {
+            assert_eq!(end_by(slice_end, at(100), Duration::ZERO), at(end));
+            assert_eq!(
+                check_run(safe, at(120), Some(at(end)), GRACE, marks),
+                (Check::Preempt, None)
             );
         }
     }

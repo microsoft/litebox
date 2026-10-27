@@ -216,6 +216,10 @@ static SHOOTDOWNS: Shootdowns = Shootdowns::new();
 /// waits for those. The caller changed the leaves, and holds no spin lock
 /// (see the module docs).
 pub(crate) fn shootdown(cpus: &Cpus, root: PhysFrame, pages: PageRange<Size4KiB>) {
+    debug_assert!(
+        !crate::kthread::in_kthread(),
+        "a kernel thread shoots down translations"
+    );
     // The leaves' changes, then the mask (see the module docs).
     fence(Ordering::SeqCst);
     let me = cpu::current();

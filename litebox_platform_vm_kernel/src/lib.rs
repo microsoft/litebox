@@ -11,9 +11,9 @@
 //! must precede execution that needs derived keys. The runner may then start
 //! the other CPUs ([`VmKernel::start_cpus`], [`cpu`]), which run its entry.
 //!
-//! Assumptions: no kernel threads (the runner may switch user threads);
-//! kernel mappings changed after boot only to add some or to unmap a stack's
-//! guard page, which only its CPU uses, so flushed locally; synchronized
+//! Assumptions: kernel threads only as [`kthread`] runs them (the runner may
+//! switch user threads); kernel mappings changed after boot only to add some
+//! or for stacks' guard pages (see [`kthread::Stack`]); synchronized
 //! TSCs (see [`cpu`]); and not a confidential VM (no #VE/#VC/#HV). A task's
 //! address space may be current on several CPUs at once: a change to its
 //! mappings that may leave stale translations is shot down, by IPI, on those
@@ -21,15 +21,15 @@
 //!
 //! Devices: [`VmKernel`] is the drivers' [`litebox_hal::dma::Hal`].
 //!
-//! Interrupts: the kernel runs with interrupts disabled, except while it
-//! halts ([`cpu::halt`]) or spins in [`cpu::relax`]; user code runs with them
-//! enabled. External interrupts, on any CPU, handle the TLB flushes other
-//! CPUs requested of it, then go to the handler the runner installs
-//! ([`set_interrupt_handler`]); one that interrupted user code then also
-//! enters the shim's `interrupt` (e.g., for the runner's one-shot timer, a
-//! device's input, or another CPU's wake IPI, see [`cpu`]), unless only a
-//! doorbell ([`Handled::Doorbell`]); ending the run there lets the runner
-//! preempt the thread ([`resume_thread_ref`]).
+//! Interrupts: the kernel runs with interrupts disabled, except while it halts
+//! ([`cpu::halt`]) or spins in [`cpu::relax`], and in kernel threads
+//! ([`kthread`]); user code runs with them enabled. External interrupts, on any
+//! CPU, handle the TLB flushes other CPUs requested of it, then go to the
+//! handler the runner installs ([`set_interrupt_handler`]); one that
+//! interrupted user code then also enters the shim's `interrupt` (e.g., for the
+//! runner's one-shot timer, a device's input, or another CPU's wake IPI, see
+//! [`cpu`]), unless only a doorbell ([`Handled::Doorbell`]); ending the run
+//! there lets the runner preempt the thread ([`resume_thread_ref`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -88,6 +88,7 @@ mod boot;
 pub mod clock;
 pub mod cpu;
 mod dma;
+pub mod kthread;
 pub mod mm;
 mod per_cpu;
 pub mod preempt;
@@ -386,6 +387,10 @@ impl PageTableManager {
         &self,
         task_pt_id: AddressSpaceId,
     ) -> Result<(), Errno> {
+        debug_assert!(
+            !kthread::in_kthread(),
+            "a kernel thread ends an address space"
+        );
         if task_pt_id == AddressSpaceId::KERNEL {
             return Err(Errno::EINVAL);
         }
@@ -583,9 +588,12 @@ impl VmKernel {
             ram_frame_ranges,
             ioremap_next: spin::Mutex::new(IOREMAP.start),
         }));
+        kthread::init(&platform.page_table_manager.base_page_table);
         if cfg!(debug_assertions) {
             worker::self_check(platform);
         }
+        #[cfg(debug_assertions)]
+        kthread::self_check();
         platform
     }
 
@@ -936,42 +944,73 @@ impl PinnedUserPages {
 
 impl RawMutexProvider for VmKernel {
     type RawMutex = RawMutex;
+
+    /// Debug builds: once a kernel thread exists, only kernel threads take a
+    /// lock, outside kernel services.
+    #[track_caller]
+    fn might_block() {
+        debug_assert!(
+            x86_64::instructions::interrupts::are_enabled() || kthread::live() == 0,
+            "kernel code took a lock that kernel threads take (see `RawMutex`)"
+        );
+    }
 }
 
 impl WaitWakerProvider for VmKernel {}
 
-/// No kernel thread blocks, so nothing wakes a waiter: it spins until
-/// another CPU changes the value (every wake follows a change), with
-/// [`cpu::relax`], taking interrupts meanwhile, as a halt does. That CPU may
-/// be holding the lock in its worker, suspended, until it resumes it (see
-/// [`worker`]). A spin that sees no change for [`LOCK_WARNING`] warns, once,
-/// and spins on: it may be a deadlock (e.g., the holder's CPU waits for the
-/// spinning one; which CPU holds a lock is unknown), or a long hold. With no
-/// other CPU online, blocking would deadlock, and panics; timeouts are
-/// unsupported (no kernel code uses one), and panic.
+/// The platform's locks, which kernel threads ([`kthread`]) take and may hold
+/// as they sleep or are preempted. With another CPU online, a kernel thread
+/// spins for one while its run is not due to end, up to [`cpu::NOTIFIED`];
+/// then it sleeps on the lock's queue.
+/// Other kernel code takes one only while no kernel thread exists, as it would
+/// spin for a preempted holder; with no other CPU online, that spin panics.
+/// Timeouts are unsupported, and panic.
 pub struct RawMutex {
     inner: AtomicU32,
+    waiters: kthread::WaitQueue,
 }
 
 impl RawMutexTrait for RawMutex {
     const INIT: Self = Self {
         inner: AtomicU32::new(0),
+        waiters: kthread::WaitQueue::new(),
     };
 
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
         &self.inner
     }
 
-    fn wake_many(&self, _n: usize) -> usize {
-        0
+    fn wake_many(&self, n: usize) -> usize {
+        self.waiters.wake(n)
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        match self.block_or_maybe_timeout(val, None) {
-            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
-            Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
+        // Interrupts are enabled only in a kernel thread, outside services.
+        if !x86_64::instructions::interrupts::are_enabled() {
+            return match self.spin(val, None) {
+                Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
+                Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
+                Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
+            };
         }
+        if cpu::online_count() > 1
+            && let Some(platform) = boot::started()
+        {
+            let spun = spin_for(
+                &self.inner,
+                val,
+                cpu::NOTIFIED,
+                || platform.now(),
+                cpu::relax,
+                kthread::yield_due,
+            );
+            match spun {
+                SpinEnd::Differed => return Err(ImmediatelyWokenUp),
+                SpinEnd::Changed => return Ok(()),
+                SpinEnd::Expired => {}
+            }
+        }
+        self.sleep(val)
     }
 
     fn block_or_timeout(
@@ -979,11 +1018,11 @@ impl RawMutexTrait for RawMutex {
         val: u32,
         time: core::time::Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val, Some(time))
+        self.spin(val, Some(time))
     }
 }
 
-/// How long a [`RawMutex`] spins seeing no change, or a claim stays held for
+/// How long a [`RawMutex`] waits seeing no change, or a claim stays held for
 /// a waiter (see the shim), before it warns of a possible deadlock (once per
 /// wait); it then waits on, as some locks are held longer: e.g., an open
 /// file's, across a whole read, which takes a 9P round trip per message, each
@@ -991,7 +1030,7 @@ impl RawMutexTrait for RawMutex {
 pub const LOCK_WARNING: core::time::Duration = core::time::Duration::from_mins(1);
 
 impl RawMutex {
-    fn block_or_maybe_timeout(
+    fn spin(
         &self,
         val: u32,
         timeout: Option<core::time::Duration>,
@@ -1027,7 +1066,92 @@ impl RawMutex {
         }
         Ok(UnblockedOrTimedOut::Unblocked)
     }
+
+    fn sleep(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
+        // The boot self-check's threads run before the clock may be read.
+        let mut warn_at = boot::started().map(|platform| {
+            let at = platform
+                .now()
+                .checked_add(LOCK_WARNING)
+                .expect("the clock is far from overflowing");
+            (platform, at)
+        });
+        let mut slept = false;
+        loop {
+            let prepared = self.waiters.prepare();
+            if self.underlying_atomic().load(Ordering::SeqCst) != val {
+                return if slept {
+                    Ok(())
+                } else {
+                    Err(ImmediatelyWokenUp)
+                };
+            }
+            #[cfg(debug_assertions)]
+            LOCK_SLEEPERS.fetch_add(1, Ordering::Relaxed);
+            prepared.sleep(warn_at.map(|(_, at)| at));
+            #[cfg(debug_assertions)]
+            LOCK_SLEEPERS.fetch_sub(1, Ordering::Relaxed);
+            slept = true;
+            match warn_at {
+                Some((platform, at)) if platform.now() >= at => {
+                    litebox_util_log::warn!(
+                        lock:? = core::ptr::from_ref(self),
+                        waited:? = LOCK_WARNING;
+                        "still sleeping for a lock: a deadlock? (see `RawMutex`)"
+                    );
+                    warn_at = None;
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
 }
+
+#[cfg(debug_assertions)]
+static LOCK_SLEEPERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Debug builds, for tests: how many kernel threads sleep for a lock.
+#[cfg(debug_assertions)]
+pub fn lock_sleepers() -> usize {
+    LOCK_SLEEPERS.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpinEnd {
+    /// The word differed already.
+    Differed,
+    Changed,
+    /// The budget passed, or `stop` said so.
+    Expired,
+}
+
+/// Spins while `word` is `val`, calling `relax` between looks, for up to
+/// `budget`, unless `stop` says to stop first.
+fn spin_for(
+    word: &AtomicU32,
+    val: u32,
+    budget: core::time::Duration,
+    now: impl Fn() -> Instant,
+    mut relax: impl FnMut(),
+    mut stop: impl FnMut() -> bool,
+) -> SpinEnd {
+    if word.load(Ordering::Relaxed) != val {
+        return SpinEnd::Differed;
+    }
+    let start = now();
+    loop {
+        relax();
+        if word.load(Ordering::Relaxed) != val {
+            return SpinEnd::Changed;
+        }
+        if now().duration_since(&start) >= budget || stop() {
+            return SpinEnd::Expired;
+        }
+    }
+}
+
+#[cfg(test)]
+mod lock_tests;
 
 /// An instant on the kernel clock (see `litebox_common_vm_abi`), in
 /// nanoseconds from the installed [`clock::ClockSource`]; `from_nanos` and

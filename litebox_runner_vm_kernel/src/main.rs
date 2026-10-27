@@ -31,6 +31,8 @@ extern crate alloc;
 mod client;
 mod devices;
 mod payload;
+#[cfg(debug_assertions)]
+mod self_check;
 mod service;
 
 use core::panic::PanicInfo;
@@ -52,8 +54,14 @@ fn kernel_main(kernel: Kernel) -> ! {
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
-    let scheduler = SCHEDULER.call_once(|| Scheduler::new(devices));
+    let scheduler = SCHEDULER.call_once(|| Scheduler::new(devices, devices, kernel.platform));
+    litebox_platform_vm_kernel::kthread::set_preemption(scheduler);
+    // Once interrupts and the timer are set up: alone, then with the others.
+    #[cfg(debug_assertions)]
+    self_check::kthreads(kernel.platform, devices);
     kernel.start_cpus(devices, cpu_main);
+    #[cfg(debug_assertions)]
+    self_check::smp_kthreads(kernel.platform, devices);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
     let broker = |console, shares, allow_process_duplication| {
         litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {

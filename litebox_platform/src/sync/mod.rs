@@ -88,6 +88,11 @@ pub trait RawMutex: Send + Sync + 'static {
 pub trait RawMutexProvider {
     /// Raw mutex used by portable synchronization primitives.
     type RawMutex: RawMutex;
+
+    /// Called first by every acquisition that may block, for platforms that
+    /// check where blocking is allowed.
+    #[inline(always)]
+    fn might_block() {}
 }
 
 /// Platform capabilities required by the portable synchronization primitives.

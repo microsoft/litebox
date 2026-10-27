@@ -38,6 +38,7 @@ pub(crate) struct PerCpuVariables {
     /// See [`crate::cpu::local`].
     pub(crate) local: Cell<usize>,
     pub(crate) worker: crate::worker::Worker,
+    pub(crate) kthread: crate::kthread::KthreadCpu,
     /// Keeps the task page table in CR3 alive (`None`: the base table).
     active_page_table: UnsafeCell<Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
     stacks: PerCpuStacks,
@@ -291,8 +292,8 @@ fn per_cpu_variables_ptr() -> *mut PerCpuVariables {
 /// The mode an external interrupt interrupted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Interrupted {
-    /// In [`crate::cpu::halt`] or [`crate::cpu::relax`], the only kernel code
-    /// that takes interrupts.
+    /// In [`crate::cpu::halt`] or [`crate::cpu::relax`], or a kernel thread:
+    /// the only kernel code that takes interrupts.
     Kernel,
     User,
 }
@@ -334,6 +335,7 @@ pub(crate) fn allocate_per_cpu_variables(cpu: CpuId) -> &'static PerCpuVariables
         tls: Cell::new(core::ptr::null_mut()),
         local: Cell::new(0),
         worker: crate::worker::Worker::new(),
+        kthread: crate::kthread::KthreadCpu::new(),
         active_page_table: UnsafeCell::new(None),
         stacks: PerCpuStacks::allocate(),
     }))
@@ -366,11 +368,24 @@ impl PerCpuVariables {
 ///
 /// # Safety
 ///
-/// `start` is an aligned, unused page of an allocation that is never freed.
+/// `start` is an aligned, unused page of an allocation that is not freed
+/// unless [`restore_guard`] maps the page back first.
 pub(crate) unsafe fn unmap_guard(page_table: &crate::mm::PageTable<PAGE_SIZE>, start: usize) {
     let range = litebox::mm::page::PageRange::new(start, start + PAGE_SIZE)
         .expect("stack guard page must be aligned and non-empty");
     // Safety: see the function's.
     unsafe { page_table.unmap_pages(range, UnmapOptions::KEEP_FRAMES) }
         .expect("failed to unmap a stack guard page");
+}
+
+/// Maps back the guard page at `start`.
+///
+/// # Safety
+///
+/// [`unmap_guard`] unmapped it from `page_table`; its allocation is not freed.
+pub(crate) unsafe fn restore_guard(page_table: &crate::mm::PageTable<PAGE_SIZE>, start: usize) {
+    let page = x86_64::structures::paging::Page::from_start_address(VirtAddr::new(start as u64))
+        .expect("stack guard page must be aligned");
+    // Safety: a page of the heap, so of the direct map, whose tables remain.
+    unsafe { page_table.remap_direct(page) };
 }
