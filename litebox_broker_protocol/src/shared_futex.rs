@@ -7,12 +7,14 @@
 //! native fork children inherit, is named by a [`SharedMemoryId`] that its creator picks from a
 //! block the broker reserved for it. The broker keeps no record of the memory: it keys futex wait
 //! queues by [`SharedFutexKey`], so a wake in one process reaches waiters in every process that
-//! names the same futex word. Because IDs are unguessable, only processes that were given an ID,
-//! by creating the memory or inheriting it, can name its futexes.
+//! names the same futex word. A process may only name the futexes of blocks it reserved, or that
+//! the process that created it could name at the time, so that it can only reach memory it may
+//! share. A process that creates another must therefore take its later IDs from a block it
+//! reserves afterwards.
 //!
 //! Each waiting thread owns a futex waiter object. A wait arms it on a futex with a generation
 //! that the waiter's previous arms did not use; a wake marks the armed waiters it selects woken
-//! and publishes [`futex_waiter_woken`] readiness for them, which carries that generation.
+//! and publishes [`futex_waiter_woken_readiness`] readiness for them, which carries that generation.
 //! Disarming the waiter reports whether it was woken, and resets it.
 //!
 //! Readiness that carries the generation of the current arm proves that a wake selected the
@@ -22,8 +24,9 @@
 use crate::ObjectHandle;
 use crate::readiness::ReadinessFlags;
 
-/// Readiness flag of a futex waiter that a wake selected and that has not been disarmed since.
-pub const FUTEX_WAITER_WOKEN: ReadinessFlags = ReadinessFlags::READ;
+/// Readiness flag of a futex waiter that a wake selected and that has not been disarmed or armed
+/// again since.
+const FUTEX_WAITER_WOKEN: ReadinessFlags = ReadinessFlags::READ;
 
 /// Number of distinct futex waiter arm generations, which wrap around.
 pub const FUTEX_WAITER_GENERATIONS: u32 = 1 << 24;
@@ -34,7 +37,7 @@ const FUTEX_WAITER_GENERATION_SHIFT: u32 = 8;
 /// Returns the readiness of a futex waiter that a wake selected while it was armed with
 /// `generation`, which must be less than [`FUTEX_WAITER_GENERATIONS`].
 #[must_use]
-pub const fn futex_waiter_woken(generation: u32) -> ReadinessFlags {
+pub const fn futex_waiter_woken_readiness(generation: u32) -> ReadinessFlags {
     ReadinessFlags(FUTEX_WAITER_WOKEN.0 | generation << FUTEX_WAITER_GENERATION_SHIFT)
 }
 
@@ -63,6 +66,12 @@ pub struct SharedMemoryId(
 );
 
 impl SharedMemoryId {
+    /// Returns the block the ID belongs to: its upper 64 bits.
+    #[must_use]
+    pub const fn block(self) -> u64 {
+        (self.0 >> 64) as u64
+    }
+
     /// Returns the ID `index` places after `self` in its block, wrapping within the block.
     #[must_use]
     pub fn nth_in_block(self, index: u64) -> Self {
@@ -76,8 +85,8 @@ impl SharedMemoryId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReserveMemoryIdsResponse {
     /// First ID of the reserved block: the 2^64 IDs that share its upper 64 bits, which no other
-    /// reservation shares. Its lower 64 bits are random, so that no other process can guess the
-    /// IDs of the block from the order in which they are handed out.
+    /// reservation shares, and which only the reserving process and the processes it later
+    /// creates may name.
     pub first: SharedMemoryId,
 }
 
@@ -110,7 +119,7 @@ pub struct FutexArmRequest {
     /// Futex waiter to arm, which is idle or was woken since it was last armed.
     pub waiter: ObjectHandle,
     /// Generation of this arm, less than [`FUTEX_WAITER_GENERATIONS`], which the waiter's
-    /// [`futex_waiter_woken`] readiness carries if a wake selects it.
+    /// [`futex_waiter_woken_readiness`] readiness carries if a wake selects it.
     pub generation: u32,
 }
 
@@ -149,7 +158,8 @@ pub struct FutexDisarmResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        FUTEX_WAITER_GENERATIONS, SharedMemoryId, futex_waiter_woken, woken_futex_waiter_generation,
+        FUTEX_WAITER_GENERATIONS, SharedMemoryId, futex_waiter_woken_readiness,
+        woken_futex_waiter_generation,
     };
     use crate::readiness::ReadinessFlags;
 
@@ -157,7 +167,7 @@ mod tests {
     fn woken_readiness_carries_the_arm_generation() {
         for generation in [0, 1, FUTEX_WAITER_GENERATIONS - 1] {
             assert_eq!(
-                woken_futex_waiter_generation(futex_waiter_woken(generation)),
+                woken_futex_waiter_generation(futex_waiter_woken_readiness(generation)),
                 Some(generation)
             );
         }

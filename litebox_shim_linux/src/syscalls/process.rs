@@ -1445,11 +1445,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
         // Dropping the pending child on failure discards it.
-        let child = self
-            .global
-            .litebox
-            .allocate_child_process()
-            .map_err(Errno::from)?;
+        let child = self.allocate_child_process()?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let handles = child.inherit(&objects).map_err(Errno::from)?;
@@ -1493,6 +1489,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         drop(pause);
         child.start(&payload).map_err(Errno::from)?;
         Ok(child_pid.cast_unsigned() as usize)
+    }
+
+    /// Allocates a pending child process, then retires the block of shared memory IDs that the
+    /// child may name, so that the child cannot reach the futexes of memory created afterwards.
+    fn allocate_child_process(&self) -> Result<litebox::process::PendingChild, Errno> {
+        let child = self
+            .global
+            .litebox
+            .allocate_child_process()
+            .map_err(Errno::from)?;
+        self.global.shared_memory_ids.retire_block();
+        Ok(child)
     }
 
     /// Writes the contents of each of `regions` that has contents to the pending `child`'s
@@ -1643,11 +1651,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return Err(Errno::EAGAIN);
         }
-        let child = self
-            .global
-            .litebox
-            .allocate_child_process()
-            .map_err(Errno::from)?;
+        let child = self.allocate_child_process()?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
@@ -4530,8 +4534,38 @@ mod fork_tests {
                 parent_memory
             );
             let created = memory.shared_futex_key(map_shared(&task)).unwrap().memory;
-            assert_ne!(created.0 >> 64, parent_memory.0 >> 64);
+            assert_ne!(created.block(), parent_memory.block());
         });
+    }
+
+    #[test]
+    fn shared_memory_created_after_a_child_comes_from_a_new_block() {
+        use litebox_common_linux::{MapFlags, ProtFlags};
+
+        let task = crate::syscalls::tests::init_platform();
+        let map_shared = || {
+            let address = task
+                .sys_mmap(
+                    0,
+                    PAGE_SIZE,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+                .unwrap()
+                .as_usize();
+            task.global.mm.shared_futex_key(address).unwrap().memory
+        };
+        let first = map_shared();
+        assert_eq!(map_shared().block(), first.block());
+        // The broker lets the child name the blocks this process reserved so far, so memory
+        // created from now on must come from another.
+        let child = task.allocate_child_process().unwrap();
+        let after = map_shared();
+        assert_ne!(after.block(), first.block());
+        drop(child);
+        assert_eq!(map_shared().block(), after.block());
     }
 
     #[cfg(target_arch = "aarch64")]

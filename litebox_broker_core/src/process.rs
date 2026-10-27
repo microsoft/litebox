@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::id::IdAllocator;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
+use crate::shared_futex::SharedMemoryBlocks;
 use crate::signal::ProcessSignals;
 use crate::socket::SocketAccount;
 use crate::{BrokerCore, BrokerError, Result};
@@ -201,6 +202,8 @@ pub struct BrokerProcess {
     pub(crate) readiness_queue_entries: Arc<AtomicUsize>,
     /// Signals and child exits this process has not taken.
     pub(crate) signals: Arc<ProcessSignals>,
+    /// Blocks of shared memory IDs whose futexes this process may name.
+    pub(crate) shared_memory_blocks: SharedMemoryBlocks,
     /// Cancellation state of this process's association.
     pub(crate) cancellation: AssociationCancellation,
 }
@@ -321,12 +324,14 @@ impl BrokerProcess {
     /// Creates authenticated broker process state for the allocated ID `id`.
     ///
     /// A child of `creator` starts in its group and session, while a root
-    /// process leads its own.
+    /// process leads its own. `shared_memory_blocks` are the blocks of shared
+    /// memory IDs the process may name, which a child inherits from `creator`.
     pub(crate) fn new(
         core: BrokerCore,
         id: ProcessId,
         creator: Option<&Arc<BrokerProcess>>,
         caller_credential: CallerCredential,
+        shared_memory_blocks: SharedMemoryBlocks,
     ) -> Self {
         let membership = creator.map_or(
             ProcessGroupMembership {
@@ -370,6 +375,7 @@ impl BrokerProcess {
             socket_account: Mutex::new(Some(socket_account)),
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),
+            shared_memory_blocks,
             cancellation: AssociationCancellation::default(),
         }
     }
@@ -1352,6 +1358,20 @@ impl BrokerProcess {
     #[must_use]
     pub fn is_cancellation_requested(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+
+    /// Returns the caller's object rights, failing with `PolicyDenied` unless they include
+    /// `required`.
+    pub(crate) fn require_object_rights(&self, required: ObjectRights) -> Result<ObjectRights> {
+        let rights = self
+            .core
+            .policy
+            .principal_object_rights(self.caller_credential)?;
+        if rights.contains(required) {
+            Ok(rights)
+        } else {
+            Err(BrokerError::PolicyDenied)
+        }
     }
 
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {

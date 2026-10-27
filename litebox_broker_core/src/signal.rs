@@ -33,13 +33,7 @@ pub fn open(
     process: &BrokerProcess,
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<ObjectHandle> {
-    let rights = process
-        .core
-        .policy
-        .principal_object_rights(process.caller_credential)?;
-    if !rights.contains(ObjectRights::WAIT) {
-        return Err(BrokerError::PolicyDenied);
-    }
+    let rights = process.require_object_rights(ObjectRights::WAIT)?;
     let reference = process.reserve_object_reference(rights)?;
     let readiness = ReadinessRegistration::new(reference.handle(), readiness_sink);
     {

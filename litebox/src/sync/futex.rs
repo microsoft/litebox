@@ -49,7 +49,28 @@ struct FutexEntry<Platform: RawSyncPrimitivesProvider> {
     done: AtomicBool,
 }
 
-const ALL_BITS: NonZeroU32 = NonZeroU32::new(u32::MAX).unwrap();
+/// Returns the mask of a futex operation with `bitset`, which matches all masks if it is `None`.
+fn mask(bitset: Option<NonZeroU32>) -> u32 {
+    bitset.map_or(u32::MAX, NonZeroU32::get)
+}
+
+/// Fails with [`FutexError::NotAligned`] unless `addr` is aligned for a futex word.
+fn check_aligned(addr: usize) -> Result<(), FutexError> {
+    if addr.is_multiple_of(align_of::<u32>()) {
+        Ok(())
+    } else {
+        Err(FutexError::NotAligned)
+    }
+}
+
+/// Returns whether the futex word at `futex_addr` holds `expected_value`, failing with
+/// [`FutexError::Fault`] if it cannot be read.
+fn word_matches<Platform: RawPointerProvider>(
+    futex_addr: Platform::RawMutPointer<u32>,
+    expected_value: u32,
+) -> Result<bool, FutexError> {
+    Ok(futex_addr.read_at_offset(0).ok_or(FutexError::Fault)? == expected_value)
+}
 
 impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     FutexManager<Platform>
@@ -90,11 +111,9 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         expected_value: u32,
         bitset: Option<NonZeroU32>,
     ) -> Result<(), FutexError> {
-        let bitset = bitset.unwrap_or(ALL_BITS).get();
+        let bitset = mask(bitset);
         let addr = futex_addr.as_usize();
-        if !addr.is_multiple_of(align_of::<u32>()) {
-            return Err(FutexError::NotAligned);
-        }
+        check_aligned(addr)?;
 
         let bucket = self.bucket(addr);
         let mut entry = pin!(LoanListEntry::new(FutexEntry {
@@ -110,8 +129,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
 
         // Check the value once. Do this only after inserting into the list so
         // that we don't miss a wakeup.
-        let value = futex_addr.read_at_offset(0).ok_or(FutexError::Fault)?;
-        if value != expected_value {
+        if !word_matches::<Platform>(futex_addr, expected_value)? {
             return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
         }
         // Only return when woken--don't reevaluate the futex word. This
@@ -142,10 +160,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         bitset: Option<NonZeroU32>,
     ) -> Result<u32, FutexError> {
         let addr = futex_addr.as_usize();
-        if !addr.is_multiple_of(align_of::<u32>()) {
-            return Err(FutexError::NotAligned);
-        }
-        let bitset = bitset.unwrap_or(ALL_BITS).get();
+        check_aligned(addr)?;
+        let bitset = mask(bitset);
         let mut woken = 0;
         let bucket = self.bucket(addr);
         // Extract matching entries from the bucket until we've woken enough.

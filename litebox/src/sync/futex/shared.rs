@@ -18,8 +18,9 @@
 
 use alloc::sync::Arc;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
+use super::{FutexError, check_aligned, mask, word_matches};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_futex::{
@@ -40,16 +41,16 @@ use crate::event::{
 };
 use crate::platform::{RawConstPointer as _, RawPointerProvider};
 use crate::sync::RawSyncPrimitivesProvider;
-use crate::sync::futex::FutexError;
 
-/// Errors returned when creating futex waiters or naming shared memory.
+/// Errors from the broker behind futexes in shared memory.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SharedFutexError {
     /// The broker ran out of objects or memory.
     #[error("shared futex resource exhausted")]
     ResourceExhausted,
-    /// Broker policy forbids the caller from creating the object.
+    /// Broker policy forbids the caller from using futexes in shared memory, or in the memory
+    /// named.
     #[error("shared futex permission denied")]
     PermissionDenied,
     /// The broker failed, or its association with this process did.
@@ -62,14 +63,21 @@ pub enum SharedFutexError {
 
 /// Allocates the [`SharedMemoryId`]s of memory this process creates.
 ///
-/// The IDs come from a block that the broker reserves once per allocator. A process that
-/// duplicates its memory, as native fork does, must give the duplicate a new allocator, so that
-/// the two allocate from different blocks.
+/// The IDs come from a block that the broker reserves on first use, and again after each
+/// [`Self::retire_block`]. The broker lets a process name the blocks it reserved, and those its
+/// creator had reserved when creating it. So a process must call [`Self::retire_block`] after
+/// creating another, so that memory it creates later is out of the new process's reach, and a
+/// process that duplicates its memory, as native fork does, must give the duplicate a new
+/// allocator.
 pub struct SharedMemoryIdAllocator {
-    /// The first ID of the reserved block.
-    first: spin::Once<SharedMemoryId>,
-    /// How many IDs of the block were allocated.
-    allocated: AtomicU64,
+    state: spin::Mutex<AllocatorState>,
+}
+
+struct AllocatorState {
+    /// The first ID of the current block, and how many of its IDs were allocated, once reserved.
+    block: Option<(SharedMemoryId, u64)>,
+    /// How many times the block was retired.
+    retirements: u64,
 }
 
 impl Default for SharedMemoryIdAllocator {
@@ -82,8 +90,10 @@ impl SharedMemoryIdAllocator {
     /// Creates an allocator that reserves its block on first use.
     pub const fn new() -> Self {
         Self {
-            first: spin::Once::new(),
-            allocated: AtomicU64::new(0),
+            state: spin::Mutex::new(AllocatorState {
+                block: None,
+                retirements: 0,
+            }),
         }
     }
 
@@ -100,32 +110,49 @@ impl SharedMemoryIdAllocator {
         &self,
         litebox: &LiteBox<Platform>,
     ) -> Result<SharedMemoryId, SharedFutexError> {
-        let first = if let Some(first) = self.first.get() {
-            *first
-        } else {
+        loop {
+            let retirements = {
+                let mut state = self.state.lock();
+                if let Some(block) = state.block.as_mut() {
+                    return Self::next_in_block(block);
+                }
+                state.retirements
+            };
             let broker = litebox
                 .broker_control()
                 .ok_or(SharedFutexError::Unavailable)?;
-            // Concurrent first uses may each reserve a block, without blocking each other on the
-            // broker; one is kept.
+            // Reserved without holding the lock, so concurrent first uses may each reserve a
+            // block; one is kept.
             let reserved = broker
                 .reserve_shared_memory_ids()
                 .map_err(BrokerObjectError::from)?;
-            *self.first.call_once(|| reserved)
-        };
-        let index = self
-            .allocated
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
-                allocated.checked_add(1)
-            })
-            .map_err(|_| SharedFutexError::ResourceExhausted)?;
-        Ok(first.nth_in_block(index))
+            let mut state = self.state.lock();
+            // A block reserved while the block was retired may be one that a process created
+            // meanwhile can name.
+            if state.retirements == retirements {
+                return Self::next_in_block(state.block.get_or_insert((reserved, 0)));
+            }
+        }
     }
-}
 
-/// Returns the mask of a futex operation with `bitset`, which matches all masks if it is `None`.
-fn mask(bitset: Option<NonZeroU32>) -> u32 {
-    bitset.map_or(u32::MAX, NonZeroU32::get)
+    /// Makes later IDs come from a block reserved after this call, which the processes created
+    /// before it cannot name.
+    pub fn retire_block(&self) {
+        let mut state = self.state.lock();
+        state.block = None;
+        state.retirements = state.retirements.wrapping_add(1);
+    }
+
+    /// Allocates the next ID of the block whose first ID and number of allocated IDs are
+    /// `block`, failing with [`SharedFutexError::ResourceExhausted`] once it is used up.
+    fn next_in_block(
+        (first, allocated): &mut (SharedMemoryId, u64),
+    ) -> Result<SharedMemoryId, SharedFutexError> {
+        let next = allocated
+            .checked_add(1)
+            .ok_or(SharedFutexError::ResourceExhausted)?;
+        Ok(first.nth_in_block(core::mem::replace(allocated, next)))
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -222,14 +249,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
     where
         Platform: RawPointerProvider,
     {
-        // The broker rejects a misaligned offset, so only the address needs checking here.
-        if !futex_addr.as_usize().is_multiple_of(align_of::<u32>()) {
-            return Err(FutexError::NotAligned);
-        }
+        // Shared memory is mapped page-aligned, so an aligned address has an aligned offset.
+        check_aligned(futex_addr.as_usize())?;
         let bitset = mask(bitset);
-        let matches = || -> Result<bool, FutexError> {
-            Ok(futex_addr.read_at_offset(0).ok_or(FutexError::Fault)? == expected_value)
-        };
+        let matches = || word_matches::<Platform>(futex_addr, expected_value);
         if !matches()? {
             return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
         }
@@ -253,7 +276,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
             match matches() {
                 Ok(true) => {}
                 mismatch_or_fault => {
-                    if self.woken(generation)? {
+                    if self.disarm_unless_woken(generation)? {
                         return Ok(());
                     }
                     mismatch_or_fault?;
@@ -261,7 +284,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
                 }
             }
             let waited = cx.wait_until(|| observer.is_ready());
-            if self.woken(generation)? {
+            if self.disarm_unless_woken(generation)? {
                 return Ok(());
             }
             waited.map_err(FutexError::WaitError)?;
@@ -271,12 +294,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
         }
     }
 
-    /// Returns whether a wake selected the waiter while it was armed with `generation`, leaving
-    /// it disarmed or woken, either of which it may be armed again from.
+    /// Disarms the waiter unless readiness that carries `generation` proves that a wake selected
+    /// it while it was armed with `generation`, returning whether a wake did.
     ///
-    /// Readiness that carries `generation` proves the wake without asking the broker, which then
-    /// still holds the waiter woken. Otherwise, disarming the waiter answers.
-    fn woken(&self, generation: u32) -> Result<bool, FutexError> {
+    /// Either way the waiter is left disarmed or woken, either of which it may be armed again
+    /// from. A proven wake needs no broker call, as the broker then still holds the waiter woken.
+    fn disarm_unless_woken(&self, generation: u32) -> Result<bool, FutexError> {
         let readiness = ReadinessFlags(self.latest_readiness.load(Ordering::Acquire));
         if woken_futex_waiter_generation(readiness) == Some(generation) {
             return Ok(true);

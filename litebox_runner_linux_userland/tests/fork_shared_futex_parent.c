@@ -1,13 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks that futexes in shared anonymous memory span a parent and its forked child, while
-// private futex operations on the same memory stay within each process.
+// Checks that futexes in shared anonymous memory span a parent and its forked children, while
+// private futex operations on the same memory, and futexes in private memory, stay within each
+// process.
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <limits.h>
 #include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -27,6 +30,8 @@ struct shared {
     atomic_uint word;
     atomic_uint ready;
     atomic_uint value;
+    // The thread ID that Linux clears, and wakes a waiter on, when the thread exits.
+    atomic_uint tid;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     unsigned turn;
@@ -143,6 +148,179 @@ static int check_wake(struct shared *shared, struct shared *other) {
     kill(child, SIGKILL);
     reap(child);
     return 0;
+}
+
+// Kills and reaps each child in `children[0..count]` that is still running.
+static void kill_all(pid_t *children, int count) {
+    for (int index = 0; index < count; index++) {
+        if (children[index] > 0) {
+            kill(children[index], SIGKILL);
+            reap(children[index]);
+        }
+    }
+}
+
+// Waits in a forked child for a wake of the shared word, exiting with 0 once one selects it.
+static void wait_for_wake(struct shared *shared) {
+    struct timespec timeout = {.tv_sec = TIMEOUT_SECONDS};
+    atomic_fetch_add(&shared->ready, 1);
+    long result;
+    do {
+        result = futex(&shared->word, FUTEX_WAIT, 0, &timeout);
+    } while (result == -1 && errno == EINTR);
+    _exit(result == 0 ? 0 : 1);
+}
+
+// Wakes the shared word with `count` until a wake reports waking a waiter, then reaps the one
+// child in `children` that exits, returning its index, or -1 if any of this fails.
+static int wake_and_reap_one(struct shared *shared, unsigned count, pid_t *children) {
+    long woken = 0;
+    for (int attempt = 0; attempt < TIMEOUT_SECONDS * 100 && woken == 0; attempt++) {
+        woken = futex(&shared->word, FUTEX_WAKE, count, NULL);
+        if (woken == 0) {
+            sleep_ms(10);
+        }
+    }
+    if (woken != 1) {
+        return -1;
+    }
+    for (int attempt = 0; attempt < TIMEOUT_SECONDS * 1000; attempt++) {
+        for (int index = 0; index < 2; index++) {
+            int code = -1;
+            if (children[index] > 0 && exited(children[index], &code)) {
+                children[index] = 0;
+                return code == 0 ? index : -1;
+            }
+        }
+        sleep_ms(1);
+    }
+    return -1;
+}
+
+// A FUTEX_WAKE wakes at most its count of waiters across processes, and like Linux's legacy
+// futex, a count of zero wakes one: of two children waiting, a wake of zero reports waking one,
+// which exits while the other keeps waiting, and a wake of all then reports waking the other.
+static int check_count(struct shared *shared) {
+    atomic_store(&shared->word, 0);
+    atomic_store(&shared->ready, 0);
+    pid_t children[2] = {0, 0};
+    for (int index = 0; index < 2; index++) {
+        children[index] = fork();
+        if (children[index] < 0) {
+            children[index] = 0;
+            kill_all(children, index);
+            return 0;
+        }
+        if (children[index] == 0) {
+            wait_for_wake(shared);
+        }
+    }
+    int ok = await_value(&shared->ready, 2);
+    // Let both block, so that the first wake has two waiters to choose from.
+    sleep_ms(100);
+    int first = ok ? wake_and_reap_one(shared, 0, children) : -1;
+    ok = first >= 0;
+    if (ok) {
+        sleep_ms(50);
+        int code = -1;
+        if (exited(children[1 - first], &code)) {
+            children[1 - first] = 0;
+            ok = 0;
+        }
+    }
+    ok = ok && wake_and_reap_one(shared, INT_MAX, children) == 1 - first;
+    kill_all(children, 2);
+    return ok;
+}
+
+// A non-private futex in private memory is keyed by process, so after fork the parent's wake of
+// a copy-on-write word never reaches the child's waiter on its copy.
+static int check_private_memory(struct shared *shared) {
+    atomic_uint *word = mmap(NULL, sizeof(*word), PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (word == MAP_FAILED) {
+        return 0;
+    }
+    atomic_store(word, 0);
+    atomic_store(&shared->ready, 0);
+    pid_t child = fork();
+    if (child < 0) {
+        munmap(word, sizeof(*word));
+        return 0;
+    }
+    if (child == 0) {
+        struct timespec timeout = {.tv_nsec = 300 * 1000000};
+        atomic_store(&shared->ready, 1);
+        long result = futex(word, FUTEX_WAIT, 0, &timeout);
+        _exit(result == -1 && errno == ETIMEDOUT ? 0 : 1);
+    }
+    int ok = await_value(&shared->ready, 1);
+    for (int attempt = 0; attempt < 10 && ok; attempt++) {
+        ok &= futex(word, FUTEX_WAKE, 1, NULL) == 0;
+        sleep_ms(10);
+    }
+    if (!ok) {
+        kill(child, SIGKILL);
+    }
+    munmap(word, sizeof(*word));
+    return reap(child) == 0 && ok;
+}
+
+static char clear_tid_stack[64 * 1024] __attribute__((aligned(16)));
+// The thread's own thread pointer target, which, like x86-64's thread control block, points to
+// itself, so that the thread does not share its creator's.
+static void *clear_tid_tls[512] __attribute__((aligned(64)));
+
+// Exits once released, so that Linux clears and wakes the thread ID it was created with.
+static int exit_when_released(void *arg) {
+    struct shared *shared = arg;
+    while (atomic_load(&shared->value) == 0) {
+        syscall(SYS_sched_yield);
+    }
+    return 0;
+}
+
+// When a thread whose clear_child_tid word is in shared memory exits, Linux clears the word and
+// wakes a waiter on it in another process, as a non-private futex.
+static int check_clear_tid(struct shared *shared) {
+    atomic_store(&shared->value, 0);
+    atomic_store(&shared->ready, 0);
+    int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+                CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+    clear_tid_tls[0] = clear_tid_tls;
+    pid_t thread = clone(exit_when_released, clear_tid_stack + sizeof(clear_tid_stack), flags,
+                         shared, (pid_t *)&shared->tid, clear_tid_tls, (pid_t *)&shared->tid);
+    if (thread <= 0) {
+        return 0;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        atomic_store(&shared->value, 1);
+        await_value(&shared->tid, 0);
+        return 0;
+    }
+    if (child == 0) {
+        struct timespec timeout = {.tv_sec = TIMEOUT_SECONDS};
+        atomic_store(&shared->ready, 1);
+        for (;;) {
+            unsigned tid = atomic_load(&shared->tid);
+            if (tid == 0) {
+                _exit(0);
+            }
+            if (futex(&shared->tid, FUTEX_WAIT, tid, &timeout) == -1 && errno == ETIMEDOUT) {
+                _exit(1);
+            }
+        }
+    }
+    int ok = await_value(&shared->ready, 1);
+    // Let the child block, so that only the wake on exit can release it.
+    sleep_ms(100);
+    atomic_store(&shared->value, 1);
+    ok &= await_value(&shared->tid, 0);
+    if (!ok) {
+        kill(child, SIGKILL);
+    }
+    return reap(child) == 0 && ok;
 }
 
 // A FUTEX_WAIT on shared memory times out, and fails at once if the word changed.
@@ -431,10 +609,15 @@ int main(void) {
     int semaphore = check_semaphore(shared);
     int bitset = check_bitset(shared);
     int misaligned = check_misaligned(shared);
+    int count = check_count(shared);
+    int private_memory = check_private_memory(shared);
+    int clear_tid = check_clear_tid(shared);
     printf("shared-futex memory=%d wake=%d timeout=%d private=%d mutex=%d semaphore=%d "
-           "bitset=%d misaligned=%d\n",
-           memory, wake, timeout, private, mutex, semaphore, bitset, misaligned);
-    return memory && wake && timeout && private && mutex && semaphore && bitset && misaligned
+           "bitset=%d misaligned=%d count=%d private-memory=%d clear-tid=%d\n",
+           memory, wake, timeout, private, mutex, semaphore, bitset, misaligned, count,
+           private_memory, clear_tid);
+    return memory && wake && timeout && private && mutex && semaphore && bitset && misaligned &&
+                   count && private_memory && clear_tid
                ? 0
                : 1;
 }

@@ -14,14 +14,12 @@ extern crate std;
 
 use alloc::{sync::Arc, vec};
 use core::convert::Infallible;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
     fs::{in_mem::InitialNode, resolver::Resolver},
-    random::{RandomProvider, RandomProviderError},
     socket::HOST_GATEWAY_IPV4_ADDRESS,
     stdio::{StdioProvider as _, StdioStream},
     test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
@@ -151,33 +149,9 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
         #[cfg(target_os = "linux")]
         let builder = builder.with_socket_provider(Arc::new(socket_provider));
         let core = builder
-            .with_random_provider(Arc::new(TestRandomProvider))
             .build()
             .expect("a test process may build only one broker core")
             .with_terminal(stdio.terminal().expect("the test terminal must exist"));
         TestBroker { core, stdio }
     })
-}
-
-/// Whether the test broker's randomness fails, which [`fail_randomness`] sets.
-static RANDOMNESS_FAILS: AtomicBool = AtomicBool::new(false);
-
-/// Makes the process-wide test broker's random provider fail from now on.
-pub(crate) fn fail_randomness() {
-    RANDOMNESS_FAILS.store(true, Ordering::Relaxed);
-}
-
-/// Deterministic random provider that fills each request with a fresh counter value, so that
-/// shared memory IDs differ between reservations, unless [`fail_randomness`] was called.
-struct TestRandomProvider;
-
-impl RandomProvider for TestRandomProvider {
-    fn fill(&self, output: &mut [u8]) -> Result<(), RandomProviderError> {
-        static COUNTER: AtomicU8 = AtomicU8::new(0);
-        if RANDOMNESS_FAILS.load(Ordering::Relaxed) {
-            return Err(RandomProviderError);
-        }
-        output.fill(COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1));
-        Ok(())
-    }
 }

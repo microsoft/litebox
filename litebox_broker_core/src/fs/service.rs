@@ -532,7 +532,7 @@ pub fn open(
     mode: FileMode,
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<FileResult<ObjectHandle>> {
-    let rights = authorize(process, open_required_rights(access, flags)?)?;
+    let rights = process.require_object_rights(open_required_rights(access, flags)?)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
@@ -572,7 +572,7 @@ pub(crate) fn open_without_reference(
     flags: FileOpenFlags,
     mode: FileMode,
 ) -> Result<FileResult<(File, FileStatus)>> {
-    authorize(process, open_required_rights(access, flags)?)?;
+    process.require_object_rights(open_required_rights(access, flags)?)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
@@ -748,7 +748,7 @@ pub fn path_status(
     user: FileUser,
     follow_symlinks: bool,
 ) -> Result<FileResult<FileStatus>> {
-    authorize(process, ObjectRights::WAIT)?;
+    process.require_object_rights(ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
@@ -761,7 +761,7 @@ pub fn read_link(
     path: &str,
     user: FileUser,
 ) -> Result<FileResult<String>> {
-    authorize(process, ObjectRights::WAIT)?;
+    process.require_object_rights(ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
@@ -774,7 +774,7 @@ pub fn resolve_path(
     path: &str,
     user: FileUser,
 ) -> Result<FileResult<String>> {
-    authorize(process, ObjectRights::WAIT)?;
+    process.require_object_rights(ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
@@ -788,7 +788,7 @@ pub fn chmod(
     user: FileUser,
     mode: FileMode,
 ) -> Result<FileResult<()>> {
-    authorize(process, ObjectRights::WRITE)?;
+    process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
@@ -803,7 +803,7 @@ pub fn chown(
     user: Option<u16>,
     group: Option<u16>,
 ) -> Result<FileResult<()>> {
-    authorize(process, ObjectRights::WRITE)?;
+    process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
@@ -812,7 +812,7 @@ pub fn chown(
 
 /// Removes a file at an absolute path.
 pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
-    authorize(process, ObjectRights::WRITE)?;
+    process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
@@ -826,7 +826,7 @@ pub fn mkdir(
     user: FileUser,
     mode: FileMode,
 ) -> Result<FileResult<()>> {
-    authorize(process, ObjectRights::WRITE)?;
+    process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
@@ -835,23 +835,11 @@ pub fn mkdir(
 
 /// Removes a directory at an absolute path.
 pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
-    authorize(process, ObjectRights::WRITE)?;
+    process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
     process.core.fs.rmdir(path, user)
-}
-
-fn authorize(process: &BrokerProcess, required: ObjectRights) -> Result<ObjectRights> {
-    let rights = process
-        .core
-        .policy
-        .principal_object_rights(process.caller_credential)?;
-    if rights.contains(required) {
-        Ok(rights)
-    } else {
-        Err(BrokerError::PolicyDenied)
-    }
 }
 
 fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<ObjectRights> {
