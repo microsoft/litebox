@@ -64,9 +64,11 @@ impl From<Fault> for StdioProviderError {
 /// stream's readiness to its watchers. Providers whose operations always make
 /// progress can keep the default readiness methods.
 ///
-/// A provider gives the guest at most one terminal, its controlling terminal
-/// behind `/dev/tty`. Reads, writes, and readiness of each standard stream that
-/// refers to it go through the terminal instead of this provider. Without a
+/// A provider gives the guest at most one terminal, which the broker usually
+/// makes the first root process's controlling terminal (see
+/// [`crate::BrokerCore::with_terminal`]). Reads, writes, and readiness of each
+/// standard stream that refers to it go through the terminal instead of this
+/// provider. Without a
 /// terminal, no stream is a terminal. Neither the terminal nor which streams
 /// refer to it changes over the provider's lifetime.
 pub trait StdioProvider: Send + Sync {

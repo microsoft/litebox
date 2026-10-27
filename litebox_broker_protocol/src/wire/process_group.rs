@@ -3,7 +3,8 @@
 
 use crate::message::{ProcessGroupRequest, ProcessGroupResponse};
 use crate::process_group::{
-    ProcessGroupError, ProcessGroupMembership, SetForegroundGroupRequest, SetProcessGroupRequest,
+    ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
+    SetForegroundGroupRequest, SetProcessGroupRequest,
 };
 
 use super::WireError;
@@ -13,12 +14,14 @@ const PROCESS_GROUP_REQUEST_TAG_SET: u8 = 0;
 const PROCESS_GROUP_REQUEST_TAG_CREATE_SESSION: u8 = 1;
 const PROCESS_GROUP_REQUEST_TAG_GET_FOREGROUND_GROUP: u8 = 2;
 const PROCESS_GROUP_REQUEST_TAG_SET_FOREGROUND_GROUP: u8 = 3;
+const PROCESS_GROUP_REQUEST_TAG_SET_CONTROLLING_TERMINAL: u8 = 4;
 
 const PROCESS_GROUP_RESPONSE_TAG_SET: u8 = 0;
 const PROCESS_GROUP_RESPONSE_TAG_CREATE_SESSION: u8 = 1;
 const PROCESS_GROUP_RESPONSE_TAG_GET_FOREGROUND_GROUP: u8 = 2;
 const PROCESS_GROUP_RESPONSE_TAG_SET_FOREGROUND_GROUP: u8 = 3;
 const PROCESS_GROUP_RESPONSE_TAG_FAILED: u8 = 4;
+const PROCESS_GROUP_RESPONSE_TAG_SET_CONTROLLING_TERMINAL: u8 = 5;
 
 const PROCESS_GROUP_ERROR_TAG_NOT_CONTROLLING_TERMINAL: u8 = 0;
 const PROCESS_GROUP_ERROR_TAG_NO_SUCH_PROCESS_GROUP: u8 = 1;
@@ -44,6 +47,11 @@ pub(super) fn encode_process_group_request(encoder: &mut Encoder, request: Proce
             encoder.handle(request.terminal);
             encoder.process_group_id(request.process_group);
         }
+        ProcessGroupRequest::SetControllingTerminal(request) => {
+            encoder.u8(PROCESS_GROUP_REQUEST_TAG_SET_CONTROLLING_TERMINAL);
+            encoder.process_id(request.process_id);
+            encoder.handle(request.terminal);
+        }
     }
 }
 
@@ -67,6 +75,12 @@ pub(super) fn decode_process_group_request(
                 process_group: decoder.process_group_id()?,
             })
         }
+        PROCESS_GROUP_REQUEST_TAG_SET_CONTROLLING_TERMINAL => {
+            ProcessGroupRequest::SetControllingTerminal(SetControllingTerminalRequest {
+                process_id: decoder.process_id()?,
+                terminal: decoder.handle()?,
+            })
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -84,6 +98,9 @@ pub(super) fn encode_process_group_response(encoder: &mut Encoder, response: Pro
         }
         ProcessGroupResponse::SetForegroundGroup => {
             encoder.u8(PROCESS_GROUP_RESPONSE_TAG_SET_FOREGROUND_GROUP);
+        }
+        ProcessGroupResponse::SetControllingTerminal => {
+            encoder.u8(PROCESS_GROUP_RESPONSE_TAG_SET_CONTROLLING_TERMINAL);
         }
         ProcessGroupResponse::Failed(error) => {
             encoder.u8(PROCESS_GROUP_RESPONSE_TAG_FAILED);
@@ -113,6 +130,9 @@ pub(super) fn decode_process_group_response(
             })
         }
         PROCESS_GROUP_RESPONSE_TAG_SET_FOREGROUND_GROUP => ProcessGroupResponse::SetForegroundGroup,
+        PROCESS_GROUP_RESPONSE_TAG_SET_CONTROLLING_TERMINAL => {
+            ProcessGroupResponse::SetControllingTerminal
+        }
         PROCESS_GROUP_RESPONSE_TAG_FAILED => ProcessGroupResponse::Failed(match decoder.u8()? {
             PROCESS_GROUP_ERROR_TAG_NOT_CONTROLLING_TERMINAL => {
                 ProcessGroupError::NotControllingTerminal

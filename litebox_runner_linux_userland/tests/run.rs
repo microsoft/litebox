@@ -60,6 +60,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 const DEDICATED_C_TESTS: &[&str] = &[
     "aarch64_hwcaps.c",
     "async_x16.c",
+    "ctty_parent.c",
     "fork_chain_parent.c",
     "fork_parent.c",
     "fork_interrupt_parent.c",
@@ -1329,6 +1330,20 @@ fn process_groups_and_sessions_span_processes() {
         output
             .lines()
             .any(|line| line == "process-group failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sessions_acquire_controlling_terminals_across_processes() {
+    let parent = common::compile("./tests/ctty_parent.c", "ctty_parent", true, false);
+    let mut runner = Runner::new(&parent, "ctty_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "ctty failures=0"),
         "{output}"
     );
 }

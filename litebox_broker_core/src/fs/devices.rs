@@ -16,8 +16,9 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef,
+    PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent,
+    WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -192,8 +193,7 @@ pub struct Devices {
     root_inode: NodeInfo,
     /// Stable inode info for the `pts` directory.
     pts_inode: NodeInfo,
-    /// Host standard streams behind `stdin`, `stdout`, and `stderr`, and the
-    /// controlling terminal behind `tty`.
+    /// Host standard streams behind `stdin`, `stdout`, and `stderr`.
     stdio: Arc<dyn StdioProvider>,
     /// Randomness behind `urandom`.
     random: Arc<dyn RandomProvider>,
@@ -247,7 +247,7 @@ impl Devices {
 
     /// Terminal endpoint behind `device`, through which its I/O goes.
     fn endpoint(&self, device: Device) -> Option<Arc<dyn TerminalEndpoint>> {
-        if device != Device::Tty && !self.stdio.is_terminal(device.stdio_stream()?) {
+        if !self.stdio.is_terminal(device.stdio_stream()?) {
             return None;
         }
         self.stdio.terminal()
@@ -317,10 +317,11 @@ impl BackendHandles for Devices {
 }
 
 impl Backend for Devices {
-    fn terminal(&self, h: &FileHandle) -> Option<Arc<dyn TerminalEndpoint>> {
+    fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
         match &h.get_typed::<Self>().0 {
-            DeviceFile::Device(device) => self.endpoint(*device),
-            file => file.terminal(),
+            DeviceFile::Device(Device::Tty) => Some(FileTerminal::Controlling),
+            DeviceFile::Device(device) => self.endpoint(*device).map(FileTerminal::Endpoint),
+            file => file.terminal().map(FileTerminal::Endpoint),
         }
     }
 
@@ -397,11 +398,6 @@ impl Backend for Devices {
                 let device = Device::from_name(name).ok_or_else(not_found)?;
                 if flags.contains(OFlags::DIRECTORY) {
                     return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-                }
-                // Like Linux, opening `/dev/tty` for I/O needs a controlling terminal;
-                // `O_PATH` opens and `stat` do not.
-                if device == Device::Tty && !path_only && self.stdio.terminal().is_none() {
-                    return Err(OpenError::NoSuchDevice);
                 }
                 if device == Device::Ptmx && !path_only {
                     DeviceFile::Manager(Arc::new(self.pseudo_terminals.open_manager()?))
@@ -480,19 +476,19 @@ impl Backend for Devices {
         };
         match device {
             // Opening `ptmx` yields a manager, so only `O_PATH` handles, which the resolver bars
-            // from I/O, hold `Ptmx`.
-            Device::Ptmx => Err(ReadError::Io),
+            // from I/O, hold `Ptmx`. The resolver routes I/O through a `tty` handle to the
+            // opener's controlling terminal.
+            Device::Ptmx | Device::Tty => Err(ReadError::Io),
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
-            Device::Stdin | Device::Tty if buf.is_empty() => Ok(0),
-            Device::Stdin | Device::Tty => match (self.endpoint(device), device) {
-                (Some(terminal), _) => terminal.read(buf),
-                (None, Device::Stdin) => self.stdio.read(buf).map_err(|error| match error {
+            Device::Stdin if buf.is_empty() => Ok(0),
+            Device::Stdin => match self.endpoint(device) {
+                Some(terminal) => terminal.read(buf),
+                None => self.stdio.read(buf).map_err(|error| match error {
                     StdioProviderError::WouldBlock => ReadError::WouldBlock,
                     StdioProviderError::Broker(error) => ReadError::Broker(error),
                     _ => ReadError::Io,
                 }),
-                (None, _) => Err(ReadError::Io),
             },
             Device::URandom => {
                 let mut bytes = bounce_buffer(buf.len())?;
@@ -515,11 +511,11 @@ impl Backend for Devices {
         };
         match device {
             // See `read`.
-            Device::Ptmx => return Err(WriteError::Io),
+            Device::Ptmx | Device::Tty => return Err(WriteError::Io),
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Null | Device::URandom => return Ok(buf.len()),
-            Device::Stdout | Device::Stderr | Device::Tty if buf.is_empty() => return Ok(0),
-            Device::Stdout | Device::Stderr | Device::Tty => {}
+            Device::Stdout | Device::Stderr if buf.is_empty() => return Ok(0),
+            Device::Stdout | Device::Stderr => {}
         }
         if let Some(terminal) = self.endpoint(device) {
             return terminal.write(buf);

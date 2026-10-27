@@ -651,8 +651,8 @@ mod tests {
         StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
     };
     use crate::process_group::{
-        ProcessGroupError, ProcessGroupMembership, SetForegroundGroupRequest,
-        SetProcessGroupRequest,
+        ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
+        SetForegroundGroupRequest, SetProcessGroupRequest,
     };
     use crate::readiness_queue::{
         AddReadinessQueueEntryRequest, CreateReadinessQueueResponse,
@@ -892,6 +892,12 @@ mod tests {
                 SetForegroundGroupRequest {
                     terminal: handle,
                     process_group: ProcessGroupId(u32::MAX),
+                },
+            )),
+            BrokerOperation::ProcessGroup(ProcessGroupRequest::SetControllingTerminal(
+                SetControllingTerminalRequest {
+                    process_id: process_id(7),
+                    terminal: handle,
                 },
             )),
             BrokerOperation::Signal(SignalRequest::Take(TakeSignalRequest { handle })),
@@ -1599,6 +1605,7 @@ mod tests {
                 },
             )),
             BrokerResult::ProcessGroup(ProcessGroupResponse::SetForegroundGroup),
+            BrokerResult::ProcessGroup(ProcessGroupResponse::SetControllingTerminal),
             BrokerResult::ProcessGroup(ProcessGroupResponse::Failed(
                 ProcessGroupError::NotControllingTerminal,
             )),

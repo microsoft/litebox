@@ -1132,6 +1132,7 @@ pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
 pub const TCSBRK: u32 = 0x5409;
 pub const TCFLSH: u32 = 0x540b;
+pub const TIOCSCTTY: u32 = 0x540e;
 pub const TIOCGPGRP: u32 = 0x540f;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
@@ -1171,6 +1172,9 @@ pub enum IoctlArg {
     TCSBRK(u32),
     /// Discard input (0), output (1), or both (2).
     TCFLSH(u32),
+    /// Make the terminal the caller's controlling terminal, stealing it from
+    /// another session when nonzero.
+    TIOCSCTTY(u32),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
     /// Set window size.
@@ -3160,6 +3164,7 @@ impl SyscallRequest {
                         TCSETSF2 => IoctlArg::TCSETSF2(ctx.sys_req_ptr(2)),
                         TCSBRK => IoctlArg::TCSBRK(ctx.sys_req_arg(2)),
                         TCFLSH => IoctlArg::TCFLSH(ctx.sys_req_arg(2)),
+                        TIOCSCTTY => IoctlArg::TIOCSCTTY(ctx.sys_req_arg(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),

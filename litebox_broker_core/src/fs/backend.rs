@@ -18,6 +18,7 @@ use super::errors::{
 };
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
+use crate::terminal::TerminalEndpoint;
 
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
 // broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
@@ -35,6 +36,17 @@ impl Clone for Box<dyn AnyCloneSendSync> {
     fn clone(&self) -> Self {
         (**self).clone_to_any()
     }
+}
+
+/// The terminal that an open file refers to.
+#[derive(Clone)]
+pub enum FileTerminal {
+    /// A terminal independent of the file's open file description.
+    Endpoint(Arc<dyn TerminalEndpoint>),
+    /// The controlling terminal of the opener's session, which the resolver
+    /// binds when the file is opened and through which the file's I/O then
+    /// goes.
+    Controlling,
 }
 
 /// How a backend file handle participates in seek.
@@ -162,12 +174,10 @@ pub trait Backend: Send + Sync + Any {
     /// Status of an open file or directory handle.
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
-    /// Shared terminal endpoint, independent of this open file description. A
-    /// file is a terminal exactly when it has one.
-    fn terminal(
-        &self,
-        _h: &FileHandle,
-    ) -> Option<alloc::sync::Arc<dyn crate::terminal::TerminalEndpoint>> {
+    /// The terminal that an open file handle refers to. A file is a terminal
+    /// exactly when it refers to one.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
         None
     }
 
