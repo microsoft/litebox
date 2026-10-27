@@ -699,17 +699,30 @@ where
 
     /// Returns the key of the futex word at `address` if a mapping of named shared memory, which
     /// other processes may map, holds all of it.
-    pub fn shared_futex_key(&self, address: usize) -> Option<SharedFutexKey> {
+    ///
+    /// Fails with [`Errno::EFAULT`] if that mapping has no access, as Linux faults resolving a
+    /// shared futex in an inaccessible page before looking at its waiters.
+    pub fn shared_futex_key(&self, address: usize) -> Result<Option<SharedFutexKey>, Errno> {
         if !self.names_shared_memory.load(Ordering::Acquire) {
-            return None;
+            return Ok(None);
         }
-        let end = address.checked_add(size_of::<u32>())?;
+        let Some(end) = address.checked_add(size_of::<u32>()) else {
+            return Ok(None);
+        };
         let vmem = self.vmem.read();
-        let (range, vma) = vmem.overlapping(address..end).next()?;
+        let Some((range, vma)) = vmem.overlapping(address..end).next() else {
+            return Ok(None);
+        };
         if range.start > address || range.end < end {
-            return None;
+            return Ok(None);
         }
-        vma.shared_futex_key(address)
+        let Some(key) = vma.shared_futex_key(address) else {
+            return Ok(None);
+        };
+        if !vma.flags().intersects(VmFlags::VM_ACCESS_FLAGS) {
+            return Err(Errno::EFAULT);
+        }
+        Ok(Some(key))
     }
 
     /// Returns all mappings in a vector.

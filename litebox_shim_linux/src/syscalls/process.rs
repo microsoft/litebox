@@ -4510,7 +4510,7 @@ mod fork_tests {
             let parent = builder.build();
             let task = parent.0.clone().new_test_task();
             let inherited = map_shared(&task);
-            let parent_memory = memory.shared_futex_key(inherited).unwrap().memory;
+            let parent_memory = memory.shared_futex_key(inherited).unwrap().unwrap().memory;
             drop(task);
             drop(parent);
 
@@ -4530,10 +4530,14 @@ mod fork_tests {
             // The inherited mapping keeps naming the memory the parent shares, while memory the
             // child creates comes from another block, so it cannot collide with the parent's.
             assert_eq!(
-                memory.shared_futex_key(inherited).unwrap().memory,
+                memory.shared_futex_key(inherited).unwrap().unwrap().memory,
                 parent_memory
             );
-            let created = memory.shared_futex_key(map_shared(&task)).unwrap().memory;
+            let created = memory
+                .shared_futex_key(map_shared(&task))
+                .unwrap()
+                .unwrap()
+                .memory;
             assert_ne!(created.block(), parent_memory.block());
         });
     }
@@ -4555,7 +4559,12 @@ mod fork_tests {
                 )
                 .unwrap()
                 .as_usize();
-            task.global.mm.shared_futex_key(address).unwrap().memory
+            task.global
+                .mm
+                .shared_futex_key(address)
+                .unwrap()
+                .unwrap()
+                .memory
         };
         let first = map_shared();
         assert_eq!(map_shared().block(), first.block());

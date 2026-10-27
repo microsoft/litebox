@@ -104,14 +104,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// of wake reaches the other kind of waiter. Only a program that mixes the two kinds on one
     /// word can tell: LiteBox wakes where Linux would leave the waiter sleeping.
     ///
+    /// Like Linux, fails with `EINVAL` if the word is misaligned, and then with `EFAULT` if it is
+    /// in shared memory that is inaccessible.
+    ///
     /// [`FutexManager`]: litebox::sync::futex::FutexManager
     fn shared_futex_key_for(
         &self,
         addr: UserPtrMut<u32>,
         flags: &FutexFlags,
-    ) -> Option<SharedFutexKey> {
+    ) -> Result<Option<SharedFutexKey>, Errno> {
+        if !addr.as_usize().is_multiple_of(align_of::<u32>()) {
+            return Err(Errno::EINVAL);
+        }
         if flags.contains(FutexFlags::PRIVATE) {
-            None
+            Ok(None)
         } else {
             self.global.mm.shared_futex_key(addr.as_usize())
         }
@@ -126,9 +132,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         count: u32,
         bitset: Option<NonZeroU32>,
     ) -> Result<usize, Errno> {
-        // Like Linux, a count of zero still wakes one waiter, after the address is checked.
-        let count = NonZeroU32::new(count).unwrap_or(NonZeroU32::MIN);
-        Ok(if let Some(key) = self.shared_futex_key_for(addr, flags) {
+        // Linux takes the count as an `int` and counts a waiter before comparing, so a count that
+        // is zero or negative as an `int` still wakes one waiter.
+        let count = NonZeroU32::new(count)
+            .filter(|count| i32::try_from(count.get()).is_ok())
+            .unwrap_or(NonZeroU32::MIN);
+        Ok(if let Some(key) = self.shared_futex_key_for(addr, flags)? {
             self.global.litebox.wake_shared_futex(key, count, bitset)? as usize
         } else {
             self.global
@@ -147,7 +156,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         bitset: Option<NonZeroU32>,
     ) -> Result<(), Errno> {
         let addr_ptr = addr.to_platform_ptr::<Platform>();
-        if let Some(key) = self.shared_futex_key_for(addr, flags) {
+        if let Some(key) = self.shared_futex_key_for(addr, flags)? {
             self.get_or_create_shared_futex_waiter()?
                 .wait(cx, key, addr_ptr, val, bitset)?;
         } else {
@@ -193,18 +202,21 @@ mod tests {
     }
 
     fn key(task: &Task<TestPlatform>, address: usize) -> Option<SharedFutexKey> {
-        task.global.mm.shared_futex_key(address)
+        task.global.mm.shared_futex_key(address).unwrap()
     }
 
     fn word(address: usize) -> UserPtrMut<u32> {
         UserPtrMut::from_usize(address)
     }
 
+    /// The count that wakes all waiters, the largest that Linux's signed count allows.
+    const WAKE_ALL: u32 = i32::MAX as u32;
+
     fn wake(task: &Task<TestPlatform>, address: usize, flags: FutexFlags) -> usize {
         task.sys_futex(FutexArgs::Wake {
             addr: word(address),
             flags,
-            count: u32::MAX,
+            count: WAKE_ALL,
         })
         .unwrap()
     }
@@ -339,7 +351,7 @@ mod tests {
             task.sys_futex(FutexArgs::WakeBitset {
                 addr: word(address),
                 flags: FutexFlags::empty(),
-                count: u32::MAX,
+                count: WAKE_ALL,
                 bitmask,
             })
         };
@@ -475,6 +487,91 @@ mod tests {
             assert_eq!(woken, 1);
             assert_eq!(waiter.join().unwrap(), Ok(0));
         }
+    }
+
+    /// Wakes the word at `address` with `count`, with `FUTEX_WAKE_BITSET` and `bitmask` if it is
+    /// `Some`.
+    fn wake_with(
+        task: &Task<TestPlatform>,
+        address: usize,
+        flags: FutexFlags,
+        count: u32,
+        bitmask: Option<u32>,
+    ) -> Result<usize, Errno> {
+        let addr = word(address);
+        task.sys_futex(match bitmask {
+            None => FutexArgs::Wake { addr, flags, count },
+            Some(bitmask) => FutexArgs::WakeBitset {
+                addr,
+                flags,
+                count,
+                bitmask,
+            },
+        })
+    }
+
+    #[test]
+    fn wake_with_negative_signed_count_wakes_one_waiter() {
+        let task = init_platform();
+        let shared = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
+        // Linux takes the count as an `int`, so a count past `i32::MAX` is negative, and like
+        // zero wakes one waiter even when more match.
+        for address in [shared, private] {
+            for bitmask in [None, Some(u32::MAX)] {
+                let waiters = [
+                    spawn_waiter(&task, address, FutexFlags::empty()),
+                    spawn_waiter(&task, address, FutexFlags::empty()),
+                ];
+                for count in [0x8000_0000, u32::MAX] {
+                    let woken = wake_until_woken(|| {
+                        wake_with(&task, address, FutexFlags::empty(), count, bitmask)
+                    });
+                    assert_eq!(woken, 1, "{address:#x} {bitmask:?} {count:#x}");
+                }
+                for waiter in waiters {
+                    assert_eq!(waiter.join().unwrap(), Ok(0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn futex_in_inaccessible_shared_memory_faults() {
+        let task = init_platform();
+        let shared = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
+        let protect = |address: usize, prot: ProtFlags| {
+            task.sys_mprotect(UserPtrMut::from_usize(address), PAGE_SIZE, prot)
+                .unwrap();
+        };
+        let waiter = spawn_waiter(&task, shared, FutexFlags::empty());
+        protect(shared, ProtFlags::PROT_NONE);
+        protect(private, ProtFlags::PROT_NONE);
+        // The shared memory keeps its identity, but like Linux, a shared wake checks access
+        // before looking at the waiters. Private wakes never look at the mapping.
+        for count in [0, 1] {
+            for bitmask in [None, Some(u32::MAX)] {
+                let wake = |address, flags| wake_with(&task, address, flags, count, bitmask);
+                assert_eq!(wake(shared, FutexFlags::empty()), Err(Errno::EFAULT));
+                assert_eq!(wake(shared, FutexFlags::PRIVATE), Ok(0));
+                assert_eq!(wake(private, FutexFlags::PRIVATE), Ok(0));
+                // Alignment is checked first.
+                assert_eq!(wake(shared + 2, FutexFlags::empty()), Err(Errno::EINVAL));
+            }
+        }
+        assert_eq!(
+            wait(&task, shared, 0, FutexFlags::empty(), Some(10)),
+            Err(Errno::EFAULT)
+        );
+
+        // The faulting wakes left the waiter queued.
+        protect(shared, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE);
+        assert_eq!(
+            wake_until_woken(|| wake_with(&task, shared, FutexFlags::empty(), 1, None)),
+            1
+        );
+        assert_eq!(waiter.join().unwrap(), Ok(0));
     }
 
     #[test]

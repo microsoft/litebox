@@ -225,7 +225,7 @@ fn test_fork_shared_futex_with_windows_broker() {
     assert_eq!(
         line,
         "shared-futex memory=1 wake=1 timeout=1 private=1 mutex=1 semaphore=1 bitset=1 \
-         misaligned=1 count=1 private-memory=1 clear-tid=1",
+         misaligned=1 count=1 inaccessible=1 private-memory=1 clear-tid=1",
         "{output:?}"
     );
 }

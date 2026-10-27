@@ -19,6 +19,9 @@
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <time.h>
 #include <unistd.h>
 
 #define TEST_ASSERT(cond, msg)                                                \
@@ -135,6 +138,27 @@ static inline void set_recv_timeout(int fd) {
 static inline void close_pair(int sv[2]) {
     close(sv[0]);
     close(sv[1]);
+}
+
+// Sleeps for `ms` milliseconds, resuming after signal interruptions.
+static inline void sleep_ms(long ms) {
+    struct timespec duration = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000};
+    while (nanosleep(&duration, &duration) == -1 && errno == EINTR) {
+    }
+}
+
+// Returns the exit code of `child`, first killing it unless `exiting`, or -1 if it did not exit
+// normally.
+static inline int reap(pid_t child, int exiting) {
+    if (!exiting) {
+        kill(child, SIGKILL);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited == -1 && errno == EINTR);
+    return waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 // Single-shot poll(2) for level-triggered checks. Asserts `r=1` (revents

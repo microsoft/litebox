@@ -10,7 +10,8 @@
 //!
 //! The broker does not check that a process maps the memory whose futexes it names. Instead, each
 //! process may only name the IDs of [`SharedMemoryBlocks`] it reserved, or that its creator could
-//! name when creating it, so a process cannot reach the futexes of memory created after it was.
+//! name when creating it. Enforcement is by block, so a process cannot reach the futexes of
+//! memory whose IDs come from blocks reserved after it was created.
 //!
 //! A waiter is armed on at most one futex at a time, so the buckets hold at most one entry per
 //! waiter. A wake marks waiters woken and publishes it with the generation of their arm, and
@@ -197,28 +198,26 @@ pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<
     validate_key_and_bitset(request.key, request.bitset)?;
     process.require_object_rights(ObjectRights::WAIT)?;
     process.shared_memory_blocks.authorize(request.key.memory)?;
+    let selects =
+        |queued: &QueuedWaiter| queued.key == request.key && queued.bitset & request.bitset != 0;
     let mut woken = Vec::new();
     let mut count = 0;
     {
         let mut bucket = process.core.shared_futexes.bucket(request.key).lock();
+        let eligible = bucket.iter().filter(|queued| selects(queued)).count();
+        if eligible == 0 {
+            return Ok(0);
+        }
         // Reserve first: a waiter marked woken must have its wake published.
         woken
-            .try_reserve(bucket.len().min(request.count as usize))
+            .try_reserve(eligible.min(request.count as usize))
             .map_err(|_| BrokerError::OutOfMemory)?;
-        let mut index = 0;
-        while count < request.count {
-            let Some(queued) = bucket.get(index) else {
-                break;
-            };
-            if queued.key != request.key || queued.bitset & request.bitset == 0 {
-                index += 1;
-                continue;
+        // One stable pass removes the selected entries in linear time, keeping the others oldest
+        // first. Selected entries leave the queue even if their waiter is gone or disarmed.
+        bucket.retain_mut(|queued| {
+            if count == request.count || !selects(queued) {
+                return true;
             }
-            // Selected entries leave the queue even if their waiter is gone or disarmed. Most
-            // wakes select the oldest entries, which the deque removes in constant time.
-            let Some(queued) = bucket.remove(index) else {
-                break;
-            };
             if let Some(waiter) = queued.waiter.upgrade() {
                 let mut state = waiter.state.lock();
                 if let WaiterState::Armed { generation, .. } = *state {
@@ -228,7 +227,8 @@ pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<
                     count += 1;
                 }
             }
-        }
+            false
+        });
     }
     for (waiter, generation) in &woken {
         waiter
@@ -537,6 +537,34 @@ mod tests {
             Fixture::wake(&fixture.parent, other_memory_key, 1, u32::MAX),
             Ok(1)
         );
+    }
+
+    #[test]
+    fn partial_wake_keeps_unselected_waiters_oldest_first() {
+        let fixture = fixture();
+        let waiters: std::vec::Vec<_> = (0..6).map(|_| fixture.waiter(&fixture.child)).collect();
+        for (index, &waiter) in waiters.iter().enumerate() {
+            let bitset = if index % 2 == 0 { 0b10 } else { 0b01 };
+            Fixture::arm(&fixture.child, key(0), bitset, waiter).unwrap();
+        }
+        // A wake that selects nothing leaves the queue as it was.
+        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, 0b100), Ok(0));
+        assert_eq!(Fixture::wake(&fixture.parent, key(4), 1, u32::MAX), Ok(0));
+        assert_eq!(fixture.queued(), (1, 6));
+
+        // Selecting interleaved entries keeps the rest, including the matching entry past the
+        // count, in their order.
+        assert_eq!(Fixture::wake(&fixture.parent, key(0), 2, 0b01), Ok(2));
+        assert_eq!(fixture.woken_handles(), [waiters[1], waiters[3]]);
+        assert_eq!(fixture.queued(), (1, 4));
+        assert_eq!(Fixture::wake(&fixture.parent, key(0), 3, u32::MAX), Ok(3));
+        assert_eq!(
+            fixture.woken_handles(),
+            [waiters[1], waiters[3], waiters[0], waiters[2], waiters[4]]
+        );
+        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, 0b10), Ok(0));
+        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, 0b01), Ok(1));
+        assert_eq!(fixture.queued(), (0, 0));
     }
 
     #[test]

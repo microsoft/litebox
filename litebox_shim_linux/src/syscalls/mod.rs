@@ -6,7 +6,7 @@
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub mod file;
-pub(crate) mod futex;
+mod futex;
 pub(crate) mod inet;
 pub(crate) mod misc;
 pub(crate) mod mm;

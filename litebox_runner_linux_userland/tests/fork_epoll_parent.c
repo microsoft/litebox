@@ -15,6 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "helpers.h"
+
 // Bounds every wait, so a failure cannot hang the test.
 #define TIMEOUT_MS 30000
 
@@ -37,26 +39,6 @@ static int epoll_add(int epfd, int fd, uint32_t events, uint64_t data) {
 
 static int write_count(int fd, uint64_t value) {
     return write(fd, &value, sizeof(value)) == sizeof(value);
-}
-
-static void sleep_ms(long ms) {
-    struct timespec duration = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000};
-    while (nanosleep(&duration, &duration) == -1 && errno == EINTR) {
-    }
-}
-
-// Returns the exit code of `child`, first killing it unless `exiting`, or -1 if it did not exit
-// normally.
-static int reap(pid_t child, int exiting) {
-    if (!exiting) {
-        kill(child, SIGKILL);
-    }
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = waitpid(child, &status, 0);
-    } while (waited == -1 && errno == EINTR);
-    return waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 // Interests a child adds or removes change the interest list of its parent.

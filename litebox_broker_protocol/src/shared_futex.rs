@@ -12,10 +12,11 @@
 //! share. A process that creates another must therefore take its later IDs from a block it
 //! reserves afterwards.
 //!
-//! Each waiting thread owns a futex waiter object. A wait arms it on a futex with a generation
-//! that the waiter's previous arms did not use; a wake marks the armed waiters it selects woken
-//! and publishes [`futex_waiter_woken_readiness`] readiness for them, which carries that generation.
-//! Disarming the waiter reports whether it was woken, and resets it.
+//! Each waiting thread owns a futex waiter object. A wait arms it on a futex with a wrapping arm
+//! generation, which differs from those of the waiter's recent arms; a wake marks the armed
+//! waiters it selects woken and publishes [`futex_waiter_woken_readiness`] readiness for them,
+//! which carries that generation. Disarming the waiter reports whether it was woken, and resets
+//! it.
 //!
 //! Readiness that carries the generation of the current arm proves that a wake selected the
 //! waiter, so the waiter may skip disarming and arm again. Any other readiness, such as one left

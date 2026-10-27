@@ -66,9 +66,9 @@ pub enum SharedFutexError {
 /// The IDs come from a block that the broker reserves on first use, and again after each
 /// [`Self::retire_block`]. The broker lets a process name the blocks it reserved, and those its
 /// creator had reserved when creating it. So a process must call [`Self::retire_block`] after
-/// creating another, so that memory it creates later is out of the new process's reach, and a
-/// process that duplicates its memory, as native fork does, must give the duplicate a new
-/// allocator.
+/// creating another, so that memory it creates later takes its IDs from a block reserved after
+/// the new process was created, which the new process cannot name. A process that duplicates its
+/// memory, as native fork does, must give the duplicate a new allocator.
 pub struct SharedMemoryIdAllocator {
     state: spin::Mutex<AllocatorState>,
 }
