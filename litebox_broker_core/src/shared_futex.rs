@@ -17,9 +17,8 @@
 //! takes no broker memory per block.
 //!
 //! A waiter is armed on at most one futex at a time, so the buckets hold at most one entry per
-//! waiter. A wake marks waiters woken and publishes it with the generation of their arm, and
-//! disarming reports it, so a wake racing a timeout or interruption is not lost. A woken waiter
-//! may also be armed again without disarming, as its readiness already told it of the wake.
+//! waiter. A wake marks waiters woken and publishes readiness for them, and disarming reports
+//! it, so a wake racing a timeout or interruption is not lost.
 
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -29,8 +28,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_futex::{
-    FUTEX_WAITER_GENERATIONS, FUTEX_WORD_SIZE, FutexArmRequest, FutexDisarmRequest,
-    FutexWakeRequest, SharedFutexKey, SharedMemoryId, futex_waiter_woken_readiness,
+    FUTEX_WAITER_WOKEN, FUTEX_WORD_SIZE, FutexArmRequest, FutexDisarmRequest, FutexWakeRequest,
+    SharedFutexKey, SharedMemoryId,
 };
 use spin::Mutex;
 
@@ -184,25 +183,20 @@ pub fn create_futex_waiter(
     ))))
 }
 
-/// Arms a futex waiter that is idle, or was woken since it was last armed, on the futex word
-/// `request.key`.
+/// Arms an idle futex waiter on the futex word `request.key`.
 ///
-/// Fails with `UnsupportedOperation` if the offset is unaligned, the mask is zero, the generation
-/// is out of range, or the waiter is armed, and with `PolicyDenied` if the caller may not name
-/// the key's memory.
+/// Fails with `UnsupportedOperation` if the offset is unaligned, the mask is zero, or the waiter
+/// is not idle, and with `PolicyDenied` if the caller may not name the key's memory.
 pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()> {
     validate_key_and_bitset(request.key, request.bitset)?;
     process.shared_memory.authorize(request.key.memory)?;
-    if request.generation >= FUTEX_WAITER_GENERATIONS {
-        return Err(BrokerError::UnsupportedOperation);
-    }
     // Holding the waiter's object defers a concurrent close, whose disarm then dequeues the
     // arming, until after this request's locks are released.
     let waiter_object = process.authorized_object(request.waiter, ObjectRights::WAIT)?;
     let waiter = Arc::clone(&waiter_object.read().as_futex_waiter()?.0);
     let mut bucket = waiter.futexes.bucket(request.key).lock();
     let mut state = waiter.state.lock();
-    if matches!(*state, WaiterState::Armed { .. }) {
+    if !matches!(*state, WaiterState::Idle) {
         return Err(BrokerError::UnsupportedOperation);
     }
     bucket
@@ -213,10 +207,7 @@ pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()
         waiter: Arc::downgrade(&waiter),
         bitset: request.bitset,
     });
-    *state = WaiterState::Armed {
-        key: request.key,
-        generation: request.generation,
-    };
+    *state = WaiterState::Armed { key: request.key };
     drop(state);
     drop(bucket);
     drop(waiter_object);
@@ -256,20 +247,18 @@ pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<
             }
             if let Some(waiter) = queued.waiter.upgrade() {
                 let mut state = waiter.state.lock();
-                if let WaiterState::Armed { generation, .. } = *state {
-                    *state = WaiterState::Woken { generation };
+                if let WaiterState::Armed { .. } = *state {
+                    *state = WaiterState::Woken;
                     drop(state);
-                    woken.push((waiter, generation));
+                    woken.push(waiter);
                     count += 1;
                 }
             }
             false
         });
     }
-    for (waiter, generation) in &woken {
-        waiter
-            .registration
-            .republish(futex_waiter_woken_readiness(*generation));
+    for waiter in &woken {
+        waiter.registration.republish(FUTEX_WAITER_WOKEN);
     }
     Ok(count)
 }
@@ -313,11 +302,10 @@ struct QueuedWaiter {
 pub(crate) struct FutexWaiterObject(Arc<FutexWaiter>);
 
 impl FutexWaiterObject {
-    /// Returns the waiter's readiness: [`futex_waiter_woken_readiness`] from a wake until it is disarmed or
-    /// armed again.
+    /// Returns the waiter's readiness: [`FUTEX_WAITER_WOKEN`] from a wake until it is disarmed.
     pub(crate) fn readiness(&self) -> ReadinessFlags {
-        if let WaiterState::Woken { generation } = *self.0.state.lock() {
-            futex_waiter_woken_readiness(generation)
+        if matches!(*self.0.state.lock(), WaiterState::Woken) {
+            FUTEX_WAITER_WOKEN
         } else {
             ReadinessFlags::default()
         }
@@ -339,15 +327,12 @@ struct FutexWaiter {
 
 enum WaiterState {
     Idle,
-    /// Queued on the futex word `key` by the arm with `generation`.
+    /// Queued on the futex word `key`.
     Armed {
         key: SharedFutexKey,
-        generation: u32,
     },
-    /// Selected by a wake while armed with `generation`.
-    Woken {
-        generation: u32,
-    },
+    /// Selected by a wake while armed.
+    Woken,
 }
 
 impl FutexWaiter {
@@ -358,8 +343,8 @@ impl FutexWaiter {
             let key = {
                 let mut state = self.state.lock();
                 match *state {
-                    WaiterState::Armed { key, .. } => key,
-                    WaiterState::Woken { .. } => {
+                    WaiterState::Armed { key } => key,
+                    WaiterState::Woken => {
                         *state = WaiterState::Idle;
                         return true;
                     }
@@ -368,7 +353,7 @@ impl FutexWaiter {
             };
             let mut bucket = self.futexes.bucket(key).lock();
             let mut state = self.state.lock();
-            if matches!(*state, WaiterState::Armed { key: armed, .. } if armed == key) {
+            if matches!(*state, WaiterState::Armed { key: armed } if armed == key) {
                 if let Some(index) = bucket
                     .iter()
                     .position(|queued| core::ptr::eq(queued.waiter.as_ptr(), self))
@@ -390,9 +375,8 @@ mod tests {
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::shared_futex::{
-        FUTEX_WAITER_GENERATIONS, FutexArmRequest, FutexDisarmRequest, FutexWakeRequest,
-        SharedFutexKey, SharedMemoryId, futex_waiter_woken_readiness,
-        woken_futex_waiter_generation,
+        FUTEX_WAITER_WOKEN, FutexArmRequest, FutexDisarmRequest, FutexWakeRequest, SharedFutexKey,
+        SharedMemoryId,
     };
 
     use crate::readiness::ReadinessSink;
@@ -454,23 +438,12 @@ mod tests {
             bitset: u32,
             waiter: ObjectHandle,
         ) -> Result<()> {
-            Self::arm_generation(process, key, bitset, waiter, 0)
-        }
-
-        fn arm_generation(
-            process: &BrokerProcess,
-            key: SharedFutexKey,
-            bitset: u32,
-            waiter: ObjectHandle,
-            generation: u32,
-        ) -> Result<()> {
             super::futex_arm(
                 process,
                 FutexArmRequest {
                     key,
                     bitset,
                     waiter,
-                    generation,
                 },
             )
         }
@@ -507,7 +480,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, readiness)| woken_futex_waiter_generation(*readiness).is_some())
+                .filter(|(_, readiness)| readiness.contains(FUTEX_WAITER_WOKEN))
                 .map(|(handle, _)| *handle)
                 .collect()
         }
@@ -527,7 +500,7 @@ mod tests {
         assert_eq!(fixture.woken_handles(), [waiter]);
         assert_eq!(
             fixture.child.check_readiness(waiter),
-            Ok(futex_waiter_woken_readiness(0))
+            Ok(FUTEX_WAITER_WOKEN)
         );
         assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(true));
         assert_eq!(
@@ -856,8 +829,8 @@ mod tests {
             })
         };
         let mut reported = 0;
-        for generation in 0..5000 {
-            Fixture::arm_generation(&fixture.child, key(0), u32::MAX, waiter, generation).unwrap();
+        for _ in 0..5000 {
+            Fixture::arm(&fixture.child, key(0), u32::MAX, waiter).unwrap();
             if Fixture::disarm(&fixture.child, waiter).unwrap() {
                 reported += 1;
             }
@@ -890,39 +863,29 @@ mod tests {
     }
 
     #[test]
-    fn woken_waiter_rearms_without_disarming_and_reports_each_generation() {
+    fn woken_waiter_reports_the_wake_until_disarmed_before_rearming() {
         let fixture = fixture();
         let waiter = fixture.waiter(&fixture.child);
-        for generation in [3, 4] {
-            Fixture::arm_generation(&fixture.child, key(0), u32::MAX, waiter, generation).unwrap();
-            assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, u32::MAX), Ok(1));
-            let published = *fixture.sink.republished.lock().unwrap().last().unwrap();
-            assert_eq!(
-                published,
-                (waiter, futex_waiter_woken_readiness(generation))
-            );
-            assert_eq!(
-                fixture.child.check_readiness(waiter),
-                Ok(futex_waiter_woken_readiness(generation))
-            );
-        }
-        // Arming again clears the earlier wake, so a timed-out wait reports no wake.
-        Fixture::arm_generation(&fixture.child, key(0), u32::MAX, waiter, 5).unwrap();
+        Fixture::arm(&fixture.child, key(0), u32::MAX, waiter).unwrap();
+        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, u32::MAX), Ok(1));
+        let published = *fixture.sink.republished.lock().unwrap().last().unwrap();
+        assert_eq!(published, (waiter, FUTEX_WAITER_WOKEN));
+        assert_eq!(
+            fixture.child.check_readiness(waiter),
+            Ok(FUTEX_WAITER_WOKEN)
+        );
+        // A woken waiter must be disarmed, which takes the wake, before it is armed again.
+        assert_eq!(
+            Fixture::arm(&fixture.child, key(0), u32::MAX, waiter),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(true));
         assert_eq!(
             fixture.child.check_readiness(waiter),
             Ok(ReadinessFlags::default())
         );
+        Fixture::arm(&fixture.child, key(0), u32::MAX, waiter).unwrap();
         assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(false));
         assert_eq!(fixture.queued(), (0, 0));
-        assert_eq!(
-            Fixture::arm_generation(
-                &fixture.child,
-                key(0),
-                u32::MAX,
-                waiter,
-                FUTEX_WAITER_GENERATIONS
-            ),
-            Err(BrokerError::UnsupportedOperation)
-        );
     }
 }

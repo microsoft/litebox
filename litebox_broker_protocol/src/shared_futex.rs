@@ -12,44 +12,16 @@
 //! share. A process that creates another must therefore take its later IDs from a block it
 //! reserves afterwards.
 //!
-//! Each waiting thread owns a futex waiter object. A wait arms it on a futex with a wrapping arm
-//! generation, which differs from those of the waiter's recent arms; a wake marks the armed
-//! waiters it selects woken and publishes [`futex_waiter_woken_readiness`] readiness for them,
-//! which carries that generation. Disarming the waiter reports whether it was woken, and resets
-//! it.
-//!
-//! Readiness that carries the generation of the current arm proves that a wake selected the
-//! waiter, so the waiter may skip disarming and arm again. Any other readiness, such as one left
-//! over from an earlier arm, is only a hint to disarm, whose response is authoritative.
+//! Each waiting thread owns a futex waiter object. A wait arms it on a futex; a wake marks the
+//! armed waiters it selects woken and publishes [`FUTEX_WAITER_WOKEN`] readiness for them.
+//! Readiness is only a hint to disarm the waiter, which reports whether a wake selected it, and
+//! resets it.
 
 use crate::ObjectHandle;
 use crate::readiness::ReadinessFlags;
 
-/// Readiness flag of a futex waiter that a wake selected and that has not been disarmed or armed
-/// again since.
-const FUTEX_WAITER_WOKEN: ReadinessFlags = ReadinessFlags::READ;
-
-/// Number of distinct futex waiter arm generations, which wrap around: as many as the readiness
-/// payload holds.
-pub const FUTEX_WAITER_GENERATIONS: u32 = 1 << (u32::BITS - ReadinessFlags::PAYLOAD_SHIFT);
-
-/// Returns the readiness of a futex waiter that a wake selected while it was armed with
-/// `generation`, which must be less than [`FUTEX_WAITER_GENERATIONS`].
-#[must_use]
-pub const fn futex_waiter_woken_readiness(generation: u32) -> ReadinessFlags {
-    ReadinessFlags(FUTEX_WAITER_WOKEN.0 | generation << ReadinessFlags::PAYLOAD_SHIFT)
-}
-
-/// Returns the generation of the arm in which a wake selected a futex waiter with `readiness`,
-/// or `None` if the readiness does not report a wake.
-#[must_use]
-pub const fn woken_futex_waiter_generation(readiness: ReadinessFlags) -> Option<u32> {
-    if readiness.contains(FUTEX_WAITER_WOKEN) {
-        Some(readiness.0 >> ReadinessFlags::PAYLOAD_SHIFT)
-    } else {
-        None
-    }
-}
+/// Readiness of a futex waiter that a wake selected and that has not been disarmed since.
+pub const FUTEX_WAITER_WOKEN: ReadinessFlags = ReadinessFlags::READ;
 
 /// Size of a futex word in bytes, which its offset must be a multiple of.
 pub const FUTEX_WORD_SIZE: u64 = 4;
@@ -134,11 +106,8 @@ pub struct FutexArmRequest {
     pub key: SharedFutexKey,
     /// Nonzero mask a wake's mask must intersect to select the waiter.
     pub bitset: u32,
-    /// Futex waiter to arm, which is idle or was woken since it was last armed.
+    /// Futex waiter to arm, which must be idle: never armed, or disarmed since it was last armed.
     pub waiter: ObjectHandle,
-    /// Generation of this arm, less than [`FUTEX_WAITER_GENERATIONS`], which the waiter's
-    /// [`futex_waiter_woken_readiness`] readiness carries if a wake selects it.
-    pub generation: u32,
 }
 
 /// Request to wake waiters on a futex word in shared memory.
@@ -175,25 +144,7 @@ pub struct FutexDisarmResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FUTEX_WAITER_GENERATIONS, SharedMemoryId, futex_waiter_woken_readiness,
-        woken_futex_waiter_generation,
-    };
-    use crate::readiness::ReadinessFlags;
-
-    #[test]
-    fn woken_readiness_carries_the_arm_generation() {
-        for generation in [0, 1, FUTEX_WAITER_GENERATIONS - 1] {
-            assert_eq!(
-                woken_futex_waiter_generation(futex_waiter_woken_readiness(generation)),
-                Some(generation)
-            );
-        }
-        assert_eq!(
-            woken_futex_waiter_generation(ReadinessFlags::default()),
-            None
-        );
-    }
+    use super::SharedMemoryId;
 
     #[test]
     fn ids_name_their_reserver_and_block_and_stay_in_it() {

@@ -11,22 +11,15 @@
 //!
 //! Each waiting thread owns a [`SharedFutexWaiter`]. A wait arms it in the broker, re-checks the
 //! futex word, and sleeps until the broker publishes a wake for it or the wait times out or is
-//! interrupted. A published wake that carries the generation of this arm proves the wake, so the
-//! wait returns without another broker call. Otherwise it disarms the waiter, which reports
-//! whether a wake selected it, so a wake racing with a timeout or interruption is reported rather
-//! than lost.
+//! interrupted. It then disarms the waiter, which reports whether a wake selected it, so a wake
+//! racing with a timeout or interruption is reported rather than lost.
 
 use alloc::sync::Arc;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::{FutexError, check_aligned, mask, word_matches};
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::shared_futex::{
-    FUTEX_WAITER_GENERATIONS, FUTEX_WORD_SIZE, SharedFutexKey, SharedMemoryId,
-    woken_futex_waiter_generation,
-};
+use litebox_broker_protocol::shared_futex::{FUTEX_WORD_SIZE, SharedFutexKey, SharedMemoryId};
 use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 
@@ -159,11 +152,6 @@ pub struct SharedFutexWaiter<Platform: RawSyncPrimitivesProvider + TimeProvider>
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     /// Kept alive for the pollable registry, which holds it weakly.
     pollee: Arc<Pollee<Platform>>,
-    /// The raw readiness of the latest notification for the waiter, which the pollable registry
-    /// stores before waking the pollee's observers.
-    latest_readiness: Arc<AtomicU32>,
-    /// Counts arms, whose generations it gives modulo [`FUTEX_WAITER_GENERATIONS`].
-    arms: AtomicU32,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platform> {
@@ -181,19 +169,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
             .map_err(BrokerObjectError::from)?;
         let pollable_registry = litebox.broker_pollable_registry();
         let pollee = Arc::new(Pollee::new());
-        let latest_readiness = Arc::new(AtomicU32::new(0));
-        pollable_registry.register_pollable_with_latest_readiness(
-            handle,
-            &pollee,
-            &latest_readiness,
-        );
+        pollable_registry.register_pollable(handle, &pollee);
         Ok(Self {
             broker,
             handle,
             pollable_registry,
             pollee,
-            latest_readiness,
-            arms: AtomicU32::new(0),
         })
     }
 
@@ -235,19 +216,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
         );
         loop {
             // A notification from an earlier arm may still arrive and wake this one spuriously,
-            // which its generation, or else disarming, detects.
-            let generation = self.arms.fetch_add(1, Ordering::Relaxed) % FUTEX_WAITER_GENERATIONS;
-            self.latest_readiness.store(0, Ordering::Release);
+            // which disarming detects.
             observer.reset();
             self.broker
-                .futex_arm(key, bitset, self.handle, generation)
+                .futex_arm(key, bitset, self.handle)
                 .map_err(BrokerObjectError::from)?;
             // A waker changes the word before waking, so either this sees the change or the
             // wake sees this waiter.
             match matches() {
                 Ok(true) => {}
                 mismatch_or_fault => {
-                    if self.disarm_unless_woken(generation)? {
+                    if self.disarm()? {
                         return Ok(());
                     }
                     mismatch_or_fault?;
@@ -255,7 +234,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
                 }
             }
             let waited = cx.wait_until(|| observer.is_ready());
-            if self.disarm_unless_woken(generation)? {
+            // TODO(perf): A woken wait costs two broker calls, arm and disarm. The broker could
+            // publish a per-arm generation in the waiter's readiness, which the pollable registry
+            // would record for the waiter, so that readiness carrying this arm's generation
+            // proves the wake without disarming, and the broker accepts arming a woken waiter.
+            if self.disarm()? {
                 return Ok(());
             }
             waited.map_err(FutexError::WaitError)?;
@@ -265,16 +248,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
         }
     }
 
-    /// Disarms the waiter unless readiness that carries `generation` proves that a wake selected
-    /// it while it was armed with `generation`, returning whether a wake did.
-    ///
-    /// Either way the waiter is left disarmed or woken, either of which it may be armed again
-    /// from. A proven wake needs no broker call, as the broker then still holds the waiter woken.
-    fn disarm_unless_woken(&self, generation: u32) -> Result<bool, FutexError> {
-        let readiness = ReadinessFlags(self.latest_readiness.load(Ordering::Acquire));
-        if woken_futex_waiter_generation(readiness) == Some(generation) {
-            return Ok(true);
-        }
+    /// Disarms the waiter, leaving it idle, and returns whether a wake selected it since it was
+    /// armed.
+    fn disarm(&self) -> Result<bool, FutexError> {
         Ok(self
             .broker
             .futex_disarm(self.handle)

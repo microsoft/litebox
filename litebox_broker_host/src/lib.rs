@@ -3295,7 +3295,6 @@ mod tests {
                 key,
                 bitset: u32::MAX,
                 waiter,
-                generation: 0,
             }))
         };
 

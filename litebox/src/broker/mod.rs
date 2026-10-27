@@ -7,7 +7,6 @@ use alloc::{
     vec::Vec,
 };
 use core::net::SocketAddrV4;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
@@ -628,7 +627,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         key: SharedFutexKey,
         bitset: u32,
         waiter: ObjectHandle,
-        generation: u32,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn futex_wake(
@@ -646,14 +644,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 }
 
 pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
-    pollables: Mutex<Platform, HashMap<ObjectHandle, RegisteredPollable<Platform>>>,
-}
-
-struct RegisteredPollable<Platform: RawSyncPrimitivesProvider> {
-    pollee: Weak<Pollee<Platform>>,
-    /// Where to record the raw readiness of each notification, before observers see it, for
-    /// objects whose readiness carries more than its events do.
-    latest_readiness: Option<Weak<AtomicU32>>,
+    pollables: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
@@ -664,33 +655,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     }
 
     pub(crate) fn register_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
-        self.register(handle, pollee, None);
-    }
-
-    /// Like [`Self::register_pollable`], but also stores the raw readiness of each notification
-    /// for `handle` in `latest_readiness` before notifying `pollee`'s observers.
-    pub(crate) fn register_pollable_with_latest_readiness(
-        &self,
-        handle: ObjectHandle,
-        pollee: &Arc<Pollee<Platform>>,
-        latest_readiness: &Arc<AtomicU32>,
-    ) {
-        self.register(handle, pollee, Some(Arc::downgrade(latest_readiness)));
-    }
-
-    fn register(
-        &self,
-        handle: ObjectHandle,
-        pollee: &Arc<Pollee<Platform>>,
-        latest_readiness: Option<Weak<AtomicU32>>,
-    ) {
-        let previous = self.pollables.lock().insert(
-            handle,
-            RegisteredPollable {
-                pollee: Arc::downgrade(pollee),
-                latest_readiness,
-            },
-        );
+        let previous = self.pollables.lock().insert(handle, Arc::downgrade(pollee));
         assert!(
             previous.is_none(),
             "broker handle already has a registered pollable"
@@ -708,15 +673,9 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
         let events = readiness_events(readiness);
         let pollee = {
             let mut pollables = self.pollables.lock();
-            let registered = pollables.get(&handle);
-            let pollee = registered.and_then(|registered| registered.pollee.upgrade());
+            let pollee = pollables.get(&handle).and_then(Weak::upgrade);
             if pollee.is_none() {
                 pollables.remove(&handle);
-            } else if let Some(latest) = registered
-                .and_then(|registered| registered.latest_readiness.as_ref())
-                .and_then(Weak::upgrade)
-            {
-                latest.store(readiness.0, Ordering::Release);
             }
             pollee
         };
@@ -736,7 +695,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
         let pollables = {
             let mut pollables = Vec::new();
             self.pollables.lock().retain(|_, registered| {
-                let Some(pollee) = registered.pollee.upgrade() else {
+                let Some(pollee) = registered.upgrade() else {
                     return false;
                 };
                 pollables.push(pollee);
@@ -1776,9 +1735,8 @@ where
         key: SharedFutexKey,
         bitset: u32,
         waiter: ObjectHandle,
-        generation: u32,
     ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.futex_arm(key, bitset, waiter, generation))
+        self.request(|local| local.futex_arm(key, bitset, waiter))
     }
 
     fn futex_wake(

@@ -908,7 +908,6 @@ mod tests {
                 },
                 bitset: u32::MAX,
                 waiter: ObjectHandle(1),
-                generation: u32::MAX,
             })),
             BrokerOperation::SharedFutex(SharedFutexRequest::Wake(FutexWakeRequest {
                 key: SharedFutexKey {
@@ -2069,7 +2068,6 @@ mod tests {
                 },
                 bitset: 1,
                 waiter: ObjectHandle(13),
-                generation: 5,
             })),
         });
         // Tag, request ID, and family tag precede the key, whose memory ID is cut short.

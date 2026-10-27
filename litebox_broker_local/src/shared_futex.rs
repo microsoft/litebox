@@ -42,9 +42,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Arms the futex waiter `waiter`, which is idle or was woken since it was last armed, on the
-    /// futex word `key` with `generation`, to be selected by wakes whose masks intersect
-    /// `bitset`.
+    /// Arms the idle futex waiter `waiter` on the futex word `key`, to be selected by wakes whose
+    /// masks intersect `bitset`.
     ///
     /// # Panics
     ///
@@ -55,13 +54,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         key: SharedFutexKey,
         bitset: u32,
         waiter: ObjectHandle,
-        generation: u32,
     ) -> Result<(), Channel::Error> {
         let request = FutexArmRequest {
             key,
             bitset,
             waiter,
-            generation,
         };
         match self.request_shared_futex(SharedFutexRequest::Arm(request))? {
             SharedFutexResponse::Arm => Ok(()),

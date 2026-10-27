@@ -47,7 +47,6 @@ pub(super) fn encode_shared_futex_request(encoder: &mut Encoder, request: Shared
             encode_key(encoder, request.key);
             encoder.u32(request.bitset);
             encoder.handle(request.waiter);
-            encoder.u32(request.generation);
         }
         SharedFutexRequest::Wake(request) => {
             encoder.u8(SHARED_FUTEX_REQUEST_TAG_WAKE);
@@ -72,7 +71,6 @@ pub(super) fn decode_shared_futex_request(
             key: decode_key(decoder)?,
             bitset: decoder.u32()?,
             waiter: decoder.handle()?,
-            generation: decoder.u32()?,
         }),
         SHARED_FUTEX_REQUEST_TAG_WAKE => SharedFutexRequest::Wake(FutexWakeRequest {
             key: decode_key(decoder)?,
