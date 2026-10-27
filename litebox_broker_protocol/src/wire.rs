@@ -762,6 +762,7 @@ mod tests {
                 RESPONSE_TAG_PROCESS_GROUP,
                 RESPONSE_TAG_UNIX_SOCKET,
                 RESPONSE_TAG_READINESS_QUEUE,
+                RESPONSE_TAG_SHARED_FUTEX,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -781,10 +782,11 @@ mod tests {
                 REQUEST_TAG_PROCESS_GROUP,
                 REQUEST_TAG_UNIX_SOCKET,
                 REQUEST_TAG_READINESS_QUEUE,
+                REQUEST_TAG_SHARED_FUTEX,
             ]
         );
         // Top-level tags are consecutive.
-        assert_eq!(REQUEST_TAG_READINESS_QUEUE, 16);
+        assert_eq!(REQUEST_TAG_SHARED_FUTEX, 17);
         assert_eq!(
             [
                 RESPONSE_TAG_ERROR,
@@ -906,6 +908,7 @@ mod tests {
                 },
                 bitset: u32::MAX,
                 waiter: ObjectHandle(1),
+                generation: u32::MAX,
             })),
             BrokerOperation::SharedFutex(SharedFutexRequest::Wake(FutexWakeRequest {
                 key: SharedFutexKey {
@@ -1624,7 +1627,9 @@ mod tests {
                 CreateReadinessQueueResponse { handle },
             )),
             BrokerResult::SharedFutex(SharedFutexResponse::ReserveMemoryIds(
-                ReserveMemoryIdsResponse { prefix: u64::MAX },
+                ReserveMemoryIdsResponse {
+                    first: SharedMemoryId(u128::MAX - 1),
+                },
             )),
             BrokerResult::SharedFutex(SharedFutexResponse::CreateWaiter(
                 CreateFutexWaiterResponse { handle },
@@ -2046,6 +2051,34 @@ mod tests {
             decode_request(&unknown_readiness_queue_request),
             Err(WireError::InvalidTag)
         );
+        let mut unknown_shared_futex_request = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::SharedFutex(SharedFutexRequest::CreateWaiter),
+        });
+        unknown_shared_futex_request[9] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_shared_futex_request),
+            Err(WireError::InvalidTag)
+        );
+        let futex_arm = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::SharedFutex(SharedFutexRequest::Arm(FutexArmRequest {
+                key: SharedFutexKey {
+                    memory: SharedMemoryId(u128::MAX),
+                    offset: 4,
+                },
+                bitset: 1,
+                waiter: ObjectHandle(13),
+                generation: 5,
+            })),
+        });
+        // Tag, request ID, and family tag precede the key, whose memory ID is cut short.
+        for length in [futex_arm.len() - 1, 10 + 15] {
+            assert_eq!(
+                decode_request(&futex_arm[..length]),
+                Err(WireError::TruncatedFrame)
+            );
+        }
         let mut unknown_readiness_queue_flags = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Add(
@@ -2709,6 +2742,39 @@ mod tests {
         assert_eq!(
             decode_response(&unknown_timer_response),
             Err(WireError::InvalidTag)
+        );
+
+        let mut unknown_shared_futex_response = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::SharedFutex(SharedFutexResponse::Arm),
+        });
+        unknown_shared_futex_response[9] = 0xff;
+        assert_eq!(
+            decode_response(&unknown_shared_futex_response),
+            Err(WireError::InvalidTag)
+        );
+        let mut invalid_futex_disarm = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::SharedFutex(SharedFutexResponse::Disarm(FutexDisarmResponse {
+                woken: true,
+            })),
+        });
+        *invalid_futex_disarm.last_mut().unwrap() = 2;
+        assert_eq!(
+            decode_response(&invalid_futex_disarm),
+            Err(WireError::InvalidTag)
+        );
+        let reserved = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::SharedFutex(SharedFutexResponse::ReserveMemoryIds(
+                ReserveMemoryIdsResponse {
+                    first: SharedMemoryId(1),
+                },
+            )),
+        });
+        assert_eq!(
+            decode_response(&reserved[..reserved.len() - 1]),
+            Err(WireError::TruncatedFrame)
         );
 
         let mut unknown_readiness_queue_error = encode_response(BrokerResponse {

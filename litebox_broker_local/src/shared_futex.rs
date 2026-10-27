@@ -6,28 +6,30 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, SharedFutexRequest, SharedFutexResponse,
 };
 use litebox_broker_protocol::shared_futex::{
-    FutexArmRequest, FutexDisarmRequest, FutexWakeRequest, SharedFutexKey,
+    FutexArmRequest, FutexDisarmRequest, FutexWakeRequest, SharedFutexKey, SharedMemoryId,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Reserves the shared memory IDs that start with the returned prefix, for this process to
-    /// name memory it creates.
+    /// Reserves a block of shared memory IDs for this process to name memory it creates,
+    /// returning the block's first ID, as
+    /// [`ReserveMemoryIdsResponse`](litebox_broker_protocol::shared_futex::ReserveMemoryIdsResponse)
+    /// describes.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued shared futex request.
-    pub fn reserve_shared_memory_ids(&self) -> Result<u64, Channel::Error> {
+    pub fn reserve_shared_memory_ids(&self) -> Result<SharedMemoryId, Channel::Error> {
         match self.request_shared_futex(SharedFutexRequest::ReserveMemoryIds)? {
-            SharedFutexResponse::ReserveMemoryIds(response) => Ok(response.prefix),
+            SharedFutexResponse::ReserveMemoryIds(response) => Ok(response.first),
             response => panic!("broker returned unexpected shared futex response: {response:?}"),
         }
     }
 
-    /// Creates an idle futex waiter for the calling thread.
+    /// Creates an idle futex waiter.
     ///
     /// # Panics
     ///
@@ -40,8 +42,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Arms the idle futex waiter `waiter` on the futex word `key`, to be selected by wakes whose
-    /// masks intersect `bitset`.
+    /// Arms the futex waiter `waiter`, which is idle or was woken since it was last armed, on the
+    /// futex word `key` with `generation`, to be selected by wakes whose masks intersect
+    /// `bitset`.
     ///
     /// # Panics
     ///
@@ -52,11 +55,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         key: SharedFutexKey,
         bitset: u32,
         waiter: ObjectHandle,
+        generation: u32,
     ) -> Result<(), Channel::Error> {
         let request = FutexArmRequest {
             key,
             bitset,
             waiter,
+            generation,
         };
         match self.request_shared_futex(SharedFutexRequest::Arm(request))? {
             SharedFutexResponse::Arm => Ok(()),

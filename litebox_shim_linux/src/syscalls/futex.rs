@@ -85,9 +85,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns a new name for the memory of a shared anonymous mapping, or `None` without a
     /// broker, as then no other process can share the memory either.
     ///
-    /// Fails with [`MappingError::OutOfMemory`], as `mmap` reports any failure to back a mapping
-    /// with `ENOMEM`, if the broker fails.
-    pub(super) fn new_shared_memory_id(&self) -> Result<Option<SharedMemoryId>, MappingError> {
+    /// Fails with [`MappingError::OutOfMemory`] if the broker cannot provide a name, as `mmap`
+    /// reports any failure to back a mapping with `ENOMEM`.
+    pub(super) fn allocate_shared_memory_id(&self) -> Result<Option<SharedMemoryId>, MappingError> {
         match self.global.shared_memory_ids.allocate(&self.global.litebox) {
             Ok(id) => Ok(Some(id)),
             Err(SharedFutexError::Unavailable) => Ok(None),
@@ -97,6 +97,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns the key of the futex word at `addr` if a futex operation with `flags` on it spans
     /// the processes that share the word's memory.
+    ///
+    /// Otherwise the operation goes to the process's private [`FutexManager`], keyed by address,
+    /// even without [`FutexFlags::PRIVATE`]. This differs from Linux, which keys a non-private
+    /// futex in private memory apart from a private futex on the same word, so that neither kind
+    /// of wake reaches the other kind of waiter. Only a program that mixes the two kinds on one
+    /// word can tell: LiteBox wakes where Linux would leave the waiter sleeping.
+    ///
+    /// [`FutexManager`]: litebox::sync::futex::FutexManager
     fn shared_futex_key_for(
         &self,
         addr: UserPtrMut<u32>,
@@ -118,9 +126,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         count: u32,
         bitset: Option<NonZeroU32>,
     ) -> Result<usize, Errno> {
-        let Some(count) = NonZeroU32::new(count) else {
-            return Ok(0);
-        };
+        // Like Linux, a count of zero still wakes one waiter, after the address is checked.
+        let count = NonZeroU32::new(count).unwrap_or(NonZeroU32::MIN);
         Ok(if let Some(key) = self.shared_futex_key_for(addr, flags) {
             self.global.litebox.wake_shared_futex(key, count, bitset)? as usize
         } else {
@@ -217,6 +224,9 @@ mod tests {
         })
     }
 
+    /// How long a spawned waiter waits before giving up, so that a failed test does not hang.
+    const WAITER_TIMEOUT_MS: i32 = 10_000;
+
     /// Spawns a thread of `task`'s process that waits on the word at `address` with `flags`
     /// until it is woken, and gives it time to arm its waiter.
     fn spawn_waiter(
@@ -224,14 +234,30 @@ mod tests {
         address: usize,
         flags: FutexFlags,
     ) -> std::thread::JoinHandle<Result<usize, Errno>> {
-        let waiter = task.spawn_clone_for_test(move |task| wait(&task, address, 0, flags, None));
-        // The waiter cannot report when it sleeps, so give it time to.
+        let waiter = task.spawn_clone_for_test(move |task| {
+            wait(&task, address, 0, flags, Some(WAITER_TIMEOUT_MS))
+        });
+        // The waiter cannot report when it sleeps, so wakes that must not reach it are checked
+        // after giving it time to; `wake_until_woken` then tolerates a slower waiter.
         std::thread::sleep(Duration::from_millis(100));
         waiter
     }
 
+    /// Calls `wake` until it wakes a waiter, as a spawned waiter may not have armed yet, and
+    /// returns how many it woke.
+    fn wake_until_woken(wake: impl Fn() -> Result<usize, Errno>) -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let woken = wake().unwrap();
+            if woken != 0 || std::time::Instant::now() > deadline {
+                return woken;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
-    fn shared_futex_in_shared_mapping_goes_through_broker() {
+    fn shared_mapping_futexes_are_keyed_apart_from_private_ones() {
         let task = init_platform();
         let mapping = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
         let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
@@ -257,13 +283,18 @@ mod tests {
         let waiter = spawn_waiter(&task, mapping + 8, FutexFlags::empty());
         assert_eq!(wake(&task, mapping + 8, FutexFlags::PRIVATE), 0);
         assert_eq!(wake(&task, mapping + 12, FutexFlags::empty()), 0);
-        assert_eq!(wake(&task, mapping + 8, FutexFlags::empty()), 1);
+        assert_eq!(
+            wake_until_woken(|| Ok(wake(&task, mapping + 8, FutexFlags::empty()))),
+            1
+        );
         assert_eq!(waiter.join().unwrap(), Ok(0));
 
-        // A private waiter is woken only by a private wake.
         let waiter = spawn_waiter(&task, mapping + 8, FutexFlags::PRIVATE);
         assert_eq!(wake(&task, mapping + 8, FutexFlags::empty()), 0);
-        assert_eq!(wake(&task, mapping + 8, FutexFlags::PRIVATE), 1);
+        assert_eq!(
+            wake_until_woken(|| Ok(wake(&task, mapping + 8, FutexFlags::PRIVATE))),
+            1
+        );
         assert_eq!(waiter.join().unwrap(), Ok(0));
     }
 
@@ -300,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn bitset_wakes_select_intersecting_masks_and_reject_empty_ones() {
+    fn bitset_ops_reject_empty_masks_and_wake_select_intersecting_ones() {
         let task = init_platform();
         let shared = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
         let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
@@ -335,7 +366,7 @@ mod tests {
             });
             std::thread::sleep(Duration::from_millis(100));
             assert_eq!(wake_bitset(address, 0b10), Ok(0));
-            assert_eq!(wake_bitset(address, 0b11), Ok(1));
+            assert_eq!(wake_until_woken(|| wake_bitset(address, 0b11)), 1);
             assert_eq!(waiter.join().unwrap(), Ok(0));
         }
     }
@@ -395,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_failure_wakes_shared_futex_waiter_with_error() {
+    fn broker_failure_wakes_shared_futex_waiter_with_eio() {
         let task = init_platform();
         let mapping = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
         let waiter = spawn_waiter(&task, mapping, FutexFlags::empty());
@@ -410,17 +441,79 @@ mod tests {
         // The word lies within the mapping, so only its alignment is wrong.
         let misaligned = mapping + 2;
         assert!(key(&task, misaligned).is_some());
-        assert_eq!(
-            task.sys_futex(FutexArgs::Wake {
-                addr: word(misaligned),
-                flags: FutexFlags::empty(),
-                count: 1,
-            }),
-            Err(Errno::EINVAL)
-        );
+        for count in [0, 1] {
+            assert_eq!(
+                task.sys_futex(FutexArgs::Wake {
+                    addr: word(misaligned),
+                    flags: FutexFlags::empty(),
+                    count,
+                }),
+                Err(Errno::EINVAL)
+            );
+        }
         assert_eq!(
             wait(&task, misaligned, 0, FutexFlags::empty(), Some(10)),
             Err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn wake_with_zero_count_wakes_one_waiter() {
+        let task = init_platform();
+        let shared = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let private = map(&task, 1, MapFlags::MAP_PRIVATE).as_usize();
+        // Linux's futex_wake counts a waiter before comparing with the count, so zero wakes one.
+        for address in [shared, private] {
+            let waiter = spawn_waiter(&task, address, FutexFlags::empty());
+            let woken = wake_until_woken(|| {
+                task.sys_futex(FutexArgs::Wake {
+                    addr: word(address),
+                    flags: FutexFlags::empty(),
+                    count: 0,
+                })
+            });
+            assert_eq!(woken, 1);
+            assert_eq!(waiter.join().unwrap(), Ok(0));
+        }
+    }
+
+    #[test]
+    fn shared_futex_ping_pong_loses_no_wakes() {
+        const ROUNDS: u32 = 500;
+        let task = init_platform();
+        let turn = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        // Each side waits for its turn, then hands the turn over, so a lost wake times out.
+        let take_turns = move |task: &Task<TestPlatform>, me: u32| -> Result<(), Errno> {
+            for _ in 0..ROUNDS {
+                loop {
+                    let current = word(turn).read_at_offset::<TestPlatform>(0).unwrap();
+                    if current == me {
+                        break;
+                    }
+                    match wait(
+                        task,
+                        turn,
+                        current,
+                        FutexFlags::empty(),
+                        Some(WAITER_TIMEOUT_MS),
+                    ) {
+                        Ok(_) | Err(Errno::EAGAIN) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                word(turn)
+                    .write_at_offset::<TestPlatform>(0, 1 - me)
+                    .unwrap();
+                task.sys_futex(FutexArgs::Wake {
+                    addr: word(turn),
+                    flags: FutexFlags::empty(),
+                    count: 1,
+                })?;
+            }
+            Ok(())
+        };
+        let other = task.spawn_clone_for_test(move |task| take_turns(&task, 1));
+        assert_eq!(take_turns(&task, 0), Ok(()));
+        assert_eq!(other.join().unwrap(), Ok(()));
     }
 }

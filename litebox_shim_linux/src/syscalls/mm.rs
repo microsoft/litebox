@@ -49,12 +49,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let shared_memory = if flags.contains(MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS) {
-            self.new_shared_memory_id()?
+            self.allocate_shared_memory_id()?
         } else {
             None
         };
         let fixed_start = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED));
-        let addr = self.global.mm.do_mmap(
+        self.global.mm.do_mmap_with_shared_memory(
             suggested_addr,
             len,
             prot,
@@ -63,19 +63,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
                 allowed_range: None,
             },
+            shared_memory,
             |pointer| {
                 if let Some(start) = fixed_start {
                     self.clear_file_mappings_for_range(start, len);
                 }
                 op(pointer)
             },
-        )?;
-        if let Some(memory) = shared_memory {
-            self.global
-                .mm
-                .set_shared_memory(addr.as_usize()..addr.as_usize() + len, memory);
-        }
-        Ok(addr)
+        )
     }
 
     /// Map a file, applying runtime ELF syscall patching to the new mapping.

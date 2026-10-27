@@ -190,17 +190,6 @@ impl From<BrokerObjectError> for SharedFutexError {
 
 impl From<BrokerObjectError> for FutexError {
     fn from(error: BrokerObjectError) -> Self {
-        match error {
-            BrokerObjectError::ResourceExhausted | BrokerObjectError::OutOfMemory => {
-                Self::ResourceExhausted
-            }
-            BrokerObjectError::Control
-            | BrokerObjectError::InvalidObject
-            | BrokerObjectError::WouldBlock
-            | BrokerObjectError::PeerClosed
-            | BrokerObjectError::PermissionDenied
-            | BrokerObjectError::UnsupportedOperation
-            | BrokerObjectError::Fault => Self::Io,
-        }
+        Self::Shared(error.into())
     }
 }

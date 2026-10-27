@@ -47,6 +47,7 @@ pub(super) fn encode_shared_futex_request(encoder: &mut Encoder, request: Shared
             encode_key(encoder, request.key);
             encoder.u32(request.bitset);
             encoder.handle(request.waiter);
+            encoder.u32(request.generation);
         }
         SharedFutexRequest::Wake(request) => {
             encoder.u8(SHARED_FUTEX_REQUEST_TAG_WAKE);
@@ -71,6 +72,7 @@ pub(super) fn decode_shared_futex_request(
             key: decode_key(decoder)?,
             bitset: decoder.u32()?,
             waiter: decoder.handle()?,
+            generation: decoder.u32()?,
         }),
         SHARED_FUTEX_REQUEST_TAG_WAKE => SharedFutexRequest::Wake(FutexWakeRequest {
             key: decode_key(decoder)?,
@@ -88,7 +90,7 @@ pub(super) fn encode_shared_futex_response(encoder: &mut Encoder, response: Shar
     match response {
         SharedFutexResponse::ReserveMemoryIds(response) => {
             encoder.u8(SHARED_FUTEX_RESPONSE_TAG_RESERVE_MEMORY_IDS);
-            encoder.u64(response.prefix);
+            encoder.u128(response.first.0);
         }
         SharedFutexResponse::CreateWaiter(response) => {
             encoder.u8(SHARED_FUTEX_RESPONSE_TAG_CREATE_WAITER);
@@ -114,7 +116,7 @@ pub(super) fn decode_shared_futex_response(
     Ok(match decoder.u8()? {
         SHARED_FUTEX_RESPONSE_TAG_RESERVE_MEMORY_IDS => {
             SharedFutexResponse::ReserveMemoryIds(ReserveMemoryIdsResponse {
-                prefix: decoder.u64()?,
+                first: SharedMemoryId(decoder.u128()?),
             })
         }
         SHARED_FUTEX_RESPONSE_TAG_CREATE_WAITER => {

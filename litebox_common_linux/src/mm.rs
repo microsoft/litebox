@@ -6,6 +6,7 @@
 //! Common implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
 use core::ops::Range;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::vec::Vec;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
@@ -47,6 +48,9 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
+    /// Whether any mapping was ever given a [`SharedMemoryId`], which lets futex operations skip
+    /// looking up the mapping of their futex word while none was.
+    names_shared_memory: AtomicBool,
 }
 
 impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
@@ -57,7 +61,10 @@ where
     /// Create a new `VmemManager` instance.
     pub fn new(platform: &'static Platform) -> Self {
         let vmem = RwLock::new(Vmem::new(platform));
-        Self { vmem }
+        Self {
+            vmem,
+            names_shared_memory: AtomicBool::new(false),
+        }
     }
 
     /// Rebinds an inherited memory manager to the native child's platform.
@@ -134,17 +141,64 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let (before_perms, after_perms) = permissions;
-        // SAFETY: The caller authorizes any replacements.
-        let addr = unsafe {
-            self.vmem.write().create_pages(
+        // SAFETY: The caller upholds the same requirements.
+        unsafe {
+            self.create_pages_with_shared_memory(
                 suggested_address,
                 length,
                 flags,
-                before_perms,
+                permissions,
                 allowed_range,
+                None,
+                op,
             )
-        }?;
+        }
+    }
+
+    /// Like [`Self::create_pages`], but records that a new shared anonymous mapping maps
+    /// `shared_memory` from its start, if it is given.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::create_pages`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors `create_pages`, whose arguments are independent placement and setup options"
+    )]
+    unsafe fn create_pages_with_shared_memory<F>(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        permissions: (MemoryRegionPermissions, MemoryRegionPermissions),
+        allowed_range: Option<Range<usize>>,
+        shared_memory: Option<SharedMemoryId>,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        let (before_perms, after_perms) = permissions;
+        let addr = {
+            let mut vmem = self.vmem.write();
+            // SAFETY: The caller authorizes any replacements.
+            let addr = unsafe {
+                vmem.create_pages(
+                    suggested_address,
+                    length,
+                    flags,
+                    before_perms,
+                    allowed_range,
+                )
+            }?;
+            // Under the same lock, so that no other thread sees the mapping without its memory.
+            if let Some(memory) = shared_memory {
+                let start = addr.as_usize();
+                vmem.set_shared_memory(start..start + length.as_usize(), memory);
+                self.names_shared_memory.store(true, Ordering::Release);
+            }
+            addr
+        };
         let range = PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize())
             .expect("successful mapping must return an aligned, non-empty range");
         // call the user function with the pages
@@ -643,15 +697,12 @@ where
             .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
     }
 
-    /// Records that the shared anonymous mapping just created at `range` maps `memory` from its
-    /// start, so that [`Self::shared_futex_key`] keys its futexes by it.
-    pub fn set_shared_memory(&self, range: Range<usize>, memory: SharedMemoryId) {
-        self.vmem.write().set_shared_memory(range, memory);
-    }
-
     /// Returns the key of the futex word at `address` if a mapping of named shared memory, which
     /// other processes may map, holds all of it.
     pub fn shared_futex_key(&self, address: usize) -> Option<SharedFutexKey> {
+        if !self.names_shared_memory.load(Ordering::Acquire) {
+            return None;
+        }
         let end = address.checked_add(size_of::<u32>())?;
         let vmem = self.vmem.read();
         let (range, vma) = vmem.overlapping(address..end).next()?;
@@ -920,6 +971,26 @@ where
         placement: MmapPlacement,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
+        self.do_mmap_with_shared_memory(suggested_addr, len, prot, flags, placement, None, op)
+    }
+
+    /// Like [`Self::do_mmap`], but records that a new shared anonymous mapping maps
+    /// `shared_memory` from its start, if it is given, so that [`Self::shared_futex_key`] keys
+    /// its futexes by it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the arguments of `mmap`, plus the name of the memory it maps"
+    )]
+    pub fn do_mmap_with_shared_memory(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        placement: MmapPlacement,
+        shared_memory: Option<SharedMemoryId>,
+        op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
         let mut flags = CreatePagesFlags::from(flags);
         flags.set(
             CreatePagesFlags::TOP_DOWN,
@@ -954,12 +1025,13 @@ where
         };
         // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the mapping.
         unsafe {
-            self.create_pages(
+            self.create_pages_with_shared_memory(
                 suggested_addr,
                 length,
                 flags,
                 (before, permissions),
                 placement.allowed_range,
+                shared_memory,
                 op,
             )
         }

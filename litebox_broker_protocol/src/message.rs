@@ -319,9 +319,9 @@ pub enum ReadinessQueueRequest {
 /// Request about futexes in shared memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SharedFutexRequest {
-    /// Reserve shared memory IDs for the calling process to name memory it creates.
+    /// Reserve a block of shared memory IDs for the calling process to name memory it creates.
     ReserveMemoryIds,
-    /// Create an idle futex waiter for the calling thread.
+    /// Create an idle futex waiter.
     CreateWaiter,
     /// Arm a futex waiter on a futex word.
     Arm(FutexArmRequest),

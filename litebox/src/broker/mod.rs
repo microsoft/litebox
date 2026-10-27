@@ -7,6 +7,7 @@ use alloc::{
     vec::Vec,
 };
 use core::net::SocketAddrV4;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
@@ -31,7 +32,7 @@ use litebox_broker_protocol::readiness_queue::{
     ReadyEvent,
 };
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
-use litebox_broker_protocol::shared_futex::SharedFutexKey;
+use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
@@ -617,7 +618,8 @@ pub(crate) trait BrokerControl: Send + Sync {
         name: SocketOptionName,
     ) -> core::result::Result<SocketOptionValue, BrokerControlError>;
 
-    fn reserve_shared_memory_ids(&self) -> core::result::Result<u64, BrokerControlError>;
+    fn reserve_shared_memory_ids(&self)
+    -> core::result::Result<SharedMemoryId, BrokerControlError>;
 
     fn create_futex_waiter(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -626,6 +628,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         key: SharedFutexKey,
         bitset: u32,
         waiter: ObjectHandle,
+        generation: u32,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn futex_wake(
@@ -643,7 +646,14 @@ pub(crate) trait BrokerControl: Send + Sync {
 }
 
 pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
-    pollables: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
+    pollables: Mutex<Platform, HashMap<ObjectHandle, RegisteredPollable<Platform>>>,
+}
+
+struct RegisteredPollable<Platform: RawSyncPrimitivesProvider> {
+    pollee: Weak<Pollee<Platform>>,
+    /// Where to record the raw readiness of each notification, before observers see it, for
+    /// objects whose readiness carries more than its events do.
+    latest_readiness: Option<Weak<AtomicU32>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
@@ -654,7 +664,33 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     }
 
     pub(crate) fn register_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
-        let previous = self.pollables.lock().insert(handle, Arc::downgrade(pollee));
+        self.register(handle, pollee, None);
+    }
+
+    /// Like [`Self::register_pollable`], but also stores the raw readiness of each notification
+    /// for `handle` in `latest_readiness` before notifying `pollee`'s observers.
+    pub(crate) fn register_pollable_with_latest_readiness(
+        &self,
+        handle: ObjectHandle,
+        pollee: &Arc<Pollee<Platform>>,
+        latest_readiness: &Arc<AtomicU32>,
+    ) {
+        self.register(handle, pollee, Some(Arc::downgrade(latest_readiness)));
+    }
+
+    fn register(
+        &self,
+        handle: ObjectHandle,
+        pollee: &Arc<Pollee<Platform>>,
+        latest_readiness: Option<Weak<AtomicU32>>,
+    ) {
+        let previous = self.pollables.lock().insert(
+            handle,
+            RegisteredPollable {
+                pollee: Arc::downgrade(pollee),
+                latest_readiness,
+            },
+        );
         assert!(
             previous.is_none(),
             "broker handle already has a registered pollable"
@@ -672,9 +708,15 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
         let events = readiness_events(readiness);
         let pollee = {
             let mut pollables = self.pollables.lock();
-            let pollee = pollables.get(&handle).and_then(Weak::upgrade);
+            let registered = pollables.get(&handle);
+            let pollee = registered.and_then(|registered| registered.pollee.upgrade());
             if pollee.is_none() {
                 pollables.remove(&handle);
+            } else if let Some(latest) = registered
+                .and_then(|registered| registered.latest_readiness.as_ref())
+                .and_then(Weak::upgrade)
+            {
+                latest.store(readiness.0, Ordering::Release);
             }
             pollee
         };
@@ -694,7 +736,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
         let pollables = {
             let mut pollables = Vec::new();
             self.pollables.lock().retain(|_, registered| {
-                let Some(pollee) = registered.upgrade() else {
+                let Some(pollee) = registered.pollee.upgrade() else {
                     return false;
                 };
                 pollables.push(pollee);
@@ -1719,7 +1761,9 @@ where
         self.request(|local| local.get_unix_socket_option(handle, name))
     }
 
-    fn reserve_shared_memory_ids(&self) -> core::result::Result<u64, BrokerControlError> {
+    fn reserve_shared_memory_ids(
+        &self,
+    ) -> core::result::Result<SharedMemoryId, BrokerControlError> {
         self.request(BrokerLocal::reserve_shared_memory_ids)
     }
 
@@ -1732,8 +1776,9 @@ where
         key: SharedFutexKey,
         bitset: u32,
         waiter: ObjectHandle,
+        generation: u32,
     ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.futex_arm(key, bitset, waiter))
+        self.request(|local| local.futex_arm(key, bitset, waiter, generation))
     }
 
     fn futex_wake(

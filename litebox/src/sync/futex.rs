@@ -170,8 +170,9 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     }
 }
 
-/// Potential errors that can be returned by [`FutexManager`]'s operations
-/// and [`SharedFutexWaiter`](shared::SharedFutexWaiter) operations.
+/// Potential errors that can be returned by [`FutexManager`]'s operations, and by
+/// [`SharedFutexWaiter::wait`](shared::SharedFutexWaiter::wait) and
+/// [`LiteBox::wake_shared_futex`](crate::LiteBox::wake_shared_futex).
 #[derive(Debug, Error)]
 pub enum FutexError {
     #[error("address not correctly aligned to 4-bytes")]
@@ -182,10 +183,9 @@ pub enum FutexError {
     WaitError(WaitError),
     #[error("fault reading futex word")]
     Fault,
-    #[error("futex backing resources exhausted")]
-    ResourceExhausted,
-    #[error("futex backing broker failed")]
-    Io,
+    /// The broker behind futexes in shared memory failed the operation.
+    #[error("shared futex error: {0}")]
+    Shared(#[from] shared::SharedFutexError),
 }
 
 #[cfg(test)]
@@ -358,12 +358,7 @@ mod tests {
                 | Err(
                     FutexError::WaitError(_) | FutexError::ImmediatelyWokenBecauseValueMismatch,
                 ) => {}
-                Err(
-                    FutexError::NotAligned
-                    | FutexError::Fault
-                    | FutexError::ResourceExhausted
-                    | FutexError::Io,
-                ) => {
+                Err(FutexError::NotAligned | FutexError::Fault | FutexError::Shared(_)) => {
                     unreachable!()
                 }
             }

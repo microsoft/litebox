@@ -2320,7 +2320,7 @@ pub enum FutexOperation {
     Wait = 0,
     Wake = 1,
     WaitBitset = 9,
-    /// `FUTEX_WAKE_BITSET`: wakes only waiters whose bitset intersects the wake's.
+    /// `FUTEX_WAKE_BITSET`.
     WakeBitset = 10,
 }
 
@@ -2362,11 +2362,13 @@ pub enum FutexArgs {
     },
     /// Wakes waiters on `addr` whose `FUTEX_WAIT_BITSET` bitset intersects `bitmask`.
     WakeBitset {
+        /// The futex word whose waiters to wake.
         addr: UserPtrMut<u32>,
+        /// Option flags, such as [`FutexFlags::PRIVATE`].
         flags: FutexFlags,
         /// The most waiters to wake.
         count: u32,
-        /// The bitset that selects waiters; Linux rejects an empty one with `EINVAL`.
+        /// The bitset that selects waiters.
         bitmask: u32,
     },
 }

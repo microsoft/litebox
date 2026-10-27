@@ -77,7 +77,7 @@ impl ObjectEntry {
             | Self::Socket(_)
             | Self::Timer(_)
             | Self::ReadinessQueue(_) => true,
-            // A waiter belongs to the thread that waits with it.
+            // Signals belong to their process and a futex waiter to its thread.
             Self::Signals(_) | Self::FutexWaiter(_) => false,
         }
     }

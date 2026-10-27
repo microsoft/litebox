@@ -1277,6 +1277,8 @@ fn forked_children_share_eventfds_and_timerfds() {
 #[cfg(target_os = "linux")]
 #[test]
 fn forked_children_share_futexes_in_shared_memory() {
+    const EXPECTED: &str = "shared-futex memory=1 wake=1 timeout=1 private=1 mutex=1 \
+                            semaphore=1 bitset=1 misaligned=1";
     // Copy-based fork cannot share pages, so it refuses to fork with shared anonymous mappings.
     assert!(
         std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none()
@@ -1289,25 +1291,15 @@ fn forked_children_share_futexes_in_shared_memory() {
         true,
         false,
     );
+    // The checks encode Linux's behavior, so they pass natively too.
+    let native = std::process::Command::new(&parent).output().unwrap();
+    let native = String::from_utf8(native.stdout).unwrap();
+    assert!(native.lines().any(|line| line == EXPECTED), "{native:?}");
+
     let mut runner = Runner::new(&parent, "fork_shared_futex_parent");
     runner.allow_process_duplication();
-
     let output = String::from_utf8(runner.output()).unwrap();
-    let line = output
-        .lines()
-        .find(|line| line.starts_with("shared-futex "))
-        .unwrap_or_else(|| panic!("missing shared-futex output in {output:?}"));
-    for field in [
-        "memory=",
-        "wake=",
-        "timeout=",
-        "private=",
-        "mutex=",
-        "semaphore=",
-        "bitset=",
-    ] {
-        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
-    }
+    assert!(output.lines().any(|line| line == EXPECTED), "{output:?}");
 }
 
 #[cfg(target_os = "linux")]

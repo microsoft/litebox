@@ -188,6 +188,7 @@ mod tests {
         use litebox_common_linux::RngFlags;
 
         let task = init_platform();
+        crate::syscalls::test_broker::fail_randomness();
 
         let mut buf = [0u8; 16];
         let ptr = UserPtrMut::from_ptr(buf.as_mut_ptr());

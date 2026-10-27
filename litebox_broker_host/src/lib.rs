@@ -1809,11 +1809,8 @@ fn handle_shared_futex_request(
     };
 
     let response = match request {
-        SharedFutexRequest::ReserveMemoryIds => {
-            shared_futex::reserve_memory_ids(process).map(|prefix| {
-                SharedFutexResponse::ReserveMemoryIds(ReserveMemoryIdsResponse { prefix })
-            })
-        }
+        SharedFutexRequest::ReserveMemoryIds => shared_futex::reserve_memory_ids(process)
+            .map(|first| SharedFutexResponse::ReserveMemoryIds(ReserveMemoryIdsResponse { first })),
         SharedFutexRequest::CreateWaiter => {
             shared_futex::create_futex_waiter(process, readiness_sink).map(|handle| {
                 SharedFutexResponse::CreateWaiter(CreateFutexWaiterResponse { handle })
@@ -1829,6 +1826,7 @@ fn handle_shared_futex_request(
     };
     response.map_err(RequestFailure::from)
 }
+
 fn handle_timer_request(
     process: &BrokerProcess,
     request: TimerRequest,

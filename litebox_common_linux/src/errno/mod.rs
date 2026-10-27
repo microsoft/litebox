@@ -700,6 +700,8 @@ impl From<litebox::event::timer::TimerError> for Errno {
 }
 
 impl From<litebox::sync::futex::shared::SharedFutexError> for Errno {
+    /// Maps broker failures, which Linux futexes cannot have, to the errnos LiteBox reports for
+    /// other broker objects.
     fn from(value: litebox::sync::futex::shared::SharedFutexError) -> Self {
         use litebox::sync::futex::shared::SharedFutexError;
         match value {
@@ -749,9 +751,7 @@ impl From<litebox::sync::futex::FutexError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::sync::futex::FutexError::Fault => Errno::EFAULT,
-            litebox::sync::futex::FutexError::ResourceExhausted => Errno::ENOMEM,
-            // Linux futexes have no I/O errors; a failed broker leaves the process unusable.
-            litebox::sync::futex::FutexError::Io => Errno::EIO,
+            litebox::sync::futex::FutexError::Shared(error) => error.into(),
         }
     }
 }

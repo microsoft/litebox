@@ -214,7 +214,7 @@ impl VmArea {
         let view = self.shared_memory?;
         Some(SharedFutexKey {
             memory: view.memory,
-            offset: (address - view.base) as u64,
+            offset: u64::try_from(address.checked_sub(view.base)?).ok()?,
         })
     }
 
@@ -728,15 +728,14 @@ where
         self.vmas.iter()
     }
 
-    /// Records that the shared anonymous mapping just created at `range` maps `memory` from its
-    /// start, unless another mapping has since replaced any of it.
+    /// Records that the shared anonymous mapping just created at `range`, under the same lock,
+    /// maps `memory` from its start.
     pub(super) fn set_shared_memory(&mut self, range: Range<usize>, memory: SharedMemoryId) {
-        let Some((mapped, &vma)) = self.vmas.get_key_value(&range.start) else {
+        let Some(&vma) = self.vmas.get(&range.start) else {
+            debug_assert!(false, "no mapping was just created at {range:#x?}");
             return;
         };
-        if mapped.end < range.end || !vma.is_shared_anonymous() || vma.shared_memory.is_some() {
-            return;
-        }
+        debug_assert!(vma.is_shared_anonymous() && vma.shared_memory.is_none());
         self.vmas.insert(
             range.clone(),
             VmArea {

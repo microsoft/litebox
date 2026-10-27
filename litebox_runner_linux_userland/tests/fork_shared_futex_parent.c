@@ -97,8 +97,9 @@ static int exited(pid_t child, int *code) {
 }
 
 // A child blocked in FUTEX_WAIT on shared memory wakes on its parent's FUTEX_WAKE, which
-// reports waking it.
-static int check_wake(struct shared *shared) {
+// reports waking it, but not on wakes of another word in the memory or of the same word in
+// `other` shared memory.
+static int check_wake(struct shared *shared, struct shared *other) {
     atomic_store(&shared->word, 0);
     atomic_store(&shared->ready, 0);
     pid_t child = fork();
@@ -119,12 +120,16 @@ static int check_wake(struct shared *shared) {
         reap(child);
         return 0;
     }
-    // The word stays zero, so the child returns only when a wake selects it.
+    // The word stays zero, so the child returns only when a wake selects it. The wakes that
+    // must miss it are repeated with the one that selects it, so some run while it is blocked.
+    int ok = 1;
     int code = -1;
     for (int attempt = 0; attempt < TIMEOUT_SECONDS * 100; attempt++) {
+        ok &= futex(&shared->value, FUTEX_WAKE, 1, NULL) == 0;
+        ok &= futex(&other->word, FUTEX_WAKE, 1, NULL) == 0;
         long woken = futex(&shared->word, FUTEX_WAKE, 1, NULL);
         if (woken == 1) {
-            return reap(child) == 0;
+            return reap(child) == 0 && ok;
         }
         if (woken != 0 || exited(child, &code)) {
             if (code == -1) {
@@ -146,6 +151,21 @@ static int check_timeout(struct shared *shared) {
     struct timespec timeout = {.tv_nsec = 50 * 1000000};
     return futex(&shared->word, FUTEX_WAIT, 7, &timeout) == -1 && errno == ETIMEDOUT &&
            futex(&shared->word, FUTEX_WAIT, 0, &timeout) == -1 && errno == EAGAIN;
+}
+
+// Like any futex operation, one on a misaligned word fails, whether shared or private, and even
+// a wake of no waiters.
+static int check_misaligned(struct shared *shared) {
+    atomic_uint *misaligned = (atomic_uint *)((char *)&shared->word + 2);
+    struct timespec timeout = {.tv_nsec = 10 * 1000000};
+    int ok = 1;
+    for (int flag = 0; flag <= FUTEX_PRIVATE_FLAG; flag += FUTEX_PRIVATE_FLAG) {
+        for (unsigned count = 0; count <= 1; count++) {
+            ok &= futex(misaligned, FUTEX_WAKE | flag, count, NULL) == -1 && errno == EINVAL;
+        }
+        ok &= futex(misaligned, FUTEX_WAIT | flag, 0, &timeout) == -1 && errno == EINVAL;
+    }
+    return ok;
 }
 
 // Private futex operations on shared memory are keyed by process, so a parent's private wake
@@ -202,16 +222,16 @@ static int check_keyed(struct shared *shared, int wait_op, int wake_op, int othe
     if (pthread_create(&thread, NULL, wait_keyed, &waiter) != 0) {
         return 0;
     }
-    while (atomic_load(&shared->ready) == 0) {
-        sleep_ms(1);
-    }
-    int ok = 1;
+    int ok = await_value(&shared->ready, 1);
     for (int attempt = 0; attempt < 10; attempt++) {
         ok &= futex(&shared->word, other_wake_op, 1, NULL) == 0;
         sleep_ms(5);
     }
+    // The wake that must miss the waiter is repeated with the one that selects it, so some run
+    // while it is blocked.
     long woken = 0;
-    for (int attempt = 0; attempt < TIMEOUT_SECONDS * 100 && woken == 0; attempt++) {
+    for (int attempt = 0; attempt < TIMEOUT_SECONDS * 100 && woken == 0 && ok; attempt++) {
+        ok &= futex(&shared->word, other_wake_op, 1, NULL) == 0;
         woken = futex(&shared->word, wake_op, 1, NULL);
         if (woken == 0) {
             sleep_ms(10);
@@ -221,15 +241,24 @@ static int check_keyed(struct shared *shared, int wait_op, int wake_op, int othe
     return ok && woken == 1 && waiter.result == 0;
 }
 
-// Bitset operations on shared memory: a zero mask fails, a wait honors its absolute deadline, and
-// a wake selects only waiters whose masks intersect its own, including a forked child's.
+// Bitset operations: a zero mask fails, in shared or private memory, a wait honors its absolute
+// deadline, and a wake selects only waiters whose masks intersect its own, including a forked
+// child's.
 static int check_bitset(struct shared *shared) {
     atomic_store(&shared->word, 0);
     atomic_store(&shared->ready, 0);
     struct timespec deadline = deadline_in_ms(50);
-    int ok = futex_bitset(&shared->word, FUTEX_WAIT_BITSET, 0, &deadline, 0) == -1 &&
-             errno == EINVAL;
-    ok &= futex_bitset(&shared->word, FUTEX_WAKE_BITSET, 1, NULL, 0) == -1 && errno == EINVAL;
+    int ok = 1;
+    atomic_uint private_word = 0;
+    atomic_uint *words[] = {&shared->word, &private_word};
+    for (int index = 0; index < 2; index++) {
+        for (int flag = 0; flag <= FUTEX_PRIVATE_FLAG; flag += FUTEX_PRIVATE_FLAG) {
+            ok &= futex_bitset(words[index], FUTEX_WAIT_BITSET | flag, 0, &deadline, 0) == -1 &&
+                  errno == EINVAL;
+            ok &= futex_bitset(words[index], FUTEX_WAKE_BITSET | flag, 1, NULL, 0) == -1 &&
+                  errno == EINVAL;
+        }
+    }
     ok &= futex_bitset(&shared->word, FUTEX_WAIT_BITSET, 0, &deadline, 1) == -1 &&
           errno == ETIMEDOUT;
     if (!ok) {
@@ -259,7 +288,8 @@ static int check_bitset(struct shared *shared) {
         sleep_ms(5);
     }
     long woken = 0;
-    for (int attempt = 0; attempt < TIMEOUT_SECONDS * 100 && woken == 0; attempt++) {
+    for (int attempt = 0; attempt < TIMEOUT_SECONDS * 100 && woken == 0 && ok; attempt++) {
+        ok &= futex_bitset(&shared->word, FUTEX_WAKE_BITSET, 1, NULL, 0x2) == 0;
         woken = futex_bitset(&shared->word, FUTEX_WAKE_BITSET, 1, NULL, 0x3);
         if (woken == 0) {
             sleep_ms(10);
@@ -385,12 +415,14 @@ static int check_memory(struct shared *shared) {
 int main(void) {
     struct shared *shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
                                  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (shared == MAP_FAILED) {
+    struct shared *other = mmap(NULL, sizeof(*other), PROT_READ | PROT_WRITE,
+                                MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED || other == MAP_FAILED) {
         perror("mmap");
         return 1;
     }
     int memory = check_memory(shared);
-    int wake = check_wake(shared);
+    int wake = check_wake(shared, other);
     int timeout = check_timeout(shared);
     int private = check_private(shared) &&
                   check_keyed(shared, FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAKE_PRIVATE) &&
@@ -398,8 +430,11 @@ int main(void) {
     int mutex = check_mutex(shared);
     int semaphore = check_semaphore(shared);
     int bitset = check_bitset(shared);
+    int misaligned = check_misaligned(shared);
     printf("shared-futex memory=%d wake=%d timeout=%d private=%d mutex=%d semaphore=%d "
-           "bitset=%d\n",
-           memory, wake, timeout, private, mutex, semaphore, bitset);
-    return memory && wake && timeout && private && mutex && semaphore && bitset ? 0 : 1;
+           "bitset=%d misaligned=%d\n",
+           memory, wake, timeout, private, mutex, semaphore, bitset, misaligned);
+    return memory && wake && timeout && private && mutex && semaphore && bitset && misaligned
+               ? 0
+               : 1;
 }

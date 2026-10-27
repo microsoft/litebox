@@ -222,17 +222,12 @@ fn test_fork_shared_futex_with_windows_broker() {
         run_progs_with_process_duplication(&broker, &runner, &["fork_shared_futex_parent"], &[]);
 
     let line = output_line(&output, "shared-futex ");
-    for field in [
-        "memory=",
-        "wake=",
-        "timeout=",
-        "private=",
-        "mutex=",
-        "semaphore=",
-        "bitset=",
-    ] {
-        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
-    }
+    assert_eq!(
+        line,
+        "shared-futex memory=1 wake=1 timeout=1 private=1 mutex=1 semaphore=1 bitset=1 \
+         misaligned=1",
+        "{output:?}"
+    );
 }
 
 /// Runs `vfork_exec_parent`, whose child execs `vfork_exec_child` in a new runner.
