@@ -189,6 +189,17 @@ impl fmt::Display for NetworkDevice {
 /// synchronized.
 pub struct NinePDevice(Box<Virtio9p>);
 
+/// Whether a polled request's response came (see
+/// [`NinePDevice::transmit_polled`]).
+#[derive(Debug)]
+pub enum Polled<W> {
+    /// Its length, its bytes copied (see [`NinePDevice::receive`]).
+    Received(usize),
+    /// Not yet: the device interrupts once it answers; the caller waits with
+    /// this (e.g., registered for the interrupt's wake), then looks.
+    Waiting(W),
+}
+
 impl NinePDevice {
     /// The largest message either way: the most a 9P client may negotiate.
     pub const MAX_MESSAGE_SIZE: usize = crate::virtio::nine_p::MAX_MESSAGE_SIZE;
@@ -216,13 +227,54 @@ impl NinePDevice {
         self.0.mount_tag()
     }
 
-    /// Queues `message`, one whole 9P request; false if one is in flight.
+    /// Queues `message`, one whole 9P request, the device interrupting as it
+    /// answers (e.g., for a caller that halts until then); false if one is in
+    /// flight.
     ///
     /// # Panics
     ///
     /// If `message` is empty or longer than [`Self::MAX_MESSAGE_SIZE`].
     pub fn transmit(&mut self, message: &[u8]) -> bool {
-        self.0.transmit(message)
+        self.0.transmit(message, true)
+    }
+
+    /// Queues `message` as [`Self::transmit`] does, but with the device's
+    /// interrupt off, and looks for the response while `poll`, called before
+    /// each look, returns true. Then calls `prepare` (e.g., registering for
+    /// the interrupt's wake), has the device interrupt as it answers, and
+    /// looks once more if it answered meanwhile: so a response that came
+    /// before the device was asked to interrupt is seen then, and one after
+    /// interrupts, with `prepare` done. `None` if a request is in flight.
+    ///
+    /// # Panics
+    ///
+    /// If `message` is empty or longer than [`Self::MAX_MESSAGE_SIZE`].
+    pub fn transmit_polled<W>(
+        &mut self,
+        message: &[u8],
+        response: &mut [u8],
+        mut poll: impl FnMut() -> bool,
+        prepare: impl FnOnce() -> W,
+    ) -> Option<Polled<W>> {
+        if !self.0.transmit(message, false) {
+            return None;
+        }
+        while poll() {
+            if let Some(len) = self.0.receive(response) {
+                return Some(Polled::Received(len));
+            }
+            core::hint::spin_loop();
+        }
+        let waiting = prepare();
+        Some(
+            if self.0.enable_interrupts()
+                && let Some(len) = self.0.receive(response)
+            {
+                Polled::Received(len)
+            } else {
+                Polled::Waiting(waiting)
+            },
+        )
     }
 
     /// The response's length, once the device answered, its bytes copied
@@ -390,5 +442,83 @@ impl fmt::Display for VsockDevice {
             self.interrupts(),
             self.0.guest_cid()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{NinePDevice, Polled};
+    use crate::virtio::nine_p::Virtio9p;
+    use crate::virtio::queue::testing::{Registers, device_returns};
+    use alloc::boxed::Box;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const REQUEST: &[u8] = b"Tversion";
+    /// What the device says it wrote, for each request: its one chain's
+    /// head is 0.
+    const RESPONSE_LEN: u32 = 7;
+
+    /// A polled request's response, if there before the call, is found by a
+    /// look of the poll, which goes on while `poll` says so, or by the last
+    /// look, which comes after `prepare`; if not, the caller waits. The device
+    /// is asked to interrupt only once the poll is over, and then always.
+    #[test]
+    fn a_polled_requests_response_is_never_missed() {
+        let registers = Registers::new();
+        let mut nine_p = NinePDevice(Box::new(Virtio9p::in_memory(&registers)));
+        let mut response = [0; 16];
+        // A polled request whose `poll` says yes `looks` times: how many times
+        // it was called, and the result.
+        let mut request = |nine_p: &mut NinePDevice, looks: usize| {
+            let mut polls = 0;
+            let poll = || {
+                polls += 1;
+                polls <= looks
+            };
+            let polled = nine_p.transmit_polled(REQUEST, &mut response, poll, || ());
+            (polls, polled)
+        };
+        // There: the poll's first look finds it, with the interrupt off.
+        device_returns(nine_p.0.queue(), 0, 0, RESPONSE_LEN);
+        let (polls, polled) = request(&mut nine_p, 1);
+        assert!(matches!(polled, Some(Polled::Received(len)) if len == RESPONSE_LEN as usize));
+        assert_eq!(polls, 1);
+        assert!(!nine_p.0.queue().asks_to_interrupt(), "during the poll");
+        // There, with the poll over at once: the last look finds it, with the
+        // interrupt on.
+        device_returns(nine_p.0.queue(), 1, 0, RESPONSE_LEN);
+        let (_, polled) = request(&mut nine_p, 0);
+        assert!(matches!(polled, Some(Polled::Received(len)) if len == RESPONSE_LEN as usize));
+        assert!(nine_p.0.queue().asks_to_interrupt(), "after the poll");
+        // Not there: the poll looks while `poll` says so, then the caller
+        // waits, with the interrupt on.
+        let (polls, polled) = request(&mut nine_p, 3);
+        assert!(matches!(polled, Some(Polled::Waiting(()))));
+        assert_eq!(polls, 4);
+        assert!(nine_p.0.queue().asks_to_interrupt(), "waiting");
+        device_returns(nine_p.0.queue(), 2, 0, RESPONSE_LEN);
+        assert_eq!(nine_p.receive(&mut [0; 16]), Some(RESPONSE_LEN as usize));
+        // `prepare` comes before the arming and the last look: one that stops
+        // the call leaves the interrupt off and the response there.
+        device_returns(nine_p.0.queue(), 3, 0, RESPONSE_LEN);
+        let stopped = catch_unwind(AssertUnwindSafe(|| {
+            nine_p.transmit_polled(REQUEST, &mut [0; 16], || false, || panic!("prepare"))
+        }));
+        assert!(stopped.is_err());
+        assert!(
+            !nine_p.0.queue().asks_to_interrupt(),
+            "armed only after prepare"
+        );
+        assert_eq!(nine_p.receive(&mut [0; 16]), Some(RESPONSE_LEN as usize));
+        // A request to wait for asks for the interrupt.
+        assert!(nine_p.transmit(REQUEST));
+        assert!(
+            nine_p.0.queue().asks_to_interrupt(),
+            "a request to wait for"
+        );
+        device_returns(nine_p.0.queue(), 4, 0, RESPONSE_LEN);
+        assert_eq!(nine_p.receive(&mut [0; 16]), Some(RESPONSE_LEN as usize));
     }
 }

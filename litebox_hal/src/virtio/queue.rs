@@ -241,7 +241,7 @@ impl VirtQueue {
 
 /// Host tests' stand-ins for the kernel and a device.
 #[cfg(test)]
-pub(in crate::virtio) mod testing {
+pub(crate) mod testing {
     use super::{AVAIL_F_NO_INTERRUPT, Buffer, DESC_F_WRITE, DESC_SIZE, VirtQueue};
     use crate::dma::{Hal, Mmio};
     use crate::virtio::pci::PciTransport;
@@ -282,14 +282,15 @@ pub(in crate::virtio) mod testing {
     /// A transport's registers, in heap memory, which no device plays. A
     /// driver started on [`Self::transport`] must be dropped first (declared
     /// after them).
-    pub(in crate::virtio) struct Registers(NonNull<[u64; REGISTER_WORDS]>);
+    pub(crate) struct Registers(NonNull<[u64; REGISTER_WORDS]>);
 
     impl Registers {
-        pub(in crate::virtio) fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self(NonNull::from(Box::leak(Box::new([0; REGISTER_WORDS]))))
         }
 
-        /// A transport on them, whose notifications reach no device.
+        /// A transport on them, whose notifications and resets reach no
+        /// device.
         pub(in crate::virtio) fn transport(&self) -> PciTransport {
             PciTransport::fake(
                 self.mmio(0, COMMON_LEN),
@@ -341,13 +342,13 @@ pub(in crate::virtio) mod testing {
 
         /// Plays the device: whether the available ring asks it to interrupt
         /// as it returns chains.
-        pub(in crate::virtio) fn asks_to_interrupt(&self) -> bool {
+        pub(crate) fn asks_to_interrupt(&self) -> bool {
             self.read::<u16>(self.avail) & AVAIL_F_NO_INTERRUPT == 0
         }
     }
 
     /// Plays the device: returns `id` with `len` in the used ring.
-    pub(in crate::virtio) fn device_returns(queue: &VirtQueue, slot: u16, id: u32, len: u32) {
+    pub(crate) fn device_returns(queue: &VirtQueue, slot: u16, id: u32, len: u32) {
         let elem = queue.used + 4 + 8 * usize::from(slot % queue.size);
         queue.write(elem, id);
         queue.write(elem + 4, len);
