@@ -17,6 +17,9 @@ const DESC_F_WRITE: u16 = 2;
 const DESC_SIZE: usize = 16;
 /// `VIRTQ_AVAIL_F_NO_INTERRUPT`, in the available ring's flags.
 const AVAIL_F_NO_INTERRUPT: u16 = 1;
+/// `VIRTIO_F_RING_EVENT_IDX`: interrupts follow the driver's `used_event`
+/// (see [`VirtQueue::use_event_index`]).
+pub(super) const F_RING_EVENT_IDX: u64 = 1 << 29;
 
 /// One buffer of a chain, in DMA memory.
 #[derive(Clone, Copy, Debug)]
@@ -45,9 +48,12 @@ pub struct VirtQueue {
     num_free: u16,
     next_avail: u16,
     last_used: u16,
-    /// Whether the available ring asks the device to interrupt (see
+    /// Whether the device is asked to interrupt (see
     /// [`Self::set_interrupts`]).
     interrupts: bool,
+    /// Asked by `used_event`, not the available ring's flags (see
+    /// [`Self::use_event_index`]).
+    event_index: bool,
 }
 
 // Safety: the queue exclusively owns its ring.
@@ -81,6 +87,7 @@ impl VirtQueue {
             next_avail: 0,
             last_used: 0,
             interrupts: true,
+            event_index: false,
         })
     }
 
@@ -102,12 +109,14 @@ impl VirtQueue {
         [pa, pa + self.avail as u64, pa + self.used as u64]
     }
 
-    /// Asks the device to interrupt as it returns chains: whether it returned
-    /// some meanwhile, which it may not interrupt for.
+    /// Asks the device to interrupt as it returns chains (with an event
+    /// index, the next one only): whether it returned some meanwhile, which it
+    /// may not interrupt for.
     #[must_use]
     pub fn enable_interrupts(&mut self) -> bool {
         self.set_interrupts(true);
-        // Pairs with the device's barrier before it reads the flags.
+        // Pairs with the device's barrier before it reads the flags or
+        // `used_event`.
         fence(Ordering::SeqCst);
         self.has_used()
     }
@@ -117,16 +126,52 @@ impl VirtQueue {
         self.set_interrupts(false);
     }
 
-    /// Whether the device is to interrupt as it returns chains: a hint
-    /// (`VIRTQ_AVAIL_F_NO_INTERRUPT` when not), which it reads after it wrote
-    /// the used ring, so one returned before a change may or may not
-    /// interrupt. Written only when it changes.
+    /// Switches to event indexes (`VIRTIO_F_RING_EVENT_IDX`, which the device
+    /// accepted), the current on/off state carrying over, before the device
+    /// starts (`DRIVER_OK`); the flags must then be 0, so this clears them.
+    /// On asks for the next chain returned only: callers keep one chain in
+    /// flight and arm each.
+    pub(super) fn use_event_index(&mut self) {
+        self.write(self.avail, 0_u16);
+        self.event_index = true;
+        self.set_interrupts(self.interrupts);
+    }
+
+    /// Whether the device is to interrupt as it returns chains, which it reads
+    /// after it wrote the used ring, so one returned before a change may or
+    /// may not interrupt: the flag (`VIRTQ_AVAIL_F_NO_INTERRUPT` when not),
+    /// written only when it changes; or, with an event index, `used_event`,
+    /// written at every call (see [`Self::use_event_index`]).
     fn set_interrupts(&mut self, enabled: bool) {
+        if self.event_index {
+            debug_assert_eq!(
+                self.read::<u16>(self.avail),
+                0,
+                "with an event index, the available ring's flags stay 0"
+            );
+            self.interrupts = enabled;
+            // On arms the next chain returned (`last_used`). Off is two behind,
+            // not one: the device may yet check the chain it last returned
+            // (`last_used - 1`) against `used_event`, but it checked the one
+            // before ahead of returning that one, which the driver has seen.
+            let event = if enabled {
+                self.last_used
+            } else {
+                self.last_used.wrapping_sub(2)
+            };
+            self.write(self.used_event(), event);
+            return;
+        }
         if self.interrupts != enabled {
             self.interrupts = enabled;
             let flags = if enabled { 0 } else { AVAIL_F_NO_INTERRUPT };
             self.write(self.avail, flags);
         }
+    }
+
+    /// `used_event`'s offset: the available ring's last field.
+    fn used_event(&self) -> usize {
+        self.avail + 4 + 2 * usize::from(self.size)
     }
 
     fn write<T>(&self, offset: usize, value: T) {
@@ -241,7 +286,7 @@ impl VirtQueue {
 
 /// Host tests' stand-ins for the kernel and a device.
 #[cfg(test)]
-pub(in crate::virtio) mod testing {
+pub(crate) mod testing {
     use super::{AVAIL_F_NO_INTERRUPT, Buffer, DESC_F_NEXT, DESC_F_WRITE, DESC_SIZE, VirtQueue};
     use crate::dma::{Hal, Mmio};
     use crate::virtio::pci::PciTransport;
@@ -283,14 +328,15 @@ pub(in crate::virtio) mod testing {
     /// A transport's registers, in heap memory, which no device plays. A
     /// driver started on [`Self::transport`] must be dropped first (declared
     /// after them).
-    pub(in crate::virtio) struct Registers(NonNull<[u64; REGISTER_WORDS]>);
+    pub(crate) struct Registers(NonNull<[u64; REGISTER_WORDS]>);
 
     impl Registers {
-        pub(in crate::virtio) fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self(NonNull::from(Box::leak(Box::new([0; REGISTER_WORDS]))))
         }
 
-        /// A transport on them, whose notifications reach no device.
+        /// A transport on them, whose notifications and resets reach no
+        /// device.
         pub(in crate::virtio) fn transport(&self) -> PciTransport {
             PciTransport::fake(
                 self.mmio(0, COMMON_LEN),
@@ -370,15 +416,22 @@ pub(in crate::virtio) mod testing {
             }
         }
 
-        /// Plays the device: whether the available ring asks it to interrupt
-        /// as it returns chains.
-        pub(in crate::virtio) fn asks_to_interrupt(&self) -> bool {
-            self.read::<u16>(self.avail) & AVAIL_F_NO_INTERRUPT == 0
+        /// Plays the device: whether it is asked to interrupt as it returns
+        /// the next chain (at the used ring's index): by the flags, or, with
+        /// an event index, by the check devices make (`vring_need_event`).
+        pub(crate) fn asks_to_interrupt(&self) -> bool {
+            if !self.event_index {
+                return self.read::<u16>(self.avail) & AVAIL_F_NO_INTERRUPT == 0;
+            }
+            let event: u16 = self.read(self.used_event());
+            let old: u16 = self.read(self.used + 2);
+            let new = old.wrapping_add(1);
+            new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
         }
     }
 
     /// Plays the device: returns `id` with `len` in the used ring.
-    pub(in crate::virtio) fn device_returns(queue: &VirtQueue, slot: u16, id: u32, len: u32) {
+    pub(crate) fn device_returns(queue: &VirtQueue, slot: u16, id: u32, len: u32) {
         let elem = queue.used + 4 + 8 * usize::from(slot % queue.size);
         queue.write(elem, id);
         queue.write(elem + 4, len);
@@ -455,6 +508,74 @@ mod tests {
         }
         device_returns(&q, 1000, u32::from(head), 1);
         assert_eq!(q.pop_used(), Some((head, 1)));
+    }
+
+    /// The flags are cleared and stay 0, and enabling asks for the chain in
+    /// flight only.
+    #[test]
+    fn an_event_index_keeps_the_flags_zero_and_arms_the_chain_in_flight() {
+        let mut q = queue(4);
+        q.disable_interrupts();
+        assert_ne!(q.read::<u16>(q.avail), 0);
+        q.use_event_index();
+        assert_eq!(q.read::<u16>(q.avail), 0);
+        assert!(!q.asks_to_interrupt(), "still off");
+        // Safety: as above.
+        let head = unsafe { q.add(&[buffer(true)]) }.unwrap();
+        assert!(!q.enable_interrupts());
+        assert!(q.asks_to_interrupt());
+        q.disable_interrupts();
+        assert!(!q.asks_to_interrupt());
+        assert_eq!(q.read::<u16>(q.avail), 0);
+        device_returns(&q, 0, u32::from(head), 1);
+        assert!(q.enable_interrupts(), "returned while they were off");
+        assert_eq!(q.pop_used(), Some((head, 1)));
+        assert!(!q.asks_to_interrupt(), "armed for that chain, not the next");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the available ring's flags stay 0")]
+    fn an_event_index_asserts_that_the_flags_stay_zero() {
+        let mut q = queue(4);
+        q.use_event_index();
+        q.write(q.avail, AVAIL_F_NO_INTERRUPT);
+        q.disable_interrupts();
+    }
+
+    /// Off leaves the chain last returned alone too, which the device may check
+    /// late (its check for one chain asks if `used_event` is that chain's
+    /// index).
+    #[test]
+    fn an_event_index_off_leaves_the_chain_last_returned_alone() {
+        let mut q = queue(4);
+        q.use_event_index();
+        // Safety: as above.
+        let head = unsafe { q.add(&[buffer(true)]) }.unwrap();
+        device_returns(&q, 0, u32::from(head), 1);
+        assert_eq!(q.pop_used(), Some((head, 1)));
+        q.disable_interrupts();
+        assert_ne!(q.read::<u16>(q.used_event()), 0);
+    }
+
+    /// Each chain is asked for, or not, as the used index wraps.
+    #[test]
+    fn an_event_index_arms_each_chain_across_the_wrap() {
+        let mut q = queue(4);
+        q.use_event_index();
+        let mut slot: u16 = 0;
+        for _ in 0..(1 << 16) + 3 {
+            q.disable_interrupts();
+            // Safety: as above.
+            let head = unsafe { q.add(&[buffer(true)]) }.unwrap();
+            assert!(!q.asks_to_interrupt(), "off at {slot}");
+            assert!(!q.enable_interrupts());
+            assert!(q.asks_to_interrupt(), "on at {slot}");
+            device_returns(&q, slot, u32::from(head), 1);
+            assert_eq!(q.pop_used(), Some((head, 1)));
+            slot = slot.wrapping_add(1);
+        }
+        assert_eq!(q.last_used, 3, "wrapped");
     }
 
     #[test]

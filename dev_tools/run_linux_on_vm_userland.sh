@@ -45,6 +45,10 @@
 #   writable_root: the root is writable.
 #   egress: sockets reach only the policy's destinations.
 #   console_flood: the console keeps 4 writers' records (check_records).
+# Hooked init tests, named GROUP.CASE, also give a debug kernel the keys of
+# INIT_KARGS (see litebox_runner_vm_kernel/src/test_hooks.rs).
+#   bthread_stress: broker threads' slices of 50 us, with no grace (its
+#     virtiofs case reads the share over virtio-fs).
 #
 # Runner processes' standard output and error go to a virtio console, backed
 # by a file.
@@ -53,10 +57,10 @@
 # isolated from the host (restrict=on) but for an echo server (cat) at
 # 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
-# The virtiofs test's boots each mount a fresh host directory (see
-# start_share) read-only at /mnt/host (its tag), over virtio-fs, served by an
-# unprivileged virtiofsd ($VIRTIOFSD) of the boot's own, which shares the
-# guest's RAM.
+# The boots of the virtiofs test and of the init tests named GROUP.virtiofs
+# each mount a fresh host directory (see start_share) read-only at /mnt/host
+# (its tag), over virtio-fs, served by an unprivileged virtiofsd ($VIRTIOFSD)
+# of the boot's own, which shares the guest's RAM.
 #
 # Under Cloud Hypervisor, the VMs run in a network namespace of the run's own,
 # made with (passwordless) sudo, where a TAP device has the guest's gateway
@@ -66,7 +70,8 @@
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
 # checks threads of a program running at once. With VM_MEM below 4G, the
 # highmem test is skipped: it needs RAM above 4 GiB. A test given with -t that
-# would be skipped is an error instead.
+# would be skipped is an error instead. Release builds skip the hooked init
+# tests.
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
@@ -117,9 +122,12 @@ verbose=0
 while getopts "t:rvh" opt; do
     case $opt in
         t)
-            # Plain names only: boots' files are named after their tests.
-            [[ $OPTARG =~ ^[A-Za-z0-9_]+$ ]] ||
-                { echo "error: test name $OPTARG is not a plain name ([A-Za-z0-9_]+)" >&2; exit 2; }
+            # Plain names only, or a hooked init test's GROUP.CASE: boots' files
+            # are named after their tests.
+            [[ $OPTARG =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)?$ ]] || {
+                echo "error: test name $OPTARG is not a plain name ([A-Za-z0-9_]+, or GROUP.CASE)" >&2
+                exit 2
+            }
             tests+=("$OPTARG")
             ;;
         r) profile=release; cargo_flags+=(--release) ;;
@@ -144,16 +152,34 @@ virtiofsd=
 
 # Init tests (see the header): their init's path in the root.
 declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root [egress]=/egress
-    [console_flood]=/console_flood [lifecycle]=/lifecycle)
+    [console_flood]=/console_flood [lifecycle]=/lifecycle
+    [bthread_stress.fork_chain]=/fork [bthread_stress.fork_many]=/fork
+    [bthread_stress.console_flood]=/console_flood [bthread_stress.net_loopback]=/net
+    [bthread_stress.net_external]=/net [bthread_stress.virtiofs]=/share)
 
-# Why test $1 is skipped with these CPUs or this RAM (see the header), if it
-# is.
+# Hooked init tests' kernel keys (see the header).
+stress="litebox.hooks=broker_slice_us:50"
+declare -A INIT_KARGS=(
+    [bthread_stress.fork_chain]="litebox.init.args=chain,48 $stress"
+    [bthread_stress.fork_many]="litebox.init.args=many,100 $stress"
+    [bthread_stress.console_flood]="$stress"
+    [bthread_stress.net_loopback]="litebox.init.args=loopback $stress"
+    [bthread_stress.net_external]="litebox.init.args=external,10.0.2.100,7 $stress"
+    [bthread_stress.virtiofs]="$stress"
+)
+
+# Why test $1 is skipped with these CPUs, this RAM or this build profile (see
+# the header), if it is.
 skip_reason() {
+    if [[ -n ${INIT_KARGS[$1]:-} && $profile != debug ]]; then
+        echo "its kernel keys are debug builds' only"
+        return
+    fi
     case $1 in
         preempt) [[ $VM_CPUS -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $VM_CPUS -ge 2 ]] || echo "needs threads running at once" ;;
         highmem) [[ $VM_MIB -ge 4096 ]] || echo "needs VM_MEM of at least 4G" ;;
-        virtiofs) [[ -n $VIRTIOFSD ]] || echo "needs virtiofsd, not found ($virtiofsd_wanted)" ;;
+        virtiofs | bthread_stress.virtiofs) [[ -n $VIRTIOFSD ]] || echo "needs virtiofsd, not found ($virtiofsd_wanted)" ;;
     esac
 }
 
@@ -305,7 +331,7 @@ network_args() {
 # virtiofs, or nothing. A virtiofsd serves one connection: one per boot.
 start_share() {
     share=
-    [[ $test == virtiofs ]] || return 0
+    [[ $test == virtiofs || $test == *.virtiofs ]] || return 0
     share=virtiofs
     local dir="$WORK/$1.share"
     # Fresh, even if a boot of the same name ran before.
@@ -361,7 +387,11 @@ share_args() {
     [[ -n $share ]] || return 0
     case $VMM in
         qemu)
-            # The vsock arguments share the guest's RAM, as vhost-user needs.
+            # The vsock arguments share the guest's RAM, as vhost-user needs;
+            # an init test has none.
+            [[ ${#vsock[@]} -ne 0 ]] ||
+                echo -object "memory-backend-memfd,id=mem,size=${VM_MIB}M,share=on" \
+                    -machine memory-backend=mem
             echo -chardev "socket,id=vfs0,path=$WORK/$1.virtiofs" \
                 -device vhost-user-fs-pci,chardev=vfs0,tag=/mnt/host
             ;;
@@ -464,6 +494,14 @@ check_records() {
         }' "$1"
 }
 
+# The output of /share that the virtiofs test expects, which share.c prints
+# but does not check: the console of a /share init test.
+share_output() {
+    python3 -c 'import json, sys
+print(next(r["expect_stdout"] for r in json.load(open(sys.argv[1])) if r["argv"][0] == "/share"), end="")' \
+        "$TESTS_DIR/virtiofs.json"
+}
+
 # Shows boot $1's output, and checks what only its kernel can (see the
 # header); for an init test, that init exited 0.
 check_boot() {
@@ -471,7 +509,12 @@ check_boot() {
     if [[ -n ${INIT_TESTS[$1]:-} ]]; then
         grep -qF '[litebox] init exit status: exited 0' "$WORK/$1.log" ||
             { echo "no exit status 0 of init in the log"; return 1; }
-        [[ $1 != console_flood ]] || check_records "$WORK/$1.console" 4 512
+        if [[ ${INIT_TESTS[$1]} == /console_flood ]]; then
+            check_records "$WORK/$1.console" 4 512
+        elif [[ ${INIT_TESTS[$1]} == /share ]]; then
+            share_output | cmp -s - "$WORK/$1.console" ||
+                { echo "the console is not virtiofs.json's output of /share"; return 1; }
+        fi
         return
     fi
     # The container's end must end every guest process (e.g., fork.c's).
@@ -552,7 +595,7 @@ for test in "${tests[@]}"; do
                 -C "$WORK/$test/root" guest.txt
         fi
         pack_payload "$test" "$WORK/$test/rootfs.tar"
-        kernel_args="litebox.init=${INIT_TESTS[$test]}"
+        kernel_args="litebox.init=${INIT_TESTS[$test]}${INIT_KARGS[$test]:+ ${INIT_KARGS[$test]}}"
         boot "$test" "$WORK/$test.tar"
         continue
     fi

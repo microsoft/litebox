@@ -5,7 +5,7 @@
 
 use alloc::ffi::CString;
 use core::time::Duration;
-use litebox_broker_vm_kernel::Broker;
+use litebox_broker_vm_kernel::BrokerHandle;
 use litebox_common_vm_abi::program::{self, ExitStatus, Program};
 use litebox_hal::serial_println;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
@@ -44,27 +44,35 @@ pub enum RunError {
 }
 
 /// Runs the program at `path` as init until it exits, and reports its outcome. Debug builds
-/// then run the other processes until idle, and check that they left nothing behind.
+/// give it `hooks`' arguments and hooks, then run the other processes until idle, and check that
+/// the hooks acted and the processes left nothing behind.
 ///
 /// # Panics
 ///
-/// If init's runner process cannot be spawned, or, in debug builds, if
-/// processes left something behind.
+/// If init's runner process cannot be spawned, or, in debug builds, if a check fails.
 pub fn run(
     scheduler: &Scheduler,
     platform: &'static VmKernel,
-    broker: &Broker,
+    broker: &BrokerHandle,
     config: &ProcessConfig<'_>,
     path: &str,
+    #[cfg(debug_assertions)] hooks: &crate::test_hooks::Boot,
 ) -> Result<ExitStatus, RunError> {
     let mut process = Process::spawn(scheduler, platform, broker, config)
         .unwrap_or_else(|error| panic!("failed to spawn init's runner: {error}"));
-    let status = run_program(&mut process, path);
+    let status = run_program(
+        &mut process,
+        path,
+        #[cfg(debug_assertions)]
+        hooks,
+    );
     process.finish();
     // Before the debug checks, which a descendant that never ends blocks.
     report(status);
     if cfg!(debug_assertions) {
         scheduler.run_until_idle();
+        #[cfg(debug_assertions)]
+        hooks.check();
         drop(process);
         check_released(scheduler, platform);
     }
@@ -90,11 +98,22 @@ fn report(status: Result<ExitStatus, RunError>) {
     }
 }
 
-fn run_program(process: &mut Process, path: &str) -> Result<ExitStatus, RunError> {
+fn run_program(
+    process: &mut Process,
+    path: &str,
+    #[cfg(debug_assertions)] hooks: &crate::test_hooks::Boot,
+) -> Result<ExitStatus, RunError> {
     let argv0 = CString::new(path).map_err(|_| RunError::BadProgram)?;
+    #[cfg(debug_assertions)]
+    let argv = core::iter::once(Ok(argv0))
+        .chain(hooks.args.iter().map(|&arg| CString::new(arg)))
+        .collect::<Result<_, _>>()
+        .map_err(|_| RunError::BadProgram)?;
+    #[cfg(not(debug_assertions))]
+    let argv = alloc::vec![argv0];
     let request = program::encode_request(&Program {
         path: path.into(),
-        argv: alloc::vec![argv0],
+        argv,
         envp: alloc::vec![],
     })
     .filter(|request| request.len() as u64 <= MAX_MESSAGE_LEN)
@@ -105,7 +124,8 @@ fn run_program(process: &mut Process, path: &str) -> Result<ExitStatus, RunError
         .ok_or_else(|| RunError::Dead(process.kill("malformed program reply")))
 }
 
-/// Checks that the ended processes left no address space or shared frame behind.
+/// Checks that the ended processes left no address space, shared frame or
+/// broker stack behind: the one stack left is the source thread's.
 ///
 /// # Panics
 ///
@@ -140,5 +160,10 @@ fn check_released(scheduler: &Scheduler, platform: &VmKernel) {
         platform.shared_frame_count(),
         0,
         "ended processes left shared frames, after waiting {TIMEOUT:?} for the other CPUs"
+    );
+    assert_eq!(
+        litebox_platform_vm_kernel::kthread::stacks(),
+        1,
+        "ended processes left broker stacks"
     );
 }

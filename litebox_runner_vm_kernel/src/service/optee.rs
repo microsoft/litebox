@@ -45,7 +45,7 @@ impl Optee {
         wall_clock: WallClock,
         timer: &'static dyn ProcessTimer,
         payload: &Payload,
-        broker: litebox_broker_vm_kernel::Broker,
+        broker: litebox_broker_vm_kernel::BrokerHandle,
     ) -> Self {
         let file = |name| {
             payload

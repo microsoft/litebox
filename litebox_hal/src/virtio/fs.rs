@@ -21,7 +21,9 @@
 //! copies the host's pages into whole pages. One request is in flight at a
 //! time, on the first request queue, as the FUSE client serializes them
 //! anyway; requests without a reply (forgets) go on the high-priority queue,
-//! as the specification asks.
+//! as the specification asks. Both queues interrupt by event index where the
+//! device offers it, as some ignore the flag that turns a polled request's
+//! interrupt off (virtiofsd does).
 //!
 //! The device is not trusted: the lengths it reports are clamped to the room
 //! offered, and the driver never accesses the buffers it shares with the
@@ -29,7 +31,7 @@
 
 use super::Error;
 use super::pci::PciTransport;
-use super::queue::{Buffer, VirtQueue};
+use super::queue::{Buffer, F_RING_EVENT_IDX, VirtQueue};
 use crate::dma::{DmaRegion, Hal, PAGE_SIZE};
 use crate::interrupt::MsiMessage;
 use alloc::vec::Vec;
@@ -195,7 +197,7 @@ impl VirtioFs {
     /// Does the fallible work that gives the device no memory first, then
     /// sets up the queues (see [`setup_queues`]).
     fn bring_up(hal: &'static dyn Hal, transport: PciTransport) -> Result<Self, Error> {
-        transport.init(0)?;
+        let event_index = transport.init(F_RING_EVENT_IDX)? & F_RING_EVENT_IDX != 0;
         let setup = || -> Result<_, Error> {
             let tag = read_tag(&transport)?;
             let regions = Regions::new(hal)?;
@@ -203,16 +205,28 @@ impl VirtioFs {
             Ok((tag, hiprio, requests, regions))
         };
         let (tag, hiprio, requests, regions) = setup().inspect_err(|_| transport.fail())?;
-        Ok(Self::start(transport, tag, hiprio, requests, regions))
+        Ok(Self::start(
+            transport,
+            tag,
+            hiprio,
+            requests,
+            regions,
+            event_index,
+        ))
     }
 
     fn start(
         transport: PciTransport,
         tag: Vec<u8>,
-        hiprio: VirtQueue,
-        requests: VirtQueue,
+        mut hiprio: VirtQueue,
+        mut requests: VirtQueue,
         regions: Regions,
+        event_index: bool,
     ) -> Self {
+        if event_index {
+            hiprio.use_event_index();
+            requests.use_event_index();
+        }
         transport.start();
         Self {
             transport,
@@ -256,7 +270,9 @@ impl VirtioFs {
     /// Queues the first `request` bytes of [`Self::request`], then the first
     /// `payload` bytes of [`Self::payload`], with room for a reply body of
     /// `room` bytes (at most [`MAX_PAYLOAD_SIZE`], or, with a payload,
-    /// [`MAX_SMALL_REPLY_SIZE`]); false if a request is in flight.
+    /// [`MAX_SMALL_REPLY_SIZE`]), the device to interrupt as it answers if
+    /// `interrupt` (see [`Self::enable_interrupts`]); false if a request is in
+    /// flight.
     ///
     /// Offer no more room than the largest valid reply: devices may fill all
     /// of it.
@@ -265,7 +281,13 @@ impl VirtioFs {
     ///
     /// If `request` is zero or more than [`MAX_REQUEST_SIZE`], or `payload`
     /// or `room` is too large.
-    pub fn transmit(&mut self, request: usize, payload: usize, room: usize) -> bool {
+    pub fn transmit(
+        &mut self,
+        request: usize,
+        payload: usize,
+        room: usize,
+        interrupt: bool,
+    ) -> bool {
         if self.in_flight.is_some() {
             return false;
         }
@@ -308,13 +330,30 @@ impl VirtioFs {
             let (region, offset) = regions.body(body);
             push(region.pa() + offset as u64, room, true);
         }
+        // Before the request, which the device may answer at once.
+        if interrupt {
+            // Nothing is in flight, so nothing was answered meanwhile.
+            let _ = self.requests.enable_interrupts();
+        } else {
+            self.requests.disable_interrupts();
+        }
         // Safety: DMA memory that outlives the device's use, which the
         // driver never accesses (callers copy as `Shared` bytes).
         let head =
             unsafe { self.requests.add(&chain[..len]) }.expect("bring-up checked the queue's size");
         self.in_flight = Some(InFlight { head, body, room });
+        // Every time, though an event index lets the device ask for fewer: with
+        // one request in flight, it is idle, and asks for the next one.
         self.transport.notify(&self.requests);
         true
+    }
+
+    /// Asks the device to interrupt as it answers requests: whether it answered
+    /// meanwhile, which it may not interrupt for (see
+    /// [`VirtQueue::enable_interrupts`]).
+    #[must_use]
+    pub fn enable_interrupts(&mut self) -> bool {
+        self.requests.enable_interrupts()
     }
 
     /// Once the device answered, the reply's length, header and body, at most
@@ -379,6 +418,9 @@ impl VirtioFs {
             len: u32_of(len),
             device_writes: false,
         }];
+        // An event index arms one chain: arm this forget's (the last one was
+        // taken, so the result is moot).
+        let _ = self.hiprio.enable_interrupts();
         // Safety: as in `transmit`.
         let head = unsafe { self.hiprio.add(&chain) }.expect("one message at a time");
         self.oneway_in_flight = Some(head);
@@ -413,6 +455,31 @@ impl Drop for VirtioFs {
             ManuallyDrop::drop(&mut self.hiprio);
             ManuallyDrop::drop(&mut self.regions);
         }
+    }
+}
+
+#[cfg(test)]
+impl VirtioFs {
+    /// For host tests: one on `registers`, which must outlive it, its queues
+    /// interrupting by event index if `event_index`.
+    pub(crate) fn in_memory(
+        registers: &super::queue::testing::Registers,
+        event_index: bool,
+    ) -> Self {
+        use super::queue::testing::HeapHal;
+        Self::start(
+            registers.transport(),
+            b"/mnt/host".to_vec(),
+            VirtQueue::new(&HeapHal, HIPRIO_QUEUE, HIPRIO_QUEUE_SIZE, 0).unwrap(),
+            VirtQueue::new(&HeapHal, REQUEST_QUEUE, REQUEST_QUEUE_SIZE, 0).unwrap(),
+            Regions::new(&HeapHal).unwrap(),
+            event_index,
+        )
+    }
+
+    /// Its request queue, on which the test plays the device.
+    pub(crate) fn requests(&self) -> &VirtQueue {
+        &self.requests
     }
 }
 
@@ -469,14 +536,7 @@ mod tests {
     use crate::virtio::queue::testing::{HeapHal, Registers, device_returns};
 
     fn device(registers: &Registers) -> VirtioFs {
-        let transport = registers.transport();
-        VirtioFs::start(
-            transport,
-            b"/mnt/host".to_vec(),
-            VirtQueue::new(&HeapHal, HIPRIO_QUEUE, HIPRIO_QUEUE_SIZE, 0).unwrap(),
-            VirtQueue::new(&HeapHal, REQUEST_QUEUE, REQUEST_QUEUE_SIZE, 0).unwrap(),
-            Regions::new(&HeapHal).unwrap(),
-        )
+        VirtioFs::in_memory(registers, false)
     }
 
     /// Plays the device (physical addresses are virtual under [`HeapHal`]).
@@ -498,8 +558,8 @@ mod tests {
     fn requests_are_chains_and_replies_are_clamped() {
         let registers = Registers::new();
         let mut device = device(&registers);
-        assert!(device.transmit(7, 3, 8));
-        assert!(!device.transmit(5, 0, 0), "one at a time");
+        assert!(device.transmit(7, 3, 8, true));
+        assert!(!device.transmit(5, 0, 0, true), "one at a time");
         assert!(device.request().is_none(), "the device may access it");
         assert!(device.payload().is_none(), "the device may access it");
         let chain = device.requests.device_chain(0).unwrap();
@@ -539,7 +599,7 @@ mod tests {
     fn large_bodies_use_the_payload_buffer_and_short_replies_are_short() {
         let registers = Registers::new();
         let mut device = device(&registers);
-        assert!(device.transmit(4, 0, MAX_PAYLOAD_SIZE));
+        assert!(device.transmit(4, 0, MAX_PAYLOAD_SIZE, true));
         let chain = device.requests.device_chain(0).unwrap();
         let [request, header, body] = chain[..] else {
             panic!("a chain of 3 buffers: {chain:?}");
@@ -554,7 +614,7 @@ mod tests {
         assert_eq!(copy_out(device.reply_header().unwrap()), [9; 16]);
         assert!(device.reply_body().unwrap().is_empty());
 
-        assert!(device.transmit(7, 0, 0));
+        assert!(device.transmit(7, 0, 0, true));
         assert!(device.reply_header().is_none(), "a request is in flight");
         let chain = device.requests.device_chain(1).unwrap();
         let [request, header] = chain[..] else {
@@ -588,6 +648,20 @@ mod tests {
         assert!(device.oneway_done());
         assert!(device.oneway().is_some());
         assert!(device.transmit_oneway(6));
+    }
+
+    /// With an event index, each forget is asked for as the device takes it:
+    /// an index arms one chain.
+    #[test]
+    fn forgets_rearm_the_event_index() {
+        let registers = Registers::new();
+        let mut device = VirtioFs::in_memory(&registers, true);
+        for slot in 0..3 {
+            assert!(device.transmit_oneway(6));
+            assert!(device.hiprio.asks_to_interrupt(), "forget {slot}");
+            device_returns(&device.hiprio, slot, 0, 0);
+            assert!(device.oneway_done());
+        }
     }
 
     fn configure(registers: &Registers, tag: &[u8], queues: u32) {

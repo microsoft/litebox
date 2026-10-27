@@ -64,7 +64,9 @@ use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_core::BrokerError;
 use litebox_broker_protocol::process::ProcessExitStatus;
-use litebox_broker_vm_kernel::{Association, Broker, PendingRunnerAssociation, Wait};
+use litebox_broker_vm_kernel::{
+    Association, Binding, BrokerHandle, PendingRunnerAssociation, Wait,
+};
 use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::envelope::Envelope;
 use litebox_common_vm_abi::{
@@ -78,7 +80,7 @@ use litebox_common_vm_abi::{
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 #[cfg(doc)]
 use litebox_platform_vm_kernel::UserThreadState;
-use litebox_platform_vm_kernel::cpu::{self, CpuId};
+use litebox_platform_vm_kernel::cpu;
 use litebox_platform_vm_kernel::{AddressSpaceId, Instant, PinnedUserPages, RunEnd, VmKernel};
 use zerocopy::IntoBytes;
 
@@ -142,8 +144,6 @@ pub enum SpawnError {
     Map(Status),
     #[error("pinning the broker's memory failed: {0:?}")]
     Pin(litebox_common_linux::errno::Errno),
-    #[error("creating the broker process failed: {0:?}")]
-    Broker(BrokerError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,11 +189,10 @@ enum State {
     Dead(Dead),
 }
 
-/// A runner process, shared by its [`Scheduler`], its [`Process`] handle, if
-/// any, and, while one serves the process, a CPU's broker worker, behind its
-/// claim (see `claim`); a process clone not adopted yet, weakly, by its parent
-/// (see `fork`). Its address space is released once the last of them drops
-/// it.
+/// A runner process, shared by its [`Scheduler`] and its [`Process`] handle,
+/// if any, behind its claim (see `claim`); a process clone not adopted yet,
+/// weakly, by its parent (see `fork`). Its address space is released once the
+/// last of them drops it, in the kernel: no broker thread holds the process.
 struct Inner {
     platform: &'static VmKernel,
     address_space: AddressSpaceId,
@@ -226,14 +225,6 @@ struct Inner {
     threads: RefCell<Vec<Arc<Thread>>>,
     /// The next [`Thread::id`].
     next_thread: Cell<u64>,
-    /// See [`Inner::broker_requester`].
-    broker_requester: Cell<u64>,
-    /// The CPU whose broker worker is suspended serving the process, set and
-    /// cleared by that CPU: the association is in use, so broker calls wait
-    /// ([`Self::broker_busy`]); only that CPU resumes the worker, while any
-    /// may run the process's threads (see `sched`). The one record of it,
-    /// mirrored in [`Owned::worker`] at each release.
-    worker: Cell<Option<CpuId>>,
     /// The process clone the process made that is not adopted yet, if any, with
     /// its ID (see `fork`), reached only through the clone's claim. Weak: the
     /// scheduler owns it, and forgets it once dead (see `sched`).
@@ -251,17 +242,17 @@ enum Suspended {
     No,
     /// Its slice ended, anywhere in ring 3; or, new, it has yet to run.
     Preempted,
-    /// In `Futex`'s Wake on the broker's requests, for the broker's worker;
-    /// it keeps its slice.
-    Yielded,
+    /// In a broker call (see [`BrokerCall`]).
+    InBroker(BrokerCall),
+    /// Its `BrokerHandshake`'s response was made, to return at `slot`.
+    Handshaken {
+        slot: u64,
+    },
     /// In `Futex`'s Wait on the broker's control ring: the scheduler polls
     /// the wait.
     Waiting(Wait),
     /// In `Futex`'s Wait elsewhere: the scheduler polls the wait.
     Futex(FutexWait),
-    /// Its broker call is to be made again, once the worker is done with
-    /// the process: it resumes at the call.
-    Retry,
     /// `Futex`, or a failed `Clone` of a process clone, returns this once
     /// the thread resumes.
     Woken(Result<(), Status>),
@@ -279,6 +270,21 @@ enum Suspended {
     /// An entry that gave up on the process's claim (see `Running::entry`),
     /// handled once the thread resumes.
     Replay(Entry),
+}
+
+/// A broker call that a broker thread serves (see `sched`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrokerCall {
+    /// A `Futex` on the control ring that bound the inbox: a Wake waits until
+    /// `binding` ended; a Wait (`then`) only for itself, from the call's
+    /// handoff on, while the binding's thread works on apart from it.
+    Futex {
+        binding: Binding,
+        then: Option<Wait>,
+    },
+    /// The `BrokerHandshake`, whose response goes to `slot`: it waits for the
+    /// response, which the inbox's broker thread makes.
+    Handshake { slot: u64 },
 }
 
 /// A kernel entry of a running thread, from the context the thread saved.
@@ -344,10 +350,8 @@ impl GiveUp {
 /// Dropping it [finishes](Self::finish) it.
 ///
 /// Its methods, but [`Self::is_stopped`] and [`Self::identity`], take the
-/// process's claim (see `claim`), waiting while another CPU holds it (e.g.,
-/// serving its broker requests): call them between the scheduler's steps,
-/// holding nothing the processes' broker work may take (see
-/// `sched::Scheduler::claim`).
+/// process's claim (see `claim`), waiting while another CPU holds it: call
+/// them between the scheduler's steps, holding no claim.
 pub struct Process {
     owned: Arc<Owned>,
     scheduler: Scheduler,
@@ -370,7 +374,7 @@ impl Process {
     pub fn spawn(
         scheduler: &Scheduler,
         platform: &'static VmKernel,
-        broker: &Broker,
+        broker: &BrokerHandle,
         config: &ProcessConfig<'_>,
     ) -> Result<Self, SpawnError> {
         // Frees the memory of those that died (e.g., dropped ones) first.
@@ -493,7 +497,6 @@ impl Process {
         if process.dead().is_none() {
             process.die(Dead::Finished);
         }
-        // E.g., for the worker suspended serving it.
         process.share();
     }
 
@@ -509,9 +512,8 @@ impl Process {
         Dead::Killed(reason)
     }
 
-    /// See [`Scheduler::claim`].
     fn claim(&self) -> Claim<'_> {
-        self.scheduler.claim(&self.owned)
+        self.owned.claim()
     }
 }
 
@@ -523,11 +525,11 @@ impl Drop for Process {
 
 impl Inner {
     /// With `launch`, the process is a launched one (see
-    /// [`Broker::associate`]). Leaves the kernel's address space current (see
-    /// the crate docs).
+    /// [`BrokerHandle::associate`]). Leaves the kernel's address space current
+    /// (see the crate docs).
     fn spawn(
         platform: &'static VmKernel,
-        broker: &Broker,
+        broker: &BrokerHandle,
         config: &ProcessConfig<'_>,
         launch: Option<PendingRunnerAssociation>,
     ) -> Result<Self, SpawnError> {
@@ -550,7 +552,7 @@ impl Inner {
     fn populate(
         platform: &'static VmKernel,
         address_space: AddressSpaceId,
-        broker: &Broker,
+        broker: &BrokerHandle,
         config: &ProcessConfig<'_>,
         launch: Option<PendingRunnerAssociation>,
     ) -> Result<Self, SpawnError> {
@@ -576,7 +578,7 @@ impl Inner {
             pin_broker_memory(platform, address_space, &mappings, Placement::NoReplace)?;
         let broker = broker
             .associate(shared_memory, control_ring, launch)
-            .map_err(SpawnError::Broker)?;
+            .map_err(SpawnError::Map)?;
         let images = map_images(&mappings, config.images)?;
 
         let info = StartupInfo {
@@ -625,8 +627,6 @@ impl Inner {
             shared: Cell::new(false),
             threads: RefCell::new(alloc::vec![new_thread(Thread::main(layout::UPCALL_STACK))]),
             next_thread: Cell::new(thread::MAIN + 1),
-            broker_requester: Cell::new(thread::MAIN),
-            worker: Cell::new(None),
             pending_clone: RefCell::new(None),
             next_clone: Cell::new(1),
             // Armed so before any CPU may run the process.
@@ -652,12 +652,6 @@ impl Inner {
         }
     }
 
-    /// Not running, so its deadline is not to interrupt anything (e.g., the
-    /// kernel's halts, or the next process); re-armed as it resumes.
-    fn deactivate(&self) {
-        self.timer.arm(None);
-    }
-
     /// Ring 3 can set any FS base (FSGSBASE is enabled); one that
     /// `activate_thread` could not restore kills a live process.
     fn save_fs_base(&self, thread: &Thread, fs_base: usize) {
@@ -679,14 +673,11 @@ impl Inner {
     /// Creates a runner process for each child this process started since the
     /// last call (see [`Association::take_pending_associations`]), adding it to
     /// `spawned`, or adopts the process clone it was started with as its runner
-    /// (see `fork`), and fails the start of those it cannot. Returns whether
-    /// there were any: either way, the requests that started them can complete.
-    /// Leaves the kernel's address space current if it creates a process.
-    pub(crate) fn spawn_launched(&self, spawned: &mut Vec<Self>) -> bool {
+    /// (see `fork`), and fails the start of those it cannot. Leaves the
+    /// kernel's address space current if it creates a process.
+    pub(crate) fn spawn_launched(&self, spawned: &mut Vec<Self>) {
         let broker = self.broker.broker();
-        let launches = self.broker.take_pending_associations();
-        let started = !launches.is_empty();
-        for launch in launches {
+        for launch in self.broker.take_pending_associations() {
             if let Some(clone) = launch.clone_to_adopt() {
                 self.adopt(clone, launch);
                 continue;
@@ -702,12 +693,15 @@ impl Inner {
                 Err(error) => log::warn!("failed to spawn a launched process: {error}"),
             }
         }
-        started
     }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        debug_assert!(
+            !litebox_platform_vm_kernel::kthread::in_kthread(),
+            "a broker thread drops a process"
+        );
         // Safety: the kernel holds no references into user memory, and the
         // process never runs again.
         unsafe { release_address_space(self.platform, self.address_space) };
@@ -726,12 +720,15 @@ struct Activated {
 
 impl Activated {
     /// Ends the thread's run on the calling CPU, needing no claim: the
-    /// kernel's address space is current again, and the timer disarmed (see
-    /// [`Inner::deactivate`]). Returns the FS base the thread left, unchecked
-    /// (see [`Inner::save_fs_base`]).
-    fn end(self) -> usize {
+    /// kernel's address space is current again, and the timer disarmed, unless
+    /// `handoff`, whose broker run keeps it armed if for no later than its own
+    /// end (see `Kthread::run`), unwritten. Returns the FS base the thread
+    /// left, unchecked (see [`Inner::save_fs_base`]).
+    fn end(self, handoff: bool) -> usize {
         use litebox::platform::{ArchSpecificProvider as _, ArchSpecificRegister};
-        self.timer.arm(None);
+        if !handoff {
+            self.timer.arm(None);
+        }
         self.platform
             .get_arch_specific_register(&ArchSpecificRegister::FsBase)
             .expect("the platform supports FS")
@@ -1011,11 +1008,6 @@ impl Inner {
         );
     }
 
-    /// See [`Self::worker`].
-    fn broker_busy(&self) -> bool {
-        self.worker.get().is_some()
-    }
-
     /// The process has work another CPU may take (e.g., a runnable thread):
     /// the claim's release wakes the other idle CPUs.
     pub(crate) fn share(&self) {
@@ -1050,7 +1042,8 @@ impl Inner {
         // Others may have published to it (e.g., fired its timers).
         self.broker.poll_events();
         // That, or an interrupt during a halt in the kernel, may have made
-        // another due to run: a blocked thread, which it runs soon after (see `sched`).
+        // another due to run (see `sched`): a blocked thread, which it runs
+        // soon after, or a broker thread, at once.
         self.take_notified(thread);
         self.rearm_timer(thread);
         ContinueOperation::Resume
@@ -1067,13 +1060,14 @@ impl Inner {
         self.resume(thread)
     }
 
-    /// Suspends `thread` to make its call again (the gate's `syscall`) once
-    /// it resumes, as Linux restarts a call (`ERESTARTNOINTR`).
-    fn retry(thread: &Thread, ctx: &mut PtRegs) -> Flow {
-        ctx.rip -= 2;
-        ctx.rax = ctx.orig_rax;
-        thread.suspended.set(Suspended::Retry);
-        Flow::Stop
+    /// Resumes a thread from its handshake, whose response goes to `slot`.
+    fn resume_handshaken(&self, thread: &Thread, ctx: &mut PtRegs, slot: u64) -> ContinueOperation {
+        let reply = self
+            .broker
+            .take_handshake_reply()
+            .expect("a handshake's response is made");
+        let result = reply.and_then(|reply| copy_to_user(slot, reply.as_bytes()));
+        self.resume_call(thread, ctx, result)
     }
 
     fn dispatch(&self, thread: &Thread, ctx: &mut PtRegs) -> Flow {
@@ -1081,9 +1075,9 @@ impl Inner {
             return Flow::Return(Err(Status::UnknownCall));
         };
         // A process clone may make the handshake its inherited lockdown
-        // refuses while its association holds the response of the one the
-        // kernel made at adoption, which `Association::handshake` takes.
-        let exempt = id == CallId::BrokerHandshake && self.broker.holds_adoption_response();
+        // refuses while its association holds the response of the one its
+        // adoption makes, which its handshake takes.
+        let exempt = id == CallId::BrokerHandshake && self.broker.adoption_pending();
         if !self.lockdown.get().permits_call(id) && !exempt {
             return self.violation("call not allowed by the lockdown", id);
         }
@@ -1098,8 +1092,6 @@ impl Inner {
         };
         let slot = ctx.rdx as u64;
         match request {
-            // The worker is using the association (see `sched`).
-            Request::BrokerHandshake(_) if self.broker_busy() => Self::retry(thread, ctx),
             Request::Ready(_) | Request::ReplyAndWait(_)
                 if !thread.is_main() || self.live_threads() > 1 =>
             {
@@ -1162,7 +1154,16 @@ impl Inner {
             Request::Map(r) => respond(&r, slot, self.map(&r)),
             Request::Unmap(r) => respond(&r, slot, self.unmap(&r)),
             Request::Protect(r) => respond(&r, slot, self.protect(&r)),
-            Request::BrokerHandshake(r) => respond(&r, slot, self.broker.handshake(&r.0)),
+            // Its broker thread makes it (see `sched`).
+            Request::BrokerHandshake(r) => match self.broker.handshake(&r.0) {
+                Ok(()) => {
+                    thread
+                        .suspended
+                        .set(Suspended::InBroker(BrokerCall::Handshake { slot }));
+                    Flow::Stop
+                }
+                Err(status) => Flow::Return(Err(status)),
+            },
             Request::DeriveKey(r) => respond(&r, slot, self.derive_key(&r)),
             Request::Log(r) => respond(&r, slot, Self::log(&r)),
             Request::Exit(r) => {
@@ -1189,7 +1190,9 @@ impl Inner {
             }
             Request::Futex(r) => match self.futex(thread, &r) {
                 Ok(FutexFlow::Done(woken)) => respond(&r, slot, Ok(FutexReply { woken })),
-                // Its reply is ready, for a successful return.
+                // Its reply is ready, for a successful return; written after the
+                // call, which may read a word the slot overlaps. One that cannot
+                // be written returns the call, binding or not (see `on_syscall`).
                 Ok(FutexFlow::Block(suspended)) => {
                     match copy_to_user(slot, FutexReply { woken: 0 }.as_bytes()) {
                         Ok(()) => {
@@ -1199,7 +1202,6 @@ impl Inner {
                         Err(status) => Flow::Return(Err(status)),
                     }
                 }
-                Ok(FutexFlow::Retry) => Self::retry(thread, ctx),
                 Ok(FutexFlow::Failed) => {
                     self.kill("broker association failed");
                     Flow::Stop
@@ -1269,9 +1271,19 @@ impl Inner {
             self.upcall_entry().and(timer_deadline(
                 self.notified.get() || thread.kicked.get(),
                 self.armed_deadline.get(),
-                self.broker.next_timer_deadline(),
+                self.broker_deadline(thread),
             )),
         );
+    }
+
+    /// The broker's next deadline, unless it passed before `thread` was
+    /// picked: preempting for it would only pick `thread` again. The pick
+    /// weighed the source thread if the deadline was published by then;
+    /// otherwise its wake, or the [`QUANTUM`](sched::QUANTUM), ends the slice.
+    fn broker_deadline(&self, thread: &Thread) -> Option<Instant> {
+        self.broker
+            .next_timer_deadline()
+            .filter(|&deadline| deadline > thread.slice_start.get())
     }
 
     /// Arms the platform's timer for `deadline` or the end of `thread`'s time
@@ -1558,6 +1570,13 @@ impl Inner {
     /// A `syscall` of `thread`: a kernel call from the runner's gate, or a
     /// guest's, which is reflected.
     fn on_syscall(&self, thread: &Thread, ctx: &mut PtRegs) -> ContinueOperation {
+        // Every binding has its thread by the next entry (see `Flow::Return`
+        // below).
+        #[cfg(debug_assertions)]
+        assert!(
+            !self.broker.is_unthreaded(),
+            "a kernel call found the inbox bound with no thread"
+        );
         self.entries.set(self.entries.get() + 1);
         if !self.is_kernel_call(ctx) {
             // A guest syscall: reflect it.
@@ -1566,10 +1585,17 @@ impl Inner {
         }
         match self.dispatch(thread, ctx) {
             Flow::Return(result) => {
+                // A call that binds the inbox stops for its handoff (see
+                // `sched`); one that returns instead (e.g., its reply could
+                // not be written) leaves the binding to a queued thread.
+                self.broker.queue_unthreaded();
                 if let Err(status) = result {
                     log::debug!("kernel call {:#x} failed: {status:?}", ctx.orig_rax);
                 }
                 ctx.rax = Status::to_raw(result).trunc();
+                // A wake the call made may have marked this CPU to reschedule:
+                // the slice then ends at once.
+                self.take_notified(thread);
                 self.rearm_timer(thread);
                 ContinueOperation::Resume
             }
@@ -1597,9 +1623,9 @@ impl Inner {
     }
 
     /// An interrupt (e.g., the timer's, or a device's) stopped `thread`.
-    /// First has the broker look at the devices and fire its due timers, as
-    /// a kernel call would. Past its slice end, or once another may be due
-    /// to run (see `sched`), then preempts it; what is due is delivered
+    /// First has the broker look at the devices. Past its slice end, or the
+    /// broker's deadline (see [`Self::broker_deadline`]), or once another may
+    /// be due to run (see `sched`), then preempts it; what is due is delivered
     /// once it resumes. Otherwise delivers
     /// [`UpcallKind::Interrupt`] (quietly ignored before [`CallId::Ready`],
     /// like any upcall with no entry registered yet) if that published a
@@ -1618,11 +1644,10 @@ impl Inner {
         // Another may be due to run (see `sched`).
         self.take_notified(thread);
         let now = self.platform.now();
-        if thread
-            .slice_end
-            .get()
-            .is_some_and(|slice_end| now >= slice_end)
-        {
+        // Past the broker's deadline, the source thread is due to run, and
+        // publishes what is due.
+        let due = |deadline: Option<Instant>| deadline.is_some_and(|deadline| now >= deadline);
+        if due(thread.slice_end.get()) || due(self.broker_deadline(thread)) {
             thread.suspended.set(Suspended::Preempted);
             return ContinueOperation::Terminate;
         }
@@ -1630,7 +1655,7 @@ impl Inner {
         let deadline = timer_deadline(
             self.notified.get() || thread.kicked.get(),
             self.armed_deadline.get(),
-            self.broker.next_timer_deadline(),
+            self.broker_deadline(thread),
         );
         match InterruptAction::decide(deadline, now, on_upcall_stack) {
             // The slice end, if any, may still be armed.
@@ -1863,12 +1888,12 @@ impl<'a, 't> Running<'a, 't> {
         );
         match thread.suspended.replace(Suspended::No) {
             Suspended::No => {}
-            Suspended::Waiting(_) | Suspended::Futex(_) => {
+            Suspended::Waiting(_) | Suspended::Futex(_) | Suspended::InBroker(_) => {
                 return inner.kill_and_stop("resumed while waiting");
             }
             Suspended::Forking { .. } => return inner.kill_and_stop("resumed while forking"),
-            Suspended::Preempted | Suspended::Retry => return inner.resume(thread),
-            Suspended::Yielded => return inner.resume_call(thread, ctx, Ok(())),
+            Suspended::Preempted => return inner.resume(thread),
+            Suspended::Handshaken { slot } => return inner.resume_handshaken(thread, ctx, slot),
             Suspended::Woken(result) => return inner.resume_call(thread, ctx, result),
             Suspended::Cloned { slot, thread: id } => {
                 return inner.resume_cloned(thread, ctx, slot, id);
@@ -1931,7 +1956,7 @@ impl EnterShim for Running<'_, '_> {
         if info.kernel_mode {
             // Safety: the fault interrupted this CPU, which, if it holds the
             // claim (e.g., in a thread's entry, where alone the kernel
-            // touches user memory: the broker's worker reaches it through
+            // touches user memory: the broker's threads reach it through
             // pinned pages), holds it until the fault returns.
             let inner = unsafe { self.process.claimed() };
             return if let Some(inner) = inner

@@ -22,9 +22,8 @@
 //!
 //! Each CPU has its own local APIC, so its own timer; devices interrupt the
 //! boot CPU. The interrupt handler only ends the interrupt, noting a device's
-//! for every CPU and waking the other idle ones; the broker looks at the
-//! devices when it next runs, which, if the interrupt stopped a process, the
-//! shim has it do at once (see `litebox_platform_vm_kernel`). A wake IPI only
+//! and waking the other idle CPUs; the first CPU to look at the devices then
+//! ([`Events::poll`]) wakes the threads that wait for one. A wake IPI only
 //! ends a halt, or has a CPU running a process enter the kernel. A TLB-flush
 //! IPI is only a doorbell: the platform flushes before the handler runs, and a
 //! process it interrupted resumes at once.
@@ -34,7 +33,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::fs::fuse::transport as fuse;
 use litebox_broker_core::stdio::StdioOutputStream;
@@ -47,12 +46,15 @@ use litebox_broker_vm_kernel::Events;
 use litebox_broker_vm_kernel::share::Share;
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
-use litebox_hal::devices::{self as hal, ConsoleDevice, FuseDevice, NetworkDevice, VsockDevice};
+use litebox_hal::devices::{
+    self as hal, ConsoleDevice, FuseDevice, NetworkDevice, Polled, VsockDevice,
+};
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_hal::virtio::fs::Shared as FuseShared;
 use litebox_platform::buffer::RawBytes;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
+use litebox_platform_vm_kernel::kthread::{self, Prepared, WaitQueue};
 use litebox_platform_vm_kernel::preempt::{KernelMutex, KernelMutexGuard};
 use litebox_platform_vm_kernel::{Handled, Instant, VmKernel};
 use litebox_shim_vm_kernel::ProcessTimer;
@@ -60,9 +62,13 @@ use litebox_shim_vm_kernel::ProcessTimer;
 /// How long a share's server may take to answer a request before the share
 /// fails.
 const SHARE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How often a share waiting for its server is polled, whether or not it
-/// interrupts (see [`FuseShare`]).
+/// How often a share waiting for its server is polled: outside kernel
+/// threads whether or not it interrupts, and in them only if it does not (see
+/// [`Devices::wait_for_share`]).
 const SHARE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// How long a kernel thread polls a share for its answer before it sleeps:
+/// longer than most of the server's round trips.
+const SHARE_SPIN: Duration = Duration::from_micros(250);
 
 /// The local APIC's timer.
 const TIMER_VECTOR: u8 = 0x30;
@@ -124,9 +130,10 @@ pub struct Devices {
     /// (see [`armed`]), so it can skip rewriting it: under KVM each write is
     /// a VM exit, and it rearms before every resume of a process.
     armed: [AtomicU64; MAX_CPUS],
-    /// Bit `i`: a device interrupted since CPU `i`'s last
-    /// [`Events::take_device_interrupt`].
-    device_interrupted: AtomicU64,
+    /// A device interrupted since the last [`Events::poll`].
+    device_interrupted: AtomicBool,
+    /// The kernel threads that wait for a device.
+    waiters: WaitQueue,
 }
 
 /// [`Devices::armed`]'s value for `deadline`: zero for none (the instant zero,
@@ -183,7 +190,8 @@ impl Devices {
             vsock_interrupts: vsock.as_ref().is_some_and(VsockDevice::interrupts),
             vsock: vsock.map(KernelMutex::new),
             armed: [const { AtomicU64::new(ARMED_UNKNOWN) }; MAX_CPUS],
-            device_interrupted: AtomicU64::new(0),
+            device_interrupted: AtomicBool::new(false),
+            waiters: WaitQueue::new(),
             console: KernelMutex::new(console),
         }));
         litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|cpu, vector| {
@@ -272,14 +280,35 @@ impl Devices {
         shares
     }
 
+    /// A kernel thread's poll of a share for its answer (see
+    /// [`FuseDevice::transmit_polled`]): for up to [`SHARE_SPIN`] from now,
+    /// while the thread's run is not due to end.
+    fn share_poll(&self) -> impl FnMut() -> bool {
+        let platform = self.platform;
+        let end = platform.now().checked_add(SHARE_SPIN);
+        move || end.is_some_and(|end| platform.now() < end) && !kthread::yield_due()
+    }
+
     /// Polls `done` until it has a result, for at most [`SHARE_TIMEOUT`]:
-    /// `None` if it has none by then. Waits in [`Self::halt`] between polls.
-    fn wait_for_share<R>(&self, mut done: impl FnMut() -> Option<R>) -> Option<R> {
+    /// `None` if it has none by then. In a kernel thread, it sleeps between
+    /// polls on the devices' queue, registered before each look (`prepared`,
+    /// if the caller registered before its own last look), until the devices'
+    /// interrupt, or, for a device that does not `interrupt`, its next poll.
+    /// Otherwise (at boot or shutdown, when no kernel thread exists), it halts
+    /// ([`Self::halt`]).
+    fn wait_for_share<R>(
+        &self,
+        interrupts: bool,
+        prepared: Option<Prepared<'_>>,
+        mut done: impl FnMut() -> Option<R>,
+    ) -> Option<R> {
         let platform = self.platform;
         let deadline = platform
             .now()
             .checked_add(SHARE_TIMEOUT)
             .expect("the clock is far from overflowing");
+        let mut prepared =
+            kthread::in_kthread().then(|| prepared.unwrap_or_else(|| self.waiters.prepare()));
         loop {
             if let Some(result) = done() {
                 return Some(result);
@@ -288,14 +317,22 @@ impl Devices {
             if now >= deadline {
                 return None;
             }
-            // Until the device answers; nothing else runs on this CPU
-            // meanwhile (and, while the CPU has a wakeup to acknowledge, this
-            // polls).
-            let wake = match now.checked_add(SHARE_POLL_INTERVAL) {
+            let poll = match now.checked_add(SHARE_POLL_INTERVAL) {
                 Some(poll) if poll < deadline => poll,
                 _ => deadline,
             };
-            self.halt(Some(wake));
+            match prepared.take() {
+                Some(registered) => {
+                    registered.sleep(Some(if interrupts { deadline } else { poll }));
+                    // Before the look: an interrupt's wake after it ends the
+                    // sleep.
+                    prepared = Some(self.waiters.prepare());
+                }
+                // Until the device answers; nothing else runs on this CPU
+                // meanwhile (and, while the CPU has a wakeup to acknowledge,
+                // this polls).
+                None => self.halt(Some(poll)),
+            }
         }
     }
 
@@ -307,10 +344,9 @@ impl Devices {
             // fire) must reprogram it. Only `cpu`'s: another CPU's timer may
             // still be armed for an earlier deadline.
             TIMER_VECTOR => self.armed[cpu.index()].store(ARMED_UNKNOWN, Ordering::Relaxed),
-            // The other idle CPUs step again, to poll the devices (this one,
-            // the boot CPU, is already in).
+            // The other idle CPUs step again, to look at the devices.
             DEVICE_VECTOR => {
-                self.device_interrupted.store(u64::MAX, Ordering::SeqCst);
+                self.device_interrupted.store(true, Ordering::SeqCst);
                 cpu::wake_idle(CpuId::BOOT);
             }
             WAKE_VECTOR => {}
@@ -393,10 +429,16 @@ impl Events for Devices {
         true
     }
 
-    fn take_device_interrupt(&self) -> bool {
-        let bit = 1 << cpu::current().index();
-        self.device_interrupted.load(Ordering::SeqCst) & bit != 0
-            && self.device_interrupted.fetch_and(!bit, Ordering::SeqCst) & bit != 0
+    /// After the device wrote what it interrupted for: so a thread that
+    /// registers after the wake, then looks, sees it.
+    fn poll(&self) -> bool {
+        // A load first: no write to the shared line on every look.
+        let interrupted = self.device_interrupted.load(Ordering::Relaxed)
+            && self.device_interrupted.swap(false, Ordering::SeqCst);
+        if interrupted {
+            self.waiters.wake(usize::MAX);
+        }
+        interrupted
     }
 }
 
@@ -601,15 +643,12 @@ const _: () = {
     assert!(FuseDevice::OUT_HEADER_SIZE == fuse::OUT_HEADER_SIZE);
 };
 
-/// A share's virtio-fs device: a request at a time, waiting for its reply in
-/// [`Devices::halt`], not suspending the worker: the FUSE client holds its
-/// lock across the round trip, and while the worker is suspended, the kernel
-/// may take it (e.g., ending another process's association closes its files),
-/// which nothing on that CPU would release. Polled even if it interrupts: its
-/// interrupt goes to the boot CPU, which wakes this one for it (see
-/// [`Devices::on_interrupt`]) only as it takes interrupts, which it may not
-/// for a while, running kernel code (e.g., creating or freeing a process's
-/// address space, or spinning for a spin lock).
+/// A share's virtio-fs device: a request at a time, the FUSE client holding
+/// its lock across the round trip. In a kernel thread, it polls for the reply
+/// for up to [`SHARE_SPIN`], with the device's interrupt off, then sleeps
+/// until the devices' interrupt, or its next poll. Otherwise (at boot or
+/// shutdown), it halts, polling every [`SHARE_POLL_INTERVAL`] (see
+/// [`Devices::wait_for_share`]).
 struct FuseShare {
     devices: &'static Devices,
     device: FuseDevice,
@@ -619,14 +658,19 @@ struct FuseShare {
 }
 
 impl FuseShare {
-    /// Polls `done`, as [`Devices::wait_for_share`]; on a timeout, the share
-    /// fails.
+    /// Polls `done`, as [`Devices::wait_for_share`], `prepared` before the
+    /// caller's last look, if it looked; on a timeout, the share fails.
     fn wait<R>(
         &mut self,
+        prepared: Option<Prepared<'static>>,
         mut done: impl FnMut(&mut FuseDevice) -> Option<R>,
     ) -> Result<R, fuse::TransportError> {
+        let interrupts = self.device.interrupts();
         let device = &mut self.device;
-        if let Some(result) = self.devices.wait_for_share(|| done(device)) {
+        let waited = self
+            .devices
+            .wait_for_share(interrupts, prepared, || done(device));
+        if let Some(result) = waited {
             return Ok(result);
         }
         litebox_util_log::warn!(
@@ -678,10 +722,25 @@ impl fuse::Transport for FuseShare {
         raw_bytes(buffer)
             .subrange(0..request.len())
             .copy_from_slice(request);
-        if !self.device.transmit(request.len(), payload, room) {
+        let len = if kthread::in_kthread() {
+            let devices = self.devices;
+            let prepare = || devices.waiters.prepare();
+            let poll = devices.share_poll();
+            match self
+                .device
+                .transmit_polled(request.len(), payload, room, poll, prepare)
+            {
+                None => return Err(fuse::TransportError),
+                Some(Polled::Received(len)) => len,
+                Some(Polled::Waiting(prepared)) => {
+                    self.wait(Some(prepared), FuseDevice::receive)?
+                }
+            }
+        } else if self.device.transmit(request.len(), payload, room) {
+            self.wait(None, FuseDevice::receive)?
+        } else {
             return Err(fuse::TransportError);
-        }
-        let len = self.wait(FuseDevice::receive)?;
+        };
         // As much of the header as the device reports; the rest reads as
         // zeros, as the client expects.
         let mut header = [0; fuse::OUT_HEADER_SIZE];
@@ -699,12 +758,14 @@ impl fuse::Transport for FuseShare {
     }
 
     /// Waits for the device to take the last request without a reply, whose
-    /// buffer this one needs, but not for it to take this one.
+    /// buffer this one needs, but not for it to take this one. The device
+    /// interrupts as it takes one (that queue's interrupt is never turned
+    /// off), so a kernel thread waits for that without polling first.
     fn send(&mut self, request: &[u8]) -> Result<(), fuse::TransportError> {
         if self.failed || request.len() > FuseDevice::MAX_ONEWAY_SIZE {
             return Err(fuse::TransportError);
         }
-        self.wait(|device| device.oneway_done().then_some(()))?;
+        self.wait(None, |device| device.oneway_done().then_some(()))?;
         let buffer = self.device.oneway().expect("the device took the last one");
         raw_bytes(buffer)
             .subrange(0..request.len())
