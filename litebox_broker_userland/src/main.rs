@@ -227,6 +227,11 @@ where
     let in_mem = in_mem.with_shared_memory(Arc::new(
         litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider,
     ));
+    // On Windows they move into temporary files, of which every mapping maps a section.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let in_mem = in_mem.with_shared_memory(Arc::new(
+        litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider,
+    ));
     let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
             Overlay::<Platform>::new(

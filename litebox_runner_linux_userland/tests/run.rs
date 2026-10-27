@@ -1192,7 +1192,9 @@ fn shared_file_mappings_are_shared_across_fork_and_processes() {
 
     let output = String::from_utf8(runner.output()).unwrap();
     assert!(
-        output.lines().any(|line| line == "shared-file failures=0"),
+        output
+            .lines()
+            .any(|line| line == "shared-file failures=0 shrink=ok"),
         "{output}"
     );
 }

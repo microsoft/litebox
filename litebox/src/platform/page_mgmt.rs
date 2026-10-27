@@ -509,8 +509,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Err(CowAllocationError::UnsupportedByPlatform)
     }
 
-    /// Returns whether [`Self::try_map_shared_object`] can map host shared objects that the
-    /// broker hands this process.
+    /// Returns whether this platform can map host shared objects that the broker hands this
+    /// process, with [`Self::try_map_shared_object`] or [`Self::commit_shared_object`].
     ///
     /// Callers must check this before asking the broker for an object, since the broker
     /// delivers each object only once. The default implementation returns `false`.
@@ -520,6 +520,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 
     /// Maps the host shared object that the broker delivered under `token`, starting at its
     /// byte `offset`, over exactly `range` with `permissions`.
+    ///
+    /// Platforms whose mappings need no reservation handles implement this; platforms that track
+    /// reservations implement [`Self::commit_shared_object`] instead.
     ///
     /// Every mapping of the same object, in this or any other process, shares its pages, and a
     /// native fork child keeps sharing them. The platform takes the delivered object whether or
@@ -549,10 +552,49 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     {
         Err(AllocationError::UnsupportedByPlatform)
     }
+
+    /// Backs the reserved but unbacked `range`, within live reservations, with the host shared
+    /// object that the broker delivered under `token`, starting at its byte `offset`, with
+    /// `permissions`.
+    ///
+    /// This is [`Self::try_map_shared_object`] for platforms that track reservations, as
+    /// [`Self::commit_pages`] is to [`Self::reserve_and_commit_pages`]. Every mapping of the same
+    /// object, in this or any other process, shares its pages, and a native fork child keeps
+    /// sharing them. Accessing a page past the end of the object faults.
+    ///
+    /// The platform takes the delivered object whether or not the mapping succeeds; the caller
+    /// must not map `token` again. On failure, `range` remains reserved and unbacked.
+    ///
+    /// # Safety
+    ///
+    /// The supplied reservations must collectively cover `range`, which must have no backing, and
+    /// the caller must exclude its users.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    unsafe fn commit_shared_object<'reservation, Reservations>(
+        &self,
+        covering_reservations: impl FnOnce() -> Reservations,
+        range: Range<usize>,
+        token: SharedObjectToken,
+        offset: u64,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), AllocationError>
+    where
+        Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
+        ReservationOf<Self, ALIGN>: 'reservation,
+    {
+        Err(AllocationError::UnsupportedByPlatform)
+    }
+
+    /// Releases the host shared object that the broker delivered under `token`, for a caller
+    /// that will not map it after all.
+    ///
+    /// The default implementation does nothing.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn release_shared_object(&self, token: SharedObjectToken) {}
 }
 
 /// Names a host shared object that the broker delivered to this process out of band, such as a
-/// memfd backing a shared file. See [`PageManagementProvider::try_map_shared_object`].
+/// memfd or section backing a shared file. See [`PageManagementProvider::try_map_shared_object`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedObjectToken(pub u64);
 

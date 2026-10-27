@@ -1014,6 +1014,7 @@ fn file_truncate_error(error: TruncateError) -> FileError {
         TruncateError::NotForWriting => FileError::NotForWriting,
         TruncateError::NotOpenForWriting => FileError::PathOnly,
         TruncateError::IsTerminalDevice => FileError::IsTerminalDevice,
+        TruncateError::Busy => FileError::Busy,
         TruncateError::ClosedFd | TruncateError::Io => FileError::Io,
     }
 }

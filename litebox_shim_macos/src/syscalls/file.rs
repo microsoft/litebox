@@ -284,6 +284,7 @@ fn open_error(error: OpenError) -> Errno {
             TruncateError::IsDirectory => Errno::EISDIR,
             TruncateError::NotForWriting => Errno::EACCES,
             TruncateError::NotOpenForWriting | TruncateError::IsTerminalDevice => Errno::EINVAL,
+            TruncateError::Busy => Errno::EBUSY,
             TruncateError::Io => Errno::EIO,
         },
         _ => Errno::EIO,

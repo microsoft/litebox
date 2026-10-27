@@ -5,6 +5,10 @@
 // read/write/ftruncate on the file, with a forked child, and with an unrelated process started
 // through execve. Run with this program's own path as the argument to include the exec check;
 // it reruns itself with "child" to act as that process.
+//
+// Windows hosts cannot shrink a file while it is mapped, so there ftruncate fails with EBUSY
+// instead. The summary line reports which behavior the host showed as "shrink=ok" or
+// "shrink=busy", for the caller to check.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -21,6 +25,7 @@
 #include <unistd.h>
 
 #define PATH "/tmp/shared-file-mapping"
+#define SHORT_PATH "/tmp/shared-file-mapping-short"
 #define INCREMENTS 100000
 
 struct shared {
@@ -71,6 +76,15 @@ static void on_bus(int signal) {
     siglongjmp(bus_jump, 1);
 }
 
+// Returns whether reading `address` raises SIGBUS.
+static int raises_bus(const char *address) {
+    if (sigsetjmp(bus_jump, 1) == 0) {
+        (void)*(volatile const char *)address;
+        return 0;
+    }
+    return 1;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc >= 2 && strcmp(argv[1], "child") == 0) {
@@ -86,7 +100,7 @@ int main(int argc, char **argv) {
     struct shared *shared = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     CHECK(shared != MAP_FAILED);
     if (shared == MAP_FAILED) {
-        printf("shared-file failures=%d\n", failures);
+        printf("shared-file failures=%d shrink=unknown\n", failures);
         return 1;
     }
     char *bytes = (char *)shared;
@@ -168,32 +182,47 @@ int main(int argc, char **argv) {
         CHECK(shared->counter == 3 * INCREMENTS);
     }
 
-    // Truncation discards the pages past the new end, and growing the file again exposes
-    // zeros.
-    CHECK(ftruncate(fd, page) == 0);
-    CHECK(ftruncate(fd, 2 * page) == 0);
-    CHECK(bytes[page] == 0);
-    CHECK(pwrite(fd, "again", 6, page) == 6);
-    CHECK(strcmp(bytes + page, "again") == 0);
-
-    // Accessing a mapped page past the end of the file raises SIGBUS.
-    CHECK(ftruncate(fd, page) == 0);
     struct sigaction action = {0};
     action.sa_handler = on_bus;
     CHECK(sigaction(SIGBUS, &action, NULL) == 0);
-    volatile int bus = 0;
-    if (sigsetjmp(bus_jump, 1) == 0) {
-        (void)*(volatile char *)(bytes + page);
+
+    // Truncation discards the pages past the new end, and growing the file again exposes
+    // zeros. Accessing a mapped page past the end of the file raises SIGBUS.
+    errno = 0;
+    int shrunk = ftruncate(fd, page) == 0;
+    if (shrunk) {
+        CHECK(ftruncate(fd, 2 * page) == 0);
+        CHECK(bytes[page] == 0);
+        CHECK(pwrite(fd, "again", 6, page) == 6);
+        CHECK(strcmp(bytes + page, "again") == 0);
+        CHECK(ftruncate(fd, page) == 0);
+        CHECK(raises_bus(bytes + page));
     } else {
-        bus = 1;
+        CHECK(errno == EBUSY);
     }
-    CHECK(bus == 1);
+
+    // A mapping that extends past the end of its file raises SIGBUS there too.
+    int short_fd = open(SHORT_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    CHECK(short_fd >= 0);
+    CHECK(ftruncate(short_fd, page / 2) == 0);
+    char *past_end = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, short_fd, 0);
+    CHECK(past_end != MAP_FAILED);
+    if (past_end != MAP_FAILED) {
+        // The rest of the last page is accessible and zero, as on Linux.
+        past_end[0] = 'x';
+        CHECK(past_end[page - 1] == 0);
+        CHECK(!raises_bus(past_end + page / 2));
+        CHECK(raises_bus(past_end + page));
+        CHECK(munmap(past_end, 2 * page) == 0);
+    }
+    close(short_fd);
+    unlink(SHORT_PATH);
 
     CHECK(munmap(reader, page) == 0);
     CHECK(munmap(shared, 2 * page) == 0);
     close(read_only);
     close(fd);
     unlink(PATH);
-    printf("shared-file failures=%d\n", failures);
+    printf("shared-file failures=%d shrink=%s\n", failures, shrunk ? "ok" : "busy");
     return failures != 0;
 }
