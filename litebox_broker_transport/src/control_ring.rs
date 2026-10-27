@@ -809,10 +809,10 @@ pub struct ControlRingProducer<Memory: ControlRingMemory> {
 ///
 /// This handle intentionally exposes neither the backing memory nor endpoint
 /// state. Concrete transports use it to interrupt a ring wait provided by
-/// [`WaitableSharedMemory`] when liveness or cancellation state changes. It is
-/// public so that transport bindings outside this crate, such as the endpoints
-/// in `litebox_broker_transport_linux_userland`, can interrupt ring waits
-/// without gaining access to ring memory.
+/// [`WaitableSharedMemory`] when liveness or cancellation state changes, as the
+/// `std`-only `ring_association` endpoints do on failure or peer close. It is
+/// public so that transport bindings outside this crate can interrupt ring
+/// waits without gaining access to ring memory.
 pub struct ControlRingWakeHandle<Memory: ControlRingMemory> {
     ring: Arc<ControlRing<Memory>>,
     wake_offset: usize,
