@@ -349,7 +349,7 @@ pub struct BrokerCore {
     pub(crate) fs: Arc<dyn FileService>,
     /// Terminal that the first root process's session acquires when that
     /// process starts.
-    pub(crate) initial_terminal: Arc<Mutex<Option<Arc<dyn terminal::TerminalEndpoint>>>>,
+    pub(crate) terminal: Arc<Mutex<Option<Arc<dyn terminal::TerminalEndpoint>>>>,
     /// Which terminal controls which session.
     pub(crate) controlling_terminals: Arc<process_group::ControllingTerminals>,
     pub(crate) socket_ports: BrokerSocketPorts,
@@ -417,7 +417,7 @@ impl BrokerCore {
             socket_provider,
             timer_provider,
             fs,
-            initial_terminal: Arc::new(Mutex::new(None)),
+            terminal: Arc::new(Mutex::new(None)),
             controlling_terminals: Arc::default(),
             socket_ports: BrokerSocketPorts::default(),
             process_lifecycle_sink: Arc::new(NoopProcessLifecycleSink),
@@ -430,7 +430,7 @@ impl BrokerCore {
     /// `/dev/tty`. Set it before sharing the core.
     #[must_use]
     pub fn with_terminal(self, terminal: Arc<dyn terminal::TerminalEndpoint>) -> Self {
-        *self.initial_terminal.lock() = Some(terminal);
+        *self.terminal.lock() = Some(terminal);
         self
     }
 
@@ -570,7 +570,7 @@ impl BrokerCore {
         match process.create_initial_thread() {
             Ok(()) => {
                 if parent_id.is_none() {
-                    let terminal = self.initial_terminal.lock().take();
+                    let terminal = self.terminal.lock().take();
                     if let Some(terminal) = terminal {
                         process_group::acquire(&process, &terminal);
                     }

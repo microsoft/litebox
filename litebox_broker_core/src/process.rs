@@ -931,13 +931,13 @@ impl BrokerProcess {
         // Children that cannot start without this process fail, as when its
         // owner dies.
         self.handle_owner_death();
-        let hangup = {
+        {
             let _tree = self.core.process_tree_lock.lock();
             self.state
                 .lock()
                 .status
                 .transition(ProcessStatus::Exited(exit_status))?;
-            let hangup = crate::process_group::leader_left(self);
+            crate::process_group::leader_left(self);
             let (parent, children) = {
                 let mut node = self.tree_node.lock();
                 node.exit_status = Some(exit_status);
@@ -960,10 +960,6 @@ impl BrokerProcess {
                 Self::adopt(adopter.as_ref(), child);
             }
             self.report_exit(parent.as_deref(), exit_status);
-            hangup
-        };
-        if let Some(hangup) = hangup {
-            hangup.deliver();
         }
         self.core.process_lifecycle_sink.changed();
         Ok(())
@@ -1093,7 +1089,7 @@ impl BrokerProcess {
         abnormal: bool,
         expected_shutdown: bool,
     ) -> Result<()> {
-        let (shutdown, hangup) = {
+        let shutdown = {
             let _tree = self.core.process_tree_lock.lock();
             let shutdown = {
                 let mut state = self.state.lock();
@@ -1117,13 +1113,10 @@ impl BrokerProcess {
                 }
                 state.shutdown.clone()
             };
-            let hangup = crate::process_group::leader_left(self);
+            crate::process_group::leader_left(self);
             self.release_unstarted();
-            (shutdown, hangup)
+            shutdown
         };
-        if let Some(hangup) = hangup {
-            hangup.deliver();
-        }
         // Release the child's references before publishing the failure.
         if self.release_references() {
             self.state.lock().retirement.mark_abnormal();
@@ -1156,7 +1149,6 @@ impl BrokerProcess {
         self.cancellation.cancel();
         let pending_child_process = self.state.lock().pending_child_process.take();
         let mut shutdowns = Vec::new();
-        let mut hangups = Vec::new();
         let changed = {
             // Child creation checks cancellation under the tree lock, so once
             // this lock is taken every child created for a live owner is
@@ -1168,7 +1160,7 @@ impl BrokerProcess {
                 let (failed, shutdown) = child.handle_parent_death();
                 shutdowns.extend(shutdown);
                 if failed {
-                    hangups.extend(crate::process_group::leader_left(child));
+                    crate::process_group::leader_left(child);
                 }
                 !failed
             });
@@ -1176,9 +1168,6 @@ impl BrokerProcess {
             self.tree_node.lock().children = children;
             changed
         };
-        for hangup in hangups {
-            hangup.deliver();
-        }
         if changed {
             self.core.process_lifecycle_sink.changed();
         }

@@ -375,53 +375,33 @@ impl TerminalEventSink for TerminalSink {
     }
 }
 
-/// A [`TerminalEvents::HANGUP`] owed to a session's foreground group once the
-/// process tree lock is released, along with the terminal that stopped
-/// controlling the session, if it had not hung up, which must not drop under
-/// that lock.
-#[must_use]
-pub(crate) struct Hangup {
-    targets: Vec<Arc<BrokerProcess>>,
-    _terminal: Option<Arc<dyn TerminalEndpoint>>,
-}
-
-impl Hangup {
-    pub(crate) fn deliver(self) {
-        for target in &self.targets {
+/// Ends the control of the session that `process` leads by its terminal, as
+/// `process` exits or fails to start, hanging up the session's foreground
+/// group, even if the terminal already hung up.
+///
+/// Callers hold the process tree lock.
+pub(crate) fn leader_left(process: &BrokerProcess) {
+    let session = process.membership().session;
+    if session != process.id().into() {
+        return;
+    }
+    let association = {
+        let mut associations = process.core.controlling_terminals.0.lock();
+        let Some(index) = associations
+            .iter()
+            .position(|association| association.session == session)
+        else {
+            return;
+        };
+        associations.swap_remove(index)
+    };
+    let foreground = association.foreground_group();
+    drop(association.release(&process.core.ids));
+    for target in process.core.registered_processes() {
+        if target.membership() == foreground {
             target.signals.post_terminal_events(TerminalEvents::HANGUP);
         }
     }
-}
-
-/// Ends the control of the session that `process` leads by its terminal, as
-/// `process` exits or fails to start, returning the hang-up owed to the
-/// session's foreground group, which it owes even if the terminal already hung
-/// up.
-///
-/// Callers hold the process tree lock, and deliver the hang-up after releasing
-/// it.
-pub(crate) fn leader_left(process: &BrokerProcess) -> Option<Hangup> {
-    let session = process.membership().session;
-    if session != process.id().into() {
-        return None;
-    }
-    let (foreground, terminal) = {
-        let mut associations = process.core.controlling_terminals.0.lock();
-        let index = associations
-            .iter()
-            .position(|association| association.session == session)?;
-        let association = associations.swap_remove(index);
-        (
-            association.foreground_group(),
-            association.release(&process.core.ids),
-        )
-    };
-    let mut targets = process.core.registered_processes();
-    targets.retain(|target| target.membership() == foreground);
-    Some(Hangup {
-        targets,
-        _terminal: terminal,
-    })
 }
 
 /// Ends the control of the session that `process` led by its terminal, if it
@@ -921,7 +901,7 @@ mod tests {
         };
         let root = allocate(None).unwrap();
         root.complete_start().unwrap();
-        let terminal = broker.initial_terminal.lock().take().unwrap();
+        let terminal = broker.terminal.lock().take().unwrap();
         super::acquire(&root, &terminal);
         let tty = open(&root, "/dev/tty", FileOpenFlags::NONE);
         let job = allocate(Some(&root)).unwrap();
