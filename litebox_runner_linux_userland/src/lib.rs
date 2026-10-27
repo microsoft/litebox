@@ -288,7 +288,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 prev_user = mode_and_user.1;
             }
             let last = ancestor_modes_and_users.last().ok_or_else(|| {
-                anyhow!("{} path has no ancestor directories (is it the root path?)", prog.display())
+                anyhow!(
+                    "{} path has no ancestor directories (is it the root path?)",
+                    prog.display()
+                )
             })?;
             entries.push((
                 prog.to_str().unwrap().to_owned(),
