@@ -105,14 +105,23 @@ impl Virtio9p {
         self.tag.as_deref()
     }
 
-    /// Queues `message`, one whole 9P request; false if one is in flight.
+    /// Queues `message`, one whole 9P request, the device to interrupt as it
+    /// answers if `interrupt` (see [`Self::enable_interrupts`]); false if one
+    /// is in flight.
     ///
     /// # Panics
     ///
     /// If `message` is empty or longer than [`MAX_MESSAGE_SIZE`].
-    pub fn transmit(&mut self, message: &[u8]) -> bool {
+    pub fn transmit(&mut self, message: &[u8], interrupt: bool) -> bool {
         if self.in_flight.is_some() {
             return false;
+        }
+        // Before the request, which the device may answer at once.
+        if interrupt {
+            // Nothing is in flight, so nothing was answered meanwhile.
+            let _ = self.queue.enable_interrupts();
+        } else {
+            self.queue.disable_interrupts();
         }
         let len = u32::try_from(message.len())
             .ok()
@@ -139,6 +148,14 @@ impl Virtio9p {
         self.in_flight = Some(head);
         self.transport.notify(&self.queue);
         true
+    }
+
+    /// Asks the device to interrupt as it answers: whether it answered
+    /// meanwhile, which it may not interrupt for (see
+    /// [`VirtQueue::enable_interrupts`]).
+    #[must_use]
+    pub fn enable_interrupts(&mut self) -> bool {
+        self.queue.enable_interrupts()
     }
 
     /// The response's length, once the device answered the request in
@@ -171,6 +188,30 @@ impl Drop for Virtio9p {
             ManuallyDrop::drop(&mut self.request);
             ManuallyDrop::drop(&mut self.response);
         }
+    }
+}
+
+#[cfg(test)]
+impl Virtio9p {
+    /// For host tests: one on `registers`, which must outlive it.
+    pub(crate) fn in_memory(registers: &super::queue::testing::Registers) -> Self {
+        use super::queue::testing::HeapHal;
+        let region = || ManuallyDrop::new(DmaRegion::new(&HeapHal, MAX_MESSAGE_SIZE).unwrap());
+        Self {
+            transport: registers.transport(),
+            queue: ManuallyDrop::new(
+                VirtQueue::new(&HeapHal, REQUEST_QUEUE, QUEUE_SIZE, 0).unwrap(),
+            ),
+            tag: None,
+            request: region(),
+            response: region(),
+            in_flight: None,
+        }
+    }
+
+    /// Its queue, on which the test plays the device.
+    pub(crate) fn queue(&self) -> &VirtQueue {
+        &self.queue
     }
 }
 
