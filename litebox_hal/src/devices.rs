@@ -63,6 +63,14 @@ impl ConsoleDevice {
         }
     }
 
+    /// Whether [`Self::write`] would take output now.
+    pub fn can_write(&mut self) -> bool {
+        match &mut self.0 {
+            Backend::Virtio(device) => device.can_write(),
+            Backend::Serial => true,
+        }
+    }
+
     /// Queues as much of `bytes` as the device takes now; returns how much.
     pub fn write(&mut self, bytes: &[u8]) -> usize {
         match &mut self.0 {

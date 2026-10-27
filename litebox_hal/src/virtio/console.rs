@@ -35,6 +35,10 @@ const RECEIVE_BUFFER_SIZE: usize = 256;
 const TRANSMIT_BUFFERS: u16 = 32;
 const TRANSMIT_BUFFER_SIZE: usize = 512;
 
+/// The most output the device holds at once, so the most one
+/// [`VirtioConsole::write`] takes.
+pub const TRANSMIT_CAPACITY: usize = TRANSMIT_BUFFERS as usize * TRANSMIT_BUFFER_SIZE;
+
 /// A live console. Not internally synchronized.
 pub struct VirtioConsole {
     transport: PciTransport,
@@ -100,12 +104,22 @@ impl VirtioConsole {
         &self.transport
     }
 
-    /// Queues as much of `bytes` as free transmit buffers hold; returns how
-    /// much. Zero means every buffer is still with the device.
-    pub fn write(&mut self, bytes: &[u8]) -> usize {
+    fn reclaim_transmitted(&mut self) {
         while let Some((buffer, _)) = self.transmit_buffers.take_used(&mut self.transmit) {
             self.transmit_buffers.free.push(buffer);
         }
+    }
+
+    /// Whether [`Self::write`] would take output now.
+    pub fn can_write(&mut self) -> bool {
+        self.reclaim_transmitted();
+        !self.transmit_buffers.free.is_empty()
+    }
+
+    /// Queues as much of `bytes` as free transmit buffers hold; returns how
+    /// much. Zero means every buffer is still with the device.
+    pub fn write(&mut self, bytes: &[u8]) -> usize {
+        self.reclaim_transmitted();
         let mut written = 0;
         while written < bytes.len() {
             let Some(buffer) = self.transmit_buffers.free.pop() else {
