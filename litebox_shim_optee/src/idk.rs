@@ -337,10 +337,10 @@ enum EcdsaCurve {
     P521 = 0x03,
 }
 
-pub fn generate_identity_signing_key<'a, Platform: crate::OpteeShimPlatform>(
+pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
     public_key_ptr: NormalWorldMutPtr<
-        'a,
+        '_,
         Platform,
         [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN],
         PAGE_SIZE,
@@ -367,10 +367,10 @@ pub fn generate_identity_signing_key<'a, Platform: crate::OpteeShimPlatform>(
 /// This function assumes that the caller prepares a buffer at the given physical
 /// address (in a single or contiguous physical memory page(s)) whose length is equal to
 /// or greater than `IDENTITY_SIGNING_PUBLIC_KEY_LEN`.
-fn generate_identity_signing_key_inner<'a, Platform: crate::OpteeShimPlatform>(
+fn generate_identity_signing_key_inner<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
     public_key_ptr: NormalWorldMutPtr<
-        'a,
+        '_,
         Platform,
         [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN],
         PAGE_SIZE,

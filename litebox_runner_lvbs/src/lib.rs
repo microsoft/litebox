@@ -361,7 +361,11 @@ fn exchange_secrets(platform: &'static Platform, request_pa: u64) -> i64 {
     }
 
     if public_key_len_ptr
-        .write_at_offset(0, IDENTITY_SIGNING_PUBLIC_KEY_LEN as u32)
+        .write_at_offset(
+            0,
+            u32::try_from(IDENTITY_SIGNING_PUBLIC_KEY_LEN)
+                .expect("IDK_S public key length fits in u32"),
+        )
         .is_err()
     {
         return Errno::EFAULT.as_neg().into();
