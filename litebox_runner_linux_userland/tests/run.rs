@@ -72,6 +72,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_shared_futex_parent.c",
     "fork_unix_parent.c",
     "gate_signals.c",
+    "native_tp.c",
     "inherited_ignored_signals.c",
     "process_group_parent.c",
     "process_tree_parent.c",
@@ -1130,8 +1131,8 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
         )
     };
 
-    // Mirrors the platform filter intersected with the shim filter, which drops pointer
-    // authentication under copy-based fork.
+    // Mirrors the platform filter intersected with the shim filter: copy-based fork drops pointer
+    // authentication, and PACGA mode drops the generic key it owns.
     let mut exposed =
         CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH | CpuFeatures::PAUTH_GENERIC;
     if common::guest_sve_vl().is_some() {
@@ -1139,6 +1140,9 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
     }
     if litebox_shim_linux::syscalls::process::COPY_BASED_FORK {
         exposed.remove(CpuFeatures::PAUTH | CpuFeatures::PAUTH_GENERIC);
+    }
+    if cfg!(feature = "aarch64_pacga") {
+        exposed.remove(CpuFeatures::PAUTH_GENERIC);
     }
     let host = LinuxHwcaps {
         hwcap: host_hwcap,

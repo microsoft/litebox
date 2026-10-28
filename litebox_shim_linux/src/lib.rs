@@ -41,13 +41,27 @@ use litebox_common_linux::{
 use litebox_platform::time::TimeProvider;
 use syscalls::signal::SyscallRestart;
 
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    feature = "aarch64_pacga",
+    feature = "aarch64_virtualize_x18"
+))]
+compile_error!("aarch64_pacga is incompatible with aarch64_virtualize_x18 on Linux AArch64");
+
 #[cfg(target_arch = "aarch64")]
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
     #[cfg(target_os = "macos")]
     let host = litebox_trampoline::TargetHost::MacOs;
     #[cfg(not(target_os = "macos"))]
     let host = litebox_trampoline::TargetHost::Linux;
-    litebox_syscall_rewriter::RewriteOptions::new(host, cfg!(feature = "aarch64_virtualize_x18"))
+    let options = litebox_syscall_rewriter::RewriteOptions::new(
+        host,
+        cfg!(feature = "aarch64_virtualize_x18"),
+    );
+    #[cfg(all(target_os = "linux", feature = "aarch64_pacga"))]
+    let options = options.with_native_tpidr_el0();
+    options
 }
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.

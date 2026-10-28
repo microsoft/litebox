@@ -2170,6 +2170,30 @@ pub fn decode_adrp_target(adrp: u32, pc: u64, rd: u8) -> Option<u64> {
     (pc & !PAGE_OFFSET_MASK).checked_add_signed(page_delta)
 }
 
+/// Checks whether a Linux-host trampoline has unfinalized thread-pointer offsets
+/// without modifying it. Already finalized thread-pointer offsets are accepted
+/// independently of their value.
+///
+/// # Errors
+///
+/// Rejects malformed slots and x18 gates.
+pub fn has_unfinalized_guest_tpidr_offsets(trampoline: &[u8]) -> Result<bool> {
+    let validation = validate_trampoline_offsets_with_layout(
+        trampoline,
+        None,
+        false,
+        GateLayout::linux(TargetHost::Linux),
+    )?;
+    if validation.has_x18_gate {
+        return Err(Error::TrampolinePatchFailure(
+            "AArch64 trampoline contains x18 gates or placeholders; use \
+             finalize_trampoline_gates_for_host"
+                .into(),
+        ));
+    }
+    Ok(!validation.patch_offsets.is_empty())
+}
+
 /// Validates and patches every thread-pointer gate in a Linux-host trampoline.
 /// Trampolines containing x18 gates must use
 /// [`finalize_trampoline_gates_for_host`].
@@ -2185,7 +2209,7 @@ pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<u
     validate_guest_offset(offset, false)?;
     let validation = validate_trampoline_offsets_with_layout(
         trampoline,
-        offset,
+        Some(offset),
         false,
         GateLayout::linux(TargetHost::Linux),
     )?;
@@ -2223,7 +2247,7 @@ pub fn finalize_trampoline_gates_for_host(
     validate_guest_offset(guest_tpidr_offset, false)?;
     let tp = validate_trampoline_offsets_with_layout(
         trampoline,
-        guest_tpidr_offset,
+        Some(guest_tpidr_offset),
         false,
         GateLayout::linux(host),
     )?;
@@ -2236,7 +2260,7 @@ pub fn finalize_trampoline_gates_for_host(
     };
     let x18 = validate_trampoline_offsets_with_layout(
         trampoline,
-        x18_patch_value,
+        Some(x18_patch_value),
         true,
         GateLayout::linux(host),
     )?;
@@ -2254,7 +2278,7 @@ pub fn finalize_macho_trampoline(
     validate_guest_offset(offset, false)?;
     let validation = validate_trampoline_offsets_with_layout(
         trampoline,
-        offset,
+        Some(offset),
         false,
         GateLayout::darwin(host),
     )?;
@@ -2318,7 +2342,7 @@ struct TrampolineValidation {
 
 fn validate_trampoline_offsets_with_layout(
     trampoline: &[u8],
-    expected_offset: u16,
+    expected_offset: Option<u16>,
     x18: bool,
     layout: GateLayout,
 ) -> Result<TrampolineValidation> {
@@ -2396,7 +2420,9 @@ fn validate_trampoline_offsets_with_layout(
                 let gate_offset = encoded * u32::from(GUEST_TPIDR_OFFSET_ALIGN);
                 if gate_offset == u32::from(field.placeholder()) {
                     patch_offsets.push(offset);
-                } else if gate_offset != u32::from(expected_offset) {
+                } else if let Some(expected_offset) = expected_offset
+                    && gate_offset != u32::from(expected_offset)
+                {
                     return Err(Error::TrampolinePatchFailure(format!(
                         "AArch64 gate at byte {offset} uses TLS offset {gate_offset}, which is \
                          neither the placeholder nor the offset being patched in \
@@ -2434,11 +2460,11 @@ pub fn find_guest_x18_placeholder(trampoline: &[u8]) -> Option<usize> {
 fn find_structured_placeholder(trampoline: &[u8], x18: bool) -> Option<usize> {
     let validation = validate_trampoline_offsets_with_layout(
         trampoline,
-        if x18 {
+        Some(if x18 {
             GUEST_X18_OFFSET_PLACEHOLDER
         } else {
             GUEST_TPIDR_OFFSET_PLACEHOLDER
-        },
+        }),
         x18,
         GateLayout::linux(TargetHost::Linux),
     )
@@ -2857,6 +2883,48 @@ mod tests {
     }
     /// An offset a real host runtime might measure: not the placeholder.
     const MEASURED_OFFSET: u16 = 96;
+    #[test]
+    fn has_unfinalized_guest_tpidr_offsets_checks_without_patching() {
+        let mut trampoline = Vec::new();
+        emit_shared_prologue(&mut trampoline, 0);
+        assert!(!has_unfinalized_guest_tpidr_offsets(&trampoline).unwrap());
+        gate::build(
+            &gate::GateInstance::new(GateMetadata::MrsTpidr { destination: 9 }, 0x1004),
+            GateLayout::linux(TargetHost::Linux),
+            0x400010,
+            0x400000,
+        )
+        .unwrap()
+        .append_to(&mut trampoline);
+        let before = trampoline.clone();
+        assert!(has_unfinalized_guest_tpidr_offsets(&trampoline).unwrap());
+        assert_eq!(trampoline, before);
+        finalize_trampoline_gates(&mut trampoline, MEASURED_OFFSET).unwrap();
+        assert!(!has_unfinalized_guest_tpidr_offsets(&trampoline).unwrap());
+        let mut malformed = before;
+        malformed[GATES_START_OFFSET] ^= 1;
+        assert!(has_unfinalized_guest_tpidr_offsets(&malformed).is_err());
+        assert!(has_unfinalized_guest_tpidr_offsets(&[]).is_err());
+
+        let mut x18 = Vec::new();
+        emit_shared_prologue(&mut x18, 0);
+        let mut instance = gate::GateInstance::new(GateMetadata::X18 { scratch: 17 }, 0x1004);
+        instance.anchor = 16;
+        instance.guest = 0xaa00_03f1; // mov x17, x0
+        gate::build(
+            &instance,
+            GateLayout::linux(TargetHost::Linux),
+            0x400010,
+            0x400000,
+        )
+        .unwrap()
+        .append_to(&mut x18);
+        assert!(matches!(
+            has_unfinalized_guest_tpidr_offsets(&x18),
+            Err(Error::TrampolinePatchFailure(message)) if message.contains("contains x18 gates")
+        ));
+    }
+
     #[test]
     fn patch_rejects_a_blob_that_is_not_a_trampoline() {
         // Shorter than the shared prologue.
