@@ -340,36 +340,33 @@ mod tests {
     }
 
     #[test]
-    fn a_split_mapping_is_named_once_and_merges_again() {
+    fn pieces_of_a_mapping_split_before_first_use_share_one_name() {
         let task = init_platform();
-        let start = map(&task, 3, MapFlags::MAP_SHARED).as_usize();
-        let read_write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
-        let middle = UserPtrMut::from_usize(start + PAGE_SIZE);
-        // Split the mapping into three pieces before any futex names it.
-        task.sys_mprotect(middle, PAGE_SIZE, ProtFlags::PROT_READ)
+        let start = map(&task, 4, MapFlags::MAP_SHARED).as_usize();
+        // Mapping issues no name, so split the mapping before any futex names it: changing the
+        // protection of the second page leaves adjacent pieces, and unmapping the third leaves a
+        // hole between them.
+        task.sys_mprotect(
+            UserPtrMut::from_usize(start + PAGE_SIZE),
+            PAGE_SIZE,
+            ProtFlags::PROT_READ,
+        )
+        .unwrap();
+        task.sys_munmap(UserPtrMut::from_usize(start + 2 * PAGE_SIZE), PAGE_SIZE)
             .unwrap();
-        let last = key(&task, start + 2 * PAGE_SIZE).unwrap();
         // Naming one piece names the whole mapping, with offsets from its start, as Linux keys
         // the words of one shared mapping by their offset in its memory.
-        assert_eq!(last.offset, 2 * PAGE_SIZE as u64);
-        assert_eq!(
-            key(&task, start),
-            Some(SharedFutexKey {
-                memory: last.memory,
-                offset: 0
-            })
-        );
-        // Once its pieces match again, the named mapping is one area again.
-        task.sys_mprotect(middle, PAGE_SIZE, read_write).unwrap();
-        let areas: alloc::vec::Vec<_> = task
-            .global
-            .mm
-            .mappings()
-            .into_iter()
-            .filter(|(range, _)| range.start < start + 3 * PAGE_SIZE && start < range.end)
-            .map(|(range, _)| range)
-            .collect();
-        assert_eq!(areas, alloc::vec![start..start + 3 * PAGE_SIZE]);
+        let last = key(&task, start + 3 * PAGE_SIZE + 4).unwrap();
+        assert_eq!(last.offset, 3 * PAGE_SIZE as u64 + 4);
+        for offset in [4, PAGE_SIZE + 4] {
+            assert_eq!(
+                key(&task, start + offset),
+                Some(SharedFutexKey {
+                    memory: last.memory,
+                    offset: offset as u64
+                })
+            );
+        }
     }
 
     #[test]
@@ -416,24 +413,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_memory_is_named_on_first_use_for_the_whole_mapping() {
-        let task = init_platform();
-        let mapping = map(&task, 3, MapFlags::MAP_SHARED).as_usize();
-        // Mapping issues no name; the pieces a mapping leaves before its first use share one.
-        task.sys_munmap(UserPtrMut::from_usize(mapping + PAGE_SIZE), PAGE_SIZE)
-            .unwrap();
-        let tail = key(&task, mapping + 2 * PAGE_SIZE + 4).unwrap();
-        let head = key(&task, mapping + 4).unwrap();
-        assert_eq!(head.memory, tail.memory);
-        assert_eq!((head.offset, tail.offset), (4, 2 * PAGE_SIZE as u64 + 4));
-        // Later uses keep the name.
-        assert_eq!(
-            key(&task, mapping),
-            Some(SharedFutexKey { offset: 0, ..head })
-        );
-    }
-
-    #[test]
     fn splitting_a_mapping_keeps_its_futex_keys() {
         let task = init_platform();
         let mapping = map(&task, 3, MapFlags::MAP_SHARED);
@@ -457,6 +436,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(key(&task, start + 2 * PAGE_SIZE + 4), Some(tail));
+        // Once its pieces match again, the named mapping is one area again.
+        let areas: alloc::vec::Vec<_> = task
+            .global
+            .mm
+            .mappings()
+            .into_iter()
+            .filter(|(range, _)| range.start < start + 3 * PAGE_SIZE && start < range.end)
+            .map(|(range, _)| range)
+            .collect();
+        assert_eq!(areas, alloc::vec![start..start + 3 * PAGE_SIZE]);
 
         task.sys_munmap(middle, PAGE_SIZE).unwrap();
         assert!(key(&task, start + PAGE_SIZE).is_none());
