@@ -13,10 +13,6 @@
 //! it does not map. That only affects the guests' synchronization: the broker's own state stays
 //! bounded and consistent whatever keys arrive.
 //!
-//! TODO: Restrict each process to the memory it may share, such as the blocks it reserved and
-//! those its ancestors had reserved when creating the next process on the way to it, with each
-//! process moving to a new block after creating another.
-//!
 //! A waiter is armed on at most one futex at a time, so the buckets hold at most one entry per
 //! waiter. A wake marks waiters woken and publishes readiness for them, and disarming reports
 //! it, so a wake racing a timeout or interruption is not lost.
@@ -73,6 +69,11 @@ impl SharedFutexes {
     }
 }
 
+// TODO: Restrict each process to the memory it may share, so that `futex_arm` and `futex_wake`
+// reject the keys of other memory. For example, authorize a process for the blocks it reserved
+// and those its ancestors had reserved when creating the next process on the way to it, naming
+// blocks by their reserver and a per-reserver index, with each process moving to a new block
+// after creating another.
 /// Reserves a block of shared memory IDs that no other reservation returns, and returns its
 /// first ID.
 ///
