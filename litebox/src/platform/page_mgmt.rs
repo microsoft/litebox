@@ -535,8 +535,10 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Safety
     ///
-    /// Replacement ownership follows [`Self::reserve_pages`]. The caller must track the returned
-    /// reservation directly and must not construct duplicate ownership from its range.
+    /// `token` must be one the broker delivered to this process that has not been consumed yet;
+    /// this consumes it, as on some platforms it is the object's handle, which the platform then
+    /// owns. Replacement ownership follows [`Self::reserve_pages`]. The caller must track the
+    /// returned reservation directly and must not construct duplicate ownership from its range.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     unsafe fn try_map_shared_object<Reservations>(
         &self,
@@ -567,8 +569,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Safety
     ///
-    /// The supplied reservations must collectively cover `range`, which must have no backing, and
-    /// the caller must exclude its users.
+    /// `token` must be one the broker delivered to this process that has not been consumed yet;
+    /// this consumes it. The supplied reservations must collectively cover `range`, which must
+    /// have no backing, and the caller must exclude its users.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     unsafe fn commit_shared_object<'reservation, Reservations>(
         &self,
@@ -589,12 +592,20 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// that will not map it after all.
     ///
     /// The default implementation does nothing.
+    ///
+    /// # Safety
+    ///
+    /// `token` must be one the broker delivered to this process that has not been consumed yet;
+    /// this consumes it.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn release_shared_object(&self, token: SharedObjectToken) {}
+    unsafe fn release_shared_object(&self, token: SharedObjectToken) {}
 }
 
 /// Names a host shared object that the broker delivered to this process out of band, such as a
 /// memfd or section backing a shared file. See [`PageManagementProvider::try_map_shared_object`].
+///
+/// A token is consumed by mapping or releasing the object it names, after which it must not be
+/// used again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedObjectToken(pub u64);
 

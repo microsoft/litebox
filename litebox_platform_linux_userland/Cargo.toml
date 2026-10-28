@@ -26,5 +26,8 @@ linux_syscall = []
 optee_syscall = ["dep:litebox_common_optee"]
 aarch64_virtualize_x18 = []
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+litebox_broker_transport_linux_userland = { path = "../litebox_broker_transport_linux_userland", version = "0.1.0" }
+
 [lints]
 workspace = true

@@ -37,10 +37,13 @@ use super::errors::{
 /// A host shared object holding a file's contents, as returned by [`File::map_shared`].
 #[derive(Clone, Copy, Debug)]
 pub struct SharedFileObject {
-    /// Identity of the file, the same in every process that maps it.
-    pub identity: u128,
+    /// Names the file's shared memory, the same in every process that maps it, so that futexes
+    /// in it span those processes.
+    pub memory: litebox_broker_protocol::shared_futex::SharedMemoryId,
     /// The token under which the broker delivered the object to this process.
     pub token: crate::platform::page_mgmt::SharedObjectToken,
+    /// Whether the object may be mapped writable.
+    pub writable: bool,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -417,19 +420,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     }
 
     /// Asks the broker for the host shared object holding this file's contents, so that every
-    /// process mapping it `MAP_SHARED` shares its pages. The mapping may be made writable only if
-    /// `writable` is set, which requires the file to be open for writing.
+    /// process mapping it `MAP_SHARED` shares its pages. The object may be mapped writable if
+    /// `writable` is set and the file is open for writing, as the result tells.
     ///
     /// The broker delivers the object out of band, before this returns, under the returned
-    /// token, which the caller must pass to
-    /// [`PageManagementProvider::try_map_shared_object`](crate::platform::PageManagementProvider::try_map_shared_object).
+    /// token. The caller must consume the token exactly once: by mapping it with
+    /// [`PageManagementProvider::try_map_shared_object`](crate::platform::PageManagementProvider::try_map_shared_object)
+    /// or
+    /// [`commit_shared_object`](crate::platform::PageManagementProvider::commit_shared_object),
+    /// or by releasing it with
+    /// [`release_shared_object`](crate::platform::PageManagementProvider::release_shared_object).
     /// Callers must first check
     /// [`supports_shared_objects`](crate::platform::PageManagementProvider::supports_shared_objects).
     pub fn map_shared(&self, writable: bool) -> Result<SharedFileObject, MapSharedError> {
         let response = self.broker.map_file(self.handle, writable)??;
         Ok(SharedFileObject {
-            identity: response.identity,
+            memory: response.memory,
             token: crate::platform::page_mgmt::SharedObjectToken(response.token),
+            writable: response.writable,
         })
     }
 
@@ -665,8 +673,9 @@ impl From<FileError> for MapSharedError {
     fn from(error: FileError) -> Self {
         match error {
             FileError::IsDirectory => Self::IsDirectory,
-            FileError::NotForReading | FileError::PathOnly => Self::NotForReading,
-            FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
+            FileError::NotForReading | FileError::PathOnly | FileError::AccessNotAllowed => {
+                Self::NotForReading
+            }
             FileError::NoSuchDevice => Self::Unsupported,
             FileError::NoSpace => Self::NoMemory,
             _ => Self::Io,
@@ -743,6 +752,7 @@ impl From<FileError> for OpenError {
             FileError::IsDirectory => Self::TruncateError(TruncateError::IsDirectory),
             FileError::NotForWriting => Self::TruncateError(TruncateError::NotForWriting),
             FileError::IsTerminalDevice => Self::TruncateError(TruncateError::IsTerminalDevice),
+            FileError::Busy => Self::TruncateError(TruncateError::Busy),
             FileError::NoSuchDevice => Self::NoSuchDevice,
             FileError::NoSpace => Self::NoSpace,
             _ => Self::Io,

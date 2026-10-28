@@ -429,20 +429,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         };
         let fd = fd.expect("file should remain unchanged on host");
 
-        let mut flags = MapFlags::MAP_PRIVATE;
-        match fixed_address_behavior {
-            FixedAddressBehavior::Hint(_) => {}
-            FixedAddressBehavior::Replace => flags |= MapFlags::MAP_FIXED,
-            FixedAddressBehavior::NoReplace => flags |= MapFlags::MAP_FIXED_NOREPLACE,
-        }
-
+        // SAFETY: The caller authorizes replacement, and `fd` was just opened.
         let result = unsafe {
-            syscalls::syscall6(
-                syscalls::Sysno::mmap,
-                suggested_start,
-                source_data.len(),
-                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
-                flags.bits().reinterpret_as_unsigned() as usize,
+            mmap_fd(
+                suggested_start..suggested_start + source_data.len(),
+                permissions,
+                MapFlags::MAP_PRIVATE,
+                fixed_address_behavior,
                 fd,
                 file_offset,
             )
@@ -466,7 +459,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         self.shared_objects.get().is_some()
     }
 
-    fn release_shared_object(&self, token: litebox::platform::page_mgmt::SharedObjectToken) {
+    unsafe fn release_shared_object(&self, token: litebox::platform::page_mgmt::SharedObjectToken) {
         if let Some(channel) = self.shared_objects.get() {
             // The broker sent the descriptor before answering with its token, so this only
             // drains it from the socket and closes it.
@@ -499,26 +492,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         let object = channel
             .take(token.0)
             .map_err(|_| AllocationError::OutOfMemory)?;
-        let placement = match fixed_address_behavior {
-            FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
-            FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
-            FixedAddressBehavior::Hint(_) => {
-                unreachable!("shared objects are mapped at addresses vmem chose")
-            }
-        };
+        debug_assert!(!matches!(
+            fixed_address_behavior,
+            FixedAddressBehavior::Hint(_)
+        ));
+        let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
         // SAFETY: The caller authorizes replacing `range`; otherwise the kernel refuses to
         // replace anything. The mapping keeps the object alive after its descriptor closes.
         let result = unsafe {
-            syscalls::syscall6(
-                syscalls::Sysno::mmap,
-                range.start,
-                range.len(),
-                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
-                (MapFlags::MAP_SHARED | placement)
-                    .bits()
-                    .reinterpret_as_unsigned() as usize,
+            mmap_fd(
+                range.clone(),
+                permissions,
+                MapFlags::MAP_SHARED,
+                fixed_address_behavior,
                 usize::try_from(object.as_raw_fd()).unwrap(),
-                usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?,
+                offset,
             )
         };
         drop(object);
@@ -537,6 +525,40 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             }
             Err(_) => Err(AllocationError::OutOfMemory),
         }
+    }
+}
+
+/// Maps `fd` from `offset` over `range` with `permissions`, `MAP_SHARED` or `MAP_PRIVATE` as
+/// `sharing` says, placed as `behavior` requires, returning the address mapped.
+///
+/// # Safety
+///
+/// Replacement must be authorized: with [`FixedAddressBehavior::Replace`], the mapping replaces
+/// whatever `range` holds.
+unsafe fn mmap_fd(
+    range: core::ops::Range<usize>,
+    permissions: MemoryRegionPermissions,
+    sharing: MapFlags,
+    behavior: FixedAddressBehavior,
+    fd: usize,
+    offset: usize,
+) -> Result<usize, syscalls::Errno> {
+    let placement = match behavior {
+        FixedAddressBehavior::Hint(_) => MapFlags::empty(),
+        FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
+        FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
+    };
+    // SAFETY: The caller authorizes any replacement.
+    unsafe {
+        syscalls::syscall6(
+            syscalls::Sysno::mmap,
+            range.start,
+            range.len(),
+            prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
+            (sharing | placement).bits().reinterpret_as_unsigned() as usize,
+            fd,
+            offset,
+        )
     }
 }
 

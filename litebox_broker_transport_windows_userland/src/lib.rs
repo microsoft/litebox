@@ -16,3 +16,4 @@ pub mod named_pipe;
 pub mod process_image;
 mod setup;
 pub mod shared_memory;
+pub mod shared_objects;

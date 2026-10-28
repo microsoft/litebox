@@ -8,7 +8,7 @@
 //! dedicated `SOCK_SEQPACKET` socket. Concurrent requests may complete in any order, so
 //! descriptors that arrive for other tokens wait here until their requester takes them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::Mutex;
@@ -17,29 +17,39 @@ use std::sync::Mutex;
 /// that a broker cannot make this process hold descriptors without bound.
 const MAX_PENDING: usize = 64;
 
+/// Tokens whose descriptors were dropped are remembered up to this many, oldest forgotten first,
+/// so that taking one fails instead of waiting for a descriptor that will not come.
+const MAX_EVICTED: usize = 4096;
+
 /// The receiving end of the broker's shared-object socket.
-pub(crate) struct SharedObjectChannel {
+pub struct SharedObjectChannel {
     state: Mutex<State>,
 }
 
 struct State {
     socket: OwnedFd,
     pending: BTreeMap<u64, OwnedFd>,
+    evicted: BTreeSet<u64>,
 }
 
 impl SharedObjectChannel {
-    pub(crate) fn new(socket: OwnedFd) -> Self {
+    /// Receives shared objects over `socket`, the runner's end of the broker's socket pair.
+    pub fn new(socket: OwnedFd) -> Self {
         Self {
             state: Mutex::new(State {
                 socket,
                 pending: BTreeMap::new(),
+                evicted: BTreeSet::new(),
             }),
         }
     }
 
     /// Takes the descriptor that the broker sent under `token`, waiting for it if it has not
     /// been received yet.
-    pub(crate) fn take(&self, token: u64) -> Result<OwnedFd> {
+    ///
+    /// Fails with [`ErrorKind::NotFound`] if the descriptor was received but dropped, as too
+    /// many others were waiting for their requesters.
+    pub fn take(&self, token: u64) -> Result<OwnedFd> {
         let mut state = self
             .state
             .lock()
@@ -48,12 +58,23 @@ impl SharedObjectChannel {
             if let Some(fd) = state.pending.remove(&token) {
                 return Ok(fd);
             }
+            if state.evicted.remove(&token) {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    "the shared object was dropped before it was taken",
+                ));
+            }
             let (received, fd) = receive(&state.socket)?;
             if received == token {
                 return Ok(fd);
             }
-            if state.pending.len() >= MAX_PENDING {
-                state.pending.pop_first();
+            if state.pending.len() >= MAX_PENDING
+                && let Some((dropped, _)) = state.pending.pop_first()
+            {
+                if state.evicted.len() >= MAX_EVICTED {
+                    state.evicted.pop_first();
+                }
+                state.evicted.insert(dropped);
             }
             state.pending.insert(received, fd);
         }
@@ -96,23 +117,35 @@ fn receive(socket: &OwnedFd) -> Result<(u64, OwnedFd)> {
     }
 
     let mut fds = Vec::new();
-    // SAFETY: `header` was filled in by `recvmsg`, and each control message lies within
-    // `control`.
-    unsafe {
-        let mut message = libc::CMSG_FIRSTHDR(&raw const header);
-        while !message.is_null() {
-            if (*message).cmsg_level == libc::SOL_SOCKET && (*message).cmsg_type == libc::SCM_RIGHTS
-            {
-                let data = libc::CMSG_DATA(message).cast::<libc::c_int>();
-                let header_len = libc::CMSG_LEN(0) as usize;
-                let count = ((*message).cmsg_len as usize - header_len) / size_of::<libc::c_int>();
-                for index in 0..count {
-                    let fd = data.add(index).read_unaligned();
-                    fds.push(OwnedFd::from_raw_fd(fd));
-                }
+    // SAFETY: `header` was filled in by `recvmsg`, so the first control message, if any, lies
+    // within `control`.
+    let mut message = unsafe { libc::CMSG_FIRSTHDR(&raw const header) };
+    while !message.is_null() {
+        // SAFETY: `message` is a control message within `control`, which `recvmsg` filled in.
+        let (level, kind, length) = unsafe {
+            (
+                (*message).cmsg_level,
+                (*message).cmsg_type,
+                (*message).cmsg_len as usize,
+            )
+        };
+        if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
+            // SAFETY: `CMSG_LEN` and `CMSG_DATA` only compute sizes and addresses.
+            let (header_len, data) = unsafe {
+                (
+                    libc::CMSG_LEN(0) as usize,
+                    libc::CMSG_DATA(message).cast::<libc::c_int>(),
+                )
+            };
+            let count = length.saturating_sub(header_len) / size_of::<libc::c_int>();
+            for index in 0..count {
+                // SAFETY: The message holds `count` descriptors after its header, each a new
+                // descriptor that the kernel installed for this process alone.
+                fds.push(unsafe { OwnedFd::from_raw_fd(data.add(index).read_unaligned()) });
             }
-            message = libc::CMSG_NXTHDR(&raw const header, message);
         }
+        // SAFETY: `message` lies within the control buffer that `header` describes.
+        message = unsafe { libc::CMSG_NXTHDR(&raw const header, message) };
     }
     if received.cast_unsigned() != token.len()
         || header.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
@@ -129,58 +162,8 @@ fn receive(socket: &OwnedFd) -> Result<(u64, OwnedFd)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
     use std::os::fd::AsFd as _;
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "a descriptor is four bytes"
-    )]
-    const FD_SIZE: u32 = size_of::<libc::c_int>() as u32;
-
-    fn send(socket: &OwnedFd, token: u64, fd: std::os::fd::BorrowedFd<'_>) {
-        let token = token.to_le_bytes();
-        let mut iov = libc::iovec {
-            iov_base: token.as_ptr().cast_mut().cast(),
-            iov_len: token.len(),
-        };
-        let mut control = [0u64; 4];
-        // SAFETY: `msghdr` is plain data, for which all-zero bytes are valid.
-        let mut header: libc::msghdr = unsafe { core::mem::zeroed() };
-        header.msg_iov = &raw mut iov;
-        header.msg_iovlen = 1;
-        header.msg_control = control.as_mut_ptr().cast();
-        // SAFETY: `CMSG_SPACE` only computes a size.
-        header.msg_controllen = unsafe { libc::CMSG_SPACE(FD_SIZE) } as _;
-        // SAFETY: `control` is large enough for one descriptor.
-        unsafe {
-            let message = libc::CMSG_FIRSTHDR(&raw const header);
-            (*message).cmsg_level = libc::SOL_SOCKET;
-            (*message).cmsg_type = libc::SCM_RIGHTS;
-            (*message).cmsg_len = libc::CMSG_LEN(FD_SIZE) as _;
-            libc::CMSG_DATA(message)
-                .cast::<libc::c_int>()
-                .write_unaligned(fd.as_raw_fd());
-        }
-        // SAFETY: `header` describes live buffers.
-        let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const header, 0) };
-        assert_eq!(sent, 8);
-    }
-
-    fn socket_pair() -> (OwnedFd, OwnedFd) {
-        let mut fds = [0; 2];
-        // SAFETY: `fds` has room for both ends.
-        let result = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-                0,
-                fds.as_mut_ptr(),
-            )
-        };
-        assert_eq!(result, 0);
-        // SAFETY: `socketpair` returned two new descriptors.
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
-    }
 
     fn inode(fd: &OwnedFd) -> u64 {
         std::fs::File::from(fd.try_clone().unwrap())
@@ -191,22 +174,39 @@ mod tests {
 
     #[test]
     fn takes_descriptors_by_token_in_any_order() {
-        let (sender, receiver) = socket_pair();
+        let (sender, receiver) = SharedObjectSender::pair().unwrap();
         let channel = SharedObjectChannel::new(receiver);
         let first = std::fs::File::open("/").unwrap();
         let second = std::fs::File::open("/proc").unwrap();
-        send(&sender, 1, first.as_fd());
-        send(&sender, 2, second.as_fd());
+        let first_token = sender.send(first.as_fd()).unwrap();
+        let second_token = sender.send(second.as_fd()).unwrap();
 
-        let second_received = channel.take(2).unwrap();
-        let first_received = channel.take(1).unwrap();
+        let second_received = channel.take(second_token).unwrap();
+        let first_received = channel.take(first_token).unwrap();
         assert_eq!(inode(&second_received), inode(&OwnedFd::from(second)));
         assert_eq!(inode(&first_received), inode(&OwnedFd::from(first)));
     }
 
     #[test]
+    fn dropped_descriptors_fail_instead_of_blocking() {
+        let (sender, receiver) = SharedObjectSender::pair().unwrap();
+        let channel = SharedObjectChannel::new(receiver);
+        let file = std::fs::File::open("/").unwrap();
+        let tokens: Vec<u64> = (0..=MAX_PENDING + 1)
+            .map(|_| sender.send(file.as_fd()).unwrap())
+            .collect();
+        // Taking the last one queues the others, dropping the oldest beyond the limit.
+        channel.take(*tokens.last().unwrap()).unwrap();
+        assert_eq!(
+            channel.take(tokens[0]).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        channel.take(tokens[2]).unwrap();
+    }
+
+    #[test]
     fn closed_socket_fails_instead_of_blocking() {
-        let (sender, receiver) = socket_pair();
+        let (sender, receiver) = SharedObjectSender::pair().unwrap();
         let channel = SharedObjectChannel::new(receiver);
         drop(sender);
         assert_eq!(
