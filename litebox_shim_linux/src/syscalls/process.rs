@@ -1406,6 +1406,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return Err(Errno::EAGAIN);
         }
+        if shares_memory {
+            // A native child inherits this process's memory manager, so name its shared memory
+            // now, for both to key futexes in it alike. Other threads are paused.
+            self.global
+                .mm
+                .name_shared_memory(|| self.issue_shared_memory_id())
+                .map_err(|_| Errno::EAGAIN)?;
+        }
         let (fds, objects): (Vec<_>, Vec<_>) =
             self.fds_inherited_across_fork()?.into_iter().unzip();
         let fs = self.fs.borrow();
@@ -3271,6 +3279,16 @@ mod tests {
             // Only a native child, which shares the pages, may inherit shared memory.
             if shared && matches!(mode, ForkLauncherMode::Native) {
                 result.unwrap();
+                // The child inherits the memory's name, so the parent named it before forking.
+                assert!(
+                    task.global
+                        .mm
+                        .shared_futex_key(mapping.as_usize(), || unreachable!(
+                            "fork names shared memory"
+                        ))
+                        .unwrap()
+                        .is_some()
+                );
             } else if shared {
                 assert_eq!(result, Err(Errno::EAGAIN));
             } else if matches!(mode, ForkLauncherMode::Native) {

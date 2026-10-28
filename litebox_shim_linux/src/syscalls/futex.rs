@@ -9,7 +9,6 @@ use litebox::event::wait::WaitContext;
 use litebox::sync::futex::shared::{SharedFutexError, SharedFutexWaiter};
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox_common_linux::errno::Errno;
-use litebox_common_linux::vmem::MappingError;
 use litebox_common_linux::{ClockId, FutexArgs, FutexFlags};
 
 use crate::wait::wait_errno;
@@ -84,14 +83,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns a new name for the memory of a shared anonymous mapping, or `None` without a
     /// broker, as then no other process can share the memory either.
-    ///
-    /// Fails with [`MappingError::OutOfMemory`] if the broker cannot provide a name, as `mmap`
-    /// reports any failure to back a mapping with `ENOMEM`.
-    pub(super) fn issue_shared_memory_id(&self) -> Result<Option<SharedMemoryId>, MappingError> {
+    pub(super) fn issue_shared_memory_id(&self) -> Result<Option<SharedMemoryId>, Errno> {
         match self.global.litebox.issue_shared_memory_id() {
             Ok(id) => Ok(Some(id)),
             Err(SharedFutexError::Unavailable) => Ok(None),
-            Err(_) => Err(MappingError::OutOfMemory),
+            Err(_) => Err(Errno::ENOMEM),
         }
     }
 
@@ -116,7 +112,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if flags.contains(FutexFlags::PRIVATE) {
             Ok(None)
         } else {
-            self.global.mm.shared_futex_key(addr.as_usize())
+            self.global
+                .mm
+                .shared_futex_key(addr.as_usize(), || self.issue_shared_memory_id())
         }
     }
 
@@ -199,7 +197,10 @@ mod tests {
     }
 
     fn key(task: &Task<TestPlatform>, address: usize) -> Option<SharedFutexKey> {
-        task.global.mm.shared_futex_key(address).unwrap()
+        task.global
+            .mm
+            .shared_futex_key(address, || task.issue_shared_memory_id())
+            .unwrap()
     }
 
     fn word(address: usize) -> UserPtrMut<u32> {
@@ -279,8 +280,21 @@ mod tests {
     #[test]
     fn each_shared_mapping_names_its_own_memory() {
         let task = init_platform();
-        let first = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
-        let second = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+        let first = map(&task, 2, MapFlags::MAP_SHARED).as_usize();
+        // A second mapping right after the first stays distinct memory, even though neither is
+        // named until its first futex use.
+        let second = task
+            .sys_mmap(
+                first + PAGE_SIZE,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED,
+                -1,
+                0,
+            )
+            .unwrap()
+            .as_usize();
+        assert_eq!(second, first + PAGE_SIZE);
         let (first_key, second_key) = (key(&task, first).unwrap(), key(&task, second).unwrap());
         assert_ne!(first_key.memory, second_key.memory);
         // Even when adjacent, distinct mappings stay distinct memory, each from offset zero.
@@ -302,6 +316,57 @@ mod tests {
         assert_ne!(key(&task, first).unwrap().memory, first_key.memory);
         assert_eq!(remap(MapFlags::MAP_PRIVATE).as_usize(), first);
         assert!(key(&task, first).is_none());
+    }
+
+    #[test]
+    fn memory_split_while_it_is_named_still_gets_a_shared_key() {
+        let task = init_platform();
+        let mapping = map(&task, 2, MapFlags::MAP_SHARED);
+        // Another thread splits the mapping while this one asks the broker for its name. The
+        // word must still get a shared key, the one every later futex call on it uses, rather
+        // than a private one that their wakes would never reach.
+        let racing = task
+            .global
+            .mm
+            .shared_futex_key(mapping.as_usize(), || {
+                let second = UserPtrMut::from_usize(mapping.as_usize() + PAGE_SIZE);
+                task.sys_mprotect(second, PAGE_SIZE, ProtFlags::PROT_READ)
+                    .unwrap();
+                task.issue_shared_memory_id()
+            })
+            .unwrap();
+        assert!(racing.is_some());
+        assert_eq!(racing, key(&task, mapping.as_usize()));
+    }
+
+    #[test]
+    fn pieces_of_a_mapping_split_before_first_use_share_one_name() {
+        let task = init_platform();
+        let start = map(&task, 4, MapFlags::MAP_SHARED).as_usize();
+        // Mapping issues no name, so split the mapping before any futex names it: changing the
+        // protection of the second page leaves adjacent pieces, and unmapping the third leaves a
+        // hole between them.
+        task.sys_mprotect(
+            UserPtrMut::from_usize(start + PAGE_SIZE),
+            PAGE_SIZE,
+            ProtFlags::PROT_READ,
+        )
+        .unwrap();
+        task.sys_munmap(UserPtrMut::from_usize(start + 2 * PAGE_SIZE), PAGE_SIZE)
+            .unwrap();
+        // Naming one piece names the whole mapping, with offsets from its start, as Linux keys
+        // the words of one shared mapping by their offset in its memory.
+        let last = key(&task, start + 3 * PAGE_SIZE + 4).unwrap();
+        assert_eq!(last.offset, 3 * PAGE_SIZE as u64 + 4);
+        for offset in [4, PAGE_SIZE + 4] {
+            assert_eq!(
+                key(&task, start + offset),
+                Some(SharedFutexKey {
+                    memory: last.memory,
+                    offset: offset as u64
+                })
+            );
+        }
     }
 
     #[test]
@@ -371,6 +436,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(key(&task, start + 2 * PAGE_SIZE + 4), Some(tail));
+        // Once its pieces match again, the named mapping is one area again.
+        let areas: alloc::vec::Vec<_> = task
+            .global
+            .mm
+            .mappings()
+            .into_iter()
+            .filter(|(range, _)| range.start < start + 3 * PAGE_SIZE && start < range.end)
+            .map(|(range, _)| range)
+            .collect();
+        assert_eq!(areas, alloc::vec![start..start + 3 * PAGE_SIZE]);
 
         task.sys_munmap(middle, PAGE_SIZE).unwrap();
         assert!(key(&task, start + PAGE_SIZE).is_none());
