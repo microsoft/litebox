@@ -45,28 +45,37 @@ fn test_broker_core(
         .build()
 }
 
-type HookAction = Arc<dyn Fn(&HookLog, usize, HookPoint) + Send + Sync>;
+type HookAction = Arc<dyn Fn(&TestHook, usize, HookPoint) + Send + Sync>;
 
-/// A provider hook that records every [`HookPoint`] and runs the test's
-/// action at each, so a test can force an interleaving.
-struct HookLog {
+/// The test's provider hook, which forces a chosen interleaving of a socket
+/// call and the epoll thread.
+///
+/// Calls and the epoll thread can work on one socket at once, and their races
+/// have windows too narrow for stress tests to hit reliably. A `TestHook`
+/// records every [`HookPoint`] the provider reaches, so a test can wait for a
+/// thread to reach a point instead of sleeping. It also runs the test's
+/// action at each point, so the action can hold that thread there while
+/// another thread makes its move.
+struct TestHook {
     points: Mutex<Vec<HookPoint>>,
     changed: Condvar,
     action: Mutex<Option<HookAction>>,
 }
 
-impl HookLog {
+impl TestHook {
+    /// Creates a hook and installs it as `provider`'s, replacing any previous
+    /// one.
     fn install(provider: &LinuxSocketProvider) -> Arc<Self> {
-        let log = Arc::new(Self {
+        let hook = Arc::new(Self {
             points: Mutex::new(Vec::new()),
             changed: Condvar::new(),
             action: Mutex::new(None),
         });
-        let hook_log = Arc::clone(&log);
+        let installed = Arc::clone(&hook);
         provider
             .core
-            .set_hook(Some(Arc::new(move |point| hook_log.record(point))));
-        log
+            .set_hook(Some(Arc::new(move |point| installed.record(point))));
+        hook
     }
 
     fn record(&self, point: HookPoint) {
@@ -83,7 +92,7 @@ impl HookLog {
     }
 
     /// Runs `action` with each later point and its index.
-    fn act(&self, action: impl Fn(&HookLog, usize, HookPoint) + Send + Sync + 'static) {
+    fn act(&self, action: impl Fn(&TestHook, usize, HookPoint) + Send + Sync + 'static) {
         *self.action.lock().unwrap() = Some(Arc::new(action));
     }
 

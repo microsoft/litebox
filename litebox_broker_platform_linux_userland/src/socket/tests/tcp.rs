@@ -3022,12 +3022,12 @@ fn tcp_edge_during_eagain_is_applied_after_the_read_clear() {
     // The action writes through a clone, so stopping it does not close the
     // connection, whose end of stream would raise READ on its own.
     let writer = Mutex::new(host.try_clone().unwrap());
-    let log = HookLog::install(&provider);
+    let hook = TestHook::install(&provider);
     let deferred_at = AtomicUsize::new(usize::MAX);
-    log.act(move |log, index, point| match point {
+    hook.act(move |hook, index, point| match point {
         HookPoint::Eagain(socket) if socket == id => {
             writer.lock().unwrap().write_all(b"data").unwrap();
-            let (deferred, _) = log.wait_for(index, |point| {
+            let (deferred, _) = hook.wait_for(index, |point| {
                 point == HookPoint::Handled(id, Dispatch::Deferred)
             });
             deferred_at.store(deferred, Ordering::Relaxed);
@@ -3035,7 +3035,7 @@ fn tcp_edge_during_eagain_is_applied_after_the_read_clear() {
         HookPoint::Unlocked(socket) if socket == id => {
             let deferred = deferred_at.swap(usize::MAX, Ordering::Relaxed);
             if deferred != usize::MAX {
-                log.wait_for(deferred, |point| {
+                hook.wait_for(deferred, |point| {
                     point == HookPoint::Handled(id, Dispatch::Applied)
                 });
             }
@@ -3048,7 +3048,7 @@ fn tcp_edge_during_eagain_is_applied_after_the_read_clear() {
         receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
         Err(BrokerError::WouldBlock)
     );
-    log.stop();
+    hook.stop();
     assert!(
         process
             .check_readiness(socket)
@@ -3104,10 +3104,10 @@ fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
         send_bytes(&connector_process, connector, b"early", SendFlags::NONE),
         Ok(SocketOutcome::Completed(5))
     );
-    let log = HookLog::install(&provider);
-    log.act(|log, index, point| {
+    let hook = TestHook::install(&provider);
+    hook.act(|hook, index, point| {
         if let HookPoint::EpollAdded(token) = point {
-            let (_, handled) = log.wait_for(
+            let (_, handled) = hook.wait_for(
                 index,
                 |point| matches!(point, HookPoint::Handled(handled, _) if handled == token),
             );
@@ -3125,10 +3125,10 @@ fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
         panic!("guest accept returned a socket failure");
     };
     let token = *provider.core.socket_ids().last().unwrap();
-    log.wait_for(0, |point| {
+    hook.wait_for(0, |point| {
         point == HookPoint::Handled(token, Dispatch::Applied)
     });
-    log.stop();
+    hook.stop();
     assert!(
         listener_process
             .check_readiness(accepted.handle)
@@ -3153,10 +3153,10 @@ fn external_tcp_connect_applies_only_events_after_connect() {
         ..
     } = external_tcp_socket();
     let id = *provider.core.socket_ids().last().unwrap();
-    let log = HookLog::install(&provider);
-    log.act(move |log, index, point| {
+    let hook = TestHook::install(&provider);
+    hook.act(move |hook, index, point| {
         if point == HookPoint::EpollAdded(id) {
-            let (_, handled) = log.wait_for(
+            let (_, handled) = hook.wait_for(
                 index,
                 |point| matches!(point, HookPoint::Handled(handled, _) if handled == id),
             );
@@ -3165,10 +3165,10 @@ fn external_tcp_connect_applies_only_events_after_connect() {
     });
 
     let _host = connect_to_host(&process, socket, &publications, &listener);
-    log.wait_for(0, |point| {
+    hook.wait_for(0, |point| {
         point == HookPoint::Handled(id, Dispatch::Applied)
     });
-    log.stop();
+    hook.stop();
     let readiness = process.check_readiness(socket).unwrap();
     assert!(!readiness.contains(ReadinessFlags::HANGUP));
     assert!(!readiness.contains(ReadinessFlags::CLOSED));
@@ -3204,20 +3204,20 @@ fn guest_tcp_abortive_close_during_peer_receive_reports_reset() {
         ),
         Ok(SocketOutcome::Completed(()))
     );
-    let log = HookLog::install(&pair.provider);
+    let hook = TestHook::install(&pair.provider);
     let closer = Arc::new(Mutex::new(Some((
         Arc::clone(&pair.listener_process),
         pair.accepted,
     ))));
     let pending_close = Arc::clone(&closer);
-    log.act(move |log, index, point| {
+    hook.act(move |hook, index, point| {
         if point != HookPoint::Receiving(connector_id) {
             return;
         }
         let closer = pending_close.lock().unwrap().take();
         if let Some((process, accepted)) = closer {
             run_on_thread(move || process.close_object_reference(accepted).unwrap());
-            log.wait_for(index, |point| point == HookPoint::FdClosed(accepted_id));
+            hook.wait_for(index, |point| point == HookPoint::FdClosed(accepted_id));
         }
     });
 
@@ -3232,7 +3232,7 @@ fn guest_tcp_abortive_close_during_peer_receive_reports_reset() {
         ),
         Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
     );
-    log.stop();
+    hook.stop();
     assert!(closer.lock().unwrap().is_none());
 }
 
@@ -3250,13 +3250,13 @@ fn guest_tcp_receive_after_abortive_close_closes_descriptor_reports_reset() {
         ),
         Ok(SocketOutcome::Completed(()))
     );
-    let log = HookLog::install(&pair.provider);
+    let hook = TestHook::install(&pair.provider);
     let receiver = Arc::new(Mutex::new(Some((
         Arc::clone(&pair.connector_process),
         pair.connector,
     ))));
     let pending_receive = Arc::clone(&receiver);
-    log.act(move |_, _, point| {
+    hook.act(move |_, _, point| {
         if point != HookPoint::FdClosed(accepted_id) {
             return;
         }
@@ -3274,7 +3274,7 @@ fn guest_tcp_receive_after_abortive_close_closes_descriptor_reports_reset() {
     pair.listener_process
         .close_object_reference(pair.accepted)
         .unwrap();
-    log.stop();
+    hook.stop();
     assert!(receiver.lock().unwrap().is_none());
     assert_eq!(
         pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
@@ -3297,10 +3297,10 @@ fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
     } = external_tcp_socket();
     let id = *provider.core.socket_ids().last().unwrap();
     let mut host = connect_to_host(&process, socket, &publications, &listener);
-    let log = HookLog::install(&provider);
+    let hook = TestHook::install(&provider);
     let closer = Arc::new(Mutex::new(Some((Arc::clone(&process), socket))));
     let pending_close = Arc::clone(&closer);
-    log.act(move |_, _, point| {
+    hook.act(move |_, _, point| {
         if point != HookPoint::Harvested(id) {
             return;
         }
@@ -3310,13 +3310,13 @@ fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
         }
     });
 
-    let start = log.len();
+    let start = hook.len();
     host.write_all(b"data").unwrap();
     assert_eq!(
-        log.wait_for_harvest_handled(start, |token| token == id),
+        hook.wait_for_harvest_handled(start, |token| token == id),
         Dispatch::Dropped
     );
-    log.stop();
+    hook.stop();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), socket);
 
     let socket = create_socket(&process, readiness);
@@ -3380,8 +3380,8 @@ fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
     // A receive would find the data without the epoll thread, so wait for
     // the epoll thread to apply an event for the quiet socket during the
     // flood.
-    let log = HookLog::install(&provider);
-    let start = log.len();
+    let hook = TestHook::install(&provider);
+    let start = hook.len();
     assert_eq!(
         send_bytes(
             &quiet.connector_process,
@@ -3392,10 +3392,10 @@ fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
         Ok(SocketOutcome::Completed(4))
     );
     assert_eq!(
-        log.wait_for_harvest_handled(start, |token| token == quiet_accepted_id),
+        hook.wait_for_harvest_handled(start, |token| token == quiet_accepted_id),
         Dispatch::Applied
     );
-    log.stop();
+    hook.stop();
     let flooded_before = sent.load(Ordering::Relaxed);
     wait_until(
         || sent.load(Ordering::Relaxed) > flooded_before,

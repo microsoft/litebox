@@ -151,6 +151,7 @@ struct ProviderCore {
     /// Set under the `registry` write lock once the epoll thread fails.
     failed: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Test callback run at every [`HookPoint`].
     #[cfg(test)]
     hook: RwLock<Option<Hook>>,
 }
@@ -209,6 +210,12 @@ enum Dispatch {
 }
 
 /// Points where tests can observe or pause provider threads.
+///
+/// Socket calls and the epoll thread can work on one socket at once, so some
+/// races have windows too narrow for stress tests to hit reliably. Tests
+/// install a hook that runs at each point, so a test can hold one thread at a
+/// point while another acts, which makes each race happen on every run.
+/// Outside tests the hook is a no-op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum HookPoint {

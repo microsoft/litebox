@@ -2274,10 +2274,10 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
 
     // The queued datagram leaves the endpoint armed only for errors, so the
     // ICMP error is its next event.
-    let log = HookLog::install(&provider);
+    let hook = TestHook::install(&provider);
     let receiver = Arc::new(Mutex::new(Some(Arc::clone(&process))));
     let pending_receive = Arc::clone(&receiver);
-    log.act(move |_, _, point| {
+    hook.act(move |_, _, point| {
         let HookPoint::Harvested(token) = point else {
             return;
         };
@@ -2294,13 +2294,13 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
             });
         }
     });
-    let start = log.len();
+    let start = hook.len();
     assert_eq!(
         send_datagram(&process, socket, b"refused", SendFlags::NONE, None),
         Ok(SocketOutcome::Completed(7))
     );
-    let handled = log.wait_for_harvest_handled(start, |token| token & UDP_EVENT_TOKEN_FLAG != 0);
-    log.stop();
+    let handled = hook.wait_for_harvest_handled(start, |token| token & UDP_EVENT_TOKEN_FLAG != 0);
+    hook.stop();
     assert!(receiver.lock().unwrap().is_none());
     assert_eq!(handled, Dispatch::Applied);
     assert!(
