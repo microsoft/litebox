@@ -617,7 +617,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         name: SocketOptionName,
     ) -> core::result::Result<SocketOptionValue, BrokerControlError>;
 
-    fn create_shared_memory(&self) -> core::result::Result<SharedMemoryId, BrokerControlError>;
+    fn issue_shared_memory_id(&self) -> core::result::Result<SharedMemoryId, BrokerControlError>;
 
     fn create_futex_waiter(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -1719,8 +1719,8 @@ where
         self.request(|local| local.get_unix_socket_option(handle, name))
     }
 
-    fn create_shared_memory(&self) -> core::result::Result<SharedMemoryId, BrokerControlError> {
-        self.request(BrokerLocal::create_shared_memory)
+    fn issue_shared_memory_id(&self) -> core::result::Result<SharedMemoryId, BrokerControlError> {
+        self.request(BrokerLocal::issue_shared_memory_id)
     }
 
     fn create_futex_waiter(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {

@@ -4,12 +4,12 @@
 //! Futexes in memory that several processes share.
 //!
 //! Memory that several processes map, such as a Linux `MAP_SHARED | MAP_ANONYMOUS` mapping that
-//! native fork children inherit, is named by a [`SharedMemoryId`] that the broker creates for its
+//! native fork children inherit, is named by a [`SharedMemoryId`] that the broker issues to its
 //! creator. The broker keeps no record of the memory: it keys futex wait queues by
 //! [`SharedFutexKey`], so a wake in one process reaches waiters in every process that names the
 //! same futex word.
 //!
-//! The broker signs each ID it creates and rejects keys whose IDs it did not sign. So a process
+//! The broker signs each ID it issues and rejects keys whose IDs it did not sign. So a process
 //! can only name memory whose ID it was given: memory it created, or that it inherited by copying
 //! its creator's memory, as native fork does.
 //!
@@ -29,7 +29,7 @@ pub const FUTEX_WORD_SIZE: u64 = 4;
 
 /// Names memory shared by several processes.
 ///
-/// Only the broker creates IDs, as [`CreateSharedMemoryResponse`] describes, and no two of its IDs
+/// Only the broker issues IDs, as [`IssueMemoryIdResponse`] describes, and no two of its IDs
 /// are equal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SharedMemoryId(
@@ -64,9 +64,9 @@ impl SharedMemoryId {
     }
 }
 
-/// Response to a request to create shared memory.
+/// Response to a request to issue a shared memory ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateSharedMemoryResponse {
+pub struct IssueMemoryIdResponse {
     /// ID of the new memory, signed by the broker.
     pub memory: SharedMemoryId,
 }

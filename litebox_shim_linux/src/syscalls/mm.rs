@@ -49,7 +49,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let shared_memory = if flags.contains(MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS) {
-            self.create_shared_memory()?
+            self.issue_shared_memory_id()?
         } else {
             None
         };

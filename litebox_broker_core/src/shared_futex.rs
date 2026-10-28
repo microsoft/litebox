@@ -4,11 +4,11 @@
 //! Futex wait queues for memory that several processes share.
 //!
 //! The broker never sees the memory. Processes name it by a [`SharedMemoryId`] that
-//! [`create_shared_memory`] creates, and each waiter checks its futex word itself after arming,
+//! [`issue_shared_memory_id`] issues, and each waiter checks its futex word itself after arming,
 //! as the [protocol](litebox_broker_protocol::shared_futex) describes. Waiters are queued by
 //! [`SharedFutexKey`] in buckets chosen by hashing the key.
 //!
-//! The broker signs each ID it creates with a key only it knows, and rejects keys naming IDs it
+//! The broker signs each ID it issues with a key only it knows, and rejects keys naming IDs it
 //! did not sign. So a process can only name memory whose ID it was given: memory it created, or
 //! that it inherited by copying its creator's memory, as native fork does. Like a capability
 //! handle, which a process could keep after unmapping the memory too, an ID grants access for as
@@ -57,7 +57,7 @@ pub(crate) struct SharedFutexes {
     buckets: [Bucket; BUCKETS],
     /// The serial of the next shared memory ID to create.
     next_serial: AtomicU64,
-    /// Signs shared memory IDs, keyed with random bytes when the first ID is created.
+    /// Signs shared memory IDs, keyed with random bytes when the first ID is issued.
     signer: Once<Hmac<Sha256>>,
 }
 
@@ -115,13 +115,13 @@ impl SharedFutexes {
     }
 }
 
-/// Creates an ID for new shared memory, which no other ID equals, and signs it so that futex
-/// operations accept it.
+/// Issues a signed ID for new shared memory, which no other ID equals, so that futex operations
+/// accept it.
 ///
 /// Fails with `PolicyDenied` if the caller may not wait on objects, with `ResourceExhausted`
-/// once 2^64 IDs were created, and with `Internal` if the broker has no randomness to key its
+/// once 2^64 IDs were issued, and with `Internal` if the broker has no randomness to key its
 /// signatures with.
-pub fn create_shared_memory(process: &BrokerProcess) -> Result<SharedMemoryId> {
+pub fn issue_shared_memory_id(process: &BrokerProcess) -> Result<SharedMemoryId> {
     process.require_object_rights(ObjectRights::WAIT)?;
     let futexes = &process.core.shared_futexes;
     let signer = futexes.signer(process)?;
@@ -382,7 +382,7 @@ mod tests {
         let parent = core
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let memory = super::create_shared_memory(&parent).unwrap();
+        let memory = super::issue_shared_memory_id(&parent).unwrap();
         let child = core
             .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
             .unwrap();
@@ -503,7 +503,7 @@ mod tests {
         Fixture::arm(&fixture.parent, fixture.key(4), u32::MAX, other_offset).unwrap();
         let other_memory = fixture.waiter(&fixture.parent);
         let other_memory_key = SharedFutexKey {
-            memory: super::create_shared_memory(&fixture.parent).unwrap(),
+            memory: super::issue_shared_memory_id(&fixture.parent).unwrap(),
             offset: 0,
         };
         Fixture::arm(&fixture.parent, other_memory_key, u32::MAX, other_memory).unwrap();
@@ -721,9 +721,9 @@ mod tests {
             .core
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        // IDs are unique, whoever creates them.
+        // IDs are unique, whoever asks for them.
         let created = [&fixture.parent, &fixture.child, &unrelated]
-            .map(|process| super::create_shared_memory(process).unwrap());
+            .map(|process| super::issue_shared_memory_id(process).unwrap());
         assert!(
             created.iter().all(|&id| id != fixture.memory)
                 && created[0] != created[1]
@@ -770,10 +770,10 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(
-            super::create_shared_memory(&process),
+            super::issue_shared_memory_id(&process),
             Err(BrokerError::Internal)
         );
-        // A broker that never created an ID accepts none.
+        // A broker that never issued an ID accepts none.
         let key = SharedFutexKey {
             memory: SharedMemoryId(0),
             offset: 0,
@@ -821,7 +821,7 @@ mod tests {
             .unwrap();
         let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
         assert_eq!(
-            super::create_shared_memory(&process),
+            super::issue_shared_memory_id(&process),
             Err(BrokerError::PolicyDenied)
         );
         assert_eq!(

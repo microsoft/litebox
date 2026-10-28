@@ -2,17 +2,6 @@
 // Licensed under the MIT license.
 
 //! Futexes in memory that several processes share.
-//!
-//! Processes that share memory, such as a Linux `MAP_SHARED | MAP_ANONYMOUS` mapping that native
-//! fork children inherit, name it by a [`SharedMemoryId`] that its creator gets from
-//! [`LiteBox::create_shared_memory`], and a futex word in it by a [`SharedFutexKey`]. The broker
-//! keys futex wait queues by that key, so [`LiteBox::wake_shared_futex`] in any process reaches
-//! the threads waiting with [`SharedFutexWaiter::wait`] in every process.
-//!
-//! Each waiting thread owns a [`SharedFutexWaiter`]. A wait arms it in the broker, re-checks the
-//! futex word, and sleeps until the broker publishes a wake for it or the wait times out or is
-//! interrupted. It then disarms the waiter, which reports whether a wake selected it, so a wake
-//! racing with a timeout or interruption is reported rather than lost.
 
 use alloc::sync::Arc;
 use core::num::NonZeroU32;
@@ -55,21 +44,16 @@ pub enum SharedFutexError {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// Returns a new name for memory this process creates, which the broker signs, so that only
-    /// processes given the name, such as native fork children, can reach its futexes.
-    ///
-    /// Fails with [`SharedFutexError::Unavailable`] without a broker, as then no other process
-    /// can share the memory either, and with [`SharedFutexError::ResourceExhausted`],
-    /// [`SharedFutexError::PermissionDenied`], or [`SharedFutexError::Io`] if the broker cannot
-    /// create one.
+    /// Returns a new ID for memory this process creates, which the broker signs, so that only
+    /// processes given the ID, such as native fork children, can reach its futexes.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error.
-    pub fn create_shared_memory(&self) -> Result<SharedMemoryId, SharedFutexError> {
+    pub fn issue_shared_memory_id(&self) -> Result<SharedMemoryId, SharedFutexError> {
         let broker = self.broker_control().ok_or(SharedFutexError::Unavailable)?;
         Ok(broker
-            .create_shared_memory()
+            .issue_shared_memory_id()
             .map_err(BrokerObjectError::from)?)
     }
 }

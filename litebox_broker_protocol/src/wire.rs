@@ -688,8 +688,8 @@ mod tests {
         SharedBufferSlotIndex,
     };
     use crate::shared_futex::{
-        CreateFutexWaiterResponse, CreateSharedMemoryResponse, FutexArmRequest, FutexDisarmRequest,
-        FutexDisarmResponse, FutexWakeRequest, FutexWakeResponse, SharedFutexKey, SharedMemoryId,
+        CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
+        FutexWakeRequest, FutexWakeResponse, IssueMemoryIdResponse, SharedFutexKey, SharedMemoryId,
     };
     use crate::signal::{
         OpenSignalsResponse, PendingSignal, SendSignalRequest, SignalEvent, SignalTarget,
@@ -898,7 +898,7 @@ mod tests {
                 queue: handle,
                 buffer: sequence(4, 48),
             })),
-            BrokerOperation::SharedFutex(SharedFutexRequest::CreateMemory),
+            BrokerOperation::SharedFutex(SharedFutexRequest::IssueMemoryId),
             BrokerOperation::SharedFutex(SharedFutexRequest::CreateWaiter),
             BrokerOperation::SharedFutex(SharedFutexRequest::Arm(FutexArmRequest {
                 key: SharedFutexKey {
@@ -1624,11 +1624,9 @@ mod tests {
             BrokerResult::ReadinessQueue(ReadinessQueueResponse::Create(
                 CreateReadinessQueueResponse { handle },
             )),
-            BrokerResult::SharedFutex(SharedFutexResponse::CreateMemory(
-                CreateSharedMemoryResponse {
-                    memory: SharedMemoryId(u128::MAX - 1),
-                },
-            )),
+            BrokerResult::SharedFutex(SharedFutexResponse::IssueMemoryId(IssueMemoryIdResponse {
+                memory: SharedMemoryId(u128::MAX - 1),
+            })),
             BrokerResult::SharedFutex(SharedFutexResponse::CreateWaiter(
                 CreateFutexWaiterResponse { handle },
             )),
@@ -2763,8 +2761,8 @@ mod tests {
         );
         let reserved = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::SharedFutex(SharedFutexResponse::CreateMemory(
-                CreateSharedMemoryResponse {
+            result: BrokerResult::SharedFutex(SharedFutexResponse::IssueMemoryId(
+                IssueMemoryIdResponse {
                     memory: SharedMemoryId(1),
                 },
             )),

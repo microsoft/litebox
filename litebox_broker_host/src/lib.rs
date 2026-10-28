@@ -1805,13 +1805,12 @@ fn handle_shared_futex_request(
 ) -> RequestResult<SharedFutexResponse> {
     use litebox_broker_core::shared_futex;
     use litebox_broker_protocol::shared_futex::{
-        CreateFutexWaiterResponse, CreateSharedMemoryResponse, FutexDisarmResponse,
-        FutexWakeResponse,
+        CreateFutexWaiterResponse, FutexDisarmResponse, FutexWakeResponse, IssueMemoryIdResponse,
     };
 
     let response = match request {
-        SharedFutexRequest::CreateMemory => shared_futex::create_shared_memory(process)
-            .map(|memory| SharedFutexResponse::CreateMemory(CreateSharedMemoryResponse { memory })),
+        SharedFutexRequest::IssueMemoryId => shared_futex::issue_shared_memory_id(process)
+            .map(|memory| SharedFutexResponse::IssueMemoryId(IssueMemoryIdResponse { memory })),
         SharedFutexRequest::CreateWaiter => {
             shared_futex::create_futex_waiter(process, readiness_sink).map(|handle| {
                 SharedFutexResponse::CreateWaiter(CreateFutexWaiterResponse { handle })
@@ -3264,9 +3263,9 @@ mod tests {
 
     fn active_requests_operate_shared_futexes(broker: &BrokerCore) {
         use litebox_broker_protocol::shared_futex::{
-            CreateFutexWaiterResponse, CreateSharedMemoryResponse, FutexArmRequest,
-            FutexDisarmRequest, FutexDisarmResponse, FutexWakeRequest, FutexWakeResponse,
-            SharedFutexKey, SharedMemoryId,
+            CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
+            FutexWakeRequest, FutexWakeResponse, IssueMemoryIdResponse, SharedFutexKey,
+            SharedMemoryId,
         };
 
         let process = broker
@@ -3274,10 +3273,10 @@ mod tests {
             .unwrap();
         let request =
             |request| handle_test_request(&process, BrokerOperation::SharedFutex(request));
-        let response = request(SharedFutexRequest::CreateMemory);
-        let BrokerResult::SharedFutex(SharedFutexResponse::CreateMemory(
-            CreateSharedMemoryResponse { memory },
-        )) = response
+        let response = request(SharedFutexRequest::IssueMemoryId);
+        let BrokerResult::SharedFutex(SharedFutexResponse::IssueMemoryId(IssueMemoryIdResponse {
+            memory,
+        })) = response
         else {
             panic!("unexpected create memory response: {response:?}");
         };

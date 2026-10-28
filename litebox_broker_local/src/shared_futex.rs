@@ -13,17 +13,17 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Creates shared memory, returning its ID, which the broker signs, as
-    /// [`CreateSharedMemoryResponse`](litebox_broker_protocol::shared_futex::CreateSharedMemoryResponse)
+    /// Asks the broker to issue a signed ID for memory this process creates, as
+    /// [`IssueMemoryIdResponse`](litebox_broker_protocol::shared_futex::IssueMemoryIdResponse)
     /// describes.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued shared futex request.
-    pub fn create_shared_memory(&self) -> Result<SharedMemoryId, Channel::Error> {
-        match self.request_shared_futex(SharedFutexRequest::CreateMemory)? {
-            SharedFutexResponse::CreateMemory(response) => Ok(response.memory),
+    pub fn issue_shared_memory_id(&self) -> Result<SharedMemoryId, Channel::Error> {
+        match self.request_shared_futex(SharedFutexRequest::IssueMemoryId)? {
+            SharedFutexResponse::IssueMemoryId(response) => Ok(response.memory),
             response => panic!("broker returned unexpected shared futex response: {response:?}"),
         }
     }

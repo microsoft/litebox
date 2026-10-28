@@ -36,8 +36,8 @@ use crate::readiness_queue::{
 };
 use crate::shared_buffer::SharedBufferSequence;
 use crate::shared_futex::{
-    CreateFutexWaiterResponse, CreateSharedMemoryResponse, FutexArmRequest, FutexDisarmRequest,
-    FutexDisarmResponse, FutexWakeRequest, FutexWakeResponse,
+    CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
+    FutexWakeRequest, FutexWakeResponse, IssueMemoryIdResponse,
 };
 use crate::signal::{OpenSignalsResponse, SendSignalRequest, SignalEvent, TakeSignalRequest};
 use crate::socket::{
@@ -319,8 +319,8 @@ pub enum ReadinessQueueRequest {
 /// Request about futexes in shared memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SharedFutexRequest {
-    /// Create shared memory, returning its ID, which the broker signs.
-    CreateMemory,
+    /// Issue a signed ID for memory the calling process creates.
+    IssueMemoryId,
     /// Create an idle futex waiter.
     CreateWaiter,
     /// Arm a futex waiter on a futex word.
@@ -596,8 +596,8 @@ pub enum TimerResponse {
 /// Response about futexes in shared memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SharedFutexResponse {
-    /// Shared memory create operation response.
-    CreateMemory(CreateSharedMemoryResponse),
+    /// Shared memory ID issue operation response.
+    IssueMemoryId(IssueMemoryIdResponse),
     /// Futex waiter create operation response.
     CreateWaiter(CreateFutexWaiterResponse),
     /// Futex arm operation completed.

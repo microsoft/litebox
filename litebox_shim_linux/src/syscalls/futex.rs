@@ -87,8 +87,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Fails with [`MappingError::OutOfMemory`] if the broker cannot provide a name, as `mmap`
     /// reports any failure to back a mapping with `ENOMEM`.
-    pub(super) fn create_shared_memory(&self) -> Result<Option<SharedMemoryId>, MappingError> {
-        match self.global.litebox.create_shared_memory() {
+    pub(super) fn issue_shared_memory_id(&self) -> Result<Option<SharedMemoryId>, MappingError> {
+        match self.global.litebox.issue_shared_memory_id() {
             Ok(id) => Ok(Some(id)),
             Err(SharedFutexError::Unavailable) => Ok(None),
             Err(_) => Err(MappingError::OutOfMemory),
