@@ -4,7 +4,6 @@
 //! Process/thread related syscalls.
 
 use crate::syscalls::signal::{child_termination, siginfo_child, siginfo_kill_from};
-use crate::wait::wait_errno;
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
@@ -40,8 +39,8 @@ use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
-    errno::Errno, program_startup::LinuxProgramStartup,
+    ArchPrctlArg, CloneFlags, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam, errno::Errno,
+    program_startup::LinuxProgramStartup,
 };
 use litebox_common_linux::{
     PAGE_SIZE,
@@ -1205,9 +1204,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
             // Cast from *i32 to *u32
             let clear_child_tid = UserPtrMut::from_usize(clear_child_tid.as_usize());
+            // Linux wakes the word as a shared futex.
             let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
                 addr: clear_child_tid,
-                flags: litebox_common_linux::FutexFlags::PRIVATE,
+                flags: litebox_common_linux::FutexFlags::empty(),
                 count: 1,
             });
         }
@@ -1909,6 +1909,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         global: self.global.clone(),
                         litebox_thread: Cell::new(None),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
+                        shared_futex_waiter: core::cell::OnceCell::new(),
                         thread,
                         vfork: core::cell::RefCell::new(None),
                         pid: self.pid,
@@ -2204,7 +2205,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// If the time is so far in the future that it cannot be represented as an
     /// `Instant`, returns `Ok(None)`. If the time occurs in the past, returns
     /// the current time.
-    fn duration_since_epoch_to_deadline(
+    pub(super) fn duration_since_epoch_to_deadline(
         &self,
         clock_id: litebox_common_linux::ClockId,
         duration: Duration,
@@ -2732,85 +2733,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
         cpuset.iter_mut().for_each(|mut b| *b = true);
         CpuSet { bits: cpuset }
-    }
-}
-
-impl<Platform: ShimPlatform> Task<Platform> {
-    /// Handle syscall `futex`
-    pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
-        /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
-        /// It should be fine to treat shared futexes as private for now.
-        macro_rules! warn_shared_futex {
-            ($flag:ident) => {
-                if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    log_unsupported!("shared futex");
-                }
-            };
-        }
-
-        let res = match arg {
-            FutexArgs::Wake { addr, flags, count } => {
-                warn_shared_futex!(flags);
-                let Some(count) = core::num::NonZeroU32::new(count) else {
-                    return Ok(0);
-                };
-                self.global
-                    .futex_manager
-                    .wake(addr.to_platform_ptr::<Platform>(), count, None)? as usize
-            }
-            FutexArgs::Wait {
-                addr,
-                flags,
-                val,
-                timeout,
-            } => {
-                warn_shared_futex!(flags);
-                let timeout = timeout.read::<Platform>()?;
-                self.global
-                    .futex_manager
-                    .wait(
-                        &self.wait_cx().with_timeout(timeout),
-                        addr.to_platform_ptr::<Platform>(),
-                        val,
-                        None,
-                    )
-                    .map_err(|error| wait_errno(timeout, error))?;
-                0
-            }
-            litebox_common_linux::FutexArgs::WaitBitset {
-                addr,
-                flags,
-                val,
-                timeout,
-                bitmask,
-            } => {
-                warn_shared_futex!(flags);
-                let timeout = timeout.read::<Platform>()?;
-                let deadline = if let Some(timeout) = timeout {
-                    let clock_id =
-                        if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
-                            litebox_common_linux::ClockId::RealTime
-                        } else {
-                            litebox_common_linux::ClockId::Monotonic
-                        };
-                    self.duration_since_epoch_to_deadline(clock_id, timeout)?
-                } else {
-                    None
-                };
-                self.global
-                    .futex_manager
-                    .wait(
-                        &self.wait_cx().with_deadline(deadline),
-                        addr.to_platform_ptr::<Platform>(),
-                        val,
-                        core::num::NonZeroU32::new(bitmask),
-                    )
-                    .map_err(|error| wait_errno(timeout, error))?;
-                0
-            }
-            _ => unimplemented!("Unsupported futex operation"),
-        };
-        Ok(res)
     }
 }
 

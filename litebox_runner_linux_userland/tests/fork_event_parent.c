@@ -17,6 +17,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "helpers.h"
+
 // Bounds every wait, so a failure cannot hang the test.
 #define TIMEOUT_MS 30000
 
@@ -49,26 +51,6 @@ static int read_would_block(int fd) {
     uint64_t value;
     return flags != -1 && (flags & O_NONBLOCK) != 0 && read(fd, &value, sizeof(value)) == -1 &&
            errno == EAGAIN;
-}
-
-static void sleep_ms(long ms) {
-    struct timespec duration = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000};
-    while (nanosleep(&duration, &duration) == -1 && errno == EINTR) {
-    }
-}
-
-// Returns the exit code of `child`, first killing it unless `exiting`, or -1 if it did not exit
-// normally.
-static int reap(pid_t child, int exiting) {
-    if (!exiting) {
-        kill(child, SIGKILL);
-    }
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = waitpid(child, &status, 0);
-    } while (waited == -1 && errno == EINTR);
-    return waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 // A child blocked reading an eventfd wakes when its parent writes it, and its reply wakes the

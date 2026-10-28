@@ -148,26 +148,26 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     }
 }
 
-/// Private observer, used solely to help implement [`WaitContext::wait_on_events`].
-struct PolleeObserver<Platform: RawSyncPrimitivesProvider> {
+/// Observer that records any notification and wakes the waiting thread.
+pub(crate) struct PolleeObserver<Platform: RawSyncPrimitivesProvider> {
     ready: AtomicBool,
     waker: super::wait::Waker<Platform>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> PolleeObserver<Platform> {
-    fn new(waker: super::wait::Waker<Platform>) -> Self {
+    pub(crate) fn new(waker: super::wait::Waker<Platform>) -> Self {
         Self {
             ready: AtomicBool::new(false),
             waker,
         }
     }
 
-    fn reset(&self) {
+    pub(crate) fn reset(&self) {
         self.ready
             .store(false, core::sync::atomic::Ordering::SeqCst);
     }
 
-    fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         self.ready.load(core::sync::atomic::Ordering::SeqCst)
     }
 }

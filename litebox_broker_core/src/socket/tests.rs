@@ -1495,6 +1495,7 @@ fn test_broker_with_policy(
         unix_sockets: Arc::new(crate::unix_socket::UnixSockets::new(
             &crate::BrokerCoreLimits::DEFAULT,
         )),
+        shared_futexes: Arc::default(),
         ids: Arc::new(spin::Mutex::new(
             crate::id::IdAllocator::new(crate::id::MAX_ALLOCATED_ID).unwrap(),
         )),

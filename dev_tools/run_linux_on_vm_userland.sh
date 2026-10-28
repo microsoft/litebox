@@ -72,7 +72,8 @@ KERNEL_DIR="$REPO_DIR/litebox_runner_vm_kernel"
 USERLAND_DIR="$REPO_DIR/litebox_runner_linux_on_vm_userland"
 TESTS_DIR="$KERNEL_DIR/tests/linux"
 HOSTED_TESTS_DIR="$REPO_DIR/litebox_runner_linux_userland/tests"
-SHARED=(fork_threads_parent.c fork_interrupt_parent.c fork_event_parent.c fork_epoll_parent.c)
+SHARED=(fork_threads_parent.c fork_interrupt_parent.c fork_event_parent.c fork_epoll_parent.c
+    fork_shared_futex_parent.c)
 # shellcheck source=dev_tools/qemu_test_lib.sh
 source "$SCRIPT_DIR/qemu_test_lib.sh"
 

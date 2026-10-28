@@ -1567,9 +1567,11 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
  "hashbrown",
+ "hmac",
  "litebox_broker_protocol",
  "litebox_platform",
  "litebox_util_log",
+ "sha2",
  "spin 0.9.8",
  "tar-no-std",
  "tempfile",

@@ -699,6 +699,20 @@ impl From<litebox::event::timer::TimerError> for Errno {
     }
 }
 
+impl From<litebox::sync::futex::shared::SharedFutexError> for Errno {
+    /// Maps broker failures, which Linux futexes cannot have, to the errnos LiteBox reports for
+    /// other broker objects.
+    fn from(value: litebox::sync::futex::shared::SharedFutexError) -> Self {
+        use litebox::sync::futex::shared::SharedFutexError;
+        match value {
+            SharedFutexError::ResourceExhausted => Errno::ENOMEM,
+            SharedFutexError::PermissionDenied => Errno::EACCES,
+            SharedFutexError::Io | SharedFutexError::Unavailable => Errno::EIO,
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::event::readiness_queue::ReadinessQueueError> for Errno {
     fn from(value: litebox::event::readiness_queue::ReadinessQueueError) -> Self {
         use litebox::event::readiness_queue::ReadinessQueueError;
@@ -737,6 +751,7 @@ impl From<litebox::sync::futex::FutexError> for Errno {
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
             litebox::sync::futex::FutexError::Fault => Errno::EFAULT,
+            litebox::sync::futex::FutexError::Shared(error) => error.into(),
         }
     }
 }

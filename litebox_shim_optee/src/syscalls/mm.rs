@@ -38,6 +38,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
                     direction: litebox::platform::page_mgmt::AllocationDirection::BottomUp,
                     allowed_range: None,
                 },
+                None,
                 op,
             )
             .map(UserPtrMut::to_platform_ptr::<Platform>)

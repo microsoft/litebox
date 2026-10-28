@@ -2321,6 +2321,7 @@ pub enum FutexOperation {
     Wait = 0,
     Wake = 1,
     WaitBitset = 9,
+    WakeBitset = 10,
 }
 
 bitflags::bitflags! {
@@ -2358,6 +2359,17 @@ pub enum FutexArgs {
         addr: UserPtrMut<u32>,
         flags: FutexFlags,
         count: u32,
+    },
+    /// Wakes waiters on `addr` whose `FUTEX_WAIT_BITSET` bitset intersects `bitmask`.
+    WakeBitset {
+        /// The futex word whose waiters to wake.
+        addr: UserPtrMut<u32>,
+        /// Option flags, such as [`FutexFlags::PRIVATE`].
+        flags: FutexFlags,
+        /// The most waiters to wake.
+        count: u32,
+        /// The bitset that selects waiters.
+        bitmask: u32,
     },
 }
 
@@ -3802,6 +3814,12 @@ impl SyscallRequest {
                 addr,
                 flags,
                 count: val,
+            },
+            FutexOperation::WakeBitset => FutexArgs::WakeBitset {
+                addr,
+                flags,
+                count: val,
+                bitmask: ctx.sys_req_arg(5),
             },
         };
         Ok(SyscallRequest::Futex { args })

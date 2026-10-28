@@ -27,6 +27,7 @@ use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
     page_mgmt::{DeallocationError, PageReservation, PermissionUpdateError, ReservationStore},
 };
+use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 
 use crate::PAGE_SIZE;
 
@@ -176,6 +177,16 @@ pub struct VmArea {
     flags: VmFlags,
     /// Whether this area is backed by a file
     is_file_backed: bool,
+    /// The shared memory a shared anonymous area maps, which native fork children share.
+    shared_memory: Option<SharedMemoryView>,
+}
+
+/// Where a shared anonymous area maps its shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedMemoryView {
+    memory: SharedMemoryId,
+    /// Address that offset zero of the memory maps at, which stays the same as the area splits.
+    base: usize,
 }
 
 impl VmArea {
@@ -197,6 +208,16 @@ impl VmArea {
         self.flags.contains(VmFlags::VM_SHARED) && !self.is_file_backed
     }
 
+    /// Returns the key of the futex word at `address` in this area, if the area maps named
+    /// shared memory.
+    pub(super) fn shared_futex_key(&self, address: usize) -> Option<SharedFutexKey> {
+        let view = self.shared_memory?;
+        Some(SharedFutexKey {
+            memory: view.memory,
+            offset: u64::try_from(address.checked_sub(view.base)?).ok()?,
+        })
+    }
+
     /// Create a new [`VmArea`] with the given flags, adding [`VmFlags::VM_HAS_CONTENTS`] if the
     /// area is file-backed or has any access.
     #[inline]
@@ -207,6 +228,7 @@ impl VmArea {
         Self {
             flags,
             is_file_backed,
+            shared_memory: None,
         }
     }
 }
@@ -706,6 +728,25 @@ where
         self.vmas.iter()
     }
 
+    /// Records that the shared anonymous mapping just created at `range`.
+    pub(super) fn set_shared_memory(&mut self, range: Range<usize>, memory: SharedMemoryId) {
+        let Some(&vma) = self.vmas.get(&range.start) else {
+            debug_assert!(false, "no mapping was just created at {range:#x?}");
+            return;
+        };
+        debug_assert!(vma.is_shared_anonymous() && vma.shared_memory.is_none());
+        self.vmas.insert(
+            range.clone(),
+            VmArea {
+                shared_memory: Some(SharedMemoryView {
+                    memory,
+                    base: range.start,
+                }),
+                ..vma
+            },
+        );
+    }
+
     /// Gets an iterator over all the stored ranges that are
     /// either partially or completely overlapped by the given range.
     pub(super) fn overlapping(
@@ -1146,6 +1187,7 @@ where
         while end < range.end {
             let (next_range, next) = self.vmas.get_key_value(&end)?;
             if next.is_file_backed() != first.is_file_backed()
+                || next.shared_memory != first.shared_memory
                 || !((next.flags() ^ first.flags()) - VmFlags::VM_HAS_CONTENTS).is_empty()
             {
                 return None;

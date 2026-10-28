@@ -34,6 +34,7 @@ mod primitive;
 mod process;
 mod process_group;
 mod readiness_queue;
+mod shared_futex;
 mod signal;
 mod socket;
 mod terminal;
@@ -58,6 +59,7 @@ const REQUEST_TAG_SIGNAL: u8 = 13;
 const REQUEST_TAG_PROCESS_GROUP: u8 = 14;
 const REQUEST_TAG_UNIX_SOCKET: u8 = 15;
 const REQUEST_TAG_READINESS_QUEUE: u8 = 16;
+const REQUEST_TAG_SHARED_FUTEX: u8 = 17;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -77,6 +79,7 @@ const RESPONSE_TAG_SIGNAL: u8 = 13;
 const RESPONSE_TAG_PROCESS_GROUP: u8 = 14;
 const RESPONSE_TAG_UNIX_SOCKET: u8 = 15;
 const RESPONSE_TAG_READINESS_QUEUE: u8 = 16;
+const RESPONSE_TAG_SHARED_FUTEX: u8 = 17;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -141,7 +144,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_SIGNAL
         | REQUEST_TAG_PROCESS_GROUP
         | REQUEST_TAG_UNIX_SOCKET
-        | REQUEST_TAG_READINESS_QUEUE => {
+        | REQUEST_TAG_READINESS_QUEUE
+        | REQUEST_TAG_SHARED_FUTEX => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -241,6 +245,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             readiness_queue::encode_readiness_queue_request(&mut encoder, request);
         }
+        BrokerOperation::SharedFutex(request) => {
+            encoder.u8(REQUEST_TAG_SHARED_FUTEX);
+            encoder.request_id(request_id);
+            shared_futex::encode_shared_futex_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -266,7 +275,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_SIGNAL
         | REQUEST_TAG_PROCESS_GROUP
         | REQUEST_TAG_UNIX_SOCKET
-        | REQUEST_TAG_READINESS_QUEUE => {}
+        | REQUEST_TAG_READINESS_QUEUE
+        | REQUEST_TAG_SHARED_FUTEX => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -297,6 +307,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_READINESS_QUEUE => BrokerOperation::ReadinessQueue(
             readiness_queue::decode_readiness_queue_request(&mut decoder)?,
         ),
+        REQUEST_TAG_SHARED_FUTEX => {
+            BrokerOperation::SharedFutex(shared_futex::decode_shared_futex_request(&mut decoder)?)
+        }
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -378,7 +391,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_SIGNAL
         | RESPONSE_TAG_PROCESS_GROUP
         | RESPONSE_TAG_UNIX_SOCKET
-        | RESPONSE_TAG_READINESS_QUEUE => {
+        | RESPONSE_TAG_READINESS_QUEUE
+        | RESPONSE_TAG_SHARED_FUTEX => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -478,6 +492,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             readiness_queue::encode_readiness_queue_response(&mut encoder, response);
         }
+        BrokerResult::SharedFutex(response) => {
+            encoder.u8(RESPONSE_TAG_SHARED_FUTEX);
+            encoder.request_id(request_id);
+            shared_futex::encode_shared_futex_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -511,7 +530,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_SIGNAL
         | RESPONSE_TAG_PROCESS_GROUP
         | RESPONSE_TAG_UNIX_SOCKET
-        | RESPONSE_TAG_READINESS_QUEUE => {}
+        | RESPONSE_TAG_READINESS_QUEUE
+        | RESPONSE_TAG_SHARED_FUTEX => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -543,6 +563,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_READINESS_QUEUE => BrokerResult::ReadinessQueue(
             readiness_queue::decode_readiness_queue_response(&mut decoder)?,
         ),
+        RESPONSE_TAG_SHARED_FUTEX => {
+            BrokerResult::SharedFutex(shared_futex::decode_shared_futex_response(&mut decoder)?)
+        }
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -637,9 +660,9 @@ mod tests {
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
         ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
-        ReadinessQueueRequest, ReadinessQueueResponse, SignalRequest, SignalResponse,
-        SocketRequest, SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse,
-        UnixSocketRequest, UnixSocketResponse,
+        ReadinessQueueRequest, ReadinessQueueResponse, SharedFutexRequest, SharedFutexResponse,
+        SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest,
+        ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -663,6 +686,10 @@ mod tests {
     use crate::shared_buffer::{
         MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
         SharedBufferSlotIndex,
+    };
+    use crate::shared_futex::{
+        CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
+        FutexWakeRequest, FutexWakeResponse, IssueMemoryIdResponse, SharedFutexKey, SharedMemoryId,
     };
     use crate::signal::{
         OpenSignalsResponse, PendingSignal, SendSignalRequest, SignalEvent, SignalTarget,
@@ -734,6 +761,7 @@ mod tests {
                 RESPONSE_TAG_PROCESS_GROUP,
                 RESPONSE_TAG_UNIX_SOCKET,
                 RESPONSE_TAG_READINESS_QUEUE,
+                RESPONSE_TAG_SHARED_FUTEX,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -753,10 +781,11 @@ mod tests {
                 REQUEST_TAG_PROCESS_GROUP,
                 REQUEST_TAG_UNIX_SOCKET,
                 REQUEST_TAG_READINESS_QUEUE,
+                REQUEST_TAG_SHARED_FUTEX,
             ]
         );
         // Top-level tags are consecutive.
-        assert_eq!(REQUEST_TAG_READINESS_QUEUE, 16);
+        assert_eq!(REQUEST_TAG_SHARED_FUTEX, 17);
         assert_eq!(
             [
                 RESPONSE_TAG_ERROR,
@@ -868,6 +897,27 @@ mod tests {
             BrokerOperation::ReadinessQueue(ReadinessQueueRequest::TakeReady(TakeReadyRequest {
                 queue: handle,
                 buffer: sequence(4, 48),
+            })),
+            BrokerOperation::SharedFutex(SharedFutexRequest::IssueMemoryId),
+            BrokerOperation::SharedFutex(SharedFutexRequest::CreateWaiter),
+            BrokerOperation::SharedFutex(SharedFutexRequest::Arm(FutexArmRequest {
+                key: SharedFutexKey {
+                    memory: SharedMemoryId(u128::MAX - 1),
+                    offset: u64::MAX,
+                },
+                bitset: u32::MAX,
+                waiter: ObjectHandle(1),
+            })),
+            BrokerOperation::SharedFutex(SharedFutexRequest::Wake(FutexWakeRequest {
+                key: SharedFutexKey {
+                    memory: SharedMemoryId(1 << 64 | 2),
+                    offset: 4,
+                },
+                count: u32::MAX,
+                bitset: 1,
+            })),
+            BrokerOperation::SharedFutex(SharedFutexRequest::Disarm(FutexDisarmRequest {
+                waiter: handle,
             })),
             BrokerOperation::Signal(SignalRequest::Open),
             BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
@@ -1578,6 +1628,22 @@ mod tests {
             BrokerResult::ReadinessQueue(ReadinessQueueResponse::Create(
                 CreateReadinessQueueResponse { handle },
             )),
+            BrokerResult::SharedFutex(SharedFutexResponse::IssueMemoryId(IssueMemoryIdResponse {
+                memory: SharedMemoryId(u128::MAX - 1),
+            })),
+            BrokerResult::SharedFutex(SharedFutexResponse::CreateWaiter(
+                CreateFutexWaiterResponse { handle },
+            )),
+            BrokerResult::SharedFutex(SharedFutexResponse::Arm),
+            BrokerResult::SharedFutex(SharedFutexResponse::Wake(FutexWakeResponse {
+                woken: u32::MAX,
+            })),
+            BrokerResult::SharedFutex(SharedFutexResponse::Disarm(FutexDisarmResponse {
+                woken: true,
+            })),
+            BrokerResult::SharedFutex(SharedFutexResponse::Disarm(FutexDisarmResponse {
+                woken: false,
+            })),
             BrokerResult::ReadinessQueue(ReadinessQueueResponse::Add),
             BrokerResult::ReadinessQueue(ReadinessQueueResponse::Modify),
             BrokerResult::ReadinessQueue(ReadinessQueueResponse::Remove),
@@ -1985,6 +2051,33 @@ mod tests {
             decode_request(&unknown_readiness_queue_request),
             Err(WireError::InvalidTag)
         );
+        let mut unknown_shared_futex_request = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::SharedFutex(SharedFutexRequest::CreateWaiter),
+        });
+        unknown_shared_futex_request[9] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_shared_futex_request),
+            Err(WireError::InvalidTag)
+        );
+        let futex_arm = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::SharedFutex(SharedFutexRequest::Arm(FutexArmRequest {
+                key: SharedFutexKey {
+                    memory: SharedMemoryId(u128::MAX),
+                    offset: 4,
+                },
+                bitset: 1,
+                waiter: ObjectHandle(13),
+            })),
+        });
+        // Tag, request ID, and family tag precede the key, whose memory ID is cut short.
+        for length in [futex_arm.len() - 1, 10 + 15] {
+            assert_eq!(
+                decode_request(&futex_arm[..length]),
+                Err(WireError::TruncatedFrame)
+            );
+        }
         let mut unknown_readiness_queue_flags = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Add(
@@ -2648,6 +2741,39 @@ mod tests {
         assert_eq!(
             decode_response(&unknown_timer_response),
             Err(WireError::InvalidTag)
+        );
+
+        let mut unknown_shared_futex_response = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::SharedFutex(SharedFutexResponse::Arm),
+        });
+        unknown_shared_futex_response[9] = 0xff;
+        assert_eq!(
+            decode_response(&unknown_shared_futex_response),
+            Err(WireError::InvalidTag)
+        );
+        let mut invalid_futex_disarm = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::SharedFutex(SharedFutexResponse::Disarm(FutexDisarmResponse {
+                woken: true,
+            })),
+        });
+        *invalid_futex_disarm.last_mut().unwrap() = 2;
+        assert_eq!(
+            decode_response(&invalid_futex_disarm),
+            Err(WireError::InvalidTag)
+        );
+        let reserved = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::SharedFutex(SharedFutexResponse::IssueMemoryId(
+                IssueMemoryIdResponse {
+                    memory: SharedMemoryId(1),
+                },
+            )),
+        });
+        assert_eq!(
+            decode_response(&reserved[..reserved.len() - 1]),
+            Err(WireError::TruncatedFrame)
         );
 
         let mut unknown_readiness_queue_error = encode_response(BrokerResponse {

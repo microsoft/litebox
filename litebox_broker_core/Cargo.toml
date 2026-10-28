@@ -9,12 +9,18 @@ test-support = []
 [dependencies]
 bitflags = { version = "2.9.0", default-features = false }
 hashbrown = "0.15.2"
+# HMAC-SHA256 signs shared memory IDs, so processes cannot name memory they were not given.
+hmac = { version = "0.12", default-features = false }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 litebox_util_log = { path = "../litebox_util_log", version = "0.1.0" }
+sha2 = { version = "0.10", default-features = false }
 spin = { version = "0.9.8", default-features = false, features = ["once", "rwlock", "spin_mutex"] }
 tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0.6", default-features = false }
+
+[target.'cfg(target_os = "none")'.dependencies]
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
 [lints]
 workspace = true

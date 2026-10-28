@@ -1354,6 +1354,20 @@ impl BrokerProcess {
         self.cancellation.is_cancelled()
     }
 
+    /// Returns the caller's object rights, failing with `PolicyDenied` unless they include
+    /// `required`.
+    pub(crate) fn require_object_rights(&self, required: ObjectRights) -> Result<ObjectRights> {
+        let rights = self
+            .core
+            .policy
+            .principal_object_rights(self.caller_credential)?;
+        if rights.contains(required) {
+            Ok(rights)
+        } else {
+            Err(BrokerError::PolicyDenied)
+        }
+    }
+
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
         let rights = self
             .core

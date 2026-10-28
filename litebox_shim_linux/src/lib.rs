@@ -538,6 +538,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 litebox_thread: Cell::new(None),
                 thread: syscalls::process::ThreadState::new_process(pid, Some(initial_thread)),
                 wait_state: wait::WaitState::new(self.0.platform),
+                shared_futex_waiter: core::cell::OnceCell::new(),
                 vfork: RefCell::new(None),
                 pid,
                 credentials,
@@ -699,6 +700,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 litebox_thread: Cell::new(None),
                 thread,
                 wait_state: wait::WaitState::new(self.0.platform),
+                shared_futex_waiter: core::cell::OnceCell::new(),
                 vfork: RefCell::new(None),
                 pid,
                 credentials,
@@ -1671,6 +1673,9 @@ struct Task<Platform: ShimPlatform> {
     /// thread ID is the process ID.
     litebox_thread: Cell<Option<litebox::thread::Thread>>,
     wait_state: wait::WaitState<Platform>,
+    /// This thread's waiter for futexes in shared memory, created on first use.
+    shared_futex_waiter:
+        core::cell::OnceCell<litebox::sync::futex::shared::SharedFutexWaiter<Platform>>,
     thread: syscalls::process::ThreadState<Platform>,
     vfork: RefCell<Option<VforkState<Platform>>>,
     /// Process ID
@@ -1750,6 +1755,7 @@ mod test_utils {
             files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
             Task {
                 wait_state: wait::WaitState::new(self.platform),
+                shared_futex_waiter: core::cell::OnceCell::new(),
                 litebox_thread: Cell::new(None),
                 thread: syscalls::process::ThreadState::new_process(pid, None),
                 vfork: RefCell::new(None),
@@ -1776,6 +1782,7 @@ mod test_utils {
             };
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
+                shared_futex_waiter: core::cell::OnceCell::new(),
                 global: self.global.clone(),
                 litebox_thread: Cell::new(Some(litebox_thread)),
                 thread,

@@ -20,6 +20,7 @@ use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
     fs::{in_mem::InitialNode, resolver::Resolver},
+    random::{RandomProvider, RandomProviderError},
     socket::HOST_GATEWAY_IPV4_ADDRESS,
     stdio::{StdioProvider as _, StdioStream},
     test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
@@ -38,6 +39,20 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use crate::syscalls::tests::TestPlatform;
 
 pub(crate) const MAX_TEST_BROKER_REFERENCES: usize = 64;
+
+/// The byte the test broker's random provider fills every buffer with.
+pub(crate) const TEST_RANDOM_BYTE: u8 = 0x5a;
+
+/// Deterministic random source, so that tests can tell the broker's randomness and need it to
+/// succeed, as signing shared memory IDs does.
+struct FixedRandomProvider;
+
+impl RandomProvider for FixedRandomProvider {
+    fn fill(&self, output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
+        output.fill(TEST_RANDOM_BYTE);
+        Ok(())
+    }
+}
 
 static BROKER: OnceLock<TestBroker> = OnceLock::new();
 
@@ -145,6 +160,7 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
                 .with_socket_policy(socket_policy),
         )
         .with_limits(limits)
+        .with_random_provider(Arc::new(FixedRandomProvider))
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)));
         #[cfg(target_os = "linux")]
         let builder = builder.with_socket_provider(Arc::new(socket_provider));

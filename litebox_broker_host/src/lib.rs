@@ -44,9 +44,9 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
     ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
-    ReadinessQueueRequest, ReadinessQueueResponse, SignalRequest, SignalResponse, SocketRequest,
-    SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest,
-    UnixSocketResponse,
+    ReadinessQueueRequest, ReadinessQueueResponse, SharedFutexRequest, SharedFutexResponse,
+    SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse,
+    TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -551,6 +551,10 @@ fn handle_request<Memory: SharedMemory>(
         }
         BrokerOperation::ProcessGroup(request) => {
             handle_process_group_request(process, request).map(BrokerResult::ProcessGroup)
+        }
+        BrokerOperation::SharedFutex(request) => {
+            handle_shared_futex_request(process, request, readiness_sink)
+                .map(BrokerResult::SharedFutex)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -1794,6 +1798,35 @@ fn handle_event_request(
     }
 }
 
+fn handle_shared_futex_request(
+    process: &BrokerProcess,
+    request: SharedFutexRequest,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<SharedFutexResponse> {
+    use litebox_broker_core::shared_futex;
+    use litebox_broker_protocol::shared_futex::{
+        CreateFutexWaiterResponse, FutexDisarmResponse, FutexWakeResponse, IssueMemoryIdResponse,
+    };
+
+    let response = match request {
+        SharedFutexRequest::IssueMemoryId => shared_futex::issue_shared_memory_id(process)
+            .map(|memory| SharedFutexResponse::IssueMemoryId(IssueMemoryIdResponse { memory })),
+        SharedFutexRequest::CreateWaiter => {
+            shared_futex::create_futex_waiter(process, readiness_sink).map(|handle| {
+                SharedFutexResponse::CreateWaiter(CreateFutexWaiterResponse { handle })
+            })
+        }
+        SharedFutexRequest::Arm(request) => {
+            shared_futex::futex_arm(process, request).map(|()| SharedFutexResponse::Arm)
+        }
+        SharedFutexRequest::Wake(request) => shared_futex::futex_wake(process, request)
+            .map(|woken| SharedFutexResponse::Wake(FutexWakeResponse { woken })),
+        SharedFutexRequest::Disarm(request) => shared_futex::futex_disarm(process, request)
+            .map(|woken| SharedFutexResponse::Disarm(FutexDisarmResponse { woken })),
+    };
+    response.map_err(RequestFailure::from)
+}
+
 fn handle_timer_request(
     process: &BrokerProcess,
     request: TimerRequest,
@@ -2362,6 +2395,7 @@ mod tests {
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
         active_requests_operate_timers(&broker, &timer_provider);
+        active_requests_operate_shared_futexes(&broker);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequences_stage_unix_socket_data(&broker);
@@ -3224,6 +3258,75 @@ mod tests {
                 BrokerOperation::CloseObject(ObjectHandle(handle.0 + 1))
             ),
             BrokerResult::Error(ErrorCode::UnknownObject)
+        );
+    }
+
+    fn active_requests_operate_shared_futexes(broker: &BrokerCore) {
+        use litebox_broker_protocol::shared_futex::{
+            CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
+            FutexWakeRequest, FutexWakeResponse, IssueMemoryIdResponse, SharedFutexKey,
+            SharedMemoryId,
+        };
+
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let request =
+            |request| handle_test_request(&process, BrokerOperation::SharedFutex(request));
+        let response = request(SharedFutexRequest::IssueMemoryId);
+        let BrokerResult::SharedFutex(SharedFutexResponse::IssueMemoryId(IssueMemoryIdResponse {
+            memory,
+        })) = response
+        else {
+            panic!("unexpected create memory response: {response:?}");
+        };
+        let response = request(SharedFutexRequest::CreateWaiter);
+        let BrokerResult::SharedFutex(SharedFutexResponse::CreateWaiter(
+            CreateFutexWaiterResponse { handle: waiter },
+        )) = response
+        else {
+            panic!("unexpected create response: {response:?}");
+        };
+        let key = SharedFutexKey { memory, offset: 4 };
+        let arm = |key| {
+            request(SharedFutexRequest::Arm(FutexArmRequest {
+                key,
+                bitset: u32::MAX,
+                waiter,
+            }))
+        };
+
+        // An ID the broker did not sign names no memory.
+        let forged = SharedFutexKey {
+            memory: SharedMemoryId(memory.0 ^ 1),
+            offset: 4,
+        };
+        assert_eq!(arm(forged), BrokerResult::Error(ErrorCode::PolicyDenied));
+        assert_eq!(
+            arm(key),
+            BrokerResult::SharedFutex(SharedFutexResponse::Arm)
+        );
+        assert_eq!(
+            arm(key),
+            BrokerResult::Error(ErrorCode::UnsupportedOperation)
+        );
+        assert_eq!(
+            request(SharedFutexRequest::Wake(FutexWakeRequest {
+                key,
+                count: 1,
+                bitset: u32::MAX,
+            })),
+            BrokerResult::SharedFutex(SharedFutexResponse::Wake(FutexWakeResponse { woken: 1 }))
+        );
+        assert_eq!(
+            request(SharedFutexRequest::Disarm(FutexDisarmRequest { waiter })),
+            BrokerResult::SharedFutex(SharedFutexResponse::Disarm(FutexDisarmResponse {
+                woken: true
+            }))
+        );
+        assert_eq!(
+            handle_test_request(&process, BrokerOperation::CloseObject(waiter)),
+            BrokerResult::ObjectClosed
         );
     }
 

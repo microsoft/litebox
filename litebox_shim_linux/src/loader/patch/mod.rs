@@ -319,6 +319,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
                     allowed_range,
                 },
+                None,
                 |_| Ok(0),
             )
             .map_err(Errno::from)

@@ -180,7 +180,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
 mod tests {
     use crate::syscalls::tests::init_platform;
     use litebox::user_pointers::UserPtrMut;
-    use litebox_common_linux::errno::Errno;
     use zerocopy::FromZeros as _;
 
     #[test]
@@ -198,9 +197,12 @@ mod tests {
         );
         assert_eq!(
             task.sys_getrandom(ptr, buf.len() - 1, RngFlags::empty()),
-            Err(Errno::EIO)
+            Ok(buf.len() - 1)
         );
-        assert_eq!(buf, [0; 16]);
+        // The bytes come from the test broker's random provider.
+        let random = crate::syscalls::test_broker::TEST_RANDOM_BYTE;
+        assert_eq!(buf[..buf.len() - 1], [random; 15]);
+        assert_eq!(buf[buf.len() - 1], 0);
     }
 
     #[test]

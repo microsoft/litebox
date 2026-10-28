@@ -40,7 +40,6 @@ pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) 
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    #[inline]
     pub(crate) fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
@@ -49,6 +48,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MapFlags,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
+        let shared_memory = if flags.contains(MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS) {
+            self.issue_shared_memory_id()?
+        } else {
+            None
+        };
         let fixed_start = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED));
         self.global.mm.do_mmap(
             suggested_addr,
@@ -59,6 +63,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
                 allowed_range: None,
             },
+            shared_memory,
             |pointer| {
                 if let Some(start) = fixed_start {
                     self.clear_file_mappings_for_range(start, len);
