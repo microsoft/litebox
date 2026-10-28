@@ -39,6 +39,10 @@
 //! CPU, once no other CPU runs anything.
 //!
 //! Known limitations:
+//! - A run, or a worker job for a thread, is charged at most one slice of CPU
+//!   time (see `charged`), because the clock cannot tell long kernel work from
+//!   time the host did not run the vCPU. A thread whose runs regularly exceed
+//!   a slice therefore gets more than its share of the CPU.
 //! - A notification to any waiting process shortens every busy CPU's slice.
 //! - A process running on another CPU, with no thread waiting for
 //!   notifications, sees one only at its next kernel entry, at the latest as
@@ -242,6 +246,30 @@ struct Found<'a> {
 /// Bit `i`: CPU `i`.
 pub(crate) fn bit(cpu: CpuId) -> u64 {
     1 << cpu.index()
+}
+
+/// The CPU time to count for a runnable thread that has used `cpu_time`, as
+/// it is polled: at least one slice below `floor` (the [`RunQueue::floor`]).
+/// A thread back from a long wait (e.g., for a device) thus gets at most one
+/// extra slice before the others get their turns, instead of running until
+/// it has caught up with them.
+///
+/// It never lowers `cpu_time`. The floor can stop rising while threads run
+/// (e.g., while a stalled CPU holds a process, see [`Found::held`]); pulling
+/// their CPU time down toward it would erase their progress and leave them
+/// tied, ordered only by the shared round-robin position, which other CPUs
+/// keep moving, so a thread could starve.
+fn counted(cpu_time: u64, floor: u64) -> u64 {
+    cpu_time.max(floor.saturating_sub(QUANTUM_NANOS))
+}
+
+/// The CPU time to charge for a thread's run, or a worker job for it, that
+/// took `elapsed` nanoseconds: at most one slice. The clock also counts time
+/// the host did not run the vCPU, which looks the same as real work; without
+/// this cap, a thread charged for such a stall would wait until every other
+/// thread caught up with it.
+pub(crate) fn charged(elapsed: u64) -> u64 {
+    elapsed.min(QUANTUM_NANOS)
 }
 
 impl Shared {
@@ -707,10 +735,8 @@ impl<'a> Found<'a> {
             match turn {
                 Turn::Runnable => {
                     runnable += 1;
-                    // A thread back from waiting (e.g., for a device) is due
-                    // at most a slice more than the others.
                     let cpu_time = &thread.cpu_time;
-                    cpu_time.set(cpu_time.get().max(floor.saturating_sub(QUANTUM_NANOS)));
+                    cpu_time.set(counted(cpu_time.get(), floor));
                     let id = (process.seq, thread.id);
                     let key = (cpu_time.get(), id <= last, id.0, id.1);
                     let other = match best {
@@ -1035,5 +1061,94 @@ impl Inner {
             self.kill("returned to the kernel without waiting");
         }
         clone
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Models one scheduling step (`Shared::step`, then `Shared::run_best`) on
+    /// a CPU that claims only process `seq`, whose threads are all runnable,
+    /// thread `id` having used `cpu_time[id]`. It picks the thread with the
+    /// least counted CPU time (ties go round-robin), charges it for a run of
+    /// `elapsed` nanoseconds, and raises the floor to the least CPU time among
+    /// these threads and `held`, the least CPU time published by processes
+    /// that other CPUs hold. Returns the ID of the thread that ran.
+    fn take_step(
+        queue: &mut RunQueue,
+        seq: u64,
+        cpu_time: &mut [u64],
+        elapsed: u64,
+        held: Option<u64>,
+    ) -> u64 {
+        for time in &mut *cpu_time {
+            *time = counted(*time, queue.floor);
+        }
+        let (id, time) = (0..)
+            .zip(&mut *cpu_time)
+            .min_by_key(|(id, time)| -> Key { (**time, (seq, *id) <= queue.last, seq, *id) })
+            .expect("a runnable thread");
+        *time += charged(elapsed);
+        let runnable = cpu_time.iter().copied().chain(held).min();
+        queue.floor = queue.floor.max(runnable.expect("a thread"));
+        queue.last = (seq, id);
+        id
+    }
+
+    /// Asserts that, of `count` threads, none went more than two rounds
+    /// (`2 * count` steps) without running; `order` lists the ID of the
+    /// thread that ran at each step. This checks for a reasonable share of
+    /// the CPU (about half a fair share at least), not an exact one.
+    fn assert_no_starvation(order: &[u64], count: usize) {
+        for thread in (0..).take(count) {
+            let wait = order
+                .split(|&ran| ran == thread)
+                .map(<[u64]>::len)
+                .max()
+                .unwrap_or_default();
+            assert!(
+                wait <= 2 * count,
+                "thread {thread} waited {wait} steps: {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thread_whose_run_the_host_stalled_runs_again_soon() {
+        let mut queue = RunQueue::default();
+        let mut cpu_time = [0; 8];
+        let mut order = Vec::new();
+        for step in 0..200 {
+            // The run at step 20 takes 70 ms longer, as if the host stopped the
+            // vCPU during it.
+            let stall = if step == 20 { 70_000_000 } else { 0 };
+            let elapsed = QUANTUM_NANOS + stall;
+            order.push(take_step(&mut queue, 1, &mut cpu_time, elapsed, None));
+        }
+        // Without the cap, the stalled thread would wait about 7 rounds, until
+        // every other thread had run 70 ms more.
+        assert_no_starvation(&order, 8);
+    }
+
+    #[test]
+    fn neither_sibling_starves_while_a_stalled_cpu_holds_the_floor_down() {
+        let mut queue = RunQueue::default();
+        // A stalled CPU holds process 1, whose published least CPU time is 0,
+        // so the floor stays at 0 (see `Found::held`).
+        let held = Some(0);
+        // Process 2's two threads run on one CPU and process 3's thread on
+        // another, their steps interleaved: each run of process 3 moves the
+        // shared round-robin position past process 2's threads.
+        let (mut siblings, mut other) = ([0; 2], [0]);
+        let mut order = Vec::new();
+        for _ in 0..100 {
+            order.push(take_step(&mut queue, 2, &mut siblings, QUANTUM_NANOS, held));
+            take_step(&mut queue, 3, &mut other, QUANTUM_NANOS, held);
+        }
+        // Each run adds to the siblings' CPU time, so they keep taking turns;
+        // erasing it would leave them tied, and the moved round-robin would
+        // always pick the first.
+        assert_no_starvation(&order, 2);
     }
 }
