@@ -440,8 +440,8 @@ impl<Memory: SharedMemory> Drop for AssociationEndingGuard<'_, Memory> {
 /// executing see that promptly.
 ///
 /// `readiness` is created by the caller rather than here so readiness sources
-/// can record into the same runtime this publishes from. The Linux network
-/// reactor is currently its production source.
+/// can record into the same runtime this publishes from. The Linux
+/// socket provider is currently its production source.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_requests<Memory, LaneSource, NotificationChannel, Shutdown>(
     association: BrokerHostAssociation<Memory>,

@@ -6,6 +6,7 @@ use super::*;
 use std::collections::VecDeque;
 
 struct GuestTcpPair {
+    provider: Arc<LinuxSocketProvider>,
     listener_process: Arc<BrokerProcess>,
     connector_process: Arc<BrokerProcess>,
     connector: ObjectHandle,
@@ -20,9 +21,18 @@ fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
-        provider,
+        provider.clone(),
     )
     .unwrap();
+    connect_guest_tcp_pair(&broker, provider, port)
+}
+
+/// Connects a guest TCP pair on `broker`, whose sockets `provider` hosts.
+fn connect_guest_tcp_pair(
+    broker: &BrokerCore,
+    provider: Arc<LinuxSocketProvider>,
+    port: u16,
+) -> GuestTcpPair {
     let listener_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
         .unwrap();
@@ -57,6 +67,7 @@ fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
         panic!("guest accept returned a socket failure");
     };
     GuestTcpPair {
+        provider,
         listener_process,
         connector_process,
         connector,
@@ -95,7 +106,7 @@ fn wait_for_guest_reset(
 }
 
 #[test]
-fn reactor_drives_a_loopback_tcp_socket() {
+fn provider_drives_a_loopback_tcp_socket() {
     assert_eq!(
         socket_operation_error_from_errno(Errno::NOMEM),
         Err(BrokerError::OutOfMemory)
@@ -163,7 +174,7 @@ fn reactor_drives_a_loopback_tcp_socket() {
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
     let handle = create_socket(&process, readiness.clone());
-    assert_eq!(provider.reactor.tcp_descriptor_counts(), (1, 0, 0));
+    assert_eq!(provider.core.tcp_descriptor_counts(), (1, 0, 0));
     let connect = litebox_broker_core::socket::connect(
         &process,
         handle,
@@ -177,7 +188,7 @@ fn reactor_drives_a_loopback_tcp_socket() {
         )
     ));
     wait_until_connected(&process, handle, &publications);
-    assert_eq!(provider.reactor.tcp_descriptor_counts(), (0, 1, 0));
+    assert_eq!(provider.core.tcp_descriptor_counts(), (0, 1, 0));
     let status = litebox_broker_core::socket::status(&process, handle).unwrap();
     assert_eq!(status.status, SocketConnectionStatus::Connected);
     let local_address = status
@@ -1368,7 +1379,7 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
         litebox_broker_core::socket::listen(&listener_process, listener, 3),
         Ok(SocketOutcome::Completed(guest_address))
     );
-    assert_eq!(provider.reactor.tcp_descriptor_counts(), (1, 0, 0));
+    assert_eq!(provider.core.tcp_descriptor_counts(), (1, 0, 0));
     let client = create_socket(&client_process, readiness.clone());
     assert!(matches!(
         litebox_broker_core::socket::connect(&client_process, client, guest_destination),
@@ -1377,7 +1388,7 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
         ))
     ));
     wait_until_connected(&client_process, client, &publications);
-    assert_eq!(provider.reactor.tcp_descriptor_counts(), (1, 0, 1));
+    assert_eq!(provider.core.tcp_descriptor_counts(), (1, 0, 1));
     let client_address = litebox_broker_core::socket::status(&client_process, client)
         .unwrap()
         .local_address
@@ -1402,8 +1413,8 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
     };
     assert_eq!(accepted.local_address, guest_address);
     assert_eq!(accepted.remote_address, client_address);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
-    assert_eq!(provider.reactor.tcp_descriptor_counts(), (1, 0, 2));
+    assert_eq!(provider.core.queued_guest_connection_count(), 0);
+    assert_eq!(provider.core.tcp_descriptor_counts(), (1, 0, 2));
 
     assert_eq!(
         send_bytes(&client_process, client, b"x", SendFlags::NONE),
@@ -1634,7 +1645,7 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
     wait_until_connected(&connector_process, connector, &publications);
     connector_process.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
+    assert_eq!(provider.core.queued_guest_connection_count(), 1);
     let capacity = create_socket(&connector_process, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::create(
@@ -1654,7 +1665,7 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), capacity);
 
     drop(connector_process);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
+    assert_eq!(provider.core.queued_guest_connection_count(), 0);
     assert!(
         !listener_process
             .check_readiness(listener)
@@ -1687,10 +1698,10 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
         ))
     ));
     wait_until_connected(&final_connector_process, final_connector, &publications);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
+    assert_eq!(provider.core.queued_guest_connection_count(), 1);
     listener_process.close_object_reference(listener).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
+    assert_eq!(provider.core.queued_guest_connection_count(), 0);
     wait_for_guest_reset(&publications, final_connector);
     let mut byte = [0_u8; 1];
     assert_eq!(
@@ -1755,7 +1766,7 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
 
     connector_process.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
+    assert_eq!(provider.core.queued_guest_connection_count(), 1);
     wait_until_ready(
         &listener_process,
         &publications,
@@ -1775,7 +1786,7 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
         SocketOutcome::Failed(error) => panic!("late accept failed: {error:?}"),
     };
     assert_eq!(accepted.remote_address, connector_address);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
+    assert_eq!(provider.core.queued_guest_connection_count(), 0);
     wait_until_ready(
         &listener_process,
         &publications,
@@ -1945,7 +1956,7 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
                 .unwrap(),
         );
     }
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 2);
+    assert_eq!(provider.core.queued_guest_connection_count(), 2);
     let full = create_socket(&connector_process, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::connect(&connector_process, full, address),
@@ -1955,7 +1966,7 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
         litebox_broker_core::socket::listen(&listener_process, listener, 1),
         Ok(SocketOutcome::Completed(address))
     );
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 2);
+    assert_eq!(provider.core.queued_guest_connection_count(), 2);
 
     wait_until_ready(
         &listener_process,
@@ -2014,7 +2025,7 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
         };
         assert_eq!(accepted.remote_address, expected_remote);
     }
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
+    assert_eq!(provider.core.queued_guest_connection_count(), 0);
     assert!(
         !listener_process
             .check_readiness(listener)
@@ -2522,7 +2533,7 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
         litebox_broker_core::socket::connect(&connector_process, connector, address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
+    assert_eq!(provider.core.queued_guest_connection_count(), 1);
     let capacity_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
         .unwrap();
@@ -2550,7 +2561,7 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
     )
     .unwrap();
     assert!(matches!(accepted, SocketOutcome::Completed(_)));
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
+    assert_eq!(provider.core.queued_guest_connection_count(), 0);
 }
 
 #[test]
@@ -2589,7 +2600,7 @@ fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
         litebox_broker_core::socket::connect(&connector_process, connector, address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
+    assert_eq!(provider.core.queued_guest_connection_count(), 1);
     assert!(matches!(
         litebox_broker_core::socket::accept(
             &listener_process,
@@ -2599,7 +2610,7 @@ fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
         ),
         Err(BrokerError::ResourceExhausted)
     ));
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
+    assert_eq!(provider.core.queued_guest_connection_count(), 1);
     assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
 
     listener_process
@@ -2617,7 +2628,7 @@ fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
     )
     .unwrap();
     assert!(matches!(accepted, SocketOutcome::Completed(_)));
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
+    assert_eq!(provider.core.queued_guest_connection_count(), 0);
 }
 
 #[test]
@@ -2662,7 +2673,7 @@ fn abortive_connector_close_releases_descriptor_capacity() {
         litebox_broker_core::socket::shutdown(&connector_process, connector, ShutdownMode::Abort,),
         Ok(SocketOutcome::Completed(()))
     );
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
+    assert_eq!(provider.core.queued_guest_connection_count(), 1);
     let accepted = match litebox_broker_core::socket::accept(
         &listener_process,
         listener,
@@ -2674,7 +2685,7 @@ fn abortive_connector_close_releases_descriptor_capacity() {
         SocketOutcome::Completed(accepted) => accepted.handle,
         SocketOutcome::Failed(error) => panic!("accept after Abort failed: {error:?}"),
     };
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
+    assert_eq!(provider.core.queued_guest_connection_count(), 0);
     connector_process.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
     wait_for_guest_reset(&publications, accepted);
@@ -2692,7 +2703,7 @@ fn abortive_connector_close_releases_descriptor_capacity() {
     );
     listener_process.close_object_reference(accepted).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), accepted);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
+    assert_eq!(provider.core.queued_guest_connection_count(), 0);
 
     let replacement = create_socket(&connector_process, readiness);
     assert!(matches!(
@@ -2702,11 +2713,11 @@ fn abortive_connector_close_releases_descriptor_capacity() {
         ))
     ));
     wait_until_connected(&connector_process, replacement, &publications);
-    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
+    assert_eq!(provider.core.queued_guest_connection_count(), 1);
 }
 
 #[test]
-fn reactor_drives_a_loopback_tcp_listener() {
+fn provider_drives_a_loopback_tcp_listener() {
     let provider = Arc::new(LinuxSocketProvider::new(6, 6).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -2909,4 +2920,561 @@ fn reactor_drives_a_loopback_tcp_listener() {
             .expect("timed out waiting for listener retirements");
         observed.push(retirements.recv_timeout(remaining).unwrap());
     }
+}
+
+/// A provider and broker for external TCP to host loopback, with one process
+/// and its socket.
+struct ExternalTcpSocket {
+    provider: Arc<LinuxSocketProvider>,
+    process: Arc<BrokerProcess>,
+    socket: ObjectHandle,
+    publications: Receiver<(ObjectHandle, ReadinessFlags)>,
+    retirements: Receiver<ObjectHandle>,
+    readiness: Arc<TestReadinessSink>,
+}
+
+fn external_tcp_socket() -> ExternalTcpSocket {
+    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_tcp_policy()),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        provider.clone(),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let socket = create_socket(&process, readiness.clone());
+    ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        retirements,
+        readiness,
+    }
+}
+
+fn connect_to_host(
+    process: &BrokerProcess,
+    socket: ObjectHandle,
+    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+    listener: &TcpListener,
+) -> std::net::TcpStream {
+    let destination = gateway_address(socket_address_v4(listener.local_addr().unwrap()));
+    assert!(matches!(
+        litebox_broker_core::socket::connect(process, socket, destination),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(process, socket, publications);
+    listener.accept().unwrap().0
+}
+
+/// Receives exactly `data.len()` bytes, waiting for READ when none are queued.
+fn receive_exact(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+    data: &mut [u8],
+) {
+    let mut received = 0;
+    while received < data.len() {
+        match receive_into(
+            process,
+            handle,
+            &mut data[received..],
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ) {
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(length))) => {
+                received += length as usize;
+            }
+            Err(BrokerError::WouldBlock) => {
+                wait_until_ready(process, publications, handle, ReadinessFlags::READ);
+            }
+            outcome => panic!("unexpected receive outcome: {outcome:?}"),
+        }
+    }
+}
+
+/// Data that arrives between a receive's EAGAIN and its READ clear raises an
+/// edge that is deferred while the receive holds the socket and applied after,
+/// so READ survives the clear.
+#[test]
+fn tcp_edge_during_eagain_is_applied_after_the_read_clear() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let host = connect_to_host(&process, socket, &publications, &listener);
+    // The action writes through a clone, so stopping it does not close the
+    // connection, whose end of stream would raise READ on its own.
+    let writer = Mutex::new(host.try_clone().unwrap());
+    let log = HookLog::install(&provider);
+    let deferred_at = AtomicUsize::new(usize::MAX);
+    log.act(move |log, index, point| match point {
+        HookPoint::Eagain(socket) if socket == id => {
+            writer.lock().unwrap().write_all(b"data").unwrap();
+            let (deferred, _) = log.wait_for(index, |point| {
+                point == HookPoint::Handled(id, Dispatch::Deferred)
+            });
+            deferred_at.store(deferred, Ordering::Relaxed);
+        }
+        HookPoint::Unlocked(socket) if socket == id => {
+            let deferred = deferred_at.swap(usize::MAX, Ordering::Relaxed);
+            if deferred != usize::MAX {
+                log.wait_for(deferred, |point| {
+                    point == HookPoint::Handled(id, Dispatch::Applied)
+                });
+            }
+        }
+        _ => {}
+    });
+
+    let mut data = [0; 4];
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Err(BrokerError::WouldBlock)
+    );
+    log.stop();
+    assert!(
+        process
+            .check_readiness(socket)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+    );
+    assert_eq!(
+        receive_into(&process, socket, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
+    );
+    assert_eq!(&data, b"data");
+    drop(host);
+}
+
+/// An accepted socket's descriptor joins epoll only once the socket is set
+/// up, so the first edge, for data sent before the accept, is deferred and
+/// then applied rather than dropped.
+#[test]
+fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
+    let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
+        provider.clone(),
+    )
+    .unwrap();
+    let listener_process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let connector_process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8201);
+    let listener = create_socket(&listener_process, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&listener_process, listener, address),
+        Ok(SocketOutcome::Completed(address))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::listen(&listener_process, listener, 1),
+        Ok(SocketOutcome::Completed(address))
+    );
+    let connector = create_socket(&connector_process, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::connect(&connector_process, connector, address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_bytes(&connector_process, connector, b"early", SendFlags::NONE),
+        Ok(SocketOutcome::Completed(5))
+    );
+    let log = HookLog::install(&provider);
+    log.act(|log, index, point| {
+        if let HookPoint::EpollAdded(token) = point {
+            let (_, handled) = log.wait_for(
+                index,
+                |point| matches!(point, HookPoint::Handled(handled, _) if handled == token),
+            );
+            assert_eq!(handled, HookPoint::Handled(token, Dispatch::Deferred));
+        }
+    });
+
+    let SocketOutcome::Completed(accepted) = litebox_broker_core::socket::accept(
+        &listener_process,
+        listener,
+        FileOpenFlags::NONE,
+        readiness,
+    )
+    .unwrap() else {
+        panic!("guest accept returned a socket failure");
+    };
+    let token = *provider.core.socket_ids().last().unwrap();
+    log.wait_for(0, |point| {
+        point == HookPoint::Handled(token, Dispatch::Applied)
+    });
+    log.stop();
+    assert!(
+        listener_process
+            .check_readiness(accepted.handle)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+    );
+    let mut data = [0; 5];
+    receive_exact(&listener_process, accepted.handle, &publications, &mut data);
+    assert_eq!(&data, b"early");
+}
+
+/// An external connect adds its descriptor to epoll only after `connect()`,
+/// so the fresh socket's OUT|HUP never marks it hung up.
+#[test]
+fn external_tcp_connect_applies_only_events_after_connect() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let log = HookLog::install(&provider);
+    log.act(move |log, index, point| {
+        if point == HookPoint::EpollAdded(id) {
+            let (_, handled) = log.wait_for(
+                index,
+                |point| matches!(point, HookPoint::Handled(handled, _) if handled == id),
+            );
+            assert_eq!(handled, HookPoint::Handled(id, Dispatch::Deferred));
+        }
+    });
+
+    let _host = connect_to_host(&process, socket, &publications, &listener);
+    log.wait_for(0, |point| {
+        point == HookPoint::Handled(id, Dispatch::Applied)
+    });
+    log.stop();
+    let readiness = process.check_readiness(socket).unwrap();
+    assert!(!readiness.contains(ReadinessFlags::HANGUP));
+    assert!(!readiness.contains(ReadinessFlags::CLOSED));
+    assert_eq!(
+        litebox_broker_core::socket::status(&process, socket)
+            .unwrap()
+            .status,
+        SocketConnectionStatus::Connected
+    );
+}
+
+/// The IDs of a pair's connector and accepted sockets.
+fn guest_tcp_pair_ids(pair: &GuestTcpPair) -> (u64, u64) {
+    let ids = pair.provider.core.socket_ids();
+    let [_listener, connector, accepted] = ids[..] else {
+        panic!("unexpected sockets: {ids:?}");
+    };
+    (connector, accepted)
+}
+
+/// An abortive close that completes after the peer's receive checked for a
+/// reset, just before its `recv`, still reports a reset, not the end of stream
+/// its syscall sees.
+#[test]
+fn guest_tcp_abortive_close_during_peer_receive_reports_reset() {
+    let pair = connected_guest_tcp_pair(8202);
+    let (connector_id, accepted_id) = guest_tcp_pair_ids(&pair);
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(
+            &pair.listener_process,
+            pair.accepted,
+            ShutdownMode::Abort,
+        ),
+        Ok(SocketOutcome::Completed(()))
+    );
+    let log = HookLog::install(&pair.provider);
+    let closer = Arc::new(Mutex::new(Some((
+        Arc::clone(&pair.listener_process),
+        pair.accepted,
+    ))));
+    let pending_close = Arc::clone(&closer);
+    log.act(move |log, index, point| {
+        if point != HookPoint::Receiving(connector_id) {
+            return;
+        }
+        let closer = pending_close.lock().unwrap().take();
+        if let Some((process, accepted)) = closer {
+            run_on_thread(move || process.close_object_reference(accepted).unwrap());
+            log.wait_for(index, |point| point == HookPoint::FdClosed(accepted_id));
+        }
+    });
+
+    assert_eq!(
+        receive_into(
+            &pair.connector_process,
+            pair.connector,
+            &mut [0; 1],
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
+    );
+    log.stop();
+    assert!(closer.lock().unwrap().is_none());
+}
+
+/// A receive that runs once an abortive close has closed its descriptor
+/// reports the reset, which the close posted first.
+#[test]
+fn guest_tcp_receive_after_abortive_close_closes_descriptor_reports_reset() {
+    let pair = connected_guest_tcp_pair(8203);
+    let (_, accepted_id) = guest_tcp_pair_ids(&pair);
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(
+            &pair.listener_process,
+            pair.accepted,
+            ShutdownMode::Abort,
+        ),
+        Ok(SocketOutcome::Completed(()))
+    );
+    let log = HookLog::install(&pair.provider);
+    let receiver = Arc::new(Mutex::new(Some((
+        Arc::clone(&pair.connector_process),
+        pair.connector,
+    ))));
+    let pending_receive = Arc::clone(&receiver);
+    log.act(move |_, _, point| {
+        if point != HookPoint::FdClosed(accepted_id) {
+            return;
+        }
+        let receiver = pending_receive.lock().unwrap().take();
+        if let Some((process, connector)) = receiver {
+            run_on_thread(move || {
+                assert_eq!(
+                    receive_into(&process, connector, &mut [0; 1], ReceiveFlags::NONE, 0, 0,),
+                    Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
+                );
+            });
+        }
+    });
+
+    pair.listener_process
+        .close_object_reference(pair.accepted)
+        .unwrap();
+    log.stop();
+    assert!(receiver.lock().unwrap().is_none());
+    assert_eq!(
+        pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
+        pair.accepted
+    );
+}
+
+/// An event harvested for a socket that closes before the event is handled
+/// is dropped, and the provider keeps working.
+#[test]
+fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        provider,
+        process,
+        socket,
+        publications,
+        retirements,
+        readiness,
+    } = external_tcp_socket();
+    let id = *provider.core.socket_ids().last().unwrap();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    let log = HookLog::install(&provider);
+    let closer = Arc::new(Mutex::new(Some((Arc::clone(&process), socket))));
+    let pending_close = Arc::clone(&closer);
+    log.act(move |_, _, point| {
+        if point != HookPoint::Harvested(id) {
+            return;
+        }
+        let closer = pending_close.lock().unwrap().take();
+        if let Some((process, socket)) = closer {
+            run_on_thread(move || process.close_object_reference(socket).unwrap());
+        }
+    });
+
+    let start = log.len();
+    host.write_all(b"data").unwrap();
+    assert_eq!(
+        log.wait_for_harvest_handled(start, |token| token == id),
+        Dispatch::Dropped
+    );
+    log.stop();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), socket);
+
+    let socket = create_socket(&process, readiness);
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.write_all(b"next").unwrap();
+    let mut data = [0; 4];
+    receive_exact(&process, socket, &publications, &mut data);
+    assert_eq!(&data, b"next");
+}
+
+/// A peer flooding an endpoint after its guest read shutdown does not stall
+/// the epoll thread: another socket's readiness still arrives.
+#[test]
+fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
+    let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(16, 0, 6, 3),
+        provider.clone(),
+    )
+    .unwrap();
+    let flooded = connect_guest_tcp_pair(&broker, provider.clone(), 8204);
+    let quiet = connect_guest_tcp_pair(&broker, provider.clone(), 8205);
+    let quiet_accepted_id = *provider.core.socket_ids().last().unwrap();
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(
+            &flooded.listener_process,
+            flooded.accepted,
+            ShutdownMode::Read,
+        ),
+        Ok(SocketOutcome::Completed(()))
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let flood = {
+        let stop = Arc::clone(&stop);
+        let sent = Arc::clone(&sent);
+        let process = Arc::clone(&flooded.connector_process);
+        let connector = flooded.connector;
+        thread::spawn(move || {
+            let data = vec![0; MAX_SOCKET_TRANSFER_SIZE as usize];
+            while !stop.load(Ordering::Relaxed) {
+                match send_bytes(&process, connector, &data, SendFlags::NONE) {
+                    Ok(SocketOutcome::Completed(length)) => {
+                        sent.fetch_add(length, Ordering::Relaxed);
+                    }
+                    Err(BrokerError::WouldBlock) => thread::yield_now(),
+                    outcome => panic!("unexpected send outcome: {outcome:?}"),
+                }
+            }
+        })
+    };
+    // Far more than an AF_UNIX send buffer, so the epoll thread is discarding.
+    let flooding = 64 * MAX_SOCKET_TRANSFER_SIZE as usize;
+    wait_until(
+        || sent.load(Ordering::Relaxed) >= flooding,
+        "the flood starts",
+    );
+
+    // A receive would find the data without the epoll thread, so wait for
+    // the epoll thread to apply an event for the quiet socket during the
+    // flood.
+    let log = HookLog::install(&provider);
+    let start = log.len();
+    assert_eq!(
+        send_bytes(
+            &quiet.connector_process,
+            quiet.connector,
+            b"ping",
+            SendFlags::NONE
+        ),
+        Ok(SocketOutcome::Completed(4))
+    );
+    assert_eq!(
+        log.wait_for_harvest_handled(start, |token| token == quiet_accepted_id),
+        Dispatch::Applied
+    );
+    log.stop();
+    let flooded_before = sent.load(Ordering::Relaxed);
+    wait_until(
+        || sent.load(Ordering::Relaxed) > flooded_before,
+        "the flood continues",
+    );
+    let mut data = [0; 4];
+    receive_exact(
+        &quiet.listener_process,
+        quiet.accepted,
+        &quiet.publications,
+        &mut data,
+    );
+    assert_eq!(&data, b"ping");
+    stop.store(true, Ordering::Relaxed);
+    flood.join().unwrap();
+}
+
+/// Many connections exchange data in parallel, and every socket's readiness
+/// then settles.
+#[test]
+fn many_guest_tcp_pairs_exchange_data_in_parallel() {
+    const PAIRS: u16 = 8;
+    const ROUNDS: u8 = 64;
+    let provider = Arc::new(LinuxSocketProvider::new(3 * usize::from(PAIRS), 2).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(8 * usize::from(PAIRS), 0, 3 * usize::from(PAIRS), 2),
+        provider.clone(),
+    )
+    .unwrap();
+    let workers: Vec<_> = (0..PAIRS)
+        .map(|index| {
+            let pair = connect_guest_tcp_pair(&broker, provider.clone(), 8300 + index);
+            thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    let message = [round; 256];
+                    let mut data = [0; 256];
+                    assert_eq!(
+                        send_bytes(
+                            &pair.connector_process,
+                            pair.connector,
+                            &message,
+                            SendFlags::NONE,
+                        ),
+                        Ok(SocketOutcome::Completed(message.len()))
+                    );
+                    receive_exact(
+                        &pair.listener_process,
+                        pair.accepted,
+                        &pair.publications,
+                        &mut data,
+                    );
+                    assert_eq!(data, message);
+                    assert_eq!(
+                        send_bytes(
+                            &pair.listener_process,
+                            pair.accepted,
+                            &data,
+                            SendFlags::NONE,
+                        ),
+                        Ok(SocketOutcome::Completed(data.len()))
+                    );
+                    receive_exact(
+                        &pair.connector_process,
+                        pair.connector,
+                        &pair.publications,
+                        &mut data,
+                    );
+                    assert_eq!(data, message);
+                }
+                pair
+            })
+        })
+        .collect();
+    let pairs: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    wait_for_settled_readiness(&provider);
+    drop(pairs);
 }
