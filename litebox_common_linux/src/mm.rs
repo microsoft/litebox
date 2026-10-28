@@ -6,7 +6,6 @@
 //! Common implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::vec::Vec;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
@@ -48,9 +47,6 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
-    /// Whether any mapping was ever given a [`SharedMemoryId`], which lets futex operations skip
-    /// looking up the mapping of their futex word while none was.
-    ever_named_shared_memory: AtomicBool,
 }
 
 impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
@@ -61,10 +57,7 @@ where
     /// Create a new `VmemManager` instance.
     pub fn new(platform: &'static Platform) -> Self {
         let vmem = RwLock::new(Vmem::new(platform));
-        Self {
-            vmem,
-            ever_named_shared_memory: AtomicBool::new(false),
-        }
+        Self { vmem }
     }
 
     /// Rebinds an inherited memory manager to the native child's platform.
@@ -120,6 +113,9 @@ where
     ///
     /// `allowed_range` optionally restricts placement of the entire mapping.
     ///
+    /// `shared_memory` names the memory a new shared anonymous mapping maps from its start, if
+    /// any, so that [`Self::shared_futex_key`] keys its futexes by it.
+    ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
     /// # Safety
@@ -129,43 +125,11 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
-    unsafe fn create_pages<F>(
-        &self,
-        suggested_address: Option<NonZeroAddress<ALIGN>>,
-        length: NonZeroPageSize<ALIGN>,
-        flags: CreatePagesFlags,
-        permissions: (MemoryRegionPermissions, MemoryRegionPermissions),
-        allowed_range: Option<Range<usize>>,
-        op: F,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
-    where
-        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
-    {
-        // SAFETY: The caller upholds the same requirements.
-        unsafe {
-            self.create_pages_with_shared_memory(
-                suggested_address,
-                length,
-                flags,
-                permissions,
-                allowed_range,
-                None,
-                op,
-            )
-        }
-    }
-
-    /// Like [`Self::create_pages`], but records that a new shared anonymous mapping maps
-    /// `shared_memory` from its start, if it is given.
-    ///
-    /// # Safety
-    ///
-    /// See [`Self::create_pages`].
     #[expect(
         clippy::too_many_arguments,
-        reason = "mirrors `create_pages`, whose arguments are independent placement and setup options"
+        reason = "independent placement and setup options of a new mapping"
     )]
-    unsafe fn create_pages_with_shared_memory<F>(
+    unsafe fn create_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
@@ -195,7 +159,6 @@ where
             if let Some(memory) = shared_memory {
                 let start = addr.as_usize();
                 vmem.set_shared_memory(start..start + length.as_usize(), memory);
-                self.ever_named_shared_memory.store(true, Ordering::Release);
             }
             addr
         };
@@ -253,6 +216,7 @@ where
                     permissions,
                 ),
                 allowed_range,
+                None,
                 op,
             )
         }
@@ -295,6 +259,7 @@ where
                     MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
                 ),
                 None,
+                None,
                 op,
             )
         }
@@ -326,7 +291,17 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        unsafe { self.create_pages(suggested_address, length, flags, (perms, perms), None, op) }
+        unsafe {
+            self.create_pages(
+                suggested_address,
+                length,
+                flags,
+                (perms, perms),
+                None,
+                None,
+                op,
+            )
+        }
     }
 
     /// Create read-only pages.
@@ -365,6 +340,7 @@ where
                     // keep READ, turn off WRITE
                     MemoryRegionPermissions::READ,
                 ),
+                None,
                 None,
                 op,
             )
@@ -406,6 +382,7 @@ where
                     MemoryRegionPermissions::empty(),
                 ),
                 None,
+                None,
                 op,
             )
         }
@@ -438,6 +415,7 @@ where
                 length,
                 flags,
                 (perms, perms),
+                None,
                 None,
                 |_| Ok(0),
             )
@@ -703,9 +681,6 @@ where
     /// Fails with [`Errno::EFAULT`] if that mapping has no access, as Linux faults resolving a
     /// shared futex in an inaccessible page before looking at its waiters.
     pub fn shared_futex_key(&self, address: usize) -> Result<Option<SharedFutexKey>, Errno> {
-        if !self.ever_named_shared_memory.load(Ordering::Acquire) {
-            return Ok(None);
-        }
         let Some(end) = address.checked_add(size_of::<u32>()) else {
             return Ok(None);
         };
@@ -972,29 +947,16 @@ where
     /// Creates an anonymous or file-backed mapping with Linux `mmap` semantics.
     ///
     /// `placement` controls the allocation direction and optional address bounds.
+    /// `shared_memory` names the memory a new shared anonymous mapping maps from its start, if
+    /// any, so that [`Self::shared_futex_key`] keys its futexes by it.
     /// `op` initializes the mapping while it is writable;
     /// its error removes the new mapping. A file-backed mapping is expected to be filled with the
     /// file's contents from its start, so the platform is hinted to back it with larger pages.
-    pub fn do_mmap(
-        &self,
-        suggested_addr: Option<usize>,
-        len: usize,
-        prot: ProtFlags,
-        flags: MapFlags,
-        placement: MmapPlacement,
-        op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
-    ) -> Result<UserPtrMut<u8>, MappingError> {
-        self.do_mmap_with_shared_memory(suggested_addr, len, prot, flags, placement, None, op)
-    }
-
-    /// Like [`Self::do_mmap`], but records that a new shared anonymous mapping maps
-    /// `shared_memory` from its start, if it is given, so that [`Self::shared_futex_key`] keys
-    /// its futexes by it.
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors the arguments of `mmap`, plus the name of the memory it maps"
     )]
-    pub fn do_mmap_with_shared_memory(
+    pub fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
@@ -1038,7 +1000,7 @@ where
         };
         // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the mapping.
         unsafe {
-            self.create_pages_with_shared_memory(
+            self.create_pages(
                 suggested_addr,
                 length,
                 flags,

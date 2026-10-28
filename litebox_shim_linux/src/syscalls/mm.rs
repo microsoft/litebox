@@ -54,7 +54,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             None
         };
         let fixed_start = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED));
-        self.global.mm.do_mmap_with_shared_memory(
+        self.global.mm.do_mmap(
             suggested_addr,
             len,
             prot,

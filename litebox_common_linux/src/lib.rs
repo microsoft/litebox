@@ -2320,7 +2320,6 @@ pub enum FutexOperation {
     Wait = 0,
     Wake = 1,
     WaitBitset = 9,
-    /// `FUTEX_WAKE_BITSET`.
     WakeBitset = 10,
 }
 
