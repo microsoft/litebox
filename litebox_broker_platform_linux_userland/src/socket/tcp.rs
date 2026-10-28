@@ -237,7 +237,7 @@ struct TcpLink {
 }
 
 enum TcpLinkPeer {
-    /// The accepted end is still queued on this listener.
+    /// The peer end is still queued on this listener, not yet accepted.
     Queued {
         listener_id: u64,
     },

@@ -68,7 +68,7 @@ use udp::{
 /// Epoll token reserved for the eventfd that wakes the epoll thread.
 const WAKE_TOKEN: u64 = 0;
 const MAX_EPOLL_EVENTS: usize = 64;
-/// How long the epoll thread waits before retrying events for busy sockets.
+/// Longest the epoll thread waits before retrying events for busy sockets.
 const DEFERRED_EVENT_RETRY: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 1_000_000,
@@ -348,7 +348,6 @@ impl ProviderCore {
         let _ = epoll::delete(self.epoll.as_ref(), socket);
     }
 
-    /// Charges a new socket to the global and per-process quotas.
     fn charge_socket(&self, process_authority: ProcessId) -> BrokerResult<()> {
         lock(&self.topology).charge_socket(
             process_authority,
@@ -731,7 +730,7 @@ impl LinuxSocket {
         Ok(Dispatch::Applied)
     }
 
-    /// Retires the socket; with `failure`, ERROR is its last readiness.
+    /// Locks the socket and retires it unless it already is.
     fn close(&self, failure: bool) {
         let state = lock(&self.state);
         if state.closed {
@@ -918,7 +917,7 @@ enum SocketTransportState {
 
 /// Socket state guarded by the socket's `state` lock.
 struct SocketState {
-    /// Set before the socket opens and once it retires.
+    /// True until the socket opens, and again once it retires.
     closed: bool,
     transport: SocketTransportState,
     connection_status: SocketConnectionStatus,
@@ -1161,8 +1160,8 @@ impl<'a> SocketEntry<'a> {
     }
 }
 
-/// The part of a socket that other sockets and the epoll thread may post to
-/// without holding its `state`.
+/// The part of a socket that other sockets may post to without holding its
+/// `state`.
 struct SocketInbox {
     /// Last published readiness, readable without a lock.
     snapshot: AtomicU32,

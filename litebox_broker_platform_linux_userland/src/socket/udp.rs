@@ -6,8 +6,7 @@
 //! Guest bindings live in the provider's `topology`, so a datagram between
 //! guest sockets is routed by address and queued directly in the receiver's
 //! inbox. A socket stages a native endpoint only for external destinations;
-//! `udp_ports` records the endpoint's host port so that no guest peer
-//! mistakes another broker endpoint for an external host.
+//! [`UdpPorts`] keeps those endpoints distinct from external hosts.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -763,7 +762,7 @@ impl SocketEntry<'_> {
     }
 
     /// Drops every queued internal datagram and makes the inbox accept later
-    /// ones only from `peer`, or none after a read shutdown.
+    /// ones only from `peer`, if set, or none after a read shutdown.
     pub(super) fn filter_udp_receive_queue(&mut self, peer: Option<UdpPeer>, read_shutdown: bool) {
         let dropped = {
             let mut inbox = self.inbox();
