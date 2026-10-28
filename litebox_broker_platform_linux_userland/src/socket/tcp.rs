@@ -32,8 +32,8 @@ use rustix::net::{
 use super::{
     HookPoint, LinuxSocket, SocketEntry, SocketInbox, SocketKind, SocketState,
     SocketTransportState, Topology, broker_error_from_errno, can_consume_synchronous_error, lock,
-    republish_snapshot, socket_error_from_errno, socket_operation_error_from_errno,
-    take_socket_error, update_snapshot, zeroed_vec,
+    republish_own_readiness, set_own_readiness, socket_error_from_errno,
+    socket_operation_error_from_errno, take_socket_error, zeroed_vec,
 };
 
 pub(super) struct AcceptedEndpoints {
@@ -357,12 +357,12 @@ fn active_epoll_events() -> epoll::EventFlags {
 
 fn add_readiness(socket: &SocketEntry<'_>, readiness: ReadinessFlags) {
     let current = socket.own();
-    update_snapshot(socket, ReadinessFlags(current.0 | readiness.0));
+    set_own_readiness(socket, ReadinessFlags(current.0 | readiness.0));
 }
 
 fn clear_readiness(socket: &SocketEntry<'_>, readiness: ReadinessFlags) {
     let current = socket.own();
-    update_snapshot(socket, ReadinessFlags(current.0 & !readiness.0));
+    set_own_readiness(socket, ReadinessFlags(current.0 & !readiness.0));
 }
 
 fn consume_synchronous_error(socket: &mut SocketEntry<'_>) -> BrokerResult<()> {
@@ -381,7 +381,7 @@ fn consume_synchronous_error(socket: &mut SocketEntry<'_>) -> BrokerResult<()> {
     } else {
         current | ReadinessFlags::ERROR
     };
-    update_snapshot(socket, readiness);
+    set_own_readiness(socket, readiness);
     Ok(())
 }
 
@@ -661,7 +661,7 @@ fn fail_connect(socket: &mut SocketEntry<'_>, error: SocketError) {
     }
     socket.connection_status = SocketConnectionStatus::Failed(error);
     let readiness = socket.own() | ReadinessFlags::ERROR;
-    update_snapshot(socket, readiness);
+    set_own_readiness(socket, readiness);
 }
 
 /// Records the receive by `reader` for the peek continuation check, failing
@@ -1149,7 +1149,7 @@ fn shutdown_tcp_stream(
             .map_err(broker_error_from_errno)?
     {
         socket.connection_status = SocketConnectionStatus::Failed(socket_error_from_errno(error));
-        update_snapshot(socket, ReadinessFlags::ERROR);
+        set_own_readiness(socket, ReadinessFlags::ERROR);
         return Ok(SocketOutcome::Completed(()));
     }
     let shutdown_error = if let Some(mut queued) = guest_read_shutdown_buffer {
@@ -1175,9 +1175,9 @@ fn shutdown_tcp_stream(
     let current = socket.own();
     let readiness = with_tcp_closed(socket, ReadinessFlags((current.0 & !clear.0) | add.0));
     if republish_readiness {
-        republish_snapshot(socket, readiness);
+        republish_own_readiness(socket, readiness);
     } else {
-        update_snapshot(socket, readiness);
+        set_own_readiness(socket, readiness);
     }
     if let Some(error) = shutdown_error {
         return Err(error);
@@ -1218,13 +1218,13 @@ pub(super) fn handle_socket_event(
             complete_connect(socket, events)?;
         }
         SocketConnectionStatus::Connected => {
-            update_snapshot(socket, readiness_from_epoll(socket, events));
+            set_own_readiness(socket, readiness_from_epoll(socket, events));
         }
         SocketConnectionStatus::Failed(SocketError::NotConnected) if socket.read_shutdown => {
-            update_snapshot(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
+            set_own_readiness(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
         }
         SocketConnectionStatus::Failed(_) => {
-            update_snapshot(socket, ReadinessFlags::ERROR);
+            set_own_readiness(socket, ReadinessFlags::ERROR);
         }
         _ => return Err(BrokerError::Internal),
     }
@@ -1251,7 +1251,7 @@ fn complete_connect(socket: &mut SocketEntry<'_>, events: epoll::EventFlags) -> 
         _ => return Err(BrokerError::Internal),
     };
     socket.connection_status = status;
-    update_snapshot(socket, readiness);
+    set_own_readiness(socket, readiness);
     Ok(())
 }
 
@@ -1475,7 +1475,7 @@ impl SocketEntry<'_> {
                 drop(guest_source_lease);
                 let status = SocketConnectionStatus::Failed(error);
                 self.connection_status = status;
-                update_snapshot(self, ReadinessFlags::ERROR);
+                set_own_readiness(self, ReadinessFlags::ERROR);
                 return Ok(status);
             }
         };
@@ -1566,7 +1566,7 @@ impl SocketEntry<'_> {
                         Err(error) => {
                             self.connection_status =
                                 SocketConnectionStatus::Failed(SocketError::Other);
-                            update_snapshot(self, ReadinessFlags::ERROR);
+                            set_own_readiness(self, ReadinessFlags::ERROR);
                             return Err(PlatformConnectError::PeerIndeterminate(error));
                         }
                     };
@@ -1591,7 +1591,7 @@ impl SocketEntry<'_> {
         ) {
             self.guest_local_address = Some(guest_local_address);
         }
-        update_snapshot(self, readiness);
+        set_own_readiness(self, readiness);
         // Adding the descriptor only after `connect()` and the initial
         // publication means every event describes it after the connect: a
         // fresh socket polls as OUT|HUP, which would otherwise mark a pending
@@ -1643,7 +1643,7 @@ impl SocketEntry<'_> {
             drop(guest_source_lease);
             let status = SocketConnectionStatus::Failed(SocketError::ConnectionRefused);
             self.connection_status = status;
-            update_snapshot(self, ReadinessFlags::ERROR);
+            set_own_readiness(self, ReadinessFlags::ERROR);
             return Ok(status);
         }
         listener
@@ -1676,7 +1676,7 @@ impl SocketEntry<'_> {
         });
         self.guest_local_address = Some(source_address);
         self.connection_status = SocketConnectionStatus::Connected;
-        update_snapshot(self, ReadinessFlags::WRITE);
+        set_own_readiness(self, ReadinessFlags::WRITE);
 
         let listener = topology
             .tcp
@@ -1820,7 +1820,7 @@ impl SocketEntry<'_> {
             socket: accepted,
             state,
         };
-        update_snapshot(&accepted, ReadinessFlags::WRITE);
+        set_own_readiness(&accepted, ReadinessFlags::WRITE);
         let added = core.epoll_add(
             accepted.tcp_state()?.descriptor.socket()?,
             accepted.id(),

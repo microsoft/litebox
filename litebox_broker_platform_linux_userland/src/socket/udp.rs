@@ -38,8 +38,8 @@ use rustix::net::{
 use super::LinuxSocket;
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
-    broker_error_from_errno, local_socket_address, lock, read_lock, republish_snapshot,
-    socket_error_from_errno, socket_operation_error_from_errno, update_snapshot, write_lock,
+    broker_error_from_errno, local_socket_address, lock, read_lock, republish_own_readiness,
+    set_own_readiness, socket_error_from_errno, socket_operation_error_from_errno, write_lock,
     zeroed_vec,
 };
 
@@ -635,7 +635,7 @@ impl SocketEntry<'_> {
     /// internal datagrams add READ in the inbox.
     pub(super) fn publish_udp_readiness(&self) -> BrokerResult<()> {
         let readiness = self.udp_readiness()?;
-        update_snapshot(self, readiness);
+        set_own_readiness(self, readiness);
         Ok(())
     }
 
@@ -1201,15 +1201,15 @@ impl SocketEntry<'_> {
         if cached_error.is_some() && native_error_pending {
             // Returning the cached error leaves another error pending without
             // changing readiness, so wake a waiter for the remaining error.
-            republish_snapshot(self, readiness);
+            republish_own_readiness(self, readiness);
         } else {
-            update_snapshot(self, readiness);
+            set_own_readiness(self, readiness);
         }
         if let Err(error) = self.rearm_udp_endpoint_if_needed() {
             if let Some(pending_error) = pending_error {
                 self.pending_error = Some(pending_error);
                 let readiness = self.own() | ReadinessFlags::ERROR;
-                update_snapshot(self, readiness);
+                set_own_readiness(self, readiness);
             }
             return Err(error);
         }
@@ -1669,7 +1669,7 @@ impl ProviderCore {
         self.with_udp_socket(guest_port, |socket| {
             socket.pending_error = Some(cached_error);
             let readiness = socket.own() | ReadinessFlags::ERROR;
-            update_snapshot(socket, readiness);
+            set_own_readiness(socket, readiness);
             socket
                 .udp_endpoint_mut()?
                 .error

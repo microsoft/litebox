@@ -1163,11 +1163,11 @@ impl<'a> SocketEntry<'a> {
 struct SocketInbox {
     /// Last published readiness, readable without a lock.
     snapshot: AtomicU32,
-    inner: Mutex<Inbox>,
+    inner: Mutex<InboxState>,
 }
 
 /// Readiness inputs and cross-socket deliveries for one socket.
-struct Inbox {
+struct InboxState {
     registration: ReadinessRegistration,
     /// Readiness derived from the socket's own descriptor and state.
     own: ReadinessFlags,
@@ -1184,14 +1184,14 @@ struct Inbox {
 /// A locked inbox.
 struct InboxGuard<'a> {
     snapshot: &'a AtomicU32,
-    inbox: MutexGuard<'a, Inbox>,
+    inbox: MutexGuard<'a, InboxState>,
 }
 
 impl SocketInbox {
     fn new(registration: ReadinessRegistration) -> Self {
         Self {
             snapshot: AtomicU32::new(0),
-            inner: Mutex::new(Inbox {
+            inner: Mutex::new(InboxState {
                 registration,
                 own: ReadinessFlags::default(),
                 queue_ready: false,
@@ -1214,7 +1214,7 @@ impl SocketInbox {
     }
 }
 
-impl Inbox {
+impl InboxState {
     fn value(&self) -> ReadinessFlags {
         let mut readiness = self.own;
         if self.queue_ready || self.udp.has_queued_datagrams() {
@@ -1232,15 +1232,15 @@ impl Inbox {
 }
 
 impl Deref for InboxGuard<'_> {
-    type Target = Inbox;
+    type Target = InboxState;
 
-    fn deref(&self) -> &Inbox {
+    fn deref(&self) -> &InboxState {
         &self.inbox
     }
 }
 
 impl DerefMut for InboxGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Inbox {
+    fn deref_mut(&mut self) -> &mut InboxState {
         &mut self.inbox
     }
 }
@@ -1382,12 +1382,12 @@ fn status_socket(socket: &mut SocketEntry<'_>) -> BrokerResult<PlatformSocketSta
 }
 
 /// Sets the socket's own readiness, publishing if the combined value changed.
-fn update_snapshot(socket: &SocketEntry<'_>, readiness: ReadinessFlags) {
+fn set_own_readiness(socket: &SocketEntry<'_>, readiness: ReadinessFlags) {
     socket.inbox().set_own(readiness);
 }
 
 /// Sets the socket's own readiness and wakes waiters even if unchanged.
-fn republish_snapshot(socket: &SocketEntry<'_>, readiness: ReadinessFlags) {
+fn republish_own_readiness(socket: &SocketEntry<'_>, readiness: ReadinessFlags) {
     let mut inbox = socket.inbox();
     inbox.own = readiness;
     inbox.republish();
