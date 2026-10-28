@@ -322,6 +322,49 @@ mod tests {
     }
 
     #[test]
+    fn native_fork_child_keeps_inherited_ids_and_gets_new_ones() {
+        use crate::syscalls::tests::test_platform;
+        use litebox::platform::ThreadProvider;
+
+        let platform = test_platform();
+        TestPlatform::run_test_thread(|| {
+            let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+            let builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
+            let memory = std::sync::Arc::clone(&builder.memory_manager);
+            let parent = builder.build();
+            let task = parent.0.clone().new_test_task();
+            let inherited = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+            let parent_memory = key(&task, inherited).unwrap().memory;
+            drop(task);
+            drop(parent);
+
+            // A native fork child is another broker process holding the parent's memory manager.
+            let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+            // SAFETY: The old task and shim are gone, no locks are held, and this test transfers
+            // the manager to a single fresh shim using the same live platform.
+            let child = unsafe {
+                crate::LinuxShimBuilder::new_for_native_fork(platform, litebox, process_id, memory)
+            }
+            .build();
+            let task = child.0.clone().new_test_task();
+            // The inherited mapping keeps naming the memory the parent shares, and the broker
+            // accepts its signed ID from the child, while memory the child creates gets an ID of
+            // its own.
+            assert_eq!(key(&task, inherited).unwrap().memory, parent_memory);
+            assert_eq!(
+                task.sys_futex(FutexArgs::Wake {
+                    addr: word(inherited),
+                    flags: FutexFlags::empty(),
+                    count: 1,
+                }),
+                Ok(0)
+            );
+            let created = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
+            assert_ne!(key(&task, created).unwrap().memory, parent_memory);
+        });
+    }
+
+    #[test]
     fn shared_futex_wait_checks_value_and_times_out() {
         let task = init_platform();
         let mapping = map(&task, 1, MapFlags::MAP_SHARED).as_usize();
