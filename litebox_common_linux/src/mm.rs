@@ -644,13 +644,10 @@ where
             .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
     }
 
-    /// Returns the key of the futex word at `address` if a mapping of shared memory holds all of
-    /// it.
+    /// Returns the key of the futex word at `address` if a mapping of shared memory
+    /// holds all of it.
     ///
-    /// Shared anonymous memory is named the first time a futex in it needs a key, by an ID from
-    /// `issue`, or never if `issue` returns `None`, as when no other process can share the
-    /// memory. The name covers every piece of the mapping, from the start of its lowest piece,
-    /// whatever splits it went through.
+    /// Shared anonymous memory is named the first time a futex in it needs a key.
     pub fn shared_futex_key(
         &self,
         address: usize,
@@ -682,10 +679,8 @@ where
             return Err(Errno::EFAULT);
         }
         // The broker is asked without holding the lock, so another thread may name the memory,
-        // split it, or unmap it meanwhile; the first name recorded is kept. The ID is fresh and
-        // known to no one else, so it may name whichever unnamed mapping holds the word by now:
-        // falling back to a private key there would park a waiter where wakes through the
-        // shared key, which every later futex call on the word uses, never reach it.
+        // split it, or unmap it meanwhile. The ID is fresh and known to no one else, so it may
+        // name whichever unnamed mapping holds the word by now.
         let Some(memory) = issue()? else {
             return Ok(None);
         };

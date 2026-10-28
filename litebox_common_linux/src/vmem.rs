@@ -178,14 +178,11 @@ pub struct VmArea {
     flags: VmFlags,
     /// Whether this area is backed by a file
     is_file_backed: bool,
-    /// Which memory, shared with other processes, the area maps, if any.
+    /// Which memory the area maps.
     sharing: Sharing,
 }
 
-/// The memory, shared with other processes, that an area maps.
-///
-/// Every piece of one mapping carries the same value, so that pieces split apart merge again
-/// once they match in everything else, and pieces of different mappings never do.
+/// The memory an area maps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sharing {
     /// The area's pages are its own.
@@ -773,8 +770,7 @@ where
     }
 
     /// Names every piece of the unnamed shared anonymous mapping numbered `mapping` as
-    /// `memory`, with offset zero at the start of its lowest piece, so that the pieces keep
-    /// merging as they would have unnamed. Does nothing if no piece of it is left.
+    /// `memory`, with offset zero at the start of its lowest piece.
     pub(super) fn name_shared_mapping(&mut self, mapping: NonZeroU64, memory: SharedMemoryId) {
         let pieces: Vec<(Range<usize>, VmArea)> = self
             .vmas
