@@ -113,8 +113,8 @@ where
     ///
     /// `allowed_range` optionally restricts placement of the entire mapping.
     ///
-    /// `shared_memory` names the memory a new shared anonymous mapping maps from its start, if
-    /// any, so that [`Self::shared_futex_key`] keys its futexes by it.
+    /// `shared_memory` assigns the shared memory ID, if any, so that [`Self::shared_futex_key`]
+    /// keys its futexes by it.
     ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
@@ -675,11 +675,8 @@ where
             .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
     }
 
-    /// Returns the key of the futex word at `address` if a mapping of named shared memory, which
-    /// other processes may map, holds all of it.
-    ///
-    /// Fails with [`Errno::EFAULT`] if that mapping has no access, as Linux faults resolving a
-    /// shared futex in an inaccessible page before looking at its waiters.
+    /// Returns the key of the futex word at `address` if a mapping of named shared memory
+    /// holds all of it.
     pub fn shared_futex_key(&self, address: usize) -> Result<Option<SharedFutexKey>, Errno> {
         let Some(end) = address.checked_add(size_of::<u32>()) else {
             return Ok(None);
@@ -947,8 +944,8 @@ where
     /// Creates an anonymous or file-backed mapping with Linux `mmap` semantics.
     ///
     /// `placement` controls the allocation direction and optional address bounds.
-    /// `shared_memory` names the memory a new shared anonymous mapping maps from its start, if
-    /// any, so that [`Self::shared_futex_key`] keys its futexes by it.
+    /// `shared_memory` assigns the shared memory ID, if any, so that [`Self::shared_futex_key`]
+    /// keys its futexes by it.
     /// `op` initializes the mapping while it is writable;
     /// its error removes the new mapping. A file-backed mapping is expected to be filled with the
     /// file's contents from its start, so the platform is hinted to back it with larger pages.

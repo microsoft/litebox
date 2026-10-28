@@ -728,8 +728,7 @@ where
         self.vmas.iter()
     }
 
-    /// Records that the shared anonymous mapping just created at `range`, under the same lock,
-    /// maps `memory` from its start.
+    /// Records that the shared anonymous mapping just created at `range`.
     pub(super) fn set_shared_memory(&mut self, range: Range<usize>, memory: SharedMemoryId) {
         let Some(&vma) = self.vmas.get(&range.start) else {
             debug_assert!(false, "no mapping was just created at {range:#x?}");

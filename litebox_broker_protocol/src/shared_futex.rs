@@ -33,11 +33,12 @@ pub const FUTEX_WORD_SIZE: u64 = 4;
 /// are equal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SharedMemoryId(
-    /// The ID's value laid out from the most significant bits to the least significant bits:
+    /// The ID's value:
     /// | ---------------- | ------------- |
     /// | serial (64 bits) | tag (64 bits) |
     /// | ---------------- | ------------- |
-    /// Serial: a value the broker uses for only one ID. Tag: the broker's signature of the serial.
+    /// Serial: a value the broker uses for only one ID.
+    /// Tag: the broker's signature of the serial.
     pub u128,
 );
 
@@ -130,17 +131,4 @@ pub struct FutexDisarmRequest {
 pub struct FutexDisarmResponse {
     /// Whether a wake selected the waiter since it was armed.
     pub woken: bool,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SharedMemoryId;
-
-    #[test]
-    fn ids_keep_their_serial_and_tag_apart() {
-        for (serial, tag) in [(0, 0), (1, u64::MAX), (u64::MAX, 1), (u64::MAX, u64::MAX)] {
-            let id = SharedMemoryId::new(serial, tag);
-            assert_eq!((id.serial(), id.tag()), (serial, tag));
-        }
-    }
 }

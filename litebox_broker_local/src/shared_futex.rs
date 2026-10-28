@@ -13,9 +13,7 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Asks the broker to issue a signed ID for memory this process creates, as
-    /// [`IssueMemoryIdResponse`](litebox_broker_protocol::shared_futex::IssueMemoryIdResponse)
-    /// describes.
+    /// Asks the broker to issue a signed ID for memory this process creates.
     ///
     /// # Panics
     ///
