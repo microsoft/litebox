@@ -69,11 +69,6 @@ impl SharedFutexes {
     }
 }
 
-// TODO: Restrict each process to the memory it may share, so that `futex_arm` and `futex_wake`
-// reject the keys of other memory. For example, authorize a process for the blocks it reserved
-// and those its ancestors had reserved when creating the next process on the way to it, naming
-// blocks by their reserver and a per-reserver index, with each process moving to a new block
-// after creating another.
 /// Reserves a block of shared memory IDs that no other reservation returns, and returns its
 /// first ID.
 ///
@@ -81,6 +76,11 @@ impl SharedFutexes {
 /// once every block is reserved.
 pub fn reserve_memory_ids(process: &BrokerProcess) -> Result<SharedMemoryId> {
     process.require_object_rights(ObjectRights::WAIT)?;
+    // TODO: Restrict each process to the memory it may share, so that `futex_arm` and `futex_wake`
+    // reject the keys of other memory. For example, authorize a process for the blocks it reserved
+    // and those its ancestors had reserved when creating the next process on the way to it, naming
+    // blocks by their reserver and a per-reserver index, with each process moving to a new block
+    // after creating another.
     let block = process
         .core
         .shared_futexes
