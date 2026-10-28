@@ -44,7 +44,7 @@ pub struct SharedMemoryId(
 
 impl SharedMemoryId {
     /// Mask of the ID's tag.
-    const TAG: u128 = u64::MAX as u128;
+    const TAG_MASK: u128 = u64::MAX as u128;
 
     /// Returns the ID made of `serial` and its `tag`.
     #[must_use]
@@ -61,7 +61,7 @@ impl SharedMemoryId {
     /// Returns the tag of the ID.
     #[must_use]
     pub const fn tag(self) -> u64 {
-        (self.0 & Self::TAG) as u64
+        (self.0 & Self::TAG_MASK) as u64
     }
 }
 

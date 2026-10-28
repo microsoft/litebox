@@ -429,12 +429,13 @@ pub struct TruncateFileRequest {
 /// Requests the host shared object holding an open regular file's contents, so that the caller
 /// can map it as a `MAP_SHARED` file mapping.
 ///
-/// The file must be open for reading, and also for writing if `writable` is set.
+/// The file must be open for reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapFileRequest {
     /// Broker-owned file handle.
     pub handle: ObjectHandle,
-    /// Whether the caller may map the object writable.
+    /// Whether to deliver the object writable, if the file is open for writing and the handle
+    /// grants writing.
     pub writable: bool,
 }
 
@@ -444,10 +445,13 @@ pub struct MapFileRequest {
 /// it sends this response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapFileResponse {
-    /// Identity of the object, the same for every caller that maps the same file.
-    pub identity: u128,
+    /// Names the file's shared memory, the same for every caller that maps the file, so that
+    /// futexes in it span every process mapping it.
+    pub memory: crate::shared_futex::SharedMemoryId,
     /// Tag of the out-of-band delivery of the object.
     pub token: u64,
+    /// Whether the object was delivered writable.
+    pub writable: bool,
 }
 
 /// Reads one bounded page of directory entries into a shared-buffer region.

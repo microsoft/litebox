@@ -3,8 +3,9 @@
 
 // Checks that MAP_SHARED file mappings share pages: between mappings in one process, with
 // read/write/ftruncate on the file, with a forked child, and with an unrelated process started
-// through execve. Run with this program's own path as the argument to include the exec check;
-// it reruns itself with "child" to act as that process.
+// through execve, including futex wakes across those processes. Run with this program's own path
+// as the argument to include the exec check; it reruns itself with "child" to act as that
+// process.
 //
 // Windows hosts cannot shrink a file while it is mapped, so there ftruncate fails with EBUSY
 // instead. The summary line reports which behavior the host showed as "shrink=ok" or
@@ -20,8 +21,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/futex.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PATH "/tmp/shared-file-mapping"
@@ -33,6 +37,8 @@ struct shared {
     char parent[32];
     char child[32];
     char exec_child[32];
+    uint32_t child_done;
+    uint32_t exec_child_done;
 };
 
 static int failures;
@@ -51,6 +57,27 @@ static void add(struct shared *shared) {
     }
 }
 
+// Sets `word` and wakes its waiters in any process, after a pause that lets them start waiting.
+static void signal_done(uint32_t *word) {
+    struct timespec pause = {0, 100 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+    __atomic_store_n(word, 1, __ATOMIC_SEQ_CST);
+    syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0);
+}
+
+// Returns whether a wake from another process ended the wait for `word` to be set. A wake that
+// does not cross processes leaves the wait to time out.
+static int woken_when_done(uint32_t *word) {
+    struct timespec timeout = {5, 0};
+    while (__atomic_load_n(word, __ATOMIC_SEQ_CST) == 0) {
+        if (syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, NULL, 0) == -1 &&
+            errno != EAGAIN && errno != EINTR) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int exec_child(void) {
     int fd = open(PATH, O_RDWR);
     if (fd < 0) {
@@ -66,6 +93,7 @@ static int exec_child(void) {
     }
     strcpy(shared->exec_child, "from-exec-child");
     add(shared);
+    signal_done(&shared->exec_child_done);
     return 0;
 }
 
@@ -122,6 +150,39 @@ int main(int argc, char **argv) {
     CHECK(reader->counter == 123);
     CHECK(strcmp(reader->parent, "from-parent") == 0);
 
+    // A mapping from a nonzero offset shares the pages at that offset.
+    char *second_page = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, page);
+    CHECK(second_page != MAP_FAILED);
+    CHECK(strcmp(second_page, "written") == 0);
+    second_page[8] = 'Y';
+    CHECK(bytes[page + 8] == 'Y');
+    CHECK(munmap(second_page, page) == 0);
+
+    // A fixed mapping replaces what was there, but not when asked not to.
+    char *anonymous =
+        mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(anonymous != MAP_FAILED);
+    anonymous[page] = 'A';
+    struct shared *fixed = mmap(anonymous, page, PROT_READ | PROT_WRITE,
+                                MAP_SHARED | MAP_FIXED, fd, 0);
+    CHECK(fixed == (struct shared *)anonymous);
+    CHECK(fixed->counter == 123);
+    CHECK(anonymous[page] == 'A');
+    errno = 0;
+    CHECK(mmap(anonymous + page, page, PROT_READ, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0) ==
+          MAP_FAILED);
+    CHECK(errno == EEXIST);
+    CHECK(anonymous[page] == 'A');
+    CHECK(munmap(anonymous, 2 * page) == 0);
+
+    // A file open only for writing cannot be mapped at all.
+    int write_only = open(PATH, O_WRONLY);
+    CHECK(write_only >= 0);
+    errno = 0;
+    CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, write_only, 0) == MAP_FAILED);
+    CHECK(errno == EACCES);
+    close(write_only);
+
     // A file open only for reading can be mapped neither writable nor made writable later.
     errno = 0;
     CHECK(mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, read_only, 0) == MAP_FAILED);
@@ -142,6 +203,22 @@ int main(int argc, char **argv) {
     errno = 0;
     CHECK(msync(shared, page, MS_SYNC | MS_ASYNC) == -1);
     CHECK(errno == EINVAL);
+    errno = 0;
+    CHECK(msync(bytes + 1, page, MS_SYNC) == -1);
+    CHECK(errno == EINVAL);
+    char *unmapped = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(unmapped != MAP_FAILED);
+    CHECK(munmap(unmapped, page) == 0);
+    errno = 0;
+    CHECK(msync(unmapped, page, MS_SYNC) == -1);
+    CHECK(errno == ENOMEM);
+
+    // Freeing applies only to anonymous memory; the file keeps its contents.
+    errno = 0;
+    CHECK(madvise(shared, page, MADV_FREE) == -1);
+    CHECK(errno == EINVAL);
+    CHECK(madvise(shared, page, MADV_DONTNEED) == 0);
+    CHECK(strcmp(shared->parent, "from-parent") == 0);
 
     // A forked child shares the pages.
     shared->counter = 0;
@@ -156,10 +233,12 @@ int main(int argc, char **argv) {
             _exit(1);
         }
         strcpy(again->child + 11, "+");
+        signal_done(&shared->child_done);
         _exit(0);
     }
     CHECK(pid > 0);
     add(shared);
+    CHECK(woken_when_done(&shared->child_done));
     int status = -1;
     CHECK(waitpid(pid, &status, 0) == pid);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -175,6 +254,7 @@ int main(int argc, char **argv) {
             _exit(127);
         }
         CHECK(pid > 0);
+        CHECK(woken_when_done(&shared->exec_child_done));
         status = -1;
         CHECK(waitpid(pid, &status, 0) == pid);
         CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -198,6 +278,10 @@ int main(int argc, char **argv) {
         CHECK(ftruncate(fd, page) == 0);
         CHECK(raises_bus(bytes + page));
     } else {
+        CHECK(errno == EBUSY);
+        // So does truncating on open.
+        errno = 0;
+        CHECK(open(PATH, O_RDWR | O_TRUNC) == -1);
         CHECK(errno == EBUSY);
     }
 

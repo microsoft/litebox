@@ -92,8 +92,9 @@ impl From<CreatePagesFlags> for FixedAddressBehavior {
 impl VmFlags {
     /// Compute the default `VM_MAY*` and `VM_SHARED` flags for a mapping.
     ///
-    /// Write permission (`VM_MAYWRITE`) is restricted only for shared **file-backed**
-    /// mappings, because writes cannot be propagated back to the underlying file.
+    /// Write permission (`VM_MAYWRITE`) is restricted for shared **file-backed** mappings made
+    /// here, which are private copies of the file whose writes could not reach it. Shared file
+    /// mappings of the file's host shared object set it from how the file was opened instead.
     pub(super) fn may_flags_for_mapping(shared: bool, file_backed: bool) -> Self {
         let restrict_write = shared && file_backed;
         let may = if restrict_write {
@@ -171,16 +172,6 @@ bitflags::bitflags! {
     }
 }
 
-/// Names the host object that backs a shared file mapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SharedObjectKey {
-    /// Identity of the object, the same in every process that maps it.
-    pub id: u128,
-    /// Address that object offset zero would have in this mapping. It stays the same when the
-    /// area splits, so pieces of one mapping keep comparing equal.
-    pub base: usize,
-}
-
 /// Virtual memory area
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmArea {
@@ -188,21 +179,22 @@ pub struct VmArea {
     flags: VmFlags,
     /// Whether this area is backed by a file
     is_file_backed: bool,
-    /// Which memory the area maps.
+    /// Which memory, shared with other processes, the area maps, if any.
     sharing: Sharing,
-    /// The host object a shared file mapping maps, if its pages are shared rather than copied.
-    shared_object: Option<SharedObjectKey>,
 }
 
-/// The memory an area maps.
+/// The memory, shared with other processes, that an area maps.
+///
+/// Every piece of one mapping carries the same value, so that pieces split apart merge again
+/// once they match in everything else, and pieces of different mappings never do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sharing {
-    /// The area's pages are its own.
+    /// The area's pages are its own: private memory, or a private copy of a file.
     None,
     /// Shared anonymous memory that has no name yet. The number tells the pieces of one
     /// `mmap` apart from those of any other, and is never reused within a [`Vmem`].
     Unnamed(NonZeroU64),
-    /// Shared anonymous memory once named, which native fork children share.
+    /// Named shared memory: shared anonymous memory once named, or a file's host shared object.
     Named(SharedMemoryView),
 }
 
@@ -231,6 +223,13 @@ impl VmArea {
     #[inline]
     pub fn is_shared_anonymous(&self) -> bool {
         self.flags.contains(VmFlags::VM_SHARED) && !self.is_file_backed
+    }
+
+    /// Returns whether this area is a shared file mapping of a file's host shared object, whose
+    /// pages every mapper of the file shares, rather than a private copy of the file.
+    #[inline]
+    pub fn is_shared_object(&self) -> bool {
+        self.is_file_backed && matches!(self.sharing, Sharing::Named(_))
     }
 
     /// Returns the number of the shared anonymous mapping this area is a piece of, if that
@@ -268,13 +267,6 @@ impl VmArea {
         })
     }
 
-    /// Returns the host object this area maps, if it is a shared file mapping whose pages every
-    /// mapper of the file shares.
-    #[inline]
-    pub fn shared_object(&self) -> Option<SharedObjectKey> {
-        self.shared_object
-    }
-
     /// Create a new [`VmArea`] with the given flags, adding [`VmFlags::VM_HAS_CONTENTS`] if the
     /// area is file-backed or has any access.
     #[inline]
@@ -286,7 +278,6 @@ impl VmArea {
             flags,
             is_file_backed,
             sharing: Sharing::None,
-            shared_object: None,
         }
     }
 }
@@ -302,13 +293,13 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
 /// A host shared object to map as a shared file mapping.
 #[derive(Clone, Copy, Debug)]
 pub struct SharedObjectMapping {
-    /// Identity of the object, the same in every process that maps it.
-    pub id: u128,
+    /// Names the object's memory, the same in every process that maps it.
+    pub memory: SharedMemoryId,
     /// The token under which the broker delivered the object.
     pub token: SharedObjectToken,
     /// Byte offset in the object of the mapping's first page.
     pub offset: u64,
-    /// Whether the file was opened for writing, so the mapping may become writable.
+    /// Whether the object may be mapped writable, so the mapping may become writable.
     pub may_write: bool,
 }
 
@@ -332,8 +323,8 @@ fn mapping_options(vma: VmArea, populate_pages_immediately: bool) -> AllocationO
         vma.flags.contains(VmFlags::VM_GROWSDOWN),
     );
     options.set(AllocationOptions::POPULATE, populate_pages_immediately);
-    // TODO: share the pages of shared file-backed mappings too, which are private copies until
-    // then, so that every `VM_SHARED` area is shared.
+    // Shared file mappings that share their pages map the file's host shared object instead, so
+    // the ones made here are read-only private copies.
     options.set(AllocationOptions::SHARED, vma.is_shared_anonymous());
     options
 }
@@ -348,6 +339,15 @@ fn insert_mapped_vma<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize
     debug_assert!(start >= Platform::TASK_ADDR_MIN);
     debug_assert!(end <= Platform::TASK_ADDR_MAX);
     vmas.insert(start..end, vma);
+}
+
+/// Reports a platform's refusal to place a mapping at an address that vmem saw free as the
+/// address being used by the platform.
+fn in_use_by_platform(error: AllocationError) -> AllocationError {
+    match error {
+        AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+        other => other,
+    }
 }
 
 /// Linux Vmem operations supported by a reservation store.
@@ -418,13 +418,13 @@ where
     /// `range`, and update reservation ownership. The caller inserts the VMA.
     ///
     /// `behavior` must be [`FixedAddressBehavior::Replace`] or
-    /// [`FixedAddressBehavior::NoReplace`]. The platform takes the object whether or not this
-    /// succeeds.
+    /// [`FixedAddressBehavior::NoReplace`]. This consumes `token` whether or not it succeeds.
     ///
     /// # Safety
     ///
-    /// For replacement, every page of `range` must be mapped, and the caller must ensure that the
-    /// replaced mappings are not in active use. Otherwise, `range` must not overlap any VMA.
+    /// `token` must be an unconsumed delivery to this process. For replacement, every page of
+    /// `range` must be mapped, and the caller must ensure that the replaced mappings are not in
+    /// active use. Otherwise, `range` must not overlap any VMA.
     #[expect(clippy::too_many_arguments, reason = "mirrors the platform operation")]
     unsafe fn map_shared_object(
         &mut self,
@@ -554,8 +554,9 @@ where
         permissions: MemoryRegionPermissions,
         behavior: FixedAddressBehavior,
     ) -> Result<(), AllocationError> {
-        // SAFETY: The caller authorizes replacement; the supplier transfers overlapping ownership
-        // only if the provider successfully performs a replacement.
+        // SAFETY: The caller passes an unconsumed token and authorizes replacement; the supplier
+        // transfers overlapping ownership only if the provider successfully performs a
+        // replacement.
         let reservation = unsafe {
             platform.try_map_shared_object(
                 || self.take_replaced(range.clone()).into_iter(),
@@ -566,10 +567,7 @@ where
                 behavior,
             )
         }
-        .map_err(|error| match error {
-            AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-            other => other,
-        })?;
+        .map_err(in_use_by_platform)?;
         debug_assert_eq!(reservation.range(), range);
         assert!(self.insert(range.start, reservation).is_none());
         Ok(())
@@ -846,15 +844,14 @@ where
         } {
             Ok(acquired) => acquired,
             Err(error) => {
-                platform.release_shared_object(token);
-                return Err(match error {
-                    AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-                    other => other,
-                });
+                // SAFETY: The caller passes an unconsumed token, which nothing else consumes.
+                unsafe { platform.release_shared_object(token) };
+                return Err(in_use_by_platform(error));
             }
         };
-        // SAFETY: Tracked reservations now cover the range, whose pages are unbacked: they were
-        // either just reserved, detached above, or unmapped gaps of existing reservations.
+        // SAFETY: The caller passes an unconsumed token. Tracked reservations now cover the
+        // range, whose pages are unbacked: they were either just reserved, detached above, or
+        // unmapped gaps of existing reservations.
         let result = unsafe {
             platform.commit_shared_object(
                 || self.overlapping(range.clone()),
@@ -1001,11 +998,12 @@ where
     ///
     /// The current implementation effectively re-inserts the mapping with the same
     /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
-    /// However, shared anonymous areas are skipped to keep their contents.
+    /// However, shared anonymous areas and shared file mappings of host shared objects are
+    /// skipped to keep their contents.
     ///
     /// # Panics
     ///
-    /// File-backed mapping is not supported yet.
+    /// Private file-backed mappings are not supported yet.
     ///
     /// # Safety
     ///
@@ -1035,7 +1033,7 @@ where
             }
             // Shared file pages are the file's contents, which discarding the mapping's pages
             // must not change, as on Linux. Only private anonymous pages can be freed.
-            if vma.shared_object.is_some() {
+            if vma.is_shared_object() {
                 if anonymous_only {
                     return Err(VmemResetError::FileBacked);
                 }
@@ -1084,43 +1082,8 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
-        let (start, end) = (suggested_range.start(), suggested_range.end());
-        if start < Platform::TASK_ADDR_MIN {
-            return Err(AllocationError::BelowMinAddress);
-        }
-        if end > Platform::TASK_ADDR_MAX {
-            return Err(AllocationError::AboveMaxAddress);
-        }
-        let platform_fixed_address_behavior = match fixed_address_behavior {
-            FixedAddressBehavior::Hint(direction) => FixedAddressBehavior::Hint(direction),
-            FixedAddressBehavior::NoReplace => {
-                // Ensure there are no mappings managed by us.
-                if self.vmas.overlaps(&(start..end)) {
-                    return Err(AllocationError::AddressInUse);
-                }
-                FixedAddressBehavior::NoReplace
-            }
-            FixedAddressBehavior::Replace => {
-                if self.vmas.overlaps(&(start..end)) {
-                    if self.vmas.gaps(&(start..end)).next().is_some() {
-                        // The range is partially overlapping with existing
-                        // mappings. If we call into the platform with
-                        // `Replace`, then it may overwrite external mappings
-                        // that are not managed by us.
-                        //
-                        // FUTURE: support this case, either by splitting this
-                        // into multiple allocate calls or by separating VA
-                        // allocation from page backing.
-                        return Err(AllocationError::AddressPartiallyInUse);
-                    }
-                    FixedAddressBehavior::Replace
-                } else {
-                    // There are no mappings managed by us, so just treat this
-                    // as NoReplace.
-                    FixedAddressBehavior::NoReplace
-                }
-            }
-        };
+        let platform_fixed_address_behavior =
+            self.platform_placement(&suggested_range.into(), fixed_address_behavior)?;
         // SAFETY: The caller authorizes replacement, and the checks above preserve external gaps.
         // Other requests target VMA gaps selected by the caller.
         unsafe {
@@ -1135,9 +1098,49 @@ where
                 },
             )
         }
-        .map_err(|err| match err {
-            AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-            other => other,
+        .map_err(in_use_by_platform)
+    }
+
+    /// Checks that `range` lies within the task's address space and returns how the platform
+    /// should place a mapping there for `behavior`.
+    ///
+    /// Replacement is passed on only when vmem maps every page of `range`, so that the platform
+    /// never replaces host mappings that vmem does not manage; with none of it mapped, it becomes
+    /// [`FixedAddressBehavior::NoReplace`].
+    fn platform_placement(
+        &self,
+        range: &Range<usize>,
+        behavior: FixedAddressBehavior,
+    ) -> Result<FixedAddressBehavior, AllocationError> {
+        if range.start < Platform::TASK_ADDR_MIN {
+            return Err(AllocationError::BelowMinAddress);
+        }
+        if range.end > Platform::TASK_ADDR_MAX {
+            return Err(AllocationError::AboveMaxAddress);
+        }
+        Ok(match behavior {
+            FixedAddressBehavior::Hint(direction) => FixedAddressBehavior::Hint(direction),
+            FixedAddressBehavior::NoReplace => {
+                // Ensure there are no mappings managed by us.
+                if self.vmas.overlaps(range) {
+                    return Err(AllocationError::AddressInUse);
+                }
+                FixedAddressBehavior::NoReplace
+            }
+            FixedAddressBehavior::Replace if self.vmas.overlaps(range) => {
+                if self.vmas.gaps(range).next().is_some() {
+                    // The range is partially overlapping with existing mappings. If we call into
+                    // the platform with `Replace`, then it may overwrite external mappings that
+                    // are not managed by us.
+                    //
+                    // FUTURE: support this case, either by splitting this into multiple allocate
+                    // calls or by separating VA allocation from page backing.
+                    return Err(AllocationError::AddressPartiallyInUse);
+                }
+                FixedAddressBehavior::Replace
+            }
+            // There are no mappings managed by us, so just treat this as NoReplace.
+            FixedAddressBehavior::Replace => FixedAddressBehavior::NoReplace,
         })
     }
 
@@ -1331,7 +1334,7 @@ where
             return Err(VmemResizeError::Unsupported);
         }
         // TODO: grow shared file mappings by mapping more of the same object.
-        if area.shared_object.is_some() {
+        if area.is_shared_object() {
             litebox_util_log::warn!(
                 range:? = range, new_size = new_size.as_usize();
                 "growing a shared file mapping is unsupported"
@@ -1397,7 +1400,6 @@ where
             let (next_range, next) = self.vmas.get_key_value(&end)?;
             if next.is_file_backed() != first.is_file_backed()
                 || next.sharing != first.sharing
-                || next.shared_object != first.shared_object
                 || !((next.flags() ^ first.flags()) - VmFlags::VM_HAS_CONTENTS).is_empty()
             {
                 return None;
@@ -1648,16 +1650,17 @@ where
         Ok(())
     }
 
-    /// Maps the host object delivered under `token`, from its byte `offset`, as a shared file
-    /// mapping of `length` bytes, placed as `flags` request.
+    /// Maps the host object delivered under `object.token`, from its byte `offset`, as a shared
+    /// file mapping of `length` bytes, placed as `flags` request. This consumes the token whether
+    /// or not it succeeds.
     ///
     /// `may_write` decides whether `mprotect` may later make the mapping writable, which Linux
     /// allows only if the file was opened for writing.
     ///
     /// # Safety
     ///
-    /// For replacement, the caller must ensure overlapping mappings are not in use.
-    #[allow(clippy::too_many_arguments)]
+    /// `object.token` must be an unconsumed delivery to this process. For replacement, the
+    /// caller must ensure overlapping mappings are not in use.
     pub(super) unsafe fn create_shared_object_mapping(
         &mut self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -1680,13 +1683,15 @@ where
         let (range, platform_behavior, base) = match placement {
             Ok(placement) => placement,
             Err(error) => {
-                self.platform.release_shared_object(object.token);
+                // SAFETY: The caller passes an unconsumed token, which nothing else consumes.
+                unsafe { self.platform.release_shared_object(object.token) };
                 return Err(error);
             }
         };
 
-        // SAFETY: The caller authorizes replacement, which `shared_object_placement` limits to
-        // ranges vmem maps completely; otherwise the range overlaps no VMA.
+        // SAFETY: The caller passes an unconsumed token and authorizes replacement, which
+        // `shared_object_placement` limits to ranges vmem maps completely; otherwise the range
+        // overlaps no VMA.
         unsafe {
             self.reservations.map_shared_object(
                 self.platform,
@@ -1702,8 +1707,8 @@ where
         let mut may = VmFlags::may_flags_for_mapping(true, true);
         may.set(VmFlags::VM_MAYWRITE, object.may_write);
         let mut vma = VmArea::new(VmFlags::from(permissions) | may, true);
-        vma.shared_object = Some(SharedObjectKey {
-            id: object.id,
+        vma.sharing = Sharing::Named(SharedMemoryView {
+            memory: object.memory,
             base,
         });
         self.vmas.insert(range.clone(), vma);
@@ -1728,25 +1733,10 @@ where
             .find_area(&request)?
             .ok_or(AllocationError::OutOfMemory)?;
         let range = start..start + length.as_usize();
-        if range.start < Platform::TASK_ADDR_MIN {
-            return Err(AllocationError::BelowMinAddress);
-        }
-        if range.end > Platform::TASK_ADDR_MAX {
-            return Err(AllocationError::AboveMaxAddress);
-        }
-        // As in `insert_mapping`, only replace when every page is ours, so that the platform never
-        // replaces host mappings that vmem does not manage.
-        let platform_behavior = match behavior {
-            FixedAddressBehavior::Replace if self.vmas.overlaps(&range) => {
-                if self.vmas.gaps(&range).next().is_some() {
-                    return Err(AllocationError::AddressPartiallyInUse);
-                }
-                FixedAddressBehavior::Replace
-            }
-            FixedAddressBehavior::NoReplace if self.vmas.overlaps(&range) => {
-                return Err(AllocationError::AddressInUse);
-            }
-            _ => FixedAddressBehavior::NoReplace,
+        let platform_behavior = match self.platform_placement(&range, behavior)? {
+            // The area found for a hint is free, so the object maps exactly there.
+            FixedAddressBehavior::Hint(_) => FixedAddressBehavior::NoReplace,
+            behavior => behavior,
         };
         let base = range.start.wrapping_sub(offset);
         Ok((range, platform_behavior, base))
@@ -2299,7 +2289,7 @@ mod tests {
             Ok(())
         }
 
-        fn release_shared_object(&self, token: SharedObjectToken) {
+        unsafe fn release_shared_object(&self, token: SharedObjectToken) {
             self.released_tokens.lock().push(token.0);
         }
 
@@ -2645,12 +2635,13 @@ mod tests {
         };
         let size = |count: usize| NonZeroPageSize::new(count * PAGE_SIZE).unwrap();
         let object = |id: u128, offset: usize, may_write: bool| SharedObjectMapping {
-            id,
+            memory: SharedMemoryId(id),
             token: SharedObjectToken(0),
             offset: offset as u64,
             may_write,
         };
         let read_write = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        // SAFETY: The test owns the mock address space, and its tokens name nothing.
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>, address, count, flags, object| unsafe {
             vmem.create_shared_object_mapping(
                 NonZeroAddress::new(address),
@@ -2690,13 +2681,13 @@ mod tests {
         assert_eq!(areas.len(), 2, "different objects never coalesce");
         let (_, area) = areas[0];
         assert_eq!(
-            area.shared_object(),
-            Some(SharedObjectKey {
-                id: 1,
+            area.shared_memory(),
+            Some(SharedMemoryView {
+                memory: SharedMemoryId(1),
                 base: start - 2 * PAGE_SIZE
             })
         );
-        assert!(area.is_file_backed() && !area.is_shared_anonymous());
+        assert!(area.is_shared_object() && !area.is_shared_anonymous());
         assert!(
             area.flags()
                 .contains(VmFlags::VM_SHARED | VmFlags::VM_MAYWRITE)
@@ -2704,25 +2695,33 @@ mod tests {
         assert!(!areas[1].1.flags().contains(VmFlags::VM_MAYWRITE));
 
         // Unmapping the middle page leaves two pieces of the same object at the same base.
+        // SAFETY: Nothing uses the mock pages.
         unsafe { vmem.remove_mapping(pages(start + PAGE_SIZE, 1)) }.unwrap();
-        let keys: Vec<_> = vmem
+        let views: Vec<_> = vmem
             .overlapping(start..next)
-            .map(|(_, area)| area.shared_object())
+            .map(|(_, area)| area.shared_memory())
             .collect();
-        assert_eq!(keys, [area.shared_object(), area.shared_object()]);
+        assert_eq!(views, [area.shared_memory(), area.shared_memory()]);
 
-        // Shared file pages keep their contents and cannot grow or move.
+        // Shared file pages keep their contents, so only MADV_DONTNEED, which Linux lets skip
+        // them, succeeds.
+        // SAFETY: Nothing uses the mock pages.
         unsafe { vmem.reset_pages(pages(start, 1), false) }.unwrap();
         assert!(matches!(
+            // SAFETY: As above.
             unsafe { vmem.reset_pages(pages(start, 1), true) },
             Err(VmemResetError::FileBacked)
         ));
+        // Unlike Linux, LiteBox cannot grow or move shared file mappings yet; see the TODO in
+        // esize_mapping.
         let tail = start + 2 * PAGE_SIZE;
         assert!(matches!(
+            // SAFETY: As above.
             unsafe { vmem.resize_mapping(pages(tail, 1), size(4)) },
             Err(VmemResizeError::Unsupported)
         ));
         assert!(matches!(
+            // SAFETY: As above.
             unsafe { vmem.move_mappings(pages(tail, 1), None, size(1)) },
             Err(VmemMoveError::Unsupported)
         ));
@@ -2765,10 +2764,10 @@ mod tests {
                 .next()
                 .unwrap()
                 .1
-                .shared_object()
+                .shared_memory()
                 .unwrap()
-                .id,
-            3
+                .memory,
+            SharedMemoryId(3)
         );
     }
 
@@ -2780,11 +2779,12 @@ mod tests {
         let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
         let read_write = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let object = |id: u128, token: u64| SharedObjectMapping {
-            id,
+            memory: SharedMemoryId(id),
             token: SharedObjectToken(token),
             offset: 0,
             may_write: true,
         };
+        // SAFETY: The test owns the mock address space, and its tokens name nothing.
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>, address, pages: usize, flags, object| unsafe {
             vmem.create_shared_object_mapping(
                 NonZeroAddress::new(address),
@@ -2798,8 +2798,8 @@ mod tests {
         let id_at = |vmem: &Vmem<_, PAGE_SIZE>, address: usize| {
             vmem.overlapping(address..address + 1)
                 .next()
-                .and_then(|(_, area)| area.shared_object())
-                .map(|key| key.id)
+                .and_then(|(_, area)| area.shared_memory())
+                .map(|view| view.memory.0)
         };
 
         // The object backs pages of a reservation acquired for the gap.

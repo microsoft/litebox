@@ -216,10 +216,11 @@ impl SharedViews {
     /// Windows only allows unmapping the full view, so partial unmapping requires unmapping the
     /// entire view and remapping the surviving parts.
     ///
-    /// Remapped parts briefly allow every access before their protections are restored, since a
-    /// view's mapping protection also bounds later protection changes. A concurrent guest access
-    /// that the restored protections would deny can therefore succeed during a split. This only
-    /// affects the guest's own memory, and avoiding it would require suspending guest threads.
+    /// Remapped parts briefly allow every access their section allows before their protections
+    /// are restored, since a view's mapping protection also bounds later protection changes. A
+    /// concurrent guest access that the restored protections would deny can therefore succeed
+    /// during a split. This only affects the guest's own memory, and avoiding it would require
+    /// suspending guest threads.
     fn detach(&mut self, range: Range<usize>) {
         for start in self.overlapping(&range) {
             let view = self.views.remove(&start).unwrap();
@@ -349,22 +350,16 @@ fn shared_section(size: usize) -> Result<OwnedHandle, AllocationError> {
     Ok(unsafe { OwnedHandle::from_raw_handle(section) })
 }
 
-/// A file section that the broker delivered into this process to map a shared file.
-struct DeliveredSection {
-    section: OwnedHandle,
-    /// The section's size, which is the file's size when the broker created it.
-    size: usize,
-    /// Whether the handle allows writable views.
-    writable: bool,
-}
-
 /// Takes ownership of the section the broker delivered under `token`, which is the section's
 /// handle value in this process, or zero for an empty file, which has no section.
 ///
-/// A token that does not name a section is left alone, since this process does not own it.
-fn take_delivered_section(
+/// # Safety
+///
+/// `token` must be an unconsumed delivery to this process, so that its handle is one that only
+/// the caller owns.
+unsafe fn take_delivered_section(
     token: SharedObjectToken,
-) -> Result<Option<DeliveredSection>, AllocationError> {
+) -> Result<Option<Section>, AllocationError> {
     #[repr(C)]
     struct SectionBasicInformation {
         base_address: *mut c_void,
@@ -423,8 +418,8 @@ fn take_delivered_section(
     if status < 0 {
         return Err(AllocationError::OutOfMemory);
     }
-    // SAFETY: `handle` names a section, which the broker duplicated into this process for this
-    // caller alone.
+    // SAFETY: The caller guarantees that `token` is an unconsumed delivery, whose handle only it
+    // owns; the query above confirms that the handle names a section.
     let section_handle = unsafe { OwnedHandle::from_raw_handle(handle) };
     let mut object = ObjectBasicInformation {
         attributes: 0,
@@ -446,10 +441,15 @@ fn take_delivered_section(
     if status < 0 {
         return Err(AllocationError::OutOfMemory);
     }
-    Ok(Some(DeliveredSection {
-        section: section_handle,
+    Ok(Some(Section {
+        handle: section_handle,
         size: usize::try_from(section.maximum_size).map_err(|_| AllocationError::OutOfMemory)?,
-        writable: object.granted_access & Win32_Memory::SECTION_MAP_WRITE != 0,
+        // Views allow every access the handle does, so that protection can later grant any.
+        protection: if object.granted_access & Win32_Memory::SECTION_MAP_WRITE != 0 {
+            Win32_Memory::PAGE_EXECUTE_READWRITE
+        } else {
+            Win32_Memory::PAGE_EXECUTE_READ
+        },
     }))
 }
 
@@ -1085,7 +1085,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         WindowsUserlandReservation<ALIGN>: 'reservation,
     {
         debug_assert_alignment!(range, ALIGN);
-        let section = take_delivered_section(token)?;
+        // SAFETY: The caller passes an unconsumed token.
+        let section = unsafe { take_delivered_section(token) }?;
         if !self.use_placeholders {
             return Err(AllocationError::UnsupportedByPlatform);
         }
@@ -1093,7 +1094,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         let Some(section) = section else {
             return Ok(());
         };
-        if permissions.contains(MemoryRegionPermissions::WRITE) && !section.writable {
+        if permissions.contains(MemoryRegionPermissions::WRITE)
+            && section.protection != Win32_Memory::PAGE_EXECUTE_READWRITE
+        {
             return Err(AllocationError::PermissionDenied);
         }
         let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;
@@ -1104,21 +1107,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         if mapped.is_empty() {
             return Ok(());
         }
-        let view_protection = if section.writable {
-            Win32_Memory::PAGE_EXECUTE_READWRITE
-        } else {
-            Win32_Memory::PAGE_EXECUTE_READ
-        };
-        let section = Arc::new(Section {
-            handle: section.section,
-            size: section.size,
-            protection: view_protection,
-        });
-        map_section(mapped, &section, offset, permissions)
+        map_section(mapped, &Arc::new(section), offset, permissions)
     }
 
-    fn release_shared_object(&self, token: SharedObjectToken) {
-        drop(take_delivered_section(token));
+    unsafe fn release_shared_object(&self, token: SharedObjectToken) {
+        // SAFETY: The caller passes an unconsumed token.
+        drop(unsafe { take_delivered_section(token) });
     }
 }
 
@@ -2223,6 +2217,33 @@ mod tests {
             assert_eq!((page(base, 1) as *const u8).read(), 7);
             let survivor = page(base, 1)..page(base, 2);
             assert_eq!(shared_views_within(reservation.range()), [survivor]);
+            platform.release_pages(reservation).unwrap();
+        }
+
+        // A mapping from a file offset sees the file from there, still only up to its end.
+        let (_file, token) = file_section(&contents, map_access);
+        // SAFETY: As above.
+        unsafe {
+            let reservation = platform
+                .reserve_pages(
+                    core::iter::empty,
+                    0..2 * PAGE_SIZE,
+                    false,
+                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                )
+                .unwrap();
+            let base = reservation.range().start;
+            platform
+                .commit_shared_object(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 2),
+                    token,
+                    PAGE_SIZE as u64,
+                    read,
+                )
+                .unwrap();
+            assert_eq!((page(base, 0) as *const u8).read(), 7);
+            assert_eq!(query_region(page(base, 1)).State, Win32_Memory::MEM_RESERVE);
             platform.release_pages(reservation).unwrap();
         }
 
