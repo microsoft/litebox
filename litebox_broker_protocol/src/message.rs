@@ -440,7 +440,7 @@ pub enum UnixSocketRequest {
     CreatePair(CreateUnixSocketRequest),
     /// Bind a socket to a name.
     Bind(BindUnixSocketRequest),
-    /// Make a bound stream socket accept connections.
+    /// Make a bound stream or sequenced-packet socket accept connections.
     Listen(ListenUnixSocketRequest),
     /// Connect a socket to a named socket.
     Connect(ConnectUnixSocketRequest),

@@ -54,6 +54,9 @@ pub enum SocketType {
     Stream,
     /// Message-oriented datagrams.
     Datagram,
+    /// Reliable ordered records over a connection, which keep their
+    /// boundaries.
+    SeqPacket,
 }
 
 /// IP protocol carried by a broker socket.

@@ -75,7 +75,8 @@ const CONNECTION_OVERHEAD: usize = 256;
 pub struct Received {
     /// Number of bytes received into the start of the caller's buffer.
     pub received: usize,
-    /// Length of the whole datagram, or `received` for a stream socket.
+    /// Length of the whole datagram or record, or `received` for a stream
+    /// socket.
     pub length: usize,
     /// Name of the sending socket, if requested.
     pub source: Option<UnixSocketName>,
@@ -208,8 +209,8 @@ pub fn bind(
     Ok(registered)
 }
 
-/// Starts accepting connections on a bound stream socket, or changes the
-/// backlog limit of a listening one.
+/// Starts accepting connections on a bound stream or sequenced-packet socket,
+/// or changes the backlog limit of a listening one.
 pub fn listen(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -217,7 +218,7 @@ pub fn listen(
 ) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     let socket = &lease.socket;
-    if socket.kind != SocketType::Stream {
+    if !socket.is_connection_oriented() {
         return Ok(Err(UnixSocketError::Unsupported));
     }
     let limit = backlog.min(MAX_UNIX_SOCKET_BACKLOG) as usize;
@@ -246,9 +247,9 @@ pub fn listen(
 
 /// Connects a Unix socket to the socket bound to `address`.
 ///
-/// A stream socket queues a new connection on the listening socket there,
-/// failing with [`BrokerError::WouldBlock`] while its backlog is full. A
-/// datagram socket sets its default destination.
+/// A stream or sequenced-packet socket queues a new connection on the
+/// listening socket there, failing with [`BrokerError::WouldBlock`] while its
+/// backlog is full. A datagram socket sets its default destination.
 pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -268,13 +269,16 @@ pub fn connect(
         Err(error) => return Ok(Err(error)),
     };
     match socket.kind {
-        SocketType::Stream => socket.connect_stream(&target, lease.nonblocking),
+        SocketType::Stream | SocketType::SeqPacket => {
+            socket.connect_to_listener(&target, lease.nonblocking)
+        }
         SocketType::Datagram => Ok(socket.connect_datagram(&target)),
         _ => Err(BrokerError::Internal),
     }
 }
 
-/// Accepts the oldest queued connection of a listening stream socket.
+/// Accepts the oldest queued connection of a listening stream or
+/// sequenced-packet socket.
 ///
 /// The accepted socket starts with the status flags `flags`, which must be
 /// within [`FileOpenFlags::STATUS`], and its reference publishes readiness
@@ -289,7 +293,7 @@ pub fn accept(
     let (rights, status) = creation_rights(process, flags)?;
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
     let listener = &lease.socket;
-    if listener.kind != SocketType::Stream {
+    if !listener.is_connection_oriented() {
         return Ok(Err(UnixSocketError::Unsupported));
     }
     let reference = process.reserve_object_reference(rights)?;
@@ -327,8 +331,9 @@ pub fn accept(
 /// given or otherwise to its connected peer, and returns how many were sent.
 ///
 /// A stream socket sends as many bytes as its peer has room for. A datagram
-/// socket sends `data` as one datagram. Fails with [`BrokerError::WouldBlock`]
-/// while the receiving socket is full.
+/// socket sends `data` as one datagram. A sequenced-packet socket sends
+/// `data` as one record to its peer, ignoring `address` like Linux. Fails
+/// with [`BrokerError::WouldBlock`] while the receiving socket is full.
 pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -360,6 +365,7 @@ pub fn send(
             };
             socket.send_datagram(target, data, lease.nonblocking)
         }
+        SocketType::SeqPacket => socket.send_record(data, lease.nonblocking),
         _ => Err(BrokerError::Internal),
     }
 }
@@ -367,15 +373,17 @@ pub fn send(
 /// Receives bytes from a Unix socket into the start of `output`, leaving them
 /// queued if `peek` is set and returning the sender's name if `source` is set.
 ///
-/// A stream socket receives queued bytes. A datagram socket receives one
-/// datagram, discarding the bytes beyond `output`'s length unless peeking.
-/// Receiving no bytes with zero length into a nonempty `output` means no more
-/// data can arrive. Fails with [`BrokerError::WouldBlock`] while nothing is queued.
+/// A stream socket receives queued bytes. A datagram or sequenced-packet
+/// socket receives one datagram or record, discarding the bytes beyond
+/// `output`'s length unless peeking. Receiving no bytes with zero length into
+/// a nonempty `output` means no more data can arrive, or that an empty
+/// datagram or record arrived. Fails with [`BrokerError::WouldBlock`] while
+/// nothing is queued.
 ///
 /// If `nonblocking` is set, the receive acts as for a non-blocking socket:
 /// it fails with [`BrokerError::NonBlockingWouldBlock`], and a datagram
 /// socket whose receive direction is shut down fails instead of reporting the
-/// end of data, as Linux does.
+/// end of data, unlike a sequenced-packet socket, as Linux does.
 pub fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -393,14 +401,15 @@ pub fn receive(
     match socket.kind {
         SocketType::Stream => socket.receive_stream(output, peek, source, nonblocking),
         SocketType::Datagram => socket.receive_datagram(output, peek, source, nonblocking),
+        SocketType::SeqPacket => socket.receive_record(output, peek, source, nonblocking),
         _ => Err(BrokerError::Internal),
     }
 }
 
 /// Shuts down one or both directions of a Unix socket.
 ///
-/// Shutting down a direction of a connected stream socket also shuts down
-/// the opposite direction of its peer.
+/// Shutting down a direction of a connected stream or sequenced-packet
+/// socket also shuts down the opposite direction of its peer.
 pub fn shutdown(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -548,7 +557,10 @@ pub(crate) struct UnixSocketObject {
 impl UnixSocketObject {
     /// Creates a new unnamed, unconnected `socket_type` socket.
     fn new(process: &BrokerProcess, socket_type: SocketType, status: StatusFlags) -> Result<Self> {
-        if !matches!(socket_type, SocketType::Stream | SocketType::Datagram) {
+        if !matches!(
+            socket_type,
+            SocketType::Stream | SocketType::Datagram | SocketType::SeqPacket
+        ) {
             return Err(BrokerError::UnsupportedOperation);
         }
         let socket = Socket::new(
@@ -765,7 +777,8 @@ enum Connection {
         limit: usize,
     },
     Connected {
-        /// The peer, which a stream socket forgets once the peer closes.
+        /// The peer, which a connection-oriented socket forgets once the peer
+        /// closes.
         peer: Weak<Socket>,
         /// Name the peer had when the connection formed.
         peer_name: UnixSocketName,
@@ -777,7 +790,8 @@ enum Connection {
 struct Queue {
     /// Bytes queued for a stream socket.
     bytes: VecDeque<u8>,
-    /// Datagrams queued for a datagram socket.
+    /// Datagrams queued for a datagram socket, or records for a
+    /// sequenced-packet socket.
     datagrams: VecDeque<Datagram>,
 }
 
@@ -793,6 +807,16 @@ struct Datagram {
 }
 
 impl Datagram {
+    /// Copies `data` into a datagram sent by the socket named `source`.
+    fn new(data: &dyn WriteBuffer, source: UnixSocketName) -> Result<Self> {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(data.len())
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        copy.resize(data.len(), 0);
+        data.copy_to_slice_at(0, &mut copy)?;
+        Ok(Self { data: copy, source })
+    }
+
     fn charge(&self) -> usize {
         self.data.len() + DATAGRAM_OVERHEAD
     }
@@ -860,6 +884,12 @@ impl Socket {
         watchers.publish(self.readiness());
     }
 
+    /// Returns whether the socket exchanges data only with the one peer it
+    /// connects to, as stream and sequenced-packet sockets do.
+    fn is_connection_oriented(&self) -> bool {
+        matches!(self.kind, SocketType::Stream | SocketType::SeqPacket)
+    }
+
     /// Returns the readiness of the socket.
     ///
     /// A socket that cannot send because its peer is full starts waiting for
@@ -891,7 +921,7 @@ impl Socket {
         }
         let peer = match connection {
             None => {
-                if self.kind == SocketType::Stream {
+                if self.is_connection_oriented() {
                     readiness = readiness | ReadinessFlags::CLOSED;
                 }
                 None
@@ -931,7 +961,9 @@ impl Socket {
         Ok(Ok(()))
     }
 
-    fn connect_stream(
+    /// Queues a connection to `listener`, which accepts it as a new socket of
+    /// this socket's type.
+    fn connect_to_listener(
         self: &Arc<Self>,
         listener: &Arc<Socket>,
         nonblocking: bool,
@@ -974,7 +1006,7 @@ impl Socket {
                 .map_err(|_| BrokerError::OutOfMemory)?;
             self.sockets.charge(&listener.quota, CONNECTION_OVERHEAD)?;
             let server = Arc::new(Socket::new(
-                SocketType::Stream,
+                self.kind,
                 Arc::clone(&listener.sockets),
                 Arc::clone(&listener.quota),
                 listener_name.clone(),
@@ -1139,13 +1171,7 @@ impl Socket {
         if write_shut {
             return Ok(Err(UnixSocketError::BrokenPipe));
         }
-        let mut copy = Vec::new();
-        copy.try_reserve_exact(data.len())
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        copy.resize(data.len(), 0);
-        data.copy_to_slice_at(0, &mut copy)?;
-        let datagram = Datagram { data: copy, source };
-        let charge = datagram.charge();
+        let datagram = Datagram::new(data, source)?;
         // The receiver's state stays locked while the datagram is queued, so
         // connecting it rejects other senders from then on, as in Linux.
         let closed = {
@@ -1159,22 +1185,11 @@ impl Socket {
                 true
             } else {
                 let mut channel = target.incoming.lock();
-                if channel.is_shut() {
-                    return Ok(Err(UnixSocketError::BrokenPipe));
+                if let Err(error) =
+                    self.queue_datagram(&target, &mut channel, datagram, nonblocking)?
+                {
+                    return Ok(Err(error));
                 }
-                // A datagram may overrun the capacity, so a socket that is
-                // not full accepts any datagram, as its readiness reports.
-                if channel.room() == 0 {
-                    channel.wait(self)?;
-                    return Err(BrokerError::would_block(nonblocking));
-                }
-                self.sockets.charge(&target.quota, charge)?;
-                if channel.queue.datagrams.try_reserve(1).is_err() {
-                    self.sockets.refund(&target.quota, charge);
-                    return Err(BrokerError::OutOfMemory);
-                }
-                channel.queue.datagrams.push_back(datagram);
-                channel.add(charge);
                 false
             }
         };
@@ -1187,6 +1202,65 @@ impl Socket {
         }
         target.publish();
         Ok(Ok(data.len()))
+    }
+
+    /// Sends `data` as one record to the connected peer.
+    fn send_record(
+        self: &Arc<Self>,
+        data: &dyn WriteBuffer,
+        nonblocking: bool,
+    ) -> Result<UnixSocketResult<usize>> {
+        let (peer, write_shut, source) = {
+            let state = self.state.lock();
+            let Connection::Connected { peer, .. } = &state.connection else {
+                return Ok(Err(UnixSocketError::NotConnected));
+            };
+            (peer.clone(), state.write_shut, state.name.clone())
+        };
+        if data.len() > CAPACITY {
+            return Ok(Err(UnixSocketError::MessageTooLarge));
+        }
+        let Some(peer) = peer.upgrade().filter(|_| !write_shut) else {
+            return Ok(Err(UnixSocketError::BrokenPipe));
+        };
+        let record = Datagram::new(data, source)?;
+        {
+            let mut channel = peer.incoming.lock();
+            if let Err(error) = self.queue_datagram(&peer, &mut channel, record, nonblocking)? {
+                return Ok(Err(error));
+            }
+        }
+        peer.publish();
+        Ok(Ok(data.len()))
+    }
+
+    /// Queues `datagram` in `channel`, the incoming channel of `receiver`.
+    ///
+    /// A datagram may overrun the capacity, so a receiver that is not full
+    /// accepts any datagram, as its readiness reports.
+    fn queue_datagram(
+        self: &Arc<Self>,
+        receiver: &Socket,
+        channel: &mut ChannelState<Queue, Socket>,
+        datagram: Datagram,
+        nonblocking: bool,
+    ) -> Result<UnixSocketResult<()>> {
+        if channel.is_shut() {
+            return Ok(Err(UnixSocketError::BrokenPipe));
+        }
+        if channel.room() == 0 {
+            channel.wait(self)?;
+            return Err(BrokerError::would_block(nonblocking));
+        }
+        let charge = datagram.charge();
+        self.sockets.charge(&receiver.quota, charge)?;
+        if channel.queue.datagrams.try_reserve(1).is_err() {
+            self.sockets.refund(&receiver.quota, charge);
+            return Err(BrokerError::OutOfMemory);
+        }
+        channel.queue.datagrams.push_back(datagram);
+        channel.add(charge);
+        Ok(Ok(()))
     }
 
     /// Disconnects this datagram socket from `peer`, which closed, and
@@ -1277,7 +1351,10 @@ impl Socket {
         let (received, wakeups) = {
             let mut channel = self.incoming.lock();
             let Some(datagram) = channel.queue.datagrams.front() else {
-                return if channel.is_shut() && !nonblocking {
+                // Like Linux, only a sequenced-packet socket reports the end
+                // of data to a receive that would not wait.
+                return if channel.is_shut() && (!nonblocking || self.kind == SocketType::SeqPacket)
+                {
                     Ok(Ok(Received {
                         source: source.then_some(UnixSocketName::Unnamed),
                         ..Received::default()
@@ -1317,13 +1394,28 @@ impl Socket {
         Ok(Ok(received))
     }
 
+    /// Receives one record from the connected peer.
+    fn receive_record(
+        &self,
+        output: &mut dyn ReadBuffer,
+        peek: bool,
+        source: bool,
+        nonblocking: bool,
+    ) -> Result<UnixSocketResult<Received>> {
+        if !matches!(self.state.lock().connection, Connection::Connected { .. }) {
+            return Ok(Err(UnixSocketError::NotConnected));
+        }
+        self.receive_datagram(output, peek, source, nonblocking)
+    }
+
     /// Stops the socket from receiving if `read` is set, and from sending if
-    /// `write` is set, returning its connected stream peer.
+    /// `write` is set, returning its connected peer if the peer shares the
+    /// shutdown.
     fn shut_down(&self, read: bool, write: bool) -> (Option<Arc<Socket>>, Wakeups<Socket>) {
         let mut state = self.state.lock();
         state.write_shut |= write;
         let peer = match &state.connection {
-            Connection::Connected { peer, .. } if self.kind == SocketType::Stream => peer.upgrade(),
+            Connection::Connected { peer, .. } if self.is_connection_oriented() => peer.upgrade(),
             _ => None,
         };
         if !read {
@@ -1335,7 +1427,8 @@ impl Socket {
         (peer, channel.wake())
     }
 
-    /// Ends this stream socket's connection after its peer closed.
+    /// Ends this connection-oriented socket's connection after its peer
+    /// closed.
     fn hang_up(self: &Arc<Self>) {
         let wakeups = {
             let mut state = self.state.lock();
@@ -1392,7 +1485,7 @@ impl Socket {
                     socket.close();
                 }
             }
-            Connection::Connected { peer, .. } if self.kind == SocketType::Stream => {
+            Connection::Connected { peer, .. } if self.is_connection_oriented() => {
                 if let Some(peer) = peer.upgrade() {
                     peer.hang_up();
                 }

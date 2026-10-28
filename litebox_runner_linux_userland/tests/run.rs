@@ -1197,7 +1197,7 @@ fn forked_and_exec_children_share_unix_sockets() {
             .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
     };
     let parent_line = line("unix-fork ");
-    for field in ["stream=", "dgram=", "path=", "exec="] {
+    for field in ["stream=", "dgram=", "path=", "exec=", "seqpacket="] {
         assert_eq!(
             numeric_field(parent_line, field),
             0,

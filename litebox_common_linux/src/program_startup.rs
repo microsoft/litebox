@@ -134,7 +134,7 @@ pub enum InheritedFdKind {
     },
     /// A Unix domain socket.
     UnixSocket {
-        /// Stream or datagram.
+        /// Stream, datagram, or sequenced packet.
         socket_type: SocketType,
     },
     /// An eventfd.
@@ -601,7 +601,8 @@ impl InheritedFd {
                 output.push(match socket_type {
                     SocketType::Stream => 0,
                     SocketType::Datagram => 1,
-                    _ => unreachable!("Unix sockets are streams or datagrams"),
+                    SocketType::SeqPacket => 2,
+                    _ => unreachable!("Unix sockets are streams, datagrams, or sequenced packets"),
                 });
             }
             InheritedFdKind::Pipe { endpoint } => {
@@ -643,6 +644,7 @@ impl InheritedFd {
                 socket_type: match read_u8(input)? {
                     0 => SocketType::Stream,
                     1 => SocketType::Datagram,
+                    2 => SocketType::SeqPacket,
                     _ => return Err(LinuxProgramStartupError::Malformed),
                 },
             },
@@ -942,6 +944,13 @@ mod tests {
                     handle: ObjectHandle(14),
                     kind: InheritedFdKind::InetSocket {
                         socket_type: SocketType::Stream,
+                    },
+                },
+                InheritedFd {
+                    fd: 12,
+                    handle: ObjectHandle(15),
+                    kind: InheritedFdKind::UnixSocket {
+                        socket_type: SocketType::SeqPacket,
                     },
                 },
             ],

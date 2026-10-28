@@ -1330,7 +1330,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         buf: impl WriteBuffer,
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
-        let is_datagram = core::cell::Cell::new(false);
+        let is_message_oriented = core::cell::Cell::new(false);
         let result = fd.dispatch(
             |fd| {
                 self.global
@@ -1339,7 +1339,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global.with_inet_socket(fd, |socket| {
-                    is_datagram.set(!socket.is_stream());
+                    is_message_oriented.set(!socket.is_stream());
                     socket.sendto(
                         &self.wait_cx(),
                         &buf,
@@ -1369,15 +1369,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global.with_unix_socket(fd, |socket| {
-                    is_datagram.set(!socket.is_stream());
+                    is_message_oriented.set(!socket.is_stream());
                     socket.sendto(self, &buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
             |_fd| Err(Errno::EINVAL),
         );
-        // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
+        // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
+        // EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = result
-            && !is_datagram.get()
+            && !is_message_oriented.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }

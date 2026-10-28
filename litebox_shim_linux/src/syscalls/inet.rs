@@ -168,6 +168,10 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                 SocketType::Datagram
             }
             SockType::Raw => todo!(),
+            SockType::SeqPacket => {
+                log_unsupported!("inet sequenced-packet socket");
+                return Err(Errno::ESOCKTNOSUPPORT);
+            }
             _ => unimplemented!(),
         };
         let socket = litebox.create_inet_socket(socket_type, open_flags(flags))?;

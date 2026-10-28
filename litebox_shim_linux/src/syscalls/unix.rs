@@ -263,12 +263,19 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
-        let supported_flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
+        // Like Linux, every Unix socket ignores `MSG_EOR`, which is how a record ends anyway.
+        let supported_flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL | SendFlags::EOR;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported sendto flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
-        let address = addr.map(|addr| addr.to_address(task)).transpose()?;
+        // Like Linux, a sequenced-packet socket ignores the destination.
+        let address = match addr {
+            Some(addr) if self.socket.socket_type() != SocketType::SeqPacket => {
+                Some(addr.to_address(task)?)
+            }
+            _ => None,
+        };
         Ok(self.socket.send(
             &task.wait_cx(),
             address.as_ref(),
@@ -279,9 +286,10 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     }
 
     /// Receives into `buf`, returning the length of the received data, which for a datagram
-    /// socket may exceed `buf`.
+    /// or sequenced-packet socket may exceed `buf`.
     ///
-    /// A datagram socket stores its sender's name in `source_addr` if requested.
+    /// A datagram or sequenced-packet socket stores its sender's name in `source_addr` if
+    /// requested.
     pub(super) fn recvfrom(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -391,16 +399,14 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
                 }
                 // Unix sockets don't track async errors
                 SocketOption::ERROR => 0,
-                SocketOption::TYPE => {
-                    if self.is_stream() {
-                        SockType::Stream as u32
-                    } else {
-                        SockType::Datagram as u32
-                    }
-                }
+                SocketOption::TYPE => match self.socket.socket_type() {
+                    SocketType::Stream => SockType::Stream as u32,
+                    SocketType::SeqPacket => SockType::SeqPacket as u32,
+                    _ => SockType::Datagram as u32,
+                },
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_SOCKET_BUFFER_SIZE,
                 SocketOption::PEERCRED => {
-                    if !self.is_stream() {
+                    if self.socket.socket_type() == SocketType::Datagram {
                         log_unsupported!("get PEERCRED for unix datagram socket");
                         return Err(Errno::EOPNOTSUPP);
                     }
@@ -488,6 +494,7 @@ fn socket_type(sock_type: SockType, protocol: u8) -> Result<SocketType, Errno> {
     match sock_type {
         SockType::Stream => Ok(SocketType::Stream),
         SockType::Datagram => Ok(SocketType::Datagram),
+        SockType::SeqPacket => Ok(SocketType::SeqPacket),
         e => {
             log_unsupported!("Unsupported unix socket type: {:?}", e);
             Err(Errno::ESOCKTNOSUPPORT)
@@ -1063,9 +1070,11 @@ mod tests {
     fn test_unix_socketpair_bidirectional() {
         unix_socketpair_bidirectional(SockType::Stream, false);
         unix_socketpair_bidirectional(SockType::Datagram, false);
+        unix_socketpair_bidirectional(SockType::SeqPacket, false);
 
         unix_socketpair_bidirectional(SockType::Stream, true);
         unix_socketpair_bidirectional(SockType::Datagram, true);
+        unix_socketpair_bidirectional(SockType::SeqPacket, true);
     }
 
     #[test]
@@ -1211,15 +1220,20 @@ mod tests {
     fn test_unix_socket_recv_timeout() {
         unix_socket_recv_timeout(SockType::Stream);
         unix_socket_recv_timeout(SockType::Datagram);
+        unix_socket_recv_timeout(SockType::SeqPacket);
     }
 
     #[test]
-    fn unix_dgram_epipe_does_not_raise_sigpipe() {
+    fn unix_message_epipe_does_not_raise_sigpipe() {
         use litebox_common_linux::signal::Signal;
 
         let task = init_platform();
         // A raised SIGPIPE stays pending, so the stream socket comes last.
-        for (ty, raises) in [(SockType::Datagram, false), (SockType::Stream, true)] {
+        for (ty, raises) in [
+            (SockType::Datagram, false),
+            (SockType::SeqPacket, false),
+            (SockType::Stream, true),
+        ] {
             let (sender, receiver) = task
                 .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
                 .unwrap();

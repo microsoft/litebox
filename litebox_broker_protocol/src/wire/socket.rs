@@ -44,6 +44,7 @@ const ADDRESS_FAMILY_TAG_IPV4: u8 = 0;
 
 const TYPE_TAG_STREAM: u8 = 0;
 const TYPE_TAG_DATAGRAM: u8 = 1;
+const TYPE_TAG_SEQ_PACKET: u8 = 2;
 
 const IP_PROTOCOL_TAG_TCP: u8 = 0;
 const IP_PROTOCOL_TAG_UDP: u8 = 1;
@@ -388,6 +389,7 @@ pub(super) fn encode_socket_type(encoder: &mut Encoder, socket_type: SocketType)
     encoder.u8(match socket_type {
         SocketType::Stream => TYPE_TAG_STREAM,
         SocketType::Datagram => TYPE_TAG_DATAGRAM,
+        SocketType::SeqPacket => TYPE_TAG_SEQ_PACKET,
     });
 }
 
@@ -395,6 +397,7 @@ pub(super) fn decode_socket_type(decoder: &mut Decoder<'_>) -> Result<SocketType
     match decoder.u8()? {
         TYPE_TAG_STREAM => Ok(SocketType::Stream),
         TYPE_TAG_DATAGRAM => Ok(SocketType::Datagram),
+        TYPE_TAG_SEQ_PACKET => Ok(SocketType::SeqPacket),
         _ => Err(WireError::InvalidTag),
     }
 }

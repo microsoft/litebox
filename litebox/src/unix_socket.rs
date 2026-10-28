@@ -47,7 +47,8 @@ use errors::UnixSocketError;
 pub struct Received {
     /// Number of bytes copied into the buffer.
     pub received: usize,
-    /// Length of the whole datagram, or `received` for a stream socket.
+    /// Length of the whole datagram or record, or `received` for a stream
+    /// socket.
     pub length: usize,
     /// Name of the sending socket, if requested.
     pub source: Option<UnixSocketName>,
@@ -66,9 +67,9 @@ pub struct UnixSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Creates an unnamed, unconnected Unix socket.
     ///
-    /// `socket_type` must be [`SocketType::Stream`] or
-    /// [`SocketType::Datagram`], and `flags` must be within
-    /// [`FileOpenFlags::STATUS`].
+    /// `socket_type` must be [`SocketType::Stream`],
+    /// [`SocketType::Datagram`], or [`SocketType::SeqPacket`], and `flags`
+    /// must be within [`FileOpenFlags::STATUS`].
     pub fn create_unix_socket(
         &self,
         socket_type: SocketType,
@@ -159,16 +160,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         )
     }
 
-    /// Makes a bound stream socket accept connections, with up to `backlog`
-    /// connections waiting beyond the first.
+    /// Makes a bound stream or sequenced-packet socket accept connections,
+    /// with up to `backlog` connections waiting beyond the first.
     pub fn listen(&self, backlog: u32) -> Result<(), UnixSocketError> {
         flatten(self.broker.listen_unix_socket(self.handle, backlog))
     }
 
-    /// Connects a stream socket to the listener at `address`, or sets the
-    /// default destination of a datagram socket.
+    /// Connects a stream or sequenced-packet socket to the listener at
+    /// `address`, or sets the default destination of a datagram socket.
     ///
-    /// A stream connection waits while the listener's backlog is full, unless
+    /// A connection waits while the listener's backlog is full, unless
     /// `nonblock` is set or the socket is non-blocking, for at most the
     /// socket's send timeout.
     pub fn connect(
@@ -183,8 +184,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         })
     }
 
-    /// Accepts a connection from a listening stream socket, giving the new
-    /// socket the status flags `flags`.
+    /// Accepts a connection from a listening socket as a new socket of the
+    /// same type, giving it the status flags `flags`.
     ///
     /// Waits while no connection is pending, unless `nonblock` is set or the
     /// socket is non-blocking, for at most the socket's receive timeout.
@@ -202,7 +203,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         Ok(Self {
             broker: Arc::clone(&self.broker),
             handle,
-            socket_type: SocketType::Stream,
+            socket_type: self.socket_type,
             pollable_registry: Arc::clone(&self.pollable_registry),
             pollee,
         })
@@ -211,11 +212,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     /// Sends `data` to `address`, or to the connected peer if `address` is
     /// `None`, returning the number of bytes sent.
     ///
-    /// A datagram socket sends `data` as one datagram. A stream socket sends
-    /// all of `data`. Either waits while the receiver is full, unless
-    /// `nonblock` is set or the socket is non-blocking, for at most the
-    /// socket's send timeout each time. A stream socket that stops early
-    /// after sending some bytes returns their count instead of failing.
+    /// A datagram or sequenced-packet socket sends `data` as one datagram or
+    /// record. A stream socket sends all of `data`. Either waits while the
+    /// receiver is full, unless `nonblock` is set or the socket is
+    /// non-blocking, for at most the socket's send timeout each time. A
+    /// stream socket that stops early after sending some bytes returns their
+    /// count instead of failing.
     pub fn send(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -256,13 +258,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     /// [`UnixSocketError::Fault`] and, unless peeking, the bytes received are
     /// lost.
     ///
-    /// A stream socket receives queued bytes. A datagram socket receives one
-    /// datagram, discarding the bytes that do not fit unless peeking. Waits
-    /// while no data is queued, unless `nonblock` is set or the socket is
-    /// non-blocking, for at most the socket's receive timeout. Receiving zero
-    /// bytes into a nonempty buffer means no more data can arrive, except that
-    /// a datagram socket that would not wait fails with
-    /// [`UnixSocketError::WouldBlock`] instead.
+    /// A stream socket receives queued bytes. A datagram or sequenced-packet
+    /// socket receives one datagram or record, discarding the bytes that do
+    /// not fit unless peeking. Waits while no data is queued, unless
+    /// `nonblock` is set or the socket is non-blocking, for at most the
+    /// socket's receive timeout. Receiving zero bytes into a nonempty buffer
+    /// means an empty datagram or record arrived or no more data can arrive,
+    /// except that a datagram socket that would not wait fails with
+    /// [`UnixSocketError::WouldBlock`] instead of reporting the latter.
     pub fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
