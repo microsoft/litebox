@@ -5,6 +5,7 @@
 //!
 //! Common implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
+use core::num::NonZeroU64;
 use core::ops::Range;
 
 use alloc::vec::Vec;
@@ -113,9 +114,6 @@ where
     ///
     /// `allowed_range` optionally restricts placement of the entire mapping.
     ///
-    /// `shared_memory` assigns the shared memory ID, if any, so that [`Self::shared_futex_key`]
-    /// keys its futexes by it.
-    ///
     /// `op` is a callback for caller to initialize the created pages.
     ///
     /// # Safety
@@ -125,10 +123,6 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "independent placement and setup options of a new mapping"
-    )]
     unsafe fn create_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -136,32 +130,22 @@ where
         flags: CreatePagesFlags,
         permissions: (MemoryRegionPermissions, MemoryRegionPermissions),
         allowed_range: Option<Range<usize>>,
-        shared_memory: Option<SharedMemoryId>,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let (before_perms, after_perms) = permissions;
-        let addr = {
-            let mut vmem = self.vmem.write();
-            // SAFETY: The caller authorizes any replacements.
-            let addr = unsafe {
-                vmem.create_pages(
-                    suggested_address,
-                    length,
-                    flags,
-                    before_perms,
-                    allowed_range,
-                )
-            }?;
-            // Under the same lock, so that no other thread sees the mapping without its memory.
-            if let Some(memory) = shared_memory {
-                let start = addr.as_usize();
-                vmem.set_shared_memory(start..start + length.as_usize(), memory);
-            }
-            addr
-        };
+        // SAFETY: The caller authorizes any replacements.
+        let addr = unsafe {
+            self.vmem.write().create_pages(
+                suggested_address,
+                length,
+                flags,
+                before_perms,
+                allowed_range,
+            )
+        }?;
         let range = PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize())
             .expect("successful mapping must return an aligned, non-empty range");
         // call the user function with the pages
@@ -216,7 +200,6 @@ where
                     permissions,
                 ),
                 allowed_range,
-                None,
                 op,
             )
         }
@@ -259,7 +242,6 @@ where
                     MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
                 ),
                 None,
-                None,
                 op,
             )
         }
@@ -291,17 +273,7 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        unsafe {
-            self.create_pages(
-                suggested_address,
-                length,
-                flags,
-                (perms, perms),
-                None,
-                None,
-                op,
-            )
-        }
+        unsafe { self.create_pages(suggested_address, length, flags, (perms, perms), None, op) }
     }
 
     /// Create read-only pages.
@@ -340,7 +312,6 @@ where
                     // keep READ, turn off WRITE
                     MemoryRegionPermissions::READ,
                 ),
-                None,
                 None,
                 op,
             )
@@ -382,7 +353,6 @@ where
                     MemoryRegionPermissions::empty(),
                 ),
                 None,
-                None,
                 op,
             )
         }
@@ -415,7 +385,6 @@ where
                 length,
                 flags,
                 (perms, perms),
-                None,
                 None,
                 |_| Ok(0),
             )
@@ -675,26 +644,82 @@ where
             .any(|(_, vma)| vma.flags().contains(VmFlags::VM_SHARED) && vma.is_file_backed())
     }
 
-    /// Returns the key of the futex word at `address` if a mapping of named shared memory
-    /// holds all of it.
-    pub fn shared_futex_key(&self, address: usize) -> Result<Option<SharedFutexKey>, Errno> {
+    /// Returns the key of the futex word at `address` if a mapping of shared memory holds all of
+    /// it.
+    ///
+    /// Shared anonymous memory is named the first time a futex in it needs a key, by an ID from
+    /// `issue`, or never if `issue` returns `None`, as when no other process can share the
+    /// memory. The name covers every piece of the mapping, from the start of its lowest piece,
+    /// whatever splits it went through.
+    pub fn shared_futex_key(
+        &self,
+        address: usize,
+        issue: impl FnOnce() -> Result<Option<SharedMemoryId>, Errno>,
+    ) -> Result<Option<SharedFutexKey>, Errno> {
         let Some(end) = address.checked_add(size_of::<u32>()) else {
             return Ok(None);
         };
-        let vmem = self.vmem.read();
-        let Some((range, vma)) = vmem.overlapping(address..end).next() else {
+        // Returns the area holding the whole word, if any.
+        let area = |vmem: &Vmem<Platform, ALIGN>| {
+            vmem.overlapping(address..end)
+                .next()
+                .filter(|(range, _)| range.start <= address && end <= range.end)
+                .map(|(_, vma)| *vma)
+        };
+        let Some(vma) = area(&self.vmem.read()) else {
             return Ok(None);
         };
-        if range.start > address || range.end < end {
-            return Ok(None);
+        if !vma.needs_shared_memory_id() {
+            let Some(key) = vma.shared_futex_key(address) else {
+                return Ok(None);
+            };
+            if !vma.flags().intersects(VmFlags::VM_ACCESS_FLAGS) {
+                return Err(Errno::EFAULT);
+            }
+            return Ok(Some(key));
         }
-        let Some(key) = vma.shared_futex_key(address) else {
-            return Ok(None);
-        };
         if !vma.flags().intersects(VmFlags::VM_ACCESS_FLAGS) {
             return Err(Errno::EFAULT);
         }
-        Ok(Some(key))
+        // The broker is asked without holding the lock, so another thread may name the memory,
+        // split it, or unmap it meanwhile; the first name recorded is kept. The ID is fresh and
+        // known to no one else, so it may name whichever unnamed mapping holds the word by now:
+        // falling back to a private key there would park a waiter where wakes through the
+        // shared key, which every later futex call on the word uses, never reach it.
+        let Some(memory) = issue()? else {
+            return Ok(None);
+        };
+        let mut vmem = self.vmem.write();
+        if let Some(mapping) = area(&vmem).and_then(|vma| vma.unnamed_shared_mapping()) {
+            vmem.name_shared_mapping(mapping, memory);
+        }
+        Ok(area(&vmem).and_then(|vma| vma.shared_futex_key(address)))
+    }
+
+    /// Names, with IDs from `issue`, every shared anonymous mapping that has no name yet, so
+    /// that a native fork child, which inherits the names, keys futexes in it as this process
+    /// does.
+    ///
+    /// Other threads must not map memory meanwhile.
+    pub fn name_shared_memory(
+        &self,
+        mut issue: impl FnMut() -> Result<Option<SharedMemoryId>, Errno>,
+    ) -> Result<(), Errno> {
+        let mut unnamed: Vec<NonZeroU64> = self
+            .vmem
+            .read()
+            .iter()
+            .filter_map(|(_, vma)| vma.unnamed_shared_mapping())
+            .collect();
+        unnamed.sort_unstable();
+        unnamed.dedup();
+        for mapping in unnamed {
+            let Some(memory) = issue()? else {
+                return Ok(());
+            };
+            self.vmem.write().name_shared_mapping(mapping, memory);
+        }
+        Ok(())
     }
 
     /// Returns all mappings in a vector.
@@ -944,15 +969,9 @@ where
     /// Creates an anonymous or file-backed mapping with Linux `mmap` semantics.
     ///
     /// `placement` controls the allocation direction and optional address bounds.
-    /// `shared_memory` assigns the shared memory ID, if any, so that [`Self::shared_futex_key`]
-    /// keys its futexes by it.
     /// `op` initializes the mapping while it is writable;
     /// its error removes the new mapping. A file-backed mapping is expected to be filled with the
     /// file's contents from its start, so the platform is hinted to back it with larger pages.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "mirrors the arguments of `mmap`, plus the name of the memory it maps"
-    )]
     pub fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
@@ -960,7 +979,6 @@ where
         prot: ProtFlags,
         flags: MapFlags,
         placement: MmapPlacement,
-        shared_memory: Option<SharedMemoryId>,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let mut flags = CreatePagesFlags::from(flags);
@@ -1003,7 +1021,6 @@ where
                 flags,
                 (before, permissions),
                 placement.allowed_range,
-                shared_memory,
                 op,
             )
         }

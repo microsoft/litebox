@@ -5,6 +5,7 @@
 //! backed by a memory [backend](PageManagementProvider). It provides functionality to create, remove, resize,
 //! move, and protect memory mappings within a process's virtual address space.
 
+use core::num::NonZeroU64;
 use core::ops::Range;
 
 use alloc::vec::Vec;
@@ -177,11 +178,26 @@ pub struct VmArea {
     flags: VmFlags,
     /// Whether this area is backed by a file
     is_file_backed: bool,
-    /// The shared memory a shared anonymous area maps, which native fork children share.
-    shared_memory: Option<SharedMemoryView>,
+    /// Which memory, shared with other processes, the area maps, if any.
+    sharing: Sharing,
 }
 
-/// Where a shared anonymous area maps its shared memory.
+/// The memory, shared with other processes, that an area maps.
+///
+/// Every piece of one mapping carries the same value, so that pieces split apart merge again
+/// once they match in everything else, and pieces of different mappings never do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sharing {
+    /// The area's pages are its own.
+    None,
+    /// Shared anonymous memory that has no name yet. The number tells the pieces of one
+    /// `mmap` apart from those of any other, and is never reused within a [`Vmem`].
+    Unnamed(NonZeroU64),
+    /// Shared anonymous memory once named, which native fork children share.
+    Named(SharedMemoryView),
+}
+
+/// Where an area maps named shared memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SharedMemoryView {
     memory: SharedMemoryId,
@@ -208,10 +224,35 @@ impl VmArea {
         self.flags.contains(VmFlags::VM_SHARED) && !self.is_file_backed
     }
 
+    /// Returns the number of the shared anonymous mapping this area is a piece of, if that
+    /// mapping has no name yet.
+    #[inline]
+    pub(super) fn unnamed_shared_mapping(&self) -> Option<NonZeroU64> {
+        match self.sharing {
+            Sharing::Unnamed(mapping) => Some(mapping),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this area is shared anonymous memory that has no name yet.
+    #[inline]
+    pub(super) fn needs_shared_memory_id(&self) -> bool {
+        self.unnamed_shared_mapping().is_some()
+    }
+
+    /// Returns where this area maps named shared memory, if it does.
+    #[inline]
+    fn shared_memory(&self) -> Option<SharedMemoryView> {
+        match self.sharing {
+            Sharing::Named(view) => Some(view),
+            _ => None,
+        }
+    }
+
     /// Returns the key of the futex word at `address` in this area, if the area maps named
     /// shared memory.
     pub(super) fn shared_futex_key(&self, address: usize) -> Option<SharedFutexKey> {
-        let view = self.shared_memory?;
+        let view = self.shared_memory()?;
         Some(SharedFutexKey {
             memory: view.memory,
             offset: u64::try_from(address.checked_sub(view.base)?).ok()?,
@@ -228,7 +269,7 @@ impl VmArea {
         Self {
             flags,
             is_file_backed,
-            shared_memory: None,
+            sharing: Sharing::None,
         }
     }
 }
@@ -703,6 +744,8 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     vmas: RangeMap<usize, VmArea>,
     /// Reservations selected and owned by the platform.
     reservations: Platform::Reservations,
+    /// The number of shared anonymous mappings created, which numbers each of their areas.
+    shared_anonymous_mappings: u64,
 }
 
 impl<Platform, const ALIGN: usize> Vmem<Platform, ALIGN>
@@ -719,6 +762,7 @@ where
             platform,
             vmas: RangeMap::new(),
             reservations: Platform::Reservations::default(),
+            shared_anonymous_mappings: 0,
         }
     }
 
@@ -728,23 +772,28 @@ where
         self.vmas.iter()
     }
 
-    /// Records that the shared anonymous mapping just created at `range`.
-    pub(super) fn set_shared_memory(&mut self, range: Range<usize>, memory: SharedMemoryId) {
-        let Some(&vma) = self.vmas.get(&range.start) else {
-            debug_assert!(false, "no mapping was just created at {range:#x?}");
+    /// Names every piece of the unnamed shared anonymous mapping numbered `mapping` as
+    /// `memory`, with offset zero at the start of its lowest piece, so that the pieces keep
+    /// merging as they would have unnamed. Does nothing if no piece of it is left.
+    pub(super) fn name_shared_mapping(&mut self, mapping: NonZeroU64, memory: SharedMemoryId) {
+        let pieces: Vec<(Range<usize>, VmArea)> = self
+            .vmas
+            .iter()
+            .filter(|(_, vma)| vma.unnamed_shared_mapping() == Some(mapping))
+            .map(|(range, vma)| (range.clone(), *vma))
+            .collect();
+        let Some(base) = pieces.first().map(|(range, _)| range.start) else {
             return;
         };
-        debug_assert!(vma.is_shared_anonymous() && vma.shared_memory.is_none());
-        self.vmas.insert(
-            range.clone(),
-            VmArea {
-                shared_memory: Some(SharedMemoryView {
-                    memory,
-                    base: range.start,
-                }),
-                ..vma
-            },
-        );
+        for (range, vma) in pieces {
+            self.vmas.insert(
+                range,
+                VmArea {
+                    sharing: Sharing::Named(SharedMemoryView { memory, base }),
+                    ..vma
+                },
+            );
+        }
     }
 
     /// Gets an iterator over all the stored ranges that are
@@ -1187,7 +1236,7 @@ where
         while end < range.end {
             let (next_range, next) = self.vmas.get_key_value(&end)?;
             if next.is_file_backed() != first.is_file_backed()
-                || next.shared_memory != first.shared_memory
+                || next.sharing != first.sharing
                 || !((next.flags() ^ first.flags()) - VmFlags::VM_HAS_CONTENTS).is_empty()
             {
                 return None;
@@ -1553,7 +1602,7 @@ where
     {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
-        let vma = VmArea::new(
+        let mut vma = VmArea::new(
             VmFlags::from(perms)
                 | VmFlags::may_flags_for_mapping(shared, file_backed)
                 | if flags.contains(CreatePagesFlags::IS_STACK) {
@@ -1563,6 +1612,12 @@ where
                 },
             file_backed,
         );
+        if vma.is_shared_anonymous() {
+            self.shared_anonymous_mappings += 1;
+            let mapping = NonZeroU64::new(self.shared_anonymous_mappings)
+                .expect("a count that only grows from zero is nonzero after an increment");
+            vma.sharing = Sharing::Unnamed(mapping);
+        }
         // SAFETY: The caller authorizes any replacement `FIXED_ADDR` requests.
         unsafe {
             self.create_mapping_in_range(suggested_new_address, length, vma, flags, allowed_range)
