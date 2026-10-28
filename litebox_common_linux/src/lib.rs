@@ -2175,6 +2175,8 @@ pub enum MadviseBehavior {
     DontNeedLocked = 24,
 }
 
+/// Linux's `struct sysinfo`.
+#[repr(C)]
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
 pub struct Sysinfo {
     /// Seconds since boot
@@ -2197,6 +2199,9 @@ pub struct Sysinfo {
     pub procs: u16,
     /// Explicit padding for m68k
     pub pad: u16,
+    /// Padding that aligns `totalhigh`.
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad_high: u32,
     /// Total high memory size
     pub totalhigh: usize,
     /// Available high memory size
@@ -2206,6 +2211,9 @@ pub struct Sysinfo {
     /// Padding: libc5 uses this..
     #[allow(clippy::pub_underscore_fields)]
     pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
+    /// Padding that rounds the size up to the alignment of `usize`.
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad_end: u32,
 }
 
 bitflags::bitflags! {
