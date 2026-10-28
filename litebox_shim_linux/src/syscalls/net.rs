@@ -73,13 +73,13 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
         }
     }
 
-    /// Receives into `buf`, returning the length of the received data, which for a datagram
-    /// socket may exceed `buf`.
+    /// Receives into `buf`, returning the length of the received data, which for a
+    /// message-oriented socket may exceed `buf`.
     ///
     /// `has_prior_progress` tells whether the call already received data, which a failure
     /// then ends instead of being reported.
     ///
-    /// A datagram socket stores its sender's address in `source_addr` if requested.
+    /// A message-oriented socket stores its sender's address in `source_addr` if requested.
     fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -736,12 +736,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        let is_datagram = core::cell::Cell::new(false);
+        let is_message_oriented = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
             |socket| {
-                is_datagram.set(!socket.is_stream());
+                is_message_oriented.set(!socket.is_stream());
                 let sockaddr = sockaddr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
@@ -753,14 +753,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                is_datagram.set(!file.is_stream());
+                is_message_oriented.set(!file.is_stream());
                 file.sendto(self, &buf, flags, addr)
             },
         );
-        // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
+        // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
+        // EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_datagram.get()
+            && !is_message_oriented.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -812,12 +813,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )
         };
         let data = GuestWriteBuffer::<Platform>::new(iovs.as_deref().unwrap_or_default())?;
-        let is_datagram = core::cell::Cell::new(false);
+        let is_message_oriented = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
             |socket| {
-                is_datagram.set(!socket.is_stream());
+                is_message_oriented.set(!socket.is_stream());
                 let sock_addr = sock_addr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
@@ -829,14 +830,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                is_datagram.set(!file.is_stream());
+                is_message_oriented.set(!file.is_stream());
                 file.sendto(self, &data, flags, unix_addr)
             },
         );
-        // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
+        // Like Linux, message-oriented (datagram and sequenced-packet) sockets report
+        // EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_datagram.get()
+            && !is_message_oriented.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }

@@ -271,7 +271,8 @@ pub struct BindUnixSocketRequest {
     pub mode: FileMode,
 }
 
-/// Request to make a bound stream socket accept connections.
+/// Request to make a bound stream or sequenced-packet socket accept
+/// connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListenUnixSocketRequest {
     /// Socket handle.
@@ -280,8 +281,8 @@ pub struct ListenUnixSocketRequest {
     pub backlog: u32,
 }
 
-/// Request to connect a stream socket, or to set a datagram socket's default
-/// destination.
+/// Request to connect a stream or sequenced-packet socket, or to set a
+/// datagram socket's default destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectUnixSocketRequest {
     /// Socket handle.
@@ -311,7 +312,8 @@ pub struct AcceptUnixSocketResponse {
 /// Request to send bytes staged in shared memory.
 ///
 /// A stream socket may send only part of the bytes. A datagram socket sends
-/// them as one datagram.
+/// them as one datagram. A sequenced-packet socket sends them as one record
+/// to its connected peer, ignoring any destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendUnixSocketRequest {
     /// Socket handle.
@@ -335,8 +337,9 @@ pub struct SendUnixSocketResponse {
 
 /// Request to receive bytes into shared memory.
 ///
-/// A stream socket receives queued bytes. A datagram socket receives one
-/// datagram, discarding the bytes beyond `capacity` unless peeking.
+/// A stream socket receives queued bytes. A datagram or sequenced-packet
+/// socket receives one datagram or record, discarding the bytes beyond
+/// `capacity` unless peeking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReceiveUnixSocketRequest {
     /// Socket handle.
@@ -364,12 +367,13 @@ pub struct ReceiveUnixSocketRequest {
 /// Response to a receive request.
 ///
 /// A response with zero `received` and `length` for a nonzero `capacity`
-/// means no more data can arrive.
+/// means an empty datagram or record arrived, or no more data can arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReceiveUnixSocketResponse {
     /// Number of data bytes placed in the buffer.
     pub received: u32,
-    /// Length of the whole datagram, or `received` for a stream socket.
+    /// Length of the whole datagram or record, or `received` for a stream
+    /// socket.
     pub length: u32,
     /// Length of the sender's encoded name, which follows the data, or zero
     /// if the request did not ask for it.

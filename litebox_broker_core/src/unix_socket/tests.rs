@@ -108,7 +108,16 @@ impl Fixture {
     }
 
     fn listener(&self, address: &UnixSocketAddress, backlog: u32) -> ObjectHandle {
-        let listener = self.create(SocketType::Stream);
+        self.typed_listener(SocketType::Stream, address, backlog)
+    }
+
+    fn typed_listener(
+        &self,
+        socket_type: SocketType,
+        address: &UnixSocketAddress,
+        backlog: u32,
+    ) -> ObjectHandle {
+        let listener = self.create(socket_type);
         self.bind(listener, address).unwrap();
         listen(&self.process, listener, backlog).unwrap().unwrap();
         listener
@@ -521,7 +530,7 @@ fn closed_listeners_refuse_connections_first() {
     // A connect that found the listener before it closed is refused, even if
     // the client connected elsewhere meanwhile.
     assert_eq!(
-        client.connect_stream(&closed, false).unwrap(),
+        client.connect_to_listener(&closed, false).unwrap(),
         Err(UnixSocketError::ConnectionRefused)
     );
 }
@@ -545,62 +554,71 @@ fn sends_that_raced_a_reconnect_are_reset() {
 }
 
 #[test]
-fn shutdown_reaches_the_stream_peer() {
+fn shutdown_reaches_the_connected_peer() {
     let fixture = Fixture::new();
-    let (first, second) = fixture.pair(SocketType::Stream);
-    assert_eq!(fixture.send(first, b"tail").unwrap(), Ok(4));
-    shutdown(&fixture.process, first, ShutdownMode::Write)
-        .unwrap()
-        .unwrap();
-    assert!(fixture.take_republished().contains(&second));
-    assert_eq!(
-        fixture.send(first, b"x").unwrap(),
-        Err(UnixSocketError::BrokenPipe)
-    );
-    assert!(
-        fixture
-            .readiness(second)
-            .contains(ReadinessFlags::READ | ReadinessFlags::HANGUP)
-    );
-    assert_eq!(fixture.receive_data(second, 8), b"tail");
-    assert_eq!(fixture.receive_data(second, 8), b"");
-    assert_eq!(fixture.send(second, b"ok").unwrap(), Ok(2));
-    assert_eq!(fixture.receive_data(first, 8), b"ok");
+    for socket_type in [SocketType::Stream, SocketType::SeqPacket] {
+        let (first, second) = fixture.pair(socket_type);
+        assert_eq!(fixture.send(first, b"tail").unwrap(), Ok(4));
+        fixture.take_republished();
+        shutdown(&fixture.process, first, ShutdownMode::Write)
+            .unwrap()
+            .unwrap();
+        assert!(fixture.take_republished().contains(&second));
+        assert_eq!(
+            fixture.send(first, b"x").unwrap(),
+            Err(UnixSocketError::BrokenPipe)
+        );
+        assert!(
+            fixture
+                .readiness(second)
+                .contains(ReadinessFlags::READ | ReadinessFlags::HANGUP)
+        );
+        assert_eq!(fixture.receive_data(second, 8), b"tail");
+        assert_eq!(fixture.receive_data(second, 8), b"");
+        assert_eq!(
+            receive_message(&fixture.process, second, 8, false, false, true),
+            Ok(Ok(Message::default()))
+        );
+        assert_eq!(fixture.send(second, b"ok").unwrap(), Ok(2));
+        assert_eq!(fixture.receive_data(first, 8), b"ok");
 
-    shutdown(&fixture.process, first, ShutdownMode::Read)
-        .unwrap()
-        .unwrap();
-    assert!(fixture.readiness(first).contains(ReadinessFlags::CLOSED));
-    assert_eq!(
-        fixture.send(second, b"x").unwrap(),
-        Err(UnixSocketError::BrokenPipe)
-    );
-    assert_eq!(
-        shutdown(&fixture.process, first, ShutdownMode::Abort),
-        Err(BrokerError::UnsupportedOperation)
-    );
+        shutdown(&fixture.process, first, ShutdownMode::Read)
+            .unwrap()
+            .unwrap();
+        assert!(fixture.readiness(first).contains(ReadinessFlags::CLOSED));
+        assert_eq!(
+            fixture.send(second, b"x").unwrap(),
+            Err(UnixSocketError::BrokenPipe)
+        );
+        assert_eq!(
+            shutdown(&fixture.process, first, ShutdownMode::Abort),
+            Err(BrokerError::UnsupportedOperation)
+        );
+    }
 }
 
 #[test]
-fn closing_a_stream_hangs_up_its_peer() {
+fn closing_a_connected_socket_hangs_up_its_peer() {
     let fixture = Fixture::new();
-    let (first, second) = fixture.pair(SocketType::Stream);
-    assert_eq!(fixture.send(second, b"unread").unwrap(), Ok(6));
-    fixture.close(first);
-    assert!(fixture.take_republished().contains(&second));
-    assert_eq!(fixture.queued(), (0, 0));
-    assert_eq!(
-        fixture.readiness(second),
-        ReadinessFlags::READ
-            | ReadinessFlags::WRITE
-            | ReadinessFlags::HANGUP
-            | ReadinessFlags::CLOSED
-    );
-    assert_eq!(fixture.receive_data(second, 8), b"");
-    assert_eq!(
-        fixture.send(second, b"x").unwrap(),
-        Err(UnixSocketError::BrokenPipe)
-    );
+    for socket_type in [SocketType::Stream, SocketType::SeqPacket] {
+        let (first, second) = fixture.pair(socket_type);
+        assert_eq!(fixture.send(second, b"unread").unwrap(), Ok(6));
+        fixture.close(first);
+        assert!(fixture.take_republished().contains(&second));
+        assert_eq!(fixture.queued(), (0, 0));
+        assert_eq!(
+            fixture.readiness(second),
+            ReadinessFlags::READ
+                | ReadinessFlags::WRITE
+                | ReadinessFlags::HANGUP
+                | ReadinessFlags::CLOSED
+        );
+        assert_eq!(fixture.receive_data(second, 8), b"");
+        assert_eq!(
+            fixture.send(second, b"x").unwrap(),
+            Err(UnixSocketError::BrokenPipe)
+        );
+    }
 }
 
 #[test]
@@ -773,20 +791,22 @@ fn reconnecting_a_datagram_socket_drops_queued_datagrams() {
 }
 
 #[test]
-fn full_datagram_receivers_wake_connected_senders() {
+fn full_record_receivers_wake_connected_senders() {
     let fixture = Fixture::new();
-    let (first, second) = fixture.pair(SocketType::Datagram);
-    let datagram = vec![0; CAPACITY / 2];
-    assert_eq!(fixture.send(first, &datagram).unwrap(), Ok(datagram.len()));
-    assert_eq!(fixture.send(first, &datagram).unwrap(), Ok(datagram.len()));
-    assert_eq!(fixture.send(first, b"x"), Err(BrokerError::WouldBlock));
-    assert!(!fixture.readiness(first).contains(ReadinessFlags::WRITE));
-    fixture.take_republished();
+    for socket_type in [SocketType::Datagram, SocketType::SeqPacket] {
+        let (first, second) = fixture.pair(socket_type);
+        let record = vec![0; CAPACITY / 2];
+        assert_eq!(fixture.send(first, &record).unwrap(), Ok(record.len()));
+        assert_eq!(fixture.send(first, &record).unwrap(), Ok(record.len()));
+        assert_eq!(fixture.send(first, b"x"), Err(BrokerError::WouldBlock));
+        assert!(!fixture.readiness(first).contains(ReadinessFlags::WRITE));
+        fixture.take_republished();
 
-    assert_eq!(fixture.receive_data(second, 1).len(), 1);
-    assert!(fixture.take_republished().contains(&first));
-    assert!(fixture.readiness(first).contains(ReadinessFlags::WRITE));
-    assert_eq!(fixture.send(first, b"x").unwrap(), Ok(1));
+        assert_eq!(fixture.receive_data(second, 1).len(), 1);
+        assert!(fixture.take_republished().contains(&first));
+        assert!(fixture.readiness(first).contains(ReadinessFlags::WRITE));
+        assert_eq!(fixture.send(first, b"x").unwrap(), Ok(1));
+    }
 }
 
 #[test]
@@ -820,6 +840,108 @@ fn connecting_a_full_datagram_receiver_wakes_rejected_senders() {
         fixture.send_to(sender, &receiver_address, b"x").unwrap(),
         Err(UnixSocketError::NotPermitted)
     );
+}
+
+#[test]
+fn sequenced_packets_keep_boundaries_over_connections() {
+    let fixture = Fixture::new();
+    let address = abstract_name(b"server");
+    let listener = fixture.typed_listener(SocketType::SeqPacket, &address, 8);
+    let client = fixture.create(SocketType::SeqPacket);
+    assert_eq!(fixture.connect(client, &address).unwrap(), Ok(()));
+    let server = fixture.accept(listener).unwrap().unwrap();
+    assert_eq!(
+        fixture.socket(server).upgrade().unwrap().kind,
+        SocketType::SeqPacket
+    );
+
+    assert_eq!(fixture.send(client, b"abc").unwrap(), Ok(3));
+    assert_eq!(fixture.send(client, b"").unwrap(), Ok(0));
+    // Like Linux, a connected sequenced-packet socket ignores the address.
+    assert_eq!(
+        fixture
+            .send_to(client, &abstract_name(b"elsewhere"), b"defgh")
+            .unwrap(),
+        Ok(5)
+    );
+    assert_eq!(
+        fixture.receive(server, 2).unwrap().unwrap(),
+        Message {
+            data: b"ab".to_vec(),
+            length: 3,
+            source: Some(UnixSocketName::Unnamed),
+        }
+    );
+    assert_eq!(
+        fixture.receive(server, 8).unwrap().unwrap(),
+        Message {
+            source: Some(UnixSocketName::Unnamed),
+            ..Message::default()
+        }
+    );
+    let peeked = receive_message(&fixture.process, server, 8, true, false, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(peeked.data, b"defgh");
+    assert_eq!(fixture.receive_data(server, 8), b"defgh");
+    assert_eq!(fixture.receive(server, 8), Err(BrokerError::WouldBlock));
+
+    assert_eq!(fixture.send(server, b"pong").unwrap(), Ok(4));
+    let received = fixture.receive(client, 8).unwrap().unwrap();
+    assert_eq!(received.data, b"pong");
+    assert_eq!(received.source, Some(address.name()));
+    assert_eq!(
+        fixture.send(client, &vec![0; CAPACITY + 1]).unwrap(),
+        Err(UnixSocketError::MessageTooLarge)
+    );
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn unconnected_sequenced_packet_sockets_reject_data_operations() {
+    let fixture = Fixture::new();
+    let address = abstract_name(b"server");
+    let unconnected = fixture.create(SocketType::SeqPacket);
+    let listener = fixture.typed_listener(SocketType::SeqPacket, &address, 1);
+    for handle in [unconnected, listener] {
+        assert_eq!(
+            fixture.send(handle, b"x").unwrap(),
+            Err(UnixSocketError::NotConnected)
+        );
+        assert_eq!(
+            fixture.send_to(handle, &address, b"x").unwrap(),
+            Err(UnixSocketError::NotConnected)
+        );
+        assert_eq!(
+            fixture.receive(handle, 1).unwrap(),
+            Err(UnixSocketError::NotConnected)
+        );
+    }
+    assert_eq!(
+        fixture.readiness(unconnected),
+        ReadinessFlags::WRITE | ReadinessFlags::CLOSED
+    );
+}
+
+#[test]
+fn sequenced_packet_sockets_connect_only_to_their_type() {
+    let fixture = Fixture::new();
+    let address = abstract_name(b"server");
+    fixture.listener(&address, 1);
+    fixture.listener(&path("/server"), 1);
+    let client = fixture.create(SocketType::SeqPacket);
+    assert_eq!(
+        fixture.connect(client, &address).unwrap(),
+        Err(UnixSocketError::ConnectionRefused)
+    );
+    assert_eq!(
+        fixture.connect(client, &path("/server")).unwrap(),
+        Err(UnixSocketError::WrongType)
+    );
+
+    let listener = fixture.typed_listener(SocketType::SeqPacket, &address, 1);
+    assert_eq!(fixture.connect(client, &address).unwrap(), Ok(()));
+    assert!(fixture.accept(listener).unwrap().is_ok());
 }
 
 #[test]

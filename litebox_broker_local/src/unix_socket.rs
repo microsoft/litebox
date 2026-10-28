@@ -92,7 +92,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Makes a bound stream socket accept connections.
+    /// Makes a bound stream or sequenced-packet socket accept connections.
     ///
     /// # Panics
     ///

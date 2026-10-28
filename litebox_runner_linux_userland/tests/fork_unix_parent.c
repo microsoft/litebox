@@ -211,6 +211,40 @@ static int exec_child(const char *child_path) {
     return failures;
 }
 
+// A forked child reports through a close-on-exec sequenced-packet socket pair, as process spawners
+// do, and the exec ends the parent's receives by closing the child's end.
+static int seqpacket_exec(const char *child_path) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) != 0) {
+        return 1;
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        if (send(pair[1], "forked", 6, 0) != 6) {
+            _exit(1);
+        }
+        char *const argv[] = {(char *)child_path, "kill-wait", NULL};
+        execv(child_path, argv);
+        _exit(99);
+    }
+    close(pair[1]);
+    if (child < 0) {
+        close(pair[0]);
+        return 1;
+    }
+    char buffer[16];
+    int failures = !wait_readable(pair[0]) || recv(pair[0], buffer, sizeof buffer, 0) != 6 ||
+                   memcmp(buffer, "forked", 6) != 0;
+    failures += !wait_readable(pair[0]) || recv(pair[0], buffer, sizeof buffer, 0) != 0;
+    // Only a child that exec'd is still running to be killed.
+    kill(child, SIGKILL);
+    failures += wait_code(child) != -1;
+    close(pair[0]);
+    return failures;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         return 2;
@@ -220,6 +254,8 @@ int main(int argc, char **argv) {
     int datagram = datagram_pair();
     int path = path_listener();
     int exec = exec_child(argv[1]);
-    printf("unix-fork stream=%d dgram=%d path=%d exec=%d\n", stream, datagram, path, exec);
-    return stream + datagram + path + exec;
+    int seqpacket = seqpacket_exec(argv[1]);
+    printf("unix-fork stream=%d dgram=%d path=%d exec=%d seqpacket=%d\n", stream, datagram, path,
+           exec, seqpacket);
+    return stream + datagram + path + exec + seqpacket;
 }

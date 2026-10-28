@@ -1213,6 +1213,10 @@ mod tests {
                 socket_type: SocketType::Datagram,
                 flags: FileOpenFlags::NONE,
             })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::CreatePair(CreateUnixSocketRequest {
+                socket_type: SocketType::SeqPacket,
+                flags: FileOpenFlags::NONE,
+            })),
             BrokerOperation::UnixSocket(UnixSocketRequest::Bind(BindUnixSocketRequest {
                 handle,
                 address: largest_sequence,

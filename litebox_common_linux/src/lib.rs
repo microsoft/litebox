@@ -1401,6 +1401,7 @@ pub enum SockType {
     Stream = 1,
     Datagram = 2,
     Raw = 3,
+    SeqPacket = 5,
 }
 
 bitflags::bitflags! {
