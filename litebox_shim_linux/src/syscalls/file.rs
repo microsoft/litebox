@@ -1104,7 +1104,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let context = fs.context.read();
         self.global
             .litebox
-            .symlink_file(&context, target, &linkpath)
+            .symlink_file(target, &context, &linkpath)
             .map_err(Errno::from)
     }
 

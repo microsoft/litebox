@@ -118,8 +118,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// interpreted relative to the link's parent when the link is subsequently followed.
     pub fn symlink_file(
         &self,
-        context: &Context,
         target: &str,
+        context: &Context,
         linkpath: &str,
     ) -> Result<(), SymlinkError> {
         let linkpath = Self::broker_path(context, linkpath);
