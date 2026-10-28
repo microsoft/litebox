@@ -76,7 +76,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     let mut payload = [0; 6];
     let (_, host_source) = first.recv_from(&mut payload).unwrap();
     assert_eq!(&payload[..5], b"first");
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 1);
 
     unauthorized.send_to(b"spoof", host_source).unwrap();
     first.send_to(b"reply", host_source).unwrap();
@@ -106,7 +106,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     let (_, reused_source) = second.recv_from(&mut payload).unwrap();
     assert_eq!(&payload, b"second");
     assert_eq!(reused_source.port(), host_source.port());
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 1);
 
     second.send_to(b"native", reused_source).unwrap();
     wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
@@ -154,7 +154,7 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
             .ip(),
         GUEST_IPV4_ADDRESS
     );
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 1);
     assert_eq!(
         send_datagram(&process, socket, b"request", SendFlags::NONE, None),
         Ok(SocketOutcome::Completed(7))
@@ -254,7 +254,7 @@ fn unmatched_guest_udp_destinations_are_port_unreachable() {
         !has_error(),
         "only datagrams to the connected peer report refusals"
     );
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 0);
     assert_eq!(
         host.recv_from(&mut [0; 7]).unwrap_err().kind(),
         ErrorKind::WouldBlock
@@ -290,7 +290,7 @@ fn udp_status_republishes_when_another_error_remains_pending() {
         .unwrap();
     while publications.try_recv().is_ok() {}
 
-    provider.reactor.inject_udp_status_errors(
+    provider.core.inject_udp_status_errors(
         local_address.port(),
         SocketError::ConnectionRefused,
         SocketError::Other,
@@ -362,7 +362,7 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
         );
     }
     assert_eq!(
-        provider.reactor.udp_queued_datagram_count(),
+        provider.core.udp_queued_datagram_count(),
         MAX_UDP_QUEUE_DATAGRAMS_PER_SOURCE
     );
 
@@ -401,7 +401,7 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
         ));
         assert_eq!(byte, *b"x");
     }
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 0);
 }
 
 #[test]
@@ -480,7 +480,7 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
 }
 
 #[test]
-fn reactor_preserves_udp_datagram_semantics() {
+fn provider_preserves_udp_datagram_semantics() {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     server.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let server_address = gateway_address(socket_address_v4(server.local_addr().unwrap()));
@@ -750,7 +750,7 @@ fn reactor_preserves_udp_datagram_semantics() {
     let connected_source = socket_address_v4(connected_source);
     assert!(connected_source.ip().is_loopback());
     assert_eq!(connected_source, source);
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 1);
     assert_eq!(
         litebox_broker_core::socket::connect(
             &process,
@@ -885,11 +885,11 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
     );
     assert_eq!(
         provider
-            .reactor
+            .core
             .udp_guest_local_address(receiver_guest_address.port()),
         None
     );
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 0);
     let tcp_same_port = create_socket(&sender_process, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&sender_process, tcp_same_port, receiver_guest_address,),
@@ -922,7 +922,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
         ),
         Ok(SocketOutcome::Completed(12))
     );
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 0);
     assert_eq!(
         send_datagram(
             &sender_process,
@@ -1013,10 +1013,10 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
     let mut external_packet = [0; 7];
     let (_, receiver_source) = external.recv_from(&mut external_packet).unwrap();
     assert_eq!(&external_packet, b"contact");
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 1);
     assert!(
         provider
-            .reactor
+            .core
             .udp_native_receive_buffer_size(receiver_guest_address.port())
             .is_some_and(|size| size <= MAX_UDP_NATIVE_RECEIVE_BUFFER)
     );
@@ -1328,8 +1328,8 @@ fn udp_native_endpoint_is_reused_and_retired() {
     let first_address = gateway_address(socket_address_v4(first.local_addr().unwrap()));
     let second_address = gateway_address(socket_address_v4(second.local_addr().unwrap()));
 
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
-    assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.core.udp_native_event_token_count(), 0);
     assert_eq!(
         send_datagram(
             &process,
@@ -1343,8 +1343,8 @@ fn udp_native_endpoint_is_reused_and_retired() {
     let mut first_payload = [0; 5];
     let (_, first_source) = first.recv_from(&mut first_payload).unwrap();
     assert_eq!(&first_payload, b"first");
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
-    assert_eq!(provider.reactor.udp_native_event_token_count(), 1);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.core.udp_native_event_token_count(), 1);
 
     assert_eq!(
         send_datagram(
@@ -1360,13 +1360,13 @@ fn udp_native_endpoint_is_reused_and_retired() {
     let (_, second_source) = second.recv_from(&mut second_payload).unwrap();
     assert_eq!(&second_payload, b"second");
     assert_eq!(second_source, first_source);
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
-    assert_eq!(provider.reactor.udp_native_event_token_count(), 1);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.core.udp_native_event_token_count(), 1);
 
     process.close_object_reference(socket).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), socket);
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
-    assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.core.udp_native_event_token_count(), 0);
 }
 
 #[test]
@@ -1389,7 +1389,7 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
     let external = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let external_address = gateway_address(socket_address_v4(external.local_addr().unwrap()));
 
-    provider.reactor.exhaust_udp_event_tokens();
+    provider.core.exhaust_udp_event_tokens();
     assert_eq!(
         send_datagram(
             &process,
@@ -1400,9 +1400,9 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
         ),
         Err(BrokerError::ResourceExhausted)
     );
-    assert_eq!(provider.reactor.udp_external_peer_count(), 0);
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
-    assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
+    assert_eq!(provider.core.udp_external_peer_count(), 0);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.core.udp_native_event_token_count(), 0);
 
     process.close_object_reference(socket).unwrap();
 }
@@ -1443,7 +1443,7 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
         litebox_broker_core::socket::bind(&source_process, source, source_address),
         Ok(SocketOutcome::Completed(source_address))
     );
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.core.udp_native_endpoint_count(), 0);
     assert_eq!(
         send_datagram(
             &source_process,
@@ -1460,7 +1460,7 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
         receiver,
         ReadinessFlags::READ,
     );
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 1);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 1);
 
     source_process.close_object_reference(source).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), source);
@@ -1511,7 +1511,7 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
         }))
     );
     assert_eq!(&payload, b"fresh");
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 0);
 }
 
 #[test]
@@ -1573,7 +1573,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
         .local_address
         .map(|address| SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port()))
         .expect("implicit UDP source bind missing");
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 1);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 1);
     assert_eq!(
         send_datagram(
             &source_process,
@@ -1584,7 +1584,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
         ),
         Ok(SocketOutcome::Completed(6))
     );
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 2);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 2);
     wait_until_ready(
         &first_receiver_process,
         &publications,
@@ -1615,12 +1615,8 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
         ),
         Err(BrokerError::WouldBlock)
     );
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 1);
-    assert!(
-        provider
-            .reactor
-            .has_udp_source_accounting(source_process_id)
-    );
+    assert_eq!(provider.core.udp_queued_datagram_count(), 1);
+    assert!(provider.core.has_udp_source_accounting(source_process_id));
     wait_until_ready(
         &second_receiver_process,
         &publications,
@@ -1629,13 +1625,9 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
     );
     source_process.cleanup(true);
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), source);
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 1);
-    assert!(
-        !provider
-            .reactor
-            .has_udp_source_accounting(source_process_id)
-    );
-    assert_eq!(provider.reactor.process_state_count(), 2);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 1);
+    assert!(!provider.core.has_udp_source_accounting(source_process_id));
+    assert_eq!(provider.core.process_state_count(), 2);
 
     let replacement = create_udp_socket(&replacement_process, readiness);
     assert_eq!(
@@ -1652,7 +1644,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
         }))
     );
     assert_eq!(&payload, b"second");
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 0);
 
     replacement_process
         .close_object_reference(replacement)
@@ -1702,12 +1694,12 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
         Ok(SocketOutcome::Completed(5))
     );
     wait_until_ready(&first_process, &publications, first, ReadinessFlags::READ);
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 1);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 1);
     assert_eq!(
         litebox_broker_core::socket::connect(&first_process, first, second_address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 0);
     let mut stale = [0; 5];
     assert_eq!(
         receive_datagram_into(&first_process, first, &mut stale, ReceiveFromFlags::NONE,),
@@ -2087,7 +2079,7 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
         ),
         Err(BrokerError::WouldBlock)
     );
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 0);
     assert_eq!(
         send_datagram(
             &receiver_process,
@@ -2098,7 +2090,7 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
         ),
         Ok(SocketOutcome::Completed(5))
     );
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 0);
     assert_eq!(
         receive_datagram_into(
             &source_process,
@@ -2108,7 +2100,7 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
         ),
         Err(BrokerError::WouldBlock)
     );
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
+    assert_eq!(provider.core.udp_queued_datagram_count(), 0);
 }
 
 #[test]
@@ -2194,34 +2186,23 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
     let mut contact = [0; 7];
     let (_, receiver_host_address) = attacker.recv_from(&mut contact).unwrap();
     assert_eq!(&contact, b"contact");
-    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
-    let (ready, wait_until_ready) = sync_channel(1);
-    let (proceed, wait_to_proceed) = sync_channel(1);
-    let (response, receive_response) = sync_channel(1);
-    provider
-        .reactor
-        .commands
-        .send(ReactorCommand::ExerciseUdpReceiveRejectionCap {
-            guest_port,
-            ready,
-            proceed: wait_to_proceed,
-            response,
-        })
-        .unwrap();
-    provider.reactor.signal().unwrap();
-    wait_until_ready.recv_timeout(TEST_TIMEOUT).unwrap();
-    for _ in 0..MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
-        attacker.send_to(b"x", receiver_host_address).unwrap();
-    }
+    assert_eq!(provider.core.udp_native_endpoint_count(), 1);
     let sentinel = b"sentinel";
-    attacker.send_to(sentinel, receiver_host_address).unwrap();
-    proceed.send(()).unwrap();
+    // Queue the datagrams while the call holds the socket, so the epoll
+    // thread cannot drain them first.
     assert_eq!(
-        receive_response.recv_timeout(TEST_TIMEOUT).unwrap(),
+        provider
+            .core
+            .exercise_udp_receive_rejection_cap(guest_port, || {
+                for _ in 0..MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
+                    attacker.send_to(b"x", receiver_host_address).unwrap();
+                }
+                attacker.send_to(sentinel, receiver_host_address).unwrap();
+            }),
         Ok((false, sentinel.len()))
     );
     let deadline = Instant::now() + TEST_TIMEOUT;
-    while provider.reactor.udp_native_head_datagram_bytes(guest_port) != 0 {
+    while provider.core.udp_native_head_datagram_bytes(guest_port) != 0 {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for the rearmed native UDP drain"
@@ -2254,4 +2235,313 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
         }))
     );
     assert_eq!(&payload, b"ok");
+}
+
+/// A native error that a receive consumes after the epoll thread harvested
+/// its event is not reported again, and the endpoint keeps rearming.
+#[test]
+fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
+    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider.clone(),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
+    let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let host_address = host.local_addr().unwrap();
+    let gateway = gateway_address(socket_address_v4(host_address));
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, socket, gateway),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(&process, socket, b"hello", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(5))
+    );
+    let (_, endpoint) = host.recv_from(&mut [0; 5]).unwrap();
+    host.send_to(b"queued", endpoint).unwrap();
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+    drop(host);
+
+    // The queued datagram leaves the endpoint armed only for errors, so the
+    // ICMP error is its next event.
+    let hook = TestHook::install(&provider);
+    let receiver = Arc::new(Mutex::new(Some(Arc::clone(&process))));
+    let pending_receive = Arc::clone(&receiver);
+    hook.act(move |_, _, point| {
+        let HookPoint::Harvested(token) = point else {
+            return;
+        };
+        if token & UDP_EVENT_TOKEN_FLAG == 0 {
+            return;
+        }
+        let receiver = pending_receive.lock().unwrap().take();
+        if let Some(process) = receiver {
+            run_on_thread(move || {
+                assert_eq!(
+                    receive_datagram_into(&process, socket, &mut [0; 6], ReceiveFromFlags::NONE),
+                    Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+                );
+            });
+        }
+    });
+    let start = hook.len();
+    assert_eq!(
+        send_datagram(&process, socket, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    let handled = hook.wait_for_harvest_handled(start, |token| token & UDP_EVENT_TOKEN_FLAG != 0);
+    hook.stop();
+    assert!(receiver.lock().unwrap().is_none());
+    assert_eq!(handled, Dispatch::Applied);
+    assert!(
+        !process
+            .check_readiness(socket)
+            .unwrap()
+            .contains(ReadinessFlags::ERROR)
+    );
+
+    // Consuming the error rearmed the endpoint for input, so the queued
+    // datagram raises READ again.
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+    let mut payload = [0; 6];
+    assert_eq!(
+        receive_datagram_into(&process, socket, &mut payload, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+            received: 6,
+            datagram_length: 6,
+            source_address: gateway,
+        }))
+    );
+    assert_eq!(&payload, b"queued");
+    let host = UdpSocket::bind(host_address).unwrap();
+    host.send_to(b"later", endpoint).unwrap();
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+    let mut payload = [0; 5];
+    assert_eq!(
+        receive_datagram_into(&process, socket, &mut payload, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+            received: 5,
+            datagram_length: 5,
+            source_address: gateway,
+        }))
+    );
+    assert_eq!(&payload, b"later");
+}
+
+/// Internal datagrams sent while their receiver receives and closes are
+/// each delivered or dropped, and every queue and source counter returns to
+/// zero.
+#[test]
+fn guest_udp_send_racing_receive_and_close_releases_all_accounting() {
+    let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 1),
+        provider.clone(),
+    )
+    .unwrap();
+    let sender_process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let receiver_process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18090);
+    let receiver = create_udp_socket(&receiver_process, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&receiver_process, receiver, address),
+        Ok(SocketOutcome::Completed(address))
+    );
+    let sender = create_udp_socket(&sender_process, readiness);
+    let sender_process_id = sender_process.id();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // An unconnected sender's datagram to an unbound address is dropped, so
+    // sends keep completing across the close.
+    let sending = {
+        let sent = Arc::clone(&sent);
+        let stop = Arc::clone(&stop);
+        let sender_process = Arc::clone(&sender_process);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                assert_eq!(
+                    send_datagram(
+                        &sender_process,
+                        sender,
+                        b"datagram",
+                        SendFlags::NONE,
+                        Some(address),
+                    ),
+                    Ok(SocketOutcome::Completed(8))
+                );
+                sent.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+    let receiving = {
+        let delivered = Arc::clone(&delivered);
+        let receiver_process = Arc::clone(&receiver_process);
+        thread::spawn(move || {
+            loop {
+                match receive_datagram_into(
+                    &receiver_process,
+                    receiver,
+                    &mut [0; 8],
+                    ReceiveFromFlags::NONE,
+                ) {
+                    Ok(SocketOutcome::Completed(datagram)) => {
+                        assert_eq!(datagram.received, 8);
+                        delivered.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(BrokerError::WouldBlock) => thread::yield_now(),
+                    // The close removed the handle.
+                    Err(_) => break,
+                    outcome => panic!("unexpected receive outcome: {outcome:?}"),
+                }
+            }
+        })
+    };
+    wait_until(
+        || delivered.load(Ordering::Relaxed) > 0,
+        "a datagram is delivered",
+    );
+    receiver_process.close_object_reference(receiver).unwrap();
+    // The second send counted after the close started after it.
+    let sent_at_close = sent.load(Ordering::Relaxed);
+    wait_until(
+        || sent.load(Ordering::Relaxed) > sent_at_close + 1,
+        "sends continue after the close",
+    );
+    stop.store(true, Ordering::Relaxed);
+    receiving.join().unwrap();
+    sending.join().unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), receiver);
+    assert!(delivered.load(Ordering::Relaxed) <= sent.load(Ordering::Relaxed));
+    assert_eq!(provider.core.udp_queued_datagram_count(), 0);
+    assert!(!provider.core.has_udp_source_accounting(sender_process_id));
+}
+
+/// Receives one datagram of `data.len()` bytes, waiting for READ when none is
+/// queued.
+fn receive_datagram(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+    data: &mut [u8],
+) {
+    loop {
+        match receive_datagram_into(process, handle, data, ReceiveFromFlags::NONE) {
+            Ok(SocketOutcome::Completed(datagram)) => {
+                assert_eq!(datagram.datagram_length, data.len());
+                return;
+            }
+            Err(BrokerError::WouldBlock) => {
+                wait_until_ready(process, publications, handle, ReadinessFlags::READ);
+            }
+            outcome => panic!("unexpected receive outcome: {outcome:?}"),
+        }
+    }
+}
+
+/// Many internal UDP socket pairs exchange datagrams in parallel, and every
+/// socket's readiness then settles, including with a datagram left queued.
+#[test]
+fn many_guest_udp_pairs_exchange_datagrams_in_parallel() {
+    const PAIRS: u16 = 8;
+    const ROUNDS: u8 = 64;
+    let provider = Arc::new(LinuxSocketProvider::new(2 * usize::from(PAIRS), 2).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(4 * usize::from(PAIRS), 0, 2 * usize::from(PAIRS), 2),
+        provider.clone(),
+    )
+    .unwrap();
+    let workers: Vec<_> = (0..PAIRS)
+        .map(|index| {
+            let process = broker
+                .create_process(CallerCredential::Unauthenticated, None)
+                .unwrap();
+            let (published, publications) = channel();
+            let (retired, _retirements) = channel();
+            let readiness = Arc::new(TestReadinessSink { published, retired });
+            let addresses = [
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18100 + 2 * index),
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18101 + 2 * index),
+            ];
+            let sockets = addresses.map(|address| {
+                let socket = create_udp_socket(&process, readiness.clone());
+                assert_eq!(
+                    litebox_broker_core::socket::bind(&process, socket, address),
+                    Ok(SocketOutcome::Completed(address))
+                );
+                socket
+            });
+            thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    let message = [round; 256];
+                    let mut data = [0; 256];
+                    for (from, to) in [(0, 1), (1, 0)] {
+                        assert_eq!(
+                            send_datagram(
+                                &process,
+                                sockets[from],
+                                &message,
+                                SendFlags::NONE,
+                                Some(addresses[to]),
+                            ),
+                            Ok(SocketOutcome::Completed(message.len()))
+                        );
+                        receive_datagram(&process, sockets[to], &publications, &mut data);
+                        assert_eq!(data, message);
+                    }
+                }
+                assert_eq!(
+                    send_datagram(
+                        &process,
+                        sockets[0],
+                        b"left",
+                        SendFlags::NONE,
+                        Some(addresses[1]),
+                    ),
+                    Ok(SocketOutcome::Completed(4))
+                );
+                (process, sockets, readiness)
+            })
+        })
+        .collect();
+    let pairs: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    wait_for_settled_readiness(&provider);
+    for (process, sockets, _) in &pairs {
+        assert!(
+            process
+                .check_readiness(sockets[1])
+                .unwrap()
+                .contains(ReadinessFlags::READ)
+        );
+    }
+    assert_eq!(
+        provider.core.udp_queued_datagram_count(),
+        usize::from(PAIRS)
+    );
+    drop(pairs);
 }

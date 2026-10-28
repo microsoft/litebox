@@ -514,7 +514,7 @@ jobs:
           #
           # - `litebox_broker_platform_linux_userland` is allowed to have
           #   `std` access, since it owns hosted Linux broker resources such as
-          #   sockets and the epoll reactor.
+          #   sockets and their epoll thread.
           #
           # - `litebox_broker_platform_windows_userland` is allowed to have
           #   `std` access, since it owns hosted Windows broker resources.

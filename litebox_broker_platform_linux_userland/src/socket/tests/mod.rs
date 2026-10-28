@@ -4,7 +4,9 @@
 use std::io::{Read as _, Write as _};
 use std::net::Ipv4Addr;
 use std::net::{Shutdown, TcpListener, UdpSocket};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::Condvar;
+use std::sync::atomic::AtomicUsize;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -17,7 +19,9 @@ use litebox_broker_core::{
 };
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::FileOpenFlags;
-use litebox_broker_protocol::socket::{Ipv4Address, Port, ReceiveSocketResponse};
+use litebox_broker_protocol::socket::{
+    Ipv4Address, MAX_SOCKET_TRANSFER_SIZE, Port, ReceiveSocketResponse,
+};
 
 use super::tcp::TcpPendingErrors;
 use super::udp::{
@@ -39,6 +43,144 @@ fn test_broker_core(
         .with_limits(limits)
         .with_socket_provider(socket_provider)
         .build()
+}
+
+type HookAction = Arc<dyn Fn(&TestHook, usize, HookPoint) + Send + Sync>;
+
+/// The test's provider hook, which forces a chosen interleaving of a socket
+/// call and the epoll thread.
+///
+/// Calls and the epoll thread can work on one socket at once, and their races
+/// have windows too narrow for stress tests to hit reliably. A `TestHook`
+/// records every [`HookPoint`] the provider reaches, so a test can wait for a
+/// thread to reach a point instead of sleeping. It also runs the test's
+/// action at each point, so the action can hold that thread there while
+/// another thread makes its move.
+struct TestHook {
+    points: Mutex<Vec<HookPoint>>,
+    changed: Condvar,
+    action: Mutex<Option<HookAction>>,
+}
+
+impl TestHook {
+    /// Creates a hook and installs it as `provider`'s, replacing any previous
+    /// one.
+    fn install(provider: &LinuxSocketProvider) -> Arc<Self> {
+        let hook = Arc::new(Self {
+            points: Mutex::new(Vec::new()),
+            changed: Condvar::new(),
+            action: Mutex::new(None),
+        });
+        let installed = Arc::clone(&hook);
+        provider
+            .core
+            .set_hook(Some(Arc::new(move |point| installed.record(point))));
+        hook
+    }
+
+    fn record(&self, point: HookPoint) {
+        let index = {
+            let mut points = self.points.lock().unwrap();
+            points.push(point);
+            points.len() - 1
+        };
+        self.changed.notify_all();
+        let action = self.action.lock().unwrap().clone();
+        if let Some(action) = action {
+            action(self, index, point);
+        }
+    }
+
+    /// Runs `action` with each later point and its index.
+    fn act(&self, action: impl Fn(&TestHook, usize, HookPoint) + Send + Sync + 'static) {
+        *self.action.lock().unwrap() = Some(Arc::new(action));
+    }
+
+    /// Stops running the action, releasing what it captured.
+    fn stop(&self) {
+        *self.action.lock().unwrap() = None;
+    }
+
+    fn len(&self) -> usize {
+        self.points.lock().unwrap().len()
+    }
+
+    /// Waits for the first harvest at or after `start` of a token that
+    /// `matches`, and returns how the epoll thread handled that event.
+    ///
+    /// An event harvested before `start` may still report `Handled` after
+    /// it, so a wait for `Handled` alone could see that event.
+    fn wait_for_harvest_handled(&self, start: usize, matches: impl Fn(u64) -> bool) -> Dispatch {
+        let (harvested, point) = self.wait_for(
+            start,
+            |point| matches!(point, HookPoint::Harvested(token) if matches(token)),
+        );
+        let HookPoint::Harvested(token) = point else {
+            unreachable!()
+        };
+        // A harvest merges any deferred flags for its token, so the next
+        // `Handled` for the token is this event's.
+        match self.wait_for(
+            harvested,
+            |point| matches!(point, HookPoint::Handled(handled, _) if handled == token),
+        ) {
+            (_, HookPoint::Handled(_, dispatch)) => dispatch,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Waits for the first point at or after `start` that `matches`.
+    fn wait_for(&self, start: usize, matches: impl Fn(HookPoint) -> bool) -> (usize, HookPoint) {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let mut points = self.points.lock().unwrap();
+        loop {
+            if let Some((index, point)) = points
+                .iter()
+                .enumerate()
+                .skip(start)
+                .find(|(_, point)| matches(**point))
+            {
+                return (index, *point);
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("timed out waiting for a provider hook point");
+            points = self.changed.wait_timeout(points, remaining).unwrap().0;
+        }
+    }
+}
+
+/// Runs `operation` on another thread and waits for it, failing rather than
+/// hanging if it blocks.
+fn run_on_thread(operation: impl FnOnce() + Send + 'static) {
+    let (done, finished) = channel();
+    let worker = thread::spawn(move || {
+        operation();
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(TEST_TIMEOUT) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => worker.join().unwrap(),
+        Err(RecvTimeoutError::Timeout) => panic!("the operation did not finish"),
+    }
+}
+
+/// Waits until `condition` holds, failing after [`TEST_TIMEOUT`].
+fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        thread::yield_now();
+    }
+}
+
+/// Waits for every socket's readiness to reflect its state; a lost wakeup
+/// never settles.
+fn wait_for_settled_readiness(provider: &LinuxSocketProvider) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !provider.core.readiness_is_settled() {
+        assert!(Instant::now() < deadline, "socket readiness did not settle");
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -69,94 +211,6 @@ fn gateway_tcp_policy() -> SocketPolicy {
 
 fn gateway_address(host_address: SocketAddrV4) -> SocketAddrV4 {
     SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, host_address.port())
-}
-
-#[test]
-fn pending_socket_retirement_prevents_reactor_activation() {
-    let lifecycle = SocketLifecycle::pending();
-    lifecycle.retire(|| panic!("pending sockets have no reactor resource to close"));
-    assert!(!lifecycle.activate());
-    assert_eq!(lifecycle.load(), SocketLifecycleState::Retired);
-}
-
-#[test]
-fn concurrent_socket_retirement_waits_for_close_acknowledgement() {
-    let lifecycle = Arc::new(SocketLifecycle::pending());
-    assert!(lifecycle.activate());
-    let (close_started, close_started_receive) = sync_channel(1);
-    let (release_close, release_close_receive) = sync_channel(1);
-    let first_lifecycle = Arc::clone(&lifecycle);
-    let first = thread::spawn(move || {
-        first_lifecycle.retire(|| {
-            close_started.send(()).unwrap();
-            release_close_receive.recv_timeout(TEST_TIMEOUT).unwrap();
-        });
-    });
-    close_started_receive.recv_timeout(TEST_TIMEOUT).unwrap();
-
-    let (second_waiting, second_waiting_receive) = sync_channel(1);
-    let (second_finished, second_finished_receive) = sync_channel(1);
-    let second_lifecycle = Arc::clone(&lifecycle);
-    let second = thread::spawn(move || {
-        second_lifecycle.retire_with_wait_observer(
-            || panic!("only the active caller may close the socket"),
-            || second_waiting.send(()).unwrap(),
-        );
-        second_finished.send(()).unwrap();
-    });
-    second_waiting_receive.recv_timeout(TEST_TIMEOUT).unwrap();
-    assert!(
-        second_finished_receive
-            .recv_timeout(Duration::from_millis(100))
-            .is_err()
-    );
-
-    release_close.send(()).unwrap();
-    first.join().unwrap();
-    second_finished_receive.recv_timeout(TEST_TIMEOUT).unwrap();
-    second.join().unwrap();
-    assert_eq!(lifecycle.load(), SocketLifecycleState::Retired);
-}
-
-#[test]
-fn failed_close_acknowledgement_waits_for_reactor_termination() {
-    let (commands, receiver) = sync_channel(1);
-    let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap());
-    let (acknowledgement_dropped, wait_for_acknowledgement_drop) = sync_channel(1);
-    let (release_reactor, wait_to_release_reactor) = sync_channel(1);
-    let reactor_thread = thread::spawn(move || {
-        let ReactorCommand::Close { response, .. } = receiver.recv().unwrap() else {
-            panic!("unexpected reactor command");
-        };
-        drop(response);
-        acknowledgement_dropped.send(()).unwrap();
-        wait_to_release_reactor.recv_timeout(TEST_TIMEOUT).unwrap();
-    });
-    let reactor = Arc::new(ReactorClient {
-        commands,
-        wake,
-        next_socket_id: AtomicU64::new(1),
-        thread: Mutex::new(Some(reactor_thread)),
-    });
-
-    let closing_reactor = Arc::clone(&reactor);
-    let (close_finished, wait_for_close) = sync_channel(1);
-    let close = thread::spawn(move || {
-        closing_reactor.close_socket(1);
-        close_finished.send(()).unwrap();
-    });
-    wait_for_acknowledgement_drop
-        .recv_timeout(TEST_TIMEOUT)
-        .unwrap();
-    assert!(
-        wait_for_close
-            .recv_timeout(Duration::from_millis(100))
-            .is_err()
-    );
-
-    release_reactor.send(()).unwrap();
-    wait_for_close.recv_timeout(TEST_TIMEOUT).unwrap();
-    close.join().unwrap();
 }
 
 fn send_bytes(
