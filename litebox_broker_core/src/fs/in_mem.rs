@@ -13,7 +13,7 @@ use litebox_platform::sync;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WriteError,
+    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
@@ -591,6 +591,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         Ok(super::backend::FileHandle::from_typed::<Self>(
             InMemFileHandle { file },
         ))
+    }
+
+    fn symlink_at(
+        &self,
+        dir: super::backend::DirHandle,
+        name: &str,
+        target: &str,
+        metadata: super::backend::CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        let parent = dir.into_typed::<Self>();
+        let mut parent = parent.dir.write();
+        if parent.children.contains_key(name) {
+            return Err(SymlinkError::AlreadyExists);
+        }
+        let file = Arc::new(sync::RwLock::new(FileData {
+            perms: Permissions {
+                mode: metadata.mode,
+                userinfo: metadata.owner,
+            },
+            file_type: FileType::SymbolicLink,
+            data: target.as_bytes().to_vec().into(),
+            node_info: self.inode_allocator.next(),
+        }));
+        parent.children.insert(name.into(), Node::File(file));
+        Ok(())
     }
 
     fn mkdir_at(

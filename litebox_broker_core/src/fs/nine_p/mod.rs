@@ -24,7 +24,8 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
@@ -559,6 +560,19 @@ where
         Ok(FileHandle::from_typed::<Self>(NinePFileHandle {
             fid: self.own(fid),
         }))
+    }
+
+    fn symlink_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _target: &str,
+        _metadata: super::backend::CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        // The 9P server follows symlinks itself, so on a writable export a guest-created link
+        // (e.g., to `/` or `../..`) could make later lookups escape the share onto the host.
+        // Supporting this requires the server to confine path resolution to the export.
+        unimplemented!()
     }
 
     fn mkdir_at(

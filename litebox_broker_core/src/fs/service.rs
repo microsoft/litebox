@@ -19,7 +19,8 @@ use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 use super::OFlags;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
 use crate::object::{ObjectEntry, ObjectRights};
@@ -205,6 +206,10 @@ mod private {
         }
 
         fn mkdir(&self, _path: &str, _user: FileUser, _mode: FileMode) -> ServiceResult<()> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn symlink(&self, _target: &str, _linkpath: &str, _user: FileUser) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -508,6 +513,10 @@ where
 
     fn mkdir(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
         Ok(Resolver::mkdir(self, user, path, mode & FileMode::SUPPORTED).map_err(file_mkdir_error))
+    }
+
+    fn symlink(&self, target: &str, linkpath: &str, user: FileUser) -> ServiceResult<()> {
+        Ok(Resolver::symlink(self, user, target, linkpath).map_err(file_symlink_error))
     }
 
     fn rmdir(&self, path: &str, user: FileUser) -> ServiceResult<()> {
@@ -833,6 +842,20 @@ pub fn mkdir(
     process.core.fs.mkdir(path, user, mode)
 }
 
+/// Creates a symbolic link at an absolute path, storing `target` without resolving it.
+pub fn symlink(
+    process: &BrokerProcess,
+    target: &str,
+    linkpath: &str,
+    user: FileUser,
+) -> Result<FileResult<()>> {
+    process.require_object_rights(ObjectRights::WRITE)?;
+    if let Err(error) = validate_path(linkpath) {
+        return Ok(Err(error));
+    }
+    process.core.fs.symlink(target, linkpath, user)
+}
+
 /// Removes a directory at an absolute path.
 pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
@@ -1019,6 +1042,17 @@ fn file_unlink_error(error: UnlinkError) -> FileError {
         UnlinkError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
         UnlinkError::PathError(error) => file_path_error(error),
         UnlinkError::Io => FileError::Io,
+    }
+}
+
+fn file_symlink_error(error: SymlinkError) -> FileError {
+    match error {
+        SymlinkError::NoWritePerms => FileError::NoWritePermissions,
+        SymlinkError::AlreadyExists => FileError::AlreadyExists,
+        SymlinkError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
+        SymlinkError::NotSupported => FileError::NotSupported,
+        SymlinkError::PathError(error) => file_path_error(error),
+        SymlinkError::Io => FileError::Io,
     }
 }
 

@@ -22,7 +22,7 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -594,6 +594,16 @@ impl Backend for Devices {
         _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn symlink_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _target: &str,
+        _metadata: CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        Err(SymlinkError::ReadOnlyFileSystem)
     }
 
     fn mkdir_at(

@@ -32,7 +32,7 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -1072,6 +1072,49 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             parent: path,
             name: String::from(name),
         }))
+    }
+
+    fn symlink_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        target: &str,
+        metadata: CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        fn open_to_symlink_error(error: OpenError) -> SymlinkError {
+            match error {
+                OpenError::PathError(error) => SymlinkError::PathError(error),
+                OpenError::AlreadyExists => SymlinkError::AlreadyExists,
+                OpenError::ReadOnlyFileSystem => SymlinkError::ReadOnlyFileSystem,
+                OpenError::NoWritePerms => SymlinkError::NoWritePerms,
+                _ => SymlinkError::Io,
+            }
+        }
+        if !valid(name) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let path = dir.into_typed::<Self>().path;
+        let locked = self.namespace.lock();
+        let resolved = self.resolve_dir(&path).map_err(open_to_symlink_error)?;
+        if self
+            .entry(&resolved, name)
+            .map_err(open_to_symlink_error)?
+            .is_some()
+        {
+            return Err(SymlinkError::AlreadyExists);
+        }
+        let upper = self
+            .ensure_upper_dir(&locked, &path)
+            .map_err(open_to_symlink_error)?;
+        self.upper
+            .symlink_at(upper.clone(), name, target, metadata)?;
+        // Like a regular file, a replacement link clears its whiteout but
+        // needs no opaque marker: only directories can merge with lower entries.
+        if let Err(error) = self.remove_marker(&locked, &upper, &whiteout(name)) {
+            let _rollback_result = self.upper.unlink_at(upper, name);
+            return Err(open_to_symlink_error(unlink_to_open_error(error)));
+        }
+        Ok(())
     }
 
     fn mkdir_at(

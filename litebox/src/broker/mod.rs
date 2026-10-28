@@ -503,6 +503,13 @@ pub(crate) trait BrokerControl: Send + Sync {
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
+    fn symlink_file(
+        &self,
+        target: &str,
+        linkpath: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
     fn unlink_file(
         &self,
         path: &str,
@@ -1547,6 +1554,21 @@ where
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.chown_file(lease.sequence(), path, acting_user, user, group))
+    }
+
+    fn symlink_file(
+        &self,
+        target: &str,
+        linkpath: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        let length = linkpath
+            .len()
+            .checked_add(target.len())
+            .filter(|length| *length <= SHARED_BUFFER_SLOT_SIZE as usize)
+            .ok_or(BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.symlink_file(lease.sequence(), target, linkpath, user))
     }
 
     fn unlink_file(

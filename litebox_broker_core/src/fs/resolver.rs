@@ -14,7 +14,8 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 use super::{
     FileType, Mode, OFlags,
@@ -1113,6 +1114,52 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 WalkError::PathError(error) => error.into(),
             })?;
         self.backend.unlink_at(parent, &name)
+    }
+
+    /// Create a symbolic link without resolving its target.
+    pub fn symlink(
+        &self,
+        user: UserInfo,
+        target: &str,
+        linkpath: &str,
+    ) -> Result<(), SymlinkError> {
+        if target.is_empty() {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        }
+        if target.as_bytes().contains(&0) || linkpath.as_bytes().contains(&0) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let context = Context::new(user);
+        let Some((parent, name)) =
+            self.parent_dir_and_name(&context, linkpath)
+                .map_err(|error| match error {
+                    WalkError::Io => SymlinkError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?
+        else {
+            return Err(SymlinkError::AlreadyExists);
+        };
+        if matches!(name.as_str(), "." | "..") {
+            return Err(SymlinkError::AlreadyExists);
+        }
+        if !Self::can_change_entries_in_dir(&context, &parent) {
+            return Err(SymlinkError::NoWritePerms);
+        }
+        let parent = self
+            .owned_parent_dir(parent.handle)
+            .map_err(|error| match error {
+                WalkError::Io => SymlinkError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
+        self.backend.symlink_at(
+            parent,
+            &name,
+            target,
+            CreationMetadata {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: context.acting_user(),
+            },
+        )
     }
 
     /// Create a new directory

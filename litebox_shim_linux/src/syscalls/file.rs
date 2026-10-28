@@ -1087,6 +1087,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.insert_raw_file_fd(file, flags)
     }
 
+    /// Handle path-based `symlink` and `symlinkat`.
+    pub(crate) fn sys_symlinkat(
+        &self,
+        target: &str,
+        dirfd: i32,
+        linkpath: &str,
+    ) -> Result<(), Errno> {
+        // Report long targets as ENAMETOOLONG rather than as broker slot overflow (EIO).
+        // TODO: Paths relative to a real dirfd (not AT_FDCWD) are unsupported, as in mkdirat.
+        if target.len() > PATH_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        let linkpath = self.resolve_path_at(dirfd, linkpath)?;
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        self.global
+            .litebox
+            .symlink_file(&context, target, &linkpath)
+            .map_err(Errno::from)
+    }
+
     /// Handle path-based `chmod` and `fchmodat`.
     pub(crate) fn sys_fchmodat(&self, dirfd: i32, pathname: &str, mode: u32) -> Result<(), Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;

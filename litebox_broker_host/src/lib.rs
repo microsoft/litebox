@@ -37,8 +37,9 @@ use litebox_broker_protocol::fs::{
     MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
     PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
     ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
+    SeekFileRequest, SeekFileResponse, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -909,6 +910,32 @@ fn handle_file_request<Memory: SharedMemory>(
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FileResponse::Mkdir,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::Symlink(SymlinkFileRequest {
+            buffer,
+            path_length,
+            user,
+        }) => {
+            let data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
+            if path_length > buffer.length() {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            let (linkpath, target) = data.split_at(path_length as usize);
+            let linkpath = core::str::from_utf8(linkpath)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
+            let target = core::str::from_utf8(target)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
+            if !linkpath.starts_with('/') {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            Ok(
+                match litebox_broker_core::fs::symlink(process, target, linkpath, user)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FileResponse::Symlink,
                     Err(error) => FileResponse::Failed(error),
                 },
             )

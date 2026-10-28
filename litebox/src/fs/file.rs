@@ -30,7 +30,7 @@ use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FilePathError, FileStatusError, IsTerminalError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError, SymlinkError,
     TerminalControlError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 
@@ -110,6 +110,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .chown_file(&path, context.acting_user(), user, group)
             .map_err(|_| ChownError::Io)?
             .map_err(ChownError::from)
+    }
+
+    /// Create a symbolic link at `linkpath`, storing `target` verbatim.
+    ///
+    /// Only `linkpath` is resolved against the context's working directory. A relative target is
+    /// interpreted relative to the link's parent when the link is subsequently followed.
+    pub fn symlink_file(
+        &self,
+        context: &Context,
+        target: &str,
+        linkpath: &str,
+    ) -> Result<(), SymlinkError> {
+        let linkpath = Self::broker_path(context, linkpath);
+        self.broker_control()
+            .ok_or(SymlinkError::Io)?
+            .symlink_file(target, &linkpath, context.acting_user())
+            .map_err(|_| SymlinkError::Io)?
+            .map_err(SymlinkError::from)
     }
 
     /// Unlink a file.
@@ -771,6 +789,21 @@ impl From<FileError> for ChownError {
         match error {
             FileError::NotOwner => Self::NotTheOwner,
             FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<FileError> for SymlinkError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::NoWritePermissions => Self::NoWritePerms,
+            FileError::AlreadyExists => Self::AlreadyExists,
+            FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            FileError::NotSupported => Self::NotSupported,
             _ => Self::Io,
         }
     }

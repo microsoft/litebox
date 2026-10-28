@@ -297,6 +297,20 @@ impl From<litebox::fs::errors::SeekError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::SymlinkError> for Errno {
+    fn from(value: litebox::fs::errors::SymlinkError) -> Self {
+        match value {
+            litebox::fs::errors::SymlinkError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::SymlinkError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::SymlinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::SymlinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::SymlinkError::NotSupported => Errno::EPERM,
+            litebox::fs::errors::SymlinkError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::MkdirError> for Errno {
     fn from(value: litebox::fs::errors::MkdirError) -> Self {
         match value {

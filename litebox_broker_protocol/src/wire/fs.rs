@@ -10,8 +10,8 @@ use crate::fs::{
     OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
     ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
     ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
+    SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -38,6 +38,7 @@ const REQUEST_TAG_TERMINAL_CONTROL: u8 = 14;
 const REQUEST_TAG_READ_LINK: u8 = 15;
 const REQUEST_TAG_RESOLVE_PATH: u8 = 16;
 const REQUEST_TAG_HANDLE_PATH: u8 = 17;
+const REQUEST_TAG_SYMLINK: u8 = 18;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -57,6 +58,7 @@ const RESPONSE_TAG_TERMINAL_CONTROL: u8 = 14;
 const RESPONSE_TAG_READ_LINK: u8 = 15;
 const RESPONSE_TAG_RESOLVE_PATH: u8 = 16;
 const RESPONSE_TAG_HANDLE_PATH: u8 = 17;
+const RESPONSE_TAG_SYMLINK: u8 = 18;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -77,6 +79,7 @@ const _: () = {
     assert!(REQUEST_TAG_READ_LINK == RESPONSE_TAG_READ_LINK);
     assert!(REQUEST_TAG_RESOLVE_PATH == RESPONSE_TAG_RESOLVE_PATH);
     assert!(REQUEST_TAG_HANDLE_PATH == RESPONSE_TAG_HANDLE_PATH);
+    assert!(REQUEST_TAG_SYMLINK == RESPONSE_TAG_SYMLINK);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -184,6 +187,12 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.buffer);
         }
+        FileRequest::Symlink(request) => {
+            encoder.u8(REQUEST_TAG_SYMLINK);
+            encoder.shared_buffer_sequence(request.buffer);
+            encoder.u32(request.path_length);
+            encode_user(encoder, request.user);
+        }
     }
 }
 
@@ -280,6 +289,11 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
         })),
+        REQUEST_TAG_SYMLINK => Ok(FileRequest::Symlink(SymlinkFileRequest {
+            buffer: decoder.shared_buffer_sequence()?,
+            path_length: decoder.u32()?,
+            user: decode_user(decoder)?,
+        })),
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -329,6 +343,7 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
         FileResponse::Unlink => encoder.u8(RESPONSE_TAG_UNLINK),
         FileResponse::Mkdir => encoder.u8(RESPONSE_TAG_MKDIR),
         FileResponse::Rmdir => encoder.u8(RESPONSE_TAG_RMDIR),
+        FileResponse::Symlink => encoder.u8(RESPONSE_TAG_SYMLINK),
         FileResponse::ReadLink(FilePathResponse { length }) => {
             encoder.u8(RESPONSE_TAG_READ_LINK);
             encoder.u32(length);
@@ -382,6 +397,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_UNLINK => Ok(FileResponse::Unlink),
         RESPONSE_TAG_MKDIR => Ok(FileResponse::Mkdir),
         RESPONSE_TAG_RMDIR => Ok(FileResponse::Rmdir),
+        RESPONSE_TAG_SYMLINK => Ok(FileResponse::Symlink),
         RESPONSE_TAG_READ_LINK => Ok(FileResponse::ReadLink(FilePathResponse {
             length: decoder.u32()?,
         })),
@@ -425,6 +441,7 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::TooManySymlinks => 25,
         FileError::NoSuchDevice => 26,
         FileError::NoSpace => 27,
+        FileError::NotSupported => 28,
     });
 }
 
@@ -457,6 +474,7 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         25 => Ok(FileError::TooManySymlinks),
         26 => Ok(FileError::NoSuchDevice),
         27 => Ok(FileError::NoSpace),
+        28 => Ok(FileError::NotSupported),
         _ => Err(WireError::InvalidTag),
     }
 }

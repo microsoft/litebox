@@ -19,7 +19,7 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -777,6 +777,29 @@ impl Backend for Composer {
                             handle,
                         })
                     })
+            }
+        }
+    }
+
+    fn symlink_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        target: &str,
+        metadata: CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        let dir = dir.into_typed::<Self>();
+        match dir.inner {
+            ComposerDirHandleInner::Virtual { .. } => Err(SymlinkError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Mounted {
+                path,
+                mount_index,
+                handle,
+            } => {
+                self.checked_child_path(path, name, SymlinkError::ReadOnlyFileSystem)?;
+                self.mounts[mount_index]
+                    .backend
+                    .symlink_at(handle, name, target, metadata)
             }
         }
     }

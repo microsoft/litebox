@@ -14,7 +14,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
@@ -195,6 +195,15 @@ pub trait Backend: Send + Sync + Any {
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError>;
+
+    /// Create a symbolic link storing `target` verbatim at `dir` with the given `name` and metadata.
+    fn symlink_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        target: &str,
+        metadata: CreationMetadata,
+    ) -> Result<(), SymlinkError>;
 
     /// Create a new directory at `parent` with the given `name` and metadata.
     fn mkdir_at(
