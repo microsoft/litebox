@@ -270,7 +270,13 @@ pub unsafe fn fork_process() -> Result<ForkResult> {
     };
     match result {
         -1 => Err(Error::last_os_error()),
-        0 => Ok(ForkResult::Child),
+        0 => {
+            // SAFETY: clone returned in its sole surviving thread, with host TP.
+            unsafe {
+                crate::arch::reset_after_fork();
+            }
+            Ok(ForkResult::Child)
+        }
         process_id => {
             let process_id = u32::try_from(process_id)
                 .map_err(|_| Error::other("clone returned an invalid process ID"))?;

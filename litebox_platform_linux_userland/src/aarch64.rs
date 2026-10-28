@@ -1,8 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! AArch64 guest/host transitions and signal recovery. `TPIDR_EL0` remains the
-//! host anchor; the guest thread pointer is virtualized in memory.
+//! AArch64 guest/host transitions and signal recovery.
 
 use super::*;
 use litebox::arch::aarch64::vector::{SveVectorLength, VectorArea};
@@ -13,8 +12,9 @@ pub(super) type Aarch64GateSignalResult =
 use std::cell::RefCell;
 
 /// Overwrites the destination with the TLS control-block address derived from
-/// the host anchor in `TPIDR_EL0`. Callbacks entered directly from a rewritten
-/// gate must use `x16`, the only scratch register provided by the gate ABI.
+/// the host TP in `TPIDR_EL0`, which each TP mode makes ready before platform
+/// code runs. Callbacks entered directly from a rewritten gate must use `x16`,
+/// the only scratch register provided by the gate ABI.
 /// Valid only for local-exec TLS in the main executable.
 macro_rules! load_tls_block_base {
     ($reg:literal) => {
@@ -58,6 +58,23 @@ macro_rules! tprel_offset {
     }};
 }
 
+// The TP mode makes the host TP ready before platform code runs and the guest
+// TP ready right before returning to the guest. Its `enter_host_tp!()` runs at
+// `syscall_callback` entry and may use only x16, plus x17 spilled to the gate
+// frame's spare `[sp, #24]` slot. Its `enter_guest_tp!(reg)` needs x17 to hold
+// the TLS block base and clobbers only `reg`.
+#[cfg(not(feature = "aarch64_pacga"))]
+pub(crate) mod aarch64_gated_tp;
+#[cfg(not(feature = "aarch64_pacga"))]
+pub(crate) use aarch64_gated_tp as tp;
+#[cfg(feature = "aarch64_pacga")]
+pub(crate) mod aarch64_pacga;
+#[cfg(feature = "aarch64_pacga")]
+pub(crate) use aarch64_pacga as tp;
+pub(crate) use tp::{
+    Registration, add_seccomp_rules, exception_entry, interrupt_entry, reset_after_fork,
+};
+
 /// Layout of the AArch64 TLS control block.
 ///
 /// A layout witness only: the storage is the `.tbss` block reserved below, and
@@ -65,12 +82,7 @@ macro_rules! tprel_offset {
 /// is derived from it with [`core::mem::offset_of`], so the two cannot drift.
 #[repr(C)]
 struct TlsBlock {
-    /// Guest thread pointer — the slot rewritten guest binaries read and write
-    /// in place of the hardware `TPIDR_EL0`.
-    ///
-    /// Also part of the `litebox_trampoline` ABI, but dynamically: the
-    /// loader patches each rewritten binary's gates with this slot's measured
-    /// address (see [`guest_thread_pointer_tp_offset`]).
+    /// Guest TP whenever it is not installed in `TPIDR_EL0`.
     guest_thread_pointer: usize,
     /// Guest x18 value used when optional x18 virtualization is enabled.
     guest_x18: usize,
@@ -92,6 +104,7 @@ struct TlsBlock {
     /// no vector length. Written once, when [`with_guest_vector_area`] creates
     /// this thread's area.
     host_has_sve: u8,
+    tp_state: tp::TlsState,
     host_fp_state: FpState,
     resume_frame: resume_frame::ResumeFrame,
 }
@@ -130,31 +143,11 @@ core::arch::global_asm!(
     size = const core::mem::size_of::<TlsBlock>(),
 );
 
-/// Byte offset of this thread's `guest_thread_pointer` slot from the thread
-/// pointer (TP) — `TPIDR_EL0` — as fixed by this binary's link.
-///
-/// The loader patches this into every rewritten guest binary's thread-pointer
-/// gates. The linker decides it per embedder, but it is the same on every
-/// thread.
+/// Verifies resume-frame alignment and TLS placement.
 ///
 /// # Panics
 ///
-/// Panics if the offset is not one a gate can be patched to reach.
-pub(super) fn guest_thread_pointer_tp_offset() -> u16 {
-    let offset = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_THREAD_POINTER;
-    u16::try_from(offset)
-        .ok()
-        .filter(|off| litebox_trampoline::aarch64::is_patchable_guest_tpidr_offset(*off))
-        .expect(
-            "guest_thread_pointer must sit at a thread-pointer offset a rewriter gate can reach",
-        )
-}
-
-/// Verifies the resume-frame alignment and rewriter-gate reach invariants.
-///
-/// # Panics
-///
-/// Panics if either invariant is violated.
+/// Panics if a placement invariant is violated.
 pub(super) fn assert_tls_block_placement() {
     let frame = tprel_offset!(litebox_tls_block) + tls_offset::RESUME_FRAME;
     assert!(
@@ -162,26 +155,9 @@ pub(super) fn assert_tls_block_placement() {
         "the resume frame is at thread-pointer offset {frame}, which `sys_rt_sigreturn` would \
          reject, failing every guest resume through the generic path",
     );
-
-    let _ = guest_thread_pointer_tp_offset();
-    let guest_tp = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_THREAD_POINTER;
-    let guest_x18 = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_X18;
-    assert_eq!(
-        guest_x18.checked_sub(guest_tp),
-        Some(litebox_trampoline::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP),
-    );
-    assert!(guest_x18.is_multiple_of(8) && u16::try_from(guest_x18).is_ok());
-    #[cfg(feature = "aarch64_virtualize_x18")]
-    assert!(
-        u16::try_from(guest_x18)
-            .is_ok_and(litebox_trampoline::aarch64::is_patchable_guest_x18_offset)
-    );
+    tp::assert_tls_placement();
 }
 
-const _: () = assert!(
-    tls_offset::GUEST_X18 - tls_offset::GUEST_THREAD_POINTER
-        == litebox_trampoline::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP
-);
 const _: () =
     assert!(tls_offset::GUEST_VECTOR_STATE < (1 << 12) && tls_offset::HOST_HAS_SVE < (1 << 12));
 
@@ -269,7 +245,7 @@ pub(super) fn replace_guest_thread_marker(value: bool) -> bool {
 pub(super) fn is_guest_thread_from_signal_context() -> bool {
     let value: u32;
     // SAFETY: an own-thread [`tls_offset`] slot access. Also safe from a signal
-    // handler: `TPIDR_EL0` is the host anchor at all times, guest code included.
+    // handler: signal entry has already made the host TP ready.
     unsafe {
         core::arch::asm! {
             load_tls_block_base!("{tmp}"),
@@ -482,9 +458,11 @@ pub(super) unsafe extern "C-unwind" fn run_thread_arch(
     //   | [sp, #16]                | this site's outbound stub address      |
     //   | sp                       | guest SP minus 32 (gate frame is live) |
     //   | x0-x15, x17-x30, NZCV    | pristine guest values                  |
-    //   | TPIDR_EL0                | host anchor                            |
     .globl syscall_callback
 syscall_callback:
+    ",
+    tp::enter_host_tp!(),
+    "
     // Clear `in_guest`. This takes four instructions, so a pc can sit inside
     // the prologue with `in_guest` still 1. `in_syscall_callback_prologue`
     // tests the half-open range up to the label below; keep that label
@@ -668,6 +646,7 @@ interrupt_callback:
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
     GUEST_X18 = const tls_offset::GUEST_X18,
+    GUEST_TP = const tls_offset::GUEST_THREAD_POINTER,
     VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
     SVC_FRAME_BYTES = const litebox_trampoline::aarch64::SVC_FRAME_BYTES,
     SVC_FRAME_OFF_STUB = const litebox_trampoline::aarch64::SVC_FRAME_OFF_STUB,
@@ -817,8 +796,7 @@ pub(super) mod resume_frame {
     pub(super) fn prepare(ctx: &PtRegs) -> *mut ResumeFrame {
         let block: usize;
         // SAFETY: materializes the base of this thread's own TLS control
-        // block from `TPIDR_EL0`, which always holds the host anchor. Reads no
-        // memory.
+        // block from `TPIDR_EL0` while executing host code. Reads no memory.
         unsafe {
             core::arch::asm!(
                 load_tls_block_base!("{block}"),
@@ -1250,6 +1228,10 @@ switch_to_guest_stage_x16_fixup:
     .arch_extension nosve
 5:
 
+    ",
+    tp::enter_guest_tp!("x4"),
+    "
+
     // x16 carries the stub. Recompute the frame after x4 was used as scratch;
     // SP starts below the frame because the stub pops it before returning.
     ldr  x16, [x17, #{OUTBOUND_STUB}]
@@ -1298,6 +1280,7 @@ switch_to_guest_via_outbound_stub_end:
     VECTOR_FPSR = const VectorArea::FPSR_OFFSET,
     VECTOR_FPCR = const VectorArea::FPCR_OFFSET,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
+    GUEST_TP = const tls_offset::GUEST_THREAD_POINTER,
     SVC_FRAME_BYTES = const litebox_trampoline::aarch64::SVC_FRAME_BYTES,
     SVC_FRAME_OFF_X16 = const litebox_trampoline::aarch64::SVC_FRAME_OFF_X16,
     VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
@@ -1358,6 +1341,9 @@ switch_to_guest_via_sigreturn_start:
     // `sys_rt_sigreturn` takes the frame address from `SP` and nothing else;
     // it rejects `SP & 15`, which `ResumeFrame`'s `align(16)` rules out. The
     // guest's own `SP` is in the frame and the kernel installs it.
+    ",
+    tp::enter_guest_tp!("x16"),
+    "
     mov  sp,  x0
     mov  x8,  #{NR_RT_SIGRETURN}
     svc  #0
@@ -1373,6 +1359,7 @@ switch_to_guest_via_sigreturn_end:
     INTERRUPT = const tls_offset::INTERRUPT,
     HOST_FP_STATE = const tls_offset::HOST_FP_STATE,
     NR_RT_SIGRETURN = const resume_frame::NR_RT_SIGRETURN,
+    GUEST_TP = const tls_offset::GUEST_THREAD_POINTER,
     );
 }
 
@@ -1415,14 +1402,16 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
             )
         };
         let host = litebox_common_linux::hwcap::LinuxHwcaps { hwcap, hwcap2 }.to_cpu_features();
-        // PAUTH and PAUTH_GENERIC are kept: PAC keys are per host process and inherited by native
-        // fork. SVE state is kept at `guest_sve_vl`, if any. Excluded:
+        // PAC keys are per host process and inherited by native fork; the TP mode
+        // withholds any it reserves.
+        // SVE state is kept at `guest_sve_vl`, if any. Excluded:
         // - DIT and SSBS: the syscall path saves and restores only NZCV (see
         //   `switch_to_guest_via_outbound_stub`).
         // - SME: ZA and streaming-mode state are not saved.
         // - BTI and MTE: there is no PROT_BTI/PROT_MTE page-attribute support.
         let mut offered =
             CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH | CpuFeatures::PAUTH_GENERIC;
+        offered.remove(tp::RESERVED_CPU_FEATURES);
         if guest_sve_vl().is_some() {
             offered |= CpuFeatures::SVE_STATE_ONLY;
         }
@@ -1715,7 +1704,7 @@ pub(super) fn canonicalize_runtime_aarch64_gate_signal_context(
     let block: usize;
     let expected_outbound_stub: usize;
     let expected_outbound_pc: usize;
-    // SAFETY: reads the permanent host TLS anchor without touching memory.
+    // SAFETY: signal entry has made the host TP ready. Reads no memory.
     unsafe {
         core::arch::asm!(
             load_tls_block_base!("{block}"),
@@ -1750,7 +1739,7 @@ pub(super) fn canonicalize_runtime_aarch64_gate_signal_context(
             // bytes through the exception table, never as a live Rust
             // reference. Faulting is expected rather than exceptional, and
             // reaching the fixup requires a re-entrant handler:
-            // `exception_signal_handler` runs on `SA_NODEFER` for exactly this.
+            // `tp::exception_entry` runs on `SA_NODEFER` for exactly this.
             // Recursion is bounded at one level, because the nested fault lands
             // on this load, which the table covers, and that lookup reads no
             // guest memory.
@@ -1837,9 +1826,11 @@ fn restore_host_fp_state() {
 
 /// Clears `in_guest` and returns the published guest context only if `in_guest`
 /// was set. Its registers may still require copying or gate canonicalization.
-pub(super) fn signal_handler_take_guest() -> Option<*mut litebox_common_linux::PtRegs> {
+fn signal_handler_take_guest(
+    was_in_guest: Option<u8>,
+) -> Option<*mut litebox_common_linux::PtRegs> {
     let block: usize;
-    // SAFETY: `TPIDR_EL0` anchors host TLS even in guest code. Reads no memory.
+    // SAFETY: signal entry has made the host TP ready. Reads no memory.
     unsafe {
         core::arch::asm!(
             load_tls_block_base!("{block}"),
@@ -1851,7 +1842,7 @@ pub(super) fn signal_handler_take_guest() -> Option<*mut litebox_common_linux::P
     // writes them unseen by the compiler.
     unsafe {
         let in_guest = (block + tls_offset::IN_GUEST) as *mut u8;
-        let was_in_guest = in_guest.read_volatile();
+        let was_in_guest = was_in_guest.unwrap_or_else(|| in_guest.read_volatile());
         in_guest.write_volatile(0);
         if was_in_guest == 0 {
             return None;
@@ -1881,7 +1872,7 @@ pub(super) fn signal_handler_capture_guest_vector_state(context: &libc::ucontext
 /// Records an interrupt in this thread's TLS.
 pub(super) fn signal_handler_set_interrupt() {
     let block: usize;
-    // SAFETY: `TPIDR_EL0` anchors this thread's host TLS even in guest code.
+    // SAFETY: signal entry has made this thread's host TP ready.
     // Volatile because transition assembly accesses the slot unseen by the compiler.
     unsafe {
         core::arch::asm!(
@@ -1944,7 +1935,6 @@ pub(super) fn set_signal_return(
 mod tests {
     use super::*;
     use core::mem::offset_of;
-    use litebox::platform::SystemInfoProvider as _;
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::signal::{SigSet, Signal};
@@ -2074,77 +2064,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_gate_patching_lands_in_the_runtime_tls_block() {
-        const IMM12_SHIFT: u32 = 10;
-        const IMM12_MASK: u32 = 0x003F_FC00;
-        const ALIGN: u16 = litebox_trampoline::aarch64::GUEST_TPIDR_OFFSET_ALIGN;
-
-        let (_, mut tramp) = gate_bytes(
-            GateInstance::new(GateMetadata::MrsTpidr { destination: 9 }, 0x1004),
-            0x400000,
-        );
-        assert_eq!(
-            litebox_trampoline::aarch64::find_guest_tpidr_placeholder(&tramp),
-            Some(16 + 4),
-            "the emitted gate must be in the unpatched state, or everything below \
-             passes vacuously"
-        );
-
-        let platform = LinuxUserland::new();
-        let offset = platform.guest_thread_pointer_offset().expect(
-            "an AArch64 platform must supply a guest thread-pointer offset; without one the \
-             loader leaves every gate on the placeholder, which does not fault",
-        );
-        let offset = u16::try_from(offset).expect("the guest slot must sit within a gate's reach");
-        assert_eq!(
-            litebox_trampoline::aarch64::finalize_trampoline_gates(&mut tramp, offset).unwrap(),
-            1
-        );
-        assert_eq!(
-            litebox_trampoline::aarch64::find_guest_tpidr_placeholder(&tramp),
-            None,
-            "no gate may still hold the placeholder once the loader has staged the trampoline"
-        );
-        let classified = litebox_trampoline::aarch64::classify_gate_pc(&tramp, 0x400000, 0x400010)
-            .expect("finalized emitted MRS slot must validate");
-        assert_eq!(classified.slot_offset(), 16);
-        assert!(matches!(
-            classified.metadata(),
-            litebox_trampoline::aarch64::GateMetadata::MrsTpidr { destination: 9, .. }
-        ));
-
-        let patched = u32::from_le_bytes(tramp[16 + 4..16 + 8].try_into().unwrap());
-        let gate_offset = ((patched & IMM12_MASK) >> IMM12_SHIFT) as usize * usize::from(ALIGN);
-        let tp: usize;
-        // SAFETY: reads the thread pointer; touches no memory.
-        unsafe {
-            core::arch::asm!(
-                "mrs {tp}, tpidr_el0",
-                tp = out(reg) tp,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-        let gate_target = tp + gate_offset;
-
-        // Compared against the slot's address as the *linker* resolves it, so
-        // this is an independent check of the number rather than a restatement
-        // of it.
-        assert_eq!(
-            gate_target,
-            tp + tprel_offset!(litebox_tls_block) + tls_offset::GUEST_THREAD_POINTER,
-            "a patched gate must dereference this thread's own `guest_thread_pointer` slot"
-        );
-
-        let block = tp + tprel_offset!(litebox_tls_block);
-        let block_end = block + core::mem::size_of::<super::TlsBlock>();
-        assert!(
-            (block..block_end).contains(&gate_target),
-            "gate dereferences {gate_target:#x}, outside the runtime TLS control block \
-             {block:#x}..{block_end:#x}"
-        );
-    }
-
     /// Pins the `PtRegs` field offsets that the AArch64 transition assembly
     /// hardcodes. A field reorder or insertion in `litebox_common_linux`
     /// would otherwise silently corrupt the guest context.
@@ -2209,7 +2128,7 @@ mod tests {
             previous
         };
 
-        let captured = signal_handler_take_guest();
+        let captured = tp::SignalEntry::for_test().take_guest();
         let actual = live_fp_state();
         // SAFETY: restores the transition slots saved above.
         unsafe {
@@ -2258,7 +2177,7 @@ mod tests {
 
     // A fixture describes one known gate explicitly; no instruction scanning
     // or rewriting is involved. Return its inbound branch and shared-header image.
-    fn gate_bytes(instance: GateInstance, trampoline_base: u64) -> (Vec<u8>, Vec<u8>) {
+    pub(super) fn gate_bytes(instance: GateInstance, trampoline_base: u64) -> (Vec<u8>, Vec<u8>) {
         let mut trampoline = Vec::new();
         aarch64::emit_shared_prologue(&mut trampoline, 0);
         let slot_address = trampoline_base + aarch64::GATES_START_OFFSET as u64;
@@ -3694,7 +3613,7 @@ mod tests {
         assert_eq!(read_tls_slot!(u32, tls_offset::PENDING_HOST_SIGNALS), 0);
 
         // SAFETY: on AArch64 `record_pending_signal` has no precondition
-        // beyond `TPIDR_EL0` being the host anchor, which it always is. The
+        // beyond `TPIDR_EL0` being the host TP, as it is in host code. The
         // waker slot is null on this thread (asserted below), so no waker is
         // dereferenced.
         assert_eq!(read_tls_slot!(usize, tls_offset::WAIT_WAKER_ADDR), 0);
@@ -3909,7 +3828,7 @@ mod tests {
                 let pc = context.uc_mcontext.pc;
                 info.si_errno = 0;
 
-                super::exception_signal_handler(signum, info, context);
+                super::exception_signal_handler(signum, info, context, tp::SignalEntry::for_test());
 
                 let after = regs.read();
                 let unchanged = before.regs == after.regs
@@ -4016,7 +3935,12 @@ mod tests {
             ((block + tls_offset::GUEST_CONTEXT_TOP) as *mut usize)
                 .write_volatile((&raw mut *guest).add(1) as usize);
             ((block + tls_offset::IN_GUEST) as *mut u8).write_volatile(1);
-            super::exception_signal_handler(libc::SIGSYS, &mut info, &mut context);
+            super::exception_signal_handler(
+                libc::SIGSYS,
+                &mut info,
+                &mut context,
+                tp::SignalEntry::for_test(),
+            );
             libc::_exit(3); // The nested exception must have run and exited first.
         }
     }
@@ -4064,7 +3988,14 @@ mod tests {
         // the two pointers a `SA_SIGINFO` handler receives; both are valid
         // here. It is reentrant with respect to this thread's TLS block, which
         // is the only state it touches besides the context it is handed.
-        unsafe { super::exception_signal_handler(libc::SIGSEGV, &mut info, &mut context) };
+        unsafe {
+            super::exception_signal_handler(
+                libc::SIGSEGV,
+                &mut info,
+                &mut context,
+                tp::SignalEntry::for_test(),
+            );
+        };
 
         // SAFETY: as above.
         let was_in_guest = unsafe {
