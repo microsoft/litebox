@@ -367,8 +367,7 @@ pub struct ReceiveUnixSocketRequest {
 /// Response to a receive request.
 ///
 /// A response with zero `received` and `length` for a nonzero `capacity`
-/// means no more data can arrive, or that an empty datagram or record
-/// arrived.
+/// means an empty datagram or record arrived, or no more data can arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReceiveUnixSocketResponse {
     /// Number of data bytes placed in the buffer.

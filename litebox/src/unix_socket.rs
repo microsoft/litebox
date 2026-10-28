@@ -212,8 +212,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     /// Sends `data` to `address`, or to the connected peer if `address` is
     /// `None`, returning the number of bytes sent.
     ///
-    /// A datagram or sequenced-packet socket sends `data` as one datagram or
-    /// record. A stream socket sends all of `data`. Either waits while the
+    /// A datagram socket sends `data` as one datagram. A sequenced-packet
+    /// socket sends it as one record to its connected peer, ignoring
+    /// `address`. A stream socket sends all of `data`. Each waits while the
     /// receiver is full, unless `nonblock` is set or the socket is
     /// non-blocking, for at most the socket's send timeout each time. A
     /// stream socket that stops early after sending some bytes returns their
@@ -263,9 +264,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     /// not fit unless peeking. Waits while no data is queued, unless
     /// `nonblock` is set or the socket is non-blocking, for at most the
     /// socket's receive timeout. Receiving zero bytes into a nonempty buffer
-    /// means an empty datagram or record arrived or no more data can arrive,
-    /// except that a datagram socket that would not wait fails with
-    /// [`UnixSocketError::WouldBlock`] instead of reporting the latter.
+    /// means an empty datagram or record arrived, or no more data can arrive;
+    /// a datagram socket that would not wait fails with
+    /// [`UnixSocketError::WouldBlock`] instead of reporting the end of data.
     pub fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,

@@ -263,7 +263,8 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
-        // Like Linux, every Unix socket ignores `MSG_EOR`, which is how a record ends anyway.
+        // Like Linux, Unix sockets ignore `MSG_EOR`; each sequenced-packet send already ends a
+        // record.
         let supported_flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL | SendFlags::EOR;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported sendto flags: {:?}", flags);

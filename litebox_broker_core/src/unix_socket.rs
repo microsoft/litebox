@@ -376,14 +376,15 @@ pub fn send(
 /// A stream socket receives queued bytes. A datagram or sequenced-packet
 /// socket receives one datagram or record, discarding the bytes beyond
 /// `output`'s length unless peeking. Receiving no bytes with zero length into
-/// a nonempty `output` means no more data can arrive, or that an empty
-/// datagram or record arrived. Fails with [`BrokerError::WouldBlock`] while
-/// nothing is queued.
+/// a nonempty `output` means an empty datagram or record arrived, or no more
+/// data can arrive. Fails with [`BrokerError::WouldBlock`] while nothing is
+/// queued.
 ///
 /// If `nonblocking` is set, the receive acts as for a non-blocking socket:
-/// it fails with [`BrokerError::NonBlockingWouldBlock`], and a datagram
-/// socket whose receive direction is shut down fails instead of reporting the
-/// end of data, unlike a sequenced-packet socket, as Linux does.
+/// it fails with [`BrokerError::NonBlockingWouldBlock`], and, as in Linux, a
+/// datagram socket whose receive direction is shut down fails instead of
+/// reporting the end of data, while a sequenced-packet socket still reports
+/// it.
 pub fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -884,8 +885,8 @@ impl Socket {
         watchers.publish(self.readiness());
     }
 
-    /// Returns whether the socket exchanges data only with the one peer it
-    /// connects to, as stream and sequenced-packet sockets do.
+    /// Returns whether the socket must be connected to exchange data, as
+    /// stream and sequenced-packet sockets must.
     fn is_connection_oriented(&self) -> bool {
         matches!(self.kind, SocketType::Stream | SocketType::SeqPacket)
     }
@@ -1351,8 +1352,9 @@ impl Socket {
         let (received, wakeups) = {
             let mut channel = self.incoming.lock();
             let Some(datagram) = channel.queue.datagrams.front() else {
-                // Like Linux, only a sequenced-packet socket reports the end
-                // of data to a receive that would not wait.
+                // Like Linux, a sequenced-packet socket reports the end of
+                // data even to a receive that would not wait; a datagram
+                // socket does not.
                 return if channel.is_shut() && (!nonblocking || self.kind == SocketType::SeqPacket)
                 {
                     Ok(Ok(Received {
