@@ -17,7 +17,7 @@ use litebox_broker_core::{
     },
     random::{RandomProvider, RandomProviderError},
     stdio::StdioOutputStream,
-    test_support::{TestBrokerCoreBuilder, TestStdioProvider},
+    test_support::{ManualWallClockProvider, TestBrokerCoreBuilder, TestStdioProvider},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -92,7 +92,10 @@ pub(crate) fn setup(
         ),
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
-    let upper = InMem::<MacosUserland4K>::new_initialized(entries);
+    let upper = InMem::<MacosUserland4K>::new_initialized(
+        entries,
+        Arc::new(ManualWallClockProvider::default()),
+    );
     let fs = Composer::builder()
         .mount_nestable("/", |allocators| {
             Overlay::<MacosUserland4K>::new(

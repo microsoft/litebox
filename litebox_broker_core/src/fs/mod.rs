@@ -29,7 +29,7 @@ mod tests;
 
 pub use litebox_broker_protocol::fs::{
     FileDirectoryEntry as DirEntry, FileMode as Mode, FileNodeInfo as NodeInfo,
-    FileSeekWhence as SeekWhence, FileStatus, FileType, FileUser as UserInfo,
+    FileSeekWhence as SeekWhence, FileStatus, FileTime, FileType, FileUser as UserInfo, TimeUpdate,
 };
 pub(crate) use service::{
     File, get_status_flags, handle_terminal, handle_terminal_access, open_without_reference,
@@ -40,6 +40,13 @@ pub use service::{
     is_terminal, mkdir, open, path_status, read, read_directory, read_link, resolve_path, rmdir,
     seek, terminal_control, truncate, unlink, write,
 };
+
+/// Trusted source of the wall-clock time that backends such as [`in_mem::InMem`] stamp on the
+/// objects they hold.
+pub trait WallClockProvider: Send + Sync {
+    /// Returns the current wall-clock time.
+    fn now(&self) -> FileTime;
+}
 
 bitflags! {
     /// `O_*` constants for use with open, ...

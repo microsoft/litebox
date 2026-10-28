@@ -16,13 +16,13 @@ use litebox_broker_core::fs::backend::{
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError as FsReadError, RmdirError, TruncateError, UnlinkError, WalkError,
+    ReadError as FsReadError, RmdirError, SetTimesError, TruncateError, UnlinkError, WalkError,
     WriteError as FsWriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::nine_p::transport::{Read, ReadError, Write, WriteError};
 use litebox_broker_core::fs::nine_p::{self, NineP};
-use litebox_broker_core::fs::{DirEntry, FileStatus, Mode, OFlags};
+use litebox_broker_core::fs::{DirEntry, FileStatus, Mode, OFlags, TimeUpdate};
 use litebox_broker_core::readiness::ReadinessSource;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform_vm_kernel::VmKernel;
@@ -295,5 +295,14 @@ impl Backend for ShareFs {
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn set_times(
+        &self,
+        _h: HandleRef<'_>,
+        _accessed: TimeUpdate,
+        _modified: TimeUpdate,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
     }
 }

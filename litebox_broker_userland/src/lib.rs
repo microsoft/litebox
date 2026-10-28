@@ -30,3 +30,4 @@ pub mod random;
 pub mod stdio;
 mod terminal;
 mod timer;
+pub mod wall_clock;

@@ -18,7 +18,7 @@ use crate::fs::errors::{
 };
 use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
-use crate::fs::{FileType, Mode, OFlags, SeekWhence};
+use crate::fs::{FileTime, FileType, Mode, OFlags, SeekWhence, TimeUpdate};
 use crate::test_platform::TestPlatform;
 use crate::test_support::FaultingBuffer;
 
@@ -325,6 +325,68 @@ fn test_nine_p_file_status() {
         FileType::Directory,
         "should be a directory"
     );
+}
+
+/// The host's access, modification, and status change times of `path`.
+fn host_times(path: &Path) -> (FileTime, FileTime, FileTime) {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    let time = |seconds, nanoseconds: i64| FileTime {
+        seconds,
+        nanoseconds: u32::try_from(nanoseconds).unwrap(),
+    };
+    (
+        time(metadata.atime(), metadata.atime_nsec()),
+        time(metadata.mtime(), metadata.mtime_nsec()),
+        time(metadata.ctime(), metadata.ctime_nsec()),
+    )
+}
+
+#[test]
+fn test_nine_p_times() {
+    let server = DiodServer::start();
+    let fs = connect_9p(&server);
+    let host = server.export_path().join("times.txt");
+    let file = fs
+        .open(
+            USER,
+            "/times.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RWXU,
+        )
+        .unwrap();
+    let times = || {
+        let status = fs.handle_status(&file).unwrap();
+        (status.accessed, status.modified, status.changed)
+    };
+    assert_eq!(times(), host_times(&host));
+
+    // Times before the epoch survive the wire's unsigned seconds.
+    let accessed = FileTime {
+        seconds: -1,
+        nanoseconds: 123_456_789,
+    };
+    let modified = FileTime {
+        seconds: 1_000_000_000,
+        nanoseconds: 1,
+    };
+    fs.backend_set_times(&file, TimeUpdate::Set(accessed), TimeUpdate::Set(modified))
+        .unwrap();
+    let (host_accessed, host_modified, _) = host_times(&host);
+    assert_eq!((host_accessed, host_modified), (accessed, modified));
+    assert_eq!(times(), host_times(&host));
+
+    // `Now` is the server's current time, and an omitted time stays as it was.
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    fs.backend_set_times(&file, TimeUpdate::Now, TimeUpdate::Omit)
+        .unwrap();
+    let (host_accessed, host_modified, _) = host_times(&host);
+    assert!(host_accessed.seconds.abs_diff(before.cast_signed()) <= 2);
+    assert_eq!(host_modified, modified);
+    assert_eq!(times(), host_times(&host));
 }
 
 #[test]

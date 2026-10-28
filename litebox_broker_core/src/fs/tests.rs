@@ -8,14 +8,16 @@
 //! broker core.
 
 use alloc::borrow::Cow;
+use alloc::sync::Arc;
 
 use super::in_mem::InMem;
 use super::inode_allocator::InodeAllocator;
 use super::overlay::Overlay;
 use super::resolver::{Resolver, ResolverEntry};
 use super::tar_ro::TarRo;
-use super::{FileType, Mode, OFlags, SeekWhence, UserInfo};
+use super::{FileTime, FileType, Mode, OFlags, SeekWhence, TimeUpdate, UserInfo};
 use crate::test_platform::TestPlatform;
+use crate::test_support::ManualWallClockProvider;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
 const USER: UserInfo = UserInfo {
@@ -24,8 +26,42 @@ const USER: UserInfo = UserInfo {
 };
 const ROOT: UserInfo = UserInfo::ROOT;
 
+/// A wall clock stopped at the Unix epoch.
+fn clock() -> Arc<ManualWallClockProvider> {
+    Arc::new(ManualWallClockProvider::default())
+}
+
+/// The time `seconds` after the Unix epoch.
+const fn at(seconds: i64) -> FileTime {
+    FileTime {
+        seconds,
+        nanoseconds: 0,
+    }
+}
+
+/// The access, modification, and status change times of the object at `path`.
+fn times<Backend: super::backend::Backend>(
+    fs: &Resolver<TestPlatform, Backend>,
+    path: &str,
+) -> (FileTime, FileTime, FileTime) {
+    let status = fs.file_status(ROOT, path, false).unwrap();
+    (status.accessed, status.modified, status.changed)
+}
+
+/// The access, modification, and status change times of `entry`.
+fn entry_times<Backend: super::backend::Backend>(
+    fs: &Resolver<TestPlatform, Backend>,
+    entry: &ResolverEntry<Backend>,
+) -> (FileTime, FileTime, FileTime) {
+    let status = fs.handle_status(entry).unwrap();
+    (status.accessed, status.modified, status.changed)
+}
+
 fn in_mem_fs() -> Resolver<TestPlatform, InMem<TestPlatform>> {
-    Resolver::new(InMem::<TestPlatform>::new(InodeAllocator::standalone()))
+    Resolver::new(InMem::<TestPlatform>::new(
+        InodeAllocator::standalone(),
+        clock(),
+    ))
 }
 
 fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
@@ -46,13 +82,15 @@ fn overlay_fs(
 
 mod in_mem {
     use super::{
-        FileType, InMem, Mode, OFlags, ROOT, Resolver, ResolverEntry, SeekWhence, TestPlatform,
-        USER, UserInfo, in_mem_fs,
+        FileTime, FileType, InMem, InodeAllocator, ManualWallClockProvider, Mode, OFlags, ROOT,
+        Resolver, ResolverEntry, SeekWhence, TestPlatform, TimeUpdate, USER, UserInfo, at, clock,
+        entry_times, in_mem_fs, times,
     };
     use crate::fs::errors::{
         ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
         UnlinkError,
     };
+    use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -69,6 +107,107 @@ mod in_mem {
     fn world_writable_root(fs: &InMemFs) {
         fs.chmod(ROOT, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to chmod /");
+    }
+
+    /// A filesystem with a world-writable root, created at the epoch, and the clock it reads.
+    fn timed_fs() -> (InMemFs, Arc<ManualWallClockProvider>) {
+        let clock = clock();
+        let fs = Resolver::new(InMem::new(InodeAllocator::standalone(), clock.clone()));
+        world_writable_root(&fs);
+        (fs, clock)
+    }
+
+    #[test]
+    fn times_follow_modifications() {
+        let (fs, clock) = timed_fs();
+
+        clock.set(at(1));
+        let mut file = fs
+            .open(USER, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        assert_eq!(times(&fs, "/file"), (at(1), at(1), at(1)));
+        assert_eq!(times(&fs, "/"), (at(0), at(1), at(1)));
+
+        clock.set(at(2));
+        fs.write(&mut file, b"data", None).unwrap();
+        assert_eq!(times(&fs, "/file"), (at(1), at(2), at(2)));
+        assert_eq!(times(&fs, "/"), (at(0), at(1), at(1)));
+
+        // Neither reads nor empty writes change any time.
+        clock.set(at(3));
+        fs.read(&mut file, &mut [0; 4], Some(0)).unwrap();
+        fs.write(&mut file, b"", None).unwrap();
+        assert_eq!(times(&fs, "/file"), (at(1), at(2), at(2)));
+
+        fs.truncate(&mut file, 2, false).unwrap();
+        assert_eq!(times(&fs, "/file"), (at(1), at(3), at(3)));
+
+        clock.set(at(4));
+        fs.chmod(USER, "/file", Mode::RUSR | Mode::WUSR).unwrap();
+        assert_eq!(times(&fs, "/file"), (at(1), at(3), at(4)));
+
+        clock.set(at(5));
+        fs.chown(ROOT, "/file", Some(USER.user), None).unwrap();
+        assert_eq!(times(&fs, "/file"), (at(1), at(3), at(5)));
+
+        clock.set(at(6));
+        fs.mkdir(USER, "/dir", Mode::RWXU).unwrap();
+        assert_eq!(times(&fs, "/dir"), (at(6), at(6), at(6)));
+        assert_eq!(times(&fs, "/"), (at(0), at(6), at(6)));
+
+        clock.set(at(7));
+        fs.unlink(USER, "/file").unwrap();
+        assert_eq!(entry_times(&fs, &file), (at(1), at(3), at(7)));
+        assert_eq!(times(&fs, "/"), (at(0), at(7), at(7)));
+
+        let dir = fs
+            .open(
+                USER,
+                "/dir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        clock.set(at(8));
+        fs.rmdir(USER, "/dir").unwrap();
+        assert_eq!(entry_times(&fs, &dir), (at(6), at(6), at(8)));
+        assert_eq!(times(&fs, "/"), (at(0), at(8), at(8)));
+    }
+
+    #[test]
+    fn set_times_updates_the_requested_times() {
+        let (fs, clock) = timed_fs();
+        clock.set(at(1));
+        let file = fs
+            .open(USER, "/file", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .unwrap();
+
+        clock.set(at(2));
+        fs.backend_set_times(&file, TimeUpdate::Set(at(10)), TimeUpdate::Omit)
+            .unwrap();
+        assert_eq!(entry_times(&fs, &file), (at(10), at(1), at(2)));
+
+        clock.set(at(3));
+        let before_epoch = FileTime {
+            seconds: -5,
+            nanoseconds: 999_999_999,
+        };
+        fs.backend_set_times(&file, TimeUpdate::Now, TimeUpdate::Set(before_epoch))
+            .unwrap();
+        assert_eq!(entry_times(&fs, &file), (at(3), before_epoch, at(3)));
+
+        // Omitting both times changes nothing, not even the status change time.
+        clock.set(at(4));
+        fs.backend_set_times(&file, TimeUpdate::Omit, TimeUpdate::Omit)
+            .unwrap();
+        assert_eq!(entry_times(&fs, &file), (at(3), before_epoch, at(3)));
+
+        let dir = fs
+            .open(ROOT, "/", OFlags::PATH | OFlags::DIRECTORY, Mode::empty())
+            .unwrap();
+        fs.backend_set_times(&dir, TimeUpdate::Set(at(20)), TimeUpdate::Now)
+            .unwrap();
+        assert_eq!(times(&fs, "/"), (at(20), at(4), at(4)));
     }
 
     #[test]
@@ -949,21 +1088,24 @@ mod in_mem {
             owner: ROOT,
             target: target.into(),
         };
-        let fs: InMemFs = Resolver::new(InMem::new_initialized([
-            ("/", directory()),
-            ("/dir", directory()),
-            (
-                "/dir/file",
-                InitialNode::File {
-                    mode: ALL_PERMS,
-                    owner: ROOT,
-                    data: (&[][..]).into(),
-                },
-            ),
-            ("/dir/file-link", symlink("file")),
-            ("/dir-link", symlink("/dir")),
-            ("/dangling", symlink("dir/created")),
-        ]));
+        let fs: InMemFs = Resolver::new(InMem::new_initialized(
+            [
+                ("/", directory()),
+                ("/dir", directory()),
+                (
+                    "/dir/file",
+                    InitialNode::File {
+                        mode: ALL_PERMS,
+                        owner: ROOT,
+                        data: (&[][..]).into(),
+                    },
+                ),
+                ("/dir/file-link", symlink("file")),
+                ("/dir-link", symlink("/dir")),
+                ("/dangling", symlink("dir/created")),
+            ],
+            crate::fs::tests::clock(),
+        ));
         let path = |path: &str, flags: OFlags| -> String {
             let entry = fs
                 .open(USER, path, flags, Mode::RWXU)
@@ -987,10 +1129,22 @@ mod in_mem {
 }
 
 mod tar_ro {
-    use super::{FileType, Mode, OFlags, TEST_TAR_FILE, USER, tar_ro_fs};
+    use super::{FileType, Mode, OFlags, TEST_TAR_FILE, USER, at, tar_ro_fs, times};
     use crate::fs::errors::{OpenError, PathError, ReadDirError};
     use alloc::vec;
     use alloc::vec::Vec;
+
+    #[test]
+    fn times_come_from_the_archive() {
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
+        // The archived modification times; a directory takes the newest time beneath it.
+        let foo = at(1_740_437_165);
+        let baz = at(1_740_437_172);
+        assert_eq!(times(&fs, "/foo"), (foo, foo, foo));
+        assert_eq!(times(&fs, "/bar/baz"), (baz, baz, baz));
+        assert_eq!(times(&fs, "/bar"), (baz, baz, baz));
+        assert_eq!(times(&fs, "/"), (baz, baz, baz));
+    }
 
     #[test]
     fn file_read() {
@@ -1145,11 +1299,12 @@ mod tar_ro {
 
 mod overlay {
     use super::{
-        FileType, Mode, OFlags, Overlay, Resolver, SeekWhence, TEST_TAR_FILE, TestPlatform, USER,
-        UserInfo,
+        FileType, ManualWallClockProvider, Mode, OFlags, Overlay, ROOT, Resolver, SeekWhence,
+        TEST_TAR_FILE, TestPlatform, TimeUpdate, USER, UserInfo, at, clock, entry_times, times,
     };
     use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError};
     use crate::fs::in_mem::{InMem, InitialNode};
+    use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
@@ -1165,6 +1320,14 @@ mod overlay {
     fn upper(
         entries: impl IntoIterator<Item = (&'static str, InitialNode)>,
     ) -> InMem<TestPlatform> {
+        upper_with_clock(entries, clock())
+    }
+
+    /// Like [`upper`], but reading `clock`.
+    fn upper_with_clock(
+        entries: impl IntoIterator<Item = (&'static str, InitialNode)>,
+        clock: Arc<ManualWallClockProvider>,
+    ) -> InMem<TestPlatform> {
         InMem::new_initialized(
             [(
                 "/",
@@ -1175,11 +1338,78 @@ mod overlay {
             )]
             .into_iter()
             .chain(entries),
+            clock,
         )
     }
 
     fn overlay_fs(upper: InMem<TestPlatform>) -> Resolver<TestPlatform, Overlay<TestPlatform>> {
         super::overlay_fs(upper, TEST_TAR_FILE.into())
+    }
+
+    /// An overlay over the test archive, whose upper backend reads the returned clock, which
+    /// starts at the epoch.
+    fn timed_overlay_fs() -> (
+        Resolver<TestPlatform, Overlay<TestPlatform>>,
+        Arc<ManualWallClockProvider>,
+    ) {
+        let clock = clock();
+        (overlay_fs(upper_with_clock([], clock.clone())), clock)
+    }
+
+    /// Long after anything in the test archive.
+    const LATER: i64 = 2_000_000_000;
+
+    #[test]
+    fn copy_up_keeps_times() {
+        let (fs, clock) = timed_overlay_fs();
+        let root = times(&fs, "/");
+        let (dir_accessed, dir_modified, _) = times(&fs, "/bar");
+        let (file_accessed, file_modified, _) = times(&fs, "/bar/baz");
+
+        // A metadata change copies the file up, materialising its directory, but modifies neither.
+        clock.set(at(LATER));
+        fs.chmod(ROOT, "/bar/baz", ALL_PERMS).unwrap();
+        assert_eq!(
+            times(&fs, "/bar/baz"),
+            (file_accessed, file_modified, at(LATER))
+        );
+        assert_eq!(times(&fs, "/bar"), (dir_accessed, dir_modified, at(LATER)));
+        assert_eq!(times(&fs, "/"), (root.0, root.1, at(LATER)));
+    }
+
+    #[test]
+    fn truncating_copy_up_is_a_modification() {
+        let (fs, clock) = timed_overlay_fs();
+        let (accessed, _, _) = times(&fs, "/foo");
+
+        clock.set(at(LATER));
+        let file = fs
+            .open(
+                ACTING_USER,
+                "/foo",
+                OFlags::WRONLY | OFlags::TRUNC,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert_eq!(entry_times(&fs, &file), (accessed, at(LATER), at(LATER)));
+    }
+
+    #[test]
+    fn set_times_copies_up_only_when_changing_times() {
+        let (fs, clock) = timed_overlay_fs();
+        let lower = times(&fs, "/foo");
+        let file = fs
+            .open(ACTING_USER, "/foo", OFlags::PATH, Mode::empty())
+            .unwrap();
+
+        clock.set(at(LATER));
+        fs.backend_set_times(&file, TimeUpdate::Omit, TimeUpdate::Omit)
+            .unwrap();
+        assert_eq!(times(&fs, "/foo"), lower);
+
+        fs.backend_set_times(&file, TimeUpdate::Set(at(1)), TimeUpdate::Now)
+            .unwrap();
+        assert_eq!(times(&fs, "/foo"), (at(1), at(LATER), at(LATER)));
     }
 
     #[test]
@@ -2226,13 +2456,16 @@ mod composed {
         Resolver::new(
             Composer::builder()
                 .mount("/", |_| {
-                    InMem::<TestPlatform>::new_initialized([(
-                        "/",
-                        InitialNode::Directory {
-                            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                            owner: UserInfo::ROOT,
-                        },
-                    )])
+                    InMem::<TestPlatform>::new_initialized(
+                        [(
+                            "/",
+                            InitialNode::Directory {
+                                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                                owner: UserInfo::ROOT,
+                            },
+                        )],
+                        crate::fs::tests::clock(),
+                    )
                 })
                 .mount("/dev", |allocator| {
                     Devices::new(allocator, provider, Arc::new(TestRandomProvider))

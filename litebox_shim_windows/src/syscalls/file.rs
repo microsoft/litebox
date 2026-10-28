@@ -16,7 +16,7 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProv
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
-    FileType, MAX_FILE_TRANSFER_SIZE,
+    FileTime, FileType, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::byteorder::native_endian::U32;
@@ -252,13 +252,49 @@ struct FileIdBothDirectoryInformation {
 
 struct DirectoryEntry {
     name: String,
+    times: FileTimeTicks,
     end_of_file: i64,
     allocation_size: i64,
     file_attributes: FileAttributes,
     file_id: i64,
 }
 
+/// File timestamps as Windows `FILETIME` values: 100 ns ticks since 1601-01-01 UTC.
+#[derive(Clone, Copy)]
+struct FileTimeTicks {
+    creation: i64,
+    last_access: i64,
+    last_write: i64,
+    change: i64,
+}
+
+impl FileTimeTicks {
+    fn from_status(status: &FileStatus) -> Self {
+        let change = Self::ticks(status.changed);
+        Self {
+            // POSIX has no creation time; like Wine, report the change time.
+            creation: change,
+            last_access: Self::ticks(status.accessed),
+            last_write: Self::ticks(status.modified),
+            change,
+        }
+    }
+
+    /// Saturates times outside the `FILETIME` range.
+    fn ticks(time: FileTime) -> i64 {
+        const WINDOWS_TO_UNIX_EPOCH_SECONDS: i64 = 11_644_473_600;
+        const TICKS_PER_SECOND: i64 = 10_000_000;
+        const NANOSECONDS_PER_TICK: u32 = 100;
+        time.seconds
+            .saturating_add(WINDOWS_TO_UNIX_EPOCH_SECONDS)
+            .saturating_mul(TICKS_PER_SECOND)
+            .saturating_add(i64::from(time.nanoseconds / NANOSECONDS_PER_TICK))
+            .max(0)
+    }
+}
+
 struct FileStatusMetadata {
+    times: FileTimeTicks,
     end_of_file: i64,
     allocation_size: i64,
     file_attributes: FileAttributes,
@@ -286,6 +322,7 @@ impl FileStatusMetadata {
         let mut file_id_128 = [0; 16];
         file_id_128[..size_of::<u64>()].copy_from_slice(&file_id.to_ne_bytes());
         Self {
+            times: FileTimeTicks::from_status(status),
             end_of_file,
             allocation_size,
             file_attributes,
@@ -300,6 +337,7 @@ impl DirectoryEntry {
         let metadata = FileStatusMetadata::from_status(status);
         Self {
             name,
+            times: metadata.times,
             end_of_file: metadata.end_of_file,
             allocation_size: metadata.allocation_size,
             file_attributes: metadata.file_attributes,
@@ -312,11 +350,14 @@ impl DirectoryInformationMetadata {
     fn new(file_index: u32, file_name_length: u32, entry: &DirectoryEntry) -> Self {
         Self {
             header: DirectoryInformationHeader::new(file_index),
+            creation_time: entry.times.creation,
+            last_access_time: entry.times.last_access,
+            last_write_time: entry.times.last_write,
+            change_time: entry.times.change,
             end_of_file: entry.end_of_file,
             allocation_size: entry.allocation_size,
             file_attributes: entry.file_attributes.bits(),
             file_name_length,
-            ..Default::default()
         }
     }
 }
@@ -336,8 +377,7 @@ impl FileInformationClass {
         let file_name_length =
             u32::try_from(entry.name.encode_utf16().count() * size_of::<u16>()).unwrap();
         let file_index = u32::try_from(index).unwrap_or(u32::MAX);
-        // TODO(dir-timestamps): Populate timestamps, EA sizes, and short names once FileSystem
-        // exposes them; the current API only supplies size, type, mode, and inode.
+        // TODO(dir-metadata): Populate EA sizes and short names once FileSystem exposes them.
         let mut record = match self {
             Self::FileDirectoryInformation => {
                 let information = FileDirectoryInformation {
@@ -459,11 +499,13 @@ struct FileStandardInformation {
     padding: [u8; 2],
 }
 
-// TODO(fs-timestamps): Populate timestamps when FileStatus exposes them; the conversions
-// below leave every timestamp field zeroed.
 impl From<&FileStatusMetadata> for FileBasicInformation {
     fn from(metadata: &FileStatusMetadata) -> Self {
         Self {
+            creation_time: metadata.times.creation,
+            last_access_time: metadata.times.last_access,
+            last_write_time: metadata.times.last_write,
+            change_time: metadata.times.change,
             file_attributes: metadata.file_attributes.bits(),
             ..Self::default()
         }
@@ -473,6 +515,10 @@ impl From<&FileStatusMetadata> for FileBasicInformation {
 impl From<&FileStatusMetadata> for FileNetworkOpenInformation {
     fn from(metadata: &FileStatusMetadata) -> Self {
         Self {
+            creation_time: metadata.times.creation,
+            last_access_time: metadata.times.last_access,
+            last_write_time: metadata.times.last_write,
+            change_time: metadata.times.change,
             allocation_size: metadata.allocation_size,
             end_of_file: metadata.end_of_file,
             file_attributes: metadata.file_attributes.bits(),
@@ -485,6 +531,10 @@ impl From<&FileStatusMetadata> for FileStatBasicInformation {
     fn from(metadata: &FileStatusMetadata) -> Self {
         Self {
             file_id: i64::from_ne_bytes(metadata.file_id.to_ne_bytes()),
+            creation_time: metadata.times.creation,
+            last_access_time: metadata.times.last_access,
+            last_write_time: metadata.times.last_write,
+            change_time: metadata.times.change,
             allocation_size: metadata.allocation_size,
             end_of_file: metadata.end_of_file,
             file_attributes: metadata.file_attributes.bits(),
@@ -3256,6 +3306,21 @@ mod tests {
         (status, handle)
     }
 
+    #[test]
+    fn file_times_convert_to_filetime_ticks() {
+        let ticks = |seconds, nanoseconds| {
+            FileTimeTicks::ticks(FileTime {
+                seconds,
+                nanoseconds,
+            })
+        };
+        assert_eq!(ticks(0, 0), 116_444_736_000_000_000);
+        assert_eq!(ticks(1, 199), 116_444_736_010_000_001);
+        assert_eq!(ticks(-11_644_473_600, 0), 0);
+        assert_eq!(ticks(-11_644_473_601, 0), 0);
+        assert_eq!(ticks(i64::MAX, 0), i64::MAX);
+    }
+
     fn basic_information_sentinel() -> FileBasicInformation {
         FileBasicInformation {
             creation_time: 1,
@@ -3454,14 +3519,13 @@ mod tests {
                 NtStatus::SUCCESS,
                 "{path}"
             );
+            let file_status = task.fs.path_file_status(&task.fs_context, path).unwrap();
             assert_eq!(
                 information,
-                FileBasicInformation {
-                    file_attributes: expected_attributes,
-                    ..FileBasicInformation::default()
-                },
+                FileBasicInformation::from(&FileStatusMetadata::from_status(&file_status)),
                 "{path}"
             );
+            assert_eq!(information.file_attributes, expected_attributes, "{path}");
         }
     }
 

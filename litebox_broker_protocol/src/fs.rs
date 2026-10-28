@@ -64,6 +64,37 @@ pub struct FileNodeInfo {
     pub rdev: Option<NonZeroU64>,
 }
 
+/// A point in wall-clock time, relative to the Unix epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileTime {
+    /// Whole seconds since the Unix epoch; negative before it.
+    pub seconds: i64,
+    /// Nanoseconds past `seconds`, always less than [`Self::NANOSECONDS_PER_SECOND`].
+    pub nanoseconds: u32,
+}
+
+impl FileTime {
+    /// The Unix epoch.
+    pub const EPOCH: Self = Self {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+
+    /// One more than the largest valid [`Self::nanoseconds`].
+    pub const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
+}
+
+/// How an operation updates one of a fs object's timestamps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeUpdate {
+    /// Leave it unchanged.
+    Omit,
+    /// Set it to the fs's current time.
+    Now,
+    /// Set it to the given time.
+    Set(FileTime),
+}
+
 /// Status returned for a fs object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileStatus {
@@ -79,6 +110,12 @@ pub struct FileStatus {
     pub node_info: FileNodeInfo,
     /// Preferred fs I/O block size.
     pub blksize: u64,
+    /// Last access time.
+    pub accessed: FileTime,
+    /// Last data modification time.
+    pub modified: FileTime,
+    /// Last status change time.
+    pub changed: FileTime,
 }
 
 /// One directory entry.

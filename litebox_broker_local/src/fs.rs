@@ -598,8 +598,8 @@ mod tests {
     use alloc::sync::Arc;
     use core::{cell::RefCell, convert::Infallible};
     use litebox_broker_protocol::fs::{
-        FileNodeInfo, FileType, OpenFileResponse, ReadDirectoryResponse, ReadFileResponse,
-        SeekFileResponse, WriteFileResponse, encode_directory_entries,
+        FileNodeInfo, FileTime, FileType, OpenFileResponse, ReadDirectoryResponse,
+        ReadFileResponse, SeekFileResponse, WriteFileResponse, encode_directory_entries,
     };
     use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
     use litebox_broker_protocol::shared_buffer::{
@@ -627,6 +627,9 @@ mod tests {
                 rdev: None,
             },
             blksize: 4096,
+            accessed: FileTime::EPOCH,
+            modified: FileTime::EPOCH,
+            changed: FileTime::EPOCH,
         };
         let entries = [FileDirectoryEntry {
             name: "file".into(),

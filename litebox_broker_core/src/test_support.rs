@@ -23,7 +23,7 @@ use spin::Mutex;
 use crate::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, Result,
     fs::{
-        FileResult, FileService, UnsupportedFileService,
+        FileResult, FileService, FileTime, UnsupportedFileService, WallClockProvider,
         errors::{ReadError, WriteError},
     },
     random::{RandomProvider, RandomProviderError},
@@ -119,6 +119,25 @@ pub struct FailingRandomProvider;
 impl RandomProvider for FailingRandomProvider {
     fn fill(&self, _output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
         Err(RandomProviderError)
+    }
+}
+
+/// Wall clock for tests that moves only when [`Self::set`]; it starts at the Unix epoch.
+#[derive(Default)]
+pub struct ManualWallClockProvider {
+    now: Mutex<FileTime>,
+}
+
+impl ManualWallClockProvider {
+    /// Moves the clock to `now`.
+    pub fn set(&self, now: FileTime) {
+        *self.now.lock() = now;
+    }
+}
+
+impl WallClockProvider for ManualWallClockProvider {
+    fn now(&self) -> FileTime {
+        *self.now.lock()
     }
 }
 

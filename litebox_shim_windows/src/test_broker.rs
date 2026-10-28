@@ -93,7 +93,10 @@ pub(crate) fn litebox_with_broker_files_and_stdio(
     entries: Vec<(String, InitialNode)>,
     stdio: Arc<dyn StdioProvider>,
 ) -> (litebox::LiteBox<TestPlatform>, usize) {
-    let in_mem = litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(entries);
+    let in_mem = litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(
+        entries,
+        Arc::new(litebox_broker_core::test_support::ManualWallClockProvider::default()),
+    );
     let fs = litebox_broker_core::fs::composer::Composer::builder()
         .mount("/", |_| in_mem)
         .mount("/dev", |allocator| {

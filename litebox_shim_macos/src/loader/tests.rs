@@ -83,18 +83,21 @@ fn builder(executable: Vec<u8>) -> MacosShimBuilder<Platform> {
         mode,
         owner: FileUser::ROOT,
     };
-    let fs = InMem::<Platform>::new_initialized(vec![
-        ("/", directory()),
-        ("/bin", directory()),
-        (
-            "/bin/main",
-            InitialNode::File {
-                mode,
-                owner: FileUser::ROOT,
-                data: executable.into(),
-            },
-        ),
-    ]);
+    let fs = InMem::<Platform>::new_initialized(
+        vec![
+            ("/", directory()),
+            ("/bin", directory()),
+            (
+                "/bin/main",
+                InitialNode::File {
+                    mode,
+                    owner: FileUser::ROOT,
+                    data: executable.into(),
+                },
+            ),
+        ],
+        Arc::new(litebox_broker_core::test_support::ManualWallClockProvider::default()),
+    );
     let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))

@@ -47,6 +47,18 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             _sync: PhantomData,
         }
     }
+
+    /// Update the times of `entry` through the backend directly, with no permission checks.
+    #[cfg(test)]
+    pub(crate) fn backend_set_times(
+        &self,
+        entry: &ResolverEntry<Backend>,
+        accessed: super::TimeUpdate,
+        modified: super::TimeUpdate,
+    ) -> Result<(), super::errors::SetTimesError> {
+        self.backend
+            .set_times(entry.handle.as_ref(), accessed, modified)
+    }
 }
 
 struct Context {

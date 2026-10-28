@@ -2320,7 +2320,12 @@ mod tests {
         let stdio_provider =
             Arc::new(TestStdioProvider::default().with_terminal(StdioStream::Stderr));
         let fs = litebox_broker_core::fs::composer::Composer::builder()
-            .mount("/", litebox_broker_core::fs::in_mem::InMem::<TestSync>::new)
+            .mount("/", |allocator| {
+                litebox_broker_core::fs::in_mem::InMem::<TestSync>::new(
+                    allocator,
+                    Arc::new(litebox_broker_core::test_support::ManualWallClockProvider::default()),
+                )
+            })
             .mount("/dev", |allocator| {
                 litebox_broker_core::fs::devices::Devices::new(
                     allocator,

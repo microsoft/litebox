@@ -4007,7 +4007,12 @@ mod tests {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
         let stdio_provider = Arc::new(TestStdioProvider::default().with_open_input());
         let fs = crate::fs::composer::Composer::builder()
-            .mount("/", crate::fs::in_mem::InMem::<TestPlatform>::new)
+            .mount("/", |allocator| {
+                crate::fs::in_mem::InMem::<TestPlatform>::new(
+                    allocator,
+                    Arc::new(crate::test_support::ManualWallClockProvider::default()),
+                )
+            })
             .mount("/dev", |allocator| {
                 crate::fs::devices::Devices::new(
                     allocator,

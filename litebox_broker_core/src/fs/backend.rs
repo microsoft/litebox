@@ -14,9 +14,9 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    RmdirError, SetTimesError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, OFlags, TimeUpdate, UserInfo};
 use crate::readiness::ReadinessSource;
 use crate::terminal::TerminalEndpoint;
 
@@ -172,6 +172,10 @@ pub trait Backend: Send + Sync + Any {
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
 
     /// Status of an open file or directory handle.
+    ///
+    /// Its times follow POSIX: writing or truncating a file, and adding or removing a directory's
+    /// entries, update its modification and status change times, and any other change to an
+    /// object updates its status change time. Reads need not update access times.
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
     /// The terminal that an open file handle refers to. A file is a terminal
@@ -221,6 +225,16 @@ pub trait Backend: Send + Sync + Any {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
+
+    /// Update the access and modification times of the object `h` refers to, and its status
+    /// change time to the backend's current time, which is also what [`TimeUpdate::Now`] means.
+    /// Omitting both changes nothing.
+    fn set_times(
+        &self,
+        h: HandleRef<'_>,
+        accessed: TimeUpdate,
+        modified: TimeUpdate,
+    ) -> Result<(), SetTimesError>;
 }
 
 /// Concrete handle types used by a backend.

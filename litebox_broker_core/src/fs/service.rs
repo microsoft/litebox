@@ -1082,7 +1082,7 @@ fn file_walk_error(error: WalkError) -> FileError {
 mod tests {
     use super::*;
     use core::num::NonZeroU64;
-    use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
+    use litebox_broker_protocol::fs::{FileNodeInfo, FileTime, FileType};
 
     #[test]
     fn file_status_excludes_object_type_mode_bits() {
@@ -1097,6 +1097,9 @@ mod tests {
                 rdev: NonZeroU64::new(u64::MAX),
             },
             blksize: u64::MAX,
+            accessed: FileTime::EPOCH,
+            modified: FileTime::EPOCH,
+            changed: FileTime::EPOCH,
         };
         let mut expected = status;
         expected.mode = FileMode::from_bits(0o644).unwrap();

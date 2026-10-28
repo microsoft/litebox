@@ -22,10 +22,12 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SetTimesError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{
+    DirEntry, FileStatus, FileTime, FileType, Mode, NodeInfo, OFlags, TimeUpdate, UserInfo,
+};
 use crate::pseudo_terminal::{ManagerFile, PseudoTerminal, PseudoTerminals, SubsidiaryFile};
 use crate::random::RandomProvider;
 use crate::readiness::{ReadinessRegistration, ReadinessSource};
@@ -150,6 +152,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: STDIO_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
+                accessed: FileTime::EPOCH,
+                modified: FileTime::EPOCH,
+                changed: FileTime::EPOCH,
             },
             Device::Tty => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -158,6 +163,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: TTY_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
+                accessed: FileTime::EPOCH,
+                modified: FileTime::EPOCH,
+                changed: FileTime::EPOCH,
             },
             Device::Null => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -166,6 +174,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: NULL_NODE_INFO,
                 blksize: NULL_BLOCK_SIZE,
+                accessed: FileTime::EPOCH,
+                modified: FileTime::EPOCH,
+                changed: FileTime::EPOCH,
             },
             Device::URandom => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -174,6 +185,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: URANDOM_NODE_INFO,
                 blksize: URANDOM_BLOCK_SIZE,
+                accessed: FileTime::EPOCH,
+                modified: FileTime::EPOCH,
+                changed: FileTime::EPOCH,
             },
             Device::Ptmx => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -182,6 +196,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: PTMX_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
+                accessed: FileTime::EPOCH,
+                modified: FileTime::EPOCH,
+                changed: FileTime::EPOCH,
             },
         }
     }
@@ -242,6 +259,9 @@ impl Devices {
                 rdev: Some(pts_rdev(index)),
             },
             blksize: STDIO_BLOCK_SIZE,
+            accessed: FileTime::EPOCH,
+            modified: FileTime::EPOCH,
+            changed: FileTime::EPOCH,
         }
     }
 
@@ -583,6 +603,9 @@ impl Backend for Devices {
                     DeviceDirHandle::Pts => self.pts_inode,
                 },
                 blksize: super::DEFAULT_DIRECTORY_SIZE,
+                accessed: FileTime::EPOCH,
+                modified: FileTime::EPOCH,
+                changed: FileTime::EPOCH,
             }),
         }
     }
@@ -624,5 +647,13 @@ impl Backend for Devices {
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         Err(ChownError::ReadOnlyFileSystem)
+    }
+    fn set_times(
+        &self,
+        _h: HandleRef<'_>,
+        _accessed: TimeUpdate,
+        _modified: TimeUpdate,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
     }
 }

@@ -32,10 +32,10 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SetTimesError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, TimeUpdate, UserInfo};
 use crate::readiness::ReadinessSource;
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
@@ -91,9 +91,9 @@ pub struct OverlayFile {
     /// The layer this file was _opened_ against; a later copy-up can move it, which is what
     /// [`State::copied_up`] records.
     layer: OverlayFileLayer,
-    // TODO(jayb): the parent path plus name is how object-addressed operations (`chmod`/`chown`)
-    // find the file again in order to copy it up. This must be revisited when rename lands, since a
-    // rename invalidates the recorded location.
+    // TODO(jayb): the parent path plus name is how object-addressed operations (`chmod`/`chown`/
+    // `set_times`) find the file again in order to copy it up. This must be revisited when rename
+    // lands, since a rename, like an unlink, invalidates the recorded location.
     parent: Vec<String>,
     name: String,
 }
@@ -257,7 +257,8 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         Ok(current)
     }
 
-    /// Copy the lower file `lower` up into the upper backend as `name` within `upper_dir`.
+    /// Copy the lower file `lower` up into the upper backend as `name` within `upper_dir`, keeping
+    /// its times unless `truncate` makes the copy-up a modification.
     ///
     /// The namespace lock is held for the whole copy, so a partially written (or failed and
     /// unlinked) upper file is never observable.
@@ -274,25 +275,39 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         truncate: bool,
     ) -> Result<FileHandle, OpenError> {
         let (layer, lower) = lower;
-        let upper = self.upper.create_file_at(
-            upper_dir.clone(),
-            name,
-            CreationMetadata {
-                mode: status.mode,
-                owner: status.owner,
-            },
-        )?;
-        let copied = if truncate {
-            Ok(())
-        } else {
-            self.copy_bytes(layer, lower, &upper)
-        };
+        let upper = self.preserving_times(upper_dir, || {
+            let upper = self.upper.create_file_at(
+                upper_dir.clone(),
+                name,
+                CreationMetadata {
+                    mode: status.mode,
+                    owner: status.owner,
+                },
+            )?;
+            let copied = if truncate {
+                Ok(())
+            } else {
+                self.copy_bytes(layer, lower, &upper)
+            };
 
-        if let Err(error) = copied {
-            // Ancestor directories materialised for this copy-up deliberately stay behind.
-            let _rollback_result = self.upper.unlink_at(upper_dir.clone(), name);
-            return Err(error);
-        }
+            if let Err(error) = copied {
+                // Ancestor directories materialised for this copy-up deliberately stay behind.
+                let _rollback_result = self.upper.unlink_at(upper_dir.clone(), name);
+                return Err(error);
+            }
+            Ok(upper)
+        })?;
+        let modified = if truncate {
+            TimeUpdate::Omit
+        } else {
+            TimeUpdate::Set(status.modified)
+        };
+        // Best effort, like Linux's overlayfs: a failure leaves only newer times behind.
+        let _best_effort = self.upper.set_times(
+            HandleRef::File(&upper),
+            TimeUpdate::Set(status.accessed),
+            modified,
+        );
         // The copied-up file keeps the identity it had in the lower backend, so existing
         // lower-backed handles keep reporting the same inode.
         if let Ok(upper_status) = self.upper.status(HandleRef::File(&upper)) {
@@ -339,13 +354,13 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     /// Materialise whatever `h` refers to in the upper backend, and return a handle to it.
     fn ensure_upper(
         &self,
-        locked: NamespaceGuard<'_, Platform>,
+        locked: &NamespaceGuard<'_, Platform>,
         h: HandleRef<'_>,
     ) -> Result<Handle, OpenError> {
         let file = match h {
             HandleRef::Dir(dir) => {
                 let path = &dir.get_typed::<Self>().path;
-                return Ok(Handle::Dir(self.ensure_upper_dir(&locked, path)?));
+                return Ok(Handle::Dir(self.ensure_upper_dir(locked, path)?));
             }
             HandleRef::File(file) => file.get_typed::<Self>(),
         };
@@ -364,9 +379,9 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             // Only regular files can be copied up.
             return Err(OpenError::ReadOnlyFileSystem);
         }
-        let upper_dir = self.ensure_upper_dir(&locked, &file.parent)?;
+        let upper_dir = self.ensure_upper_dir(locked, &file.parent)?;
         let upper = self.copy_up_file(
-            &locked,
+            locked,
             &upper_dir,
             &file.name,
             (layer, lower),
@@ -461,7 +476,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     }
 
     /// Create the upper counterpart of the lower-only directory `resolved`, named `name` in
-    /// `parent`.
+    /// `parent`, with the same times.
     fn materialize_dir(
         &self,
         _locked: &NamespaceGuard<'_, Platform>,
@@ -474,15 +489,16 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             .status(HandleRef::Dir(handle))
             .map_err(file_status_to_open_error)?;
         let child = self
-            .upper
-            .mkdir_at(
-                parent.clone(),
-                name,
-                CreationMetadata {
-                    mode: status.mode,
-                    owner: status.owner,
-                },
-            )
+            .preserving_times(parent, || {
+                self.upper.mkdir_at(
+                    parent.clone(),
+                    name,
+                    CreationMetadata {
+                        mode: status.mode,
+                        owner: status.owner,
+                    },
+                )
+            })
             .map_err(|error| match error {
                 MkdirError::PathError(error) => OpenError::PathError(error),
                 MkdirError::AlreadyExists => OpenError::AlreadyExists,
@@ -490,11 +506,34 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 MkdirError::NoWritePerms => OpenError::NoWritePerms,
                 MkdirError::Io => OpenError::Io,
             })?;
+        // Best effort, like Linux's overlayfs: a failure leaves only newer times behind.
+        let _best_effort = self.upper.set_times(
+            HandleRef::Dir(&child),
+            TimeUpdate::Set(status.accessed),
+            TimeUpdate::Set(status.modified),
+        );
         // A materialised directory stands in for the lower one, so it keeps its identity.
         if let (Some(layer), Ok(upper)) = (layer, self.upper.status(HandleRef::Dir(&child))) {
             self.bind_copy_up(layer, status.node_info, upper.node_info, None);
         }
         Ok(child)
+    }
+
+    /// Run `create`, which adds an entry to the upper directory `parent` that callers already
+    /// see there, and then restore the times `parent` had, since its visible entries are unchanged.
+    ///
+    /// Like Linux's overlayfs, the restore is best effort: a failure leaves only newer times.
+    fn preserving_times<R>(&self, parent: &DirHandle, create: impl FnOnce() -> R) -> R {
+        let before = self.upper.status(HandleRef::Dir(parent));
+        let result = create();
+        if let Ok(before) = before {
+            let _best_effort = self.upper.set_times(
+                HandleRef::Dir(parent),
+                TimeUpdate::Set(before.accessed),
+                TimeUpdate::Set(before.modified),
+            );
+        }
+        result
     }
 
     /// The layer that owns a resolved directory, and its handle within that layer: the upper
@@ -1241,7 +1280,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(ChmodError::IsSymlink);
         }
         let locked = self.namespace.lock();
-        let handle = self.ensure_upper(locked, h).map_err(|error| match error {
+        let handle = self.ensure_upper(&locked, h).map_err(|error| match error {
             OpenError::PathError(error) => ChmodError::PathError(error),
             OpenError::ReadOnlyFileSystem => ChmodError::ReadOnlyFileSystem,
             _ => ChmodError::Io,
@@ -1261,11 +1300,31 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(ChownError::IsSymlink);
         }
         let locked = self.namespace.lock();
-        let handle = self.ensure_upper(locked, h).map_err(|error| match error {
+        let handle = self.ensure_upper(&locked, h).map_err(|error| match error {
             OpenError::PathError(error) => ChownError::PathError(error),
             OpenError::ReadOnlyFileSystem => ChownError::ReadOnlyFileSystem,
             _ => ChownError::Io,
         })?;
         self.upper.chown(handle.as_ref(), user, group)
+    }
+
+    fn set_times(
+        &self,
+        h: HandleRef<'_>,
+        accessed: TimeUpdate,
+        modified: TimeUpdate,
+    ) -> Result<(), SetTimesError> {
+        // Copying up would change the status change time.
+        if (accessed, modified) == (TimeUpdate::Omit, TimeUpdate::Omit) {
+            return Ok(());
+        }
+        // Held through the update, so that a concurrent copy-up cannot restore older times over it.
+        let locked = self.namespace.lock();
+        let handle = self.ensure_upper(&locked, h).map_err(|error| match error {
+            OpenError::PathError(error) => SetTimesError::PathError(error),
+            OpenError::ReadOnlyFileSystem => SetTimesError::ReadOnlyFileSystem,
+            _ => SetTimesError::Io,
+        })?;
+        self.upper.set_times(handle.as_ref(), accessed, modified)
     }
 }

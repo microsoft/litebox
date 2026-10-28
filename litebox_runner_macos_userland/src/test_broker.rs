@@ -14,7 +14,9 @@ use litebox_broker_core::{
         resolver::Resolver,
     },
     stdio::StdioOutputStream,
-    test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
+    test_support::{
+        FailingRandomProvider, ManualWallClockProvider, TestBrokerCoreBuilder, TestStdioProvider,
+    },
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -64,7 +66,10 @@ pub(crate) fn setup(
             },
         ));
     }
-    let fs = InMem::<MacosUserland>::new_initialized(initial_nodes);
+    let fs = InMem::<MacosUserland>::new_initialized(
+        initial_nodes,
+        Arc::new(ManualWallClockProvider::default()),
+    );
     let fs = Composer::builder()
         .mount("/", |_| fs)
         .mount("/dev", |allocator| {
