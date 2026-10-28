@@ -115,12 +115,7 @@ impl SharedFutexes {
     }
 }
 
-/// Issues a signed ID for new shared memory, which no other ID equals, so that futex operations
-/// accept it.
-///
-/// Fails with `PolicyDenied` if the caller may not wait on objects, with `ResourceExhausted`
-/// once 2^64 IDs were issued, and with `Internal` if the broker has no randomness to key its
-/// signatures with.
+/// Issues a signed ID for new shared memory.
 pub fn issue_shared_memory_id(process: &BrokerProcess) -> Result<SharedMemoryId> {
     process.require_object_rights(ObjectRights::WAIT)?;
     let futexes = &process.core.shared_futexes;
@@ -139,8 +134,6 @@ pub fn issue_shared_memory_id(process: &BrokerProcess) -> Result<SharedMemoryId>
 
 /// Creates an idle futex waiter whose reference publishes its readiness through
 /// `readiness_sink`.
-///
-/// Fails with `PolicyDenied` if the caller may not wait on objects.
 pub fn create_futex_waiter(
     process: &BrokerProcess,
     readiness_sink: &Arc<dyn ReadinessSink>,
@@ -158,9 +151,6 @@ pub fn create_futex_waiter(
 }
 
 /// Arms an idle futex waiter on the futex word `request.key`.
-///
-/// Fails with `UnsupportedOperation` if the offset is unaligned, the mask is zero, or the waiter
-/// is not idle, and with `PolicyDenied` if the broker did not sign the key's memory ID.
 pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()> {
     validate_key_and_bitset(request.key, request.bitset)?;
     process.core.shared_futexes.authorize(request.key.memory)?;
@@ -190,10 +180,6 @@ pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()
 
 /// Wakes up to `request.count` of the oldest waiters armed on the futex word `request.key`
 /// whose masks intersect `request.bitset`, returning how many it woke.
-///
-/// Fails with `UnsupportedOperation` if the offset is unaligned or the mask is zero, and with
-/// `PolicyDenied` if the caller may not wait on objects or the broker did not sign the key's
-/// memory ID.
 pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<u32> {
     validate_key_and_bitset(request.key, request.bitset)?;
     process.require_object_rights(ObjectRights::WAIT)?;
@@ -463,42 +449,55 @@ mod tests {
     }
 
     #[test]
-    fn wake_reaches_waiter_in_another_process() {
+    fn waiter_reports_a_wake_from_another_process_until_disarmed() {
         let fixture = fixture();
         let waiter = fixture.waiter(&fixture.child);
+        let readiness = || fixture.child.check_readiness(waiter);
+        // An armed waiter may not be armed again, and disarming it before any wake reports none
+        // and leaves it unwakeable.
         Fixture::arm(&fixture.child, fixture.key(8), u32::MAX, waiter).unwrap();
         assert_eq!(
-            fixture.child.check_readiness(waiter),
-            Ok(ReadinessFlags::default())
+            Fixture::arm(&fixture.child, fixture.key(8), u32::MAX, waiter),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(false));
+        assert_eq!(fixture.queued(), (0, 0));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(8), 1, u32::MAX),
+            Ok(0)
         );
 
+        // A wake from another process marks the rearmed waiter woken and publishes it.
+        Fixture::arm(&fixture.child, fixture.key(8), u32::MAX, waiter).unwrap();
+        assert_eq!(readiness(), Ok(ReadinessFlags::default()));
         assert_eq!(
             Fixture::wake(&fixture.parent, fixture.key(8), 1, u32::MAX),
             Ok(1)
         );
-        assert_eq!(fixture.woken_handles(), [waiter]);
+        let published = *fixture.sink.republished.lock().unwrap().last().unwrap();
+        assert_eq!(published, (waiter, FUTEX_WAITER_WOKEN));
+        assert_eq!(readiness(), Ok(FUTEX_WAITER_WOKEN));
+        // A woken waiter must be disarmed, which takes the wake, before it is armed again.
         assert_eq!(
-            fixture.child.check_readiness(waiter),
-            Ok(FUTEX_WAITER_WOKEN)
+            Fixture::arm(&fixture.child, fixture.key(8), u32::MAX, waiter),
+            Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(true));
-        assert_eq!(
-            fixture.child.check_readiness(waiter),
-            Ok(ReadinessFlags::default())
-        );
+        assert_eq!(readiness(), Ok(ReadinessFlags::default()));
         assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(false));
         assert_eq!(fixture.queued(), (0, 0));
     }
 
     #[test]
-    fn wake_selects_oldest_matching_waiters_up_to_count() {
+    fn wake_selects_oldest_matching_waiters_up_to_count_and_keeps_the_rest_in_order() {
         let fixture = fixture();
-        let waiters: std::vec::Vec<_> = (0..4).map(|_| fixture.waiter(&fixture.child)).collect();
+        let waiters: std::vec::Vec<_> = (0..6).map(|_| fixture.waiter(&fixture.child)).collect();
         for (index, &waiter) in waiters.iter().enumerate() {
-            let bitset = if index == 1 { 0b10 } else { 0b01 };
+            let bitset = if index % 2 == 0 { 0b10 } else { 0b01 };
             Fixture::arm(&fixture.child, fixture.key(0), bitset, waiter).unwrap();
         }
-        // Another futex word, in the same memory or in other memory, is not woken.
+        // Waiters on another futex word, in the same memory or in other memory, are never
+        // selected.
         let other_offset = fixture.waiter(&fixture.parent);
         Fixture::arm(&fixture.parent, fixture.key(4), u32::MAX, other_offset).unwrap();
         let other_memory = fixture.waiter(&fixture.parent);
@@ -508,49 +507,12 @@ mod tests {
         };
         Fixture::arm(&fixture.parent, other_memory_key, u32::MAX, other_memory).unwrap();
 
-        assert_eq!(
-            Fixture::wake(&fixture.parent, fixture.key(0), 2, 0b01),
-            Ok(2)
-        );
-        assert_eq!(fixture.woken_handles(), [waiters[0], waiters[2]]);
-        assert_eq!(
-            Fixture::wake(&fixture.parent, fixture.key(0), u32::MAX, u32::MAX),
-            Ok(2)
-        );
-        assert_eq!(
-            fixture.woken_handles(),
-            [waiters[0], waiters[2], waiters[1], waiters[3]]
-        );
-        assert_eq!(fixture.queued(), (2, 2));
-        assert_eq!(Fixture::disarm(&fixture.parent, other_offset), Ok(false));
-        assert_eq!(
-            Fixture::wake(&fixture.parent, fixture.key(4), 1, u32::MAX),
-            Ok(0)
-        );
-        assert_eq!(
-            Fixture::wake(&fixture.parent, other_memory_key, 1, u32::MAX),
-            Ok(1)
-        );
-    }
-
-    #[test]
-    fn partial_wake_keeps_unselected_waiters_oldest_first() {
-        let fixture = fixture();
-        let waiters: std::vec::Vec<_> = (0..6).map(|_| fixture.waiter(&fixture.child)).collect();
-        for (index, &waiter) in waiters.iter().enumerate() {
-            let bitset = if index % 2 == 0 { 0b10 } else { 0b01 };
-            Fixture::arm(&fixture.child, fixture.key(0), bitset, waiter).unwrap();
-        }
-        // A wake that selects nothing leaves the queue as it was.
+        // A wake that selects nothing leaves the queues as they were.
         assert_eq!(
             Fixture::wake(&fixture.parent, fixture.key(0), 1, 0b100),
             Ok(0)
         );
-        assert_eq!(
-            Fixture::wake(&fixture.parent, fixture.key(4), 1, u32::MAX),
-            Ok(0)
-        );
-        assert_eq!(fixture.queued(), (1, 6));
+        assert_eq!(fixture.queued(), (3, 8));
 
         // Selecting interleaved entries keeps the rest, including the matching entry past the
         // count, in their order.
@@ -559,7 +521,6 @@ mod tests {
             Ok(2)
         );
         assert_eq!(fixture.woken_handles(), [waiters[1], waiters[3]]);
-        assert_eq!(fixture.queued(), (1, 4));
         assert_eq!(
             Fixture::wake(&fixture.parent, fixture.key(0), 3, u32::MAX),
             Ok(3)
@@ -576,43 +537,31 @@ mod tests {
             Fixture::wake(&fixture.parent, fixture.key(0), 1, 0b01),
             Ok(1)
         );
+        assert_eq!(fixture.queued(), (2, 2));
+        for key in [fixture.key(4), other_memory_key] {
+            assert_eq!(Fixture::wake(&fixture.parent, key, 1, u32::MAX), Ok(1));
+        }
         assert_eq!(fixture.queued(), (0, 0));
     }
 
     #[test]
-    fn disarmed_waiter_is_not_woken_and_can_rearm() {
+    fn closed_and_exited_waiters_leave_their_queues() {
         let fixture = fixture();
-        let waiter = fixture.waiter(&fixture.child);
-        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
-        assert_eq!(
-            Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter),
-            Err(BrokerError::UnsupportedOperation)
-        );
-        assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(false));
-        assert_eq!(fixture.queued(), (0, 0));
-        assert_eq!(
-            Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
-            Ok(0)
-        );
-
-        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
-        assert_eq!(
-            Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
-            Ok(1)
-        );
-        assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(true));
-    }
-
-    #[test]
-    fn closed_waiter_leaves_its_queue() {
-        let fixture = fixture();
-        let closed = fixture.waiter(&fixture.child);
-        let remaining = fixture.waiter(&fixture.child);
-        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, closed).unwrap();
-        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, remaining).unwrap();
-        fixture.child.close_object_reference(closed).unwrap();
+        let closed = fixture.waiter(&fixture.parent);
+        let exiting = fixture.waiter(&fixture.child);
+        let remaining = fixture.waiter(&fixture.parent);
+        for (process, waiter) in [
+            (&fixture.parent, closed),
+            (&fixture.child, exiting),
+            (&fixture.parent, remaining),
+        ] {
+            Fixture::arm(process, fixture.key(0), u32::MAX, waiter).unwrap();
+        }
+        fixture.parent.close_object_reference(closed).unwrap();
+        fixture.child.cleanup(true);
         assert_eq!(fixture.queued(), (1, 1));
 
+        // A wake is not spent on waiters that are gone.
         assert_eq!(
             Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
             Ok(1)
@@ -693,25 +642,6 @@ mod tests {
             ),
             Err(BrokerError::UnsupportedOperation)
         );
-    }
-
-    #[test]
-    fn exited_process_waiters_leave_their_queues() {
-        let fixture = fixture();
-        let exiting = fixture.waiter(&fixture.child);
-        let remaining = fixture.waiter(&fixture.parent);
-        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, exiting).unwrap();
-        Fixture::arm(&fixture.parent, fixture.key(0), u32::MAX, remaining).unwrap();
-        fixture.child.cleanup(true);
-        assert_eq!(fixture.queued(), (1, 1));
-
-        // A wake is not spent on the waiter of the process that exited.
-        assert_eq!(
-            Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
-            Ok(1)
-        );
-        assert_eq!(fixture.woken_handles(), [remaining]);
-        assert_eq!(fixture.queued(), (0, 0));
     }
 
     #[test]
@@ -836,35 +766,5 @@ mod tests {
             Fixture::wake(&process, key, 1, u32::MAX),
             Err(BrokerError::PolicyDenied)
         );
-    }
-
-    #[test]
-    fn woken_waiter_reports_the_wake_until_disarmed_before_rearming() {
-        let fixture = fixture();
-        let waiter = fixture.waiter(&fixture.child);
-        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
-        assert_eq!(
-            Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
-            Ok(1)
-        );
-        let published = *fixture.sink.republished.lock().unwrap().last().unwrap();
-        assert_eq!(published, (waiter, FUTEX_WAITER_WOKEN));
-        assert_eq!(
-            fixture.child.check_readiness(waiter),
-            Ok(FUTEX_WAITER_WOKEN)
-        );
-        // A woken waiter must be disarmed, which takes the wake, before it is armed again.
-        assert_eq!(
-            Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter),
-            Err(BrokerError::UnsupportedOperation)
-        );
-        assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(true));
-        assert_eq!(
-            fixture.child.check_readiness(waiter),
-            Ok(ReadinessFlags::default())
-        );
-        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
-        assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(false));
-        assert_eq!(fixture.queued(), (0, 0));
     }
 }
