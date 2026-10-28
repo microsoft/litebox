@@ -7,6 +7,8 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use crate::syscalls::pta::PseudoTa;
 use aes::{Aes128, Aes192, Aes256};
@@ -1617,18 +1619,30 @@ struct TaVerifyKey(rsa::RsaPublicKey);
 
 impl TaVerifyKey {
     fn from_der(der: &[u8]) -> Result<Self, SignedTaError> {
-        use rsa::pkcs8::DecodePublicKey;
+        use x509_cert::{
+            Certificate,
+            der::{Decode, referenced::OwnedToRef},
+        };
 
-        rsa::RsaPublicKey::from_public_key_der(der)
-            .map(Self)
-            .map_err(|_| SignedTaError::InvalidPublicKeyDer)
+        let certificate =
+            Certificate::from_der(der).map_err(|_| SignedTaError::InvalidCertificateDer)?;
+        rsa::RsaPublicKey::try_from(
+            certificate
+                .tbs_certificate
+                .subject_public_key_info
+                .owned_to_ref(),
+        )
+        .map(Self)
+        .map_err(|_| SignedTaError::InvalidCertificatePublicKey)
     }
 }
 
 #[derive(Debug, Error)]
 enum SignedTaError {
-    #[error("invalid RSA public key DER")]
-    InvalidPublicKeyDer,
+    #[error("invalid X.509 certificate DER")]
+    InvalidCertificateDer,
+    #[error("X.509 certificate does not contain a valid RSA public key")]
+    InvalidCertificatePublicKey,
     #[error("invalid signed TA file")]
     InvalidFile,
     #[error("invalid signed TA header")]
@@ -1987,8 +2001,18 @@ mod dynamic_ta_tests {
     use rsa::{
         RsaPrivateKey,
         pkcs8::EncodePublicKey,
+        pss::SigningKey,
         rand_core::{CryptoRng, RngCore, impls},
         traits::PublicKeyParts,
+    };
+    use std::{str::FromStr, time::Duration};
+    use x509_cert::{
+        builder::{Builder, CertificateBuilder, Profile},
+        der::Encode,
+        name::Name,
+        serial_number::SerialNumber,
+        spki::SubjectPublicKeyInfoOwned,
+        time::Validity,
     };
     use zerocopy::IntoBytes;
 
@@ -2055,8 +2079,20 @@ mod dynamic_ta_tests {
         let builder = crate::syscalls::tests::shim_builder();
         let mut rng = TestRng(builder.platform);
         let private_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
-        let cert = private_key.to_public_key().to_public_key_der().unwrap();
-        let cert = Box::leak(cert.as_bytes().to_vec().into_boxed_slice());
+        let public_key_der = private_key.to_public_key().to_public_key_der().unwrap();
+        let public_key = SubjectPublicKeyInfoOwned::try_from(public_key_der.as_bytes()).unwrap();
+        let certificate = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(1u32),
+            Validity::from_now(Duration::from_hours(24)).unwrap(),
+            Name::from_str("CN=LiteBox TA Test").unwrap(),
+            public_key,
+            &SigningKey::<Sha256>::new(private_key.clone()),
+        )
+        .unwrap()
+        .build_with_rng(&mut rng)
+        .unwrap();
+        let cert = Box::leak(certificate.to_der().unwrap().into_boxed_slice());
         let uuid = litebox_common_optee::parse_ta_head(HELLO_TA).unwrap().uuid;
         let svn = 7u32;
         let header = Shdr {
