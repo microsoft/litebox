@@ -247,6 +247,12 @@ jobs:
           LITEBOX_DISABLE_NATIVE_FORK: "1"
         run: |
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_copy_based_fork -E '(binary(run) and test(/fork|hwcaps/) and not test(/^deep_fork|^forked_children_share_futexes/)) or (binary(rewritten_guests) and test(sve))'
+      - name: Test containerd shim
+        # Separate from AARCH64_CRATES: the shim enables copy-based fork, which would otherwise
+        # apply to those crates' tests too.
+        run: |
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_containerd_shim
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim
       # Nextest does not run doctests.
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc $AARCH64_CRATES
@@ -522,6 +528,9 @@ jobs:
           # - `litebox_broker_userland` is allowed to have `std` access,
           #   since it is the hosted userland broker executable.
           #
+          # - `litebox_containerd_shim` is allowed to have `std` access, since it
+          #   is the hosted containerd shim executable.
+          #
           # - `litebox_egress_proxy` is allowed to have `std` access, since it
           #   is the hosted userland CONNECT proxy executable.
           #
@@ -595,6 +604,7 @@ jobs:
             -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_windows_userland/Cargo.toml' \
             -not -path './litebox_broker_userland/Cargo.toml' \
+            -not -path './litebox_containerd_shim/Cargo.toml' \
             -not -path './litebox_egress_proxy/Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_macos_userland/Cargo.toml' \

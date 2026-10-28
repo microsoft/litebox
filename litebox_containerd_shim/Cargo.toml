@@ -1,0 +1,42 @@
+[package]
+name = "litebox_containerd_shim"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
+description = "containerd runtime v2 shim that runs each container's processes on one LiteBox broker"
+
+[[bin]]
+name = "containerd-shim-litebox-v1"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+containerd-shim = "0.11"
+libc = { version = "0.2.177", default-features = false }
+litebox = { path = "../litebox", version = "0.1.0" }
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
+litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
+litebox_broker_platform_linux_userland = { path = "../litebox_broker_platform_linux_userland", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+litebox_broker_transport_linux_userland = { path = "../litebox_broker_transport_linux_userland", version = "0.1.0" }
+litebox_broker_userland = { path = "../litebox_broker_userland", version = "0.1.0" }
+litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
+litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
+litebox_runner_linux_userland = { path = "../litebox_runner_linux_userland", version = "0.1.0" }
+log = { version = "0.4", default-features = false, features = ["std"] }
+oci-spec = { version = "0.9", default-features = false, features = ["runtime"] }
+rustix = { version = "1.1.2", default-features = false, features = ["std", "event", "fs", "mount", "pipe", "process", "thread"] }
+serde = { version = "1.0.142", default-features = false }
+serde_json = "1.0.142"
+
+# Runners disable native fork, so AArch64 guests fork only by copy, at the cost of pointer
+# authentication, which runners then disable.
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+litebox_runner_linux_userland = { path = "../litebox_runner_linux_userland", version = "0.1.0", features = ["aarch64_copy_based_fork"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
