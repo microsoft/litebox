@@ -14,7 +14,6 @@ use litebox_platform::time::TimeProvider;
 use crate::{
     broker,
     fd::Descriptors,
-    sync::futex::shared::SharedMemoryIdAllocator,
     sync::{RawSyncPrimitivesProvider, RwLock},
     thread::Thread,
 };
@@ -146,7 +145,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 descriptors,
                 broker: broker_control,
                 broker_pollables,
-                shared_memory_ids: SharedMemoryIdAllocator::new(),
             }),
         }
     }
@@ -226,5 +224,4 @@ pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     descriptors: RwLock<Platform, Descriptors<Platform>>,
     broker: Option<Arc<dyn broker::BrokerControl>>,
     broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,
-    pub(crate) shared_memory_ids: SharedMemoryIdAllocator<Platform>,
 }

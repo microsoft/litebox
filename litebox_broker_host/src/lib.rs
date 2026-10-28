@@ -1805,12 +1805,13 @@ fn handle_shared_futex_request(
 ) -> RequestResult<SharedFutexResponse> {
     use litebox_broker_core::shared_futex;
     use litebox_broker_protocol::shared_futex::{
-        CreateFutexWaiterResponse, FutexDisarmResponse, FutexWakeResponse, ReserveMemoryIdsResponse,
+        CreateFutexWaiterResponse, CreateSharedMemoryResponse, FutexDisarmResponse,
+        FutexWakeResponse,
     };
 
     let response = match request {
-        SharedFutexRequest::ReserveMemoryIds => shared_futex::reserve_memory_ids(process)
-            .map(|first| SharedFutexResponse::ReserveMemoryIds(ReserveMemoryIdsResponse { first })),
+        SharedFutexRequest::CreateMemory => shared_futex::create_shared_memory(process)
+            .map(|memory| SharedFutexResponse::CreateMemory(CreateSharedMemoryResponse { memory })),
         SharedFutexRequest::CreateWaiter => {
             shared_futex::create_futex_waiter(process, readiness_sink).map(|handle| {
                 SharedFutexResponse::CreateWaiter(CreateFutexWaiterResponse { handle })
@@ -3263,8 +3264,9 @@ mod tests {
 
     fn active_requests_operate_shared_futexes(broker: &BrokerCore) {
         use litebox_broker_protocol::shared_futex::{
-            CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
-            FutexWakeRequest, FutexWakeResponse, ReserveMemoryIdsResponse, SharedFutexKey,
+            CreateFutexWaiterResponse, CreateSharedMemoryResponse, FutexArmRequest,
+            FutexDisarmRequest, FutexDisarmResponse, FutexWakeRequest, FutexWakeResponse,
+            SharedFutexKey, SharedMemoryId,
         };
 
         let process = broker
@@ -3272,12 +3274,12 @@ mod tests {
             .unwrap();
         let request =
             |request| handle_test_request(&process, BrokerOperation::SharedFutex(request));
-        let response = request(SharedFutexRequest::ReserveMemoryIds);
-        let BrokerResult::SharedFutex(SharedFutexResponse::ReserveMemoryIds(
-            ReserveMemoryIdsResponse { first },
+        let response = request(SharedFutexRequest::CreateMemory);
+        let BrokerResult::SharedFutex(SharedFutexResponse::CreateMemory(
+            CreateSharedMemoryResponse { memory },
         )) = response
         else {
-            panic!("unexpected reserve response: {response:?}");
+            panic!("unexpected create memory response: {response:?}");
         };
         let response = request(SharedFutexRequest::CreateWaiter);
         let BrokerResult::SharedFutex(SharedFutexResponse::CreateWaiter(
@@ -3286,10 +3288,7 @@ mod tests {
         else {
             panic!("unexpected create response: {response:?}");
         };
-        let key = SharedFutexKey {
-            memory: first,
-            offset: 4,
-        };
+        let key = SharedFutexKey { memory, offset: 4 };
         let arm = |key| {
             request(SharedFutexRequest::Arm(FutexArmRequest {
                 key,
@@ -3298,6 +3297,12 @@ mod tests {
             }))
         };
 
+        // An ID the broker did not sign names no memory.
+        let forged = SharedFutexKey {
+            memory: SharedMemoryId(memory.0 ^ 1),
+            offset: 4,
+        };
+        assert_eq!(arm(forged), BrokerResult::Error(ErrorCode::PolicyDenied));
         assert_eq!(
             arm(key),
             BrokerResult::SharedFutex(SharedFutexResponse::Arm)

@@ -4480,7 +4480,7 @@ mod fork_tests {
     }
 
     #[test]
-    fn native_fork_child_names_new_shared_memory_from_its_own_block() {
+    fn native_fork_child_uses_inherited_shared_memory_and_names_new_memory_apart() {
         use crate::syscalls::tests::{TestPlatform, test_platform};
         use litebox::platform::ThreadProvider;
         use litebox_common_linux::{MapFlags, ProtFlags};
@@ -4522,18 +4522,27 @@ mod fork_tests {
             }
             .build();
             let task = child.0.clone().new_test_task();
-            // The inherited mapping keeps naming the memory the parent shares, while memory the
-            // child creates comes from another block, so it cannot collide with the parent's.
+            // The inherited mapping keeps naming the memory the parent shares, and the broker
+            // accepts its signed ID from the child, while memory the child creates gets an ID of
+            // its own.
             assert_eq!(
                 memory.shared_futex_key(inherited).unwrap().unwrap().memory,
                 parent_memory
+            );
+            assert_eq!(
+                task.sys_futex(litebox_common_linux::FutexArgs::Wake {
+                    addr: crate::UserPtrMut::from_usize(inherited),
+                    flags: litebox_common_linux::FutexFlags::empty(),
+                    count: 1,
+                }),
+                Ok(0)
             );
             let created = memory
                 .shared_futex_key(map_shared(&task))
                 .unwrap()
                 .unwrap()
                 .memory;
-            assert_ne!(created.block(), parent_memory.block());
+            assert_ne!(created, parent_memory);
         });
     }
 

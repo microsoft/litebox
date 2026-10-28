@@ -4,10 +4,14 @@
 //! Futexes in memory that several processes share.
 //!
 //! Memory that several processes map, such as a Linux `MAP_SHARED | MAP_ANONYMOUS` mapping that
-//! native fork children inherit, is named by a [`SharedMemoryId`] that its creator picks from a
-//! block the broker reserved for it. The broker keeps no record of the memory: it keys futex wait
-//! queues by [`SharedFutexKey`], so a wake in one process reaches waiters in every process that
-//! names the same futex word. The broker does not restrict which IDs a process names.
+//! native fork children inherit, is named by a [`SharedMemoryId`] that the broker creates for its
+//! creator. The broker keeps no record of the memory: it keys futex wait queues by
+//! [`SharedFutexKey`], so a wake in one process reaches waiters in every process that names the
+//! same futex word.
+//!
+//! The broker signs each ID it creates and rejects keys whose IDs it did not sign. So a process
+//! can only name memory whose ID it was given: memory it created, or that it inherited by copying
+//! its creator's memory, as native fork does.
 //!
 //! Each waiting thread owns a futex waiter object. A wait arms it on a futex; a wake marks the
 //! armed waiters it selects woken and publishes [`FUTEX_WAITER_WOKEN`] readiness for them.
@@ -25,50 +29,46 @@ pub const FUTEX_WORD_SIZE: u64 = 4;
 
 /// Names memory shared by several processes.
 ///
-/// The creator of the memory picks an ID that no other shared memory uses from a block that the
-/// broker reserved for it, as [`ReserveMemoryIdsResponse`] describes.
+/// Only the broker creates IDs, as [`CreateSharedMemoryResponse`] describes, and no two of its IDs
+/// are equal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SharedMemoryId(
     /// The ID's value laid out from the most significant bits to the least significant bits:
-    /// | --------------- | --------------------------- |
-    /// | block (64 bits) | position in block (64 bits) |
-    /// | --------------- | --------------------------- |
-    /// Block: a value the broker returns from only one reservation.
+    /// | ---------------- | ------------- |
+    /// | serial (64 bits) | tag (64 bits) |
+    /// | ---------------- | ------------- |
+    /// Serial: a value the broker uses for only one ID. Tag: the broker's signature of the serial.
     pub u128,
 );
 
 impl SharedMemoryId {
-    /// Mask of the ID's position in its block.
-    const POSITION: u128 = u64::MAX as u128;
+    /// Mask of the ID's tag.
+    const TAG: u128 = u64::MAX as u128;
 
-    /// Returns the first ID of `block`.
+    /// Returns the ID made of `serial` and its `tag`.
     #[must_use]
-    pub const fn first_in_block(block: u64) -> Self {
-        Self((block as u128) << 64)
+    pub const fn new(serial: u64, tag: u64) -> Self {
+        Self((serial as u128) << 64 | tag as u128)
     }
 
-    /// Returns the block the ID belongs to.
+    /// Returns the serial of the ID.
     #[must_use]
-    pub const fn block(self) -> u64 {
+    pub const fn serial(self) -> u64 {
         (self.0 >> 64) as u64
     }
 
-    /// Returns the ID after this one in its block, or `None` if this is the block's last.
+    /// Returns the tag of the ID.
     #[must_use]
-    pub const fn next_in_block(self) -> Option<Self> {
-        if self.0 & Self::POSITION == Self::POSITION {
-            None
-        } else {
-            Some(Self(self.0 + 1))
-        }
+    pub const fn tag(self) -> u64 {
+        (self.0 & Self::TAG) as u64
     }
 }
 
-/// Response to a request to reserve shared memory IDs.
+/// Response to a request to create shared memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReserveMemoryIdsResponse {
-    /// First ID of the reserved block, whose IDs no other reservation returns.
-    pub first: SharedMemoryId,
+pub struct CreateSharedMemoryResponse {
+    /// ID of the new memory, signed by the broker.
+    pub memory: SharedMemoryId,
 }
 
 /// A futex word in shared memory.
@@ -137,14 +137,10 @@ mod tests {
     use super::SharedMemoryId;
 
     #[test]
-    fn ids_stay_in_their_block() {
-        let first = SharedMemoryId::first_in_block(u64::MAX);
-        assert_eq!(first.block(), u64::MAX);
-        let second = first.next_in_block().unwrap();
-        assert_eq!(second.block(), u64::MAX);
-        assert_ne!(second, first);
-        let last = SharedMemoryId(first.0 | u128::from(u64::MAX));
-        assert_eq!(last.block(), u64::MAX);
-        assert_eq!(last.next_in_block(), None);
+    fn ids_keep_their_serial_and_tag_apart() {
+        for (serial, tag) in [(0, 0), (1, u64::MAX), (u64::MAX, 1), (u64::MAX, u64::MAX)] {
+            let id = SharedMemoryId::new(serial, tag);
+            assert_eq!((id.serial(), id.tag()), (serial, tag));
+        }
     }
 }

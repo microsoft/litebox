@@ -5,9 +5,9 @@
 //!
 //! Processes that share memory, such as a Linux `MAP_SHARED | MAP_ANONYMOUS` mapping that native
 //! fork children inherit, name it by a [`SharedMemoryId`] that its creator gets from
-//! [`LiteBox::allocate_shared_memory_id`], and a futex word in it by a [`SharedFutexKey`]. The
-//! broker keys futex wait queues by that key, so [`LiteBox::wake_shared_futex`] in any process
-//! reaches the threads waiting with [`SharedFutexWaiter::wait`] in every process.
+//! [`LiteBox::create_shared_memory`], and a futex word in it by a [`SharedFutexKey`]. The broker
+//! keys futex wait queues by that key, so [`LiteBox::wake_shared_futex`] in any process reaches
+//! the threads waiting with [`SharedFutexWaiter::wait`] in every process.
 //!
 //! Each waiting thread owns a [`SharedFutexWaiter`]. A wait arms it in the broker, re-checks the
 //! futex word, and sleeps until the broker publishes a wake for it or the wait times out or is
@@ -33,7 +33,7 @@ use crate::event::{
     polling::{Pollee, PolleeObserver},
 };
 use crate::platform::{RawConstPointer as _, RawPointerProvider};
-use crate::sync::{Mutex, RawSyncPrimitivesProvider};
+use crate::sync::RawSyncPrimitivesProvider;
 
 /// Errors from the broker behind futexes in shared memory.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -54,54 +54,23 @@ pub enum SharedFutexError {
     Unavailable,
 }
 
-/// Allocates the [`SharedMemoryId`]s of memory this process creates.
-///
-/// The IDs come from a block that the broker reserves on first use, and again once a block runs
-/// out. Each [`LiteBox`] has its own allocator, so a process that duplicates its memory, as native
-/// fork does, gives the duplicate a new one with its new [`LiteBox`], and the two never hand out
-/// the same ID.
-pub(crate) struct SharedMemoryIdAllocator<Platform: RawSyncPrimitivesProvider> {
-    /// The next ID to allocate, or `None` if the next allocation must reserve a block.
-    next: Mutex<Platform, Option<SharedMemoryId>>,
-}
-
-impl<Platform: RawSyncPrimitivesProvider> SharedMemoryIdAllocator<Platform> {
-    /// Creates an allocator that reserves its block on first use.
-    pub(crate) const fn new() -> Self {
-        Self {
-            next: Mutex::new(None),
-        }
-    }
-
-    /// Returns an ID that no other shared memory uses, reserving a block with `broker` if
-    /// needed.
-    fn allocate(&self, broker: &dyn BrokerControl) -> Result<SharedMemoryId, SharedFutexError> {
-        let mut next = self.next.lock();
-        let id = match *next {
-            Some(id) => id,
-            None => broker
-                .reserve_shared_memory_ids()
-                .map_err(BrokerObjectError::from)?,
-        };
-        *next = id.next_in_block();
-        Ok(id)
-    }
-}
-
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// Returns a name for memory this process creates, which no other shared memory uses.
+    /// Returns a new name for memory this process creates, which the broker signs, so that only
+    /// processes given the name, such as native fork children, can reach its futexes.
     ///
     /// Fails with [`SharedFutexError::Unavailable`] without a broker, as then no other process
     /// can share the memory either, and with [`SharedFutexError::ResourceExhausted`],
     /// [`SharedFutexError::PermissionDenied`], or [`SharedFutexError::Io`] if the broker cannot
-    /// reserve a block of names.
+    /// create one.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error.
-    pub fn allocate_shared_memory_id(&self) -> Result<SharedMemoryId, SharedFutexError> {
+    pub fn create_shared_memory(&self) -> Result<SharedMemoryId, SharedFutexError> {
         let broker = self.broker_control().ok_or(SharedFutexError::Unavailable)?;
-        self.x.shared_memory_ids.allocate(&*broker)
+        Ok(broker
+            .create_shared_memory()
+            .map_err(BrokerObjectError::from)?)
     }
 }
 

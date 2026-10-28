@@ -3,15 +3,16 @@
 
 //! Futex wait queues for memory that several processes share.
 //!
-//! The broker never sees the memory. Processes name it by a
-//! [`SharedMemoryId`] from a block that [`reserve_memory_ids`] reserves, and each waiter checks
-//! its futex word itself after arming, as the [protocol](litebox_broker_protocol::shared_futex)
-//! describes. Waiters are queued by [`SharedFutexKey`] in buckets chosen by hashing the key.
+//! The broker never sees the memory. Processes name it by a [`SharedMemoryId`] that
+//! [`create_shared_memory`] creates, and each waiter checks its futex word itself after arming,
+//! as the [protocol](litebox_broker_protocol::shared_futex) describes. Waiters are queued by
+//! [`SharedFutexKey`] in buckets chosen by hashing the key.
 //!
-//! The broker does not check which memory a process names, so a process that sends keys of its
-//! own choosing can steal or inject wakes on the futexes of any shared memory, including memory
-//! it does not map. That only affects the guests' synchronization: the broker's own state stays
-//! bounded and consistent whatever keys arrive.
+//! The broker signs each ID it creates with a key only it knows, and rejects keys naming IDs it
+//! did not sign. So a process can only name memory whose ID it was given: memory it created, or
+//! that it inherited by copying its creator's memory, as native fork does. Like a capability
+//! handle, which a process could keep after unmapping the memory too, an ID grants access for as
+//! long as the process holds it, but it takes no broker state.
 //!
 //! A waiter is armed on at most one futex at a time, so the buckets hold at most one entry per
 //! waiter. A wake marks waiters woken and publishes readiness for them, and disarming reports
@@ -22,13 +23,15 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use hmac::{Hmac, Mac};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_futex::{
     FUTEX_WAITER_WOKEN, FUTEX_WORD_SIZE, FutexArmRequest, FutexDisarmRequest, FutexWakeRequest,
     SharedFutexKey, SharedMemoryId,
 };
-use spin::Mutex;
+use sha2::Sha256;
+use spin::{Mutex, Once};
 
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
@@ -38,6 +41,13 @@ use crate::{BrokerError, BrokerProcess, Result};
 const BUCKET_BITS: u32 = 8;
 const BUCKETS: usize = 1 << BUCKET_BITS;
 
+/// Length in bytes of the key that signs shared memory IDs.
+const SIGNING_KEY_LEN: usize = 32;
+
+/// Separates the signatures of shared memory IDs from any other signatures made with the same
+/// key.
+const SIGNING_DOMAIN: &[u8] = b"litebox shared memory id\0";
+
 /// The waiters armed on the futex words whose keys hash to one bucket, oldest first.
 type Bucket = Mutex<VecDeque<QueuedWaiter>>;
 
@@ -45,51 +55,86 @@ type Bucket = Mutex<VecDeque<QueuedWaiter>>;
 pub(crate) struct SharedFutexes {
     /// Lock order: a bucket, then a waiter's state.
     buckets: [Bucket; BUCKETS],
-    /// The next block of shared memory IDs to reserve.
-    next_block: AtomicU64,
+    /// The serial of the next shared memory ID to create.
+    next_serial: AtomicU64,
+    /// Signs shared memory IDs, keyed with random bytes when the first ID is created.
+    signer: Once<Hmac<Sha256>>,
 }
 
 impl Default for SharedFutexes {
     fn default() -> Self {
         Self {
             buckets: core::array::from_fn(|_| Mutex::new(VecDeque::new())),
-            next_block: AtomicU64::new(0),
+            next_serial: AtomicU64::new(0),
+            signer: Once::new(),
         }
     }
 }
 
 impl SharedFutexes {
     fn bucket(&self, key: SharedFutexKey) -> &Bucket {
-        // Fibonacci hashing of the memory ID, folding its block into its position in the block,
-        // and the word's index in the memory.
+        // Fibonacci hashing of the memory ID, folding its serial into its tag, and the word's
+        // index in the memory.
         const MULTIPLIER: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835;
         let mixed = key.memory.0 ^ (key.memory.0 >> 64) ^ u128::from(key.offset / FUTEX_WORD_SIZE);
         let hash = mixed.wrapping_mul(MULTIPLIER) >> (u128::BITS - BUCKET_BITS);
         &self.buckets[usize::try_from(hash).unwrap_or_default() % BUCKETS]
     }
+
+    /// Returns the signer, keying it from `process`'s broker random provider the first time.
+    fn signer(&self, process: &BrokerProcess) -> Result<&Hmac<Sha256>> {
+        if let Some(signer) = self.signer.get() {
+            return Ok(signer);
+        }
+        let mut key = [0; SIGNING_KEY_LEN];
+        process
+            .core
+            .random_provider
+            .fill(&mut key)
+            .map_err(|_| BrokerError::Internal)?;
+        let signer = Hmac::<Sha256>::new_from_slice(&key).map_err(|_| BrokerError::Internal)?;
+        // Concurrent first uses may each draw a key; the first one kept signs every ID.
+        Ok(self.signer.call_once(|| signer))
+    }
+
+    /// Returns `signer`'s signature over `serial`.
+    fn sign(signer: &Hmac<Sha256>, serial: u64) -> Hmac<Sha256> {
+        let mut mac = signer.clone();
+        mac.update(SIGNING_DOMAIN);
+        mac.update(&serial.to_le_bytes());
+        mac
+    }
+
+    /// Fails with `PolicyDenied` unless the broker signed `memory`.
+    fn authorize(&self, memory: SharedMemoryId) -> Result<()> {
+        // Without a signer, no ID was ever created.
+        let signer = self.signer.get().ok_or(BrokerError::PolicyDenied)?;
+        Self::sign(signer, memory.serial())
+            .verify_truncated_left(&memory.tag().to_le_bytes())
+            .map_err(|_| BrokerError::PolicyDenied)
+    }
 }
 
-/// Reserves a block of shared memory IDs that no other reservation returns, and returns its
-/// first ID.
+/// Creates an ID for new shared memory, which no other ID equals, and signs it so that futex
+/// operations accept it.
 ///
-/// Fails with `PolicyDenied` if the caller may not wait on objects, and with `ResourceExhausted`
-/// once every block is reserved.
-pub fn reserve_memory_ids(process: &BrokerProcess) -> Result<SharedMemoryId> {
+/// Fails with `PolicyDenied` if the caller may not wait on objects, with `ResourceExhausted`
+/// once 2^64 IDs were created, and with `Internal` if the broker has no randomness to key its
+/// signatures with.
+pub fn create_shared_memory(process: &BrokerProcess) -> Result<SharedMemoryId> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    // TODO: Restrict each process to the memory it may share, so that `futex_arm` and `futex_wake`
-    // reject the keys of other memory. For example, authorize a process for the blocks it reserved
-    // and those its ancestors had reserved when creating the next process on the way to it, naming
-    // blocks by their reserver and a per-reserver index, with each process moving to a new block
-    // after creating another.
-    let block = process
-        .core
-        .shared_futexes
-        .next_block
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |block| {
-            block.checked_add(1)
+    let futexes = &process.core.shared_futexes;
+    let signer = futexes.signer(process)?;
+    let serial = futexes
+        .next_serial
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |serial| {
+            serial.checked_add(1)
         })
         .map_err(|_| BrokerError::ResourceExhausted)?;
-    Ok(SharedMemoryId::first_in_block(block))
+    let signature = SharedFutexes::sign(signer, serial).finalize().into_bytes();
+    let mut tag = [0; size_of::<u64>()];
+    tag.copy_from_slice(&signature[..size_of::<u64>()]);
+    Ok(SharedMemoryId::new(serial, u64::from_le_bytes(tag)))
 }
 
 /// Creates an idle futex waiter whose reference publishes its readiness through
@@ -115,9 +160,10 @@ pub fn create_futex_waiter(
 /// Arms an idle futex waiter on the futex word `request.key`.
 ///
 /// Fails with `UnsupportedOperation` if the offset is unaligned, the mask is zero, or the waiter
-/// is not idle.
+/// is not idle, and with `PolicyDenied` if the broker did not sign the key's memory ID.
 pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()> {
     validate_key_and_bitset(request.key, request.bitset)?;
+    process.core.shared_futexes.authorize(request.key.memory)?;
     // Holding the waiter's object defers a concurrent close, whose disarm then dequeues the
     // arming, until after this request's locks are released.
     let waiter_object = process.authorized_object(request.waiter, ObjectRights::WAIT)?;
@@ -146,10 +192,12 @@ pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()
 /// whose masks intersect `request.bitset`, returning how many it woke.
 ///
 /// Fails with `UnsupportedOperation` if the offset is unaligned or the mask is zero, and with
-/// `PolicyDenied` if the caller may not wait on objects.
+/// `PolicyDenied` if the caller may not wait on objects or the broker did not sign the key's
+/// memory ID.
 pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<u32> {
     validate_key_and_bitset(request.key, request.bitset)?;
     process.require_object_rights(ObjectRights::WAIT)?;
+    process.core.shared_futexes.authorize(request.key.memory)?;
     let selects =
         |queued: &QueuedWaiter| queued.key == request.key && queued.bitset & request.bitset != 0;
     let mut woken = Vec::new();
@@ -306,32 +354,25 @@ mod tests {
         SharedMemoryId,
     };
 
+    use crate::random::TestRandomProvider;
     use crate::readiness::ReadinessSink;
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::TestBrokerCoreBuilder;
     use crate::{BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights};
     use crate::{PolicyEngine, Result};
 
-    /// The first block the broker reserves, which the fixture's parent reserves before creating
-    /// its child.
-    const MEMORY: SharedMemoryId = SharedMemoryId::first_in_block(0);
-
-    fn key(offset: u64) -> SharedFutexKey {
-        SharedFutexKey {
-            memory: MEMORY,
-            offset,
-        }
-    }
-
     struct Fixture {
         core: BrokerCore,
         parent: Arc<BrokerProcess>,
         child: Arc<BrokerProcess>,
         sink: Arc<TestReadinessSink>,
+        /// Memory the parent created before creating its child.
+        memory: SharedMemoryId,
     }
 
     fn core(rights: ObjectRights) -> BrokerCore {
         TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
+            .with_random_provider(Arc::new(TestRandomProvider))
             .build()
             .unwrap()
     }
@@ -341,7 +382,7 @@ mod tests {
         let parent = core
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        assert_eq!(super::reserve_memory_ids(&parent), Ok(MEMORY));
+        let memory = super::create_shared_memory(&parent).unwrap();
         let child = core
             .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
             .unwrap();
@@ -350,10 +391,18 @@ mod tests {
             parent,
             child,
             sink: Arc::new(TestReadinessSink::default()),
+            memory,
         }
     }
 
     impl Fixture {
+        fn key(&self, offset: u64) -> SharedFutexKey {
+            SharedFutexKey {
+                memory: self.memory,
+                offset,
+            }
+        }
+
         fn waiter(&self, process: &BrokerProcess) -> ObjectHandle {
             super::create_futex_waiter(process, &(self.sink.clone() as Arc<dyn ReadinessSink>))
                 .unwrap()
@@ -417,13 +466,16 @@ mod tests {
     fn wake_reaches_waiter_in_another_process() {
         let fixture = fixture();
         let waiter = fixture.waiter(&fixture.child);
-        Fixture::arm(&fixture.child, key(8), u32::MAX, waiter).unwrap();
+        Fixture::arm(&fixture.child, fixture.key(8), u32::MAX, waiter).unwrap();
         assert_eq!(
             fixture.child.check_readiness(waiter),
             Ok(ReadinessFlags::default())
         );
 
-        assert_eq!(Fixture::wake(&fixture.parent, key(8), 1, u32::MAX), Ok(1));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(8), 1, u32::MAX),
+            Ok(1)
+        );
         assert_eq!(fixture.woken_handles(), [waiter]);
         assert_eq!(
             fixture.child.check_readiness(waiter),
@@ -444,22 +496,25 @@ mod tests {
         let waiters: std::vec::Vec<_> = (0..4).map(|_| fixture.waiter(&fixture.child)).collect();
         for (index, &waiter) in waiters.iter().enumerate() {
             let bitset = if index == 1 { 0b10 } else { 0b01 };
-            Fixture::arm(&fixture.child, key(0), bitset, waiter).unwrap();
+            Fixture::arm(&fixture.child, fixture.key(0), bitset, waiter).unwrap();
         }
         // Another futex word, in the same memory or in other memory, is not woken.
         let other_offset = fixture.waiter(&fixture.parent);
-        Fixture::arm(&fixture.parent, key(4), u32::MAX, other_offset).unwrap();
+        Fixture::arm(&fixture.parent, fixture.key(4), u32::MAX, other_offset).unwrap();
         let other_memory = fixture.waiter(&fixture.parent);
         let other_memory_key = SharedFutexKey {
-            memory: MEMORY.next_in_block().unwrap(),
+            memory: super::create_shared_memory(&fixture.parent).unwrap(),
             offset: 0,
         };
         Fixture::arm(&fixture.parent, other_memory_key, u32::MAX, other_memory).unwrap();
 
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 2, 0b01), Ok(2));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 2, 0b01),
+            Ok(2)
+        );
         assert_eq!(fixture.woken_handles(), [waiters[0], waiters[2]]);
         assert_eq!(
-            Fixture::wake(&fixture.parent, key(0), u32::MAX, u32::MAX),
+            Fixture::wake(&fixture.parent, fixture.key(0), u32::MAX, u32::MAX),
             Ok(2)
         );
         assert_eq!(
@@ -468,7 +523,10 @@ mod tests {
         );
         assert_eq!(fixture.queued(), (2, 2));
         assert_eq!(Fixture::disarm(&fixture.parent, other_offset), Ok(false));
-        assert_eq!(Fixture::wake(&fixture.parent, key(4), 1, u32::MAX), Ok(0));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(4), 1, u32::MAX),
+            Ok(0)
+        );
         assert_eq!(
             Fixture::wake(&fixture.parent, other_memory_key, 1, u32::MAX),
             Ok(1)
@@ -481,25 +539,43 @@ mod tests {
         let waiters: std::vec::Vec<_> = (0..6).map(|_| fixture.waiter(&fixture.child)).collect();
         for (index, &waiter) in waiters.iter().enumerate() {
             let bitset = if index % 2 == 0 { 0b10 } else { 0b01 };
-            Fixture::arm(&fixture.child, key(0), bitset, waiter).unwrap();
+            Fixture::arm(&fixture.child, fixture.key(0), bitset, waiter).unwrap();
         }
         // A wake that selects nothing leaves the queue as it was.
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, 0b100), Ok(0));
-        assert_eq!(Fixture::wake(&fixture.parent, key(4), 1, u32::MAX), Ok(0));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 1, 0b100),
+            Ok(0)
+        );
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(4), 1, u32::MAX),
+            Ok(0)
+        );
         assert_eq!(fixture.queued(), (1, 6));
 
         // Selecting interleaved entries keeps the rest, including the matching entry past the
         // count, in their order.
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 2, 0b01), Ok(2));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 2, 0b01),
+            Ok(2)
+        );
         assert_eq!(fixture.woken_handles(), [waiters[1], waiters[3]]);
         assert_eq!(fixture.queued(), (1, 4));
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 3, u32::MAX), Ok(3));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 3, u32::MAX),
+            Ok(3)
+        );
         assert_eq!(
             fixture.woken_handles(),
             [waiters[1], waiters[3], waiters[0], waiters[2], waiters[4]]
         );
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, 0b10), Ok(0));
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, 0b01), Ok(1));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 1, 0b10),
+            Ok(0)
+        );
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 1, 0b01),
+            Ok(1)
+        );
         assert_eq!(fixture.queued(), (0, 0));
     }
 
@@ -507,17 +583,23 @@ mod tests {
     fn disarmed_waiter_is_not_woken_and_can_rearm() {
         let fixture = fixture();
         let waiter = fixture.waiter(&fixture.child);
-        Fixture::arm(&fixture.child, key(0), u32::MAX, waiter).unwrap();
+        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
         assert_eq!(
-            Fixture::arm(&fixture.child, key(0), u32::MAX, waiter),
+            Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter),
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(false));
         assert_eq!(fixture.queued(), (0, 0));
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, u32::MAX), Ok(0));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
+            Ok(0)
+        );
 
-        Fixture::arm(&fixture.child, key(0), u32::MAX, waiter).unwrap();
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, u32::MAX), Ok(1));
+        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
+            Ok(1)
+        );
         assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(true));
     }
 
@@ -526,12 +608,15 @@ mod tests {
         let fixture = fixture();
         let closed = fixture.waiter(&fixture.child);
         let remaining = fixture.waiter(&fixture.child);
-        Fixture::arm(&fixture.child, key(0), u32::MAX, closed).unwrap();
-        Fixture::arm(&fixture.child, key(0), u32::MAX, remaining).unwrap();
+        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, closed).unwrap();
+        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, remaining).unwrap();
         fixture.child.close_object_reference(closed).unwrap();
         assert_eq!(fixture.queued(), (1, 1));
 
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, u32::MAX), Ok(1));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
+            Ok(1)
+        );
         assert_eq!(fixture.woken_handles(), [remaining]);
         assert_eq!(fixture.queued(), (0, 0));
     }
@@ -544,7 +629,7 @@ mod tests {
             let fixture = Arc::clone(&fixture);
             std::thread::spawn(move || {
                 for _ in 0..2000 {
-                    let _ = Fixture::arm(&fixture.child, key(0), 1, waiter);
+                    let _ = Fixture::arm(&fixture.child, fixture.key(0), 1, waiter);
                 }
             })
         };
@@ -566,7 +651,7 @@ mod tests {
             let armer = {
                 let fixture = Arc::clone(&fixture);
                 std::thread::spawn(move || {
-                    let _ = Fixture::arm(&fixture.child, key(0), 1, waiter);
+                    let _ = Fixture::arm(&fixture.child, fixture.key(0), 1, waiter);
                 })
             };
             fixture.child.close_object_reference(waiter).unwrap();
@@ -581,18 +666,18 @@ mod tests {
         let waiter = fixture.waiter(&fixture.child);
         for (offset, bitset) in [(2, u32::MAX), (u64::MAX, 1), (0, 0)] {
             assert_eq!(
-                Fixture::arm(&fixture.child, key(offset), bitset, waiter),
+                Fixture::arm(&fixture.child, fixture.key(offset), bitset, waiter),
                 Err(BrokerError::UnsupportedOperation)
             );
             assert_eq!(
-                Fixture::wake(&fixture.child, key(offset), 1, bitset),
+                Fixture::wake(&fixture.child, fixture.key(offset), 1, bitset),
                 Err(BrokerError::UnsupportedOperation)
             );
         }
         assert_eq!(fixture.queued(), (0, 0));
         // Handles are per process, so another process cannot name the waiter.
         assert_eq!(
-            Fixture::arm(&fixture.parent, key(0), 1, waiter),
+            Fixture::arm(&fixture.parent, fixture.key(0), 1, waiter),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
@@ -615,32 +700,88 @@ mod tests {
         let fixture = fixture();
         let exiting = fixture.waiter(&fixture.child);
         let remaining = fixture.waiter(&fixture.parent);
-        Fixture::arm(&fixture.child, key(0), u32::MAX, exiting).unwrap();
-        Fixture::arm(&fixture.parent, key(0), u32::MAX, remaining).unwrap();
+        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, exiting).unwrap();
+        Fixture::arm(&fixture.parent, fixture.key(0), u32::MAX, remaining).unwrap();
         fixture.child.cleanup(true);
         assert_eq!(fixture.queued(), (1, 1));
 
         // A wake is not spent on the waiter of the process that exited.
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, u32::MAX), Ok(1));
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
+            Ok(1)
+        );
         assert_eq!(fixture.woken_handles(), [remaining]);
         assert_eq!(fixture.queued(), (0, 0));
     }
 
     #[test]
-    fn reservations_are_unique_and_any_process_may_name_any_memory() {
+    fn processes_name_only_memory_whose_signed_id_they_were_given() {
         let fixture = fixture();
         let unrelated = fixture
             .core
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let blocks = [&fixture.parent, &fixture.child, &unrelated, &fixture.parent]
-            .map(|process| super::reserve_memory_ids(process).unwrap().block());
-        assert_eq!(blocks, [1, 2, 3, 4]);
-        // Without authorization, an unrelated process reaches a waiter in the child.
+        // IDs are unique, whoever creates them.
+        let created = [&fixture.parent, &fixture.child, &unrelated]
+            .map(|process| super::create_shared_memory(process).unwrap());
+        assert!(
+            created.iter().all(|&id| id != fixture.memory)
+                && created[0] != created[1]
+                && created[1] != created[2]
+                && created[0] != created[2]
+        );
         let waiter = fixture.waiter(&fixture.child);
-        Fixture::arm(&fixture.child, key(0), u32::MAX, waiter).unwrap();
-        assert_eq!(Fixture::wake(&unrelated, key(0), 1, u32::MAX), Ok(1));
+        // Changing any bit of a signed ID, in its serial or its tag, yields an unsigned one, as
+        // does an ID with a serial the broker has yet to use.
+        let memory = fixture.memory.0;
+        let unissued = SharedMemoryId::new(u64::MAX, fixture.memory.tag());
+        for forged in [memory ^ 1, memory ^ 1 << 63, memory ^ 1 << 64, unissued.0] {
+            let key = SharedFutexKey {
+                memory: SharedMemoryId(forged),
+                offset: 0,
+            };
+            assert_eq!(
+                Fixture::arm(&fixture.child, key, u32::MAX, waiter),
+                Err(BrokerError::PolicyDenied)
+            );
+            assert_eq!(
+                Fixture::wake(&unrelated, key, 1, u32::MAX),
+                Err(BrokerError::PolicyDenied)
+            );
+        }
+        assert_eq!(fixture.queued(), (0, 0));
+        // A signed ID is honored from any process holding it.
+        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
+        assert_eq!(
+            Fixture::wake(&unrelated, fixture.key(0), 1, u32::MAX),
+            Ok(1)
+        );
         assert_eq!(fixture.woken_handles(), [waiter]);
+    }
+
+    #[test]
+    fn creating_memory_needs_randomness() {
+        let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::WAIT,
+        ))
+        .build()
+        .unwrap();
+        let process = core
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        assert_eq!(
+            super::create_shared_memory(&process),
+            Err(BrokerError::Internal)
+        );
+        // A broker that never created an ID accepts none.
+        let key = SharedFutexKey {
+            memory: SharedMemoryId(0),
+            offset: 0,
+        };
+        assert_eq!(
+            Fixture::wake(&process, key, 1, u32::MAX),
+            Err(BrokerError::PolicyDenied)
+        );
     }
 
     #[test]
@@ -654,14 +795,14 @@ mod tests {
             std::thread::spawn(move || {
                 let mut woken = 0;
                 while !done.load(core::sync::atomic::Ordering::Acquire) {
-                    woken += Fixture::wake(&fixture.parent, key(0), 1, u32::MAX).unwrap();
+                    woken += Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX).unwrap();
                 }
                 woken
             })
         };
         let mut reported = 0;
         for _ in 0..5000 {
-            Fixture::arm(&fixture.child, key(0), u32::MAX, waiter).unwrap();
+            Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
             if Fixture::disarm(&fixture.child, waiter).unwrap() {
                 reported += 1;
             }
@@ -680,15 +821,19 @@ mod tests {
             .unwrap();
         let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
         assert_eq!(
-            super::reserve_memory_ids(&process),
+            super::create_shared_memory(&process),
             Err(BrokerError::PolicyDenied)
         );
         assert_eq!(
             super::create_futex_waiter(&process, &sink),
             Err(BrokerError::PolicyDenied)
         );
+        let key = SharedFutexKey {
+            memory: SharedMemoryId(0),
+            offset: 0,
+        };
         assert_eq!(
-            Fixture::wake(&process, key(0), 1, u32::MAX),
+            Fixture::wake(&process, key, 1, u32::MAX),
             Err(BrokerError::PolicyDenied)
         );
     }
@@ -697,8 +842,11 @@ mod tests {
     fn woken_waiter_reports_the_wake_until_disarmed_before_rearming() {
         let fixture = fixture();
         let waiter = fixture.waiter(&fixture.child);
-        Fixture::arm(&fixture.child, key(0), u32::MAX, waiter).unwrap();
-        assert_eq!(Fixture::wake(&fixture.parent, key(0), 1, u32::MAX), Ok(1));
+        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
+        assert_eq!(
+            Fixture::wake(&fixture.parent, fixture.key(0), 1, u32::MAX),
+            Ok(1)
+        );
         let published = *fixture.sink.republished.lock().unwrap().last().unwrap();
         assert_eq!(published, (waiter, FUTEX_WAITER_WOKEN));
         assert_eq!(
@@ -707,7 +855,7 @@ mod tests {
         );
         // A woken waiter must be disarmed, which takes the wake, before it is armed again.
         assert_eq!(
-            Fixture::arm(&fixture.child, key(0), u32::MAX, waiter),
+            Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter),
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(true));
@@ -715,7 +863,7 @@ mod tests {
             fixture.child.check_readiness(waiter),
             Ok(ReadinessFlags::default())
         );
-        Fixture::arm(&fixture.child, key(0), u32::MAX, waiter).unwrap();
+        Fixture::arm(&fixture.child, fixture.key(0), u32::MAX, waiter).unwrap();
         assert_eq!(Fixture::disarm(&fixture.child, waiter), Ok(false));
         assert_eq!(fixture.queued(), (0, 0));
     }

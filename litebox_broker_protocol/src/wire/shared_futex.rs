@@ -3,20 +3,20 @@
 
 use crate::message::{SharedFutexRequest, SharedFutexResponse};
 use crate::shared_futex::{
-    CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
-    FutexWakeRequest, FutexWakeResponse, ReserveMemoryIdsResponse, SharedFutexKey, SharedMemoryId,
+    CreateFutexWaiterResponse, CreateSharedMemoryResponse, FutexArmRequest, FutexDisarmRequest,
+    FutexDisarmResponse, FutexWakeRequest, FutexWakeResponse, SharedFutexKey, SharedMemoryId,
 };
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
 
-const SHARED_FUTEX_REQUEST_TAG_RESERVE_MEMORY_IDS: u8 = 0;
+const SHARED_FUTEX_REQUEST_TAG_CREATE_MEMORY: u8 = 0;
 const SHARED_FUTEX_REQUEST_TAG_CREATE_WAITER: u8 = 1;
 const SHARED_FUTEX_REQUEST_TAG_ARM: u8 = 2;
 const SHARED_FUTEX_REQUEST_TAG_WAKE: u8 = 3;
 const SHARED_FUTEX_REQUEST_TAG_DISARM: u8 = 4;
 
-const SHARED_FUTEX_RESPONSE_TAG_RESERVE_MEMORY_IDS: u8 = 0;
+const SHARED_FUTEX_RESPONSE_TAG_CREATE_MEMORY: u8 = 0;
 const SHARED_FUTEX_RESPONSE_TAG_CREATE_WAITER: u8 = 1;
 const SHARED_FUTEX_RESPONSE_TAG_ARM: u8 = 2;
 const SHARED_FUTEX_RESPONSE_TAG_WAKE: u8 = 3;
@@ -36,8 +36,8 @@ fn decode_key(decoder: &mut Decoder<'_>) -> Result<SharedFutexKey, WireError> {
 
 pub(super) fn encode_shared_futex_request(encoder: &mut Encoder, request: SharedFutexRequest) {
     match request {
-        SharedFutexRequest::ReserveMemoryIds => {
-            encoder.u8(SHARED_FUTEX_REQUEST_TAG_RESERVE_MEMORY_IDS);
+        SharedFutexRequest::CreateMemory => {
+            encoder.u8(SHARED_FUTEX_REQUEST_TAG_CREATE_MEMORY);
         }
         SharedFutexRequest::CreateWaiter => {
             encoder.u8(SHARED_FUTEX_REQUEST_TAG_CREATE_WAITER);
@@ -65,7 +65,7 @@ pub(super) fn decode_shared_futex_request(
     decoder: &mut Decoder<'_>,
 ) -> Result<SharedFutexRequest, WireError> {
     Ok(match decoder.u8()? {
-        SHARED_FUTEX_REQUEST_TAG_RESERVE_MEMORY_IDS => SharedFutexRequest::ReserveMemoryIds,
+        SHARED_FUTEX_REQUEST_TAG_CREATE_MEMORY => SharedFutexRequest::CreateMemory,
         SHARED_FUTEX_REQUEST_TAG_CREATE_WAITER => SharedFutexRequest::CreateWaiter,
         SHARED_FUTEX_REQUEST_TAG_ARM => SharedFutexRequest::Arm(FutexArmRequest {
             key: decode_key(decoder)?,
@@ -86,9 +86,9 @@ pub(super) fn decode_shared_futex_request(
 
 pub(super) fn encode_shared_futex_response(encoder: &mut Encoder, response: SharedFutexResponse) {
     match response {
-        SharedFutexResponse::ReserveMemoryIds(response) => {
-            encoder.u8(SHARED_FUTEX_RESPONSE_TAG_RESERVE_MEMORY_IDS);
-            encoder.u128(response.first.0);
+        SharedFutexResponse::CreateMemory(response) => {
+            encoder.u8(SHARED_FUTEX_RESPONSE_TAG_CREATE_MEMORY);
+            encoder.u128(response.memory.0);
         }
         SharedFutexResponse::CreateWaiter(response) => {
             encoder.u8(SHARED_FUTEX_RESPONSE_TAG_CREATE_WAITER);
@@ -112,9 +112,9 @@ pub(super) fn decode_shared_futex_response(
     decoder: &mut Decoder<'_>,
 ) -> Result<SharedFutexResponse, WireError> {
     Ok(match decoder.u8()? {
-        SHARED_FUTEX_RESPONSE_TAG_RESERVE_MEMORY_IDS => {
-            SharedFutexResponse::ReserveMemoryIds(ReserveMemoryIdsResponse {
-                first: SharedMemoryId(decoder.u128()?),
+        SHARED_FUTEX_RESPONSE_TAG_CREATE_MEMORY => {
+            SharedFutexResponse::CreateMemory(CreateSharedMemoryResponse {
+                memory: SharedMemoryId(decoder.u128()?),
             })
         }
         SHARED_FUTEX_RESPONSE_TAG_CREATE_WAITER => {
