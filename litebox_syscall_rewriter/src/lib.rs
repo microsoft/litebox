@@ -3690,8 +3690,8 @@ mod tests {
         let (trampoline, trapped) =
             patch_aarch64_code_segment(&mut code, 0x1000_0000, 0x1000_1000, 0x2000, native)
                 .unwrap();
-        assert!(trapped.is_empty());
-        assert!(!trampoline.is_empty());
+        assert_eq!(trapped, [] as [u64; 0]);
+        assert_ne!(trampoline, [] as [u8; 0]);
         assert_eq!(
             u32::from_le_bytes(code[..4].try_into().unwrap()) & 0xFC00_0000,
             0x1400_0000

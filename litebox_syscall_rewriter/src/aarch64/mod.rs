@@ -2288,7 +2288,7 @@ mod tests {
         let (patched, outcome) = hook_words_opt_with_config(&words, 0x1000, 0x200000, config);
 
         let outcome = outcome.expect("SVC sites need gates");
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, [] as [u64; 0]);
         assert_eq!(
             outcome.trampoline.len(),
             GATES_START_OFFSET + 2 * SVC_GATE_SIZE

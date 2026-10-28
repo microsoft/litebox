@@ -999,8 +999,15 @@ mod tests {
 
     signal_entry!(nested_entry, litebox_pacga_nested_end, dispatch_nested);
 
-    static NESTED_HOST_TP: AtomicUsize = AtomicUsize::new(0);
-    static NESTED_COUNT: AtomicUsize = AtomicUsize::new(0);
+    struct SignalTestState {
+        nested_host_tp: AtomicUsize,
+        nested_count: AtomicUsize,
+    }
+
+    static SIGNAL_TEST_STATE: SignalTestState = SignalTestState {
+        nested_host_tp: AtomicUsize::new(0),
+        nested_count: AtomicUsize::new(0),
+    };
 
     unsafe extern "C" fn dispatch_nested(
         signal: i32,
@@ -1010,7 +1017,7 @@ mod tests {
         tp: usize,
     ) {
         // Avoid panicking across the signal ABI; a failed check exits the child.
-        let host = NESTED_HOST_TP.load(Ordering::Relaxed);
+        let host = SIGNAL_TEST_STATE.nested_host_tp.load(Ordering::Relaxed);
         let valid = host_tp() == host
             && if signal == libc::SIGUSR1 {
                 in_guest == 1 && tp == TP1
@@ -1020,7 +1027,9 @@ mod tests {
         if !valid {
             unsafe { libc::_exit(10) };
         }
-        NESTED_COUNT.fetch_add(1, Ordering::Relaxed);
+        SIGNAL_TEST_STATE
+            .nested_count
+            .fetch_add(1, Ordering::Relaxed);
         if signal == libc::SIGUSR1 {
             unsafe {
                 let pid = syscalls::syscall0(syscalls::Sysno::getpid).unwrap();
@@ -1028,7 +1037,7 @@ mod tests {
                 let _ =
                     syscalls::syscall3(syscalls::Sysno::tgkill, pid, tid, libc::SIGUSR2 as usize);
             }
-            if NESTED_COUNT.load(Ordering::Relaxed) != 2 || host_tp() != host {
+            if SIGNAL_TEST_STATE.nested_count.load(Ordering::Relaxed) != 2 || host_tp() != host {
                 unsafe { libc::_exit(11) };
             }
         }
@@ -1042,7 +1051,9 @@ mod tests {
                 // interrupt_guest sends x2; substitute SIGUSR1 rather than the runtime
                 // interrupt. Both wrappers return transparently to physical guest TP.
                 let platform = crate::LinuxUserland::new();
-                NESTED_HOST_TP.store(host_tp(), Ordering::Relaxed);
+                SIGNAL_TEST_STATE
+                    .nested_host_tp
+                    .store(host_tp(), Ordering::Relaxed);
                 for signal in [libc::SIGUSR1, libc::SIGUSR2] {
                     let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
                     action.sa_sigaction = nested_entry as *const () as usize;
@@ -1076,10 +1087,13 @@ mod tests {
                 };
                 platform.set_guest_vector_state(&vectors());
                 unsafe { crate::run_thread_ref(&shim, &mut ctx) };
-                assert_eq!(NESTED_COUNT.load(Ordering::Relaxed), 2);
+                assert_eq!(SIGNAL_TEST_STATE.nested_count.load(Ordering::Relaxed), 2);
                 assert_eq!(shim.calls.get(), 1);
                 assert_eq!(shim.interrupts.get(), 0);
-                assert_eq!(host_tp(), NESTED_HOST_TP.load(Ordering::Relaxed));
+                assert_eq!(
+                    host_tp(),
+                    SIGNAL_TEST_STATE.nested_host_tp.load(Ordering::Relaxed)
+                );
             },
         );
     }
