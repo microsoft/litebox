@@ -99,8 +99,8 @@ impl Thread {
         self.id == MAIN
     }
 
-    /// Adds the CPU time since `start` (its run, or the worker's for it), a
-    /// slice at most (see `sched::charged`).
+    /// Adds the time elapsed since `start` (its run, or a worker job for
+    /// it) to its CPU time, capped at one slice (see `sched::charged`).
     pub(crate) fn charge(&self, platform: &litebox_platform_vm_kernel::VmKernel, start: Instant) {
         let used = platform.now().as_nanos().saturating_sub(start.as_nanos());
         let used = sched::charged(used);
