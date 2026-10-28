@@ -1415,13 +1415,14 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
             )
         };
         let host = litebox_common_linux::hwcap::LinuxHwcaps { hwcap, hwcap2 }.to_cpu_features();
-        // PAUTH is kept: PAC keys are per host process and inherited by native fork. SVE state
-        // is kept at `guest_sve_vl`, if any. Excluded:
+        // PAUTH and PAUTH_GENERIC are kept: PAC keys are per host process and inherited by native
+        // fork. SVE state is kept at `guest_sve_vl`, if any. Excluded:
         // - DIT and SSBS: the syscall path saves and restores only NZCV (see
         //   `switch_to_guest_via_outbound_stub`).
         // - SME: ZA and streaming-mode state are not saved.
         // - BTI and MTE: there is no PROT_BTI/PROT_MTE page-attribute support.
-        let mut offered = CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH;
+        let mut offered =
+            CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH | CpuFeatures::PAUTH_GENERIC;
         if guest_sve_vl().is_some() {
             offered |= CpuFeatures::SVE_STATE_ONLY;
         }

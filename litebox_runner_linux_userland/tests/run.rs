@@ -1130,14 +1130,15 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
         )
     };
 
-    // Mirrors the platform filter intersected with the shim filter, which drops PAUTH under
-    // copy-based fork.
-    let mut exposed = CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH;
+    // Mirrors the platform filter intersected with the shim filter, which drops pointer
+    // authentication under copy-based fork.
+    let mut exposed =
+        CpuFeatures::BASE_STATE_ONLY | CpuFeatures::PAUTH | CpuFeatures::PAUTH_GENERIC;
     if common::guest_sve_vl().is_some() {
         exposed |= CpuFeatures::SVE_STATE_ONLY;
     }
     if litebox_shim_linux::syscalls::process::COPY_BASED_FORK {
-        exposed.remove(CpuFeatures::PAUTH);
+        exposed.remove(CpuFeatures::PAUTH | CpuFeatures::PAUTH_GENERIC);
     }
     let host = LinuxHwcaps {
         hwcap: host_hwcap,

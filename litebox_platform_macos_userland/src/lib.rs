@@ -1171,7 +1171,10 @@ const HOST_CPU_FEATURE_SYSCTLS: &[(&CStr, CpuFeatures)] = &[
     (c"hw.optional.arm.FEAT_HBC", CpuFeatures::HBC),
     (c"hw.optional.arm.FEAT_DIT", CpuFeatures::DIT),
     (c"hw.optional.arm.FEAT_SSBS", CpuFeatures::SSBS),
-    (c"hw.optional.arm.FEAT_PAuth", CpuFeatures::PAUTH),
+    (
+        c"hw.optional.arm.FEAT_PAuth",
+        CpuFeatures::PAUTH.union(CpuFeatures::PAUTH_GENERIC),
+    ),
     (c"hw.optional.arm.FEAT_BTI", CpuFeatures::BTI),
     (c"hw.optional.arm.FEAT_SME", CpuFeatures::SME),
 ];
@@ -1230,8 +1233,8 @@ impl<const PAGE_SIZE: usize> litebox::platform::ArchSpecificProvider
     }
     fn get_guest_cpu_features(&self) -> CpuFeatures {
         // Excluded:
-        // - PAUTH: it is not established that XNU enables PAC keys for arm64 (non-arm64e)
-        //   processes.
+        // - PAUTH and PAUTH_GENERIC: it is not established that XNU enables PAC keys for arm64
+        //   (non-arm64e) processes.
         // - DIT and SSBS: the syscall path saves and restores only NZCV.
         // - SME and BTI: they need architectural state or kernel ABI this platform lacks.
         // Assumes XNU keeps the whole FPCR across exceptions and sigreturn (its ARM_NEON_STATE64
