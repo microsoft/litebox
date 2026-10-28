@@ -200,7 +200,6 @@ impl fmt::Display for EventFailure {
 
 /// What the epoll thread did with one event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum Dispatch {
     Applied,
     /// The socket was busy; the event is retried after the batch.
@@ -217,7 +216,6 @@ enum Dispatch {
 /// point while another acts, which makes each race happen on every run.
 /// Outside tests the hook is a no-op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum HookPoint {
     /// A call on the socket released its `state`.
     Unlocked(u64),
@@ -325,7 +323,7 @@ impl ProviderCore {
             .map_err(|_| BrokerError::ResourceExhausted)
     }
 
-    /// Adds `socket` to epoll under `token`, edge-triggered for `events`.
+    /// Adds `socket` to epoll under `token` for `events`.
     fn epoll_add(
         &self,
         socket: &OwnedFd,
