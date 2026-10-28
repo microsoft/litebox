@@ -119,11 +119,13 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
     /// Returns the offsets of the strings in the stack.
     /// Returns `None` if the stack has insufficient space.
     fn push_cstrings(&mut self, vals: &[CString]) -> Option<Vec<usize>> {
+        // Lay strings in ascending order like Linux.
         let mut envp = Vec::with_capacity(vals.len());
-        for val in vals {
+        for val in vals.iter().rev() {
             self.push_cstring(val)?;
             envp.push(self.pos);
         }
+        envp.reverse();
         Some(envp)
     }
 
