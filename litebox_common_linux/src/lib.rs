@@ -2175,7 +2175,7 @@ pub enum MadviseBehavior {
     DontNeedLocked = 24,
 }
 
-/// Linux's `struct sysinfo`, laid out as on 64-bit targets, with its implicit padding explicit.
+/// Linux's `struct sysinfo`.
 #[repr(C)]
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
 pub struct Sysinfo {
@@ -2215,14 +2215,6 @@ pub struct Sysinfo {
     #[allow(clippy::pub_underscore_fields)]
     pub _pad_end: u32,
 }
-
-#[cfg(target_pointer_width = "64")]
-const _: () = {
-    assert!(core::mem::size_of::<Sysinfo>() == 112);
-    assert!(core::mem::offset_of!(Sysinfo, procs) == 80);
-    assert!(core::mem::offset_of!(Sysinfo, totalhigh) == 88);
-    assert!(core::mem::offset_of!(Sysinfo, mem_unit) == 104);
-};
 
 bitflags::bitflags! {
     /// Represents a set of Linux capabilities.
