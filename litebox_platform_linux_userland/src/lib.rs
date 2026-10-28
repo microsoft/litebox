@@ -36,7 +36,7 @@ extern crate alloc;
 mod arch;
 mod page_mgmt;
 pub mod process;
-mod shared_objects;
+pub mod shared_objects;
 
 #[cfg(target_arch = "aarch64")]
 use arch::{
@@ -295,14 +295,13 @@ impl LinuxUserland {
             ),
             (libc::SYS_close, vec![]),
         ];
+        let arg_eq = |index, value: u64| {
+            SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value).unwrap()
+        };
+        let as_arg = |value: i32| {
+            u64::from(u32::try_from(value).expect("syscall argument must be non-negative"))
+        };
         if let Some(stream_fd) = native_fork_stream_fd {
-            let arg_eq = |index, value: u64| {
-                SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value)
-                    .unwrap()
-            };
-            let as_arg = |value: i32| {
-                u64::from(u32::try_from(value).expect("syscall argument must be non-negative"))
-            };
             // The clone's descriptor-specific rules are confined to its control socket.
             let stream = as_arg(stream_fd);
             let socket_timeouts = [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO]
@@ -373,21 +372,7 @@ impl LinuxUserland {
             let fd_rules = || {
                 positional_io_fds
                     .iter()
-                    .map(|fd| {
-                        SeccompRule::new(vec![
-                            SeccompCondition::new(
-                                0,
-                                SeccompCmpArgLen::Dword,
-                                SeccompCmpOp::Eq,
-                                u64::from(
-                                    u32::try_from(*fd)
-                                        .expect("positional I/O descriptor must be valid"),
-                                ),
-                            )
-                            .unwrap(),
-                        ])
-                        .unwrap()
-                    })
+                    .map(|fd| SeccompRule::new(vec![arg_eq(0, as_arg(*fd))]).unwrap())
                     .collect()
             };
             rules.push((libc::SYS_pread64, fd_rules()));
@@ -400,25 +385,8 @@ impl LinuxUserland {
                 .iter()
                 .map(|fd| {
                     SeccompRule::new(vec![
-                        SeccompCondition::new(
-                            0,
-                            SeccompCmpArgLen::Dword,
-                            SeccompCmpOp::Eq,
-                            u64::from(
-                                u32::try_from(*fd).expect("shutdown descriptor must be valid"),
-                            ),
-                        )
-                        .unwrap(),
-                        SeccompCondition::new(
-                            1,
-                            SeccompCmpArgLen::Dword,
-                            SeccompCmpOp::Eq,
-                            u64::from(
-                                u32::try_from(libc::SHUT_RDWR)
-                                    .expect("SHUT_RDWR must be non-negative"),
-                            ),
-                        )
-                        .unwrap(),
+                        arg_eq(0, as_arg(*fd)),
+                        arg_eq(1, as_arg(libc::SHUT_RDWR)),
                     ])
                     .unwrap()
                 })
@@ -428,20 +396,7 @@ impl LinuxUserland {
         if let Some(fd) = shared_object_fd {
             rules.push((
                 libc::SYS_recvmsg,
-                vec![
-                    SeccompRule::new(vec![
-                        SeccompCondition::new(
-                            0,
-                            SeccompCmpArgLen::Dword,
-                            SeccompCmpOp::Eq,
-                            u64::from(
-                                u32::try_from(fd).expect("shared-object descriptor must be valid"),
-                            ),
-                        )
-                        .unwrap(),
-                    ])
-                    .unwrap(),
-                ],
+                vec![SeccompRule::new(vec![arg_eq(0, as_arg(fd))]).unwrap()],
             ));
         }
         // A syscall may have rules from more than one source, such as `recvmsg` on both the

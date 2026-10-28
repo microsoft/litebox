@@ -227,25 +227,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let AnyTypedFd::File(file_fd) = &typed_fd else {
             return Err(Errno::ENODEV);
         };
-        let access = self
-            .global
-            .with_file(file_fd, super::file::File::access_mode)?;
-        // As on Linux, a shared mapping needs a readable file, and a writable one, or one that
-        // `mprotect` may later make writable, needs a file open for writing too.
-        let may_write = match access {
-            FileAccessMode::ReadOnly => false,
-            FileAccessMode::ReadWrite => true,
-            _ => return Err(Errno::EACCES),
-        };
         let writable = prot.contains(ProtFlags::PROT_WRITE);
-        if writable && !may_write {
-            return Err(Errno::EACCES);
-        }
         let copy = || {
-            if writable {
+            // As on Linux, a shared mapping needs a readable file, and a writable one needs a
+            // file open for writing too.
+            let may_write = match self
+                .global
+                .with_file(file_fd, super::file::File::access_mode)?
+            {
+                FileAccessMode::ReadOnly => false,
+                FileAccessMode::ReadWrite => true,
+                _ => return Err(Errno::EACCES),
+            };
+            if !writable {
+                self.do_mmap_file(suggested_addr, len, prot, flags, fd, offset)
+            } else if may_write {
                 Err(Errno::ENODEV)
             } else {
-                self.do_mmap_file(suggested_addr, len, prot, flags, fd, offset)
+                Err(Errno::EACCES)
             }
         };
         if (prot.contains(ProtFlags::PROT_EXEC) && !writable)
@@ -255,33 +254,41 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let object = match self
             .global
-            .with_file(file_fd, |file| Ok(file.map_shared(may_write)))?
+            .with_file(file_fd, |file| Ok(file.map_shared(true)))?
         {
             Ok(object) => object,
             Err(MapSharedError::Unsupported) => return copy(),
             Err(MapSharedError::ClosedFd) => return Err(Errno::EBADF),
             Err(MapSharedError::IsDirectory) => return Err(Errno::ENODEV),
-            Err(MapSharedError::NotForReading | MapSharedError::NotForWriting) => {
-                return Err(Errno::EACCES);
-            }
+            Err(MapSharedError::NotForReading) => return Err(Errno::EACCES),
             Err(MapSharedError::NoMemory | MapSharedError::Io) => return Err(Errno::ENOMEM),
         };
-        let mapped = self.global.mm.do_mmap_shared_object(
-            suggested_addr,
-            len,
-            prot,
-            flags,
-            MmapPlacement {
-                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
-                allowed_range: None,
-            },
-            SharedObjectMapping {
-                id: object.identity,
-                token: object.token,
-                offset: offset as u64,
-                may_write,
-            },
-        )?;
+        // The broker delivers the object writable exactly when the file is open for writing,
+        // which Linux requires of a writable shared mapping, or one `mprotect` may make writable.
+        if writable && !object.writable {
+            // SAFETY: The broker just delivered this token, and nothing else consumes it.
+            unsafe { self.global.platform.release_shared_object(object.token) };
+            return Err(Errno::EACCES);
+        }
+        // SAFETY: The broker just delivered this token, and nothing else consumes it.
+        let mapped = unsafe {
+            self.global.mm.do_mmap_shared_object(
+                suggested_addr,
+                len,
+                prot,
+                flags,
+                MmapPlacement {
+                    direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
+                    allowed_range: None,
+                },
+                SharedObjectMapping {
+                    memory: object.memory,
+                    token: object.token,
+                    offset: offset as u64,
+                    may_write: object.writable,
+                },
+            )
+        }?;
         if flags.contains(MapFlags::MAP_FIXED) {
             self.clear_file_mappings_for_range(mapped.as_usize(), len);
         }
@@ -1085,7 +1092,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(copy.read_at_offset::<Platform>(0), Some(b's'));
-        assert!(!task.global.mm.has_shared_mappings());
+        assert!(!task.global.mm.has_shared_pages());
         task.sys_munmap(copy, 0x1000).unwrap();
         for fd in [read_only, write_only, read_write_fd] {
             task.sys_close(fd).unwrap();

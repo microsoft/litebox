@@ -1341,14 +1341,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Returns the host shared memory holding an open file's contents, for a `MAP_SHARED`
     /// mapping that may be made writable if `writable` is set.
     ///
-    /// The file must be open for reading, and also for writing if `writable` is set. The
-    /// mapping's identity is the file's device and inode numbers, which every process that
-    /// opens the file sees.
+    /// The file must be open for reading. The contents may be mapped writable only if `writable`
+    /// is set and the file is open for writing, which the second value of the result tells.
     pub fn map_shared(
         &self,
         entry: &ResolverEntry<Backend>,
         writable: bool,
-    ) -> Result<super::shared_memory::SharedFileMapping, MapSharedError> {
+    ) -> Result<(Arc<super::shared_memory::SharedFileContents>, bool), MapSharedError> {
         let file = match &entry.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(MapSharedError::IsDirectory),
@@ -1359,15 +1358,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if !entry.read_allowed {
             return Err(MapSharedError::NotForReading);
         }
-        if writable && !entry.write_allowed {
-            return Err(MapSharedError::NotForWriting);
-        }
-        let status = self.handle_status(entry).map_err(|_| MapSharedError::Io)?;
-        let memory = self.backend.map_shared(file)?;
-        Ok(super::shared_memory::SharedFileMapping {
-            identity: (u128::from(status.node_info.dev) << 64) | u128::from(status.node_info.ino),
-            memory,
-        })
+        let contents = self.backend.map_shared(file)?;
+        Ok((contents, writable && entry.write_allowed))
     }
 }
 

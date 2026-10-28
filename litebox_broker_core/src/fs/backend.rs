@@ -150,15 +150,15 @@ pub trait Backend: Send + Sync + Any {
     /// necessary, so that runners can map the file `MAP_SHARED`.
     ///
     /// After this succeeds, the backend must keep the file's contents in that memory, so that
-    /// every mapping and every read, write, and truncation see the same bytes. The `identity` of
-    /// the result is filled in by the caller.
+    /// every mapping and every read, write, and truncation see the same bytes, and must return
+    /// the same contents for every later call on the same file.
     ///
     /// The default implementation returns [`MapSharedError::Unsupported`].
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn map_shared(
         &self,
         h: &FileHandle,
-    ) -> Result<alloc::sync::Arc<dyn super::shared_memory::SharedFileMemory>, MapSharedError> {
+    ) -> Result<alloc::sync::Arc<super::shared_memory::SharedFileContents>, MapSharedError> {
         Err(MapSharedError::Unsupported)
     }
 

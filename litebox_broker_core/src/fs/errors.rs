@@ -127,8 +127,6 @@ pub enum MapSharedError {
     IsDirectory,
     #[error("file is not opened for reading")]
     NotForReading,
-    #[error("file is not opened for writing")]
-    NotForWriting,
     #[error("file descriptor is not open for reading or writing")]
     PathOnly,
     #[error("the file system cannot share this file's pages")]

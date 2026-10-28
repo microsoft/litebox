@@ -14,6 +14,9 @@
 use alloc::sync::Arc;
 use core::any::Any;
 
+use litebox_broker_protocol::shared_futex::SharedMemoryId;
+use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use spin::Once;
 use thiserror::Error;
 
 /// Error accessing or creating [`SharedFileMemory`].
@@ -29,6 +32,15 @@ pub enum SharedFileMemoryError {
     /// file with mapped views.
     #[error("host shared memory is mapped")]
     Busy,
+    /// Copying to or from the caller's buffer faulted.
+    #[error("buffer access faulted")]
+    Fault,
+}
+
+impl From<litebox_platform::buffer::Fault> for SharedFileMemoryError {
+    fn from(_: litebox_platform::buffer::Fault) -> Self {
+        Self::Fault
+    }
 }
 
 /// Host memory that holds one file's contents.
@@ -37,11 +49,22 @@ pub enum SharedFileMemoryError {
 /// `SIGBUS` past the end of a mapped file.
 pub trait SharedFileMemory: Send + Sync + Any {
     /// Copies bytes from `offset` into `buffer`, returning how many were copied, which is fewer
-    /// than requested only at the end of the memory.
-    fn read_at(&self, offset: usize, buffer: &mut [u8]) -> Result<usize, SharedFileMemoryError>;
+    /// than `buffer.len()` only at the end of the memory.
+    fn read_at(
+        &self,
+        offset: usize,
+        buffer: &mut dyn ReadBuffer,
+    ) -> Result<usize, SharedFileMemoryError>;
 
-    /// Copies `data` to `offset`. The memory must already be large enough.
-    fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), SharedFileMemoryError>;
+    /// Copies all of `data` to `offset`. The memory must already be large enough.
+    fn write_at(&self, offset: usize, data: &dyn WriteBuffer) -> Result<(), SharedFileMemoryError>;
+
+    /// Returns the size in bytes.
+    ///
+    /// A runner that may map the memory writable may also be able to grow it, so the broker
+    /// asks the memory rather than remembering the size, as if the runner had extended the
+    /// file, which it may write anyway.
+    fn size(&self) -> Result<usize, SharedFileMemoryError>;
 
     /// Changes the size to `length` bytes, zero-filling any added bytes.
     fn set_len(&self, length: usize) -> Result<(), SharedFileMemoryError>;
@@ -56,19 +79,52 @@ pub trait SharedFileMemoryProvider: Send + Sync {
     fn create(&self, contents: &[u8]) -> Result<Arc<dyn SharedFileMemory>, SharedFileMemoryError>;
 }
 
+/// A file's contents in host shared memory, which every runner mapping the file maps.
+pub struct SharedFileContents {
+    memory: Arc<dyn SharedFileMemory>,
+    /// Names the memory for futexes, issued when a runner first maps the file.
+    memory_id: Once<SharedMemoryId>,
+}
+
+impl SharedFileContents {
+    /// Holds a file's contents in `memory`.
+    pub fn new(memory: Arc<dyn SharedFileMemory>) -> Self {
+        Self {
+            memory,
+            memory_id: Once::new(),
+        }
+    }
+
+    /// Returns the memory holding the file's contents.
+    pub fn memory(&self) -> &Arc<dyn SharedFileMemory> {
+        &self.memory
+    }
+
+    /// Returns the ID naming the memory, issuing it with `issue` the first time.
+    pub(crate) fn memory_id<E>(
+        &self,
+        issue: impl FnOnce() -> Result<SharedMemoryId, E>,
+    ) -> Result<SharedMemoryId, E> {
+        self.memory_id.try_call_once(issue).copied()
+    }
+}
+
 /// The shared memory holding a file's contents, as returned to a runner that maps the file.
 #[derive(Clone)]
 pub struct SharedFileMapping {
-    /// Identity of the file, the same for every process that maps it.
-    pub identity: u128,
+    /// Names the memory, the same for every process that maps the file.
+    pub memory_id: SharedMemoryId,
     /// The memory holding the file's contents.
     pub memory: Arc<dyn SharedFileMemory>,
+    /// Whether the runner may map the memory writable.
+    pub writable: bool,
 }
 
 impl core::fmt::Debug for SharedFileMapping {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SharedFileMapping")
-            .field("identity", &self.identity)
+            .field("memory_id", &self.memory_id)
+            .field("writable", &self.writable)
             .finish_non_exhaustive()
     }
 }
@@ -81,36 +137,52 @@ pub(crate) mod test_memory {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::any::Any;
+    use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
     use spin::mutex::SpinMutex as Mutex;
 
-    #[derive(Default)]
-    pub(crate) struct VecMemory(pub(crate) Mutex<Vec<u8>>);
+    struct VecMemory {
+        data: Mutex<Vec<u8>>,
+        /// Whether shrinking fails, as on Windows while the memory is mapped.
+        refuse_shrink: bool,
+    }
 
     impl SharedFileMemory for VecMemory {
         fn read_at(
             &self,
             offset: usize,
-            buffer: &mut [u8],
+            buffer: &mut dyn ReadBuffer,
         ) -> Result<usize, SharedFileMemoryError> {
-            let data = self.0.lock();
+            let data = self.data.lock();
             let start = offset.min(data.len());
             let end = offset.saturating_add(buffer.len()).min(data.len());
-            buffer[..end - start].copy_from_slice(&data[start..end]);
+            buffer.copy_from_slice_at(0, &data[start..end])?;
             Ok(end - start)
         }
 
-        fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), SharedFileMemoryError> {
-            let mut memory = self.0.lock();
+        fn write_at(
+            &self,
+            offset: usize,
+            data: &dyn WriteBuffer,
+        ) -> Result<(), SharedFileMemoryError> {
+            let mut memory = self.data.lock();
             let end = offset + data.len();
             if end > memory.len() {
                 return Err(SharedFileMemoryError::Io);
             }
-            memory[offset..end].copy_from_slice(data);
+            data.copy_to_slice_at(0, &mut memory[offset..end])?;
             Ok(())
         }
 
+        fn size(&self) -> Result<usize, SharedFileMemoryError> {
+            Ok(self.data.lock().len())
+        }
+
         fn set_len(&self, length: usize) -> Result<(), SharedFileMemoryError> {
-            self.0.lock().resize(length, 0);
+            let mut data = self.data.lock();
+            if self.refuse_shrink && length < data.len() {
+                return Err(SharedFileMemoryError::Busy);
+            }
+            data.resize(length, 0);
             Ok(())
         }
 
@@ -119,14 +191,18 @@ pub(crate) mod test_memory {
         }
     }
 
-    pub(crate) struct VecMemoryProvider;
+    /// Creates vector memory, which refuses to shrink if the field is set.
+    pub(crate) struct VecMemoryProvider(pub(crate) bool);
 
     impl SharedFileMemoryProvider for VecMemoryProvider {
         fn create(
             &self,
             contents: &[u8],
         ) -> Result<Arc<dyn SharedFileMemory>, SharedFileMemoryError> {
-            Ok(Arc::new(VecMemory(Mutex::new(contents.to_vec()))))
+            Ok(Arc::new(VecMemory {
+                data: Mutex::new(contents.to_vec()),
+                refuse_shrink: self.0,
+            }))
         }
     }
 }

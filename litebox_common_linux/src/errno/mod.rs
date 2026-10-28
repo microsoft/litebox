@@ -190,6 +190,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::Io => Errno::EIO,
             litebox::fs::errors::OpenError::NoSuchDevice => Errno::ENXIO,
             litebox::fs::errors::OpenError::NoSpace => Errno::ENOSPC,
+            litebox::fs::errors::OpenError::TruncateError(error) => error.into(),
             _ => unimplemented!(),
         }
     }

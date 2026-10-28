@@ -1825,8 +1825,9 @@ mod tests {
             BrokerResult::File(FileResponse::ResolvePath(FilePathResponse { length: 37 })),
             BrokerResult::File(FileResponse::HandlePath(FilePathResponse { length: 41 })),
             BrokerResult::File(FileResponse::Map(MapFileResponse {
-                identity: (7 << 64) | 9,
+                memory: SharedMemoryId((7 << 64) | 9),
                 token: 11,
+                writable: true,
             })),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
