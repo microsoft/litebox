@@ -62,9 +62,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Wakes up to `count` of the oldest waiters on the futex word `key` whose masks intersect
     /// `bitset`, or all masks if it is `None`, returning how many it woke.
     ///
-    /// Fails with [`FutexError::NotAligned`] if the word's offset is not a multiple of
-    /// [`FUTEX_WORD_SIZE`], and with [`SharedFutexError::Unavailable`] without a broker.
-    ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error.
@@ -120,11 +117,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
     /// Waits on the futex word at `futex_addr`, which `key` names, until a
     /// [`LiteBox::wake_shared_futex`] whose mask intersects `bitset`, or any mask if it is
     /// `None`, selects this waiter, or the wait times out or is interrupted.
-    ///
-    /// Returns [`FutexError::ImmediatelyWokenBecauseValueMismatch`] if the word does not hold
-    /// `expected_value`, checked both before and after the waiter is armed so that no wake in
-    /// between is missed. A wake that selects the waiter before it disarms is reported as
-    /// success, even if it races with a value change, fault, timeout, or interruption.
     ///
     /// # Panics
     ///
