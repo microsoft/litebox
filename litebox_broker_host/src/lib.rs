@@ -3320,18 +3320,6 @@ mod tests {
                 woken: true
             }))
         );
-        // The process may not name memory from a block it has yet to reserve.
-        let unreserved = SharedFutexKey {
-            memory: litebox_broker_protocol::shared_futex::SharedMemoryId::first_in_block(
-                first.reserver(),
-                first.block() + 1,
-            ),
-            offset: 0,
-        };
-        assert_eq!(
-            arm(unreserved),
-            BrokerResult::Error(ErrorCode::PolicyDenied)
-        );
         assert_eq!(
             handle_test_request(&process, BrokerOperation::CloseObject(waiter)),
             BrokerResult::ObjectClosed

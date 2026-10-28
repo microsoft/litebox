@@ -7,10 +7,7 @@
 //! native fork children inherit, is named by a [`SharedMemoryId`] that its creator picks from a
 //! block the broker reserved for it. The broker keeps no record of the memory: it keys futex wait
 //! queues by [`SharedFutexKey`], so a wake in one process reaches waiters in every process that
-//! names the same futex word. A process may only name the futexes of blocks it reserved, or that
-//! the process that created it could name at the time, so that it can only reach memory it may
-//! share. A process that creates another must therefore take its later IDs from a block it
-//! reserves afterwards.
+//! names the same futex word. The broker does not restrict which IDs a process names.
 //!
 //! Each waiting thread owns a futex waiter object. A wait arms it on a futex; a wake marks the
 //! armed waiters it selects woken and publishes [`FUTEX_WAITER_WOKEN`] readiness for them.
@@ -32,34 +29,28 @@ pub const FUTEX_WORD_SIZE: u64 = 4;
 /// broker reserved for it, as [`ReserveMemoryIdsResponse`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SharedMemoryId(
-    /// The ID's value: from the most significant bits, the [reserver](Self::reserver) of its
-    /// block (64 bits), the [block](Self::block)'s index among the reserver's blocks (32 bits),
-    /// and the ID's position in the block (32 bits).
+    /// The ID's value laid out from the most significant bits to the least significant bits:
+    /// | --------------- | --------------------------- |
+    /// | block (64 bits) | position in block (64 bits) |
+    /// | --------------- | --------------------------- |
+    /// Block: a value the broker returns from only one reservation.
     pub u128,
 );
 
 impl SharedMemoryId {
     /// Mask of the ID's position in its block.
-    const POSITION: u128 = u32::MAX as u128;
+    const POSITION: u128 = u64::MAX as u128;
 
-    /// Returns the first ID of the block with index `block` among those of `reserver`.
+    /// Returns the first ID of `block`.
     #[must_use]
-    pub const fn first_in_block(reserver: u64, block: u32) -> Self {
-        Self((reserver as u128) << 64 | (block as u128) << 32)
+    pub const fn first_in_block(block: u64) -> Self {
+        Self((block as u128) << 64)
     }
 
-    /// Returns the ID of the process that reserved the ID's block, which no other process the
-    /// broker creates shares.
+    /// Returns the block the ID belongs to.
     #[must_use]
-    pub const fn reserver(self) -> u64 {
+    pub const fn block(self) -> u64 {
         (self.0 >> 64) as u64
-    }
-
-    /// Returns the index of the ID's block among those its [reserver](Self::reserver) reserved,
-    /// in the order it reserved them.
-    #[must_use]
-    pub const fn block(self) -> u32 {
-        ((self.0 >> 32) & Self::POSITION) as u32
     }
 
     /// Returns the ID after this one in its block, or `None` if this is the block's last.
@@ -76,8 +67,7 @@ impl SharedMemoryId {
 /// Response to a request to reserve shared memory IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReserveMemoryIdsResponse {
-    /// First ID of the reserved block, which the reserving process and the processes it creates
-    /// from now on may name.
+    /// First ID of the reserved block, whose IDs no other reservation returns.
     pub first: SharedMemoryId,
 }
 
@@ -147,14 +137,14 @@ mod tests {
     use super::SharedMemoryId;
 
     #[test]
-    fn ids_name_their_reserver_and_block_and_stay_in_it() {
-        let first = SharedMemoryId::first_in_block(u64::MAX, u32::MAX);
-        assert_eq!((first.reserver(), first.block()), (u64::MAX, u32::MAX));
+    fn ids_stay_in_their_block() {
+        let first = SharedMemoryId::first_in_block(u64::MAX);
+        assert_eq!(first.block(), u64::MAX);
         let second = first.next_in_block().unwrap();
-        assert_eq!((second.reserver(), second.block()), (u64::MAX, u32::MAX));
+        assert_eq!(second.block(), u64::MAX);
         assert_ne!(second, first);
-        let last = SharedMemoryId(first.0 | u128::from(u32::MAX));
-        assert_eq!(last.block(), u32::MAX);
+        let last = SharedMemoryId(first.0 | u128::from(u64::MAX));
+        assert_eq!(last.block(), u64::MAX);
         assert_eq!(last.next_in_block(), None);
     }
 }

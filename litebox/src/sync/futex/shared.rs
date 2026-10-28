@@ -56,17 +56,12 @@ pub enum SharedFutexError {
 
 /// Allocates the [`SharedMemoryId`]s of memory this process creates.
 ///
-/// The IDs come from a block that the broker reserves on first use, and again after each process
-/// this process creates. The broker lets a process name the blocks it reserved, and those its
-/// creator could name when creating it, so memory created after a process must take its IDs from
-/// a block reserved after it, which that process cannot name. Each [`LiteBox`] has its own
-/// allocator, so a process that duplicates its memory, as native fork does, gives the duplicate a
-/// new one with its new [`LiteBox`].
+/// The IDs come from a block that the broker reserves on first use, and again once a block runs
+/// out. Each [`LiteBox`] has its own allocator, so a process that duplicates its memory, as native
+/// fork does, gives the duplicate a new one with its new [`LiteBox`], and the two never hand out
+/// the same ID.
 pub(crate) struct SharedMemoryIdAllocator<Platform: RawSyncPrimitivesProvider> {
     /// The next ID to allocate, or `None` if the next allocation must reserve a block.
-    ///
-    /// Held while allocating and while creating a process, so that no ID is allocated from a
-    /// block that a process created meanwhile may name.
     next: Mutex<Platform, Option<SharedMemoryId>>,
 }
 
@@ -91,19 +86,10 @@ impl<Platform: RawSyncPrimitivesProvider> SharedMemoryIdAllocator<Platform> {
         *next = id.next_in_block();
         Ok(id)
     }
-
-    /// Creates a process with `create`, after which IDs come from a block reserved afterwards.
-    pub(crate) fn create_process<T>(&self, create: impl FnOnce() -> T) -> T {
-        let mut next = self.next.lock();
-        let created = create();
-        *next = None;
-        created
-    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// Returns a name for memory this process creates, which no other shared memory uses, and
-    /// which this process and the processes it creates from now on may name.
+    /// Returns a name for memory this process creates, which no other shared memory uses.
     ///
     /// Fails with [`SharedFutexError::Unavailable`] without a broker, as then no other process
     /// can share the memory either, and with [`SharedFutexError::ResourceExhausted`],

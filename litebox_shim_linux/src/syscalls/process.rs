@@ -1204,8 +1204,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
             // Cast from *i32 to *u32
             let clear_child_tid = UserPtrMut::from_usize(clear_child_tid.as_usize());
-            // Linux wakes the word as a shared futex, which reaches waiters in other processes
-            // if it is in shared memory.
+            // Linux wakes the word as a shared futex.
             let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
                 addr: clear_child_tid,
                 flags: litebox_common_linux::FutexFlags::empty(),
@@ -4534,46 +4533,8 @@ mod fork_tests {
                 .unwrap()
                 .unwrap()
                 .memory;
-            assert_ne!(
-                (created.reserver(), created.block()),
-                (parent_memory.reserver(), parent_memory.block())
-            );
+            assert_ne!(created.block(), parent_memory.block());
         });
-    }
-
-    #[test]
-    fn shared_memory_created_after_a_child_comes_from_a_new_block() {
-        use litebox_common_linux::{MapFlags, ProtFlags};
-
-        let task = crate::syscalls::tests::init_platform();
-        let map_shared = || {
-            let address = task
-                .sys_mmap(
-                    0,
-                    PAGE_SIZE,
-                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                    MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-                .unwrap()
-                .as_usize();
-            task.global
-                .mm
-                .shared_futex_key(address)
-                .unwrap()
-                .unwrap()
-                .memory
-        };
-        let first = map_shared();
-        assert_eq!(map_shared().block(), first.block());
-        // The broker lets the child name the blocks this process reserved so far, so memory
-        // created from now on must come from another.
-        let child = task.global.litebox.allocate_child_process().unwrap();
-        let after = map_shared();
-        assert_ne!(after.block(), first.block());
-        drop(child);
-        assert_eq!(map_shared().block(), after.block());
     }
 
     #[cfg(target_arch = "aarch64")]
