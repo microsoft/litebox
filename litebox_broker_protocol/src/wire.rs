@@ -626,8 +626,8 @@ mod tests {
     };
     use crate::fs::{
         ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-        FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileType,
-        FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
+        FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileTime,
+        FileType, FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
         MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
         ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
         ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
@@ -1723,6 +1723,18 @@ mod tests {
                     rdev: Some(NonZeroU64::MAX),
                 },
                 blksize: u64::MAX,
+                accessed: FileTime {
+                    seconds: i64::MIN,
+                    nanoseconds: FileTime::NANOSECONDS_PER_SECOND - 1,
+                },
+                modified: FileTime {
+                    seconds: i64::MAX,
+                    nanoseconds: 1,
+                },
+                changed: FileTime {
+                    seconds: -1,
+                    nanoseconds: 0,
+                },
             })),
             BrokerResult::File(FileResponse::HandleStatus(FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -1738,6 +1750,18 @@ mod tests {
                     rdev: Some(NonZeroU64::MAX),
                 },
                 blksize: u64::MAX,
+                accessed: FileTime {
+                    seconds: i64::MIN,
+                    nanoseconds: FileTime::NANOSECONDS_PER_SECOND - 1,
+                },
+                modified: FileTime {
+                    seconds: i64::MAX,
+                    nanoseconds: 1,
+                },
+                changed: FileTime {
+                    seconds: -1,
+                    nanoseconds: 0,
+                },
             })),
             BrokerResult::File(FileResponse::IsTerminal(false)),
             BrokerResult::File(FileResponse::IsTerminal(true)),
@@ -1827,7 +1851,7 @@ mod tests {
                 Err(WireError::WrongMessagePhase)
             );
         }
-        assert_eq!(maximum_encoded_size, 62);
+        assert_eq!(maximum_encoded_size, 94);
     }
 
     #[test]
@@ -2227,6 +2251,9 @@ mod tests {
                     rdev: None,
                 },
                 blksize: 4096,
+                accessed: FileTime::EPOCH,
+                modified: FileTime::EPOCH,
+                changed: FileTime::EPOCH,
             })),
         };
         let status = encode_response(status);
@@ -2240,6 +2267,14 @@ mod tests {
         unsupported_mode[11..13].copy_from_slice(&0o10000u16.to_le_bytes());
         assert_eq!(
             decode_response(&unsupported_mode),
+            Err(WireError::InvalidTag)
+        );
+        let mut invalid_nanoseconds = status.clone();
+        let changed_nanoseconds = invalid_nanoseconds.len() - 4;
+        invalid_nanoseconds[changed_nanoseconds..]
+            .copy_from_slice(&FileTime::NANOSECONDS_PER_SECOND.to_le_bytes());
+        assert_eq!(
+            decode_response(&invalid_nanoseconds),
             Err(WireError::InvalidTag)
         );
         let mut invalid_next_index = encode_response(BrokerResponse {

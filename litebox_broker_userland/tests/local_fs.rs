@@ -14,6 +14,7 @@ use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use litebox_broker_core::fs::FileType;
@@ -29,7 +30,7 @@ use litebox_broker_core::fs::errors::{ChownError, TruncateError, WriteError};
 use litebox_broker_core::fs::errors::{OpenError, PathError, WalkError};
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::resolver::Resolver;
-use litebox_broker_core::fs::{Mode, OFlags, UserInfo};
+use litebox_broker_core::fs::{FileTime, Mode, OFlags, TimeUpdate, UserInfo};
 use litebox_broker_protocol::shared_buffer::{
     SharedBufferLayout, SharedBufferSequence, SharedBufferSlotIndex,
 };
@@ -798,4 +799,107 @@ fn symlinks_are_bounded_when_windows_allows_test_symlink_creation() {
     local.unlink(USER, "/inside_link").unwrap();
     assert!(fs::symlink_metadata(root.join("inside_link")).is_err());
     assert_eq!(fs::read(root.join("target")).unwrap(), b"inside");
+}
+
+/// The host time `seconds` and `nanoseconds` after the Unix epoch.
+fn host_time(seconds: u64, nanoseconds: u32) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::new(seconds, nanoseconds)
+}
+
+#[test]
+fn times_round_trip_through_the_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::write(root.join("file"), b"").unwrap();
+    fs::create_dir(root.join("dir")).unwrap();
+    let local = backend(root);
+    // Read-only, so Windows has to set the times by path.
+    let file = local
+        .open_file_at(local.root(), "file", OFlags::RDONLY)
+        .unwrap()
+        .item;
+    let dir = local
+        .owned_dir_at(
+            local.walk_directories(local.root(), &["dir"]).unwrap().last,
+            OFlags::PATH,
+        )
+        .unwrap();
+    // Whole multiples of 100 ns, which is as precise as Windows gets.
+    let accessed = FileTime {
+        seconds: 1_000_000_000,
+        nanoseconds: 123_456_700,
+    };
+    let modified = FileTime {
+        seconds: 1_234_567_890,
+        nanoseconds: 100,
+    };
+
+    for (handle, name) in [
+        (HandleRef::File(&file), "file"),
+        (HandleRef::Dir(&dir), "dir"),
+    ] {
+        local
+            .set_times(handle, TimeUpdate::Set(accessed), TimeUpdate::Set(modified))
+            .unwrap();
+        let metadata = fs::metadata(root.join(name)).unwrap();
+        assert_eq!(
+            metadata.accessed().unwrap(),
+            host_time(1_000_000_000, 123_456_700)
+        );
+        assert_eq!(metadata.modified().unwrap(), host_time(1_234_567_890, 100));
+        let status = local.status(handle).unwrap();
+        assert_eq!((status.accessed, status.modified), (accessed, modified));
+        #[cfg(unix)]
+        assert_eq!(
+            (
+                status.changed.seconds,
+                i64::from(status.changed.nanoseconds)
+            ),
+            (metadata.ctime(), metadata.ctime_nsec())
+        );
+    }
+
+    // `Now` is the host's current time, and an omitted time stays as it was.
+    let before = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    local
+        .set_times(HandleRef::File(&file), TimeUpdate::Now, TimeUpdate::Omit)
+        .unwrap();
+    let status = local.status(HandleRef::File(&file)).unwrap();
+    assert!(status.accessed.seconds.abs_diff(before.cast_signed()) <= 2);
+    assert_eq!(status.modified, modified);
+}
+
+#[cfg(unix)]
+#[test]
+fn set_times_on_a_symlink_handle_changes_the_link() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::write(root.join("file"), b"").unwrap();
+    symlink("file", root.join("link")).unwrap();
+    let local = backend(root);
+    let link = local
+        .open_file_at(local.root(), "link", OFlags::PATH | OFlags::NOFOLLOW)
+        .unwrap()
+        .item;
+    let before_epoch = FileTime {
+        seconds: -1,
+        nanoseconds: 5,
+    };
+    local
+        .set_times(
+            HandleRef::File(&link),
+            TimeUpdate::Omit,
+            TimeUpdate::Set(before_epoch),
+        )
+        .unwrap();
+    let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_nanos(999_999_995);
+    let link = fs::symlink_metadata(root.join("link")).unwrap();
+    assert_eq!(link.modified().unwrap(), before_epoch);
+    assert_ne!(
+        fs::metadata(root.join("file")).unwrap().modified().unwrap(),
+        before_epoch
+    );
 }

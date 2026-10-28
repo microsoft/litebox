@@ -364,23 +364,26 @@ mod tests {
     fn inherited_litebox_files_use_the_syscall_dispatcher() {
         let platform = Platform::new();
         let mode = FileMode::RWXU | FileMode::RWXG | FileMode::RWXO;
-        let fs = InMem::<Platform>::new_initialized(vec![
-            (
-                "/",
-                InitialNode::Directory {
-                    mode,
-                    owner: FileUser::ROOT,
-                },
-            ),
-            (
-                "/data",
-                InitialNode::File {
-                    mode,
-                    owner: FileUser::ROOT,
-                    data: (&b"abcdef"[..]).into(),
-                },
-            ),
-        ]);
+        let fs = InMem::<Platform>::new_initialized(
+            vec![
+                (
+                    "/",
+                    InitialNode::Directory {
+                        mode,
+                        owner: FileUser::ROOT,
+                    },
+                ),
+                (
+                    "/data",
+                    InitialNode::File {
+                        mode,
+                        owner: FileUser::ROOT,
+                        data: (&b"abcdef"[..]).into(),
+                    },
+                ),
+            ],
+            Arc::new(litebox_broker_core::test_support::ManualWallClockProvider::default()),
+        );
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))

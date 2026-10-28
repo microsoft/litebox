@@ -30,14 +30,14 @@ use core::ops::Range;
 use hashbrown::HashMap;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-use super::{DirEntry, FileType};
+use super::{DirEntry, FileTime, FileType};
 
 use super::{
-    Mode, NodeInfo, OFlags, UserInfo,
+    Mode, NodeInfo, OFlags, TimeUpdate, UserInfo,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+        RmdirError, SetTimesError, TruncateError, UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
@@ -47,6 +47,9 @@ use super::{
 const BLOCK_SIZE: u64 = 0;
 
 /// A [`super::backend::Backend`] that stores all files in-memory, via a read-only `.tar` file.
+///
+/// Every time of a file is its modification time in the archive, and every time of a directory is
+/// the newest such time beneath it, or the epoch if there is none.
 pub struct TarRo {
     tar_index: TarIndex,
 }
@@ -246,6 +249,9 @@ impl super::backend::Backend for TarRo {
                     owner: file.owner,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
+                    accessed: file.modified,
+                    modified: file.modified,
+                    changed: file.modified,
                 })
             }
             HandleRef::Dir(h) => {
@@ -257,6 +263,9 @@ impl super::backend::Backend for TarRo {
                     owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
                     node_info: dir.node_info,
                     blksize: BLOCK_SIZE,
+                    accessed: dir.modified,
+                    modified: dir.modified,
+                    changed: dir.modified,
                 })
             }
         }
@@ -310,6 +319,15 @@ impl super::backend::Backend for TarRo {
     ) -> Result<(), ChownError> {
         Err(ChownError::ReadOnlyFileSystem)
     }
+
+    fn set_times(
+        &self,
+        _h: HandleRef<'_>,
+        _accessed: TimeUpdate,
+        _modified: TimeUpdate,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
 }
 
 /// An empty tar file to support an empty file system.
@@ -320,12 +338,14 @@ struct IndexedFile {
     mode: Mode,
     owner: UserInfo,
     node_info: NodeInfo,
+    modified: FileTime,
 }
 
 struct IndexedDir {
     owner: Option<UserInfo>,
     node_info: NodeInfo,
     children: HashMap<String, IndexedChild>,
+    modified: FileTime,
 }
 
 #[derive(Clone, Copy)]
@@ -364,6 +384,7 @@ impl TarIndex {
                 mode: mode_of_modeflags(entry.posix_header().mode.to_flags().unwrap()),
                 owner: owner_from_posix_header(entry.posix_header()),
                 node_info: inode_allocator.next(),
+                modified: mtime_from_posix_header(entry.posix_header()),
             };
 
             let file_idx = files.len();
@@ -379,6 +400,7 @@ impl TarIndex {
             owner: None,
             node_info: inode_allocator.next(),
             children: HashMap::new(),
+            modified: FileTime::EPOCH,
         }];
         let mut dirs_by_path: HashMap<String, usize> = [(String::new(), 0)].into_iter().collect();
         for (path, &file_idx) in &files_by_path {
@@ -392,7 +414,9 @@ impl TarIndex {
             let mut parent_dir_idx = 0;
             for (component_idx, component) in components.iter().enumerate() {
                 let is_last_component = component_idx + 1 == components.len();
-                dirs[parent_dir_idx].owner.get_or_insert(file.owner);
+                let parent_dir = &mut dirs[parent_dir_idx];
+                parent_dir.owner.get_or_insert(file.owner);
+                parent_dir.modified = parent_dir.modified.max(file.modified);
 
                 if is_last_component {
                     dirs[parent_dir_idx]
@@ -412,6 +436,7 @@ impl TarIndex {
                         owner: Some(file.owner),
                         node_info: inode_allocator.next(),
                         children: HashMap::new(),
+                        modified: FileTime::EPOCH,
                     });
                     dirs.len() - 1
                 });
@@ -484,4 +509,21 @@ fn owner_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> UserInfo {
         user: posix_header.uid.as_number().unwrap(),
         group: posix_header.gid.as_number().unwrap(),
     }
+}
+
+/// The modification time in `posix_header`, or the epoch unless it is an unsigned octal number, as
+/// tar stores it.
+fn mtime_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> FileTime {
+    // `tar_no_std` declares this field decimal, but tar stores it in octal like its other numbers.
+    posix_header
+        .mtime
+        .as_inner()
+        .as_str()
+        .ok()
+        .and_then(|mtime| u64::from_str_radix(mtime.trim_matches(' '), 8).ok())
+        .and_then(|seconds| i64::try_from(seconds).ok())
+        .map_or(FileTime::EPOCH, |seconds| FileTime {
+            seconds,
+            nanoseconds: 0,
+        })
 }

@@ -13,12 +13,18 @@ use litebox_platform::sync;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WriteError,
+    ReadError, RmdirError, SetTimesError, TruncateError, UnlinkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
+use super::{
+    DirEntry, FileStatus, FileTime, FileType, Mode, NodeInfo, TimeUpdate, UserInfo,
+    WallClockProvider,
+};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
+///
+/// Objects are stamped with times from a [`WallClockProvider`]; reading a file does not update its
+/// access time.
 ///
 /// # Warning
 ///
@@ -29,12 +35,13 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
     // sync-primitives platform, as well as cost of mutexes and such?
     root: DirNode<Platform>,
     inode_allocator: InodeAllocator,
+    clock: Arc<dyn WallClockProvider>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
-    /// Construct a new `InMem` backend.
+    /// Construct a new `InMem` backend, whose objects are stamped with times from `clock`.
     #[must_use]
-    pub fn new(inode_allocator: InodeAllocator) -> Self {
+    pub fn new(inode_allocator: InodeAllocator, clock: Arc<dyn WallClockProvider>) -> Self {
         let root = Arc::new(sync::RwLock::new(DirData {
             perms: Permissions {
                 mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
@@ -42,14 +49,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             },
             children: HashMap::default(),
             node_info: inode_allocator.next(),
+            times: Times::new(clock.now()),
         }));
         Self {
             root,
             inode_allocator,
+            clock,
         }
     }
 
-    /// Construct an `InMem` backend pre-populated with `entries`.
+    /// Construct an `InMem` backend pre-populated with `entries`, whose objects are stamped with
+    /// times from `clock`.
     ///
     /// Entries are inserted in order, bypassing all permission checks, which is what lets a caller
     /// set up root-owned directories and files without ever acting as root at runtime. Each
@@ -65,8 +75,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     #[must_use]
     pub fn new_initialized<Path: AsRef<str>>(
         entries: impl IntoIterator<Item = (Path, impl Into<InitialNode>)>,
+        clock: Arc<dyn WallClockProvider>,
     ) -> Self {
-        let this = Self::new(InodeAllocator::standalone());
+        let this = Self::new(InodeAllocator::standalone(), clock);
         for (path, node) in entries {
             this.insert_initial(path.as_ref(), node.into());
         }
@@ -122,6 +133,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         }
 
         let mut dir = dir.write();
+        let now = self.clock.now();
+        if !dir.children.contains_key(name) {
+            dir.times.modify(now);
+        }
         match (dir.children.get(name), node) {
             (Some(Node::Dir(existing)), InitialNode::Directory { mode, owner }) => {
                 existing.write().perms = Permissions {
@@ -171,6 +186,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     },
                     children: HashMap::default(),
                     node_info: self.inode_allocator.next(),
+                    times: Times::new(now),
                 }));
                 dir.children.insert(name.into(), Node::Dir(child));
             }
@@ -183,6 +199,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     file_type: FileType::RegularFile,
                     data,
                     node_info: self.inode_allocator.next(),
+                    times: Times::new(now),
                 }));
                 dir.children.insert(name.into(), Node::File(child));
             }
@@ -202,6 +219,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     file_type: FileType::SymbolicLink,
                     data: target.into_bytes().into(),
                     node_info: self.inode_allocator.next(),
+                    times: Times::new(now),
                 }));
                 dir.children.insert(name.into(), Node::File(child));
             }
@@ -237,6 +255,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             "must only be used on empty files during initialization"
         );
         file.data = data;
+    }
+
+    /// Apply `update` to the permissions of the non-symlink object `h` refers to, failing with
+    /// `symlink_error` for a symlink, and stamp its status change time.
+    fn change_permissions<E>(
+        &self,
+        h: super::backend::HandleRef<'_>,
+        symlink_error: E,
+        update: impl FnOnce(&mut Permissions),
+    ) -> Result<(), E> {
+        match h {
+            super::backend::HandleRef::File(h) => {
+                let mut file = h.get_typed::<Self>().file.write();
+                if file.file_type == FileType::SymbolicLink {
+                    return Err(symlink_error);
+                }
+                update(&mut file.perms);
+                file.times.changed = self.clock.now();
+            }
+            super::backend::HandleRef::Dir(h) => {
+                let mut dir = h.get_typed::<Self>().dir.write();
+                update(&mut dir.perms);
+                dir.times.changed = self.clock.now();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -515,6 +559,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             data.truncate(previous_len);
             return Err(fault.into());
         }
+        if !buf.is_empty() {
+            file.times.modify(self.clock.now());
+        }
         Ok(buf.len())
     }
 
@@ -528,6 +575,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             core::cmp::Ordering::Equal => (),
             core::cmp::Ordering::Greater => file.data.to_mut().resize(length, 0),
         }
+        // Like Linux's `ftruncate` and `O_TRUNC`, even a truncation to the current size counts.
+        file.times.modify(self.clock.now());
         Ok(())
     }
 
@@ -546,6 +595,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     owner: file.perms.userinfo,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
+                    accessed: file.times.accessed,
+                    modified: file.times.modified,
+                    changed: file.times.changed,
                 })
             }
             super::backend::HandleRef::Dir(h) => {
@@ -557,6 +609,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     owner: dir.perms.userinfo,
                     node_info: dir.node_info,
                     blksize: BLOCK_SIZE,
+                    accessed: dir.times.accessed,
+                    modified: dir.times.modified,
+                    changed: dir.times.changed,
                 })
             }
         }
@@ -575,6 +630,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         if parent.children.contains_key(name) {
             return Err(OpenError::AlreadyExists);
         }
+        let now = self.clock.now();
         let file = Arc::new(sync::RwLock::new(FileData {
             perms: Permissions {
                 mode: metadata.mode,
@@ -583,7 +639,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             file_type: FileType::RegularFile,
             data: Vec::new().into(),
             node_info: self.inode_allocator.next(),
+            times: Times::new(now),
         }));
+        parent.times.modify(now);
         let old = parent
             .children
             .insert(name.into(), Node::File(file.clone()));
@@ -606,6 +664,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         if parent.children.contains_key(name) {
             return Err(MkdirError::AlreadyExists);
         }
+        let now = self.clock.now();
         let child = Arc::new(sync::RwLock::new(DirData {
             perms: Permissions {
                 mode: metadata.mode,
@@ -613,7 +672,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             },
             children: HashMap::default(),
             node_info: self.inode_allocator.next(),
+            times: Times::new(now),
         }));
+        parent.times.modify(now);
         parent
             .children
             .insert(name.into(), Node::Dir(child.clone()));
@@ -634,8 +695,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         match parent.children.get(name) {
             None => Err(PathError::NoSuchFileOrDirectory.into()),
             Some(Node::Dir(_)) => Err(UnlinkError::IsADirectory),
-            Some(Node::File(_)) => {
+            Some(Node::File(file)) => {
+                // Its link count changed, which open handles can still observe.
+                let mut file = file.write();
+                let now = self.clock.now();
+                file.times.changed = now;
+                drop(file);
                 parent.children.remove(name);
+                parent.times.modify(now);
                 Ok(())
             }
         }
@@ -652,28 +719,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             Some(Node::Dir(child)) if !child.read().children.is_empty() => {
                 Err(RmdirError::NotEmpty)
             }
-            Some(Node::Dir(_)) => {
+            Some(Node::Dir(child)) => {
+                // Its link count changed, which open handles can still observe.
+                let mut child = child.write();
+                let now = self.clock.now();
+                child.times.changed = now;
+                drop(child);
                 parent.children.remove(name);
+                parent.times.modify(now);
                 Ok(())
             }
         }
     }
 
     fn chmod(&self, h: super::backend::HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
-        let mut perms = match h {
-            super::backend::HandleRef::File(h) => {
-                let file = h.get_typed::<Self>().file.write();
-                if file.file_type == FileType::SymbolicLink {
-                    return Err(ChmodError::IsSymlink);
-                }
-                sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
-            }
-            super::backend::HandleRef::Dir(h) => {
-                sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
-            }
-        };
-        perms.mode = mode;
-        Ok(())
+        self.change_permissions(h, ChmodError::IsSymlink, |perms| perms.mode = mode)
     }
 
     fn chown(
@@ -682,24 +742,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let mut perms = match h {
+        self.change_permissions(h, ChownError::IsSymlink, |perms| {
+            if let Some(new_user) = user {
+                perms.userinfo.user = new_user;
+            }
+            if let Some(new_group) = group {
+                perms.userinfo.group = new_group;
+            }
+        })
+    }
+
+    fn set_times(
+        &self,
+        h: super::backend::HandleRef<'_>,
+        accessed: TimeUpdate,
+        modified: TimeUpdate,
+    ) -> Result<(), SetTimesError> {
+        let mut times = match h {
             super::backend::HandleRef::File(h) => {
-                let file = h.get_typed::<Self>().file.write();
-                if file.file_type == FileType::SymbolicLink {
-                    return Err(ChownError::IsSymlink);
-                }
-                sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
+                sync::RwLockWriteGuard::map(h.get_typed::<Self>().file.write(), |f| &mut f.times)
             }
             super::backend::HandleRef::Dir(h) => {
-                sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
+                sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.times)
             }
         };
-        if let Some(new_user) = user {
-            perms.userinfo.user = new_user;
-        }
-        if let Some(new_group) = group {
-            perms.userinfo.group = new_group;
-        }
+        times.update(accessed, modified, self.clock.now());
         Ok(())
     }
 
@@ -776,6 +843,7 @@ struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
     perms: Permissions,
     children: HashMap<String, Node<Platform>>,
     node_info: NodeInfo,
+    times: Times,
 }
 
 type FileNode<Platform> = Arc<sync::RwLock<Platform, FileData>>;
@@ -785,10 +853,50 @@ struct FileData {
     /// The contents of a regular file, or the target of a symlink.
     data: alloc::borrow::Cow<'static, [u8]>,
     node_info: NodeInfo,
+    times: Times,
 }
 
 #[derive(Clone, Debug)]
 struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Times {
+    accessed: FileTime,
+    modified: FileTime,
+    changed: FileTime,
+}
+
+impl Times {
+    /// The times of an object created at `now`.
+    fn new(now: FileTime) -> Self {
+        Self {
+            accessed: now,
+            modified: now,
+            changed: now,
+        }
+    }
+
+    /// Record a change, at `now`, to a file's data or a directory's entries.
+    fn modify(&mut self, now: FileTime) {
+        self.modified = now;
+        self.changed = now;
+    }
+
+    /// Apply a [`super::backend::Backend::set_times`] at `now`.
+    fn update(&mut self, accessed: TimeUpdate, modified: TimeUpdate, now: FileTime) {
+        if (accessed, modified) == (TimeUpdate::Omit, TimeUpdate::Omit) {
+            return;
+        }
+        let resolve = |update, current| match update {
+            TimeUpdate::Omit => current,
+            TimeUpdate::Now => now,
+            TimeUpdate::Set(time) => time,
+        };
+        self.accessed = resolve(accessed, self.accessed);
+        self.modified = resolve(modified, self.modified);
+        self.changed = now;
+    }
 }

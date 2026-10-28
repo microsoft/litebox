@@ -103,10 +103,10 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
             mode: FileMode::RWXU | FileMode::RWXG | FileMode::RWXO,
             owner: FileUser::ROOT,
         };
-        let in_mem =
-            litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(vec![(
-                "/", root,
-            )]);
+        let in_mem = litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(
+            vec![("/", root)],
+            Arc::new(litebox_broker_core::test_support::ManualWallClockProvider::default()),
+        );
         let stdio = Arc::new(
             TestStdioProvider::default()
                 .with_open_input()

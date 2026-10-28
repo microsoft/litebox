@@ -10,7 +10,9 @@ use core::ffi::{c_char, c_uint};
 use core::time::Duration;
 use int_enum::IntEnum;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
-use litebox_broker_protocol::fs::{FileMode, FileNodeInfo, FileStatus, FileType, FileUser};
+use litebox_broker_protocol::fs::{
+    FileMode, FileNodeInfo, FileStatus, FileTime, FileType, FileUser,
+};
 use litebox_broker_protocol::terminal::{
     ControlCharacters, GUEST_ATTRIBUTES_LEN, InputFlags, LocalFlags, OutputFlags, TerminalSettings,
     WindowSize,
@@ -486,7 +488,9 @@ impl TryFrom<FileStatus> for FileStat {
             owner: FileUser { user, group },
             node_info: FileNodeInfo { dev, ino, rdev },
             blksize: block_size,
-            ..
+            accessed,
+            modified,
+            changed,
         } = value;
         // Linux exposes signed sizes even where the Rust ABI struct uses `usize`.
         let size = i64::try_from(size).map_err(|_| errno::Errno::EOVERFLOW)?;
@@ -509,6 +513,12 @@ impl TryFrom<FileStatus> for FileStat {
             #[cfg(target_arch = "aarch64")]
             st_blksize: i32::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
             st_blocks: 0,
+            st_atime: accessed.seconds,
+            st_atime_nsec: accessed.nanoseconds.into(),
+            st_mtime: modified.seconds,
+            st_mtime_nsec: modified.nanoseconds.into(),
+            st_ctime: changed.seconds,
+            st_ctime_nsec: changed.nanoseconds.into(),
             ..Default::default()
         })
     }
@@ -544,10 +554,6 @@ bitflags::bitflags! {
             | Self::STATX_INO.bits()
             | Self::STATX_SIZE.bits()
             | Self::STATX_BLOCKS.bits();
-        /// The basic-stats fields LiteBox actually fills. Excludes the
-        /// time bits because `FileStatus` doesn't carry timestamps.
-        const STATX_BASIC_FILLED = Self::STATX_BASIC_STATS.bits()
-            & !(Self::STATX_ATIME.bits() | Self::STATX_MTIME.bits() | Self::STATX_CTIME.bits());
         const STATX_BTIME = 0x0000_0800;
         const STATX_MNT_ID = 0x0000_1000;
         const STATX_DIOALIGN = 0x0000_2000;
@@ -627,11 +633,18 @@ impl TryFrom<FileStatus> for Statx {
             owner: FileUser { user, group },
             node_info: FileNodeInfo { dev, ino, rdev },
             blksize: block_size,
-            ..
+            accessed,
+            modified,
+            changed,
         } = value;
         let rdev = rdev.map_or(0, core::num::NonZeroU64::get);
+        let timestamp = |time: FileTime| StatxTimestamp {
+            tv_sec: time.seconds,
+            tv_nsec: time.nanoseconds,
+            ..Default::default()
+        };
         Ok(Self {
-            stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
+            stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
             stx_blksize: u32::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
             stx_nlink: 1,
             stx_uid: u32::from(user),
@@ -640,6 +653,9 @@ impl TryFrom<FileStatus> for Statx {
             stx_ino: ino,
             stx_size: size,
             stx_blocks: 0,
+            stx_atime: timestamp(accessed),
+            stx_ctime: timestamp(changed),
+            stx_mtime: timestamp(modified),
             stx_rdev_major: dev_major(rdev),
             stx_rdev_minor: dev_minor(rdev),
             stx_dev_major: dev_major(dev),
@@ -1168,6 +1184,53 @@ impl From<Winsize> for WindowSize {
             x_pixels: size.xpixel,
             y_pixels: size.ypixel,
         }
+    }
+}
+
+#[cfg(test)]
+mod stat_tests {
+    use super::*;
+
+    fn status() -> FileStatus {
+        FileStatus {
+            file_type: FileType::RegularFile,
+            mode: FileMode::RUSR,
+            size: 3,
+            owner: FileUser { user: 1, group: 2 },
+            node_info: FileNodeInfo {
+                dev: 3,
+                ino: 4,
+                rdev: None,
+            },
+            blksize: 4096,
+            accessed: FileTime {
+                seconds: -1,
+                nanoseconds: 999_999_999,
+            },
+            modified: FileTime {
+                seconds: 1_700_000_000,
+                nanoseconds: 5,
+            },
+            changed: FileTime {
+                seconds: 1_700_000_001,
+                nanoseconds: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn stat_and_statx_report_times() {
+        let stat = FileStat::try_from(status()).unwrap();
+        assert_eq!((stat.st_atime, stat.st_atime_nsec), (-1, 999_999_999));
+        assert_eq!((stat.st_mtime, stat.st_mtime_nsec), (1_700_000_000, 5));
+        assert_eq!((stat.st_ctime, stat.st_ctime_nsec), (1_700_000_001, 0));
+
+        let statx = Statx::try_from(status()).unwrap();
+        assert_eq!(statx.stx_mask, StatxMask::STATX_BASIC_STATS.bits());
+        let time = |timestamp: StatxTimestamp| (timestamp.tv_sec, timestamp.tv_nsec);
+        assert_eq!(time(statx.stx_atime), (-1, 999_999_999));
+        assert_eq!(time(statx.stx_mtime), (1_700_000_000, 5));
+        assert_eq!(time(statx.stx_ctime), (1_700_000_001, 0));
     }
 }
 

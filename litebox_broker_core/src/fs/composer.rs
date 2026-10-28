@@ -19,10 +19,12 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SetTimesError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{
+    DirEntry, FileStatus, FileTime, FileType, Mode, NodeInfo, OFlags, TimeUpdate, UserInfo,
+};
 use crate::readiness::ReadinessSource;
 use thiserror::Error;
 
@@ -310,6 +312,9 @@ impl Composer {
             owner: UserInfo::ROOT,
             node_info,
             blksize: super::DEFAULT_DIRECTORY_SIZE,
+            accessed: FileTime::EPOCH,
+            modified: FileTime::EPOCH,
+            changed: FileTime::EPOCH,
         }
     }
 
@@ -886,6 +891,35 @@ impl Backend for Composer {
                 } => self.mounts[*mount_index]
                     .backend
                     .chown(HandleRef::Dir(handle), user, group),
+            },
+        }
+    }
+    fn set_times(
+        &self,
+        h: HandleRef<'_>,
+        accessed: TimeUpdate,
+        modified: TimeUpdate,
+    ) -> Result<(), SetTimesError> {
+        match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.mounts[h.mount_index].backend.set_times(
+                    HandleRef::File(&h.handle),
+                    accessed,
+                    modified,
+                )
+            }
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { .. } => Err(SetTimesError::ReadOnlyFileSystem),
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self.mounts[*mount_index].backend.set_times(
+                    HandleRef::Dir(handle),
+                    accessed,
+                    modified,
+                ),
             },
         }
     }

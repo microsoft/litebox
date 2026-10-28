@@ -5,13 +5,13 @@ use core::num::NonZeroU64;
 
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-    FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
+    FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileTime,
+    FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
+    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest,
+    SeekFileResponse, SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -595,6 +595,9 @@ fn encode_status(encoder: &mut Encoder, status: FileStatus) {
     encoder.u64(status.node_info.ino);
     encode_optional_u64(encoder, status.node_info.rdev.map(NonZeroU64::get));
     encoder.u64(status.blksize);
+    encode_time(encoder, status.accessed);
+    encode_time(encoder, status.modified);
+    encode_time(encoder, status.changed);
 }
 
 fn decode_status(decoder: &mut Decoder<'_>) -> Result<FileStatus, WireError> {
@@ -615,5 +618,25 @@ fn decode_status(decoder: &mut Decoder<'_>) -> Result<FileStatus, WireError> {
         owner,
         node_info: FileNodeInfo { dev, ino, rdev },
         blksize,
+        accessed: decode_time(decoder)?,
+        modified: decode_time(decoder)?,
+        changed: decode_time(decoder)?,
+    })
+}
+
+fn encode_time(encoder: &mut Encoder, time: FileTime) {
+    encoder.u64(time.seconds.cast_unsigned());
+    encoder.u32(time.nanoseconds);
+}
+
+fn decode_time(decoder: &mut Decoder<'_>) -> Result<FileTime, WireError> {
+    let seconds = decoder.u64()?.cast_signed();
+    let nanoseconds = decoder.u32()?;
+    if nanoseconds >= FileTime::NANOSECONDS_PER_SECOND {
+        return Err(WireError::InvalidTag);
+    }
+    Ok(FileTime {
+        seconds,
+        nanoseconds,
     })
 }

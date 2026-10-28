@@ -17,15 +17,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 use self::fcall::Rlerror;
-use super::OFlags;
 use super::backend::{
     DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned, SeekBehavior, WalkOutcome,
     WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SeekError, SetTimesError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
+use super::{FileTime, OFlags, TimeUpdate};
 use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
@@ -645,6 +646,38 @@ where
         };
         Ok(self.client.setattr(&fid.fid, valid, stat)?)
     }
+
+    fn set_times(
+        &self,
+        h: HandleRef<'_>,
+        accessed: TimeUpdate,
+        modified: TimeUpdate,
+    ) -> Result<(), SetTimesError> {
+        let fid = match h {
+            HandleRef::File(h) => &h.get_typed::<Self>().fid,
+            HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
+        };
+        let mut valid = fcall::SetattrMask::empty();
+        let stat = fcall::SetAttr {
+            atime: setattr_time(
+                accessed,
+                fcall::SetattrMask::ATIME,
+                fcall::SetattrMask::ATIME_SET,
+                &mut valid,
+            ),
+            mtime: setattr_time(
+                modified,
+                fcall::SetattrMask::MTIME,
+                fcall::SetattrMask::MTIME_SET,
+                &mut valid,
+            ),
+            ..Default::default()
+        };
+        if valid.is_empty() {
+            return Ok(());
+        }
+        Ok(self.client.setattr(&fid.fid, valid, stat)?)
+    }
 }
 
 /// The 9P server is authoritative for permissions, so every component the backend reports is left
@@ -763,6 +796,9 @@ fn rgetattr_to_file_status(
                 rdev: NonZeroU64::new(attr.stat.rdev),
             },
             blksize: attr.stat.blksize,
+            accessed: rgetattr_time(attr, fcall::GetattrMask::ATIME, attr.stat.atime)?,
+            modified: rgetattr_time(attr, fcall::GetattrMask::MTIME, attr.stat.mtime)?,
+            changed: rgetattr_time(attr, fcall::GetattrMask::CTIME, attr.stat.ctime)?,
         })
     } else {
         Ok(super::FileStatus {
@@ -803,7 +839,54 @@ fn rgetattr_to_file_status(
             } else {
                 0
             },
+            accessed: rgetattr_time(attr, fcall::GetattrMask::ATIME, attr.stat.atime)?,
+            modified: rgetattr_time(attr, fcall::GetattrMask::MTIME, attr.stat.mtime)?,
+            changed: rgetattr_time(attr, fcall::GetattrMask::CTIME, attr.stat.ctime)?,
         })
+    }
+}
+
+/// The `time` that `attr` reports under `bit`, or the epoch when it reports none.
+fn rgetattr_time(
+    attr: &fcall::Rgetattr,
+    bit: fcall::GetattrMask,
+    time: fcall::Time,
+) -> Result<FileTime, Error> {
+    if !attr.valid.contains(bit) {
+        return Ok(FileTime::EPOCH);
+    }
+    let nanoseconds = u32::try_from(time.nsec)
+        .ok()
+        .filter(|&nanoseconds| nanoseconds < FileTime::NANOSECONDS_PER_SECOND)
+        .ok_or(Error::InvalidResponse)?;
+    // 9P carries the seconds of the server's signed `time_t` in an unsigned field.
+    Ok(FileTime {
+        seconds: time.sec.cast_signed(),
+        nanoseconds,
+    })
+}
+
+/// The `Tsetattr` time for `update`, adding the `valid` bits that apply it: `now` alone makes the
+/// server use its own current time, and with `set` it uses the time sent.
+fn setattr_time(
+    update: TimeUpdate,
+    now: fcall::SetattrMask,
+    set: fcall::SetattrMask,
+    valid: &mut fcall::SetattrMask,
+) -> fcall::Time {
+    match update {
+        TimeUpdate::Omit => fcall::Time::default(),
+        TimeUpdate::Now => {
+            *valid |= now;
+            fcall::Time::default()
+        }
+        TimeUpdate::Set(time) => {
+            *valid |= now | set;
+            fcall::Time {
+                sec: time.seconds.cast_unsigned(),
+                nsec: time.nanoseconds.into(),
+            }
+        }
     }
 }
 
@@ -1016,6 +1099,21 @@ impl From<Error> for ChmodError {
                 _ => ChmodError::Io,
             },
             Error::Io | Error::InvalidResponse | Error::Broker(_) => ChmodError::Io,
+        }
+    }
+}
+
+impl From<Error> for SetTimesError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => SetTimesError::PathError(PathError::InvalidPathname),
+            Error::Remote(errno) => match errno {
+                ENOENT => SetTimesError::PathError(PathError::NoSuchFileOrDirectory),
+                ENOTDIR => SetTimesError::PathError(PathError::ComponentNotADirectory),
+                EPERM | EACCES => SetTimesError::NotTheOwner,
+                _ => SetTimesError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::Broker(_) => SetTimesError::Io,
         }
     }
 }

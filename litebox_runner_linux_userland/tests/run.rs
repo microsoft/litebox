@@ -1682,7 +1682,10 @@ fn test_file_service(
 
     let backend = Composer::builder()
         .mount("/", |_| {
-            InMem::<LinuxSyncPrimitivesProvider>::new_initialized(entries)
+            InMem::<LinuxSyncPrimitivesProvider>::new_initialized(
+                entries,
+                std::sync::Arc::new(litebox_broker_userland::wall_clock::UserlandWallClockProvider),
+            )
         })
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(

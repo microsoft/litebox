@@ -154,6 +154,22 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`super::backend::Backend::set_times`]
+#[derive(Error, Debug)]
+pub enum SetTimesError {
+    #[error(
+        "the effective UID does not match the owner of the file, \
+         and the process is not privileged"
+    )]
+    NotTheOwner,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`super::resolver::Resolver::unlink`]
 #[derive(Error, Debug)]
 pub enum UnlinkError {

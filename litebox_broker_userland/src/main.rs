@@ -31,6 +31,7 @@ use litebox_broker_userland::fs::LocalFs;
 use litebox_broker_userland::mapped_file;
 use litebox_broker_userland::random::UserlandRandomProvider;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
+use litebox_broker_userland::wall_clock::UserlandWallClockProvider;
 use litebox_platform::sync::RawSyncPrimitivesProvider;
 
 #[cfg(target_os = "linux")]
@@ -221,7 +222,7 @@ where
         }
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
-    let in_mem = InMem::<Platform>::new_initialized(entries);
+    let in_mem = InMem::<Platform>::new_initialized(entries, Arc::new(UserlandWallClockProvider));
     let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
             Overlay::<Platform>::new(

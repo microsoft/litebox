@@ -20,9 +20,10 @@
 //! same name may not be reusable until retained handles close.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 mod io_errors;
 // On Linux and x86-64 Windows hosts, file reads and writes transfer directly between the host file
@@ -36,20 +37,23 @@ mod windows;
 #[cfg(unix)]
 use io_errors::chown_error;
 use io_errors::{
-    chmod_error, invalid_path, mkdir_error, open_error, rmdir_error, unlink_error,
+    chmod_error, invalid_path, mkdir_error, open_error, rmdir_error, set_times_error, unlink_error,
     unsupported_object, walk_error,
 };
 
+use crate::wall_clock::{file_time, system_time};
 use litebox_broker_core::fs::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SetTimesError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
-use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use litebox_broker_core::fs::{
+    DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, TimeUpdate, UserInfo,
+};
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
@@ -255,18 +259,25 @@ fn status_from_metadata(
     node_info: NodeInfo,
 ) -> std::io::Result<FileStatus> {
     let file_type = host_file_type(metadata)?;
-    let (mode, owner, blksize) = {
+    let modified = file_time(metadata.modified()?);
+    let (mode, owner, blksize, changed) = {
         #[cfg(unix)]
         {
+            use litebox_broker_core::fs::FileTime;
             use std::os::unix::fs::MetadataExt as _;
             let owner = UserInfo {
                 user: u16::try_from(metadata.uid()).unwrap_or(65534),
                 group: u16::try_from(metadata.gid()).unwrap_or(65534),
             };
+            let changed = FileTime {
+                seconds: metadata.ctime(),
+                nanoseconds: u32::try_from(metadata.ctime_nsec()).map_err(std::io::Error::other)?,
+            };
             (
                 Mode::from_u32_bits_truncate(metadata.mode()),
                 owner,
                 metadata.blksize(),
+                changed,
             )
         }
         #[cfg(windows)]
@@ -290,7 +301,10 @@ fn status_from_metadata(
             litebox_util_log::debug!(
                 "reporting a 4096-byte block size because Windows reports none"
             );
-            (mode, UserInfo::ROOT, 4096)
+            litebox_util_log::debug!(
+                "reporting the modification time as the status change time because std reports none on Windows"
+            );
+            (mode, UserInfo::ROOT, 4096, modified)
         }
     };
     Ok(FileStatus {
@@ -300,6 +314,9 @@ fn status_from_metadata(
         owner,
         node_info,
         blksize,
+        accessed: file_time(metadata.accessed()?),
+        modified,
+        changed,
     })
 }
 
@@ -1057,5 +1074,51 @@ impl Backend for LocalFs {
                 Ok(())
             }
         }
+    }
+
+    fn set_times(
+        &self,
+        h: HandleRef<'_>,
+        accessed: TimeUpdate,
+        modified: TimeUpdate,
+    ) -> Result<(), SetTimesError> {
+        let (path, open) = match h {
+            HandleRef::Dir(dir) => {
+                let dir = dir.get_typed::<Self>();
+                if !self.valid_dir(dir) {
+                    return Err(SetTimesError::Io);
+                }
+                (&dir.canonical_path, None)
+            }
+            HandleRef::File(file) => {
+                let file = file.get_typed::<Self>();
+                if !self.valid_file(file) {
+                    return Err(SetTimesError::Io);
+                }
+                (&file.canonical_path, file.file.as_deref())
+            }
+        };
+        // Std cannot ask for the host's own current time, so the host checks `Now` as an explicit
+        // time, which only the owner may set.
+        let now = SystemTime::now();
+        let host_time = |update| match update {
+            TimeUpdate::Omit => Ok(None),
+            TimeUpdate::Now => Ok(Some(now)),
+            TimeUpdate::Set(time) => system_time(time).map(Some).ok_or(SetTimesError::Io),
+        };
+        let mut times = FileTimes::new();
+        if let Some(time) = host_time(accessed)? {
+            times = times.set_accessed(time);
+        }
+        if let Some(time) = host_time(modified)? {
+            times = times.set_modified(time);
+        }
+        let result = match open {
+            // A Windows handle opened only for reading cannot write attributes.
+            Some(open) if cfg!(unix) => open.set_times(times),
+            // The resolver follows symlinks itself, so a symlink's handle names the link.
+            _ => fs::set_times_nofollow(path, times),
+        };
+        result.map_err(set_times_error)
     }
 }

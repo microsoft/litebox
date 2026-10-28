@@ -8,7 +8,7 @@
 #[cfg(unix)]
 use litebox_broker_core::fs::errors::ChownError;
 use litebox_broker_core::fs::errors::{
-    ChmodError, MkdirError, OpenError, PathError, RmdirError, UnlinkError, WalkError,
+    ChmodError, MkdirError, OpenError, PathError, RmdirError, SetTimesError, UnlinkError, WalkError,
 };
 
 pub(super) fn invalid_path() -> std::io::Error {
@@ -110,6 +110,14 @@ pub(super) fn chmod_error(error: std::io::Error) -> ChmodError {
         std::io::ErrorKind::PermissionDenied => ChmodError::NotTheOwner,
         std::io::ErrorKind::ReadOnlyFilesystem => ChmodError::ReadOnlyFileSystem,
         _ => unmapped(&error, ChmodError::Io),
+    }
+}
+
+pub(super) fn set_times_error(error: std::io::Error) -> SetTimesError {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => SetTimesError::NotTheOwner,
+        std::io::ErrorKind::ReadOnlyFilesystem => SetTimesError::ReadOnlyFileSystem,
+        _ => unmapped(&error, SetTimesError::Io),
     }
 }
 
