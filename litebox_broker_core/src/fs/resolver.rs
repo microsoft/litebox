@@ -356,6 +356,17 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         }
     }
 
+    /// Whether a walk finds the entry `name` in `dir`.
+    ///
+    /// An existing name can never be created, whatever the permissions, so creation reports that
+    /// it exists ahead of any missing write permission on `dir` or a read-only backend (such as at
+    /// a mount point), and callers check this first.
+    fn has_entry(&self, dir: &DirHandle, name: &str) -> bool {
+        self.backend
+            .walking_dir_at(dir)
+            .is_some_and(|dir| self.backend.walk_directories(dir, &[name]).is_ok())
+    }
+
     fn owned_parent_dir(&self, dir: WalkingDirHandle<'_>) -> Result<DirHandle, WalkError> {
         self.backend
             .owned_dir_at(dir, OFlags::PATH)
@@ -1142,15 +1153,19 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if matches!(name.as_str(), "." | "..") {
             return Err(SymlinkError::AlreadyExists);
         }
-        if !Self::can_change_entries_in_dir(&context, &parent) {
-            return Err(SymlinkError::NoWritePerms);
-        }
+        let may_change_entries = Self::can_change_entries_in_dir(&context, &parent);
         let parent = self
             .owned_parent_dir(parent.handle)
             .map_err(|error| match error {
                 WalkError::Io => SymlinkError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
+        if self.has_entry(&parent, &name) {
+            return Err(SymlinkError::AlreadyExists);
+        }
+        if !may_change_entries {
+            return Err(SymlinkError::NoWritePerms);
+        }
         self.backend.symlink_at(
             parent,
             &name,
@@ -1177,15 +1192,19 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         if matches!(name.as_str(), "." | "..") {
             return Err(MkdirError::AlreadyExists);
         }
-        if !Self::can_change_entries_in_dir(&context, &parent) {
-            return Err(MkdirError::NoWritePerms);
-        }
+        let may_change_entries = Self::can_change_entries_in_dir(&context, &parent);
         let parent = self
             .owned_parent_dir(parent.handle)
             .map_err(|error| match error {
                 WalkError::Io => MkdirError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
+        if self.has_entry(&parent, &name) {
+            return Err(MkdirError::AlreadyExists);
+        }
+        if !may_change_entries {
+            return Err(MkdirError::NoWritePerms);
+        }
         self.backend
             .mkdir_at(
                 parent,

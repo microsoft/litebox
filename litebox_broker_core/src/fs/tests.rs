@@ -405,6 +405,11 @@ mod in_mem {
             fs.mkdir(USER, "/rootdir/newdir", Mode::RWXU),
             Err(MkdirError::NoWritePerms)
         ));
+        // An existing name is reported ahead of the missing write permission.
+        assert!(matches!(
+            fs.mkdir(USER, "/rootdir/sub", Mode::RWXU),
+            Err(MkdirError::AlreadyExists)
+        ));
         assert!(matches!(
             fs.unlink(USER, "/rootdir/file"),
             Err(UnlinkError::NoWritePerms)
@@ -2215,6 +2220,7 @@ mod composed {
     use super::{InMem, Mode, OFlags, Resolver, TestPlatform, USER, UserInfo};
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
+    use crate::fs::errors::{MkdirError, SymlinkError};
     use crate::fs::in_mem::InitialNode;
     use crate::random::TestRandomProvider;
     use crate::stdio::StdioOutputStream;
@@ -2282,5 +2288,26 @@ mod composed {
             fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "File should not exist"
         );
+    }
+
+    #[test]
+    fn creating_an_existing_name_reports_it_exists() {
+        let fs = composed_fs(Arc::new(TestStdioProvider::default()));
+
+        // A mount point and an entry of a read-only backend exist, though neither can be replaced.
+        for path in ["/dev", "/dev/null"] {
+            assert!(matches!(
+                fs.mkdir(USER, path, Mode::RWXU),
+                Err(MkdirError::AlreadyExists)
+            ));
+            assert!(matches!(
+                fs.symlink(USER, "target", path),
+                Err(SymlinkError::AlreadyExists)
+            ));
+        }
+        assert!(matches!(
+            fs.mkdir(USER, "/dev/new", Mode::RWXU),
+            Err(MkdirError::ReadOnlyFileSystem)
+        ));
     }
 }
