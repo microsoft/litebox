@@ -593,7 +593,7 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
         &mut trampoline_data,
     )?;
     // The NT sysno rewrite leaves the sysno of a jump-targeted `syscall`
-    // untranslated, so those must stay unpatchable rather than be redirected.
+    // untranslated, so jumps to it must not be redirected.
     let patch_result = patch_syscalls_in_sections(
         Arch::X86_64,
         buf,
@@ -933,22 +933,35 @@ fn patch_syscalls_in_sections(
     unpatchable: UnpatchableSyscalls,
     redirect_jumps: bool,
 ) -> Result<SyscallPatchResult> {
-    let patched_targets = if redirect_jumps {
-        redirect_jumps_to_syscalls(
-            arch,
-            buf,
-            text_sections,
-            control_transfer_targets,
-            trampoline_base_addr,
-            syscall_entry_addr,
-            trampoline_data,
-        )?
-    } else {
-        None
-    };
-    let mut found_syscall = patched_targets.is_some();
+    let mut found_syscall = false;
     let mut skipped_addrs = Vec::new();
-    let control_transfer_targets = patched_targets.as_ref().unwrap_or(control_transfer_targets);
+
+    // Redirect jumps first, so that the syscalls they no longer reach can be
+    // patched with the branch targets of the redirected code.
+    let redirected_targets;
+    let mut control_transfer_targets = control_transfer_targets;
+    if redirect_jumps {
+        let trampoline_len = trampoline_data.len();
+        for section in text_sections {
+            if let Err(InternalError::Public(e)) = hook_syscalls_in_section(
+                arch,
+                control_transfer_targets,
+                section.vaddr,
+                section_slice_mut(buf, section)?,
+                trampoline_base_addr,
+                syscall_entry_addr,
+                trampoline_data,
+                UnpatchableSyscalls::Keep,
+                true,
+            ) {
+                return Err(e);
+            }
+        }
+        if trampoline_data.len() != trampoline_len {
+            redirected_targets = get_control_transfer_targets(arch, buf, text_sections)?;
+            control_transfer_targets = &redirected_targets;
+        }
+    }
 
     for section in text_sections {
         let section_data = section_slice_mut(buf, section)?;
@@ -961,6 +974,7 @@ fn patch_syscalls_in_sections(
             syscall_entry_addr,
             trampoline_data,
             unpatchable,
+            false,
         ) {
             Ok(addrs) => {
                 found_syscall = true;
@@ -1261,6 +1275,12 @@ enum Arch {
 /// stub jumps to (via `JMP [RIP+disp32]` on x86-64).
 ///
 /// Returns the unpatchable sites, trapped or kept per `unpatchable`.
+///
+/// If `redirect_jumps`, instead patches each direct `JMP S` where `S` is a
+/// `syscall` in this section that cannot be patched in place: it is
+/// equivalent to `syscall; JMP S+2`, so it is patched as a syscall site that
+/// resumes after `S`. Its window is padded with `INT3`, so later decodes still
+/// see that nothing falls through the jump.
 #[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
@@ -1271,6 +1291,7 @@ fn hook_syscalls_in_section(
     syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
     unpatchable: UnpatchableSyscalls,
+    redirect_jumps: bool,
 ) -> core::result::Result<Vec<u64>, InternalError> {
     let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
     let mut found_any = false;
@@ -1278,56 +1299,195 @@ fn hook_syscalls_in_section(
     // `instructions` predates the patches, so no window may reach back into one.
     let mut patched_end = section_base_addr;
     for (i, inst) in instructions.iter().enumerate() {
-        // Forward search for `syscall`
-        match arch {
-            Arch::X86_64 => {
-                if inst.code() != iced_x86::Code::Syscall {
-                    continue;
-                }
+        let return_addr = if redirect_jumps {
+            if !matches!(
+                inst.code(),
+                iced_x86::Code::Jmp_rel8_64 | iced_x86::Code::Jmp_rel32_64
+            ) {
+                continue;
             }
-            Arch::Aarch64 => unreachable!("AArch64 uses the arm64 module, not iced-x86"),
-        }
+            match instructions
+                .binary_search_by_key(&inst.near_branch_target(), iced_x86::Instruction::ip)
+            {
+                Ok(s)
+                    if instructions[s].code() == iced_x86::Code::Syscall
+                        && forward_patch_window_end(&instructions, s, control_transfer_targets)
+                            .is_none() =>
+                {
+                    instructions[s].next_ip()
+                }
+                _ => continue,
+            }
+        } else {
+            // Forward search for `syscall`
+            match arch {
+                Arch::X86_64 => {
+                    if inst.code() != iced_x86::Code::Syscall {
+                        continue;
+                    }
+                }
+                Arch::Aarch64 => unreachable!("AArch64 uses the arm64 module, not iced-x86"),
+            }
+            inst.next_ip()
+        };
 
         found_any = true;
+        let replace_end = inst.next_ip();
 
-        // Prefer a window that ends at the syscall; if there is none, or a
-        // preceding instruction cannot be relocated, try the forward-only path.
-        if let Some(start) =
-            backward_patch_window_start(&instructions, i, control_transfer_targets, patched_end)
-            && patch_backward_window(
+        let mut replace_start = None;
+        let mut replace_start_idx = 0;
+        // If the syscall itself is a control transfer target, we cannot extend
+        // the replaced range backward (a jump landing on the syscall would hit
+        // NOPs instead). Skip the backward scan and fall through to the
+        // forward-only path (hook_syscall_and_after).
+        if inst.len() >= 5 {
+            // A `JMP rel32` site can be replaced on its own.
+            replace_start = Some(inst.ip());
+            replace_start_idx = i;
+        } else if !control_transfer_targets.contains(&inst.ip()) {
+            for inst_id in (0..i).rev() {
+                let prev_inst = &instructions[inst_id];
+                if prev_inst.ip() < patched_end
+                    || prev_inst.flow_control() != iced_x86::FlowControl::Next
+                {
+                    break;
+                }
+                if replace_end - prev_inst.ip() >= 5 {
+                    replace_start = Some(prev_inst.ip());
+                    replace_start_idx = inst_id;
+                    break;
+                } else if control_transfer_targets.contains(&prev_inst.ip()) {
+                    // If the previous instruction is a control transfer target, we don't want to cross it
+                    break;
+                }
+            }
+        }
+
+        if replace_start.is_none() {
+            // Only a syscall can be patched forward.
+            if redirect_jumps {
+                continue;
+            }
+            match hook_syscall_and_after(
+                control_transfer_targets,
                 section_base_addr,
                 section_data,
                 trampoline_base_addr,
                 syscall_entry_addr,
                 trampoline_data,
-                &instructions[start..=i],
-                inst.next_ip(),
-                X86_NOP,
-            )?
-        {
-            patched_end = inst.next_ip();
+                &instructions,
+                i,
+            ) {
+                Ok(end) => patched_end = end,
+                Err(InternalError::InsufficientBytesBeforeOrAfter) => {
+                    if unpatchable == UnpatchableSyscalls::Trap {
+                        replace_with_trap(section_data, section_base_addr, inst);
+                    }
+                    skipped_addrs.push(inst.ip());
+                }
+                Err(e) => return Err(e),
+            }
             continue;
         }
 
-        match hook_syscall_and_after(
-            control_transfer_targets,
-            section_base_addr,
-            section_data,
+        let replace_start = replace_start.unwrap();
+        let replace_len = usize::try_from(replace_end - replace_start).unwrap();
+
+        let target_addr = checked_add_u64(
             trampoline_base_addr,
-            syscall_entry_addr,
-            trampoline_data,
-            &instructions,
-            i,
-        ) {
-            Ok(end) => patched_end = end,
-            Err(InternalError::InsufficientBytesBeforeOrAfter) => {
-                if unpatchable == UnpatchableSyscalls::Trap {
-                    replace_with_trap(section_data, section_base_addr, inst);
+            trampoline_data.len() as u64,
+            "syscall trampoline target",
+        )?;
+
+        // Encode the pre-syscall instructions for the trampoline, re-encoding
+        // any RIP-relative memory operands for the new location.
+        let presyscall_bytes = if replace_start < inst.ip() {
+            if let Some(bytes) =
+                reencode_instructions(&instructions[replace_start_idx..i], target_addr)
+            {
+                bytes
+            } else {
+                if redirect_jumps {
+                    continue;
                 }
-                skipped_addrs.push(inst.ip());
+                match hook_syscall_and_after(
+                    control_transfer_targets,
+                    section_base_addr,
+                    section_data,
+                    trampoline_base_addr,
+                    syscall_entry_addr,
+                    trampoline_data,
+                    &instructions,
+                    i,
+                ) {
+                    Ok(end) => patched_end = end,
+                    Err(InternalError::InsufficientBytesBeforeOrAfter) => {
+                        if unpatchable == UnpatchableSyscalls::Trap {
+                            replace_with_trap(section_data, section_base_addr, inst);
+                        }
+                        skipped_addrs.push(inst.ip());
+                    }
+                    Err(e) => return Err(e),
+                }
+                continue;
             }
-            Err(e) => return Err(e),
+        } else {
+            Vec::new()
+        };
+        trampoline_data.extend_from_slice(&presyscall_bytes);
+
+        // LEA RCX, [RIP + 6] — load RCX with the address of the in-trampoline
+        // `post_jmp` (the instruction immediately after the indirect JMP into
+        // the callback). The SA_RESTART handler relies on the invariant that
+        // pt_regs.rcx - X86_64_SYSCALL_ENTRY_JMP_LEN points at the indirect
+        // JMP itself, so it can rewind ctx.rip and re-enter the callback.
+        trampoline_data.extend_from_slice(&X86_64_LEA_RCX_RESUME_PC);
+
+        // Add jmp [rip + offset_to_entry_point]
+        trampoline_data.extend_from_slice(&[0xFF, 0x25]);
+        // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
+        // We want: RIP + disp32 = syscall_entry_addr
+        let entry_base = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64 + 4,
+            "x86_64 trampoline entry base",
+        )?;
+        trampoline_data.extend_from_slice(&rel32_bytes(
+            syscall_entry_addr,
+            entry_base,
+            "x86_64 trampoline entry",
+        )?);
+
+        // post_jmp: JMP rel32 back to the guest instruction following the
+        // original syscall. The callback returns via `jmp rcx` and lands here.
+        let jmp_back_base = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64 + 5,
+            "x86_64 trampoline jump-back base",
+        )?;
+        trampoline_data.push(0xE9);
+        trampoline_data.extend_from_slice(&rel32_bytes(
+            return_addr,
+            jmp_back_base,
+            "x86_64 trampoline jump-back",
+        )?);
+
+        // Replace original instructions with jump to trampoline
+        let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
+        section_data[replace_offset] = 0xE9; // JMP rel32
+        let patch_base = checked_add_u64(replace_start, 5, "syscall patch jump base")?;
+        section_data[replace_offset + 1..replace_offset + 5].copy_from_slice(&rel32_bytes(
+            target_addr,
+            patch_base,
+            "syscall patch jump",
+        )?);
+
+        // Fill remaining bytes with NOP, or INT3 after a redirected jump
+        let fill = if redirect_jumps { 0xCC } else { 0x90 };
+        for idx in 5..replace_len {
+            section_data[replace_offset + idx] = fill;
         }
+        patched_end = replace_end;
     }
 
     if found_any {
@@ -1335,262 +1495,6 @@ fn hook_syscalls_in_section(
     } else {
         Err(InternalError::NoSyscallInstructionsFound)
     }
-}
-
-const X86_NOP: u8 = 0x90;
-const X86_INT3: u8 = 0xCC;
-const X86_SYSCALL: [u8; 2] = [0x0F, 0x05];
-
-/// Returns the index of the first instruction of the shortest window that
-/// ends with `instructions[last]`, has room for a `JMP rel32`, starts no
-/// earlier than `min_start`, and is entered only at its start: every earlier
-/// instruction in the window falls through and none after the first is a
-/// direct branch target.
-fn backward_patch_window_start(
-    instructions: &[iced_x86::Instruction],
-    last: usize,
-    control_transfer_targets: &BTreeSet<u64>,
-    min_start: u64,
-) -> Option<usize> {
-    let last_inst = &instructions[last];
-    if last_inst.len() >= 5 && last_inst.ip() >= min_start {
-        return Some(last);
-    }
-    if control_transfer_targets.contains(&last_inst.ip()) {
-        return None;
-    }
-    let end = last_inst.next_ip();
-    for idx in (0..last).rev() {
-        let inst = &instructions[idx];
-        if inst.ip() < min_start || inst.flow_control() != iced_x86::FlowControl::Next {
-            return None;
-        }
-        if end - inst.ip() >= 5 {
-            return Some(idx);
-        }
-        if control_transfer_targets.contains(&inst.ip()) {
-            return None;
-        }
-    }
-    None
-}
-
-/// Returns the index past the last instruction of the shortest window that
-/// starts with the `syscall` at `instructions[first]`, has room for a
-/// `JMP rel32`, enters no direct branch target after its start, and relocates
-/// no other `syscall` (which would then run unpatched).
-fn forward_patch_window_end(
-    instructions: &[iced_x86::Instruction],
-    first: usize,
-    control_transfer_targets: &BTreeSet<u64>,
-) -> Option<usize> {
-    let start = instructions[first].ip();
-    for (idx, inst) in instructions.iter().enumerate().skip(first + 1) {
-        if control_transfer_targets.contains(&inst.ip()) || inst.code() == iced_x86::Code::Syscall {
-            return None;
-        }
-        if inst.next_ip() - start >= 5 {
-            return Some(idx + 1);
-        }
-        if inst.flow_control() != iced_x86::FlowControl::Next {
-            return None;
-        }
-    }
-    None
-}
-
-/// Redirects `window` to a new trampoline that runs all but the window's last
-/// instruction, then performs a syscall in place of that last instruction and
-/// resumes at `return_addr`. The window becomes a `JMP rel32` padded with
-/// `fill`.
-///
-/// Returns `false` without modifying anything if a leading instruction cannot
-/// be relocated.
-#[allow(clippy::too_many_arguments)]
-fn patch_backward_window(
-    section_base_addr: u64,
-    section_data: &mut [u8],
-    trampoline_base_addr: u64,
-    syscall_entry_addr: u64,
-    trampoline_data: &mut Vec<u8>,
-    window: &[iced_x86::Instruction],
-    return_addr: u64,
-    fill: u8,
-) -> Result<bool> {
-    let (last, leading) = window.split_last().unwrap();
-    let target_addr = checked_add_u64(
-        trampoline_base_addr,
-        trampoline_data.len() as u64,
-        "syscall trampoline target",
-    )?;
-
-    // Re-encode the leading instructions, fixing up any RIP-relative operands
-    // for the new location.
-    let Some(leading_bytes) = reencode_instructions(leading, target_addr) else {
-        return Ok(false);
-    };
-    trampoline_data.extend_from_slice(&leading_bytes);
-
-    // LEA RCX, [RIP + 6] — load RCX with the address of the in-trampoline
-    // `post_jmp` (the instruction immediately after the indirect JMP into
-    // the callback). The SA_RESTART handler relies on the invariant that
-    // pt_regs.rcx - X86_64_SYSCALL_ENTRY_JMP_LEN points at the indirect
-    // JMP itself, so it can rewind ctx.rip and re-enter the callback.
-    trampoline_data.extend_from_slice(&X86_64_LEA_RCX_RESUME_PC);
-
-    // Add jmp [rip + offset_to_entry_point]
-    trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-    // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-    // We want: RIP + disp32 = syscall_entry_addr
-    let entry_base = checked_add_u64(
-        trampoline_base_addr,
-        trampoline_data.len() as u64 + 4,
-        "x86_64 trampoline entry base",
-    )?;
-    trampoline_data.extend_from_slice(&rel32_bytes(
-        syscall_entry_addr,
-        entry_base,
-        "x86_64 trampoline entry",
-    )?);
-
-    // post_jmp: JMP rel32 to `return_addr`. The callback returns via
-    // `jmp rcx` and lands here.
-    let jmp_back_base = checked_add_u64(
-        trampoline_base_addr,
-        trampoline_data.len() as u64 + 5,
-        "x86_64 trampoline jump-back base",
-    )?;
-    trampoline_data.push(0xE9);
-    trampoline_data.extend_from_slice(&rel32_bytes(
-        return_addr,
-        jmp_back_base,
-        "x86_64 trampoline jump-back",
-    )?);
-
-    // Replace the window with a jump to the trampoline.
-    let replace_start = window[0].ip();
-    let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
-    let replace_end = usize::try_from(last.next_ip() - section_base_addr).unwrap();
-    section_data[replace_offset] = 0xE9; // JMP rel32
-    let patch_base = checked_add_u64(replace_start, 5, "syscall patch jump base")?;
-    section_data[replace_offset + 1..replace_offset + 5].copy_from_slice(&rel32_bytes(
-        target_addr,
-        patch_base,
-        "syscall patch jump",
-    )?);
-    section_data[replace_offset + 5..replace_end].fill(fill);
-
-    Ok(true)
-}
-
-/// Redirects direct `JMP`s to each `syscall` that cannot be patched in place.
-///
-/// A branch target cannot be moved into a trampoline, so a targeted `syscall`
-/// is patched only by a window that starts with it; when none fits, its
-/// `JMP` sources are patched instead. A `JMP S` where `S` holds `syscall` is
-/// equivalent to `syscall; JMP S+2`, so the jump is patched like a syscall
-/// site that resumes after `S`. Its window is padded with `INT3` rather than
-/// `NOP` so that a later decode of the patched bytes still sees that nothing
-/// falls through past the jump.
-///
-/// Returns the direct branch targets of the patched code, or `None` if it
-/// has no such syscall. A syscall that is no longer a target may extend its
-/// window backward, and the point after a redirected syscall becomes a target
-/// so that no window covers where its jumps' trampolines resume.
-fn redirect_jumps_to_syscalls(
-    arch: Arch,
-    buf: &mut [u8],
-    text_sections: &[TextSectionInfo],
-    control_transfer_targets: &BTreeSet<u64>,
-    trampoline_base_addr: u64,
-    syscall_entry_addr: u64,
-    trampoline_data: &mut Vec<u8>,
-) -> Result<Option<BTreeSet<u64>>> {
-    let mut syscall_targets = BTreeSet::new();
-    for &target in control_transfer_targets {
-        let Some(code) = text_from(buf, text_sections, target)? else {
-            continue;
-        };
-        if !code.starts_with(&X86_SYSCALL) {
-            continue;
-        }
-        // A forward window ends with an instruction that starts within the
-        // first 5 bytes.
-        let code = &code[..code.len().min(5 + MAX_X86_INSTRUCTION_LEN)];
-        let instructions = decode_section_instructions(arch, code, target)?;
-        if forward_patch_window_end(&instructions, 0, control_transfer_targets).is_none() {
-            syscall_targets.insert(target);
-        }
-    }
-    if syscall_targets.is_empty() {
-        return Ok(None);
-    }
-
-    let mut targets = control_transfer_targets.clone();
-    let mut still_targeted = BTreeSet::new();
-    for section in text_sections {
-        let section_data = section_slice_mut(buf, section)?;
-        let instructions = decode_section_instructions(arch, section_data, section.vaddr)?;
-        let mut patched_end = section.vaddr;
-        for (i, inst) in instructions.iter().enumerate() {
-            let target = inst.near_branch_target();
-            if !syscall_targets.contains(&target) {
-                continue;
-            }
-            let return_addr = checked_add_u64(target, X86_SYSCALL.len() as u64, "syscall return")?;
-            let redirected = matches!(
-                inst.code(),
-                iced_x86::Code::Jmp_rel8_64 | iced_x86::Code::Jmp_rel32_64
-            ) && match backward_patch_window_start(
-                &instructions,
-                i,
-                control_transfer_targets,
-                patched_end,
-            ) {
-                Some(start) => patch_backward_window(
-                    section.vaddr,
-                    section_data,
-                    trampoline_base_addr,
-                    syscall_entry_addr,
-                    trampoline_data,
-                    &instructions[start..=i],
-                    return_addr,
-                    X86_INT3,
-                )?,
-                None => false,
-            };
-            if redirected {
-                patched_end = inst.next_ip();
-                targets.insert(return_addr);
-            } else {
-                still_targeted.insert(target);
-            }
-        }
-    }
-    for target in syscall_targets.difference(&still_targeted) {
-        targets.remove(target);
-    }
-    Ok(Some(targets))
-}
-
-/// Returns the bytes from virtual address `addr` to the end of the text
-/// section that contains it.
-fn text_from<'a>(
-    buf: &'a [u8],
-    text_sections: &[TextSectionInfo],
-    addr: u64,
-) -> Result<Option<&'a [u8]>> {
-    for section in text_sections {
-        let Some(offset) = addr.checked_sub(section.vaddr) else {
-            continue;
-        };
-        if offset >= section.size {
-            continue;
-        }
-        let offset = usize::try_from(offset).unwrap();
-        return Ok(section_slice(buf, section)?.get(offset..));
-    }
-    Ok(None)
 }
 
 /// If the ELF64 program header table offset (`e_phoff`) is not 8-byte aligned, shift the table
@@ -2657,6 +2561,30 @@ fn hook_syscall_and_after(
     Ok(replace_end)
 }
 
+/// Returns the index past the last instruction of the shortest window that
+/// starts with the `syscall` at `instructions[first]`, has room for a
+/// `JMP rel32`, and enters no control transfer target after its start.
+fn forward_patch_window_end(
+    instructions: &[iced_x86::Instruction],
+    first: usize,
+    control_transfer_targets: &BTreeSet<u64>,
+) -> Option<usize> {
+    let start = instructions[first].ip();
+    for (idx, next_inst) in instructions.iter().enumerate().skip(first + 1) {
+        if control_transfer_targets.contains(&next_inst.ip()) {
+            // If the next instruction is a control transfer target, we don't want to cross it
+            return None;
+        }
+        if next_inst.next_ip() - start >= 5 {
+            return Some(idx + 1);
+        }
+        if next_inst.flow_control() != iced_x86::FlowControl::Next {
+            return None;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2674,6 +2602,7 @@ mod tests {
             0x10_0000,
             &mut Vec::new(),
             unpatchable,
+            false,
         )
         .unwrap();
         (code, kept)
@@ -2876,21 +2805,6 @@ mod tests {
         assert_eq!(kept, [0x100a]);
         assert_eq!(code[5], 0xe9);
         assert_eq!(&code[0xa..], [0x0f, 0x05, 0xc3]);
-    }
-
-    #[test]
-    fn forward_window_never_relocates_a_syscall() {
-        #[rustfmt::skip]
-        let (code, _, kept) = patch_code(&[
-            0xe9, 0x04, 0x00, 0x00, 0x00, // 0x1000: jmp 0x1009
-            0x0f, 0x05,                   // 0x1005: syscall (reached indirectly)
-            0x90,                         // 0x1007: nop
-            0x90,                         // 0x1008: nop
-            0x0f, 0x05,                   // 0x1009: syscall
-            0xc3,                         // 0x100b: ret
-        ]);
-        assert_eq!(kept, [0x1005, 0x1009]);
-        assert_eq!(&code[5..], [0x0f, 0x05, 0x90, 0x90, 0x0f, 0x05, 0xc3]);
     }
 
     #[test]
