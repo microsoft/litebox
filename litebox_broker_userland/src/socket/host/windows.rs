@@ -30,6 +30,10 @@
 //!   reports one only after those datagrams, where Linux reports it first.
 //!   A receive that reports one, even a peek, takes it and the errors queued
 //!   right behind it, as Linux keeps only one.
+//! - Windows rounds a wait's timeout up to its timer resolution, 15.6ms by
+//!   default, where Linux waits about as long as asked. So the event
+//!   thread's waits raise this process's resolution while they have a
+//!   timeout; see [`Waiter::wait`].
 
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
@@ -44,6 +48,7 @@ use litebox_broker_protocol::socket::{MAX_UDP_DATAGRAM_SIZE, SocketError};
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
+use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
     SIO_TCP_INITIAL_RTO, SIO_UDP_CONNRESET, SO_CONNECT_TIME, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
@@ -670,14 +675,24 @@ pub(crate) struct Poller {
 /// Collects a [`Poller`]'s events on the event thread.
 pub(crate) struct Waiter {
     poll: Poll,
+    /// Whether the waiter raised the process's timer resolution to
+    /// [`FINE_TIMER_PERIOD_MS`].
+    fine_timer: bool,
 }
+
+/// The timer resolution, in milliseconds, of a wait with a timeout.
+const FINE_TIMER_PERIOD_MS: u32 = 1;
 
 impl Poller {
     pub(crate) fn new() -> IoResult<(Self, Waiter)> {
         let poll = Poll::new()?;
         let registry = poll.registry().try_clone()?;
         let waker = Waker::new(&registry, Token(token(WAKE_TOKEN)?))?;
-        Ok((Self { registry, waker }, Waiter { poll }))
+        let waiter = Waiter {
+            poll,
+            fine_timer: false,
+        };
+        Ok((Self { registry, waker }, waiter))
     }
 
     /// Watches `socket` for `interest`, reporting its events under `token`.
@@ -743,12 +758,38 @@ impl Poller {
 impl Waiter {
     /// Waits for events, at most `timeout` if set, and replaces `events`
     /// with them.
+    ///
+    /// Windows rounds a timeout up to the process's timer resolution, 15.6ms
+    /// by default, and the provider sets one only to retry events soon. So
+    /// while waits have a timeout, the waiter raises the resolution to
+    /// [`FINE_TIMER_PERIOD_MS`], and restores it at the first wait without
+    /// one. Since Windows 10 2004, this affects only this process.
     pub(crate) fn wait(
         &mut self,
         events: &mut Events,
         timeout: Option<Duration>,
     ) -> Result<(), Errno> {
+        self.set_fine_timer(timeout.is_some());
         Ok(self.poll.poll(&mut events.0, timeout)?)
+    }
+
+    fn set_fine_timer(&mut self, fine: bool) {
+        if fine == self.fine_timer {
+            return;
+        }
+        // SAFETY: Both functions take only an integer, and the waiter ends
+        // only a period it began.
+        let result = unsafe {
+            if fine {
+                timeBeginPeriod(FINE_TIMER_PERIOD_MS)
+            } else {
+                timeEndPeriod(FINE_TIMER_PERIOD_MS)
+            }
+        };
+        // If raising the resolution fails, retries are only slower.
+        if result == TIMERR_NOERROR {
+            self.fine_timer = fine;
+        }
     }
 
     /// Consumes the wakes a [`WAKE_TOKEN`] event reported.
@@ -756,6 +797,12 @@ impl Waiter {
     pub(crate) fn drain_wake(&self) -> Result<(), Errno> {
         // Each wake is a completion that the wait already consumed.
         Ok(())
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        self.set_fine_timer(false);
     }
 }
 
@@ -1002,5 +1049,28 @@ fn sockaddr_in(address: SocketAddrV4) -> SOCKADDR_IN {
             },
         },
         sin_zero: [0; 8],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{Events, Poller};
+
+    #[test]
+    fn timed_waits_end_soon_after_their_timeout() {
+        const WAITS: u32 = 20;
+        let (_poller, mut waiter) = Poller::new().unwrap();
+        let mut events = Events::with_capacity(1).unwrap();
+        let start = Instant::now();
+        for _ in 0..WAITS {
+            waiter
+                .wait(&mut events, Some(Duration::from_millis(1)))
+                .unwrap();
+        }
+        // At the default timer resolution, each wait takes 15.6ms.
+        let elapsed = start.elapsed();
+        assert!(elapsed < WAITS * Duration::from_millis(8), "{elapsed:?}");
     }
 }
