@@ -96,8 +96,8 @@ fn abandon(process: &BrokerProcess, error: BrokerError) {
 /// One container's broker and runners.
 pub(crate) struct Container {
     core: BrokerCore,
-    /// A broker process that never runs: it owns the host ends of every task's stdio pipes,
-    /// sends containerd's signals, and looks up the tasks' programs.
+    /// A broker process that never runs: it owns the host ends of every task's stdio pipes and
+    /// terminal managers, sends containerd's signals, and looks up the tasks' programs.
     authority: Arc<BrokerProcess>,
     wake: Arc<Wake>,
     runners: Arc<Runners>,
@@ -269,8 +269,9 @@ impl Container {
         if !env.iter().any(|entry| entry.starts_with("HOME=")) {
             env.push(format!("HOME={}", self.home(spec.uid)?));
         }
-        let (io, inherited) = TaskIo::start(&self.authority, &self.wake, process, stdio)
-            .map_err(|error| Error::io("cannot set up the standard streams", &error))?;
+        let (io, inherited) =
+            TaskIo::start(&self.authority, &self.wake, process, stdio, spec.terminal)
+                .map_err(|error| Error::io("cannot set up the standard streams", &error))?;
         let startup = encode_startup(spec, &env, path, cwd, inherited)?;
         Ok((Arc::new(io), startup))
     }

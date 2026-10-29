@@ -278,13 +278,20 @@ impl Process {
     }
 }
 
-fn task_io(stdin: &str, stdout: &str, stderr: &str) -> TaskIO {
+fn task_io(stdin: &str, stdout: &str, stderr: &str, terminal: bool) -> TaskIO {
     TaskIO {
         stdin: stdin.to_owned(),
         stdout: stdout.to_owned(),
         stderr: stderr.to_owned(),
+        terminal,
         ..Default::default()
     }
+}
+
+/// The stderr URI to open for the process `spec`: none with a terminal, whose output is all
+/// stdout, as containerd's runc shim ignores it then.
+fn stderr_uri<'a>(spec: &ProcessSpec, uri: &'a str) -> &'a str {
+    if spec.terminal.is_some() { "" } else { uri }
 }
 
 impl Inner {
@@ -296,9 +303,6 @@ impl Inner {
     }
 
     fn create(self: &Arc<Self>, request: &CreateTaskRequest) -> Result<CreateTaskResponse> {
-        if request.terminal {
-            return Err(Error::unimplemented("terminals are not supported"));
-        }
         if !request.checkpoint.is_empty() {
             return Err(Error::unimplemented("checkpoints are not supported"));
         }
@@ -320,10 +324,16 @@ impl Inner {
             .map_err(|error| Error::io("cannot read config.json", &error))?;
         let (plan, init_spec) =
             ContainerPlan::from_spec(&spec::parse_json::<Spec>("config.json", &config)?)?;
+        // As runc requires.
+        if init_spec.terminal.is_some() != request.terminal {
+            return Err(Error::invalid(
+                "the request and the process spec disagree on the terminal",
+            ));
+        }
         let host = stdio::open(
             &request.stdin,
             &request.stdout,
-            &request.stderr,
+            stderr_uri(&init_spec, &request.stderr),
             &request.id,
             &self.namespace,
             &self.loggers,
@@ -354,7 +364,12 @@ impl Inner {
         };
         let (process, stdio) = (prepared.process_id(), prepared.io());
         let exited = prepared.exit_waiter();
-        let io = task_io(&request.stdin, &request.stdout, &request.stderr);
+        let io = task_io(
+            &request.stdin,
+            &request.stdout,
+            &request.stderr,
+            request.terminal,
+        );
         let mut init = Process::new(0, io.clone(), Pending::Init(prepared));
         init.pid = pid;
         init.broker_id = Some(process);
@@ -424,7 +439,7 @@ impl Inner {
             Pending::Exec(spec) => stdio::open(
                 &io.stdin,
                 &io.stdout,
-                &io.stderr,
+                stderr_uri(&spec, &io.stderr),
                 exec_id,
                 &self.namespace,
                 &self.loggers,
@@ -598,17 +613,15 @@ impl Inner {
         if request.exec_id.is_empty() {
             return Err(Error::invalid("the exec ID is empty"));
         }
-        if request.terminal {
-            return Err(Error::unimplemented("terminals are not supported"));
-        }
         let spec = request
             .spec
             .as_ref()
             .ok_or_else(|| Error::invalid("the exec process has no spec"))?;
-        let spec = ProcessSpec::from_oci(&spec::parse_json::<oci_spec::runtime::Process>(
-            "exec process spec",
-            &spec.value,
-        )?)?;
+        let mut process =
+            spec::parse_json::<oci_spec::runtime::Process>("exec process spec", &spec.value)?;
+        // The request's terminal overrides the spec's, as with runc.
+        process.set_terminal(Some(request.terminal));
+        let spec = ProcessSpec::from_oci(&process)?;
         let mut state = lock(&self.state);
         let container = state.container(&request.id)?;
         if !matches!(container.init.phase, Phase::Running) {
@@ -620,7 +633,12 @@ impl Inner {
                 format!("exec process {} already exists", request.exec_id),
             ));
         }
-        let io = task_io(&request.stdin, &request.stdout, &request.stderr);
+        let io = task_io(
+            &request.stdin,
+            &request.stdout,
+            &request.stderr,
+            request.terminal,
+        );
         let serial = container.next_serial;
         container.next_serial += 1;
         container.execs.insert(
@@ -756,6 +774,7 @@ impl Inner {
             stdin: process.io.stdin.clone(),
             stdout: process.io.stdout.clone(),
             stderr: process.io.stderr.clone(),
+            terminal: process.io.terminal,
             exit_status: exit.map_or(0, |exit| exit.status),
             exited_at: exit.map_or_else(MessageField::none, |exit| timestamp(exit.at)),
             exec_id: request.exec_id.clone(),
@@ -825,6 +844,20 @@ impl Inner {
             processes,
             ..Default::default()
         })
+    }
+
+    fn resize_pty(&self, request: &ResizePtyRequest) -> Result<()> {
+        let size = spec::window_size(request.height, request.width)
+            .ok_or_else(|| Error::invalid("the terminal size is too large"))?;
+        let mut state = lock(&self.state);
+        let process = state.container(&request.id)?.process(&request.exec_id)?;
+        // As with containerd's runc shim, an exec process has no terminal to resize before it
+        // starts.
+        let Some(stdio) = process.stdio.clone() else {
+            return Ok(());
+        };
+        drop(state);
+        stdio.resize(size)
     }
 
     fn close_io(&self, request: &CloseIORequest) -> Result<()> {
@@ -965,7 +998,8 @@ impl Task for Service {
         Err(Error::unimplemented("statistics are not supported").into())
     }
 
-    fn resize_pty(&self, _ctx: &TtrpcContext, _request: ResizePtyRequest) -> TtrpcResult<Empty> {
-        Err(Error::unimplemented("terminals are not supported").into())
+    fn resize_pty(&self, _ctx: &TtrpcContext, request: ResizePtyRequest) -> TtrpcResult<Empty> {
+        self.inner.resize_pty(&request)?;
+        Ok(Empty::new())
     }
 }

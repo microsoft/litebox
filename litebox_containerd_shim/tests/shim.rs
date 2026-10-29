@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use containerd_shim::api::{
     CloseIORequest, CreateTaskRequest, DeleteRequest, DeleteResponse, ExecProcessRequest,
-    KillRequest, PidsRequest, ShutdownRequest, StartRequest, StateRequest, Status, WaitRequest,
+    KillRequest, PidsRequest, ResizePtyRequest, ShutdownRequest, StartRequest, StateRequest,
+    StateResponse, Status, WaitRequest,
 };
 use containerd_shim::protos::events::task::{
     TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskExit, TaskStart,
@@ -47,7 +48,8 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// The events the shim publishes, summarized as `topic [exec ID] [status]`; `/tasks/delete`
+/// The events the shim publishes, summarized as `topic [exec ID] [status]`; `/tasks/create`
+/// shows `terminal` after its container ID if its process has a terminal, and `/tasks/delete`
 /// shows its container ID and its quoted exec ID.
 #[derive(Default)]
 struct EventLog {
@@ -63,10 +65,11 @@ impl Events for EventLog {
         let topic = envelope.topic.as_str();
         assert!(envelope.timestamp.is_some());
         let (event_type, summary) = match topic {
-            "/tasks/create" => (
-                "TaskCreate",
-                TaskCreate::parse_from_bytes(value).unwrap().container_id,
-            ),
+            "/tasks/create" => {
+                let event = TaskCreate::parse_from_bytes(value).unwrap();
+                let terminal = if event.io.terminal { " terminal" } else { "" };
+                ("TaskCreate", format!("{}{terminal}", event.container_id))
+            }
             "/tasks/start" => (
                 "TaskStart",
                 TaskStart::parse_from_bytes(value).unwrap().container_id,
@@ -255,17 +258,21 @@ impl Shim {
         path
     }
 
-    fn create(&self, stdin: &str) -> ttrpc::Result<u32> {
-        let request = CreateTaskRequest {
+    /// The `Create` request of the container, whose stdout is `c.out` and stderr the FIFO `c.err`.
+    fn create_request(&self, stdin: &str) -> CreateTaskRequest {
+        CreateTaskRequest {
             id: "c".to_owned(),
             bundle: self.bundle.to_str().unwrap().to_owned(),
             stdin: stdin.to_owned(),
             stdout: format!("file://{}", self.path("c.out")),
             stderr: self.path("c.err"),
             ..Default::default()
-        };
+        }
+    }
+
+    fn create(&self, stdin: &str) -> ttrpc::Result<u32> {
         self.client
-            .create(deadline(), &request)
+            .create(deadline(), &self.create_request(stdin))
             .map(|response| response.pid)
     }
 
@@ -280,8 +287,14 @@ impl Shim {
             .map(|response| response.pid)
     }
 
-    fn exec(&self, exec_id: &str, process: &serde_json::Value, stdin: &str) -> ttrpc::Result<()> {
-        let request = ExecProcessRequest {
+    /// The `Exec` request of `exec_id`, whose stdout is `<exec_id>.out`.
+    fn exec_request(
+        &self,
+        exec_id: &str,
+        process: &serde_json::Value,
+        stdin: &str,
+    ) -> ExecProcessRequest {
+        ExecProcessRequest {
             id: "c".to_owned(),
             exec_id: exec_id.to_owned(),
             stdin: stdin.to_owned(),
@@ -291,7 +304,11 @@ impl Shim {
                 ..Default::default()
             }),
             ..Default::default()
-        };
+        }
+    }
+
+    fn exec(&self, exec_id: &str, process: &serde_json::Value, stdin: &str) -> ttrpc::Result<()> {
+        let request = self.exec_request(exec_id, process, stdin);
         self.client.exec(deadline(), &request).map(drop)
     }
 
@@ -356,14 +373,28 @@ impl Shim {
         self.client.kill(deadline(), &request)
     }
 
-    fn status(&self, exec_id: &str) -> Status {
+    fn resize(&self, exec_id: &str, width: u32, height: u32) -> ttrpc::Result<Empty> {
+        let request = ResizePtyRequest {
+            id: "c".to_owned(),
+            exec_id: exec_id.to_owned(),
+            width,
+            height,
+            ..Default::default()
+        };
+        self.client.resize_pty(deadline(), &request)
+    }
+
+    fn state(&self, exec_id: &str) -> StateResponse {
         let request = StateRequest {
             id: "c".to_owned(),
             exec_id: exec_id.to_owned(),
             ..Default::default()
         };
-        let state = self.client.state(deadline(), &request).unwrap();
-        state.status.enum_value_or_default()
+        self.client.state(deadline(), &request).unwrap()
+    }
+
+    fn status(&self, exec_id: &str) -> Status {
+        self.state(exec_id).status.enum_value_or_default()
     }
 
     fn pids(&self) -> Vec<u32> {
@@ -730,6 +761,105 @@ fn close_io_ends_the_input_while_a_producer_keeps_writing() {
     let output = shim.output("c.out");
     let tail = &output[output.len().saturating_sub(100)..];
     assert!(tail.ends_with("yyyyeof\n"), "{tail}");
+    shim.delete("").unwrap();
+    shim.shut_down();
+}
+
+#[test]
+fn terminals_give_processes_a_controlling_terminal() {
+    let shim = Shim::launch(&process(&["guest", "tty"]));
+    shim.configure(|spec| {
+        spec["process"]["terminal"] = true.into();
+        spec["process"]["consoleSize"] = serde_json::json!({"height": 24, "width": 80});
+    });
+    let fifo = shim.mkfifo("c.in");
+    // The stderr FIFO is unused: the terminal's output is stdout.
+    let request = CreateTaskRequest {
+        terminal: true,
+        ..shim.create_request(&fifo)
+    };
+    shim.client.create(deadline(), &request).unwrap();
+    assert!(shim.state("").terminal);
+    assert_eq!(shim.events(1)[0], "/tasks/create c terminal");
+    shim.start("").unwrap();
+    // Output processing turns each newline into CR LF.
+    shim.wait_output("c.out", "tty=111 foreground=1 leader=1 size=24x80\r\n");
+    let mut input = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+    input.write_all(b"hello\r").unwrap();
+    shim.wait_output("c.out", "hello\r\nline=[hello]\r\n");
+    input.write_all(b"\x03").unwrap();
+    shim.wait_output("c.out", "interrupted\r\n");
+    shim.resize("", 100, 30).unwrap();
+    shim.wait_output("c.out", "resized 30x100\r\n");
+
+    // As with runc, an exec process's request decides its terminal. This one has none, so
+    // resizing it does nothing.
+    let mut spec = process(&["guest", "tty"]);
+    spec["terminal"] = true.into();
+    shim.exec("e0", &spec, "").unwrap();
+    assert!(!shim.state("e0").terminal);
+    shim.start("e0").unwrap();
+    shim.resize("e0", 3, 2).unwrap();
+    assert_eq!(shim.wait("e0"), 0);
+    assert!(shim.output("e0.out").ends_with("]\neof\n"));
+    shim.delete("e0").unwrap();
+
+    // This one has a terminal of its own, which starts without a size: it has none to resize
+    // before it starts.
+    let exec_fifo = shim.mkfifo("e1.in");
+    let exec = ExecProcessRequest {
+        terminal: true,
+        ..shim.exec_request("e1", &process(&["guest", "tty"]), &exec_fifo)
+    };
+    shim.client.exec(deadline(), &exec).unwrap();
+    assert!(shim.state("e1").terminal);
+    shim.resize("e1", 9, 8).unwrap();
+    shim.start("e1").unwrap();
+    shim.wait_output("e1.out", "tty=111 foreground=1 leader=1 size=0x0\r\n");
+    // After `CloseIO`, the input flows until no client writes the FIFO, which hangs up the
+    // terminal.
+    let mut exec_input = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&exec_fifo)
+        .unwrap();
+    exec_input.write_all(b"before\r").unwrap();
+    shim.close_stdin("e1");
+    exec_input.write_all(b"after\r").unwrap();
+    shim.wait_output("e1.out", "line=[before]\r\n");
+    shim.wait_output("e1.out", "line=[after]\r\n");
+    shim.resize("e1", 3, 2).unwrap();
+    shim.wait_output("e1.out", "resized 2x3\r\n");
+    assert_eq!(shim.status("e1"), Status::RUNNING);
+    drop(exec_input);
+    assert_eq!(shim.wait("e1"), 128 + 1);
+    // Its terminal closed with its output.
+    assert_eq!(code(&shim.resize("e1", 3, 2).unwrap_err()), Code::NOT_FOUND);
+    shim.delete("e1").unwrap();
+
+    input.write_all(b"exit 7\r").unwrap();
+    assert_eq!(shim.wait(""), 7);
+    let output = shim.output("c.out");
+    // The exec process's terminal is its own.
+    assert!(!output.contains("before"), "{output}");
+    shim.delete("").unwrap();
+    shim.shut_down();
+}
+
+#[test]
+fn a_terminal_outlives_the_closing_of_its_last_descriptor() {
+    let shim = Shim::launch(&process(&["guest", "reopen"]));
+    shim.configure(|spec| spec["process"]["terminal"] = true.into());
+    // Without stdin, only the output keeps the terminal open.
+    let request = CreateTaskRequest {
+        terminal: true,
+        ..shim.create_request("")
+    };
+    shim.client.create(deadline(), &request).unwrap();
+    shim.start("").unwrap();
+    shim.wait_output("c.out", "closing\r\n");
+    shim.resize("", 6, 5).unwrap();
+    assert_eq!(shim.wait(""), 0);
+    assert!(shim.output("c.out").ends_with("reopened 5x6\r\n"));
     shim.delete("").unwrap();
     shim.shut_down();
 }
@@ -1106,11 +1236,9 @@ fn create_logged(shim: &Shim, script: &str) {
     std::fs::set_permissions(&logger, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let uri = format!("binary://{logger}?dir={}", shim.dir.path().display());
     let request = CreateTaskRequest {
-        id: "c".to_owned(),
-        bundle: shim.bundle.to_str().unwrap().to_owned(),
         stdout: uri.clone(),
         stderr: uri,
-        ..Default::default()
+        ..shim.create_request("")
     };
     shim.client.create(deadline(), &request).unwrap();
 }
@@ -1281,10 +1409,8 @@ fn an_endless_passwd_has_no_home() {
     std::fs::remove_file(&passwd).unwrap();
     std::os::unix::fs::symlink("/dev/urandom", &passwd).unwrap();
     let request = CreateTaskRequest {
-        id: "c".to_owned(),
-        bundle: shim.bundle.to_str().unwrap().to_owned(),
-        stdout: format!("file://{}", shim.path("c.out")),
-        ..Default::default()
+        stderr: String::new(),
+        ..shim.create_request("")
     };
     // Short, since reading the device to its end would never finish.
     let timeout = i64::try_from(Duration::from_secs(10).as_nanos()).unwrap();

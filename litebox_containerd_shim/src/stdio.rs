@@ -2,12 +2,12 @@
 // Licensed under the MIT license.
 
 //! A task's standard streams: the host ends containerd names, and the pumps that copy between
-//! them and broker pipes.
+//! them and the task's broker pipes or pseudo-terminal.
 //!
 //! The container's authority, a broker process that never runs, owns the host-side ends of every
-//! task's pipes; the task inherits the other ends as descriptors 0, 1 and 2. Each stream has a
-//! thread, which waits for the authority's readiness notifications on the broker side and for
-//! `poll` on the host side.
+//! task's pipes and the manager of every task's terminal; the task inherits the other ends, or the
+//! terminal, as descriptors 0, 1 and 2. Each stream has a thread, which waits for the authority's
+//! readiness notifications on the broker side and for `poll` on the host side.
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -22,13 +22,16 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use litebox::pipes::HalfPipeType;
+use litebox_broker_core::fs::{self, Mode as FileMode, UserInfo};
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerError, BrokerProcess, pipe};
+use litebox_broker_core::{BrokerError, BrokerProcess, pipe, process_group};
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::fs::FileOpenFlags;
+use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse, WindowSize};
 use litebox_common_linux::program_startup::{InheritedFd, InheritedFdKind};
 use rustix::event::{EventfdFlags, PollFd, PollFlags};
+use rustix::fs::{FileType, OFlags};
 use rustix::pipe::PipeFlags;
 
 use crate::error::{Error, Result};
@@ -335,8 +338,9 @@ impl ReadinessSink for Wake {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd)]
 enum Mode {
     Run,
-    /// Input only: forward what is readable when the pump first sees this mode, then end the
-    /// stream.
+    /// For input, `CloseIO`: with pipes, forward what is readable when the pump first sees this
+    /// mode, then end the stream; with a terminal, end it once no client writes the FIFO. For
+    /// output, the task exited: a terminal's output ends once no file is open on its subsidiary.
     Close,
     Abort,
 }
@@ -387,57 +391,92 @@ impl Control {
     }
 }
 
+fn broker_error(error: BrokerError) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+/// The outcome of a broker call whose operation can also fail on its own.
+fn flatten<T, E: std::fmt::Display>(
+    result: litebox_broker_core::Result<Result<T, E>>,
+) -> io::Result<T> {
+    result
+        .map_err(broker_error)?
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// A broker object of the authority that a pump copies to or from.
+#[derive(Clone, Copy)]
+enum Endpoint {
+    Pipe(ObjectHandle),
+    /// A pseudo-terminal manager.
+    Manager(ObjectHandle),
+}
+
+impl Endpoint {
+    /// Reads into `buffer`, returning 0 at the end of a pipe, or while no file is open on a
+    /// terminal's subsidiary and its output is drained, which a later open ends.
+    fn read(self, authority: &BrokerProcess, mut buffer: &mut [u8]) -> Result<usize, BrokerError> {
+        match self {
+            Self::Pipe(handle) => pipe::read(authority, handle, &mut buffer),
+            Self::Manager(handle) => {
+                Ok(fs::read(authority, handle, &mut buffer, None)?.unwrap_or(0))
+            }
+        }
+    }
+
+    fn write(self, authority: &BrokerProcess, data: &[u8]) -> Result<usize, BrokerError> {
+        match self {
+            Self::Pipe(handle) => pipe::write(authority, handle, &data),
+            Self::Manager(handle) => {
+                fs::write(authority, handle, &data, None)?.map_err(|_| BrokerError::Internal)
+            }
+        }
+    }
+}
+
 /// The pumps of one task's standard streams.
 pub(crate) struct TaskIo {
     stdin: Arc<Control>,
-    outputs: [Arc<Control>; 2],
+    /// Stdout's, and stderr's unless the task has a terminal.
+    outputs: Vec<Arc<Control>>,
     wake: Arc<Wake>,
+    /// The authority and the stdout pump's reference to the manager of the task's terminal, if it
+    /// has one.
+    terminal: Option<(Arc<BrokerProcess>, ObjectHandle)>,
 }
 
 impl TaskIo {
-    /// Creates `task`'s stdio pipes in `authority`, pumps between them and `host`, and returns the
+    /// Creates `task`'s stdio pipes in `authority`, or with `terminal` a pseudo-terminal of that
+    /// size whose manager `authority` holds, pumps between them and `host`, and returns the
     /// descriptors `task` inherits.
+    ///
+    /// The terminal becomes the controlling terminal of the session that `task` leads, with its
+    /// group in the foreground, and the host stderr is unused, as with containerd's runc shim.
     pub(crate) fn start(
         authority: &Arc<BrokerProcess>,
         wake: &Arc<Wake>,
         task: &BrokerProcess,
         host: Host,
+        terminal: Option<WindowSize>,
     ) -> io::Result<(Self, Vec<InheritedFd>)> {
-        let io = Self {
-            stdin: Control::new()?,
-            outputs: [Control::new()?, Control::new()?],
-            wake: Arc::clone(wake),
-        };
-        let broker = |error: BrokerError| io::Error::other(format!("stdio pipes: {error}"));
+        let stdin = Control::new()?;
+        let outputs = (0..if terminal.is_some() { 1 } else { 2 })
+            .map(|_| Control::new())
+            .collect::<io::Result<Vec<_>>>()?;
+        let sink: Arc<dyn ReadinessSink> = Arc::<Wake>::clone(wake);
+        // The authority's references, one per pump in stream order.
         let mut handles = Vec::new();
-        let created = (|| {
-            for _ in 0..3 {
-                let (read, write) = pipe::create(
-                    authority,
-                    PIPE_CAPACITY,
-                    PIPE_ATOMIC_WRITE,
-                    FileOpenFlags::NONE,
-                )
-                .map_err(broker)?;
-                handles.extend([read, write]);
-            }
-            let guest_ends = [handles[0], handles[3], handles[5]];
-            let guest = authority
-                .duplicate_object_references_to(&guest_ends, task)
-                .map_err(broker)?;
-            // The task's references must be the only ones to its ends, or no end of file ever
-            // reaches either side.
-            for handle in guest_ends {
-                authority.close_object_reference(handle).map_err(broker)?;
-                handles.retain(|kept| *kept != handle);
-            }
+        let created = match terminal {
+            Some(size) => open_terminal(authority, &sink, task, size, &mut handles),
+            None => create_pipes(authority, task, &mut handles),
+        }
+        .and_then(|inherited| {
             // Registration covers only the references that exist now.
-            let sink: Arc<dyn ReadinessSink> = Arc::<Wake>::clone(wake);
-            authority.register_readiness(&sink).map_err(broker)?;
-            Ok(guest)
-        })();
-        let guest = match created {
-            Ok(guest) => guest,
+            authority.register_readiness(&sink).map_err(broker_error)?;
+            Ok(inherited)
+        });
+        let inherited = match created {
+            Ok(inherited) => inherited,
             Err(error) => {
                 for handle in handles {
                     let _ = authority.close_object_reference(handle);
@@ -445,24 +484,44 @@ impl TaskIo {
                 return Err(error);
             }
         };
-        let Host { fds: host, logger } = host;
+        let io = Self {
+            stdin,
+            outputs,
+            wake: Arc::clone(wake),
+            terminal: terminal.map(|_| (Arc::clone(authority), handles[1])),
+        };
+        let Host {
+            fds: [stdin, stdout, stderr],
+            logger,
+        } = host;
         let logger = logger.map(Arc::new);
-        let streams = [
-            (handles[0], Arc::clone(&io.stdin)),
-            (handles[1], Arc::clone(&io.outputs[0])),
-            (handles[2], Arc::clone(&io.outputs[1])),
-        ];
-        for (index, ((handle, control), host)) in streams.into_iter().zip(host).enumerate() {
-            let (pump_authority, wake) = (Arc::clone(authority), Arc::clone(wake));
+        let mut streams = vec![(stdin, &io.stdin), (stdout, &io.outputs[0])];
+        streams.extend(io.outputs.get(1).map(|control| (stderr, control)));
+        for (index, ((mut host, control), handle)) in streams.into_iter().zip(&handles).enumerate()
+        {
+            let handle = *handle;
+            let endpoint = match terminal {
+                Some(_) => Endpoint::Manager(handle),
+                None => Endpoint::Pipe(handle),
+            };
+            let (pump_authority, wake, control) =
+                (Arc::clone(authority), Arc::clone(wake), Arc::clone(control));
             // The output pumps hold the logging binary, which the last one to end reaps.
             let logger = logger.clone().filter(|_| index > 0);
+            // As with containerd's runc shim, the end of a terminal's input after `CloseIO` hangs
+            // up the terminal, which takes closing both references to its manager.
+            let stdout = (index == 0 && terminal.is_some()).then(|| Arc::clone(&io.outputs[0]));
             let spawned = std::thread::Builder::new()
                 .name("litebox-stdio".to_owned())
                 .spawn(move || {
                     if index == 0 {
-                        copy_input(&pump_authority, &wake, handle, &host, &control);
+                        if copy_input(&pump_authority, &wake, endpoint, &mut host, &control)
+                            && let Some(stdout) = stdout
+                        {
+                            stdout.request(Mode::Abort, &wake);
+                        }
                     } else {
-                        copy_output(&pump_authority, &wake, handle, &host, &control);
+                        copy_output(&pump_authority, &wake, endpoint, &host, &control);
                     }
                     drop(host);
                     let _ = pump_authority.close_object_reference(handle);
@@ -478,23 +537,25 @@ impl TaskIo {
                 return Err(error);
             }
         }
-        let ends = [
-            HalfPipeType::ReceiverHalf,
-            HalfPipeType::SenderHalf,
-            HalfPipeType::SenderHalf,
-        ];
-        let inherited = (0..)
-            .zip(guest.into_iter().zip(ends))
-            .map(|(fd, (handle, endpoint))| InheritedFd {
-                fd,
-                handle,
-                kind: InheritedFdKind::Pipe { endpoint },
-            })
-            .collect();
         Ok((io, inherited))
     }
 
-    /// Forwards the input that is already readable, then ends the task's stdin.
+    /// Sets the size of the task's terminal, if it has one, which signals its foreground group.
+    pub(crate) fn resize(&self, size: WindowSize) -> Result<()> {
+        let Some((authority, manager)) = &self.terminal else {
+            return Ok(());
+        };
+        match fs::terminal_control(authority, *manager, TerminalOperation::SetWindowSize(size)) {
+            Ok(Ok(_)) => Ok(()),
+            // The stdout pump closed it once the output ended.
+            Err(BrokerError::UnknownObject) => Err(Error::not_found("the terminal is closed")),
+            Ok(Err(error)) => Err(Error::io("cannot resize the terminal", &error)),
+            Err(error) => Err(Error::io("cannot resize the terminal", &error)),
+        }
+    }
+
+    /// Ends the task's stdin: with pipes, once the input that is already readable is forwarded;
+    /// with a terminal, once no client writes the input FIFO, which then hangs up the terminal.
     pub(crate) fn close_stdin(&self) {
         self.stdin.request(Mode::Close, &self.wake);
     }
@@ -511,6 +572,9 @@ impl TaskIo {
     /// stopping the output pumps too.
     pub(crate) fn finish(&self, timeout: Duration) {
         self.stdin.request(Mode::Abort, &self.wake);
+        for output in &self.outputs {
+            output.request(Mode::Close, &self.wake);
+        }
         let deadline = Instant::now() + timeout;
         if !self.outputs.iter().all(|output| output.wait(deadline)) {
             log::warn!("the output of a process did not end in time");
@@ -530,8 +594,112 @@ impl Drop for TaskIo {
     }
 }
 
+/// Creates `task`'s stdio pipes, whose host-side ends `authority` holds in `handles`, and returns
+/// the descriptors through which `task` inherits the other ends.
+fn create_pipes(
+    authority: &BrokerProcess,
+    task: &BrokerProcess,
+    handles: &mut Vec<ObjectHandle>,
+) -> io::Result<Vec<InheritedFd>> {
+    for _ in 0..3 {
+        let (read, write) = pipe::create(
+            authority,
+            PIPE_CAPACITY,
+            PIPE_ATOMIC_WRITE,
+            FileOpenFlags::NONE,
+        )
+        .map_err(broker_error)?;
+        handles.extend([read, write]);
+    }
+    let guest_ends = [handles[0], handles[3], handles[5]];
+    let guest = authority
+        .duplicate_object_references_to(&guest_ends, task)
+        .map_err(broker_error)?;
+    // The task's references must be the only ones to its ends, or no end of file ever reaches
+    // either side.
+    for handle in guest_ends {
+        authority
+            .close_object_reference(handle)
+            .map_err(broker_error)?;
+        handles.retain(|kept| *kept != handle);
+    }
+    let ends = [
+        HalfPipeType::ReceiverHalf,
+        HalfPipeType::SenderHalf,
+        HalfPipeType::SenderHalf,
+    ];
+    Ok((0..)
+        .zip(guest.into_iter().zip(ends))
+        .map(|(fd, (handle, endpoint))| InheritedFd {
+            fd,
+            handle,
+            kind: InheritedFdKind::Pipe { endpoint },
+        })
+        .collect())
+}
+
+/// Creates a pseudo-terminal pair of `size`, whose manager `authority` holds twice in `handles`,
+/// makes its subsidiary the controlling terminal of the session that `task` leads, and returns
+/// the descriptors through which `task` inherits the subsidiary.
+fn open_terminal(
+    authority: &BrokerProcess,
+    sink: &Arc<dyn ReadinessSink>,
+    task: &BrokerProcess,
+    size: WindowSize,
+    handles: &mut Vec<ObjectHandle>,
+) -> io::Result<Vec<InheritedFd>> {
+    let open = |path: &str, flags| {
+        flatten(fs::open(
+            authority,
+            path,
+            UserInfo::ROOT,
+            FileAccessMode::ReadWrite,
+            flags,
+            FileMode::empty(),
+            sink,
+        ))
+    };
+    let manager = open("/dev/ptmx", FileOpenFlags::NONE)?;
+    handles.push(manager);
+    let control = |operation| flatten(fs::terminal_control(authority, manager, operation));
+    let TerminalResponse::SubsidiaryIndex(index) = control(TerminalOperation::GetSubsidiaryIndex)?
+    else {
+        return Err(io::Error::other("the terminal has no subsidiary index"));
+    };
+    control(TerminalOperation::SetSubsidiaryLock(false))?;
+    control(TerminalOperation::SetWindowSize(size))?;
+    handles.extend(
+        authority
+            .duplicate_object_references_to(&[manager], authority)
+            .map_err(broker_error)?,
+    );
+    // The authority leads a session too, which must not acquire the terminal.
+    let subsidiary = open(
+        &format!("/dev/pts/{index}"),
+        FileOpenFlags::NO_CONTROLLING_TERMINAL,
+    )?;
+    let guest = authority.duplicate_object_references_to(&[subsidiary], task);
+    // The task's reference must be the only one, or the output never ends.
+    authority
+        .close_object_reference(subsidiary)
+        .map_err(broker_error)?;
+    let guest = guest.map_err(broker_error)?[0];
+    flatten(process_group::set_controlling_terminal(
+        task,
+        task.id(),
+        guest,
+    ))?;
+    Ok((0..3)
+        .map(|fd| InheritedFd {
+            fd,
+            handle: guest,
+            kind: InheritedFdKind::File,
+        })
+        .collect())
+}
+
 /// Waits until `host` is ready for `flags`, returning `false` instead once `control` changes
-/// mode or the wait fails.
+/// mode or the wait fails. Each change ends one wait.
 fn wait_host(host: &OwnedFd, flags: PollFlags, control: &Control) -> bool {
     let mut fds = [
         PollFd::new(host, flags),
@@ -539,49 +707,72 @@ fn wait_host(host: &OwnedFd, flags: PollFlags, control: &Control) -> bool {
     ];
     loop {
         match rustix::event::poll(&mut fds, None) {
-            Ok(_) => return fds[1].revents().is_empty(),
+            Ok(_) if fds[1].revents().is_empty() => return true,
+            Ok(_) => {
+                let _ = rustix::io::read(&control.event, &mut [0; 8]);
+                return false;
+            }
             Err(rustix::io::Errno::INTR) => {}
             Err(_) => return false,
         }
     }
 }
 
+/// Returns whether a terminal's input ended after `CloseIO`.
 fn copy_input(
     authority: &BrokerProcess,
     wake: &Wake,
-    handle: ObjectHandle,
-    host: &OwnedFd,
+    endpoint: Endpoint,
+    host: &mut OwnedFd,
     control: &Control,
-) {
+) -> bool {
     let mut buffer = vec![0; CHUNK];
-    // Once `CloseIO` is seen, what remains of the input that was pending then: input that arrives
-    // later is not forwarded, or a producer that never stops would keep the stream open.
+    // With pipes, once `CloseIO` is seen, what remains of the input that was pending then: input
+    // that arrives later is not forwarded, or a producer that never stops would keep the stream
+    // open.
     let mut closing: Option<usize> = None;
+    // With a terminal, whether `host` was reopened to only read its FIFO, which then ends once no
+    // client writes it.
+    let mut read_only = false;
     loop {
-        match control.mode() {
-            Mode::Run if !wait_host(host, PollFlags::IN, control) => continue,
-            Mode::Run => {}
-            Mode::Close => {
+        match (control.mode(), endpoint) {
+            (Mode::Abort, _) => return false,
+            (Mode::Close, Endpoint::Pipe(_)) => {
                 let left = *closing.get_or_insert_with(|| {
-                    rustix::io::ioctl_fionread(host)
+                    rustix::io::ioctl_fionread(&*host)
                         .map_or(0, |pending| usize::try_from(pending).unwrap_or(usize::MAX))
                 });
                 if left == 0 {
-                    return;
+                    return false;
                 }
             }
-            Mode::Abort => return,
-        }
-        let limit = closing.map_or(CHUNK, |left| left.min(CHUNK));
-        let read = match rustix::io::read(host, &mut buffer[..limit]) {
-            Ok(0) => return,
-            Ok(read) => read,
-            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR)
-                if control.mode() == Mode::Run =>
-            {
+            (Mode::Close, Endpoint::Manager(_)) if !read_only => {
+                // Without a FIFO, nothing hangs up, as with runc.
+                let fifo = rustix::fs::fstat(&*host)
+                    .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Fifo);
+                if !fifo {
+                    return false;
+                }
+                let path = format!("/proc/self/fd/{}", host.as_raw_fd());
+                let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+                let Ok(reader) = rustix::fs::open(path, flags, rustix::fs::Mode::empty()) else {
+                    return false;
+                };
+                *host = reader;
+                read_only = true;
                 continue;
             }
-            Err(_) => return,
+            _ if !wait_host(host, PollFlags::IN, control) => continue,
+            _ => {}
+        }
+        let limit = closing.map_or(CHUNK, |left| left.min(CHUNK));
+        let read = match rustix::io::read(&*host, &mut buffer[..limit]) {
+            Ok(0) => return read_only,
+            Ok(read) => read,
+            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) if closing.is_none() => {
+                continue;
+            }
+            Err(_) => return false,
         };
         if let Some(left) = &mut closing {
             *left -= read;
@@ -589,10 +780,10 @@ fn copy_input(
         let mut data = &buffer[..read];
         while !data.is_empty() {
             let seen = wake.generation();
-            match pipe::write(authority, handle, &data) {
+            match endpoint.write(authority, data) {
                 Ok(written) => data = &data[written..],
                 Err(BrokerError::WouldBlock) if control.mode() != Mode::Abort => wake.wait(seen),
-                Err(_) => return,
+                Err(_) => return false,
             }
         }
     }
@@ -601,14 +792,19 @@ fn copy_input(
 fn copy_output(
     authority: &BrokerProcess,
     wake: &Wake,
-    handle: ObjectHandle,
+    endpoint: Endpoint,
     host: &OwnedFd,
     control: &Control,
 ) {
     let mut buffer = vec![0; CHUNK];
     while control.mode() != Mode::Abort {
         let seen = wake.generation();
-        let read = match pipe::read(authority, handle, &mut buffer) {
+        let read = match endpoint.read(authority, &mut buffer) {
+            // The subsidiary may open again until the task exits.
+            Ok(0) if matches!(endpoint, Endpoint::Manager(_)) && control.mode() == Mode::Run => {
+                wake.wait(seen);
+                continue;
+            }
             Ok(0) => return,
             Ok(read) => read,
             Err(BrokerError::WouldBlock) => {
@@ -622,11 +818,12 @@ fn copy_output(
             match rustix::io::write(host, data) {
                 Ok(written) => data = &data[written..],
                 Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {
-                    if !wait_host(host, PollFlags::OUT, control) {
+                    if !wait_host(host, PollFlags::OUT, control) && control.mode() == Mode::Abort {
                         return;
                     }
                 }
-                // The output is gone: the task's next write fails as on a broken pipe.
+                // The output is gone: with pipes, the task's next write fails as on a broken
+                // pipe.
                 Err(_) => return,
             }
         }

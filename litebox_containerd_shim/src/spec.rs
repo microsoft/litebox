@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use litebox_broker_protocol::terminal::WindowSize;
 use oci_spec::runtime::{LinuxNamespaceType, Mount, Process, Spec};
 
 use crate::error::{Error, Result};
@@ -40,13 +41,24 @@ pub(crate) struct ProcessSpec {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) umask: u32,
+    /// The initial size of the process's terminal, if it has one: zero, as Linux starts it,
+    /// unless the spec sets `consoleSize`.
+    pub(crate) terminal: Option<WindowSize>,
 }
 
 impl ProcessSpec {
     pub(crate) fn from_oci(process: &Process) -> Result<Self> {
-        if process.terminal().unwrap_or(false) {
-            return Err(Error::unimplemented("terminals are not supported"));
-        }
+        let terminal = process
+            .terminal()
+            .unwrap_or(false)
+            .then(|| {
+                let Some(size) = process.console_size() else {
+                    return Ok(WindowSize::default());
+                };
+                window_size(size.height(), size.width())
+                    .ok_or_else(|| Error::invalid("process.consoleSize is too large"))
+            })
+            .transpose()?;
         let args = process.args().clone().unwrap_or_default();
         if args.first().is_none_or(String::is_empty) {
             return Err(Error::invalid("process.args must name a program"));
@@ -77,6 +89,7 @@ impl ProcessSpec {
             uid: user.uid(),
             gid: user.gid(),
             umask,
+            terminal,
         })
     }
 
@@ -380,6 +393,18 @@ impl MountPlan {
     }
 }
 
+/// The terminal size of `rows` and `columns`, unless Linux cannot represent it.
+pub(crate) fn window_size(
+    rows: impl TryInto<u16>,
+    columns: impl TryInto<u16>,
+) -> Option<WindowSize> {
+    Some(WindowSize {
+        rows: rows.try_into().ok()?,
+        columns: columns.try_into().ok()?,
+        ..WindowSize::default()
+    })
+}
+
 /// Validates a `Kill` signal number.
 pub(crate) fn kill_signal(signal: u32) -> Result<u32> {
     // SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU: LiteBox treats stopping as termination.
@@ -487,9 +512,19 @@ mod tests {
                 uid: 0,
                 gid: 0,
                 umask: 0o022,
+                terminal: None,
             }
         );
         assert_eq!(process.search_path(), "/usr/local/bin:/usr/bin:/bin");
+    }
+
+    #[test]
+    fn console_sizes_linux_cannot_represent_are_rejected_for_terminals() {
+        let mut json = ctr_default();
+        json["process"]["consoleSize"] = serde_json::json!({"height": 24, "width": 65536});
+        assert_eq!(translate(&json).unwrap().1.terminal, None);
+        json["process"]["terminal"] = true.into();
+        assert_eq!(translate(&json).unwrap_err().kind, Kind::InvalidArgument);
     }
 
     #[test]
@@ -560,8 +595,7 @@ mod tests {
         assert_eq!(error.message, "process.env[0] contains a NUL byte");
 
         let bind = |options: &[&str]| serde_json::json!([{"destination": "/d", "type": "bind", "source": "/s", "options": options}]);
-        let cases: [(&str, serde_json::Value, Kind); 14] = [
-            ("/process/terminal", true.into(), Kind::Unimplemented),
+        let cases: [(&str, serde_json::Value, Kind); 13] = [
             (
                 "/process/args",
                 serde_json::json!([]),

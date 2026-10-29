@@ -4,11 +4,13 @@
 // Static guest for the shim tests. argv[1] selects the behavior; every mode first describes its
 // startup on stdout.
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -112,6 +114,88 @@ static int threads(void) {
     return 0;
 }
 
+static void on_interrupt(int signal) {
+    (void)signal;
+    static const char message[] = "interrupted\n";
+    if (write(1, message, sizeof message - 1)) {}
+}
+
+// Writes the decimal digits of `n` to `buffer` and returns where they end; unlike `printf`, it is
+// async-signal-safe.
+static char *digits(char *buffer, unsigned n) {
+    char reversed[16];
+    int count = 0;
+    do reversed[count++] = (char)('0' + n % 10); while ((n /= 10) != 0);
+    while (count > 0) *buffer++ = reversed[--count];
+    return buffer;
+}
+
+static void on_resize(int signal) {
+    (void)signal;
+    struct winsize size = {0};
+    ioctl(0, TIOCGWINSZ, &size);
+    char message[64] = "resized ";
+    char *end = digits(message + 8, size.ws_row);
+    *end++ = 'x';
+    end = digits(end, size.ws_col);
+    *end++ = '\n';
+    if (write(1, message, (size_t)(end - message))) {}
+}
+
+// Describes its terminal on stderr, reports SIGINT and SIGWINCH, and prints each line it reads
+// until one is `exit <status>`.
+static int tty(void) {
+    struct sigaction action = {.sa_handler = on_interrupt, .sa_flags = SA_RESTART};
+    sigaction(SIGINT, &action, NULL);
+    action.sa_handler = on_resize;
+    sigaction(SIGWINCH, &action, NULL);
+    struct winsize size = {0};
+    ioctl(0, TIOCGWINSZ, &size);
+    fprintf(stderr, "tty=%d%d%d foreground=%d leader=%d size=%dx%d\n", isatty(0), isatty(1),
+            isatty(2), tcgetpgrp(0) == getpgrp(), getsid(0) == getpid(), size.ws_row, size.ws_col);
+    char line[256];
+    ssize_t n;
+    while ((n = read(0, line, sizeof line - 1)) != 0) {
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return 44;
+        }
+        line[n] = '\0';
+        if (line[n - 1] == '\n') line[n - 1] = '\0';
+        if (strncmp(line, "exit ", 5) == 0) return atoi(line + 5);
+        printf("line=[%s]\n", line);
+        fflush(stdout);
+    }
+    printf("eof\n");
+    return 0;
+}
+
+static volatile sig_atomic_t winched;
+
+static void on_winch(int signal) {
+    (void)signal;
+    winched = 1;
+}
+
+// Closes its standard descriptors, so that no file is open on its terminal, until SIGWINCH,
+// then reports the size on its terminal reopened as /dev/tty.
+static int reopen(void) {
+    struct sigaction action = {.sa_handler = on_winch};
+    sigaction(SIGWINCH, &action, NULL);
+    printf("closing\n");
+    fflush(stdout);
+    close(0);
+    close(1);
+    close(2);
+    while (!winched) usleep(10000);
+    int fd = open("/dev/tty", O_RDWR);
+    if (fd < 0) return 45;
+    struct winsize size = {0};
+    ioctl(fd, TIOCGWINSZ, &size);
+    dprintf(fd, "reopened %dx%d\n", size.ws_row, size.ws_col);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     describe(argc, argv);
     const char *mode = argc > 1 ? argv[1] : "";
@@ -124,6 +208,8 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "trap") == 0) return trap();
     if (strcmp(mode, "family") == 0) return family(argv[0]);
     if (strcmp(mode, "threads") == 0) return threads();
+    if (strcmp(mode, "tty") == 0) return tty();
+    if (strcmp(mode, "reopen") == 0) return reopen();
     // Prints the target of the symlink argv[2], then the files that follow it.
     if (strcmp(mode, "read") == 0 && argc > 3) {
         char target[256];
