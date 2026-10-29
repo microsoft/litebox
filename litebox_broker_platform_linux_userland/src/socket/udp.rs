@@ -24,6 +24,8 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, SocketConnectionStatus, SocketError, SocketOutcome,
 };
+#[cfg(test)]
+use litebox_platform::buffer::RawBytes;
 use rustix::event::epoll;
 use rustix::io::Errno;
 #[cfg(test)]
@@ -31,11 +33,12 @@ use rustix::io::ioctl_fionread;
 use rustix::net::{
     AddressFamily as LinuxAddressFamily, RecvFlags as LinuxRecvFlags, SendFlags as LinuxSendFlags,
     SocketFlags as LinuxSocketFlags, SocketType as LinuxSocketType, bind, connect, ipproto,
-    recvfrom, sendto, socket_with, sockopt,
+    socket_with, sockopt,
 };
 
 #[cfg(test)]
 use super::LinuxSocket;
+use super::direct::{RawParts, receive_parts, send_parts};
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
     broker_error_from_errno, local_socket_address, lock, read_lock, republish_own_readiness,
@@ -646,7 +649,7 @@ impl SocketEntry<'_> {
     pub(super) fn send_internal_udp(
         &mut self,
         destination: SocketAddrV4,
-        data: &[u8],
+        data: RawParts<'_>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let source_address = self.udp_source_address(destination)?;
         let receiver = {
@@ -691,13 +694,10 @@ impl SocketEntry<'_> {
         receiver_counters: Arc<ProcessCounters>,
         source_counters: Arc<ProcessCounters>,
         source_address: SocketAddrV4,
-        data: &[u8],
+        data: RawParts<'_>,
     ) -> BrokerResult<bool> {
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(data.len())
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        payload.extend_from_slice(data);
+        let mut payload = zeroed_vec(data.len())?;
+        data.copy_to_slice(&mut payload);
         let mut inbox = receiver.lock();
         if inbox.closed || !inbox.udp.accepts_from(source_address) {
             return Ok(false);
@@ -722,7 +722,7 @@ impl SocketEntry<'_> {
 
     pub(super) fn receive_internal_udp(
         &mut self,
-        length: usize,
+        output: RawParts<'_>,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<Option<ReceiveFromOutcome>> {
         let peek = flags.contains(ReceiveFromFlags::PEEK);
@@ -731,13 +731,10 @@ impl SocketEntry<'_> {
             let Some(datagram) = inbox.udp.queue.front() else {
                 return Ok(None);
             };
-            let copied = length.min(datagram.payload.len());
-            let mut data = Vec::new();
-            data.try_reserve_exact(copied)
-                .map_err(|_| BrokerError::OutOfMemory)?;
-            data.extend_from_slice(&datagram.payload[..copied]);
+            let received = output.len().min(datagram.payload.len());
+            output.copy_from_slice(&datagram.payload[..received]);
             let outcome = ReceiveFromOutcome::Received {
-                data,
+                received,
                 datagram_length: datagram.payload.len(),
                 source_address: datagram.source_address,
             };
@@ -957,7 +954,7 @@ impl SocketEntry<'_> {
     /// accepts replies from the destination.
     pub(super) fn send_to_external_udp(
         &mut self,
-        data: &[u8],
+        data: RawParts<'_>,
         external_destination: SocketAddrV4,
         authorize_reply: bool,
     ) -> BrokerResult<SocketOutcome<usize>> {
@@ -978,7 +975,7 @@ impl SocketEntry<'_> {
 
     fn stage_and_send_external_udp(
         &mut self,
-        data: &[u8],
+        data: RawParts<'_>,
         external_destination: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<usize>> {
         if self.udp_state()?.native_endpoint.is_none() {
@@ -1266,7 +1263,7 @@ impl SocketEntry<'_> {
         let _ = sockopt::socket_error(&endpoint.socket)
             .map_err(|error| indeterminate(broker_error_from_errno(error)))?;
         for _ in 0..MAX_UDP_NATIVE_CONNECT_DRAIN_DATAGRAMS {
-            match receive_datagram_fd(&endpoint.socket, 0, ReceiveFromFlags::NONE) {
+            match receive_datagram_fd(&endpoint.socket, RawParts::EMPTY, ReceiveFromFlags::NONE) {
                 Ok(ReceiveFromOutcome::Received { .. } | ReceiveFromOutcome::Failed(_)) => {}
                 Err(BrokerError::WouldBlock) => {
                     let udp = self.udp_state_mut().map_err(indeterminate)?;
@@ -1425,7 +1422,7 @@ impl SocketEntry<'_> {
         for _ in 0..MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
             let host_source = match receive_datagram_fd(
                 &self.udp_endpoint()?.socket,
-                0,
+                RawParts::EMPTY,
                 ReceiveFromFlags::PEEK,
             ) {
                 Ok(ReceiveFromOutcome::Received { source_address, .. }) => source_address,
@@ -1441,7 +1438,11 @@ impl SocketEntry<'_> {
                 self.udp_endpoint_mut()?.readable = true;
                 return Ok(());
             }
-            match receive_datagram_fd(&self.udp_endpoint()?.socket, 0, ReceiveFromFlags::NONE) {
+            match receive_datagram_fd(
+                &self.udp_endpoint()?.socket,
+                RawParts::EMPTY,
+                ReceiveFromFlags::NONE,
+            ) {
                 Ok(ReceiveFromOutcome::Received { .. }) => {}
                 Ok(ReceiveFromOutcome::Failed(error)) => {
                     self.record_udp_endpoint_error(error)?;
@@ -1457,7 +1458,7 @@ impl SocketEntry<'_> {
 
     pub(super) fn send_external_udp(
         &mut self,
-        data: &[u8],
+        data: RawParts<'_>,
         external_destination: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let destination = host_socket_destination(external_destination);
@@ -1470,7 +1471,7 @@ impl SocketEntry<'_> {
             }
             let socket = &self.udp_endpoint()?.socket;
             loop {
-                match sendto(socket, data, LinuxSendFlags::NOSIGNAL, &destination) {
+                match send_parts(socket, data, Some(destination), LinuxSendFlags::NOSIGNAL) {
                     Ok(sent) if sent == data.len() => break Ok(SocketOutcome::Completed(sent)),
                     Ok(_) => break Err(BrokerError::Internal),
                     Err(Errno::INTR) => {}
@@ -1490,7 +1491,7 @@ impl SocketEntry<'_> {
 
     pub(super) fn receive_external_udp(
         &mut self,
-        length: usize,
+        output: RawParts<'_>,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<Option<ReceiveFromOutcome>> {
         let can_receive = self
@@ -1502,16 +1503,14 @@ impl SocketEntry<'_> {
             return Ok(None);
         }
         for _ in 0..MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
-            let (data, datagram_length, host_source) = match receive_datagram_fd(
+            // Peek at no bytes, so a rejected sender's bytes never reach the
+            // output.
+            let host_source = match receive_datagram_fd(
                 &self.udp_endpoint()?.socket,
-                length,
+                RawParts::EMPTY,
                 ReceiveFromFlags::PEEK,
             ) {
-                Ok(ReceiveFromOutcome::Received {
-                    data,
-                    datagram_length,
-                    source_address,
-                }) => (data, datagram_length, source_address),
+                Ok(ReceiveFromOutcome::Received { source_address, .. }) => source_address,
                 Ok(ReceiveFromOutcome::Failed(error)) => {
                     return self.finish_udp_receive_error(error);
                 }
@@ -1522,14 +1521,13 @@ impl SocketEntry<'_> {
                 Err(error) => return Err(error),
             };
             if let Some(source_address) = self.resolve_external_udp_source(host_source)? {
-                let received = ReceiveFromOutcome::Received {
-                    data,
-                    datagram_length,
-                    source_address,
-                };
-                return self.consume_external_udp(received, flags);
+                return self.consume_external_udp(output, source_address, flags);
             }
-            match receive_datagram_fd(&self.udp_endpoint()?.socket, 0, ReceiveFromFlags::NONE) {
+            match receive_datagram_fd(
+                &self.udp_endpoint()?.socket,
+                RawParts::EMPTY,
+                ReceiveFromFlags::NONE,
+            ) {
                 Ok(ReceiveFromOutcome::Received { .. }) => {}
                 Ok(ReceiveFromOutcome::Failed(error)) => {
                     return self.finish_udp_receive_error(error);
@@ -1545,16 +1543,44 @@ impl SocketEntry<'_> {
         Ok(None)
     }
 
-    /// Returns a peeked accepted native datagram, dequeuing it unless the
+    /// Receives the accepted native datagram at the head of the endpoint,
+    /// sent from `source_address`, into `output`, dequeuing it unless the
     /// caller only peeks.
+    ///
+    /// The socket is its endpoint's only reader, so the head stays the
+    /// datagram the caller peeked.
     fn consume_external_udp(
         &mut self,
-        received: ReceiveFromOutcome,
+        output: RawParts<'_>,
+        source_address: SocketAddrV4,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<Option<ReceiveFromOutcome>> {
         if flags.contains(ReceiveFromFlags::PEEK) {
+            let (received, datagram_length) = match receive_datagram_fd(
+                &self.udp_endpoint()?.socket,
+                output,
+                ReceiveFromFlags::PEEK,
+            ) {
+                Ok(ReceiveFromOutcome::Received {
+                    received,
+                    datagram_length,
+                    ..
+                }) => (received, datagram_length),
+                Ok(ReceiveFromOutcome::Failed(error)) => {
+                    return self.finish_udp_receive_error(error);
+                }
+                Err(BrokerError::WouldBlock) => {
+                    self.clear_udp_readable_and_rearm()?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             self.udp_state_mut()?.peeked_origin = Some(UdpReceiveOrigin::External);
-            return Ok(Some(received));
+            return Ok(Some(ReceiveFromOutcome::Received {
+                received,
+                datagram_length,
+                source_address,
+            }));
         }
         let endpoint = self.udp_endpoint_mut()?;
         let should_rearm = !endpoint.error.is_pending();
@@ -1565,20 +1591,26 @@ impl SocketEntry<'_> {
                 return Err(error);
             }
         }
-        match receive_datagram_fd(&self.udp_endpoint()?.socket, 0, ReceiveFromFlags::NONE) {
-            Ok(ReceiveFromOutcome::Received { .. }) => {}
-            Ok(ReceiveFromOutcome::Failed(error)) => {
-                return self.finish_udp_receive_error(error);
-            }
-            Err(BrokerError::WouldBlock) => {
-                let _ = self.publish_udp_readiness();
-                return Ok(None);
-            }
-            Err(error) => {
-                self.udp_endpoint_mut()?.readable = true;
-                return Err(error);
-            }
-        }
+        let (received, datagram_length) =
+            match receive_datagram_fd(&self.udp_endpoint()?.socket, output, ReceiveFromFlags::NONE)
+            {
+                Ok(ReceiveFromOutcome::Received {
+                    received,
+                    datagram_length,
+                    ..
+                }) => (received, datagram_length),
+                Ok(ReceiveFromOutcome::Failed(error)) => {
+                    return self.finish_udp_receive_error(error);
+                }
+                Err(BrokerError::WouldBlock) => {
+                    let _ = self.publish_udp_readiness();
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.udp_endpoint_mut()?.readable = true;
+                    return Err(error);
+                }
+            };
         let udp = self.udp_state_mut()?;
         udp.peeked_origin = None;
         udp.next_receive_origin = UdpReceiveOrigin::Internal;
@@ -1589,7 +1621,11 @@ impl SocketEntry<'_> {
         // Consumption is irreversible; ignore a failure to recompute
         // readiness.
         let _ = self.publish_udp_readiness();
-        Ok(Some(received))
+        Ok(Some(ReceiveFromOutcome::Received {
+            received,
+            datagram_length,
+            source_address,
+        }))
     }
 }
 
@@ -1718,18 +1754,21 @@ impl ProviderCore {
 
     /// Runs `before` while holding the socket bound to `guest_port`, then
     /// receives from a readable native endpoint whose head datagrams are all
-    /// rejected; returns whether the endpoint stays readable and the size of
-    /// the datagram left at its head.
+    /// rejected; returns whether the endpoint stays readable, the size of the
+    /// datagram left at its head, and the receive's 1-byte output, which
+    /// starts as 0.
     pub(super) fn exercise_udp_receive_rejection_cap(
         &self,
         guest_port: u16,
         before: impl FnOnce(),
-    ) -> BrokerResult<(bool, usize)> {
+    ) -> BrokerResult<(bool, usize, u8)> {
         self.with_udp_socket(guest_port, |socket| {
             before();
             socket.udp_endpoint_mut()?.readable = true;
+            let mut byte = [0];
+            let part = [RawBytes::from(&mut byte[..])];
             if socket
-                .receive_external_udp(1, ReceiveFromFlags::NONE)?
+                .receive_external_udp(RawParts::from(&part), ReceiveFromFlags::NONE)?
                 .is_some()
             {
                 return Err(BrokerError::Internal);
@@ -1738,34 +1777,32 @@ impl ProviderCore {
             let head_datagram_bytes =
                 usize::try_from(ioctl_fionread(&endpoint.socket).map_err(broker_error_from_errno)?)
                     .map_err(|_| BrokerError::Internal)?;
-            Ok((endpoint.readable, head_datagram_bytes))
+            Ok((endpoint.readable, head_datagram_bytes, byte[0]))
         })
     }
 }
 
+/// Receives the datagram at the head of `socket` into `output`, reporting
+/// its full length even if `output` is shorter.
 fn receive_datagram_fd(
     socket: &OwnedFd,
-    length: usize,
+    output: RawParts<'_>,
     flags: ReceiveFromFlags,
 ) -> BrokerResult<ReceiveFromOutcome> {
-    if length > MAX_UDP_DATAGRAM_SIZE as usize || flags.has_unsupported_bits() {
+    if output.len() > MAX_UDP_DATAGRAM_SIZE as usize || flags.has_unsupported_bits() {
         return Ok(ReceiveFromOutcome::Failed(SocketError::InvalidArgument));
     }
-    let mut data = zeroed_vec(length)?;
     let mut linux_flags = LinuxRecvFlags::TRUNC;
     if flags.contains(ReceiveFromFlags::PEEK) {
         linux_flags |= LinuxRecvFlags::PEEK;
     }
     loop {
-        match recvfrom(socket, data.as_mut_slice(), linux_flags) {
-            Ok((received, datagram_length, address)) => {
-                let source_address = SocketAddrV4::try_from(address.ok_or(BrokerError::Internal)?)
-                    .map_err(|_| BrokerError::Internal)?;
-                data.truncate(received);
+        match receive_parts(socket, output, linux_flags) {
+            Ok((datagram_length, address)) => {
                 return Ok(ReceiveFromOutcome::Received {
-                    data,
+                    received: datagram_length.min(output.len()),
                     datagram_length,
-                    source_address,
+                    source_address: address.ok_or(BrokerError::Internal)?,
                 });
             }
             Err(Errno::INTR) => {}

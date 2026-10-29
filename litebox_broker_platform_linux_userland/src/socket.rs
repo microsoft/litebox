@@ -52,13 +52,15 @@ use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, p
 use rustix::io::{Errno, read, write};
 use rustix::net::{getsockname, sockopt};
 
+mod direct;
 mod tcp;
 mod udp;
 
+use direct::{RawParts, receive_into, send_from};
 use tcp::{
     AcceptedEndpoints, ReceiveOutcome, TcpPendingError, TcpSocketState, TcpTopology,
     consume_pending_guest_reset, create_tcp_transport, guest_reset_pending, handle_socket_event,
-    tcp_receive_buffer,
+    tcp_peek_buffer,
 };
 use udp::{
     ProcessCounters, QueueCounter, UDP_EVENT_TOKEN_FLAG, UdpInbox, UdpPeer, UdpPorts,
@@ -798,9 +800,9 @@ impl PlatformSocket for LinuxSocket {
         data: &dyn WriteBuffer,
         _flags: SendFlags,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let mut staged = zeroed_vec(data.len())?;
-        data.copy_to_slice_at(0, &mut staged)?;
-        self.call(|socket| socket.send_tcp_socket(&staged))
+        send_from(data, |data| {
+            self.call(|socket| socket.send_tcp_socket(data))
+        })
     }
 
     fn send_to(
@@ -809,9 +811,9 @@ impl PlatformSocket for LinuxSocket {
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let mut staged = zeroed_vec(data.len())?;
-        data.copy_to_slice_at(0, &mut staged)?;
-        self.call(|socket| socket.send_to_socket(&staged, destination))
+        send_from(data, |data| {
+            self.call(|socket| socket.send_to_socket(data, destination))
+        })
     }
 
     fn receive(
@@ -827,16 +829,22 @@ impl PlatformSocket for LinuxSocket {
             usize::try_from(peek_offset).map_err(|_| BrokerError::UnsupportedOperation)?;
         let peek_length =
             usize::try_from(peek_length).map_err(|_| BrokerError::UnsupportedOperation)?;
-        let buffer = tcp_receive_buffer(length, flags, peek_offset, peek_length)?;
-        match self.call(|socket| {
-            socket.receive_tcp_socket(reader, buffer, length, flags, peek_offset, peek_length)
+        let peek_buffer = tcp_peek_buffer(length, flags, peek_offset, peek_length)?;
+        match receive_into(output, ReceiveOutcome::received, |output| {
+            self.call(|socket| {
+                socket.receive_tcp_socket(
+                    reader,
+                    output,
+                    peek_buffer,
+                    flags,
+                    peek_offset,
+                    peek_length,
+                )
+            })
         })? {
-            ReceiveOutcome::Received(received) => {
-                output.copy_from_slice_at(0, &received)?;
-                Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
-                    received.len(),
-                )))
-            }
+            ReceiveOutcome::Received(received) => Ok(SocketOutcome::Completed(
+                PlatformStreamReceive::Received(received),
+            )),
             ReceiveOutcome::EndOfStream => {
                 Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
             }
@@ -849,20 +857,18 @@ impl PlatformSocket for LinuxSocket {
         output: &mut dyn ReadBuffer,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
-        let length = output.len();
-        match self.call(|socket| socket.receive_from_socket(length, flags))? {
+        match receive_into(output, ReceiveFromOutcome::received, |output| {
+            self.call(|socket| socket.receive_from_socket(output, flags))
+        })? {
             ReceiveFromOutcome::Received {
-                data,
+                received,
                 datagram_length,
                 source_address,
-            } => {
-                output.copy_from_slice_at(0, &data)?;
-                Ok(SocketOutcome::Completed(PlatformDatagramReceive {
-                    received: data.len(),
-                    datagram_length,
-                    source_address,
-                }))
-            }
+            } => Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                received,
+                datagram_length,
+                source_address,
+            })),
             ReceiveFromOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
         }
     }
@@ -900,11 +906,22 @@ impl Drop for LinuxSocket {
 
 enum ReceiveFromOutcome {
     Received {
-        data: Vec<u8>,
+        /// Bytes received into the start of the output.
+        received: usize,
         datagram_length: usize,
         source_address: SocketAddrV4,
     },
     Failed(SocketError),
+}
+
+impl ReceiveFromOutcome {
+    /// Returns how many bytes the receive copied into its output.
+    fn received(&self) -> usize {
+        match self {
+            Self::Received { received, .. } => *received,
+            Self::Failed(_) => 0,
+        }
+    }
 }
 
 /// Exactly one transport-specific payload for a socket.
@@ -1060,7 +1077,7 @@ impl<'a> SocketEntry<'a> {
 
     fn send_to_socket(
         &mut self,
-        data: &[u8],
+        data: RawParts<'_>,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         if self.kind() != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
@@ -1125,7 +1142,7 @@ impl<'a> SocketEntry<'a> {
 
     fn receive_from_socket(
         &mut self,
-        length: usize,
+        output: RawParts<'_>,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<ReceiveFromOutcome> {
         if let Some(error) = self.take_udp_cached_error() {
@@ -1143,8 +1160,8 @@ impl<'a> SocketEntry<'a> {
         };
         for origin in [first, second] {
             let outcome = match origin {
-                UdpReceiveOrigin::Internal => self.receive_internal_udp(length, flags)?,
-                UdpReceiveOrigin::External => self.receive_external_udp(length, flags)?,
+                UdpReceiveOrigin::Internal => self.receive_internal_udp(output, flags)?,
+                UdpReceiveOrigin::External => self.receive_external_udp(output, flags)?,
             };
             if let Some(outcome) = outcome {
                 return Ok(outcome);

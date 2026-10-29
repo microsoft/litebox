@@ -177,6 +177,93 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
     assert_eq!(&response, b"response");
 }
 
+/// An external UDP socket sends from and receives and peeks into a buffer's
+/// own raw parts, stages only a buffer with too many parts or none, and
+/// keeps datagrams whole either way.
+#[test]
+fn external_udp_transfers_use_raw_parts() {
+    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider,
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
+    let host = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let gateway = gateway_address(socket_address_v4(host.local_addr().unwrap()));
+    for part_length in TEST_BUFFER_LAYOUTS {
+        let mut data = TEST_MESSAGE;
+        assert_eq!(
+            litebox_broker_core::socket::send_to(
+                &process,
+                socket,
+                &TestBuffer::new(&mut data, part_length),
+                SendFlags::NONE,
+                Some(gateway),
+            ),
+            Ok(SocketOutcome::Completed(TEST_MESSAGE.len()))
+        );
+        let mut sent = [0; TEST_MESSAGE.len() + 1];
+        let (length, host_source) = host.recv_from(&mut sent).unwrap();
+        assert_eq!(sent[..length], TEST_MESSAGE);
+
+        host.send_to(&TEST_MESSAGE, host_source).unwrap();
+        receive_test_message(&process, socket, &publications, part_length, gateway);
+    }
+}
+
+/// An internal UDP socket sends from and receives and peeks into a buffer's
+/// own raw parts, stages only a buffer with too many parts or none, and
+/// keeps datagrams whole either way.
+#[test]
+fn internal_udp_transfers_use_raw_parts() {
+    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        provider,
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let addresses = [18110, 18111].map(|port| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let [sender, receiver] = addresses.map(|address| {
+        let socket = create_udp_socket(&process, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(&process, socket, address),
+            Ok(SocketOutcome::Completed(address))
+        );
+        socket
+    });
+    for part_length in TEST_BUFFER_LAYOUTS {
+        let mut data = TEST_MESSAGE;
+        assert_eq!(
+            litebox_broker_core::socket::send_to(
+                &process,
+                sender,
+                &TestBuffer::new(&mut data, part_length),
+                SendFlags::NONE,
+                Some(addresses[1]),
+            ),
+            Ok(SocketOutcome::Completed(TEST_MESSAGE.len()))
+        );
+        receive_test_message(&process, receiver, &publications, part_length, addresses[0]);
+    }
+}
+
 #[test]
 fn unmatched_guest_udp_destinations_are_port_unreachable() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
@@ -2199,7 +2286,8 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
                 }
                 attacker.send_to(sentinel, receiver_host_address).unwrap();
             }),
-        Ok((false, sentinel.len()))
+        // No rejected datagram reached the output.
+        Ok((false, sentinel.len(), 0))
     );
     let deadline = Instant::now() + TEST_TIMEOUT;
     while provider.core.udp_native_head_datagram_bytes(guest_port) != 0 {
