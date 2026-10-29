@@ -101,13 +101,21 @@ pub fn activate_local<Memory: WaitableSharedMemory<Error = Error>>(
         wakes,
     });
     let monitor_association = Arc::clone(&association);
+    let (started, wait_for_start) = std::sync::mpsc::sync_channel(1);
     if let Err(error) = thread::Builder::new()
         .name("litebox-broker-liveness".to_owned())
-        .spawn(move || monitor_association.monitor())
+        .spawn(move || {
+            let _ = started.send(());
+            monitor_association.monitor();
+        })
     {
         let _ = association.fail(error);
         return Err(Error::other("failed to start broker liveness monitor"));
     }
+    // Wait until the monitor runs, past the runtime's own thread startup, which holds a
+    // process-wide lock. A runner may clone itself as soon as this returns, and a clone that
+    // inherited that lock held could never start a thread.
+    let _ = wait_for_start.recv();
 
     Ok((
         ControlRingLocalCallChannel {
