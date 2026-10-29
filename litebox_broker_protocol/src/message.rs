@@ -12,8 +12,8 @@ use crate::fs::{
     OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
     ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
     ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse,
+    SetStatusFlagsRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -140,7 +140,8 @@ impl BrokerOperation {
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. })
                 | FileRequest::HandlePath(HandleFilePathRequest { buffer, .. })
                 | FileRequest::ReadLink(ReadLinkFileRequest { buffer, .. })
-                | FileRequest::ResolvePath(ResolvePathFileRequest { buffer, .. }),
+                | FileRequest::ResolvePath(ResolvePathFileRequest { buffer, .. })
+                | FileRequest::Symlink(SymlinkFileRequest { buffer, .. }),
             )
             | Self::Process(
                 ProcessRequest::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
@@ -826,6 +827,8 @@ pub enum FileRequest {
     ReadLink(ReadLinkFileRequest),
     /// Resolve a path to its physical location.
     ResolvePath(ResolvePathFileRequest),
+    /// Create a symbolic link with an opaque target.
+    Symlink(SymlinkFileRequest),
 }
 
 /// Broker-owned fs response.
@@ -867,6 +870,8 @@ pub enum FileResponse {
     ReadLink(FilePathResponse),
     /// Resolved-path response.
     ResolvePath(FilePathResponse),
+    /// Symbolic-link creation completed.
+    Symlink,
     /// File operation failed with a guest-visible error.
     Failed(FileError),
 }

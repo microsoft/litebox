@@ -37,7 +37,7 @@ use super::{
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+        RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
@@ -269,6 +269,16 @@ impl super::backend::Backend for TarRo {
         _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn symlink_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _target: &str,
+        _metadata: CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        Err(SymlinkError::ReadOnlyFileSystem)
     }
 
     fn mkdir_at(

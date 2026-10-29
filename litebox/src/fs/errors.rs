@@ -147,6 +147,24 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`crate::LiteBox::symlink_file`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SymlinkError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("pathname already exists")]
+    AlreadyExists,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("symbolic links are not supported")]
+    NotSupported,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`crate::LiteBox::unlink_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

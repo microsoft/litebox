@@ -169,6 +169,23 @@ pub enum UnlinkError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`super::resolver::Resolver::symlink`]
+#[derive(Error, Debug)]
+pub enum SymlinkError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("pathname already exists, not necessarily a directory")]
+    AlreadyExists,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("symbolic link creation is not supported")]
+    NotSupported,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`super::resolver::Resolver::mkdir`]
 #[derive(Error, Debug)]
 pub enum MkdirError {

@@ -12,8 +12,9 @@ use litebox_broker_protocol::fs::{
     FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest, HandleFileStatusRequest,
     IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
     PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, TerminalControlFileRequest,
-    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SymlinkFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -431,6 +432,42 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Rmdir => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file rmdir response: {response:?}"),
+        }
+    }
+
+    /// Creates a symbolic link at an absolute `linkpath`, storing `target` verbatim.
+    ///
+    /// `buffer` must exactly fit the linkpath followed by the target, within one slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer sequence is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn symlink_file(
+        &self,
+        buffer: SharedBufferSequence,
+        target: &str,
+        linkpath: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        let length = linkpath
+            .len()
+            .checked_add(target.len())
+            .filter(|length| *length <= SHARED_BUFFER_SLOT_SIZE as usize)
+            .ok_or(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))?;
+        self.validate_file_buffer(buffer, length, SHARED_BUFFER_SLOT_SIZE)?;
+        let path_length =
+            u32::try_from(linkpath.len()).expect("linkpath fits one shared-buffer slot");
+        self.write_shared_buffer_at(buffer, 0, linkpath.as_bytes());
+        self.write_shared_buffer_at(buffer, linkpath.len(), target.as_bytes());
+        match self.request_file(FileRequest::Symlink(SymlinkFileRequest {
+            buffer,
+            path_length,
+            user,
+        }))? {
+            FileResponse::Symlink => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file symlink response: {response:?}"),
         }
     }
 

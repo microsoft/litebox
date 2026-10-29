@@ -150,6 +150,8 @@ pub enum FileError {
     NoSuchDevice,
     #[error("no space is left for a new object")]
     NoSpace,
+    #[error("operation is not supported")]
+    NotSupported,
 }
 
 /// Seek origin.
@@ -449,6 +451,17 @@ pub struct PathFileStatusRequest {
     pub user: FileUser,
     /// Whether a final symbolic link is followed rather than described itself.
     pub follow_symlinks: bool,
+}
+
+/// Creates a symbolic link by path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SymlinkFileRequest {
+    /// Shared-buffer region containing the absolute UTF-8 linkpath followed by the target verbatim.
+    pub buffer: SharedBufferSequence,
+    /// Length of the linkpath at the start of `buffer`; the remaining bytes are the target.
+    pub path_length: u32,
+    /// Caller identity for permission checks.
+    pub user: FileUser,
 }
 
 /// Reads the target of a symbolic link by path.

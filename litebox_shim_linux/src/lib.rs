@@ -1055,6 +1055,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     syscall!(sys_mkdirat(dirfd, path, mode))
                 }),
+            SyscallRequest::Symlinkat {
+                target,
+                dirfd,
+                linkpath,
+            } => {
+                let target = target.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                let linkpath = linkpath.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+                let target = target.to_str().map_err(|_| Errno::EINVAL)?;
+                let linkpath = linkpath.to_str().map_err(|_| Errno::EINVAL)?;
+                syscall!(sys_symlinkat(target, dirfd, linkpath))
+            }
             SyscallRequest::Fchmodat {
                 dirfd,
                 pathname,

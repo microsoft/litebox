@@ -46,7 +46,7 @@ use litebox_broker_core::fs::backend::{
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -836,6 +836,19 @@ impl Backend for LocalFs {
             readable: true,
             writable: true,
         }))
+    }
+
+    fn symlink_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _target: &str,
+        _metadata: CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        // Guest-created host symlinks would let the guest race path checks against later opens
+        // to escape the root. Validating the target alone cannot make this path-based backend
+        // safe; supporting this requires confining host access atomically.
+        unimplemented!()
     }
 
     fn mkdir_at(

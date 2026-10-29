@@ -16,7 +16,7 @@ use litebox_broker_core::fs::backend::{
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError as FsReadError, RmdirError, TruncateError, UnlinkError, WalkError,
+    ReadError as FsReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError,
     WriteError as FsWriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
@@ -265,6 +265,16 @@ impl Backend for ShareFs {
         _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn symlink_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _target: &str,
+        _metadata: CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        Err(SymlinkError::ReadOnlyFileSystem)
     }
 
     fn mkdir_at(
