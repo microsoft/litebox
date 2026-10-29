@@ -1206,13 +1206,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
 impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for WindowsUserland<ALIGN> {
     type SharedObject = DeliveredSection;
 
-    fn supports_shared_objects(&self) -> bool {
-        // Views of delivered sections replace placeholders.
-        self.use_placeholders
-    }
-
-    fn supports_private_object_mappings(&self) -> bool {
-        // Private views are copy-on-write views of delivered sections.
+    /// Views of delivered sections, shared or copy-on-write, replace placeholders.
+    fn supports_object_mappings(
+        &self,
+        _sharing: litebox::platform::page_mgmt::ObjectSharing,
+    ) -> bool {
         self.use_placeholders
     }
 
@@ -2315,8 +2313,9 @@ mod tests {
             | Win32_Memory::SECTION_MAP_READ
             | Win32_Memory::SECTION_MAP_EXECUTE;
         assert!(
-            <WindowsUserland as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::supports_shared_objects(
-                platform
+            <WindowsUserland as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::supports_object_mappings(
+                platform,
+                ObjectSharing::Shared,
             )
         );
 
@@ -2488,8 +2487,9 @@ mod tests {
         let writable = read | MemoryRegionPermissions::WRITE;
         let page = |base: usize, index: usize| base + index * PAGE_SIZE;
         assert!(
-            <WindowsUserland as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::supports_private_object_mappings(
-                platform
+            <WindowsUserland as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::supports_object_mappings(
+                platform,
+                ObjectSharing::Private,
             )
         );
         let mut contents = vec![1u8; 3 * PAGE_SIZE];

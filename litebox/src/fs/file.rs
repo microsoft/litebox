@@ -449,7 +449,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// [`SharedObjectProvider::take_shared_object`](crate::platform::SharedObjectProvider::take_shared_object),
     /// after which the platform's object owns it: mapping consumes it, and dropping it releases
     /// it. Callers must first check
-    /// [`supports_shared_objects`](crate::platform::SharedObjectProvider::supports_shared_objects).
+    /// [`supports_object_mappings`](crate::platform::SharedObjectProvider::supports_object_mappings).
     pub fn map_object(&self, mode: MapFileMode) -> Result<SharedFileObject, MapSharedError> {
         let response = self.broker.map_file(self.handle, mode)??;
         Ok(SharedFileObject {
