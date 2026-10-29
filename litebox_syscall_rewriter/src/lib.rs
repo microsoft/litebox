@@ -936,8 +936,9 @@ fn patch_syscalls_in_sections(
     let mut found_syscall = false;
     let mut skipped_addrs = Vec::new();
 
-    // Redirect jumps first, so that the syscalls they no longer reach can be
-    // patched with the branch targets of the redirected code.
+    // First patch each jump to an unpatchable `syscall` as a syscall site
+    // (`jmp S` == `syscall; jmp S+2`). Once no jump targets `S`, recomputing
+    // the branch targets lets the main pass patch `S` with a backward window.
     let redirected_targets;
     let mut control_transfer_targets = control_transfer_targets;
     if redirect_jumps {
@@ -2563,7 +2564,8 @@ fn hook_syscall_and_after(
 
 /// Returns the index past the last instruction of the shortest window that
 /// starts with the `syscall` at `instructions[first]`, has room for a
-/// `JMP rel32`, and enters no control transfer target after its start.
+/// `JMP rel32`, and enters no control transfer target or other `syscall`
+/// after its start.
 fn forward_patch_window_end(
     instructions: &[iced_x86::Instruction],
     first: usize,
@@ -2571,8 +2573,11 @@ fn forward_patch_window_end(
 ) -> Option<usize> {
     let start = instructions[first].ip();
     for (idx, next_inst) in instructions.iter().enumerate().skip(first + 1) {
-        if control_transfer_targets.contains(&next_inst.ip()) {
-            // If the next instruction is a control transfer target, we don't want to cross it
+        if control_transfer_targets.contains(&next_inst.ip())
+            || next_inst.code() == iced_x86::Code::Syscall
+        {
+            // Don't cross a control transfer target, or relocate a syscall
+            // into the trampoline where it would bypass the hook
             return None;
         }
         if next_inst.next_ip() - start >= 5 {
@@ -2805,6 +2810,25 @@ mod tests {
         assert_eq!(kept, [0x100a]);
         assert_eq!(code[5], 0xe9);
         assert_eq!(&code[0xa..], [0x0f, 0x05, 0xc3]);
+    }
+
+    #[test]
+    fn forward_window_never_relocates_a_syscall() {
+        #[rustfmt::skip]
+        let (code, trampoline, kept) = patch_code(&[
+            0xe9, 0x05, 0x00, 0x00, 0x00, // 0x1000: jmp 0x100a
+            0xe9, 0x03, 0x00, 0x00, 0x00, // 0x1005: jmp 0x100d
+            0x0f, 0x05,                   // 0x100a: syscall
+            0x90,                         // 0x100c: nop
+            0x0f, 0x05,                   // 0x100d: syscall
+            0xc3,                         // 0x100f: ret
+        ]);
+        // Once both jumps are redirected, neither syscall is a branch target,
+        // but the first one still must not take the second into its window.
+        assert_redirected(&code, &trampoline, 0x1000, &[], 0x100c);
+        assert_redirected(&code, &trampoline, 0x1005, &[], 0x100f);
+        assert_eq!(kept, [0x100a, 0x100d]);
+        assert_eq!(&code[0xa..], [0x0f, 0x05, 0x90, 0x0f, 0x05, 0xc3]);
     }
 
     #[test]
