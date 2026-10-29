@@ -5,7 +5,7 @@ use std::any::Any;
 use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -19,6 +19,7 @@ use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::existing_runner::ExistingRunnerDescriptor;
 use litebox_broker_transport_linux_userland::memfd::{MemfdProcessImage, MemfdSharedMemory};
+use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
@@ -63,6 +64,34 @@ pub(crate) fn create_image(_capacity: u64) -> Result<Box<dyn ProcessImage>, Brok
     MemfdProcessImage::create()
         .map(|image| Box::new(RunnerProcessImage(image)) as Box<dyn ProcessImage>)
         .map_err(|_| BrokerError::OutOfMemory)
+}
+
+/// Makes `command` start its process with only the standard streams of the descriptors this
+/// process may have inherited without close-on-exec.
+///
+/// A runner finds the broker through its control socket path and gets every broker descriptor
+/// over it, at the lowest free numbers. A native fork-capable runner needs them at fixed numbers
+/// just above the standard streams, so a stray descriptor there, such as one leaked by the
+/// broker's own parent, would disable native fork. It would also leak a host descriptor into the
+/// sandbox.
+pub(super) fn inherit_only_standard_streams(command: &mut Command) {
+    // SAFETY: The hook runs in the forked child before exec and only makes the async-signal-safe
+    // `close_range` system call. Marking descriptors close-on-exec, rather than closing them,
+    // keeps the descriptor through which `Command` reports a failed exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) != 0
+            {
+                return Err(IoError::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Makes `command` start its process with address-space layout randomization
@@ -298,6 +327,17 @@ fn serve_association(
             };
         }
     };
+    // The broker keeps its end for as long as it serves the association, to deliver host
+    // objects through.
+    let (_shared_objects, runner_shared_objects) = match SharedObjectSender::pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            return AssociationOutcome {
+                result: Err(error),
+                abnormal: true,
+            };
+        }
+    };
     crate::runtime::serve_out_of_process_runner_association(
         startup,
         broker,
@@ -309,6 +349,8 @@ fn serve_association(
         move |channel, shared_memory, control_memory| {
             channel.send_memfd(shared_memory, Some(setup_deadline))?;
             channel.send_memfd(control_memory, Some(setup_deadline))?;
+            channel
+                .send_shared_object_channel(runner_shared_objects.as_fd(), Some(setup_deadline))?;
             let image = image.as_ref().map(|image| {
                 &image
                     .image()
@@ -426,6 +468,31 @@ mod tests {
         }
         .encode()
         .unwrap()
+    }
+
+    #[test]
+    fn runners_inherit_only_standard_streams() {
+        let mut pipe = [0; 2];
+        // SAFETY: `pipe` has room for both ends. Without `O_CLOEXEC`, a plain spawn would leak
+        // them into the child.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // SAFETY: `pipe` returned two new descriptors that nothing else owns.
+        let ends = pipe.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+        let leaked = ends[1].as_raw_fd();
+        let check = format!("[ ! -e /proc/self/fd/{leaked} ]");
+        let spawn = |isolate: bool| {
+            let mut command = Command::new("sh");
+            command.args(["-c", &check]);
+            if isolate {
+                inherit_only_standard_streams(&mut command);
+            }
+            command.status().unwrap().success()
+        };
+        assert!(
+            !spawn(false),
+            "the test descriptor must otherwise be inherited"
+        );
+        assert!(spawn(true));
     }
 
     #[test]

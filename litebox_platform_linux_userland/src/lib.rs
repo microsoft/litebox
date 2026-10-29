@@ -36,6 +36,7 @@ extern crate alloc;
 mod arch;
 mod page_mgmt;
 pub mod process;
+pub mod shared_objects;
 
 #[cfg(target_arch = "aarch64")]
 use arch::{
@@ -64,6 +65,8 @@ pub struct LinuxUserland {
     /// is persistent across multiple process executions, however, it is ephemeral across true
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
+    /// Receives the host shared objects that the broker delivers, once the runner installs it.
+    shared_objects: std::sync::OnceLock<shared_objects::SharedObjectChannel>,
 }
 
 /// Determines how an x86-64 guest accesses its thread-local storage.
@@ -100,6 +103,7 @@ impl LinuxUserland {
 
         let platform = Self {
             boot_id: std::sync::OnceLock::new(),
+            shared_objects: std::sync::OnceLock::new(),
         };
         Box::leak(Box::new(platform))
     }
@@ -116,7 +120,39 @@ impl LinuxUserland {
 
         Box::leak(Box::new(Self {
             boot_id: std::sync::OnceLock::new(),
+            shared_objects: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Installs the socket over which the broker delivers host objects that this process must
+    /// hold itself, such as memfds. See [`shared_objects`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a socket was already installed.
+    pub fn set_shared_object_channel(&self, socket: std::os::fd::OwnedFd) {
+        assert!(
+            self.shared_objects
+                .set(shared_objects::SharedObjectChannel::new(socket))
+                .is_ok(),
+            "shared-object channel already installed"
+        );
+    }
+
+    /// Takes the descriptor that the broker delivered under `token`, waiting for it if it has
+    /// not arrived yet. See [`shared_objects::SharedObjectChannel::take`].
+    ///
+    /// Fails with [`std::io::ErrorKind::Unsupported`] if no channel is installed.
+    pub fn take_shared_object(&self, token: u64) -> std::io::Result<std::os::fd::OwnedFd> {
+        self.shared_objects
+            .get()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "no shared-object channel is installed",
+                )
+            })?
+            .take(token)
     }
 
     /// Configures the process-wide guest TLS mode.
@@ -184,12 +220,15 @@ impl LinuxUserland {
     ///
     /// Broker transport exceptions are restricted to the supplied descriptors. If
     /// `native_fork_stream_fd` is given, the runner may natively clone itself, and the clone
-    /// negotiates its broker association over a socket it places at that descriptor number.
+    /// negotiates its broker association over a socket it places at that descriptor number. If
+    /// `shared_object_fd` is given, the runner may receive the host shared objects the broker
+    /// delivers over that socket (see [`Self::set_shared_object_channel`]).
     pub fn enable_seccomp_filter(
         positional_io_fds: &[std::os::fd::RawFd],
         shutdown_fds: &[std::os::fd::RawFd],
         scope: SeccompScope,
         native_fork_stream_fd: Option<std::os::fd::RawFd>,
+        shared_object_fd: Option<std::os::fd::RawFd>,
     ) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
@@ -272,14 +311,13 @@ impl LinuxUserland {
             ),
             (libc::SYS_close, vec![]),
         ];
+        let arg_eq = |index, value: u64| {
+            SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value).unwrap()
+        };
+        let as_arg = |value: i32| {
+            u64::from(u32::try_from(value).expect("syscall argument must be non-negative"))
+        };
         if let Some(stream_fd) = native_fork_stream_fd {
-            let arg_eq = |index, value: u64| {
-                SeccompCondition::new(index, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value)
-                    .unwrap()
-            };
-            let as_arg = |value: i32| {
-                u64::from(u32::try_from(value).expect("syscall argument must be non-negative"))
-            };
             // The clone's descriptor-specific rules are confined to its control socket.
             let stream = as_arg(stream_fd);
             let socket_timeouts = [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO]
@@ -350,21 +388,7 @@ impl LinuxUserland {
             let fd_rules = || {
                 positional_io_fds
                     .iter()
-                    .map(|fd| {
-                        SeccompRule::new(vec![
-                            SeccompCondition::new(
-                                0,
-                                SeccompCmpArgLen::Dword,
-                                SeccompCmpOp::Eq,
-                                u64::from(
-                                    u32::try_from(*fd)
-                                        .expect("positional I/O descriptor must be valid"),
-                                ),
-                            )
-                            .unwrap(),
-                        ])
-                        .unwrap()
-                    })
+                    .map(|fd| SeccompRule::new(vec![arg_eq(0, as_arg(*fd))]).unwrap())
                     .collect()
             };
             rules.push((libc::SYS_pread64, fd_rules()));
@@ -377,33 +401,38 @@ impl LinuxUserland {
                 .iter()
                 .map(|fd| {
                     SeccompRule::new(vec![
-                        SeccompCondition::new(
-                            0,
-                            SeccompCmpArgLen::Dword,
-                            SeccompCmpOp::Eq,
-                            u64::from(
-                                u32::try_from(*fd).expect("shutdown descriptor must be valid"),
-                            ),
-                        )
-                        .unwrap(),
-                        SeccompCondition::new(
-                            1,
-                            SeccompCmpArgLen::Dword,
-                            SeccompCmpOp::Eq,
-                            u64::from(
-                                u32::try_from(libc::SHUT_RDWR)
-                                    .expect("SHUT_RDWR must be non-negative"),
-                            ),
-                        )
-                        .unwrap(),
+                        arg_eq(0, as_arg(*fd)),
+                        arg_eq(1, as_arg(libc::SHUT_RDWR)),
                     ])
                     .unwrap()
                 })
                 .collect();
             rules.push((libc::SYS_shutdown, shutdown_rules));
         }
-        let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
-            rules.into_iter().collect();
+        if let Some(fd) = shared_object_fd {
+            rules.push((
+                libc::SYS_recvmsg,
+                vec![SeccompRule::new(vec![arg_eq(0, as_arg(fd))]).unwrap()],
+            ));
+        }
+        // A syscall may have rules from more than one source, such as `recvmsg` on both the
+        // native fork socket and the shared-object socket; any of them allows it.
+        let mut rule_map = std::collections::BTreeMap::<i64, Vec<SeccompRule>>::new();
+        for (syscall, syscall_rules) in rules {
+            match rule_map.entry(syscall) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(syscall_rules);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // An empty rule list allows the syscall unconditionally.
+                    if !entry.get().is_empty() && !syscall_rules.is_empty() {
+                        entry.get_mut().extend(syscall_rules);
+                    } else {
+                        entry.get_mut().clear();
+                    }
+                }
+            }
+        }
         let filter = SeccompFilter::new(
             rule_map,
             // In debug builds, log violations instead of silently returning an error so that
@@ -2347,6 +2376,7 @@ mod tests {
             &[allowed.as_raw_fd()],
             &[allowed_shutdown.as_raw_fd()],
             super::SeccompScope::AllThreads,
+            None,
             None,
         );
         barrier.wait();

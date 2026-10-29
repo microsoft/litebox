@@ -299,6 +299,8 @@ impl RunnerInstance {
         let mut command = Command::new(&config.executable);
         command.args(config.arguments(endpoint.control_channel()));
         #[cfg(target_os = "linux")]
+        linux::inherit_only_standard_streams(&mut command);
+        #[cfg(target_os = "linux")]
         if config.disable_aslr {
             linux::disable_aslr(&mut command);
         }
