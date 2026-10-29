@@ -1755,7 +1755,7 @@ fn spawn_test_broker_with_mode(
             let broker = litebox_broker_core::test_support::TestBrokerCoreBuilder::new(policy)
                 .with_limits(limits)
                 .with_socket_provider(std::sync::Arc::new(
-                    litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
+                    litebox_broker_userland::socket::UserlandSocketProvider::new(
                         limits.max_sockets,
                         limits.max_sockets_per_process,
                     )

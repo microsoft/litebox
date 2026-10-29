@@ -19,6 +19,7 @@ litebox_broker_platform_linux_userland = { path = "../litebox_broker_platform_li
 litebox_broker_transport_linux_userland = { path = "../litebox_broker_transport_linux_userland", version = "0.1.0" }
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland", version = "0.1.0" }
 litebox_runner_linux_userland = { path = "../litebox_runner_linux_userland", version = "0.1.0" }
+rustix = { version = "1.1.2", default-features = false, features = ["event", "net", "std"] }
 tempfile = { version = "3", default-features = false }
 
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]

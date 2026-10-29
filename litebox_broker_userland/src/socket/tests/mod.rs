@@ -39,7 +39,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 fn test_broker_core(
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
-    socket_provider: Arc<LinuxSocketProvider>,
+    socket_provider: Arc<UserlandSocketProvider>,
 ) -> litebox_broker_core::Result<BrokerCore> {
     TestBrokerCoreBuilder::new(policy)
         .with_limits(limits)
@@ -50,9 +50,9 @@ fn test_broker_core(
 type HookAction = Arc<dyn Fn(&TestHook, usize, HookPoint) + Send + Sync>;
 
 /// The test's provider hook, which forces a chosen interleaving of a socket
-/// call and the epoll thread.
+/// call and the event thread.
 ///
-/// Calls and the epoll thread can work on one socket at once, and their races
+/// Calls and the event thread can work on one socket at once, and their races
 /// have windows too narrow for stress tests to hit reliably. A `TestHook`
 /// records every [`HookPoint`] the provider reaches, so a test can wait for a
 /// thread to reach a point instead of sleeping. It also runs the test's
@@ -67,7 +67,7 @@ struct TestHook {
 impl TestHook {
     /// Creates a hook and installs it as `provider`'s, replacing any previous
     /// one.
-    fn install(provider: &LinuxSocketProvider) -> Arc<Self> {
+    fn install(provider: &UserlandSocketProvider) -> Arc<Self> {
         let hook = Arc::new(Self {
             points: Mutex::new(Vec::new()),
             changed: Condvar::new(),
@@ -108,7 +108,7 @@ impl TestHook {
     }
 
     /// Waits for the first harvest at or after `start` of a token that
-    /// `matches`, and returns how the epoll thread handled that event.
+    /// `matches`, and returns how the event thread handled that event.
     ///
     /// An event harvested before `start` may still report `Handled` after
     /// it, so a wait for `Handled` alone could see that event.
@@ -177,7 +177,7 @@ fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
 
 /// Waits for every socket's readiness to reflect its state; a lost wakeup
 /// never settles.
-fn wait_for_settled_readiness(provider: &LinuxSocketProvider) {
+fn wait_for_settled_readiness(provider: &UserlandSocketProvider) {
     let deadline = Instant::now() + TEST_TIMEOUT;
     while !provider.core.readiness_is_settled() {
         assert!(Instant::now() < deadline, "socket readiness did not settle");

@@ -39,7 +39,7 @@ fn ratchet_pub_uses() -> Result<()> {
             ("litebox_broker_host/", 1),
             ("litebox_broker_local/", 1),
             ("litebox_broker_local_userland/", 2),
-            ("litebox_broker_platform_linux_userland/", 3),
+            ("litebox_broker_platform_linux_userland/", 2),
             ("litebox_broker_platform_windows_userland/", 1),
             ("litebox_broker_transport/", 2),
             ("litebox_broker_transport_linux_userland/", 2),
