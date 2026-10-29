@@ -52,6 +52,11 @@ impl<'a> RawParts<'a> {
         self.parts.iter().map(RawBytes::len).sum()
     }
 
+    /// Returns the parts.
+    pub(super) fn parts(self) -> &'a [RawBytes<'a>] {
+        self.parts
+    }
+
     /// Copies `source` into the start of the bytes.
     ///
     /// # Panics

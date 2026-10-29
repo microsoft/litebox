@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use super::super::tcp::{TcpDescriptor, create_tcp_transport};
 use super::*;
 use std::collections::VecDeque;
 
@@ -2338,28 +2337,6 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
 }
 
 #[test]
-fn guest_read_shutdown_detects_data_awaiting_discard() {
-    let (socket, peer) = rustix::net::socketpair(
-        rustix::net::AddressFamily::UNIX,
-        rustix::net::SocketType::STREAM,
-        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
-        None,
-    )
-    .unwrap();
-    let SocketTransportState::Tcp(mut tcp) = create_tcp_transport() else {
-        unreachable!();
-    };
-    tcp.descriptor = TcpDescriptor::InternalUnix(socket);
-    tcp.install_empty_guest_read_shutdown_for_test();
-
-    assert_eq!(
-        rustix::net::send(&peer, b"x", rustix::net::SendFlags::NOSIGNAL).unwrap(),
-        1
-    );
-    assert!(tcp.has_guest_unread_data_for_test());
-}
-
-#[test]
 fn guest_tcp_both_shutdown_keeps_peer_send_open_and_closes_write_half() {
     let pair = connected_guest_tcp_pair(8106);
     assert_eq!(
@@ -3169,7 +3146,7 @@ fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
     );
     let hook = TestHook::install(&provider);
     hook.act(|hook, index, point| {
-        if let HookPoint::EpollAdded(token) = point {
+        if let HookPoint::Watched(token) = point {
             let (_, handled) = hook.wait_for(
                 index,
                 |point| matches!(point, HookPoint::Handled(handled, _) if handled == token),
@@ -3218,7 +3195,7 @@ fn external_tcp_connect_applies_only_events_after_connect() {
     let id = *provider.core.socket_ids().last().unwrap();
     let hook = TestHook::install(&provider);
     hook.act(move |hook, index, point| {
-        if point == HookPoint::EpollAdded(id) {
+        if point == HookPoint::Watched(id) {
             let (_, handled) = hook.wait_for(
                 index,
                 |point| matches!(point, HookPoint::Handled(handled, _) if handled == id),
@@ -3280,7 +3257,9 @@ fn guest_tcp_abortive_close_during_peer_receive_reports_reset() {
         let closer = pending_close.lock().unwrap().take();
         if let Some((process, accepted)) = closer {
             run_on_thread(move || process.close_object_reference(accepted).unwrap());
-            hook.wait_for(index, |point| point == HookPoint::FdClosed(accepted_id));
+            hook.wait_for(index, |point| {
+                point == HookPoint::EndpointClosed(accepted_id)
+            });
         }
     });
 
@@ -3320,7 +3299,7 @@ fn guest_tcp_receive_after_abortive_close_closes_descriptor_reports_reset() {
     ))));
     let pending_receive = Arc::clone(&receiver);
     hook.act(move |_, _, point| {
-        if point != HookPoint::FdClosed(accepted_id) {
+        if point != HookPoint::EndpointClosed(accepted_id) {
             return;
         }
         let receiver = pending_receive.lock().unwrap().take();
@@ -3433,7 +3412,7 @@ fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
             }
         })
     };
-    // Far more than an AF_UNIX send buffer, so the epoll thread is discarding.
+    // Far more than a stream's capacity, so the stream is discarding.
     let flooding = 64 * MAX_SOCKET_TRANSFER_SIZE as usize;
     wait_until(
         || sent.load(Ordering::Relaxed) >= flooding,
