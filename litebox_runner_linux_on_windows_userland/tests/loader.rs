@@ -266,6 +266,13 @@ const GATEWAY_UDP: [&str; 2] = ["--allow-udp-destination", "10.0.2.1/32:1-65535"
 /// How long a host-side test server waits for the guest's next datagram.
 const HOST_SERVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Closes `stream` with a reset.
+fn reset(stream: std::net::TcpStream) {
+    socket2::SockRef::from(&stream)
+        .set_linger(Some(std::time::Duration::ZERO))
+        .unwrap();
+}
+
 /// Runs `tcp_broker`, a TCP client of servers on the host gateway, through the broker's Windows
 /// sockets: connects, socket options, partial and blocking transfers, peeks, backpressure,
 /// shutdown, resets, faulting receives, refusals, and policy denials.
@@ -274,19 +281,12 @@ const HOST_SERVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 #[test]
 fn test_tcp_with_windows_broker() {
     use std::io::{Read as _, Write as _};
-    use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, Shutdown, TcpListener};
     use std::time::Duration;
 
     const REQUEST_SIZE: usize = 65_536;
     const RESPONSE_SIZE: usize = 600_000;
     const BACKPRESSURE_SIZE: usize = 8 * 1024 * 1024;
-
-    /// Closes `stream` with a reset.
-    fn reset(stream: TcpStream) {
-        socket2::SockRef::from(&stream)
-            .set_linger(Some(Duration::ZERO))
-            .unwrap();
-    }
 
     let (broker, runner) = build_windows_broker();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -413,6 +413,115 @@ fn test_udp_with_windows_broker() {
         &[&port.to_string(), &refused_port.to_string()],
     );
     server.join().unwrap();
+}
+
+/// Runs `tcp_broker_states`, which checks how TCP sockets that are not, or are no longer,
+/// connected to servers on the host gateway report readiness, receives, sends, connects, and
+/// pending errors through the broker's Windows sockets.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/tcp_broker_states.c`.
+#[test]
+fn test_tcp_connection_states_with_windows_broker() {
+    use std::io::{Read as _, Write as _};
+    use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener};
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{SO_CONDITIONAL_ACCEPT, SOL_SOCKET, setsockopt};
+
+    let (broker, runner) = build_windows_broker();
+    let reset_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let reset_port = reset_listener.local_addr().unwrap().port();
+    let reset_server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = reset_listener.accept().unwrap();
+            stream.read_exact(&mut [0; 1]).unwrap();
+            reset(stream);
+        }
+    });
+
+    // Winsock refuses connection requests once a listener's accept queue is full, where Linux
+    // drops them, so this listener instead leaves each request to the application, which never
+    // accepts it, and connects to it stay pending.
+    let unresponsive_listener =
+        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    let enable = 1_i32;
+    // SAFETY: `unresponsive_listener` owns a live socket, and `enable` outlives the call, which
+    // reads only the given length from it.
+    assert_eq!(
+        unsafe {
+            setsockopt(
+                usize::try_from(unresponsive_listener.as_raw_socket()).unwrap(),
+                SOL_SOCKET,
+                SO_CONDITIONAL_ACCEPT,
+                std::ptr::from_ref(&enable).cast(),
+                i32::try_from(size_of_val(&enable)).unwrap(),
+            )
+        },
+        0
+    );
+    unresponsive_listener
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    unresponsive_listener.listen(16).unwrap();
+    let unresponsive_port = unresponsive_listener
+        .local_addr()
+        .unwrap()
+        .as_socket_ipv4()
+        .unwrap()
+        .port();
+
+    let half_closed_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let half_closed_port = half_closed_listener.local_addr().unwrap().port();
+    let half_closed_server = std::thread::spawn(move || {
+        (0..2)
+            .map(|_| {
+                let (stream, _) = half_closed_listener.accept().unwrap();
+                stream.shutdown(Shutdown::Write).unwrap();
+                stream
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let greeting_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let greeting_port = greeting_listener.local_addr().unwrap().port();
+    let greeting_server = std::thread::spawn(move || {
+        let (mut stream, _) = greeting_listener.accept().unwrap();
+        stream.write_all(b"hi").unwrap();
+        stream
+    });
+
+    let open_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let open_port = open_listener.local_addr().unwrap().port();
+    let open_server = std::thread::spawn(move || {
+        (0..8)
+            .map(|_| open_listener.accept().unwrap().0)
+            .collect::<Vec<_>>()
+    });
+
+    // Freed after the other listeners are bound, so none of them can reuse it.
+    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    run_progs_with_broker_arguments(
+        &broker,
+        &runner,
+        &["tcp_broker_states"],
+        &GATEWAY_TCP,
+        &[
+            &reset_port.to_string(),
+            &unresponsive_port.to_string(),
+            &refused_port.to_string(),
+            &half_closed_port.to_string(),
+            &open_port.to_string(),
+            &greeting_port.to_string(),
+        ],
+    );
+    reset_server.join().unwrap();
+    half_closed_server.join().unwrap();
+    open_server.join().unwrap();
+    greeting_server.join().unwrap();
 }
 
 const DYNAMIC_LIBS: [(&str, &str); 2] = [
