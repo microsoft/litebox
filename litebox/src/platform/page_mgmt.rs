@@ -483,21 +483,15 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     type SharedObject: Send;
 
     /// Returns whether this platform can map host shared objects that the broker hands this
-    /// process, with [`Self::try_map_shared_object`] or [`Self::commit_shared_object`].
+    /// process as `sharing` says, with [`Self::try_map_shared_object`] or
+    /// [`Self::commit_shared_object`]. Supporting [`ObjectSharing::Private`] also means
+    /// supporting [`Self::discard_private_object_pages`].
     ///
-    /// Callers must check this before asking the broker for an object, since the broker
-    /// delivers each object only once. The default implementation returns `false`.
-    fn supports_shared_objects(&self) -> bool {
-        false
-    }
-
-    /// Returns whether this platform can also map host shared objects privately, with
-    /// [`ObjectSharing::Private`], and discard a private mapping's copies with
-    /// [`Self::discard_private_object_pages`].
-    ///
-    /// Callers must check this, as well as [`Self::supports_shared_objects`], before asking the
-    /// broker for an object to map privately. The default implementation returns `false`.
-    fn supports_private_object_mappings(&self) -> bool {
+    /// Callers must check this before asking the broker for an object, since asking has lasting
+    /// effects, such as moving a file's contents into host shared memory, and the broker delivers
+    /// each object only once. The default implementation returns `false`.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn supports_object_mappings(&self, sharing: ObjectSharing) -> bool {
         false
     }
 

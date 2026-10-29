@@ -307,19 +307,40 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
 
 /// A host shared object to map as a file mapping.
 pub struct SharedObjectMapping<Object> {
-    /// Names the object's memory, the same in every process that maps it.
-    pub memory: SharedMemoryId,
     /// The object, which the platform took from the broker's delivery. Dropping it, as on any
     /// failure before the platform maps it, releases it.
     pub object: Object,
     /// Byte offset in the object of the mapping's first page.
     pub offset: u64,
-    /// Whether the mapping is shared, so that its writes reach the object, or private, so that
-    /// they go to its own copies of the pages.
-    pub sharing: ObjectSharing,
-    /// Whether a shared mapping may write the object, so that it may become writable. A private
-    /// mapping may always become writable, since it never writes the object.
-    pub may_write: bool,
+    /// How the mapping uses the object.
+    pub kind: ObjectMappingKind,
+}
+
+/// How a file mapping uses a host shared object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectMappingKind {
+    /// A `MAP_SHARED` mapping, whose writes reach the object.
+    Shared {
+        /// Names the object's memory, the same in every process that maps it, so that futexes
+        /// in it span those processes.
+        memory: SharedMemoryId,
+        /// Whether the mapping may write the object, so that it may become writable, which
+        /// Linux allows only if the file was opened for writing.
+        may_write: bool,
+    },
+    /// A `MAP_PRIVATE` mapping, whose writes go to its own copies of the pages. It may always
+    /// become writable, since it never writes the object, and futexes in it are private.
+    Private,
+}
+
+impl ObjectMappingKind {
+    /// Returns how the platform maps the object.
+    fn sharing(self) -> ObjectSharing {
+        match self {
+            Self::Shared { .. } => ObjectSharing::Shared,
+            Self::Private => ObjectSharing::Private,
+        }
+    }
 }
 
 /// Parameters for creating a Linux Vmem mapping.
@@ -1691,13 +1712,9 @@ where
         Ok(())
     }
 
-    /// Maps the host object `object.object`, from its byte `offset`, as a shared or private
-    /// file mapping of `length` bytes, placed as `flags` request. This consumes the object
-    /// whether or not it succeeds.
-    ///
-    /// For a shared mapping, `may_write` decides whether `mprotect` may later make the mapping
-    /// writable, which Linux allows only if the file was opened for writing. A private mapping
-    /// may always become writable.
+    /// Maps the host object `object.object`, from its byte `offset`, as a file mapping of
+    /// `length` bytes of the kind `object.kind` says, placed as `flags` request. This consumes
+    /// the object whether or not it succeeds.
     ///
     /// # Safety
     ///
@@ -1734,21 +1751,18 @@ where
                 range.clone(),
                 object.object,
                 object.offset,
-                object.sharing,
+                object.kind.sharing(),
                 permissions,
                 platform_behavior,
             )
         }?;
 
-        let (may, sharing) = match object.sharing {
-            ObjectSharing::Shared => (
-                VmFlags::may_flags_for_mapping(true, object.may_write),
-                Sharing::Named(SharedMemoryView {
-                    memory: object.memory,
-                    base,
-                }),
+        let (may, sharing) = match object.kind {
+            ObjectMappingKind::Shared { memory, may_write } => (
+                VmFlags::may_flags_for_mapping(true, may_write),
+                Sharing::Named(SharedMemoryView { memory, base }),
             ),
-            ObjectSharing::Private => (
+            ObjectMappingKind::Private => (
                 VmFlags::may_flags_for_mapping(false, true),
                 Sharing::PrivateObject,
             ),
@@ -2737,11 +2751,12 @@ mod tests {
         };
         let size = |count: usize| NonZeroPageSize::new(count * PAGE_SIZE).unwrap();
         let object = |id: u128, offset: usize, may_write: bool| SharedObjectMapping {
-            memory: SharedMemoryId(id),
             object: backend.object(0),
             offset: offset as u64,
-            sharing: ObjectSharing::Shared,
-            may_write,
+            kind: ObjectMappingKind::Shared {
+                memory: SharedMemoryId(id),
+                may_write,
+            },
         };
         let read_write = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         // SAFETY: The test owns the mock address space, and its objects are mock objects.
@@ -2893,11 +2908,9 @@ mod tests {
                 read,
                 None,
                 SharedObjectMapping {
-                    memory: SharedMemoryId(1),
                     object: backend.object(0),
                     offset: 0,
-                    sharing: ObjectSharing::Private,
-                    may_write: false,
+                    kind: ObjectMappingKind::Private,
                 },
             )
         }
@@ -2974,11 +2987,12 @@ mod tests {
         let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
         let read_write = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let object = |id: u128, token: u64| SharedObjectMapping {
-            memory: SharedMemoryId(id),
             object: backend.object(token),
             offset: 0,
-            sharing: ObjectSharing::Shared,
-            may_write: true,
+            kind: ObjectMappingKind::Shared {
+                memory: SharedMemoryId(id),
+                may_write: true,
+            },
         };
         // SAFETY: The test owns the mock address space, and its objects are mock objects.
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>, address, pages: usize, flags, object| unsafe {

@@ -12,7 +12,7 @@ use litebox_common_linux::{
     IoReadVec, MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     mm::MmapPlacement,
-    vmem::{MappingError, SharedObjectMapping, VmemProtectError},
+    vmem::{MappingError, ObjectMappingKind, SharedObjectMapping, VmemProtectError},
 };
 use litebox_platform::buffer::Buffer as _;
 
@@ -135,8 +135,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let platform = self.global.platform;
         if flags.contains(MapFlags::MAP_SHARED)
             || self.global.fork_launcher.is_none()
-            || !platform.supports_shared_objects()
-            || !platform.supports_private_object_mappings()
+            || !platform.supports_object_mappings(ObjectSharing::Private)
         {
             return Ok(None);
         }
@@ -162,11 +161,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 allowed_range: None,
             },
             SharedObjectMapping {
-                memory: delivered.memory,
                 object,
                 offset: offset as u64,
-                sharing: ObjectSharing::Private,
-                may_write: false,
+                kind: ObjectMappingKind::Private,
             },
         ) {
             Ok(mapped) => mapped,
@@ -337,7 +334,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Err(Errno::EACCES)
             }
         };
-        if !self.global.platform.supports_shared_objects() {
+        if !self
+            .global
+            .platform
+            .supports_object_mappings(litebox::platform::page_mgmt::ObjectSharing::Shared)
+        {
             return copy();
         }
         let delivered = match self.global.with_file(file_fd, |file| {
@@ -369,11 +370,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 allowed_range: None,
             },
             SharedObjectMapping {
-                memory: delivered.memory,
                 object,
                 offset: offset as u64,
-                sharing: litebox::platform::page_mgmt::ObjectSharing::Shared,
-                may_write: delivered.writable,
+                kind: ObjectMappingKind::Shared {
+                    memory: delivered.memory,
+                    may_write: delivered.writable,
+                },
             },
         )?;
         if flags.contains(MapFlags::MAP_FIXED) {

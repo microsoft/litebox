@@ -392,12 +392,13 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Linu
     /// The descriptor the broker delivered, which closes when dropped.
     type SharedObject = std::os::fd::OwnedFd;
 
-    fn supports_shared_objects(&self) -> bool {
+    /// Both kinds of mapping need only the broker's delivery channel: the kernel maps a
+    /// descriptor `MAP_SHARED` or `MAP_PRIVATE` alike.
+    fn supports_object_mappings(
+        &self,
+        _sharing: litebox::platform::page_mgmt::ObjectSharing,
+    ) -> bool {
         self.shared_objects.get().is_some()
-    }
-
-    fn supports_private_object_mappings(&self) -> bool {
-        true
     }
 
     unsafe fn take_shared_object(
