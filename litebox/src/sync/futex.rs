@@ -391,7 +391,6 @@ mod tests {
         assert!((1..=3).contains(&woken));
     }
 
-    /// A wake that takes the waiter as its wait is interrupted wakes it, rather than being lost.
     #[test]
     fn test_futex_wait_woken_as_interrupted_succeeds() {
         use crate::event::wait::CheckForInterrupt;

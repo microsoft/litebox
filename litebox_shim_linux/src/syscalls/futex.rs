@@ -632,11 +632,6 @@ mod tests {
         );
     }
 
-    /// Like Linux, a futex wait with a timeout that a signal interrupts resumes through
-    /// `restart_syscall`, which waits again, checking the word, and then leaves nothing to resume,
-    /// while a wait without a timeout is reissued (see the `wait_restart.c` runner test). SIGCHLD
-    /// is pending before each wait, which lasts an hour or has no timeout, so every interruption
-    /// is certain.
     #[test]
     fn test_interrupted_futex_wait_with_timeout_resumes_through_restart_syscall() {
         use litebox::platform::ThreadProvider as _;

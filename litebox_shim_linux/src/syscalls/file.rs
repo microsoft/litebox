@@ -3011,9 +3011,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         deadline: Option<<Platform as TimeProvider>::Instant>,
     ) -> Result<usize, Errno> {
         match self.do_poll(fds, nfds, deadline) {
-            // Like Linux, an interrupted poll resumes through `restart_syscall` until `deadline` unless
-            // a handler runs, reading the entries again, so a handler interrupts it even with
-            // `SA_RESTART`.
             Err(Errno::ERESTARTNOHAND) => Err(self.thread.save_restart_block(RestartBlock::Poll {
                 fds,
                 nfds,
@@ -3061,8 +3058,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Polls the `nfds` entries at `fds` until `deadline`, or until one is ready if `None`, and
-    /// writes back their `revents`, failing with [`Errno::ERESTARTNOHAND`] if interrupted, like
-    /// Linux's `do_sys_poll`.
+    /// writes back their `revents`, failing with [`Errno::ERESTARTNOHAND`] if interrupted.
     fn do_poll(
         &self,
         fds: UserPtrMut<litebox_common_linux::Pollfd>,

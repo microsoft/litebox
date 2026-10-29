@@ -763,9 +763,6 @@ mod test {
         });
     }
 
-    /// Like Linux, an interrupted `ppoll` or `select` writes back the time left, which a
-    /// reissued call waits for. SIGCHLD is pending before each call, so the interruption is
-    /// certain.
     #[test]
     fn test_interrupted_ppoll_and_select_write_back_time_left() {
         use core::time::Duration;
@@ -820,9 +817,6 @@ mod test {
         });
     }
 
-    /// Like Linux, an interrupted `pselect` keeps its signal mask until signals are processed,
-    /// so a signal the mask unblocks is taken rather than interrupting the reissued call again,
-    /// and only then restores the mask it replaced (see the `wait_restart.c` runner test).
     #[test]
     fn test_interrupted_pselect_keeps_its_mask_until_signals_are_processed() {
         use litebox::platform::ThreadProvider as _;
@@ -852,9 +846,6 @@ mod test {
         });
     }
 
-    /// Like Linux, `select` and `pselect` end through the same step whether their arguments are
-    /// wrong or they wait, restoring the signal mask they set and writing back the time left
-    /// (see the `wait_restart.c` runner test).
     #[test]
     fn test_pselect_with_bad_arguments_restores_its_mask() {
         use litebox_common_linux::signal::{SigSet, Signal};
@@ -893,8 +884,6 @@ mod test {
         }
     }
 
-    /// Like Linux, `pselect` given no mask in its argument block, whatever the block's size,
-    /// leaves the signal mask alone, as glibc's `pselect` passes for a null mask.
     #[test]
     fn test_pselect_with_null_mask_leaves_mask_alone() {
         use litebox_common_linux::signal::SigSet;
@@ -921,9 +910,6 @@ mod test {
         }
     }
 
-    /// Like Linux, an interrupted `epoll_pwait` fails with `EINTR` but keeps its signal mask
-    /// until signals are processed, so a signal the mask unblocks is taken (see the
-    /// `wait_restart.c` runner test).
     #[test]
     fn test_interrupted_epoll_pwait_keeps_its_mask_until_signals_are_processed() {
         use litebox::platform::ThreadProvider as _;
@@ -957,9 +943,6 @@ mod test {
         });
     }
 
-    /// Like Linux, an interrupted `ppoll` that cannot write back the time left fails with
-    /// `EINTR`, as reissued it would wait its whole timeout again (see the `wait_restart.c` runner
-    /// test).
     #[test]
     fn test_interrupted_ppoll_without_writable_timeout_fails_with_eintr() {
         use litebox::platform::ThreadProvider as _;

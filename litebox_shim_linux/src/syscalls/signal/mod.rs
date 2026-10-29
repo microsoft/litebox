@@ -48,7 +48,7 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
     /// The mask a syscall's temporary mask replaced, until signal processing restores it or a
-    /// handler's frame saves it. `Some` plays the role of Linux's `TIF_RESTORE_SIGMASK`.
+    /// handler's frame saves it.
     saved_sigmask: Cell<Option<SigSet>>,
 }
 
@@ -975,11 +975,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Deliver any pending signals.
     ///
     /// If `restart` is set, `ctx` is the return from a syscall interrupted by a signal, which
-    /// restarts unless the first handler delivered interrupts it. If the syscall left a temporary
-    /// mask (see [`Self::set_user_signal_mask`]) that no handler's frame saves, then once nothing
-    /// more can be delivered under it, the syscall restarts if it was to, and the mask it replaced
-    /// is restored, after which the signals that mask unblocks are delivered without interrupting
-    /// the syscall.
+    /// restarts unless the first handler delivered interrupts it.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs, mut restart: Option<SyscallRestart>) {
         loop {
             let blocked = self.signals.blocked.get();

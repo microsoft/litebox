@@ -242,14 +242,10 @@ unsafe impl<Platform: ShimPlatform> Send for ThreadState<Platform> {}
 /// `restart_syscall` resumes.
 #[derive(Clone, Copy)]
 pub(super) enum RestartBlock<Instant> {
-    /// A relative `clock_nanosleep` that sleeps until `deadline` and reports the time left to
-    /// `remain`.
     Nanosleep {
         deadline: Instant,
         remain: TimeParam,
     },
-    /// A `futex` wait with a timeout, with `flags`, on the word at `addr`, while it holds `val`,
-    /// for a wake matching `bitset`, or any wake if `None`, until `deadline`.
     Futex {
         addr: UserPtrMut<u32>,
         flags: litebox_common_linux::FutexFlags,
@@ -257,7 +253,6 @@ pub(super) enum RestartBlock<Instant> {
         bitset: Option<core::num::NonZeroU32>,
         deadline: Instant,
     },
-    /// A `poll` of the `nfds` entries at `fds` until `deadline`, or until ready if `None`.
     Poll {
         fds: UserPtrMut<litebox_common_linux::Pollfd>,
         nfds: usize,
@@ -2397,11 +2392,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// [`Errno::ERESTART_RESTARTBLOCK`].
     ///
     /// Like Linux, this thread's saved state stays until its next sleep or signal handler return,
-    /// so resuming a sleep or poll that already finished does it again until the same deadline,
-    /// at once if that has passed, or for a poll without a timeout, until an fd is ready. A
-    /// resumed futex wait instead leaves nothing to resume. New threads start with a copy. Unlike
-    /// Linux, a process duplicated by `fork`, or started by `execve` in a fresh runner, starts with
-    /// nothing to resume.
+    /// so resuming a sleep or poll that already finished does it again until the same deadline.
+    /// Unlike Linux, a process duplicated by `fork`, or started by `execve` in a fresh runner,
+    /// starts with nothing to resume.
     pub(crate) fn sys_restart_syscall(&self) -> Result<usize, Errno> {
         match self.thread.restart_block.get() {
             Some(RestartBlock::Nanosleep { deadline, remain }) => {
@@ -4541,9 +4534,6 @@ mod tests {
         });
     }
 
-    /// Like Linux, once no handler takes the mask an interrupted `pselect` replaced, the restored
-    /// mask lets a signal the call's mask blocked reach its handler before the call is reissued,
-    /// rather than once the reissued call returns (see the `wait_restart.c` runner test).
     #[test]
     fn test_signal_unblocked_by_restored_mask_is_delivered_before_reissue() {
         use crate::syscalls::signal::SyscallRestart;
@@ -4600,8 +4590,6 @@ mod tests {
         });
     }
 
-    /// Like Linux, an absolute deadline, even one past what the platform's `Instant` can hold,
-    /// is no later than [`MAX_SLEEP_SINCE_BOOT`].
     #[test]
     fn test_absolute_deadline_is_at_most_max_sleep_since_boot() {
         use super::MAX_SLEEP_SINCE_BOOT;
