@@ -1852,6 +1852,54 @@ impl<const ALIGN: usize> TimeProvider for WindowsUserland<ALIGN> {
     }
 }
 
+impl<const ALIGN: usize> litebox::platform::CpuTimeProvider for WindowsUserland<ALIGN> {
+    fn thread_cpu_time(&self) -> Option<litebox::platform::CpuTime> {
+        let [mut creation, mut exit, mut kernel, mut user] = [FILETIME::default(); 4];
+        // SAFETY: The current-thread pseudo handle has query access and every output is
+        // writable.
+        let result = unsafe {
+            Win32_Threading::GetThreadTimes(
+                Win32_Threading::GetCurrentThread(),
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        (result != 0).then(|| filetimes_cpu_time(kernel, user))
+    }
+
+    fn process_cpu_time(&self) -> Option<litebox::platform::CpuTime> {
+        let [mut creation, mut exit, mut kernel, mut user] = [FILETIME::default(); 4];
+        // SAFETY: The current-process pseudo handle has query access and every output is
+        // writable.
+        let result = unsafe {
+            Win32_Threading::GetProcessTimes(
+                GetCurrentProcess(),
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        (result != 0).then(|| filetimes_cpu_time(kernel, user))
+    }
+}
+
+/// Converts kernel and user `FILETIME` intervals, counted in 100ns units, to a CPU time.
+fn filetimes_cpu_time(kernel: FILETIME, user: FILETIME) -> litebox::platform::CpuTime {
+    const UNITS_PER_SECOND: u64 = 10_000_000;
+    let duration = |time: FILETIME| {
+        let units = (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+        Duration::from_secs(units / UNITS_PER_SECOND)
+            + Duration::from_nanos(units % UNITS_PER_SECOND * 100)
+    };
+    litebox::platform::CpuTime {
+        user: duration(user),
+        system: duration(kernel),
+    }
+}
+
 /// 100ns units returned by `QueryUnbiasedInterruptTimePrecise`.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);

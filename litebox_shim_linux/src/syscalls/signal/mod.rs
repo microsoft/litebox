@@ -24,7 +24,7 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::process::ProcessError;
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
-use litebox_broker_protocol::process::ProcessExitStatus;
+use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
 use litebox_broker_protocol::signal::SignalTarget;
 use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_common_linux::signal::{
@@ -450,15 +450,27 @@ pub(crate) fn child_termination(exit_status: ProcessExitStatus) -> (i32, i32) {
 }
 
 /// Creates the `Siginfo` for the `SIGCHLD` reporting that child `pid` of user `uid` terminated
-/// with `exit_status`.
-pub(crate) fn siginfo_child(pid: i32, uid: u32, exit_status: ProcessExitStatus) -> Siginfo {
+/// with `exit_status` after using `cpu_time` itself, which, like Linux, excludes the time of the
+/// children it waited for.
+pub(crate) fn siginfo_child(
+    pid: i32,
+    uid: u32,
+    exit_status: ProcessExitStatus,
+    cpu_time: CpuTime,
+) -> Siginfo {
     let (code, status) = child_termination(exit_status);
     Siginfo {
         signo: Signal::SIGCHLD.as_i32(),
         errno: 0,
         code,
         __pad: 0,
-        data: SiginfoData::new_child(pid, uid, status),
+        data: SiginfoData::new_child(
+            pid,
+            uid,
+            status,
+            litebox_common_linux::clock_ticks(cpu_time.user),
+            litebox_common_linux::clock_ticks(cpu_time.system),
+        ),
     }
 }
 

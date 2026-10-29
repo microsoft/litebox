@@ -8,7 +8,7 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessRequest, ProcessResponse,
 };
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
     MAX_RUNNER_DESCRIPTOR_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo,
     ProcessStartupDescriptor, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
@@ -294,6 +294,19 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn thread_info(&self, thread_id: ThreadId) -> Result<ThreadInfo, Channel::Error> {
         match self.request_process(ProcessRequest::GetThreadInfo(thread_id))? {
             ProcessResponse::GetThreadInfo(info) => Ok(info),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Returns the CPU time used by the children whose exits this process
+    /// collected, including the time they collected from their own children.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn children_cpu_time(&self) -> Result<CpuTime, Channel::Error> {
+        match self.request_process(ProcessRequest::GetChildrenCpuTime)? {
+            ProcessResponse::GetChildrenCpuTime(cpu_time) => Ok(cpu_time),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

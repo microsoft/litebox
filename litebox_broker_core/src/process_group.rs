@@ -509,7 +509,7 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileUser,
     };
-    use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
+    use litebox_broker_protocol::process::{ChildSelector, CpuTime, ProcessExitStatus};
     use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
@@ -667,7 +667,7 @@ mod tests {
         let leader_id = leader.id();
         leader.retire(true);
         leader
-            .complete_exit(ProcessExitStatus::Exited { code: 0 })
+            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
             .unwrap();
         drop(leader);
         let other = allocate(None).unwrap();
@@ -913,7 +913,7 @@ mod tests {
             Ok(Ok(()))
         );
         job.retire(true);
-        job.complete_exit(ProcessExitStatus::Exited { code: 0 })
+        job.complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
             .unwrap();
         drop(job);
         root.collect_child_exit(ChildSelector::Process(job_id))
@@ -1167,7 +1167,7 @@ mod tests {
         // leader leave.
         leader.retire(true);
         leader
-            .complete_exit(ProcessExitStatus::Exited { code: 0 })
+            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
             .unwrap();
         assert_signalled(&job, handles[1], TerminalEvents::HANGUP);
     }
@@ -1278,7 +1278,7 @@ mod tests {
 
         leader.retire(true);
         leader
-            .complete_exit(ProcessExitStatus::Exited { code: 0 })
+            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
             .unwrap();
         assert_signalled(&member, handles[0], TerminalEvents::HANGUP);
         assert_not_signalled(&background, handles[1]);

@@ -60,6 +60,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 const DEDICATED_C_TESTS: &[&str] = &[
     "aarch64_hwcaps.c",
     "async_x16.c",
+    "cpu_time_parent.c",
     "ctty_parent.c",
     "fork_chain_parent.c",
     "fork_parent.c",
@@ -1421,6 +1422,20 @@ fn orphans_are_adopted_by_subreapers_and_the_initial_process() {
     let output = String::from_utf8(runner.output()).unwrap();
     assert!(
         output.lines().any(|line| line == "process-tree failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cpu_time_covers_the_process_and_its_waited_descendants() {
+    let parent = common::compile("./tests/cpu_time_parent.c", "cpu_time_parent", true, false);
+    let mut runner = Runner::new(&parent, "cpu_time_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "cpu-time failures=0"),
         "{output}"
     );
 }
