@@ -147,12 +147,14 @@ pub trait Backend: Send + Sync + Any {
         None
     }
 
-    /// Returns the host shared memory that holds the file's contents, moving them there first if
-    /// necessary, so that runners can map the file `MAP_SHARED`.
+    /// Returns the host shared object that holds the file's contents, moving them there first if
+    /// necessary, so that runners can map the file `MAP_SHARED` or `MAP_PRIVATE` without copying
+    /// it.
     ///
-    /// After this succeeds, the backend must keep the file's contents in that memory, so that
+    /// After this succeeds, the backend must keep the file's contents in that object, so that
     /// every mapping and every read, write, and truncation see the same bytes, and must return
-    /// the same contents for every later call on the same file.
+    /// the same object for every later call on the same file. A file that never changes may
+    /// instead return a snapshot that never changes either.
     ///
     /// The default implementation returns [`MapSharedError::Unsupported`].
     #[expect(unused_variables, reason = "default body, non-underscored param names")]

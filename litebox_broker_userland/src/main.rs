@@ -21,6 +21,8 @@ use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::resolver::Resolver;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_core::fs::shared_memory::SnapshotLimit;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::fs::shared_memory::{DEFAULT_MAX_SHARED_FILES, SharedFileLimit};
 use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 use litebox_broker_core::{
@@ -241,11 +243,21 @@ where
     );
     let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
-            Overlay::<Platform>::new(
-                in_mem,
-                TarRo::new(tar_data, allocators.next()),
-                allocators.next(),
-            )
+            let tar = TarRo::new(tar_data, allocators.next());
+            // Runners map the archive's files, such as executables and libraries, through
+            // snapshots that every mapping shares, rather than copying them each time: sealed
+            // memfds on Linux, and temporary files delivered only read-only on Windows.
+            #[cfg(target_os = "linux")]
+            let tar = tar.with_snapshots(
+                Arc::new(litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider),
+                Arc::new(SnapshotLimit::default()),
+            );
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            let tar = tar.with_snapshots(
+                Arc::new(litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider),
+                Arc::new(SnapshotLimit::default()),
+            );
+            Overlay::<Platform>::new(in_mem, tar, allocators.next())
         })
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(

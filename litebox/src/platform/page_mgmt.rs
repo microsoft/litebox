@@ -468,8 +468,10 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 /// band, such as the memfd or section that holds a shared file's contents.
 ///
 /// Every mapping of the same object, in this or any other process, shares its pages, which is
-/// how `MAP_SHARED` file mappings stay coherent across processes. Platforms that cannot map such
-/// objects implement this trait with an uninhabited [`Self::SharedObject`], such as
+/// how `MAP_SHARED` file mappings stay coherent across processes. A private mapping
+/// ([`ObjectSharing::Private`]) shares them too until it writes one, which then becomes its own
+/// copy, which is how `MAP_PRIVATE` file mappings avoid copying files. Platforms that cannot map
+/// such objects implement this trait with an uninhabited [`Self::SharedObject`], such as
 /// [`core::convert::Infallible`], and the other defaults, which report it as unsupported.
 ///
 /// A delivered object is named by a [`SharedObjectToken`] only until
@@ -486,6 +488,16 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     /// Callers must check this before asking the broker for an object, since the broker
     /// delivers each object only once. The default implementation returns `false`.
     fn supports_shared_objects(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this platform can also map host shared objects privately, with
+    /// [`ObjectSharing::Private`], and discard a private mapping's copies with
+    /// [`Self::discard_private_object_pages`].
+    ///
+    /// Callers must check this, as well as [`Self::supports_shared_objects`], before asking the
+    /// broker for an object to map privately. The default implementation returns `false`.
+    fn supports_private_object_mappings(&self) -> bool {
         false
     }
 
@@ -506,13 +518,16 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     }
 
     /// Maps the host shared object `object`, starting at its byte `offset`, over exactly `range`
-    /// with `permissions`, consuming the object whether or not the mapping succeeds.
+    /// with `permissions`, shared or private as `sharing` says, consuming the object whether or
+    /// not the mapping succeeds.
     ///
     /// Platforms whose mappings need no reservation handles implement this; platforms that track
     /// reservations implement [`Self::commit_shared_object`] instead.
     ///
     /// Every mapping of the same object, in this or any other process, shares its pages, and a
-    /// native fork child keeps sharing them.
+    /// native fork child keeps sharing them. A private mapping shares only the pages it has not
+    /// written, and never writes the object, even if `object` would allow it; a native fork
+    /// child gets its own copies of the pages either writes later.
     ///
     /// `fixed_address_behavior` must be [`FixedAddressBehavior::Replace`] or
     /// [`FixedAddressBehavior::NoReplace`]. On replacement, `replaced_reservations` lazily
@@ -525,12 +540,17 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     /// track the returned reservation directly and must not construct duplicate ownership from
     /// its range.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors a host mmap of an object"
+    )]
     unsafe fn try_map_shared_object<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
         object: Self::SharedObject,
         offset: u64,
+        sharing: ObjectSharing,
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
@@ -541,8 +561,8 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     }
 
     /// Backs the reserved but unbacked `range`, within live reservations, with the host shared
-    /// object `object`, starting at its byte `offset`, with `permissions`, consuming the object
-    /// whether or not the mapping succeeds.
+    /// object `object`, starting at its byte `offset`, with `permissions`, shared or private as
+    /// `sharing` says, consuming the object whether or not the mapping succeeds.
     ///
     /// This is [`Self::try_map_shared_object`] for platforms that track reservations, as
     /// [`PageManagementProvider::commit_pages`] is to
@@ -563,6 +583,7 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
         range: Range<usize>,
         object: Self::SharedObject,
         offset: u64,
+        sharing: ObjectSharing,
         permissions: MemoryRegionPermissions,
     ) -> Result<(), AllocationError>
     where
@@ -571,6 +592,33 @@ pub trait SharedObjectProvider<const ALIGN: usize>: PageManagementProvider<ALIGN
     {
         Err(AllocationError::UnsupportedByPlatform)
     }
+
+    /// Discards the copies that a private mapping of a host shared object made of the pages in
+    /// `range` it wrote, so that they show the object's contents again, as `MADV_DONTNEED` does
+    /// to a `MAP_PRIVATE` file mapping on Linux. Pages not written are unchanged.
+    ///
+    /// The default implementation fails with [`AllocationError::UnsupportedByPlatform`].
+    ///
+    /// # Safety
+    ///
+    /// `range` must lie within private mappings of host shared objects that this provider made,
+    /// and the caller must ensure that nothing relies on the discarded contents.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    unsafe fn discard_private_object_pages(
+        &self,
+        range: Range<usize>,
+    ) -> Result<(), AllocationError> {
+        Err(AllocationError::UnsupportedByPlatform)
+    }
+}
+
+/// How a host shared object is mapped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectSharing {
+    /// Writes reach the object, and every mapping sees them, as with `MAP_SHARED`.
+    Shared,
+    /// Writes go to the mapping's own copies of the pages, as with `MAP_PRIVATE`.
+    Private,
 }
 
 /// Names a host shared object that the broker delivered to this process out of band, such as a

@@ -483,7 +483,10 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
         anonymous_only: bool,
-    ) -> Result<(), VmemResetError> {
+    ) -> Result<(), VmemResetError>
+    where
+        Platform: litebox::platform::SharedObjectProvider<ALIGN>,
+    {
         let mut vmem = self.vmem.write();
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemResetError::UnAligned)?;
@@ -606,20 +609,22 @@ where
     }
 
     /// Returns whether any mapping's pages are shared with other mappings: shared anonymous
-    /// memory, or a shared file mapping of a host shared object.
+    /// memory, or a shared or private file mapping of a host shared object.
     ///
     /// A shared file mapping whose pages are a private copy of the file does not count: it can
-    /// never become writable, so a copy of it is indistinguishable from sharing it.
+    /// never become writable, so a copy of it is indistinguishable from sharing it. A private
+    /// mapping of a host object counts, since a copy of it could no longer show the file again
+    /// after `MADV_DONTNEED`, nor fault past its end.
     pub fn has_shared_pages(&self) -> bool {
         self.vmem
             .read()
             .iter()
-            .any(|(_, vma)| vma.is_shared_anonymous() || vma.is_shared_object())
+            .any(|(_, vma)| vma.is_shared_anonymous() || vma.is_object_backed())
     }
 
     /// Returns whether a host fault at `address` must be past the end of a mapped file: it lies
-    /// in a shared file mapping of a host shared object that allows the `access`, which the
-    /// host would otherwise have served. Linux raises `SIGBUS` for such accesses.
+    /// in a shared or private file mapping of a host shared object that allows the `access`,
+    /// which the host would otherwise have served. Linux raises `SIGBUS` for such accesses.
     pub fn is_fault_past_shared_file_end(&self, address: usize, access: FaultAccess) -> bool {
         self.vmem
             .read()
@@ -631,7 +636,7 @@ where
                     FaultAccess::Write => VmFlags::VM_READ | VmFlags::VM_WRITE,
                     FaultAccess::Execute => VmFlags::VM_EXEC,
                 };
-                area.is_shared_object() && area.flags().contains(needed)
+                area.is_object_backed() && area.flags().contains(needed)
             })
     }
 
@@ -1035,11 +1040,12 @@ where
         .map(UserPtrMut::from_platform_ptr::<Platform>)
     }
 
-    /// Maps a host shared object as a `MAP_SHARED` file mapping with Linux `mmap` semantics.
+    /// Maps a host shared object as a `MAP_SHARED` or `MAP_PRIVATE` file mapping, as
+    /// `object.sharing` says, with Linux `mmap` semantics.
     ///
-    /// Every mapping of the object, in this or any other process, shares its pages, so the
-    /// mapping needs no initialization. This consumes the object whether or not it succeeds;
-    /// on failure, dropping it releases it.
+    /// Every mapping of the object, in this or any other process, shares its pages, until a
+    /// private mapping writes one, so the mapping needs no initialization. This consumes the
+    /// object whether or not it succeeds; on failure, dropping it releases it.
     pub fn do_mmap_shared_object(
         &self,
         suggested_addr: Option<usize>,
@@ -1059,7 +1065,7 @@ where
         // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the
         // mapping.
         unsafe {
-            self.vmem.write().create_shared_object_mapping(
+            self.vmem.write().create_object_mapping(
                 suggested_addr,
                 length,
                 flags,
@@ -1232,7 +1238,10 @@ where
         addr: UserPtrMut<u8>,
         len: usize,
         advice: crate::MadviseBehavior,
-    ) -> Result<(), Errno> {
+    ) -> Result<(), Errno>
+    where
+        Platform: litebox::platform::SharedObjectProvider<PAGE_SIZE>,
+    {
         if addr.as_usize() & !PAGE_MASK != 0 {
             return Err(Errno::EINVAL);
         }

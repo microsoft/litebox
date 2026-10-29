@@ -1448,8 +1448,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EAGAIN);
         }
         let pause = self.pause_other_threads()?;
-        // Copying would silently unshare shared memory, so only a native child, which shares
-        // shared pages, may inherit it.
+        // Copying would silently unshare shared memory, or detach a private file mapping from its
+        // file, so only a native child, which shares such pages, may inherit them.
         let shares_memory = self.global.mm.has_shared_pages();
         if !self.thread.process.limits.has_default_state()
             || !self.global.elf_patch_cache.lock().is_empty()

@@ -68,7 +68,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         )
     }
 
-    /// Map a file, applying runtime ELF syscall patching to the new mapping.
+    /// Map a file privately, applying runtime ELF syscall patching to the new mapping.
+    ///
+    /// Where the platform and the file system support it, a `MAP_PRIVATE` mapping maps the host
+    /// shared object holding the file's contents, as described in
+    /// [`Self::try_mmap_private_object`]. Otherwise, and for the read-only copies that stand in
+    /// for shared mappings, it is a copy of the file.
     pub(crate) fn do_mmap_file(
         &self,
         suggested_addr: Option<usize>,
@@ -85,15 +90,98 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let patch = self.begin_file_patch(file_fd, suggested_addr, len, prot, flags, offset)?;
         let (addr, flags) = patch.placement(suggested_addr, flags);
-        let mapped = match self.do_mmap_file_memcpy(addr, len, prot, flags, &typed_fd, offset) {
+        let mapped = match self.try_mmap_private_object(addr, len, prot, flags, file_fd, offset) {
+            Ok(Some(mapped)) => Ok(mapped),
+            Ok(None) => self
+                .do_mmap_file_memcpy(addr, len, prot, flags, &typed_fd, offset)
+                .map_err(Errno::from),
+            Err(error) => Err(error),
+        };
+        let mapped = match mapped {
             Ok(mapped) => mapped,
             Err(error) => {
                 self.abort_file_patch(patch);
-                return Err(error.into());
+                return Err(error);
             }
         };
         self.complete_file_patch(patch, mapped)?;
         Ok(mapped)
+    }
+
+    /// Maps a file `MAP_PRIVATE` by mapping the host shared object holding its contents
+    /// privately, if the platform and the file system support it, or returns `None` for the
+    /// caller to copy the file instead.
+    ///
+    /// The mapping shares the object's pages, with every other mapping of the file in any
+    /// process, until it writes one, which then becomes its own copy, as a `MAP_PRIVATE` file
+    /// mapping does on Linux: pages not yet written see later changes to the file, accesses
+    /// past the end of the file raise `SIGBUS`, and `MADV_DONTNEED` shows the file again.
+    ///
+    /// Only processes that fork natively map objects, since a native fork child keeps sharing
+    /// unwritten pages while a copied child could not; see `sys_fork`. Any failure other than a
+    /// closed file falls back to a copy, which fails in turn as Linux would, if it must.
+    fn try_mmap_private_object(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        file_fd: &alloc::sync::Arc<super::file::FileFd<Platform>>,
+        offset: usize,
+    ) -> Result<Option<UserPtrMut<u8>>, Errno> {
+        use litebox::fs::errors::MapSharedError;
+        use litebox::platform::page_mgmt::ObjectSharing;
+
+        let platform = self.global.platform;
+        if flags.contains(MapFlags::MAP_SHARED)
+            || self.global.fork_launcher.is_none()
+            || !platform.supports_shared_objects()
+            || !platform.supports_private_object_mappings()
+        {
+            return Ok(None);
+        }
+        let delivered = match self.global.with_file(file_fd, |file| {
+            Ok(file.map_object(litebox_broker_protocol::fs::MapFileMode::Private))
+        })? {
+            Ok(delivered) => delivered,
+            Err(MapSharedError::ClosedFd) => return Err(Errno::EBADF),
+            Err(_) => return Ok(None),
+        };
+        // SAFETY: The broker just delivered the object under this token, which nothing else
+        // takes. From here on, dropping the object releases it.
+        let Ok(object) = (unsafe { platform.take_shared_object(delivered.token) }) else {
+            return Ok(None);
+        };
+        let mapped = match self.global.mm.do_mmap_shared_object(
+            suggested_addr,
+            len,
+            prot,
+            flags,
+            MmapPlacement {
+                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
+                allowed_range: None,
+            },
+            SharedObjectMapping {
+                memory: delivered.memory,
+                object,
+                offset: offset as u64,
+                sharing: ObjectSharing::Private,
+                may_write: false,
+            },
+        ) {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                litebox_util_log::debug!(
+                    error:? = error;
+                    "failed to map a file's object privately; copying it instead"
+                );
+                return Ok(None);
+            }
+        };
+        if flags.contains(MapFlags::MAP_FIXED) {
+            self.clear_file_mappings_for_range(mapped.as_usize(), len);
+        }
+        Ok(Some(mapped))
     }
 
     /// Map a file by reading its contents through the filesystem API into allocated pages.
@@ -252,10 +340,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !self.global.platform.supports_shared_objects() {
             return copy();
         }
-        let delivered = match self
-            .global
-            .with_file(file_fd, |file| Ok(file.map_shared()))?
-        {
+        let delivered = match self.global.with_file(file_fd, |file| {
+            Ok(file.map_object(litebox_broker_protocol::fs::MapFileMode::Shared))
+        })? {
             Ok(delivered) => delivered,
             Err(MapSharedError::Unsupported) => return copy(),
             Err(MapSharedError::ClosedFd) => return Err(Errno::EBADF),
@@ -285,6 +372,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 memory: delivered.memory,
                 object,
                 offset: offset as u64,
+                sharing: litebox::platform::page_mgmt::ObjectSharing::Shared,
                 may_write: delivered.writable,
             },
         )?;

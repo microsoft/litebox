@@ -651,11 +651,12 @@ mod tests {
         ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
         FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags, FileType,
         FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-        MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-        PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-        ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-        SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, TerminalControlFileRequest,
-        TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+        MapFileMode, MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest,
+        OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+        ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest,
+        RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
+        TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+        WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
@@ -1065,7 +1066,14 @@ mod tests {
                 handle,
                 buffer: sequence(13, 256),
             })),
-            BrokerOperation::File(FileRequest::Map(MapFileRequest { handle })),
+            BrokerOperation::File(FileRequest::Map(MapFileRequest {
+                handle,
+                mode: MapFileMode::Shared,
+            })),
+            BrokerOperation::File(FileRequest::Map(MapFileRequest {
+                handle,
+                mode: MapFileMode::Private,
+            })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
