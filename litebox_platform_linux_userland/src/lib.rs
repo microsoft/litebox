@@ -141,8 +141,6 @@ impl LinuxUserland {
 
     /// Takes the descriptor that the broker delivered under `token`, waiting for it if it has
     /// not arrived yet. See [`shared_objects::SharedObjectChannel::take`].
-    ///
-    /// Fails with [`std::io::ErrorKind::Unsupported`] if no channel is installed.
     pub fn take_shared_object(&self, token: u64) -> std::io::Result<std::os::fd::OwnedFd> {
         self.shared_objects
             .get()
