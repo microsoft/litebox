@@ -1,16 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks that a relative nanosleep interrupted by a signal that runs no handler restarts through
-// restart_syscall for its remaining time, however often it is interrupted, while a handler
-// interrupts it with EINTR, and that restart_syscall fails with EINTR unless an interrupted sleep
-// left something to resume. Also checks that an absolute clock_nanosleep restarts with its
-// deadline unless a handler runs, without reporting the time left.
-//
-// The checks do not depend on timing. A sleep that a signal must interrupt never ends on its
-// own, and the main thread signals it until it sees the outcome: the sleep returning, or, for a
-// relative sleep, `remain` being written, which happens as the signal interrupts it.
-
 #define _GNU_SOURCE
 #include <limits.h>
 #include <pthread.h>
