@@ -43,6 +43,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     val,
                     None,
                 )
+                // TODO: Like Linux, resume a wait with a timeout through `restart_syscall` until
+                // its original deadline unless a handler runs (`ERESTART_RESTARTBLOCK`, see
+                // `RestartBlock`), rather than failing with `EINTR`. Also below.
                 .map_err(|error| wait_errno(timeout, error))?;
                 0
             }

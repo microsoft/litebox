@@ -3019,7 +3019,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ) {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
-                // TODO: update the remaining time.
+                // TODO: Like Linux, restart unless a handler runs, rather than failing with
+                // `EINTR`: `poll` with a timeout through `restart_syscall` until its original
+                // deadline (`ERESTART_RESTARTBLOCK`, see `RestartBlock`), and otherwise by
+                // reissuing the syscall (`ERESTARTNOHAND`), after `ppoll` writes the remaining
+                // time back.
                 return Err(Errno::EINTR);
             }
             Err(WaitError::TimedOut) => {
@@ -3089,7 +3093,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ) {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
-                // TODO: update the remaining time.
+                // TODO: Like Linux, write the remaining time back and restart unless a handler
+                // runs (`ERESTARTNOHAND`), rather than failing with `EINTR`.
                 return Err(Errno::EINTR);
             }
             Err(WaitError::TimedOut) => {

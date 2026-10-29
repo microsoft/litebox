@@ -586,8 +586,9 @@ struct DeliverFault;
 
 /// How a syscall interrupted by a signal resumes once pending signals are processed.
 ///
-/// Like Linux, the syscall restarts by moving the guest back to its syscall instruction, unless a
-/// signal handler interrupts it with `EINTR`.
+/// Like Linux, the syscall restarts by moving the guest back to its syscall instruction, which
+/// issues `restart_syscall` instead for [`Self::RestartBlock`], unless a signal handler interrupts
+/// it with `EINTR`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyscallRestart {
     /// From [`Errno::ERESTARTSYS`]: only a handler without `SA_RESTART` interrupts the syscall.
@@ -993,7 +994,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     if let Some(restart) = restart.take()
                         && !restart.is_interrupted_by(&action)
                     {
-                        self.restart_syscall(ctx, restart);
+                        self.reissue_syscall(ctx, restart);
                     }
                     let delivered =
                         arch::sigreturn_trampoline(self, &action).and_then(|trampoline| {
@@ -1017,13 +1018,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         // No handler ran, so the interrupted syscall is invisible to the guest.
         if let Some(restart) = restart {
-            self.restart_syscall(ctx, restart);
+            self.reissue_syscall(ctx, restart);
         }
     }
 
     /// Moves `ctx` back to reissue its interrupted syscall, or, like Linux, to issue
     /// `restart_syscall` in its place if it saved its state to resume from.
-    fn restart_syscall(&self, ctx: &mut PtRegs, restart: SyscallRestart) {
+    fn reissue_syscall(&self, ctx: &mut PtRegs, restart: SyscallRestart) {
         arch::restart_syscall(ctx, syscall_instruction_len(self.global.platform));
         if restart == SyscallRestart::RestartBlock {
             arch::set_syscall_number(ctx, ::syscalls::Sysno::restart_syscall);
