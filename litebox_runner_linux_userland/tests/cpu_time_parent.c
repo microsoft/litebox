@@ -1,11 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks that CPU-time clocks, getrusage, times, wait4, and SIGCHLD report the CPU time used by a
-// process and by the descendants it waited for.
+// Checks that CPU-time clocks, including those from clock_getcpuclockid and pthread_getcpuclockid,
+// getrusage, times, wait4, and SIGCHLD report the CPU time used by a process and by the descendants
+// it waited for.
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,6 +136,13 @@ int main(void) {
     struct timespec resolution;
     CHECK(clock_getres(CLOCK_THREAD_CPUTIME_ID, &resolution) == 0 && resolution.tv_sec == 0 &&
           resolution.tv_nsec > 0);
+    clockid_t clocks[3];
+    CHECK(clock_getcpuclockid(0, &clocks[0]) == 0);
+    CHECK(clock_getcpuclockid(getpid(), &clocks[1]) == 0);
+    CHECK(pthread_getcpuclockid(pthread_self(), &clocks[2]) == 0);
+    for (int i = 0; i < 3; i++) {
+        CHECK(clock_ns(clocks[i]) >= WORK_NS);
+    }
     struct tms tms;
     CHECK(times(&tms) != (clock_t)-1);
     // Each of two truncated fields loses less than a tick.
