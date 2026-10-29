@@ -3044,6 +3044,46 @@ fn tcp_transfers_use_raw_parts() {
     }
 }
 
+/// A shutdown of an external TCP connection that its peer reset fails as not
+/// connected, as Linux has closed the connection, and leaves the reset
+/// pending.
+#[test]
+fn external_tcp_shutdown_after_reset_is_not_connected() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let host = connect_to_host(&process, socket, &publications, &listener);
+    let mut data = *b"x";
+    assert_eq!(
+        litebox_broker_core::socket::send(
+            &process,
+            socket,
+            &TestBuffer::new(&mut data, None),
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(data.len()))
+    );
+    // Closing a stream with unread data resets the connection.
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    assert_eq!(host.peek(&mut [0]).unwrap(), 1);
+    drop(host);
+    wait_until_ready(&process, &publications, socket, ReadinessFlags::ERROR);
+    for mode in [ShutdownMode::Write, ShutdownMode::Read] {
+        assert_eq!(
+            litebox_broker_core::socket::shutdown(&process, socket, mode),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+    }
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&process, socket),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+}
+
 /// Data that arrives between a receive's EAGAIN and its READ clear raises an
 /// edge that is deferred while the receive holds the socket and applied after,
 /// so READ survives the clear.

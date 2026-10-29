@@ -11,7 +11,11 @@
 //!   they raise and the wakes that `Poller::wake` sends under
 //!   [`WAKE_TOKEN`];
 //! - `Errno`, the host's error codes, with the constants the provider
-//!   matches on, and the functions that map them to broker errors.
+//!   matches on, and the functions that map them to broker errors;
+//! - `REPORTS_EVERY_ARRIVAL`, whether a stream socket watched for
+//!   [`Interest::Stream`] reports each arrival of data, even while earlier
+//!   data is queued. Otherwise it reports only the first, and the provider
+//!   polls for the data a peek waits for.
 //!
 //! The types in this module are host-neutral, so the provider's logic is
 //! the same on every host.
@@ -22,6 +26,10 @@ use core::ops::{BitOr, BitOrAssign};
 mod linux;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::*;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod windows;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use windows::*;
 
 /// Poller token reserved for the poller's own wakes.
 pub(crate) const WAKE_TOKEN: u64 = 0;

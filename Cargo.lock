@@ -1718,7 +1718,9 @@ dependencies = [
  "litebox_runner_linux_userland",
  "litebox_runner_windows_userland",
  "litebox_util_log",
+ "mio",
  "rustix",
+ "socket2",
  "tempfile",
  "windows-sys 0.60.2",
 ]
@@ -2041,6 +2043,7 @@ dependencies = [
  "litebox_shim_linux",
  "litebox_syscall_rewriter",
  "litebox_util_log",
+ "socket2",
  "tar",
  "tracing-subscriber",
 ]

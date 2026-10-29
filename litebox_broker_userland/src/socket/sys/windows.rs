@@ -1,0 +1,926 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! The Windows host: sockets through socket2 and Winsock, and events from
+//! mio, which polls sockets through AFD and wakes through its completion
+//! port.
+//!
+//! The provider expects Linux socket semantics, so this module emulates them
+//! where Winsock differs:
+//! - mio reports each kind of readiness once until the socket is rearmed. A
+//!   TCP call that would block rearms it, and so does a read that empties
+//!   the receive queue, after which Linux reports the next arrival. Other
+//!   arrivals go unreported; see [`REPORTS_EVERY_ARRIVAL`].
+//! - Winsock resets a connection that receives data after a read shutdown,
+//!   so a read shutdown is recorded here, and receives end the stream once
+//!   the queued data is read.
+//! - Winsock reports a connection's error on every call, and Linux only
+//!   once, after which receives end the stream and sends fail with
+//!   [`Errno::PIPE`]. Winsock also still shuts down a failed connection,
+//!   which Linux has closed.
+//! - Winsock fails a datagram receive into a shorter output instead of
+//!   truncating the datagram and reporting its length, so short receives go
+//!   through a staging buffer.
+//! - As on Linux, only a connected UDP socket reports ICMP errors. Winsock
+//!   queues each behind the datagrams that arrived first, so a receive
+//!   reports one only after those datagrams, where Linux reports it first.
+//!   A receive that reports one, even a peek, takes it and the errors queued
+//!   right behind it, as Linux keeps only one.
+
+use std::fmt;
+use std::io::{Error, ErrorKind, Result as IoResult};
+use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
+use std::os::windows::io::AsRawSocket;
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::Duration;
+
+use litebox_broker_core::BrokerError;
+use litebox_broker_protocol::socket::{MAX_UDP_DATAGRAM_SIZE, SocketError};
+use mio::net::{TcpStream, UdpSocket};
+use mio::{Poll, Registry, Token, Waker};
+use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
+use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
+    SIO_UDP_CONNRESET, SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSA_NOT_ENOUGH_MEMORY, WSABUF,
+    WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED,
+    WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR, WSAEINVAL,
+    WSAEISCONN, WSAEMFILE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN,
+    WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll, WSARecv,
+    WSARecvFrom, WSASend, WSASendTo, ioctlsocket,
+};
+
+use super::{HostEvents, Interest, ReceiveMode, WAKE_TOKEN};
+use crate::socket::direct::{MAX_RAW_PARTS, RawParts};
+
+/// mio reports each kind of readiness once until the socket is rearmed, so
+/// it does not report data that arrives while earlier data is queued.
+pub(crate) const REPORTS_EVERY_ARRIVAL: bool = false;
+
+/// The length of the longest datagram a UDP socket receives.
+const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
+
+/// The most queued ICMP errors that a receive merges into the one it
+/// reports.
+const MAX_MERGED_DATAGRAM_ERRORS: usize = 64;
+
+/// A Winsock error code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Errno(i32);
+
+impl Errno {
+    pub(crate) const INTR: Self = Self(WSAEINTR);
+    pub(crate) const AGAIN: Self = Self(WSAEWOULDBLOCK);
+    /// A TCP connect started, which Winsock reports as [`Self::AGAIN`].
+    pub(crate) const INPROGRESS: Self = Self(WSAEINPROGRESS);
+    pub(crate) const ALREADY: Self = Self(WSAEALREADY);
+    pub(crate) const ISCONN: Self = Self(WSAEISCONN);
+    pub(crate) const NOTCONN: Self = Self(WSAENOTCONN);
+    /// The stream can no longer send, which Linux reports as `EPIPE`.
+    pub(crate) const PIPE: Self = Self(WSAESHUTDOWN);
+    pub(crate) const ADDRINUSE: Self = Self(WSAEADDRINUSE);
+    pub(crate) const ADDRNOTAVAIL: Self = Self(WSAEADDRNOTAVAIL);
+    pub(crate) const AFNOSUPPORT: Self = Self(WSAEAFNOSUPPORT);
+    pub(crate) const CONNREFUSED: Self = Self(WSAECONNREFUSED);
+    pub(crate) const CONNRESET: Self = Self(WSAECONNRESET);
+    pub(crate) const CONNABORTED: Self = Self(WSAECONNABORTED);
+    pub(crate) const NETRESET: Self = Self(WSAENETRESET);
+    pub(crate) const NETUNREACH: Self = Self(WSAENETUNREACH);
+    pub(crate) const HOSTUNREACH: Self = Self(WSAEHOSTUNREACH);
+    pub(crate) const TIMEDOUT: Self = Self(WSAETIMEDOUT);
+    pub(crate) const INVAL: Self = Self(WSAEINVAL);
+    pub(crate) const MFILE: Self = Self(WSAEMFILE);
+    pub(crate) const NOBUFS: Self = Self(WSAENOBUFS);
+    pub(crate) const NOMEM: Self = Self(WSA_NOT_ENOUGH_MEMORY);
+    /// `ERROR_OUTOFMEMORY`, which some calls report instead of
+    /// [`Self::NOMEM`].
+    const OUTOFMEMORY: Self = Self(14);
+
+    /// Returns the error of the calling thread's last failed Winsock call.
+    fn last() -> Self {
+        // SAFETY: `WSAGetLastError` takes no arguments and only reads the
+        // calling thread's last error.
+        Self(unsafe { WSAGetLastError() })
+    }
+}
+
+impl From<Error> for Errno {
+    fn from(error: Error) -> Self {
+        if let Some(code) = error.raw_os_error() {
+            return Self(code);
+        }
+        match error.kind() {
+            ErrorKind::WouldBlock => Self::AGAIN,
+            ErrorKind::Interrupted => Self::INTR,
+            ErrorKind::OutOfMemory => Self::NOMEM,
+            _ => Self::INVAL,
+        }
+    }
+}
+
+impl From<Errno> for Error {
+    fn from(error: Errno) -> Self {
+        Self::from_raw_os_error(error.0)
+    }
+}
+
+impl fmt::Display for Errno {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&Error::from_raw_os_error(self.0), formatter)
+    }
+}
+
+/// A nonblocking, non-inheritable IPv4 host socket.
+pub(crate) struct HostSocket {
+    source: Source,
+    /// Whether the poller watches the socket.
+    registered: bool,
+    /// The read side is shut down. Winsock is not told, because it resets a
+    /// connection that receives data after a read shutdown.
+    read_shutdown: AtomicBool,
+    /// A TCP connect started without completing at once.
+    connecting: AtomicBool,
+    /// The TCP connection's error was reported.
+    error_reported: AtomicBool,
+    /// An error Winsock cannot raise itself, which the socket reports next,
+    /// or 0.
+    stashed_error: AtomicI32,
+}
+
+enum Source {
+    Tcp(TcpStream),
+    Udp(UdpSocket),
+}
+
+impl HostSocket {
+    /// Opens a TCP socket.
+    pub(crate) fn tcp() -> Result<Self, Errno> {
+        let socket = open(Type::STREAM, Protocol::TCP)?;
+        Ok(Self::new(Source::Tcp(TcpStream::from_std(socket.into()))))
+    }
+
+    /// Opens a UDP socket.
+    pub(crate) fn udp() -> Result<Self, Errno> {
+        let socket = open(Type::DGRAM, Protocol::UDP)?;
+        // Linux reports ICMP errors only to connected UDP sockets.
+        report_connection_resets(raw_socket(&socket), false)?;
+        Ok(Self::new(Source::Udp(UdpSocket::from_std(socket.into()))))
+    }
+
+    fn new(source: Source) -> Self {
+        Self {
+            source,
+            registered: false,
+            read_shutdown: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
+            error_reported: AtomicBool::new(false),
+            stashed_error: AtomicI32::new(0),
+        }
+    }
+
+    fn raw(&self) -> SOCKET {
+        match &self.source {
+            Source::Tcp(socket) => raw_socket(socket),
+            Source::Udp(socket) => raw_socket(socket),
+        }
+    }
+
+    fn socket(&self) -> SockRef<'_> {
+        match &self.source {
+            Source::Tcp(socket) => SockRef::from(socket),
+            Source::Udp(socket) => SockRef::from(socket),
+        }
+    }
+
+    fn source_mut(&mut self) -> &mut dyn mio::event::Source {
+        match &mut self.source {
+            Source::Tcp(socket) => socket,
+            Source::Udp(socket) => socket,
+        }
+    }
+
+    fn is_tcp(&self) -> bool {
+        matches!(self.source, Source::Tcp(_))
+    }
+
+    pub(crate) fn bind(&self, address: SocketAddrV4) -> Result<(), Errno> {
+        Ok(self.socket().bind(&SockAddr::from(address))?)
+    }
+
+    /// Connects to `address`, or starts connecting a TCP socket, which fails
+    /// with [`Errno::INPROGRESS`].
+    pub(crate) fn connect(&self, address: SocketAddrV4) -> Result<(), Errno> {
+        if !self.is_tcp() {
+            report_connection_resets(self.raw(), true)?;
+        }
+        match self.socket().connect(&SockAddr::from(address)) {
+            Ok(()) => Ok(()),
+            Err(error) => match Errno::from(error) {
+                Errno::AGAIN if self.is_tcp() => {
+                    self.connecting.store(true, Ordering::Relaxed);
+                    Err(Errno::INPROGRESS)
+                }
+                error => Err(error),
+            },
+        }
+    }
+
+    pub(crate) fn local_address(&self) -> Result<SocketAddrV4, Errno> {
+        match self.socket().local_addr() {
+            Ok(address) => address.as_socket_ipv4().ok_or(Errno::AFNOSUPPORT),
+            // Winsock fails on an unbound socket, which Linux reports bound
+            // to the wildcard address.
+            Err(error) => match Errno::from(error) {
+                Errno::INVAL => Ok(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                error => Err(error),
+            },
+        }
+    }
+
+    pub(crate) fn shutdown(&self, how: Shutdown) -> Result<(), Errno> {
+        let socket = self.socket();
+        if let Err(error) = socket.peer_addr() {
+            let error = Errno::from(error);
+            // Linux aborts a pending connect that is shut down, which then
+            // reports a reset.
+            if error == Errno::NOTCONN
+                && self.connecting.load(Ordering::Relaxed)
+                && !self.error_reported.load(Ordering::Relaxed)
+                && !self.error_pending()?
+            {
+                socket.set_linger(Some(Duration::ZERO))?;
+                self.stashed_error
+                    .store(Errno::CONNRESET.0, Ordering::Relaxed);
+                return Ok(());
+            }
+            return Err(error);
+        }
+        // Winsock still shuts down a failed connection, which Linux has
+        // closed.
+        if self.error_reported.load(Ordering::Relaxed) || self.error_pending()? {
+            return Err(Errno::NOTCONN);
+        }
+        if how != Shutdown::Read {
+            socket.shutdown(Shutdown::Write)?;
+        }
+        if how != Shutdown::Write {
+            self.read_shutdown.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Sends `data` with one system call, to `destination` if set, and
+    /// returns how many bytes it sent.
+    pub(crate) fn send(
+        &self,
+        data: RawParts<'_>,
+        destination: Option<SocketAddrV4>,
+    ) -> Result<usize, Errno> {
+        let result = send_parts(self.raw(), data, destination);
+        if self.is_tcp() {
+            result.or_else(|error| self.stream_error(error, false))
+        } else {
+            result.map_err(datagram_error)
+        }
+    }
+
+    /// Receives stream data into `output` with one system call.
+    pub(crate) fn receive(&self, output: RawParts<'_>, mode: ReceiveMode) -> Result<usize, Errno> {
+        let (buffers, count) = wsabufs(output)?;
+        match receive_into(self.raw(), &buffers[..count], mode.is_peek(), false) {
+            Ok((received, _)) => {
+                if mode == ReceiveMode::Read && received != 0 && self.queued_bytes() == Ok(0) {
+                    self.rearm();
+                }
+                Ok(received)
+            }
+            Err(error) => self.stream_error(error, true),
+        }
+    }
+
+    /// Receives the datagram at the head of the socket into `output`,
+    /// leaving it queued with `peek`.
+    ///
+    /// Returns the datagram's full length, even if `output` is shorter, and
+    /// its source, if IPv4.
+    pub(crate) fn receive_datagram(
+        &self,
+        output: RawParts<'_>,
+        peek: bool,
+    ) -> Result<(usize, Option<SocketAddrV4>), Errno> {
+        let result = self.receive_datagram_once(output, peek);
+        if matches!(result, Err(Errno::CONNRESET | Errno::NETRESET)) {
+            self.take_queued_errors(peek);
+        }
+        result.map_err(datagram_error)
+    }
+
+    /// Takes the ICMP errors queued at the head of a UDP socket after a
+    /// receive reported the first, which a peek left queued.
+    ///
+    /// Winsock queues each error among the datagrams, where Linux keeps one
+    /// pending error, which a peek takes too.
+    fn take_queued_errors(&self, peeked: bool) {
+        let buffers = [WSABUF {
+            len: 0,
+            buf: NonNull::dangling().as_ptr(),
+        }];
+        if peeked {
+            let _ = receive_into(self.raw(), &buffers, false, false);
+        }
+        // Bound the work that a flood of ICMP errors causes.
+        for _ in 0..MAX_MERGED_DATAGRAM_ERRORS {
+            // A zero-length peek of a datagram fails with `WSAEMSGSIZE`
+            // and leaves it queued.
+            if !matches!(
+                receive_into(self.raw(), &buffers, true, false),
+                Err(Errno::CONNRESET | Errno::NETRESET)
+            ) {
+                break;
+            }
+            let _ = receive_into(self.raw(), &buffers, false, false);
+        }
+    }
+
+    /// Receives a datagram, returning Winsock's error.
+    fn receive_datagram_once(
+        &self,
+        output: RawParts<'_>,
+        peek: bool,
+    ) -> Result<(usize, Option<SocketAddrV4>), Errno> {
+        if output.len() >= MAX_DATAGRAM_LENGTH {
+            let (buffers, count) = wsabufs(output)?;
+            return receive_into(self.raw(), &buffers[..count], peek, true);
+        }
+        let mut staging = Vec::new();
+        staging
+            .try_reserve_exact(MAX_DATAGRAM_LENGTH)
+            .map_err(|_| Errno::NOMEM)?;
+        staging.resize(MAX_DATAGRAM_LENGTH, 0);
+        let buffers = [wsabuf(staging.as_mut_ptr(), staging.len())?];
+        let (received, source) = receive_into(self.raw(), &buffers, peek, true)?;
+        output.copy_from_slice(&staging[..received.min(output.len())]);
+        Ok((received, source))
+    }
+
+    /// Returns how many bytes a stream receive could take now.
+    pub(crate) fn queued_bytes(&self) -> Result<usize, Errno> {
+        let mut queued = 0_u32;
+        // SAFETY: `queued` outlives the call, which writes only it.
+        if unsafe { ioctlsocket(self.raw(), FIONREAD, &raw mut queued) } == SOCKET_ERROR {
+            return Err(Errno::last());
+        }
+        usize::try_from(queued).map_err(|_| Errno::INVAL)
+    }
+
+    /// Returns the length of the datagram at the head of a UDP socket, or 0
+    /// if none is queued.
+    #[cfg(test)]
+    pub(crate) fn head_datagram_length(&self) -> Result<usize, Errno> {
+        // On a datagram socket, `FIONREAD` reports every queued datagram.
+        match self.receive_datagram_once(RawParts::EMPTY, true) {
+            Ok((length, _)) => Ok(length),
+            Err(Errno::AGAIN) => Ok(0),
+            Err(error) => Err(datagram_error(error)),
+        }
+    }
+
+    /// Takes the socket's pending error, if any.
+    pub(crate) fn take_error(&self) -> Result<Option<Errno>, Errno> {
+        let stashed = self.stashed_error.swap(0, Ordering::Relaxed);
+        if stashed != 0 {
+            self.error_reported.store(true, Ordering::Relaxed);
+            return Ok(Some(Errno(stashed)));
+        }
+        if !self.is_tcp() {
+            return Ok(self
+                .socket()
+                .take_error()?
+                .map(|error| datagram_error(error.into())));
+        }
+        if self.error_reported.load(Ordering::Relaxed) || !self.error_polled()? {
+            return Ok(None);
+        }
+        let error = self.connection_error()?;
+        self.error_reported.store(true, Ordering::Relaxed);
+        Ok(Some(error))
+    }
+
+    /// Reports whether the socket has a pending error, without taking it.
+    pub(crate) fn error_pending(&self) -> Result<bool, Errno> {
+        if self.stashed_error.load(Ordering::Relaxed) != 0 {
+            return Ok(true);
+        }
+        if !self.is_tcp() || self.error_reported.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        self.error_polled()
+    }
+
+    /// Reports whether Winsock reports a TCP connection failed.
+    fn error_polled(&self) -> Result<bool, Errno> {
+        // Winsock reports a failed connect only to a poll for data.
+        let mut sockets = [WSAPOLLFD {
+            fd: self.raw(),
+            events: POLLRDNORM | POLLWRNORM,
+            revents: 0,
+        }];
+        // SAFETY: `sockets` outlives the call, which polls without waiting
+        // and writes only the entries' `revents`.
+        if unsafe { WSAPoll(sockets.as_mut_ptr(), 1, 0) } == SOCKET_ERROR {
+            return Err(Errno::last());
+        }
+        Ok(sockets[0].revents & POLLERR != 0)
+    }
+
+    /// Returns the error of a failed TCP connection.
+    fn connection_error(&self) -> Result<Errno, Errno> {
+        if let Some(error) = self.socket().take_error()? {
+            return Ok(stream_error_code(error.into()));
+        }
+        // Winsock reports a reset to receives rather than in `SO_ERROR`.
+        let (buffers, count) = wsabufs(RawParts::EMPTY)?;
+        match receive_into(self.raw(), &buffers[..count], true, false) {
+            Err(error) if error != Errno::AGAIN => Ok(stream_error_code(error)),
+            _ => Ok(Errno::CONNRESET),
+        }
+    }
+
+    /// Maps the error of a TCP call to the result Linux reports; a receive
+    /// ends the stream where Linux's would.
+    fn stream_error(&self, error: Errno, receiving: bool) -> Result<usize, Errno> {
+        let error = match error {
+            Errno::AGAIN if receiving && self.read_shutdown.load(Ordering::Relaxed) => {
+                return Ok(0);
+            }
+            Errno::AGAIN => {
+                self.rearm();
+                return Err(Errno::AGAIN);
+            }
+            // Winsock fails calls on a pending or failed connect, where Linux
+            // would block or report the failure.
+            Errno::NOTCONN if self.connecting.load(Ordering::Relaxed) => match self.take_error()? {
+                Some(error) => return Err(error),
+                None if !self.error_reported.load(Ordering::Relaxed) => return Err(Errno::AGAIN),
+                // Already reported, which the check below handles.
+                None => Errno::CONNRESET,
+            },
+            error => stream_error_code(error),
+        };
+        if is_connection_error(error) && self.error_reported.swap(true, Ordering::Relaxed) {
+            return if receiving { Ok(0) } else { Err(Errno::PIPE) };
+        }
+        Err(error)
+    }
+
+    /// Has mio report the stream's readiness again, as Linux reports each
+    /// change in it.
+    fn rearm(&self) {
+        if let Source::Tcp(stream) = &self.source {
+            // `try_io` rearms the socket when its closure would block. Failing
+            // to rearm loses events, which the next call that would block
+            // rearms again.
+            let _ = stream.try_io(|| Err::<(), _>(Error::from(ErrorKind::WouldBlock)));
+        }
+    }
+
+    pub(crate) fn set_no_delay(&self, value: bool) -> Result<(), Errno> {
+        Ok(self.socket().set_tcp_nodelay(value)?)
+    }
+
+    pub(crate) fn no_delay(&self) -> Result<bool, Errno> {
+        Ok(self.socket().tcp_nodelay()?)
+    }
+
+    pub(crate) fn set_keep_alive(&self, value: bool) -> Result<(), Errno> {
+        Ok(self.socket().set_keepalive(value)?)
+    }
+
+    pub(crate) fn keep_alive(&self) -> Result<bool, Errno> {
+        Ok(self.socket().keepalive()?)
+    }
+
+    /// Makes closing the socket reset its connection instead of finishing
+    /// it.
+    pub(crate) fn set_linger_zero(&self) -> Result<(), Errno> {
+        Ok(self.socket().set_linger(Some(Duration::ZERO))?)
+    }
+
+    pub(crate) fn set_receive_buffer_size(&self, size: usize) -> Result<(), Errno> {
+        Ok(self.socket().set_recv_buffer_size(size)?)
+    }
+
+    pub(crate) fn receive_buffer_size(&self) -> Result<usize, Errno> {
+        Ok(self.socket().recv_buffer_size()?)
+    }
+}
+
+/// Opens a nonblocking, non-inheritable IPv4 socket.
+fn open(socket_type: Type, protocol: Protocol) -> Result<Socket, Errno> {
+    let socket = Socket::new(Domain::IPV4, socket_type, Some(protocol))?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn raw_socket(socket: &impl AsRawSocket) -> SOCKET {
+    // A `SOCKET` is pointer-sized, which on x86_64 holds every raw socket.
+    socket.as_raw_socket() as SOCKET
+}
+
+/// Sets whether a UDP socket reports the ICMP errors its datagrams cause.
+fn report_connection_resets(socket: SOCKET, report: bool) -> Result<(), Errno> {
+    let value = i32::from(report);
+    let mut returned = 0_u32;
+    // SAFETY: `value` and `returned` outlive the call, which reads only
+    // `value` and writes only `returned`, and the call is not overlapped.
+    let result = unsafe {
+        WSAIoctl(
+            socket,
+            SIO_UDP_CONNRESET,
+            ptr::from_ref(&value).cast(),
+            I32_LENGTH,
+            ptr::null_mut(),
+            0,
+            &raw mut returned,
+            ptr::null_mut(),
+            None,
+        )
+    };
+    if result == SOCKET_ERROR {
+        return Err(Errno::last());
+    }
+    Ok(())
+}
+
+/// Maps a TCP call's error to the one Linux reports.
+const fn stream_error_code(error: Errno) -> Errno {
+    match error {
+        // Winsock reports keep-alive failures this way.
+        Errno::NETRESET => Errno::TIMEDOUT,
+        error => error,
+    }
+}
+
+/// Maps a UDP call's error to the one Linux reports.
+const fn datagram_error(error: Errno) -> Errno {
+    match error {
+        // Winsock reports an ICMP port unreachable as a reset, and an ICMP
+        // time exceeded as a network reset.
+        Errno::CONNRESET => Errno::CONNREFUSED,
+        Errno::NETRESET => Errno::HOSTUNREACH,
+        error => error,
+    }
+}
+
+/// Whether `error` reports that a TCP connection failed.
+const fn is_connection_error(error: Errno) -> bool {
+    matches!(
+        error,
+        Errno::CONNREFUSED
+            | Errno::CONNRESET
+            | Errno::CONNABORTED
+            | Errno::TIMEDOUT
+            | Errno::NETUNREACH
+            | Errno::HOSTUNREACH
+    )
+}
+
+/// Watches host sockets with mio; a [`Waiter`] collects their events.
+pub(crate) struct Poller {
+    registry: Registry,
+    /// Wakes the waiter under [`WAKE_TOKEN`].
+    waker: Waker,
+}
+
+/// Collects a [`Poller`]'s events on the event thread.
+pub(crate) struct Waiter {
+    poll: Poll,
+}
+
+impl Poller {
+    pub(crate) fn new() -> IoResult<(Self, Waiter)> {
+        let poll = Poll::new()?;
+        let registry = poll.registry().try_clone()?;
+        let waker = Waker::new(&registry, Token(token(WAKE_TOKEN)?))?;
+        Ok((Self { registry, waker }, Waiter { poll }))
+    }
+
+    /// Watches `socket` for `interest`, reporting its events under `token`.
+    pub(crate) fn add(
+        &self,
+        socket: &mut HostSocket,
+        token: u64,
+        interest: Interest,
+    ) -> Result<(), Errno> {
+        self.watch(socket, token, interest)
+    }
+
+    /// Replaces the interest a watched `socket` is watched for.
+    pub(crate) fn modify(
+        &self,
+        socket: &mut HostSocket,
+        token: u64,
+        interest: Interest,
+    ) -> Result<(), Errno> {
+        self.watch(socket, token, interest)
+    }
+
+    fn watch(&self, socket: &mut HostSocket, token: u64, interest: Interest) -> Result<(), Errno> {
+        let token = Token(self::token(token)?);
+        let interest = match interest {
+            Interest::Stream
+            | Interest::Oneshot {
+                read: true,
+                write: true,
+            } => Some(mio::Interest::READABLE | mio::Interest::WRITABLE),
+            Interest::Oneshot { read: true, .. } => Some(mio::Interest::READABLE),
+            Interest::Oneshot { write: true, .. } => Some(mio::Interest::WRITABLE),
+            // mio cannot watch a socket for nothing, and not watching it
+            // keeps errors from raising events, which Linux allows.
+            Interest::Oneshot { .. } => None,
+        };
+        let registered = socket.registered;
+        let source = socket.source_mut();
+        match (interest, registered) {
+            (Some(interest), false) => self.registry.register(source, token, interest)?,
+            (Some(interest), true) => self.registry.reregister(source, token, interest)?,
+            (None, true) => self.registry.deregister(source)?,
+            (None, false) => {}
+        }
+        socket.registered = interest.is_some();
+        Ok(())
+    }
+
+    /// Stops watching `socket` before it closes.
+    pub(crate) fn delete(&self, socket: &mut HostSocket) {
+        if socket.registered {
+            let _ = self.registry.deregister(socket.source_mut());
+            socket.registered = false;
+        }
+    }
+
+    /// Wakes the waiter, which reports an event under [`WAKE_TOKEN`].
+    pub(crate) fn wake(&self) -> IoResult<()> {
+        self.waker.wake()
+    }
+}
+
+impl Waiter {
+    /// Waits for events, at most `timeout` if set, and replaces `events`
+    /// with them.
+    pub(crate) fn wait(
+        &mut self,
+        events: &mut Events,
+        timeout: Option<Duration>,
+    ) -> Result<(), Errno> {
+        Ok(self.poll.poll(&mut events.0, timeout)?)
+    }
+
+    /// Consumes the wakes a [`WAKE_TOKEN`] event reported.
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    pub(crate) fn drain_wake(&self) -> Result<(), Errno> {
+        // Each wake is a completion that the wait already consumed.
+        Ok(())
+    }
+}
+
+/// Room for the events one [`Waiter::wait`] reports.
+pub(crate) struct Events(mio::Events);
+
+impl Events {
+    /// Allocates room for `capacity` events.
+    ///
+    /// mio aborts if the allocation fails, so this never returns `None`.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn with_capacity(capacity: usize) -> Option<Self> {
+        Some(Self(mio::Events::with_capacity(capacity)))
+    }
+
+    /// Returns the token and events of each event the last wait reported.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, HostEvents)> + '_ {
+        self.0
+            .iter()
+            .map(|event| (event.token().0 as u64, host_events(event)))
+    }
+}
+
+fn host_events(event: &mio::event::Event) -> HostEvents {
+    let mut events = HostEvents::empty();
+    if event.is_readable() {
+        events |= HostEvents::READABLE;
+    }
+    if event.is_writable() {
+        events |= HostEvents::WRITABLE;
+    }
+    if event.is_read_closed() {
+        events |= HostEvents::READ_CLOSED;
+    }
+    // mio reports a reset or a failed connect as closing the write side,
+    // which Linux reports as a hang-up with an error.
+    if event.is_write_closed() {
+        events |= HostEvents::HANGUP | HostEvents::ERROR;
+    }
+    if event.is_error() {
+        events |= HostEvents::ERROR;
+    }
+    events
+}
+
+fn token(token: u64) -> Result<usize, Errno> {
+    usize::try_from(token).map_err(|_| Errno::INVAL)
+}
+
+/// Maps a socket operation's error to the error the guest observes.
+pub(crate) const fn socket_error_from_errno(error: Errno) -> SocketError {
+    match error {
+        Errno::CONNREFUSED => SocketError::ConnectionRefused,
+        Errno::CONNRESET | Errno::PIPE => SocketError::ConnectionReset,
+        Errno::CONNABORTED => SocketError::ConnectionAborted,
+        Errno::NETUNREACH => SocketError::NetworkUnreachable,
+        Errno::HOSTUNREACH => SocketError::HostUnreachable,
+        Errno::TIMEDOUT => SocketError::TimedOut,
+        Errno::ADDRINUSE => SocketError::AddressInUse,
+        Errno::ADDRNOTAVAIL => SocketError::AddressNotAvailable,
+        Errno::NOTCONN => SocketError::NotConnected,
+        Errno::INVAL => SocketError::InvalidArgument,
+        _ => SocketError::Other,
+    }
+}
+
+/// Maps an error that reports the host out of a resource to the broker's.
+pub(crate) const fn broker_resource_error_from_errno(error: Errno) -> Option<BrokerError> {
+    match error {
+        Errno::NOMEM | Errno::OUTOFMEMORY => Some(BrokerError::OutOfMemory),
+        Errno::MFILE | Errno::NOBUFS => Some(BrokerError::ResourceExhausted),
+        _ => None,
+    }
+}
+
+/// Sends `data` on `socket` with one system call, to `destination` if set,
+/// and returns how many bytes it sent.
+fn send_parts(
+    socket: SOCKET,
+    data: RawParts<'_>,
+    destination: Option<SocketAddrV4>,
+) -> Result<usize, Errno> {
+    let (buffers, count) = wsabufs(data)?;
+    let count = u32::try_from(count).map_err(|_| Errno::INVAL)?;
+    let mut sent = 0_u32;
+    let result = if let Some(destination) = destination {
+        let address = sockaddr_in(destination);
+        // SAFETY: `buffers`, `sent` and `address` outlive the call, which is
+        // not overlapped. Each of the first `count` buffers covers raw bytes
+        // that are readable for the call and that Winsock reads without Rust
+        // references to them.
+        unsafe {
+            WSASendTo(
+                socket,
+                buffers.as_ptr(),
+                count,
+                &raw mut sent,
+                0,
+                ptr::from_ref(&address).cast(),
+                SOCKADDR_IN_LENGTH,
+                ptr::null_mut(),
+                None,
+            )
+        }
+    } else {
+        // SAFETY: `buffers` and `sent` outlive the call, which is not
+        // overlapped. Each of the first `count` buffers covers raw bytes that
+        // are readable for the call and that Winsock reads without Rust
+        // references to them.
+        unsafe {
+            WSASend(
+                socket,
+                buffers.as_ptr(),
+                count,
+                &raw mut sent,
+                0,
+                ptr::null_mut(),
+                None,
+            )
+        }
+    };
+    if result == SOCKET_ERROR {
+        return Err(Errno::last());
+    }
+    usize::try_from(sent).map_err(|_| Errno::INVAL)
+}
+
+/// Receives into `buffers` from `socket` with one system call, leaving the
+/// data queued with `peek`.
+///
+/// Returns how many bytes it received and, with `with_source`, the source
+/// address, if IPv4.
+fn receive_into(
+    socket: SOCKET,
+    buffers: &[WSABUF],
+    peek: bool,
+    with_source: bool,
+) -> Result<(usize, Option<SocketAddrV4>), Errno> {
+    let count = u32::try_from(buffers.len()).map_err(|_| Errno::INVAL)?;
+    let mut flags = if peek { PEEK } else { 0 };
+    let mut received = 0_u32;
+    let mut address = SOCKADDR_IN {
+        sin_family: 0,
+        sin_port: 0,
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 { S_addr: 0 },
+        },
+        sin_zero: [0; 8],
+    };
+    let mut address_length = SOCKADDR_IN_LENGTH;
+    let result = if with_source {
+        // SAFETY: `buffers`, `received`, `flags`, `address` and
+        // `address_length` outlive the call, which is not overlapped and
+        // writes at most `address_length` bytes of `address`. Each buffer
+        // covers raw bytes that are writable for the call and that Winsock
+        // fills without Rust references to them.
+        unsafe {
+            WSARecvFrom(
+                socket,
+                buffers.as_ptr(),
+                count,
+                &raw mut received,
+                &raw mut flags,
+                ptr::from_mut(&mut address).cast(),
+                &raw mut address_length,
+                ptr::null_mut(),
+                None,
+            )
+        }
+    } else {
+        // SAFETY: `buffers`, `received` and `flags` outlive the call, which
+        // is not overlapped. Each buffer covers raw bytes that are writable
+        // for the call and that Winsock fills without Rust references to
+        // them.
+        unsafe {
+            WSARecv(
+                socket,
+                buffers.as_ptr(),
+                count,
+                &raw mut received,
+                &raw mut flags,
+                ptr::null_mut(),
+                None,
+            )
+        }
+    };
+    if result == SOCKET_ERROR {
+        return Err(Errno::last());
+    }
+    let received = usize::try_from(received).map_err(|_| Errno::INVAL)?;
+    let source =
+        (with_source && address_length == SOCKADDR_IN_LENGTH && address.sin_family == AF_INET)
+            .then(|| {
+                // SAFETY: Every field of the address union is plain bytes, so
+                // any value of it is a valid `S_addr`.
+                let host = unsafe { address.sin_addr.S_un.S_addr };
+                SocketAddrV4::new(
+                    Ipv4Addr::from(host.to_ne_bytes()),
+                    u16::from_be(address.sin_port),
+                )
+            });
+    Ok((received, source))
+}
+
+/// Returns a buffer for each of `parts`, or one empty buffer if there are
+/// none, followed by empty ones, and how many it filled in.
+fn wsabufs(parts: RawParts<'_>) -> Result<([WSABUF; MAX_RAW_PARTS], usize), Errno> {
+    let mut buffers = [wsabuf(NonNull::dangling().as_ptr(), 0)?; MAX_RAW_PARTS];
+    for (buffer, part) in buffers.iter_mut().zip(parts.parts()) {
+        *buffer = wsabuf(part.as_ptr(), part.len())?;
+    }
+    Ok((buffers, parts.parts().len().max(1)))
+}
+
+fn wsabuf(bytes: *mut u8, length: usize) -> Result<WSABUF, Errno> {
+    Ok(WSABUF {
+        len: u32::try_from(length).map_err(|_| Errno::INVAL)?,
+        buf: bytes,
+    })
+}
+
+#[allow(clippy::cast_sign_loss)]
+const PEEK: u32 = MSG_PEEK as u32;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+const SOCKADDR_IN_LENGTH: i32 = size_of::<SOCKADDR_IN>() as i32;
+
+#[allow(clippy::cast_possible_truncation)]
+const I32_LENGTH: u32 = size_of::<i32>() as u32;
+
+fn sockaddr_in(address: SocketAddrV4) -> SOCKADDR_IN {
+    SOCKADDR_IN {
+        sin_family: AF_INET,
+        sin_port: address.port().to_be(),
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 {
+                S_addr: u32::from_ne_bytes(address.ip().octets()),
+            },
+        },
+        sin_zero: [0; 8],
+    }
+}

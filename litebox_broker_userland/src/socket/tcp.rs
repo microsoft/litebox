@@ -22,7 +22,7 @@ use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::RawBytes;
 
 use super::direct::RawParts;
-use super::sys::{Errno, HostEvents, HostSocket, Interest, ReceiveMode};
+use super::sys::{self, Errno, HostEvents, HostSocket, Interest, ReceiveMode};
 use super::{
     HookPoint, SocketEntry, SocketInbox, SocketKind, SocketState, SocketTransportState, Topology,
     UserlandSocket, broker_error_from_errno, can_consume_synchronous_error, lock,
@@ -811,6 +811,11 @@ fn receive_socket(
                 tcp.peek_waitall_threshold
                     .map_or(peek_length, |threshold| threshold.min(peek_length)),
             );
+            // The host reports no arrival while data is queued, so the event
+            // thread polls until the peek's data arrives.
+            if !sys::REPORTS_EVERY_ARRIVAL && tcp.descriptor.is_external() {
+                socket.core().posted.post(socket.id());
+            }
             return Err(BrokerError::WouldBlock);
         }
     }
@@ -1064,17 +1069,24 @@ fn shutdown_tcp_stream(
     Ok(SocketOutcome::Completed(()))
 }
 
+/// Applies host `events` to the socket.
+///
+/// Returns whether the event thread should apply an empty event soon,
+/// because a peek waits for more data than the socket holds and its host
+/// does not report each arrival.
 pub(super) fn handle_socket_event(
     socket: &mut SocketEntry<'_>,
     events: HostEvents,
-) -> BrokerResult<()> {
+) -> BrokerResult<bool> {
     // An internal endpoint's wakeups carry no events; its stream's state is
     // the source of truth.
-    let events = match &socket.tcp_state()?.descriptor {
-        TcpDescriptor::Internal(end) => stream_events(end),
-        _ => events,
+    let (events, polled) = match &socket.tcp_state()?.descriptor {
+        TcpDescriptor::Internal(end) => (stream_events(end), false),
+        TcpDescriptor::ExternalInet(_) => (events, !sys::REPORTS_EVERY_ARRIVAL),
+        TcpDescriptor::Unrealized => (events, false),
     };
-    let republish_readiness = if events.contains(HostEvents::READABLE)
+    let (republish_readiness, threshold_pending) = if (polled
+        || events.contains(HostEvents::READABLE))
         && let Some(threshold) = socket
             .tcp_state()
             .ok()
@@ -1088,9 +1100,9 @@ pub(super) fn handle_socket_event(
         if threshold_reached {
             socket.tcp_state_mut()?.peek_waitall_threshold = None;
         }
-        threshold_reached
+        (threshold_reached, !threshold_reached)
     } else {
-        false
+        (false, false)
     };
     match socket.connection_status {
         SocketConnectionStatus::Connecting => {
@@ -1110,7 +1122,16 @@ pub(super) fn handle_socket_event(
     if republish_readiness {
         socket.inbox().republish();
     }
-    Ok(())
+    Ok(polled && threshold_pending && !peek_waitall_ended(socket))
+}
+
+/// Whether a socket's peek waiting for data can no longer receive more.
+fn peek_waitall_ended(socket: &SocketEntry<'_>) -> bool {
+    let readiness = socket.own();
+    socket.connection_status != SocketConnectionStatus::Connected
+        || socket.read_shutdown
+        || readiness.contains(ReadinessFlags::HANGUP)
+        || readiness.contains(ReadinessFlags::ERROR)
 }
 
 fn complete_connect(socket: &mut SocketEntry<'_>, events: HostEvents) -> BrokerResult<()> {

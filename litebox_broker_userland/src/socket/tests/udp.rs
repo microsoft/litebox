@@ -2321,6 +2321,9 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
 
 /// A native error that a receive consumes after the event thread harvested
 /// its event is not reported again, and the endpoint keeps rearming.
+// Windows queues the ICMP error behind the queued datagram, so the receive
+// this test races with the event returns the datagram instead.
+#[cfg(target_os = "linux")]
 #[test]
 fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
     let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());

@@ -216,6 +216,9 @@ enum Dispatch {
     Applied,
     /// The socket was busy; the event is retried after the batch.
     Deferred,
+    /// The socket waits for data its host does not report; an empty event
+    /// is retried after the batch.
+    Polled,
     /// The socket is gone or closed.
     Dropped,
 }
@@ -545,7 +548,12 @@ impl ProviderCore {
         };
         drop(socket);
         let outcome = outcome.map_err(EventFailure::Broker)?;
-        if outcome == Dispatch::Deferred {
+        let retry = match outcome {
+            Dispatch::Deferred => Some(flags),
+            Dispatch::Polled => Some(HostEvents::empty()),
+            Dispatch::Applied | Dispatch::Dropped => None,
+        };
+        if let Some(flags) = retry {
             deferred
                 .try_reserve(1)
                 .map_err(|_| EventFailure::Broker(BrokerError::OutOfMemory))?;
@@ -759,7 +767,9 @@ impl UserlandSocket {
             flags.remove(HostEvents::ERROR);
         }
         if token & UDP_EVENT_TOKEN_FLAG == 0 {
-            handle_socket_event(&mut socket, flags)?;
+            if handle_socket_event(&mut socket, flags)? {
+                return Ok(Dispatch::Polled);
+            }
         } else {
             socket.handle_udp_endpoint_event(token, flags)?;
         }

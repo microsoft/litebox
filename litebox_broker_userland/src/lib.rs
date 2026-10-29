@@ -27,7 +27,7 @@ pub mod readiness;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod runner;
 pub mod runtime;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod socket;
 
 pub mod random;
