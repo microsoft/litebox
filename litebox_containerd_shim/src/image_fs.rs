@@ -20,7 +20,7 @@ use litebox_broker_core::fs::backend::{
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::{DirEntry, FileStatus, Mode, OFlags};
@@ -208,6 +208,18 @@ impl Backend for ImageFs {
     ) -> Result<FileHandle, OpenError> {
         self.inner
             .create_file_at(dir.into_typed::<Self>().inner, name, metadata)
+    }
+
+    fn symlink_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _target: &str,
+        _metadata: CreationMetadata,
+    ) -> Result<(), SymlinkError> {
+        // Path-based serving assumes guests create no host symlinks; `LocalFs` does not support
+        // them either.
+        Err(SymlinkError::NotSupported)
     }
 
     fn mkdir_at(
