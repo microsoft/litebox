@@ -25,7 +25,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     let Some(native_ip) = native_ip else {
         return;
     };
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let socket_policy = SocketPolicy::guest_network()
         .with_udp_destination_rules(&[
             DestinationRule::new(
@@ -124,7 +124,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
 
 #[test]
 fn connected_udp_gateway_preserves_guest_visible_mapping() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -181,7 +181,7 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
 /// own raw parts, keeping datagrams whole.
 #[test]
 fn external_udp_transfers_use_raw_parts() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -221,7 +221,7 @@ fn external_udp_transfers_use_raw_parts() {
 /// own raw parts, keeping datagrams whole.
 #[test]
 fn internal_udp_transfers_use_raw_parts() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -260,7 +260,7 @@ fn internal_udp_transfers_use_raw_parts() {
 
 #[test]
 fn unmatched_guest_udp_destinations_are_port_unreachable() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -344,7 +344,7 @@ fn unmatched_guest_udp_destinations_are_port_unreachable() {
 
 #[test]
 fn udp_status_republishes_when_another_error_remains_pending() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -396,7 +396,7 @@ fn udp_status_republishes_when_another_error_remains_pending() {
 
 #[test]
 fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -487,7 +487,7 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
 
 #[test]
 fn udp_external_peer_authorization_is_bounded_without_eviction() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -565,7 +565,7 @@ fn provider_preserves_udp_datagram_semantics() {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     server.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let server_address = gateway_address(socket_address_v4(server.local_addr().unwrap()));
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let socket_policy = SocketPolicy::deny()
         .with_udp_destination_rules(&[
             DestinationRule::new(
@@ -935,7 +935,7 @@ fn provider_preserves_udp_datagram_semantics() {
 
 #[test]
 fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -1199,7 +1199,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
 
 #[test]
 fn udp_exact_bindings_coexist_and_wildcard_covers_guest_addresses() {
-    let provider = Arc::new(LinuxSocketProvider::new(8, 5).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(8, 5).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1387,7 +1387,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_guest_addresses() {
 
 #[test]
 fn udp_native_endpoint_is_reused_and_retired() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -1452,7 +1452,7 @@ fn udp_native_endpoint_is_reused_and_retired() {
 
 #[test]
 fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -1490,7 +1490,7 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
 
 #[test]
 fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
-    let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(5, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1597,7 +1597,7 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
 
 #[test]
 fn udp_queued_datagrams_survive_source_process_teardown() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(3, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1734,7 +1734,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
 
 #[test]
 fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1896,7 +1896,7 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
 
 #[test]
 fn connected_guest_udp_filters_other_wildcard_peer_aliases() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1989,7 +1989,7 @@ fn connected_guest_udp_filters_other_wildcard_peer_aliases() {
 
 #[test]
 fn wildcard_udp_reconnect_updates_guest_source_identity() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(3, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2063,7 +2063,7 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
     let external = UdpSocket::bind((local_ip, 0)).unwrap();
     external.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let external_address = socket_address_v4(external.local_addr().unwrap());
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 2).unwrap());
     let policy = SocketPolicy::deny()
         .with_udp_destination_rules(&[
             DestinationRule::new(
@@ -2186,7 +2186,7 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
 
 #[test]
 fn internally_connected_udp_drains_external_datagrams_without_delivering_them() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -2269,7 +2269,7 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
     assert_eq!(&contact, b"contact");
     assert_eq!(provider.core.udp_native_endpoint_count(), 1);
     let sentinel = b"sentinel";
-    // Queue the datagrams while the call holds the socket, so the epoll
+    // Queue the datagrams while the call holds the socket, so the event
     // thread cannot drain them first.
     assert_eq!(
         provider
@@ -2319,11 +2319,11 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
     assert_eq!(&payload, b"ok");
 }
 
-/// A native error that a receive consumes after the epoll thread harvested
+/// A native error that a receive consumes after the event thread harvested
 /// its event is not reported again, and the endpoint keeps rearming.
 #[test]
 fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_udp_policy()),
@@ -2425,7 +2425,7 @@ fn udp_error_consumed_before_its_event_is_applied_is_not_reported() {
 /// zero.
 #[test]
 fn guest_udp_send_racing_receive_and_close_releases_all_accounting() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2547,7 +2547,7 @@ fn receive_datagram(
 fn many_guest_udp_pairs_exchange_datagrams_in_parallel() {
     const PAIRS: u16 = 8;
     const ROUNDS: u8 = 64;
-    let provider = Arc::new(LinuxSocketProvider::new(2 * usize::from(PAIRS), 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2 * usize::from(PAIRS), 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),

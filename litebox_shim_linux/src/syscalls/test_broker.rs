@@ -140,7 +140,7 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
             .build()
             .expect("the test filesystem must be valid");
         #[cfg(target_os = "linux")]
-        let socket_provider = litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
+        let socket_provider = litebox_broker_userland::socket::UserlandSocketProvider::new(
             limits.max_sockets,
             limits.max_sockets_per_process,
         )

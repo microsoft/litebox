@@ -1,13 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux TCP socket state and transport-specific helpers.
+//! TCP socket state and transport-specific helpers.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddrV4;
-use std::os::fd::OwnedFd;
+use std::net::{Shutdown, SocketAddrV4};
 use std::sync::Arc;
-use std::time::Duration;
 
 use litebox_broker_core::socket::stream::{StreamEnd, StreamError, stream_pair};
 use litebox_broker_core::socket::{
@@ -22,18 +20,12 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::RawBytes;
-use rustix::event::epoll;
-use rustix::io::{Errno, ioctl_fionread};
-use rustix::net::ipproto;
-use rustix::net::{
-    RecvFlags as LinuxRecvFlags, SendFlags as LinuxSendFlags, Shutdown as LinuxShutdown,
-    SocketFlags as LinuxSocketFlags, connect, shutdown, socket_with, sockopt,
-};
 
-use super::direct::{RawParts, receive_parts, send_parts};
+use super::direct::RawParts;
+use super::sys::{Errno, HostEvents, HostSocket, Interest, ReceiveMode};
 use super::{
-    HookPoint, LinuxSocket, SocketEntry, SocketInbox, SocketKind, SocketState,
-    SocketTransportState, Topology, broker_error_from_errno, can_consume_synchronous_error, lock,
+    HookPoint, SocketEntry, SocketInbox, SocketKind, SocketState, SocketTransportState, Topology,
+    UserlandSocket, broker_error_from_errno, can_consume_synchronous_error, lock,
     republish_own_readiness, set_own_readiness, socket_error_from_errno,
     socket_operation_error_from_errno, take_socket_error, zeroed_vec,
 };
@@ -150,14 +142,22 @@ struct TcpOptions {
 
 pub(super) enum TcpDescriptor {
     Unrealized,
-    ExternalInet(OwnedFd),
+    ExternalInet(HostSocket),
     /// This socket's end of an internal connection.
     Internal(StreamEnd),
 }
 
 impl TcpDescriptor {
     /// Returns an external connection's host socket.
-    pub(super) fn socket(&self) -> BrokerResult<&OwnedFd> {
+    pub(super) fn socket(&self) -> BrokerResult<&HostSocket> {
+        match self {
+            Self::ExternalInet(socket) => Ok(socket),
+            Self::Internal(_) | Self::Unrealized => Err(BrokerError::Internal),
+        }
+    }
+
+    /// Returns an external connection's host socket for the poller.
+    fn socket_mut(&mut self) -> BrokerResult<&mut HostSocket> {
         match self {
             Self::ExternalInet(socket) => Ok(socket),
             Self::Internal(_) | Self::Unrealized => Err(BrokerError::Internal),
@@ -175,9 +175,7 @@ impl TcpDescriptor {
     /// Returns how many bytes a receive could take now.
     pub(super) fn queued_bytes(&self) -> BrokerResult<usize> {
         match self {
-            Self::ExternalInet(socket) => ioctl_fionread(socket)
-                .map_err(broker_error_from_errno)
-                .and_then(|queued| usize::try_from(queued).map_err(|_| BrokerError::Internal)),
+            Self::ExternalInet(socket) => socket.queued_bytes().map_err(broker_error_from_errno),
             Self::Internal(end) => Ok(end.available()),
             Self::Unrealized => Err(BrokerError::Internal),
         }
@@ -189,27 +187,22 @@ impl TcpDescriptor {
     /// kinds of connection share their error handling.
     fn send(&self, data: RawParts<'_>) -> BrokerResult<Result<usize, Errno>> {
         match self {
-            Self::ExternalInet(socket) => {
-                Ok(send_parts(socket, data, None, LinuxSendFlags::NOSIGNAL))
-            }
+            Self::ExternalInet(socket) => Ok(socket.send(data, None)),
             Self::Internal(end) => errno_from_stream(end.write(data.parts())),
             Self::Unrealized => Err(BrokerError::Internal),
         }
     }
 
-    /// Receives into `output` without blocking, keeping the data with `PEEK`.
+    /// Receives into `output` without blocking, keeping the data if `mode`
+    /// peeks.
     fn receive(
         &self,
         output: RawParts<'_>,
-        flags: LinuxRecvFlags,
+        mode: ReceiveMode,
     ) -> BrokerResult<Result<usize, Errno>> {
         match self {
-            Self::ExternalInet(socket) => {
-                Ok(receive_parts(socket, output, flags).map(|(received, _)| received))
-            }
-            Self::Internal(end) if flags.contains(LinuxRecvFlags::PEEK) => {
-                errno_from_stream(end.peek(output.parts()))
-            }
+            Self::ExternalInet(socket) => Ok(socket.receive(output, mode)),
+            Self::Internal(end) if mode.is_peek() => errno_from_stream(end.peek(output.parts())),
             Self::Internal(end) => errno_from_stream(end.read(output.parts())),
             Self::Unrealized => Err(BrokerError::Internal),
         }
@@ -226,21 +219,21 @@ fn errno_from_stream(result: Result<usize, StreamError>) -> BrokerResult<Result<
     }
 }
 
-/// Synthesizes the epoll events an internal endpoint's stream would raise.
-fn stream_events(end: &StreamEnd) -> epoll::EventFlags {
+/// Synthesizes the host events an internal endpoint's stream would raise.
+fn stream_events(end: &StreamEnd) -> HostEvents {
     let readiness = end.readiness();
-    let mut events = epoll::EventFlags::empty();
+    let mut events = HostEvents::empty();
     if readiness.readable {
-        events |= epoll::EventFlags::IN;
+        events |= HostEvents::READABLE;
     }
     if readiness.writable {
-        events |= epoll::EventFlags::OUT;
+        events |= HostEvents::WRITABLE;
     }
     if readiness.peer_finished {
-        events |= epoll::EventFlags::RDHUP;
+        events |= HostEvents::READ_CLOSED;
     }
     if readiness.peer_closed {
-        events |= epoll::EventFlags::HUP;
+        events |= HostEvents::HANGUP;
     }
     events
 }
@@ -351,28 +344,27 @@ impl TcpBindings {
     }
 }
 
-fn readiness_from_epoll(socket: &SocketEntry<'_>, events: epoll::EventFlags) -> ReadinessFlags {
+fn readiness_from_events(socket: &SocketEntry<'_>, events: HostEvents) -> ReadinessFlags {
     let mut readiness = ReadinessFlags::default();
-    if events.contains(epoll::EventFlags::IN) {
+    if events.contains(HostEvents::READABLE) {
         readiness = readiness | ReadinessFlags::READ;
     }
-    if events.contains(epoll::EventFlags::OUT) && !socket.write_shutdown {
+    if events.contains(HostEvents::WRITABLE) && !socket.write_shutdown {
         readiness = readiness | ReadinessFlags::WRITE;
     }
-    if !socket.read_shutdown && events.intersects(epoll::EventFlags::RDHUP | epoll::EventFlags::HUP)
-    {
+    if !socket.read_shutdown && events.intersects(HostEvents::READ_CLOSED | HostEvents::HANGUP) {
         readiness = readiness | ReadinessFlags::READ | ReadinessFlags::HANGUP;
     }
     // A host hang-up closes both directions of an external connection, but on
     // an internal endpoint it only reports that the peer closed.
-    if events.contains(epoll::EventFlags::HUP)
+    if events.contains(HostEvents::HANGUP)
         && socket
             .tcp_state()
             .is_ok_and(|tcp| tcp.descriptor.is_external())
     {
         readiness = readiness | ReadinessFlags::CLOSED;
     }
-    if events.contains(epoll::EventFlags::ERR) {
+    if events.contains(HostEvents::ERROR) {
         readiness = readiness | ReadinessFlags::ERROR;
     }
     let previous = socket.own();
@@ -387,15 +379,6 @@ fn with_tcp_closed(socket: &SocketEntry<'_>, readiness: ReadinessFlags) -> Readi
     } else {
         readiness
     }
-}
-
-fn active_epoll_events() -> epoll::EventFlags {
-    // Cached readiness turns these edge-triggered kernel events into the
-    // level-triggered snapshots consumed by the broker protocol.
-    epoll::EventFlags::IN
-        | epoll::EventFlags::OUT
-        | epoll::EventFlags::RDHUP
-        | epoll::EventFlags::ET
 }
 
 fn add_readiness(socket: &SocketEntry<'_>, readiness: ReadinessFlags) {
@@ -813,7 +796,7 @@ fn receive_socket(
             return Err(BrokerError::UnsupportedOperation);
         }
         socket.tcp_state_mut()?.peek_cache = None;
-        return receive_socket_once(socket, output, LinuxRecvFlags::empty());
+        return receive_socket_once(socket, output, ReceiveMode::Read);
     }
 
     let peek_end = validate_peek_window(length, peek_offset, peek_length)?;
@@ -831,14 +814,14 @@ fn receive_socket(
             return Err(BrokerError::WouldBlock);
         }
     }
-    let peek_flags = if flags.contains(ReceiveFlags::WAITALL) {
-        LinuxRecvFlags::PEEK | LinuxRecvFlags::WAITALL
+    let peek_mode = if flags.contains(ReceiveFlags::WAITALL) {
+        ReceiveMode::PeekAll
     } else {
-        LinuxRecvFlags::PEEK
+        ReceiveMode::Peek
     };
     if single_window_peek(length, peek_offset, peek_length) {
         socket.tcp_state_mut()?.peek_cache = None;
-        return receive_socket_once(socket, output, peek_flags);
+        return receive_socket_once(socket, output, peek_mode);
     }
 
     let refresh_exhausted_cache = match socket.tcp_state()?.peek_cache.as_ref() {
@@ -862,7 +845,7 @@ fn receive_socket(
             zeroed_vec(peek_length)?
         };
         let part = [RawBytes::from(data.as_mut_slice())];
-        match receive_socket_once(socket, RawParts::from(&part), peek_flags)? {
+        match receive_socket_once(socket, RawParts::from(&part), peek_mode)? {
             ReceiveOutcome::Received(received) => {
                 data.truncate(received);
                 socket.tcp_state_mut()?.peek_cache = Some(PeekCache {
@@ -907,11 +890,11 @@ fn receive_socket(
 fn receive_socket_once(
     socket: &mut SocketEntry<'_>,
     output: RawParts<'_>,
-    flags: LinuxRecvFlags,
+    mode: ReceiveMode,
 ) -> BrokerResult<ReceiveOutcome> {
     socket.core().hook(HookPoint::Receiving(socket.id()));
     loop {
-        match socket.tcp_state()?.descriptor.receive(output, flags)? {
+        match socket.tcp_state()?.descriptor.receive(output, mode)? {
             Ok(0) => {
                 if take_late_guest_reset(socket)? {
                     return Ok(ReceiveOutcome::Failed(SocketError::ConnectionReset));
@@ -929,7 +912,7 @@ fn receive_socket_once(
                 confirm_tcp_connected(socket);
                 let terminal_readable =
                     socket.read_shutdown || socket.own().contains(ReadinessFlags::HANGUP);
-                if !flags.contains(LinuxRecvFlags::PEEK) && !terminal_readable {
+                if !mode.is_peek() && !terminal_readable {
                     let no_queued_data = socket
                         .tcp_state()?
                         .descriptor
@@ -960,9 +943,13 @@ fn receive_socket_once(
     }
 }
 
-fn apply_tcp_options(socket: &OwnedFd, options: TcpOptions) -> BrokerResult<()> {
-    sockopt::set_tcp_nodelay(socket, options.no_delay).map_err(broker_error_from_errno)?;
-    sockopt::set_socket_keepalive(socket, options.keep_alive).map_err(broker_error_from_errno)
+fn apply_tcp_options(socket: &HostSocket, options: TcpOptions) -> BrokerResult<()> {
+    socket
+        .set_no_delay(options.no_delay)
+        .map_err(broker_error_from_errno)?;
+    socket
+        .set_keep_alive(options.keep_alive)
+        .map_err(broker_error_from_errno)
 }
 
 fn shutdown_tcp_stream(
@@ -971,11 +958,12 @@ fn shutdown_tcp_stream(
 ) -> BrokerResult<SocketOutcome<()>> {
     if mode == ShutdownMode::Abort {
         if socket.tcp_state()?.descriptor.is_external() {
-            sockopt::set_socket_linger(
-                socket.tcp_state()?.descriptor.socket()?,
-                Some(Duration::ZERO),
-            )
-            .map_err(broker_error_from_errno)?;
+            socket
+                .tcp_state()?
+                .descriptor
+                .socket()?
+                .set_linger_zero()
+                .map_err(broker_error_from_errno)?;
         }
         socket.tcp_state_mut()?.abortive_close = true;
         return Ok(SocketOutcome::Completed(()));
@@ -1017,13 +1005,18 @@ fn shutdown_tcp_stream(
             end.finish();
         }
     } else {
-        let kernel_shutdown = match (shuts_down_read, shuts_down_write) {
-            (true, true) => LinuxShutdown::Both,
-            (true, false) => LinuxShutdown::Read,
-            (false, _) => LinuxShutdown::Write,
+        let host_shutdown = match (shuts_down_read, shuts_down_write) {
+            (true, true) => Shutdown::Both,
+            (true, false) => Shutdown::Read,
+            (false, _) => Shutdown::Write,
         };
         loop {
-            match shutdown(socket.tcp_state()?.descriptor.socket()?, kernel_shutdown) {
+            match socket
+                .tcp_state()?
+                .descriptor
+                .socket()?
+                .shutdown(host_shutdown)
+            {
                 Ok(()) => break,
                 Err(Errno::INTR) => {}
                 Err(Errno::NOTCONN) => {
@@ -1042,7 +1035,11 @@ fn shutdown_tcp_stream(
     // so the caller observes it.
     if socket.connection_status == SocketConnectionStatus::Connecting
         && socket.tcp_state()?.descriptor.is_external()
-        && let Err(error) = sockopt::socket_error(socket.tcp_state()?.descriptor.socket()?)
+        && let Some(error) = socket
+            .tcp_state()?
+            .descriptor
+            .socket()?
+            .take_error()
             .map_err(broker_error_from_errno)?
     {
         socket.connection_status = SocketConnectionStatus::Failed(socket_error_from_errno(error));
@@ -1069,7 +1066,7 @@ fn shutdown_tcp_stream(
 
 pub(super) fn handle_socket_event(
     socket: &mut SocketEntry<'_>,
-    events: epoll::EventFlags,
+    events: HostEvents,
 ) -> BrokerResult<()> {
     // An internal endpoint's wakeups carry no events; its stream's state is
     // the source of truth.
@@ -1077,7 +1074,7 @@ pub(super) fn handle_socket_event(
         TcpDescriptor::Internal(end) => stream_events(end),
         _ => events,
     };
-    let republish_readiness = if events.contains(epoll::EventFlags::IN)
+    let republish_readiness = if events.contains(HostEvents::READABLE)
         && let Some(threshold) = socket
             .tcp_state()
             .ok()
@@ -1100,7 +1097,7 @@ pub(super) fn handle_socket_event(
             complete_connect(socket, events)?;
         }
         SocketConnectionStatus::Connected => {
-            set_own_readiness(socket, readiness_from_epoll(socket, events));
+            set_own_readiness(socket, readiness_from_events(socket, events));
         }
         SocketConnectionStatus::Failed(SocketError::NotConnected) if socket.read_shutdown => {
             set_own_readiness(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
@@ -1116,18 +1113,18 @@ pub(super) fn handle_socket_event(
     Ok(())
 }
 
-fn complete_connect(socket: &mut SocketEntry<'_>, events: epoll::EventFlags) -> BrokerResult<()> {
+fn complete_connect(socket: &mut SocketEntry<'_>, events: HostEvents) -> BrokerResult<()> {
     if !socket.tcp_state()?.descriptor.is_external() {
         return Err(BrokerError::Internal);
     }
-    let status = match sockopt::socket_error(socket.tcp_state()?.descriptor.socket()?) {
-        Ok(Ok(())) if events.contains(epoll::EventFlags::OUT) => SocketConnectionStatus::Connected,
-        Ok(Ok(())) => SocketConnectionStatus::Connecting,
-        Ok(Err(error)) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
+    let status = match socket.tcp_state()?.descriptor.socket()?.take_error() {
+        Ok(None) if events.contains(HostEvents::WRITABLE) => SocketConnectionStatus::Connected,
+        Ok(None) => SocketConnectionStatus::Connecting,
+        Ok(Some(error)) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
         Err(error) => return Err(broker_error_from_errno(error)),
     };
     let readiness = match status {
-        SocketConnectionStatus::Connected => readiness_from_epoll(socket, events),
+        SocketConnectionStatus::Connected => readiness_from_events(socket, events),
         SocketConnectionStatus::Connecting => ReadinessFlags::default(),
         SocketConnectionStatus::Failed(_) => ReadinessFlags::ERROR,
         _ => return Err(BrokerError::Internal),
@@ -1240,14 +1237,20 @@ impl SocketEntry<'_> {
         match value {
             SocketOptionValue::NoDelay(value) => {
                 if self.tcp_state()?.descriptor.is_external() {
-                    sockopt::set_tcp_nodelay(self.tcp_state()?.descriptor.socket()?, value)
+                    self.tcp_state()?
+                        .descriptor
+                        .socket()?
+                        .set_no_delay(value)
                         .map_err(broker_error_from_errno)?;
                 }
                 self.tcp_state_mut()?.options.no_delay = value;
             }
             SocketOptionValue::KeepAlive(value) => {
                 if self.tcp_state()?.descriptor.is_external() {
-                    sockopt::set_socket_keepalive(self.tcp_state()?.descriptor.socket()?, value)
+                    self.tcp_state()?
+                        .descriptor
+                        .socket()?
+                        .set_keep_alive(value)
                         .map_err(broker_error_from_errno)?;
                 }
                 self.tcp_state_mut()?.options.keep_alive = value;
@@ -1265,19 +1268,23 @@ impl SocketEntry<'_> {
             return Err(BrokerError::UnsupportedOperation);
         }
         match name {
-            SocketOptionName::NoDelay if self.tcp_state()?.descriptor.is_external() => {
-                sockopt::tcp_nodelay(self.tcp_state()?.descriptor.socket()?)
-                    .map(SocketOptionValue::NoDelay)
-                    .map_err(broker_error_from_errno)
-            }
+            SocketOptionName::NoDelay if self.tcp_state()?.descriptor.is_external() => self
+                .tcp_state()?
+                .descriptor
+                .socket()?
+                .no_delay()
+                .map(SocketOptionValue::NoDelay)
+                .map_err(broker_error_from_errno),
             SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(
                 self.tcp_state()?.options.no_delay,
             )),
-            SocketOptionName::KeepAlive if self.tcp_state()?.descriptor.is_external() => {
-                sockopt::socket_keepalive(self.tcp_state()?.descriptor.socket()?)
-                    .map(SocketOptionValue::KeepAlive)
-                    .map_err(broker_error_from_errno)
-            }
+            SocketOptionName::KeepAlive if self.tcp_state()?.descriptor.is_external() => self
+                .tcp_state()?
+                .descriptor
+                .socket()?
+                .keep_alive()
+                .map(SocketOptionValue::KeepAlive)
+                .map_err(broker_error_from_errno),
             SocketOptionName::KeepAlive => Ok(SocketOptionValue::KeepAlive(
                 self.tcp_state()?.options.keep_alive,
             )),
@@ -1414,13 +1421,8 @@ impl SocketEntry<'_> {
         if !unrealized {
             return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
         }
-        let external_socket = socket_with(
-            rustix::net::AddressFamily::INET,
-            rustix::net::SocketType::STREAM,
-            LinuxSocketFlags::CLOEXEC | LinuxSocketFlags::NONBLOCK,
-            Some(ipproto::TCP),
-        )
-        .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
+        let external_socket = HostSocket::tcp()
+            .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
         apply_tcp_options(&external_socket, options)
             .map_err(PlatformConnectError::PeerUnchanged)?;
         self.tcp_state_mut()
@@ -1428,14 +1430,14 @@ impl SocketEntry<'_> {
             .descriptor = TcpDescriptor::ExternalInet(external_socket);
         self.connection_status = SocketConnectionStatus::Connecting;
         let status = loop {
-            match connect(
-                self.tcp_state()
-                    .map_err(PlatformConnectError::PeerIndeterminate)?
-                    .descriptor
-                    .socket()
-                    .map_err(PlatformConnectError::PeerIndeterminate)?,
-                &address,
-            ) {
+            match self
+                .tcp_state()
+                .map_err(PlatformConnectError::PeerIndeterminate)?
+                .descriptor
+                .socket()
+                .map_err(PlatformConnectError::PeerIndeterminate)?
+                .connect(address)
+            {
                 Ok(()) | Err(Errno::ISCONN) => break SocketConnectionStatus::Connected,
                 Err(Errno::INTR) => {}
                 Err(Errno::INPROGRESS | Errno::ALREADY) => {
@@ -1473,19 +1475,20 @@ impl SocketEntry<'_> {
             self.guest_local_address = Some(guest_local_address);
         }
         set_own_readiness(self, readiness);
-        // Adding the descriptor only after `connect()` and the initial
+        // Watching the socket only after `connect()` and the initial
         // publication means every event describes it after the connect: a
-        // fresh socket polls as OUT|HUP, which would otherwise mark a pending
-        // handshake connected.
-        self.core()
-            .epoll_add(
-                self.tcp_state()
-                    .and_then(|tcp| tcp.descriptor.socket())
-                    .map_err(PlatformConnectError::PeerIndeterminate)?,
-                self.id(),
-                active_epoll_events(),
-            )
-            .map_err(PlatformConnectError::PeerIndeterminate)?;
+        // fresh socket polls as writable and hung up, which would otherwise
+        // mark a pending handshake connected.
+        let core = self.core();
+        let id = self.id();
+        core.watch_host_socket(
+            self.tcp_state_mut()
+                .and_then(|tcp| tcp.descriptor.socket_mut())
+                .map_err(PlatformConnectError::PeerIndeterminate)?,
+            id,
+            Interest::Stream,
+        )
+        .map_err(PlatformConnectError::PeerIndeterminate)?;
         Ok(status)
     }
 
@@ -1627,7 +1630,7 @@ impl SocketEntry<'_> {
     /// holding its `state` along with the listener's cannot deadlock.
     pub(super) fn accept_socket(
         &mut self,
-        accepted: &Arc<LinuxSocket>,
+        accepted: &Arc<UserlandSocket>,
     ) -> BrokerResult<SocketOutcome<AcceptedEndpoints>> {
         if !self.tcp_state()?.listening {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
@@ -1726,13 +1729,13 @@ impl SocketEntry<'_> {
             return;
         };
         match core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized) {
-            TcpDescriptor::ExternalInet(socket) => {
+            TcpDescriptor::ExternalInet(mut socket) => {
                 if tcp.abortive_close {
                     // Abort may be requested before lazy external realization,
                     // so enforce it again at close.
-                    let _ = sockopt::set_socket_linger(&socket, Some(Duration::ZERO));
+                    let _ = socket.set_linger_zero();
                 }
-                core.epoll_delete(&socket);
+                core.unwatch_host_socket(&mut socket);
             }
             TcpDescriptor::Internal(end) => {
                 drop(end);

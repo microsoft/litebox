@@ -1,12 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-owned Linux sockets with per-socket locking.
+//! Broker-owned sockets on the host's network stack, with per-socket locking.
 //!
 //! Calls run on the caller's thread under the socket's own `state` lock, so
 //! calls on different sockets run in parallel and none waits for network
-//! readiness. One epoll thread turns edge-triggered kernel events into cached
-//! readiness under the same lock. State shared between sockets (bindings,
+//! readiness. One event thread turns the host's socket events into cached
+//! readiness under the same lock. The host's sockets and events are behind
+//! the `sys` module, so the rest of the provider is the same on every host.
+//! State shared between sockets (bindings,
 //! listener queues, peer links, and quotas) lives in the provider-wide
 //! `topology` lock, and a socket reaches another socket only through that
 //! socket's `inbox`.
@@ -20,9 +22,9 @@
 //! own readiness with what other sockets posted.
 //!
 //! An internal connection between guest sockets is an in-memory
-//! [`stream`](litebox_broker_core::socket::stream) rather than a kernel
-//! socket. Each end's waker posts its socket's token for the epoll thread,
-//! which applies it like a kernel event. A stream's lock and the posted-token
+//! [`stream`](litebox_broker_core::socket::stream) rather than a host
+//! socket. Each end's waker posts its socket's token for the event thread,
+//! which applies it like a host event. A stream's lock and the posted-token
 //! lock are innermost: a thread may take them under any other lock, but takes
 //! nothing while holding them, and wakers run only after the stream's lock is
 //! released.
@@ -32,13 +34,13 @@ use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::net::SocketAddrV4;
 use std::ops::{Deref, DerefMut};
-use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{
     Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError, Weak,
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::stream::StreamWaker;
@@ -56,16 +58,17 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
-use rustix::buffer::spare_capacity;
-use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, poll};
-use rustix::io::{Errno, read, write};
-use rustix::net::{getsockname, sockopt};
 
 mod direct;
+mod sys;
 mod tcp;
 mod udp;
 
 use direct::{RawParts, receive_into, send_from};
+use sys::{
+    Errno, Events, HostEvents, HostSocket, Interest, Poller, WAKE_TOKEN, Waiter,
+    broker_resource_error_from_errno, socket_error_from_errno,
+};
 use tcp::{
     AcceptedEndpoints, ReceiveOutcome, TcpPendingError, TcpSocketState, TcpTopology,
     consume_pending_guest_reset, create_tcp_transport, guest_reset_pending, handle_socket_event,
@@ -76,14 +79,10 @@ use udp::{
     UdpReceiveOrigin, UdpSocketState, UdpTopology,
 };
 
-/// Epoll token reserved for the eventfd that wakes the epoll thread.
-const WAKE_TOKEN: u64 = 0;
-const MAX_EPOLL_EVENTS: usize = 64;
-/// Longest the epoll thread waits before retrying events for busy sockets.
-const DEFERRED_EVENT_RETRY: Timespec = Timespec {
-    tv_sec: 0,
-    tv_nsec: 1_000_000,
-};
+/// Most host events the event thread collects per wait.
+const MAX_HOST_EVENTS: usize = 64;
+/// Longest the event thread waits before retrying events for busy sockets.
+const DEFERRED_EVENT_RETRY: Duration = Duration::from_millis(1);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("socket provider lock poisoned")
@@ -97,16 +96,16 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write().expect("socket provider lock poisoned")
 }
 
-/// Linux-userland socket provider.
+/// Userland socket provider on the host's network stack.
 ///
 /// Calls run on the broker's request workers under each socket's own lock and
-/// never wait for network readiness. One epoll thread turns kernel events into
-/// cached readiness.
-pub struct LinuxSocketProvider {
+/// never wait for network readiness. One event thread turns the host's socket
+/// events into cached readiness.
+pub struct UserlandSocketProvider {
     core: Arc<ProviderCore>,
 }
 
-impl LinuxSocketProvider {
+impl UserlandSocketProvider {
     /// Starts a provider with global and per-process socket limits.
     pub fn new(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Self> {
         Ok(Self {
@@ -115,7 +114,7 @@ impl LinuxSocketProvider {
     }
 }
 
-impl SocketProvider for LinuxSocketProvider {
+impl SocketProvider for UserlandSocketProvider {
     fn create(
         &self,
         process_authority: ProcessId,
@@ -123,7 +122,7 @@ impl SocketProvider for LinuxSocketProvider {
         readiness: ReadinessRegistration,
     ) -> BrokerResult<Arc<dyn PlatformSocket>> {
         let kind = socket_kind(request).ok_or(BrokerError::UnsupportedOperation)?;
-        let socket = LinuxSocket::new(&self.core, process_authority, kind, readiness)?;
+        let socket = UserlandSocket::new(&self.core, process_authority, kind, readiness)?;
         let mut state = lock(&socket.state);
         self.core.charge_socket(process_authority)?;
         if kind == SocketKind::Udp {
@@ -143,10 +142,10 @@ impl SocketProvider for LinuxSocketProvider {
     }
 }
 
-/// Provider-wide state shared by every socket and the epoll thread.
+/// Provider-wide state shared by every socket and the event thread.
 struct ProviderCore {
-    epoll: Arc<OwnedFd>,
-    wake: Arc<OwnedFd>,
+    /// Watches host sockets for the event thread.
+    poller: Arc<Poller>,
     /// Tokens of internal endpoints whose streams changed.
     posted: Arc<PostedEvents>,
     next_socket_id: AtomicU64,
@@ -155,13 +154,13 @@ struct ProviderCore {
     max_sockets_per_process: usize,
     /// Bindings, listener queues, peer links, and quota accounting.
     topology: Mutex<Topology>,
-    /// Maps epoll tokens to sockets for the epoll thread.
+    /// Maps event tokens to sockets for the event thread.
     registry: RwLock<Registry>,
     /// Host UDP ports the broker owns or sends to.
     udp_ports: RwLock<UdpPorts>,
     /// Datagrams and bytes queued between guest UDP sockets broker-wide.
     udp_queued: Arc<QueueCounter>,
-    /// Set under the `registry` write lock once the epoll thread fails.
+    /// Set under the `registry` write lock once the event thread fails.
     failed: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Test callback run at every [`HookPoint`].
@@ -188,14 +187,14 @@ struct ProcessAccount {
     udp_counters: Arc<ProcessCounters>,
 }
 
-/// Live sockets by ID and native UDP endpoints by epoll token.
+/// Live sockets by ID and native UDP endpoints by event token.
 #[derive(Default)]
 struct Registry {
-    sockets: HashMap<u64, Weak<LinuxSocket>>,
+    sockets: HashMap<u64, Weak<UserlandSocket>>,
     udp_tokens: HashMap<u64, u64>,
 }
 
-/// Fatal failure that stops the epoll thread.
+/// Fatal failure that stops the event thread.
 #[derive(Debug)]
 enum EventFailure {
     Io(Errno),
@@ -211,7 +210,7 @@ impl fmt::Display for EventFailure {
     }
 }
 
-/// What the epoll thread did with one event.
+/// What the event thread did with one event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dispatch {
     Applied,
@@ -223,7 +222,7 @@ enum Dispatch {
 
 /// Points where tests can observe or pause provider threads.
 ///
-/// Socket calls and the epoll thread can work on one socket at once, so some
+/// Socket calls and the event thread can work on one socket at once, so some
 /// races have windows too narrow for stress tests to hit reliably. Tests
 /// install a hook that runs at each point, so a test can hold one thread at a
 /// point while another acts, which makes each race happen on every run.
@@ -236,32 +235,32 @@ enum HookPoint {
     Receiving(u64),
     /// A TCP receive would block and is about to clear READ.
     Eagain(u64),
-    /// A descriptor was added to epoll, or an internal endpoint began posting
-    /// events, with this token.
+    /// A host socket was added to the poller, or an internal endpoint began
+    /// posting events, with this token.
     Watched(u64),
     /// Retiring the socket closed its internal endpoint.
     EndpointClosed(u64),
-    /// The epoll thread harvested an event for this token.
+    /// The event thread harvested an event for this token.
     Harvested(u64),
-    /// The epoll thread finished an event for this token.
+    /// The event thread finished an event for this token.
     Handled(u64, Dispatch),
 }
 
 #[cfg(test)]
 type Hook = Arc<dyn Fn(HookPoint) + Send + Sync>;
 
-/// Tokens that internal stream ends posted for the epoll thread, which they
-/// wake through the eventfd.
+/// Tokens that internal stream ends posted for the event thread, which they
+/// wake through the poller.
 struct PostedEvents {
     /// Holds room for every socket, so posting does not allocate.
     tokens: Mutex<HashSet<u64>>,
     /// A post failed to allocate, so its event was lost.
     overflowed: AtomicBool,
-    wake: Arc<OwnedFd>,
+    poller: Arc<Poller>,
 }
 
 impl PostedEvents {
-    /// Posts an event for `token`, waking the epoll thread unless an earlier
+    /// Posts an event for `token`, waking the event thread unless an earlier
     /// post it has not yet taken already did.
     fn post(&self, token: u64) {
         let mut tokens = lock(&self.tokens);
@@ -273,9 +272,9 @@ impl PostedEvents {
         }
         drop(tokens);
         if first {
-            // Signaling fails only if the eventfd is broken, which the epoll
-            // thread's next read of it reports.
-            let _ = signal(&self.wake);
+            // Waking fails only if the poller is broken, which the event
+            // thread's next wait on it reports.
+            let _ = self.poller.wake();
         }
     }
 
@@ -301,14 +300,8 @@ fn token_set(capacity: usize) -> IoResult<HashSet<u64>> {
 
 impl ProviderCore {
     fn start(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Arc<Self>> {
-        let epoll = Arc::new(epoll::create(epoll::CreateFlags::CLOEXEC)?);
-        let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
-        epoll::add(
-            epoll.as_ref(),
-            wake.as_ref(),
-            epoll::EventData::new_u64(WAKE_TOKEN),
-            epoll::EventFlags::IN,
-        )?;
+        let (poller, waiter) = Poller::new()?;
+        let poller = Arc::new(poller);
         let mut registry = Registry::default();
         registry
             .sockets
@@ -317,12 +310,11 @@ impl ProviderCore {
         let posted = Arc::new(PostedEvents {
             tokens: Mutex::new(token_set(max_sockets)?),
             overflowed: AtomicBool::new(false),
-            wake: Arc::clone(&wake),
+            poller: Arc::clone(&poller),
         });
         let taken = token_set(max_sockets)?;
         let core = Arc::new(Self {
-            epoll: Arc::clone(&epoll),
-            wake: Arc::clone(&wake),
+            poller,
             posted,
             next_socket_id: AtomicU64::new(1),
             next_udp_event_token: AtomicU64::new(1),
@@ -340,14 +332,16 @@ impl ProviderCore {
         let weak = Arc::downgrade(&core);
         let (started, startup) = sync_channel(1);
         let thread = thread::Builder::new()
-            .name("litebox-broker-socket-epoll".into())
+            .name("litebox-broker-socket-events".into())
             .spawn(move || {
-                // `epoll::Event` is not `Send`, so the thread allocates its
+                // Host events need not be `Send`, so the thread allocates its
                 // own event buffer.
-                let mut events = Vec::new();
-                let allocated = events.try_reserve_exact(MAX_EPOLL_EVENTS).is_ok();
-                if started.send(allocated).is_ok() && allocated {
-                    run_epoll_thread(&weak, &epoll, &wake, events, taken);
+                let events = Events::with_capacity(MAX_HOST_EVENTS);
+                let allocated = events.is_some();
+                if started.send(allocated).is_ok()
+                    && let Some(events) = events
+                {
+                    run_event_thread(&weak, waiter, events, taken);
                 }
             })?;
         match startup.recv() {
@@ -356,12 +350,12 @@ impl ProviderCore {
                 let _ = thread.join();
                 return Err(Error::new(
                     ErrorKind::OutOfMemory,
-                    "epoll event allocation failed",
+                    "socket event allocation failed",
                 ));
             }
             Err(_) => {
                 let _ = thread.join();
-                return Err(Error::other("socket epoll thread failed during startup"));
+                return Err(Error::other("socket event thread failed during startup"));
             }
         }
         *lock(&core.thread) = Some(thread);
@@ -393,27 +387,23 @@ impl ProviderCore {
             .map_err(|_| BrokerError::ResourceExhausted)
     }
 
-    /// Adds `socket` to epoll under `token` for `events`.
-    fn epoll_add(
+    /// Watches `socket` for `interest` under `token`.
+    fn watch_host_socket(
         &self,
-        socket: &OwnedFd,
+        socket: &mut HostSocket,
         token: u64,
-        events: epoll::EventFlags,
+        interest: Interest,
     ) -> BrokerResult<()> {
-        epoll::add(
-            self.epoll.as_ref(),
-            socket,
-            epoll::EventData::new_u64(token),
-            events,
-        )
-        .map_err(broker_error_from_errno)?;
+        self.poller
+            .add(socket, token, interest)
+            .map_err(broker_error_from_errno)?;
         self.hook(HookPoint::Watched(token));
         Ok(())
     }
 
-    /// Removes `socket` from epoll before its descriptor closes.
-    fn epoll_delete(&self, socket: &OwnedFd) {
-        let _ = epoll::delete(self.epoll.as_ref(), socket);
+    /// Stops watching `socket` before it closes.
+    fn unwatch_host_socket(&self, socket: &mut HostSocket) {
+        self.poller.delete(socket);
     }
 
     /// Returns a stream waker that posts an event for `token`.
@@ -423,7 +413,7 @@ impl ProviderCore {
     }
 
     /// Posts the first event for an internal endpoint, whose stream posts the
-    /// later ones, so the epoll thread applies its current state.
+    /// later ones, so the event thread applies its current state.
     fn watch_internal(&self, token: u64) {
         self.posted.post(token);
         self.hook(HookPoint::Watched(token));
@@ -441,11 +431,11 @@ impl ProviderCore {
         lock(&self.topology).release_socket(process_authority);
     }
 
-    /// Makes `socket` reachable by the epoll thread.
+    /// Makes `socket` reachable by the event thread.
     ///
     /// Fails once the provider has failed, so every socket is either
     /// collected by [`Self::fail`] or never opened.
-    fn register(&self, socket: &Arc<LinuxSocket>) -> BrokerResult<()> {
+    fn register(&self, socket: &Arc<UserlandSocket>) -> BrokerResult<()> {
         let mut registry = write_lock(&self.registry);
         if self.failed() {
             return Err(BrokerError::Internal);
@@ -472,7 +462,7 @@ impl ProviderCore {
         }
     }
 
-    /// Fails every socket after the epoll thread fails.
+    /// Fails every socket after the event thread fails.
     ///
     /// Each socket publishes ERROR as its last readiness, and later calls
     /// return `Internal`.
@@ -491,27 +481,26 @@ impl ProviderCore {
         }
     }
 
-    /// Applies one batch of epoll events, and the events internal endpoints
+    /// Applies one batch of host events, and the events internal endpoints
     /// posted, then retries deferred ones.
     fn handle_events(
         &self,
-        events: &mut Vec<epoll::Event>,
-        deferred: &mut HashMap<u64, epoll::EventFlags>,
+        events: &Events,
+        waiter: &Waiter,
+        deferred: &mut HashMap<u64, HostEvents>,
         posted: &mut HashSet<u64>,
-        wake: &OwnedFd,
     ) -> Result<(), EventFailure> {
-        for event in events.drain(..) {
-            let token = event.data.u64();
+        for (token, flags) in events.iter() {
             if token == WAKE_TOKEN {
                 // Draining first means a post after the take wakes again.
-                drain_wake(wake)?;
+                waiter.drain_wake().map_err(EventFailure::Io)?;
                 self.posted.take_into(posted)?;
                 for token in posted.drain() {
-                    self.harvest(token, epoll::EventFlags::empty(), deferred)?;
+                    self.harvest(token, HostEvents::empty(), deferred)?;
                 }
                 continue;
             }
-            self.harvest(token, event.flags, deferred)?;
+            self.harvest(token, flags, deferred)?;
         }
         for (token, flags) in core::mem::take(deferred) {
             self.dispatch(token, flags, deferred)?;
@@ -524,22 +513,19 @@ impl ProviderCore {
     fn harvest(
         &self,
         token: u64,
-        flags: epoll::EventFlags,
-        deferred: &mut HashMap<u64, epoll::EventFlags>,
+        flags: HostEvents,
+        deferred: &mut HashMap<u64, HostEvents>,
     ) -> Result<(), EventFailure> {
         self.hook(HookPoint::Harvested(token));
-        let flags = flags
-            | deferred
-                .remove(&token)
-                .unwrap_or(epoll::EventFlags::empty());
+        let flags = flags | deferred.remove(&token).unwrap_or_default();
         self.dispatch(token, flags, deferred)
     }
 
     fn dispatch(
         &self,
         token: u64,
-        flags: epoll::EventFlags,
-        deferred: &mut HashMap<u64, epoll::EventFlags>,
+        flags: HostEvents,
+        deferred: &mut HashMap<u64, HostEvents>,
     ) -> Result<(), EventFailure> {
         let socket = {
             let registry = read_lock(&self.registry);
@@ -572,20 +558,20 @@ impl ProviderCore {
 
 impl Drop for ProviderCore {
     fn drop(&mut self) {
-        // Wake the epoll thread so it observes that the provider is gone.
-        let _ = signal(&self.wake);
+        // Wake the event thread so it observes that the provider is gone.
+        let _ = self.poller.wake();
         let thread = self
             .thread
             .get_mut()
             .expect("socket provider lock poisoned")
             .take();
-        // The epoll thread drops the last reference only when it retires the
+        // The event thread drops the last reference only when it retires the
         // last socket, and then exits on its own.
         if let Some(thread) = thread
             && thread.thread().id() != thread::current().id()
             && thread.join().is_err()
         {
-            std::eprintln!("broker socket epoll thread panicked");
+            std::eprintln!("broker socket event thread panicked");
         }
     }
 }
@@ -655,88 +641,34 @@ impl Topology {
     }
 }
 
-fn run_epoll_thread(
+fn run_event_thread(
     core: &Weak<ProviderCore>,
-    epoll: &OwnedFd,
-    wake: &OwnedFd,
-    mut events: Vec<epoll::Event>,
+    mut waiter: Waiter,
+    mut events: Events,
     mut posted: HashSet<u64>,
 ) {
     let mut deferred = HashMap::new();
     loop {
-        events.clear();
         let timeout = (!deferred.is_empty()).then_some(DEFERRED_EVENT_RETRY);
-        let waited = epoll::wait(epoll, spare_capacity(&mut events), timeout.as_ref());
+        let wait_result = waiter.wait(&mut events, timeout);
         let Some(core) = core.upgrade() else {
             return;
         };
-        let result = match waited {
-            Ok(_) => core.handle_events(&mut events, &mut deferred, &mut posted, wake),
+        let result = match wait_result {
+            Ok(()) => core.handle_events(&events, &waiter, &mut deferred, &mut posted),
             Err(Errno::INTR) => Ok(()),
             Err(error) => Err(EventFailure::Io(error)),
         };
         if let Err(error) = result {
-            std::eprintln!("broker socket epoll thread failed: {error}");
+            std::eprintln!("broker socket event thread failed: {error}");
             core.fail();
             return;
         }
     }
 }
 
-fn drain_wake(wake: &OwnedFd) -> Result<(), EventFailure> {
-    let mut value = [0_u8; size_of::<u64>()];
-    loop {
-        match read(wake, &mut value) {
-            Ok(length) if length == value.len() => return Ok(()),
-            Ok(_) => return Err(EventFailure::Io(Errno::IO)),
-            Err(Errno::INTR) => {}
-            Err(Errno::AGAIN) => return Ok(()),
-            Err(error) => return Err(EventFailure::Io(error)),
-        }
-    }
-}
-
-fn signal(wake: &OwnedFd) -> IoResult<()> {
-    let value = 1_u64.to_ne_bytes();
-    loop {
-        match write(wake, &value) {
-            Ok(length) if length == value.len() => return Ok(()),
-            Ok(_) => {
-                return Err(Error::new(
-                    ErrorKind::WriteZero,
-                    "eventfd wake was truncated",
-                ));
-            }
-            Err(Errno::INTR) => {}
-            // A saturated counter is already readable and therefore does
-            // not need another wake value.
-            Err(Errno::AGAIN) => return Ok(()),
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-/// Reports whether `socket` has a pending error right now.
-///
-/// An ERR event may be stale by the time the epoll thread applies it, because
-/// a call can consume the error first.
-fn socket_error_pending(socket: &OwnedFd) -> BrokerResult<bool> {
-    let mut sockets = [PollFd::new(socket, PollFlags::empty())];
-    let now = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    loop {
-        match poll(&mut sockets, Some(&now)) {
-            Ok(_) => return Ok(sockets[0].revents().contains(PollFlags::ERR)),
-            Err(Errno::INTR) => {}
-            Err(error) => return Err(broker_error_from_errno(error)),
-        }
-    }
-}
-
 /// Broker-core-facing handle for one socket.
-struct LinuxSocket {
+struct UserlandSocket {
     id: u64,
     process_authority: ProcessId,
     core: Arc<ProviderCore>,
@@ -744,7 +676,7 @@ struct LinuxSocket {
     inbox: Arc<SocketInbox>,
 }
 
-impl LinuxSocket {
+impl UserlandSocket {
     /// Allocates a closed socket; its creator opens it after charging and
     /// registering it.
     fn new(
@@ -800,8 +732,8 @@ impl LinuxSocket {
         result
     }
 
-    /// Applies an epoll event for `token` unless a call holds the socket.
-    fn handle_event(&self, token: u64, flags: epoll::EventFlags) -> BrokerResult<Dispatch> {
+    /// Applies a host event for `token` unless a call holds the socket.
+    fn handle_event(&self, token: u64, flags: HostEvents) -> BrokerResult<Dispatch> {
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => return Ok(Dispatch::Deferred),
@@ -816,11 +748,15 @@ impl LinuxSocket {
         };
         socket.drain_inbox()?;
         let mut flags = flags;
-        if flags.contains(epoll::EventFlags::ERR)
+        // An ERROR event may be stale by the time the event thread applies it,
+        // because a call can consume the error first.
+        if flags.contains(HostEvents::ERROR)
             && let Some(descriptor) = socket.event_descriptor(token)
-            && !socket_error_pending(descriptor)?
+            && !descriptor
+                .error_pending()
+                .map_err(broker_error_from_errno)?
         {
-            flags.remove(epoll::EventFlags::ERR);
+            flags.remove(HostEvents::ERROR);
         }
         if token & UDP_EVENT_TOKEN_FLAG == 0 {
             handle_socket_event(&mut socket, flags)?;
@@ -844,7 +780,7 @@ impl LinuxSocket {
     }
 }
 
-impl PlatformSocket for LinuxSocket {
+impl PlatformSocket for UserlandSocket {
     fn bind(&self, binding: GuestSocketBinding) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         self.call(|socket| socket.bind_socket(binding))
     }
@@ -857,7 +793,7 @@ impl PlatformSocket for LinuxSocket {
         &self,
         readiness: ReadinessRegistration,
     ) -> BrokerResult<SocketOutcome<AcceptedPlatformSocket>> {
-        let accepted = LinuxSocket::new(
+        let accepted = UserlandSocket::new(
             &self.core,
             self.process_authority,
             SocketKind::Tcp,
@@ -998,7 +934,7 @@ impl PlatformSocket for LinuxSocket {
     }
 }
 
-impl Drop for LinuxSocket {
+impl Drop for UserlandSocket {
     fn drop(&mut self) {
         self.close(false);
     }
@@ -1073,7 +1009,7 @@ enum SocketKind {
 
 /// A socket whose `state` lock is held.
 struct SocketEntry<'a> {
-    socket: &'a LinuxSocket,
+    socket: &'a UserlandSocket,
     state: MutexGuard<'a, SocketState>,
 }
 
@@ -1124,8 +1060,8 @@ impl<'a> SocketEntry<'a> {
         }
     }
 
-    /// The descriptor an epoll `token` of this socket refers to.
-    fn event_descriptor(&self, token: u64) -> Option<&OwnedFd> {
+    /// The host socket an event `token` of this socket refers to.
+    fn event_descriptor(&self, token: u64) -> Option<&HostSocket> {
         match &self.transport {
             SocketTransportState::Tcp(tcp) => tcp.descriptor.socket().ok(),
             SocketTransportState::Udp(udp) => udp
@@ -1423,16 +1359,14 @@ fn take_socket_error(socket: &SocketEntry<'_>) -> BrokerResult<Option<SocketErro
         return Ok(None);
     }
     let external_socket = tcp.descriptor.socket()?;
-    match sockopt::socket_error(external_socket) {
-        Ok(Ok(())) => Ok(None),
-        Ok(Err(error)) => Ok(Some(socket_error_from_errno(error))),
+    match external_socket.take_error() {
+        Ok(error) => Ok(error.map(socket_error_from_errno)),
         Err(error) => Err(broker_error_from_errno(error)),
     }
 }
 
-fn local_socket_address(socket: &OwnedFd) -> BrokerResult<SocketAddrV4> {
-    let address = getsockname(socket).map_err(broker_error_from_errno)?;
-    SocketAddrV4::try_from(address).map_err(|_| BrokerError::Internal)
+fn local_socket_address(socket: &HostSocket) -> BrokerResult<SocketAddrV4> {
+    socket.local_address().map_err(broker_error_from_errno)
 }
 
 fn status_tcp_socket(socket: &mut SocketEntry<'_>) -> BrokerResult<PlatformSocketStatus> {
@@ -1514,22 +1448,6 @@ const fn can_consume_synchronous_error(status: SocketConnectionStatus) -> bool {
     matches!(status, SocketConnectionStatus::Connected)
 }
 
-const fn socket_error_from_errno(error: Errno) -> SocketError {
-    match error {
-        Errno::CONNREFUSED => SocketError::ConnectionRefused,
-        Errno::CONNRESET | Errno::PIPE => SocketError::ConnectionReset,
-        Errno::CONNABORTED => SocketError::ConnectionAborted,
-        Errno::NETUNREACH => SocketError::NetworkUnreachable,
-        Errno::HOSTUNREACH => SocketError::HostUnreachable,
-        Errno::TIMEDOUT => SocketError::TimedOut,
-        Errno::ADDRINUSE => SocketError::AddressInUse,
-        Errno::ADDRNOTAVAIL => SocketError::AddressNotAvailable,
-        Errno::NOTCONN => SocketError::NotConnected,
-        Errno::INVAL => SocketError::InvalidArgument,
-        _ => SocketError::Other,
-    }
-}
-
 const fn socket_operation_error_from_errno(error: Errno) -> BrokerResult<SocketError> {
     match broker_resource_error_from_errno(error) {
         Some(error) => Err(error),
@@ -1541,16 +1459,6 @@ const fn broker_error_from_errno(error: Errno) -> BrokerError {
     match broker_resource_error_from_errno(error) {
         Some(error) => error,
         None => BrokerError::Internal,
-    }
-}
-
-const fn broker_resource_error_from_errno(error: Errno) -> Option<BrokerError> {
-    match error {
-        Errno::NOMEM => Some(BrokerError::OutOfMemory),
-        Errno::MFILE | Errno::NFILE | Errno::NOBUFS | Errno::NOSPC => {
-            Some(BrokerError::ResourceExhausted)
-        }
-        _ => None,
     }
 }
 

@@ -9,11 +9,9 @@
 
 #![cfg(target_os = "linux")]
 
-mod socket;
 mod sync;
 pub mod terminal;
 mod time;
 
-pub use socket::LinuxSocketProvider;
 pub use sync::LinuxSyncPrimitivesProvider;
 pub use time::{LinuxInstant, LinuxSystemTime, LinuxTimeProvider};

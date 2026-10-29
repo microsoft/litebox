@@ -5,7 +5,7 @@ use super::*;
 use std::collections::VecDeque;
 
 struct GuestTcpPair {
-    provider: Arc<LinuxSocketProvider>,
+    provider: Arc<UserlandSocketProvider>,
     listener_process: Arc<BrokerProcess>,
     connector_process: Arc<BrokerProcess>,
     connector: ObjectHandle,
@@ -15,7 +15,7 @@ struct GuestTcpPair {
 }
 
 fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -29,7 +29,7 @@ fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
 /// Connects a guest TCP pair on `broker`, whose sockets `provider` hosts.
 fn connect_guest_tcp_pair(
     broker: &BrokerCore,
-    provider: Arc<LinuxSocketProvider>,
+    provider: Arc<UserlandSocketProvider>,
     port: u16,
 ) -> GuestTcpPair {
     let listener_process = broker
@@ -158,7 +158,7 @@ fn provider_drives_a_loopback_tcp_socket() {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     });
 
-    let provider = Arc::new(LinuxSocketProvider::new(8, 8).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(8, 8).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -488,7 +488,7 @@ fn external_tcp_deferred_abortive_close_resets_peer() {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     });
 
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -534,7 +534,7 @@ fn external_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
             DestinationPortRange::new(Port(destination.port()), Port(destination.port())).unwrap(),
         )])
         .unwrap();
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(3, 0, 2, 2),
@@ -608,7 +608,7 @@ fn external_tcp_route_keeps_guest_private_identity() {
             DestinationPortRange::new(Port(destination.port()), Port(destination.port())).unwrap(),
         )])
         .unwrap();
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
@@ -648,7 +648,7 @@ fn external_tcp_route_keeps_guest_private_identity() {
 
 #[test]
 fn tcp_connect_to_zero_port_returns_an_ordinary_socket_outcome() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -691,7 +691,7 @@ fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
         stream.shutdown(Shutdown::Write).unwrap();
     });
 
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -784,7 +784,7 @@ fn tcp_peek_continues_only_for_its_reader() {
         stream.shutdown(Shutdown::Write).unwrap();
     });
 
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -873,7 +873,7 @@ fn tcp_peek_continues_only_for_its_reader() {
 
 #[test]
 fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(3, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1310,7 +1310,7 @@ fn guest_read_shutdown_buffer_precedes_reset_and_eof() {
 
 #[test]
 fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
-    let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(5, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1446,7 +1446,7 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
 
 #[test]
 fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
-    let provider = Arc::new(LinuxSocketProvider::new(12, 8).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(12, 8).unwrap());
     let policy = SocketPolicy::deny()
         .with_tcp_destination_rules(&[DestinationRule::new(
             CallerCredential::Unauthenticated,
@@ -1606,7 +1606,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
 
 #[test]
 fn connector_and_process_teardown_clean_bounded_pending_state() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1718,7 +1718,7 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
 
 #[test]
 fn graceful_connector_close_preserves_late_accept_and_eof() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -1818,7 +1818,7 @@ fn guest_tcp_zero_backlog_wildcard_listener_accepts_one_connection() {
             DestinationPortRange::new(Port(port), Port(port)).unwrap(),
         )])
         .unwrap();
-    let provider = Arc::new(LinuxSocketProvider::new(6, 4).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 4).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(10, 0, 6, 6),
@@ -1912,7 +1912,7 @@ fn guest_tcp_zero_backlog_wildcard_listener_accepts_one_connection() {
 
 #[test]
 fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
-    let provider = Arc::new(LinuxSocketProvider::new(10, 8).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(10, 8).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2035,7 +2035,7 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
 
 #[test]
 fn guest_tcp_stream_preserves_options_peek_waitall_and_half_close() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 4).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 4).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2477,7 +2477,7 @@ fn drained_guest_read_shutdown_close_delivers_end_of_stream() {
 
 #[test]
 fn queued_guest_accept_transfers_capacity_without_global_growth() {
-    let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(5, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2543,7 +2543,7 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
 
 #[test]
 fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2610,7 +2610,7 @@ fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
 
 #[test]
 fn abortive_connector_close_releases_descriptor_capacity() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(3, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2695,7 +2695,7 @@ fn abortive_connector_close_releases_descriptor_capacity() {
 
 #[test]
 fn provider_drives_a_loopback_tcp_listener() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 6).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 6).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -2902,7 +2902,7 @@ fn provider_drives_a_loopback_tcp_listener() {
 /// A provider and broker for external TCP to host loopback, with one process
 /// and its socket.
 struct ExternalTcpSocket {
-    provider: Arc<LinuxSocketProvider>,
+    provider: Arc<UserlandSocketProvider>,
     process: Arc<BrokerProcess>,
     socket: ObjectHandle,
     publications: Receiver<(ObjectHandle, ReadinessFlags)>,
@@ -2911,7 +2911,7 @@ struct ExternalTcpSocket {
 }
 
 fn external_tcp_socket() -> ExternalTcpSocket {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(2, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
@@ -3103,12 +3103,12 @@ fn tcp_edge_during_eagain_is_applied_after_the_read_clear() {
     drop(host);
 }
 
-/// An accepted socket's descriptor joins epoll only once the socket is set
+/// An accepted socket's descriptor joins the poller only once the socket is set
 /// up, so the first edge, for data sent before the accept, is deferred and
 /// then applied rather than dropped.
 #[test]
 fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(4, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -3180,7 +3180,7 @@ fn accepted_tcp_socket_applies_the_edge_for_data_sent_before_accept() {
     assert_eq!(&data, b"early");
 }
 
-/// An external connect adds its descriptor to epoll only after `connect()`,
+/// An external connect adds its descriptor to the poller only after `connect()`,
 /// so the fresh socket's OUT|HUP never marks it hung up.
 #[test]
 fn external_tcp_connect_applies_only_events_after_connect() {
@@ -3370,10 +3370,10 @@ fn tcp_event_for_a_socket_closed_after_harvest_is_dropped() {
 }
 
 /// A peer flooding an endpoint after its guest read shutdown does not stall
-/// the epoll thread: another socket's readiness still arrives.
+/// the event thread: another socket's readiness still arrives.
 #[test]
 fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(6, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
@@ -3419,8 +3419,8 @@ fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
         "the flood starts",
     );
 
-    // A receive would find the data without the epoll thread, so wait for
-    // the epoll thread to apply an event for the quiet socket during the
+    // A receive would find the data without the event thread, so wait for
+    // the event thread to apply an event for the quiet socket during the
     // flood.
     let hook = TestHook::install(&provider);
     let start = hook.len();
@@ -3461,7 +3461,7 @@ fn guest_read_shutdown_flood_does_not_stall_other_sockets() {
 fn many_guest_tcp_pairs_exchange_data_in_parallel() {
     const PAIRS: u16 = 8;
     const ROUNDS: u8 = 64;
-    let provider = Arc::new(LinuxSocketProvider::new(3 * usize::from(PAIRS), 2).unwrap());
+    let provider = Arc::new(UserlandSocketProvider::new(3 * usize::from(PAIRS), 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
