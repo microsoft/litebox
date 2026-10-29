@@ -38,6 +38,7 @@ mod common {
     pub const DRIVER_FEATURE_SELECT: usize = 0x08;
     pub const DRIVER_FEATURE: usize = 0x0c;
     pub const DEVICE_STATUS: usize = 0x14;
+    pub const CONFIG_GENERATION: usize = 0x15;
     pub const QUEUE_SELECT: usize = 0x16;
     pub const QUEUE_SIZE: usize = 0x18;
     pub const QUEUE_MSIX_VECTOR: usize = 0x1a;
@@ -192,6 +193,12 @@ impl PciTransport {
         self.device
     }
 
+    /// The device configuration's generation: a field read while it changed
+    /// may be torn.
+    pub fn config_generation(&self) -> u8 {
+        self.common.read_u8(common::CONFIG_GENERATION)
+    }
+
     fn status(&self) -> u8 {
         self.common.read_u8(common::DEVICE_STATUS)
     }
@@ -318,5 +325,37 @@ impl PciTransport {
     pub fn notify(&self, queue: &VirtQueue) {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.notify.write_u16(queue.notify_offset(), queue.index());
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    pub(in crate::virtio) use super::common::{DEVICE_STATUS, LEN as COMMON_LEN};
+    pub(in crate::virtio) use super::status::{DRIVER_OK, FAILED};
+
+    impl PciTransport {
+        /// A transport on registers in plain memory, which the test plays
+        /// the device in: `common` ([`COMMON_LEN`] bytes) is set to offer
+        /// `VIRTIO_F_VERSION_1` (and bit 0 of each feature word) and queues
+        /// of 16 entries, all notified at the start of `notify`; `device` is
+        /// the device configuration.
+        pub(in crate::virtio) fn fake(common: Mmio, notify: Mmio, device: Mmio) -> Self {
+            // Bit 0 of each feature word: of word 1, `VIRTIO_F_VERSION_1`.
+            common.write_u32(common::DEVICE_FEATURE, 1);
+            common.write_u16(common::QUEUE_SIZE, 16);
+            Self {
+                function: Function {
+                    device: 0,
+                    function: 0,
+                },
+                common,
+                notify,
+                notify_off_multiplier: 0,
+                device: Some(device),
+                interrupts: false,
+            }
+        }
     }
 }
