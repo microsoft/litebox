@@ -3004,6 +3004,69 @@ fn receive_exact(
     }
 }
 
+/// A TCP socket sends from and receives and peeks into a buffer's own raw
+/// parts.
+#[test]
+fn tcp_transfers_use_raw_parts() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ExternalTcpSocket {
+        process,
+        socket,
+        publications,
+        ..
+    } = external_tcp_socket();
+    let mut host = connect_to_host(&process, socket, &publications, &listener);
+    host.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let mut data = TEST_MESSAGE;
+    assert_eq!(
+        litebox_broker_core::socket::send(
+            &process,
+            socket,
+            &TestBuffer::new(&mut data, Some(TEST_PART_LENGTH)),
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(TEST_MESSAGE.len()))
+    );
+    let mut sent = [0; TEST_MESSAGE.len()];
+    host.read_exact(&mut sent).unwrap();
+    assert_eq!(sent, TEST_MESSAGE);
+
+    host.write_all(&TEST_MESSAGE).unwrap();
+    for (flags, peek_length) in [
+        (
+            ReceiveFlags::PEEK,
+            u32::try_from(TEST_MESSAGE.len()).unwrap(),
+        ),
+        (ReceiveFlags::NONE, 0),
+    ] {
+        let mut received = [0; TEST_MESSAGE.len()];
+        loop {
+            match litebox_broker_core::socket::receive(
+                &process,
+                socket,
+                &mut TestBuffer::new(&mut received, Some(TEST_PART_LENGTH)),
+                flags,
+                0,
+                peek_length,
+            ) {
+                Err(BrokerError::WouldBlock) => {
+                    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
+                }
+                outcome => {
+                    assert_eq!(
+                        outcome,
+                        Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+                            TEST_MESSAGE.len()
+                        )))
+                    );
+                    break;
+                }
+            }
+        }
+        assert_eq!(received, TEST_MESSAGE);
+    }
+}
+
 /// Data that arrives between a receive's EAGAIN and its READ clear raises an
 /// edge that is deferred while the receive holds the socket and applied after,
 /// so READ survives the clear.

@@ -20,15 +20,16 @@ use litebox_broker_protocol::socket::{
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_platform::buffer::RawBytes;
 use rustix::event::epoll;
 use rustix::io::{Errno, ioctl_fionread};
 use rustix::net::ipproto;
 use rustix::net::{
     RecvFlags as LinuxRecvFlags, SendFlags as LinuxSendFlags, Shutdown as LinuxShutdown,
-    SocketFlags as LinuxSocketFlags, connect, recv, send, shutdown, socket_with, socketpair,
-    sockopt,
+    SocketFlags as LinuxSocketFlags, connect, recv, shutdown, socket_with, socketpair, sockopt,
 };
 
+use super::direct::{RawParts, receive_parts, send_parts};
 use super::{
     HookPoint, LinuxSocket, SocketEntry, SocketInbox, SocketKind, SocketState,
     SocketTransportState, Topology, broker_error_from_errno, can_consume_synchronous_error, lock,
@@ -42,9 +43,20 @@ pub(super) struct AcceptedEndpoints {
 }
 
 pub(super) enum ReceiveOutcome {
-    Received(Vec<u8>),
+    /// Bytes received into the start of the output.
+    Received(usize),
     EndOfStream,
     Failed(SocketError),
+}
+
+impl ReceiveOutcome {
+    /// Returns how many bytes the receive copied into its output.
+    pub(super) fn received(&self) -> usize {
+        match self {
+            Self::Received(received) => *received,
+            Self::EndOfStream | Self::Failed(_) => 0,
+        }
+    }
 }
 
 /// Bytes a multi-window peek read at offset zero, served to its later windows.
@@ -708,22 +720,30 @@ fn validate_peek_window(
     Ok(peek_end)
 }
 
-/// Allocates the buffer a TCP receive reads into before its socket is
-/// locked, so the lock is not held while zeroing a large peek window.
+/// Returns whether a peek is one window, which reads straight into its
+/// output, rather than one of several served from the peek cache.
+fn single_window_peek(length: usize, peek_offset: usize, peek_length: usize) -> bool {
+    peek_offset == 0 && peek_length == length
+}
+
+/// Allocates the peek cache a multi-window peek at offset zero reads into,
+/// before its socket is locked, so the lock is not held while zeroing a
+/// large peek window.
 ///
-/// A receive or a peek at offset zero reads into it; a later peek window
-/// is served from the peek cache. An invalid peek window gets an empty
-/// buffer, and the receive reports the error after its other checks.
-pub(super) fn tcp_receive_buffer(
+/// Any other receive reads straight into its output or is served from the
+/// cache, and gets an empty buffer. So does an invalid peek window, whose
+/// receive reports the error after its other checks.
+pub(super) fn tcp_peek_buffer(
     length: usize,
     flags: ReceiveFlags,
     peek_offset: usize,
     peek_length: usize,
 ) -> BrokerResult<Vec<u8>> {
-    if !flags.contains(ReceiveFlags::PEEK) {
-        return zeroed_vec(length);
-    }
-    if peek_offset != 0 || validate_peek_window(length, peek_offset, peek_length).is_err() {
+    if !flags.contains(ReceiveFlags::PEEK)
+        || peek_offset != 0
+        || single_window_peek(length, peek_offset, peek_length)
+        || validate_peek_window(length, peek_offset, peek_length).is_err()
+    {
         return Ok(Vec::new());
     }
     zeroed_vec(peek_length)
@@ -731,12 +751,13 @@ pub(super) fn tcp_receive_buffer(
 
 fn receive_socket(
     socket: &mut SocketEntry<'_>,
-    buffer: Vec<u8>,
-    length: usize,
+    output: RawParts<'_>,
+    peek_buffer: Vec<u8>,
     flags: ReceiveFlags,
     peek_offset: usize,
     peek_length: usize,
 ) -> BrokerResult<ReceiveOutcome> {
+    let length = output.len();
     if socket.kind() != SocketKind::Tcp {
         return Ok(ReceiveOutcome::Failed(SocketError::InvalidArgument));
     }
@@ -745,7 +766,7 @@ fn receive_socket(
             socket.tcp_state_mut()?.peek_cache = None;
         }
         if let Some(outcome) =
-            receive_guest_read_shutdown(socket, length, flags, peek_offset, peek_length)?
+            receive_guest_read_shutdown(socket, output, flags, peek_offset, peek_length)?
         {
             return Ok(outcome);
         }
@@ -782,7 +803,7 @@ fn receive_socket(
             return Err(BrokerError::UnsupportedOperation);
         }
         socket.tcp_state_mut()?.peek_cache = None;
-        return receive_socket_once(socket, buffer, LinuxRecvFlags::empty());
+        return receive_socket_once(socket, output, LinuxRecvFlags::empty());
     }
 
     let peek_end = validate_peek_window(length, peek_offset, peek_length)?;
@@ -803,6 +824,15 @@ fn receive_socket(
             );
             return Err(BrokerError::WouldBlock);
         }
+    }
+    let peek_flags = if flags.contains(ReceiveFlags::WAITALL) {
+        LinuxRecvFlags::PEEK | LinuxRecvFlags::WAITALL
+    } else {
+        LinuxRecvFlags::PEEK
+    };
+    if single_window_peek(length, peek_offset, peek_length) {
+        socket.tcp_state_mut()?.peek_cache = None;
+        return receive_socket_once(socket, output, peek_flags);
     }
 
     let refresh_exhausted_cache = match socket.tcp_state()?.peek_cache.as_ref() {
@@ -825,18 +855,15 @@ fn receive_socket(
         || refresh_exhausted_cache;
     if refresh {
         socket.tcp_state_mut()?.peek_cache = None;
-        let buffer = if buffer.len() == peek_length {
-            buffer
+        let mut data = if peek_buffer.len() == peek_length {
+            peek_buffer
         } else {
             zeroed_vec(peek_length)?
         };
-        let flags = if flags.contains(ReceiveFlags::WAITALL) {
-            LinuxRecvFlags::PEEK | LinuxRecvFlags::WAITALL
-        } else {
-            LinuxRecvFlags::PEEK
-        };
-        match receive_socket_once(socket, buffer, flags)? {
-            ReceiveOutcome::Received(data) => {
+        let part = [RawBytes::from(data.as_mut_slice())];
+        match receive_socket_once(socket, RawParts::from(&part), peek_flags)? {
+            ReceiveOutcome::Received(received) => {
+                data.truncate(received);
                 socket.tcp_state_mut()?.peek_cache = Some(PeekCache {
                     requested_length: peek_length,
                     data,
@@ -869,29 +896,22 @@ fn receive_socket(
     let tcp = socket.tcp_state_mut()?;
     let cache = tcp.peek_cache.as_ref().ok_or(BrokerError::Internal)?;
     let end = peek_end.min(cache.data.len());
-    let mut data = Vec::new();
-    data.try_reserve_exact(end - peek_offset)
-        .map_err(|_| BrokerError::OutOfMemory)?;
-    data.extend_from_slice(&cache.data[peek_offset..end]);
+    output.copy_from_slice(&cache.data[peek_offset..end]);
     if end < peek_end || end == peek_length {
         tcp.peek_cache = None;
     }
-    Ok(ReceiveOutcome::Received(data))
+    Ok(ReceiveOutcome::Received(end - peek_offset))
 }
 
 fn receive_socket_once(
     socket: &mut SocketEntry<'_>,
-    mut data: Vec<u8>,
+    output: RawParts<'_>,
     flags: LinuxRecvFlags,
 ) -> BrokerResult<ReceiveOutcome> {
     socket.core().hook(HookPoint::Receiving(socket.id()));
     loop {
-        match recv(
-            socket.tcp_state()?.descriptor.socket()?,
-            data.as_mut_slice(),
-            flags,
-        ) {
-            Ok((_buffer, 0)) => {
+        match receive_parts(socket.tcp_state()?.descriptor.socket()?, output, flags) {
+            Ok((0, _)) => {
                 if take_late_guest_reset(socket)? {
                     return Ok(ReceiveOutcome::Failed(SocketError::ConnectionReset));
                 }
@@ -904,9 +924,8 @@ fn receive_socket_once(
                 add_readiness(socket, readiness);
                 return Ok(ReceiveOutcome::EndOfStream);
             }
-            Ok((_buffer, received)) => {
+            Ok((received, _)) => {
                 confirm_tcp_connected(socket);
-                data.truncate(received);
                 let terminal_readable =
                     socket.read_shutdown || socket.own().contains(ReadinessFlags::HANGUP);
                 if !flags.contains(LinuxRecvFlags::PEEK) && !terminal_readable {
@@ -916,7 +935,7 @@ fn receive_socket_once(
                         clear_readiness(socket, ReadinessFlags::READ);
                     }
                 }
-                return Ok(ReceiveOutcome::Received(data));
+                return Ok(ReceiveOutcome::Received(received));
             }
             Err(Errno::INTR) => {}
             Err(Errno::AGAIN) => {
@@ -939,11 +958,12 @@ fn receive_socket_once(
 
 fn receive_guest_read_shutdown(
     socket: &mut SocketEntry<'_>,
-    length: usize,
+    output: RawParts<'_>,
     flags: ReceiveFlags,
     peek_offset: usize,
     peek_length: usize,
 ) -> BrokerResult<Option<ReceiveOutcome>> {
+    let length = output.len();
     let peek = flags.contains(ReceiveFlags::PEEK);
     let (relative_start, relative_end) = if peek {
         (
@@ -977,10 +997,7 @@ fn receive_guest_read_shutdown(
         .checked_add(relative_end)
         .ok_or(BrokerError::Internal)?
         .min(shutdown.queued.len());
-    let mut data = Vec::new();
-    data.try_reserve_exact(end - start)
-        .map_err(|_| BrokerError::OutOfMemory)?;
-    data.extend_from_slice(&shutdown.queued[start..end]);
+    output.copy_from_slice(&shutdown.queued[start..end]);
     if !peek {
         shutdown.consumed = end;
         if shutdown.consumed == shutdown.queued.len() {
@@ -988,7 +1005,7 @@ fn receive_guest_read_shutdown(
             shutdown.consumed = 0;
         }
     }
-    Ok(Some(ReceiveOutcome::Received(data)))
+    Ok(Some(ReceiveOutcome::Received(end - start)))
 }
 
 fn capture_guest_read_shutdown(socket: &SocketEntry<'_>, queued: &mut Vec<u8>) -> BrokerResult<()> {
@@ -1279,7 +1296,10 @@ impl SocketEntry<'_> {
         Ok(())
     }
 
-    pub(super) fn send_tcp_socket(&mut self, data: &[u8]) -> BrokerResult<SocketOutcome<usize>> {
+    pub(super) fn send_tcp_socket(
+        &mut self,
+        data: RawParts<'_>,
+    ) -> BrokerResult<SocketOutcome<usize>> {
         if self.kind() != SocketKind::Tcp {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
@@ -1300,9 +1320,10 @@ impl SocketEntry<'_> {
             _ => {}
         }
         loop {
-            match send(
+            match send_parts(
                 self.tcp_state()?.descriptor.socket()?,
                 data,
+                None,
                 LinuxSendFlags::NOSIGNAL,
             ) {
                 Ok(sent) => {
@@ -1335,13 +1356,13 @@ impl SocketEntry<'_> {
         }
     }
 
-    /// Receives into `buffer`, which [`tcp_receive_buffer`] allocated for
-    /// this request.
+    /// Receives into `output`; a multi-window peek at offset zero reads into
+    /// `peek_buffer`, which [`tcp_peek_buffer`] allocated for this request.
     pub(super) fn receive_tcp_socket(
         &mut self,
         reader: ObjectHandle,
-        buffer: Vec<u8>,
-        length: usize,
+        output: RawParts<'_>,
+        peek_buffer: Vec<u8>,
         flags: ReceiveFlags,
         peek_offset: usize,
         peek_length: usize,
@@ -1349,7 +1370,7 @@ impl SocketEntry<'_> {
         if self.kind() == SocketKind::Tcp {
             continue_peek(self.tcp_state_mut()?, reader, flags, peek_offset)?;
         }
-        receive_socket(self, buffer, length, flags, peek_offset, peek_length)
+        receive_socket(self, output, peek_buffer, flags, peek_offset, peek_length)
     }
 
     pub(super) fn set_tcp_socket_option(&mut self, value: SocketOptionValue) -> BrokerResult<()> {
