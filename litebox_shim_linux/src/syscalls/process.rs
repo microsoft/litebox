@@ -227,6 +227,8 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
     /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
     robust_list: Cell<Option<UserPtr<litebox_common_linux::RobustListHead>>>,
+    /// What `restart_syscall` resumes, like Linux's `restart_block`.
+    restart_block: Cell<Option<RestartBlock<Platform>>>,
     /// Linux `TIF_SVE_VL_INHERIT`: whether the last `PR_SVE_SET_VL` set `PR_SVE_VL_INHERIT`.
     /// Threads and processes created by this thread start with a copy, and `execve` keeps it.
     #[cfg(target_arch = "aarch64")]
@@ -235,6 +237,26 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
 
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
 unsafe impl<Platform: ShimPlatform> Send for ThreadState<Platform> {}
+
+/// The state of a syscall interrupted with [`Errno::ERESTART_RESTARTBLOCK`], which
+/// `restart_syscall` resumes.
+enum RestartBlock<Platform: ShimPlatform> {
+    /// A relative `clock_nanosleep` that sleeps until `deadline`, or forever if `None`, and
+    /// reports the time left to `remain` if interrupted.
+    Nanosleep {
+        deadline: Option<<Platform as TimeProvider>::Instant>,
+        remain: TimeParam,
+    },
+}
+
+// Derived impls would needlessly require `Platform: Copy`.
+impl<Platform: ShimPlatform> Clone for RestartBlock<Platform> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Platform: ShimPlatform> Copy for RestartBlock<Platform> {}
 
 impl<Platform: ShimPlatform> ThreadState<Platform> {
     /// Creates the main thread of a new process, which holds the broker's `initial_thread` for
@@ -248,6 +270,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
+            restart_block: Cell::new(None),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: Cell::new(false),
         }
@@ -262,6 +285,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             tid: Cell::new(Some(tid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
+            restart_block: Cell::new(None),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: Cell::new(self.sve_vl_inherit.get()),
         })
@@ -295,6 +319,11 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             set_child_tid: user_ptr(set_child_tid),
         });
         self.clear_child_tid.set(user_ptr(clear_child_tid));
+    }
+
+    /// Discards what `restart_syscall` would resume, as when a signal handler returns.
+    pub(crate) fn discard_restart_block(&self) {
+        self.restart_block.set(None);
     }
 
     pub(crate) fn begin_detach_from_process(&self) -> Option<ThreadDetachGuard<'_, Platform>> {
@@ -2275,33 +2304,68 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
         let is_abs = flags.contains(litebox_common_linux::TimerFlags::ABSTIME);
+        // Like Linux, a new sleep leaves nothing for `restart_syscall` to resume until it is
+        // interrupted.
+        self.thread.discard_restart_block();
 
-        // Set up a wait context with the right deadline/timeout.
         let wait_cx = self.wait_cx();
-        let wait_cx = if is_abs {
-            wait_cx.with_deadline(self.duration_since_epoch_to_deadline(clockid, request)?)
-        } else {
+        if !is_abs {
             // Relative. Treat all clocks the same. TODO: handle the different clocks differently.
-            wait_cx.with_timeout(request)
-        };
-
+            return self.nanosleep_until(wait_cx.with_timeout(request).deadline(), remain);
+        }
+        let wait_cx =
+            wait_cx.with_deadline(self.duration_since_epoch_to_deadline(clockid, request)?);
         match wait_cx.sleep() {
-            WaitError::TimedOut => {}
+            WaitError::TimedOut => Ok(()),
+            // Like Linux, an absolute sleep restarts with its deadline unless a handler runs.
+            WaitError::Interrupted => Err(Errno::ERESTARTNOHAND),
+        }
+    }
+
+    /// Sleeps until `deadline`, or forever if `None`, for a relative `clock_nanosleep`.
+    ///
+    /// Like Linux, an interrupted sleep reports the time left to `remain`, then resumes through
+    /// `restart_syscall` until `deadline` unless a handler runs. Restarting the syscall instead
+    /// would sleep its whole duration again.
+    fn nanosleep_until(
+        &self,
+        deadline: Option<<Platform as TimeProvider>::Instant>,
+        remain: TimeParam,
+    ) -> Result<(), Errno> {
+        let wait_cx = self.wait_cx().with_deadline(deadline);
+        match wait_cx.sleep() {
+            WaitError::TimedOut => Ok(()),
             WaitError::Interrupted => {
-                if is_abs {
-                    // Like Linux, an absolute sleep restarts with its deadline unless a handler
-                    // runs.
-                    return Err(Errno::ERESTARTNOHAND);
-                }
-                if let Some(remaining_timeout) = wait_cx.remaining_timeout() {
+                // A sleep without a deadline has no time left to report.
+                if deadline.is_some() {
+                    let Some(remaining_timeout) = wait_cx.remaining_timeout() else {
+                        // Time ran out after getting interrupted. Treat this as a timeout.
+                        return Ok(());
+                    };
                     remain.write::<Platform>(remaining_timeout)?;
-                    return Err(Errno::EINTR);
                 }
-                // Whoops, time ran out after getting interrupted. Treat this as a timeout.
+                self.thread
+                    .restart_block
+                    .set(Some(RestartBlock::Nanosleep { deadline, remain }));
+                Err(Errno::ERESTART_RESTARTBLOCK)
             }
         }
+    }
 
-        Ok(())
+    /// Handle syscall `restart_syscall`, which resumes the syscall a signal interrupted with
+    /// [`Errno::ERESTART_RESTARTBLOCK`].
+    ///
+    /// Like Linux, the saved state stays until the next sleep or signal handler return, so
+    /// resuming a sleep that already finished returns at once.
+    pub(crate) fn sys_restart_syscall(&self) -> Result<(), Errno> {
+        match self.thread.restart_block.get() {
+            Some(RestartBlock::Nanosleep { deadline, remain }) => {
+                self.nanosleep_until(deadline, remain)
+            }
+            // Like Linux, there is nothing to resume unless an interrupted syscall saved its
+            // state.
+            None => Err(Errno::EINTR),
+        }
     }
 
     /// Handle syscall `gettimeofday`.
@@ -3886,7 +3950,7 @@ mod tests {
             );
             assert_eq!(
                 result,
-                Err(litebox_common_linux::errno::Errno::EINTR),
+                Err(litebox_common_linux::errno::Errno::ERESTART_RESTARTBLOCK),
                 "nanosleep should be interrupted by SIGINT from background thread"
             );
 
@@ -3943,7 +4007,7 @@ mod tests {
             // The nanosleep should have been interrupted by SIGALRM.
             assert_eq!(
                 result,
-                Err(litebox_common_linux::errno::Errno::EINTR),
+                Err(litebox_common_linux::errno::Errno::ERESTART_RESTARTBLOCK),
                 "nanosleep should have been interrupted"
             );
             assert!(task.pending_signal_set().contains(Signal::SIGALRM));
@@ -4260,6 +4324,96 @@ mod tests {
         });
     }
 
+    /// An interrupted relative sleep reports the time left and, when no handler runs, resumes
+    /// through `restart_syscall` until its original deadline, like Linux (see the
+    /// `nanosleep_restart.c` runner test).
+    #[test]
+    fn test_relative_nanosleep_resumes_through_restart_syscall() {
+        use crate::syscalls::signal::SyscallRestart;
+        use litebox_common_linux::errno::Errno;
+        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
+        use litebox_common_linux::{ClockId, TimeParam, TimerFlags, Timespec};
+        use litebox_platform::time::{Instant as _, TimeProvider as _};
+
+        const SLEEP: Duration = Duration::from_millis(200);
+
+        let task = crate::syscalls::tests::init_platform();
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            // Nothing to resume yet.
+            assert_eq!(task.sys_restart_syscall(), Err(Errno::EINTR));
+
+            // SIGCHLD is ignored by default, but is queued while blocked, and interrupts the
+            // sleep once unblocked.
+            let set = SigSet::empty().with(Signal::SIGCHLD);
+            let sigprocmask = |how| {
+                task.sys_rt_sigprocmask(
+                    how,
+                    Some(UserPtr::from_ptr(&raw const set)),
+                    None,
+                    core::mem::size_of::<SigSet>(),
+                )
+                .expect("rt_sigprocmask failed");
+            };
+            sigprocmask(SigmaskHow::SIG_BLOCK);
+            task.sys_tkill(task.tid(), Signal::SIGCHLD.as_i32())
+                .expect("tkill failed");
+            sigprocmask(SigmaskHow::SIG_UNBLOCK);
+
+            let start = task.global.platform.now();
+            let mut request = Timespec::from(SLEEP);
+            let mut remain = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let result = task.sys_clock_nanosleep(
+                ClockId::Monotonic,
+                TimerFlags::empty(),
+                TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut request)),
+                TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut remain)),
+            );
+            assert_eq!(result, Err(Errno::ERESTART_RESTARTBLOCK));
+            let remain = Duration::try_from(remain).expect("remain should be written");
+            assert!(!remain.is_zero() && remain <= SLEEP, "{remain:?}");
+
+            // Discarding SIGCHLD runs no handler, so the guest issues `restart_syscall` in
+            // place of the sleep.
+            let mut stack = [0u8; 2 * litebox_common_linux::PAGE_SIZE];
+            let mut regs = interrupted_syscall_regs(&mut stack);
+            task.process_signals(&mut regs, Some(SyscallRestart::RestartBlock));
+            assert!(!task.has_pending_signals(), "SIGCHLD should be consumed");
+            #[cfg(target_arch = "x86_64")]
+            let (pc, sysno) = (regs.rip, regs.rax);
+            #[cfg(target_arch = "aarch64")]
+            let (pc, sysno) = (regs.pc, regs.regs[8]);
+            assert_eq!(pc, restarted_state().0);
+            assert_eq!(
+                sysno,
+                syscalls::Sysno::restart_syscall.id().cast_unsigned() as usize
+            );
+
+            assert_eq!(task.sys_restart_syscall(), Ok(()));
+            let elapsed = task
+                .global
+                .platform
+                .now()
+                .checked_duration_since(&start)
+                .unwrap_or_default();
+            assert!(elapsed >= SLEEP, "slept {elapsed:?}");
+            // Resuming the finished sleep again returns at once.
+            assert_eq!(task.sys_restart_syscall(), Ok(()));
+            // A new sleep leaves nothing to resume.
+            let mut request = Timespec::from(Duration::from_micros(1));
+            let result = task.sys_clock_nanosleep(
+                ClockId::Monotonic,
+                TimerFlags::empty(),
+                TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut request)),
+                TimeParam::None,
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(task.sys_restart_syscall(), Err(Errno::EINTR));
+        });
+    }
+
     /// Setting alarm with SIG_IGN for SIGALRM: a blocking operation is still
     /// interrupted, but `process_signals` discards the signal.
     #[test]
@@ -4349,7 +4503,7 @@ mod tests {
             // The nanosleep should have been interrupted.
             assert_eq!(
                 result,
-                Err(litebox_common_linux::errno::Errno::EINTR),
+                Err(litebox_common_linux::errno::Errno::ERESTART_RESTARTBLOCK),
                 "nanosleep should be interrupted by the timer"
             );
 

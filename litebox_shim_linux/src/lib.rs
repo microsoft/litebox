@@ -1642,6 +1642,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
             SyscallRequest::Pause => syscall!(sys_pause()),
+            SyscallRequest::RestartSyscall => syscall!(sys_restart_syscall()),
             SyscallRequest::GetITimer { which, curr_value } => {
                 syscall!(sys_getitimer(which, curr_value))
             }

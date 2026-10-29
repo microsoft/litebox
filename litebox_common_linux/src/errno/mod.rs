@@ -62,6 +62,9 @@ impl Errno {
     pub const ERESTARTNOINTR: Self = Self::from_const(513);
     /// Restart the syscall only if no handler runs.
     pub const ERESTARTNOHAND: Self = Self::from_const(514);
+    /// Restart through `restart_syscall`, which resumes the syscall from its saved state, only if
+    /// no handler runs.
+    pub const ERESTART_RESTARTBLOCK: Self = Self::from_const(516);
 
     /// Provide the negative integer representation of the error
     ///
@@ -79,7 +82,10 @@ impl Errno {
     /// restart.
     #[must_use]
     pub fn without_restart(self) -> Self {
-        if self == Self::ERESTARTSYS || self == Self::ERESTARTNOINTR || self == Self::ERESTARTNOHAND
+        if self == Self::ERESTARTSYS
+            || self == Self::ERESTARTNOINTR
+            || self == Self::ERESTARTNOHAND
+            || self == Self::ERESTART_RESTARTBLOCK
         {
             Self::EINTR
         } else {

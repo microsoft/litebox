@@ -596,6 +596,9 @@ pub(crate) enum SyscallRestart {
     NoIntr,
     /// From [`Errno::ERESTARTNOHAND`]: any handler interrupts the syscall.
     NoHandler,
+    /// From [`Errno::ERESTART_RESTARTBLOCK`]: any handler interrupts the syscall, which otherwise
+    /// resumes through `restart_syscall` instead of being reissued.
+    RestartBlock,
 }
 
 impl SyscallRestart {
@@ -605,6 +608,7 @@ impl SyscallRestart {
             Errno::ERESTARTSYS => Some(Self::Sys),
             Errno::ERESTARTNOINTR => Some(Self::NoIntr),
             Errno::ERESTARTNOHAND => Some(Self::NoHandler),
+            Errno::ERESTART_RESTARTBLOCK => Some(Self::RestartBlock),
             _ => None,
         }
     }
@@ -614,7 +618,7 @@ impl SyscallRestart {
         match self {
             Self::Sys => !action.flags.contains(SaFlags::RESTART),
             Self::NoIntr => false,
-            Self::NoHandler => true,
+            Self::NoHandler | Self::RestartBlock => true,
         }
     }
 }
@@ -712,6 +716,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns the restored return register, or 0 after forcing `SIGSEGV` for a bad frame.
     pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> usize {
+        // Like Linux, the syscall a handler interrupted can no longer be resumed.
+        self.thread.discard_restart_block();
         let uctx_addr = arch::uctx_addr(ctx);
         let uctx_ptr = UserPtr::<Ucontext>::from_usize(uctx_addr);
         let Some(uctx) = uctx_ptr.read_at_offset::<Platform>(0) else {
@@ -984,11 +990,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 _ => {
                     // Resolve the syscall before the frame saves `ctx`, so a restarting syscall
                     // is reissued when the handler returns.
-                    if restart
-                        .take()
-                        .is_some_and(|restart| !restart.is_interrupted_by(&action))
+                    if let Some(restart) = restart.take()
+                        && !restart.is_interrupted_by(&action)
                     {
-                        self.restart_syscall(ctx);
+                        self.restart_syscall(ctx, restart);
                     }
                     let delivered =
                         arch::sigreturn_trampoline(self, &action).and_then(|trampoline| {
@@ -1011,14 +1016,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
         // No handler ran, so the interrupted syscall is invisible to the guest.
-        if restart.is_some() {
-            self.restart_syscall(ctx);
+        if let Some(restart) = restart {
+            self.restart_syscall(ctx, restart);
         }
     }
 
-    /// Moves `ctx` back to reissue its interrupted syscall.
-    fn restart_syscall(&self, ctx: &mut PtRegs) {
+    /// Moves `ctx` back to reissue its interrupted syscall, or, like Linux, to issue
+    /// `restart_syscall` in its place if it saved its state to resume from.
+    fn restart_syscall(&self, ctx: &mut PtRegs, restart: SyscallRestart) {
         arch::restart_syscall(ctx, syscall_instruction_len(self.global.platform));
+        if restart == SyscallRestart::RestartBlock {
+            arch::set_syscall_number(ctx, ::syscalls::Sysno::restart_syscall);
+        }
     }
 
     /// Check whether the process-wide alarm deadline has passed and, if so,
