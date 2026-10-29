@@ -38,6 +38,8 @@ pub struct BrokerConnection {
     pub positional_io_fds: [RawFd; 2],
     /// Association-shutdown descriptor that a runner's syscall filter must permit.
     pub shutdown_fd: RawFd,
+    /// Socket over which the broker delivers host shared objects.
+    pub shared_object_channel: OwnedFd,
     /// Sealed memfd holding the memory image this process starts from, if
     /// its parent wrote one.
     pub process_image: Option<OwnedFd>,
@@ -80,44 +82,54 @@ fn negotiate(
     setup_deadline: Instant,
 ) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
-    let (local, startup, (notification_channel, positional_io_fds, shutdown_fd, process_image)) =
-        BrokerLocal::negotiate(setup_channel, |mut setup| {
-            let shared_memory =
-                setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
-            let layout = ControlRingLayout::MULTI_LANE;
-            let control_memory = setup.receive_control_ring(layout, Some(setup_deadline))?;
-            let process_image = setup.receive_process_image(Some(setup_deadline))?;
-            let positional_io_fds = [
-                shared_memory.as_fd().as_raw_fd(),
-                control_memory.as_fd().as_raw_fd(),
-            ];
-            let control_ring = ControlRing::new(control_memory, layout).map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid broker control ring: {error:?}"),
-                )
+    let (
+        local,
+        startup,
+        (
+            notification_channel,
+            positional_io_fds,
+            shutdown_fd,
+            shared_object_channel,
+            process_image,
+        ),
+    ) = BrokerLocal::negotiate(setup_channel, |mut setup| {
+        let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
+        let layout = ControlRingLayout::MULTI_LANE;
+        let control_memory = setup.receive_control_ring(layout, Some(setup_deadline))?;
+        let shared_object_channel = setup.receive_shared_object_channel(Some(setup_deadline))?;
+        let process_image = setup.receive_process_image(Some(setup_deadline))?;
+        let positional_io_fds = [
+            shared_memory.as_fd().as_raw_fd(),
+            control_memory.as_fd().as_raw_fd(),
+        ];
+        let control_ring = ControlRing::new(control_memory, layout).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid broker control ring: {error:?}"),
+            )
+        })?;
+        let weak_association_coordinator = Arc::downgrade(&association_coordinator);
+        let (call_channel, notification_channel, association_shutdown) =
+            setup.into_active(control_ring, move || {
+                if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
+                    association_coordinator.report_failure();
+                }
             })?;
-            let weak_association_coordinator = Arc::downgrade(&association_coordinator);
-            let (call_channel, notification_channel, association_shutdown) =
-                setup.into_active(control_ring, move || {
-                    if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
-                        association_coordinator.report_failure();
-                    }
-                })?;
-            let shutdown_fd = association_shutdown.as_fd().as_raw_fd();
-            association_coordinator.install_shutdown(association_shutdown)?;
-            Ok((
-                call_channel,
-                Arc::new(shared_memory),
-                (
-                    notification_channel,
-                    positional_io_fds,
-                    shutdown_fd,
-                    process_image,
-                ),
-            ))
-        })
-        .context("broker negotiation failed")?;
+        let shutdown_fd = association_shutdown.as_fd().as_raw_fd();
+        association_coordinator.install_shutdown(association_shutdown)?;
+        Ok((
+            call_channel,
+            Arc::new(shared_memory),
+            (
+                notification_channel,
+                positional_io_fds,
+                shutdown_fd,
+                shared_object_channel,
+                process_image,
+            ),
+        ))
+    })
+    .context("broker negotiation failed")?;
     Ok((
         BrokerConnection {
             local,
@@ -125,6 +137,7 @@ fn negotiate(
             coordinator: association_coordinator,
             positional_io_fds,
             shutdown_fd,
+            shared_object_channel,
             process_image,
         },
         startup,

@@ -34,15 +34,17 @@ const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
 /// Descriptor number of a native clone's broker control socket.
 ///
 /// A runner's broker association occupies the lowest descriptors after the standard streams:
-/// the control socket, the shared-memory and control-ring memfds, and the socket's shutdown
-/// duplicate, in that order. A clone that keeps only its standard streams, its socket at this
-/// number, and a higher socket-pair end recreates that layout, which the inherited syscall
-/// filter is bound to.
+/// the control socket, the shared-memory and control-ring memfds, the shared-object socket, and
+/// the control socket's shutdown duplicate, in that order. A clone that keeps only its standard
+/// streams, its socket at this number, and a higher socket-pair end recreates that layout, which
+/// the inherited syscall filter is bound to.
 const NATIVE_FORK_STREAM_FD: RawFd = 3;
 /// Shared-memory and control-ring descriptors of a native fork-capable runner.
 const NATIVE_FORK_POSITIONAL_IO_FDS: [RawFd; 2] = [4, 5];
+/// Shared-object socket of a native fork-capable runner.
+const NATIVE_FORK_SHARED_OBJECT_FD: RawFd = 6;
 /// Shutdown descriptor of a native fork-capable runner.
-const NATIVE_FORK_SHUTDOWN_FD: RawFd = 6;
+const NATIVE_FORK_SHUTDOWN_FD: RawFd = 7;
 #[derive(Clone)]
 struct NativeForkRunner {
     memory: Arc<litebox_shim_linux::MemoryManager<Platform>>,
@@ -120,16 +122,19 @@ impl NativeForkRunner {
             coordinator,
             positional_io_fds,
             shutdown_fd,
+            shared_object_channel,
             process_image,
         } = connection;
         if positional_io_fds != NATIVE_FORK_POSITIONAL_IO_FDS
             || shutdown_fd != NATIVE_FORK_SHUTDOWN_FD
+            || shared_object_channel.as_raw_fd() != NATIVE_FORK_SHARED_OBJECT_FD
         {
             anyhow::bail!("native fork child received broker descriptors at unexpected numbers");
         }
         if process_image.is_some() {
             anyhow::bail!("native fork child unexpectedly received a process image");
         }
+        platform.set_shared_object_channel(shared_object_channel);
         let (litebox, process_id, initial_thread) =
             litebox::LiteBox::new_process_with_broker_local(platform, local);
         let process_id =
@@ -356,10 +361,13 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         coordinator: broker_association_coordinator,
         positional_io_fds,
         shutdown_fd,
+        shared_object_channel,
         process_image,
     } = connection;
     broker_positional_io_fds.extend(positional_io_fds);
     broker_shutdown_fds.push(shutdown_fd);
+    let shared_object_fd = shared_object_channel.as_raw_fd();
+    platform.set_shared_object_channel(shared_object_channel);
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, broker_local);
     let process_id = i32::try_from(process_id.0).context("process ID does not fit Linux pid_t")?;
@@ -376,6 +384,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
     let native_fork_stream_fd = (seccomp_scope == SeccompScope::AllThreads
         && std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none()
         && positional_io_fds == NATIVE_FORK_POSITIONAL_IO_FDS
+        && shared_object_fd == NATIVE_FORK_SHARED_OBJECT_FD
         && shutdown_fd == NATIVE_FORK_SHUTDOWN_FD
         && litebox_platform_linux_userland::process::native_fork_supported())
     .then_some(NATIVE_FORK_STREAM_FD);
@@ -403,6 +412,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                 &broker_shutdown_fds,
                 seccomp_scope,
                 native_fork_stream_fd,
+                Some(shared_object_fd),
             );
             return Ok(run_program(&shim, program));
         }
@@ -498,6 +508,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         &broker_shutdown_fds,
         seccomp_scope,
         native_fork_stream_fd,
+        Some(shared_object_fd),
     );
 
     let program = shim.load_program(task_params, initial_thread, &prog_path, argv, envp)?;

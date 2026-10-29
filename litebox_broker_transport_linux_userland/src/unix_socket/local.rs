@@ -118,8 +118,17 @@ impl UnixStreamLocalSetupChannel {
         crate::memfd::receive_control_ring_memfd(&mut self.stream, layout, deadline)
     }
 
+    /// Receives the shared-object socket offered by the broker during setup, after the control
+    /// ring. See [`crate::shared_objects`].
+    pub fn receive_shared_object_channel(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> IoResult<OwnedFd> {
+        crate::memfd::receive_shared_object_channel(&mut self.stream, deadline)
+    }
+
     /// Receives the optional process image offered by the broker during
-    /// setup, after the control ring.
+    /// setup, after the shared-object socket.
     pub fn receive_process_image(
         &mut self,
         deadline: Option<Instant>,

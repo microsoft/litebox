@@ -1875,6 +1875,14 @@ fn run_test_broker_connection(
         |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
             channel.send_memfd(control_ring.memory(), Some(setup_deadline))?;
+            // This broker never delivers objects over the socket.
+            let (_sender, runner_end) =
+                litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender::pair(
+                )?;
+            channel.send_shared_object_channel(
+                std::os::fd::AsFd::as_fd(&runner_end),
+                Some(setup_deadline),
+            )?;
             channel.send_process_image(None, Some(setup_deadline))
         },
     )
