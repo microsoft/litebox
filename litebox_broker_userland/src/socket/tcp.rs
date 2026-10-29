@@ -22,7 +22,7 @@ use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::RawBytes;
 
 use super::direct::RawParts;
-use super::sys::{self, Errno, HostEvents, HostSocket, Interest, ReceiveMode};
+use super::host::{self, Errno, HostEvents, HostSocket, Interest, ReceiveMode};
 use super::{
     HookPoint, SocketEntry, SocketInbox, SocketKind, SocketState, SocketTransportState, Topology,
     UserlandSocket, broker_error_from_errno, can_consume_synchronous_error, lock,
@@ -813,7 +813,7 @@ fn receive_socket(
             );
             // The host reports no arrival while data is queued, so the event
             // thread polls until the peek's data arrives.
-            if !sys::REPORTS_EVERY_ARRIVAL && tcp.descriptor.is_external() {
+            if !host::REPORTS_EVERY_ARRIVAL && tcp.descriptor.is_external() {
                 socket.core().posted.post(socket.id());
             }
             return Err(BrokerError::WouldBlock);
@@ -1082,7 +1082,7 @@ pub(super) fn handle_socket_event(
     // the source of truth.
     let (events, polled) = match &socket.tcp_state()?.descriptor {
         TcpDescriptor::Internal(end) => (stream_events(end), false),
-        TcpDescriptor::ExternalInet(_) => (events, !sys::REPORTS_EVERY_ARRIVAL),
+        TcpDescriptor::ExternalInet(_) => (events, !host::REPORTS_EVERY_ARRIVAL),
         TcpDescriptor::Unrealized => (events, false),
     };
     let (republish_readiness, threshold_pending) = if (polled
