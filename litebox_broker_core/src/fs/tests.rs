@@ -2291,8 +2291,12 @@ mod shared_mapping {
     };
     use crate::fs::errors::{MapSharedError, OpenError, TruncateError};
     use crate::fs::in_mem::InitialNode;
+    use crate::fs::overlay::Overlay;
     use crate::fs::shared_memory::test_memory::VecMemoryProvider;
-    use crate::fs::shared_memory::{DEFAULT_MAX_SHARED_FILES, SharedFileLimit, SharedFileMemory};
+    use crate::fs::shared_memory::{
+        DEFAULT_MAX_SHARED_FILES, SharedFileLimit, SharedFileMemory, SnapshotLimit,
+    };
+    use crate::fs::tar_ro::TarRo;
     use alloc::borrow::Cow;
     use alloc::sync::Arc;
     use alloc::vec;
@@ -2464,8 +2468,130 @@ mod shared_mapping {
         assert_eq!(limit.live(), 2);
     }
 
+    /// A tar backend that snapshots its files into vector memory, within `limit`.
+    fn snapshotted_tar(
+        limit: SnapshotLimit,
+    ) -> (TarRo, Arc<VecMemoryProvider>, Arc<SnapshotLimit>) {
+        let provider = Arc::new(VecMemoryProvider::new(false));
+        let limit = Arc::new(limit);
+        let tar = TarRo::new(Cow::Borrowed(TEST_TAR_FILE), InodeAllocator::standalone())
+            .with_snapshots(provider.clone(), Arc::clone(&limit));
+        (tar, provider, limit)
+    }
+
     #[test]
-    fn overlay_shares_only_upper_files() {
+    fn tar_files_share_one_snapshot_each() {
+        let (tar, provider, limit) = snapshotted_tar(SnapshotLimit::default());
+        let fs = Resolver::<TestPlatform, _>::new(tar);
+        let mut fd = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let mut expected = vec![0; 64];
+        let len = fs.read(&mut fd, &mut expected, Some(0)).unwrap();
+        expected.truncate(len);
+
+        let (snapshot, writable) = fs.map_shared(&fd).unwrap();
+        assert!(!writable);
+        // Every mapping, through any open file, shares the one snapshot of the file.
+        let again = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert!(Arc::ptr_eq(&fs.map_shared(&again).unwrap().0, &snapshot));
+        assert_eq!(provider.sealed(), [expected]);
+        assert_eq!(limit.live(), (1, 4096));
+    }
+
+    #[test]
+    fn tar_files_past_the_snapshot_limit_are_not_shared() {
+        // Too many files.
+        let (tar, provider, limit) = snapshotted_tar(SnapshotLimit::new(0, 1 << 20, 1 << 20));
+        let fs = Resolver::<TestPlatform, _>::new(tar);
+        let fd = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&fd),
+            Err(MapSharedError::Unsupported)
+        ));
+        // Too large a file.
+        let (tar, _, _) = snapshotted_tar(SnapshotLimit::new(1, 1 << 20, 1));
+        let fs = Resolver::<TestPlatform, _>::new(tar);
+        let fd = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&fd),
+            Err(MapSharedError::Unsupported)
+        ));
+        assert_eq!(provider.sealed(), Vec::<Vec<u8>>::new());
+        assert_eq!(limit.live(), (0, 0));
+
+        // Without a provider, nothing is shared.
+        let fs = super::tar_ro_fs(Cow::Borrowed(TEST_TAR_FILE));
+        let fd = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            fs.map_shared(&fd),
+            Err(MapSharedError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn snapshot_limit_counts_whole_pages() {
+        let limit = SnapshotLimit::new(3, 3 * 4096, 2 * 4096);
+        assert!(limit.reserve(0));
+        assert!(limit.reserve(4097));
+        assert_eq!(limit.live(), (2, 2 * 4096));
+        assert!(
+            !limit.reserve(2 * 4096 + 1),
+            "larger than any one file may be"
+        );
+        assert!(!limit.reserve(4097), "more bytes than all files may hold");
+        assert!(limit.reserve(4096));
+        assert!(!limit.reserve(0), "more files than may exist");
+        limit.release(4097);
+        assert_eq!(limit.live(), (2, 4096));
+    }
+
+    #[test]
+    fn overlay_shares_lower_files_through_snapshots() {
+        let (tar, snapshots, _) = snapshotted_tar(SnapshotLimit::default());
+        let memory = Arc::new(VecMemoryProvider::new(false));
+        let upper = InMem::<TestPlatform>::new_initialized([(
+            "/",
+            InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: ROOT,
+            },
+        )])
+        .with_shared_memory(
+            memory.clone(),
+            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+        );
+        let fs = Resolver::<TestPlatform, _>::new(Overlay::<TestPlatform>::new(
+            upper,
+            tar,
+            InodeAllocator::standalone(),
+        ));
+        let lower = fs
+            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let (snapshot, writable) = fs.map_shared(&lower).unwrap();
+        assert!(!writable);
+        assert_eq!(snapshots.sealed().len(), 1);
+
+        // Once copied up, the file is shared through its own memory instead, while the snapshot
+        // stays as it was.
+        let upper = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
+        let (copied, writable) = fs.map_shared(&upper).unwrap();
+        assert!(writable);
+        assert!(!Arc::ptr_eq(&copied, &snapshot));
+        assert_eq!(contents(&*memory.last()), snapshots.sealed()[0]);
+    }
+
+    #[test]
+    fn overlay_without_snapshots_shares_only_upper_files() {
         let provider = Arc::new(VecMemoryProvider::new(false));
         let upper = InMem::<TestPlatform>::new_initialized([(
             "/",
@@ -2479,7 +2605,7 @@ mod shared_mapping {
             Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
         );
         let fs = super::overlay_fs(upper, Cow::Borrowed(TEST_TAR_FILE));
-        // A lower file opened for reading cannot change, so it is not shared.
+        // Without snapshots, a lower file opened for reading is not shared.
         let lower = fs
             .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
             .unwrap();

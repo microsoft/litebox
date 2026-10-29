@@ -13,7 +13,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
-    MAX_FILE_TRANSFER_SIZE,
+    MAX_FILE_TRANSFER_SIZE, MapFileMode,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
@@ -35,7 +35,7 @@ use super::errors::{
     WriteError,
 };
 
-/// A host shared object holding a file's contents, as returned by [`File::map_shared`].
+/// A host object holding a file's contents, as returned by [`File::map_object`].
 #[derive(Clone, Copy, Debug)]
 pub struct SharedFileObject {
     /// Names the file's shared memory, the same in every process that maps it, so that futexes
@@ -438,9 +438,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(TruncateError::from)
     }
 
-    /// Asks the broker for the host shared object holding this file's contents, so that every
-    /// process mapping it `MAP_SHARED` shares its pages. The object may be mapped writable
-    /// exactly when the file is open for writing, as the result tells.
+    /// Asks the broker for the host object holding this file's contents, to map it as `mode`
+    /// says, so that every process mapping the file shares its pages: for good with
+    /// [`MapFileMode::Shared`], and until written with [`MapFileMode::Private`]. A shared
+    /// mapping may write the object exactly when the file is open for writing, and a private
+    /// one never, as the result tells.
     ///
     /// The broker delivers the object out of band, before this returns, under the returned
     /// token. The caller must take it exactly once, with
@@ -448,8 +450,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// after which the platform's object owns it: mapping consumes it, and dropping it releases
     /// it. Callers must first check
     /// [`supports_shared_objects`](crate::platform::SharedObjectProvider::supports_shared_objects).
-    pub fn map_shared(&self) -> Result<SharedFileObject, MapSharedError> {
-        let response = self.broker.map_file(self.handle)??;
+    pub fn map_object(&self, mode: MapFileMode) -> Result<SharedFileObject, MapSharedError> {
+        let response = self.broker.map_file(self.handle, mode)??;
         Ok(SharedFileObject {
             memory: response.memory,
             token: crate::platform::page_mgmt::SharedObjectToken(response.token),

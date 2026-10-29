@@ -115,7 +115,7 @@ pub enum TruncateError {
     Io,
 }
 
-/// Possible errors from [`super::File::map_shared`].
+/// Possible errors from [`super::File::map_object`].
 #[derive(Error, Debug)]
 pub enum MapSharedError {
     #[error("fd has been closed already")]

@@ -2051,7 +2051,7 @@ mod tests {
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags,
-        FileType, FileUser, SetStatusFlagsRequest,
+        FileType, FileUser, MapFileMode, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
         ChildExit, ChildSelector, ProcessExitStatus, ThreadInfo,
@@ -3756,15 +3756,26 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mapping = crate::fs::map_shared(&source, file).unwrap().unwrap();
+        let mapping = crate::fs::map_shared(&source, file, MapFileMode::Shared)
+            .unwrap()
+            .unwrap();
         assert!(mapping.writable);
+        // A private mapping of the same file shares its memory, but never writes it.
+        let private = crate::fs::map_shared(&source, file, MapFileMode::Private)
+            .unwrap()
+            .unwrap();
+        assert!(!private.writable);
+        assert_eq!(private.memory_id, mapping.memory_id);
+        assert!(Arc::ptr_eq(&private.object, &mapping.object));
 
         // A reference that grants only reading maps the same memory, by the same ID, but only
         // read-only, even though the file is open for writing.
         let reader = source
             .duplicate_object_reference_to(file, &target, ObjectRights::WAIT)
             .unwrap();
-        let shared = crate::fs::map_shared(&target, reader).unwrap().unwrap();
+        let shared = crate::fs::map_shared(&target, reader, MapFileMode::Shared)
+            .unwrap()
+            .unwrap();
         assert!(!shared.writable);
         assert_eq!(shared.memory_id, mapping.memory_id);
         assert!(Arc::ptr_eq(&shared.object, &mapping.object));
@@ -3773,7 +3784,7 @@ mod tests {
             .duplicate_object_reference_to(file, &target, ObjectRights::WRITE)
             .unwrap();
         assert_eq!(
-            crate::fs::map_shared(&target, writer).map(|_| ()),
+            crate::fs::map_shared(&target, writer, MapFileMode::Shared).map(|_| ()),
             Err(BrokerError::InvalidRights)
         );
 

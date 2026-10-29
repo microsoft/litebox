@@ -278,6 +278,27 @@ fn test_shared_file_mapping_with_windows_broker() {
     );
 }
 
+/// Runs `private_file_mapping`, whose `MAP_PRIVATE` file mappings share the file's pages until
+/// they write them, also across fork, both for a file in memory and for its own program file in
+/// the initial file system.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/private_file_mapping.c`.
+#[test]
+fn test_private_file_mapping_with_windows_broker() {
+    let (broker, runner) = build_windows_broker();
+    let output = run_progs_with_process_duplication(
+        &broker,
+        &runner,
+        &["private_file_mapping"],
+        &["/bin/private_file_mapping.hooked"],
+    );
+
+    assert!(
+        output.lines().any(|line| line == "private-file failures=0"),
+        "{output}"
+    );
+}
+
 const DYNAMIC_LIBS: [(&str, &str); 2] = [
     ("libc.so.6", "/lib/x86_64-linux-gnu"),
     ("ld-linux-x86-64.so.2", "/lib64"),

@@ -74,6 +74,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "gate_signals.c",
     "inherited_ignored_signals.c",
     "process_group_parent.c",
+    "private_file_mapping.c",
     "process_tree_parent.c",
     "shared_file_mapping.c",
     "sigreturn.c",
@@ -1195,6 +1196,33 @@ fn shared_file_mappings_are_shared_across_fork_and_processes() {
         output
             .lines()
             .any(|line| line == "shared-file failures=0 shrink=ok"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_file_mappings_share_unwritten_pages_with_the_file() {
+    let program = common::compile(
+        "./tests/private_file_mapping.c",
+        "private_file_mapping",
+        true,
+        false,
+    );
+    let program_guest_path = std::path::absolute(&program).unwrap();
+    let mut runner = Runner::new(&program, "private_file_mapping");
+    // Only processes that fork natively map files' objects rather than copy them.
+    runner
+        .allow_process_duplication()
+        .arg(&program_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(program_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&program, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "private-file failures=0"),
         "{output}"
     );
 }

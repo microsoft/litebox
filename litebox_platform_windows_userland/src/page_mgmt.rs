@@ -121,6 +121,9 @@ struct SharedView {
     section: Arc<Section>,
     /// Offset in `section` of the view's start.
     offset: usize,
+    /// Whether the view is copy-on-write, as for a `MAP_PRIVATE` file mapping: the pages it
+    /// writes become its own copies, which only it, and a native fork child, sees.
+    private: bool,
 }
 
 /// Every shared view in this process.
@@ -215,6 +218,16 @@ impl SharedViews {
         starts
     }
 
+    /// Discards the copies that private views made of the pages they wrote within `range`, so
+    /// that those pages show their sections again. Shared views in `range` are left alone.
+    fn discard(&mut self, range: &Range<usize>) {
+        for start in self.overlapping(range) {
+            if self.views[&start].private {
+                self.remap(start, start..start, range);
+            }
+        }
+    }
+
     /// Detaches the shared views within `range`, leaving it reserved but unbacked.
     ///
     /// Windows only allows unmapping the full view, so partial unmapping requires unmapping the
@@ -227,51 +240,96 @@ impl SharedViews {
     /// suspending guest threads.
     fn detach(&mut self, range: Range<usize>) {
         for start in self.overlapping(&range) {
-            let view = self.views.remove(&start).unwrap();
-            let detached = start.max(range.start)..view.end.min(range.end);
-            let survivors: Vec<(Range<usize>, usize)> = [
-                (start..detached.start, view.offset),
-                (detached.end..view.end, view.offset + (detached.end - start)),
-            ]
-            .into_iter()
-            .filter(|(survivor, _)| !survivor.is_empty())
+            let detached = start.max(range.start)..self.views[&start].end.min(range.end);
+            self.remap(start, detached, &(0..0));
+        }
+    }
+
+    /// Unmaps the view at `start` and maps its parts outside `detached` again, leaving
+    /// `detached`, if not empty, reserved but unbacked.
+    ///
+    /// A private view's written pages are its own copies, which unmapping it would lose, so they
+    /// are saved first and written back after, except within `discarded`, which then shows the
+    /// section again. Until they are written back, a concurrent guest access sees the section's
+    /// contents instead, as with the protections noted on [`Self::detach`].
+    fn remap(&mut self, start: usize, detached: Range<usize>, discarded: &Range<usize>) {
+        let view = self.views.remove(&start).unwrap();
+        let survivors: Vec<(Range<usize>, usize)> = [
+            (start..detached.start, view.offset),
+            (detached.end..view.end, view.offset + (detached.end - start)),
+        ]
+        .into_iter()
+        .filter(|(survivor, _)| !survivor.is_empty())
+        .collect();
+        let protections: Vec<_> = survivors
+            .iter()
+            .flat_map(|(survivor, _)| regions(survivor.clone()))
+            .map(|(region, information)| (region, information.Protect))
             .collect();
-            let protections: Vec<_> = survivors
+        let written: Vec<(usize, Vec<u8>)> = if view.private {
+            survivors
                 .iter()
-                .flat_map(|(survivor, _)| regions(survivor.clone()))
-                .map(|(region, information)| (region, information.Protect))
-                .collect();
-            unmap_view(start);
-            // Split the resulting placeholder so that each part can be replaced separately.
-            let mut piece = start;
-            for boundary in [detached.start, detached.end] {
-                if piece < boundary && boundary < view.end {
-                    make_placeholder(piece..boundary);
-                    piece = boundary;
-                }
+                .flat_map(|(survivor, _)| {
+                    [
+                        survivor.start..survivor.end.min(discarded.start),
+                        survivor.start.max(discarded.end)..survivor.end,
+                    ]
+                })
+                .filter(|kept| kept.start < kept.end)
+                .flat_map(written_pages)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        unmap_view(start);
+        // Split the resulting placeholder so that each part can be replaced separately.
+        let mut piece = start;
+        for boundary in [detached.start, detached.end] {
+            if piece < boundary && boundary < view.end {
+                make_placeholder(piece..boundary);
+                piece = boundary;
             }
-            for (survivor, offset) in survivors {
-                assert!(
-                    map_view(&survivor, &view.section, offset),
-                    "failed to map surviving part of a shared view: {}",
-                    std::io::Error::last_os_error()
-                );
-                self.views.insert(
-                    survivor.start,
-                    SharedView {
-                        end: survivor.end,
-                        section: Arc::clone(&view.section),
-                        offset,
-                    },
+        }
+        for (survivor, offset) in survivors {
+            assert!(
+                map_view(&survivor, &view.section, offset, view.private),
+                "failed to map surviving part of a shared view: {}",
+                std::io::Error::last_os_error()
+            );
+            self.views.insert(
+                survivor.start,
+                SharedView {
+                    end: survivor.end,
+                    section: Arc::clone(&view.section),
+                    offset,
+                    private: view.private,
+                },
+            );
+        }
+        for (address, contents) in written {
+            // SAFETY: The page was just mapped again copy-on-write, so writing it makes it
+            // the view's own copy again, and the caller excludes conflicting accesses.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    contents.as_ptr(),
+                    address as *mut u8,
+                    contents.len(),
                 );
             }
-            for (region, protection) in protections {
-                assert!(
-                    protect(&region, protection),
-                    "failed to restore shared view protection: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
+        }
+        for (region, protection) in protections {
+            let protection = if view.private {
+                copy_on_write(protection)
+            } else {
+                protection
+            };
+            assert!(
+                protect(&region, protection),
+                "failed to restore shared view protection: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if !detached.is_empty() {
             assert!(
                 replace_placeholder(&detached, NativeReservation::Reserved),
                 "failed to reserve a detached shared view: {}",
@@ -548,12 +606,68 @@ fn replace_placeholder(extent: &Range<usize>, kind: NativeReservation) -> bool {
     ptr as usize == extent.start
 }
 
-/// Replaces the placeholder at exactly `range` with a view of `section` starting at `offset`.
+/// Returns the copy-on-write form of `protection`, for a private view, on which Windows refuses
+/// writable protections but allows their copy-on-write forms, which grant the same accesses.
+///
+/// Windows reports a page that a private view already copied as writable again, so restoring
+/// this form of a protection read from such a page keeps the copy.
+fn copy_on_write(
+    protection: Win32_Memory::PAGE_PROTECTION_FLAGS,
+) -> Win32_Memory::PAGE_PROTECTION_FLAGS {
+    match protection {
+        Win32_Memory::PAGE_READWRITE => Win32_Memory::PAGE_WRITECOPY,
+        Win32_Memory::PAGE_EXECUTE_READWRITE => Win32_Memory::PAGE_EXECUTE_WRITECOPY,
+        protection => protection,
+    }
+}
+
+/// Returns the contents of the pages in `range`, within a private view, that the view wrote,
+/// by address: they are the view's own copies, which unmapping it loses.
+///
+/// This reprotects the committed pages copy-on-write, which Windows then reports as writable
+/// for exactly the pages already copied, whatever protection they had.
+fn written_pages(range: Range<usize>) -> Vec<(usize, Vec<u8>)> {
+    for (region, information) in regions(range.clone()) {
+        if information.State == Win32_Memory::MEM_COMMIT {
+            assert!(
+                protect(&region, Win32_Memory::PAGE_EXECUTE_WRITECOPY),
+                "failed to inspect a private view: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    regions(range)
+        .into_iter()
+        .filter(|(_, information)| {
+            information.State == Win32_Memory::MEM_COMMIT
+                && information.Protect == Win32_Memory::PAGE_EXECUTE_READWRITE
+        })
+        .map(|(region, _)| {
+            // SAFETY: The pages are committed and were just made readable, and the caller
+            // excludes conflicting accesses.
+            let contents =
+                unsafe { core::slice::from_raw_parts(region.start as *const u8, region.len()) };
+            (region.start, contents.to_vec())
+        })
+        .collect()
+}
+
+/// Returns whether the native allocation at `address` is a private view, which allows only
+/// copy-on-write forms of writable protections.
+fn is_private_view(address: usize) -> bool {
+    query(address).is_some_and(|information| {
+        information.Type == Win32_Memory::MEM_MAPPED
+            && information.AllocationProtect == Win32_Memory::PAGE_EXECUTE_WRITECOPY
+    })
+}
+
+/// Replaces the placeholder at exactly `range` with a view of `section` starting at `offset`,
+/// copy-on-write if `private` is set.
 ///
 /// The view is mapped with every access the section allows, so that protection can later grant
-/// any of them. A view ending past the section maps only up to its end, which Windows rounds up
-/// to a page.
-fn map_view(range: &Range<usize>, section: &Section, offset: usize) -> bool {
+/// any of them; a private view may always be written, since its writes never reach the section.
+/// A view ending past the section maps only up to its end, which Windows rounds up to a page.
+fn map_view(range: &Range<usize>, section: &Section, offset: usize, private: bool) -> bool {
     let length = range.len().min(section.size.saturating_sub(offset));
     // SAFETY: The caller owns this placeholder; the section covers the requested window.
     let view = unsafe {
@@ -564,7 +678,11 @@ fn map_view(range: &Range<usize>, section: &Section, offset: usize) -> bool {
             offset as u64,
             length,
             Win32_Memory::MEM_REPLACE_PLACEHOLDER,
-            section.protection,
+            if private {
+                Win32_Memory::PAGE_EXECUTE_WRITECOPY
+            } else {
+                section.protection
+            },
             core::ptr::null_mut(),
             0,
         )
@@ -769,27 +887,35 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
             size: range.len(),
             protection: Win32_Memory::PAGE_EXECUTE_READWRITE,
         });
-        map_section(range, &section, 0, permissions)
+        map_section(range, &section, 0, permissions, false)
     }
 }
 
 /// Backs the reserved but unbacked `range` with views of `section` from its byte `offset`, one
-/// per native allocation, protected with `permissions`. On failure, `range` remains reserved and
-/// unbacked.
+/// per native allocation, copy-on-write if `private` is set, protected with `permissions`. On
+/// failure, `range` remains reserved and unbacked.
 fn map_section(
     range: Range<usize>,
     section: &Arc<Section>,
     offset: usize,
     permissions: MemoryRegionPermissions,
+    private: bool,
 ) -> Result<(), AllocationError> {
-    let flags = prot_flags(permissions);
+    let (flags, full) = if private {
+        (
+            copy_on_write(prot_flags(permissions)),
+            Win32_Memory::PAGE_EXECUTE_WRITECOPY,
+        )
+    } else {
+        (prot_flags(permissions), section.protection)
+    };
     let mut views = SharedViews::lock();
     SHARED_VIEWS.used.store(true, Ordering::Release);
     for allocation in allocations(range.clone()) {
         // Windows only allows mapping views of a section into reserved memory that is currently a placeholder.
         make_placeholder(allocation.clone());
         let view_offset = offset + (allocation.start - range.start);
-        if !map_view(&allocation, section, view_offset) {
+        if !map_view(&allocation, section, view_offset, private) {
             assert!(
                 replace_placeholder(&allocation, NativeReservation::Reserved),
                 "failed to restore reservation after shared mapping failure"
@@ -805,11 +931,12 @@ fn map_section(
                 end: allocation.end,
                 section: Arc::clone(section),
                 offset: view_offset,
+                private,
             },
         );
         // Views are mapped with the section's full access, which also bounds later protection
         // changes, so narrow it to the requested protection separately.
-        if flags != section.protection {
+        if flags != full {
             assert!(
                 protect(&allocation, flags),
                 "failed to protect shared view: {}",
@@ -1053,8 +1180,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         WindowsUserlandReservation<ALIGN>: 'reservation,
     {
         debug_assert_alignment!(range, ALIGN);
-        let flags = prot_flags(permissions);
         for allocation in allocations(range) {
+            let flags = if is_private_view(allocation.start) {
+                copy_on_write(prot_flags(permissions))
+            } else {
+                prot_flags(permissions)
+            };
             if protect(&allocation, flags) {
                 continue;
             }
@@ -1080,6 +1211,11 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         self.use_placeholders
     }
 
+    fn supports_private_object_mappings(&self) -> bool {
+        // Private views are copy-on-write views of delivered sections.
+        self.use_placeholders
+    }
+
     unsafe fn take_shared_object(
         &self,
         token: SharedObjectToken,
@@ -1094,6 +1230,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         range: Range<usize>,
         object: Self::SharedObject,
         offset: u64,
+        sharing: litebox::platform::page_mgmt::ObjectSharing,
         permissions: MemoryRegionPermissions,
     ) -> Result<(), AllocationError>
     where
@@ -1104,11 +1241,14 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         if !self.use_placeholders {
             return Err(AllocationError::UnsupportedByPlatform);
         }
+        let private = sharing == litebox::platform::page_mgmt::ObjectSharing::Private;
         // An empty file has no section, and all its pages are past its end.
         let Some(section) = object.0 else {
             return Ok(());
         };
-        if permissions.contains(MemoryRegionPermissions::WRITE)
+        // A private view may always be written, since its writes never reach the section.
+        if !private
+            && permissions.contains(MemoryRegionPermissions::WRITE)
             && section.protection != Win32_Memory::PAGE_EXECUTE_READWRITE
         {
             return Err(AllocationError::PermissionDenied);
@@ -1121,7 +1261,18 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
         if mapped.is_empty() {
             return Ok(());
         }
-        map_section(mapped, &Arc::new(section), offset, permissions)
+        map_section(mapped, &Arc::new(section), offset, permissions, private)
+    }
+
+    unsafe fn discard_private_object_pages(
+        &self,
+        range: Range<usize>,
+    ) -> Result<(), AllocationError> {
+        debug_assert_alignment!(range, ALIGN);
+        // Windows cannot drop a private view's copies of some pages, so the views are mapped
+        // again, keeping the copies outside `range`.
+        SharedViews::lock().discard(&range);
+        Ok(())
     }
 }
 
@@ -1129,6 +1280,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
 mod tests {
     use super::*;
     use crate::PAGE_SIZE;
+    use litebox::platform::page_mgmt::ObjectSharing;
     use litebox::platform::{PageManagementProvider, RawConstPointer, SharedObjectProvider};
 
     fn query_region(address: usize) -> Win32_Memory::MEMORY_BASIC_INFORMATION {
@@ -2189,6 +2341,7 @@ mod tests {
                     page(base, 0)..page(base, 3),
                     platform.take_shared_object(token).unwrap(),
                     0,
+                    ObjectSharing::Shared,
                     writable,
                 )
                 .unwrap();
@@ -2248,6 +2401,7 @@ mod tests {
                     page(base, 0)..page(base, 2),
                     platform.take_shared_object(token).unwrap(),
                     PAGE_SIZE as u64,
+                    ObjectSharing::Shared,
                     read,
                 )
                 .unwrap();
@@ -2277,6 +2431,7 @@ mod tests {
                     page(base, 0)..page(base, 2),
                     platform.take_shared_object(rejected).unwrap(),
                     0,
+                    ObjectSharing::Shared,
                     writable,
                 ),
                 Err(AllocationError::PermissionDenied)
@@ -2287,6 +2442,7 @@ mod tests {
                     page(base, 0)..page(base, 2),
                     platform.take_shared_object(token).unwrap(),
                     0,
+                    ObjectSharing::Shared,
                     read,
                 )
                 .unwrap();
@@ -2314,10 +2470,137 @@ mod tests {
                     page(base, 0)..page(base, 1),
                     platform.take_shared_object(SharedObjectToken(0)).unwrap(),
                     0,
+                    ObjectSharing::Shared,
                     writable,
                 )
                 .unwrap();
             assert_eq!(query_region(page(base, 0)).State, Win32_Memory::MEM_RESERVE);
+            platform.release_pages(reservation).unwrap();
+        }
+    }
+
+    #[test]
+    fn private_views_copy_on_write_and_keep_copies_across_splits() {
+        use std::os::windows::fs::FileExt as _;
+
+        let platform = WindowsUserland::<PAGE_SIZE>::new();
+        let read = MemoryRegionPermissions::READ;
+        let writable = read | MemoryRegionPermissions::WRITE;
+        let page = |base: usize, index: usize| base + index * PAGE_SIZE;
+        assert!(
+            <WindowsUserland as litebox::platform::SharedObjectProvider<PAGE_SIZE>>::supports_private_object_mappings(
+                platform
+            )
+        );
+        let mut contents = vec![1u8; 3 * PAGE_SIZE];
+        contents[PAGE_SIZE..].fill(2);
+        // A read-only section, as the broker delivers for a private mapping.
+        let (file, token) = file_section(
+            &contents,
+            Win32_Memory::SECTION_QUERY
+                | Win32_Memory::SECTION_MAP_READ
+                | Win32_Memory::SECTION_MAP_EXECUTE,
+        );
+        let read_file = |offset: usize| {
+            let mut byte = [0];
+            file.seek_read(&mut byte, offset as u64).unwrap();
+            byte[0]
+        };
+        // SAFETY: The fixture exclusively owns the fresh reservation and every page in it.
+        unsafe {
+            let reservation = platform
+                .reserve_pages(
+                    core::iter::empty,
+                    0..4 * PAGE_SIZE,
+                    false,
+                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                )
+                .unwrap();
+            let base = reservation.range().start;
+            platform
+                .commit_shared_object(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 4),
+                    platform.take_shared_object(token).unwrap(),
+                    0,
+                    ObjectSharing::Private,
+                    read,
+                )
+                .unwrap();
+            // The page past the end of the file stays reserved.
+            assert_eq!(query_region(page(base, 3)).State, Win32_Memory::MEM_RESERVE);
+
+            // A read-only section still maps writable privately, and writes stay private.
+            platform
+                .protect_pages(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 4),
+                    writable,
+                )
+                .unwrap();
+            (page(base, 0) as *mut u8).write(42);
+            (page(base, 2) as *mut u8).write(43);
+            assert_eq!(read_file(0), 1);
+            // Pages not written see the file's changes; written ones do not.
+            file.seek_write(&[7], PAGE_SIZE as u64).unwrap();
+            file.seek_write(&[8], 1).unwrap();
+            assert_eq!((page(base, 1) as *const u8).read(), 7);
+            assert_eq!((page(base, 0) as *const u8).add(1).read(), 1);
+
+            // Splitting the view keeps the written pages around the detached one, with their
+            // protections, while unwritten pages still follow the file.
+            platform
+                .protect_pages(
+                    || core::iter::once(&reservation),
+                    page(base, 0)..page(base, 1),
+                    read,
+                )
+                .unwrap();
+            platform
+                .decommit_pages(
+                    || core::iter::once(&reservation),
+                    page(base, 1)..page(base, 2),
+                )
+                .unwrap();
+            assert_eq!(
+                shared_views_within(reservation.range()),
+                [page(base, 0)..page(base, 1), page(base, 2)..page(base, 3)]
+            );
+            assert_eq!((page(base, 0) as *const u8).read(), 42);
+            assert_eq!((page(base, 0) as *const u8).add(1).read(), 1);
+            assert_eq!(
+                query_region(page(base, 0)).Protect,
+                Win32_Memory::PAGE_READONLY
+            );
+            assert_eq!((page(base, 2) as *const u8).read(), 43);
+            assert_eq!(
+                query_region(page(base, 2)).Protect,
+                Win32_Memory::PAGE_READWRITE
+            );
+            file.seek_write(&[9], 2 * PAGE_SIZE as u64 + 1).unwrap();
+            assert_eq!((page(base, 2) as *const u8).add(1).read(), 2);
+
+            // Discarding drops the copies, so the file shows again, keeping the protection.
+            platform
+                .discard_private_object_pages(page(base, 0)..page(base, 1))
+                .unwrap();
+            assert_eq!((page(base, 0) as *const u8).read(), 1);
+            assert_eq!((page(base, 0) as *const u8).add(1).read(), 8);
+            assert_eq!(
+                query_region(page(base, 0)).Protect,
+                Win32_Memory::PAGE_READONLY
+            );
+            platform
+                .discard_private_object_pages(page(base, 2)..page(base, 3))
+                .unwrap();
+            assert_eq!((page(base, 2) as *const u8).read(), 2);
+            assert_eq!((page(base, 2) as *const u8).add(1).read(), 9);
+            assert_eq!(
+                query_region(page(base, 2)).Protect,
+                Win32_Memory::PAGE_WRITECOPY
+            );
+            (page(base, 2) as *mut u8).write(44);
+            assert_eq!(read_file(2 * PAGE_SIZE), 2);
             platform.release_pages(reservation).unwrap();
         }
     }

@@ -25,10 +25,12 @@
 //! ```
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use spin::Once;
 
 use super::{DirEntry, FileType};
 
@@ -36,10 +38,11 @@ use super::{
     Mode, NodeInfo, OFlags, UserInfo,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
-        ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+        ChmodError, ChownError, MapSharedError, MkdirError, OpenError, PathError, ReadDirError,
+        ReadError, RmdirError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
+    shared_memory::{SharedFile, SharedFileMemoryError, SharedFileMemoryProvider, SnapshotLimit},
 };
 
 /// Block size for file system I/O operations
@@ -49,6 +52,16 @@ const BLOCK_SIZE: u64 = 0;
 /// A [`super::backend::Backend`] that stores all files in-memory, via a read-only `.tar` file.
 pub struct TarRo {
     tar_index: TarIndex,
+    snapshots: Option<Snapshots>,
+}
+
+/// Sealed snapshots of a [`TarRo`]'s files, which runners map instead of copying the files.
+struct Snapshots {
+    provider: Arc<dyn SharedFileMemoryProvider>,
+    limit: Arc<SnapshotLimit>,
+    /// Each file's snapshot, by index, created the first time a runner maps the file and kept
+    /// for as long as the backend lives, since the file never changes.
+    files: Vec<Once<Arc<SharedFile>>>,
 }
 
 impl TarRo {
@@ -60,7 +73,28 @@ impl TarRo {
     ) -> Self {
         Self {
             tar_index: TarIndex::new(tar_data, inode_allocator),
+            snapshots: None,
         }
+    }
+
+    /// Lets runners map this backend's files rather than copy them, through sealed snapshots
+    /// from `provider`, which every runner that maps a file shares.
+    ///
+    /// A file's snapshot lives as long as the backend. Files past what `limit` allows get none,
+    /// and runners copy them as they would without snapshots.
+    #[must_use]
+    pub fn with_snapshots(
+        mut self,
+        provider: Arc<dyn SharedFileMemoryProvider>,
+        limit: Arc<SnapshotLimit>,
+    ) -> Self {
+        let files = self.tar_index.files.iter().map(|_| Once::new()).collect();
+        self.snapshots = Some(Snapshots {
+            provider,
+            limit,
+            files,
+        });
+        self
     }
 }
 
@@ -212,6 +246,33 @@ impl super::backend::Backend for TarRo {
         let len = end - start;
         buf.copy_from_slice_at(0, &file[start..end])?;
         Ok(len)
+    }
+
+    fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
+        let snapshots = self.snapshots.as_ref().ok_or(MapSharedError::Unsupported)?;
+        let idx = h.get_typed::<Self>().idx;
+        // Concurrent first mappings of a file wait for one snapshot rather than each creating
+        // one, and a failure leaves the next mapping to try again.
+        snapshots.files[idx]
+            .try_call_once(|| {
+                let data = self.tar_index.file_data(idx);
+                // A file that does not fit is not an error: runners copy it instead.
+                if !snapshots.limit.reserve(data.len()) {
+                    return Err(MapSharedError::Unsupported);
+                }
+                match snapshots.provider.create_sealed(data) {
+                    Ok(object) => Ok(Arc::new(SharedFile::snapshot(object))),
+                    Err(error) => {
+                        snapshots.limit.release(data.len());
+                        Err(match error {
+                            SharedFileMemoryError::NoMemory => MapSharedError::NoMemory,
+                            SharedFileMemoryError::Unsupported => MapSharedError::Unsupported,
+                            _ => MapSharedError::Io,
+                        })
+                    }
+                }
+            })
+            .cloned()
     }
 
     fn write(

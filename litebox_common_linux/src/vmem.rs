@@ -23,6 +23,7 @@ use litebox::platform::page_mgmt::AllocationOptions;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::page_mgmt::HintPlacementBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::page_mgmt::ObjectSharing;
 use litebox::platform::page_mgmt::RemapError;
 use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
@@ -192,6 +193,10 @@ enum Sharing {
     Unnamed(NonZeroU64),
     /// Named shared memory: shared anonymous memory once named, or a file's host shared object.
     Named(SharedMemoryView),
+    /// A private file mapping of a file's host shared object: pages not yet written are the
+    /// object's, and written ones the area's own copies. Futexes in it are private, as Linux
+    /// keys them for a private mapping.
+    PrivateObject,
 }
 
 /// Where an area maps named shared memory.
@@ -226,6 +231,20 @@ impl VmArea {
     #[inline]
     pub fn is_shared_object(&self) -> bool {
         self.is_file_backed && matches!(self.sharing, Sharing::Named(_))
+    }
+
+    /// Returns whether this area is a private file mapping of a file's host shared object, whose
+    /// unwritten pages every mapper of the file shares, rather than a private copy of the file.
+    #[inline]
+    pub fn is_private_object(&self) -> bool {
+        self.is_file_backed && self.sharing == Sharing::PrivateObject
+    }
+
+    /// Returns whether this area maps a file's host shared object, shared or private, rather
+    /// than memory of its own.
+    #[inline]
+    pub fn is_object_backed(&self) -> bool {
+        self.is_shared_object() || self.is_private_object()
     }
 
     /// Returns the number of the shared anonymous mapping this area is a piece of, if that
@@ -286,7 +305,7 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
     pub(super) address_range: Range<usize>,
 }
 
-/// A host shared object to map as a shared file mapping.
+/// A host shared object to map as a file mapping.
 pub struct SharedObjectMapping<Object> {
     /// Names the object's memory, the same in every process that maps it.
     pub memory: SharedMemoryId,
@@ -295,7 +314,11 @@ pub struct SharedObjectMapping<Object> {
     pub object: Object,
     /// Byte offset in the object of the mapping's first page.
     pub offset: u64,
-    /// Whether the object may be mapped writable, so the mapping may become writable.
+    /// Whether the mapping is shared, so that its writes reach the object, or private, so that
+    /// they go to its own copies of the pages.
+    pub sharing: ObjectSharing,
+    /// Whether a shared mapping may write the object, so that it may become writable. A private
+    /// mapping may always become writable, since it never writes the object.
     pub may_write: bool,
 }
 
@@ -410,8 +433,9 @@ where
         permissions: MemoryRegionPermissions,
     ) -> Result<Platform::RawMutPointer<u8>, RemapError>;
 
-    /// Map the host shared object `object`, from its byte `offset`, over exactly `range`, and
-    /// update reservation ownership. The caller inserts the VMA.
+    /// Map the host shared object `object`, from its byte `offset`, over exactly `range`, shared
+    /// or private as `sharing` says, and update reservation ownership. The caller inserts the
+    /// VMA.
     ///
     /// `behavior` must be [`FixedAddressBehavior::Replace`] or
     /// [`FixedAddressBehavior::NoReplace`]. This consumes `object` whether or not it succeeds.
@@ -428,6 +452,7 @@ where
         range: Range<usize>,
         object: <Platform as SharedObjectProvider<ALIGN>>::SharedObject,
         offset: u64,
+        sharing: ObjectSharing,
         permissions: MemoryRegionPermissions,
         behavior: FixedAddressBehavior,
     ) -> Result<(), AllocationError>
@@ -548,6 +573,7 @@ where
         range: Range<usize>,
         object: <Platform as SharedObjectProvider<ALIGN>>::SharedObject,
         offset: u64,
+        sharing: ObjectSharing,
         permissions: MemoryRegionPermissions,
         behavior: FixedAddressBehavior,
     ) -> Result<(), AllocationError>
@@ -562,6 +588,7 @@ where
                 range.clone(),
                 object,
                 offset,
+                sharing,
                 permissions,
                 behavior,
             )
@@ -610,13 +637,13 @@ where
         let can_grow_down = options.contains(AllocationOptions::GROWS_DOWN);
 
         // Replacement normally recommits pages in place, which cannot turn private pages into
-        // shared ones or shared pages into private ones. Detach such replaced pages first instead,
-        // as Linux unmaps replaced pages before mapping new ones.
+        // shared ones, nor shared pages or pages of a host object into private ones. Detach such
+        // replaced pages first instead, as Linux unmaps replaced pages before mapping new ones.
         if behavior == FixedAddressBehavior::Replace
             && (vma.is_shared_anonymous()
-                || vmas
-                    .overlapping(range.clone())
-                    .any(|(_, replaced)| replaced.is_shared_anonymous()))
+                || vmas.overlapping(range.clone()).any(|(_, replaced)| {
+                    replaced.is_shared_anonymous() || replaced.is_object_backed()
+                }))
         {
             // SAFETY: Replacement covers only mapped, hence reserved, pages, and the caller
             // excludes their users.
@@ -820,6 +847,7 @@ where
         range: Range<usize>,
         object: <Platform as SharedObjectProvider<ALIGN>>::SharedObject,
         offset: u64,
+        sharing: ObjectSharing,
         permissions: MemoryRegionPermissions,
         behavior: FixedAddressBehavior,
     ) -> Result<(), AllocationError>
@@ -856,6 +884,7 @@ where
                 range.clone(),
                 object,
                 offset,
+                sharing,
                 permissions,
             )
         };
@@ -1013,6 +1042,7 @@ where
         anonymous_only: bool,
     ) -> Result<(), VmemResetError>
     where
+        Platform: SharedObjectProvider<ALIGN>,
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
         let range: Range<usize> = range.into();
@@ -1035,6 +1065,19 @@ where
                 if anonymous_only {
                     return Err(VmemResetError::FileBacked);
                 }
+                continue;
+            }
+            // Private pages of a host object drop the copies the mapping wrote, so that they
+            // show the file again, as on Linux.
+            if vma.is_private_object() {
+                if anonymous_only {
+                    return Err(VmemResetError::FileBacked);
+                }
+                let discard = r.start.max(range.start)..r.end.min(range.end);
+                // SAFETY: The range lies in a private object mapping, and the caller guarantees
+                // that nothing relies on its contents.
+                unsafe { self.platform.discard_private_object_pages(discard) }
+                    .expect("failed to discard private file pages");
                 continue;
             }
             if vma.is_file_backed() {
@@ -1331,11 +1374,11 @@ where
             );
             return Err(VmemResizeError::Unsupported);
         }
-        // TODO: grow shared file mappings by mapping more of the same object.
-        if area.is_shared_object() {
+        // TODO: grow file mappings of host objects by mapping more of the same object.
+        if area.is_object_backed() {
             litebox_util_log::warn!(
                 range:? = range, new_size = new_size.as_usize();
-                "growing a shared file mapping is unsupported"
+                "growing a file mapping of a host object is unsupported"
             );
             return Err(VmemResizeError::Unsupported);
         }
@@ -1648,17 +1691,18 @@ where
         Ok(())
     }
 
-    /// Maps the host object `object.object`, from its byte `offset`, as a shared file mapping of
-    /// `length` bytes, placed as `flags` request. This consumes the object whether or not it
-    /// succeeds.
+    /// Maps the host object `object.object`, from its byte `offset`, as a shared or private
+    /// file mapping of `length` bytes, placed as `flags` request. This consumes the object
+    /// whether or not it succeeds.
     ///
-    /// `may_write` decides whether `mprotect` may later make the mapping writable, which Linux
-    /// allows only if the file was opened for writing.
+    /// For a shared mapping, `may_write` decides whether `mprotect` may later make the mapping
+    /// writable, which Linux allows only if the file was opened for writing. A private mapping
+    /// may always become writable.
     ///
     /// # Safety
     ///
     /// For replacement, the caller must ensure overlapping mappings are not in use.
-    pub(super) unsafe fn create_shared_object_mapping(
+    pub(super) unsafe fn create_object_mapping(
         &mut self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
@@ -1690,22 +1734,32 @@ where
                 range.clone(),
                 object.object,
                 object.offset,
+                object.sharing,
                 permissions,
                 platform_behavior,
             )
         }?;
 
-        let may = VmFlags::may_flags_for_mapping(true, object.may_write);
+        let (may, sharing) = match object.sharing {
+            ObjectSharing::Shared => (
+                VmFlags::may_flags_for_mapping(true, object.may_write),
+                Sharing::Named(SharedMemoryView {
+                    memory: object.memory,
+                    base,
+                }),
+            ),
+            ObjectSharing::Private => (
+                VmFlags::may_flags_for_mapping(false, true),
+                Sharing::PrivateObject,
+            ),
+        };
         let mut vma = VmArea::new(VmFlags::from(permissions) | may, true);
-        vma.sharing = Sharing::Named(SharedMemoryView {
-            memory: object.memory,
-            base,
-        });
+        vma.sharing = sharing;
         self.vmas.insert(range.clone(), vma);
         Ok(Platform::RawMutPointer::<u8>::from_usize(range.start))
     }
 
-    /// Chooses where [`Self::create_shared_object_mapping`] maps `length` bytes from object
+    /// Chooses where [`Self::create_object_mapping`] maps `length` bytes from object
     /// `offset`, returning the range, the platform placement behavior, and the address that
     /// object offset zero has in the mapping.
     fn shared_object_placement(
@@ -1767,7 +1821,7 @@ where
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
         // A shared file mapping made here is the fallback for a file whose pages cannot be
         // shared: a private copy, to which writes would never reach the file. Shared file
-        // mappings of a host shared object are made by `create_shared_object_mapping` instead.
+        // mappings of a host shared object are made by `create_object_mapping` instead.
         let may_write = !(shared && file_backed);
         let mut vma = VmArea::new(
             VmFlags::from(perms)
@@ -2130,6 +2184,7 @@ mod tests {
         calls: Mutex<Vec<AllocationCall>>,
         decommits: Mutex<Vec<Range<usize>>>,
         shared_allocations: Mutex<Vec<Range<usize>>>,
+        discarded: Mutex<Vec<Range<usize>>>,
         rejected_release: Mutex<Option<usize>>,
         releases: Mutex<Vec<Range<usize>>>,
         permission_updates: Mutex<Vec<PermissionUpdate>>,
@@ -2186,6 +2241,7 @@ mod tests {
             range: Range<usize>,
             object: DummyObject,
             _offset: u64,
+            _sharing: ObjectSharing,
             _permissions: MemoryRegionPermissions,
             fixed_address_behavior: FixedAddressBehavior,
         ) -> Result<litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>, AllocationError>
@@ -2216,6 +2272,7 @@ mod tests {
             range: Range<usize>,
             object: DummyObject,
             _offset: u64,
+            _sharing: ObjectSharing,
             _permissions: MemoryRegionPermissions,
         ) -> Result<(), AllocationError>
         where
@@ -2227,6 +2284,14 @@ mod tests {
             }
             object.map();
             self.shared_allocations.lock().push(range);
+            Ok(())
+        }
+
+        unsafe fn discard_private_object_pages(
+            &self,
+            range: Range<usize>,
+        ) -> Result<(), AllocationError> {
+            self.discarded.lock().push(range);
             Ok(())
         }
     }
@@ -2447,6 +2512,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
+            discarded: Mutex::new(Vec::new()),
             rejected_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),
@@ -2674,12 +2740,13 @@ mod tests {
             memory: SharedMemoryId(id),
             object: backend.object(0),
             offset: offset as u64,
+            sharing: ObjectSharing::Shared,
             may_write,
         };
         let read_write = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         // SAFETY: The test owns the mock address space, and its objects are mock objects.
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>, address, count, flags, object| unsafe {
-            vmem.create_shared_object_mapping(
+            vmem.create_object_mapping(
                 NonZeroAddress::new(address),
                 size(count),
                 flags,
@@ -2808,6 +2875,98 @@ mod tests {
     }
 
     #[test]
+    fn private_object_mappings_copy_on_write_and_discard_through_the_platform() {
+        let backend = dummy_backend::<true>(None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        let pages = |start: usize, count: usize| {
+            PageRange::<PAGE_SIZE>::new(start, start + count * PAGE_SIZE).unwrap()
+        };
+        let size = |count: usize| NonZeroPageSize::new(count * PAGE_SIZE).unwrap();
+        let read = MemoryRegionPermissions::READ;
+        // SAFETY: The test owns the mock address space, and its objects are mock objects.
+        unsafe {
+            vmem.create_object_mapping(
+                NonZeroAddress::new(start),
+                size(2),
+                CreatePagesFlags::FIXED_ADDR,
+                read,
+                None,
+                SharedObjectMapping {
+                    memory: SharedMemoryId(1),
+                    object: backend.object(0),
+                    offset: 0,
+                    sharing: ObjectSharing::Private,
+                    may_write: false,
+                },
+            )
+        }
+        .unwrap();
+        // A private copy of a file right after it is a different kind of area.
+        let copy = start + 2 * PAGE_SIZE;
+        // SAFETY: As above.
+        unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(copy),
+                size(1),
+                VmArea::new(VmFlags::VM_READ, true),
+                CreatePagesFlags::FIXED_ADDR,
+            )
+        }
+        .unwrap();
+
+        let areas: Vec<_> = vmem.iter().map(|(r, a)| (r.clone(), *a)).collect();
+        assert_eq!(areas.len(), 2, "object pages never merge with copies");
+        let (_, area) = areas[0];
+        assert!(area.is_private_object() && area.is_object_backed());
+        assert!(!area.is_shared_object() && !area.is_shared_anonymous());
+        assert!(!areas[1].1.is_object_backed());
+        // A private mapping never writes the object, so it may become writable even when the
+        // file is not open for writing, and futexes in it are private.
+        assert!(area.flags().contains(VmFlags::VM_MAYWRITE));
+        assert!(!area.flags().contains(VmFlags::VM_SHARED));
+        assert_eq!(area.shared_futex_key(start), None);
+        // SAFETY: As above.
+        unsafe {
+            vmem.protect_mapping(
+                pages(start, 1),
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            )
+        }
+        .unwrap();
+
+        // MADV_DONTNEED discards written copies through the platform, without remapping, but
+        // MADV_FREE does not apply to file pages.
+        // SAFETY: Nothing uses the mock pages.
+        unsafe { vmem.reset_pages(pages(start, 2), false) }.unwrap();
+        // The writable page split from the read-only one, so each discards on its own.
+        assert_eq!(
+            *backend.discarded.lock(),
+            [start..start + PAGE_SIZE, start + PAGE_SIZE..copy]
+        );
+        let mapped = start..copy;
+        assert_eq!(*backend.shared_allocations.lock(), [mapped]);
+        assert!(matches!(
+            // SAFETY: As above.
+            unsafe { vmem.reset_pages(pages(start, 1), true) },
+            Err(VmemResetError::FileBacked)
+        ));
+        assert!(vmem.iter().next().unwrap().1.is_private_object());
+
+        // Object mappings can neither grow nor move yet.
+        assert!(matches!(
+            // SAFETY: As above.
+            unsafe { vmem.resize_mapping(pages(start + PAGE_SIZE, 1), size(2)) },
+            Err(VmemResizeError::Unsupported)
+        ));
+        assert!(matches!(
+            // SAFETY: As above.
+            unsafe { vmem.move_mappings(pages(start + PAGE_SIZE, 1), None, size(1)) },
+            Err(VmemMoveError::Unsupported)
+        ));
+    }
+
+    #[test]
     fn tracked_shared_object_mappings_reserve_gaps_and_release_unused_objects() {
         let start = DummyVmemBackend::<false, TrackedDummyReservations>::TASK_ADDR_MIN;
         let failing = start + 8 * PAGE_SIZE;
@@ -2818,11 +2977,12 @@ mod tests {
             memory: SharedMemoryId(id),
             object: backend.object(token),
             offset: 0,
+            sharing: ObjectSharing::Shared,
             may_write: true,
         };
         // SAFETY: The test owns the mock address space, and its objects are mock objects.
         let map = |vmem: &mut Vmem<_, PAGE_SIZE>, address, pages: usize, flags, object| unsafe {
-            vmem.create_shared_object_mapping(
+            vmem.create_object_mapping(
                 NonZeroAddress::new(address),
                 NonZeroPageSize::new(pages * PAGE_SIZE).unwrap(),
                 flags,
@@ -2903,6 +3063,23 @@ mod tests {
             Err(AllocationError::AddressInUse)
         ));
         assert_eq!(*backend.released_tokens.lock(), [12, 13]);
+
+        // Private memory replacing an object's pages detaches them first, since it cannot be
+        // committed over them in place.
+        backend.decommits.lock().clear();
+        let replaced = start + PAGE_SIZE..start + 2 * PAGE_SIZE;
+        // SAFETY: Nothing uses the mock pages.
+        unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(replaced.start),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_WRITE, false),
+                CreatePagesFlags::FIXED_ADDR,
+            )
+        }
+        .unwrap();
+        assert_eq!(*backend.decommits.lock(), [replaced]);
+        assert_eq!(id_at(&vmem, start + PAGE_SIZE), None);
     }
 
     #[test]
@@ -3896,6 +4073,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
             shared_allocations: Mutex::new(Vec::new()),
+            discarded: Mutex::new(Vec::new()),
             rejected_release: Mutex::new(None),
             releases: Mutex::new(Vec::new()),
             permission_updates: Mutex::new(Vec::new()),

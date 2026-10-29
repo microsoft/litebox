@@ -9,7 +9,7 @@ use core::any::Any;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
+    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, MapFileMode,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
@@ -666,17 +666,20 @@ pub fn truncate(
     process.core.fs.truncate(&file, length, reset_offset)
 }
 
-/// Returns the host shared object holding a broker-owned open file's contents, so that the
-/// caller can map the file `MAP_SHARED`, and the ID naming it for futexes.
+/// Returns the host object holding a broker-owned open file's contents, so that the caller can
+/// map the file as `mode` says, and the ID naming it for futexes.
 ///
-/// The handle must grant reading. The object may be mapped writable exactly when the file is
-/// open for writing and the handle also grants writing, so that a mapping grants no access that
-/// the handle does not, but as much as a later `mprotect` may need.
+/// The handle must grant reading. For [`MapFileMode::Shared`], the object may be mapped writable
+/// exactly when the file is open for writing and the handle also grants writing, so that a
+/// mapping grants no access that the handle does not, but as much as a later `mprotect` may
+/// need. For [`MapFileMode::Private`], it is always read-only: the caller's writes stay in its
+/// own copies of the pages.
 ///
 /// Fails with [`FileError::NoSuchDevice`] if the file system cannot share the file's pages.
 pub fn map_shared(
     process: &BrokerProcess,
     handle: ObjectHandle,
+    mode: MapFileMode,
 ) -> Result<FileResult<SharedFileMapping>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
     let handle_writable = process
@@ -690,7 +693,7 @@ pub fn map_shared(
     Ok(Ok(SharedFileMapping {
         memory_id,
         object: Arc::clone(shared.object()),
-        writable: handle_writable && file_writable,
+        writable: mode == MapFileMode::Shared && handle_writable && file_writable,
     }))
 }
 

@@ -47,12 +47,13 @@ pub(crate) fn handle_map_file(
     process: &BrokerProcess,
     operation: &BrokerOperation,
 ) -> Option<Result<BrokerResult, RequestFailure>> {
-    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle })) = *operation else {
+    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, mode })) = *operation
+    else {
         return None;
     };
     let response = match delivery {
         None => FileResponse::Failed(FileError::NoSuchDevice),
-        Some(delivery) => match litebox_broker_core::fs::map_shared(process, handle) {
+        Some(delivery) => match litebox_broker_core::fs::map_shared(process, handle, mode) {
             Err(error) => return Some(Err(RequestFailure::from(error))),
             Ok(Err(error)) => FileResponse::Failed(error),
             Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable) {
@@ -385,11 +386,12 @@ mod host_file {
 pub mod linux {
     use std::fs::File;
     use std::io::{Error as IoError, Result as IoResult};
-    use std::os::fd::{BorrowedFd, FromRawFd as _};
+    use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _};
     use std::sync::Arc;
 
     use litebox_broker_core::fs::shared_memory::{
-        SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider, SharedFileObject,
+        HostHandle, SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
+        SharedFileObject,
     };
     use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 
@@ -403,29 +405,69 @@ pub mod linux {
     /// `ftruncate` and `fallocate`, which the broker sees as the file growing.
     pub struct MemfdFileMemoryProvider;
 
+    /// Creates a memfd with `flags`, executable if the host allows.
+    fn memfd(flags: libc::c_uint) -> Result<File, SharedFileMemoryError> {
+        // Runners may map the file executable, as Linux allows for a file mapping, so ask for an
+        // executable memfd where the host would otherwise seal it against execution
+        // (`vm.memfd_noexec=1`). Older kernels reject the flag, and hosts that forbid executable
+        // memfds refuse it; either way, a plain memfd is the best left.
+        let memfd = |flags| {
+            // SAFETY: The name is a valid C string, and the call creates a new descriptor.
+            unsafe { libc::memfd_create(c"litebox-shared-file".as_ptr(), flags) }
+        };
+        let mut fd = memfd(flags | libc::MFD_CLOEXEC | libc::MFD_EXEC);
+        if fd < 0 {
+            fd = memfd(flags | libc::MFD_CLOEXEC);
+        }
+        if fd < 0 {
+            return Err(memory_error(&IoError::last_os_error()));
+        }
+        // SAFETY: `memfd_create` returned a new descriptor that nothing else owns.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
     impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
         fn create(
             &self,
             contents: &[u8],
         ) -> Result<Arc<dyn SharedFileMemory>, SharedFileMemoryError> {
-            // Runners may map the file executable, as Linux allows for a shared file mapping, so
-            // ask for an executable memfd where the host would otherwise seal it against
-            // execution (`vm.memfd_noexec=1`). Older kernels reject the flag, and hosts that
-            // forbid executable memfds refuse it; either way, a plain memfd is the best left.
-            let memfd = |flags| {
-                // SAFETY: The name is a valid C string, and the call creates a new descriptor.
-                unsafe { libc::memfd_create(c"litebox-shared-file".as_ptr(), flags) }
-            };
-            let mut fd = memfd(libc::MFD_CLOEXEC | libc::MFD_EXEC);
-            if fd < 0 {
-                fd = memfd(libc::MFD_CLOEXEC);
-            }
-            if fd < 0 {
+            create(memfd(0)?, contents)
+        }
+
+        /// Copies `contents` into a memfd sealed against any change of its contents or size,
+        /// which the kernel enforces on every holder of the descriptor, runners and broker
+        /// alike: writes and writable shared mappings fail, while private mappings stay
+        /// writable, with their writes in copies of the pages.
+        fn create_sealed(
+            &self,
+            contents: &[u8],
+        ) -> Result<Arc<dyn SharedFileObject>, SharedFileMemoryError> {
+            let file = memfd(libc::MFD_ALLOW_SEALING)?;
+            let length =
+                u64::try_from(contents.len()).map_err(|_| SharedFileMemoryError::NoMemory)?;
+            file.set_len(length).map_err(|error| memory_error(&error))?;
+            std::os::unix::fs::FileExt::write_all_at(&file, contents, 0)
+                .map_err(|error| memory_error(&error))?;
+            let seals =
+                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
+            // SAFETY: Seals a descriptor that `file` owns.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
                 return Err(memory_error(&IoError::last_os_error()));
             }
-            // SAFETY: `memfd_create` returned a new descriptor that nothing else owns.
-            let file = unsafe { File::from_raw_fd(fd) };
-            create(file, contents)
+            Ok(Arc::new(SealedMemfd(file)))
+        }
+    }
+
+    /// A memfd sealed so that its contents never change.
+    struct SealedMemfd(File);
+
+    impl SharedFileObject for SealedMemfd {
+        /// Lends the memfd itself, even to a reader: its seals, rather than its access mode,
+        /// refuse every writable shared mapping.
+        fn host_handle(&self, _writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
+            let raw = u64::try_from(self.0.as_raw_fd()).map_err(|_| SharedFileMemoryError::Io)?;
+            // SAFETY: The descriptor belongs to `self`, which keeps it open while borrowed.
+            Ok(unsafe { HostHandle::borrow_raw(raw) })
         }
     }
 
@@ -449,7 +491,7 @@ pub mod linux {
     mod tests {
         use super::*;
         use litebox_platform_linux_userland::shared_objects::SharedObjectChannel;
-        use std::os::fd::{AsRawFd as _, OwnedFd};
+        use std::os::fd::OwnedFd;
 
         #[test]
         fn memfd_memory_reads_writes_and_resizes() {
@@ -494,6 +536,53 @@ pub mod linux {
             let fd = channel.take(writable).unwrap();
             assert!(map(&fd, libc::PROT_READ | libc::PROT_WRITE));
         }
+
+        #[test]
+        fn sealed_snapshots_map_privately_but_never_change() {
+            let (sender, runner) = SharedObjectSender::pair().unwrap();
+            let channel = SharedObjectChannel::new(runner);
+            let delivery = MemfdDelivery(sender);
+            let snapshot = MemfdFileMemoryProvider.create_sealed(b"hello").unwrap();
+            let fd = channel
+                .take(delivery.deliver(&*snapshot, false).unwrap())
+                .unwrap();
+
+            let map = |flags| {
+                // SAFETY: Maps fresh pages that nothing else uses.
+                let address = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags,
+                        fd.as_raw_fd(),
+                        0,
+                    )
+                };
+                (address != libc::MAP_FAILED).then_some(address.cast::<u8>())
+            };
+            assert!(map(libc::MAP_SHARED).is_none());
+            let private = map(libc::MAP_PRIVATE).unwrap();
+            let again = map(libc::MAP_PRIVATE).unwrap();
+            // SAFETY: Both mappings are 4096 bytes, readable and writable, and nothing else uses
+            // them.
+            unsafe {
+                assert_eq!(core::slice::from_raw_parts(private, 5), b"hello");
+                *private = b'J';
+                assert_eq!(*again, b'h', "a private write is the writer's alone");
+                libc::munmap(private.cast(), 4096);
+                libc::munmap(again.cast(), 4096);
+            }
+
+            // Neither writes nor size changes reach the snapshot, through any descriptor.
+            let file = File::from(fd);
+            assert!(std::os::unix::fs::FileExt::write_at(&file, b"J", 0).is_err());
+            assert!(file.set_len(1).is_err());
+            assert!(file.set_len(8192).is_err());
+            let mut bytes = [0; 8];
+            let read = std::os::unix::fs::FileExt::read_at(&file, &mut bytes, 0).unwrap();
+            assert_eq!(&bytes[..read], b"hello");
+        }
     }
 }
 
@@ -511,7 +600,8 @@ pub mod windows {
     use std::sync::Arc;
 
     use litebox_broker_core::fs::shared_memory::{
-        SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider, SharedFileObject,
+        HostHandle, SharedFileMemory, SharedFileMemoryError, SharedFileMemoryProvider,
+        SharedFileObject,
     };
     use litebox_broker_transport_windows_userland::shared_objects::SectionSender;
     use windows_sys::Win32::Foundation::{
@@ -530,39 +620,73 @@ pub mod windows {
     /// Creates memory for files in the host's temporary directory.
     pub struct TempFileMemoryProvider;
 
+    /// Creates an empty temporary file that only this process may open, deleted when closed.
+    fn temp_file() -> Result<std::fs::File, SharedFileMemoryError> {
+        let directory = std::env::temp_dir();
+        loop {
+            let mut nonce = [0u8; 8];
+            getrandom::fill(&mut nonce).map_err(|_| SharedFileMemoryError::Io)?;
+            let path = directory.join(format!(
+                "litebox-shared-file-{}-{:016x}",
+                std::process::id(),
+                u64::from_le_bytes(nonce),
+            ));
+            // Sections need execute access to the file for runners to map it executable, as
+            // Linux allows for a shared file mapping. No other process may open the file, and
+            // it is deleted when the broker closes it.
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .access_mode(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE)
+                .share_mode(0)
+                .attributes(FILE_ATTRIBUTE_TEMPORARY)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                .open(path)
+            {
+                Ok(file) => return Ok(file),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(memory_error(&error)),
+            }
+        }
+    }
+
     impl SharedFileMemoryProvider for TempFileMemoryProvider {
         fn create(
             &self,
             contents: &[u8],
         ) -> Result<Arc<dyn SharedFileMemory>, SharedFileMemoryError> {
-            let directory = std::env::temp_dir();
-            let file = loop {
-                let mut nonce = [0u8; 8];
-                getrandom::fill(&mut nonce).map_err(|_| SharedFileMemoryError::Io)?;
-                let path = directory.join(format!(
-                    "litebox-shared-file-{}-{:016x}",
-                    std::process::id(),
-                    u64::from_le_bytes(nonce),
-                ));
-                // Sections need execute access to the file for runners to map it executable, as
-                // Linux allows for a shared file mapping. No other process may open the file, and
-                // it is deleted when the broker closes it.
-                match std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .access_mode(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE)
-                    .share_mode(0)
-                    .attributes(FILE_ATTRIBUTE_TEMPORARY)
-                    .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-                    .open(path)
-                {
-                    Ok(file) => break file,
-                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(memory_error(&error)),
-                }
-            };
-            create(file, contents)
+            create(temp_file()?, contents)
+        }
+
+        /// Copies `contents` into a temporary file that the broker never writes again and that
+        /// no other process may open, and that it delivers only as read-only sections, which no
+        /// runner can map writable but may map copy-on-write.
+        fn create_sealed(
+            &self,
+            contents: &[u8],
+        ) -> Result<Arc<dyn SharedFileObject>, SharedFileMemoryError> {
+            let file = temp_file()?;
+            std::io::Write::write_all(&mut &file, contents)
+                .map_err(|error| memory_error(&error))?;
+            Ok(Arc::new(SnapshotFile(file)))
+        }
+    }
+
+    /// A temporary file holding a snapshot that never changes.
+    struct SnapshotFile(std::fs::File);
+
+    impl SharedFileObject for SnapshotFile {
+        /// Lends the file's handle for read-only sections only.
+        fn host_handle(&self, writable: bool) -> Result<HostHandle<'_>, SharedFileMemoryError> {
+            use std::os::windows::io::AsRawHandle as _;
+
+            if writable {
+                return Err(SharedFileMemoryError::Unsupported);
+            }
+            let raw = self.0.as_raw_handle() as usize as u64;
+            // SAFETY: The handle belongs to `self`, which keeps it open while borrowed.
+            Ok(unsafe { HostHandle::borrow_raw(raw) })
         }
     }
 
@@ -629,6 +753,46 @@ pub mod windows {
         #[test]
         fn temp_file_memory_reads_writes_and_resizes() {
             super::super::host_file::tests::check_reads_writes_and_resizes(&TempFileMemoryProvider);
+        }
+
+        #[test]
+        fn snapshots_map_copy_on_write_but_never_writable() {
+            use windows_sys::Win32::System::Memory::FILE_MAP_COPY;
+
+            // SAFETY: The pseudo-handle names this process and is always valid.
+            let process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
+            let delivery = SectionDelivery::new(process).unwrap();
+            let snapshot = TempFileMemoryProvider.create_sealed(b"hello").unwrap();
+            assert_eq!(
+                delivery
+                    .deliver(&*snapshot, true)
+                    .map_err(|error| error.kind()),
+                Err(ErrorKind::Unsupported)
+            );
+            let token = delivery.deliver(&*snapshot, false).unwrap();
+            // SAFETY: The token is a section handle that `deliver` duplicated into this process
+            // for this caller alone.
+            let section =
+                unsafe { OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE) };
+            let map = |access| {
+                // SAFETY: Maps a fresh view of a live section.
+                let view = unsafe { MapViewOfFile(section.as_raw_handle(), access, 0, 0, 0) };
+                (!view.Value.is_null()).then_some(view)
+            };
+            assert!(map(FILE_MAP_READ | FILE_MAP_WRITE).is_none());
+            let private = map(FILE_MAP_COPY).unwrap();
+            let again = map(FILE_MAP_READ).unwrap();
+            // SAFETY: Both views are live and at least five bytes long.
+            unsafe {
+                assert_eq!(
+                    core::slice::from_raw_parts(private.Value.cast::<u8>(), 5),
+                    b"hello"
+                );
+                private.Value.cast::<u8>().write(b'J');
+                assert_eq!(again.Value.cast::<u8>().read(), b'h');
+                assert_ne!(UnmapViewOfFile(private), 0);
+                assert_ne!(UnmapViewOfFile(again), 0);
+            }
         }
 
         #[test]

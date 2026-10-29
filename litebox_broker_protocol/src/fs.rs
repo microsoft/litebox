@@ -422,16 +422,29 @@ pub struct TruncateFileRequest {
     pub reset_offset: bool,
 }
 
-/// Requests the host shared object holding an open regular file's contents, so that the caller
-/// can map it as a `MAP_SHARED` file mapping.
+/// How a caller maps a file's host object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapFileMode {
+    /// A `MAP_SHARED` mapping, whose writes reach the file.
+    Shared,
+    /// A `MAP_PRIVATE` mapping, which shares the file's pages until it writes them, and whose
+    /// writes never reach the file.
+    Private,
+}
+
+/// Requests the host object holding an open regular file's contents, so that the caller can map
+/// it as a file mapping.
 ///
-/// The file must be open for reading. The object is writable exactly when the file is open for
-/// writing and the handle grants writing, since a mapping that starts read-only may later become
-/// writable, as Linux allows for a file open for writing.
+/// The file must be open for reading. For a shared mapping, the object is writable exactly when
+/// the file is open for writing and the handle grants writing, since a mapping that starts
+/// read-only may later become writable, as Linux allows for a file open for writing. For a
+/// private mapping, it is always read-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapFileRequest {
     /// Broker-owned file handle.
     pub handle: ObjectHandle,
+    /// How the caller maps the object.
+    pub mode: MapFileMode,
 }
 
 /// Successful map response.
