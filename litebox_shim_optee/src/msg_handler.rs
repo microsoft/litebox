@@ -27,10 +27,9 @@ use litebox::{
 use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
-    OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeSecureWorldCapabilities,
-    OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeIdentity, TeeLogin,
-    TeeOrigin, TeeParamType, TeeResult, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
-    optee_msg_args_total_size,
+    OpteeMsgParamTmem, OpteeRpcArgs, OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction,
+    OpteeSmcResult, OpteeSmcReturnCode, TeeIdentity, TeeLogin, TeeOrigin, TeeParamType, TeeResult,
+    TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams, optee_msg_args_total_size,
 };
 use once_cell::race::OnceBox;
 use zerocopy::{FromBytes, Immutable};
@@ -445,11 +444,11 @@ pub fn handle_optee_msg_args<Platform: crate::OpteeShimPlatform>(
     Ok(())
 }
 
-/// TA request information extracted from an OP-TEE message.
+/// A TA request, decoded from an OP-TEE message or built with [`Self::new`].
 ///
-/// In addition to standard TA information (i.e., TA UUID, session ID, command ID,
-/// and parameters), it contains shared memory information (`shm_info`) to
-/// transfer data between the normal world and the TA.
+/// `shm_info` holds the normal-world memory of each memref param. Loading the request
+/// into a TA entry records where the shim placed `params` in TA memory; write-back reads
+/// TA outputs only through that record.
 pub struct TaRequestInfo<const ALIGN: usize> {
     pub uuid: Option<TeeUuid>,
     pub client_identity: Option<TeeIdentity>,
@@ -458,6 +457,38 @@ pub struct TaRequestInfo<const ALIGN: usize> {
     pub cmd_id: u32,
     pub params: [UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
     pub shm_info: [Option<ShmInfo<ALIGN>>; UteeParamOwned::TEE_NUM_PARAMS],
+    /// Placement of `params` in TA memory, recorded by
+    /// [`load_ta_context`](crate::OpteeShimEntrypoints::load_ta_context); `None` until then.
+    pub(crate) ta_layout: Option<crate::TaParamLayout>,
+}
+
+impl<const ALIGN: usize> TaRequestInfo<ALIGN> {
+    /// A request without normal-world memory: no UUID, client identity, `shm_info`, or params.
+    #[must_use]
+    pub fn new(entry_func: UteeEntryFunc, session: u32, cmd_id: u32) -> Self {
+        Self {
+            uuid: None,
+            client_identity: None,
+            session,
+            entry_func,
+            cmd_id,
+            params: [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS],
+            shm_info: [const { None }; UteeParamOwned::TEE_NUM_PARAMS],
+            ta_layout: None,
+        }
+    }
+
+    /// Address of the TA's `UteeParams` block, once the request is loaded into a TA entry.
+    #[must_use]
+    pub fn ta_params_address(&self) -> Option<usize> {
+        self.ta_layout.map(|layout| layout.params_address)
+    }
+
+    /// `(address, len)` of the TA buffer for memref output or inout parameter `index`, once loaded.
+    #[must_use]
+    pub fn ta_memref_buffer(&self, index: usize) -> Option<(usize, usize)> {
+        self.ta_layout?.memref_buffers.get(index).copied().flatten()
+    }
 }
 
 /// This function decodes a TA request contained in `OpteeMsgArgs`.
@@ -532,6 +563,7 @@ pub fn decode_ta_request<Platform: crate::OpteeShimPlatform>(
         cmd_id: msg_args.func,
         params: [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS],
         shm_info: [const { None }; UteeParamOwned::TEE_NUM_PARAMS],
+        ta_layout: None,
     };
 
     if num_params
@@ -635,97 +667,160 @@ pub fn decode_ta_request<Platform: crate::OpteeShimPlatform>(
     Ok(ta_req_info)
 }
 
-/// This function updates the OP-TEE message arguments for returning from the secure world to the normal world.
+/// TA outputs for [`write_back`].
 ///
-/// It writes back TA execution outputs associated with shared memory references and updates
-/// the `OpteeMsgArgs` structure to return value-based outputs.
-/// `return_code` indicates the result of an OP-TEE request and `return_origin` indicates which component
-/// generated the return code. `session_id` can be provided if this is for an OpenSession request.
-/// `ta_params` is a reference to `UteeParams` structure that stores TA's output within its memory.
-/// `ta_req_info` refers to the decoded TA request information including the normal world
-/// shared memory addresses to write back output data.
-/// `memref_addresses` locates memref output data in TA memory; `None` means the
-/// data was already written to shared memory in place (client PTAs).
-#[allow(clippy::too_many_arguments)]
+/// Output kinds come from `request`, never from `UteeParams::types`, which a TA
+/// can rewrite.
+#[derive(Clone, Copy)]
+pub(crate) enum ParamOutputs<'a> {
+    /// TA entry: `UteeParams` and memref data are in TA memory, at the placement
+    /// recorded in the request.
+    Ta(&'a TaRequestInfo<PAGE_SIZE>),
+    /// Client PTA: values and sizes are in `params`; memref data is already in
+    /// shared memory.
+    ClientPta {
+        request: &'a TaRequestInfo<PAGE_SIZE>,
+        params: &'a UteeParams,
+    },
+}
+
+/// A validated copy of memref output data from TA memory to shared memory.
+struct MemrefCopy<'a> {
+    src: usize,
+    dst: &'a ShmInfo<PAGE_SIZE>,
+    len: usize,
+}
+
+/// Update the OP-TEE message arguments for returning from the secure world to the normal world.
+///
+/// Like OP-TEE `copy_out_param`, outputs follow the request's param types for every
+/// result, except that `TargetDead` writes back only the result.
+///
+/// # Errors
+///
+/// Fails if a `Success` memref size exceeds its shared memory (clients may trust it),
+/// TA memory cannot be read, or a copy fails. `msg_args` is then unchanged, but memref
+/// data copied before the failure stays in shared memory.
+///
+/// # Panics
+///
+/// Panics if `request` was not loaded with
+/// [`load_ta_context`](crate::OpteeShimEntrypoints::load_ta_context), unless
+/// `return_code` is `TargetDead`.
 pub fn update_optee_msg_args<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
     return_code: TeeResult,
     return_origin: TeeOrigin,
     session_id: Option<u32>,
-    ta_params: Option<&UteeParams>,
-    ta_req_info: Option<&TaRequestInfo<PAGE_SIZE>>,
-    memref_addresses: Option<&crate::TaMemrefAddresses>,
+    request: Option<&TaRequestInfo<PAGE_SIZE>>,
     msg_args: &mut OpteeMsgArgs,
 ) -> Result<(), OpteeSmcReturnCode> {
-    msg_args.ret = return_code;
-    msg_args.ret_origin = return_origin;
-    if let Some(session_id) = session_id {
-        msg_args.session = session_id;
-    }
+    write_back(
+        platform,
+        return_code,
+        return_origin,
+        session_id,
+        request.map(ParamOutputs::Ta),
+        msg_args,
+    )
+}
 
-    let Some(ta_params) = ta_params else {
-        return Ok(());
+/// [`update_optee_msg_args`] with explicit output sources.
+pub(crate) fn write_back<Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
+    return_code: TeeResult,
+    return_origin: TeeOrigin,
+    session_id: Option<u32>,
+    outputs: Option<ParamOutputs<'_>>,
+    msg_args: &mut OpteeMsgArgs,
+) -> Result<(), OpteeSmcReturnCode> {
+    let mut staged = *msg_args;
+    staged.ret = return_code;
+    staged.ret_origin = return_origin;
+    if let Some(session_id) = session_id {
+        staged.session = session_id;
+    }
+    // A dead TA's memory must not be read.
+    if let Some(outputs) = outputs
+        && return_code != TeeResult::TargetDead
+    {
+        let copies = stage_outputs::<Platform>(outputs, return_code, &mut staged)?;
+        for copy in copies.iter().flatten() {
+            let src = crate::UserConstPtr::<Platform, u8>::from_usize(copy.src);
+            copy.dst.copy_from_user(platform, src, copy.len)?;
+        }
+    }
+    *msg_args = staged;
+    Ok(())
+}
+
+/// Write the outputs into `msg_args` and return the memref copies to perform.
+///
+/// Reads TA memory for [`ParamOutputs::Ta`], so the TA must not be dead.
+fn stage_outputs<'a, Platform: crate::OpteeShimPlatform>(
+    outputs: ParamOutputs<'a>,
+    return_code: TeeResult,
+    msg_args: &mut OpteeMsgArgs,
+) -> Result<[Option<MemrefCopy<'a>>; UteeParams::TEE_NUM_PARAMS], OpteeSmcReturnCode> {
+    let mut copies = [const { None }; UteeParams::TEE_NUM_PARAMS];
+    let (request, params, layout) = match outputs {
+        ParamOutputs::Ta(request) => {
+            let layout = request
+                .ta_layout
+                .expect("request is loaded before write-back");
+            // Single fetch: the TA owns this memory.
+            let params =
+                crate::UserConstPtr::<Platform, UteeParams>::from_usize(layout.params_address)
+                    .read_at_offset(0)
+                    .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            (request, params, Some(layout))
+        }
+        ParamOutputs::ClientPta { request, params } => (request, *params, None),
     };
-    let Some(ta_req_info) = ta_req_info else {
-        return Ok(());
-    };
-    let wire_param_offset = if ta_req_info.entry_func == UteeEntryFunc::OpenSession {
+    let wire_param_offset = if request.entry_func == UteeEntryFunc::OpenSession {
         2
     } else {
         0
     };
-    for index in 0..UteeParams::TEE_NUM_PARAMS {
+    for (index, param) in request.params.iter().enumerate() {
         let wire_index = index + wire_param_offset;
-        let param_type = ta_params
-            .get_type(index)
-            .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
-        match param_type {
-            TeeParamType::ValueOutput | TeeParamType::ValueInout => {
-                if let Ok(Some((value_a, value_b))) = ta_params.get_values(index) {
-                    msg_args.set_param_value(
-                        wire_index,
-                        OpteeMsgParamValue {
-                            a: value_a,
-                            b: value_b,
-                            c: 0,
-                        },
-                    )?;
-                }
+        // For a memref, `vals[2 * index]` is a TA-written address and is ignored.
+        let (value_a, value_b) = (params.vals[2 * index], params.vals[2 * index + 1]);
+        match param {
+            UteeParamOwned::ValueOutput | UteeParamOwned::ValueInout { .. } => {
+                // `c` is preserved, as in OP-TEE `copy_out_param`.
+                let mut value = msg_args.get_param_value(wire_index)?;
+                value.a = value_a;
+                value.b = value_b;
+                msg_args.set_param_value(wire_index, value)?;
             }
-            TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
-                if let Ok(Some((_addr, len))) = ta_params.get_values(index) {
-                    let len = checked_memref_size(len)?;
-                    if !matches!(
-                        &ta_req_info.params[index],
-                        UteeParamOwned::MemrefOutput { .. } | UteeParamOwned::MemrefInout { .. }
-                    ) {
-                        continue;
+            UteeParamOwned::MemrefOutput { .. } | UteeParamOwned::MemrefInout { .. } => {
+                let dst = request.shm_info[index]
+                    .as_ref()
+                    .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+                let fitting_len = usize::try_from(value_b)
+                    .ok()
+                    .filter(|&len| len <= dst.len());
+                if let Some(len) = fitting_len {
+                    if let Some(layout) = layout {
+                        // The recorded buffer bounds the read even if `request.params` changed.
+                        let (src, _) = layout.memref_buffers[index]
+                            .filter(|&(_, buf_len)| len <= buf_len)
+                            .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+                        copies[index] = Some(MemrefCopy { src, dst, len });
                     }
-                    let Some(shm_info) = &ta_req_info.shm_info[index] else {
-                        continue;
-                    };
-                    if len > shm_info.len() {
-                        if return_code != TeeResult::ShortBuffer {
-                            return Err(OpteeSmcReturnCode::EBadAddr);
-                        }
-                        // For short-buffer returns, report the required size without copying data.
-                        msg_args.set_param_memref_size(wire_index, len as u64)?;
-                        continue;
-                    }
-                    // Update the output size in msg_args before attempting any copy-out.
-                    msg_args.set_param_memref_size(wire_index, len as u64)?;
-                    let Some(memref_addresses) = memref_addresses else {
-                        continue;
-                    };
-                    let address = memref_addresses[index].ok_or(OpteeSmcReturnCode::EBadAddr)?;
-                    let ptr = crate::UserConstPtr::<Platform, u8>::from_usize(address);
-                    shm_info.copy_from_user(platform, ptr, len)?;
+                } else if return_code == TeeResult::Success {
+                    // A client may trust a `Success` size to bound its reads.
+                    return Err(OpteeSmcReturnCode::EBadAddr);
                 }
+                msg_args.set_param_memref_size(wire_index, value_b)?;
             }
-            _ => {}
+            UteeParamOwned::None
+            | UteeParamOwned::ValueInput { .. }
+            | UteeParamOwned::MemrefInput { .. } => {}
         }
     }
-    Ok(())
+    Ok(copies)
 }
 
 /// Build `UteeParams` for a client PTA from a decoded request.
@@ -1157,4 +1252,168 @@ fn get_shm_info_from_optee_msg_param_rmem(
         start % PAGE_SIZE,
         rmem.size.trunc(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox_common_optee::{OpteeMsgAttr, UteeParamsTypes};
+    use litebox_platform_linux_userland::LinuxUserland as Platform;
+    use zerocopy::IntoBytes;
+
+    /// An unmapped TA address: any read of it faults.
+    const UNMAPPED: usize = 0x8;
+
+    fn platform() -> &'static Platform {
+        crate::syscalls::tests::shim_builder().build().platform()
+    }
+
+    /// Raw `optee_msg_param`: the attribute word, then the 24-byte payload.
+    fn wire(attr: OpteeMsgAttrType, payload: [u64; 3]) -> [u64; 4] {
+        [attr as u64, payload[0], payload[1], payload[2]]
+    }
+
+    fn msg_args(cmd: OpteeMessageCommand, params: &[[u64; 4]]) -> OpteeMsgArgs {
+        let header = OpteeMsgArgsHeader {
+            cmd: cmd as u32,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: u32::try_from(params.len()).unwrap(),
+        };
+        OpteeMsgArgs::from_header_and_raw_params(&header, params.as_flattened().as_bytes()).unwrap()
+    }
+
+    fn to_bytes(msg_args: &OpteeMsgArgs) -> Vec<u8> {
+        let mut blob = alloc::vec![0u8; optee_msg_args_total_size(msg_args.num_params)];
+        msg_args.serialize(&mut blob).unwrap();
+        blob
+    }
+
+    /// Mirrors `TaStack::init`: records a placement where only memref output/inout
+    /// params get a buffer, `(memref_address, buffer_size)`.
+    fn record_placement(
+        request: &mut TaRequestInfo<PAGE_SIZE>,
+        params_address: usize,
+        memref_address: usize,
+    ) {
+        let memref_buffers = core::array::from_fn(|i| match request.params[i] {
+            UteeParamOwned::MemrefOutput { buffer_size }
+            | UteeParamOwned::MemrefInout { buffer_size, .. } => {
+                Some((memref_address, buffer_size))
+            }
+            _ => None,
+        });
+        request.ta_layout = Some(crate::TaParamLayout {
+            params_address,
+            memref_buffers,
+        });
+    }
+
+    #[test]
+    fn writeback_ignores_ta_written_types_and_addresses() {
+        let platform = platform();
+        let meta = u64::read_from_bytes(OpteeMsgAttr::META_VALUE_INPUT.as_bytes()).unwrap();
+        let wire_params = [
+            [meta, 0x1111, 0x2222, 0],
+            // Client identity with login `TEE_LOGIN_PUBLIC`.
+            [meta, 0, 0, 0],
+            wire(OpteeMsgAttrType::ValueInout, [1, 2, 0x33]),
+            wire(OpteeMsgAttrType::TmemOutput, [0x10_0000, 0x40, 0xabc]),
+            wire(OpteeMsgAttrType::ValueInput, [4, 5, 6]),
+            wire(OpteeMsgAttrType::None, [7, 8, 9]),
+        ];
+        let original = msg_args(OpteeMessageCommand::OpenSession, &wire_params);
+        let mut request = decode_ta_request(platform, &original).unwrap();
+        let mut expected_params = wire_params;
+        expected_params[2] = wire(OpteeMsgAttrType::ValueInout, [0xa0, 0xb0, 0x33]);
+        expected_params[3] = wire(OpteeMsgAttrType::TmemOutput, [0x10_0000, 0, 0xabc]);
+        let mut expected = msg_args(OpteeMessageCommand::OpenSession, &expected_params);
+        expected.ret = TeeResult::Success;
+        expected.ret_origin = TeeOrigin::TrustedApp;
+        expected.session = 42;
+        // The memref at TA index 1 has TA-written address 0xa1 and size 0. Its
+        // zero-length copy is staged, but `ShmInfo::copy_from_user` returns early
+        // for it, so shared memory (unmappable in userland) is never touched.
+        let mut params = UteeParams {
+            vals: [0xa0, 0xb0, 0xa1, 0, 0xa2, 0xb2, 0xa3, 0xb3],
+            ..UteeParams::new()
+        };
+
+        // All value outputs, all memref outputs, and all invalid.
+        for types in [0x2222_u64, 0x6666, 0xffff] {
+            params.types = UteeParamsTypes::read_from_bytes(types.as_bytes()).unwrap();
+            let params_address = core::ptr::from_ref(&params).expose_provenance();
+            record_placement(&mut request, params_address, UNMAPPED);
+            let mut msg_args = original;
+            update_optee_msg_args(
+                platform,
+                TeeResult::Success,
+                TeeOrigin::TrustedApp,
+                Some(42),
+                Some(&request),
+                &mut msg_args,
+            )
+            .unwrap_or_else(|e| panic!("types {types:#x}: {e:?}"));
+            assert_eq!(to_bytes(&msg_args), to_bytes(&expected), "types {types:#x}");
+        }
+
+        // Size 0x10 stages a copy from the recorded buffer, not from 0xa1.
+        params.vals[3] = 0x10;
+        let params_address = core::ptr::from_ref(&params).expose_provenance();
+        record_placement(&mut request, params_address, UNMAPPED);
+        let outputs = ParamOutputs::Ta(&request);
+        let copies =
+            stage_outputs::<Platform>(outputs, TeeResult::Success, &mut { original }).unwrap();
+        let copy = copies[1].as_ref().expect("memref output 1 is staged");
+        assert_eq!((copy.src, copy.len), (UNMAPPED, 0x10));
+        assert!(core::ptr::eq(
+            copy.dst,
+            request.shm_info[1].as_ref().unwrap()
+        ));
+
+        // A recorded buffer smaller than the size is rejected.
+        request.ta_layout = Some(crate::TaParamLayout {
+            params_address,
+            memref_buffers: [None, Some((UNMAPPED, 0xf)), None, None],
+        });
+        let outputs = ParamOutputs::Ta(&request);
+        assert!(matches!(
+            stage_outputs::<Platform>(outputs, TeeResult::Success, &mut { original }),
+            Err(OpteeSmcReturnCode::EBadAddr)
+        ));
+    }
+
+    #[test]
+    fn target_dead_writes_header_only() {
+        let platform = platform();
+        let original = msg_args(
+            OpteeMessageCommand::InvokeCommand,
+            &[
+                wire(OpteeMsgAttrType::ValueOutput, [1, 2, 3]),
+                wire(OpteeMsgAttrType::TmemOutput, [0x10_0000, 0x40, 0xabc]),
+            ],
+        );
+        let mut request = decode_ta_request(platform, &original).unwrap();
+        // Any read of the dead TA's memory fails.
+        record_placement(&mut request, UNMAPPED, UNMAPPED);
+        let mut expected = original;
+        expected.ret = TeeResult::TargetDead;
+        expected.ret_origin = TeeOrigin::Tee;
+
+        let mut msg_args = original;
+        update_optee_msg_args(
+            platform,
+            TeeResult::TargetDead,
+            TeeOrigin::Tee,
+            None,
+            Some(&request),
+            &mut msg_args,
+        )
+        .unwrap();
+        assert_eq!(to_bytes(&msg_args), to_bytes(&expected));
+    }
 }

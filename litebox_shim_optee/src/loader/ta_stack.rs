@@ -8,12 +8,17 @@ use litebox_common_linux::vmem::CreatePagesFlags;
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 use zerocopy::IntoBytes;
 
-use crate::{TaMemrefAddresses, UserMutPtr, msg_handler::ShmInfo};
+use crate::{TaParamLayout, UserMutPtr, msg_handler::ShmInfo};
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     addr & !(align - 1)
+}
+
+/// Offset of `UteeParams` in a `len`-byte TA stack: it sits at the top of the stack.
+const fn params_offset(len: usize) -> usize {
+    len - core::mem::size_of::<UteeParams>()
 }
 
 /// the user stack for OP-TEE TAs. Unlike Linux/libc, OP-TEE TAs do not assume
@@ -78,7 +83,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
         Some(Self {
             stack_top,
             len,
-            pos: len - core::mem::size_of::<UteeParams>(),
+            pos: params_offset(len),
             params: UteeParams::new(),
             num_params: 0,
             ldelf_arg_pos: None,
@@ -92,11 +97,6 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
 
     pub(crate) fn get_stack_base(&self) -> usize {
         self.stack_top.as_usize()
-    }
-
-    /// Get the address of `UteeParams` on the stack.
-    pub(crate) fn get_params_address(&self) -> usize {
-        self.stack_top.as_usize() + self.len - core::mem::size_of::<UteeParams>()
     }
 
     /// Get the address of `LdelfArg` on the stack.
@@ -230,9 +230,8 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
 
     /// Set `UteeParams` on the stack.
     fn set_utee_params(&mut self) -> Option<()> {
-        let size = core::mem::size_of::<UteeParams>();
         self.stack_top
-            .copy_from_slice(self.len - size, self.params.as_bytes())?;
+            .copy_from_slice(params_offset(self.len), self.params.as_bytes())?;
         Some(())
     }
 
@@ -241,7 +240,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
         platform: &Platform,
         params: &[UteeParamOwned],
         shm_info: &[Option<ShmInfo<ALIGN>>],
-    ) -> Option<TaMemrefAddresses>
+    ) -> Option<TaParamLayout>
     where
         Platform: litebox::mm::vmap::VmapManager<ALIGN>,
     {
@@ -251,7 +250,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
 
         self.scrub()?;
 
-        let mut memref_addresses = [None; UteeParams::TEE_NUM_PARAMS];
+        let mut memref_buffers = [None; UteeParams::TEE_NUM_PARAMS];
         for (index, param) in params.iter().enumerate() {
             match param {
                 UteeParamOwned::ValueInput { value_a, value_b } => {
@@ -293,14 +292,12 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
                                 *buffer_size,
                             )?
                         };
-                    memref_addresses[index] = Some(address);
+                    memref_buffers[index] = Some((address, *buffer_size));
                 }
                 UteeParamOwned::MemrefOutput { buffer_size } => {
-                    memref_addresses[index] = Some(self.push_param_memref(
-                        TeeParamType::MemrefOutput,
-                        None,
-                        *buffer_size,
-                    )?);
+                    let address =
+                        self.push_param_memref(TeeParamType::MemrefOutput, None, *buffer_size)?;
+                    memref_buffers[index] = Some((address, *buffer_size));
                 }
                 UteeParamOwned::None => self.push_param_none()?,
             }
@@ -321,7 +318,10 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
             self.pos % Self::STACK_ALIGNMENT,
             core::mem::size_of::<usize>()
         );
-        Some(memref_addresses)
+        Some(TaParamLayout {
+            params_address: self.stack_top.as_usize() + params_offset(self.len),
+            memref_buffers,
+        })
     }
 
     pub(crate) fn init_with_ldelf_arg(&mut self, ldelf_arg: &LdelfArg) -> Option<()> {

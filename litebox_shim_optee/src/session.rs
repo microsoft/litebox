@@ -1019,7 +1019,6 @@ mod tests {
     fn make_loaded_program(ta_flags: TaFlags) -> alloc::boxed::Box<LoadedProgram<Platform>> {
         alloc::boxed::Box::new(LoadedProgram {
             entrypoints: None,
-            params_address: None,
             ta_flags,
         })
     }
